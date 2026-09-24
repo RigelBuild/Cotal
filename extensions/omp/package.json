@@ -27,8 +27,7 @@
     "prepublishOnly": "pnpm run build"
   },
   "peerDependencies": {
-    "@cotal-ai/core": ">=0.1.0",
-    "@earendil-works/pi-tui": ">=0.79.10"
+    "@cotal-ai/core": ">=0.1.0"
   },
   "devDependencies": {
     "@cotal-ai/core": "workspace:*",

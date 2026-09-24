@@ -37,6 +37,7 @@ const WORKSPACE_PACKAGE_DIRS = {
   "@cotal-ai/delivery": "implementations/delivery",
   "@cotal-ai/connector-hermes": "extensions/connector-hermes",
   "@cotal-ai/connector-jcode": "extensions/connector-jcode",
+  "@cotal-ai/omp": "extensions/omp",
   "@cotal-ai/pi": "extensions/pi",
   "@cotal-ai/auth": "implementations/auth",
   "@cotal-ai/cli": "implementations/cli",
@@ -98,7 +99,7 @@ const check = (name: string, condition: boolean, detail?: unknown): void => {
 const discovered = discoverWorkspacePackages();
 const pinnedEntries = Object.entries(WORKSPACE_PACKAGE_DIRS).sort(([a], [b]) => a.localeCompare(b));
 const discoveredEntries = Object.entries(discovered).sort(([a], [b]) => a.localeCompare(b));
-check("the pinned workspace inventory contains exactly 29 packages", pinnedEntries.length === 29, pinnedEntries);
+check("the pinned workspace inventory contains exactly 30 packages", pinnedEntries.length === 30, pinnedEntries);
 check("independent workspace discovery exactly matches the pinned package inventory", JSON.stringify(discoveredEntries) === JSON.stringify(pinnedEntries), { discoveredEntries, pinnedEntries });
 check("the pinned affected package set contains exactly 11 packages", AFFECTED.length === 11, AFFECTED);
 

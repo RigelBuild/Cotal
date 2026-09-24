@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,6 +39,7 @@ export const ompConnector: Connector = {
     const stateRoot = opts.workspaceRoot ? join(opts.workspaceRoot, ".cotal", "pi-sessions") : undefined;
     const sessionStatePath = stateRoot ? join(stateRoot, `${opts.name}-${opts.lifecycleUid ?? "unmanaged"}.json`) : undefined;
     if (stateRoot) mkSecretDir(stateRoot);
+    if (sessionStatePath) rmSync(sessionStatePath, { force: true });
     const env: Record<string, string> = {
       ...launchEnv({ providerKeys: PI_PROVIDER_KEYS, envAllow: opts.envAllow }), ...aclEnv(opts),
       ...materialEnv({ creds: opts.creds, servers: opts.servers, controlToken: control.token, eventsRequired: opts.eventsRequired, userAuth: opts.userAuth }),
