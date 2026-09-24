@@ -444,6 +444,21 @@ importers:
         specifier: workspace:*
         version: link:../../packages/core
 
+  extensions/zellij:
+    devDependencies:
+      '@cotal-ai/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      esbuild:
+        specifier: ^0.28.0
+        version: 0.28.1
+      tsx:
+        specifier: ^4.23.0
+        version: 4.23.0
+      yaml:
+        specifier: ^2.9.0
+        version: 2.9.0
+
   implementations/auth:
     dependencies:
       '@cotal-ai/core':
