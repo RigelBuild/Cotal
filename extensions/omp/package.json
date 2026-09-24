@@ -1,0 +1,46 @@
+{
+  "name": "@cotal-ai/omp",
+  "version": "0.53.0",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Cotal-AI/Cotal.git",
+    "directory": "extensions/omp"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json --emitDeclarationOnly && pnpm run bundle",
+    "bundle": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/index.js --external:@cotal-ai/core && node -e \"require('node:fs').copyFileSync('node_modules/@cotal-ai/pi/dist/standalone.js','dist/standalone.js')\"",
+    "test": "pnpm run build && tsx omp.smoke.ts",
+    "prepublishOnly": "pnpm run build"
+  },
+  "peerDependencies": {
+    "@cotal-ai/core": ">=0.1.0",
+    "@earendil-works/pi-tui": ">=0.79.10"
+  },
+  "devDependencies": {
+    "@cotal-ai/core": "workspace:*",
+    "@cotal-ai/connector-core": "workspace:*",
+    "@cotal-ai/pi": "workspace:*",
+    "esbuild": "^0.28.0",
+    "tsx": "^4.20.6"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
