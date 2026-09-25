@@ -86,7 +86,6 @@ export class ZellijRuntime implements Runtime {
     if (!zellij.available()) throw new Error("zellij runtime: zellij is not available — is it installed and on PATH?");
     const placement = readZellijPlacement(spec.env?.COTAL_AGENT_FILE);
     zellij.ensureSession(this.session);
-    const launcher = privateLauncher(spec, cwd);
     let paneId: string | undefined;
     let createdTabId: string | undefined;
     const targetTabName = placement?.tab ?? name;
@@ -94,6 +93,8 @@ export class ZellijRuntime implements Runtime {
     const existingTab = placement?.tab
       ? tabsBefore.find((candidate) => candidate.name === placement.tab)
       : undefined;
+    // Created last: every later failure path deletes it, and it holds the connector's secrets.
+    const launcher = privateLauncher(spec, cwd);
     try {
       if (!placement?.tab || !existingTab) {
         createdTabId = zellij.createTab(this.session, targetTabName, cwd, launcher.argv);

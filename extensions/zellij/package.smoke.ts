@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LaunchSpec } from "@cotal-ai/core";
@@ -33,7 +33,7 @@ function readCalls(logPath: string): string[][] {
 }
 
 async function withFakeZellij(
-  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error",
+  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs",
   run: (logPath: string, session: string) => void | Promise<void>,
 ): Promise<void> {
   const bin = mkdtempSync(join(tmpdir(), "cotal-zellij-fake-"));
@@ -65,6 +65,7 @@ if (action === "list-clients") {
 }
 if (action === "new-tab") { console.log("77"); process.exit(0); }
 if (action === "list-tabs") {
+  if (process.env.COTAL_ZELLIJ_TEST_MODE === "bad-tabs") { console.log("not json"); process.exit(0); }
   console.log(JSON.stringify([{ tab_id: 77, name: "confirm-agent", active: true }]));
   process.exit(0);
 }
@@ -198,6 +199,24 @@ check(
   !zellij.hasLiveSession("lane [Created 5s ago] (EXITED - attach to resurrect)\n", "lane") &&
     zellij.hasLiveSession("lane [Created 5s ago] \n", "lane"),
 );
+
+await withFakeZellij("bad-tabs", (_logPath, session) => {
+  const tmp = mkdtempSync(join(tmpdir(), "cotal-zellij-tmp-"));
+  const savedTmp = process.env.TMPDIR;
+  process.env.TMPDIR = tmp;
+  let spawnFailed = false;
+  try {
+    new ZellijRuntime(session).spawn("leak-agent", { command: "sleep", args: ["600"], env: { COTAL_CREDS: "secret" } }, process.cwd());
+  } catch {
+    spawnFailed = true;
+  } finally {
+    if (savedTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = savedTmp;
+  }
+  const leaked = readdirSync(tmp).filter((entry) => entry.startsWith("cotal-zellij-launch-"));
+  rmSync(tmp, { recursive: true, force: true });
+  check("a failed tab probe leaves no launcher file with secrets", spawnFailed && leaked.length === 0);
+});
 
 await withFakeZellij("partial-tab", (logPath, session) => {
   let spawnFailed = false;
