@@ -381,6 +381,24 @@ importers:
         specifier: ^4.22.4
         version: 4.23.0
 
+  extensions/omp:
+    devDependencies:
+      '@cotal-ai/connector-core':
+        specifier: workspace:*
+        version: link:../connector-core
+      '@cotal-ai/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      '@cotal-ai/pi':
+        specifier: workspace:*
+        version: link:../pi
+      esbuild:
+        specifier: ^0.28.0
+        version: 0.28.1
+      tsx:
+        specifier: ^4.20.6
+        version: 4.23.0
+
   extensions/orca:
     devDependencies:
       '@cotal-ai/core':

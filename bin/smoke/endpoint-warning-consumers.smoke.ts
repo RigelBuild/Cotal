@@ -27,6 +27,7 @@ const BUNDLED_MESH_AGENT_ARTIFACTS = [
   "extensions/connector-jcode/dist/host.js",
   "extensions/connector-opencode/dist/plugin.bundle.js",
   "extensions/pi/dist/index.js",
+  "extensions/omp/dist/standalone.js",
   "extensions/pi/dist/standalone.js",
 ] as const;
 
