@@ -43,4 +43,10 @@ window.COTAL_HARNESS = {
     glyph: "π",
     svg: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M9 7v12"/><path d="M15 7v12c0 1.5 1.5 2 3 1"/></svg>`,
   },
+  omp: {
+    label: "omp",
+    color: "#c4b5fd", // oh-my-pi, no official mark: the π glyph in violet
+    glyph: "π",
+    svg: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M9 7v12"/><path d="M15 7v12c0 1.5 1.5 2 3 1"/></svg>`,
+  },
 };

@@ -56,9 +56,11 @@
     "@cotal-ai/connector-hermes": "workspace:*",
     "@cotal-ai/connector-jcode": "workspace:*",
     "@cotal-ai/connector-opencode": "workspace:*",
+    "@cotal-ai/omp": "workspace:*",
     "@cotal-ai/pi": "workspace:*",
     "@cotal-ai/smoke-kit": "workspace:*",
     "@cotal-ai/web": "workspace:*",
+    "@cotal-ai/zellij": "workspace:*",
     "@nats-io/jetstream": "^3.4.0",
     "@nats-io/transport-node": "^3.4.0",
     "typescript": "^5.9.3"

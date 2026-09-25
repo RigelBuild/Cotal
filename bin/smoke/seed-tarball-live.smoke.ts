@@ -77,7 +77,7 @@ try {
   // as the generation, so a skewed payload would be installed and treated as current (F1). The prepack
   // asserts this too; the tarball is the last place to catch it before a customer install.
   const umbrellaVersion = (JSON.parse(packedPkg) as { version: string }).version;
-  for (const n of ["claude", "opencode", "hermes", "pi", "web"]) {
+  for (const n of ["claude", "opencode", "hermes", "pi", "omp", "web", "zellij"]) {
     const seededPkg = JSON.parse(
       execFileSync("tar", ["xzf", cotalTgz, "-O", `package/seeded-connectors/${n}/package.json`], { encoding: "utf8" }),
     ) as { version: string };
@@ -128,20 +128,21 @@ try {
   }
   const list = spawnSync("node", [invokedBin, "ext", "list"], { encoding: "utf8", env: { ...process.env, XDG_CONFIG_HOME: cfg } });
   const out = list.stdout ?? "";
-  for (const n of ["claude", "opencode", "codex", "hermes", "jcode", "pi"]) {
+  for (const n of ["claude", "opencode", "codex", "hermes", "jcode", "pi", "omp"]) {
     check(`seeded connector:${n} from the tarball binary`, out.includes(`connector:${n}`), list.stderr);
   }
   check("seeded command:web (the dashboard) from the bundled payload", out.includes("command:web"), list.stderr);
+  check("seeded runtime:zellij from the bundled payload", out.includes("runtime:zellij"), list.stderr);
 
   const manifest = JSON.parse(readFileSync(join(cfg, "cotal", "extensions", "extensions.json"), "utf8")) as {
     extensions: { pkg: string; spec: string; source?: string }[];
   };
   const hermes = manifest.extensions.find((e) => e.pkg === "@cotal-ai/connector-hermes");
   check("connector installed from the durable store under the isolated config (pubDir branch)", Boolean(hermes && hermes.spec.startsWith(cfg)), hermes?.spec);
-  const firstParty = ["@cotal-ai/connector-claude-code", "@cotal-ai/connector-opencode", "@cotal-ai/connector-codex", "@cotal-ai/connector-hermes", "@cotal-ai/connector-jcode", "@cotal-ai/pi", "@cotal-ai/web"];
+  const firstParty = ["@cotal-ai/connector-claude-code", "@cotal-ai/connector-opencode", "@cotal-ai/connector-codex", "@cotal-ai/connector-hermes", "@cotal-ai/connector-jcode", "@cotal-ai/pi", "@cotal-ai/omp", "@cotal-ai/web", "@cotal-ai/zellij"];
   const seededEntries = manifest.extensions.filter((e) => firstParty.includes(e.pkg));
   const allSeeded = seededEntries.every((e) => e.source === "seeded");
-  check("all seven first-party exts recorded source:seeded (registered into the binary's single core)", allSeeded && seededEntries.length === 7);
+  check("all nine first-party exts recorded source:seeded (registered into the binary's single core)", allSeeded && seededEntries.length === 9);
   const webEntry = manifest.extensions.find((e) => e.pkg === "@cotal-ai/web");
   check("web installed from the durable store under the isolated config (bundled, not npm-fetched)", Boolean(webEntry && webEntry.spec.startsWith(cfg)), webEntry?.spec);
 

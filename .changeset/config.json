@@ -25,6 +25,8 @@
       "@cotal-ai/connector-opencode",
       "@cotal-ai/connector-codex",
       "@cotal-ai/pi",
+      "@cotal-ai/omp",
+      "@cotal-ai/zellij",
       "@cotal-ai/auth"
     ]
   ],

@@ -172,7 +172,7 @@ the entry is `reconcileSeededConnectors()`, gated in `runCli` before the manifes
 `prepack` step ([`bin/scripts/copy-seeded-connectors.mjs`](../bin/scripts/copy-seeded-connectors.mjs))
 `npm pack`s each into `bin/seeded-connectors/<name>/` (honoring each connector's own `files`), added to
 the package `files`. `SEEDED_EXTENSIONS` (`@cotal-ai/workspace`) is the shared list: the
-connectors plus `web`. The prepack asserts that every bundled payload's `name` and `version` match
+connectors plus `web` and the `zellij` runtime. The prepack asserts that every bundled payload's `name` and `version` match
 the umbrella (the
 `fixed` changeset group keeps them lockstep), so a version-skewed payload can never be published; `web`
 also emits `dist/web/vendor/vendor-manifest.json` (name/version/license/sha512) as the auditable

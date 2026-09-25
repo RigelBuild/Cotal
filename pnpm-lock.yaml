@@ -103,6 +103,9 @@ importers:
       '@cotal-ai/connector-opencode':
         specifier: workspace:*
         version: link:../extensions/connector-opencode
+      '@cotal-ai/omp':
+        specifier: workspace:*
+        version: link:../extensions/omp
       '@cotal-ai/pi':
         specifier: workspace:*
         version: link:../extensions/pi
@@ -112,6 +115,9 @@ importers:
       '@cotal-ai/web':
         specifier: workspace:*
         version: link:../implementations/web
+      '@cotal-ai/zellij':
+        specifier: workspace:*
+        version: link:../extensions/zellij
       '@nats-io/jetstream':
         specifier: ^3.4.0
         version: 3.4.0
