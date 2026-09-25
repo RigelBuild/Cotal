@@ -89,18 +89,19 @@ export class ZellijRuntime implements Runtime {
     const launcher = privateLauncher(spec, cwd);
     let paneId: string | undefined;
     let createdTabId: string | undefined;
+    const targetTabName = placement?.tab ?? name;
+    const tabsBefore = zellij.listTabs(this.session);
+    const existingTab = placement?.tab
+      ? tabsBefore.find((candidate) => candidate.name === placement.tab)
+      : undefined;
     try {
-      const targetTabName = placement?.tab;
-      const tab = targetTabName
-        ? zellij.listTabs(this.session).find((candidate) => candidate.name === targetTabName)
-        : undefined;
-      if (!targetTabName || !tab) {
-        createdTabId = zellij.createTab(this.session, targetTabName ?? name, cwd, launcher.argv);
+      if (!placement?.tab || !existingTab) {
+        createdTabId = zellij.createTab(this.session, targetTabName, cwd, launcher.argv);
         paneId = paneForTab(this.session, Number(createdTabId));
       } else {
         paneId = zellij.createPane(
           this.session,
-          String(tab.tab_id),
+          String(existingTab.tab_id),
           name,
           cwd,
           launcher.argv,
@@ -110,7 +111,12 @@ export class ZellijRuntime implements Runtime {
     } catch (error) {
       try {
         if (paneId) zellij.closePane(this.session, paneId);
-        else if (createdTabId) zellij.closeTab(this.session, createdTabId);
+        else {
+          const partialTabId = createdTabId ?? zellij.listTabs(this.session)
+            .find((candidate) => candidate.name === targetTabName && !tabsBefore.some((previous) => previous.tab_id === candidate.tab_id))
+            ?.tab_id.toString();
+          if (partialTabId) zellij.closeTab(this.session, partialTabId);
+        }
       } catch {
         /* best-effort teardown of a partially created agent */
       }

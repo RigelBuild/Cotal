@@ -33,7 +33,7 @@ function readCalls(logPath: string): string[][] {
 }
 
 async function withFakeZellij(
-  mode: "missing-session" | "partial-tab" | "confirm",
+  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error",
   run: (logPath: string, session: string) => void | Promise<void>,
 ): Promise<void> {
   const bin = mkdtempSync(join(tmpdir(), "cotal-zellij-fake-"));
@@ -52,7 +52,10 @@ const args = process.argv.slice(2);
 appendFileSync(process.env.COTAL_ZELLIJ_TEST_LOG, JSON.stringify(args) + "\\n");
 if (args[0] === "--version") { console.log("zellij 0.45.1"); process.exit(0); }
 if (args[0] === "list-sessions") {
-  console.log(process.env.COTAL_ZELLIJ_TEST_MODE === "missing-session" ? "other-session" : process.env.COTAL_ZELLIJ_TEST_SESSION);
+  const mode = process.env.COTAL_ZELLIJ_TEST_MODE;
+  if (mode === "no-server") { console.error("No active zellij sessions found."); process.exit(1); }
+  if (mode === "probe-error") { console.error("Error occurred: timed out"); process.exit(1); }
+  console.log(mode === "missing-session" ? "other-session [Created 1s ago] " : process.env.COTAL_ZELLIJ_TEST_SESSION + " [Created 1s ago] ");
   process.exit(0);
 }
 const action = args[3];
@@ -168,6 +171,33 @@ await withFakeZellij("missing-session", (logPath, session) => {
     state === "exited" && closeSucceeded && calls.every((args) => args[3] !== "list-clients"),
   );
 });
+
+await withFakeZellij("no-server", (_logPath, session) => {
+  check("zellij's no-sessions answer reads as exited", zellij.paneState(session, "terminal_99") === "exited");
+});
+
+await withFakeZellij("probe-error", (_logPath, session) => {
+  let threw = false;
+  try {
+    zellij.paneState(session, "terminal_99");
+  } catch {
+    threw = true;
+  }
+  const handleStatus = (() => {
+    try {
+      return zellij.paneState(session, "terminal_99");
+    } catch {
+      return "running";
+    }
+  })();
+  check("a failed session probe throws instead of reading as exited", threw && handleStatus === "running");
+});
+
+check(
+  "an EXITED (resurrectable) session is not live",
+  !zellij.hasLiveSession("lane [Created 5s ago] (EXITED - attach to resurrect)\n", "lane") &&
+    zellij.hasLiveSession("lane [Created 5s ago] \n", "lane"),
+);
 
 await withFakeZellij("partial-tab", (logPath, session) => {
   let spawnFailed = false;

@@ -40,20 +40,35 @@ function actionArgs(session: string, action: string[]): string[] {
   return ["--session", session, "action", ...action];
 }
 
-function hasNamedSession(output: string, session: string): boolean {
-  return output.split("\n").some((line) => line.trim().split(/\s+/, 1)[0] === session);
+const NO_SESSIONS = "No active zellij sessions found";
+
+// Dead sessions stay listed (resurrectable) with an EXITED suffix; they are not live.
+export function hasLiveSession(listing: string, session: string): boolean {
+  return listing
+    .split("\n")
+    .some((line) => line.trim().split(/\s+/, 1)[0] === session && !line.includes("(EXITED"));
 }
 
-function sessions(): string {
-  return run(["list-sessions", "--no-formatting", "--short"]);
+function isNoSessionsError(error: unknown): boolean {
+  if (!error || typeof error !== "object" || !("stderr" in error)) return false;
+  const { stderr } = error;
+  return (typeof stderr === "string" || Buffer.isBuffer(stderr)) && String(stderr).includes(NO_SESSIONS);
 }
 
+// Only zellij's own "no sessions" answer means absent; any other probe failure throws, so a
+// failed probe can never read as a confirmed exit.
 function sessionExists(session: string): boolean {
+  let listing: string;
   try {
-    return hasNamedSession(sessions(), session);
-  } catch {
-    return false;
+    listing = execFileSync("zellij", ["list-sessions", "--no-formatting"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    if (isNoSessionsError(error)) return false;
+    throw error;
   }
+  return hasLiveSession(listing, session);
 }
 
 export function ensureSession(session: string): void {
@@ -236,7 +251,7 @@ export async function waitForPaneExit(session: string, paneId: string): Promise<
     try {
       if (paneState(session, paneId) === "exited") return;
     } catch {
-      if (!sessionExists(session)) return;
+      // A failed probe is not an exit; poll again.
     }
     await new Promise<void>((resolve) => setTimeout(resolve, 100));
   }
