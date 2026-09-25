@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { ZellijRuntime } from "./src/runtime.ts";
 import * as zellij from "./src/driver.ts";
 
@@ -14,6 +14,13 @@ let created = false;
 try {
   zellij.ensureSession(session);
   created = true;
+  zellij.ensureClient(session);
+  const headlessTabs = JSON.parse(execFileSync("zellij", ["--session", session, "action", "list-tabs", "--json"], { encoding: "utf8" })) as Array<{
+    display_area_columns?: number;
+    display_area_rows?: number;
+  }>;
+  assert.ok(headlessTabs.some((tab) => (tab.display_area_columns ?? 0) >= 1000 && (tab.display_area_rows ?? 0) >= 500));
+  console.log("  ✓ headless client advertises 1000x500 terminal size");
 
   zellij.createEmptyTab(session, "focus-sentinel", process.cwd());
   const focusedBefore = zellij.listTabs(session).find((tab) => tab.active)?.tab_id;

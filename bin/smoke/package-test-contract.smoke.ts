@@ -14,7 +14,6 @@ const AFFECTED = [
   "@cotal-ai/orca",
   "@cotal-ai/smoke-kit",
   "@cotal-ai/tmux",
-  "@cotal-ai/zellij",
   "@cotal-ai/delivery",
 ] as const;
 
@@ -103,7 +102,7 @@ const pinnedEntries = Object.entries(WORKSPACE_PACKAGE_DIRS).sort(([a], [b]) => 
 const discoveredEntries = Object.entries(discovered).sort(([a], [b]) => a.localeCompare(b));
 check("the pinned workspace inventory contains exactly 31 packages", pinnedEntries.length === 31, pinnedEntries);
 check("independent workspace discovery exactly matches the pinned package inventory", JSON.stringify(discoveredEntries) === JSON.stringify(pinnedEntries), { discoveredEntries, pinnedEntries });
-check("the pinned affected package set contains exactly 12 packages", AFFECTED.length === 12, AFFECTED);
+check("the pinned affected package set contains exactly 11 packages", AFFECTED.length === 11, AFFECTED);
 
 for (const [name, dir] of Object.entries(WORKSPACE_PACKAGE_DIRS)) {
   const manifest = JSON.parse(readFileSync(join(ROOT, dir, "package.json"), "utf8")) as { name?: string; private?: boolean; scripts?: { test?: string } };

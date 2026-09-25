@@ -48,14 +48,18 @@ function sessions(): string {
   return run(["list-sessions", "--no-formatting", "--short"]);
 }
 
+function sessionExists(session: string): boolean {
+  try {
+    return hasNamedSession(sessions(), session);
+  } catch {
+    return false;
+  }
+}
+
 export function ensureSession(session: string): void {
   if (!/^[A-Za-z0-9_.][A-Za-z0-9_.-]*$/.test(session))
     throw new Error(`zellij runtime: unsafe session name ${JSON.stringify(session)}`);
-  try {
-    if (hasNamedSession(sessions(), session)) return;
-  } catch {
-    // No reachable server means there cannot be an existing session.
-  }
+  if (sessionExists(session)) return;
   run(["attach", "--create-background", session], { stdio: "ignore" });
 }
 
@@ -69,13 +73,15 @@ function clientAttached(session: string): boolean {
   }
 }
 
-function scriptAttachArgs(session: string): string[] {
+export function scriptAttachArgs(session: string): string[] {
   if (!/^[A-Za-z0-9_.][A-Za-z0-9_.-]*$/.test(session))
     throw new Error(`zellij runtime: unsafe session name ${JSON.stringify(session)}`);
-  return ["-qec", `zellij attach ${session}`, "/dev/null"];
+  return ["-qec", `stty cols 1000 rows 500; exec zellij attach ${session}`, "/dev/null"];
 }
 
 export function ensureClient(session: string): void {
+  if (!sessionExists(session))
+    throw new Error(`zellij runtime: session ${JSON.stringify(session)} does not exist`);
   if (clientAttached(session)) return;
   const env = { ...process.env };
   delete env.ZELLIJ;
@@ -109,6 +115,7 @@ function parseArray(raw: string, label: string): unknown[] {
 }
 
 export function listTabs(session: string): ZellijTab[] {
+  if (!sessionExists(session)) return [];
   const rows = parseArray(run(actionArgs(session, ["list-tabs", "--json"])), "tab list");
   return rows.flatMap((row): ZellijTab[] => {
     if (typeof row !== "object" || row === null || Array.isArray(row)) return [];
@@ -121,7 +128,7 @@ export function listTabs(session: string): ZellijTab[] {
 }
 
 export function listPanes(session: string): ZellijPane[] {
-  ensureClient(session);
+  if (!sessionExists(session)) return [];
   const rows = parseArray(run(actionArgs(session, ["list-panes", "--json", "--all"])), "pane list");
   return rows.flatMap((row): ZellijPane[] => {
     if (typeof row !== "object" || row === null || Array.isArray(row)) return [];
@@ -193,16 +200,33 @@ export function createPane(
 }
 
 export function closePane(session: string, paneId: string): void {
+  if (!sessionExists(session)) return;
   ensureClient(session);
   run(actionArgs(session, ["close-pane", "-p", paneId]), { stdio: "ignore" });
 }
 
-export function interruptPane(session: string, paneId: string): void {
+export function closeTab(session: string, tabId: string): void {
+  if (!sessionExists(session)) return;
   ensureClient(session);
-  run(actionArgs(session, ["write", "-p", paneId, "3"]), { stdio: "ignore" });
+  run(actionArgs(session, ["close-tab", "--tab-id", tabId]), { stdio: "ignore" });
+}
+
+export function buildWriteArgs(paneId: string, input: string): string[] {
+  return ["write", "-p", paneId, input];
+}
+
+export function writePane(session: string, paneId: string, input: string): void {
+  if (!sessionExists(session)) return;
+  ensureClient(session);
+  run(actionArgs(session, buildWriteArgs(paneId, input)), { stdio: "ignore" });
+}
+
+export function interruptPane(session: string, paneId: string): void {
+  writePane(session, paneId, "3");
 }
 
 export function paneState(session: string, paneId: string): "running" | "exited" {
+  if (!sessionExists(session)) return "exited";
   const pane = listPanes(session).find((candidate) => candidate.id === paneId && !candidate.is_plugin);
   return !pane || pane.exited || pane.exit_status !== null ? "exited" : "running";
 }
@@ -212,11 +236,7 @@ export async function waitForPaneExit(session: string, paneId: string): Promise<
     try {
       if (paneState(session, paneId) === "exited") return;
     } catch {
-      try {
-        if (!hasNamedSession(sessions(), session)) return;
-      } catch {
-        return;
-      }
+      if (!sessionExists(session)) return;
     }
     await new Promise<void>((resolve) => setTimeout(resolve, 100));
   }

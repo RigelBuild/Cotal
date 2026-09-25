@@ -1,23 +1,96 @@
 import { strict as assert } from "node:assert";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LaunchSpec } from "@cotal-ai/core";
 import { buildNewPaneArgs, buildNewTabArgs } from "./src/driver.js";
 import { parseZellijPlacement } from "./src/placement.js";
-import { privateLauncher } from "./src/runtime.js";
+import { privateLauncher, ZellijRuntime } from "./src/runtime.js";
+import * as zellij from "./src/driver.js";
 
 let checks = 0;
+const failures: string[] = [];
 function check(name: string, condition: boolean): void {
-  assert.ok(condition, name);
   checks++;
-  console.log(`  ✓ ${name}`);
+  if (condition) console.log(`  ✓ ${name}`);
+  else {
+    failures.push(name);
+    console.log(`  ✗ FAIL: ${name}`);
+  }
 }
 
 function rejects(name: string, raw: string): void {
   assert.throws(() => parseZellijPlacement(raw), undefined, name);
   checks++;
   console.log(`  ✓ ${name}`);
+}
+
+function readCalls(logPath: string): string[][] {
+  return readFileSync(logPath, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as string[]);
+}
+
+async function withFakeZellij(
+  mode: "missing-session" | "partial-tab" | "confirm",
+  run: (logPath: string, session: string) => void | Promise<void>,
+): Promise<void> {
+  const bin = mkdtempSync(join(tmpdir(), "cotal-zellij-fake-"));
+  const executable = join(bin, "zellij");
+  const logPath = join(bin, "calls.jsonl");
+  const session = `ztest-fake-${process.pid}`;
+  const saved = {
+    PATH: process.env.PATH,
+    mode: process.env.COTAL_ZELLIJ_TEST_MODE,
+    session: process.env.COTAL_ZELLIJ_TEST_SESSION,
+    log: process.env.COTAL_ZELLIJ_TEST_LOG,
+  };
+  writeFileSync(executable, `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(process.env.COTAL_ZELLIJ_TEST_LOG, JSON.stringify(args) + "\\n");
+if (args[0] === "--version") { console.log("zellij 0.45.1"); process.exit(0); }
+if (args[0] === "list-sessions") {
+  console.log(process.env.COTAL_ZELLIJ_TEST_MODE === "missing-session" ? "other-session" : process.env.COTAL_ZELLIJ_TEST_SESSION);
+  process.exit(0);
+}
+const action = args[3];
+if (action === "list-clients") {
+  console.log(process.env.COTAL_ZELLIJ_TEST_MODE === "missing-session" ? "not found" : "1");
+  process.exit(0);
+}
+if (action === "new-tab") { console.log("77"); process.exit(0); }
+if (action === "list-tabs") {
+  console.log(JSON.stringify([{ tab_id: 77, name: "confirm-agent", active: true }]));
+  process.exit(0);
+}
+if (action === "list-panes") {
+  console.log(JSON.stringify(process.env.COTAL_ZELLIJ_TEST_MODE === "partial-tab" ? [] : [{
+    id: 77, tab_id: 77, title: "confirm-agent", is_plugin: false, exited: false, exit_status: null
+  }]));
+  process.exit(0);
+}
+process.exit(0);
+`);
+  chmodSync(executable, 0o755);
+  process.env.PATH = `${bin}:${saved.PATH ?? ""}`;
+  process.env.COTAL_ZELLIJ_TEST_MODE = mode;
+  process.env.COTAL_ZELLIJ_TEST_SESSION = session;
+  process.env.COTAL_ZELLIJ_TEST_LOG = logPath;
+  try {
+    await run(logPath, session);
+  } finally {
+    if (saved.PATH === undefined) delete process.env.PATH;
+    else process.env.PATH = saved.PATH;
+    if (saved.mode === undefined) delete process.env.COTAL_ZELLIJ_TEST_MODE;
+    else process.env.COTAL_ZELLIJ_TEST_MODE = saved.mode;
+    if (saved.session === undefined) delete process.env.COTAL_ZELLIJ_TEST_SESSION;
+    else process.env.COTAL_ZELLIJ_TEST_SESSION = saved.session;
+    if (saved.log === undefined) delete process.env.COTAL_ZELLIJ_TEST_LOG;
+    else process.env.COTAL_ZELLIJ_TEST_LOG = saved.log;
+    rmSync(bin, { recursive: true, force: true });
+  }
 }
 
 check("no frontmatter has no placement", parseZellijPlacement("# agent\n") === undefined);
@@ -68,8 +141,7 @@ try {
   const secret = "unit-only-secret";
   const spec: LaunchSpec = { command: "sleep", args: ["600"], env: { PRIVATE_VALUE: secret } };
   const launcher = privateLauncher(spec, temp);
-  const mode = statSync(launcher.script).mode & 0o777;
-  check("launcher script is owner-only", mode === 0o600);
+  check("launcher script is owner-only", (statSync(launcher.script).mode & 0o777) === 0o600);
   check("launcher argv contains no connector env values", !launcher.argv.includes(secret));
   check("launcher stores command and env outside pane argv", readFileSync(launcher.script, "utf8").includes(secret));
   rmSync(launcher.dir, { recursive: true, force: true });
@@ -77,4 +149,54 @@ try {
   rmSync(temp, { recursive: true, force: true });
 }
 
+await withFakeZellij("missing-session", (logPath, session) => {
+  let state = "error";
+  try {
+    state = zellij.paneState(session, "terminal_99");
+  } catch {
+    // Assert the absent-session contract below.
+  }
+  let closeSucceeded = true;
+  try {
+    zellij.closePane(session, "terminal_99");
+  } catch {
+    closeSucceeded = false;
+  }
+  const calls = readCalls(logPath);
+  check(
+    "missing session reads as exited and close is a no-op without attaching a client",
+    state === "exited" && closeSucceeded && calls.every((args) => args[3] !== "list-clients"),
+  );
+});
+
+await withFakeZellij("partial-tab", (logPath, session) => {
+  let spawnFailed = false;
+  try {
+    new ZellijRuntime(session).spawn("partial-agent", { command: "sleep", args: ["600"] }, process.cwd());
+  } catch {
+    spawnFailed = true;
+  }
+  const calls = readCalls(logPath);
+  check(
+    "failed first-pane lookup closes the created tab",
+    spawnFailed && calls.some((args) => args[3] === "close-tab" && args.includes("77")),
+  );
+});
+
+await withFakeZellij("confirm", async (logPath, session) => {
+  const handle = new ZellijRuntime(session).spawn(
+    "confirm-agent",
+    { command: "sleep", args: ["600"], confirm: "Continue?" },
+    process.cwd(),
+  );
+  await new Promise<void>((resolve) => setTimeout(resolve, 5_250));
+  const writes = readCalls(logPath).filter((args) => args[3] === "write");
+  handle.stop({ graceful: false });
+  check(
+    "confirm sends five Enter presses to the spawned pane",
+    writes.length === 5 && writes.every((args) => args.slice(4).join(" ") === "-p terminal_77 13"),
+  );
+});
+
 console.log(`ZELLIJ PACKAGE TESTS: ${checks} tests executed`);
+if (failures.length > 0) throw new Error(`${failures.length} regression checks failed: ${failures.join(", ")}`);

@@ -13,6 +13,18 @@ import {
 import * as zellij from "./driver.js";
 import { readZellijPlacement, type AgentPlacement } from "./placement.js";
 
+const CONFIRM_INTERVAL_MS = 1_000;
+const MAX_CONFIRMS = 5;
+
+export function scheduleConfirmation(
+  confirm: string,
+  write: () => void,
+  schedule: (callback: () => void, delay: number) => unknown = (callback, delay) => setTimeout(callback, delay),
+): void {
+  if (!confirm) return;
+  for (let i = 1; i <= MAX_CONFIRMS; i++) schedule(write, i * CONFIRM_INTERVAL_MS);
+}
+
 interface LauncherPayload {
   readonly cwd: string;
   readonly command: string;
@@ -75,15 +87,16 @@ export class ZellijRuntime implements Runtime {
     const placement = readZellijPlacement(spec.env?.COTAL_AGENT_FILE);
     zellij.ensureSession(this.session);
     const launcher = privateLauncher(spec, cwd);
-    let paneId: string;
+    let paneId: string | undefined;
+    let createdTabId: string | undefined;
     try {
       const targetTabName = placement?.tab;
       const tab = targetTabName
         ? zellij.listTabs(this.session).find((candidate) => candidate.name === targetTabName)
         : undefined;
       if (!targetTabName || !tab) {
-        const tabId = zellij.createTab(this.session, targetTabName ?? name, cwd, launcher.argv);
-        paneId = paneForTab(this.session, Number(tabId));
+        createdTabId = zellij.createTab(this.session, targetTabName ?? name, cwd, launcher.argv);
+        paneId = paneForTab(this.session, Number(createdTabId));
       } else {
         paneId = zellij.createPane(
           this.session,
@@ -95,8 +108,25 @@ export class ZellijRuntime implements Runtime {
         );
       }
     } catch (error) {
+      try {
+        if (paneId) zellij.closePane(this.session, paneId);
+        else if (createdTabId) zellij.closeTab(this.session, createdTabId);
+      } catch {
+        /* best-effort teardown of a partially created agent */
+      }
       cleanupLauncher(launcher);
       throw error;
+    }
+
+    const startedPane = paneId;
+    if (spec.confirm) {
+      scheduleConfirmation(spec.confirm, () => {
+        try {
+          zellij.writePane(this.session, startedPane, "13");
+        } catch {
+          /* pane may already be gone */
+        }
+      });
     }
 
     return {
@@ -104,20 +134,20 @@ export class ZellijRuntime implements Runtime {
       kind: "zellij",
       status: () => {
         try {
-          return zellij.paneState(this.session, paneId);
+          return zellij.paneState(this.session, startedPane);
         } catch {
           return "running";
         }
       },
       stop: () => {
         try {
-          zellij.closePane(this.session, paneId);
+          zellij.closePane(this.session, startedPane);
         } finally {
           cleanupLauncher(launcher);
         }
       },
-      interrupt: () => zellij.interruptPane(this.session, paneId),
-      waitForExit: () => zellij.waitForPaneExit(this.session, paneId),
+      interrupt: () => zellij.interruptPane(this.session, startedPane),
+      waitForExit: () => zellij.waitForPaneExit(this.session, startedPane),
       attach: () => {
         throw new Error(`zellij runtime: attach natively with zellij attach ${this.session}`);
       },
