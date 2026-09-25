@@ -36,6 +36,11 @@ async function withFakeZellij(
   mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs",
   run: (logPath: string, session: string) => void | Promise<void>,
 ): Promise<void> {
+  // The fake is a shebang script Windows cannot exec, and zellij ships no Windows build.
+  if (process.platform === "win32") {
+    console.log(`  ✓ win32: skipped fake-zellij scenario "${mode}" (zellij is POSIX-only)`);
+    return;
+  }
   const bin = mkdtempSync(join(tmpdir(), "cotal-zellij-fake-"));
   const executable = join(bin, "zellij");
   const logPath = join(bin, "calls.jsonl");
@@ -145,7 +150,8 @@ try {
   const secret = "unit-only-secret";
   const spec: LaunchSpec = { command: "sleep", args: ["600"], env: { PRIVATE_VALUE: secret } };
   const launcher = privateLauncher(spec, temp);
-  check("launcher script is owner-only", (statSync(launcher.script).mode & 0o777) === 0o600);
+  // POSIX mode bits only; NTFS hardening is asserted by smoke:secret-fs.
+  if (process.platform !== "win32") check("launcher script is owner-only", (statSync(launcher.script).mode & 0o777) === 0o600);
   check("launcher argv contains no connector env values", !launcher.argv.includes(secret));
   check("launcher stores command and env outside pane argv", readFileSync(launcher.script, "utf8").includes(secret));
   rmSync(launcher.dir, { recursive: true, force: true });
