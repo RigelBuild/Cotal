@@ -18,11 +18,11 @@
     }
   },
   "scripts": {
-    "test": "tsx package.smoke.ts",
+    "test": "pnpm run build && tsx package.smoke.ts && node --input-type=module -e \"await import('./dist/index.js'); console.log('zellij dist smoke: import passed')\"",
     "test:live": "tsx smoke.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json --emitDeclarationOnly && pnpm run bundle",
-    "bundle": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node24 --outfile=dist/index.js --external:@cotal-ai/core",
+    "bundle": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node24 --outfile=dist/index.js --external:@cotal-ai/core --banner:js=\"import { createRequire as __cotalCreateRequire } from 'node:module'; const require = __cotalCreateRequire(import.meta.url);\"",
     "prepublishOnly": "pnpm run build"
   },
   "peerDependencies": {
@@ -34,6 +34,10 @@
     "tsx": "^4.23.0",
     "yaml": "^2.9.0"
   },
-  "files": ["dist"],
-  "publishConfig": { "access": "public" }
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
 }
