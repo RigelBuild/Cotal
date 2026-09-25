@@ -1,0 +1,43 @@
+{
+  "name": "@cotal-ai/zellij",
+  "description": "Cotal Zellij integration: runtime provider for spawning agents in Zellij panes.",
+  "version": "0.53.0",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Cotal-AI/Cotal.git",
+    "directory": "extensions/zellij"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "test": "pnpm run build && tsx package.smoke.ts && node --input-type=module -e \"await import('./dist/index.js'); console.log('zellij dist smoke: import passed')\"",
+    "test:live": "tsx smoke.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json --emitDeclarationOnly && pnpm run bundle",
+    "bundle": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node24 --outfile=dist/index.js --external:@cotal-ai/core --banner:js=\"import { createRequire as __cotalCreateRequire } from 'node:module'; const require = __cotalCreateRequire(import.meta.url);\"",
+    "prepublishOnly": "pnpm run build"
+  },
+  "peerDependencies": {
+    "@cotal-ai/core": "*"
+  },
+  "devDependencies": {
+    "@cotal-ai/core": "workspace:*",
+    "esbuild": "^0.28.0",
+    "tsx": "^4.23.0",
+    "yaml": "^2.9.0"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
