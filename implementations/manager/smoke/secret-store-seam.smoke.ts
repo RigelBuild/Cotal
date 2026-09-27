@@ -30,7 +30,7 @@ import {
   type AgentHandle, type Connector, type LaunchSpec, type Presence, type SecretStore,
 } from "@cotal-ai/core";
 import { authDir, saveSpaceAuth, workspaceSecretStore, agentSecretKeyForFile } from "@cotal-ai/workspace";
-import { Manager } from "../src/manager.js";
+import { Manager, type FreeSlotCause } from "../src/manager.js";
 import { bootDeliveryDaemon, type DeliveryDaemon } from "./_boot-delivery.js";
 import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
 
@@ -125,7 +125,7 @@ try {
     renewDaemonCreds(): Promise<void>;
     renewManagedStaticCred(a: unknown): Promise<void>;
     deprovision(a: { id: string; name: string; lifecycleUid: string; secretPaths?: { creds?: string } }): Promise<void>;
-    freeSlot(a: unknown, floor: boolean, cause: string): void;
+    freeSlot(a: unknown, floor: boolean, cause: FreeSlotCause): void;
     retiring: Map<string, unknown>;
   };
 
@@ -192,7 +192,7 @@ try {
   console.log("D. the retirement teardown deletes the credential through the injected store");
   {
     const before = store.seen.length;
-    M.freeSlot(a, false, "manager-shutdown");
+    M.freeSlot(a, false, { kind: "stopped-shutdown" });
     await M.deprovision({ id: a.id, name: a.name, lifecycleUid: a.lifecycleUid, secretPaths: a.secretPaths });
     for (let i = 0; i < 150 && M.retiring.has("worker"); i++) await wait(200);
     check("the teardown really happened (the credential file is gone)", !existsSync(credsPath!));
