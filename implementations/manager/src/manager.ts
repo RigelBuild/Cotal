@@ -72,6 +72,7 @@ import {
   type Runtime,
   type RuntimeMode,
 } from "./runtime/index.js";
+import { managedStaticCredRenewalDue } from "./renewal.js";
 import { AttachEndpoint, type SessionEstablishment } from "./attach-endpoint.js";
 import { makeManagerEndpointEvictionEvidence, makeManagerEndpointEvictor } from "./endpoint-evict.js";
 import { makeManagerHolderLivenessProbe } from "./holder-liveness.js";
@@ -1715,7 +1716,8 @@ export class Manager {
             const stored = await this.secrets.get(agentSecretKeyForFile(a.secretPaths.creds, this.space));
             if (stored === undefined) continue; // no materialized cred (never minted here) - nothing to renew
             const health = inspectCredHealth(stored);
-            if (health.state === "healthy") continue;
+            if (health.state === "healthy" && health.iat !== undefined && health.exp !== undefined &&
+              !managedStaticCredRenewalDue(health.iat, health.exp, Math.floor(Date.now() / 1000))) continue;
             if (health.state === "unbounded" || health.state === "unreadable") {
               console.error(`! managed cred renewal ${a.name}: credential is ${health.state}${health.error ? ` (${health.error})` : ""} - not renewed (a pre-TTL credential stays as minted until respawn)`);
               continue;
