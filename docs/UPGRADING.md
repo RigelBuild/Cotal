@@ -57,9 +57,9 @@ at renewal time.
 ### What does not migrate
 
 **A credential minted before 0.49.0 cannot be renewed.** Managed agent credentials carry a
-24-hour lifetime and the manager re-signs one once it passes **75%** of its life, ticking every
-quarter of the TTL so a tick always lands inside that window. When the manager reaches a credential
-that carries no issuance, it refuses to renew it and logs the agent by name:
+24-hour lifetime and the manager re-signs one at 37.5% of its life, between the TTL/4 pass ticks.
+This keeps the re-sign before the endpoint's 75% credential re-read. When the manager reaches a
+credential that carries no issuance, it refuses to renew it and logs the agent by name:
 
 ```
 ! managed cred renewal <agent>: renewManagedStaticCred: <agent> carries no issuance;
