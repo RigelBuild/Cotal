@@ -72,6 +72,7 @@ import {
   type Runtime,
   type RuntimeMode,
 } from "./runtime/index.js";
+import { managedStaticCredOffTickRenewalDue } from "./renewal.js";
 import { AttachEndpoint, type SessionEstablishment } from "./attach-endpoint.js";
 import { makeManagerEndpointEvictionEvidence, makeManagerEndpointEvictor } from "./endpoint-evict.js";
 import { makeManagerHolderLivenessProbe } from "./holder-liveness.js";
@@ -238,21 +239,10 @@ const INPUT_SLICE_CHARS = 2048;
  * are not counted into the receipt, so `bytes` still reports what the caller asked to deliver. */
 export const PASTE_START = "\x1b[200~";
 export const PASTE_END = "\x1b[201~";
-/** Pick a `setInterval` period for {@link Manager.renewDaemonCreds} that guarantees at least one
- * tick lands inside every renewal owner's `[renewAt, exp)` window.
- *
- * `inspectCredHealth` marks a credential `near-expiry` at 75% of its iat-to-exp lifetime and
- * `expired` at 100%, so the window width is TTL/4. Ticks TTL/4 apart therefore land at least once
- * inside every window; ticks TTL/2 apart (the old schedule) can miss it entirely for any TTL. That
- * is the cause of Cotal #457, reproduced at both TTL=86400 and TTL=20 (the compressed-ratio probe).
- *
- * Deriving from the caller's TTL keeps the schedule correct for any credential class: the 24h
- * `STANDING_RENEWABLE_TTL_SEC` and the 30-day `ROTATION_RENEWED_TTL_SEC` both get a tick inside
- * their own renewal window without a hardcoded number. Post-boot responsiveness is already
- * covered by the caller invoking `renewDaemonCreds` once synchronously before starting the timer,
- * so no separate floor is needed. The pass is idempotent, since `renewDaemonCreds` no-ops each
- * credential when its state is `healthy`, so a tick that lands before the window costs one health
- * check per owner. */
+/** Pick a `setInterval` period that guarantees a daemon credential's `[renewAt, exp)` window
+ * contains a tick. Daemon credentials still use {@link inspectCredHealth}'s 75% renewal point,
+ * so TTL/4 ticks fit within their TTL/4-wide window. Managed agent credentials instead renew at
+ * 37.5%, off the pass ticks, to re-sign before the endpoint's 75% re-read. */
 export function credRenewIntervalMs(ttlSeconds: number): number {
   return Math.max(1, Math.floor((ttlSeconds / 4) * 1000));
 }
@@ -1715,7 +1705,8 @@ export class Manager {
             const stored = await this.secrets.get(agentSecretKeyForFile(a.secretPaths.creds, this.space));
             if (stored === undefined) continue; // no materialized cred (never minted here) - nothing to renew
             const health = inspectCredHealth(stored);
-            if (health.state === "healthy") continue;
+            if (health.state === "healthy" && health.iat !== undefined && health.exp !== undefined &&
+              !managedStaticCredOffTickRenewalDue(health.iat, health.exp, Math.floor(Date.now() / 1000))) continue;
             if (health.state === "unbounded" || health.state === "unreadable") {
               console.error(`! managed cred renewal ${a.name}: credential is ${health.state}${health.error ? ` (${health.error})` : ""} - not renewed (a pre-TTL credential stays as minted until respawn)`);
               continue;

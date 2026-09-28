@@ -30,7 +30,7 @@ import {
   type AgentHandle, type Connector, type LaunchSpec, type Presence, type SecretStore,
 } from "@cotal-ai/core";
 import { authDir, saveSpaceAuth, workspaceSecretStore, agentSecretKeyForFile } from "@cotal-ai/workspace";
-import { Manager } from "../src/manager.js";
+import { Manager, type FreeSlotCause } from "../src/manager.js";
 import { bootDeliveryDaemon, type DeliveryDaemon } from "./_boot-delivery.js";
 import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
 
@@ -125,7 +125,7 @@ try {
     renewDaemonCreds(): Promise<void>;
     renewManagedStaticCred(a: unknown): Promise<void>;
     deprovision(a: { id: string; name: string; lifecycleUid: string; secretPaths?: { creds?: string } }): Promise<void>;
-    freeSlot(a: unknown, floor: boolean): void;
+    freeSlot(a: unknown, floor: boolean, cause: FreeSlotCause): void;
     retiring: Map<string, unknown>;
   };
 
@@ -136,16 +136,24 @@ try {
   check("fixture: the spawn recorded a credential path", typeof credsPath === "string" && existsSync(credsPath), credsPath);
   const credKey = agentSecretKeyForFile(credsPath!, space);
 
-  // ── SITE renewManagedStaticCred: the re-sign must WRITE through the seam ──────────────────────
-  console.log("A. the managed-cred re-sign writes through the injected store");
+  console.log("A. the renewal pass re-signs managed credentials off the pass ticks");
   {
-    await wait(1100); // JWT iat is second-granular; step past the boundary so the re-sign is real
-    const before = store.seen.length;
+    const originalNow = Date.now;
     const fileBefore = readFileSync(credsPath!, "utf8");
-    await M.renewManagedStaticCred(a);
-    const fileAfter = readFileSync(credsPath!, "utf8");
-    check("the re-sign really happened (the credential file changed)", fileAfter !== fileBefore);
-    check("the renewed credential was PUT through the injected store", store.sawSince(before, "put", credKey), store.seen.slice(before));
+    const before = store.seen.length;
+    try {
+      Date.now = () => originalNow() + 8 * 60 * 60 * 1000;
+      await M.renewDaemonCreds();
+      check("renewal pass leaves a credential below the off-tick threshold unchanged", readFileSync(credsPath!, "utf8") === fileBefore);
+      Date.now = () => originalNow() + 10 * 60 * 60 * 1000;
+      await M.renewDaemonCreds();
+      const fileAfter = readFileSync(credsPath!, "utf8");
+      check("renewal pass re-signs a credential past the off-tick threshold", fileAfter !== fileBefore);
+      check("threshold re-sign writes through the injected store", store.sawSince(before, "put", credKey));
+      console.log(`  threshold cells: ${pass} pass, ${fail} fail`);
+    } finally {
+      Date.now = originalNow;
+    }
   }
 
   // ── SITE renewCredentials: the managed-cred renewal scan must READ through the seam ───────────
@@ -184,7 +192,7 @@ try {
   console.log("D. the retirement teardown deletes the credential through the injected store");
   {
     const before = store.seen.length;
-    M.freeSlot(a, false);
+    M.freeSlot(a, false, { kind: "stopped-shutdown" });
     await M.deprovision({ id: a.id, name: a.name, lifecycleUid: a.lifecycleUid, secretPaths: a.secretPaths });
     for (let i = 0; i < 150 && M.retiring.has("worker"); i++) await wait(200);
     check("the teardown really happened (the credential file is gone)", !existsSync(credsPath!));
