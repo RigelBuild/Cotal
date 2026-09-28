@@ -77,7 +77,7 @@ Read the authoritative Cotal docs bundled with this installed version: the wire 
 
 *who's present*
 
-List the agents currently present in your Cotal space, with their role, status, and current activity.
+List the agents and mesh endpoints currently present in your Cotal space, with their role, status, and current activity. Endpoint rows are marked because they do not take direct messages.
 
 - **Side-effect:** read-only.
 - **Available:** always.
@@ -120,7 +120,7 @@ Broadcast a message to everyone on a channel in your space.
 
 *direct-message a peer*
 
-Send a private message to one specific peer, by name (or instance id).
+Send a private message to one agent, by name (or instance id). Mesh endpoints, including the manager process, do not read direct messages; use cotal_roster to find an agent.
 
 - **Side-effect:** sends a private message to one peer.
 - **Available:** always.

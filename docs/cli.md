@@ -1535,6 +1535,8 @@ One-shot messaging: connect, send a single direct message (`dm`), channel post (
 ask/anycast (`ask`), then exit. For a running conversation, agents use the mesh tools instead
 ([MCP tools](mcp-tools.md)).
 
+Direct messages target agents only. Mesh endpoints, including the manager process, do not read them. Use `cotal_roster` to find an agent; targeting an endpoint by name or instance id is refused.
+
 `cotal send` works from an operator shell or from a seat. It uses `cotal-send` as the advisory
 display name. The wire principal comes from the resolved operator credential or user bearer, not
 from `COTAL_NAME`, `COTAL_ID`, `COTAL_OWNER`, or `COTAL_ACTOR`. On an open mesh the transient

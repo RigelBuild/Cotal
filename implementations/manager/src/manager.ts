@@ -1445,7 +1445,7 @@ export class Manager {
     this.ep.on("error", reportEndpoint);
     this.ep.on("warning", reportEndpoint);
     await this.ep.start();
-    await this.ep.setActivity(`supervisor (${this.runtime.kind})`);
+    await this.ep.setActivity(`agent host (${this.runtime.kind})`);
     // Per-instance liveness lease (P2 item 3 — the old per-space singleton is DEMOTED per D9). Acquire
     // THIS logical instance's own key (atomic CAS create). A DIFFERENT instance (a second manager in a
     // second workspace root) has a distinct id ⇒ a distinct key ⇒ it coexists; the create THROWS only

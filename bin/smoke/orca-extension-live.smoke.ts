@@ -42,7 +42,7 @@ const TSX_IMPORT = import.meta.resolve("tsx");
 const runId = `${process.pid}-${Date.now().toString(36)}`;
 const SPACE = `orca-e2e-${runId}`;
 // The no-manifest `--runtime orca` checks run under their own space so the bare manager's
-// "supervisor (orca)" presence can never be confused with a stale entry from the `-f` manager
+// "agent host (orca)" presence cannot be confused with a stale entry from the -f manager
 // (which is also orca) in the shared JetStream store.
 const BARE_SPACE = `orca-e2e-bare-${runId}`;
 const AGENT = `orcae2e-${runId}`;
@@ -260,7 +260,7 @@ try {
 
   // The runtime selection also works WITHOUT a manifest: `up --detach --runtime orca` must boot the
   // control-plane manager ON the installed orca runtime (the flag reaches the detached supervise),
-  // not silently pty. The live manager's own presence activity ("supervisor (orca)") is the
+  // not silently pty. The live manager's own presence activity ("agent host (orca)") is the
   // authoritative signal, so query it rather than parse the appended manager.log.
   const bareUp = cli(["up", "--detach", "--open", "--runtime", "orca", "--space", BARE_SPACE, "--server", SERVER]);
   ok("up --detach --runtime orca (no -f) starts the mesh", bareUp.status === 0, bareUp.stdout + bareUp.stderr);
@@ -271,7 +271,7 @@ try {
   for (let i = 0; i < 30 && !bareRuntime; i++) {
     const r = cli(["endpoints", "--space", BARE_SPACE, "--server", SERVER]);
     bareEndpoints = { stdout: r.stdout, stderr: r.stderr };
-    bareRuntime = r.status === 0 && /supervisor \(orca\)/.test(r.stdout);
+    bareRuntime = r.status === 0 && /agent host \(orca\)/.test(r.stdout);
     if (!bareRuntime) await sleep(1_000);
   }
   ok("the no-manifest manager runs on the orca runtime, not pty", bareRuntime, bareEndpoints);

@@ -11,6 +11,7 @@ import { completedFlagValue, completingFlagValue, positionalsForCompletion } fro
 import { openTransient } from "../lib/transient.js";
 import { listDeclaredChannels, listDeclaredRoles } from "../lib/personas.js";
 import { mentionsIn } from "../lib/mentions.js";
+import { dmEndpointRefusal } from "../lib/dm-refusal.js";
 
 /**
  * One-shot send command — `cotal send <dm|msg|ask>` — the headless equivalent of the console's
@@ -70,6 +71,11 @@ async function dm(opened: Awaited<ReturnType<typeof openTransient>>, positionals
     await ep.stop();
     process.exit(1);
   }
+  if (peer.card.kind !== "agent") {
+    console.error(c.red(dmEndpointRefusal(peer.card.name)));
+    await ep.stop();
+    process.exit(1);
+  }
   await ep.unicast(peer.card.id, text);
   console.log(c.green(`→ ${peer.card.name}`) + c.dim(`  ${text}`));
   await ep.stop();
@@ -116,7 +122,7 @@ export function sendComplete(argv: string[]): CompletionResult {
   if (positionals.length <= 1)
     return {
       items: [
-        { value: "dm", description: "unicast to a peer" },
+        { value: "dm", description: "unicast to an agent" },
         { value: "msg", description: "broadcast to a channel" },
         { value: "ask", description: "anycast to a role" },
       ],

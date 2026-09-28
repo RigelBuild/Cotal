@@ -660,7 +660,7 @@ export function cotalToolSpecs(config: AgentConfig, source = "connector"): Cotal
       name: "cotal_roster",
       title: "Cotal: who's present",
       description:
-        "List the agents currently present in your Cotal space, with their role, status, and current activity.",
+        "List the agents and mesh endpoints currently present in your Cotal space, with their role, status, and current activity. Endpoint rows are marked because they do not take direct messages.",
       run(agent) {
         if (!agent.connected) return ok(`Not connected to the mesh yet (${config.servers}).`);
         const roster = agent.roster();
@@ -689,7 +689,8 @@ export function cotalToolSpecs(config: AgentConfig, source = "connector"): Cotal
           const mutedHint = muted.length ? ` (locally muted ${muted.join(", ")}; DM to reach)` : "";
           const condition = p.condition ? ` (${p.condition.code})` : "";
           const progress = p.status === "working" ? `working${condition} · progress unknown` : `${p.status}${condition}`;
-          return `${statusGlyph(p.status)} ${who} — ${progress}${p.activity ? `: ${p.activity}` : ""}${attn}${me}${mutedHint}${id}`;
+          const endpointHint = p.card.kind !== "agent" ? " (endpoint; does not take DMs)" : "";
+          return `${statusGlyph(p.status)} ${who} — ${progress}${p.activity ? `: ${p.activity}` : ""}${attn}${me}${mutedHint}${endpointHint}${id}`;
         });
         return ok(`Present in "${config.space}" (${roster.length}):\n${lines.join("\n")}`);
       },
@@ -860,7 +861,7 @@ export function cotalToolSpecs(config: AgentConfig, source = "connector"): Cotal
     {
       name: "cotal_dm",
       title: "Cotal: direct-message a peer",
-      description: "Send a private message to one specific peer, by name (or instance id).",
+      description: "Send a private message to one agent, by name (or instance id). Mesh endpoints, including the manager process, do not read direct messages; use cotal_roster to find an agent.",
       schema: {
         to: z.string().describe("The peer's name (or instance id)."),
         text: z.string().describe("The message."),
