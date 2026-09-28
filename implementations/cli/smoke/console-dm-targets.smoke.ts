@@ -22,6 +22,11 @@ const endpointPeer: Presence = {
   status: "idle",
   ts: Date.now(),
 };
+const operatorPeer: Presence = {
+  card: { id: "operator-id", name: "operator", role: "operator", kind: "endpoint" },
+  status: "idle",
+  ts: Date.now(),
+};
 const agentPeer: Presence = {
   card: { id: "agent-id", name: "reviewer", role: "worker", kind: "agent" },
   status: "idle",
@@ -29,7 +34,7 @@ const agentPeer: Presence = {
 };
 const snapshot: MeshSnapshot = {
   agents: [agentPeer],
-  endpoints: [endpointPeer],
+  endpoints: [endpointPeer, operatorPeer],
   channels: [],
   feed: [],
   membership: {},
@@ -75,7 +80,7 @@ const flushCommand = async (line: string): Promise<void> => {
 await flushCommand("dm manager review");
 check(
   "console DM refuses an endpoint before participant activation or unicast",
-  notify[0]?.includes('Cannot DM "manager"') && notify[0]?.includes("cotal_roster") && ensured === 0 && sent.length === 0,
+  notify[0]?.includes('Cannot DM "manager"') && notify[0]?.includes("cotal endpoints") && ensured === 0 && sent.length === 0,
   { notify, ensured, sent },
 );
 await flushCommand("dm manager-id review");
@@ -90,10 +95,22 @@ check(
   notify[2]?.includes('Cannot DM "manager"') && ensured === 0 && sent.length === 0,
   { notify, ensured, sent },
 );
+await flushCommand("call manager-id");
+check(
+  "console call refuses manager endpoint addressed by exact id",
+  notify[3]?.includes('Cannot DM "manager"') && ensured === 0 && sent.length === 0,
+  { notify, ensured, sent },
+);
+await flushCommand("dm operator review");
+check(
+  "console DM to an operator endpoint activates the participant and sends",
+  ensured === 1 && sent.length === 1 && sent[0]?.id === "operator-id" && sent[0]?.text === "review" && notify[4] === "→ operator",
+  { notify, ensured, sent },
+);
 await flushCommand("dm reviewer review");
 check(
   "console DM to an agent still activates the participant and sends",
-  ensured === 1 && sent.length === 1 && sent[0]?.id === "agent-id" && sent[0]?.text === "review" && notify[3] === "→ reviewer",
+  ensured === 2 && sent.length === 2 && sent[1]?.id === "agent-id" && sent[1]?.text === "review" && notify[5] === "→ reviewer",
   { notify, ensured, sent },
 );
 

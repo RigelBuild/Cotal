@@ -1,5 +1,6 @@
 import {
   resolvePeer,
+  readsDirectMessages,
   AmbiguousPeerError,
   type Presence,
   type CompletionResult,
@@ -32,7 +33,7 @@ export async function send(args: ParsedArgs): Promise<void> {
   const [mode, ...rest] = positionals;
   if (mode !== "dm" && mode !== "msg" && mode !== "ask") {
     console.error(
-      'usage: cotal send <dm <agent> | msg <channel> | ask <role>> "<text>"  [--space <s>] [--server <url>] [--creds <path>]',
+      'usage: cotal send <dm <peer> | msg <channel> | ask <role>> "<text>"  [--space <s>] [--server <url>] [--creds <path>]',
     );
     process.exit(1);
   }
@@ -42,11 +43,11 @@ export async function send(args: ParsedArgs): Promise<void> {
   return ask(opened, rest);
 }
 
-/** `cotal send dm <agent> "<text>"` — one unicast to a peer by name, then exit. */
+/** `cotal send dm <peer> "<text>"` — one unicast to a peer by name, then exit. */
 async function dm(opened: Awaited<ReturnType<typeof openTransient>>, positionals: string[]): Promise<void> {
   const { target, text } = targetAndText(positionals, /^@/);
   if (!target || !text) {
-    console.error('usage: cotal send dm <agent> "<text>"  [--space <s>] [--server <url>] [--creds <path>]');
+    console.error('usage: cotal send dm <peer> "<text>"  [--space <s>] [--server <url>] [--creds <path>]');
     process.exit(1);
   }
   const { ep, space } = opened;
@@ -71,7 +72,7 @@ async function dm(opened: Awaited<ReturnType<typeof openTransient>>, positionals
     await ep.stop();
     process.exit(1);
   }
-  if (peer.card.kind !== "agent") {
+  if (!readsDirectMessages(peer)) {
     console.error(c.red(dmEndpointRefusal(peer.card.name)));
     await ep.stop();
     process.exit(1);

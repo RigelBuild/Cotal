@@ -36,10 +36,23 @@ const endpointPresence: Presence = {
   activity: "agent host (zellij)",
   ts: Date.now(),
 };
+const operatorPresence: Presence = {
+  card: { id: "operator-id", name: "operator", role: "operator", kind: "endpoint" },
+  status: "idle",
+  ts: Date.now(),
+};
+const hostPresence: Presence = {
+  card: { id: "host-id", name: "host", role: "host", kind: "endpoint" },
+  status: "idle",
+  ts: Date.now(),
+};
+
 const roster = [
   { card: { id: "caller-id", name: "caller", kind: "agent" as const }, status: "idle" as const, ts: Date.now() },
   agentPresence,
   endpointPresence,
+  operatorPresence,
+  hostPresence,
 ];
 const unicastTargets: string[] = [];
 const endpoint: Pick<CotalEndpoint, "card" | "getRoster" | "unicast"> = {
@@ -66,8 +79,12 @@ const rosterTool = specs.find((spec) => spec.name === "cotal_roster");
 if (!rosterTool) throw new Error("cotal_roster spec is missing");
 const rosterResult = await rosterTool.run(agent, config, {});
 check(
-  "cotal_roster marks endpoint rows and leaves agent rows unmarked",
+  "cotal_roster marks only non-consuming infrastructure endpoints",
   rosterResult.text.includes("manager/manager — idle: agent host (zellij) (endpoint; does not take DMs)") &&
+    rosterResult.text.includes("operator/operator — idle") &&
+    !rosterResult.text.includes("operator/operator — idle (endpoint; does not take DMs)") &&
+    rosterResult.text.includes("host/host — idle") &&
+    !rosterResult.text.includes("host/host — idle (endpoint; does not take DMs)") &&
     rosterResult.text.includes("reviewer/worker — idle") &&
     !rosterResult.text.includes("reviewer/worker — idle (endpoint; does not take DMs)"),
   rosterResult.text,
@@ -80,7 +97,7 @@ try {
   endpointError = error instanceof Error ? error.message : String(error);
 }
 check(
-  "DM to a mesh endpoint is refused with guidance to find an agent",
+  "DM to the manager endpoint is refused with guidance to find an agent",
   endpointError.includes("manager") &&
     endpointError.includes("mesh endpoint") &&
     endpointError.includes("does not read direct messages") &&
@@ -106,7 +123,20 @@ check(
   sent.peer.card.kind === "agent" && unicastTargets.join(",") === "agent-id:please review",
   unicastTargets,
 );
-
+const operatorSent = await agent.dm("operator-id", "please review");
+check(
+  "DM to an operator endpoint that reads direct messages is sent",
+  operatorSent.peer.card.role === "operator" &&
+    unicastTargets.join(",") === "agent-id:please review,operator-id:please review",
+  unicastTargets,
+);
+const hostSent = await agent.dm("host-id", "please review");
+check(
+  "DM to a consuming studio host endpoint is sent",
+  hostSent.peer.card.role === "host" &&
+    unicastTargets.join(",") === "agent-id:please review,operator-id:please review,host-id:please review",
+  unicastTargets,
+);
 
 console.log(`\nDM targets smoke: ${pass} passed, ${fail} failed`);
 if (fail) process.exitCode = 1;

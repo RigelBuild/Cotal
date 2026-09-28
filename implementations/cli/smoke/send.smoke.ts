@@ -37,7 +37,7 @@ import { authDir, recordMesh, saveSpaceAuth, setCurrent } from "@cotal-ai/worksp
 import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-const EXPECTED = 15;
+const EXPECTED = 17;
 let pass = 0;
 let fail = 0;
 const check = (name: string, cond: boolean, extra?: unknown) => {
@@ -144,6 +144,41 @@ try {
     registerPresence: false,
   });
   await provisioner.start();
+  const managerId = newIdentity();
+  const managerUid = mintLifecycleUid();
+  const managerCreds = await mintCreds(auth, managerId, "supervisor", { lifecycleUid: managerUid });
+  const manager = new CotalEndpoint({
+    space,
+    servers,
+    creds: managerCreds,
+    lifecycleUid: managerUid,
+    card: { name: "manager-target", role: "manager", kind: "endpoint", id: managerId.id },
+    channels: [],
+    consume: false,
+    watchChannels: false,
+    heartbeatMs: 500,
+    ttlMs: 10_000,
+  });
+  manager.on("error", (error: Error) => console.error("! manager:", error.message));
+  await manager.start();
+  await manager.waitForPresenceSnapshot(2_000);
+  await wait(400);
+  const refusedManager = await run(["send", "dm", "manager-target", "please review"]);
+  check(
+    "`cotal send dm` refuses the manager endpoint with a CLI roster hint",
+    refusedManager.code !== 0 &&
+      refusedManager.stderr.includes('Cannot DM "manager-target"') &&
+      refusedManager.stderr.includes("cotal endpoints") &&
+      !refusedManager.stderr.includes("cotal_roster"),
+    refusedManager,
+  );
+  const refusedManagerId = await run(["send", "dm", manager.card.id, "please review"]);
+  check(
+    "`cotal send dm` refuses the manager by exact instance id",
+    refusedManagerId.code !== 0 && refusedManagerId.stderr.includes('Cannot DM "manager-target"'),
+    refusedManagerId,
+  );
+  await manager.stop();
 
   const bobIdentity = newIdentity();
   const bobUid = mintLifecycleUid();

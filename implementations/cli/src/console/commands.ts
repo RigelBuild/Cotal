@@ -4,7 +4,7 @@
 // they are gated on `canWrite` (open mode, or a privileged --creds). Control commands go through
 // `ctx.control` (one per-action call on the CLI's control path, console/control.ts), gated on
 // `canControl`; the observer endpoint never carries control.
-import { resolvePeer, AmbiguousPeerError, type CotalEndpoint } from "@cotal-ai/core";
+import { resolvePeer, readsDirectMessages, AmbiguousPeerError, type CotalEndpoint } from "@cotal-ai/core";
 import type { MeshSnapshot } from "../view/mesh-view.js";
 import type { ManagerReply } from "../lib/control.js";
 import type { ControlOp, ManagedRow, PsReply } from "./control.js";
@@ -100,17 +100,17 @@ export const COMMANDS: ConsoleCommand[] = [
   },
   {
     name: "dm",
-    summary: "direct-message an agent (not a mesh endpoint)",
-    usage: "dm <@agent> <text>",
+    summary: "direct-message a peer",
+    usage: "dm <@peer> <text>",
     write: true,
     run: async (ctx, rest) => {
       const m = rest.match(/^@?(\S+)\s+([\s\S]+)/);
-      if (!m) return ctx.notify("usage: dm <@agent> <text>");
+      if (!m) return ctx.notify("usage: dm <@peer> <text>");
       let id: string | undefined;
       try {
         const peer = peerOf(ctx.snapshot, m[1]);
         id = peer?.card.id;
-        if (peer && peer.card.kind !== "agent") return ctx.notify(dmEndpointRefusal(peer.card.name));
+        if (peer && !readsDirectMessages(peer)) return ctx.notify(dmEndpointRefusal(peer.card.name));
       } catch (e) {
         if (e instanceof AmbiguousPeerError) return ctx.notify(ambiguityNote(e));
         throw e;
@@ -123,8 +123,8 @@ export const COMMANDS: ConsoleCommand[] = [
   },
   {
     name: "call",
-    summary: "ping an agent + open the DM lens",
-    usage: "call <@agent>",
+    summary: "ping a peer + open the DM lens",
+    usage: "call <@peer>",
     write: true,
     run: async (ctx, rest) => {
       const name = rest.replace(/^@/, "").trim().split(/\s+/)[0] ?? "";
@@ -132,7 +132,7 @@ export const COMMANDS: ConsoleCommand[] = [
       try {
         const peer = peerOf(ctx.snapshot, name);
         id = peer?.card.id;
-        if (peer && peer.card.kind !== "agent") return ctx.notify(dmEndpointRefusal(peer.card.name));
+        if (peer && !readsDirectMessages(peer)) return ctx.notify(dmEndpointRefusal(peer.card.name));
       } catch (e) {
         if (e instanceof AmbiguousPeerError) return ctx.notify(ambiguityNote(e));
         throw e;

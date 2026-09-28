@@ -9,7 +9,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { z } from "zod";
-import { isConcreteChannel, channelInAllow, AmbiguousPeerError, isPermissionDenied, renderLifecycleBlocked, LANG_PROBLEM_DETAIL_KIND, type ControlReply, type PresenceStatus } from "@cotal-ai/core";
+import { readsDirectMessages, isConcreteChannel, channelInAllow, AmbiguousPeerError, isPermissionDenied, renderLifecycleBlocked, LANG_PROBLEM_DETAIL_KIND, type ControlReply, type PresenceStatus } from "@cotal-ai/core";
 import { afterRecallMark, type MeshAgent, type InboxItem } from "./agent.js";
 import { attributionSafe, fmtBody, fmtItem, fmtFrom } from "./framing.js";
 import { FEEDBACK_URL, PUBLIC_FEEDBACK_URL, isAuthed, type AgentConfig } from "./config.js";
@@ -660,7 +660,7 @@ export function cotalToolSpecs(config: AgentConfig, source = "connector"): Cotal
       name: "cotal_roster",
       title: "Cotal: who's present",
       description:
-        "List the agents and mesh endpoints currently present in your Cotal space, with their role, status, and current activity. Endpoint rows are marked because they do not take direct messages.",
+        "List the agents and mesh endpoints currently present in your Cotal space, with their role, status, and current activity. Only non-consuming infrastructure endpoints are marked as unable to receive direct messages.",
       run(agent) {
         if (!agent.connected) return ok(`Not connected to the mesh yet (${config.servers}).`);
         const roster = agent.roster();
@@ -689,7 +689,7 @@ export function cotalToolSpecs(config: AgentConfig, source = "connector"): Cotal
           const mutedHint = muted.length ? ` (locally muted ${muted.join(", ")}; DM to reach)` : "";
           const condition = p.condition ? ` (${p.condition.code})` : "";
           const progress = p.status === "working" ? `working${condition} · progress unknown` : `${p.status}${condition}`;
-          const endpointHint = p.card.kind !== "agent" ? " (endpoint; does not take DMs)" : "";
+          const endpointHint = !readsDirectMessages(p) ? " (endpoint; does not take DMs)" : "";
           return `${statusGlyph(p.status)} ${who} — ${progress}${p.activity ? `: ${p.activity}` : ""}${attn}${me}${mutedHint}${endpointHint}${id}`;
         });
         return ok(`Present in "${config.space}" (${roster.length}):\n${lines.join("\n")}`);
@@ -861,7 +861,7 @@ export function cotalToolSpecs(config: AgentConfig, source = "connector"): Cotal
     {
       name: "cotal_dm",
       title: "Cotal: direct-message a peer",
-      description: "Send a private message to one agent, by name (or instance id). Mesh endpoints, including the manager process, do not read direct messages; use cotal_roster to find an agent.",
+      description: "Send a private message to one peer that reads direct messages, by name (or instance id). Manager, delivery, and provisioner endpoints do not read direct messages; use cotal_roster to find a DM-capable peer.",
       schema: {
         to: z.string().describe("The peer's name (or instance id)."),
         text: z.string().describe("The message."),

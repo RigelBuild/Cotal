@@ -42,6 +42,11 @@ export class AmbiguousPeerError extends Error {
 function candidate(p: Presence): PeerCandidate {
   return { id: p.card.id, name: p.card.name, role: p.card.role, status: p.status, ts: p.ts };
 }
+/** Only these infrastructure endpoints do not bind direct-message consumers. */
+export function readsDirectMessages(p: Presence): boolean {
+  if (p.card.kind !== "endpoint") return true;
+  return p.card.role !== "manager" && p.card.role !== "delivery" && p.card.role !== "provisioner";
+}
 
 /**
  * Resolve a `target` (an exact instance id, or a display name) to one peer on `roster`.

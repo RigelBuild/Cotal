@@ -245,7 +245,7 @@ try {
   const endpoints = cli(["endpoints", "--space", SPACE, "--server", SERVER]);
   ok(
     "cotal endpoints observes the agent and manager presence endpoints",
-    endpoints.status === 0 && endpoints.stdout.includes(AGENT) && /manager\/manager/.test(endpoints.stdout) && /supervisor \(orca\)/.test(endpoints.stdout),
+    endpoints.status === 0 && endpoints.stdout.includes(AGENT) && /manager\/manager/.test(endpoints.stdout) && /agent host \(orca\)/.test(endpoints.stdout),
     endpoints.stdout + endpoints.stderr,
   );
 

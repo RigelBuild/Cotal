@@ -8,6 +8,7 @@ import {
   isConcreteChannel,
   assertValidChannel,
   channelInAllow,
+  readsDirectMessages,
   resolvePeer as resolvePeerInRoster,
   CotalEndpoint,
   BASELINE_LIFECYCLE_ENDPOINT,
@@ -1408,9 +1409,9 @@ export class MeshAgent extends EventEmitter {
     await this.requireConnected();
     const peer = this.resolvePeer(target);
     if (!peer) throw new Error(`no peer "${target}" in space "${this.config.space}"`);
-    if (peer.card.kind !== "agent")
+    if (!readsDirectMessages(peer))
       throw new Error(
-        `Cannot DM "${peer.card.name}": this mesh endpoint does not read direct messages (for example, the manager process). Use cotal_roster to find an agent.`,
+        `Cannot DM "${peer.card.name}": this mesh endpoint does not read direct messages. Use cotal_roster to find a DM-capable peer.`,
       );
     const msg = await this.ep.unicast(peer.card.id, text, { contextId: this._contextId });
     return { msg, peer };

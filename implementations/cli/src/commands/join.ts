@@ -13,6 +13,7 @@ import {
   newIdentity,
   provisionAgent,
   partsToText,
+  readsDirectMessages,
   type Delivery,
   type EndpointKind,
   type PresenceStatus,
@@ -373,7 +374,7 @@ export async function join(args: ParsedArgs): Promise<void> {
           try {
             const peer = resolvePeer(ep.getRoster(), target, { selfId: me });
             if (!peer) print(c.red(`no peer named "${target}" present`));
-            else if (peer.card.kind !== "agent") print(c.red(dmEndpointRefusal(peer.card.name)));
+            else if (!readsDirectMessages(peer)) print(c.red(dmEndpointRefusal(peer.card.name)));
             else {
               await ep.unicast(peer.card.id, text);
               print(`${c.magenta("(DM)")} ${c.dim("you →")} ${c.bold(peer.card.name)}: ${text}`);
