@@ -24,9 +24,11 @@ export const ompConnector: Connector = {
     if (opts.variant) throw new Error("omp connector: model variants (variant) are not implemented");
     if (opts.mcpServers && Object.keys(opts.mcpServers).length > 0) throw new Error("omp connector: MCP tool-sharing is not implemented");
     const launchOptions = connectorLaunchOptions("omp", opts.launchOptions);
-    for (const [key] of launchOptions) if (key !== "config") throw new Error(`omp connector: unknown launch option ${JSON.stringify(key)} (only config is supported)`);
+    for (const [key] of launchOptions) if (key !== "config" && key !== "reapplyConfig") throw new Error(`omp connector: unknown launch option ${JSON.stringify(key)} (only config and reapplyConfig are supported)`);
     const config = launchOptions.find(([key]) => key === "config")?.[1];
     if (config !== undefined && typeof config !== "string") throw new Error("omp connector: launch option config must be a string path");
+    const reapplyConfig = launchOptions.find(([key]) => key === "reapplyConfig")?.[1];
+    if (reapplyConfig !== undefined && reapplyConfig !== "true" && reapplyConfig !== "false") throw new Error('omp connector: launch option reapplyConfig must be "true" or "false"');
 
     let model = opts.model;
     let persona: string | undefined;
@@ -70,6 +72,8 @@ export const ompConnector: Connector = {
     }
     if (model) { env.COTAL_MODEL = model; args.push("--model", model); }
     if (config !== undefined) args.push("--config", config);
+    // A restored session keeps its own model and thinking level unless told to adopt the config's.
+    if (reapplyConfig === "true" && (opts.resume || opts.continueSession)) args.push("--reapply-config");
     if (opts.prompt !== undefined) {
       const prompt = opts.prompt.trim();
       if (!prompt) throw new Error("omp connector: an initial prompt was given but it is empty, there is no first turn to submit");
