@@ -28,7 +28,7 @@ it; stopping preserves it so an operator can inspect why the session never conne
 | Mid-turn steering | ✗ | ✗ | ✓ (directed messages) | none | ✓ (directed messages) | ✓ | ✓ |
 | Session resume (`--resume`) | ✓ (forks) | ✗ ([#154](https://github.com/Cotal-AI/Cotal/issues/154)) | ✗ (a resumed thread has no MCP tools upstream) | ✗ | ✗ (private Harness API instance) | ✓ (forks) | ✓ (forks) |
 | Tool-sharing (`--share-tools`) | ✓ (scoped opt-in) | ✗ (inherits your servers wholesale) | ✗ (isolated per-agent `CODEX_HOME`) | ✗ | ✗ (private MCP configuration) | ✗ | ✗ |
-| Models | `--model` | `--model` + catalog (`cotal models`) + `--variant` | `--model` + catalog (`cotal models`) + `--variant` (reasoning effort) | any provider, via env | `--model` + `--variant` (reasoning effort) | `--model` | `--model`; `--opt config=<path>` adds an omp config overlay |
+| Models | `--model` | `--model` + catalog (`cotal models`) + `--variant` | `--model` + catalog (`cotal models`) + `--variant` (reasoning effort) | any provider, via env | `--model` + `--variant` (reasoning effort) | `--model` | `--model`; `--opt config=<path>` adds an omp config overlay; `--opt reapplyConfig=true` makes a resumed or continued session use the overlay's model and thinking level |
 | Event plane (default on; `--no-events` opts out) | ✓ | ✓ | ✓ | ✗ (requires `--no-events`) | ✓ | ✓ (completed messages) | ✓ (completed messages) |
 | Containers ([deploy](deploy.md)) | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 

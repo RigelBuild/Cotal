@@ -42,7 +42,8 @@ assert.ok(reapplied.args.includes("--reapply-config"), "a resumed session re-app
 assert.ok(launch({ ...base, continueSession: "existing-id", launchOptions: { reapplyConfig: "true" } }).args.includes("--reapply-config"));
 assert.equal(launch({ ...base, launchOptions: { reapplyConfig: "true" } }).args.includes("--reapply-config"), false, "a fresh session has nothing to re-apply over");
 assert.equal(launch({ ...base, resume: "source-id", launchOptions: { reapplyConfig: "false" } }).args.includes("--reapply-config"), false);
-assert.throws(() => launch({ ...base, resume: "source-id", launchOptions: { reapplyConfig: "yes" } }), /reapplyConfig must be "true" or "false"/);
+assert.ok(launch({ ...base, resume: "source-id", launchOptions: { reapplyConfig: true } }).args.includes("--reapply-config"), "a persona YAML boolean is accepted");
+assert.throws(() => launch({ ...base, resume: "source-id", launchOptions: { reapplyConfig: "yes" } }), /reapplyConfig must be true or false/);
 
 await import("./src/index.js");
 assert.ok(registry.has("connector", "omp"));

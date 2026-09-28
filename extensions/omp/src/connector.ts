@@ -27,8 +27,10 @@ export const ompConnector: Connector = {
     for (const [key] of launchOptions) if (key !== "config" && key !== "reapplyConfig") throw new Error(`omp connector: unknown launch option ${JSON.stringify(key)} (only config and reapplyConfig are supported)`);
     const config = launchOptions.find(([key]) => key === "config")?.[1];
     if (config !== undefined && typeof config !== "string") throw new Error("omp connector: launch option config must be a string path");
-    const reapplyConfig = launchOptions.find(([key]) => key === "reapplyConfig")?.[1];
-    if (reapplyConfig !== undefined && reapplyConfig !== "true" && reapplyConfig !== "false") throw new Error('omp connector: launch option reapplyConfig must be "true" or "false"');
+    // A persona's YAML gives a boolean; `--opt reapplyConfig=true` gives a string.
+    const reapplyRaw = launchOptions.find(([key]) => key === "reapplyConfig")?.[1];
+    const reapplyConfig = reapplyRaw === true || reapplyRaw === "true";
+    if (reapplyRaw !== undefined && !reapplyConfig && reapplyRaw !== false && reapplyRaw !== "false") throw new Error("omp connector: launch option reapplyConfig must be true or false");
 
     let model = opts.model;
     let persona: string | undefined;
@@ -73,7 +75,7 @@ export const ompConnector: Connector = {
     if (model) { env.COTAL_MODEL = model; args.push("--model", model); }
     if (config !== undefined) args.push("--config", config);
     // A restored session keeps its own model and thinking level unless told to adopt the config's.
-    if (reapplyConfig === "true" && (opts.resume || opts.continueSession)) args.push("--reapply-config");
+    if (reapplyConfig && (opts.resume || opts.continueSession)) args.push("--reapply-config");
     if (opts.prompt !== undefined) {
       const prompt = opts.prompt.trim();
       if (!prompt) throw new Error("omp connector: an initial prompt was given but it is empty, there is no first turn to submit");
