@@ -1522,7 +1522,7 @@ package. There is no silent fallback to `pty`.
 ## send
 
 ```bash
-cotal send dm <agent> "<text>"   [--space <s>] [--server <url>] [--creds <path>]
+cotal send dm <peer> "<text>"   [--space <s>] [--server <url>] [--creds <path>]
 cotal send msg <channel> "<text>"
 cotal send ask <role> "<text>"
 ```
@@ -1534,6 +1534,8 @@ cotal send ask <role> "<text>"
 One-shot messaging: connect, send a single direct message (`dm`), channel post (`msg`), or role
 ask/anycast (`ask`), then exit. For a running conversation, agents use the mesh tools instead
 ([MCP tools](mcp-tools.md)).
+
+Direct messages go to peers that read them. Endpoints with the manager, delivery, provisioner, or feedback role do not read direct messages, and targeting them by name or instance id is refused. Use `cotal endpoints` to find a DM-capable peer.
 
 `cotal send` works from an operator shell or from a seat. It uses `cotal-send` as the advisory
 display name. The wire principal comes from the resolved operator credential or user bearer, not

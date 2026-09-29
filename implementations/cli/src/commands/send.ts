@@ -1,5 +1,6 @@
 import {
   resolvePeer,
+  readsDirectMessages,
   AmbiguousPeerError,
   type Presence,
   type CompletionResult,
@@ -11,6 +12,7 @@ import { completedFlagValue, completingFlagValue, positionalsForCompletion } fro
 import { openTransient } from "../lib/transient.js";
 import { listDeclaredChannels, listDeclaredRoles } from "../lib/personas.js";
 import { mentionsIn } from "../lib/mentions.js";
+import { dmEndpointRefusal } from "../lib/dm-refusal.js";
 
 /**
  * One-shot send command — `cotal send <dm|msg|ask>` — the headless equivalent of the console's
@@ -31,7 +33,7 @@ export async function send(args: ParsedArgs): Promise<void> {
   const [mode, ...rest] = positionals;
   if (mode !== "dm" && mode !== "msg" && mode !== "ask") {
     console.error(
-      'usage: cotal send <dm <agent> | msg <channel> | ask <role>> "<text>"  [--space <s>] [--server <url>] [--creds <path>]',
+      'usage: cotal send <dm <peer> | msg <channel> | ask <role>> "<text>"  [--space <s>] [--server <url>] [--creds <path>]',
     );
     process.exit(1);
   }
@@ -41,11 +43,11 @@ export async function send(args: ParsedArgs): Promise<void> {
   return ask(opened, rest);
 }
 
-/** `cotal send dm <agent> "<text>"` — one unicast to a peer by name, then exit. */
+/** `cotal send dm <peer> "<text>"` — one unicast to a peer by name, then exit. */
 async function dm(opened: Awaited<ReturnType<typeof openTransient>>, positionals: string[]): Promise<void> {
   const { target, text } = targetAndText(positionals, /^@/);
   if (!target || !text) {
-    console.error('usage: cotal send dm <agent> "<text>"  [--space <s>] [--server <url>] [--creds <path>]');
+    console.error('usage: cotal send dm <peer> "<text>"  [--space <s>] [--server <url>] [--creds <path>]');
     process.exit(1);
   }
   const { ep, space } = opened;
@@ -67,6 +69,11 @@ async function dm(opened: Awaited<ReturnType<typeof openTransient>>, positionals
   }
   if (!peer) {
     console.error(c.red(`no agent "${target}" present in space ${space}`));
+    await ep.stop();
+    process.exit(1);
+  }
+  if (!readsDirectMessages(peer)) {
+    console.error(c.red(dmEndpointRefusal(peer.card.name)));
     await ep.stop();
     process.exit(1);
   }
@@ -116,7 +123,7 @@ export function sendComplete(argv: string[]): CompletionResult {
   if (positionals.length <= 1)
     return {
       items: [
-        { value: "dm", description: "unicast to a peer" },
+        { value: "dm", description: "unicast to an agent" },
         { value: "msg", description: "broadcast to a channel" },
         { value: "ask", description: "anycast to a role" },
       ],

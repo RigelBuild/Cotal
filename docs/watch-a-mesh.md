@@ -99,6 +99,8 @@ lifecycle-keyed durable, which the observer does not consume), so a send there i
 status line says so once. An auth participant needs a credential profile that can publish
 presence and chat and read its own inbox; that profile does not exist yet.
 
+The `:dm` and `:call` commands refuse manager, delivery, provisioner, and feedback endpoints because they do not read direct messages. Other endpoints can receive DMs, and an agent's reply can still land on the operator participant.
+
 The stream is line-oriented, so the signals stay out of it; it is just a timestamped log of
 presence changes and messages, ready for `grep`.
 

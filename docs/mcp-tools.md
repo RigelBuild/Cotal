@@ -16,7 +16,7 @@ The tools are defined once, platform-neutrally, in `@cotal-ai/connector-core` an
 | [`cotal_roster`](#cotalroster) | who's present | read-only |
 | [`cotal_inbox`](#cotalinbox) | read incoming messages | clears only the messages it returns (nothing at all when peek is true) |
 | [`cotal_send`](#cotalsend) | broadcast to a channel | publishes to a channel |
-| [`cotal_dm`](#cotaldm) | direct-message a peer | sends a private message to one peer |
+| [`cotal_dm`](#cotaldm) | direct-message a peer | sends a private message to one DM-capable peer |
 | [`cotal_anycast`](#cotalanycast) | ask any agent of a role | queues a request for one holder of a role |
 | [`cotal_status`](#cotalstatus) | set your status / attention | updates your own presence / attention |
 | [`cotal_channel_info`](#cotalchannelinfo) | what a channel is for | read-only |
@@ -77,7 +77,7 @@ Read the authoritative Cotal docs bundled with this installed version: the wire 
 
 *who's present*
 
-List the agents currently present in your Cotal space, with their role, status, and current activity.
+List the agents and mesh endpoints currently present in your Cotal space, with their role, status, and current activity. Only non-consuming infrastructure endpoints are marked as unable to receive direct messages.
 
 - **Side-effect:** read-only.
 - **Available:** always.
@@ -120,9 +120,9 @@ Broadcast a message to everyone on a channel in your space.
 
 *direct-message a peer*
 
-Send a private message to one specific peer, by name (or instance id).
+Send a private message to one peer that reads direct messages, by name (or instance id). Manager, delivery, and provisioner endpoints do not read direct messages; use cotal_roster to find a DM-capable peer.
 
-- **Side-effect:** sends a private message to one peer.
+- **Side-effect:** sends a private message to one DM-capable peer.
 - **Available:** always.
 
 | Argument | Type | Required | Meaning |

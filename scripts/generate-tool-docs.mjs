@@ -61,7 +61,7 @@ const ANNOTATIONS = {
     notes:
       "Fails loud when the channel is outside your `allowPublish`. An unknown name in `mentions` aborts the whole broadcast. A send to a name with no registry entry and no prior traffic still succeeds (ad hoc create is allowed) but the receipt says so, and names close matches when it can, so a typo is not identical to a send into a known room.",
   },
-  cotal_dm: { effect: "sends a private message to one peer", availability: "always" },
+  cotal_dm: { effect: "sends a private message to one DM-capable peer", availability: "always" },
   cotal_anycast: {
     effect: "queues a request for one holder of a role",
     availability: "always",

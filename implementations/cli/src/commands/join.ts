@@ -13,6 +13,7 @@ import {
   newIdentity,
   provisionAgent,
   partsToText,
+  readsDirectMessages,
   type Delivery,
   type EndpointKind,
   type PresenceStatus,
@@ -23,6 +24,7 @@ import { findMesh, refreshRegistrationPolicy, type MeshEntry } from "@cotal-ai/w
 import { resolveSpace } from "../lib/status.js";
 import { reachableOrExit, refuseStaticCredsForKnownUserAuthOrExit, resolveTargetOrExit, preflightOrExit } from "../lib/connect.js";
 import { c, statusBadge } from "../ui.js";
+import { dmEndpointRefusal } from "../lib/dm-refusal.js";
 
 // The plan's stale-cred fail-fast gate: render an unprovisioned / auth-rejected join as ONE human
 // sentence instead of a raw NATS stack. Shared by the self-mint provisioning step (which runs
@@ -372,6 +374,7 @@ export async function join(args: ParsedArgs): Promise<void> {
           try {
             const peer = resolvePeer(ep.getRoster(), target, { selfId: me });
             if (!peer) print(c.red(`no peer named "${target}" present`));
+            else if (!readsDirectMessages(peer)) print(c.red(dmEndpointRefusal(peer.card.name)));
             else {
               await ep.unicast(peer.card.id, text);
               print(`${c.magenta("(DM)")} ${c.dim("you →")} ${c.bold(peer.card.name)}: ${text}`);

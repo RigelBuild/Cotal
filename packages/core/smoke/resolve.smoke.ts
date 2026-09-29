@@ -3,7 +3,7 @@
  * Asserts the deterministic, fail-loud rules in src/resolve.ts.
  */
 import assert from "node:assert/strict";
-import { resolvePeer, AmbiguousPeerError, assertValidName } from "../src/resolve.js";
+import { readsDirectMessages, resolvePeer, AmbiguousPeerError, assertValidName } from "../src/resolve.js";
 import type { Presence, PresenceStatus } from "../src/types.js";
 
 let seq = 0;
@@ -13,6 +13,33 @@ function p(name: string, status: PresenceStatus = "idle", id = `id-${++seq}`): P
 function expectAmbiguous(fn: () => unknown, count: number): void {
   assert.throws(fn, (e: unknown) => e instanceof AmbiguousPeerError && e.candidates.length === count);
 }
+
+for (const role of ["manager", "delivery", "provisioner", "feedback"]) {
+  const endpoint: Presence = {
+    card: { id: role, name: role, role, kind: "endpoint" },
+    status: "idle",
+    ts: 0,
+  };
+  assert.equal(readsDirectMessages(endpoint), false);
+}
+const operatorEndpoint: Presence = {
+  card: { id: "operator", name: "operator", role: "operator", kind: "endpoint" },
+  status: "idle",
+  ts: 0,
+};
+const plainEndpoint: Presence = {
+  card: { id: "plain", name: "plain", kind: "endpoint" },
+  status: "idle",
+  ts: 0,
+};
+const agentWithInfrastructureRole: Presence = {
+  card: { id: "agent", name: "agent", role: "manager", kind: "agent" },
+  status: "idle",
+  ts: 0,
+};
+assert.equal(readsDirectMessages(operatorEndpoint), true);
+assert.equal(readsDirectMessages(plainEndpoint), true);
+assert.equal(readsDirectMessages(agentWithInfrastructureRole), true);
 
 // exact id beats a same-name peer
 {

@@ -4,11 +4,12 @@
 // they are gated on `canWrite` (open mode, or a privileged --creds). Control commands go through
 // `ctx.control` (one per-action call on the CLI's control path, console/control.ts), gated on
 // `canControl`; the observer endpoint never carries control.
-import { resolvePeer, AmbiguousPeerError, type CotalEndpoint } from "@cotal-ai/core";
+import { resolvePeer, readsDirectMessages, AmbiguousPeerError, type CotalEndpoint } from "@cotal-ai/core";
 import type { MeshSnapshot } from "../view/mesh-view.js";
 import type { ManagerReply } from "../lib/control.js";
 import type { ControlOp, ManagedRow, PsReply } from "./control.js";
 import { mentionsIn } from "../lib/mentions.js";
+import { dmEndpointRefusal } from "../lib/dm-refusal.js";
 
 export interface CommandCtx {
   ep: CotalEndpoint;
@@ -65,11 +66,11 @@ export function formatManagedRow(a: ManagedRow): string {
   return `${a.name}${role} · ${a.agent} · ${a.mode} · ${a.status} · mesh ${mesh} · up ${Math.round(a.uptimeMs / 60000)}m`;
 }
 
-/** Resolve an agent/endpoint name (with or without a leading @) to its instance id. Fail-loud:
+/** Resolve an agent/endpoint name (with or without a leading @) to its presence. Fail-loud:
  *  an exact id or a unique name resolves; a same-name collision throws `AmbiguousPeerError`
  *  (the caller renders {@link ambiguityNote}). */
-function idOf(snap: MeshSnapshot, name: string): string | undefined {
-  return resolvePeer([...snap.agents, ...snap.endpoints], name.replace(/^@/, ""))?.card.id;
+function peerOf(snap: MeshSnapshot, target: string) {
+  return resolvePeer([...snap.agents, ...snap.endpoints], target.replace(/^@/, ""));
 }
 
 /** One-line note for the transient status bar when a name matched several peers. */
@@ -99,15 +100,17 @@ export const COMMANDS: ConsoleCommand[] = [
   },
   {
     name: "dm",
-    summary: "direct-message an agent",
-    usage: "dm <@agent> <text>",
+    summary: "direct-message a peer",
+    usage: "dm <@peer> <text>",
     write: true,
     run: async (ctx, rest) => {
       const m = rest.match(/^@?(\S+)\s+([\s\S]+)/);
-      if (!m) return ctx.notify("usage: dm <@agent> <text>");
+      if (!m) return ctx.notify("usage: dm <@peer> <text>");
       let id: string | undefined;
       try {
-        id = idOf(ctx.snapshot, m[1]);
+        const peer = peerOf(ctx.snapshot, m[1]);
+        id = peer?.card.id;
+        if (peer && !readsDirectMessages(peer)) return ctx.notify(dmEndpointRefusal(peer.card.name));
       } catch (e) {
         if (e instanceof AmbiguousPeerError) return ctx.notify(ambiguityNote(e));
         throw e;
@@ -120,14 +123,16 @@ export const COMMANDS: ConsoleCommand[] = [
   },
   {
     name: "call",
-    summary: "ping an agent + open the DM lens",
-    usage: "call <@agent>",
+    summary: "ping a peer + open the DM lens",
+    usage: "call <@peer>",
     write: true,
     run: async (ctx, rest) => {
       const name = rest.replace(/^@/, "").trim().split(/\s+/)[0] ?? "";
       let id: string | undefined;
       try {
-        id = idOf(ctx.snapshot, name);
+        const peer = peerOf(ctx.snapshot, name);
+        id = peer?.card.id;
+        if (peer && !readsDirectMessages(peer)) return ctx.notify(dmEndpointRefusal(peer.card.name));
       } catch (e) {
         if (e instanceof AmbiguousPeerError) return ctx.notify(ambiguityNote(e));
         throw e;
