@@ -66,6 +66,8 @@ process exit reopens that session with the same Cotal identity, lifecycle UID, c
 inbox. Three restarts are allowed in a rolling two-minute window; a fourth is a crash loop and retires
 the seat loud. A deliberate stop/despawn/maintenance cut never restarts it.
 
+Use `cotal spawn --agent pi --continue <pi-session-id>` to reopen that exact Pi session in place. Unlike `--resume`, this does not fork a new session; the manager retains the requested id for its own restart and crash recovery.
+
 ## Event plane
 
 A managed Pi seat publishes AG-UI runs, completed assistant text messages, and tool start/end

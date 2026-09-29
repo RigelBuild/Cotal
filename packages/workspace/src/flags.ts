@@ -42,6 +42,7 @@ export const launchFlags = [
   { name: "cwd", type: "string", value: "<dir>", description: "working directory to root the agent at" },
   { name: "prompt", type: "string", value: "<text>", description: "initial prompt auto-submitted at start" },
   { name: "resume", type: "string", value: "<id>", description: "fork an existing session id into the mesh (only where the connector declares resume support; detached: pair with --cwd)" },
+  { name: "continue", type: "string", value: "<id>", description: "reopen an existing session id in place; only connectors that support session continuation accept it (mutually exclusive with --resume)" },
   { name: "events", type: "boolean", description: "force the session's AG-UI event plane on (already the default where supported)" },
   { name: "no-events", type: "boolean", description: "opt out of the session's AG-UI event plane" },
   { name: "share-tools", type: "string", value: "<sel>", description: "share named operator MCP servers with the agent" },
