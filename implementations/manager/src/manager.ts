@@ -518,8 +518,6 @@ export interface ManagerResumeAgent {
     shareTools?: string;
     /** Original connector fork source, not a captured id for the currently running host session. */
     forkSource?: string;
-    /** Exact initial session id requested for continuation, retained across restart and recovery. */
-    initialSession?: string;
     /** Exact current host session reported by a continuation-capable connector. */
     sessionId?: string;
     /** The connector's session pointer file on THIS host, when it declares one. Non-secret like
@@ -666,7 +664,6 @@ interface ManagedLaunch {
   events: boolean;
   shareTools?: string;
   forkSource?: string;
-  initialSession?: string;
   sessionId?: string;
   unresolvedLaunchOptionKeys?: string[];
 }
@@ -2187,8 +2184,7 @@ export class Manager {
         events: a.launch.events,
         shareTools: a.launch.shareTools,
         forkSource: a.launch.forkSource,
-        initialSession: a.launch.initialSession,
-        sessionId: a.restart?.armed ? this.readManagedSession(a) : a.launch.sessionId ?? a.launch.initialSession,
+        sessionId: a.restart?.armed ? this.readManagedSession(a) : a.launch.sessionId,
         // Additive and only when the connector supplied one. A seat with no pointer records no
         // field, which is what keeps an older inventory and a fresh one the same document shape.
         ...(a.restart?.sessionStatePath ? { sessionStatePath: a.restart.sessionStatePath } : {}),
@@ -4814,7 +4810,6 @@ export class Manager {
           events,
           shareTools: opts.shareTools,
           forkSource: opts.resume,
-          initialSession: opts.continueSession,
           sessionId: opts.continueSession,
           // Opaque values may contain secrets. Preserve only their keys and require the referenced
           // persona/manifest to resolve the values again; imperative overrides have no safe payload.
@@ -5400,7 +5395,6 @@ export class Manager {
           events: entry.launch.events,
           shareTools: entry.launch.shareTools,
           forkSource: entry.launch.forkSource,
-          initialSession: entry.launch.initialSession,
           sessionId: entry.launch.sessionId,
         },
         ...(prepared.spec.sessionStatePath
