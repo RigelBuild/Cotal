@@ -251,6 +251,7 @@ const SPAWN_INPUT_SCHEMA = {
     variant: { type: "string" },
     launchOptions: { type: "object" },
     resume: { type: "string" },
+    continueSession: { type: "string" },
     events: { type: "boolean" },
     cwd: { type: "string" },
     prompt: { type: "string" },

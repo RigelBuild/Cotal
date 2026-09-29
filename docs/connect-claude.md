@@ -432,6 +432,7 @@ original is untouched.
   (a mesh peer naming host-local transcripts would widen `spawn` into transcript
   disclosure). Only the Claude connector supports it today; OpenCode and Hermes fail loud.
 - Needs a `claude` new enough for `--resume … --fork-session` (verified on 2.1.197).
+- `--continue <id>` is different: it reopens the exact session in place, not a fork. Claude does not support exact-session continuation, so this flag is refused for Claude.
 
 ## Sharing your MCP servers
 

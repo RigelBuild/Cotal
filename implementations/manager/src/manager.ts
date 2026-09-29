@@ -612,6 +612,8 @@ export interface StartAgentOpts {
    *  the connector. Only ever set from imperative control args (`opStart`), NEVER from `resolved` —
    *  the manifest path stays resume-free by construction. Unsupported connectors throw at buildLaunch. */
   resume?: string;
+  /** Exact host-local session id to continue in place (`--continue`), forwarded verbatim and recorded for recovery. */
+  continueSession?: string;
   /** Publish the session's AG-UI event plane to its own principal-keyed event channel. Defaults to
    *  on when the connector declares one; `false` (`--no-events`) is the explicit opt-out. */
   events?: boolean;
@@ -3933,11 +3935,15 @@ export class Manager {
 
   /** Parse an untyped control-plane `start` request into {@link StartAgentOpts}. */
   private opStart(args: Record<string, unknown>, caller: string, hooks?: SpawnHooks, route: "one" | "all" | "inst" = "inst"): Promise<ControlReply> {
-    // `resume`, when present, must be a non-empty session id. An empty/whitespace value is a
+    // `resume`/`continueSession`, when present, must be a non-empty session id. An empty value is a
     // malformed request, not an implicit "spawn fresh" (no fallbacks). The CLI surfaces reject it,
     // but a raw control message could otherwise slip an empty value through and silently start fresh.
+    if (args.resume !== undefined && args.continueSession !== undefined)
+      return Promise.resolve({ ok: false, error: "resume and continueSession are mutually exclusive" });
     if (args.resume !== undefined && !String(args.resume).trim())
       return Promise.resolve({ ok: false, error: "resume: session id must not be empty" });
+    if (args.continueSession !== undefined && !String(args.continueSession).trim())
+      return Promise.resolve({ ok: false, error: "continueSession: session id must not be empty" });
     if (args.variant !== undefined && !String(args.variant).trim())
       return Promise.resolve({ ok: false, error: "variant: must not be empty" });
     if (args.defaultAgent !== undefined && !String(args.defaultAgent).trim())
@@ -3989,6 +3995,7 @@ export class Manager {
         variant: args.variant ? String(args.variant) : undefined,
         launchOptions: args.launchOptions as Record<string, unknown> | undefined,
         resume: args.resume ? String(args.resume) : undefined,
+        continueSession: args.continueSession ? String(args.continueSession) : undefined,
         events: typeof args.events === "boolean" ? args.events : undefined,
         cwd: args.cwd ? String(args.cwd) : undefined,
         prompt: args.prompt ? String(args.prompt) : undefined,
@@ -4356,6 +4363,8 @@ export class Manager {
     // reject-before-side-effects window as the harness preflight above; buildLaunch stays the backstop.
     if (opts.resume && !connector.supportsResume)
       return { ok: false, error: `${agent} connector does not support resuming an existing session (resume)` };
+    if (opts.continueSession && !connector.supportsSessionContinuation)
+      return { ok: false, error: `${agent} connector does not support continuing an existing session (--continue)` };
     // A restart policy this host cannot honour is refused at accept, never accepted and ignored.
     // External runtimes (tmux/cmux/orca/herdr) attach to a process they do not own and stream no
     // exit, so a name cannot be respawned in place. User-mode seats have no static slot that
@@ -4740,6 +4749,7 @@ export class Manager {
         // control arg), never from `opts.resolved` — so the manifest launch path carries no resume by
         // construction. An unsupported connector throws here before any process is spawned.
         resume: opts.resume,
+        continueSession: opts.continueSession,
         // Initial prompt: the `--prompt` flag, or the manifest entry's `prompt:` on a resolved launch.
         prompt,
         // The SAME access set the creds were minted from (above) — forwarded so the session's
@@ -4800,6 +4810,7 @@ export class Manager {
           events,
           shareTools: opts.shareTools,
           forkSource: opts.resume,
+          sessionId: opts.continueSession,
           // Opaque values may contain secrets. Preserve only their keys and require the referenced
           // persona/manifest to resolve the values again; imperative overrides have no safe payload.
           unresolvedLaunchOptionKeys:

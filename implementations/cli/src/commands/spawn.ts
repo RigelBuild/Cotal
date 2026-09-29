@@ -421,6 +421,7 @@ async function spawnDetached(
     launchOptions,
     cwd: values.cwd,
     resume: values.resume, // host-local session id; the manager preflights connector resume support
+    continueSession: values.continue, // exact session id; manager records it for restart recovery
     prompt: values.prompt,
     shareTools: values["share-tools"],
     subscribe: splitFlag(values.subscribe),
@@ -496,11 +497,17 @@ export async function spawn(args: ParsedArgs): Promise<void> {
     });
     return;
   }
+  if (values.resume !== undefined && values.continue !== undefined) {
+    console.error("✗ --resume and --continue are mutually exclusive");
+    process.exit(1);
+  }
   // `--resume ""` / `--resume=` means the operator asked to resume but named no session — fail loud
   // rather than silently spawn a fresh one (no fallbacks). An absent flag (undefined) is fine.
-  if (values.resume !== undefined && !values.resume.trim()) {
-    console.error("--resume needs a session id (got an empty value)");
-    process.exit(1);
+  for (const [flag, value] of [["--resume", values.resume], ["--continue", values.continue]] as const) {
+    if (value !== undefined && !value.trim()) {
+      console.error(`${flag} needs a session id (got an empty value)`);
+      process.exit(1);
+    }
   }
   if (values.variant !== undefined && !values.variant.trim()) {
     console.error("--variant needs a variant name (got an empty value)");
@@ -672,6 +679,10 @@ export async function spawn(args: ParsedArgs): Promise<void> {
     connector = registry.resolve<Connector>("connector", agentType);
   } catch (e) {
     console.error(c.red(`✗ ${(e as Error).message}`));
+    process.exit(1);
+  }
+  if (values.continue && !connector.supportsSessionContinuation) {
+    console.error(c.red(`✗ ${agentType} connector does not support continuing an existing session (--continue)`));
     process.exit(1);
   }
   const variant = values.variant ?? def.variant;
@@ -911,7 +922,9 @@ export async function spawn(args: ParsedArgs): Promise<void> {
       prompt: values.prompt,
       // Fork an existing session into the mesh. `prompt + resume` is a supported combo (claude accepts
       // the positional prompt alongside `--resume … --fork-session`); an unsupported connector throws.
+      // `--continue` instead reopens the exact session id in place.
       resume: values.resume,
+      continueSession: values.continue,
       events: launchEvents,
       eventsRequired,
       mcpServers,
