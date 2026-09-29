@@ -8,7 +8,7 @@
  *
  * Run: pnpm smoke:seed-checkout-store
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { writeStamp } from "../src/seed/authority.js";
@@ -80,6 +80,16 @@ function sandboxXdg(): string {
   const xdg = track(mkdtempSync(join(tmpdir(), "cotal-seed-xdg-")));
   process.env.XDG_CONFIG_HOME = xdg;
   return xdg;
+}
+
+function setTreePermissions(path: string, fileMode: number, dirMode: number): void {
+  const stat = lstatSync(path);
+  if (stat.isDirectory()) {
+    for (const name of readdirSync(path)) setTreePermissions(join(path, name), fileMode, dirMode);
+    chmodSync(path, dirMode);
+  } else {
+    chmodSync(path, fileMode);
+  }
 }
 
 function threw(fn: () => void): { ok: boolean; message: string } {
@@ -272,9 +282,32 @@ try {
       stamp,
     );
   }
+  // A store seeded before copies were made writable, from a read-only install source.
+  {
+    process.argv[1] = installedEntry();
+    sandboxXdg();
+    const generation = "0.42.0";
+    const dest = stageSeedPayload(generation, "opencode");
+    setTreePermissions(dest, 0o444, 0o555);
+    const restage = threw(() => stageSeedPayload(generation, "opencode", { force: true }));
+    check("force re-stage replaces an existing read-only seed from an older version", !restage.ok && existsSync(join(dest, "package.json")), restage.message || dest);
+  }
+
+  {
+    process.argv[1] = installedEntry();
+    sandboxXdg();
+    const old = stageSeedPayload("0.41.0", "opencode");
+    setTreePermissions(old, 0o444, 0o555);
+    stageSeedPayload("0.42.0", "opencode");
+    const gc = threw(() => gcSeedStore("0.42.0", []));
+    check("gc removes a read-only prior generation", !gc.ok && !existsSync(dirname(old)), gc.message || old);
+  }
 } finally {
   restoreEnv();
-  for (const p of cleanup) rmSync(p, { recursive: true, force: true });
+  for (const p of cleanup) {
+    setTreePermissions(p, 0o600, 0o700);
+    rmSync(p, { recursive: true, force: true });
+  }
 }
 
 console.log(`\nseed-checkout-store smoke: ${pass} passed, ${fail} failed`);

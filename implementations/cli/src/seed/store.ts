@@ -1,4 +1,4 @@
-import { cpSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { provenance } from "@cotal-ai/workspace";
 import { assertReleasedSeedWriter, seedStoreDir, seedStorePath, shippedSourceDir } from "./paths.js";
@@ -20,6 +20,23 @@ function payloadFilter(root: string, from: string): boolean {
   return !segments.includes("node_modules") && !segments.includes(".git");
 }
 
+// Install sources can be read-only (a package-manager store); copies keep those modes and
+// would block the next forced re-stage from deleting them.
+function makeTreeOwnerWritable(path: string): void {
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink()) return;
+  chmodSync(path, stat.mode | 0o200);
+  if (stat.isDirectory()) {
+    for (const name of readdirSync(path)) makeTreeOwnerWritable(join(path, name));
+  }
+}
+
+function removeTree(path: string): void {
+  if (!existsSync(path)) return;
+  makeTreeOwnerWritable(path);
+  rmSync(path, { recursive: true, force: true });
+}
+
 /**
  * Stage a built-in connector's shipped payload into `store/<generation>/<name>` and return that
  * stable path (the spec `ext add` installs from). Idempotent: an intact prior copy is reused unless
@@ -33,10 +50,11 @@ export function stageSeedPayload(generation: string, name: string, opts: { force
   assertReleasedSeedWriter(generation, "write");
   const src = shippedSourceDir(name);
   const staging = `${dest}.staging`;
-  rmSync(staging, { recursive: true, force: true });
-  rmSync(dest, { recursive: true, force: true });
+  removeTree(staging);
+  removeTree(dest);
   mkdirSync(dirname(dest), { recursive: true });
   cpSync(src, staging, { recursive: true, filter: (from) => payloadFilter(src, from) });
+  makeTreeOwnerWritable(staging);
   renameSync(staging, dest); // atomic within the store: the final path only ever holds a complete payload
   // Announce the write on the provenance channel. This store is operator-global (a sibling of the
   // shared `extensions/` prefix, moved only by `XDG_CONFIG_HOME`), so re-seeding it from a non-released
@@ -70,7 +88,7 @@ export function gcSeedStore(keepGeneration: string, referencedSpecs: readonly st
     const referenced = referencedSpecs.some((spec) => spec === genDir || spec.startsWith(genDir + sep));
     if (referenced) continue;
     assertReleasedSeedWriter(keepGeneration, "garbage-collect");
-    rmSync(genDir, { recursive: true, force: true });
+    removeTree(genDir);
     // Announce the DELETE for the same reason the write above is announced: this store is
     // operator-global, so dropping a generation from it is a machine-wide act performed by a command
     // the operator ran for a local reason. It is announced AFTER the removal, so the line reports
