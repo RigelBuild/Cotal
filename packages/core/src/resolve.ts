@@ -42,10 +42,11 @@ export class AmbiguousPeerError extends Error {
 function candidate(p: Presence): PeerCandidate {
   return { id: p.card.id, name: p.card.name, role: p.card.role, status: p.status, ts: p.ts };
 }
+const NON_READING_ROLES = new Set(["manager", "delivery", "provisioner", "feedback"]);
 /** Only these infrastructure endpoints do not bind direct-message consumers. */
 export function readsDirectMessages(p: Presence): boolean {
   if (p.card.kind !== "endpoint") return true;
-  return p.card.role !== "manager" && p.card.role !== "delivery" && p.card.role !== "provisioner";
+  return !NON_READING_ROLES.has(p.card.role ?? "");
 }
 
 /**

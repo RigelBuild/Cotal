@@ -5,4 +5,4 @@
 "@cotal-ai/manager": patch
 ---
 
-Refuse direct messages only to non-consuming infrastructure roles, preserve DM-capable endpoints, and identify unreadable endpoints in agent rosters.
+Refuse direct messages only to non-consuming infrastructure roles, preserve DM-capable endpoints, and identify unreadable endpoints in agent rosters. The manager presence activity now reads "agent host (<runtime>)" instead of "supervisor (<runtime>)".

@@ -14,7 +14,7 @@ function expectAmbiguous(fn: () => unknown, count: number): void {
   assert.throws(fn, (e: unknown) => e instanceof AmbiguousPeerError && e.candidates.length === count);
 }
 
-for (const role of ["manager", "delivery", "provisioner"]) {
+for (const role of ["manager", "delivery", "provisioner", "feedback"]) {
   const endpoint: Presence = {
     card: { id: role, name: role, role, kind: "endpoint" },
     status: "idle",
