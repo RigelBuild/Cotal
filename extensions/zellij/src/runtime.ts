@@ -40,16 +40,15 @@ function launcherSource(dir: string, payload: string, name: string): string {
     `const alreadyRun = () => { console.error("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal"); process.exit(1); };\n` +
     `let dirInfo;\n` +
     `try { dirInfo = lstatSync(dir); } catch { alreadyRun(); }\n` +
-    `if (!dirInfo.isDirectory() || typeof process.getuid !== "function" || dirInfo.uid !== process.getuid() || (dirInfo.mode & 0o077) !== 0) alreadyRun();\n` +
+    `if (!dirInfo.isDirectory() || (typeof process.getuid === "function" && (dirInfo.uid !== process.getuid() || (dirInfo.mode & 0o077) !== 0))) alreadyRun();\n` +
     `let launch;\n` +
     `try { launch = JSON.parse(readFileSync(payload, "utf8")); } catch (error) {\n` +
     `  try { rmSync(dir, { recursive: true, force: true }); } catch {}\n` +
     `  if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") alreadyRun();\n` +
     `  throw error;\n` +
     `}\n` +
-    `rmSync(payload);\n` +
     `rmSync(dir, { recursive: true, force: true });\n` +
-    `process.stdout.write("\\x1b]0;" + ${JSON.stringify(name.replace(/[\x00-\x1f\x7f]/g, ""))} + "\\x07");\n` +
+    `process.stdout.write("\\x1b]0;" + ${JSON.stringify(name.replace(/[\x00-\x1f\x7f-\x9f]/g, ""))} + "\\x07");\n` +
     `process.chdir(launch.cwd);\n` +
     `const child = spawn(launch.command, launch.args, { env: launch.env, stdio: "inherit" });\n` +
     `let exiting = false;\n` +

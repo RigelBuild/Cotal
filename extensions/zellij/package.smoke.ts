@@ -155,6 +155,7 @@ try {
     env: { PRIVATE_VALUE: secret },
   };
   const launcher = privateLauncher(spec, temp, "launcher-smoke-agent");
+  if (process.platform !== "win32") check("launcher payload is owner-only", (statSync(launcher.payload).mode & 0o777) === 0o600);
   const source = launcher.argv[3];
   check("inline launcher source contains no connector env values", typeof source === "string" && !source.includes(secret));
   const firstRun = spawnSync(process.execPath, launcher.argv.slice(1), { encoding: "utf8" });
@@ -166,41 +167,45 @@ try {
     "rerunning a consumed launcher prints the clear message and exits non-zero",
     rerun.status !== 0 && rerunOutput.includes("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal") && !rerunOutput.includes("MODULE_NOT_FOUND"),
   );
-  mkdirSync(launcher.dir, { mode: 0o755 });
-  chmodSync(launcher.dir, 0o755);
-  const marker = join(temp, "planted-command-ran");
-  writeFileSync(launcher.payload, JSON.stringify({
-    cwd: temp,
-    command: process.execPath,
-    args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "spawned")`],
-    env: process.env,
-  }), { mode: 0o600 });
-  const plantedRerun = spawnSync(process.execPath, launcher.argv.slice(1), { encoding: "utf8" });
-  const plantedOutput = `${plantedRerun.stdout}${plantedRerun.stderr}`;
-  check(
-    "rerunning against a recreated public directory refuses its planted payload",
-    plantedRerun.status !== 0 && plantedOutput.includes("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal") && !existsSync(marker),
-  );
-  rmSync(launcher.dir, { recursive: true, force: true });
-  mkdirSync(launcher.dir, { mode: 0o700 });
-  const wrongOwnerMarker = join(temp, "wrong-owner-command-ran");
-  writeFileSync(launcher.payload, JSON.stringify({
-    cwd: temp,
-    command: process.execPath,
-    args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(wrongOwnerMarker)}, "spawned")`],
-    env: process.env,
-  }), { mode: 0o600 });
-  writeFileSync(join(temp, "wrong-owner.cjs"), `Object.defineProperty(process, "getuid", { value: () => ${process.getuid() + 1} });\n`);
-  const wrongOwner = spawnSync(process.execPath, ["-r", join(temp, "wrong-owner.cjs"), ...launcher.argv.slice(1)], {
-    encoding: "utf8",
-  });
-  const wrongOwnerOutput = `${wrongOwner.stdout}${wrongOwner.stderr}`;
-  check(
-    `rerunning against a recreated owner-only directory with the wrong owner refuses its payload: ${JSON.stringify(wrongOwnerOutput)}; status ${wrongOwner.status}; marker ${existsSync(wrongOwnerMarker)}`,
-    wrongOwner.status !== 0 && wrongOwnerOutput.includes("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal") && !existsSync(wrongOwnerMarker),
-  );
-  rmSync(launcher.dir, { recursive: true, force: true });
-
+  const escaped = privateLauncher(spec, temp, "evil\x9d0;owned\x9c\x1b[2Jname");
+  const escapedRun = spawnSync(process.execPath, escaped.argv.slice(1), { encoding: "utf8" });
+  check("launcher strips C0 and C1 controls from the pane title", escapedRun.stdout.startsWith("\x1b]0;evil0;owned[2Jname\x07"));
+  if (process.platform !== "win32") {
+    mkdirSync(launcher.dir, { mode: 0o755 });
+    chmodSync(launcher.dir, 0o755);
+    const marker = join(temp, "planted-command-ran");
+    writeFileSync(launcher.payload, JSON.stringify({
+      cwd: temp,
+      command: process.execPath,
+      args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "spawned")`],
+      env: process.env,
+    }), { mode: 0o600 });
+    const plantedRerun = spawnSync(process.execPath, launcher.argv.slice(1), { encoding: "utf8" });
+    const plantedOutput = `${plantedRerun.stdout}${plantedRerun.stderr}`;
+    check(
+      "rerunning against a recreated public directory refuses its planted payload",
+      plantedRerun.status !== 0 && plantedOutput.includes("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal") && !existsSync(marker),
+    );
+    rmSync(launcher.dir, { recursive: true, force: true });
+    mkdirSync(launcher.dir, { mode: 0o700 });
+    const wrongOwnerMarker = join(temp, "wrong-owner-command-ran");
+    writeFileSync(launcher.payload, JSON.stringify({
+      cwd: temp,
+      command: process.execPath,
+      args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(wrongOwnerMarker)}, "spawned")`],
+      env: process.env,
+    }), { mode: 0o600 });
+    writeFileSync(join(temp, "wrong-owner.cjs"), `Object.defineProperty(process, "getuid", { value: () => ${process.getuid() + 1} });\n`);
+    const wrongOwner = spawnSync(process.execPath, ["-r", join(temp, "wrong-owner.cjs"), ...launcher.argv.slice(1)], {
+      encoding: "utf8",
+    });
+    const wrongOwnerOutput = `${wrongOwner.stdout}${wrongOwner.stderr}`;
+    check(
+      `rerunning against a recreated owner-only directory with the wrong owner refuses its payload: ${JSON.stringify(wrongOwnerOutput)}; status ${wrongOwner.status}; marker ${existsSync(wrongOwnerMarker)}`,
+      wrongOwner.status !== 0 && wrongOwnerOutput.includes("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal") && !existsSync(wrongOwnerMarker),
+    );
+    rmSync(launcher.dir, { recursive: true, force: true });
+  }
 } finally {
   rmSync(temp, { recursive: true, force: true });
 }

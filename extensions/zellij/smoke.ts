@@ -55,7 +55,7 @@ try {
   writeFileSync(titleFile, "---\nzellij:\n  tab: launch-title-lane\n  direction: down\n---\n");
   const titleLaunch = {
     command: process.execPath,
-    args: ["-e", 'setInterval(() => process.stdout.write("\\x1b]0;launcher-title-smoke\\x07"), 100); setTimeout(() => process.exit(0), 5000);'],
+    args: ["-e", "setTimeout(() => process.exit(0), 5000);"],
     env: { COTAL_AGENT_FILE: titleFile },
   };
   assert.ok(!zellij.buildNewPaneArgs("1", process.cwd(), [], { direction: "down" }).includes("--name"), "new panes leave OSC title ownership to the agent");
@@ -66,13 +66,15 @@ try {
   runtime.spawn("title-second", titleLaunch, process.cwd());
   await new Promise<void>((resolve) => setTimeout(resolve, 500));
   let titlePanes = zellij.listPanes(session).filter((pane) => pane.tab_id === titleTab.tab_id && !pane.is_plugin);
-  for (let attempt = 0; (titlePanes.length !== 2 || !titlePanes.every((pane) => pane.title === "launcher-title-smoke")) && attempt < 50; attempt++) {
+  const wanted = ["title-first", "title-second"];
+  const titles = () => titlePanes.map((pane) => pane.title).sort();
+  for (let attempt = 0; (titlePanes.length !== 2 || JSON.stringify(titles()) !== JSON.stringify(wanted)) && attempt < 50; attempt++) {
     await new Promise<void>((resolve) => setTimeout(resolve, 100));
     titlePanes = zellij.listPanes(session).filter((pane) => pane.tab_id === titleTab.tab_id && !pane.is_plugin);
   }
   assert.equal(titlePanes.length, 2);
-  assert.ok(titlePanes.every((pane) => pane.title === "launcher-title-smoke"), `both created panes display OSC titles: ${JSON.stringify(titlePanes)}`);
-  console.log("  ✓ both terminal panes display the program's OSC title");
+  assert.deepEqual(titles(), wanted, `each pane displays its own agent name: ${JSON.stringify(titlePanes)}`);
+  console.log("  ✓ each terminal pane displays its own agent name from the launcher's OSC title");
 
   const paneCount = zellij.listPanes(session).length;
   assert.throws(() => runtime.spawn("bad-agent", {
