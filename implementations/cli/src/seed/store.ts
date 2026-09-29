@@ -25,7 +25,7 @@ function payloadFilter(root: string, from: string): boolean {
 function makeTreeOwnerWritable(path: string): void {
   const stat = lstatSync(path);
   if (stat.isSymbolicLink()) return;
-  chmodSync(path, stat.mode | 0o200);
+  if ((stat.mode & 0o200) === 0) chmodSync(path, stat.mode | 0o200);
   if (stat.isDirectory()) {
     for (const name of readdirSync(path)) makeTreeOwnerWritable(join(path, name));
   }
