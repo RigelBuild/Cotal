@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -32,21 +32,23 @@ export interface PrivateLauncher {
   readonly payload: string;
 }
 
-function launcherSource(dir: string, payload: string): string {
+function launcherSource(dir: string, payload: string, name: string): string {
   return `import { spawn } from "node:child_process";\n` +
-    `import { readFileSync, rmSync } from "node:fs";\n` +
+    `import { lstatSync, readFileSync, rmSync } from "node:fs";\n` +
     `const dir = ${JSON.stringify(dir)};\n` +
     `const payload = ${JSON.stringify(payload)};\n` +
+    `const alreadyRun = () => { console.error("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal"); process.exit(1); };\n` +
+    `let dirInfo;\n` +
+    `try { dirInfo = lstatSync(dir); } catch { alreadyRun(); }\n` +
+    `if (!dirInfo.isDirectory() || (typeof process.getuid === "function" && (dirInfo.uid !== process.getuid() || (dirInfo.mode & 0o077) !== 0))) alreadyRun();\n` +
     `let launch;\n` +
     `try { launch = JSON.parse(readFileSync(payload, "utf8")); } catch (error) {\n` +
     `  try { rmSync(dir, { recursive: true, force: true }); } catch {}\n` +
-    `  if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {\n` +
-    `    console.error("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal");\n` +
-    `    process.exit(1);\n` +
-    `  }\n` +
+    `  if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") alreadyRun();\n` +
     `  throw error;\n` +
     `}\n` +
     `rmSync(dir, { recursive: true, force: true });\n` +
+    `process.stdout.write("\\x1b]0;" + ${JSON.stringify(name.replace(/[\x00-\x1f\x7f-\x9f]/g, ""))} + "\\x07");\n` +
     `process.chdir(launch.cwd);\n` +
     `const child = spawn(launch.command, launch.args, { env: launch.env, stdio: "inherit" });\n` +
     `let exiting = false;\n` +
@@ -57,12 +59,12 @@ function launcherSource(dir: string, payload: string): string {
     `child.on("exit", (code, signal) => { exiting = true; if (signal) process.exit(128); process.exit(code ?? 0); });\n`;
 }
 
-export function privateLauncher(spec: LaunchSpec, cwd: string): PrivateLauncher {
+export function privateLauncher(spec: LaunchSpec, cwd: string, name: string): PrivateLauncher {
   const dir = mkdtempSync(join(tmpdir(), "cotal-zellij-launch-"));
   hardenPrivate(dir, "dir");
   const payload = join(dir, "launch.json");
   writeSecretFile(payload, JSON.stringify({ cwd, command: spec.command, args: spec.args, env: spec.env ?? {} }));
-  return { argv: [process.execPath, "--input-type=module", "-e", launcherSource(dir, payload)], dir, payload };
+  return { argv: [process.execPath, "--input-type=module", "-e", launcherSource(dir, payload, name)], dir, payload };
 }
 
 function cleanupLauncher(launcher: PrivateLauncher): void {
@@ -98,7 +100,7 @@ export class ZellijRuntime implements Runtime {
       ? tabsBefore.find((candidate) => candidate.name === placement.tab)
       : undefined;
     // Created last: every later failure path deletes it, and it holds the connector's secrets.
-    const launcher = privateLauncher(spec, cwd);
+    const launcher = privateLauncher(spec, cwd, name);
     try {
       if (!placement?.tab || !existingTab) {
         createdTabId = zellij.createTab(this.session, targetTabName, cwd, launcher.argv);
