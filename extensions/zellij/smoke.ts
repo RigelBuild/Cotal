@@ -7,6 +7,7 @@ import { ZellijRuntime } from "./src/runtime.ts";
 import * as zellij from "./src/driver.ts";
 
 const session = `ztest-${process.pid}-${Date.now()}`;
+console.log(`ZELLIJ TEST SESSION: ${session}`);
 const temp = mkdtempSync(join(tmpdir(), "cotal-zellij-live-"));
 const runtime = new ZellijRuntime(session);
 let created = false;
@@ -50,7 +51,42 @@ try {
   assert.equal(tabs.find((tab) => tab.active)?.tab_id, focusedBefore);
   console.log("  ✓ tab focus is unchanged across spawns");
 
-  const paneCount = allPanes.length;
+  const titleFile = join(temp, "title.md");
+  writeFileSync(titleFile, "---\nzellij:\n  tab: launch-title-lane\n  stacked: true\n---\n");
+  const titleLaunch = {
+    command: process.execPath,
+    args: ["-e", 'process.stdout.write("\\x1b]0;launcher-title-smoke\\x07"); process.exit(0);'],
+    env: { COTAL_AGENT_FILE: titleFile },
+  };
+  runtime.spawn("title-first", titleLaunch, process.cwd());
+  runtime.spawn("title-second", titleLaunch, process.cwd());
+  const titleTab = zellij.listTabs(session).find((tab) => tab.name === "launch-title-lane");
+  assert.ok(titleTab);
+  let titledPane = zellij.listPanes(session).find(
+    (pane) => pane.tab_id === titleTab.tab_id && !pane.is_plugin && pane.title === "launcher-title-smoke",
+  );
+  for (let attempt = 0; !titledPane && attempt < 30; attempt++) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    titledPane = zellij.listPanes(session).find(
+      (pane) => pane.tab_id === titleTab.tab_id && !pane.is_plugin && pane.title === "launcher-title-smoke",
+    );
+  }
+  assert.ok(titledPane, "new pane accepts the program's OSC title");
+  console.log("  ✓ a pane created without --name displays the program's OSC title");
+  for (let attempt = 0; zellij.paneState(session, titledPane.id) !== "exited" && attempt < 30; attempt++) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(zellij.paneState(session, titledPane.id), "exited");
+  execFileSync("zellij", ["--session", session, "action", "send-keys", "--pane-id", titledPane.id, "Enter"]);
+  let rerunOutput = "";
+  for (let attempt = 0; !rerunOutput.includes("this pane's launch has already run; respawn the agent through cotal") && attempt < 30; attempt++) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    rerunOutput = execFileSync("zellij", ["--session", session, "action", "dump-screen", "--pane-id", titledPane.id], { encoding: "utf8" });
+  }
+  assert.ok(rerunOutput.includes("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal"));
+  console.log("  ✓ Enter on the exited pane prints the clear rerun message");
+
+  const paneCount = zellij.listPanes(session).length;
   assert.throws(() => runtime.spawn("bad-agent", {
     command: "sleep",
     args: ["600"],
