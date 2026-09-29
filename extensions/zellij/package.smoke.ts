@@ -1,5 +1,6 @@
 import { strict as assert } from "node:assert";
-import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LaunchSpec } from "@cotal-ai/core";
@@ -148,12 +149,23 @@ console.log("  ✓ pane and tab argv use focus-free CLI forms");
 const temp = mkdtempSync(join(tmpdir(), "cotal-zellij-unit-"));
 try {
   const secret = "unit-only-secret";
-  const spec: LaunchSpec = { command: "sleep", args: ["600"], env: { PRIVATE_VALUE: secret } };
+  const spec: LaunchSpec = {
+    command: process.execPath,
+    args: ["-e", 'process.exit(process.env.PRIVATE_VALUE ? 0 : 1)'],
+    env: { PRIVATE_VALUE: secret },
+  };
   const launcher = privateLauncher(spec, temp);
-  // POSIX mode bits only; NTFS hardening is asserted by smoke:secret-fs.
-  if (process.platform !== "win32") check("launcher script is owner-only", (statSync(launcher.script).mode & 0o777) === 0o600);
-  check("launcher argv contains no connector env values", !launcher.argv.includes(secret));
-  check("launcher stores command and env outside pane argv", readFileSync(launcher.script, "utf8").includes(secret));
+  if (process.platform !== "win32") check("launcher payload is owner-only", (statSync(launcher.payload).mode & 0o777) === 0o600);
+  const source = launcher.argv[3];
+  check("inline launcher source contains no connector env values", typeof source === "string" && !source.includes(secret));
+  const firstRun = spawnSync(process.execPath, launcher.argv.slice(1), { encoding: "utf8" });
+  check("launcher starts child with its private env and removes the payload directory", firstRun.status === 0 && !existsSync(launcher.dir));
+  const rerun = spawnSync(process.execPath, launcher.argv.slice(1), { encoding: "utf8" });
+  const rerunOutput = `${rerun.stdout}${rerun.stderr}`;
+  check(
+    "rerunning a consumed launcher prints the clear message and exits non-zero",
+    rerun.status !== 0 && rerunOutput.includes("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal") && !rerunOutput.includes("MODULE_NOT_FOUND"),
+  );
   rmSync(launcher.dir, { recursive: true, force: true });
 } finally {
   rmSync(temp, { recursive: true, force: true });
@@ -221,7 +233,7 @@ await withFakeZellij("bad-tabs", (_logPath, session) => {
   }
   const leaked = readdirSync(tmp).filter((entry) => entry.startsWith("cotal-zellij-launch-"));
   rmSync(tmp, { recursive: true, force: true });
-  check("a failed tab probe leaves no launcher file with secrets", spawnFailed && leaked.length === 0);
+  check("a failed tab probe leaves no private launcher payload", spawnFailed && leaked.length === 0);
 });
 
 await withFakeZellij("partial-tab", (logPath, session) => {

@@ -25,24 +25,28 @@ export function scheduleConfirmation(
   for (let i = 1; i <= MAX_CONFIRMS; i++) schedule(write, i * CONFIRM_INTERVAL_MS);
 }
 
-interface LauncherPayload {
-  readonly cwd: string;
-  readonly command: string;
-  readonly args: readonly string[];
-  readonly env: Record<string, string>;
-}
 
 export interface PrivateLauncher {
   readonly argv: string[];
   readonly dir: string;
-  readonly script: string;
+  readonly payload: string;
 }
 
-function launcherSource(payload: LauncherPayload): string {
+function launcherSource(dir: string, payload: string): string {
   return `import { spawn } from "node:child_process";\n` +
-    `import { rmSync } from "node:fs";\n` +
-    `const launch = ${JSON.stringify(payload)};\n` +
-    `try { rmSync(new URL(".", import.meta.url), { recursive: true, force: true }); } catch {}\n` +
+    `import { readFileSync, rmSync } from "node:fs";\n` +
+    `const dir = ${JSON.stringify(dir)};\n` +
+    `const payload = ${JSON.stringify(payload)};\n` +
+    `let launch;\n` +
+    `try { launch = JSON.parse(readFileSync(payload, "utf8")); } catch (error) {\n` +
+    `  try { rmSync(dir, { recursive: true, force: true }); } catch {}\n` +
+    `  if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {\n` +
+    `    console.error("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal");\n` +
+    `    process.exit(1);\n` +
+    `  }\n` +
+    `  throw error;\n` +
+    `}\n` +
+    `rmSync(dir, { recursive: true, force: true });\n` +
     `process.chdir(launch.cwd);\n` +
     `const child = spawn(launch.command, launch.args, { env: launch.env, stdio: "inherit" });\n` +
     `let exiting = false;\n` +
@@ -56,16 +60,16 @@ function launcherSource(payload: LauncherPayload): string {
 export function privateLauncher(spec: LaunchSpec, cwd: string): PrivateLauncher {
   const dir = mkdtempSync(join(tmpdir(), "cotal-zellij-launch-"));
   hardenPrivate(dir, "dir");
-  const script = join(dir, "launch.mjs");
-  writeSecretFile(script, launcherSource({ cwd, command: spec.command, args: spec.args, env: spec.env ?? {} }));
-  return { argv: [process.execPath, script], dir, script };
+  const payload = join(dir, "launch.json");
+  writeSecretFile(payload, JSON.stringify({ cwd, command: spec.command, args: spec.args, env: spec.env ?? {} }));
+  return { argv: [process.execPath, "--input-type=module", "-e", launcherSource(dir, payload)], dir, payload };
 }
 
 function cleanupLauncher(launcher: PrivateLauncher): void {
   try {
     rmSync(launcher.dir, { recursive: true, force: true });
   } catch {
-    /* the launcher also removes itself after loading */
+    /* the launcher removes its private payload before starting the child */
   }
 }
 
@@ -103,7 +107,6 @@ export class ZellijRuntime implements Runtime {
         paneId = zellij.createPane(
           this.session,
           String(existingTab.tab_id),
-          name,
           cwd,
           launcher.argv,
           placement,

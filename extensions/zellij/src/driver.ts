@@ -167,14 +167,12 @@ export function buildNewPaneArgs(
   cwd: string,
   argv: readonly string[],
   placement: ZellijPlacement,
-  name?: string,
 ): string[] {
   const args = ["new-pane", "--tab-id", tabId, "--no-focus"];
   if (placement.stacked === true) args.push("--stacked");
   else if (placement.floating === true) args.push("--floating");
   else if (placement.direction) args.push("--direction", placement.direction);
   else if (placement.stacked !== false && placement.floating !== false) args.push("--stacked");
-  if (name) args.push("--name", name);
   args.push("--cwd", cwd, "--", ...argv);
   return args;
 }
@@ -202,13 +200,12 @@ export function createEmptyTab(session: string, name: string, cwd: string): stri
 export function createPane(
   session: string,
   tabId: string,
-  name: string,
   cwd: string,
   argv: readonly string[],
   placement: ZellijPlacement,
 ): string {
   ensureClient(session);
-  const output = run(actionArgs(session, buildNewPaneArgs(tabId, cwd, argv, placement, name)));
+  const output = run(actionArgs(session, buildNewPaneArgs(tabId, cwd, argv, placement)));
   const id = output.trim();
   if (!/^terminal_\d+$/.test(id)) throw new Error(`zellij runtime: could not read pane ID from ${JSON.stringify(output)}`);
   return id;
