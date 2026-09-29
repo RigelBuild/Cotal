@@ -37,8 +37,8 @@
     {
       "name": "a checkout can GC an unreferenced operator-global generation again (the GC refusal is deleted)",
       "file": "implementations/cli/src/seed/store.ts",
-      "find": "    if (referenced) continue;\n    assertReleasedSeedWriter(keepGeneration, \"garbage-collect\");\n    rmSync(genDir, { recursive: true, force: true });",
-      "replace": "    if (referenced) continue;\n    rmSync(genDir, { recursive: true, force: true });",
+      "find": "    if (referenced) continue;\n    assertReleasedSeedWriter(keepGeneration, \"garbage-collect\");\n    removeTree(genDir);",
+      "replace": "    if (referenced) continue;\n    removeTree(genDir);",
       "expectRed": "✗ FAIL: checkout: GC of an unreferenced operator-global generation is refused",
       "cell": "✗ FAIL: checkout: GC of an unreferenced operator-global generation is refused"
     },
