@@ -1,4 +1,4 @@
-import { lstatSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, lstatSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -27,14 +27,17 @@ export function scheduleConfirmation(
 
 
 export interface PrivateLauncher {
+  /** Runs the launcher script from `cwd`, so zellij's fallback pane title reads `./<agent>`. */
   readonly argv: string[];
+  readonly cwd: string;
   readonly dir: string;
   readonly payload: string;
 }
 
 function launcherSource(dir: string, payload: string, name: string): string {
-  return `import { spawn } from "node:child_process";\n` +
-    `import { lstatSync, readFileSync, rmSync } from "node:fs";\n` +
+  return `#!${process.execPath}\n` +
+    `const { spawn } = require("node:child_process");\n` +
+    `const { lstatSync, readFileSync, rmSync } = require("node:fs");\n` +
     `const dir = ${JSON.stringify(dir)};\n` +
     `const payload = ${JSON.stringify(payload)};\n` +
     `const alreadyRun = () => { console.error("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal"); process.exit(1); };\n` +
@@ -43,11 +46,11 @@ function launcherSource(dir: string, payload: string, name: string): string {
     `if (!dirInfo.isDirectory() || (typeof process.getuid === "function" && (dirInfo.uid !== process.getuid() || (dirInfo.mode & 0o077) !== 0))) alreadyRun();\n` +
     `let launch;\n` +
     `try { launch = JSON.parse(readFileSync(payload, "utf8")); } catch (error) {\n` +
-    `  try { rmSync(dir, { recursive: true, force: true }); } catch {}\n` +
+    `  try { rmSync(payload, { force: true }); } catch {}\n` +
     `  if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") alreadyRun();\n` +
     `  throw error;\n` +
     `}\n` +
-    `rmSync(dir, { recursive: true, force: true });\n` +
+    `rmSync(payload, { force: true });\n` +
     `process.stdout.write("\\x1b]0;" + ${JSON.stringify(name.replace(/[\x00-\x1f\x7f-\x9f]/g, ""))} + "\\x07");\n` +
     `process.chdir(launch.cwd);\n` +
     `const child = spawn(launch.command, launch.args, { env: launch.env, stdio: "inherit" });\n` +
@@ -62,9 +65,16 @@ function launcherSource(dir: string, payload: string, name: string): string {
 export function privateLauncher(spec: LaunchSpec, cwd: string, name: string): PrivateLauncher {
   const dir = mkdtempSync(join(tmpdir(), "cotal-zellij-launch-"));
   hardenPrivate(dir, "dir");
-  const payload = join(dir, "launch.json");
+  // A space keeps the payload name out of the sanitized script-name space.
+  const payload = join(dir, "launch payload.json");
   writeSecretFile(payload, JSON.stringify({ cwd, command: spec.command, args: spec.args, env: spec.env ?? {} }));
-  return { argv: [process.execPath, "--input-type=module", "-e", launcherSource(dir, payload, name)], dir, payload };
+  // Named after the agent for the pane title; it outlives the payload so a rerun reaches the "already run" message.
+  const file = name.replace(/[^A-Za-z0-9_.-]/g, "_") || "agent";
+  const script = join(dir, file);
+  writeFileSync(script, launcherSource(dir, payload, name), { mode: 0o700 });
+  chmodSync(script, 0o700);
+  const argv = process.platform === "win32" ? [process.execPath, script] : [`./${file}`];
+  return { argv, cwd: dir, dir, payload };
 }
 
 function cleanupLauncher(launcher: PrivateLauncher): void {
@@ -73,6 +83,13 @@ function cleanupLauncher(launcher: PrivateLauncher): void {
   } catch {
     /* the launcher removes its private payload before starting the child */
   }
+}
+
+const shellQuote = (arg: string): string => `'${arg.replace(/'/g, `'\\''`)}'`;
+
+/** zellij ignores `--cwd` for shell panes, so the typed line changes directory itself. */
+export function launchLine(launcher: PrivateLauncher): string {
+  return `cd ${shellQuote(launcher.cwd)} && exec ${launcher.argv.map(shellQuote).join(" ")}`;
 }
 
 function paneForTab(session: string, tabId: number): string {
@@ -103,14 +120,14 @@ export class ZellijRuntime implements Runtime {
     const launcher = privateLauncher(spec, cwd, name);
     try {
       if (!placement?.tab || !existingTab) {
-        createdTabId = zellij.createTab(this.session, targetTabName, cwd, launcher.argv);
+        createdTabId = zellij.createTab(this.session, targetTabName, launcher.cwd, launcher.argv);
         paneId = paneForTab(this.session, Number(createdTabId));
       } else {
         paneId = zellij.createPane(
           this.session,
           String(existingTab.tab_id),
-          cwd,
-          launcher.argv,
+          launcher.cwd,
+          launchLine(launcher),
           placement,
         );
       }

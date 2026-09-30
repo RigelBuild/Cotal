@@ -58,11 +58,11 @@ try {
     args: ["-e", "setTimeout(() => process.exit(0), 5000);"],
     env: { COTAL_AGENT_FILE: titleFile },
   };
-  assert.ok(!zellij.buildNewPaneArgs("1", process.cwd(), [], { direction: "down" }).includes("--name"), "new panes leave OSC title ownership to the agent");
+  assert.ok(!zellij.buildNewPaneArgs("1", process.cwd(), { direction: "down" }).includes("--"), "new panes are shell panes so zellij applies the agent's OSC title");
   runtime.spawn("title-first", titleLaunch, process.cwd());
   const titleTab = zellij.listTabs(session).find((tab) => tab.name === "launch-title-lane");
   assert.ok(titleTab);
-  execFileSync("zellij", ["--session", session, "action", "go-to-tab-by-id", String(titleTab.tab_id)]);
+  // Stays off-screen: the joined pane must take its OSC title from a background tab.
   runtime.spawn("title-second", titleLaunch, process.cwd());
   await new Promise<void>((resolve) => setTimeout(resolve, 500));
   let titlePanes = zellij.listPanes(session).filter((pane) => pane.tab_id === titleTab.tab_id && !pane.is_plugin);
