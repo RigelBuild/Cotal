@@ -419,6 +419,7 @@ try {
       fauxAssistantMessage("Pi persisted its completed answer."),
     ]);
     await native.prompt("Run one shell tool and answer.");
+    assert.equal(manager.getSessionName(), "pi-events-sdk", "the managed Pi session is named after its Cotal agent");
     const deadline = Date.now() + 5_000;
     while (!frames.flatMap((frame) => frame.events).some((event) => event.type === "RUN_FINISHED") && Date.now() < deadline)
       await new Promise((resolve) => setTimeout(resolve, 20));

@@ -174,6 +174,11 @@ export default async function cotalMesh(pi: ExtensionAPI): Promise<void> {
   runtime.driver.bind(pi);
   registerCotalTools(pi, runtime.mesh, runtime.config);
   pi.registerMessageRenderer<CotalBatchDetails>(CUSTOM_TYPE, (message) => wrapped(messageText(message.content)));
+  // The session carries the agent's mesh name, so /resume pickers and titles match `cotal ps`.
+  const nameSession = async (): Promise<void> => {
+    if (typeof pi.setSessionName !== "function" || pi.getSessionName?.() === config.name) return;
+    await pi.setSessionName(config.name);
+  };
 
   pi.on("session_start", async (_event, context) => {
     cleanPersonaFile(runtime);
@@ -186,11 +191,13 @@ export default async function cotalMesh(pi: ExtensionAPI): Promise<void> {
       _event.reason === "new" || _event.reason === "fork" ||
       (_event.reason === "startup" && (freshManagedSession || !startupSessionId && !expectedSessionId)));
     runtime.driver.onSessionStart(asContext(context));
+    await nameSession();
   });
   pi.on("agent_start", async (_event, context) => {
     await runtime.events?.start(context.sessionManager.getSessionId(), context.sessionManager.getSessionFile(),
       freshManagedSession || !startupSessionId && !expectedSessionId);
     runtime.driver.onAgentStart(asContext(context));
+    await nameSession();
   });
   pi.on("message_start", (event) => runtime.driver.onMessageStart(event.message));
   pi.on("context", (event) => runtime.driver.onContext(event.messages));
