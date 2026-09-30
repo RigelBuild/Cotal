@@ -2,4 +2,4 @@
 "@cotal-ai/zellij": patch
 ---
 
-Agent panes run a launcher script named after the agent, so a pane in a background tab shows `./<agent>` instead of the Node launcher command. The agent's own title still applies once its tab is on screen.
+Agents that join an existing tab start in a shell pane, and Cotal types the launch line into it, so the agent's OSC title and spinner show. Zellij ignores OSC titles from panes it started with a command. The launcher script is named after the agent. `zellij.createPane` now takes a shell command line instead of an argv, and `buildNewPaneArgs` no longer takes an argv.

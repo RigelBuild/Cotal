@@ -85,6 +85,13 @@ function cleanupLauncher(launcher: PrivateLauncher): void {
   }
 }
 
+const shellQuote = (arg: string): string => `'${arg.replace(/'/g, `'\\''`)}'`;
+
+/** zellij ignores `--cwd` for shell panes, so the typed line changes directory itself. */
+export function launchLine(launcher: PrivateLauncher): string {
+  return `cd ${shellQuote(launcher.cwd)} && exec ${launcher.argv.map(shellQuote).join(" ")}`;
+}
+
 function paneForTab(session: string, tabId: number): string {
   const pane = zellij.listPanes(session).find((candidate) => candidate.tab_id === tabId && !candidate.is_plugin);
   if (!pane) throw new Error(`zellij runtime: no terminal pane found in tab ${tabId}`);
@@ -120,7 +127,7 @@ export class ZellijRuntime implements Runtime {
           this.session,
           String(existingTab.tab_id),
           launcher.cwd,
-          launcher.argv,
+          launchLine(launcher),
           placement,
         );
       }

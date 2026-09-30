@@ -128,16 +128,16 @@ rejects("invalid direction is refused", "---\nzellij:\n  direction: left\n---\n"
 check("explicit false stacked shape is preserved", JSON.stringify(parseZellijPlacement("---\nzellij:\n  stacked: false\n---\n")) === JSON.stringify({ stacked: false }));
 
 assert.deepEqual(
-  buildNewPaneArgs("42", "/work", ["node", "/tmp/launch.mjs"], { stacked: true }),
-  ["new-pane", "--tab-id", "42", "--no-focus", "--stacked", "--cwd", "/work", "--", "node", "/tmp/launch.mjs"],
+  buildNewPaneArgs("42", "/work", { stacked: true }),
+  ["new-pane", "--tab-id", "42", "--no-focus", "--stacked", "--cwd", "/work"],
 );
 assert.deepEqual(
-  buildNewPaneArgs("42", "/work", ["node", "/tmp/launch.mjs"], { floating: true }),
-  ["new-pane", "--tab-id", "42", "--no-focus", "--floating", "--cwd", "/work", "--", "node", "/tmp/launch.mjs"],
+  buildNewPaneArgs("42", "/work", { floating: true }),
+  ["new-pane", "--tab-id", "42", "--no-focus", "--floating", "--cwd", "/work"],
 );
 assert.deepEqual(
-  buildNewPaneArgs("42", "/work", ["node", "/tmp/launch.mjs"], { direction: "down" }),
-  ["new-pane", "--tab-id", "42", "--no-focus", "--direction", "down", "--cwd", "/work", "--", "node", "/tmp/launch.mjs"],
+  buildNewPaneArgs("42", "/work", { direction: "down" }),
+  ["new-pane", "--tab-id", "42", "--no-focus", "--direction", "down", "--cwd", "/work"],
 );
 assert.deepEqual(
   buildNewTabArgs("agent", "/work", ["node", "/tmp/launch.mjs"]),
