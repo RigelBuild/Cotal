@@ -58,7 +58,7 @@ try {
     args: ["-e", "setTimeout(() => process.exit(0), 5000);"],
     env: { COTAL_AGENT_FILE: titleFile },
   };
-  assert.ok(!zellij.buildNewPaneArgs("1", process.cwd(), [], { direction: "down" }).includes("--name"), "new panes leave OSC title ownership to the agent");
+  assert.ok(zellij.buildNewPaneArgs("1", "title-first", process.cwd(), [], { direction: "down" }).includes("--name"), "new panes are named after their agent");
   runtime.spawn("title-first", titleLaunch, process.cwd());
   const titleTab = zellij.listTabs(session).find((tab) => tab.name === "launch-title-lane");
   assert.ok(titleTab);
@@ -74,7 +74,7 @@ try {
   }
   assert.equal(titlePanes.length, 2);
   assert.deepEqual(titles(), wanted, `each pane displays its own agent name: ${JSON.stringify(titlePanes)}`);
-  console.log("  ✓ each terminal pane displays its own agent name from the launcher's OSC title");
+  console.log("  ✓ each terminal pane displays its own agent name");
 
   const paneCount = zellij.listPanes(session).length;
   assert.throws(() => runtime.spawn("bad-agent", {

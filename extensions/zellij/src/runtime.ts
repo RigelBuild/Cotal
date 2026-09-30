@@ -105,10 +105,13 @@ export class ZellijRuntime implements Runtime {
       if (!placement?.tab || !existingTab) {
         createdTabId = zellij.createTab(this.session, targetTabName, cwd, launcher.argv);
         paneId = paneForTab(this.session, Number(createdTabId));
+        // new-tab cannot name its first pane.
+        zellij.renamePane(this.session, paneId, name);
       } else {
         paneId = zellij.createPane(
           this.session,
           String(existingTab.tab_id),
+          name,
           cwd,
           launcher.argv,
           placement,
