@@ -164,13 +164,11 @@ export function listPanes(session: string): ZellijPane[] {
 
 export function buildNewPaneArgs(
   tabId: string,
-  name: string,
   cwd: string,
   argv: readonly string[],
   placement: ZellijPlacement,
 ): string[] {
-  // zellij titles a command pane with its argv and ignores OSC titles from it, so name it.
-  const args = ["new-pane", "--tab-id", tabId, "--name", name, "--no-focus"];
+  const args = ["new-pane", "--tab-id", tabId, "--no-focus"];
   if (placement.stacked === true) args.push("--stacked");
   else if (placement.floating === true) args.push("--floating");
   else if (placement.direction) args.push("--direction", placement.direction);
@@ -202,21 +200,15 @@ export function createEmptyTab(session: string, name: string, cwd: string): stri
 export function createPane(
   session: string,
   tabId: string,
-  name: string,
   cwd: string,
   argv: readonly string[],
   placement: ZellijPlacement,
 ): string {
   ensureClient(session);
-  const output = run(actionArgs(session, buildNewPaneArgs(tabId, name, cwd, argv, placement)));
+  const output = run(actionArgs(session, buildNewPaneArgs(tabId, cwd, argv, placement)));
   const id = output.trim();
   if (!/^terminal_\d+$/.test(id)) throw new Error(`zellij runtime: could not read pane ID from ${JSON.stringify(output)}`);
   return id;
-}
-
-export function renamePane(session: string, paneId: string, name: string): void {
-  ensureClient(session);
-  run(actionArgs(session, ["rename-pane", "-p", paneId, name]), { stdio: "ignore" });
 }
 
 export function closePane(session: string, paneId: string): void {
