@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LaunchSpec } from "@cotal-ai/core";
@@ -128,16 +128,16 @@ rejects("invalid direction is refused", "---\nzellij:\n  direction: left\n---\n"
 check("explicit false stacked shape is preserved", JSON.stringify(parseZellijPlacement("---\nzellij:\n  stacked: false\n---\n")) === JSON.stringify({ stacked: false }));
 
 assert.deepEqual(
-  buildNewPaneArgs("42", "/work", ["node", "/tmp/launch.mjs"], { stacked: true }),
-  ["new-pane", "--tab-id", "42", "--no-focus", "--stacked", "--cwd", "/work", "--", "node", "/tmp/launch.mjs"],
+  buildNewPaneArgs("42", "/work", { stacked: true }),
+  ["new-pane", "--tab-id", "42", "--no-focus", "--stacked", "--cwd", "/work"],
 );
 assert.deepEqual(
-  buildNewPaneArgs("42", "/work", ["node", "/tmp/launch.mjs"], { floating: true }),
-  ["new-pane", "--tab-id", "42", "--no-focus", "--floating", "--cwd", "/work", "--", "node", "/tmp/launch.mjs"],
+  buildNewPaneArgs("42", "/work", { floating: true }),
+  ["new-pane", "--tab-id", "42", "--no-focus", "--floating", "--cwd", "/work"],
 );
 assert.deepEqual(
-  buildNewPaneArgs("42", "/work", ["node", "/tmp/launch.mjs"], { direction: "down" }),
-  ["new-pane", "--tab-id", "42", "--no-focus", "--direction", "down", "--cwd", "/work", "--", "node", "/tmp/launch.mjs"],
+  buildNewPaneArgs("42", "/work", { direction: "down" }),
+  ["new-pane", "--tab-id", "42", "--no-focus", "--direction", "down", "--cwd", "/work"],
 );
 assert.deepEqual(
   buildNewTabArgs("agent", "/work", ["node", "/tmp/launch.mjs"]),
@@ -156,22 +156,23 @@ try {
   };
   const launcher = privateLauncher(spec, temp, "launcher-smoke-agent");
   if (process.platform !== "win32") check("launcher payload is owner-only", (statSync(launcher.payload).mode & 0o777) === 0o600);
-  const source = launcher.argv[3];
-  check("inline launcher source contains no connector env values", typeof source === "string" && !source.includes(secret));
-  const firstRun = spawnSync(process.execPath, launcher.argv.slice(1), { encoding: "utf8" });
+  const script = join(launcher.dir, "launcher-smoke-agent");
+  check("launcher script is named after the agent so zellij's fallback pane title shows it", launcher.cwd === launcher.dir && launcher.argv.at(-1)?.endsWith("launcher-smoke-agent") === true);
+  check("launcher script contains no connector env values", !readFileSync(script, "utf8").includes(secret));
+  const runLauncher = (preload: string[] = []) => spawnSync(process.execPath, [...preload, script], { cwd: launcher.cwd, encoding: "utf8" });
+  const firstRun = runLauncher();
   check("launcher sets the agent pane title before starting the child", firstRun.stdout.startsWith("\x1b]0;launcher-smoke-agent\x07"));
-  check("launcher starts child with its private env and removes the payload directory", firstRun.status === 0 && !existsSync(launcher.dir));
-  const rerun = spawnSync(process.execPath, launcher.argv.slice(1), { encoding: "utf8" });
+  check("launcher starts child with its private env and removes the payload", firstRun.status === 0 && !existsSync(launcher.payload));
+  const rerun = runLauncher();
   const rerunOutput = `${rerun.stdout}${rerun.stderr}`;
   check(
     "rerunning a consumed launcher prints the clear message and exits non-zero",
     rerun.status !== 0 && rerunOutput.includes("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal") && !rerunOutput.includes("MODULE_NOT_FOUND"),
   );
   const escaped = privateLauncher(spec, temp, "evil\x9d0;owned\x9c\x1b[2Jname");
-  const escapedRun = spawnSync(process.execPath, escaped.argv.slice(1), { encoding: "utf8" });
+  const escapedRun = spawnSync(process.execPath, [join(escaped.dir, "evil_0_owned___2Jname")], { encoding: "utf8" });
   check("launcher strips C0 and C1 controls from the pane title", escapedRun.stdout.startsWith("\x1b]0;evil0;owned[2Jname\x07"));
   if (process.platform !== "win32") {
-    mkdirSync(launcher.dir, { mode: 0o755 });
     chmodSync(launcher.dir, 0o755);
     const marker = join(temp, "planted-command-ran");
     writeFileSync(launcher.payload, JSON.stringify({
@@ -180,14 +181,13 @@ try {
       args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "spawned")`],
       env: process.env,
     }), { mode: 0o600 });
-    const plantedRerun = spawnSync(process.execPath, launcher.argv.slice(1), { encoding: "utf8" });
+    const plantedRerun = runLauncher();
     const plantedOutput = `${plantedRerun.stdout}${plantedRerun.stderr}`;
     check(
       "rerunning against a recreated public directory refuses its planted payload",
       plantedRerun.status !== 0 && plantedOutput.includes("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal") && !existsSync(marker),
     );
-    rmSync(launcher.dir, { recursive: true, force: true });
-    mkdirSync(launcher.dir, { mode: 0o700 });
+    chmodSync(launcher.dir, 0o700);
     const wrongOwnerMarker = join(temp, "wrong-owner-command-ran");
     writeFileSync(launcher.payload, JSON.stringify({
       cwd: temp,
@@ -196,9 +196,7 @@ try {
       env: process.env,
     }), { mode: 0o600 });
     writeFileSync(join(temp, "wrong-owner.cjs"), `Object.defineProperty(process, "getuid", { value: () => ${process.getuid() + 1} });\n`);
-    const wrongOwner = spawnSync(process.execPath, ["-r", join(temp, "wrong-owner.cjs"), ...launcher.argv.slice(1)], {
-      encoding: "utf8",
-    });
+    const wrongOwner = runLauncher(["-r", join(temp, "wrong-owner.cjs")]);
     const wrongOwnerOutput = `${wrongOwner.stdout}${wrongOwner.stderr}`;
     check(
       `rerunning against a recreated owner-only directory with the wrong owner refuses its payload: ${JSON.stringify(wrongOwnerOutput)}; status ${wrongOwner.status}; marker ${existsSync(wrongOwnerMarker)}`,

@@ -162,18 +162,14 @@ export function listPanes(session: string): ZellijPane[] {
   });
 }
 
-export function buildNewPaneArgs(
-  tabId: string,
-  cwd: string,
-  argv: readonly string[],
-  placement: ZellijPlacement,
-): string[] {
+// No `-- <cmd>`: zellij ignores OSC titles from command panes, so the agent is typed into a shell pane.
+export function buildNewPaneArgs(tabId: string, cwd: string, placement: ZellijPlacement): string[] {
   const args = ["new-pane", "--tab-id", tabId, "--no-focus"];
   if (placement.stacked === true) args.push("--stacked");
   else if (placement.floating === true) args.push("--floating");
   else if (placement.direction) args.push("--direction", placement.direction);
   else if (placement.stacked !== false && placement.floating !== false) args.push("--stacked");
-  args.push("--cwd", cwd, "--", ...argv);
+  args.push("--cwd", cwd);
   return args;
 }
 
@@ -201,13 +197,15 @@ export function createPane(
   session: string,
   tabId: string,
   cwd: string,
-  argv: readonly string[],
+  command: string,
   placement: ZellijPlacement,
 ): string {
   ensureClient(session);
-  const output = run(actionArgs(session, buildNewPaneArgs(tabId, cwd, argv, placement)));
+  const output = run(actionArgs(session, buildNewPaneArgs(tabId, cwd, placement)));
   const id = output.trim();
   if (!/^terminal_\d+$/.test(id)) throw new Error(`zellij runtime: could not read pane ID from ${JSON.stringify(output)}`);
+  run(actionArgs(session, ["write-chars", "-p", id, command]), { stdio: "ignore" });
+  run(actionArgs(session, buildWriteArgs(id, "13")), { stdio: "ignore" });
   return id;
 }
 
