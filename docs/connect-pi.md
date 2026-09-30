@@ -68,6 +68,8 @@ the seat loud. A deliberate stop/despawn/maintenance cut never restarts it.
 
 Use `cotal spawn --agent pi --continue <pi-session-id>` to reopen that exact Pi session in place. Unlike `--resume`, this does not fork a new session; the manager retains the requested id for its own restart and crash recovery.
 
+A managed seat names its Pi session after its Cotal agent name on the first `session_start` or `agent_start`, so session pickers and terminal titles show the same name as `cotal ps`.
+
 ## Event plane
 
 A managed Pi seat publishes AG-UI runs, completed assistant text messages, and tool start/end
