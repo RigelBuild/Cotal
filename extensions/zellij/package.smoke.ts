@@ -128,16 +128,16 @@ rejects("invalid direction is refused", "---\nzellij:\n  direction: left\n---\n"
 check("explicit false stacked shape is preserved", JSON.stringify(parseZellijPlacement("---\nzellij:\n  stacked: false\n---\n")) === JSON.stringify({ stacked: false }));
 
 assert.deepEqual(
-  buildNewPaneArgs("42", "agent", "/work", ["node", "/tmp/launch.mjs"], { stacked: true }),
-  ["new-pane", "--tab-id", "42", "--name", "agent", "--no-focus", "--stacked", "--cwd", "/work", "--", "node", "/tmp/launch.mjs"],
+  buildNewPaneArgs("42", "/work", ["node", "/tmp/launch.mjs"], { stacked: true }),
+  ["new-pane", "--tab-id", "42", "--no-focus", "--stacked", "--cwd", "/work", "--", "node", "/tmp/launch.mjs"],
 );
 assert.deepEqual(
-  buildNewPaneArgs("42", "agent", "/work", ["node", "/tmp/launch.mjs"], { floating: true }),
-  ["new-pane", "--tab-id", "42", "--name", "agent", "--no-focus", "--floating", "--cwd", "/work", "--", "node", "/tmp/launch.mjs"],
+  buildNewPaneArgs("42", "/work", ["node", "/tmp/launch.mjs"], { floating: true }),
+  ["new-pane", "--tab-id", "42", "--no-focus", "--floating", "--cwd", "/work", "--", "node", "/tmp/launch.mjs"],
 );
 assert.deepEqual(
-  buildNewPaneArgs("42", "agent", "/work", ["node", "/tmp/launch.mjs"], { direction: "down" }),
-  ["new-pane", "--tab-id", "42", "--name", "agent", "--no-focus", "--direction", "down", "--cwd", "/work", "--", "node", "/tmp/launch.mjs"],
+  buildNewPaneArgs("42", "/work", ["node", "/tmp/launch.mjs"], { direction: "down" }),
+  ["new-pane", "--tab-id", "42", "--no-focus", "--direction", "down", "--cwd", "/work", "--", "node", "/tmp/launch.mjs"],
 );
 assert.deepEqual(
   buildNewTabArgs("agent", "/work", ["node", "/tmp/launch.mjs"]),
@@ -301,10 +301,6 @@ await withFakeZellij("confirm", async (logPath, session) => {
   check(
     "confirm sends five Enter presses to the spawned pane",
     writes.length === 5 && writes.every((args) => args.slice(4).join(" ") === "-p terminal_77 13"),
-  );
-  check(
-    "a new tab's first pane is named after the agent",
-    readCalls(logPath).some((args) => args.slice(3).join(" ") === "rename-pane -p terminal_77 confirm-agent"),
   );
 });
 
