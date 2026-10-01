@@ -34,7 +34,7 @@ function readCalls(logPath: string): string[][] {
 }
 
 async function withFakeZellij(
-  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs",
+  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane",
   run: (logPath: string, session: string) => void | Promise<void>,
 ): Promise<void> {
   // The fake is a shebang script Windows cannot exec, and zellij ships no Windows build.
@@ -70,15 +70,18 @@ if (action === "list-clients") {
   process.exit(0);
 }
 if (action === "new-tab") { console.log("77"); process.exit(0); }
+// Placed panes get an ID zellij never adds; the unplaced retry lands as terminal_78.
+if (action === "new-pane") { console.log(args.includes("--stacked") ? "terminal_99" : "terminal_78"); process.exit(0); }
 if (action === "list-tabs") {
   if (process.env.COTAL_ZELLIJ_TEST_MODE === "bad-tabs") { console.log("not json"); process.exit(0); }
   console.log(JSON.stringify([{ tab_id: 77, name: "confirm-agent", active: true }]));
   process.exit(0);
 }
 if (action === "list-panes") {
-  console.log(JSON.stringify(process.env.COTAL_ZELLIJ_TEST_MODE === "partial-tab" ? [] : [{
+  const mode = process.env.COTAL_ZELLIJ_TEST_MODE;
+  console.log(JSON.stringify(mode === "partial-tab" ? [] : [{
     id: 77, tab_id: 77, title: "confirm-agent", is_plugin: false, exited: false, exit_status: null
-  }]));
+  }, ...(mode === "dropped-pane" ? [{ id: 78, tab_id: 77, title: "", is_plugin: false, exited: false, exit_status: null }] : [])]));
   process.exit(0);
 }
 process.exit(0);
@@ -299,6 +302,15 @@ await withFakeZellij("confirm", async (logPath, session) => {
   check(
     "confirm sends five Enter presses to the spawned pane",
     writes.length === 5 && writes.every((args) => args.slice(4).join(" ") === "-p terminal_77 13"),
+  );
+});
+
+await withFakeZellij("dropped-pane", (logPath, session) => {
+  const id = zellij.createPane(session, "77", "/work", "exec agent", { stacked: true });
+  const typed = readCalls(logPath).filter((args) => args[3] === "write-chars");
+  check(
+    "a placed pane zellij never adds is replaced by an unplaced pane that gets the launch line",
+    id === "terminal_78" && typed.length === 1 && typed[0].includes("terminal_78"),
   );
 });
 
