@@ -12,7 +12,7 @@ zellij:
 ---
 ```
 
-Tabs are created on demand. The optional pane shape is `stacked: true`, `floating: true`, or `direction: right|down`; a tab with no shape defaults to stacked panes.
+Tabs are created on demand. The optional pane shape is `stacked: true`, `floating: true`, or `direction: right|down`; a tab with no shape defaults to stacked panes. Zellij 0.45 can report a pane ID for a shaped pane and then fail to add it, for example "Failed to add pane to stack". When the new pane is missing from the tab, the agent is placed in an unshaped pane instead.
 
 Zellij tabs keep their assigned names. Zellij ignores OSC titles from panes it starts with a command, so an agent that joins an existing tab gets a plain shell pane and Cotal types `cd <dir> && exec ./<agent>` into it. The launcher script is named after its agent and sets that name as the first title; the agent then sets its own title and spinner. The launch payload is stored in a private temporary file and removed before the agent starts. Pressing Enter on the exited pane prints a message to respawn the agent through Cotal.
 

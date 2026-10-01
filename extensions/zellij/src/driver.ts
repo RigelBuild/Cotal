@@ -201,11 +201,19 @@ export function createPane(
   placement: ZellijPlacement,
 ): string {
   ensureClient(session);
-  const output = run(actionArgs(session, buildNewPaneArgs(tabId, cwd, placement)));
-  const id = output.trim();
-  if (!/^terminal_\d+$/.test(id)) throw new Error(`zellij runtime: could not read pane ID from ${JSON.stringify(output)}`);
+  let id = newPane(session, buildNewPaneArgs(tabId, cwd, placement));
+  // zellij 0.45 can print an ID for a placed pane it then fails to add ("Failed to add pane to stack").
+  if (!listPanes(session).some((pane) => !pane.is_plugin && pane.id === id))
+    id = newPane(session, buildNewPaneArgs(tabId, cwd, { stacked: false, floating: false }));
   run(actionArgs(session, ["write-chars", "-p", id, command]), { stdio: "ignore" });
   run(actionArgs(session, buildWriteArgs(id, "13")), { stdio: "ignore" });
+  return id;
+}
+
+function newPane(session: string, args: string[]): string {
+  const output = run(actionArgs(session, args));
+  const id = output.trim();
+  if (!/^terminal_\d+$/.test(id)) throw new Error(`zellij runtime: could not read pane ID from ${JSON.stringify(output)}`);
   return id;
 }
 
