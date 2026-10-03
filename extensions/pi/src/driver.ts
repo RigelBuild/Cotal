@@ -13,6 +13,7 @@ export interface CotalBatchDetails {
   version: 1;
   batchId: string;
   ids: string[];
+  items?: InboxItem[];
 }
 
 export interface PiContextLike {
@@ -287,11 +288,12 @@ export class PiDriver {
     }
 
     let ids: string[] = [];
+    let items: InboxItem[] = [];
     let content: string | undefined;
     if (this.nudges.length > 0) {
       content = this.nudges.splice(0).join("\n");
     } else {
-      const items = this.inbox.select(reserved, BATCH_LIMIT);
+      items = this.inbox.select(reserved, BATCH_LIMIT);
       if (items.length === 0 && !turnPeek) return;
       ids = items.map((item) => item.recvKey);
       content = items.length > 0 ? formatInjection(items) : undefined;
@@ -308,7 +310,7 @@ export class PiDriver {
           customType: CUSTOM_TYPE,
           content,
           display: true,
-          details: { version: 1, batchId: batch.id, ids: [...ids] },
+          details: { version: 1, batchId: batch.id, ids: [...ids], items },
         },
         { triggerTurn: true, deliverAs: "steer" },
       );

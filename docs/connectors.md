@@ -32,6 +32,10 @@ it; stopping preserves it so an operator can inspect why the session never conne
 | Event plane (default on; `--no-events` opts out) | ✓ | ✓ | ✓ | ✗ (requires `--no-events`) | ✓ | ✓ (completed messages) | ✓ (completed messages) |
 | Containers ([deploy](deploy.md)) | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 
+In pi and omp, an incoming message appears in the TUI with its sender, DM or channel label,
+and body on separate lines. Both hosts use the same pi extension renderer. The text sent to
+the agent keeps its attribution and delivery instructions.
+
 **Native vs. bridged.** OpenCode and pi expose real plugin runtimes, so the connector runs
 inside the host process; pi most directly: peer messages steer the live turn instead of
 waiting for it to end. Claude Code has no in-process plugin runtime; the connector composes

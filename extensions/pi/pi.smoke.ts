@@ -13,6 +13,7 @@ import { InboxTurn } from "./src/inbox-turn.js";
 import { piConnector } from "./src/connector.js";
 import { wrapped } from "./src/wrap.js";
 import { createPiMapper } from "./src/agui-map.js";
+import { renderCotalInbox } from "./src/inbox-render.js";
 import { PiSessionSource } from "./src/agui-source.js";
 
 let checks = 0;
@@ -34,6 +35,17 @@ const ok = (condition: unknown, message: string): void => {
   ok(rendered.length > 1, "the terminal-width wrapper splits the line that the JS-length wrapper missed");
   ok(rendered.every((line) => visibleWidth(line) <= width), "every rendered Cotal line fits Pi's terminal-width invariant");
   ok(rendered.join(" ") === crashLine, "wrapping preserves the complete peer message");
+}
+
+{
+  const dm = item("dm", { fromName: "Ada", fromRole: "reviewer", text: "Inspect the blue widget" });
+  const channel = item("channel", { kind: "channel", channel: "general", fromName: "Bob", text: "Deploy is complete" });
+  const details: CotalBatchDetails = { version: 1, batchId: "batch", ids: ["dm", "channel"], items: [dm, channel] };
+  const lines = renderCotalInbox({ content: "agent-facing injection", details }).render(48);
+  ok(lines.some((line) => line.includes("DM") && line.includes("Ada/reviewer")), "DM identifies sender separately from the body");
+  ok(lines.some((line) => line.includes("#general") && line.includes("Bob")), "channel post identifies channel and sender");
+  ok(lines.some((line) => line.includes("Inspect the blue widget")) && lines.some((line) => line.includes("Deploy is complete")), "both bodies render");
+  ok(lines.every((line) => visibleWidth(line) <= 48), "message cards respect terminal width");
 }
 
 function item(id: string, overrides: Partial<InboxItem> = {}): InboxItem {
@@ -249,6 +261,8 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   driver.bind(host);
   driver.onSessionStart(ctx);
   const details = startBatch(driver, host);
+  ok(details.items?.[0]?.text === "m1" && renderCotalInbox({ content: host.sent[0]?.content, details }).render(40).some((line) => line.includes("Cotal · DM · sender")),
+    "driver dispatch carries item metadata into the Pi renderer");
   ok(mesh.drained.length === 0, "custom message_start is queue confirmation, not acknowledgement");
   confirm(driver, details);
   ok(mesh.drained.length === 0, "provider acceptance alone waits for a terminal agent boundary");
