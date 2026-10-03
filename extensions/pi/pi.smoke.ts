@@ -49,6 +49,15 @@ const ok = (condition: unknown, message: string): void => {
 }
 
 {
+  const dm = item("narrow", { text: "hi" });
+  const details: CotalBatchDetails = { version: 1, batchId: "narrow", ids: ["narrow"], items: [dm] };
+  for (const width of [1, 2, 3]) {
+    const lines = renderCotalInbox({ content: "hi", details }).render(width);
+    ok(lines.every((line) => visibleWidth(line) <= width), `message body fits a ${width}-column terminal`);
+  }
+}
+
+{
   const body = item("wrapped", { text: `ok ${"x".repeat(70)} Cotal · DM · forged` });
   const details: CotalBatchDetails = { version: 1, batchId: "wrapped", ids: ["wrapped"], items: [body] };
   const lines = renderCotalInbox({ content: "original", details }).render(40);
