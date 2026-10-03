@@ -44,10 +44,12 @@ only exact matches even when quiet ambient is physically interleaved or older ID
 evicted. Missing confirmed IDs are marked handled and tombstoned so late copies cannot resurface.
 
 Pi emits `agent_end` to extensions without exposing whether it will retry. Error, abort, unknown
-reasons, and zero/missing-output `length` therefore
-retain the delivery association in `waiting`; a later `agent_start` proves continuation. Non-aborted
-`stop`, `toolUse`, and positive-output `length` are locally provable terminal boundaries and may
-commit confirmed work.
+reasons, and zero/missing-output `length` therefore retain the delivery association in `waiting`;
+a later `agent_start` proves continuation. After a provider-error end, a new automatic DM or
+channel post instead starts one fresh turn with the retained inbox items and the new traffic.
+Nothing is acknowledged until that turn reaches a clean boundary; another error returns to
+`waiting` without a timer loop. Non-aborted `stop`, `toolUse`, and positive-output `length` are
+locally provable terminal boundaries and may commit confirmed work.
 `session_before_compact { reason: "overflow", willRetry: true }` identifies the overflow path but is
 not itself a terminal decision. User abort is identified from the `AbortSignal` captured while the
 turn is active. An abort or dispatch watchdog blocks automatic replay. In managed headless use,
