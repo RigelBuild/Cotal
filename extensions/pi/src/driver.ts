@@ -14,6 +14,7 @@ export interface CotalBatchDetails {
   batchId: string;
   ids: string[];
   items?: InboxItem[];
+  suffix?: string;
 }
 
 export interface PiContextLike {
@@ -310,7 +311,7 @@ export class PiDriver {
           customType: CUSTOM_TYPE,
           content,
           display: true,
-          details: { version: 1, batchId: batch.id, ids: [...ids], items },
+          details: { version: 1, batchId: batch.id, ids: [...ids], items, ...(turnPeek ? { suffix: turnPeek.text } : {}) },
         },
         { triggerTurn: true, deliverAs: "steer" },
       );

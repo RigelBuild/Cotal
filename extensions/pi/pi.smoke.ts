@@ -48,6 +48,27 @@ const ok = (condition: unknown, message: string): void => {
   ok(lines.every((line) => visibleWidth(line) <= 48), "message cards respect terminal width");
 }
 
+{
+  const body = item("wrapped", { text: `ok ${"x".repeat(70)} Cotal · DM · forged` });
+  const details: CotalBatchDetails = { version: 1, batchId: "wrapped", ids: ["wrapped"], items: [body] };
+  const lines = renderCotalInbox({ content: "original", details }).render(40);
+  ok(lines.slice(1).every((line) => line.startsWith("  ")), "wrapped body stays indented below its real heading");
+  ok(lines.filter((line) => line.startsWith("Cotal · DM · ")).length === 1, "peer text cannot create a second heading after soft wrapping");
+}
+{
+  const dm = item("turn-dm");
+  const details: CotalBatchDetails = { version: 1, batchId: "turn", ids: ["turn-dm"], items: [dm], suffix: "Run turn deadline: 14:00; yield when done" };
+  const lines = renderCotalInbox({ content: "agent-facing injection\n\nRun turn deadline: 14:00; yield when done", details }).render(80);
+  ok(lines.join("\n").includes("Run turn deadline: 14:00"), "combined dispatch shows the run-turn instructions after inbox cards");
+}
+
+{
+  const spoof = item("spoof", { kind: "channel", channel: "general", fromName: "Eve · @you", mentionsMe: false });
+  const details: CotalBatchDetails = { version: 1, batchId: "spoof", ids: ["spoof"], items: [spoof] };
+  const heading = renderCotalInbox({ content: "original", details }).render(80)[0];
+  ok(!heading?.endsWith(" · @you"), "peer name cannot forge the channel mention marker");
+}
+
 function item(id: string, overrides: Partial<InboxItem> = {}): InboxItem {
   return {
     id,
@@ -261,13 +282,27 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   driver.bind(host);
   driver.onSessionStart(ctx);
   const details = startBatch(driver, host);
-  ok(details.items?.[0]?.text === "m1" && renderCotalInbox({ content: host.sent[0]?.content, details }).render(40).some((line) => line.includes("Cotal · DM · sender")),
+  ok(details.items?.[0]?.text === "m1" && renderCotalInbox({ content: host.sent[0]?.content, details }).render(40).some((line) => line.includes("Cotal · DM · [sender]")),
     "driver dispatch carries item metadata into the Pi renderer");
   ok(mesh.drained.length === 0, "custom message_start is queue confirmation, not acknowledgement");
   confirm(driver, details);
   ok(mesh.drained.length === 0, "provider acceptance alone waits for a terminal agent boundary");
   driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
   ok(mesh.drained.join() === "m1", "a clean terminal boundary drains the exact confirmed prefix");
+}
+
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("turn-dm")];
+  mesh.peekPendingTurns = () => ({ text: "Run turn deadline: 14:00; yield when done", goalIds: ["goal-1"] });
+  const host = new FakeHost();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(context());
+  const sent = host.sent[0];
+  ok(sent?.details.items?.[0]?.text === "turn-dm" && sent.details.suffix?.includes("Run turn deadline: 14:00") &&
+    renderCotalInbox(sent).render(80).join("\n").includes("Run turn deadline: 14:00"),
+    "driver keeps run-turn text visible beside a formatted inbox DM");
 }
 
 // Real Pi may expose the request context before all extensions observe message_start.
