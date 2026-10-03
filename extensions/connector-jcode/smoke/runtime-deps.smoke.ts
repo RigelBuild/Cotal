@@ -2,6 +2,7 @@
 // Compare the manifest with imports from every published JavaScript entrypoint.
 import nodeAssert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
+import { isBuiltin } from "node:module";
 import { join, relative } from "node:path";
 import ts from "typescript";
 import { fileURLToPath } from "node:url";
@@ -58,7 +59,9 @@ const runtimeSpecifiers = (source: string): string[] => {
     } else if (ts.isCallExpression(node) && node.arguments.length === 1) {
       const [argument] = node.arguments;
       const dynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
-      const commonJsRequire = ts.isIdentifier(node.expression) && node.expression.text === "require";
+      // esbuild's ESM output rewrites CJS requires of externals to `__require("pkg")`.
+      const commonJsRequire = ts.isIdentifier(node.expression) &&
+        (node.expression.text === "require" || node.expression.text === "__require");
       if ((dynamicImport || commonJsRequire) && argument && ts.isStringLiteral(argument)) {
         out.push(argument.text);
       }
@@ -74,7 +77,7 @@ for (const file of distFiles) {
   assert.ok(existsSync(path), `published dist entry exists: ${relative(ROOT, path)}`);
   const source = readFileSync(path, "utf8");
   for (const specifier of runtimeSpecifiers(source)) {
-    if (!specifier.startsWith("node:") && !specifier.startsWith(".") && !specifier.startsWith("#")) {
+    if (!isBuiltin(specifier) && !specifier.startsWith(".") && !specifier.startsWith("#")) {
       importedPackages.add(packageName(specifier));
     }
   }
