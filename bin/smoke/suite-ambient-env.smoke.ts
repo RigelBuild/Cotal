@@ -745,10 +745,6 @@ const REVIEWED: Record<string, string> = {
  * baseline shrinks as files are fixed and can never quietly become a permanent waiver.
  */
 const FROZEN: readonly string[] = [
-  "bin/smoke/backup-conservation-live.smoke.ts",
-  "bin/smoke/backup-faults-live.smoke.ts",
-  "bin/smoke/backup-restore-live.smoke.ts",
-  "bin/smoke/backup-usermode-live.smoke.ts",
   "bin/smoke/dogfood-live.smoke.ts",
   "bin/smoke/ext-live.smoke.ts",
   "bin/smoke/orca-extension-live.smoke.ts",
