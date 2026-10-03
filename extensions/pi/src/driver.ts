@@ -80,6 +80,7 @@ export class PiDriver {
   private _state: DriverState = "idle";
   private heldReason?: string;
   private retryableErrorHold = false;
+  private inboundDuringTurn?: InboxItem;
 
   constructor(
     private readonly mesh: MeshAgent,
@@ -114,6 +115,8 @@ export class PiDriver {
   }
 
   onIncoming(item: InboxItem): void {
+    if (this.batches.length > 0 && this._state !== "held" && this.automaticWakeable(item) &&
+      !this.batches.some((batch) => batch.ids.includes(item.recvKey))) this.inboundDuringTurn = item;
     this.retryHeldErrorOnInbound(item);
     this.pump();
   }
@@ -227,6 +230,7 @@ export class PiDriver {
     if (!terminal) {
       this.terminalEvidenceBatchIds.clear();
       if (this.batches.length === 0) {
+        this.inboundDuringTurn = undefined;
         this._state = "idle";
         this.publishIdleWhenSettled(context);
         return;
@@ -239,6 +243,9 @@ export class PiDriver {
               "Cotal delivery is retained until a proven clean continuation completes",
       );
       this.retryableErrorHold = lastAssistant?.stopReason === "error" && !aborted;
+      const inbound = this.inboundDuringTurn;
+      this.inboundDuringTurn = undefined;
+      if (inbound) this.retryHeldErrorOnInbound(inbound);
       return;
     }
 
@@ -249,6 +256,7 @@ export class PiDriver {
     this.terminalEvidenceBatchIds.clear();
     this.pendingContinuation = false;
     this.retryableErrorHold = false;
+    this.inboundDuringTurn = undefined;
     this.finalizeEnd(context);
   }
 
@@ -327,9 +335,13 @@ export class PiDriver {
     }
   }
 
+  private automaticWakeable(item: InboxItem): boolean {
+    return wakeable(this.mesh, item) && this.inbox.peek("automatic").some((candidate) => candidate.recvKey === item.recvKey);
+  }
+
   private retryHeldErrorOnInbound(item: InboxItem): void {
     if (this._state !== "held" || !this.retryableErrorHold || !this.context || !this.host) return;
-    if (!wakeable(this.mesh, item) || this.batches.some((batch) => batch.ids.includes(item.recvKey))) return;
+    if (!this.automaticWakeable(item) || this.batches.some((batch) => batch.ids.includes(item.recvKey))) return;
 
     // The ended turn cannot confirm its batch; the inbox still owns every receive key.
     this.batches = [];

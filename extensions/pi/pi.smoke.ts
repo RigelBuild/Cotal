@@ -519,6 +519,43 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   crowdedDriver.onWake();
   ok(crowdedDriver.state === "held" && crowdedHost.sent.length === 1,
     "a generic wake cannot retry stale unbatched backlog after a provider error");
+  const pullOnly = new FakeMesh();
+  pullOnly.items = [item("retained")];
+  const pullHost = new FakeHost();
+  const pullDriver = new PiDriver(pullOnly as unknown as MeshAgent);
+  pullDriver.bind(pullHost);
+  const pullContext = context();
+  pullDriver.onSessionStart(pullContext);
+  startBatch(pullDriver, pullHost);
+  pullDriver.onAgentStart(pullContext);
+  pullDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], pullContext);
+  const ambient = item("quiet", { kind: "channel", channel: "quiet" });
+  pullOnly.items.push(ambient);
+  pullOnly.pullOnly.add(ambient.id);
+  pullDriver.onIncoming(ambient);
+  ok(pullDriver.state === "held" && pullHost.sent.length === 1,
+    "pull-only ambient cannot wake an error-held automatic delivery");
+
+  const racing = new FakeMesh();
+  racing.items = [item("first")];
+  const raceHost = new FakeHost();
+  const raceDriver = new PiDriver(racing as unknown as MeshAgent);
+  raceDriver.bind(raceHost);
+  const raceContext = context();
+  raceDriver.onSessionStart(raceContext);
+  startBatch(raceDriver, raceHost);
+  raceDriver.onAgentStart(raceContext);
+  raceDriver.onProviderResponse(429);
+  racing.items.push(item("between"));
+  raceDriver.onIncoming(racing.items.at(-1)!);
+  raceDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], raceContext);
+  ok(raceHost.sent.at(-1)?.details.ids.join() === "first,between" && raceHost.sent.length === 2,
+    "a DM arriving between provider failure and agent end retries retained delivery");
+  const raceBatch = startBatch(raceDriver, raceHost);
+  raceDriver.onAgentStart(raceContext);
+  confirm(raceDriver, raceBatch);
+  raceDriver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], raceContext);
+  ok(racing.drained.join() === "first,between", "a clean turn acknowledges both messages after the race");
 }
 
 // An unconfirmed error with no automatic continuation remains observably held without a timer.
@@ -652,7 +689,7 @@ for (const assistant of [
   await new Promise((resolve) => setTimeout(resolve, 120));
   ok(driver.state === "held" && mesh.drained.length === 0, "watchdog expiry holds without acknowledgement");
   mesh.items.push(item("new"));
-  driver.onIncoming();
+  driver.onIncoming(mesh.items.at(-1)!);
   ok(host.sent.length === 1, "watchdog hold blocks a competing dispatch");
   driver.onMessageStart({ role: "custom", customType: "cotal-inbox", details });
   confirm(driver, details);
