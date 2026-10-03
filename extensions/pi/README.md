@@ -49,8 +49,10 @@ subscription may omit that hook, so an exact context is confirmed instead by its
   bounded crash loop retires the seat rather than respawning forever.
 - Non-aborted `stop`, `toolUse`, and non-overflow `length` (positive output) are terminal and may
   commit confirmed work. Error, abort, zero/missing-output `length`, and unknown stop reasons retain
-  the association in observable `waiting`; Pi exposes no retry-finality event, so retained work waits
-  for a later proven terminal boundary.
+  the association in observable `waiting`; Pi exposes no retry-finality event.
+- A new automatic DM or channel post after a provider-error end starts one fresh turn with retained
+  inbox items and new traffic. Another failed turn returns to `waiting`; no timer retries a hard quota.
+  Only a later clean boundary can acknowledge the retained items.
 - Overflow compaction with `willRetry`: retain the batch through Pi's automatic continuation.
 - Watchdog or headless abort: never timer-replay while the original provider call may still run;
   managed restart is the safe recovery path.
