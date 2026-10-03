@@ -62,12 +62,10 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const BROKEN = "BROKEN:";
 
 type UngatedExemption = { reason: string; recheckBy: string };
-// 26 → 25: `smoke:delivery-broker-coupling` left the untriaged set by being gated, not by being
-// re-explained. It had been exempt as debt while silently grading nothing, the daemon it spawned
-// refused at startup, and the refusal satisfied its own "exits when the broker is gone" assertion.
-const EXPECTED_EXEMPTIONS = 25;
+// 25 → 10: the fifteen suites whose recheck date lapsed were each run three times. The ten that
+// passed are gated; the five that failed every run were deleted.
+const EXPECTED_EXEMPTIONS = 10;
 const standing = (reason: string): UngatedExemption => ({ reason, recheckBy: "2026-11-30" });
-const untriagedExemption = (reason: string): UngatedExemption => ({ reason, recheckBy: "2026-09-30" });
 
 const UNGATED: Record<string, UngatedExemption> = {
   // Need external tooling no CI runner has.
@@ -76,12 +74,6 @@ const UNGATED: Record<string, UngatedExemption> = {
   "smoke:codex-tui-live": standing("needs a codex TUI session"),
   "smoke:jcode-live": standing("needs an installed, authenticated jcode CLI (COTAL_E2E_JCODE=1)"),
   "smoke:down-manifest-usermode:live": standing("needs a claude CLI on PATH to boot a real connector child"),
-  "smoke:backup-usermode:live": untriagedExemption("BROKEN: red; cause unconfirmed (measured on a host with a live stack); #1285; already-red so it cannot enter CI"),
-  // These four are #643's to fix (backup live coverage that can fail), not an inventory mystery.
-  "smoke:backup-perms:live": untriagedExemption("BROKEN: red on CI at 2850a5a2e (backup-live.smoke.ts:125 zero-delivery New consumer preserves its creation frontier, 1 !== 2); #643; already-red so it cannot enter CI"),
-  "smoke:backup-restore:live": untriagedExemption("BROKEN: never executed; blocked behind failing backup-perms:live on the && chain at 2850a5a2e; status unknown; #643"),
-  "smoke:backup-conservation:live": untriagedExemption("BROKEN: never executed; blocked behind failing backup-perms:live on the && chain at 2850a5a2e; status unknown; #643"),
-  "smoke:backup-faults:live": untriagedExemption("BROKEN: never executed; blocked behind failing backup-perms:live on the && chain at 2850a5a2e; status unknown; #643"),
   // A STANDING DECISION, and only for the REAL-SESSION arm. The same suite is GATED as
   // `smoke:agui-map`, pointed at a fixture DERIVED from a real session by
   // `scripts/redact-claude-session.mjs` (whitelist by construction, identifiers pseudonymised
@@ -96,16 +88,6 @@ const UNGATED: Record<string, UngatedExemption> = {
   // `smoke:user-spawn:live` left this list when it was gated: it had thrown at section B1e on a
   // missing explicit `tls` and stopped after 14 of its 66 cells, and being ungated is why nobody
   // heard about it. "Too slow for the gate" was 105 seconds.
-  // Untriaged debt. These are the ones that should shrink.
-  "smoke:attention": untriagedExemption("UNTRIAGED"),
-  "smoke:attention:auth": untriagedExemption("UNTRIAGED"),
- "smoke:delivery-boot-retry:auth": untriagedExemption("UNTRIAGED"),
-  "smoke:delivery-old-manager": untriagedExemption("UNTRIAGED"),
-  "smoke:feedback": untriagedExemption("UNTRIAGED"),
-  "smoke:lifecycle-files": untriagedExemption("UNTRIAGED"), "smoke:manager-console": untriagedExemption("UNTRIAGED"),
-  "smoke:plane3-activation:auth": untriagedExemption("UNTRIAGED"),
-  "smoke:plane3-gate:auth": untriagedExemption("UNTRIAGED"),
-  "smoke:self-serve-join-coverage:auth": untriagedExemption("UNTRIAGED"),
 };
 
 /**
