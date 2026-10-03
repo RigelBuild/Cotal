@@ -21,7 +21,7 @@ export function renderCotalInbox(message: { content: unknown; details?: CotalBat
         if (lines.length) lines.push("");
         lines.push(...wrapped(heading(item)).render(width));
         const body = `${item.historical ? "(history) " : ""}${item.text}`;
-        const indent = width > 2 ? "  " : "";
+        const indent = width > 3 ? "  " : "";
         for (const paragraph of body.split(/\r\n?|[\n\v\f\u0085\u2028\u2029]/)) {
           lines.push(...wrapped(paragraph).render(Math.max(1, width - indent.length)).map((line) => `${indent}${line}`));
         }

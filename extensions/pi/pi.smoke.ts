@@ -55,6 +55,10 @@ const ok = (condition: unknown, message: string): void => {
     const lines = renderCotalInbox({ content: "hi", details }).render(width);
     ok(lines.every((line) => visibleWidth(line) <= width), `message body fits a ${width}-column terminal`);
   }
+  const wide = item("narrow-wide", { text: "漢" });
+  const wideDetails: CotalBatchDetails = { version: 1, batchId: "narrow-wide", ids: ["narrow-wide"], items: [wide] };
+  const lines = renderCotalInbox({ content: "漢", details: wideDetails }).render(3);
+  ok(lines.every((line) => visibleWidth(line) <= 3), "two-column glyph fits a three-column terminal");
 }
 
 {
