@@ -433,6 +433,24 @@ importers:
       '@earendil-works/pi-tui':
         specifier: 0.79.10
         version: 0.79.10
+      '@eplightning/nats-server-darwin-arm64':
+        specifier: ^2.14.0
+        version: 2.14.0
+      '@eplightning/nats-server-darwin-x64':
+        specifier: ^2.14.0
+        version: 2.14.0
+      '@eplightning/nats-server-linux-arm64':
+        specifier: ^2.14.0
+        version: 2.14.0
+      '@eplightning/nats-server-linux-x64':
+        specifier: ^2.14.0
+        version: 2.14.0
+      '@eplightning/nats-server-win32-arm64':
+        specifier: ^2.14.0
+        version: 2.14.0
+      '@eplightning/nats-server-win32-x64':
+        specifier: ^2.14.0
+        version: 2.14.0
       esbuild:
         specifier: ^0.28.0
         version: 0.28.1
@@ -3634,23 +3652,17 @@ snapshots:
 
   '@endo/immutable-arraybuffer@2.0.0': {}
 
-  '@eplightning/nats-server-darwin-arm64@2.14.0':
-    optional: true
+  '@eplightning/nats-server-darwin-arm64@2.14.0': {}
 
-  '@eplightning/nats-server-darwin-x64@2.14.0':
-    optional: true
+  '@eplightning/nats-server-darwin-x64@2.14.0': {}
 
-  '@eplightning/nats-server-linux-arm64@2.14.0':
-    optional: true
+  '@eplightning/nats-server-linux-arm64@2.14.0': {}
 
-  '@eplightning/nats-server-linux-x64@2.14.0':
-    optional: true
+  '@eplightning/nats-server-linux-x64@2.14.0': {}
 
-  '@eplightning/nats-server-win32-arm64@2.14.0':
-    optional: true
+  '@eplightning/nats-server-win32-arm64@2.14.0': {}
 
-  '@eplightning/nats-server-win32-x64@2.14.0':
-    optional: true
+  '@eplightning/nats-server-win32-x64@2.14.0': {}
 
   '@esbuild/aix-ppc64@0.28.0':
     optional: true

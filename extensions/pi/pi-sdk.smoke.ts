@@ -28,6 +28,20 @@ import {
   type ExtensionAPI,
   VERSION,
 } from "@earendil-works/pi-coding-agent";
+// Resolve only the current platform's optional dev dependency; its binary is the broker used by this suite.
+async function bundledNatsServerPath(): Promise<string> {
+  const packageName = `@eplightning/nats-server-${process.platform}-${process.arch}`;
+  const serverPackage: unknown = await import(packageName);
+  if (
+    typeof serverPackage !== "object" || serverPackage === null ||
+    !("getBinaryPath" in serverPackage) || typeof serverPackage.getBinaryPath !== "function"
+  ) {
+    throw new Error(`invalid NATS server package: ${packageName}`);
+  }
+  const binaryPath: unknown = serverPackage.getBinaryPath();
+  if (typeof binaryPath !== "string") throw new Error(`invalid NATS server path from ${packageName}`);
+  return binaryPath;
+}
 
 assert.equal(VERSION, "0.79.10", "the lifecycle proof must run against the pinned Pi host");
 
@@ -337,12 +351,14 @@ try {
   const brokerRoot = process.env.PI_EVENTS_TEST_SERVER ? undefined : mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
   const port = brokerRoot ? await pickFreePort() : undefined;
   const server = process.env.PI_EVENTS_TEST_SERVER ?? `nats://127.0.0.1:${port}`;
+  const brokerPath = brokerRoot ? await bundledNatsServerPath() : undefined;
   let broker: ReturnType<typeof spawn> | undefined;
-  if (brokerRoot && port) broker = spawn("nats-server", ["-js", "-p", String(port), "-sd", brokerRoot], { stdio: "ignore" });
+  if (brokerRoot && port && brokerPath) broker = spawn(brokerPath, ["-js", "-p", String(port), "-sd", brokerRoot], { stdio: "ignore" });
   const releaseBroker = broker && brokerRoot ? teardownOnSignal(broker, brokerRoot) : undefined;
   const root = mkdtempSync(join(tmpdir(), "cotal-pi-events-sdk-"));
-  const keys = ["COTAL_SPACE", "COTAL_NAME", "COTAL_ID", "COTAL_SERVERS", "COTAL_EVENTS", "COTAL_WORKSPACE_ROOT", "COTAL_PI_EXPECTED_SESSION", "COTAL_PI_FRESH_SESSION"] as const;
-  const prior = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
+  const originalEnv = { ...process.env };
+  for (const key of Object.keys(originalEnv)) if (key.startsWith("COTAL_")) delete originalEnv[key];
   const space = process.env.PI_EVENTS_TEST_SPACE ?? `pi_events_${randomUUID().replace(/-/g, "")}`;
   const actor = `pi_${randomUUID().replace(/-/g, "")}`;
   Object.assign(process.env, {
@@ -382,8 +398,14 @@ try {
     const deathRoot = join(root, "process-death");
     mkdirSync(deathRoot);
     const runDeath = (stage: "crash" | "recover"): Promise<number | null> => new Promise((done, reject) => {
+      const childEnv = { ...process.env };
+      for (const key of Object.keys(childEnv)) if (key.startsWith("COTAL_")) delete childEnv[key];
+      Object.assign(childEnv, {
+        COTAL_PI_EXPECTED_SESSION: "", COTAL_PI_FRESH_SESSION: "", PI_EVENTS_DEATH_STAGE: stage,
+        PI_EVENTS_DEATH_ROOT: deathRoot, PI_EVENTS_TEST_SERVER: server,
+      });
       const child = spawn(process.execPath, ["--import", "tsx", fileURLToPath(import.meta.url)], {
-        env: { ...process.env, COTAL_PI_EXPECTED_SESSION: "", COTAL_PI_FRESH_SESSION: "", PI_EVENTS_DEATH_STAGE: stage, PI_EVENTS_DEATH_ROOT: deathRoot, PI_EVENTS_TEST_SERVER: server },
+        env: childEnv,
         stdio: ["ignore", "pipe", "pipe"],
       });
       let output = "";
@@ -597,10 +619,8 @@ try {
     native?.dispose();
     provider.unregister();
     await observer.stop();
-    for (const key of keys) {
-      if (prior[key] === undefined) delete process.env[key];
-      else process.env[key] = prior[key];
-    }
+    for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
+    Object.assign(process.env, originalEnv);
     rmSync(root, { recursive: true, force: true });
     if (broker) await killAndAwaitExit(broker);
     releaseBroker?.();
