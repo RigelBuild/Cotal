@@ -2,7 +2,7 @@
  * Live NATS 2.10-compatible snapshot/restore and maintenance-permission smoke.
  * Run: pnpm --filter @cotal-ai/core smoke:backup:live
  */
-import assert from "node:assert/strict";
+import nodeAssert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -37,7 +37,10 @@ import {
   validateCanonicalBackupStreamConfig,
   validatePersistentConsumerInventory,
 } from "../src/index.js";
-import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { SMOKE_BROKER_TOKEN, countedAssert, emitSentinel, teardownOnSignal } from "@cotal-ai/smoke-kit";
+
+const counted = countedAssert(nodeAssert);
+const assert: typeof nodeAssert = counted.assert;
 
 const PORT = 12000 + Math.floor(Math.random() * 8000);
 const servers = `nats://127.0.0.1:${PORT}`;
@@ -344,7 +347,7 @@ try {
     "ordinary provisioner did not gain CHAT checkpoint creation",
   );
 
-  console.log("backup live smoke: snapshot/restore and permission matrix passed");
+  emitSentinel({ passed: counted.cells(), failed: 0 });
 } finally {
   server.kill("SIGTERM");
   await awaitExit();
