@@ -1,0 +1,1 @@
+smoke:self-serve-join-coverage:auth
