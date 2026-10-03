@@ -79,6 +79,7 @@ export class PiDriver {
   private overflowRetry = false;
   private _state: DriverState = "idle";
   private heldReason?: string;
+  private retryableErrorHold = false;
 
   constructor(
     private readonly mesh: MeshAgent,
@@ -112,7 +113,8 @@ export class PiDriver {
     this.context = undefined;
   }
 
-  onIncoming(): void {
+  onIncoming(item: InboxItem): void {
+    this.retryHeldErrorOnInbound(item);
     this.pump();
   }
 
@@ -236,6 +238,7 @@ export class PiDriver {
           : `Pi turn ended with ${lastAssistant?.stopReason ?? "an unknown stop reason"}; ` +
               "Cotal delivery is retained until a proven clean continuation completes",
       );
+      this.retryableErrorHold = lastAssistant?.stopReason === "error" && !aborted;
       return;
     }
 
@@ -245,6 +248,7 @@ export class PiDriver {
     }
     this.terminalEvidenceBatchIds.clear();
     this.pendingContinuation = false;
+    this.retryableErrorHold = false;
     this.finalizeEnd(context);
   }
 
@@ -321,6 +325,19 @@ export class PiDriver {
     } catch (error) {
       this.hold(`Pi rejected Cotal dispatch: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  private retryHeldErrorOnInbound(item: InboxItem): void {
+    if (this._state !== "held" || !this.retryableErrorHold || !this.context || !this.host) return;
+    if (!wakeable(this.mesh, item) || this.batches.some((batch) => batch.ids.includes(item.recvKey))) return;
+
+    // The ended turn cannot confirm its batch; the inbox still owns every receive key.
+    this.batches = [];
+    this.retryableErrorHold = false;
+    this.pendingContinuation = false;
+    this.heldReason = undefined;
+    this._state = "idle";
+    this.pump();
   }
 
   private finalizeEnd(context: PiContextLike): void {
