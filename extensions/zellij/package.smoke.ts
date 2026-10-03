@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { assertSmokeSandboxDown, recordSmokeSandbox } from "@cotal-ai/smoke-kit";
 import type { LaunchSpec } from "@cotal-ai/core";
 import { buildNewPaneArgs, buildNewTabArgs } from "./src/driver.js";
 import { parseZellijPlacement } from "./src/placement.js";
@@ -24,6 +25,23 @@ function rejects(name: string, raw: string): void {
   assert.throws(() => parseZellijPlacement(raw), undefined, name);
   checks++;
   console.log(`  ✓ ${name}`);
+}
+
+const sandbox = mkdtempSync(join(tmpdir(), "cotal-zellij-sandbox-"));
+try {
+  const root = join(sandbox, "root");
+  const cotalHome = join(sandbox, "home");
+  const xdgConfigHome = join(sandbox, "config");
+  const anchor = recordSmokeSandbox({ root, cotalHome, xdgConfigHome });
+  const options = { cwd: root, env: { COTAL_HOME: cotalHome, XDG_CONFIG_HOME: xdgConfigHome } };
+  assert.doesNotThrow(() => assertSmokeSandboxDown(anchor, ["down"], options));
+  checks++;
+  console.log("  ✓ shared sandbox guard permits down in its recorded sandbox");
+  assert.throws(() => assertSmokeSandboxDown(undefined, ["down"], options), /missing anchor/);
+  checks++;
+  console.log("  ✓ shared sandbox guard refuses down without its anchor");
+} finally {
+  rmSync(sandbox, { recursive: true, force: true });
 }
 
 function readCalls(logPath: string): string[][] {

@@ -472,6 +472,9 @@ importers:
       '@cotal-ai/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@cotal-ai/smoke-kit':
+        specifier: workspace:*
+        version: link:../../packages/smoke-kit
       esbuild:
         specifier: ^0.28.0
         version: 0.28.1
