@@ -36,9 +36,10 @@ const unsupported: Connector = {
 registry.register(continued);
 registry.register(unsupported);
 let pass = 0;
+let failed = 0;
 function check(label: string, condition: boolean, detail = ""): void {
   if (condition) { pass++; console.log(`PASS ${label}`); }
-  else { console.error(`FAIL ${label}${detail ? `: ${detail.slice(0, 300)}` : ""}`); }
+  else { failed++; console.error(`FAIL ${label}${detail ? `: ${detail.slice(0, 300)}` : ""}`); }
 }
 async function run(extra: string[]): Promise<string> {
   let stderr = "";
@@ -62,8 +63,8 @@ try {
   const refused = await run(["--agent", "unsupported-probe", "--continue", "session-123"]);
   check("unsupported connector continuation is refused", refused.includes("does not support continuing"));
 } finally {
-  emitSentinel({ passed: pass, failed: 3 - pass });
+  emitSentinel({ passed: pass, failed });
   broker.kill();
   // The CLI leaves mesh connections open after the probe throws; exit rather than wait on them.
-  process.exit(pass === 3 ? 0 : 1);
+  process.exit(failed === 0 && pass === 3 ? 0 : 1);
 }

@@ -4,10 +4,9 @@ name: Windows
 # (no tmux/runtime/Hermes — those are Unix-only) and the broker install is Windows-specific.
 #
 # Lanes:
-#   • required — Windows-specific, BROKER-FREE checks: typecheck + build + unit tests + the seam
-#     smokes (resolver / env-isolation / view / core-boundary / preflight), the `.cmd` launch matrix
-#     (smoke:windows), update crash barriers, control-plane seams, and secret-fs ACL hardening.
-#     No nats-server needed.
+#   • required — Windows-specific checks: typecheck + build + unit tests (including Pi SDK
+#     broker integration) + broker-free seam smokes, the `.cmd` launch matrix, update crash
+#     barriers, control-plane seams, and secret-fs ACL hardening.
 #   • smoke    — the protocol/security suite (smoke:ci), round-robin sharded across runners by
 #     bin/smoke/shard.mjs (each smoke spins its own broker; shards are separate runners).
 #     NON-BLOCKING. This is the Linux-authored suite replayed on Windows, and its reds have been
@@ -39,14 +38,16 @@ concurrency:
   # Tracks the line above: `queue: max` with `cancel-in-progress: true` is a validation error.
   queue: ${{ github.event_name == 'pull_request' && 'single' || 'max' }}
 
+env:
+  NATS_VERSION: v2.12.12
+  NATS_SHA256: 66e2ab6250083794321905e1f79db4f4ea53465d84ba0760e9b00d022133050e
+
 jobs:
   # REQUIRED lane — Windows-specific tests with a broker for Pi SDK integration.
   required:
     name: Windows / required
     timeout-minutes: 25
     runs-on: windows-latest
-    env:
-      NATS_VERSION: v2.12.12
     steps:
       - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v6.0.8
@@ -73,7 +74,7 @@ jobs:
         shell: pwsh
         run: |
           $NatsVersion = $env:NATS_VERSION
-          $Sha256 = "66e2ab6250083794321905e1f79db4f4ea53465d84ba0760e9b00d022133050e"
+          $Sha256 = $env:NATS_SHA256
           $Name = "nats-server-$NatsVersion-windows-amd64"
           $Zip = Join-Path $env:RUNNER_TEMP "$Name.zip"
           Invoke-WebRequest -Uri "https://github.com/nats-io/nats-server/releases/download/$NatsVersion/$Name.zip" -OutFile $Zip
@@ -128,15 +129,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/nats-bin
-          key: nats-server-v2.12.12-${{ runner.os }}
+          key: nats-server-${{ env.NATS_VERSION }}-${{ runner.os }}
       # Checksum-pinned (supply-chain gate). PowerShell `-ne` is case-insensitive, so the uppercase
       # Get-FileHash output compares equal to the lowercase pin.
       - name: Install nats-server
         if: steps.nats.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $NatsVersion = "v2.12.12"
-          $Sha256 = "66e2ab6250083794321905e1f79db4f4ea53465d84ba0760e9b00d022133050e"
+          $NatsVersion = $env:NATS_VERSION
+          $Sha256 = $env:NATS_SHA256
           $Name = "nats-server-$NatsVersion-windows-amd64"
           $Zip = Join-Path $env:RUNNER_TEMP "$Name.zip"
           Invoke-WebRequest -Uri "https://github.com/nats-io/nats-server/releases/download/$NatsVersion/$Name.zip" -OutFile $Zip
@@ -178,13 +179,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/nats-bin
-          key: nats-server-v2.12.12-${{ runner.os }}
+          key: nats-server-${{ env.NATS_VERSION }}-${{ runner.os }}
       - name: Install nats-server
         if: steps.nats.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $NatsVersion = "v2.12.12"
-          $Sha256 = "66e2ab6250083794321905e1f79db4f4ea53465d84ba0760e9b00d022133050e"
+          $NatsVersion = $env:NATS_VERSION
+          $Sha256 = $env:NATS_SHA256
           $Name = "nats-server-$NatsVersion-windows-amd64"
           $Zip = Join-Path $env:RUNNER_TEMP "$Name.zip"
           Invoke-WebRequest -Uri "https://github.com/nats-io/nats-server/releases/download/$NatsVersion/$Name.zip" -OutFile $Zip

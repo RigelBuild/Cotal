@@ -31,7 +31,7 @@ concurrency:
 # for over an hour, so every Linux job is back on GitHub-hosted runners. bin/smoke/verify-shard-inputs.sh
 # still accepts both runner homes, so a later move back is a label change only.
 # Same coverage as before, fanned across parallel jobs so wall-clock is the slowest job, not the sum:
-#   • unit  — typecheck + build + unit tests + the broker-free view/pack checks (fast).
+#   • unit  — typecheck + build + unit tests + the view/pack checks (fast).
 #   • smoke — the protocol/security suite (smoke:ci), round-robin sharded across runners by
 #             bin/smoke/shard.mjs (each smoke still runs in its own broker; shards are on separate
 #             runners, so no cross-smoke port contention).
@@ -60,7 +60,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/nats-bin
-          key: nats-server-${{ env.NATS_VERSION }}-${{ runner.os }}
+          key: verified-nats-server-${{ env.NATS_VERSION }}-linux-amd64-${{ runner.os }}
       - name: Install nats-server
         if: steps.nats.outputs.cache-hit != 'true'
         run: |
