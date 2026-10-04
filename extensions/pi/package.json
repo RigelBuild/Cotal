@@ -43,21 +43,7 @@
     "@earendil-works/pi-tui": "0.79.10",
     "esbuild": "^0.28.0",
     "typebox": "^1.1.0",
-    "zod": "^4.4.3",
-    "@eplightning/nats-server-darwin-arm64": "^2.14.0",
-    "@eplightning/nats-server-darwin-x64": "^2.14.0",
-    "@eplightning/nats-server-linux-arm64": "^2.14.0",
-    "@eplightning/nats-server-linux-x64": "^2.14.0",
-    "@eplightning/nats-server-win32-arm64": "^2.14.0",
-    "@eplightning/nats-server-win32-x64": "^2.14.0"
-  },
-  "devDependenciesMeta": {
-    "@eplightning/nats-server-darwin-arm64": { "optional": true },
-    "@eplightning/nats-server-darwin-x64": { "optional": true },
-    "@eplightning/nats-server-linux-arm64": { "optional": true },
-    "@eplightning/nats-server-linux-x64": { "optional": true },
-    "@eplightning/nats-server-win32-arm64": { "optional": true },
-    "@eplightning/nats-server-win32-x64": { "optional": true }
+    "zod": "^4.4.3"
   },
   "files": [
     "dist"

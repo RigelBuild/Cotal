@@ -350,8 +350,11 @@ const SEAMS: Seam[] = [
   // `find`/`replace` STRINGS in bin/smoke/mutations/attach-open-mode.json, which arrived on main,
   // and it counts because this reader scans text and a mutation body is text that will become
   // code. All three state `tls` explicitly, so the seam itself is unchanged.
-  // 157/117 -> 163/121: the main-tree census is stale. The tree now has six more calls, four under
-  // smoke/ and two typechecked; the full scanner verifies the updated totals at this tip.
+  // 157/117 -> 163/121: main adds run-host-live.smoke.ts (+2 smoke sites) and
+  // hosted-retirement-stock-supervise.acceptance.smoke.ts (+3 smoke sites), plus
+  // implementations/auth/src/service.ts (+1 typechecked) and
+  // implementations/runtime/src/run-command.ts (+1 typechecked), reaching 164/122.
+  // This PR deletes bin/smoke/backup-conservation-live.smoke.ts (-1 smoke site), leaving 163/121.
   { fn: "standaloneConnectOpts", key: "tls", sites: 163, untypecheckedSites: 121 },
 ];
 

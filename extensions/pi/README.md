@@ -10,8 +10,6 @@ The package does not bundle Pi.
   Node 22.19 or newer.
 - `pi` on `PATH` for managed spawning.
 
-The package's tests use the optional platform-matched `@eplightning/nats-server-*` development
-dependency to start an isolated JetStream broker; normal consumers do not need a broker binary.
 
 ## Use
 

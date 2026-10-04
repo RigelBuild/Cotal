@@ -14,6 +14,7 @@ import { fauxToolCall } from "@earendil-works/pi-ai";
 import cotalMesh from "./src/extension.js";
 import { piConnector } from "./src/connector.js";
 import { SMOKE_BROKER_TOKEN, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { resolveNatsServer } from "../../implementations/cli/src/lib/nats-bin.js";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
 import {
   AuthStorage,
@@ -28,20 +29,6 @@ import {
   type ExtensionAPI,
   VERSION,
 } from "@earendil-works/pi-coding-agent";
-// Resolve only the current platform's optional dev dependency; its binary is the broker used by this suite.
-async function bundledNatsServerPath(): Promise<string> {
-  const packageName = `@eplightning/nats-server-${process.platform}-${process.arch}`;
-  const serverPackage: unknown = await import(packageName);
-  if (
-    typeof serverPackage !== "object" || serverPackage === null ||
-    !("getBinaryPath" in serverPackage) || typeof serverPackage.getBinaryPath !== "function"
-  ) {
-    throw new Error(`invalid NATS server package: ${packageName}`);
-  }
-  const binaryPath: unknown = serverPackage.getBinaryPath();
-  if (typeof binaryPath !== "string") throw new Error(`invalid NATS server path from ${packageName}`);
-  return binaryPath;
-}
 
 assert.equal(VERSION, "0.79.10", "the lifecycle proof must run against the pinned Pi host");
 
@@ -351,7 +338,7 @@ try {
   const brokerRoot = process.env.PI_EVENTS_TEST_SERVER ? undefined : mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
   const port = brokerRoot ? await pickFreePort() : undefined;
   const server = process.env.PI_EVENTS_TEST_SERVER ?? `nats://127.0.0.1:${port}`;
-  const brokerPath = brokerRoot ? await bundledNatsServerPath() : undefined;
+  const brokerPath = brokerRoot ? (await resolveNatsServer()).bin : undefined;
   let broker: ReturnType<typeof spawn> | undefined;
   if (brokerRoot && port && brokerPath) broker = spawn(brokerPath, ["-js", "-p", String(port), "-sd", brokerRoot], { stdio: "ignore" });
   const releaseBroker = broker && brokerRoot ? teardownOnSignal(broker, brokerRoot) : undefined;

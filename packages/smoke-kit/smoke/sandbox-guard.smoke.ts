@@ -196,6 +196,7 @@ try {
   );
 
   const semanticDownOnly = new Set([
+    "extensions/zellij/package.smoke.ts",
     "implementations/runtime/smoke/mesh-wait.smoke.ts",
     "implementations/runtime/smoke/mesh-monitor.smoke.ts",
     "packages/lang/smoke/engine.smoke.ts",

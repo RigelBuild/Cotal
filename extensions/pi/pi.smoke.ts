@@ -634,6 +634,7 @@ for (const assistant of [
   ok(JSON.parse(readFileSync(derived, "utf8")).sessionId.endsWith("0003"), "an already-running pre-upgrade seat derives its lifecycle-keyed session state path");
   if (oldAgentFile === undefined) delete process.env.COTAL_AGENT_FILE; else process.env.COTAL_AGENT_FILE = oldAgentFile;
   if (oldName === undefined) delete process.env.COTAL_NAME; else process.env.COTAL_NAME = oldName;
+  if (oldUid === undefined) delete process.env.COTAL_LIFECYCLE_UID; else process.env.COTAL_LIFECYCLE_UID = oldUid;
   if (oldSessionState === undefined) delete process.env.COTAL_PI_SESSION_STATE; else process.env.COTAL_PI_SESSION_STATE = oldSessionState;
   rmSync(root, { recursive: true, force: true });
 }
