@@ -519,6 +519,45 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   crowdedDriver.onWake();
   ok(crowdedDriver.state === "held" && crowdedHost.sent.length === 1,
     "a generic wake cannot retry stale unbatched backlog after a provider error");
+  crowdedDriver.onIncoming(crowded.items[32]!);
+  ok(crowdedDriver.state === "held" && crowdedHost.sent.length === 1,
+    "redelivery of stale unbatched traffic cannot retry a provider error");
+  const fresh = item("queued-new");
+  crowded.items.push(fresh);
+  crowdedDriver.onIncoming(fresh);
+  ok(crowdedHost.sent.length === 2, "a genuinely new delivery wakes a full held batch");
+  const staleMesh = new FakeMesh();
+  staleMesh.items = [item("old")];
+  const staleHost = new FakeHost();
+  const staleContext = context();
+  const staleDriver = new PiDriver(staleMesh as unknown as MeshAgent);
+  staleDriver.bind(staleHost);
+  staleDriver.onSessionStart(staleContext);
+  startBatch(staleDriver, staleHost);
+  staleDriver.onAgentStart(staleContext);
+  staleDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], staleContext);
+  staleDriver.onAgentStart(staleContext);
+  staleDriver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], staleContext);
+  const afterWatchdog = item("after-watchdog");
+  staleMesh.items.push(afterWatchdog);
+  staleDriver.onIncoming(afterWatchdog);
+  ok(staleDriver.state === "held" && staleHost.sent.length === 1,
+    "a later unconfirmed hold cannot inherit error-retry eligibility");
+  const channelMesh = new FakeMesh();
+  channelMesh.items = [item("before-channel")];
+  const channelHost = new FakeHost();
+  const channelDriver = new PiDriver(channelMesh as unknown as MeshAgent);
+  channelDriver.bind(channelHost);
+  const channelContext = context();
+  channelDriver.onSessionStart(channelContext);
+  startBatch(channelDriver, channelHost);
+  channelDriver.onAgentStart(channelContext);
+  channelDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], channelContext);
+  const channel = item("channel-post", { kind: "channel", channel: "general" });
+  channelMesh.items.push(channel);
+  channelDriver.onIncoming(channel);
+  ok(channelHost.sent.at(-1)?.details.ids.join() === "before-channel,channel-post",
+    "a new automatic channel post wakes retained delivery");
   const pullOnly = new FakeMesh();
   pullOnly.items = [item("retained")];
   const pullHost = new FakeHost();
@@ -536,6 +575,22 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   ok(pullDriver.state === "held" && pullHost.sent.length === 1,
     "pull-only ambient cannot wake an error-held automatic delivery");
 
+  const overflowMesh = new FakeMesh();
+  overflowMesh.items = [item("overflow-old")];
+  const overflowHost = new FakeHost();
+  const overflowContext = context();
+  const overflowDriver = new PiDriver(overflowMesh as unknown as MeshAgent);
+  overflowDriver.bind(overflowHost);
+  overflowDriver.onSessionStart(overflowContext);
+  startBatch(overflowDriver, overflowHost);
+  overflowDriver.onAgentStart(overflowContext);
+  overflowDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], overflowContext);
+  overflowDriver.onBeforeCompact("overflow", true);
+  const overflowNew = item("overflow-new");
+  overflowMesh.items.push(overflowNew);
+  overflowDriver.onIncoming(overflowNew);
+  ok(overflowDriver.state === "held" && overflowHost.sent.length === 1,
+    "provider overflow continuation retains ownership despite new inbound");
   const racing = new FakeMesh();
   racing.items = [item("first")];
   const raceHost = new FakeHost();
