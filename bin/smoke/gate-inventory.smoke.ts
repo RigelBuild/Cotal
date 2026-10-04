@@ -74,11 +74,11 @@ const UNGATED: Record<string, UngatedExemption> = {
   "smoke:codex-tui-live": standing("needs a codex TUI session"),
   "smoke:jcode-live": standing("needs an installed, authenticated jcode CLI (COTAL_E2E_JCODE=1)"),
   "smoke:down-manifest-usermode:live": standing("needs a claude CLI on PATH to boot a real connector child"),
-  "smoke:backup-usermode:live": brokenExemption("backup inventory mismatch; preserve owner-secret restore refusal coverage"),
-  "smoke:backup-restore:live": brokenExemption("backup recovery scenarios require repair before gating"),
-  "smoke:backup-conservation:live": brokenExemption("backup recovery scenarios require repair before gating"),
-  "smoke:backup-faults:live": brokenExemption("backup fault and replay scenarios require repair before gating"),
-  "smoke:lifecycle-files": brokenExemption("manager lifecycle survivor and snapshot assertions require repair before gating"),
+  "smoke:backup-usermode:live": brokenExemption("RIG-4260: backup inventory mismatch; preserve owner-secret restore refusal coverage"),
+  "smoke:backup-restore:live": brokenExemption("RIG-4260: blocked by backup-perms in the old chain; restore needs JetStream storage and user-auth service"),
+  "smoke:backup-conservation:live": brokenExemption("RIG-4260: blocked by backup-perms in the old chain; underscore space name is refused"),
+  "smoke:backup-faults:live": brokenExemption("RIG-4260: backup fault and replay scenarios still need independent repair"),
+  "smoke:lifecycle-files": brokenExemption("RIG-4260: manager lifecycle survivor and snapshot assertions need a delivery daemon"),
   // A STANDING DECISION, and only for the REAL-SESSION arm. The same suite is GATED as
   // `smoke:agui-map`, pointed at a fixture DERIVED from a real session by
   // `scripts/redact-claude-session.mjs` (whitelist by construction, identifiers pseudonymised
@@ -356,13 +356,17 @@ if (staleAllowlist.length) {
 const untriaged = ungated.filter((s) => UNGATED[s]?.reason === "UNTRIAGED");
 console.log(`\n  ${untriaged.length} of the ungated set are UNTRIAGED debt (not a failure; the number should go down).`);
 
-// The debt-with-a-fuse class, named so the list can say how much of itself is broken rather than
-// merely excluded. Reported, not enforced, for the same reason as UNTRIAGED: every entry here is
-// an exclusion someone already accepted, and failing the gate on it would block CI on debt that
-// was consciously taken. What was missing was never enforcement — it was the COUNT. `smoke:auth`
-// sat in this list for six weeks with its cause correctly written in its own reason string, and
-// nothing anywhere said "one suite here is broken and is supposed to stop being broken".
+// This classification is pinned so a renamed reason cannot silently turn a broken suite into a
+// standing exemption. The suite remains excluded until its own assertions pass.
 const broken = ungated.filter((s) => (UNGATED[s]?.reason ?? "").startsWith(BROKEN)).sort();
+const expectedBroken = [
+  "smoke:backup-conservation:live", "smoke:backup-faults:live", "smoke:backup-restore:live",
+  "smoke:backup-usermode:live", "smoke:lifecycle-files",
+];
+if (broken.join() !== expectedBroken.join()) {
+  fail++;
+  console.log(`  ✗ FAIL: BROKEN exemptions changed: expected ${expectedBroken.join(", ")}, found ${broken.join(", ")}`);
+}
 console.log(`  ${broken.length} are BROKEN — red or flaky, and expected to be fixed and removed, not kept:`);
 for (const s of broken) console.log(`      ${s} — ${(UNGATED[s]?.reason ?? "").slice(BROKEN.length).trim()}`);
 

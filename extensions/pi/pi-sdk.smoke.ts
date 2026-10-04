@@ -343,9 +343,8 @@ try {
   if (brokerRoot && port && brokerPath) broker = spawn(brokerPath, ["-js", "-p", String(port), "-sd", brokerRoot], { stdio: "ignore" });
   const releaseBroker = broker && brokerRoot ? teardownOnSignal(broker, brokerRoot) : undefined;
   const root = mkdtempSync(join(tmpdir(), "cotal-pi-events-sdk-"));
-  for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
   const originalEnv = { ...process.env };
-  for (const key of Object.keys(originalEnv)) if (key.startsWith("COTAL_")) delete originalEnv[key];
+  for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
   const space = process.env.PI_EVENTS_TEST_SPACE ?? `pi_events_${randomUUID().replace(/-/g, "")}`;
   const actor = `pi_${randomUUID().replace(/-/g, "")}`;
   Object.assign(process.env, {
