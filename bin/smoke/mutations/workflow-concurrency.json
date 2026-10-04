@@ -13,7 +13,7 @@
     "about it. That is the whole reason the guard is static, and it is also why the guard itself",
     "needs mutation proof rather than a green run.",
     "",
-    "The three mutations are the three ways this has actually gone wrong or could go wrong silently.",
+    "The three mutations cover the concurrency failures this guard must reject.",
     "",
     "M1 restores the short `concurrency: <string>` form. This is the shape changesets.yml and",
     "installer.yml sat in, and it is the dangerous one precisely because it reads as a deliberate",
@@ -39,11 +39,11 @@
       "cell": "uses the mapping form, so it can carry"
     },
     {
-      "name": "windows.yml queue becomes a literal max, pairing with cancel-in-progress true on pull_request",
-      "file": ".github/workflows/windows.yml",
+      "name": "installer.yml queue becomes a literal max, pairing with cancel-in-progress true on pull_request",
+      "file": ".github/workflows/installer.yml",
       "find": "  queue: ${{ github.event_name == 'pull_request' && 'single' || 'max' }}\n",
       "replace": "  queue: max\n",
-      "expectRed": "windows.yml: on pull_request, not (queue=max AND cancel-in-progress=true)",
+      "expectRed": "installer.yml: on pull_request, not (queue=max AND cancel-in-progress=true)",
       "cell": "not (queue=max AND cancel-in-progress=true)"
     },
     {
