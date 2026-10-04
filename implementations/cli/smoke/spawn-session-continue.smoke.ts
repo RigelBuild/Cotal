@@ -2,7 +2,7 @@ import { spawn as spawnProcess } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { SMOKE_BROKER_TOKEN, emitSentinel, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import { registry, type Connector, type LaunchOpts, type LaunchSpec } from "@cotal-ai/core";
 import { recordMesh } from "@cotal-ai/workspace";
 import { resolveNatsServer } from "../src/lib/nats-bin.js";
@@ -62,7 +62,7 @@ try {
   const refused = await run(["--agent", "unsupported-probe", "--continue", "session-123"]);
   check("unsupported connector continuation is refused", refused.includes("does not support continuing"));
 } finally {
-  console.log(`SUITE COMPLETE: ${pass}/3 passed`);
+  emitSentinel({ passed: pass, failed: 3 - pass });
   broker.kill();
   // The CLI leaves mesh connections open after the probe throws; exit rather than wait on them.
   process.exit(pass === 3 ? 0 : 1);
