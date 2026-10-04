@@ -1,7 +1,7 @@
 /**
- * Guard main-push workflow concurrency against evicting queued runs.
- * Run: pnpm smoke:workflow-concurrency
- * Prove: pnpm mutation-proof --config bin/smoke/mutations/workflow-concurrency.json
+ * Guards main-push concurrency. Reads top-level groups only; trigger detection is indentation-based.
+ * PR superseding is not asserted; unknown expressions fail closed.
+ * Run: pnpm smoke:workflow-concurrency; prove: pnpm mutation-proof --config bin/smoke/mutations/workflow-concurrency.json.
  */
 import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";

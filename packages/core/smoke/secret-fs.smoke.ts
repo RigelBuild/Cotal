@@ -3,8 +3,8 @@
  *
  * Guards the WS5 secrets-at-rest seam a POSIX-only build breaks on Windows: `0o600`/`0o700` are a
  * no-op there, so secrets must be locked down via an NTFS ACL instead. POSIX checks run EVERYWHERE
- * (the local regression guard — mode bits after write/harden). The win32 `icacls` readback (the real
- * point — broad inherited access is actually stripped) is win32-only; Windows CI is the oracle.
+ * (the local regression guard — mode bits after write/harden). The win32 `icacls` readback is
+ * win32-only and is not exercised by Linux CI.
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
@@ -342,7 +342,7 @@ if (!isWin) {
   // hardenPrivate re-asserts on an existing path (idempotent).
   hardenPrivate(file, "file");
   check("hardenPrivate keeps the file 0600", (statSync(file).mode & 0o777) === 0o600);
-  console.log("· icacls ACL stripping is win32-only — skipped (CI is the oracle)");
+  console.log("· icacls ACL stripping is win32-only — not exercised by Linux CI");
 } else {
   // win32: the Unix mode is a no-op — the NTFS ACL is the boundary. Read it back with icacls and
   // assert the broad inherited principals are GONE and only owner + SYSTEM + Administrators remain.

@@ -7,7 +7,7 @@
  * the control-auth checks are the regression guard for the local (macOS/Linux) validate loop
  * (`node:net` abstracts AF_UNIX ↔ named pipe, so the auth logic exercises identically). The pieces
  * that are inherently win32 (the ConPTY argv round-trip, orphan reap, named-pipe squat) are
- * logged-and-skipped off Windows; Windows CI is the oracle for those.
+ * logged-and-skipped off Windows; they are not exercised by Linux CI.
  *
  *   A. resolveOnPath resolves against the PASSED env (not global process.env), and on win32 prefers a
  *      real `.exe` over a `.cmd` shim. [WS1 / security: executable selection stays in P3 isolation]
@@ -98,7 +98,7 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
     writeFileSync(join(onlyCmd, "bar.cmd"), "@echo off\r\n");
     check("a bare name resolves to its .cmd shim when that's all there is", (resolveOnPath("bar", { PATH: onlyCmd, PATHEXT: ".COM;.EXE;.BAT;.CMD" }) ?? "").toLowerCase().endsWith(".cmd"));
   } else {
-    console.log("· .exe-over-.cmd preference is win32-only — skipped (CI is the oracle)");
+    console.log("· .exe-over-.cmd preference is win32-only — not exercised by Linux CI");
   }
 }
 
@@ -256,7 +256,7 @@ if (isWin) {
   check("PtyRuntime launches a command and streams its output (POSIX passthrough)", out.includes("COTAL_SHIM_OK"));
   // preparePtyLaunch is a passthrough on POSIX — assert that so the import is exercised everywhere.
   eq("preparePtyLaunch is a passthrough on POSIX", preparePtyLaunch("claude", ["--x"], {}), { command: "claude", args: ["--x"] });
-  console.log("· cmd.exe argv round-trip matrix is win32-only — skipped (CI is the oracle)");
+  console.log("· cmd.exe argv round-trip matrix is win32-only — not exercised by Linux CI");
 }
 
 // =================================================================================================
@@ -338,7 +338,7 @@ if (isWin) {
   }
   rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
 } else {
-  console.log("· orphan-on-kill is win32-only (the cmd.exe grandchild layer) — skipped (CI is the oracle)");
+  console.log("· orphan-on-kill is win32-only (the cmd.exe grandchild layer) — not exercised by Linux CI");
 }
 
 // =================================================================================================
@@ -465,7 +465,7 @@ if (isWin) {
   check(`fatal bind: a squatted managed listener exits(1) (got status ${res.status})`, res.status === 1);
   squatter.close();
 } else {
-  console.log("· fatal-bind-on-squat needs a live named-pipe squatter (EADDRINUSE) — win32-only, skipped (CI is the oracle)");
+  console.log("· fatal-bind-on-squat needs a live named-pipe squatter (EADDRINUSE) — not exercised by Linux CI");
 }
 
 // =================================================================================================

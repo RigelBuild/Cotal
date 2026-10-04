@@ -108,6 +108,12 @@ jobs:
         run: pnpm test
       - name: View smoke
         run: pnpm smoke:view
+      - name: Portable launch smoke
+        run: pnpm smoke:windows
+      - name: Secret-file smoke
+        run: pnpm smoke:secret-fs
+      - name: Update-concurrency smoke
+        run: pnpm smoke:update-concurrency
       - name: Verify Claude connector package
         run: pnpm --filter @cotal-ai/connector-claude-code pack --dry-run
       # Grades the convention, not one suite: every file that defaults COTAL_SERVERS with `||=`
