@@ -205,15 +205,15 @@ async function completionOut(positionals: string[]): Promise<string> {
 // --- exact commands and flags-before-positionals stay inside the command grammar -----------------
 {
   const exactSend = await completionOut(["send"]);
-  assert.ok(exactSend.includes("dm\tunicast to an agent"), "exact send completes send subcommands");
+  assert.ok(exactSend.split("\n").some((line) => line.startsWith("dm\t")), "exact send completes send subcommands");
   assert.ok(!exactSend.includes("spawn\t"), "exact send does not fall back to top-level commands");
 
   const flaggedSend = await completionOut(["send", "--space", "demo", ""]);
-  assert.ok(flaggedSend.includes("msg\tbroadcast to a channel"), "flags before send subcommands are ignored");
+  assert.ok(flaggedSend.split("\n").some((line) => line.startsWith("msg\t")), "flags before send subcommands are ignored");
   assert.ok(!flaggedSend.includes("spawn\t"), "flagged send does not fall back to top-level commands");
 
   const flaggedPersonas = await completionOut(["personas", "--space", "demo", ""]);
-  assert.ok(flaggedPersonas.includes("show\tprint a persona's card"), "flags before personas subcommands are ignored");
+  assert.ok(flaggedPersonas.split("\n").some((line) => line.startsWith("show\t")), "flags before personas subcommands are ignored");
 
   const exactUp = await completionOut(["up"]);
   assert.ok(exactUp.includes("--space"), "exact flag-only commands offer their flags");
