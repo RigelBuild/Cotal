@@ -104,16 +104,16 @@ jobs:
       # It was reachable from `check` and executed by nothing, which is how it sat red on main.
       - name: Docs smoke
         run: pnpm smoke:docs
-      - name: Unit tests
-        run: pnpm test
-      - name: View smoke
-        run: pnpm smoke:view
       - name: Portable launch smoke
         run: pnpm smoke:windows
       - name: Secret-file smoke
         run: pnpm smoke:secret-fs
       - name: Update-concurrency smoke
         run: pnpm smoke:update-concurrency
+      - name: Unit tests
+        run: pnpm test
+      - name: View smoke
+        run: pnpm smoke:view
       - name: Verify Claude connector package
         run: pnpm --filter @cotal-ai/connector-claude-code pack --dry-run
       # Grades the convention, not one suite: every file that defaults COTAL_SERVERS with `||=`
@@ -222,6 +222,10 @@ jobs:
           herdr --version
       - name: Build
         run: pnpm build
+      - name: Spawn manifest live smoke
+        run: pnpm smoke:spawn-manifest:live
+      - name: Cooperative-stop live smoke
+        run: pnpm smoke:cooperative-stop:live
       # Broker-free boundary/preflight guards + the live target-resolution / spawn-from-anywhere /
       # readiness / up-stack / up-manifest / ext / dogfood e2es (real broker, real agents).
       - name: Core boundary, mesh preflight & resolution
