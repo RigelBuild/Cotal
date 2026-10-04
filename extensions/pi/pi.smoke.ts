@@ -82,6 +82,17 @@ const ok = (condition: unknown, message: string): void => {
   ok(!heading?.endsWith(" · @you"), "peer name cannot forge the channel mention marker");
 }
 
+{
+  const lines = renderCotalInbox({ content: [{ type: "text", text: "Saved first line" }, { type: "text", text: "Saved second line" }] }).render(40);
+  ok(lines.join("\n").includes("Saved first line\nSaved second line"), "older array-form inbox content remains visible after resume");
+}
+
+{
+  const details = { version: 1, batchId: "malformed", ids: ["malformed"], items: [null] } as unknown as CotalBatchDetails;
+  const lines = renderCotalInbox({ content: "Saved fallback", details }).render(40);
+  ok(lines.join("\n").includes("Saved fallback"), "malformed saved item metadata uses the visible content fallback");
+}
+
 function item(id: string, overrides: Partial<InboxItem> = {}): InboxItem {
   return {
     id,

@@ -10,9 +10,27 @@ function heading(item: InboxItem): string {
   return `Cotal · #${safe(fmtChannel(item.channel))} · [${from}]${item.mentionsMe ? " · @you" : ""}`;
 }
 
+function contentText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter((part): part is { type: "text"; text: string } => part?.type === "text" && typeof part.text === "string")
+    .map((part) => part.text).join("\n");
+}
+
+function validItem(item: unknown): item is InboxItem {
+  if (!item || typeof item !== "object") return false;
+  if (!("kind" in item && "text" in item && "fromName" in item)) return false;
+  if (item.kind !== "dm" && item.kind !== "channel" && item.kind !== "anycast") return false;
+  if (typeof item.text !== "string" || typeof item.fromName !== "string") return false;
+  if ("fromRole" in item && item.fromRole !== undefined && typeof item.fromRole !== "string") return false;
+  if (item.kind === "channel" && (!("channel" in item) || typeof item.channel !== "string")) return false;
+  if (item.kind === "anycast" && (!("service" in item) || typeof item.service !== "string")) return false;
+  return true;
+}
+
 export function renderCotalInbox(message: { content: unknown; details?: CotalBatchDetails }): WrappedText {
   const items = message.details?.items;
-  if (!items?.length) return wrapped(typeof message.content === "string" ? message.content : "");
+  if (!Array.isArray(items) || !items.length || !items.every(validItem)) return wrapped(contentText(message.content));
   return {
     invalidate(): void {},
     render(width: number): string[] {
