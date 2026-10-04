@@ -93,6 +93,19 @@ const ok = (condition: unknown, message: string): void => {
   ok(lines.join("\n").includes("Saved fallback"), "malformed saved item metadata uses the visible content fallback");
 }
 
+{
+  const malformed = { ...item("saved", { kind: "channel", channel: "general" }), mentionsMe: "false" };
+  const details = { version: 1, batchId: "saved", ids: ["saved"], items: [malformed] } as unknown as CotalBatchDetails;
+  const lines = renderCotalInbox({ content: "Saved content", details }).render(80);
+  ok(lines.join("\n").includes("Saved content") && !lines.join("\n").includes(" · @you"), "malformed saved mention flag cannot claim a mention");
+}
+
+{
+  const details = { version: 1, batchId: "saved-suffix", ids: ["saved-suffix"], items: [item("saved-suffix")], suffix: { text: "invalid" } } as unknown as CotalBatchDetails;
+  const lines = renderCotalInbox({ content: "Saved content", details }).render(80);
+  ok(lines.join("\n").includes("Saved content"), "malformed saved suffix uses content fallback instead of crashing");
+}
+
 function item(id: string, overrides: Partial<InboxItem> = {}): InboxItem {
   return {
     id,

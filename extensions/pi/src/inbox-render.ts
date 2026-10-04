@@ -22,6 +22,8 @@ function validItem(item: unknown): item is InboxItem {
   if (!("kind" in item && "text" in item && "fromName" in item)) return false;
   if (item.kind !== "dm" && item.kind !== "channel" && item.kind !== "anycast") return false;
   if (typeof item.text !== "string" || typeof item.fromName !== "string") return false;
+  if (!("mentionsMe" in item && "historical" in item) ||
+      typeof item.mentionsMe !== "boolean" || typeof item.historical !== "boolean") return false;
   if ("fromRole" in item && item.fromRole !== undefined && typeof item.fromRole !== "string") return false;
   if (item.kind === "channel" && (!("channel" in item) || typeof item.channel !== "string")) return false;
   if (item.kind === "anycast" && (!("service" in item) || typeof item.service !== "string")) return false;
@@ -30,7 +32,8 @@ function validItem(item: unknown): item is InboxItem {
 
 export function renderCotalInbox(message: { content: unknown; details?: CotalBatchDetails }): WrappedText {
   const items = message.details?.items;
-  if (!Array.isArray(items) || !items.length || !items.every(validItem)) return wrapped(contentText(message.content));
+  if (!Array.isArray(items) || !items.length || !items.every(validItem) ||
+      (message.details?.suffix !== undefined && typeof message.details.suffix !== "string")) return wrapped(contentText(message.content));
   return {
     invalidate(): void {},
     render(width: number): string[] {
