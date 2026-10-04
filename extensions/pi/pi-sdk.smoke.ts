@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { isReachable } from "@cotal-ai/core";
 import { pickFreePort } from "../../packages/core/smoke/_free-port.js";
 import { CotalEndpoint, DEV_OWNER, eventChannel, principalKey } from "@cotal-ai/core";
@@ -453,7 +453,7 @@ try {
     const heldLock = await acquirePrincipalLock(lockPath);
     assert.ok(existsSync(lockPath), "Pi event writer holds its principal lock while publishing");
     const challenger = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e",
-      `import { acquirePrincipalLock } from ${JSON.stringify(resolve(import.meta.dirname, "../connector-core/src/agui-wal-path.ts"))};` +
+      `import { acquirePrincipalLock } from ${JSON.stringify(pathToFileURL(resolve(import.meta.dirname, "../connector-core/src/agui-wal-path.ts")).href)};` +
       `await acquirePrincipalLock(${JSON.stringify(lockPath)});`], { stdio: ["ignore", "ignore", "pipe"] });
     let refusal = "";
     challenger.stderr.on("data", (data: Buffer) => { refusal += data.toString(); });
