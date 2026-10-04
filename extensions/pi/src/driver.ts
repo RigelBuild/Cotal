@@ -83,6 +83,8 @@ export class PiDriver {
   private heldReason?: string;
   private retryableErrorHold = false;
   private inboundDuringTurn?: InboxItem;
+  private knownAtTurnStart = new Set<string>();
+  private knownAtErrorEnd = new Set<string>();
 
   constructor(
     private readonly mesh: MeshAgent,
@@ -118,7 +120,7 @@ export class PiDriver {
 
   onIncoming(item: InboxItem): void {
     if (this.batches.length > 0 && this._state !== "held" && this.automaticWakeable(item) &&
-      !this.batches.some((batch) => batch.ids.includes(item.recvKey))) this.inboundDuringTurn = item;
+      !this.knownAtTurnStart.has(item.recvKey)) this.inboundDuringTurn = item;
     this.retryHeldErrorOnInbound(item);
     this.pump();
   }
@@ -145,6 +147,7 @@ export class PiDriver {
       return;
     }
     this.activeSignal = context.signal;
+    this.knownAtTurnStart = new Set(this.inbox.peek().map((item) => item.recvKey));
     this.overflowRetry = false;
     if (this.pendingContinuation) {
       this.pendingContinuation = false;
@@ -245,8 +248,10 @@ export class PiDriver {
               "Cotal delivery is retained until a proven clean continuation completes",
       );
       this.retryableErrorHold = lastAssistant?.stopReason === "error" && !aborted;
+      this.knownAtErrorEnd = new Set(this.inbox.peek().map((item) => item.recvKey));
       const inbound = this.inboundDuringTurn;
       this.inboundDuringTurn = undefined;
+      if (inbound) this.knownAtErrorEnd.delete(inbound.recvKey);
       if (inbound) this.retryHeldErrorOnInbound(inbound);
       return;
     }
@@ -257,6 +262,7 @@ export class PiDriver {
     }
     this.terminalEvidenceBatchIds.clear();
     this.pendingContinuation = false;
+    this.knownAtErrorEnd.clear();
     this.retryableErrorHold = false;
     this.inboundDuringTurn = undefined;
     this.finalizeEnd(context);
@@ -343,12 +349,13 @@ export class PiDriver {
   }
 
   private retryHeldErrorOnInbound(item: InboxItem): void {
-    if (this._state !== "held" || !this.retryableErrorHold || !this.context || !this.host) return;
-    if (!this.automaticWakeable(item) || this.batches.some((batch) => batch.ids.includes(item.recvKey))) return;
+    if (this._state !== "held" || !this.retryableErrorHold || this.overflowRetry || !this.context || !this.host) return;
+    if (!this.automaticWakeable(item) || this.knownAtErrorEnd.has(item.recvKey)) return;
 
     // The ended turn cannot confirm its batch; the inbox still owns every receive key.
     this.batches = [];
     this.retryableErrorHold = false;
+    this.knownAtErrorEnd.clear();
     this.pendingContinuation = false;
     this.heldReason = undefined;
     this._state = "idle";
@@ -378,6 +385,7 @@ export class PiDriver {
 
   private hold(reason: string): void {
     if (this._state === "shuttingDown") return;
+    this.retryableErrorHold = false;
     this._state = "held";
     this.heldReason = reason;
     this.clearWatchdogs();
