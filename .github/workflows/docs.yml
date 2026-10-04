@@ -21,10 +21,11 @@ on:
       - 'assets/**'
       - '.github/workflows/docs.yml'
 
-# A new push to a PR supersedes its previous docs build.
+# Supersede PR builds while preserving the pending main build for each commit.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  queue: ${{ github.event_name == 'pull_request' && 'single' || 'max' }}
 
 jobs:
   docs:
