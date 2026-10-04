@@ -27,16 +27,14 @@
   "peerDependencies": {
     "@cotal-ai/core": ">=0.1.0"
   },
-  "dependencies": {
-    "@1jehuang/jcode-sdk": "^1.1.0",
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "smol-toml": "^1.8.0"
-  },
   "devDependencies": {
+    "@1jehuang/jcode-sdk": "^1.1.0",
     "@cotal-ai/connector-core": "workspace:*",
     "@cotal-ai/core": "workspace:*",
     "@cotal-ai/smoke-kit": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "esbuild": "^0.28.0",
+    "smol-toml": "^1.8.0",
     "tsx": "^4.22.4",
     "zod": "^4.4.3"
   },

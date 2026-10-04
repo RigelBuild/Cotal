@@ -327,17 +327,10 @@ importers:
         version: 4.4.3
 
   extensions/connector-jcode:
-    dependencies:
+    devDependencies:
       '@1jehuang/jcode-sdk':
         specifier: ^1.1.0
         version: 1.1.0
-      '@modelcontextprotocol/sdk':
-        specifier: ^1.29.0
-        version: 1.29.0(zod@4.4.3)
-      smol-toml:
-        specifier: ^1.8.0
-        version: 1.8.0
-    devDependencies:
       '@cotal-ai/connector-core':
         specifier: workspace:*
         version: link:../connector-core
@@ -347,9 +340,15 @@ importers:
       '@cotal-ai/smoke-kit':
         specifier: workspace:*
         version: link:../../packages/smoke-kit
+      '@modelcontextprotocol/sdk':
+        specifier: ^1.29.0
+        version: 1.29.0(zod@4.4.3)
       esbuild:
         specifier: ^0.28.0
         version: 0.28.1
+      smol-toml:
+        specifier: ^1.8.0
+        version: 1.8.0
       tsx:
         specifier: ^4.22.4
         version: 4.23.0
