@@ -205,7 +205,7 @@ async function completionOut(positionals: string[]): Promise<string> {
 // --- exact commands and flags-before-positionals stay inside the command grammar -----------------
 {
   const exactSend = await completionOut(["send"]);
-  assert.ok(exactSend.includes("dm\tunicast to a peer"), "exact send completes send subcommands");
+  assert.ok(exactSend.includes("dm\tunicast to an agent"), "exact send completes send subcommands");
   assert.ok(!exactSend.includes("spawn\t"), "exact send does not fall back to top-level commands");
 
   const flaggedSend = await completionOut(["send", "--space", "demo", ""]);

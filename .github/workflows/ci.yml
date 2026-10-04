@@ -53,6 +53,22 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Cache nats-server
+        id: nats
+        uses: actions/cache@v4
+        with:
+          path: ~/nats-bin
+          key: nats-server-v2.12.12-${{ runner.os }}
+      - name: Install nats-server
+        if: steps.nats.outputs.cache-hit != 'true'
+        run: |
+          NATS_VERSION=v2.12.12
+          curl -fsSL "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-amd64.tar.gz" -o /tmp/nats-server.tar.gz
+          tar -xzf /tmp/nats-server.tar.gz -C /tmp
+          mkdir -p ~/nats-bin
+          install "/tmp/nats-server-${NATS_VERSION}-linux-amd64/nats-server" ~/nats-bin/nats-server
+      - name: nats-server on PATH
+        run: echo "$HOME/nats-bin" >> "$GITHUB_PATH"
       # ci-suites.txt is round-robin `index % count`. Inserting a line mid-file moves every
       # suite below it while membership, count, and duplicate checks stay green.
       - name: Smoke chain shard stability
