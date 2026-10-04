@@ -101,6 +101,13 @@ const ok = (condition: unknown, message: string): void => {
 }
 
 {
+  const malformed = { ...item("saved-history"), historical: "false" };
+  const details = { version: 1, batchId: "saved-history", ids: ["saved-history"], items: [malformed] } as unknown as CotalBatchDetails;
+  const lines = renderCotalInbox({ content: "Saved content", details }).render(80);
+  ok(lines.join("\n").includes("Saved content") && !lines.join("\n").includes("(history)"), "malformed saved history flag cannot claim history");
+}
+
+{
   const details = { version: 1, batchId: "saved-suffix", ids: ["saved-suffix"], items: [item("saved-suffix")], suffix: { text: "invalid" } } as unknown as CotalBatchDetails;
   const lines = renderCotalInbox({ content: "Saved content", details }).render(80);
   ok(lines.join("\n").includes("Saved content"), "malformed saved suffix uses content fallback instead of crashing");

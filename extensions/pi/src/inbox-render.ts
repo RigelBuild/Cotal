@@ -32,8 +32,9 @@ function validItem(item: unknown): item is InboxItem {
 
 export function renderCotalInbox(message: { content: unknown; details?: CotalBatchDetails }): WrappedText {
   const items = message.details?.items;
+  const suffix = message.details?.suffix;
   if (!Array.isArray(items) || !items.length || !items.every(validItem) ||
-      (message.details?.suffix !== undefined && typeof message.details.suffix !== "string")) return wrapped(contentText(message.content));
+      (suffix !== undefined && typeof suffix !== "string")) return wrapped(contentText(message.content));
   return {
     invalidate(): void {},
     render(width: number): string[] {
@@ -47,7 +48,7 @@ export function renderCotalInbox(message: { content: unknown; details?: CotalBat
           lines.push(...wrapped(paragraph).render(Math.max(1, width - indent.length)).map((line) => `${indent}${line}`));
         }
       }
-      if (message.details?.suffix) lines.push("", ...wrapped(message.details.suffix).render(width));
+      if (suffix) lines.push("", ...wrapped(suffix).render(width));
       return lines;
     },
   };
