@@ -439,6 +439,7 @@ if (process.platform !== "win32") {
   const out = r.stdout ?? "";
   const names = ["claude", "opencode", "codex", "hermes", "jcode", "pi", "omp"].filter((n) => out.includes(`connector:${n}`));
   if (names.length !== 7) console.log(`[diag] symlinked boot status=${r.status}\n--stdout--\n${out}\n--stderr--\n${r.stderr}`);
+  check("symlinked bin: boot resolves the generation (no 'cannot determine' fail)", !/cannot determine the seed generation/.test(r.stderr ?? ""), r.stderr);
   check("symlinked bin: all seven built-in connectors seeded", names.length === 7, names);
   // The generation must be the cotal-ai VERSION, i.e. resolved through the link into the package —
   // not some unrelated `package.json` found by walking up out of the link's own directory.

@@ -62,10 +62,10 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const BROKEN = "BROKEN:";
 
 type UngatedExemption = { reason: string; recheckBy: string };
-// 25 → 10: the fifteen suites whose recheck date lapsed were each run three times. The ten that
-// passed are gated; the five that failed every run were deleted.
-const EXPECTED_EXEMPTIONS = 10;
+// Ten recovered suites move into CI; five live recovery suites remain visible debt.
+const EXPECTED_EXEMPTIONS = 15;
 const standing = (reason: string): UngatedExemption => ({ reason, recheckBy: "2026-11-30" });
+const brokenExemption = (reason: string): UngatedExemption => ({ reason: `${BROKEN} ${reason}`, recheckBy: "2026-11-30" });
 
 const UNGATED: Record<string, UngatedExemption> = {
   // Need external tooling no CI runner has.
@@ -74,6 +74,11 @@ const UNGATED: Record<string, UngatedExemption> = {
   "smoke:codex-tui-live": standing("needs a codex TUI session"),
   "smoke:jcode-live": standing("needs an installed, authenticated jcode CLI (COTAL_E2E_JCODE=1)"),
   "smoke:down-manifest-usermode:live": standing("needs a claude CLI on PATH to boot a real connector child"),
+  "smoke:backup-usermode:live": brokenExemption("backup inventory mismatch; preserve owner-secret restore refusal coverage"),
+  "smoke:backup-restore:live": brokenExemption("backup recovery scenarios require repair before gating"),
+  "smoke:backup-conservation:live": brokenExemption("backup recovery scenarios require repair before gating"),
+  "smoke:backup-faults:live": brokenExemption("backup fault and replay scenarios require repair before gating"),
+  "smoke:lifecycle-files": brokenExemption("manager lifecycle survivor and snapshot assertions require repair before gating"),
   // A STANDING DECISION, and only for the REAL-SESSION arm. The same suite is GATED as
   // `smoke:agui-map`, pointed at a fixture DERIVED from a real session by
   // `scripts/redact-claude-session.mjs` (whitelist by construction, identifiers pseudonymised
