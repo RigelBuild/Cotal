@@ -44,10 +44,11 @@ User-mode and hosted lifecycles are Open Question 7.
   the send always targets a leader that has exited. node-pty's `UnixTerminal.kill` is
   `process.kill(this.pid, signal || 'SIGHUP')`, a send to a bare pid.
 - `stopChild` must not use `childGone()` as authorization for `proc.kill`: the pid may be reused
-  between the check and the signal. With a contained seat cgroup, stop through `cgroup.kill`.
-  Without a kernel-pinned child handle or contained cgroup, refuse the numeric send and retain
-  custody. Open Question 6 governs whether any weaker best-effort stop is accepted; no such
-  behavior is in the recommended implementation.
+  between the check and the signal. A graceful or hard stop may signal through a kernel-pinned
+  child handle, preserving its requested signal and grace period. Without one, refuse the
+  numeric send and retain custody. `cgroup.kill` belongs to the external reap path only: it is
+  immediate SIGKILL and may kill a custodian in that cgroup. Open Question 6 governs whether a
+  weaker best-effort stop is accepted; none is in the recommended implementation.
 - `record.json` keeps `RECORD_VERSION` 1, and `readRecord` stays strict.
 
 ### Layer 2 — the reap trusts nothing in the record (`packages/seat`)
@@ -248,9 +249,9 @@ it before `driveStaticRetirement` runs. This is the lifecycle-e2e `opStop` race.
 **Edits.**
 
 - In `settleTerminal`, delete the `unlinkSync(launch.recordPath)` and exited-leader
-  `proc.kill("SIGKILL")` blocks. Replace the other bare-pid sends with a contained cgroup stop
-  when available; otherwise refuse the send and retain custody. A `childGone()` check alone is
-  not authority to signal.
+  `proc.kill("SIGKILL")` blocks. Replace other bare-pid sends only with a kernel-pinned child
+  handle that preserves graceful and hard stop semantics; otherwise refuse the signal and retain
+  custody. External reap, not the custodian stop path, uses contained `cgroup.kill`.
 
 **Existing tests.**
 
