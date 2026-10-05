@@ -206,15 +206,8 @@ function launchCapture(command: string, args: string[], env: NodeJS.ProcessEnv, 
       }
     });
     sess.onExit(() => {
-      if (expectedOutput && !buf.includes(expectedOutput)) {
-        void Promise.resolve(sess.backlog()).then((snapshot) => {
-          clearTimeout(timer);
-          resolve(buf + snapshot.toString("utf8"));
-        });
-      } else {
-        clearTimeout(timer);
-        resolve(buf);
-      }
+      clearTimeout(timer);
+      resolve(buf);
     });
   });
 }
