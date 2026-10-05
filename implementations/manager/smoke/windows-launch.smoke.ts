@@ -185,24 +185,24 @@ function launchCapture(command: string, args: string[], env: NodeJS.ProcessEnv, 
     }
     const sess = h.attach();
     let buf = "";
+    let stopping = false;
     const timer = setTimeout(() => {
       try {
         h.stop({ graceful: false });
       } catch {
         /* gone */
       }
-      resolve(buf);
+      resolve(`TIMED OUT waiting for PTY exit: ${buf}`);
     }, 8000);
     sess.onData((b) => {
       buf += b.toString("utf8");
-      if (expectedOutput && buf.includes(expectedOutput)) {
-        clearTimeout(timer);
+      if (expectedOutput && buf.includes(expectedOutput) && !stopping) {
+        stopping = true;
         try {
           h.stop({ graceful: false });
         } catch {
-          /* gone */
+          /* exit may already be in flight */
         }
-        resolve(buf);
       }
     });
     sess.onExit(() => {
@@ -273,7 +273,7 @@ if (isWin) {
   const shim = join(dir, "shim.sh");
   writeFileSync(shim, "#!/bin/sh\necho COTAL_SHIM_OK\nread reply\n", { mode: 0o755 });
   const out = await launchCapture(shim, [], { ...process.env }, dir, "COTAL_SHIM_OK");
-  check("PtyRuntime launches a command and streams its output (POSIX passthrough)", out.includes("COTAL_SHIM_OK"));
+  check("PtyRuntime launches, streams output, and exits (POSIX passthrough)", out.includes("COTAL_SHIM_OK") && !out.startsWith("TIMED OUT"));
   // preparePtyLaunch is a passthrough on POSIX — assert that so the import is exercised everywhere.
   eq("preparePtyLaunch is a passthrough on POSIX", preparePtyLaunch("claude", ["--x"], {}), { command: "claude", args: ["--x"] });
   console.log("· cmd.exe argv round-trip matrix is win32-only — not exercised by Linux CI");
