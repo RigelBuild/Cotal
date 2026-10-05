@@ -32,6 +32,7 @@ import { connect, createServer } from "node:net";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolveOnPath } from "@cotal-ai/workspace";
+import type { AgentHandle } from "@cotal-ai/core";
 import { launchEnv, controlEndpoint, startControlServer, type MeshAgent } from "@cotal-ai/connector-core";
 import { quoteCmdArg, buildCmdCommandLine, resolveComspec, preparePtyLaunch } from "../src/runtime/windows-launch.js";
 import { controlShutdown } from "../src/control-shutdown.js";
@@ -170,9 +171,9 @@ const PRESERVE_MATRIX = [
   "tab\there", // VERIFY — tab is a CRT separator; quoted should preserve
 ];
 
-function launchCapture(command: string, args: string[], env: NodeJS.ProcessEnv, cwd: string): Promise<string> {
+function launchCapture(command: string, args: string[], env: NodeJS.ProcessEnv, cwd: string, expectedOutput?: string): Promise<string> {
   return new Promise((resolve) => {
-    let h: ReturnType<ReturnType<typeof createRuntime>["spawn"]>;
+    let h: AgentHandle;
     try {
       // `process.env` values are `string | undefined`; a LaunchSpec carries only the defined ones,
       // which is also what the child would receive, since node drops an undefined entry.
@@ -184,11 +185,7 @@ function launchCapture(command: string, args: string[], env: NodeJS.ProcessEnv, 
     }
     const sess = h.attach();
     let buf = "";
-    sess.onData((b) => {
-      buf += b.toString("utf8");
-    });
-    sess.onExit(() => resolve(buf));
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       try {
         h.stop({ graceful: false });
       } catch {
@@ -196,6 +193,29 @@ function launchCapture(command: string, args: string[], env: NodeJS.ProcessEnv, 
       }
       resolve(buf);
     }, 8000);
+    sess.onData((b) => {
+      buf += b.toString("utf8");
+      if (expectedOutput && buf.includes(expectedOutput)) {
+        clearTimeout(timer);
+        try {
+          h.stop({ graceful: false });
+        } catch {
+          /* gone */
+        }
+        resolve(buf);
+      }
+    });
+    sess.onExit(() => {
+      if (expectedOutput && !buf.includes(expectedOutput)) {
+        void Promise.resolve(sess.backlog()).then((snapshot) => {
+          clearTimeout(timer);
+          resolve(buf + snapshot.toString("utf8"));
+        });
+      } else {
+        clearTimeout(timer);
+        resolve(buf);
+      }
+    });
   });
 }
 
@@ -251,8 +271,8 @@ if (isWin) {
   // quoting the win32 matrix exercises end-to-end is still covered locally by section B above.
   const dir = mkdtempSync(join(tmpdir(), "cotal-shim-"));
   const shim = join(dir, "shim.sh");
-  writeFileSync(shim, "#!/bin/sh\necho COTAL_SHIM_OK\n", { mode: 0o755 });
-  const out = await launchCapture(shim, [], { ...process.env }, dir);
+  writeFileSync(shim, "#!/bin/sh\necho COTAL_SHIM_OK\nread reply\n", { mode: 0o755 });
+  const out = await launchCapture(shim, [], { ...process.env }, dir, "COTAL_SHIM_OK");
   check("PtyRuntime launches a command and streams its output (POSIX passthrough)", out.includes("COTAL_SHIM_OK"));
   // preparePtyLaunch is a passthrough on POSIX — assert that so the import is exercised everywhere.
   eq("preparePtyLaunch is a passthrough on POSIX", preparePtyLaunch("claude", ["--x"], {}), { command: "claude", args: ["--x"] });
