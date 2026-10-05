@@ -257,9 +257,11 @@ it before `driveStaticRetirement` runs. This is the lifecycle-e2e `opStop` race.
 
 - In `packages/seat/smoke/lifecycle.smoke.ts`, the natural-exit cell now asserts that the record
   is present.
-- The spawn-action smoke teardown stops each seat through `SeatClient` (`stop("hard")`, then
-  `waitExit`) and then removes its directories. `implementations/manager/smoke/mutations/spawn-action-seat-reap.json`
-  stays red on both cells.
+- The spawn-action smoke teardown may use `SeatClient.stop("hard")` and `waitExit` only after
+  Open Question 6 supplies a kernel-pinned child handle. Otherwise it uses the external reap
+  path if contained proof is available, or leaves the retained live seat for explicit operator
+  release. The teardown cannot wait for an exit that the stop path refused.
+  `implementations/manager/smoke/mutations/spawn-action-seat-reap.json` stays red on both cells.
 - `bin/smoke/reap-seat-custodians.mjs` is CI-only tooling that matches the argv run marker. It is
   out of scope.
 
@@ -420,8 +422,8 @@ configuration: isolation, or whatever Open Question 2 accepts.
 
 ## Tasks
 
-- [ ] T1 custodian keeps `record.json`; remove unpinned bare-pid sends;
-      natural-exit cell and teardown; seat changeset.
+- [ ] T1 custodian keeps `record.json`; remove unpinned bare-pid sends; stop teardown requires
+      Open Question 6; natural-exit cell and teardown; seat changeset.
 - [ ] T2 `reapSeat` sends no record-derived numeric signal; `retained` without contained proof;
       forged-record and setsid cells and mutations; seat changeset.
 - [ ] T3 manager: the slot row is the reference authority; a missing reference fails closed;
@@ -467,9 +469,14 @@ Each question blocks the named task until Matt rules on it.
    `evictAndAudit` before `cleanupStaticSlotOnce`. Options:
    - let them run and hold back only deletion (recommended);
    - hold the whole terminal.
-6. **Removed numeric sends.** This record removes `kill(-childPid)` and `kill(custodianPid)` from
-   `reapSeat`, and unpinned bare-pid sends from the custodian. Should hosts without layer 3 get a
-   best-effort send that proves nothing? Recommended: no.
+6. **Custodian stop authority (T1, T2).** Removing unpinned bare-pid sends also affects ordinary
+   graceful and hard stops, not just reap. Options:
+   - acquire a kernel-pinned per-child handle before exposing the seat socket, and preserve
+     SIGTERM/graceful escalation and hard-stop behavior through that handle (recommended);
+   - refuse both stop modes without such a handle, retain the live seat, and make teardown use
+     external contained reap or operator release. Never wait for an exit after refusal.
+   A cgroup kill alone is not a graceful stop and can kill the custodian. No best-effort numeric
+   send is assumed. Matt must choose this independently of automatic proof in Question 1.
 7. **Lifecycles out of scope.** In `driveDeprovision`, the user-mode and `remoteAuthority`
    branches delete credentials and never reap. Does RIG-4422 cover them?
 8. **Reboot** (security-sensitive; no default). Options:
