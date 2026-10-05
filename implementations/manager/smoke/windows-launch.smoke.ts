@@ -223,6 +223,10 @@ if (isWin) {
 
   for (const arg of PRESERVE_MATRIX) {
     const out = await launchCapture(shim, [arg], env, dir);
+    if (out.startsWith("TIMED OUT")) {
+      check(`shim exited for ${JSON.stringify(arg)}`, false);
+      continue;
+    }
     const m = out.match(/__ARGV__(.*)__END__/s);
     if (!m) {
       check(`shim launched + argv captured for ${JSON.stringify(arg)} (got: ${JSON.stringify(out.slice(0, 80))})`, false);
@@ -246,6 +250,10 @@ if (isWin) {
   ];
   for (const args of MULTI_ARG_MATRIX) {
     const out = await launchCapture(shim, args, env, dir);
+    if (out.startsWith("TIMED OUT")) {
+      check(`multi-arg shim exited for ${JSON.stringify(args)}`, false);
+      continue;
+    }
     const m = out.match(/__ARGV__(.*)__END__/s);
     if (!m) {
       check(`multi-arg shim launched + captured for ${JSON.stringify(args)} (got: ${JSON.stringify(out.slice(0, 80))})`, false);
