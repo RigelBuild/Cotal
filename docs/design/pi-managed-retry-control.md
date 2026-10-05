@@ -18,8 +18,9 @@ cannot see this. `willRetry` reaches only session listeners (`_handleAgentEvent`
 holds an error-ended turn. `retryHeldErrorOnInbound` then starts one fresh turn on new automatic
 inbound. So an inbound that lands during Pi's backoff can drive a second recovery path for the
 same batch [INFERENCE from those functions, not reproduced]. Intent: in every runtime a managed seat
-builds, effective `retry.enabled === false` before its next provider request. If that cannot hold, the
-seat makes no provider turn, says why, and exits. Operator settings files are never written.
+builds, effective `retry.enabled === false` before Pi's next provider request. If that cannot hold,
+Pi makes no further provider request in that process, the seat says why, and it exits. Operator
+settings files are never written.
 
 ## Approach
 
@@ -100,54 +101,83 @@ either:
 Trust can change at reload (`DefaultResourceLoader` calls `settingsManager.setProjectTrusted`), so the
 check ignores trust.
 
-**Where the checks sit.** There are two, and both fail closed:
+**Where the checks sit.** The check runs at every point where Pi can reach a provider, and every
+failure closes the same one-way gate. Nothing throws. A factory throw fails closed only in the CLI:
+the SDK loader records the error and drops the extension (`loadExtensionFactories`,
+`core/resource-loader.js`), and only `main` (`main.js`) turns `getExtensions().errors` into exit 1.
+A handler throw is caught by `ExtensionRunner.emit` (`core/extensions/runner.js`) and reported
+through `emitError`, so it gates nothing.
 
-- **At startup, in the factory: fatal.** A throwing factory becomes `Failed to load extension`
-  (`loadExtension`, `core/extensions/loader.js`), an error diagnostic, then `process.exit(1)` before
-  the session and initial prompt (`main`, `main.js`). Pi alone would not stop: settings errors are
-  only warnings (`collectSettingsDiagnostics`).
-- **In every runtime, in `session_start`: terminate (PR #45 R1).** `session_start` is emitted in
-  `bindExtensions` before the initial prompt and on reload, new, resume and fork
-  (`AgentSession.bindExtensions`, `AgentSession.reload`, `AgentSessionRuntime`). Handler errors
-  there are swallowed (`ExtensionRunner.emit` → `emitError`), so the check cannot throw. An `input`
-  handler cannot gate either. `AgentSession.prompt` runs `_tryExecuteExtensionCommand` before
-  `emitInput`, and a command, a `withSession` continuation or any extension can call
-  `pi.sendMessage(…, { triggerTurn: true })`, which reaches the agent loop through
-  `sendCustomMessage` without `input`. So a failed check closes a one-way gate and ends the process.
+- **At load.** The factory checks `process.cwd()`, because the load-time API has no cwd
+  (`createExtensionAPI`, `core/extensions/loader.js`). On failure it registers only the barrier
+  handlers below, starts no mesh runtime, and terminates. The extension stays loaded in every host.
+- **In `session_start`.** It is emitted in `bindExtensions` before the initial prompt and on
+  reload, new, resume and fork (`AgentSession.bindExtensions`, `AgentSession.reload`,
+  `AgentSessionRuntime`). The check reads `ctx.cwd`, the session cwd that the runtime's
+  `SettingsManager` was built from.
+- **Before each request path.** `agent_start`, `session_before_compact` and `session_before_tree`
+  re-run the check on `ctx.cwd` while the gate is open. This covers an SDK host that never calls
+  `bindExtensions`; `createAgentSession` (`core/sdk.js`) does not call it.
 
-**Termination.** `closeRetryGate` runs in this order:
+An `input` handler cannot gate. `AgentSession.prompt` runs `_tryExecuteExtensionCommand` before
+`emitInput`, and a command, a `withSession` continuation or any extension can call
+`pi.sendMessage(…, { triggerTurn: true })`, which reaches the agent loop through
+`sendCustomMessage` without `input`.
 
-1. set `runtime.retryGate = reason`, which arms the turn barrier below;
-2. `driver.quit()`, so `PiDriver.pump` refuses all Cotal dispatch (`shuttingDown`);
+**Termination.** `closeRetryGate` runs once per gate, in this order:
+
+1. set the gate, which arms the barrier below;
+2. `driver.quit()`, so `PiDriver.pump` refuses all Cotal dispatch (`shuttingDown`). At load no
+   runtime exists, so there is nothing to quit;
 3. persist the session state as `quit`, so `Manager.onAgentExit` retires a seat without `supervise`
-   (`freeSlot(a, true, "process-exit")`) instead of restarting it into the same failure (OQ 2);
-4. write the reason to stderr with the `pi connector:` prefix;
+   (`freeSlot(a, true, "process-exit")`) instead of restarting it into the same failure (OQ 2). At
+   load the id is `COTAL_PI_EXPECTED_SESSION`, and the manager's readiness wait
+   (`awaitManagedSessionState`) reports a deliberate quit. A `--fork` launch has no expected id, so
+   nothing is written and that wait fails on the exited process;
+4. write the reason to fd 2 with `writeSync` and the `pi connector:` prefix, so the line is out
+   before the next step can end the process;
 5. call `hooks.terminate(reason)`, which by default sends its own process `SIGTERM`.
+
+At load, the CLI has no signal handler yet: `main` (`main.js`) builds the runtime, which loads
+extensions, before `runPrintMode` or `InteractiveMode.init` registers one. The only `SIGTERM`
+listener then is `signal-exit` 3.0.7, installed when Pi imports `proper-lockfile`; with no other
+listener it unloads and re-raises the signal, so the process dies by `SIGTERM`.
+Later, the CLI handlers run. Interactive `registerSignalHandlers` calls
+`shutdown({ fromSignal: true })`, which awaits `runtimeHost.dispose()` and exits 0; print mode
+(`print-mode.js`) disposes and exits 143. `AgentSessionRuntime.dispose` emits `session_shutdown`
+and calls `AgentSession.dispose`, which aborts the agent without awaiting the turn. An SDK host
+without its own handler dies the same way as at load.
 
 `ctx.shutdown()` is not fail-closed. Print mode binds no `shutdownHandler`, so it is a no-op there.
 Interactive mode's `shutdownHandler` (`InteractiveMode`) only sets `shutdownRequested` while
-`session.isStreaming`, and a parked turn streams forever. The SIGTERM handlers take neither branch:
-interactive `registerSignalHandlers` calls `shutdown({ fromSignal: true })`, which awaits
-`runtimeHost.dispose()` and exits 0; print mode (`print-mode.js`) disposes and exits 143.
-`AgentSessionRuntime.dispose` emits `session_shutdown` and calls `AgentSession.dispose`, which
-aborts the agent without awaiting the turn. An SDK embedding without handlers dies by the default
-action. `process.exit` is rejected: it skips `session_shutdown` and terminal restore.
+`session.isStreaming`, and a parked turn streams forever. `process.exit` is rejected: it skips
+`session_shutdown` and terminal restore.
 
-**Turn barrier until exit.** A turn can still start before the exit, for example from a
-`withSession` continuation, which runs after `bindExtensions` (`finishSessionReplacement`). Every
-provider turn passes `agent_start` first (pi-agent-core 0.79.10, `agent-loop.js`):
+**Request barrier until exit.** A request can still start before the exit, for example from a
+`withSession` continuation, which runs after `bindExtensions` (`finishSessionReplacement`). The
+only `streamSimple`/`completeSimple` call sites in Pi's `dist/` give three request paths, and each
+passes a Cotal handler first:
 
-- `runAgentLoop` and `runAgentLoopContinue` `await emit({ type: "agent_start" })` before `runLoop`,
-  the only caller of `streamAssistantResponse`;
-- `Agent.processEvents` awaits each listener, `AgentSession._handleAgentEvent` awaits
-  `_emitExtensionEvent`, and `ExtensionRunner.emit` awaits each handler.
+- **Turns.** The agent `streamFn` (`core/sdk.js`) runs only from `runLoop`, the only caller of
+  `streamAssistantResponse` (pi-agent-core 0.79.10, `agent-loop.js`). `runAgentLoop` and
+  `runAgentLoopContinue` first `await emit({ type: "agent_start" })`. `Agent.processEvents`,
+  `AgentSession._handleAgentEvent` and `ExtensionRunner.emit` await each listener. Pi retry
+  re-enters through `agent.continue()` (`_runAgentPrompt`), so it passes `agent_start` too.
+- **Compaction.** `completeSimple` (`core/compaction/compaction.js`) runs only from `compact`,
+  called by `AgentSession.compact` and `_runAutoCompaction`. Both emit `session_before_compact`
+  first and stop on `cancel`: manual compaction throws `Compaction cancelled`, and auto compaction
+  emits `compaction_end` with `aborted: true` and returns false. This covers the pre-prompt
+  `_checkCompaction` in `AgentSession.prompt`, which runs before `agent_start`.
+- **Branch summary.** `generateBranchSummary` (`core/compaction/branch-summarization.js`) runs only
+  from `AgentSession.navigateTree`, after `session_before_tree`. `cancel` returns
+  `{ cancelled: true }`.
 
-So the Cotal `agent_start` handler checks the gate first and, when it is closed, awaits a promise
-that never settles. The turn parks before any provider request, and the exit ends it. The promise
-must never resolve or reject: `streamAssistantResponse` has no aborted-signal precheck, and `emit`
-swallows a throw, so either would let the request go out. Pi retry re-enters the loop through
-`agent.continue()` (`_runAgentPrompt`), so it parks too. The `completeSimple` calls in
-`compaction.js` and `branch-summarization.js` are not turns and carry no Pi retry.
+With the gate closed, the `agent_start` handler awaits a promise that never settles, and both
+`session_before_*` handlers return `{ cancel: true }`. The promise must never resolve or reject:
+`streamAssistantResponse` has no aborted-signal precheck, and `emit` swallows a throw, so either
+would let the request go out. A cancel wins over any other extension's result, because
+`ExtensionRunner.emit` returns on the first `cancel`. Requests that an operator extension makes
+from its own code are outside this record; they carry no Pi retry.
 
 **No reopen (PR #45 R2).** The gate is one-way. The earlier draft held the driver and reopened on a
 later passing `session_start`, but `PiDriver.onSessionStart` never clears `held`, so the hold
@@ -181,6 +211,8 @@ and the loader aliases it to the host copy.
   `_isRetryableError`, drops the error text that AG-UI `runError` uses, and blinds
   `isContextOverflow`.
 - **`setRetryEnabled`.** It is an operator write.
+- **A factory throw at load.** It fails closed only in the CLI. An SDK host drops the extension and
+  runs without any gate.
 
 ## Global Constraints
 
@@ -193,8 +225,12 @@ and the loader aliases it to the host copy.
   `buildLaunch` sets.
 - **Fail loudly.** Every error starts with the `pi connector:` prefix and names the path. There is no
   fallback that keeps retry on.
-- **Fail closed, one way.** A failed runtime check ends the process (`closeRetryGate`). Nothing
-  reopens the gate.
+- **Fail closed, one way.** A failed check, at load or in any runtime, ends the process
+  (`closeRetryGate`). Nothing reopens the gate.
+- **Host contract.** Supported hosts are the Pi CLI as `buildLaunch` starts it (interactive or
+  print mode) and SDK hosts that load the extension through Pi's loader. A host must let
+  `hooks.terminate` end the process, or dispose the runtime itself; until then the barrier holds.
+  Only `COTAL_PI_AGENT_DIR`, which `buildLaunch` sets, turns any of this on (OQ 7).
 - **Only `retry.enabled` is forced.** Compaction and `retry.provider.*` are copied unchanged
   (OQ 6).
 - **Seat dir:** `<workspaceRoot>/.cotal/pi-agent/<name>-<lifecycleUid ?? "unmanaged">`, created with
@@ -307,18 +343,34 @@ export type CotalMeshHooks = { terminate(reason: string): void };
 export function installCotalMesh(pi: ExtensionAPI, hooks: CotalMeshHooks): Promise<void>;
 ```
 
-`PiRuntime` gains `retryGate?: string` and keeps the hooks of its first load.
+Gates live in a `globalThis` map, `Symbol.for("cotal.pi.retryGates")`, keyed by `runtimeKey`. The
+map is global, like `RUNTIMES`, because the loader builds jiti with `moduleCache: false`
+(`core/extensions/loader.js`), so module state does not survive a reload. `PiRuntime` keeps the
+hooks of its first load. Module-private helpers:
 
-- **At startup.** On the first load only (no cached `RUNTIMES` entry), call the check with
-  `process.cwd()` right after the Pi API check, before `persistSessionId`, and throw `reason` on
-  failure.
-- **In `session_start`.** If `runtime.retryGate` is set, return first, so a closed seat never
-  writes `running` again. Otherwise run the check on `ctx.cwd` right after `runtime.sessionId` is
-  set and before `persistSessionId(runtime.sessionId)`. On failure call the module-private
-  `closeRetryGate(runtime: PiRuntime, reason: string): void` and return.
-- **In `agent_start`.** The first statement is
-  `if (runtime.retryGate !== undefined) await PARKED;`, with the module-level
-  `const PARKED: Promise<never> = new Promise(() => {})`.
+```ts
+type GateScope = { key: string; hooks: CotalMeshHooks; runtime?: PiRuntime; sessionId?: string };
+/** No-op when the key's gate is set. Persists `quit` under runtime?.sessionId ?? sessionId. */
+function closeRetryGate(scope: GateScope, reason: string): void;
+/** True when the gate is set, or when the check on cwd fails (then closes it). Never throws. */
+function gateClosed(scope: GateScope, cwd: string): boolean;
+```
+
+`gateClosed` maps any exception from the check to a failure, because a throw inside
+`session_before_compact` would be swallowed and compaction would run.
+
+- **At load.** After `runtimeKey(config)` and before the `RUNTIMES` lookup, call `gateClosed` with
+  `process.cwd()` and the captured `expectedSessionId`. If it is closed, register only the three
+  barrier handlers and return without creating a runtime. Never throw.
+- **In `session_start`.** If the gate is set, return first, so a closed seat never writes
+  `running` again. Otherwise run `gateClosed` on `ctx.cwd` right after `runtime.sessionId` is set
+  and before `persistSessionId(runtime.sessionId)`, and return if it is closed.
+- **Barrier handlers.** Each starts with the gate test, before any existing work:
+  - `agent_start`: `if (gateClosed(scope, ctx.cwd)) await PARKED;`, with the module-level
+    `const PARKED: Promise<never> = new Promise(() => {})`;
+  - `session_before_compact`: `if (gateClosed(scope, ctx.cwd)) return { cancel: true };`, before
+    `driver.onBeforeCompact`;
+  - `session_before_tree`: the same, as a new handler.
 
 **Tests:**
 
@@ -326,15 +378,12 @@ export function installCotalMesh(pi: ExtensionAPI, hooks: CotalMeshHooks): Promi
   `{maxRetries:5}`, `{enabled:false}` and an unparseable file pass. A seat file with
   `enabled:true`, a mismatched dir and `hostVersion "0.80.0"` fail. With no `COTAL_PI_AGENT_DIR`,
   the check passes, which proves operator sessions are unchanged.
-- **Process run.** Spawn `node <pi dist/cli.js> --extension <dist/standalone.js> -p hi` in a project
-  that enables retry. Assert exit 1, stderr naming the project file, and no transcript under
-  `sessions/`.
-- **Process control run.** The same spawn without the project file must get past extension load.
 
 The runtime tests go in the broker-backed block of `pi-sdk.smoke.ts` (`nats-server`), where
 `cotalMesh` already runs. `COTAL_PI_AGENT_DIR` and `PI_CODING_AGENT_DIR` point at a converged seat
 dir, and `COTAL_PI_SESSION_STATE` at a temp file. Each runtime uses a distinct `COTAL_ID`, because
-`runtimeMap` caches by identity. A parked turn never settles, so no closed-gate test awaits it.
+gates and `runtimeMap` are keyed by identity. A parked turn never settles, so no closed-gate test
+awaits it. "No request" means the faux provider's `state.callCount` did not move within 300 ms.
 
 - **Closed gate, every trigger (PR #45 R1).** Use the existing
   `createAgentSessionRuntime(createRuntime, …)` pattern with two factories:
@@ -347,17 +396,47 @@ dir, and `COTAL_PI_SESSION_STATE` at a temp file. Each runtime uses a distinct `
   - `prompt("typed")` after the switch;
   - the switch's own `withSession`, calling `ctx.sendMessage(…, { triggerTurn: true })`.
 
-  After 300 ms, assert that the faux provider's `state.callCount` did not move, that `record` ran
-  once with a reason naming the project file, and that the session-state file reads `quit`.
+  Assert no request, that `record` ran once with a reason naming the project file, and that the
+  session-state file reads `quit`.
 - **Positive control.** The same `/kick` in a runtime on a passing cwd makes exactly one provider
   call, and `record` never runs.
 - **Valid switch, automatic inbound (PR #45 R2).** Start an `installCotalMesh` runtime, switch to a
   second session on a passing cwd, then send one DM from the observer `CotalEndpoint` with
   `unicast`, which `agent.dm` uses. Assert exactly one more provider call, one `cotal-inbox`
   `message_start` carrying that id, and that `record` never ran.
-- **Default termination.** With the existing `PI_EVENTS_DEATH_STAGE` child pattern, a child running
-  the default `cotalMesh` switches to a failing cwd. Assert the child ends by `SIGTERM` (an SDK
-  child registers no Pi handler) and that its session state reads `quit`.
+- **First runtime fails at load (rereview 1).** `process.chdir` into the failing project, then
+  build the first runtime. Assert that `getExtensions().errors` is empty, that `record` ran once,
+  and no request after an unawaited `prompt("typed")`.
+- **Host that never binds (rereview 1).** Load from a passing `process.cwd()` with a failing
+  session cwd, and never call `bindExtensions`. Assert no request after an unawaited
+  `prompt("typed")`, and that `record` ran once.
+- **Compaction and branch summary while closed (rereview 2).** Register the faux model with
+  `contextWindow: 1000`, and set `compaction` to `{ reserveTokens: 200, keepRecentTokens: 1 }` so
+  `prepareCompaction` has messages to summarize. Seed a session on the failing cwd with two
+  user/assistant exchanges, the last assistant reporting `usage.totalTokens: 900`, and switch to
+  it. Assert:
+  - no request after an unawaited `prompt("typed")`, which runs the pre-prompt `_checkCompaction`;
+  - `compact()` rejects with `Compaction cancelled`;
+  - `navigateTree(<the first user entry>, { summarize: true })` resolves `{ cancelled: true }`.
+- **Compaction control.** The same seeded session on a passing cwd: `compact()` moves
+  `state.callCount`. Without it, the closed case could pass on a session too small to compact.
+- **Pi CLI process runs (rereview 3).** Spawn `node <pi dist/cli.js> --extension
+  <dist/standalone.js> --approve --provider cotal-test --model m`. The operator `models.json`,
+  reached through the seat link, defines `cotal-test` with `api: "openai-completions"` and a
+  `baseUrl` on a local HTTP server that counts requests and answers 400. Cases:
+  - **load, print:** cwd is the failing project, with `--session-id <uuid> -p hi` and
+    `COTAL_PI_EXPECTED_SESSION` set to that id. The child ends by signal `SIGTERM`, because no Pi
+    handler exists yet;
+  - **`session_start`, print:** cwd passes, with `--session <seeded file on the failing project>
+    -p hi`. Exit code 143 from the `runPrintMode` handler;
+  - **`session_start`, interactive:** the same without `-p`, under `ptySpawn`
+    (`implementations/cli/smoke/_console-pty.ts`). Exit code 0 from
+    `shutdown({ fromSignal: true })`. Skipped on win32, where ConPTY cannot deliver `SIGTERM`
+    (`implementations/manager/src/control-shutdown.ts`);
+  - **control:** the print case with a passing session cwd makes exactly one request and prints no
+    `pi connector:` line.
+
+  Every failing case asserts zero requests, stderr naming the project file, and state `quit`.
 
 ### Task 3: prove Pi honors the generated file
 
@@ -393,7 +472,8 @@ In `pi-sdk.smoke.ts` (existing smokes use `SettingsManager.inMemory`):
   dir, and that operator sessions keep the existing ambiguity.
 - **`extensions/pi/README.md`.** Near "Pi exposes no retry-finality event", add:
   - the seat dir;
-  - the refused project `retry` values, and that a failed check ends the seat;
+  - the refused project `retry` values, and that a failed check ends the seat, including after a
+    mid-session edit (OQ 7);
   - that seat-pane settings changes persist only to the seat copy;
   - the runtime pin.
 - **`docs/design/session-recovery.md` § 4.2.** Amend the adopted recovery-rule paragraph to match.
@@ -405,9 +485,9 @@ In `pi-sdk.smoke.ts` (existing smokes use `SettingsManager.inMemory`):
 
 - [ ] Task 1: `operatorAgentDir`, `convergeSeatAgentDir` and the `buildLaunch` wiring, with the
   refusal and convergence tests.
-- [ ] Task 2: `checkManagedRetryOff`, the startup throw, `closeRetryGate`, the `agent_start`
-  barrier and the `installCotalMesh` seam, with the unit, process, closed-gate, positive-control,
-  valid-switch and default-termination tests.
+- [ ] Task 2: `checkManagedRetryOff`, the gate map, `closeRetryGate`, `gateClosed`, the load,
+  `session_start` and barrier handlers, and the `installCotalMesh` seam, with the unit,
+  every-trigger, positive-control, valid-switch, load, unbound-host, compaction and Pi CLI tests.
 - [ ] Task 3: merge pins, the retry-off proof, the retry-on control and the post-run compaction
   race.
 - [ ] Task 4: `connect-pi.md`, `README.md`, `session-recovery.md` § 4.2 and the changeset.
@@ -423,12 +503,12 @@ In `pi-sdk.smoke.ts` (existing smokes use `SettingsManager.inMemory`):
      `agent_end`. None exists in 0.79.10, and none appears in the 1.0.2 changelog.
 2. **Project override across runtimes (F1, F8, PR #45).** The record carries (i) with termination,
    the conservative option named in the PR #45 review.
-   - **(i) Startup throw plus per-runtime termination.** Closes the gap and keeps project
-     resources.
+   - **(i) Load check plus per-runtime termination.** Closes the gap and keeps project resources.
+     The load check terminates instead of throwing (rereview 1).
    - **(ii) `--no-approve` for managed seats.** It sets `projectTrustOverride = false`
      (`cli/args.js`), which closes the gap by construction but drops project
-     extensions/skills/prompts.
-   - **(iii) Startup-only check plus documented risk.**
+     extensions/skills/prompts. It does not help an SDK host, which sets trust itself.
+   - **(iii) Load-only check plus documented risk.**
 
    Still open: retire or restart after termination? The record persists `quit`, so
    `Manager.onAgentExit` retires a seat without `supervise`. A restart would reopen the same
@@ -454,3 +534,12 @@ In `pi-sdk.smoke.ts` (existing smokes use `SettingsManager.inMemory`):
    the seat dir. Options: accept the leak, or add the field and accept the dangling paths.
 6. **Force `retry.provider.maxRetries: 0`?** This retry happens inside one SDK request and defaults
    to 0. Forcing it overrides only operators who opted in.
+7. **Host scope and re-check frequency (rereview, Matt fork).** The record carries (i).
+   - **(i) Re-check before every request path.** Fail-closed in any host that loads the extension,
+     including one that never binds. A project file edited mid-session ends the seat before Pi
+     reloads it, a false positive in the safe direction.
+   - **(ii) Check at load and `session_start` only; the request hooks enforce a closed gate.**
+     Matches Pi's own read points, but an SDK host that never calls `bindExtensions` gets no
+     session-cwd check, so the host contract must require binding.
+   - **(iii) Declare the Pi CLI the only managed host** and keep the load-time throw. Simplest, but
+     an SDK host given a managed env fails open.
