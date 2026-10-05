@@ -165,7 +165,8 @@ apply.
    1. Run the read-only checks. Under layer 3 the release refuses when `populated 1`.
    2. Read the existing release record for this lifecycle. If present, compare the stable fields
       (principal, alias, lifecycle UID, authenticated operator, reason and manager instance), reuse
-      its timestamp and continue; reject a different intent. Otherwise create the record once.
+      its timestamp and continue; reject a different intent. Otherwise create it atomically.
+      A concurrent create loser rereads and compares the stored intent before deleting anything.
    3. Remove the seat directory. `ENOENT` counts as success.
    4. Re-drive the terminal.
 
@@ -345,7 +346,7 @@ export interface StaticLifecycleReleaseSpec {
   operator: { owner: string; actor: string; uid: string }; // from ctx.subject.caller, never args
   reason: string; managerInstance: string; timestamp: string;
 }
-export async function writeStaticRelease(t: LifecycleStateTransport, spec: StaticLifecycleReleaseSpec): Promise<void>; // create-only
+export async function writeStaticRelease(t: LifecycleStateTransport, spec: StaticLifecycleReleaseSpec): Promise<void>; // atomic create-only; compare stored stable fields on conflict
 export async function readStaticRelease(t: LifecycleStateTransport, owner: string, actor: string, lifecycleUid: string): Promise<StaticLifecycleReleaseSpec | undefined>;
 
 // implementations/manager/src/manager-service-contract.ts
@@ -367,6 +368,10 @@ private async opReleaseSeat(args: Record<string, unknown>, caller: EpCaller): Pr
 - **Store failure.** If writing the release record fails, the seat directory and the footprint
   remain.
 - **Crash after the record is written.** A crash before `removeSeatCustody` finishes on retry.
+- **Retry with a fresh timestamp.** A second invocation by the same operator and reason reuses
+  the durable intent and finishes; a different reason or operator is rejected without deletion.
+- **Concurrent release.** A loser of atomic create compares the winner's stable fields before
+  removing custody; different intents never share authorization.
 - **Crash during the terminal.** A crash after removal, before the terminal ends, finishes on
   retry.
 - **Refusal.** Under layer 3, a populated cgroup is refused.
