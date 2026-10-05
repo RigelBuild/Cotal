@@ -34,11 +34,11 @@ function check(name: string, condition: unknown, detail?: unknown): void {
 // changed-path set. Added in sorted position. The matching run row lives in the #1087 fixture below.
 // "Attribution" likewise: attribution.yml declares pull_request with no paths filter and a types
 // list that keeps opened and synchronize, so it is minted at every head of every PR.
-const expectedNames = ["Attribution", "CI", "Docs", "Mutation reproof", "Windows"];
+const expectedNames = ["Attribution", "CI", "Docs", "Mutation reproof"];
 check(
   "path-filtered workflows are included only when a changed path matches their declaration",
-  JSON.stringify(expectedPullRequestWorkflows(workflows, ["package.json"])) === JSON.stringify(["Attribution", "CI", "Mutation reproof", "Windows"]) &&
-    JSON.stringify(expectedPullRequestWorkflows(workflows, ["install.sh"])) === JSON.stringify(["Attribution", "CI", "Installer", "Mutation reproof", "Windows"]),
+  JSON.stringify(expectedPullRequestWorkflows(workflows, ["package.json"])) === JSON.stringify(["Attribution", "CI", "Mutation reproof"]) &&
+    JSON.stringify(expectedPullRequestWorkflows(workflows, ["install.sh"])) === JSON.stringify(["Attribution", "CI", "Installer", "Mutation reproof"]),
 );
 let repositoryWorkflowsParsed = false;
 try {
@@ -231,12 +231,12 @@ check("a successful run attached to another pull request does not satisfy this p
 const wrongHead = classifyPullRequestHead({
   pr: positive.pr,
   headSha: positive.headSha,
-  expected: ["Windows"],
+  expected: ["CI"],
   runs: succeeded.map((run: Record<string, unknown>) =>
-    run.name === "Windows" ? { ...run, head_sha: "0".repeat(40) } : run,
+    run.name === "CI" ? { ...run, head_sha: "0".repeat(40) } : run,
   ),
 });
-check("a successful run for another commit does not satisfy the exact head", JSON.stringify(wrongHead.missing) === '["Windows"]' && !wrongHead.green, wrongHead);
+check("a successful run for another commit does not satisfy the exact head", JSON.stringify(wrongHead.missing) === '["CI"]' && !wrongHead.green, wrongHead);
 
 const failedRuns = succeeded.map((run: Record<string, unknown>) =>
   run.name === "CI" ? { ...run, conclusion: "failure" } : run,

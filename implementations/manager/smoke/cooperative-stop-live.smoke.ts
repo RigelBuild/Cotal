@@ -12,9 +12,8 @@
  * The stopped agent carries a LONG presence TTL (30s) and we assert the watcher sees it offline within
  * ~1.5s — far under that TTL — so the flip can only be the cooperative leave, never TTL expiry (the
  * whole point of WS4). `node:net` abstracts the AF_UNIX socket ↔ Windows named pipe, so the control
- * wire exercises identically here; this runs everywhere a broker is on PATH (CI's soak lane is the
- * Windows oracle). The `agent` arg to startControlServer is a stub: the shutdown op never touches it
- * (it routes straight to onShutdown), exactly as §F6 does.
+ * wire exercises identically here; Linux CI runs this with a broker on PATH. Windows-specific behavior
+ * is not exercised in CI. The `agent` arg is a stub: shutdown routes straight to onShutdown.
  */
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
