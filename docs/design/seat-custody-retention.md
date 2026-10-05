@@ -43,10 +43,11 @@ User-mode and hosted lifecycles are Open Question 7.
 - `settleTerminal` drops its `proc.kill("SIGKILL")`. Every caller reaches it with `alive` false, so
   the send always targets a leader that has exited. node-pty's `UnixTerminal.kill` is
   `process.kill(this.pid, signal || 'SIGHUP')`, a send to a bare pid.
-- Residue: `stopChild` and the other `proc.kill` sends in `custodian.ts` check only `alive`. That
-  flag can lag behind node-pty's native reap until the `childGone()` poll notices. T1 adds a
-  `childGone()` check before each send. This narrows the window but does not close it. Here the
-  custodian signals its own child, not a pid read from a file.
+- `stopChild` must not use `childGone()` as authorization for `proc.kill`: the pid may be reused
+  between the check and the signal. With a contained seat cgroup, stop through `cgroup.kill`.
+  Without a kernel-pinned child handle or contained cgroup, refuse the numeric send and retain
+  custody. Open Question 6 governs whether any weaker best-effort stop is accepted; no such
+  behavior is in the recommended implementation.
 - `record.json` keeps `RECORD_VERSION` 1, and `readRecord` stays strict.
 
 ### Layer 2 — the reap trusts nothing in the record (`packages/seat`)
@@ -64,18 +65,16 @@ User-mode and hosted lifecycles are Open Question 7.
   can be empty while that descendant still runs. No census result is proof. A census appears only
   as advisory text that is labelled as not proof.
 
-A live seat is still stopped. `reapSeat` asks the custodian to stop the child through the seat
-socket: the `stop` op with mode `hard`, which is the path a live handle already uses. The custodian
-signals its own child. Then the reap returns `retained`. This lends the record no manager signal
-authority. The socket path is `socketPath(root, id)`, not `record.socket`, and any process that
-answers acts with its own uid. The connect exposure is the one today's adopt path already has,
-because `SeatClient.connect` dials the same per-seat socket.
+When a contained cgroup exists, reap stops its tasks through `cgroup.kill`. Otherwise it may ask
+the custodian to stop through `socketPath(root, id)` only if the custodian has a kernel-pinned child
+handle; without either, it sends no signal and returns `retained`. The socket path is derived from
+the seat id, never read from `record.json`. A requested stop alone never releases custody.
 
 | Record | Layer 3 | Action | Outcome |
 | --- | --- | --- | --- |
 | missing | — | none | `absent` (unchanged) |
 | unreadable | — | none | throw (retryable, unchanged) |
-| present | off, or containment not proved | `stop` hard through the seat socket, if a custodian answers | `retained` / `unprovable` |
+| present | off, or containment not proved | no numeric signal; optional pinned-handle stop | `retained` / `unprovable` |
 | present | on and contained | write `cgroup.kill` | `populated 0` and `rmdir` succeeds → `reaped`; else `retained` / `members-remain` |
 
 The missing-identity, missing-boot-id and foreign-boot throws in `reapSeat` become
@@ -164,7 +163,9 @@ apply.
    owned by this manager instance.
 3. **It writes the intent before any deletion.**
    1. Run the read-only checks. Under layer 3 the release refuses when `populated 1`.
-   2. Write a create-only release record. A retry with the same spec is a no-op.
+   2. Read the existing release record for this lifecycle. If present, compare the stable fields
+      (principal, alias, lifecycle UID, authenticated operator, reason and manager instance), reuse
+      its timestamp and continue; reject a different intent. Otherwise create the record once.
    3. Remove the seat directory. `ENOENT` counts as success.
    4. Re-drive the terminal.
 
@@ -189,16 +190,14 @@ it before `driveStaticRetirement` runs. This is the lifecycle-e2e `opStop` race.
 - **Entry.** Without isolation, `launchSeat` creates the directory and the custodian joins it
   before `pty.spawn`. With isolation, `cotal-seat-launch` creates the directory owned by
   `cotal-manager` and moves the forked process into it before `setuid`.
-- **Containment.** The kernel's cgroup v2 rules let a migration happen only if "the writer must
-  have write access to the "cgroup.procs" file of the common ancestor of the source and destination
-  cgroups" (kernel `admin-guide/cgroup-v2`). So the agent can escape exactly when its uid can write
-  `cgroup.procs` of `base` or of one of `base`'s ancestors. `seatCgroupContained` checks this for
-  the agent uid: owner, mode, and that the uid is not 0. If the check fails, layer 3 never returns
-  `reaped`.
-  - Under isolation, the base belongs to `cotal-manager` and the ancestors belong to root, so the
-    check passes.
-  - Without isolation, the agent shares the manager's uid and can write the base, so the check
-    fails and every reap is `retained`. Open Question 2 is this fork.
+- **Containment.** Cgroup v2 migration requires write access to the common ancestor's
+  `cgroup.procs` (kernel `admin-guide/cgroup-v2`). `seatCgroupContained` must prove the agent cannot
+  write that file at the base or any ancestor using its actual uid, primary and supplementary
+  groups, ACLs and effective capabilities. An owner/mode check alone is not proof. Provision a
+  controlled migration attempt under the agent's credentials; if it succeeds or any grant cannot
+  be verified, return `retained`. Under isolation the manager-owned base can pass this check;
+  without isolation the shared manager/agent uid can write the base, so it fails. Open Question 2
+  decides the single-uid policy. No proof depends on the agent's claimed identity.
 - **Proof and kill.** The kill is a write of `1` to `cgroup.kill` (Linux 5.14). The proof is
   `populated 0` in `cgroup.events` followed by a successful `rmdir`; `rmdir` fails with `EBUSY`
   while any task remains. A `setsid` escapee stays in the cgroup, so it is covered.
@@ -225,9 +224,9 @@ it before `driveStaticRetirement` runs. This is the lifecycle-e2e `opStop` race.
 
 - **Scope.** Static lifecycles (`!this.userMode && !a.userOwner` in `driveDeprovision`) under the
   custodial pty runtime. Linux only.
-- **Signals.** The record never sends a signal to a pid or group number read from `record.json`.
-  The only kills are the custodian killing its own child, and `cgroup.kill` on a contained seat
-  cgroup.
+- **Signals.** No signal targets a pid or group number from `record.json`. A contained cgroup may
+  be stopped with `cgroup.kill`. Without it, the custodian may stop only through a kernel-pinned
+  child handle; otherwise it leaves the process live and returns `retained`.
 - **Proof.** `reaped` comes only from layer 3 when `seatCgroupContained` holds. A census is never
   proof.
 - **Deletion.** No seat directory, creds file, issuance retirement, durable or ACL row is deleted
@@ -247,9 +246,10 @@ it before `driveStaticRetirement` runs. This is the lifecycle-e2e `opStop` race.
 
 **Edits.**
 
-- In `settleTerminal`, delete the `unlinkSync(launch.recordPath)` block and the
-  `proc.kill("SIGKILL")` block.
-- Add a `childGone()` check before each remaining `proc.kill`.
+- In `settleTerminal`, delete the `unlinkSync(launch.recordPath)` and exited-leader
+  `proc.kill("SIGKILL")` blocks. Replace the other bare-pid sends with a contained cgroup stop
+  when available; otherwise refuse the send and retain custody. A `childGone()` check alone is
+  not authority to signal.
 
 **Existing tests.**
 
@@ -270,15 +270,16 @@ record-present cells red.
 **Edits.**
 
 - In `reapSeat`, delete both `signal(…)` sends and the member loop.
-- Add `stopViaCustodian(root: string, id: string, graceMs: number):`
-  `Promise<"requested" | "no-custodian" | "timeout">`.
-  It builds a `SeatClient` from the record with `socket` replaced by `socketPath(root, id)`, then
-  sends `stop` with mode `hard` and waits up to `graceMs` for `wait-exit`.
+- The existing seat-socket stop may be requested only when the custodian has a kernel-pinned
+  child handle; otherwise leave the child live and return `retained`. Use `socketPath(root, id)`,
+  never `record.socket`. The pinned-handle interface is part of Open Question 1, not an assumed
+  property of node-pty.
 - Follow the Approach table: without `opts.cgroup`, the result is always `retained` or `absent`.
 
 **Existing cells that change.**
 
-- The reap-live cells now assert `retained` and that the child exited through the custodian.
+- The reap-live cells assert `retained`; with a pinned handle the custodian can stop the child,
+  otherwise it stays live pending contained-cgroup stop or operator action.
   "the custody record is forgotten" becomes "the custody record is kept".
 - The cell for a mismatched start identity now asserts `retained`.
 
@@ -380,7 +381,7 @@ export interface SeatCgroup { readonly path: string; readonly agentUid: number }
 export function seatCgroupPath(base: string, id: string): string;            // `${base}/seat-${id}`
 export function createSeatCgroup(base: string, id: string, agentUid: number): SeatCgroup;
 export function joinSeatCgroup(cg: SeatCgroup): void;                        // custodian, before pty.spawn
-export function seatCgroupContained(cg: SeatCgroup): boolean;                // agentUid cannot write cgroup.procs of base or any ancestor
+export function seatCgroupContained(cg: SeatCgroup): boolean;                // includes uid, groups, ACLs, capabilities and a migration probe
 export function seatCgroupPopulated(cg: SeatCgroup): boolean;                // cgroup.events
 export function killSeatCgroup(cg: SeatCgroup): void;                        // "1" > cgroup.kill
 export function removeSeatCgroup(cg: SeatCgroup): void;                      // rmdir; EBUSY throws
@@ -394,8 +395,10 @@ export function removeSeatCgroup(cg: SeatCgroup): void;                      // 
 - A new runtime instance proves the cgroup through the derived path.
 - `rmdir` refuses while the cgroup is populated.
 - **Migration attempt.** A child tries to write its own pid into `base/cgroup.procs`.
-  - Under isolation the write fails, and the reap is `reaped` only after the kill.
-  - In single-uid mode, `seatCgroupContained` is false and the reap is `retained`, never `reaped`.
+  - Under isolation the write fails, including a group-writable ancestor test, and the reap is
+    `reaped` only after the kill.
+  - In single-uid mode, or when effective grants cannot be proved absent,
+    `seatCgroupContained` is false and the reap is `retained`, never `reaped`.
 
 **T5 mutations.**
 
@@ -411,9 +414,9 @@ configuration: isolation, or whatever Open Question 2 accepts.
 
 ## Tasks
 
-- [ ] T1 custodian keeps `record.json`; drop the post-exit `proc.kill`; `childGone()` guards;
+- [ ] T1 custodian keeps `record.json`; remove unpinned bare-pid sends;
       natural-exit cell and teardown; seat changeset.
-- [ ] T2 `reapSeat` sends no numeric signal; stop through the custodian; `retained` by default;
+- [ ] T2 `reapSeat` sends no record-derived numeric signal; `retained` without contained proof;
       forged-record and setsid cells and mutations; seat changeset.
 - [ ] T3 manager: the slot row is the reference authority; a missing reference fails closed;
       `recordRetainedTerminal` on every path; census and fixture updates; manager changeset.
@@ -459,7 +462,7 @@ Each question blocks the named task until Matt rules on it.
    - let them run and hold back only deletion (recommended);
    - hold the whole terminal.
 6. **Removed numeric sends.** This record removes `kill(-childPid)` and `kill(custodianPid)` from
-   `reapSeat`, following RIG-4422 and the forged-record finding. Should hosts without layer 3 get a
+   `reapSeat`, and unpinned bare-pid sends from the custodian. Should hosts without layer 3 get a
    best-effort send that proves nothing? Recommended: no.
 7. **Lifecycles out of scope.** In `driveDeprovision`, the user-mode and `remoteAuthority`
    branches delete credentials and never reap. Does RIG-4422 cover them?
