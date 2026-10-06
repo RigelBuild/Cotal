@@ -566,11 +566,7 @@ function guardConjuncts(branch: ts.Node): ts.Expression[] | undefined {
   return condition === undefined ? undefined : split(condition);
 }
 
-/**
- * The registration at `call` runs once per broker started at `spawnOffset`: no loop repeats the spawn
- * without the call, and no branch skips the call unless its every conjunct is the child itself or a
- * never-reassigned name that also guards the spawn.
- */
+/** The registration at `call` runs once per broker spawned at `spawnOffset` (no loop or guard skips it). */
 function coRuns(file: ts.SourceFile, spawnOffset: number, call: ts.CallExpression, defs: Map<string, Binding[]>, stack: readonly ts.Node[] = []): boolean {
   for (let node = nodeAt(file, spawnOffset); node.parent !== undefined && !ts.isFunctionLike(node); node = node.parent) {
     if (ts.isIterationStatement(node, false) && !contains(node, call.getStart(file))) return false;

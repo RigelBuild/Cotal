@@ -81,6 +81,7 @@ function importsSmokeKit(source: string): boolean {
     if (ts.isCallExpression(node) && node.arguments.length > 0
       && (node.expression.kind === ts.SyntaxKind.ImportKeyword || ts.isIdentifier(node.expression) && node.expression.text === "require")
       && privateSpecifier(node.arguments[0]!)) found = true;
+    if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument) && privateSpecifier(node.argument.literal)) found = true;
     if (!found) ts.forEachChild(node, visit);
   };
   visit(file);
