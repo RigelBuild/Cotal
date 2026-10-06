@@ -30,9 +30,10 @@ This record turns that decision into interfaces, failure behavior and regression
 
 ## Approach
 
-Layers 1 and 2 implement RIG-4422 and work without layer 3. Layer 3 restores automatic cleanup and
-is gated on Open Questions 1 and 2. The scope is static lifecycles under the custodial pty runtime.
-User-mode and hosted lifecycles are Open Question 7.
+Layers 1 and 2 implement RIG-4422. Matt selected a contained per-seat cgroup v2 domain for
+layer 3, a privileged manager release verb, static-only scope, and no automatic foreign-boot
+release (RIG-4546, 2026-10-05). Single-uid seats fail closed because an agent can escape the
+delegated base. Ordinary stop authority remains Open Question 6 and blocks T1/T2.
 
 ### Layer 1 — the custodian keeps the record (`packages/seat`)
 
@@ -156,9 +157,8 @@ apply.
    `uid`), the same tuple that `callerOf` keys on. The verb is admitted through `adminGated`, like
    `purge` and the resume family under the `manager.admin` capability. `epAdminReach` documents the
    one residual: in a static mesh, reaching the handler is the admin tier, so "a LEAKED static
-   admin instrument keeps its reach until the credential's bounded TTL". A CLI surface would record
-   the OS uid of the invoking process and require that uid to be on the signer allowlist.
-   Open Question 3 picks the surface.
+   admin instrument keeps its reach until the credential's bounded TTL". Matt selected this
+   manager verb rather than a separate CLI (RIG-4546).
 2. **It pins one incarnation.** The input is `{ alias, lifecycleUid, reason }`, with
    `additionalProperties: false`. The slot must be `terminalizing`, at that `lifecycleUid`, and
    owned by this manager instance.
@@ -175,17 +175,17 @@ apply.
    directory is still present, the process step removes it first. A crash at any point resumes
    from the durable record. A failure before the record is written deletes nothing. An `absent`
    record without a release record stays refused.
-4. **The attestation does not go into the lifecycle audit.** Under the recommendation for Open
-   Question 5, `evictAndAudit` has already written the `v: 1` lifecycle audit, and `sameAudit` in
-   `static-lifecycle.ts` compares every field, including `v`. So the release record is separate.
-   The alternative, a `v: 2` audit with a v1-to-v2 rule, is part of Open Question 3.
+4. **The attestation does not go into the lifecycle audit.** `evictAndAudit` already writes the
+   `v: 1` lifecycle audit, and `sameAudit` in `static-lifecycle.ts` compares every field. The
+   release record remains separate so a retry can compare the authenticated operator and stable
+   intent before any deletion.
 
-### Layer 3 — contained kernel-backed proof (gated on Open Questions 1 and 2)
+### Layer 3 — contained kernel-backed proof
 
-Without layer 3, every graceful stop is retained. The custodian stops the child, and node-pty reaps
-it before `driveStaticRetirement` runs. This is the lifecycle-e2e `opStop` race.
+Without layer 3, a stopped seat remains retained. Ordinary stop behavior depends on Open
+Question 6; a custodian without a pinned child handle cannot safely signal node-pty's bare pid.
 
-**Recommended: a per-seat cgroup v2 domain.** It is a proof only if the agent cannot leave it.
+**Chosen: a per-seat cgroup v2 domain.** It is proof only if the agent cannot leave it.
 
 - **Path.** `<base>/seat-<id>`. `base` is the manager's delegated cgroup: the `0::<path>` line of
   `/proc/self/cgroup`, under `/sys/fs/cgroup`. The path is derived, never read from `record.json`.
@@ -333,9 +333,9 @@ record-present cells red.
   `no-reference`, and the creds file remains.
 - **Fixture.** Update the find text in `orphan-seat-reap.mutations.json` in the same commit.
 
-### T4 — operator release (`@cotal-ai/seat`, `@cotal-ai/manager`; Open Question 3)
+### T4 — operator release (`@cotal-ai/seat`, `@cotal-ai/manager`)
 
-Recommended surface: a manager verb.
+Use the selected privileged manager verb.
 
 ```ts
 // packages/seat/src/reap.ts
@@ -379,7 +379,7 @@ private async opReleaseSeat(args: Record<string, unknown>, caller: EpCaller): Pr
   retry.
 - **Refusal.** Under layer 3, a populated cgroup is refused.
 
-### T5 / T6 — contained automatic proof (Open Questions 1 and 2; option (a))
+### T5 / T6 — contained automatic proof (chosen cgroup v2 domain)
 
 **T5 (`@cotal-ai/seat`).**
 
@@ -428,37 +428,25 @@ configuration: isolation, or whatever Open Question 2 accepts.
       forged-record and setsid cells and mutations; seat changeset.
 - [ ] T3 manager: the slot row is the reference authority; a missing reference fails closed;
       `recordRetainedTerminal` on every path; census and fixture updates; manager changeset.
-- [ ] T4 release with intent first and a verified operator (after Open Question 3); seat and
-      manager changesets.
-- [ ] T5 contained cgroup proof, seat side (after Open Questions 1 and 2); seat changeset.
-- [ ] T6 contained cgroup proof, manager side; lifecycle-e2e green (after Open Questions 1, 2
-      and 4); manager changeset.
+- [ ] T4 release with intent first and a verified operator; seat and manager changesets.
+- [ ] T5 contained cgroup proof, seat side; verify delegation and containment; seat changeset.
+- [ ] T6 contained cgroup proof, manager side; lifecycle-e2e green only under isolation;
+      manager changeset.
 
 ## Open Questions
 
-Each question blocks the named task until Matt rules on it.
+The 2026-10-05 RIG-4546 ruling settled automatic proof, release surface, static-only scope, and
+foreign-boot policy. Open Question 6 remains load-bearing for ordinary stop and T1/T2. The
+remaining operational choices below need explicit disposition before this record freezes.
 
-1. **Automatic proof (T5, T6).** Options:
-   - (a) a contained per-seat cgroup v2 domain (recommended);
-   - (b) a pidfd group handle, which needs Linux 6.9 and an unforgeable pid, and misses `setsid`
-     escapees;
-   - (c) none, so every graceful stop needs a release.
-
-   Deciding this needs the kernel version, cgroup mode and delegation measured on CI and on the
-   fleet. Only this host is measured.
-2. **Single-uid mode** (security-sensitive). Without isolation the agent can write the base
-   `cgroup.procs` and leave its cgroup, so this record never returns `reaped` there. Every stop in
-   development and in the smoke suites is then retained until someone releases it. Options:
-   - (i) keep fail-closed (the record as written);
-   - (ii) accept cgroup proof in single-uid mode as a named residual that holds only against
-     accidental leaks. In that mode the agent can already signal the manager directly;
-   - (iii) confine the child with Landlock so it cannot write cgroupfs. [INFERENCE: Landlock ABI 1
-     needs Linux 5.13, and it is not verified that path rules cover cgroupfs writes.]
-3. **Release surface and record shape (T4).**
-   - Surface: an `adminGated` manager verb whose operator is the subject caller (recommended), or
-     a CLI that records the OS uid, sits on the signer allowlist and runs `runStaticTerminal`
-     itself.
-   - Shape: a separate release record (recommended), or a `v: 2` lifecycle audit.
+1. **Automatic proof — decided.** Use a contained per-seat cgroup v2 domain. The manager must
+   measure kernel version, delegation and cgroup mode on CI and the fleet before relying on it;
+   unavailable proof returns `retained`, never a numeric-signal fallback.
+2. **Single-uid mode — decided.** Without isolation the agent can write the base
+   `cgroup.procs` and leave its cgroup. `seatCgroupContained` is false; each reap returns
+   `retained` until a verified operator release. No weaker accidental-leak proof is accepted.
+3. **Release — decided.** Use an `adminGated` manager verb whose operator is the subject caller
+   and a separate durable release record. The v1 lifecycle audit remains unchanged.
 4. **lifecycle-e2e while T5 and T6 are pending.** T1–T3 alone turn the cells "w2 … gone after
    explicit stop" red and keep the four "… gone after despawn" cells red. Even after T6, those
    cells pass only in a contained configuration (Open Question 2). Options:
@@ -476,14 +464,11 @@ Each question blocks the named task until Matt rules on it.
    - refuse both stop modes without such a handle, retain the live seat, and make teardown use
      external contained reap or operator release. Never wait for an exit after refusal.
    A cgroup kill alone is not a graceful stop and can kill the custodian. No best-effort numeric
-   send is assumed. Matt must choose this independently of automatic proof in Question 1.
-7. **Lifecycles out of scope.** In `driveDeprovision`, the user-mode and `remoteAuthority`
-   branches delete credentials and never reap. Does RIG-4422 cover them?
-8. **Reboot** (security-sensitive; no default). Options:
-   - never release automatically;
-   - trust the per-seat directory's `statx` birth time against the boot time. Under isolation the
-     agent cannot recreate the directory;
-   - have the manager record the boot id, which needs a new slot-row field.
+   send is assumed. Matt must choose this independently of the decided cgroup proof in Question 1.
+7. **Lifecycle scope — decided.** This record covers static lifecycles only. User-mode and hosted
+   custodied seats need a separate decision and implementation if brought into scope.
+8. **Reboot — decided.** Never release a foreign-boot record automatically. Require explicit
+   authenticated operator release; neither directory birth time nor a recorded boot id is proof.
 9. **Status shape.** Reuse `refused` (recommended), or add a `retained` disposition to
    `manager-service-contract.ts` and `staticReconciliationStatus`.
 10. **Accumulation.** Retained directories collect until someone releases them. Is a count in
