@@ -33,10 +33,9 @@ This record turns that decision into interfaces, failure behavior and regression
 Layers 1 and 2 implement RIG-4422. Matt selected a contained per-seat cgroup v2 domain for
 layer 3, a privileged manager release verb, static-only scope, and no automatic foreign-boot
 release (RIG-4546, 2026-10-05). Single-uid seats fail closed because an agent can escape the
-delegated base. For ordinary stop, Matt selected RIG-4546 Option 1: the custodian acquires a
-kernel-pinned handle to its child before it exposes the seat socket, and every graceful,
-escalated or hard stop signals through that handle. The handle must name the exact spawned
-child, not any process in the seat; Open Question 11 chooses how the spawn captures it.
+delegated base. For ordinary stop, Matt selected a kernel-pinned handle to the exact spawned child
+(RIG-4546 Option 1), captured by the native PTY spawn before its exit thread can reap that child
+(RIG-4687 Option A). Every graceful, escalated or hard stop signals through that handle.
 
 ### Layer 1 — the custodian keeps the record (`packages/seat`)
 
@@ -47,15 +46,13 @@ child, not any process in the seat; Open Question 11 chooses how the spawn captu
 - `settleTerminal` drops its `proc.kill("SIGKILL")`. Every caller reaches it with `alive` false, so
   the send always targets a leader that has exited. node-pty's `UnixTerminal.kill` is
   `process.kill(this.pid, signal || 'SIGHUP')`, a send to a bare pid.
-- **The custodian pins its exact child before it exposes the seat socket.** The handle names the
-  process that `pty.spawn` created, not merely a live process in the seat. It is bound to that
-  child by evidence that the spawning native call captures before node-pty's exit thread can
-  reap the child. Under Open Question 11 Option A (recommended) that evidence is the handle
-  itself, returned by the spawn with the pid. Pinning completes before the startup-confirm timer
-  is armed and before `listening.listen` binds `launch.socket`. After the child exits, a send
-  through the handle reports it gone and reaches no other process. Like `proc.kill` today, the
-  handle covers the child only; descendants are layer 3's concern. The handle lives in the
-  custodian's memory until the custodian exits. It is not in `record.json` or the seat protocol.
+- **The custodian pins its exact child before it exposes the seat socket.** The native PTY spawn
+  obtains a handle for the child returned with its pid, before node-pty's exit thread can reap it.
+  T1 patches the pinned node-pty spawn path; a post-spawn `pidfd_open` is not a substitute. Pinning
+  completes before the startup-confirm timer is armed and before `listening.listen` binds
+  `launch.socket`. After the child exits, a send through the handle reports it gone and reaches no
+  other process. Like `proc.kill` today, the handle covers the child only; descendants are layer
+  3's concern. The handle lives in custodian memory, not in `record.json` or the seat protocol.
 - **A pid read after `pty.spawn` is not evidence.** In node-pty's `src/unix/pty.cc`, `PtyFork`
   calls `forkpty` and then `SetupExitCallback`, whose thread blocks in
   `waitpid(pid, &stat_loc, 0)`. A child that exits at once can be reaped, and its pid reused,
@@ -65,8 +62,8 @@ child, not any process in the seat; Open Question 11 chooses how the spawn captu
   its parent is the custodian does not repair this. With `CLONE_PARENT`, a seat process can
   create a process whose parent "will be the same as that of the calling process" (clone(2)).
   So a process with the custodian as its parent can take the freed pid, and a send through that
-  handle stops the wrong process. Open Question 11 records the options, and T1 lands only after
-  that ruling. [INFERENCE: T1 confirms] This source is microsoft/node-pty `main`, which
+  handle stops the wrong process. T1 must prove spawn-time capture against this race.
+  [INFERENCE: T1 confirms] This source is microsoft/node-pty `main`, which
   `@lydell/node-pty` repackages; T1 checks it against the pinned `1.2.0-beta.12`.
 - **Identities are read before the spawn.** Today `runCustodian` reads
   `processStartToken(process.pid)` and `bootToken()` after `pty.spawn`. They move before it, so a
@@ -86,6 +83,11 @@ child, not any process in the seat; Open Question 11 chooses how the spawn captu
   `alive`, because a handle on an exited child reaches no process. The custodian then exits
   through the `runCustodian` catch, so `launchSeat` throws `custodian exited before ready:
   <cause>`.
+- **A launcher timeout is not a disappearance proof.** `launchSeat` currently stops waiting after
+  ten seconds and throws while its detached custodian may still be starting. T1 must reserve the
+  same custody ID, observe the custodian through its handle or a durable launch result, and leave
+  the seat retained if absence cannot be proved. No timeout frees a static name or removes the
+  seat directory. A late record cannot make the timed-out launch look absent.
 - **A missing handle fails closed.** If pinning fails, or its evidence proves neither that the
   handle names the spawned child nor that the child is gone, the custodian sends the child no
   signal. It does not bind its socket, write `record.json` or become ready. It logs the
@@ -299,11 +301,10 @@ descendants.
   custodial pty runtime. Linux only.
 - **Signals.** No signal targets a pid or group number from `record.json`. The reap may stop a
   contained cgroup with `cgroup.kill` and sends no other signal. The custodian signals its child
-  only through its kernel-pinned child handle. That handle is bound to the exact spawned child by
-  evidence captured before node-pty's exit thread can reap it (Open Question 11); a parent and
-  liveness check is not that evidence. The custodian never calls node-pty's `proc.kill` or
-  `proc.destroy`. A custodian that cannot pin the handle never exposes its socket. A startup
-  failure after pinning sends SIGKILL through the handle.
+  only through its kernel-pinned child handle, captured by the native PTY spawn before the child
+  can be reaped. A parent and liveness check is not that evidence. The custodian never calls
+  node-pty's `proc.kill` or `proc.destroy`. A custodian that cannot pin the handle never exposes
+  its socket. A startup failure after pinning sends SIGKILL through the handle.
 - **Proof.** `reaped` comes only from layer 3 when `seatCgroupContained` holds. A census is never
   proof.
 - **Deletion.** No seat directory, creds file, issuance retirement, durable or ACL row is deleted
@@ -323,8 +324,8 @@ descendants.
 
 **Interfaces.** No exported shape changes: `StopMode`, the `stop` op, `SeatClient.stop`,
 `SeatHandle.stop`, `CustodianLaunch` and `SeatRecord` keep their current shapes. The pinned child
-handle is internal to `runCustodian` and meets the Layer 1 contract. Its mechanism is the Open
-Question 11 ruling; T1 lands only after it. The spawn's handle replaces node-pty's `proc.kill`
+handle is internal to `runCustodian` and meets the Layer 1 contract. The patched native PTY spawn
+returns it with the spawned child before the exit thread starts. It replaces node-pty's `proc.kill`
 as the only signal path.
 
 **Edits.**
@@ -333,10 +334,9 @@ as the only signal path.
   `proc.kill("SIGKILL")` blocks.
 - In `runCustodian`, move the `processStartToken(process.pid)` and `bootToken()` reads before
   `pty.spawn`. Read `childStart` after acquisition, under the Layer 1 rule.
-- Take the pinned child handle from the spawn, with the Open Question 11 mechanism. Do not open
-  a handle by pid after `pty.spawn` returns unless the ruling supplies a pre-reap token to check
-  it against. On failure, apply the Layer 1 fail-closed rule. A child proved already gone is
-  marked exited; that is not a failure.
+- Take the pinned child handle returned by the patched native PTY spawn. Never open one by pid after
+  `pty.spawn` returns. On failure, apply the Layer 1 fail-closed rule. A child proved already gone
+  is marked exited; that is not a failure.
 - From acquisition until `ready`, send SIGKILL through the handle on every startup failure,
   including the listen `error` event.
 - Send every child signal through the handle. `stopChild`, the startup-confirm timeout and the
@@ -375,11 +375,11 @@ as the only signal path.
   throws with the logged cause, neither `seat.sock` nor `record.json` exists, and the child is
   alive with no marker. The test then kills the child by that pid. Its mutation adds a
   `proc.kill("SIGKILL")` fallback on acquisition failure and must turn this cell red.
-- **A startup failure after pinning stops the child.** The T1 test seam also forces a failure
-  after the bind and before `writeRecord`, once the test's pid file exists. The child ignores
-  SIGHUP and SIGTERM, then writes its pid to that file. `launchSeat` throws with the logged
-  cause, `record.json` does not exist, and the child is gone. Its mutation removes the
-  startup-failure SIGKILL and must turn this cell red.
+- **Startup failures after pinning stop the child.** One cell forces the listen `error` event
+  before bind. Another fails after bind but before `writeRecord`, once the test's pid file exists.
+  In both, the child ignores SIGHUP and SIGTERM, `launchSeat` throws with the logged cause,
+  `record.json` does not exist, and the child is gone. Removing either SIGKILL path turns its cell
+  red.
 - **A reused pid is never signalled.** The test runs `launchSeat` inside a fresh user and pid
   namespace, where a write to `ns_last_pid` steers the next pid. The child is a small C
   fixture. It creates a sibling with `CLONE_PARENT`, writes its pid to a test file and exits at
@@ -392,6 +392,10 @@ as the only signal path.
   `unshare --user --map-root-user --pid --fork --mount-proc`, a write of 41 to `ns_last_pid`
   gave the next process pid 42 (kernel `7.2.6`). [INFERENCE: T1 verifies] CI runners allow
   unprivileged user namespaces.
+- **Late readiness after the launcher bound.** Hold the custodian before record creation past the
+  ten-second launcher deadline. The timed-out launch keeps the reserved ID and static name; a
+  subsequent record or socket cannot turn it into an absent seat. Release needs contained proof
+  or the verified operator path, not a PID observation.
 
 ### T2 — the reap sends no numeric signal (`@cotal-ai/seat`)
 
@@ -549,14 +553,17 @@ line when it is unavailable. `CustodialPtyRuntime.reap` passes the derived `cgro
 reap, so a reference whose record is missing still reaches its seat cgroup.
 
 **T6 cell.** `lifecycle-e2e.smoke.ts` passes all 30 cells only under isolation with verified
-containment; a single-uid seat retains custody until explicit release.
+containment; a single-uid seat retains custody until explicit release. This requires a delegated
+cgroup v2 base whose parent controls the agent UID cannot write. CI must provision that base and
+the distinct UID before running the cell; absent privileges report a retained outcome, not a
+passing contained-proof assertion.
 
 ## Tasks
 
-- [ ] T1 custodian keeps `record.json`; identities before the spawn; exact-child handle from the
-      spawn (Open Question 11) before the socket; every stop and startup failure through it;
-      fail closed without it; natural-exit, escalation, unpinned-child, startup-failure,
-      reused-pid and teardown cells; seat changeset. Lands after the Question 11 ruling.
+- [ ] T1 custodian keeps `record.json`; identities before the spawn; exact-child handle captured
+      in the native PTY spawn before reaping, then returned with the child; every stop and startup
+      failure through it; fail closed without it; natural-exit, escalation, unpinned-child,
+      startup-failure, reused-pid and teardown cells; seat changeset.
 - [ ] T2 `reapSeat` sends no record-derived numeric signal; stop only by request to the
       custodian; `retained` without contained proof; forged-record and setsid cells and
       mutations; seat changeset.
@@ -571,9 +578,9 @@ containment; a single-uid seat retains custody until explicit release.
 ## Open Questions
 
 The 2026-10-05 RIG-4546 ruling settled automatic proof, release surface, static-only scope, and
-foreign-boot policy. RIG-4546 Option 1 settled custodian stop authority (Question 6). Questions
-4, 5, 9 and 10 are operational choices that need explicit disposition before this record freezes.
-Question 11 is the mechanism under Option 1, and T1 waits for it.
+foreign-boot policy. RIG-4546 Option 1 settled custodian stop authority. RIG-4687 chose Option A:
+capture the exact-child handle in the native PTY spawn, before the exit thread can reap the child.
+Questions 4, 5, 9 and 10 remain operational choices requiring disposition before freeze.
 
 1. **Automatic proof — decided.** Use a contained per-seat cgroup v2 domain. The manager must
    measure kernel version, delegation and cgroup mode on CI and the fleet before relying on it;
@@ -599,8 +606,8 @@ Question 11 is the mechanism under Option 1, and T1 waits for it.
    stop and startup failures all signal through it; no path sends to a bare pid. Acquisition
    failure fails closed: no signal, no socket, no record. A reap of the reserved reference stays
    fail-closed unless a contained seat cgroup proves it. `cgroup.kill` stays reap-only. Refusing
-   both stop modes without a handle was not chosen. The handle must name the exact spawned
-   child; Question 11 chooses how the spawn captures it.
+   both stop modes without a handle was not chosen. The handle names the exact spawned child and
+   is captured during the native PTY spawn (RIG-4687 Option A).
 7. **Lifecycle scope — decided.** This record covers static lifecycles only. User-mode and hosted
    custodied seats need a separate decision and implementation if brought into scope.
 8. **Reboot — decided.** Never release a foreign-boot record automatically. Require explicit
@@ -609,24 +616,10 @@ Question 11 is the mechanism under Option 1, and T1 waits for it.
    `manager-service-contract.ts` and `staticReconciliationStatus`.
 10. **Accumulation.** Retained directories collect until someone releases them. Is a count in
     `status` enough, or does this need an alert?
-11. **How the spawn captures the exact child (T1 waits for this).** Option 1 needs a handle that
-    names the process `pty.spawn` created and no other. node-pty's exit thread reaps that child
-    by pid (Layer 1), so a pid read after `pty.spawn` returns can name a reused pid. Neither
-    option changes an exported shape. Both must pass the T1 reused-pid cell.
-    - **A. Spawn-time handle (recommended).** The native call that forks the PTY child also
-      takes its handle before the exit thread starts and returns both, so no reap window exists.
-      `PtyFork` calls `forkpty` and returns only a pid, so this needs a patched node-pty or a
-      seat-owned native PTY spawn. Cost: a native change that the seat package builds for
-      linux-x64 and linux-arm64, like `peercred.node`, and that T1 keeps in step with node-pty
-      upgrades. A seat-owned spawn also takes on fork, exec and PTY setup; the child of a fork
-      in a multithreaded process may run only async-signal-safe code before exec.
-    - **B. Open by pid, then check the parent and liveness — invalid.** After the child is
-      reaped, a seat process created with `CLONE_PARENT` can take the freed pid with the
-      custodian as its parent. The open and both checks then pass, and the custodian signals the
-      wrong seat process. A variant is viable only if node-pty atomically captures a generation
-      token for the child before its exit thread can reap it, and the custodian checks the
-      opened handle against that token. That token still needs a node-pty change, and T1 would
-      have to show that no other process can carry it.
-
-    Decision needed: A, with its native change (patched node-pty or seat-owned spawn), or the
-    token variant of B.
+11. **Exact-child capture — decided (RIG-4687 Option A).** The native PTY spawn captures a
+    kernel-pinned handle for the spawned child before node-pty's exit thread can reap it, then
+    returns the handle with the pid. T1 patches the pinned node-pty implementation and verifies
+    the returned handle names that child; upgrades must preserve the patch. The alternative,
+    opening by pid after `pty.spawn` and checking parent and liveness, is invalid: a seat process
+    created with `CLONE_PARENT` can take the reaped child's pid and appear to have the custodian
+    as its parent. T1's reused-pid cell must keep that unrelated process alive.
