@@ -15,6 +15,7 @@ import { accountFromCreds, composeSpaceAuth, createBrokerAuth, createSpaceAccoun
 import { assertEphemeralBroker, scrubAmbientBrokerEnv } from "../../../packages/core/smoke/_ephemeral-only.js";
 import { assertScratchHeld, makeScratch } from "../../../bin/smoke/_scratch.js";
 import { authDir, canonicalLocalProcessPath, connectionEvictorCredsKey, DELIVERY_CREDS_KIND, DELIVERY_PIDFILE, deliveryCredsKey, MANAGER_PIDFILE, membershipConfigPath, membershipObserverCredsKey, membershipRwCredsKey, saveBrokerAuth, saveSpaceAccountAuth, workspaceSecretStore } from "@cotal-ai/workspace";
+import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
 
 scrubAmbientBrokerEnv();
 const scratch = makeScratch("cotal-delivery-explicit-space-");
@@ -49,7 +50,7 @@ const clouddev = composeSpaceAuth(broker, clouddevAccount);
 saveBrokerAuth(authDir(root), broker);
 saveSpaceAccountAuth(authDir(root), alphaAccount);
 saveSpaceAccountAuth(authDir(root), clouddevAccount);
-const conf = join(root, "server.conf");
+const conf = join(root, `${SMOKE_BROKER_TOKEN}server.conf`);
 writeFileSync(conf, serverConfig(broker, [alphaAccount, clouddevAccount], {
   transport: { kind: "plaintext" },
   port: serverPort,
@@ -78,8 +79,10 @@ const stopPid = async (pid: number | undefined): Promise<void> => {
   if (alive(pid)) try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
 };
 let brokerChild: ChildProcess | undefined;
+let releaseBroker: (() => void) | undefined;
 try {
   brokerChild = spawn(natsServer, ["-c", conf], { stdio: "ignore" });
+  releaseBroker = teardownOnSignal(brokerChild, root);
   for (let i = 0; i < 100 && !(await isReachable(server)); i++) await wait(50);
   check("the two-account broker is reachable", await isReachable(server));
   await setupSpaceStreams({ servers: server, space: "alpha", creds: await mintCreds(alpha, newIdentity(), "provisioner") });
@@ -127,5 +130,6 @@ try {
     await Promise.race([once(brokerChild, "exit"), wait(5000)]);
     if (brokerChild.exitCode === null) brokerChild.kill("SIGKILL");
   }
+  releaseBroker?.();
   rmSync(scratch, { recursive: true, force: true });
 }

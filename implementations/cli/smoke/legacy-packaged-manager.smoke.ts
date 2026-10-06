@@ -1,5 +1,5 @@
 import nodeAssert from "node:assert/strict";
-import { countedAssert, emitSentinel, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { countedAssert, emitSentinel, SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -18,7 +18,7 @@ const stampBefore = existsSync(operatorStamp) ? readFileSync(operatorStamp) : un
 const ambient: NodeJS.ProcessEnv = { ...process.env };
 for (const key of Object.keys(ambient)) if (key.startsWith("COTAL_")) delete ambient[key];
 
-const base = mkdtempSync(join(tmpdir(), "cotal-legacy-packaged-manager-"));
+const base = mkdtempSync(join(tmpdir(), `${SMOKE_BROKER_TOKEN}legacy-packaged-manager-`));
 const home = join(base, "home");
 const xdg = join(base, "xdg");
 const tmp = join(base, "tmp");
@@ -70,6 +70,7 @@ const until = async (predicate: () => boolean, timeout = 30_000) => { const end 
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const run = (file: string, args: string[], cwd: string) => spawnSync(file, args, { cwd, env: cleanEnv, encoding: "utf8", timeout: 180_000 });
 let broker: ChildProcess | undefined;
+let releaseBroker: (() => void) | undefined;
 let legacy: ChildProcess | undefined;
 try {
   assert.equal(Object.keys(cleanEnv).filter((key) => key.startsWith("COTAL_")).length, 0, "child env carries no COTAL_*");
@@ -266,6 +267,7 @@ try {
 
   const port = await freePort();
   broker = spawn(natsServer, ["-js", "-p", String(port), "-sd", join(base, "jetstream")], { env: cleanEnv, stdio: "ignore" });
+  releaseBroker = teardownOnSignal(broker, base);
   assert.ok(await until(() => alive(broker!.pid!)), "isolated broker started");
   const host = join(base, "old-manager.mjs");
   const ready = join(base, "old-manager.json");
@@ -306,6 +308,7 @@ setInterval(() => {}, 1000);
 } finally {
   if (legacy?.pid && alive(legacy.pid)) legacy.kill("SIGKILL");
   if (broker?.pid && alive(broker.pid)) broker.kill("SIGKILL");
+  releaseBroker?.();
   await Promise.all([legacy, broker].filter(Boolean).map((child) => new Promise<void>((resolve) => child!.once("exit", () => resolve()))));
   assert.deepEqual(existsSync(operatorStamp) ? readFileSync(operatorStamp) : undefined, stampBefore, "fixture did not change the operator seed stamp");
   rmSync(base, { recursive: true, force: true });

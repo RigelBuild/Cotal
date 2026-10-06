@@ -55,8 +55,9 @@ const freePort = (): Promise<number> =>
 async function bootBroker(auth: SpaceAuth, dir: string): Promise<{ servers: string; stop: () => Promise<void> }> {
   const port = await freePort();
   const servers = `nats://127.0.0.1:${port}`;
-  writeFileSync(join(dir, "server.conf"), serverConfig(auth, [auth], { transport: { kind: "plaintext" }, port, storeDir: join(dir, "js") }));
-  const srv = spawn("nats-server", ["-c", join(dir, "server.conf")], { stdio: "ignore" });
+  const conf = join(dir, "server.conf");
+  writeFileSync(conf, serverConfig(auth, [auth], { transport: { kind: "plaintext" }, port, storeDir: join(dir, "js") }));
+  const srv = spawn("nats-server", ["-c", conf], { stdio: "ignore" });
   const release = teardownOnSignal(srv, dir);
   let up = false;
   for (let i = 0; i < 25 && srv.exitCode === null; i++) {
