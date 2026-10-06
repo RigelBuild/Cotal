@@ -124,19 +124,22 @@ An `input` handler cannot gate. `AgentSession.prompt` runs `_tryExecuteExtension
 `pi.sendMessage(…, { triggerTurn: true })`, which reaches the agent loop through
 `sendCustomMessage` without `input`.
 
-**Termination.** `closeRetryGate` runs once per gate, in this order:
+**Termination.** `closeRetryGate` sets the one-way gate before any fallible work. It then attempts
+`driver.quit()`, persists session state `quit`, and writes a `pi connector:` reason to fd 2, each
+in a separate guarded step. A failed step is recorded in the reason when stderr remains writable;
+none can reopen the gate or skip termination. In a final guarded step it calls
+`hooks.terminate(reason)` (default: own-process `SIGTERM`). Even if a test hook throws or returns,
+`closeRetryGate` itself never throws and every provider-path handler parks or cancels based on the
+already-closed gate. A host that prevents process termination must dispose the runtime; its
+provider barrier remains closed until then.
 
-1. set the gate, which arms the barrier below;
-2. `driver.quit()`, so `PiDriver.pump` refuses all Cotal dispatch (`shuttingDown`). At load no
-   runtime exists, so there is nothing to quit;
-3. persist the session state as `quit`, so `Manager.onAgentExit` retires a seat without `supervise`
-   (`freeSlot(a, true, "process-exit")`) instead of restarting it into the same failure (OQ 2). At
-   load the id is `COTAL_PI_EXPECTED_SESSION`, and the manager's readiness wait
-   (`awaitManagedSessionState`) reports a deliberate quit. A `--fork` launch has no expected id, so
-   nothing is written and that wait fails on the exited process;
-4. write the reason to fd 2 with `writeSync` and the `pi connector:` prefix, so the line is out
-   before the next step can end the process;
-5. call `hooks.terminate(reason)`, which by default sends its own process `SIGTERM`.
+Persisting `quit` lets `Manager.onAgentExit` retire a seat without `supervise`
+(`freeSlot(a, true, "process-exit")`) instead of restarting it into the same failure (OQ 2). At
+load the id is `COTAL_PI_EXPECTED_SESSION`, and the manager readiness wait
+(`awaitManagedSessionState`) reports a deliberate quit. A `--fork` launch has no expected id, so
+nothing is written and the wait fails on the exited process. If persistence fails, the manager
+must not infer a clean quit; this is a fail-loud lifecycle error, not permission for a provider
+request.
 
 At load, the CLI has no signal handler yet: `main` (`main.js`) builds the runtime, which loads
 extensions, before `runPrintMode` or `InteractiveMode.init` registers one. The only `SIGTERM`
@@ -350,9 +353,9 @@ hooks of its first load. Module-private helpers:
 
 ```ts
 type GateScope = { key: string; hooks: CotalMeshHooks; runtime?: PiRuntime; sessionId?: string };
-/** No-op when the key's gate is set. Persists `quit` under runtime?.sessionId ?? sessionId. */
+/** Sets the gate first; catches every side-effect failure and always attempts termination. */
 function closeRetryGate(scope: GateScope, reason: string): void;
-/** True when the gate is set, or when the check on cwd fails (then closes it). Never throws. */
+/** Returns true when closed or when a failed check closes it; never throws. */
 function gateClosed(scope: GateScope, cwd: string): boolean;
 ```
 
@@ -418,6 +421,10 @@ awaits it. "No request" means the faux provider's `state.callCount` did not move
   - no request after an unawaited `prompt("typed")`, which runs the pre-prompt `_checkCompaction`;
   - `compact()` rejects with `Compaction cancelled`;
   - `navigateTree(<the first user entry>, { summarize: true })` resolves `{ cancelled: true }`.
+- **Failure injection.** Make state persistence throw and make `hooks.terminate` throw in separate
+  runtimes. The gate remains closed; an unawaited turn makes zero provider requests, `compact()`
+  rejects as canceled, and `navigateTree` returns canceled. A healthy-path control must make a
+  request, so a broken faux provider cannot make both cases vacuously pass.
 - **Compaction control.** The same seeded session on a passing cwd: `compact()` moves
   `state.callCount`. Without it, the closed case could pass on a session too small to compact.
 - **Pi CLI process runs (rereview 3).** Spawn `node <pi dist/cli.js> --extension
