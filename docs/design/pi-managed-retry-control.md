@@ -422,9 +422,11 @@ awaits it. "No request" means the faux provider's `state.callCount` did not move
   - `compact()` rejects with `Compaction cancelled`;
   - `navigateTree(<the first user entry>, { summarize: true })` resolves `{ cancelled: true }`.
 - **Failure injection.** Make state persistence throw and make `hooks.terminate` throw in separate
-  runtimes. The gate remains closed; an unawaited turn makes zero provider requests, `compact()`
-  rejects as canceled, and `navigateTree` returns canceled. A healthy-path control must make a
-  request, so a broken faux provider cannot make both cases vacuously pass.
+  runtimes. In the first, a recording termination hook is called exactly once despite the write
+  failure. In the second, a throwing hook is called exactly once and its error never escapes a Pi
+  handler. In both, the gate stays closed: an unawaited turn makes zero provider requests,
+  `compact()` rejects as canceled, and `navigateTree` returns canceled. A healthy-path control
+  must make a request, so a broken faux provider cannot make both cases vacuously pass.
 - **Compaction control.** The same seeded session on a passing cwd: `compact()` moves
   `state.callCount`. Without it, the closed case could pass on a session too small to compact.
 - **Pi CLI process runs (rereview 3).** Spawn `node <pi dist/cli.js> --extension
