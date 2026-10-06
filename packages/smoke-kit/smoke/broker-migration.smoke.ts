@@ -922,6 +922,155 @@ cell("the enumerator refuses shadowed, borrowed, and unreachable teardown owners
   assert.equal(isAdopted(found[3]!), true, "a called cleanup helper still owns its broker");
 });
 
+// A `${}` segment after the tokened prefix is only as safe as the value it holds.
+cell("the enumerator rejects unproven dynamic path segments", () => {
+  const found = plantedSites("dynamic-segment",
+    `const up = "..";\n` +
+    "const a = spawn(\"nats-server\", [\"-sd\", join(SMOKE_BROKER_TOKEN, `${up}`)]); teardownOnSignal(a);\n" +
+    `const abs = "/plain";\n` +
+    "const b = spawn(\"nats-server\", [\"-sd\", resolve(SMOKE_BROKER_TOKEN, `${abs}`)]); teardownOnSignal(b);\n" +
+    "const c = spawn(\"nats-server\", [\"-sd\", join(SMOKE_BROKER_TOKEN, `${process.env.SEGMENT}`)]); teardownOnSignal(c);\n" +
+    `for (let i = 0; i < 2; i++) {\n` +
+    "  const d = spawn(\"nats-server\", [\"-sd\", join(tmpdir(), SMOKE_BROKER_TOKEN, `node-${i}`)]); teardownOnSignal(d);\n" +
+    `}\n`);
+  assert.equal(found.length, 4);
+  assert.equal(found[0]!.tokened, false, "a parent segment climbs out of the tokened dir");
+  assert.equal(found[1]!.tokened, false, "an absolute segment replaces the tokened prefix");
+  assert.equal(found[2]!.tokened, false, "an environment segment is unproven");
+  assert.equal(isAdopted(found[3]!), true, "a numeric segment keeps the tokened prefix");
+});
+
+// One binding overwritten per iteration registers only the last child.
+cell("the enumerator refuses a loop-spawned broker owned only after the loop", () => {
+  const found = plantedSites("loop-overwrite",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `let child;\n` +
+    `for (let i = 0; i < 2; i++) { child = spawn("nats-server", ["-sd", sd]); }\n` +
+    `teardownOnSignal(child);\n` +
+    `for (let i = 0; i < 2; i++) { const each = spawn("nats-server", ["-sd", sd]); teardownOnSignal(each); }\n`);
+  assert.equal(found.length, 2);
+  assert.equal(found[0]!.owned, false, "earlier iterations' brokers are never registered");
+  assert.equal(isAdopted(found[1]!), true, "a registration inside the loop owns every child");
+});
+
+// A write the parser cannot evaluate replaces the binding's provenance with an unproven value.
+cell("the enumerator drops token provenance on compound and destructuring writes", () => {
+  const found = plantedSites("compound-write",
+    `let a = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `[a] = ["/plain"];\n` +
+    `const x = spawn("nats-server", ["-sd", a]); teardownOnSignal(x);\n` +
+    `let b = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `({ b } = { b: "/plain" });\n` +
+    `const y = spawn("nats-server", ["-sd", b]); teardownOnSignal(y);\n` +
+    `let c = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `c ||= "/plain"; c += "/../../plain";\n` +
+    `const z = spawn("nats-server", ["-sd", c]); teardownOnSignal(z);\n` +
+    `let d = "/plain";\n` +
+    `d = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `const w = spawn("nats-server", ["-sd", d]); teardownOnSignal(w);\n`);
+  assert.equal(found.length, 4);
+  assert.equal(found[0]!.tokened, false, "array destructuring overwrites the tokened path");
+  assert.equal(found[1]!.tokened, false, "object destructuring overwrites the tokened path");
+  assert.equal(found[2]!.tokened, false, "a compound write leaves an unproven value");
+  assert.equal(isAdopted(found[3]!), true, "a plain tokened reassignment still counts");
+});
+
+// An object's function property registers nothing unless something calls it.
+cell("the enumerator refuses teardown in an uncalled object property", () => {
+  const found = plantedSites("property-teardown",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `const orphan = spawn("nats-server", ["-sd", sd]);\n` +
+    `const hooks = { cleanup: () => teardownOnSignal(orphan) };\n` +
+    `const lonely = spawn("nats-server", ["-sd", sd]);\n` +
+    `const methods = { cleanup() { teardownOnSignal(lonely); } };\n` +
+    `const kept = spawn("nats-server", ["-sd", sd]);\n` +
+    `const called = { cleanup: () => teardownOnSignal(kept) };\n` +
+    `called.cleanup();\n`);
+  assert.equal(found.length, 3);
+  assert.equal(found[0]!.owned, false, "an arrow property nothing calls registers no teardown");
+  assert.equal(found[1]!.owned, false, "a method nothing calls registers no teardown");
+  assert.equal(isAdopted(found[2]!), true, "a called property still owns its broker");
+});
+
+// `build().cwd` vouches only for the function the call actually resolves to.
+cell("the enumerator resolves a returned field through the call's own binding", () => {
+  const found = plantedSites("returned-shadow",
+    `function build() { return { cwd: join(tmpdir(), SMOKE_BROKER_TOKEN) }; }\n` +
+    `function viaParameter(build: () => { cwd: string }) { const a = spawn("nats-server", ["-sd", build().cwd]); teardownOnSignal(a); }\n` +
+    `viaParameter(() => ({ cwd: "/plain" }));\n` +
+    `function viaLocal() { function build() { return { cwd: "/plain" }; } const b = spawn("nats-server", ["-sd", build().cwd]); teardownOnSignal(b); }\n` +
+    `viaLocal();\n` +
+    `const c = spawn("nats-server", ["-sd", build().cwd]); teardownOnSignal(c);\n`);
+  assert.equal(found.length, 3);
+  assert.equal(found[0]!.tokened, false, "a parameter named like the builder is caller-supplied");
+  assert.equal(found[1]!.tokened, false, "a nested same-name builder returns its own field");
+  assert.equal(isAdopted(found[2]!), true, "the top-level builder still vouches for its own call");
+});
+
+// A `var` initializer in a branch is a write the branch may skip.
+cell("the enumerator keeps the earlier value of a conditional var initializer", () => {
+  const found = plantedSites("conditional-var",
+    `var sd = "/plain";\n` +
+    `if (process.env.ISOLATE) { var sd = join(tmpdir(), SMOKE_BROKER_TOKEN); }\n` +
+    `const a = spawn("nats-server", ["-sd", sd]); teardownOnSignal(a);\n` +
+    `var both = join(tmpdir(), SMOKE_BROKER_TOKEN, "a");\n` +
+    `if (process.env.ISOLATE) { var both = join(tmpdir(), SMOKE_BROKER_TOKEN, "b"); }\n` +
+    `const b = spawn("nats-server", ["-sd", both]); teardownOnSignal(b);\n`);
+  assert.equal(found.length, 2);
+  assert.equal(found[0]!.tokened, false, "the skipped branch leaves the plain path live");
+  assert.equal(isAdopted(found[1]!), true, "both possible values are tokened");
+});
+
+// A registration on a branch the spawn does not share leaves the other path unowned.
+cell("the enumerator refuses a conditional teardown registration", () => {
+  const found = plantedSites("conditional-teardown",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `const a = spawn("nats-server", ["-sd", sd]);\n` +
+    `if (process.env.CLEANUP) teardownOnSignal(a);\n` +
+    `const b = spawn("nats-server", ["-sd", sd]);\n` +
+    `process.env.CLEANUP && teardownOnSignal(b);\n` +
+    `const c = spawn("nats-server", ["-sd", sd]);\n` +
+    `const releaseC = process.env.CLEANUP ? teardownOnSignal(c) : undefined;\n` +
+    `const isolate = Boolean(process.env.ISOLATE);\n` +
+    `let d;\n` +
+    `if (isolate) d = spawn("nats-server", ["-sd", sd]);\n` +
+    `if (isolate && d) teardownOnSignal(d);\n`);
+  assert.equal(found.length, 4);
+  assert.equal(found[0]!.owned, false, "an if-guarded registration may not run");
+  assert.equal(found[1]!.owned, false, "a short-circuit registration may not run");
+  assert.equal(found[2]!.owned, false, "a ternary registration may not run");
+  assert.equal(isAdopted(found[3]!), true, "a registration under the spawn's own guard owns it");
+});
+
+// Calling the release unregisters the broker, so it must not run while the broker is live.
+cell("the enumerator refuses a release called while the broker is live", () => {
+  const found = plantedSites("early-release",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `const a = spawn("nats-server", ["-sd", sd]);\n` +
+    `teardownOnSignal(a)();\n` +
+    `const b = spawn("nats-server", ["-sd", sd]);\n` +
+    `const releaseB = teardownOnSignal(b);\n` +
+    `releaseB();\n` +
+    `const c = spawn("nats-server", ["-sd", sd]);\n` +
+    `const releaseC = teardownOnSignal(c);\n` +
+    `releaseC();\n` +
+    `await Promise.resolve();\n` +
+    `c.kill("SIGKILL");\n` +
+    `const d = spawn("nats-server", ["-sd", sd]);\n` +
+    `const releaseD = teardownOnSignal(d);\n` +
+    `d.kill("SIGKILL");\n` +
+    `releaseD();\n` +
+    `const e = spawn("nats-server", ["-sd", sd]);\n` +
+    `const releaseE = teardownOnSignal(e);\n` +
+    `releaseE(); e.kill("SIGKILL");\n`);
+  assert.equal(found.length, 5);
+  assert.equal(found[0]!.owned, false, "an immediately called release drops the registration");
+  assert.equal(found[1]!.owned, false, "a release before any kill drops the live broker");
+  assert.equal(found[2]!.owned, false, "an await between release and kill opens a signal window");
+  assert.equal(isAdopted(found[3]!), true, "a release after the kill is the normal teardown");
+  assert.equal(isAdopted(found[4]!), true, "a release synchronously followed by the kill leaves no signal window");
+});
+
 // The token the gate requires must be the one the reaper matches. Two literals that drift apart
 // would leave every suite "migrated" against a prefix nothing reaps.
 cell("the required token is the prefix the reaper matches", async () => {

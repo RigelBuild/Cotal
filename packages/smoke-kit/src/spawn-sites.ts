@@ -193,20 +193,23 @@ const SHORT_CIRCUIT: readonly ts.SyntaxKind[] = [
   ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken,
 ];
 
-/** The outermost branch below `scope` that may skip `node`, or undefined when `node` always runs. */
-function skippableBranch(node: ts.Node, scope: ts.Node | undefined): ts.Node | undefined {
-  let branch: ts.Node | undefined;
+/** Every branch below `scope` that may skip `node`, innermost first. */
+function skippableBranches(node: ts.Node, scope: ts.Node | undefined): ts.Node[] {
+  const branches: ts.Node[] = [];
   for (let child = node, parent = node.parent; parent !== undefined && parent !== scope; child = parent, parent = parent.parent) {
-    if (ts.isFunctionLike(parent)) return branch;
-    if (ts.isIfStatement(parent) && child !== parent.expression) branch = child;
-    else if (ts.isConditionalExpression(parent) && child !== parent.condition) branch = child;
-    else if (ts.isBinaryExpression(parent) && child === parent.right && SHORT_CIRCUIT.includes(parent.operatorToken.kind)) branch = child;
-    else if (ts.isIterationStatement(parent, false) && !ts.isDoStatement(parent) && child === parent.statement) branch = child;
-    else if (ts.isCaseOrDefaultClause(parent) || ts.isCatchClause(parent)) branch = parent;
-    else if (ts.isTryStatement(parent) && child === parent.tryBlock && parent.catchClause !== undefined) branch = child;
+    if (ts.isFunctionLike(parent)) break;
+    if (ts.isIfStatement(parent) && child !== parent.expression) branches.push(child);
+    else if (ts.isConditionalExpression(parent) && child !== parent.condition) branches.push(child);
+    else if (ts.isBinaryExpression(parent) && child === parent.right && SHORT_CIRCUIT.includes(parent.operatorToken.kind)) branches.push(child);
+    else if (ts.isIterationStatement(parent, false) && !ts.isDoStatement(parent) && child === parent.statement) branches.push(child);
+    else if (ts.isCaseOrDefaultClause(parent) || ts.isCatchClause(parent)) branches.push(parent);
+    else if (ts.isTryStatement(parent) && child === parent.tryBlock && parent.catchClause !== undefined) branches.push(child);
   }
-  return branch;
+  return branches;
 }
+
+/** The outermost branch below `scope` that may skip `node`, or undefined when `node` always runs. */
+const skippableBranch = (node: ts.Node, scope: ts.Node | undefined): ts.Node | undefined => skippableBranches(node, scope).at(-1);
 
 /** Collect local initializers without merging declarations from sibling scopes. */
 function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding[]> } {
@@ -229,7 +232,18 @@ function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding
       const location = { scopes: declarationScopes, offset: node.getStart(file), valueScopes: scopes, valueOffset };
       // A for-of/for-in binding has no initializer but the loop always assigns it.
       const uninitialized = node.initializer === undefined && !ts.isForInStatement(node.parent.parent) && !ts.isForOfStatement(node.parent.parent);
-      if (ts.isIdentifier(node.name)) add(node.name.text, { ...plain, ...location, value, uninitialized });
+      // A `var` initializer in a branch is a skippable write: the earlier value, or the hoisted undefined, stays live.
+      const varBranch = node.initializer !== undefined && declarationScopes !== scopes
+        ? skippableBranch(node, declarationScopes[declarationScopes.length - 1])
+        : undefined;
+      const varAlternative = (name: string): Pick<Binding, "alternative"> => {
+        if (varBranch === undefined) return {};
+        const prior = (defs.get(name) ?? []).filter((binding) => binding.scopes.length === declarationScopes.length
+          && binding.scopes.every((scope, index) => declarationScopes[index] === scope)).at(-1)
+          ?? { ...plain, ...location, value: "", uninitialized: true };
+        return { alternative: { binding: prior, start: varBranch.getStart(file), end: varBranch.end } };
+      };
+      if (ts.isIdentifier(node.name)) add(node.name.text, { ...plain, ...location, value, uninitialized, ...varAlternative(node.name.text) });
       if (ts.isObjectBindingPattern(node.name)) {
         for (const element of node.name.elements) {
           const property = element.propertyName ?? element.name;
@@ -243,7 +257,7 @@ function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding
             ? moduleCall.arguments[0]!.text
             : "";
           const kitToken = source === "@cotal-ai/smoke-kit" && property.text === "SMOKE_BROKER_TOKEN";
-          add(element.name.text, { ...plain, ...location, token: kitToken,
+          add(element.name.text, { ...plain, ...location, token: kitToken, ...varAlternative(element.name.text),
             value: kitToken ? "" : value === "" ? "" : `(${value}).${property.text}` });
         }
       }
@@ -270,8 +284,8 @@ function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding
   };
   const collectAssignments = (node: ts.Node, parentScopes: readonly ts.Node[]): void => {
     const scopes = isLexicalScope(node) ? [...parentScopes, node] : parentScopes;
-    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(node.left)) {
-      const visible = (defs.get(node.left.text) ?? []).filter((binding) =>
+    const record = (target: ts.Identifier, assigned: string): void => {
+      const visible = (defs.get(target.text) ?? []).filter((binding) =>
         binding.scopes.length <= scopes.length
         && binding.scopes.every((scope, index) => scopes[index] === scope)
         && (binding.scopes.length < scopes.length || binding.offset < node.getStart(file)),
@@ -280,10 +294,9 @@ function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding
       const nearest = visible.filter((binding) => binding.scopes.length === depth);
       const prior = nearest.length === 0 ? undefined : nearest.reduce((left, right) => left.offset > right.offset ? left : right);
       const targetScopes = prior?.scopes ?? scopes;
-      const assigned = src.slice(node.right.getStart(file), node.right.end);
       const branch = prior === undefined ? undefined : skippableBranch(node, targetScopes[targetScopes.length - 1]);
       // The right side runs before the store, so it reads the previous value of a self-extending path.
-      add(node.left.text, {
+      add(target.text, {
         ...plain,
         value: assigned,
         scopes: targetScopes,
@@ -294,6 +307,34 @@ function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding
           ? { alternative: { binding: prior, start: branch.getStart(file), end: branch.end } }
           : {}),
       });
+    };
+    // Every identifier a destructuring pattern writes; its value is unproven.
+    const patternTargets = (pattern: ts.Node): ts.Identifier[] => {
+      if (ts.isIdentifier(pattern)) return [pattern];
+      if (ts.isParenthesizedExpression(pattern) || ts.isSpreadElement(pattern) || ts.isSpreadAssignment(pattern)) return patternTargets(pattern.expression);
+      if (ts.isBinaryExpression(pattern) && pattern.operatorToken.kind === ts.SyntaxKind.EqualsToken) return patternTargets(pattern.left);
+      if (ts.isArrayLiteralExpression(pattern)) return pattern.elements.flatMap(patternTargets);
+      if (ts.isObjectLiteralExpression(pattern)) return pattern.properties.flatMap((property) =>
+        ts.isShorthandPropertyAssignment(property) ? [property.name]
+          : ts.isPropertyAssignment(property) ? patternTargets(property.initializer)
+          : ts.isSpreadAssignment(property) ? patternTargets(property.expression) : []);
+      return [];
+    };
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(node.left)) {
+      record(node.left, src.slice(node.right.getStart(file), node.right.end));
+    } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      for (const target of patternTargets(node.left)) record(target, "");
+    } else if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstCompoundAssignment
+      && node.operatorToken.kind <= ts.SyntaxKind.LastCompoundAssignment && ts.isIdentifier(node.left)) {
+      // Every compound operator but `+=` (and the logical ones) yields a number; any of them drops a path's token.
+      const numeric = ![ts.SyntaxKind.PlusEqualsToken, ts.SyntaxKind.AmpersandAmpersandEqualsToken,
+        ts.SyntaxKind.BarBarEqualsToken, ts.SyntaxKind.QuestionQuestionEqualsToken].includes(node.operatorToken.kind);
+      record(node.left, numeric ? "0" : "");
+    } else if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) && ts.isIdentifier(node.operand)
+      && (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken)) {
+      record(node.operand, "0");
+    } else if ((ts.isForOfStatement(node) || ts.isForInStatement(node)) && !ts.isVariableDeclarationList(node.initializer)) {
+      for (const target of patternTargets(node.initializer)) record(target, "");
     }
     ts.forEachChild(node, (child) => collectAssignments(child, scopes));
   };
@@ -365,8 +406,38 @@ function invocations(fn: ts.Node, defs: Map<string, Binding[]>): readonly number
   while (ts.isParenthesizedExpression(outer.parent)) outer = outer.parent;
   const named = functionBinding(fn);
   let result: readonly number[] | null = null;
-  if (ts.isCallExpression(outer.parent) && outer.parent.expression === outer) result = [outer.parent.getStart()];
-  else if (named !== undefined && !named.exported) {
+  const holder = outer.parent;
+  const member = ts.isMethodDeclaration(fn) ? fn : ts.isPropertyAssignment(holder) && holder.initializer === outer ? holder : undefined;
+  if (ts.isCallExpression(holder) && holder.expression === outer) result = [holder.getStart()];
+  else if (member !== undefined && ts.isIdentifier(member.name) && ts.isObjectLiteralExpression(member.parent)
+    && ts.isVariableDeclaration(member.parent.parent) && ts.isIdentifier(member.parent.parent.name)
+    && member.parent.parent.initializer === member.parent) {
+    // A property of a local object runs only through `object.property()`; an unreferenced object never runs it.
+    const object = member.parent.parent;
+    const statement = object.parent.parent;
+    const exported = ts.canHaveModifiers(statement) && (ts.getModifiers(statement) ?? []).some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword);
+    const file = fn.getSourceFile();
+    const property = member.name.text;
+    const objectName = object.name.getText(file);
+    const own = (defs.get(objectName) ?? []).find((binding) => binding.offset === object.getStart(file));
+    if (!exported && own !== undefined) {
+      const calls: number[] = [];
+      let escapes = false;
+      const visit = (node: ts.Node): void => {
+        if (escapes) return;
+        if (ts.isIdentifier(node) && node.text === objectName && isValueReference(node)
+          && resolvedBindings(node.text, defs, scopesAt(file, node.getStart(file)), node.getStart(file)).includes(own)) {
+          const access = node.parent;
+          if (ts.isPropertyAccessExpression(access) && access.name.text === property
+            && ts.isCallExpression(access.parent) && access.parent.expression === access) calls.push(access.parent.getStart(file));
+          else if (!(ts.isPropertyAccessExpression(access) && access.name.text !== property)) escapes = true;
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(file);
+      if (!escapes) result = calls;
+    }
+  } else if (named !== undefined && !named.exported) {
     const file = fn.getSourceFile();
     const sameName = defs.get(named.name) ?? [];
     const own = sameName.find((binding) => binding.offset === named.offset);
@@ -468,6 +539,132 @@ function reachable(file: ts.SourceFile, offset: number, defs: Map<string, Bindin
   return true;
 }
 
+/** The deepest node that contains `offset`. */
+function nodeAt(file: ts.SourceFile, offset: number): ts.Node {
+  let found: ts.Node = file;
+  const visit = (node: ts.Node): void => {
+    if (offset < node.getStart(file) || offset >= node.end) return;
+    found = node;
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(file, visit);
+  return found;
+}
+
+const contains = (node: ts.Node, offset: number): boolean => node.getStart() <= offset && offset < node.end;
+
+/** The `&&` conjuncts a branch needs to run, or undefined for a branch whose condition is not a plain conjunction. */
+function guardConjuncts(branch: ts.Node): ts.Expression[] | undefined {
+  const parent = branch.parent;
+  const condition = ts.isIfStatement(parent) && branch === parent.thenStatement ? parent.expression
+    : ts.isConditionalExpression(parent) && branch === parent.whenTrue ? parent.condition
+    : ts.isBinaryExpression(parent) && parent.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken ? parent.left
+    : undefined;
+  const split = (node: ts.Expression): ts.Expression[] => ts.isParenthesizedExpression(node) ? split(node.expression)
+    : ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken ? [...split(node.left), ...split(node.right)]
+    : [node];
+  return condition === undefined ? undefined : split(condition);
+}
+
+/**
+ * The registration at `call` runs once for each broker started at `spawnOffset`: no branch can skip
+ * the call without skipping the spawn, and no loop repeats the spawn without repeating the call. A
+ * guard on the call passes only when every conjunct is the child itself or a never-reassigned name
+ * that also guards the spawn.
+ */
+function coRuns(file: ts.SourceFile, spawnOffset: number, call: ts.CallExpression, defs: Map<string, Binding[]>, stack: readonly ts.Node[] = []): boolean {
+  for (let node = nodeAt(file, spawnOffset); node.parent !== undefined && !ts.isFunctionLike(node); node = node.parent) {
+    if (ts.isIterationStatement(node, false) && !contains(node, call.getStart(file))) return false;
+  }
+  const child = call.arguments[0];
+  const spawnGuards = skippableBranches(nodeAt(file, spawnOffset), undefined).flatMap((branch) => guardConjuncts(branch) ?? []);
+  const single = (id: ts.Identifier): boolean => {
+    const offset = id.getStart(file);
+    const nearest = resolvedBindings(id.text, defs, scopesAt(file, offset), offset);
+    const own = nearest[0];
+    return nearest.length === 1 && own !== undefined && (defs.get(id.text) ?? []).filter((binding) =>
+      binding.scopes.length === own.scopes.length && binding.scopes.every((scope, index) => own.scopes[index] === scope)).length === 1;
+  };
+  const implied = (conjunct: ts.Expression): boolean => ts.isIdentifier(conjunct) && (
+    child !== undefined && ts.isIdentifier(child) && conjunct.text === child.text
+    || single(conjunct) && spawnGuards.some((guard) => ts.isIdentifier(guard) && guard.text === conjunct.text));
+  if (skippableBranches(call, undefined).some((branch) => !contains(branch, spawnOffset)
+    && !(guardConjuncts(branch)?.every(implied) ?? false))) return false;
+  let fn: ts.Node | undefined = call.parent;
+  while (fn !== undefined && !ts.isFunctionLike(fn)) fn = fn.parent;
+  if (fn === undefined || contains(fn, spawnOffset)) return true;
+  const calls = invocations(fn, defs);
+  if (calls === null) return true;
+  if (stack.includes(fn)) return false;
+  return calls.some((caller) => {
+    let site: ts.Node = nodeAt(file, caller);
+    while (!ts.isCallExpression(site) && site.parent !== undefined && site.parent.getStart(file) === caller) site = site.parent;
+    return !contains(fn, caller) && ts.isCallExpression(site) && coRuns(file, spawnOffset, site, defs, [...stack, fn]);
+  });
+}
+
+/** A call that stops a child: the evidence a later release no longer drops a live broker. */
+const KILL_EVIDENCE = /kill|exit|^stop(?:owned|broker)/i;
+
+/** `node` holds a kill-evidence call inside [start, end) that runs where it is written. */
+function killsBetween(node: ts.Node, start: number, end: number, file: ts.SourceFile): boolean {
+  if (node.getStart(file) >= end || node.end <= start) return false;
+  // A nested function counts only as an inline callback (`kids.map((k) => k.kill())`), which runs where it is written.
+  if (ts.isFunctionLike(node) && !ts.isCallExpression(node.parent)) return false;
+  if (ts.isCallExpression(node) && node.getStart(file) >= start && node.end <= end) {
+    const callee = node.expression;
+    const name = ts.isIdentifier(callee) ? callee.text : ts.isPropertyAccessExpression(callee) ? callee.name.text : "";
+    if (KILL_EVIDENCE.test(name)) return true;
+  }
+  return ts.forEachChild(node, (child) => killsBetween(child, start, end, file) || undefined) ?? false;
+}
+
+function containsAwait(node: ts.Node): boolean {
+  if (ts.isAwaitExpression(node)) return true;
+  if (ts.isFunctionLike(node)) return false;
+  return ts.forEachChild(node, (child) => containsAwait(child) || undefined) ?? false;
+}
+
+/**
+ * The helper's returned release runs while the broker may still be live: called directly, or called
+ * later in the registering function body with no kill before it and no synchronous kill right after it.
+ */
+function releasedEarly(file: ts.SourceFile, call: ts.CallExpression, defs: Map<string, Binding[]>): boolean {
+  let outer: ts.Node = call;
+  while (ts.isParenthesizedExpression(outer.parent)) outer = outer.parent;
+  if (ts.isCallExpression(outer.parent) && outer.parent.expression === outer) return true;
+  const holder = outer.parent;
+  const name = ts.isVariableDeclaration(holder) && ts.isIdentifier(holder.name) && holder.initializer === outer ? holder.name
+    : ts.isBinaryExpression(holder) && holder.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(holder.left) && holder.right === outer
+      ? holder.left : undefined;
+  if (name === undefined) return false;
+  const record = (defs.get(name.text) ?? []).find((binding) => binding.offset === holder.getStart(file));
+  if (record === undefined) return false;
+  let body: ts.Node = call;
+  while (body.parent !== undefined && !ts.isFunctionLike(body)) body = body.parent;
+  const killedIn = (start: number, end: number): boolean =>
+    ts.forEachChild(body, (child) => killsBetween(child, start, end, file) || undefined) ?? false;
+  let early = false;
+  const visit = (node: ts.Node): void => {
+    if (early || node !== body && ts.isFunctionLike(node)) return;
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name.text
+      && node.getStart(file) > call.end
+      && resolvedBindings(name.text, defs, scopesAt(file, node.getStart(file)), node.getStart(file)).includes(record)) {
+      // `release(); broker.kill();` leaves no turn of the event loop in which a signal could land.
+      let statement: ts.Node = node;
+      while (statement.parent !== body && !ts.isBlock(statement.parent) && !ts.isSourceFile(statement.parent)) statement = statement.parent;
+      const container = statement.parent;
+      const siblings = ts.isBlock(container) || ts.isSourceFile(container) ? container.statements : undefined;
+      const next = siblings?.[siblings.findIndex((sibling) => sibling === statement) + 1];
+      const killedAfter = next !== undefined && !containsAwait(next) && killsBetween(next, next.getStart(file), next.end, file);
+      if (!killedIn(call.end, node.getStart(file)) && !killedAfter) early = true;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(body);
+  return early;
+}
+
 function teardownCalls(file: ts.SourceFile, defs: Map<string, Binding[]>, params: readonly ParameterBinding[]): ts.CallExpression[] {
   const imports = new Map<string, ts.Node>();
   const calls: ts.CallExpression[] = [];
@@ -501,10 +698,12 @@ function teardownCalls(file: ts.SourceFile, defs: Map<string, Binding[]>, params
     const scopes = scopesAt(file, offset);
     const local = resolvedBindings(callee.text, defs, scopes, offset);
     const localDepth = Math.max(0, ...local.map((binding) => binding.scopes.length));
-    // The helper must be the import itself, not a same-name local or parameter, and the call must be able to run.
+    // The helper must be the import itself, not a same-name local or parameter, the call must be able
+    // to run, and its release must not drop the broker while it is live.
     return local.every((binding) => binding.offset === imported.getStart(file))
       && !shadowedByParameter(callee.text, params, scopes, localDepth)
-      && reachable(file, offset, defs);
+      && reachable(file, offset, defs)
+      && !releasedEarly(file, call, defs);
   });
 }
 
@@ -525,7 +724,7 @@ function ownsBinding(
     const held = visibleBindings(argument.text, defs, scopesAt(file, argumentOffset), argumentOffset)
       .filter((binding) => !binding.uninitialized);
     // A declared-but-unassigned value is `undefined`, never a different child.
-    return held.length > 0 && held.every((binding) => binding === target);
+    return held.length > 0 && held.every((binding) => binding === target) && coRuns(file, offset, call, defs);
   });
 }
 /** Some call that resolves to THIS factory binding, not a same-name one, hands its result to the helper. */
@@ -602,13 +801,21 @@ const PATH_PRESERVING: Readonly<Record<string, readonly string[]>> = {
   "node:fs": ["mkdtempSync", "realpathSync"],
 };
 
-/** A later path segment that cannot climb out of, or replace, the tokened prefix. */
-function keepsPrefix(node: ts.Expression): boolean {
-  const text = ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ? node.text
-    : ts.isTemplateExpression(node) ? [node.head.text, ...node.templateSpans.map((span) => span.literal.text)].join("x")
-    : undefined;
-  return text !== undefined && !/^([\\/]|[A-Za-z]:)/.test(text) && !text.split(/[\\/]/).includes("..");
+/** A later path segment that cannot climb out of, or replace, the tokened prefix; each `${}` span must be proven safe. */
+function keepsPrefix(node: ts.Expression, spanSafe: (span: ts.Expression) => boolean): boolean {
+  const relative = (text: string): boolean => !/^([\\/]|[A-Za-z]:)/.test(text) && !text.split(/[\\/]/).includes("..");
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return relative(node.text);
+  if (!ts.isTemplateExpression(node) || !node.templateSpans.every((span) => spanSafe(span.expression))) return false;
+  // A proven span holds no separator, colon, or dot, so it is either empty or a plain name: try both, and
+  // refuse any colon, since a span beside it could complete a drive letter.
+  const parts = [node.head.text, ...node.templateSpans.map((span) => span.literal.text)];
+  return !parts.some((part) => part.includes(":")) && relative(parts.join("x")) && relative(parts.join(""));
 }
+
+const NUMERIC_OPERATORS: readonly ts.SyntaxKind[] = [
+  ts.SyntaxKind.MinusToken, ts.SyntaxKind.AsteriskToken, ts.SyntaxKind.SlashToken,
+  ts.SyntaxKind.PercentToken, ts.SyntaxKind.AsteriskAsteriskToken,
+];
 
 /** Path-builder names bound by an import, each with the local binding offset a dynamic import gives it. */
 function pathPreservingNames(file: ts.SourceFile): Map<string, number | undefined> {
@@ -655,11 +862,9 @@ type Provenance = {
 };
 
 /**
- * Does the token survive into the VALUE of `expr` on every path, not merely appear in it?
- * Mentioning the token is not proof: `token && "plain"`, `env.X || token`, `token.slice(0, 0)`, and
- * `pick(token)` all evaluate to a path without it. So only shapes known to keep their input count:
- * concatenation, template substitution, the imported path builders, and bindings whose every live value
- * carries it. Any other call or member read is unproven and reads as untokened.
+ * Does the token survive into the VALUE of `expr` on every path, not merely appear in it? Only shapes
+ * known to keep their input count: concatenation, template substitution, the imported path builders, and
+ * bindings whose every live value carries it. Any other call or member read is unproven.
  */
 function reachesToken(
   expr: string,
@@ -672,11 +877,12 @@ function reachesToken(
   if (seen.size > 16) return false;
   const returned = /^(?:await\s+)?\(?\s*([A-Za-z_$][\w$]*)\s*\(\s*\)\s*\)?\s*(?:\?\.|\.)\s*([A-Za-z_$][\w$]*)$/.exec(value);
   if (returned !== null) {
-    const candidates = context.results.filter((result) => result.name === returned[1]
-      && result.scopes.length <= scopes.length
-      && result.scopes.every((scope, index) => scopes[index] === scope));
-    const depth = Math.max(0, ...candidates.map((result) => result.scopes.length));
-    const nearest = candidates.filter((result) => result.scopes.length === depth);
+    // The call must resolve to the recorded declaration itself, never a same-name parameter or shadow.
+    const callee = resolvedBindings(returned[1]!, context.defs, scopes, offset);
+    const calleeDepth = Math.max(0, ...callee.map((binding) => binding.scopes.length));
+    if (callee.length === 0 || shadowedByParameter(returned[1]!, context.params, scopes, calleeDepth)) return false;
+    const nearest = context.results.filter((result) => result.name === returned[1]
+      && callee.every((binding) => binding.offset === functionBinding(result.declaration)?.offset));
     if (nearest.length > 0) {
       return nearest.every((result) => {
         const field = result.fields.get(returned[2]!) ?? [];
@@ -709,11 +915,13 @@ function reachesToken(
     if (ts.isCallExpression(node)) {
       if (!ts.isIdentifier(node.expression) || !preservingCallee(node.expression.text)) return false;
       const args = node.arguments;
+      const spanSafe = (span: ts.Expression): boolean => plainSegment(span.getText(parsed), context, scopes, offset, seen);
       // A tokened segment survives only when nothing after it can replace or climb out of it.
       return args.some((argument, index) => !ts.isSpreadElement(argument) && survives(argument)
-        && args.slice(index + 1).every(keepsPrefix));
+        && args.slice(index + 1).every((later) => keepsPrefix(later, spanSafe)));
     }
-    if (ts.isIdentifier(node)) return identifierSurvives(node.text);
+    if (ts.isIdentifier(node)) return everyValue(node.text, context, scopes, offset, seen, true,
+      (arg, path) => reachesToken(arg.value, context, arg.scopes, arg.offset, path));
     return false;
   };
   const preservingCallee = (name: string): boolean => {
@@ -726,34 +934,84 @@ function reachesToken(
     // An unimported builder name with no local binding is a fixture's elided import.
     return context.preserving.has(name) || Object.values(PATH_PRESERVING).some((names) => names.includes(name));
   };
-  const identifierSurvives = (id: string): boolean => {
-    const local = visibleBindings(id, context.defs, scopes, offset);
-    const localDepth = Math.max(0, ...local.map((binding) => binding.scopes.length));
-    const parameters = context.params.filter((parameter) => parameter.name === id
-      && parameter.scopes.length <= scopes.length
-      && parameter.scopes.every((scope, index) => scopes[index] === scope));
-    const parameterDepth = Math.max(0, ...parameters.map((parameter) => parameter.scopes.length));
-    if (parameters.length > 0 && parameterDepth > localDepth) {
-      return parameters.filter((parameter) => parameter.scopes.length === parameterDepth).some((parameter) => {
-        const key = `${id}@param:${parameter.node.getStart()}`;
-        if (seen.has(key) || parameter.args.length === 0) return false;
-        const path = new Set(seen);
-        path.add(key);
-        return parameter.args.every((arg) => reachesToken(arg.value, context, arg.scopes, arg.offset, path));
-      });
-    }
-    // Every value the name may hold at this point must carry the token, not just the latest write.
-    return local.length > 0 && local.every((binding) => {
-      if (binding.token) return true;
-      if (binding.uninitialized || binding.value === "") return false;
-      const key = `${id}@${binding.offset}`;
-      if (seen.has(key)) return false;
+  return survives(statement.expression);
+}
+
+/** Every value `id` may hold at `offset`, through its live local bindings or the parameter it names, passes `accept`. */
+function everyValue(
+  id: string,
+  context: Provenance,
+  scopes: readonly ts.Node[],
+  offset: number,
+  seen: ReadonlySet<string>,
+  tokenAccepted: boolean,
+  accept: (value: CallArgument, path: Set<string>) => boolean,
+): boolean {
+  const local = visibleBindings(id, context.defs, scopes, offset);
+  const localDepth = Math.max(0, ...local.map((binding) => binding.scopes.length));
+  const parameters = context.params.filter((parameter) => parameter.name === id
+    && parameter.scopes.length <= scopes.length
+    && parameter.scopes.every((scope, index) => scopes[index] === scope));
+  const parameterDepth = Math.max(0, ...parameters.map((parameter) => parameter.scopes.length));
+  if (parameters.length > 0 && parameterDepth > localDepth) {
+    return parameters.filter((parameter) => parameter.scopes.length === parameterDepth).some((parameter) => {
+      const key = `${id}@param:${parameter.node.getStart()}`;
+      if (seen.has(key) || parameter.args.length === 0) return false;
       const path = new Set(seen);
       path.add(key);
-      return reachesToken(binding.value, context, binding.valueScopes, binding.valueOffset, path);
+      return parameter.args.every((arg) => accept(arg, path));
     });
+  }
+  return local.length > 0 && local.every((binding) => {
+    if (binding.token) return tokenAccepted;
+    if (binding.uninitialized || binding.value === "") return false;
+    const key = `${id}@${binding.offset}`;
+    if (seen.has(key)) return false;
+    const path = new Set(seen);
+    path.add(key);
+    return accept({ value: binding.value, scopes: binding.valueScopes, offset: binding.valueOffset }, path);
+  });
+}
+
+/** `/[^a-z0-9_-]/g`-style class: the characters a `replace(class, "")` leaves are only letters, digits, `_`, `-`. */
+function stripsToName(regex: string): boolean {
+  const match = /^\/\[\^([^\]]*)\]\/([a-z]*)$/.exec(regex);
+  if (match === null || !match[2]!.includes("g")) return false;
+  const kept = match[1]!.replace(/^-|-$/g, "");
+  return /^(?:[a-z]-[a-z]|[A-Z]-[A-Z]|[0-9]-[0-9]|[A-Za-z0-9_])*$/.test(kept);
+}
+
+/** A template span value that is a plain name or a number: no separator, colon, or dot-only segment. */
+function plainSegment(expr: string, context: Provenance, scopes: readonly ts.Node[], offset: number, seen: ReadonlySet<string>): boolean {
+  if (seen.size > 16) return false;
+  const parsed = ts.createSourceFile("segment.ts", `(${unwrapped(expr)});`, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const statement = parsed.statements[0];
+  if (statement === undefined || !ts.isExpressionStatement(statement) || parsed.statements.length !== 1) return false;
+  const plain = (node: ts.Expression): boolean => {
+    if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isNonNullExpression(node)
+      || ts.isSatisfiesExpression(node)) return plain(node.expression);
+    if (ts.isNumericLiteral(node)) return true;
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return /^[A-Za-z0-9_-]*$/.test(node.text);
+    if (ts.isTemplateExpression(node)) return [node.head.text, ...node.templateSpans.map((span) => span.literal.text)]
+      .every((part) => /^[A-Za-z0-9_-]*$/.test(part)) && node.templateSpans.every((span) => plain(span.expression));
+    // Arithmetic and `.length` always yield a number, which cannot name a separator or a parent.
+    if (ts.isPrefixUnaryExpression(node)) return node.operator !== ts.SyntaxKind.ExclamationToken;
+    if (ts.isBinaryExpression(node)) {
+      if (NUMERIC_OPERATORS.includes(node.operatorToken.kind)) return true;
+      return node.operatorToken.kind === ts.SyntaxKind.PlusToken && plain(node.left) && plain(node.right);
+    }
+    if (ts.isPropertyAccessExpression(node)) return node.name.text === "length";
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "replace"
+      && node.arguments.length === 2 && ts.isRegularExpressionLiteral(node.arguments[0]!)) {
+      const replacement = node.arguments[1]!;
+      return stripsToName(node.arguments[0]!.text) && (ts.isStringLiteral(replacement) || ts.isNoSubstitutionTemplateLiteral(replacement))
+        && /^[A-Za-z0-9_-]*$/.test(replacement.text);
+    }
+    if (ts.isIdentifier(node)) return everyValue(node.text, context, scopes, offset, seen, false,
+      (arg, path) => plainSegment(arg.value, context, arg.scopes, arg.offset, path));
+    return false;
   };
-  return survives(statement.expression);
+  return plain(statement.expression);
 }
 
 /** Callees that actually START a process. Anything else that merely NAMES the binary (`need(...)`,
@@ -991,6 +1249,27 @@ function resolvesNatsServer(
         resolvesNatsServer(arg.value, defs, params, arg.scopes, arg.offset, new Set([...seen, key])));
     });
 }
+/** The function names a for-of array-destructured binding takes from a literal array of tuples, or none. */
+function tupleAliasTargets(callee: ts.Identifier): string[] {
+  let scope: ts.Node | undefined = callee.parent;
+  while (scope !== undefined && !ts.isForOfStatement(scope)) scope = ts.isFunctionLike(scope) ? undefined : scope.parent;
+  for (; scope !== undefined; scope = scope.parent) {
+    if (!ts.isForOfStatement(scope) || !ts.isVariableDeclarationList(scope.initializer)) continue;
+    const pattern = scope.initializer.declarations[0]?.name;
+    if (pattern === undefined || !ts.isArrayBindingPattern(pattern)) continue;
+    const index = pattern.elements.findIndex((element) => ts.isBindingElement(element) && ts.isIdentifier(element.name) && element.name.text === callee.text);
+    if (index < 0) continue;
+    let list: ts.Expression = scope.expression;
+    while (ts.isAsExpression(list) || ts.isParenthesizedExpression(list) || ts.isSatisfiesExpression(list)) list = list.expression;
+    if (!ts.isArrayLiteralExpression(list)) return [];
+    return list.elements.flatMap((row) => {
+      const entry = ts.isArrayLiteralExpression(row) ? row.elements[index] : undefined;
+      return entry !== undefined && ts.isIdentifier(entry) ? [entry.text] : [];
+    });
+  }
+  return [];
+}
+
 /** Each parameter and returned object field keeps only calls bound to its declaration. */
 function functionProvenance(src: string, file: ts.SourceFile): { params: ParameterBinding[]; results: FunctionResult[] } {
   type FunctionInfo = {
@@ -1069,15 +1348,14 @@ function functionProvenance(src: string, file: ts.SourceFile): { params: Paramet
       }
     }
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
-      calls.push({
-        name: node.expression.text,
-        scopes: parentScopes,
-        args: node.arguments.map((arg) => ({
-          value: src.slice(arg.getStart(file), arg.end),
-          scopes: scopesAt(file, arg.getStart(file)),
-          offset: arg.getStart(file),
-        })),
-      });
+      const args = node.arguments.map((arg) => ({
+        value: src.slice(arg.getStart(file), arg.end),
+        scopes: scopesAt(file, arg.getStart(file)),
+        offset: arg.getStart(file),
+      }));
+      calls.push({ name: node.expression.text, scopes: parentScopes, args });
+      // `for (const [, start] of [["a", startA], ["b", startB]])` calls each listed function through `start`.
+      for (const name of tupleAliasTargets(node.expression)) calls.push({ name, scopes: parentScopes, args });
     }
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
       const receiver = node.expression.expression;
