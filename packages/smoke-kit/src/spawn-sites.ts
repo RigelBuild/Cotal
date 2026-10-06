@@ -181,7 +181,6 @@ type Binding = {
   readonly valueScopes: readonly ts.Node[];
   readonly valueOffset: number;
   readonly token: boolean;
-  readonly assignment: boolean;
 };
 
 /** Collect local initializers without merging declarations from sibling scopes. */
@@ -196,10 +195,9 @@ function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding
     valueScopes: readonly ts.Node[] = scopes,
     valueOffset: number = offset,
     token = false,
-    assignment = false,
   ): void => {
     const list = defs.get(name) ?? [];
-    list.push({ value, scopes, offset, valueScopes, valueOffset, token, assignment });
+    list.push({ value, scopes, offset, valueScopes, valueOffset, token });
     defs.set(name, list);
   };
   const visit = (node: ts.Node, parentScopes: readonly ts.Node[]): void => {
@@ -263,7 +261,7 @@ function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding
       const value = selfReference ? `${prior.value} ${assigned}` : assigned;
       const valueScopes = selfReference ? prior.valueScopes : scopes;
       const valueOffset = selfReference ? prior.valueOffset : node.right.getStart(file);
-      add(node.left.text, value, targetScopes, node.getStart(file), valueScopes, valueOffset, false, true);
+      add(node.left.text, value, targetScopes, node.getStart(file), valueScopes, valueOffset);
     }
     ts.forEachChild(node, (child) => collectAssignments(child, scopes));
   };
@@ -349,7 +347,7 @@ function factoryNameAt(file: ts.SourceFile, offset: number): string | undefined 
   let enclosing: ts.FunctionLikeDeclaration | undefined;
   const visit = (node: ts.Node): void => {
     if (offset < node.getStart(file) || offset > node.end) return;
-    if (ts.isFunctionLike(node)) enclosing = node;
+    if (ts.isFunctionLike(node) && "body" in node) enclosing = node;
     ts.forEachChild(node, visit);
   };
   visit(file);
