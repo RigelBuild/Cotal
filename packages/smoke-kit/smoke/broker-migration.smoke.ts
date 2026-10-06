@@ -469,6 +469,49 @@ cell("the enumerator follows tokened provenance through later bindings and helpe
     rmSync(scratch, { recursive: true, force: true });
   }
 });
+cell("the enumerator follows destructured property provenance without borrowing siblings", () => {
+  const scratch = mkdtempSync(join(tmpdir(), `${SMOKE_BROKER_TOKEN}migration-destructured-`));
+  try {
+    execFileSync("git", ["init", "-q", scratch]);
+    const planted = join(scratch, "smoke", "destructured.smoke.ts");
+    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    writeFileSync(planted,
+      `import { spawn } from "node:child_process";\n` +
+      `import { SMOKE_BROKER_TOKEN } from "@cotal-ai/smoke-kit";\n` +
+      `function first({ path }: { path: string }, hint: string) { spawn("nats-server", ["-sd", path]); }\n` +
+      `function second({ path, hint }: { path: string; hint: string }) { spawn("nats-server", ["-sd", path]); }\n` +
+      `first({ path: "plain" }, SMOKE_BROKER_TOKEN);\n` +
+      `second({ path: "plain", hint: SMOKE_BROKER_TOKEN });\n`);
+    execFileSync("git", ["-C", scratch, "add", "-A"]);
+    const found = enumerateSpawnSites(scratch);
+    assert.equal(found.length, 2);
+    assert.ok(found.every((site) => !site.tokened), "neither unrelated argument nor sibling property tokens path");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+cell("the enumerator sees dynamic-import and method broker launches", () => {
+  const scratch = mkdtempSync(join(tmpdir(), `${SMOKE_BROKER_TOKEN}migration-method-`));
+  try {
+    execFileSync("git", ["init", "-q", scratch]);
+    const planted = join(scratch, "smoke", "method.smoke.ts");
+    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    writeFileSync(planted,
+      `const { spawn: launch } = await import("node:child_process");\n` +
+      `const binary = (await resolveNatsServer()).bin;\n` +
+      `const direct = launch(binary, ["-sd", "plain"]);\n` +
+      `class Broker { start(binary: string, path: string) { return launch(binary, ["-sd", path]); } }\n` +
+      `const object = { start(binary: string, path: string) { return launch(binary, ["-sd", path]); } };\n` +
+      `new Broker().start("nats-server", "plain"); object.start("nats-server", "plain");\n`);
+    execFileSync("git", ["-C", scratch, "add", "-A"]);
+    const found = enumerateSpawnSites(scratch);
+    assert.equal(found.length, 3, "dynamic import and both method bodies must be counted");
+    assert.ok(found.every((site) => !site.tokened), "method arguments remain untokened");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
 cell("the enumerator keeps reassignment provenance in the execution scope", () => {
   const scratch = mkdtempSync(join(tmpdir(), `${SMOKE_BROKER_TOKEN}migration-assignment-scope-`));
   try {

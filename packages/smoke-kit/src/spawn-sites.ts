@@ -392,7 +392,7 @@ function unwrapped(expr: string): string {
 const IGNORED_IDS = new Set(["join", "resolve", "tmpdir", "mkdtempSync", "mkdirSync", "writeFileSync", "String", "process", "env"]);
 
 type CallArgument = { readonly value: string; readonly scopes: readonly ts.Node[]; readonly offset: number };
-type ParameterBinding = { readonly node: ts.Node; readonly name: string; readonly scopes: readonly ts.Node[]; readonly args: CallArgument[] };
+type ParameterBinding = { readonly node: ts.Node; readonly name: string; readonly index: number; readonly property?: string; readonly scopes: readonly ts.Node[]; readonly args: CallArgument[] };
 type FunctionResult = { readonly declaration: ts.Node; readonly name: string; readonly scopes: readonly ts.Node[]; readonly fields: Map<string, CallArgument[]> };
 
 function reachesToken(
@@ -488,11 +488,18 @@ function processAliases(file: ts.SourceFile): { names: Set<string>; namespaces: 
     && value.arguments.length === 1 && ts.isStringLiteral(value.arguments[0]!)
     && (value.arguments[0]!.text === "node:child_process" || value.arguments[0]!.text === "child_process");
   let changed = true;
+  const isDynamicImport = (value: ts.Expression | undefined): boolean => {
+    const imported = value !== undefined && ts.isAwaitExpression(value) ? value.expression : value;
+    return imported !== undefined && ts.isCallExpression(imported)
+      && imported.expression.kind === ts.SyntaxKind.ImportKeyword
+      && imported.arguments.length === 1 && ts.isStringLiteral(imported.arguments[0]!)
+      && (imported.arguments[0]!.text === "node:child_process" || imported.arguments[0]!.text === "child_process");
+  };
   while (changed) {
     changed = false;
     for (const declaration of declarations) {
       const value = declaration.initializer;
-      if (ts.isIdentifier(declaration.name) && isRequire(value) && !namespaces.has(declaration.name.text)) {
+      if (ts.isIdentifier(declaration.name) && (isRequire(value) || isDynamicImport(value)) && !namespaces.has(declaration.name.text)) {
         namespaces.add(declaration.name.text);
         changed = true;
       } else if (ts.isIdentifier(declaration.name) && value !== undefined
@@ -509,7 +516,7 @@ function processAliases(file: ts.SourceFile): { names: Set<string>; namespaces: 
         changed = true;
       } else if (ts.isObjectBindingPattern(declaration.name)) {
         const namespace = value !== undefined && ts.isIdentifier(value) && namespaces.has(value.text)
-          || isRequire(value);
+          || isRequire(value) || isDynamicImport(value);
         if (!namespace) continue;
         for (const element of declaration.name.elements) {
           const property = element.propertyName ?? element.name;
@@ -520,7 +527,7 @@ function processAliases(file: ts.SourceFile): { names: Set<string>; namespaces: 
             && imported.arguments.length === 1 && ts.isStringLiteral(imported.arguments[0]!)
             ? imported.arguments[0]!.text
             : "";
-          const childProcess = isRequire(value) || module === "node:child_process" || module === "child_process"
+          const childProcess = isRequire(value) || isDynamicImport(value) || module === "node:child_process" || module === "child_process"
             || value !== undefined && ts.isIdentifier(value) && namespaces.has(value.text);
           if (childProcess && !names.has(element.name.text)) {
             names.add(element.name.text);
@@ -717,16 +724,29 @@ function functionProvenance(src: string, file: ts.SourceFile): { params: Paramet
             ? parameter.name.elements.flatMap((element) => ts.isOmittedExpression(element) ? []
               : ts.isIdentifier(element.name) ? [element.name.text] : [])
             : [];
-        for (const name of names) parameters.push({ node: parameter, name, scopes, args: [] });
+        for (const name of names) {
+          const element = ts.isObjectBindingPattern(parameter.name)
+            ? parameter.name.elements.find((entry) => ts.isIdentifier(entry.name) && entry.name.text === name)
+            : undefined;
+          const property = element === undefined ? undefined : element.propertyName ?? element.name;
+          parameters.push({ node: parameter, name, index: node.parameters.indexOf(parameter),
+            property: property !== undefined && (ts.isIdentifier(property) || ts.isStringLiteral(property)) ? property.text : undefined,
+            scopes, args: [] });
+        }
       }
     }
     if (ts.isCatchClause(node) && node.variableDeclaration !== undefined && ts.isIdentifier(node.variableDeclaration.name)) {
-      parameters.push({ node: node.variableDeclaration, name: node.variableDeclaration.name.text, scopes, args: [] });
+      parameters.push({ node: node.variableDeclaration, name: node.variableDeclaration.name.text, index: -1, scopes, args: [] });
     }
     if (ts.isFunctionLike(node) && "body" in node && node.body !== undefined) {
       const parent = node.parent;
       const name = ts.isFunctionDeclaration(node) ? node.name?.text
         : ts.isVariableDeclaration(parent) && ts.isIdentifier(parent.name) ? parent.name.text
+        : ts.isMethodDeclaration(node) && ts.isIdentifier(node.name) && ts.isClassDeclaration(parent) && parent.name
+          ? `${parent.name.text}.${node.name.text}`
+        : ts.isMethodDeclaration(node) && ts.isIdentifier(node.name) && ts.isObjectLiteralExpression(parent)
+          && ts.isVariableDeclaration(parent.parent) && ts.isIdentifier(parent.parent.name)
+          ? `${parent.parent.name.text}.${node.name.text}`
         : undefined;
       if (name !== undefined) {
         const ownParameters = parameters.filter((parameter) => parameter.scopes === scopes);
@@ -770,6 +790,15 @@ function functionProvenance(src: string, file: ts.SourceFile): { params: Paramet
         })),
       });
     }
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+      const receiver = node.expression.expression;
+      const name = ts.isIdentifier(receiver) ? `${receiver.text}.${node.expression.name.text}`
+        : ts.isNewExpression(receiver) && ts.isIdentifier(receiver.expression)
+          ? `${receiver.expression.text}.${node.expression.name.text}` : undefined;
+      if (name !== undefined) calls.push({ name, scopes: parentScopes, args: node.arguments.map((arg) => ({
+        value: src.slice(arg.getStart(file), arg.end), scopes: scopesAt(file, arg.getStart(file)), offset: arg.getStart(file),
+      })) });
+    }
     ts.forEachChild(node, (child) => visit(child, scopes));
   };
   visit(file, []);
@@ -779,9 +808,21 @@ function functionProvenance(src: string, file: ts.SourceFile): { params: Paramet
       && fn.scopes.every((scope, index) => call.scopes[index] === scope));
     const nearestDepth = Math.max(0, ...candidates.map((fn) => fn.scopes.length));
     for (const fn of candidates.filter((candidate) => candidate.scopes.length === nearestDepth)) {
-      fn.parameters.forEach((parameter, index) => {
-        const argument = call.args[index];
-        if (argument !== undefined) parameter.args.push(argument);
+      fn.parameters.forEach((parameter) => {
+        const argument = call.args[parameter.index];
+        if (argument === undefined) return;
+        if (parameter.property === undefined) { parameter.args.push(argument); return; }
+        const parsed = ts.createSourceFile("argument.ts", `const argument = ${argument.value};`, ts.ScriptTarget.Latest, true);
+        const statement = parsed.statements[0];
+        const initializer = statement !== undefined && ts.isVariableStatement(statement)
+          ? statement.declarationList.declarations[0]?.initializer : undefined;
+        if (!initializer || !ts.isObjectLiteralExpression(initializer)) return;
+        const member = initializer.properties.find((entry) => ts.isPropertyAssignment(entry)
+          && (ts.isIdentifier(entry.name) || ts.isStringLiteral(entry.name)) && entry.name.text === parameter.property);
+        if (member !== undefined && ts.isPropertyAssignment(member)) parameter.args.push({
+          ...argument,
+          value: member.initializer.getText(parsed),
+        });
       });
     }
   }
