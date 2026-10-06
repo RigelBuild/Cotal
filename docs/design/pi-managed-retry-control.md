@@ -4,11 +4,11 @@ A design record, not shipped behavior. Every current-behavior claim names the fi
 was read from; everything else is proposed. Pi paths are `@earendil-works/pi-coding-agent` 0.79.10
 `dist/`.
 
-**Status:** draft. Implements RIG-4293 option 1 with the RIG-4543 boundaries Matt approved (see
-Resolved decisions). The exact seat root is open (RIG-4669, Open Questions). Managed Cotal Pi seats
-disable Pi's automatic provider retry before the first provider turn. Operator sessions are
-unchanged, and overflow compaction stays host-owned. PR #37 (RIG-4249) stays draft until this
-control and the queued-inbound races are verified.
+**Status:** draft. Implements RIG-4293 option 1 with the RIG-4543 boundaries and the RIG-4669 seat
+root Matt approved (see Resolved decisions). Managed Cotal Pi seats disable Pi's automatic provider
+retry before the first provider turn. Operator sessions are unchanged, and overflow compaction stays
+host-owned. PR #37 (RIG-4249) stays draft until this control and the queued-inbound races are
+verified.
 
 ## Problem / Intent
 
@@ -238,17 +238,35 @@ and the loader aliases it to the host copy.
 - **Only `retry.enabled` is forced.** Compaction and `retry.provider.*` are copied unchanged
   (decision 6).
 - **Seat dir:** `<seat root>/<name>-<lifecycleUid>`, private user state outside the shared
-  workspace (decision 3). The exact `<seat root>` is open (RIG-4669, Open Questions). Whichever root
-  is picked, `seatAgentRoot` resolves it from the launch env only:
-  - a relative value in any variable it reads is refused, never resolved against the cwd;
-  - a missing HOME, when no set override applies, fails; there is no `os.homedir()` fallback;
-  - `homeCotalDir` (`packages/workspace/src/mesh-registry.ts`) and the Claude connector's
-    `cotalHome` (`extensions/connector-claude-code/src/setup.ts`) have the precedence a
-    `COTAL_HOME` root would keep (`COTAL_HOME`, else `%LOCALAPPDATA%\Cotal` on win32, else `.cotal`
-    under HOME). They are not reused as is: `if (process.env.COTAL_HOME) return
-    process.env.COTAL_HOME;` accepts a relative value, and the last step calls `homedir()`.
+  workspace and outside `COTAL_HOME` (decisions 3 and 5). `seatAgentRoot` reads only the launch
+  env, first match wins:
+  1. `XDG_STATE_HOME`, on every platform: `<XDG_STATE_HOME>/cotal/pi-agent`;
+  2. on win32, `LOCALAPPDATA`: `<LOCALAPPDATA>\Cotal\state\pi-agent`;
+  3. on Linux and macOS, `HOME`: `<HOME>/.local/state/cotal/pi-agent`.
 
-  The root and the seat dir are created with `mkSecretDir` (0700).
+  The order and the names follow `globalConfigDir` (`packages/core/src/connector-config.ts`): it
+  checks `XDG_CONFIG_HOME` first on every platform, then `%APPDATA%\Cotal` on win32, then
+  `~/.config/cotal`. The step 3 default is the XDG Base Directory one ("a default equal to
+  `$HOME`/.local/state should be used"). Step 2 uses `LOCALAPPDATA`, not roaming `APPDATA`,
+  because seat links name machine-local paths. `launchEnv` forwards all three (`OS_ENV_ALLOW`,
+  `extensions/connector-core/src/launch.ts`). Rules:
+  - a value that is empty after `trim()` counts as unset, as in `globalConfigDir` and the XDG spec;
+  - a relative value throws, naming its variable; it is never resolved against the cwd. The XDG
+    spec calls a relative path invalid and says to ignore it. Ignoring it would move every seat
+    dir to the next step without a word, so this refuses instead (Fail loudly);
+  - when the step's variable is missing, the call throws. There is no `os.homedir()` fallback,
+    which on POSIX falls back to a passwd lookup;
+  - `COTAL_HOME` and `XDG_CONFIG_HOME` are never read. `cotal service install` points both into
+    `serviceStateDir` (`<unit dir>/cotal-service/<spaceKey>/`), and `uninstall` runs
+    `rmSync(serviceStateDir(dir, fields.mesh), { recursive: true, force: true })`
+    (`implementations/cli/src/commands/service.ts`). A root under either would lose retained seat
+    dirs.
+
+  On win32 the root shares the `%LOCALAPPDATA%\Cotal` parent with the default `COTAL_HOME` tree
+  (`homeCotalDir`, `packages/workspace/src/mesh-registry.ts`). `state\` is not part of that tree
+  and does not move with `COTAL_HOME`; `cotal service` does not run on win32. The root and the seat
+  dir are created with `mkSecretDir` (`mkdirSync(…, { recursive: true, mode: 0o700 })` plus
+  `hardenPrivate`).
   - `buildLaunch` validates both parts of `<name>-<lifecycleUid>` before any path is joined from
     them. `assertValidName` (`packages/core/src/resolve.ts`) refuses `/` and `\` in the name.
     `assertLifecycleToken` (`packages/core/src/subjects.ts`, `/^[a-z0-9]{26,32}$/`) checks the
@@ -260,8 +278,10 @@ and the loader aliases it to the host copy.
   - Fork `parentSession` headers record seat paths (`SessionManager.forkFrom`), because Pi uses
     `resolvePath`, not `realpath` (F6). Retention (decision 5) keeps those paths resolvable.
 - **Operator agent dir:** the launch env's `PI_CODING_AGENT_DIR` if the operator forwarded it via
-  `envAllow` (`launchEnv`, `extensions/connector-core/src/launch.ts`), else
-  `join(<launch HOME>, ".pi", "agent")`, with `~` expanded against that HOME.
+  `envAllow` (`launchEnv`), else `join(<launch home>, ".pi", "agent")`, with `~` expanded against
+  that home. The launch home is `USERPROFILE` on win32 and `HOME` elsewhere: the variables
+  `os.homedir()` reads first (Node `os` docs), and Pi's `getAgentDir` (`config.js`) calls
+  `homedir()`. A missing or relative launch home throws, with no `os.homedir()` fallback.
 - **win32:** dir links are junctions, and a link that cannot be made fails loudly.
 - **One PR, no inert flag.**
 
@@ -275,9 +295,11 @@ New file `extensions/pi/src/retry-control.ts`:
 export const COTAL_PI_AGENT_DIR = "COTAL_PI_AGENT_DIR";
 export const PI_VERSION = "0.79.10";
 export function operatorAgentDir(env: Readonly<Record<string, string | undefined>>): string;
-/** The private seat root (RIG-4669) from the launch env. Throws "pi connector: …" on a relative
- *  value or a missing HOME. */
-export function seatAgentRoot(env: Readonly<Record<string, string | undefined>>): string;
+/** `<root>/pi-agent` for managed Pi seats, from the launch env only (Global Constraints, Seat
+ *  dir). Pure: creates nothing. Throws "pi connector: …" naming the variable on a missing or
+ *  relative value. `platform` picks `path.win32` or `path.posix`, so every branch runs in any OS's
+ *  tests, as `resolveComspec` (`packages/workspace/src/win-cmd.ts`) uses `win32.join`. */
+export function seatAgentRoot(env: Readonly<Record<string, string | undefined>>, platform: NodeJS.Platform = process.platform): string;
 /** Idempotent and safe against a live seat. Throws "pi connector: …". Never deletes. */
 export function convergeSeatAgentDir(seatDir: string, operatorDir: string): void;
 ```
@@ -347,17 +369,39 @@ SDK callers of `piConnector.buildLaunch` (exported from `@cotal-ai/pi`) that omi
 production launcher passes one: `Manager` spawn and resume, the `Manager` restart path (it reuses
 the spawn opts) and `cotal spawn`. The seat dir does not depend on `workspaceRoot`.
 
-**Tests** (`pi.smoke.ts` `buildLaunch` block, a temp `HOME`, temp values for the variables the
-RIG-4669 root reads, and a fake operator dir). Assert:
+**Tests** (`pi.smoke.ts`). The Windows required lane runs `pnpm test`
+(`.github/workflows/windows.yml`, "Unit tests"), which reaches `pi.smoke.ts` through the
+`extensions/pi` `test` script, so the launch cells run on win32 too.
 
-- the env vars are set, and the seat dir is `<seatAgentRoot(env)>/<name>-<lifecycleUid>` with mode
-  0700 on POSIX, for each resolution step RIG-4669 fixes;
-- nothing is created at `<workspaceRoot>/.cotal/pi-agent`;
+Resolver cells call `seatAgentRoot(env, platform)` with literal paths and create nothing:
+
+- `{ XDG_STATE_HOME: "/s", HOME: "/h" }` on `linux` and `darwin` gives `/s/cotal/pi-agent`;
+  `{ XDG_STATE_HOME: "C:\\s", LOCALAPPDATA: "C:\\l" }` on `win32` gives `C:\s\cotal\pi-agent`;
+- `{ HOME: "/h" }` on `linux` and `darwin` gives `/h/.local/state/cotal/pi-agent`;
+- `{ XDG_STATE_HOME: "  ", HOME: "/h" }` on `linux` gives the `HOME` default;
+- `{ LOCALAPPDATA: "C:\\l", USERPROFILE: "C:\\u", HOME: "C:\\h" }` on `win32` gives
+  `C:\l\Cotal\state\pi-agent`;
+- adding `COTAL_HOME` and `XDG_CONFIG_HOME` to any cell above leaves its result unchanged;
+- each refusal names its variable: `XDG_STATE_HOME: "state"` on every platform; `C:state` (drive
+  relative) on `win32`; no `HOME`, and `HOME: "h"`, on `linux`; no `LOCALAPPDATA` (with
+  `USERPROFILE` and `HOME` set), and `LOCALAPPDATA: "l"`, on `win32`.
+
+Launch cells run `buildLaunch` with a temp `HOME` (`USERPROFILE` on win32), a temp `XDG_STATE_HOME`,
+temp `COTAL_HOME` and `XDG_CONFIG_HOME`, and a fake operator dir. Assert:
+
+- the env vars are set, and the seat dir is
+  `<XDG_STATE_HOME>/cotal/pi-agent/<name>-<lifecycleUid>`, with mode 0700 on POSIX;
+- nothing is created under `COTAL_HOME`, `XDG_CONFIG_HOME` or `<workspaceRoot>/.cotal/pi-agent`;
 - the seat settings are `{ enabled: false, maxRetries: 7 }` and other keys are kept;
 - every allowlisted link exists, including a dangling `auth.json`;
 - missing dirs were created in the operator dir;
 - the operator `settings.json` bytes are unchanged;
-- a second call leaves link inodes and a planted `pi-debug.log` intact;
+- a second call with the same uid leaves link inodes and a planted `pi-debug.log` intact;
+- a call with a second uid leaves the first seat dir and its `settings.json` bytes in place;
+- on POSIX, with `XDG_STATE_HOME` unset and `COTAL_HOME=<svc>`, `XDG_CONFIG_HOME=<svc>/config` as
+  a service unit sets them, `rmSync(<svc>, { recursive: true, force: true })` (what `uninstall`
+  does to `serviceStateDir`) leaves the seat dir under `<HOME>/.local/state/cotal/pi-agent`, with
+  its `settings.json`;
 - `rmSync(seatDir, { recursive: true })` leaves operator files in place;
 - the `envAllow` forwarded dir is honored.
 
@@ -366,8 +410,8 @@ Each refusal case throws its message:
 - `apiKeys`, or `oauth.json` present;
 - `extensions: ["x/../../e.ts"]`;
 - a relative `sessionDir`;
-- a relative value in a variable the root reads;
-- no HOME in the launch env and no root override set;
+- a relative `XDG_STATE_HOME`, and nothing is created under the cwd;
+- no launch home (`HOME`, or `USERPROFILE` on win32) and no forwarded `PI_CODING_AGENT_DIR`;
 - a symlinked seat root;
 - a real dir at an allowlisted name;
 - no `lifecycleUid`;
@@ -387,7 +431,8 @@ Existing smokes change with the new refusal:
 - **`pi-sdk.smoke.ts`.** The `pi-events-sdk` launch passes a `lifecycleUid`.
 - **`bin/smoke/seat-env-scope.smoke.ts`.** It already passes `mintLifecycleUid()`.
 
-All three run under the temp home above, so no smoke converges a seat in the real operator home.
+All three set a temp `HOME` (`USERPROFILE` on win32) and a temp `XDG_STATE_HOME` before the first
+`buildLaunch`, so no smoke converges a seat or creates operator dirs in the real user home.
 
 ### Task 2: verify in the extension
 
@@ -556,7 +601,10 @@ In `pi-sdk.smoke.ts` (existing smokes use `SettingsManager.inMemory`):
   - that seat-pane settings changes persist only to the seat copy;
   - the runtime pin.
 - **`docs/design/session-recovery.md` § 4.2.** Amend the adopted recovery-rule paragraph to match.
-- **`docs/config.md`.** Document the seat root RIG-4669 picks and the variables that move it.
+- **`docs/config.md`.** Add a § State files after § Configuration files: `pi-agent/` under the
+  seat root, its precedence, that `COTAL_HOME` does not move it and `service uninstall` does not
+  remove it, that Cotal keeps one seat dir per lifecycle, and the shared `%LOCALAPPDATA%\Cotal`
+  parent on win32.
 - **Changeset.** Add `.changeset/pi-managed-retry-off.md` (`"@cotal-ai/pi": patch`).
 - **Rollout.** A seat gets the control at its next launch or supervised restart. Seats that are
   already running keep retry until then.
@@ -564,8 +612,8 @@ In `pi-sdk.smoke.ts` (existing smokes use `SettingsManager.inMemory`):
 ## Tasks
 
 - [ ] Task 1: `operatorAgentDir`, `seatAgentRoot`, `convergeSeatAgentDir` and the `buildLaunch`
-  wiring (uid validation, seat dir containment, no `unmanaged` fallback), with the location,
-  refusal and convergence tests and the smoke updates. `seatAgentRoot` waits on RIG-4669.
+  wiring (uid validation, seat dir containment, no `unmanaged` fallback), with the resolver,
+  location, retention, refusal and convergence tests and the smoke updates.
 - [ ] Task 2: `checkManagedRetryOff`, the gate map, `closeRetryGate`, `gateClosed`, the load,
   `session_start` and barrier handlers, and the `installCotalMesh` seam, with the unit,
   every-trigger, positive-control, valid-switch, load, unbound-host, compaction and Pi CLI tests.
@@ -574,27 +622,10 @@ In `pi-sdk.smoke.ts` (existing smokes use `SettingsManager.inMemory`):
 - [ ] Task 4: `connect-pi.md`, `README.md`, `config.md`, `session-recovery.md` § 4.2 and the
   changeset.
 
-## Open Questions
-
-1. **Seat root (RIG-4669, Matt).** Decision 3 fixes the boundary: private user state outside the
-   shared workspace. The exact root is open. A service unit gets "a private `COTAL_HOME` and
-   `XDG_CONFIG_HOME` under the unit directory", and `service uninstall` "removes it plus the private
-   state directory" (`docs/cli.md`, `cotal service`). Seats it launches inherit that `COTAL_HOME`
-   (`OPERATOR_ENV_KEEP`), so a `COTAL_HOME` root loses retained seat dirs and dangles fork paths
-   (decision 5).
-   - **HOME/XDG state root outside `COTAL_HOME`** (the RIG-4669 recommendation). It survives
-     uninstall and keeps `COTAL_HOME` registry-only. It needs its own resolver and HOME/XDG/win32
-     tests.
-   - **`<cotal home>/pi-agent`.** It reuses the `COTAL_HOME` precedence. It widens `COTAL_HOME`
-     past the registry and needs an uninstall policy change to keep seat dirs.
-
-   Both options follow the resolver rules in Global Constraints. Only `seatAgentRoot`'s resolution
-   order and its location tests wait on the answer.
-
 ## Resolved decisions
 
-Matt approved the RIG-4543 recommendation on 2026-10-06 ("Recommendation lgtm"). Each entry gives
-the choice, the reason, and what lost.
+Matt approved the RIG-4543 recommendation on 2026-10-06 ("Recommendation lgtm") and RIG-4669
+option 1, the HOME/XDG state root ("Opt 1"). Each entry gives the choice, the reason, and what lost.
 
 1. **Carrier: per-seat Pi agent dir.** It uses only documented Pi inputs (`PI_CODING_AGENT_DIR`,
    `retry.enabled`). Rejected:
@@ -612,13 +643,17 @@ the choice, the reason, and what lost.
    - **A `supervise` seat still restarts** on any exit (`restart.policy`), fails the same check,
      and retires as `supervise-crash-loop` at its policy limit. Exempting it needs a manager
      change, which this record does not make.
-3. **Seat dir: private user state outside the shared workspace.** A shared workspace is reachable
-   by everything else that uses it: other users, project tooling, agents confined to it. Seat-local
-   files (`pi-debug.log`, `*.lock`) also stay out of project trees. The exact root is open
-   (RIG-4669, Open Questions); it is created at 0700. Pi seats still run unconfined as the
-   launching user (no sandbox in `extensions/pi/src`), so a same-user process can edit a seat dir.
-   The symlink refusals, the containment check and the per-runtime check stay for that reason.
-   Rejected: `<workspaceRoot>/.cotal/pi-agent`.
+3. **Seat dir: private user state outside the shared workspace and `COTAL_HOME`.** A shared
+   workspace is reachable by everything else that uses it: other users, project tooling, agents
+   confined to it. Seat-local files (`pi-debug.log`, `*.lock`) also stay out of project trees. The
+   root is the user state root in Global Constraints (RIG-4669 option 1). It survives
+   `cotal service uninstall`, and `COTAL_HOME` keeps the registry-only meaning `docs/config.md`
+   gives it. Pi seats still run unconfined as the launching user (no sandbox in
+   `extensions/pi/src`), so a same-user process can edit a seat dir. The symlink refusals, the
+   containment check and the per-runtime check stay for that reason. Rejected:
+   - `<workspaceRoot>/.cotal/pi-agent`, which is shared-workspace exposure;
+   - `<COTAL_HOME>/pi-agent`. `uninstall` deletes a service's `COTAL_HOME`, dangling retained fork
+     paths, and the root would widen `COTAL_HOME` past the registry.
 4. **Credentials: linked.** `auth.json` and `trust.json` link to the operator files. The operator
    dir stays the one credential owner, and OAuth refresh tokens never fork. Accepted risk: OAuth
    refresh (`withLockAsync` → `lockfile.lock`) locks the canonical file, because `realpath`
@@ -630,7 +665,9 @@ the choice, the reason, and what lost.
    exists. Deletion can race a live seat (F2). It needs a `LaunchSpec` cleanup field, a public API
    change in `packages/core/src/connector.ts`. It also dangles fork `parentSession` paths recorded
    through the seat dir (F6). A seat dir holds only `settings.json`, links and seat-local files.
-   Retention holds only on a root that Cotal's own teardown does not remove (Open Questions 1).
+   Retention holds because no Cotal command deletes the seat root. `service uninstall` removes only
+   `serviceStateDir`, and `removeLocalState` (`implementations/cli/src/commands/clean.ts`) deletes
+   "the stopped mesh's local state" by "paths relative to the root".
 6. **Provider-internal retry: the operator's `retry.provider.*` is kept.** It runs inside one
    `streamSimple` call. The agent `streamFn` (`core/sdk.js`) passes
    `providerRetrySettings.maxRetries`, and the pi-ai 0.79.10 providers that read it default it to
