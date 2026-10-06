@@ -283,25 +283,48 @@ function scopesAt(file: ts.SourceFile, offset: number): ts.Node[] {
 }
 
 function visibleBindings(name: string, defs: Map<string, Binding[]>, scopes: readonly ts.Node[], offset: number): Binding[] {
+  const deferred = scopes.findIndex((scope) => ts.isFunctionLike(scope));
   const visible = (defs.get(name) ?? []).filter((binding) =>
     binding.scopes.length <= scopes.length
       && binding.scopes.every((scope, index) => scopes[index] === scope)
-      && (binding.scopes.length < scopes.length || binding.offset <= offset),
+      && (binding.offset <= offset || deferred >= 0 && binding.scopes.length <= deferred),
   );
   const nearestScope = Math.max(0, ...visible.map((binding) => binding.scopes.length));
   const nearest = visible.filter((binding) => binding.scopes.length === nearestScope);
   return nearest.length === 0 ? [] : [nearest.reduce((left, right) => left.offset > right.offset ? left : right)];
 }
-function teardownCalls(file: ts.SourceFile): ts.CallExpression[] {
+function teardownCalls(file: ts.SourceFile, defs: Map<string, Binding[]>): ts.CallExpression[] {
+  const imports = new Map<string, ts.Node>();
   const calls: ts.CallExpression[] = [];
   const visit = (node: ts.Node): void => {
-    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "teardownOnSignal") {
-      calls.push(node);
+    if (ts.isImportSpecifier(node) && (node.propertyName?.text ?? node.name.text) === "teardownOnSignal") {
+      const declaration = node.parent.parent.parent;
+      if (ts.isImportDeclaration(declaration) && ts.isStringLiteral(declaration.moduleSpecifier)
+        && declaration.moduleSpecifier.text === "@cotal-ai/smoke-kit") imports.set(node.name.text, node);
     }
+    if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer !== undefined) {
+      const expression = ts.isAwaitExpression(node.initializer) ? node.initializer.expression : node.initializer;
+      if (ts.isCallExpression(expression) && expression.expression.kind === ts.SyntaxKind.ImportKeyword
+        && expression.arguments.length === 1 && ts.isStringLiteral(expression.arguments[0]!)
+        && expression.arguments[0]!.text === "@cotal-ai/smoke-kit") {
+        for (const element of node.name.elements) {
+          if (ts.isIdentifier(element.name) && (element.propertyName?.getText(file) ?? element.name.text) === "teardownOnSignal")
+            imports.set(element.name.text, node);
+        }
+      }
+    }
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) calls.push(node);
     ts.forEachChild(node, visit);
   };
   visit(file);
-  return calls;
+  return calls.filter((call) => {
+    const callee = call.expression;
+    if (!ts.isIdentifier(callee)) return false;
+    const imported = imports.get(callee.text);
+    if (imported === undefined) return false;
+    return visibleBindings(callee.text, defs, scopesAt(file, callee.getStart(file)), callee.getStart(file))
+      .every((binding) => binding.offset === imported.getStart(file));
+  });
 }
 
 function ownsBinding(
@@ -405,6 +428,12 @@ function reachesToken(
   seen = new Set<string>(),
 ): boolean {
   const value = unwrapped(expr);
+  const branches = conditionalBranches(value);
+  if (branches !== undefined) return branches.every((branch) =>
+    branch === "undefined" || branch === "null" || reachesToken(branch, defs, params, results, scopes, offset, new Set(seen)));
+  const fallback = splitTopLevel(value, "??");
+  if (fallback.length > 1) return fallback.every((branch) =>
+    reachesToken(branch, defs, params, results, scopes, offset, new Set(seen)));
   const returned = /^(?:await\s+)?\(?\s*([A-Za-z_$][\w$]*)\s*\(\s*\)\s*\)?\s*(?:\?\.|\.)\s*([A-Za-z_$][\w$]*)$/.exec(value);
   if (returned !== null) {
     const candidates = results.filter((result) => result.name === returned[1]
@@ -471,6 +500,7 @@ function processAliases(file: ts.SourceFile): { names: Set<string>; namespaces: 
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)
       && (node.moduleSpecifier.text === "node:child_process" || node.moduleSpecifier.text === "child_process")) {
+      if (node.importClause?.name !== undefined) namespaces.add(node.importClause.name.text);
       const bindings = node.importClause?.namedBindings;
       if (bindings !== undefined && ts.isNamespaceImport(bindings)) namespaces.add(bindings.name.text);
       if (bindings !== undefined && ts.isNamedImports(bindings)) {
@@ -547,7 +577,7 @@ const isSpawner = (callee: string, aliases: { names: ReadonlySet<string>; namesp
 
 /** Identifiers in code, including template substitutions but excluding literal contents. */
 function identifiers(expr: string): string[] {
-  const file = ts.createSourceFile("expression.ts", `const value = (${expr});`, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const file = ts.createSourceFile("expression.ts", `(${expr});`, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const found: string[] = [];
   const visit = (node: ts.Node): void => {
     if (ts.isIdentifier(node)) found.push(node.text);
@@ -800,6 +830,15 @@ function functionProvenance(src: string, file: ts.SourceFile): { params: Paramet
       })) });
     }
     ts.forEachChild(node, (child) => visit(child, scopes));
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)
+      && ["forEach", "map", "flatMap"].includes(node.expression.name.text)) {
+      const callback = node.arguments[0];
+      if (callback !== undefined && ts.isIdentifier(callback)) {
+        calls.push({ name: callback.text, scopes: parentScopes, args: [{
+          value: "", scopes, offset: callback.getStart(file),
+        }] });
+      }
+    }
   };
   visit(file, []);
   for (const call of calls) {
@@ -810,7 +849,10 @@ function functionProvenance(src: string, file: ts.SourceFile): { params: Paramet
     for (const fn of candidates.filter((candidate) => candidate.scopes.length === nearestDepth)) {
       fn.parameters.forEach((parameter) => {
         const argument = call.args[parameter.index];
-        if (argument === undefined) return;
+        if (argument === undefined) {
+          parameter.args.push({ value: "", scopes: call.scopes, offset: call.args[0]?.offset ?? fn.declaration.getStart(file) });
+          return;
+        }
         if (parameter.property === undefined) { parameter.args.push(argument); return; }
         const parsed = ts.createSourceFile("argument.ts", `const argument = ${argument.value};`, ts.ScriptTarget.Latest, true);
         const statement = parsed.statements[0];
@@ -847,20 +889,32 @@ export function enumerateSpawnSites(cwd: string): SpawnSite[] {
     const { params, results } = functionProvenance(src, sourceFile);
     const aliases = processAliases(sourceFile);
     const commentFree = withoutComments(src, sourceFile);
-    const teardownOwnershipCalls = teardownCalls(sourceFile);
+    const teardownOwnershipCalls = teardownCalls(sourceFile, defs);
     const lineStarts = src.split("\n");
     const re = /([A-Za-z_$][\w$.]*)\s*\(/g;
+    const matches: Array<{ callee: string; offset: number; open: number }> = [];
     let m: RegExpExecArray | null;
-    while ((m = re.exec(code)) !== null) {
-      if (!isSpawner(m[1]!, aliases)) continue;
-      const open = code.indexOf("(", m.index + m[1]!.length);
+    while ((m = re.exec(code)) !== null) matches.push({ callee: m[1]!, offset: m.index, open: code.indexOf("(", m.index + m[1]!.length) });
+    const visitComputed = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && ts.isElementAccessExpression(node.expression)
+        && ts.isIdentifier(node.expression.expression) && ts.isStringLiteral(node.expression.argumentExpression)) {
+        matches.push({ callee: `${node.expression.expression.text}.${node.expression.argumentExpression.text}`,
+          offset: node.expression.getStart(sourceFile), open: node.arguments.pos - 1 });
+      }
+      ts.forEachChild(node, visitComputed);
+    };
+    visitComputed(sourceFile);
+    for (const match of matches) {
+      if (!isSpawner(match.callee, aliases)) continue;
+      const open = match.open;
+      const offset = match.offset;
       const body = open === -1 ? null : callBody(code, open);
       if (body === null) continue;
       const args = splitArgs(commentFree.slice(open + 1, open + 1 + body.length));
       const binaryExpr = args[0] ?? "";
-      const scopes = scopesAt(sourceFile, m.index);
-      if (!resolvesNatsServer(binaryExpr, defs, params, scopes, m.index)) continue;
-      const line = code.slice(0, m.index).split("\n").length;
+      const scopes = scopesAt(sourceFile, offset);
+      if (!resolvesNatsServer(binaryExpr, defs, params, scopes, offset)) continue;
+      const line = code.slice(0, offset).split("\n").length;
       const brokerCode = args[1] ?? "";
       if (/--version/.test(brokerCode)) continue;
       const brokerArguments = splitArgs(brokerCode.replace(/^\[/, "").replace(/\]$/, ""));
@@ -872,7 +926,7 @@ export function enumerateSpawnSites(cwd: string): SpawnSite[] {
       const argvIndirect = argvPath === "none"
         && /^[A-Za-z_$][\w$]*$/.test(unwrapped(brokerCode.replace(/\s*!$/, "")).replace(/\s+as\s+[A-Za-z_$][\w$.]*(?:\[\])?$/, ""));
       const effectiveExpr = pathExpr ?? (argvIndirect ? brokerCode.trim() : undefined);
-      const tokened = effectiveExpr !== undefined && reachesToken(effectiveExpr, defs, params, results, scopes, m.index);
+      const tokened = effectiveExpr !== undefined && reachesToken(effectiveExpr, defs, params, results, scopes, offset);
       // OWNERSHIP IS PER-SITE, NOT PER-FILE. A file that owns one of its two brokers would read as
       // clean under a file-level test, which is the same "named list" mistake one level down.
       //
@@ -890,18 +944,18 @@ export function enumerateSpawnSites(cwd: string): SpawnSite[] {
       //   owns its broker correctly as unowned. Look past any wrapper calls to the assignment.
       //   `kids.push(spawn("nats-server", ...))` binds nothing, so there is no name to trace. The
       //   spawn is UNOWNED unless that expression is itself wrapped in the helper.
-      const before = src.slice(0, m.index);
+      const before = src.slice(0, offset);
       const tail = before.slice(-200);
       // Strip trailing wrapper openings (`= track("broker", ` / `= trackChild(`) so the assignment
       // underneath becomes visible, without letting the strip cross a statement boundary.
       const assignmentPrefix = tail.replace(/(?:[A-Za-z_$][\w$.]*\s*\(\s*(?:(['"`])[^'"`]*\1\s*,\s*)?)+$/, "");
       const bind = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=\n]+)?=\s*(?:await\s+)?$|(?:^|[\s;{(])([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?$/.exec(assignmentPrefix);
       const name = bind?.[1] ?? bind?.[2];
-      const factory = name === undefined ? factoryNameAt(sourceFile, m.index) : undefined;
+      const factory = name === undefined ? factoryNameAt(sourceFile, offset) : undefined;
       const owned = name !== undefined
-        ? ownsBinding(name, scopes, m.index, defs, sourceFile, teardownOwnershipCalls)
-        : factory !== undefined && ownsFactoryResult(factory, m.index, defs, sourceFile, teardownOwnershipCalls)
-          || spawnIsOwnedByTeardown(m.index, teardownOwnershipCalls, sourceFile);
+        ? ownsBinding(name, scopes, offset, defs, sourceFile, teardownOwnershipCalls)
+        : factory !== undefined && ownsFactoryResult(factory, offset, defs, sourceFile, teardownOwnershipCalls)
+          || spawnIsOwnedByTeardown(offset, teardownOwnershipCalls, sourceFile);
       // The exemption may need a paragraph of justification above the spawn, so the window is
       // generous. It is still bounded: a marker further away than this belongs to another site.
       const window = lineStarts.slice(Math.max(0, line - 12), line + 1).join("\n");

@@ -104,10 +104,7 @@ cell("the enumerator's verdict matches source read by hand, in both directions",
   for (const [file, line, want, why] of VERIFIED) {
     const s = sites.find((x) => x.file === file && Math.abs(x.line - line) <= 3);
     if (s === undefined) {
-      // A moved line is fine; a site that vanished means the parser stopped seeing a spawn it used
-      // to see, which is precisely the silent-blindness failure this cell exists to catch.
-      if (sites.some((x) => x.file === file)) continue;
-      wrong.push(`${file}:${line} is no longer enumerated at all (${why})`);
+      wrong.push(`${file}:${line} is no longer enumerated at its hand-verified location (${why})`);
       continue;
     }
     if (isAdopted(s) !== want) wrong.push(`${file}:${s.line} read as adopted=${isAdopted(s)}, hand-read says ${want} (${why}); tokened=${s.tokened} owned=${s.owned} argv=${s.argvPath}`);
@@ -512,6 +509,89 @@ cell("the enumerator sees dynamic-import and method broker launches", () => {
   }
 });
 
+cell("the enumerator ignores a tokened binding named like parser syntax", () => {
+  const scratch = mkdtempSync(join(tmpdir(), `${SMOKE_BROKER_TOKEN}migration-parser-name-`));
+  try {
+    execFileSync("git", ["init", "-q", scratch]);
+    const planted = join(scratch, "smoke", "parser-name.smoke.ts");
+    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    writeFileSync(planted,
+      `import { spawn } from "node:child_process";\n` +
+      `import { SMOKE_BROKER_TOKEN } from "@cotal-ai/smoke-kit";\n` +
+      `const value = SMOKE_BROKER_TOKEN;\n` +
+      `const child = spawn("nats-server", ["-sd", "plain"]);\n`);
+    execFileSync("git", ["-C", scratch, "add", "-A"]);
+    const found = enumerateSpawnSites(scratch);
+    assert.equal(found.length, 1);
+    assert.equal(found[0]!.tokened, false, "the scanner's parse wrapper cannot mint argv provenance");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+cell("the enumerator rejects a plain branch of a conditional path", () => {
+  const scratch = mkdtempSync(join(tmpdir(), `${SMOKE_BROKER_TOKEN}migration-conditional-`));
+  try {
+    execFileSync("git", ["init", "-q", scratch]);
+    const planted = join(scratch, "smoke", "conditional.smoke.ts");
+    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    writeFileSync(planted,
+      `import { spawn } from "node:child_process";\n` +
+      `import { SMOKE_BROKER_TOKEN } from "@cotal-ai/smoke-kit";\n` +
+      `const tokenPath = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+      `const plainPath = "plain";\n` +
+      `const child = spawn("nats-server", ["-sd", process.env.ISOLATED ? tokenPath : plainPath]);\n`);
+    execFileSync("git", ["-C", scratch, "add", "-A"]);
+    const found = enumerateSpawnSites(scratch);
+    assert.equal(found.length, 1);
+    assert.equal(found[0]!.tokened, false, "each possible argv path must carry the token");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+cell("the enumerator does not borrow future outer assignments", () => {
+  const scratch = mkdtempSync(join(tmpdir(), `${SMOKE_BROKER_TOKEN}migration-future-`));
+  try {
+    execFileSync("git", ["init", "-q", scratch]);
+    const planted = join(scratch, "smoke", "future.smoke.ts");
+    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    writeFileSync(planted,
+      `import { spawn } from "node:child_process";\n` +
+      `import { SMOKE_BROKER_TOKEN } from "@cotal-ai/smoke-kit";\n` +
+      `let sd = "plain";\n` +
+      `{ const child = spawn("nats-server", ["-sd", sd]); }\n` +
+      `sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n`);
+    execFileSync("git", ["-C", scratch, "add", "-A"]);
+    const found = enumerateSpawnSites(scratch);
+    assert.equal(found.length, 1);
+    assert.equal(found[0]!.tokened, false, "later assignment cannot token a previous launch");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+cell("the enumerator refuses omitted and callback helper paths", () => {
+  const scratch = mkdtempSync(join(tmpdir(), `${SMOKE_BROKER_TOKEN}migration-omitted-`));
+  try {
+    execFileSync("git", ["init", "-q", scratch]);
+    const planted = join(scratch, "smoke", "omitted.smoke.ts");
+    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    writeFileSync(planted,
+      `import { spawn } from "node:child_process";\n` +
+      `import { SMOKE_BROKER_TOKEN } from "@cotal-ai/smoke-kit";\n` +
+      `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+      `function start(path = "plain") { return spawn("nats-server", ["-sd", path]); }\n` +
+      `start(sd); start(); ["plain"].forEach(start);\n`);
+    execFileSync("git", ["-C", scratch, "add", "-A"]);
+    const found = enumerateSpawnSites(scratch);
+    assert.equal(found.length, 1);
+    assert.equal(found[0]!.tokened, false, "all helper invocation paths must be tokened");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
 cell("the enumerator keeps reassignment provenance in the execution scope", () => {
   const scratch = mkdtempSync(join(tmpdir(), `${SMOKE_BROKER_TOKEN}migration-assignment-scope-`));
   try {
@@ -579,6 +659,7 @@ cell("the enumerator ties ownership to the exact child binding", () => {
     execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
+      `import { teardownOnSignal } from "@cotal-ai/smoke-kit";\n` +
       `function nested() { const broker = spawn("nats-server", ["-sd", "plain"]); teardownOnSignal(broker); }\n` +
       `const broker = spawn("nats-server", ["-sd", "plain"]);\n` +
       `let reassigned = spawn("nats-server", ["-sd", "plain"]);\n` +
@@ -620,6 +701,28 @@ cell("the enumerator rejects assignment and callback scope token leakage", () =>
   }
 });
 
+cell("the enumerator refuses a fake teardown", () => {
+  const scratch = mkdtempSync(join(tmpdir(), `${SMOKE_BROKER_TOKEN}migration-fake-owner-`));
+  try {
+    execFileSync("git", ["init", "-q", scratch]);
+    const planted = join(scratch, "smoke", "fake-owner.smoke.ts");
+    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    writeFileSync(planted,
+      `import { spawn } from "node:child_process";\n` +
+      `import { SMOKE_BROKER_TOKEN } from "@cotal-ai/smoke-kit";\n` +
+      `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+      `const child = spawn("nats-server", ["-sd", sd]);\n` +
+      `function teardownOnSignal(child: unknown) { void child; }\n` +
+      `teardownOnSignal(child);\n`);
+    execFileSync("git", ["-C", scratch, "add", "-A"]);
+    const found = enumerateSpawnSites(scratch);
+    assert.equal(found.length, 1);
+    assert.equal(found[0]!.owned, false, "a local no-op cannot claim broker ownership");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
 cell("the enumerator binds actual child_process command aliases", () => {
   const scratch = mkdtempSync(join(tmpdir(), `${SMOKE_BROKER_TOKEN}migration-spawn-alias-`));
   try {
@@ -629,11 +732,14 @@ cell("the enumerator binds actual child_process command aliases", () => {
     writeFileSync(planted,
       `import { spawn as launch } from "node:child_process";\n` +
       `import * as childProcess from "child_process";\n` +
+      `import defaultProcess from "node:child_process";\n` +
       `const first = launch("nats-server", ["-sd", "plain"]);\n` +
-      `const second = childProcess.spawn("nats-server", ["-sd", "plain"]);\n`);
+      `const second = childProcess.spawn("nats-server", ["-sd", "plain"]);\n` +
+      `const third = childProcess["spawn"]("nats-server", ["-sd", "plain"]);\n` +
+      `const fourth = defaultProcess.spawn("nats-server", ["-sd", "plain"]);\n`);
     execFileSync("git", ["-C", scratch, "add", "-A"], { encoding: "utf8" });
     const found = enumerateSpawnSites(scratch);
-    assert.equal(found.length, 2, "named and namespace child_process imports are census sites");
+    assert.equal(found.length, 4, "named, namespace, computed and default process imports are census sites");
     assert.ok(found.every((site) => !site.tokened && !site.owned), "alias sites retain both adoption requirements");
   } finally {
     rmSync(scratch, { recursive: true, force: true });

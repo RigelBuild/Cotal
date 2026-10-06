@@ -308,8 +308,8 @@ setInterval(() => {}, 1000);
 } finally {
   if (legacy?.pid && alive(legacy.pid)) legacy.kill("SIGKILL");
   if (broker?.pid && alive(broker.pid)) broker.kill("SIGKILL");
-  releaseBroker?.();
   await Promise.all([legacy, broker].filter(Boolean).map((child) => new Promise<void>((resolve) => child!.once("exit", () => resolve()))));
+  releaseBroker?.();
   assert.deepEqual(existsSync(operatorStamp) ? readFileSync(operatorStamp) : undefined, stampBefore, "fixture did not change the operator seed stamp");
   rmSync(base, { recursive: true, force: true });
 }
