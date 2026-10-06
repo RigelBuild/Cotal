@@ -48,8 +48,8 @@ delegated base. Ordinary stop authority remains Open Question 6 and blocks T1/T2
   between the check and the signal. A graceful or hard stop may signal through a kernel-pinned
   child handle, preserving its requested signal and grace period. Without one, refuse the
   numeric send and retain custody. `cgroup.kill` belongs to the external reap path only: it is
-  immediate SIGKILL and may kill a custodian in that cgroup. Open Question 6 governs whether a
-  weaker best-effort stop is accepted; none is in the recommended implementation.
+  immediate SIGKILL and may kill a custodian in that cgroup. Open Question 6 chooses a pinned
+  child handle or refusal; neither permits a best-effort bare-pid signal.
 - `record.json` keeps `RECORD_VERSION` 1, and `readRecord` stays strict.
 
 ### Layer 2 — the reap trusts nothing in the record (`packages/seat`)
@@ -276,7 +276,7 @@ record-present cells red.
 - In `reapSeat`, delete both `signal(…)` sends and the member loop.
 - The existing seat-socket stop may be requested only when the custodian has a kernel-pinned
   child handle; otherwise leave the child live and return `retained`. Use `socketPath(root, id)`,
-  never `record.socket`. The pinned-handle interface is part of Open Question 1, not an assumed
+  never `record.socket`. The pinned-handle interface is part of Open Question 6, not an assumed
   property of node-pty.
 - Follow the Approach table: without `opts.cgroup`, the result is always `retained` or `absent`.
 
@@ -417,8 +417,8 @@ export function removeSeatCgroup(cg: SeatCgroup): void;                      // 
 `{ cgroupBase?: string; agentUid: number }`. The manager resolves `cgroupBase` at start and logs one
 line when it is unavailable.
 
-**T6 cell.** `lifecycle-e2e.smoke.ts` passes all 30 cells. This holds only in a contained
-configuration: isolation, or whatever Open Question 2 accepts.
+**T6 cell.** `lifecycle-e2e.smoke.ts` passes all 30 cells only under isolation with verified
+containment; a single-uid seat retains custody until explicit release.
 
 ## Tasks
 
@@ -448,8 +448,8 @@ remaining operational choices below need explicit disposition before this record
 3. **Release — decided.** Use an `adminGated` manager verb whose operator is the subject caller
    and a separate durable release record. The v1 lifecycle audit remains unchanged.
 4. **lifecycle-e2e while T5 and T6 are pending.** T1–T3 alone turn the cells "w2 … gone after
-   explicit stop" red and keep the four "… gone after despawn" cells red. Even after T6, those
-   cells pass only in a contained configuration (Open Question 2). Options:
+   explicit stop" red and keep the four "… gone after despawn" cells red. After T6, those cells
+   pass only under isolation with verified containment. Options:
    - land T1–T3 and T5–T6 as one stack (recommended);
    - land T1–T3 with the red cells and their cause stated in the PR. `rule://no-inert-gating`
      bars changing the cells.
