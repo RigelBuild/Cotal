@@ -4,10 +4,11 @@ A design record, not shipped behavior. Every current-behavior claim names the fi
 was read from; everything else is proposed. Pi paths are `@earendil-works/pi-coding-agent` 0.79.10
 `dist/`.
 
-**Status:** draft. Implements RIG-4293 option 1. Managed Cotal Pi seats disable Pi's automatic provider
-retry before the first provider turn. Operator sessions are unchanged, and overflow compaction stays
-host-owned. PR #37 (RIG-4249) stays draft until this control and the queued-inbound races are
-verified.
+**Status:** draft. Implements RIG-4293 option 1 with the RIG-4543 boundaries Matt approved (see
+Resolved decisions). The exact seat root is open (RIG-4669, Open Questions). Managed Cotal Pi seats
+disable Pi's automatic provider retry before the first provider turn. Operator sessions are
+unchanged, and overflow compaction stays host-owned. PR #37 (RIG-4249) stays draft until this
+control and the queued-inbound races are verified.
 
 ## Problem / Intent
 
@@ -33,7 +34,7 @@ settings files are never written.
   `this.globalSettings.retry.enabled` and calls `save()`, the forbidden operator write. Its only
   external caller is RPC `set_auto_retry` (`modes/rpc/rpc-mode.js`).
 
-**Proposed carrier: a per-seat agent dir.** It combines two documented Pi features:
+**Carrier: a per-seat agent dir (decision 1).** It combines two documented Pi features:
 
 - `getAgentDir` (`config.js`) honors `PI_CODING_AGENT_DIR`;
 - `SettingsManager.getRetryEnabled` returns `this.settings.retry?.enabled ?? true`.
@@ -62,7 +63,7 @@ lookup (`core/resource-loader.js`), `DefaultPackageManager` `npm`/`git`/`tmp`
 Copying only what exists at launch would make state seat-local and short-lived (F3):
 
 - a `/login` writes a seat `auth.json` that the next launch loses;
-- `ensureTool` re-downloads rg/fd into the workspace;
+- `ensureTool` re-downloads rg/fd into every seat dir;
 - trust prompts repeat.
 
 With a fixed list:
@@ -134,8 +135,8 @@ already-closed gate. A host that prevents process termination must dispose the r
 provider barrier remains closed until then.
 
 Persisting `quit` lets `Manager.onAgentExit` retire a seat without `supervise`
-(`freeSlot(a, true, "process-exit")`) instead of restarting it into the same failure (OQ 2). At
-load the id is `COTAL_PI_EXPECTED_SESSION`, and the manager readiness wait
+(`freeSlot(a, true, "process-exit")`) instead of restarting it into the same failure (decision 2).
+At load the id is `COTAL_PI_EXPECTED_SESSION`, and the manager readiness wait
 (`awaitManagedSessionState`) reports a deliberate quit. A `--fork` launch has no expected id, so
 nothing is written and the wait fails on the exited process. If persistence fails, the manager
 must not infer a clean quit; this is a fail-loud lifecycle error, not permission for a provider
@@ -233,14 +234,31 @@ and the loader aliases it to the host copy.
 - **Host contract.** Supported hosts are the Pi CLI as `buildLaunch` starts it (interactive or
   print mode) and SDK hosts that load the extension through Pi's loader. A host must let
   `hooks.terminate` end the process, or dispose the runtime itself; until then the barrier holds.
-  Only `COTAL_PI_AGENT_DIR`, which `buildLaunch` sets, turns any of this on (OQ 7).
+  Only `COTAL_PI_AGENT_DIR`, which `buildLaunch` sets, turns any of this on (decision 7).
 - **Only `retry.enabled` is forced.** Compaction and `retry.provider.*` are copied unchanged
-  (OQ 6).
-- **Seat dir:** `<workspaceRoot>/.cotal/pi-agent/<name>-<lifecycleUid ?? "unmanaged">`, created with
-  `mkSecretDir`, alongside the existing `.cotal/pi-sessions` (`buildLaunch`). Its location is OQ 3.
-  - It is stable per (name, uid), so `--session-id` recovery reopens the same session path string.
+  (decision 6).
+- **Seat dir:** `<seat root>/<name>-<lifecycleUid>`, private user state outside the shared
+  workspace (decision 3). The exact `<seat root>` is open (RIG-4669, Open Questions). Whichever root
+  is picked, `seatAgentRoot` resolves it from the launch env only:
+  - a relative value in any variable it reads is refused, never resolved against the cwd;
+  - a missing HOME, when no set override applies, fails; there is no `os.homedir()` fallback;
+  - `homeCotalDir` (`packages/workspace/src/mesh-registry.ts`) and the Claude connector's
+    `cotalHome` (`extensions/connector-claude-code/src/setup.ts`) have the precedence a
+    `COTAL_HOME` root would keep (`COTAL_HOME`, else `%LOCALAPPDATA%\Cotal` on win32, else `.cotal`
+    under HOME). They are not reused as is: `if (process.env.COTAL_HOME) return
+    process.env.COTAL_HOME;` accepts a relative value, and the last step calls `homedir()`.
+
+  The root and the seat dir are created with `mkSecretDir` (0700).
+  - `buildLaunch` validates both parts of `<name>-<lifecycleUid>` before any path is joined from
+    them. `assertValidName` (`packages/core/src/resolve.ts`) refuses `/` and `\` in the name.
+    `assertLifecycleToken` (`packages/core/src/subjects.ts`, `/^[a-z0-9]{26,32}$/`) checks the
+    uid. So the leaf is one path segment, and the seat dir and the session-state file stay
+    contained in their roots.
+  - The uid is minted once per lifecycle (`mintLifecycleUid`) and reused by recovery and resume.
+    So the dir is unique across workspaces, and `--session-id` recovery reopens the same session
+    path string.
   - Fork `parentSession` headers record seat paths (`SessionManager.forkFrom`), because Pi uses
-    `resolvePath`, not `realpath` (F6, OQ 5).
+    `resolvePath`, not `realpath` (F6). Retention (decision 5) keeps those paths resolvable.
 - **Operator agent dir:** the launch env's `PI_CODING_AGENT_DIR` if the operator forwarded it via
   `envAllow` (`launchEnv`, `extensions/connector-core/src/launch.ts`), else
   `join(<launch HOME>, ".pi", "agent")`, with `~` expanded against that HOME.
@@ -257,20 +275,23 @@ New file `extensions/pi/src/retry-control.ts`:
 export const COTAL_PI_AGENT_DIR = "COTAL_PI_AGENT_DIR";
 export const PI_VERSION = "0.79.10";
 export function operatorAgentDir(env: Readonly<Record<string, string | undefined>>): string;
+/** The private seat root (RIG-4669) from the launch env. Throws "pi connector: …" on a relative
+ *  value or a missing HOME. */
+export function seatAgentRoot(env: Readonly<Record<string, string | undefined>>): string;
 /** Idempotent and safe against a live seat. Throws "pi connector: …". Never deletes. */
 export function convergeSeatAgentDir(seatDir: string, operatorDir: string): void;
 ```
 
 `convergeSeatAgentDir`:
 
-1. **Refuse unsafe seat paths.** `lstat` `<workspaceRoot>/.cotal/pi-agent` and `seatDir`. If either
-   is a symlink, throw. Then `mkSecretDir` both.
+1. **Refuse unsafe seat paths.** `lstat` the seat root (`dirname(seatDir)`) and `seatDir`. If
+   either is a symlink, throw. Then `mkSecretDir` both.
 2. **Read and validate operator settings.** Read `<operatorDir>/settings.json`, or use `{}` if it is
    absent. Throw on:
    - JSON that does not parse;
    - a value that is not a plain object;
    - legacy credentials: an `apiKeys` key, or `<operatorDir>/oauth.json` existing.
-     `migrateAuthToAuthJson` (`migrations.js`) would otherwise copy them into the workspace. The
+     `migrateAuthToAuthJson` (`migrations.js`) would otherwise copy them into each seat dir. The
      message is `run pi once to migrate them into auth.json`.
 3. **Check path entries (F5).** This covers string entries, and object sources, of `packages`,
    `extensions`, `skills`, `prompts` and `themes`.
@@ -290,19 +311,48 @@ export function convergeSeatAgentDir(seatDir: string, operatorDir: string): void
    - a seat entry that exists but is not a link throws;
    - a link with the wrong target is swapped atomically.
 
-In `piConnector.buildLaunch` (`extensions/pi/src/connector.ts`), after `env` is built and before the
-persona temp dir:
+In `piConnector.buildLaunch` (`extensions/pi/src/connector.ts`):
 
-- throw `pi connector: a managed Pi seat requires workspaceRoot for its Pi agent directory` when
-  `workspaceRoot` is missing;
-- converge the seat dir;
-- set `env.PI_CODING_AGENT_DIR` and `env.COTAL_PI_AGENT_DIR` to the seat dir.
+- **Validate the leaf first.** After the existing argument refusals and before `stateRoot`:
+  - throw `pi connector: a managed Pi seat requires lifecycleUid for its private Pi agent
+    directory` when `lifecycleUid` is missing;
+  - call `assertLifecycleToken(opts.lifecycleUid, "pi connector: lifecycleUid")`;
+  - call `assertValidName(opts.name)`. `CotalEndpoint` (`packages/core/src/endpoint.ts`) already
+    runs `assertValidName(opts.card.name)` on every join, so a name with `/` or `\` cannot reach a
+    live seat today.
 
-Both callers already pass `workspaceRoot`: `Manager` spawn and `cotal spawn`.
+  `cotal spawn` can take the uid from a remote provisioning response, and
+  `checkRemoteAgentMaterial` (`implementations/cli/src/commands/spawn.ts`) checks it only as a
+  non-empty string. Today that value reaches
+  ``join(stateRoot, `${opts.name}-${opts.lifecycleUid ?? "unmanaged"}.json`)`` and then
+  `rmSync(sessionStatePath, { force: true })`, so an unchecked uid such as `x/../../victim` deletes
+  `<workspaceRoot>/.cotal/victim.json`. A `relative`/`startsWith` check on the joined path would
+  not be enough here: `join` normalizes the `..` away first, and the session-state `rmSync` runs
+  before the seat root is known.
+- **Drop the dead fallback.** That join uses the validated uid, and `?? "unmanaged"` is removed.
+- **Converge the seat dir** after `env` is built and before the persona temp dir:
+  - `root = seatAgentRoot(env)`, ``leaf = `${opts.name}-${opts.lifecycleUid}` ``,
+    `seatDir = join(root, leaf)`;
+  - throw `pi connector: seat dir ${seatDir} escapes ${root}` unless
+    `dirname(seatDir) === resolve(root) && basename(seatDir) === leaf`. The leaf checks above make
+    this hold by construction; the assert keeps it holding if the leaf format changes. Unlike a
+    `relative(root, seatDir) === leaf` test, it fails for `../x-<uid>`, because `join` has already
+    normalized the `..`;
+  - `convergeSeatAgentDir(seatDir, operatorAgentDir(env))`;
+  - set `env.PI_CODING_AGENT_DIR` and `env.COTAL_PI_AGENT_DIR` to `seatDir`.
 
-**Tests** (`pi.smoke.ts` `buildLaunch` block, temp HOME with a fake operator dir). Assert:
+`LaunchOpts.lifecycleUid` stays optional in `packages/core/src/connector.ts`: requiring it changes
+the public type for every connector. Pi refuses at runtime instead. That is a behavior change for
+SDK callers of `piConnector.buildLaunch` (exported from `@cotal-ai/pi`) that omit the uid. Every
+production launcher passes one: `Manager` spawn and resume, the `Manager` restart path (it reuses
+the spawn opts) and `cotal spawn`. The seat dir does not depend on `workspaceRoot`.
 
-- the env vars are set;
+**Tests** (`pi.smoke.ts` `buildLaunch` block, a temp `HOME`, temp values for the variables the
+RIG-4669 root reads, and a fake operator dir). Assert:
+
+- the env vars are set, and the seat dir is `<seatAgentRoot(env)>/<name>-<lifecycleUid>` with mode
+  0700 on POSIX, for each resolution step RIG-4669 fixes;
+- nothing is created at `<workspaceRoot>/.cotal/pi-agent`;
 - the seat settings are `{ enabled: false, maxRetries: 7 }` and other keys are kept;
 - every allowlisted link exists, including a dangling `auth.json`;
 - missing dirs were created in the operator dir;
@@ -316,9 +366,28 @@ Each refusal case throws its message:
 - `apiKeys`, or `oauth.json` present;
 - `extensions: ["x/../../e.ts"]`;
 - a relative `sessionDir`;
-- a symlinked `.cotal/pi-agent`;
+- a relative value in a variable the root reads;
+- no HOME in the launch env and no root override set;
+- a symlinked seat root;
 - a real dir at an allowlisted name;
-- no `workspaceRoot`.
+- no `lifecycleUid`;
+- `lifecycleUid: "x/../../victim"` throws `not a valid lifecycle token`. A planted
+  `<workspaceRoot>/.cotal/victim.json` survives, and nothing is created under the seat root;
+- `name: "../x"` with a valid uid throws `invalid name`. A planted
+  `<workspaceRoot>/.cotal/x-<uid>.json` survives, and `<dirname(root)>/x-<uid>` does not exist.
+
+Existing smokes change with the new refusal:
+
+- **`pi.smoke.ts`.** Every call that should build, or reach a refusal after the uid check, passes a
+  valid `lifecycleUid`. That covers events without `workspaceRoot`, `creds` with `userAuth`, and the
+  prompt refusals. The `/workspaceRoot/` cell becomes
+  `buildLaunch({ space: "test", name: "pi", lifecycleUid })`, so it still proves the events
+  refusal, not the uid one. The `resume`+`continueSession`, `variant`, MCP and launch-options
+  refusals run before the uid check and stay as they are.
+- **`pi-sdk.smoke.ts`.** The `pi-events-sdk` launch passes a `lifecycleUid`.
+- **`bin/smoke/seat-env-scope.smoke.ts`.** It already passes `mintLifecycleUid()`.
+
+All three run under the temp home above, so no smoke converges a seat in the real operator home.
 
 ### Task 2: verify in the extension
 
@@ -481,75 +550,97 @@ In `pi-sdk.smoke.ts` (existing smokes use `SettingsManager.inMemory`):
   whether it will retry", add that a managed seat runs with Pi retry off through a per-seat agent
   dir, and that operator sessions keep the existing ambiguity.
 - **`extensions/pi/README.md`.** Near "Pi exposes no retry-finality event", add:
-  - the seat dir;
+  - the seat dir location, and that Cotal keeps one per lifecycle (decision 5);
   - the refused project `retry` values, and that a failed check ends the seat, including after a
-    mid-session edit (OQ 7);
+    mid-session edit (decision 7);
   - that seat-pane settings changes persist only to the seat copy;
   - the runtime pin.
 - **`docs/design/session-recovery.md` § 4.2.** Amend the adopted recovery-rule paragraph to match.
+- **`docs/config.md`.** Document the seat root RIG-4669 picks and the variables that move it.
 - **Changeset.** Add `.changeset/pi-managed-retry-off.md` (`"@cotal-ai/pi": patch`).
 - **Rollout.** A seat gets the control at its next launch or supervised restart. Seats that are
   already running keep retry until then.
 
 ## Tasks
 
-- [ ] Task 1: `operatorAgentDir`, `convergeSeatAgentDir` and the `buildLaunch` wiring, with the
-  refusal and convergence tests.
+- [ ] Task 1: `operatorAgentDir`, `seatAgentRoot`, `convergeSeatAgentDir` and the `buildLaunch`
+  wiring (uid validation, seat dir containment, no `unmanaged` fallback), with the location,
+  refusal and convergence tests and the smoke updates. `seatAgentRoot` waits on RIG-4669.
 - [ ] Task 2: `checkManagedRetryOff`, the gate map, `closeRetryGate`, `gateClosed`, the load,
   `session_start` and barrier handlers, and the `installCotalMesh` seam, with the unit,
   every-trigger, positive-control, valid-switch, load, unbound-host, compaction and Pi CLI tests.
 - [ ] Task 3: merge pins, the retry-off proof, the retry-on control and the post-run compaction
   race.
-- [ ] Task 4: `connect-pi.md`, `README.md`, `session-recovery.md` § 4.2 and the changeset.
+- [ ] Task 4: `connect-pi.md`, `README.md`, `config.md`, `session-recovery.md` § 4.2 and the
+  changeset.
 
 ## Open Questions
 
-1. **Control mechanism (load-bearing).** This record carries (a).
-   - **(a) Per-seat agent dir.** Built only from documented Pi features; costs the link overlay.
-   - **(b) A Cotal launcher on the Pi SDK.** It would inject `SettingsManager.fromStorage`.
-     `MainOptions` takes only factories, so `main.js` startup would have to be re-implemented
-     against 0.79.10 internals.
-   - **(c) An upstream Pi control.** A flag, an env var, or `willRetry` on the extension
-     `agent_end`. None exists in 0.79.10, and none appears in the 1.0.2 changelog.
-2. **Project override across runtimes (F1, F8, PR #45).** The record carries (i) with termination,
-   the conservative option named in the PR #45 review.
-   - **(i) Load check plus per-runtime termination.** Closes the gap and keeps project resources.
-     The load check terminates instead of throwing (rereview 1).
-   - **(ii) `--no-approve` for managed seats.** It sets `projectTrustOverride = false`
-     (`cli/args.js`), which closes the gap by construction but drops project
-     extensions/skills/prompts. It does not help an SDK host, which sets trust itself.
-   - **(iii) Load-only check plus documented risk.**
+1. **Seat root (RIG-4669, Matt).** Decision 3 fixes the boundary: private user state outside the
+   shared workspace. The exact root is open. A service unit gets "a private `COTAL_HOME` and
+   `XDG_CONFIG_HOME` under the unit directory", and `service uninstall` "removes it plus the private
+   state directory" (`docs/cli.md`, `cotal service`). Seats it launches inherit that `COTAL_HOME`
+   (`OPERATOR_ENV_KEEP`), so a `COTAL_HOME` root loses retained seat dirs and dangles fork paths
+   (decision 5).
+   - **HOME/XDG state root outside `COTAL_HOME`** (the RIG-4669 recommendation). It survives
+     uninstall and keeps `COTAL_HOME` registry-only. It needs its own resolver and HOME/XDG/win32
+     tests.
+   - **`<cotal home>/pi-agent`.** It reuses the `COTAL_HOME` precedence. It widens `COTAL_HOME`
+     past the registry and needs an uninstall policy change to keep seat dirs.
 
-   Still open: retire or restart after termination? The record persists `quit`, so
-   `Manager.onAgentExit` retires a seat without `supervise`. A restart would reopen the same
-   session, fail again, and end as `pi-crash-loop` after `SESSION_RESTART_LIMIT` (3 in 120 s). A
-   `supervise` seat restarts on any exit (`restart.policy`), so it takes that loop regardless;
-   exempting it needs a manager change. Recommended: retire, and accept the loop for `supervise`.
-3. **Seat dir location and threat model (F7, security-sensitive).** Assumed: workspace `.cotal`.
-   `mkSecretDir` does not lstat, and Pi seats are not sandboxed (no bwrap/landlock in
-   `extensions/pi/src`). A sibling seat can therefore edit another seat's settings or links.
-   - **Keep it in the workspace.** Pairs with the lstat checks and the per-runtime re-check. It is
-     only the same exposure as today if seats are unconfined.
-   - **Move it to a per-user private root outside the workspace.** Core has no such root today.
-4. **Credentials through links (security-sensitive).** OAuth refresh shares the operator's canonical
-   lock (`withLockAsync` → `lockfile.lock`, whose `realpath` defaults to true in proper-lockfile
-   4.1.2). Sync `withLock` passes `realpath: false`, and so does the trust lock, so they lock
-   beside the link.
-   - **(i) Link (recommended).** Same boundary as today.
-   - **(ii) Copy at launch.** Puts secrets in the workspace and lets refresh tokens diverge.
-   - **(iii) Env-only keys.** Breaks OAuth subscriptions.
-5. **Cleanup and path identity (F6).** Seat dirs are never deleted, so one accumulates per uid.
-   Deleting them would require a `LaunchSpec` cleanup field, a public API change in
-   `packages/core/src/connector.ts`. It would also dangle fork `parentSession` paths recorded through
-   the seat dir. Options: accept the leak, or add the field and accept the dangling paths.
-6. **Force `retry.provider.maxRetries: 0`?** This retry happens inside one SDK request and defaults
-   to 0. Forcing it overrides only operators who opted in.
-7. **Host scope and re-check frequency (rereview, Matt fork).** The record carries (i).
-   - **(i) Re-check before every request path.** Fail-closed in any host that loads the extension,
-     including one that never binds. A project file edited mid-session ends the seat before Pi
-     reloads it, a false positive in the safe direction.
-   - **(ii) Check at load and `session_start` only; the request hooks enforce a closed gate.**
-     Matches Pi's own read points, but an SDK host that never calls `bindExtensions` gets no
-     session-cwd check, so the host contract must require binding.
-   - **(iii) Declare the Pi CLI the only managed host** and keep the load-time throw. Simplest, but
-     an SDK host given a managed env fails open.
+   Both options follow the resolver rules in Global Constraints. Only `seatAgentRoot`'s resolution
+   order and its location tests wait on the answer.
+
+## Resolved decisions
+
+Matt approved the RIG-4543 recommendation on 2026-10-06 ("Recommendation lgtm"). Each entry gives
+the choice, the reason, and what lost.
+
+1. **Carrier: per-seat Pi agent dir.** It uses only documented Pi inputs (`PI_CODING_AGENT_DIR`,
+   `retry.enabled`). Rejected:
+   - a Cotal launcher on the Pi SDK. `MainOptions` takes only factories, so `main.js` startup,
+     trust and TUI wiring would be re-implemented against 0.79.10 internals;
+   - waiting for an upstream control (a flag, an env var, or `willRetry` on the extension
+     `agent_end`). None exists in 0.79.10 or the 1.0.2 changelog, and #37 would stay blocked.
+2. **Project override: per-runtime check with termination.** The load check and the `ctx.cwd`
+   check in every runtime close the gap and keep project resources. A failure ends the process
+   instead of holding the seat, as the PR #45 review asked. Rejected: `--no-approve`, which drops
+   project extensions/skills/prompts and does not reach an SDK host; a load-only check, which
+   misses resume or fork into another project.
+   - **The terminated seat retires.** The persisted `quit` makes `Manager.onAgentExit` free a
+     seat without `supervise`. A restart would reopen the same session and fail again.
+   - **A `supervise` seat still restarts** on any exit (`restart.policy`), fails the same check,
+     and retires as `supervise-crash-loop` at its policy limit. Exempting it needs a manager
+     change, which this record does not make.
+3. **Seat dir: private user state outside the shared workspace.** A shared workspace is reachable
+   by everything else that uses it: other users, project tooling, agents confined to it. Seat-local
+   files (`pi-debug.log`, `*.lock`) also stay out of project trees. The exact root is open
+   (RIG-4669, Open Questions); it is created at 0700. Pi seats still run unconfined as the
+   launching user (no sandbox in `extensions/pi/src`), so a same-user process can edit a seat dir.
+   The symlink refusals, the containment check and the per-runtime check stay for that reason.
+   Rejected: `<workspaceRoot>/.cotal/pi-agent`.
+4. **Credentials: linked.** `auth.json` and `trust.json` link to the operator files. The operator
+   dir stays the one credential owner, and OAuth refresh tokens never fork. Accepted risk: OAuth
+   refresh (`withLockAsync` → `lockfile.lock`) locks the canonical file, because `realpath`
+   defaults to true in proper-lockfile 4.1.2. Sync `withLock` and the trust lock pass
+   `realpath: false`, so they lock beside the seat link, and a seat's sync write does not exclude
+   the operator's. Rejected: a copy at launch (a second secret copy per seat, and refresh tokens
+   drift) and provider env keys only (breaks OAuth subscriptions).
+5. **Retention: one seat dir per lifecycle, never deleted by Cotal.** No safe cleanup contract
+   exists. Deletion can race a live seat (F2). It needs a `LaunchSpec` cleanup field, a public API
+   change in `packages/core/src/connector.ts`. It also dangles fork `parentSession` paths recorded
+   through the seat dir (F6). A seat dir holds only `settings.json`, links and seat-local files.
+   Retention holds only on a root that Cotal's own teardown does not remove (Open Questions 1).
+6. **Provider-internal retry: the operator's `retry.provider.*` is kept.** It runs inside one
+   `streamSimple` call. The agent `streamFn` (`core/sdk.js`) passes
+   `providerRetrySettings.maxRetries`, and the pi-ai 0.79.10 providers that read it default it to
+   0 (`maxRetries: options?.maxRetries ?? 0`). Pi turn retry stays off either way. Forcing 0 would
+   change opted-in operator behavior.
+7. **Host scope: re-check before every request path, with a stated host boundary.** The check runs
+   at load, in `session_start`, and in `agent_start`, `session_before_compact` and
+   `session_before_tree`. So any host that loads the extension fails closed, including one that
+   never binds. Global Constraints names the supported hosts and their termination duty. A project
+   file edited mid-session ends the seat before Pi reloads it, a false positive in the safe
+   direction. Rejected: a check at load and `session_start` only, because an SDK host that never
+   calls `bindExtensions` gets no session-cwd check; a CLI-only contract with a load-time throw,
+   because an SDK host given a managed env fails open.
