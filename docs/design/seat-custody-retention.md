@@ -147,7 +147,7 @@ record is present, missing or unreadable.
 | Record | Layer 3 | Action | Outcome |
 | --- | --- | --- | --- |
 | missing | off, not contained, or no seat cgroup | none | `absent` (unchanged) |
-| unreadable | off, not contained, or no seat cgroup | none | throw (retryable, unchanged) |
+| unreadable | off, not contained, or no seat cgroup | none | `retained` / `unprovable` |
 | present | off, not contained, or no seat cgroup | no numeric signal; optional stop request to the custodian | `retained` / `unprovable` |
 | any | seat cgroup exists and is contained | write `cgroup.kill` | `populated 0` and `rmdir` succeeds → `reaped`; else `retained` / `members-remain` |
 
@@ -209,11 +209,12 @@ reaches it (`if (a.runtime === undefined) { …; return; }`), and `reapThenClean
 hold, and `staticReconciliationStatus` never reads that field. A new `recordRetainedTerminal`
 fixes this:
 
-- The `driveStaticRetirement` catch block calls it for every `RuntimeReapUnproven`. It is the only
-  writer of that item.
-- For `members-remain` it keeps the existing retry timer. The cgroup path is derived, so a retry
-  can measure again, even after a restart.
-- For every other reason it sets `refused`, gives the release remedy and arms no timer.
+- The `driveStaticRetirement` catch records every `RuntimeReapUnproven`, including a stop or
+  `wait-exit` timeout after failed escalation. It retains the slot and footprint. On a live
+  despawn, `members-remain` hands the lifecycle to the reconcile retry scheduler.
+- `attemptStaticReconcile` preserves the retained reason, error and release remedy. It only
+  schedules a retry for `members-remain`; at budget exhaustion it reports `refused` with the
+  release remedy, never "restart this manager". Other reasons refuse immediately.
 
 **Exit signals do not release custody.** `SeatClient.waitExit`, `helloInfo.status === "exited"`
 and a handle's `status() === "exited"` all mean that the leader exited. None of them releases
@@ -271,11 +272,12 @@ descendants.
   groups, ACLs and effective capabilities. An owner/mode check alone is not proof. Provision a
   controlled migration attempt under the agent's credentials; if it succeeds or any grant cannot
   be verified, return `retained`. Under isolation the manager-owned base can pass this check;
-  without isolation the shared manager/agent uid can write the base, so it fails. Open Question 2
-  decides the single-uid policy. No proof depends on the agent's claimed identity.
-- **Proof and kill.** The kill is a write of `1` to `cgroup.kill` (Linux 5.14). The proof is
-  `populated 0` in `cgroup.events` followed by a successful `rmdir`; `rmdir` fails with `EBUSY`
-  while any task remains. A `setsid` escapee stays in the cgroup, so it is covered.
+  without isolation the shared manager/agent uid can write the base, so it fails. The decided
+  single-uid policy retains custody. No proof depends on the agent's claimed identity.
+- **Proof and kill.** Write `1` to `cgroup.kill` (Linux 5.14). Wait up to `graceMs` for
+  `populated 0` in `cgroup.events`, then require a successful `rmdir`. If tasks remain at the
+  bound or `rmdir` fails, return `retained` / `members-remain`; do not treat SIGKILL delivery as
+  synchronous. A `setsid` escapee stays in the cgroup, so it is covered.
 - **Survives restart.** The path is derived, so a successor manager can measure and kill.
 - **Costs.**
   - It needs cgroup v2 and a delegated base (`Delegate=yes` on the manager unit).
@@ -416,9 +418,10 @@ as the only signal path.
 
 **New cells.**
 
-- **Forged same-uid record.** The test starts its own sleeper, writes the sleeper's pid and start
-  token into the record as the child and the custodian, and reaps. The sleeper is still alive, and
-  the outcome is `retained`.
+- **Forged same-uid record.** The test starts its own process-group leader sleeper and confirms
+  its PGID equals its pid. It writes that pid and start token as the recorded child and
+  custodian, then reaps. The sleeper remains alive and the outcome is `retained`. The
+  `kill(-childPid)` mutation must kill that group leader and turn this cell red.
 - **setsid escapee.** A child spawns a `setsid` grandchild, writes the grandchild's pid to a test
   file and exits. The outcome is `retained`, never `reaped`, and the grandchild is alive. The test
   then kills the grandchild by that pid.
@@ -456,6 +459,13 @@ as the only signal path.
   - `writeStaticSlotIntent` throws `failed-precondition`;
   - on the live despawn path, `status` shows `refused` with the release remedy and no
     `nextRetryAt`.
+- **Members remain.** A fake runtime first reports `retained` / `members-remain` on live despawn.
+  Verify a retry is armed; after it reports `reaped`, cleanup runs once. Removing the retry must
+  fail this cell. Exhaust the retry budget separately: status becomes `refused` with the release
+  remedy, never a restart instruction.
+- **Failed escalation.** Force the delayed SIGKILL send to fail and let `wait-exit` time out.
+  Verify `status` exposes the retained reason, the slot stays `terminalizing`, the alias blocks
+  reuse, and no credential or broker footprint is deleted.
 - **No reference.** A slot row with no `runtime` under a custodial runtime gives `refused` /
   `no-reference`, and the creds file remains.
 - **Fixture.** Update the find text in `orphan-seat-reap.mutations.json` in the same commit.
