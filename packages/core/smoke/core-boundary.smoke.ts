@@ -70,7 +70,7 @@ if (srcRoots.length === 0) {
 
 // Specifier-shaped, so the rail is about what the file IMPORTS, not about the package being named
 // in prose. This file names it in its own docblock, and so does the kit's.
-const KIT_IMPORT = /(?:^|\n)[^\n]*(?:import|export|require)[^\n]*["']@cotal-ai\/smoke-kit["']/;
+const KIT_IMPORT = /(?:^|\n)[^\n]*(?:import|export|require)[^\n]*["']@cotal-ai\/smoke-kit(?:\/[^"']+)?["']/;
 // `bin` is the published `cotal-ai` package and has no `src` tree: its shipped entry points sit at
 // the top level, next to `smoke/` and `scripts/`, which are not shipped. Scanning the two entry
 // points by name rather than the directory keeps the exact package a customer installs in scope

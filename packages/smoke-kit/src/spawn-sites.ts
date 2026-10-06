@@ -181,25 +181,43 @@ type Binding = {
   readonly valueScopes: readonly ts.Node[];
   readonly valueOffset: number;
   readonly token: boolean;
+  /** A function declaration, visible across its whole scope. */
+  readonly hoisted: boolean;
+  /** A declaration without an initializer: a placeholder, never a path a broker starts with. */
+  readonly uninitialized: boolean;
+  /** A conditional assignment leaves the previous value live outside the branch that may skip it. */
+  readonly alternative?: { readonly binding: Binding; readonly start: number; readonly end: number };
 };
+
+const SHORT_CIRCUIT: readonly ts.SyntaxKind[] = [
+  ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken,
+];
+
+/** The outermost branch below `scope` that may skip `node`, or undefined when `node` always runs. */
+function skippableBranch(node: ts.Node, scope: ts.Node | undefined): ts.Node | undefined {
+  let branch: ts.Node | undefined;
+  for (let child = node, parent = node.parent; parent !== undefined && parent !== scope; child = parent, parent = parent.parent) {
+    if (ts.isFunctionLike(parent)) return branch;
+    if (ts.isIfStatement(parent) && child !== parent.expression) branch = child;
+    else if (ts.isConditionalExpression(parent) && child !== parent.condition) branch = child;
+    else if (ts.isBinaryExpression(parent) && child === parent.right && SHORT_CIRCUIT.includes(parent.operatorToken.kind)) branch = child;
+    else if (ts.isIterationStatement(parent, false) && !ts.isDoStatement(parent) && child === parent.statement) branch = child;
+    else if (ts.isCaseOrDefaultClause(parent) || ts.isCatchClause(parent)) branch = parent;
+    else if (ts.isTryStatement(parent) && child === parent.tryBlock && parent.catchClause !== undefined) branch = child;
+  }
+  return branch;
+}
 
 /** Collect local initializers without merging declarations from sibling scopes. */
 function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding[]> } {
   const file = ts.createSourceFile("source.ts", src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const defs = new Map<string, Binding[]>();
-  const add = (
-    name: string,
-    value: string,
-    scopes: readonly ts.Node[],
-    offset: number,
-    valueScopes: readonly ts.Node[] = scopes,
-    valueOffset: number = offset,
-    token = false,
-  ): void => {
+  const add = (name: string, binding: Binding): void => {
     const list = defs.get(name) ?? [];
-    list.push({ value, scopes, offset, valueScopes, valueOffset, token });
+    list.push(binding);
     defs.set(name, list);
   };
+  const plain = { token: false, hoisted: false, uninitialized: false };
   const visit = (node: ts.Node, parentScopes: readonly ts.Node[]): void => {
     const scopes = isLexicalScope(node) ? [...parentScopes, node] : parentScopes;
     if (ts.isVariableDeclaration(node)) {
@@ -208,7 +226,10 @@ function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding
         ? scopes
         : scopes.filter((scope) => ts.isSourceFile(scope) || ts.isFunctionLike(scope));
       const valueOffset = node.initializer?.getStart(file) ?? node.getStart(file);
-      if (ts.isIdentifier(node.name)) add(node.name.text, value, declarationScopes, node.getStart(file), scopes, valueOffset);
+      const location = { scopes: declarationScopes, offset: node.getStart(file), valueScopes: scopes, valueOffset };
+      // A for-of/for-in binding has no initializer but the loop always assigns it.
+      const uninitialized = node.initializer === undefined && !ts.isForInStatement(node.parent.parent) && !ts.isForOfStatement(node.parent.parent);
+      if (ts.isIdentifier(node.name)) add(node.name.text, { ...plain, ...location, value, uninitialized });
       if (ts.isObjectBindingPattern(node.name)) {
         for (const element of node.name.elements) {
           const property = element.propertyName ?? element.name;
@@ -222,8 +243,8 @@ function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding
             ? moduleCall.arguments[0]!.text
             : "";
           const kitToken = source === "@cotal-ai/smoke-kit" && property.text === "SMOKE_BROKER_TOKEN";
-          add(element.name.text, kitToken ? "" : value === "" ? "" : `(${value}).${property.text}`,
-            declarationScopes, node.getStart(file), scopes, valueOffset, kitToken);
+          add(element.name.text, { ...plain, ...location, token: kitToken,
+            value: kitToken ? "" : value === "" ? "" : `(${value}).${property.text}` });
         }
       }
     }
@@ -234,12 +255,15 @@ function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding
         && ts.isStringLiteral(declaration.moduleSpecifier)
         && declaration.moduleSpecifier.text === "@cotal-ai/smoke-kit"
         && imported === "SMOKE_BROKER_TOKEN") {
-        add(node.name.text, "", [file], node.getStart(file), [file], node.getStart(file), true);
+        const offset = node.getStart(file);
+        add(node.name.text, { ...plain, value: "", scopes: [file], offset, valueScopes: [file], valueOffset: offset, token: true });
       }
     }
     if (ts.isFunctionDeclaration(node) && node.name !== undefined) {
-      const declarationScopes = scopes.filter((scope) => ts.isSourceFile(scope) || ts.isFunctionLike(scope));
-      add(node.name.text, "", declarationScopes, node.getStart(file));
+      // The name belongs to the scope the declaration sits in, not to the function's own body.
+      const declarationScopes = parentScopes.filter((scope) => ts.isSourceFile(scope) || ts.isFunctionLike(scope));
+      const offset = node.getStart(file);
+      add(node.name.text, { ...plain, value: "", scopes: declarationScopes, offset, valueScopes: declarationScopes, valueOffset: offset, hoisted: true });
     }
 
     ts.forEachChild(node, (child) => visit(child, scopes));
@@ -257,11 +281,19 @@ function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding
       const prior = nearest.length === 0 ? undefined : nearest.reduce((left, right) => left.offset > right.offset ? left : right);
       const targetScopes = prior?.scopes ?? scopes;
       const assigned = src.slice(node.right.getStart(file), node.right.end);
-      const selfReference = identifiers(assigned).includes(node.left.text) && prior !== undefined;
-      const value = selfReference ? `${prior.value} ${assigned}` : assigned;
-      const valueScopes = selfReference ? prior.valueScopes : scopes;
-      const valueOffset = selfReference ? prior.valueOffset : node.right.getStart(file);
-      add(node.left.text, value, targetScopes, node.getStart(file), valueScopes, valueOffset);
+      const branch = prior === undefined ? undefined : skippableBranch(node, targetScopes[targetScopes.length - 1]);
+      // The right side runs before the store, so it reads the previous value of a self-extending path.
+      add(node.left.text, {
+        ...plain,
+        value: assigned,
+        scopes: targetScopes,
+        offset: node.getStart(file),
+        valueScopes: scopes,
+        valueOffset: node.getStart(file) - 1,
+        ...(prior !== undefined && branch !== undefined
+          ? { alternative: { binding: prior, start: branch.getStart(file), end: branch.end } }
+          : {}),
+      });
     }
     ts.forEachChild(node, (child) => collectAssignments(child, scopes));
   };
@@ -282,18 +314,161 @@ function scopesAt(file: ts.SourceFile, offset: number): ts.Node[] {
   return result;
 }
 
-function visibleBindings(name: string, defs: Map<string, Binding[]>, scopes: readonly ts.Node[], offset: number): Binding[] {
+/** A function declaration is live from the start of its scope; every other binding from where it is written. */
+const effectiveOffset = (binding: Binding): number => binding.hoisted ? -1 : binding.offset;
+
+/** The latest of `candidates` live at `offset`, plus the earlier values a skippable assignment leaves live. */
+function latestAt(candidates: readonly Binding[], offset: number): Binding[] {
+  const before = candidates.filter((binding) => effectiveOffset(binding) <= offset);
+  if (before.length === 0) return [];
+  let current: Binding | undefined = before.reduce((left, right) => effectiveOffset(left) >= effectiveOffset(right) ? left : right);
+  const live: Binding[] = [];
+  while (current !== undefined) {
+    live.push(current);
+    const alternative: Binding["alternative"] = current.alternative;
+    current = alternative !== undefined && (offset < alternative.start || offset >= alternative.end) ? alternative.binding : undefined;
+  }
+  return live;
+}
+
+/** The binding name a function is called through, or undefined for an anonymous function. */
+function functionBinding(fn: ts.Node): { readonly name: string; readonly offset: number; readonly exported: boolean } | undefined {
+  const exported = (node: ts.Node): boolean =>
+    ts.canHaveModifiers(node) && (ts.getModifiers(node) ?? []).some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword);
+  if (ts.isFunctionDeclaration(fn) && fn.name !== undefined) return { name: fn.name.text, offset: fn.getStart(), exported: exported(fn) };
+  const parent = fn.parent;
+  if ((ts.isArrowFunction(fn) || ts.isFunctionExpression(fn)) && ts.isVariableDeclaration(parent) && ts.isIdentifier(parent.name)) {
+    return { name: parent.name.text, offset: parent.getStart(), exported: exported(parent.parent.parent) };
+  }
+  return undefined;
+}
+
+/** An identifier that reads a binding, not one that names a declaration, a property, or a type. */
+function isValueReference(node: ts.Identifier): boolean {
+  const parent = node.parent;
+  if (ts.isPropertyAccessExpression(parent)) return parent.expression === node;
+  if (ts.isBindingElement(parent)) return false;
+  if ((ts.isPropertyAssignment(parent) || ts.isMethodDeclaration(parent) || ts.isPropertyDeclaration(parent)
+    || ts.isPropertySignature(parent) || ts.isMethodSignature(parent) || ts.isVariableDeclaration(parent)
+    || ts.isParameter(parent) || ts.isFunctionDeclaration(parent) || ts.isFunctionExpression(parent)
+    || ts.isClassDeclaration(parent) || ts.isImportSpecifier(parent) || ts.isImportClause(parent)) && parent.name === node) return false;
+  return !ts.isTypeReferenceNode(parent) && !ts.isTypeQueryNode(parent) && !ts.isQualifiedName(parent);
+}
+
+const invocationCache = new WeakMap<ts.Node, readonly number[] | null>();
+
+/** Offsets of every direct call to a local function, or null when it may run from code this file does not show. */
+function invocations(fn: ts.Node, defs: Map<string, Binding[]>): readonly number[] | null {
+  const cached = invocationCache.get(fn);
+  if (cached !== undefined) return cached;
+  let outer: ts.Node = fn;
+  while (ts.isParenthesizedExpression(outer.parent)) outer = outer.parent;
+  const named = functionBinding(fn);
+  let result: readonly number[] | null = null;
+  if (ts.isCallExpression(outer.parent) && outer.parent.expression === outer) result = [outer.parent.getStart()];
+  else if (named !== undefined && !named.exported) {
+    const file = fn.getSourceFile();
+    const sameName = defs.get(named.name) ?? [];
+    const own = sameName.find((binding) => binding.offset === named.offset);
+    // A reassigned function name may hold another function at a call, so its callers are unknown.
+    const reassigned = own === undefined || sameName.some((binding) => binding !== own
+      && binding.scopes.length === own.scopes.length && binding.scopes.every((scope, index) => own.scopes[index] === scope));
+    if (own !== undefined && !reassigned) {
+      const calls: number[] = [];
+      let escapes = false;
+      const visit = (node: ts.Node): void => {
+        if (escapes) return;
+        if (ts.isIdentifier(node) && node.text === named.name && isValueReference(node)) {
+          const scopes = scopesAt(file, node.getStart(file));
+          const resolved = sameName.filter((binding) => binding.scopes.length <= scopes.length
+            && binding.scopes.every((scope, index) => scopes[index] === scope));
+          const depth = Math.max(0, ...resolved.map((binding) => binding.scopes.length));
+          if (resolved.includes(own) && depth === own.scopes.length) {
+            if (ts.isCallExpression(node.parent) && node.parent.expression === node) calls.push(node.parent.getStart(file));
+            else escapes = true;
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(file);
+      if (!escapes) result = calls;
+    }
+  }
+  invocationCache.set(fn, result);
+  return result;
+}
+
+/** Every value a binding at scope depth `depth` may hold when `offset` runs, through the calls into enclosing functions. */
+function liveAt(
+  nearest: readonly Binding[],
+  depth: number,
+  scopes: readonly ts.Node[],
+  offset: number,
+  defs: Map<string, Binding[]>,
+  stack: readonly ts.Node[],
+): Binding[] {
+  let index = -1;
+  for (let i = scopes.length - 1; i >= depth; i--) if (ts.isFunctionLike(scopes[i]!)) { index = i; break; }
+  if (index < 0) return latestAt(nearest, offset);
+  const fn = scopes[index]!;
+  const local = latestAt(nearest.filter((binding) => binding.offset >= fn.getStart() && binding.offset < fn.end), offset);
+  if (local.length > 0) return local;
+  if (stack.includes(fn)) return [];
+  const calls = invocations(fn, defs);
+  if (calls === null) {
+    // An unseen caller may run the function at any point after it is written, so every later value is live too.
+    const later = nearest.filter((binding) => binding.offset >= fn.end && !binding.hoisted);
+    const before = latestAt(nearest, fn.getStart()).filter((binding) => later.length === 0 || !binding.uninitialized);
+    return [...new Set([...before, ...later])];
+  }
+  const file = fn.getSourceFile();
+  return [...new Set(calls
+    .filter((call) => call < fn.getStart() || call >= fn.end)
+    .flatMap((call) => liveAt(nearest, depth, scopesAt(file, call), call, defs, [...stack, fn])))];
+}
+
+/** The nearest-scope bindings a name refers to at `offset`, before asking which value is live. */
+function resolvedBindings(name: string, defs: Map<string, Binding[]>, scopes: readonly ts.Node[], offset: number): Binding[] {
   const deferred = scopes.findIndex((scope) => ts.isFunctionLike(scope));
   const visible = (defs.get(name) ?? []).filter((binding) =>
     binding.scopes.length <= scopes.length
       && binding.scopes.every((scope, index) => scopes[index] === scope)
-      && (binding.offset <= offset || deferred >= 0 && binding.scopes.length <= deferred),
+      && (effectiveOffset(binding) <= offset || deferred >= 0 && binding.scopes.length <= deferred),
   );
   const nearestScope = Math.max(0, ...visible.map((binding) => binding.scopes.length));
-  const nearest = visible.filter((binding) => binding.scopes.length === nearestScope);
-  return nearest.length === 0 ? [] : [nearest.reduce((left, right) => left.offset > right.offset ? left : right)];
+  return visible.filter((binding) => binding.scopes.length === nearestScope);
 }
-function teardownCalls(file: ts.SourceFile, defs: Map<string, Binding[]>): ts.CallExpression[] {
+
+/** Every binding whose value a name may hold when `offset` runs. */
+function visibleBindings(name: string, defs: Map<string, Binding[]>, scopes: readonly ts.Node[], offset: number): Binding[] {
+  const nearest = resolvedBindings(name, defs, scopes, offset);
+  if (nearest.length === 0) return [];
+  return liveAt(nearest, nearest[0]!.scopes.length, scopes, offset, defs, []);
+}
+
+/** A parameter or catch binding of `name` encloses `scopes` more closely than the nearest local binding. */
+function shadowedByParameter(name: string, params: readonly ParameterBinding[], scopes: readonly ts.Node[], localDepth: number): boolean {
+  return params.some((parameter) => parameter.name === name
+    && parameter.scopes.length > localDepth
+    && parameter.scopes.length <= scopes.length
+    && parameter.scopes.every((scope, index) => scopes[index] === scope));
+}
+
+/** Code at `offset` can run: each enclosing local function with known callers is called from code that can run. */
+function reachable(file: ts.SourceFile, offset: number, defs: Map<string, Binding[]>, stack: readonly ts.Node[] = []): boolean {
+  const scopes = scopesAt(file, offset);
+  for (let i = scopes.length - 1; i >= 0; i--) {
+    const fn = scopes[i]!;
+    if (!ts.isFunctionLike(fn)) continue;
+    const calls = invocations(fn, defs);
+    if (calls === null) continue;
+    if (stack.includes(fn)) return false;
+    return calls.some((call) => (call < fn.getStart() || call >= fn.end) && reachable(file, call, defs, [...stack, fn]));
+  }
+  return true;
+}
+
+function teardownCalls(file: ts.SourceFile, defs: Map<string, Binding[]>, params: readonly ParameterBinding[]): ts.CallExpression[] {
   const imports = new Map<string, ts.Node>();
   const calls: ts.CallExpression[] = [];
   const visit = (node: ts.Node): void => {
@@ -322,8 +497,14 @@ function teardownCalls(file: ts.SourceFile, defs: Map<string, Binding[]>): ts.Ca
     if (!ts.isIdentifier(callee)) return false;
     const imported = imports.get(callee.text);
     if (imported === undefined) return false;
-    return visibleBindings(callee.text, defs, scopesAt(file, callee.getStart(file)), callee.getStart(file))
-      .every((binding) => binding.offset === imported.getStart(file));
+    const offset = callee.getStart(file);
+    const scopes = scopesAt(file, offset);
+    const local = resolvedBindings(callee.text, defs, scopes, offset);
+    const localDepth = Math.max(0, ...local.map((binding) => binding.scopes.length));
+    // The helper must be the import itself, not a same-name local or parameter, and the call must be able to run.
+    return local.every((binding) => binding.offset === imported.getStart(file))
+      && !shadowedByParameter(callee.text, params, scopes, localDepth)
+      && reachable(file, offset, defs);
   });
 }
 
@@ -341,12 +522,15 @@ function ownsBinding(
     const argument = call.arguments[0];
     if (argument === undefined || !ts.isIdentifier(argument)) return false;
     const argumentOffset = argument.getStart(file);
-    const argumentScopes = scopesAt(file, argumentOffset);
-    return visibleBindings(argument.text, defs, argumentScopes, argumentOffset)[0] === target;
+    const held = visibleBindings(argument.text, defs, scopesAt(file, argumentOffset), argumentOffset)
+      .filter((binding) => !binding.uninitialized);
+    // A declared-but-unassigned value is `undefined`, never a different child.
+    return held.length > 0 && held.every((binding) => binding === target);
   });
 }
+/** Some call that resolves to THIS factory binding, not a same-name one, hands its result to the helper. */
 function ownsFactoryResult(
-  name: string,
+  factory: { readonly name: string; readonly offset: number },
   offset: number,
   defs: Map<string, Binding[]>,
   file: ts.SourceFile,
@@ -356,9 +540,12 @@ function ownsFactoryResult(
   const visit = (node: ts.Node): void => {
     if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer !== undefined) {
       const initializer = ts.isAwaitExpression(node.initializer) ? node.initializer.expression : node.initializer;
-      if (ts.isCallExpression(initializer) && ts.isIdentifier(initializer.expression) && initializer.expression.text === name) {
+      if (ts.isCallExpression(initializer) && ts.isIdentifier(initializer.expression) && initializer.expression.text === factory.name) {
         const callOffset = initializer.getStart(file);
-        if (callOffset > offset && ownsBinding(node.name.text, scopesAt(file, callOffset), callOffset, defs, file, calls)) owned = true;
+        const callScopes = scopesAt(file, callOffset);
+        const callee = resolvedBindings(factory.name, defs, callScopes, callOffset);
+        if (callOffset > offset && callee.length > 0 && callee.every((binding) => binding.offset === factory.offset)
+          && ownsBinding(node.name.text, callScopes, callOffset, defs, file, calls)) owned = true;
       }
     }
     if (!owned) ts.forEachChild(node, visit);
@@ -366,7 +553,7 @@ function ownsFactoryResult(
   visit(file);
   return owned;
 }
-function factoryNameAt(file: ts.SourceFile, offset: number): string | undefined {
+function factoryAt(file: ts.SourceFile, offset: number): { readonly name: string; readonly offset: number } | undefined {
   let enclosing: ts.FunctionLikeDeclaration | undefined;
   const visit = (node: ts.Node): void => {
     if (offset < node.getStart(file) || offset > node.end) return;
@@ -374,10 +561,7 @@ function factoryNameAt(file: ts.SourceFile, offset: number): string | undefined 
     ts.forEachChild(node, visit);
   };
   visit(file);
-  if (enclosing === undefined) return undefined;
-  if (ts.isFunctionDeclaration(enclosing)) return enclosing.name?.text;
-  const parent = enclosing.parent;
-  return ts.isVariableDeclaration(parent) && ts.isIdentifier(parent.name) ? parent.name.text : undefined;
+  return enclosing === undefined ? undefined : functionBinding(enclosing);
 }
 
 function spawnIsOwnedByTeardown(offset: number, calls: readonly ts.CallExpression[], file: ts.SourceFile): boolean {
@@ -412,31 +596,83 @@ function unwrapped(expr: string): string {
   return value;
 }
 
-const IGNORED_IDS = new Set(["join", "resolve", "tmpdir", "mkdtempSync", "mkdirSync", "writeFileSync", "String", "process", "env"]);
+/** Path builders whose result keeps a tokened argument, while every later segment is a plain relative name. */
+const PATH_PRESERVING: Readonly<Record<string, readonly string[]>> = {
+  "node:path": ["join", "resolve"],
+  "node:fs": ["mkdtempSync", "realpathSync"],
+};
+
+/** A later path segment that cannot climb out of, or replace, the tokened prefix. */
+function keepsPrefix(node: ts.Expression): boolean {
+  const text = ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ? node.text
+    : ts.isTemplateExpression(node) ? [node.head.text, ...node.templateSpans.map((span) => span.literal.text)].join("x")
+    : undefined;
+  return text !== undefined && !/^([\\/]|[A-Za-z]:)/.test(text) && !text.split(/[\\/]/).includes("..");
+}
+
+/** Path-builder names bound by an import, each with the local binding offset a dynamic import gives it. */
+function pathPreservingNames(file: ts.SourceFile): Map<string, number | undefined> {
+  const names = new Map<string, number | undefined>();
+  const moduleName = (text: string): string => text.startsWith("node:") ? text : `node:${text}`;
+  for (const statement of file.statements) {
+    if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
+      const preserving = PATH_PRESERVING[moduleName(statement.moduleSpecifier.text)];
+      const named = statement.importClause?.namedBindings;
+      if (preserving === undefined || named === undefined || !ts.isNamedImports(named)) continue;
+      for (const element of named.elements) {
+        if (preserving.includes(element.propertyName?.text ?? element.name.text)) names.set(element.name.text, undefined);
+      }
+    }
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      const initializer = declaration.initializer !== undefined && ts.isAwaitExpression(declaration.initializer)
+        ? declaration.initializer.expression : undefined;
+      if (!ts.isObjectBindingPattern(declaration.name) || initializer === undefined || !ts.isCallExpression(initializer)
+        || initializer.expression.kind !== ts.SyntaxKind.ImportKeyword || initializer.arguments.length !== 1) continue;
+      const specifier = initializer.arguments[0]!;
+      const preserving = ts.isStringLiteral(specifier) ? PATH_PRESERVING[moduleName(specifier.text)] : undefined;
+      if (preserving === undefined) continue;
+      for (const element of declaration.name.elements) {
+        const property = element.propertyName ?? element.name;
+        if (ts.isIdentifier(element.name) && ts.isIdentifier(property) && preserving.includes(property.text)) {
+          names.set(element.name.text, declaration.getStart(file));
+        }
+      }
+    }
+  }
+  return names;
+}
 
 type CallArgument = { readonly value: string; readonly scopes: readonly ts.Node[]; readonly offset: number };
 type ParameterBinding = { readonly node: ts.Node; readonly name: string; readonly index: number; readonly property?: string; readonly scopes: readonly ts.Node[]; readonly args: CallArgument[] };
 type FunctionResult = { readonly declaration: ts.Node; readonly name: string; readonly scopes: readonly ts.Node[]; readonly fields: Map<string, CallArgument[]> };
+type Provenance = {
+  readonly defs: Map<string, Binding[]>;
+  readonly params: readonly ParameterBinding[];
+  readonly results: readonly FunctionResult[];
+  /** Imported path builders by local name, with the dynamic-import binding offset when there is one. */
+  readonly preserving: ReadonlyMap<string, number | undefined>;
+};
 
+/**
+ * Does the token survive into the VALUE of `expr` on every path, not merely appear in it?
+ * Mentioning the token is not proof: `token && "plain"`, `env.X || token`, `token.slice(0, 0)`, and
+ * `pick(token)` all evaluate to a path without it. So only shapes known to keep their input count:
+ * concatenation, template substitution, the imported path builders, and bindings whose every live value
+ * carries it. Any other call or member read is unproven and reads as untokened.
+ */
 function reachesToken(
   expr: string,
-  defs: Map<string, Binding[]>,
-  params: readonly ParameterBinding[],
-  results: readonly FunctionResult[],
+  context: Provenance,
   scopes: readonly ts.Node[],
   offset: number,
   seen = new Set<string>(),
 ): boolean {
   const value = unwrapped(expr);
-  const branches = conditionalBranches(value);
-  if (branches !== undefined) return branches.every((branch) =>
-    branch === "undefined" || branch === "null" || reachesToken(branch, defs, params, results, scopes, offset, new Set(seen)));
-  const fallback = splitTopLevel(value, "??");
-  if (fallback.length > 1) return fallback.every((branch) =>
-    reachesToken(branch, defs, params, results, scopes, offset, new Set(seen)));
+  if (seen.size > 16) return false;
   const returned = /^(?:await\s+)?\(?\s*([A-Za-z_$][\w$]*)\s*\(\s*\)\s*\)?\s*(?:\?\.|\.)\s*([A-Za-z_$][\w$]*)$/.exec(value);
   if (returned !== null) {
-    const candidates = results.filter((result) => result.name === returned[1]
+    const candidates = context.results.filter((result) => result.name === returned[1]
       && result.scopes.length <= scopes.length
       && result.scopes.every((scope, index) => scopes[index] === scope));
     const depth = Math.max(0, ...candidates.map((result) => result.scopes.length));
@@ -448,41 +684,76 @@ function reachesToken(
         if (seen.has(key) || field.length === 0) return false;
         const path = new Set(seen);
         path.add(key);
-        return field.every((arg) => reachesToken(arg.value, defs, params, results, arg.scopes, arg.offset, path));
+        return field.every((arg) => reachesToken(arg.value, context, arg.scopes, arg.offset, path));
       });
     }
   }
-  const ids = new Set(identifiers(expr));
-  if (seen.size > 16) return false;
-  for (const id of ids) {
-    if (IGNORED_IDS.has(id)) continue;
-    const local = visibleBindings(id, defs, scopes, offset);
+  const parsed = ts.createSourceFile("expression.ts", `(${value});`, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const statement = parsed.statements[0];
+  if (statement === undefined || !ts.isExpressionStatement(statement) || parsed.statements.length !== 1) return false;
+  const survives = (node: ts.Expression): boolean => {
+    if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isNonNullExpression(node)
+      || ts.isSatisfiesExpression(node) || ts.isTypeAssertionExpression(node) || ts.isAwaitExpression(node)) return survives(node.expression);
+    if (ts.isConditionalExpression(node)) return [node.whenTrue, node.whenFalse].every((branch) =>
+      branch.kind === ts.SyntaxKind.NullKeyword || ts.isIdentifier(branch) && branch.text === "undefined" || survives(branch));
+    if (ts.isBinaryExpression(node)) {
+      const operator = node.operatorToken.kind;
+      // Either operand of a short circuit can be the result, so both have to carry the token.
+      if (SHORT_CIRCUIT.includes(operator)) return survives(node.left) && survives(node.right);
+      if (operator === ts.SyntaxKind.PlusToken) return survives(node.left) || survives(node.right);
+      if (operator === ts.SyntaxKind.CommaToken) return survives(node.right);
+      return false;
+    }
+    if (ts.isTemplateExpression(node)) return node.templateSpans.some((span) => survives(span.expression));
+    if (ts.isArrayLiteralExpression(node)) return node.elements.some((element) => !ts.isSpreadElement(element) && survives(element));
+    if (ts.isCallExpression(node)) {
+      if (!ts.isIdentifier(node.expression) || !preservingCallee(node.expression.text)) return false;
+      const args = node.arguments;
+      // A tokened segment survives only when nothing after it can replace or climb out of it.
+      return args.some((argument, index) => !ts.isSpreadElement(argument) && survives(argument)
+        && args.slice(index + 1).every(keepsPrefix));
+    }
+    if (ts.isIdentifier(node)) return identifierSurvives(node.text);
+    return false;
+  };
+  const preservingCallee = (name: string): boolean => {
+    const local = resolvedBindings(name, context.defs, scopes, offset);
+    if (shadowedByParameter(name, context.params, scopes, Math.max(0, ...local.map((binding) => binding.scopes.length)))) return false;
+    if (local.length > 0) {
+      const imported = context.preserving.get(name);
+      return imported !== undefined && local.every((binding) => binding.offset === imported);
+    }
+    // An unimported builder name with no local binding is a fixture's elided import.
+    return context.preserving.has(name) || Object.values(PATH_PRESERVING).some((names) => names.includes(name));
+  };
+  const identifierSurvives = (id: string): boolean => {
+    const local = visibleBindings(id, context.defs, scopes, offset);
     const localDepth = Math.max(0, ...local.map((binding) => binding.scopes.length));
-    const parameters = params.filter((parameter) => parameter.name === id
+    const parameters = context.params.filter((parameter) => parameter.name === id
       && parameter.scopes.length <= scopes.length
       && parameter.scopes.every((scope, index) => scopes[index] === scope));
     const parameterDepth = Math.max(0, ...parameters.map((parameter) => parameter.scopes.length));
     if (parameters.length > 0 && parameterDepth > localDepth) {
-      const nearest = parameters.filter((parameter) => parameter.scopes.length === parameterDepth);
-      if (nearest.some((parameter) => {
+      return parameters.filter((parameter) => parameter.scopes.length === parameterDepth).some((parameter) => {
         const key = `${id}@param:${parameter.node.getStart()}`;
         if (seen.has(key) || parameter.args.length === 0) return false;
         const path = new Set(seen);
         path.add(key);
-        return parameter.args.every((arg) => reachesToken(arg.value, defs, params, results, arg.scopes, arg.offset, path));
-      })) return true;
-      continue;
+        return parameter.args.every((arg) => reachesToken(arg.value, context, arg.scopes, arg.offset, path));
+      });
     }
-    if (local.some((binding) => {
+    // Every value the name may hold at this point must carry the token, not just the latest write.
+    return local.length > 0 && local.every((binding) => {
       if (binding.token) return true;
+      if (binding.uninitialized || binding.value === "") return false;
       const key = `${id}@${binding.offset}`;
       if (seen.has(key)) return false;
       const path = new Set(seen);
       path.add(key);
-      return reachesToken(binding.value, defs, params, results, binding.valueScopes, binding.valueOffset, path);
-    })) return true;
-  }
-  return false;
+      return reachesToken(binding.value, context, binding.valueScopes, binding.valueOffset, path);
+    });
+  };
+  return survives(statement.expression);
 }
 
 /** Callees that actually START a process. Anything else that merely NAMES the binary (`need(...)`,
@@ -574,18 +845,6 @@ const isSpawner = (callee: string, aliases: { names: ReadonlySet<string>; namesp
   const member = /^(.*?)\.([A-Za-z_$][\w$]*)$/.exec(callee);
   return member !== null && aliases.namespaces.has(member[1]!) && SPAWNERS.has(member[2]!);
 };
-
-/** Identifiers in code, including template substitutions but excluding literal contents. */
-function identifiers(expr: string): string[] {
-  const file = ts.createSourceFile("expression.ts", `(${expr});`, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const found: string[] = [];
-  const visit = (node: ts.Node): void => {
-    if (ts.isIdentifier(node)) found.push(node.text);
-    ts.forEachChild(node, visit);
-  };
-  visit(file);
-  return found;
-}
 
 /** Split at top-level operator occurrences, ignoring literals and nested groups. */
 function splitTopLevel(expr: string, operator: string): string[] {
@@ -889,7 +1148,8 @@ export function enumerateSpawnSites(cwd: string): SpawnSite[] {
     const { params, results } = functionProvenance(src, sourceFile);
     const aliases = processAliases(sourceFile);
     const commentFree = withoutComments(src, sourceFile);
-    const teardownOwnershipCalls = teardownCalls(sourceFile, defs);
+    const teardownOwnershipCalls = teardownCalls(sourceFile, defs, params);
+    const provenance = { defs, params, results, preserving: pathPreservingNames(sourceFile) };
     const lineStarts = src.split("\n");
     const re = /([A-Za-z_$][\w$.]*)\s*\(/g;
     const matches: Array<{ callee: string; offset: number; open: number }> = [];
@@ -926,7 +1186,7 @@ export function enumerateSpawnSites(cwd: string): SpawnSite[] {
       const argvIndirect = argvPath === "none"
         && /^[A-Za-z_$][\w$]*$/.test(unwrapped(brokerCode.replace(/\s*!$/, "")).replace(/\s+as\s+[A-Za-z_$][\w$.]*(?:\[\])?$/, ""));
       const effectiveExpr = pathExpr ?? (argvIndirect ? brokerCode.trim() : undefined);
-      const tokened = effectiveExpr !== undefined && reachesToken(effectiveExpr, defs, params, results, scopes, offset);
+      const tokened = effectiveExpr !== undefined && reachesToken(effectiveExpr, provenance, scopes, offset);
       // OWNERSHIP IS PER-SITE, NOT PER-FILE. A file that owns one of its two brokers would read as
       // clean under a file-level test, which is the same "named list" mistake one level down.
       //
@@ -951,7 +1211,7 @@ export function enumerateSpawnSites(cwd: string): SpawnSite[] {
       const assignmentPrefix = tail.replace(/(?:[A-Za-z_$][\w$.]*\s*\(\s*(?:(['"`])[^'"`]*\1\s*,\s*)?)+$/, "");
       const bind = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=\n]+)?=\s*(?:await\s+)?$|(?:^|[\s;{(])([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?$/.exec(assignmentPrefix);
       const name = bind?.[1] ?? bind?.[2];
-      const factory = name === undefined ? factoryNameAt(sourceFile, offset) : undefined;
+      const factory = name === undefined ? factoryAt(sourceFile, offset) : undefined;
       const owned = name !== undefined
         ? ownsBinding(name, scopes, offset, defs, sourceFile, teardownOwnershipCalls)
         : factory !== undefined && ownsFactoryResult(factory, offset, defs, sourceFile, teardownOwnershipCalls)

@@ -26,12 +26,12 @@
  * which is defect 1 in the helper's taxonomy and is not visible in a spawn site's shape.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { SMOKE_BROKER_TOKEN, SMOKE_BROKER_PREFIX } from "@cotal-ai/smoke-kit";
-import { EXEMPT_MARKER, enumerateSpawnSites, inScope, isAdopted } from "@cotal-ai/smoke-kit/spawn-sites";
+import { EXEMPT_MARKER, enumerateSpawnSites, inScope, isAdopted, type SpawnSite } from "@cotal-ai/smoke-kit/spawn-sites";
 
 const repo = join(import.meta.dirname, "..", "..", "..");
 const failures: string[] = [];
@@ -119,7 +119,7 @@ cell("the enumerator detects a newly added untokened spawn site", () => {
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const planted = join(scratch, "smoke", "planted.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(
       planted,
       `import { spawn } from "node:child_process";\n` +
@@ -161,7 +161,7 @@ cell("the enumerator classifies a locally resolved broker path", () => {
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const smokeDir = join(scratch, "smoke");
-    execFileSync("mkdir", ["-p", smokeDir]);
+    mkdirSync(smokeDir, { recursive: true });
     const planted = join(smokeDir, "indirect.smoke.ts");
     const binary =
       `const brokerRoot = process.env.SMOKE_BROKER_ROOT;\n` +
@@ -322,7 +322,7 @@ cell("the enumerator tracks reassignment origins and self-extending paths", () =
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const planted = join(scratch, "smoke", "assignment.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
       `import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";\n` +
@@ -354,7 +354,7 @@ cell("the enumerator does not treat a comment as a version probe", () => {
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const planted = join(scratch, "smoke", "version-comment.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
       `const child = spawn("nats-server", ["-js", /* --version was considered here */ "-sd", "plain"]);\n`);
@@ -371,7 +371,7 @@ cell("the enumerator does not infer resolver provenance through a loop-local bin
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const planted = join(scratch, "smoke", "loop-shadow.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(
       planted,
       `import { spawn } from "node:child_process";\n` +
@@ -389,7 +389,7 @@ cell("the enumerator ignores resolver calls shadowed by a function parameter", (
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const planted = join(scratch, "smoke", "resolver-shadow.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
       `const resolveNatsServer = async () => ({ bin: "/usr/bin/other-server" });\n` +
@@ -407,7 +407,7 @@ cell("the enumerator binds same-name declarations to their lexical scopes", () =
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const planted = join(scratch, "smoke", "shadow.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(
       planted,
       `import { spawn } from "node:child_process";\n` +
@@ -435,7 +435,7 @@ cell("the enumerator follows tokened provenance through later bindings and helpe
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const planted = join(scratch, "smoke", "provenance.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
       `import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";\n` +
@@ -471,7 +471,7 @@ cell("the enumerator follows destructured property provenance without borrowing 
   try {
     execFileSync("git", ["init", "-q", scratch]);
     const planted = join(scratch, "smoke", "destructured.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
       `import { SMOKE_BROKER_TOKEN } from "@cotal-ai/smoke-kit";\n` +
@@ -492,7 +492,7 @@ cell("the enumerator sees dynamic-import and method broker launches", () => {
   try {
     execFileSync("git", ["init", "-q", scratch]);
     const planted = join(scratch, "smoke", "method.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `const { spawn: launch } = await import("node:child_process");\n` +
       `const binary = (await resolveNatsServer()).bin;\n` +
@@ -514,7 +514,7 @@ cell("the enumerator ignores a tokened binding named like parser syntax", () => 
   try {
     execFileSync("git", ["init", "-q", scratch]);
     const planted = join(scratch, "smoke", "parser-name.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
       `import { SMOKE_BROKER_TOKEN } from "@cotal-ai/smoke-kit";\n` +
@@ -534,7 +534,7 @@ cell("the enumerator rejects a plain branch of a conditional path", () => {
   try {
     execFileSync("git", ["init", "-q", scratch]);
     const planted = join(scratch, "smoke", "conditional.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
       `import { SMOKE_BROKER_TOKEN } from "@cotal-ai/smoke-kit";\n` +
@@ -555,7 +555,7 @@ cell("the enumerator does not borrow future outer assignments", () => {
   try {
     execFileSync("git", ["init", "-q", scratch]);
     const planted = join(scratch, "smoke", "future.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
       `import { SMOKE_BROKER_TOKEN } from "@cotal-ai/smoke-kit";\n` +
@@ -576,7 +576,7 @@ cell("the enumerator refuses omitted and callback helper paths", () => {
   try {
     execFileSync("git", ["init", "-q", scratch]);
     const planted = join(scratch, "smoke", "omitted.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
       `import { SMOKE_BROKER_TOKEN } from "@cotal-ai/smoke-kit";\n` +
@@ -597,7 +597,7 @@ cell("the enumerator keeps reassignment provenance in the execution scope", () =
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const planted = join(scratch, "smoke", "assignment-scope.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
       `import { SMOKE_BROKER_TOKEN } from "@cotal-ai/smoke-kit";\n` +
@@ -619,7 +619,7 @@ cell("the enumerator rejects token spellings, lookalike ownership, and shadowed 
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const planted = join(scratch, "smoke", "false-provenance.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
       `import { SMOKE_BROKER_TOKEN as importedToken } from "@cotal-ai/smoke-kit";\n` +
@@ -656,11 +656,12 @@ cell("the enumerator ties ownership to the exact child binding", () => {
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const planted = join(scratch, "smoke", "owner-binding.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
       `import { teardownOnSignal } from "@cotal-ai/smoke-kit";\n` +
       `function nested() { const broker = spawn("nats-server", ["-sd", "plain"]); teardownOnSignal(broker); }\n` +
+      `nested();\n` +
       `const broker = spawn("nats-server", ["-sd", "plain"]);\n` +
       `let reassigned = spawn("nats-server", ["-sd", "plain"]);\n` +
       `reassigned = spawn("nats-server", ["-sd", "other"]);\n` +
@@ -681,7 +682,7 @@ cell("the enumerator rejects assignment and callback scope token leakage", () =>
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const planted = join(scratch, "smoke", "shadow-barriers.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
       `import { SMOKE_BROKER_TOKEN } from "@cotal-ai/smoke-kit";\n` +
@@ -706,7 +707,7 @@ cell("the enumerator refuses a fake teardown", () => {
   try {
     execFileSync("git", ["init", "-q", scratch]);
     const planted = join(scratch, "smoke", "fake-owner.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
       `import { SMOKE_BROKER_TOKEN } from "@cotal-ai/smoke-kit";\n` +
@@ -728,7 +729,7 @@ cell("the enumerator binds actual child_process command aliases", () => {
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const planted = join(scratch, "smoke", "spawn-alias.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn as launch } from "node:child_process";\n` +
       `import * as childProcess from "child_process";\n` +
@@ -750,7 +751,7 @@ cell("the enumerator follows only genuine imported token bindings", () => {
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const planted = join(scratch, "smoke", "import-token.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn as launch } from "node:child_process";\n` +
       `import { SMOKE_BROKER_TOKEN as token, SMOKE_BROKER_PREFIX as prefix, teardownOnSignal } from "@cotal-ai/smoke-kit";\n` +
@@ -774,7 +775,7 @@ cell("the enumerator recognizes binary lookups passed to local helpers", () => {
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const planted = join(scratch, "smoke", "lookup.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
       `const locate = (name: string) => name;\n` +
@@ -793,7 +794,7 @@ cell("the enumerator traces shorthand return fields across same-name bindings", 
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const planted = join(scratch, "smoke", "return-field.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(planted,
       `import { spawn } from "node:child_process";\n` +
       `import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";\n` +
@@ -815,7 +816,7 @@ cell("the enumerator resolves a ternary-bound NATS binary", () => {
   try {
     execFileSync("git", ["init", "-q", scratch], { encoding: "utf8" });
     const planted = join(scratch, "smoke", "ternary.smoke.ts");
-    execFileSync("mkdir", ["-p", join(scratch, "smoke")]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
     writeFileSync(
       planted,
       `import { spawn } from "node:child_process";\n` +
@@ -833,6 +834,92 @@ cell("the enumerator resolves a ternary-bound NATS binary", () => {
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
+});
+
+/** Plant one fixture suite and enumerate it; each cell below reads the sites back in source order. */
+function plantedSites(label: string, body: string): SpawnSite[] {
+  const scratch = mkdtempSync(join(tmpdir(), `${SMOKE_BROKER_TOKEN}migration-${label}-`));
+  try {
+    execFileSync("git", ["init", "-q", scratch]);
+    mkdirSync(join(scratch, "smoke"), { recursive: true });
+    writeFileSync(join(scratch, "smoke", `${label}.smoke.ts`),
+      `import { spawn } from "node:child_process";\n` +
+      `import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";\n` + body);
+    execFileSync("git", ["-C", scratch, "add", "-A"]);
+    return enumerateSpawnSites(scratch);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+// Naming the token is not carrying it. Each path below MENTIONS the token yet evaluates to a plain
+// path, so the broker's argv has nothing the reaper can match after its owner dies.
+cell("the enumerator requires the token to survive into the argv value", () => {
+  const found = plantedSites("token-survival",
+    `const a = spawn("nats-server", ["-sd", SMOKE_BROKER_TOKEN && "plain"]); teardownOnSignal(a);\n` +
+    `const b = spawn("nats-server", ["-sd", process.env.STORE || SMOKE_BROKER_TOKEN]); teardownOnSignal(b);\n` +
+    `const c = spawn("nats-server", ["-sd", SMOKE_BROKER_TOKEN.slice(0, 0) + "plain"]); teardownOnSignal(c);\n` +
+    `function pick(value: string) { void value; return "/plain"; }\n` +
+    `const d = spawn("nats-server", ["-sd", pick(SMOKE_BROKER_TOKEN)]); teardownOnSignal(d);\n` +
+    `const e = spawn("nats-server", ["-sd", join(SMOKE_BROKER_TOKEN, "/plain")]); teardownOnSignal(e);\n` +
+    `const f = spawn("nats-server", ["-sd", join(tmpdir(), SMOKE_BROKER_TOKEN, "js")]); teardownOnSignal(f);\n`);
+  assert.equal(found.length, 6);
+  const why = ["&& yields its right operand", "|| yields its left operand", "slice discards the token",
+    "an arbitrary call may discard its argument", "an absolute later segment replaces the prefix"];
+  why.forEach((reason, index) => assert.equal(found[index]!.tokened, false, reason));
+  assert.equal(isAdopted(found[5]!), true, "a token joined under relative segments stays adopted");
+});
+
+// A statement-level conditional leaves the earlier value live when the branch is skipped.
+cell("the enumerator keeps the untaken value of a conditional assignment", () => {
+  const found = plantedSites("conditional-assignment",
+    `let sd = "/plain";\n` +
+    `if (process.env.ISOLATE) { sd = join(tmpdir(), SMOKE_BROKER_TOKEN); }\n` +
+    `const a = spawn("nats-server", ["-sd", sd]); teardownOnSignal(a);\n` +
+    `let both = join(tmpdir(), SMOKE_BROKER_TOKEN, "a");\n` +
+    `if (process.env.ISOLATE) { both = join(tmpdir(), SMOKE_BROKER_TOKEN, "b"); }\n` +
+    `const b = spawn("nats-server", ["-sd", both]); teardownOnSignal(b);\n`);
+  assert.equal(found.length, 2);
+  assert.equal(found[0]!.tokened, false, "the skipped branch leaves the plain path live");
+  assert.equal(isAdopted(found[1]!), true, "both possible values are tokened");
+});
+
+// A helper runs when it is CALLED, so an outer assignment after the call cannot token its launch.
+cell("the enumerator resolves a helper's capture at its call, not at a later assignment", () => {
+  const found = plantedSites("deferred-capture",
+    `let sd = "/plain";\n` +
+    `function start() { return spawn("nats-server", ["-sd", sd]); }\n` +
+    `const a = start(); teardownOnSignal(a);\n` +
+    `sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `let late = "/plain";\n` +
+    `late = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `function startLate() { return spawn("nats-server", ["-sd", late]); }\n` +
+    `const b = startLate(); teardownOnSignal(b);\n`);
+  assert.equal(found.length, 2);
+  assert.equal(found[0]!.tokened, false, "the broker starts before the outer variable is tokened");
+  assert.equal(isAdopted(found[1]!), true, "an assignment before the call is the value the helper reads");
+});
+
+// Ownership has to be the imported helper, at a call that can run, on this factory's own result.
+cell("the enumerator refuses shadowed, borrowed, and unreachable teardown ownership", () => {
+  const found = plantedSites("ownership-bypass",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `function shadow(teardownOnSignal: (child: unknown) => void) { const a = spawn("nats-server", ["-sd", sd]); teardownOnSignal(a); }\n` +
+    `shadow(() => {});\n` +
+    `const startBroker = () => spawn("nats-server", ["-sd", sd]);\n` +
+    `const outer = startBroker();\n` +
+    `function nested() { const startBroker = () => spawn("other", []); const child = startBroker(); teardownOnSignal(child); }\n` +
+    `nested();\n` +
+    `const orphan = spawn("nats-server", ["-sd", sd]);\n` +
+    `function cleanup() { teardownOnSignal(orphan); }\n` +
+    `const kept = spawn("nats-server", ["-sd", sd]);\n` +
+    `function keep() { teardownOnSignal(kept); }\n` +
+    `keep();\n`);
+  assert.equal(found.length, 4);
+  assert.equal(found[0]!.owned, false, "a parameter named like the helper is a caller-supplied callback");
+  assert.equal(found[1]!.owned, false, "a same-name nested factory's child cannot own the outer factory's broker");
+  assert.equal(found[2]!.owned, false, "a cleanup helper nothing calls registers no teardown");
+  assert.equal(isAdopted(found[3]!), true, "a called cleanup helper still owns its broker");
 });
 
 // The token the gate requires must be the one the reaper matches. Two literals that drift apart
