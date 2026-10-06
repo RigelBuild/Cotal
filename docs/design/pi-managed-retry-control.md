@@ -42,7 +42,9 @@ settings files are never written.
 `_prepareRetry` and `_willRetryAfterAgentEnd` re-read `getRetrySettings()` on every attempt, so a
 correct file at every read is enough. `piConnector.buildLaunch` converges a seat dir:
 
-- `settings.json` = the operator's settings with `retry.enabled: false`;
+- `settings.json` starts from the operator's settings at first launch. Later launches preserve
+  existing seat-local settings and force only `retry.enabled: false`; operator changes to other
+  settings do not overwrite seat-local edits for that lifecycle (RIG-4721 option A).
 - a **fixed allowlist** of symlinks back to the operator agent dir;
 - `PI_CODING_AGENT_DIR` pointed at the seat dir.
 
@@ -76,15 +78,15 @@ With a fixed list:
 
 **Converge, never delete (F2).** `buildLaunch` also runs on the resume preflight-only path
 (`Manager`: `if (preflightOnly) return { ok: true, … }`, `implementations/manager/src/manager.ts`).
-Recovery and resume reuse the same `lifecycleUid`. So the seat dir may belong to a live Pi.
-`rm -rf` would leave a window where `settings.json` is missing (retry ON) and `sessions` is
-missing (ENOENT). Instead:
+Recovery and resume reuse the same `lifecycleUid`, so the seat dir may belong to a live Pi.
+Deleting it would expose retry-on settings and missing session files. Instead:
 
-- `settings.json` is written with `writeSecretFileAtomic` (`packages/core/src/secret-fs.ts`,
-  temp plus `renameSync`), so it is never absent;
-- each link is created if missing, or swapped through a temp link plus `renameSync` when
-  `readlinkSync` differs;
-- a re-run against a live seat is a no-op in effect.
+- on first launch, write operator settings with `retry.enabled: false` through
+  `writeSecretFileAtomic` (`packages/core/src/secret-fs.ts`);
+- on relaunch, validate the existing seat settings as a plain object, retain every seat-local
+  value, and atomically replace the file only if `retry.enabled` needs forcing to false;
+- create missing links, or swap a changed target through a temp link plus `renameSync`;
+- leave a passing live seat unchanged. A malformed seat settings file fails loudly.
 
 **Project override (F1).** Pi builds one `SettingsManager` per runtime from the *session's* cwd:
 
@@ -320,9 +322,13 @@ export function convergeSeatAgentDir(seatDir: string, operatorDir: string): void
      `implementations/cli/src/commands/backup.ts`.
    - Throw if the entry's first segment has glob metacharacters. Otherwise add that segment to the
      link set.
-   - Throw if `sessionDir` is relative.
-4. **Write the seat settings.** `writeSecretFileAtomic(<seatDir>/settings.json, …)` with
-   `{ ...op, retry: { ...(plain(op.retry) ? op.retry : {}), enabled: false } }`.
+   - Throw if `sessionDir` is present (including an absolute path). Managed sessions use Pi's
+     default `sessions` link; unmanaged operator sessions are unchanged.
+4. **Converge seat settings.** If the seat file is absent, write
+   `{ ...op, retry: { ...(plain(op.retry) ? op.retry : {}), enabled: false } }` atomically. Otherwise
+   parse and require a plain object, preserve its fields including seat-local edits, and atomically
+   write only when its `retry.enabled` is not false. Never re-copy operator settings into an
+   existing lifecycle's seat file.
 5. **Converge the links.** For each name in the allowlist plus the link set:
    - a missing operator dir is created first with `mkdirSync(…, { recursive: true })`;
    - a seat entry that exists but is not a link throws;
@@ -395,7 +401,9 @@ Launch cells run `buildLaunch` with a temp `HOME`, a temp `XDG_STATE_HOME`, temp
 - every allowlisted link exists, including a dangling `auth.json`;
 - missing dirs were created in the operator dir;
 - the operator `settings.json` bytes are unchanged;
-- a second call with the same uid leaves link inodes and a planted `pi-debug.log` intact;
+- a second call with the same uid leaves link inodes, seat settings bytes and a planted
+  `pi-debug.log` intact; a seat-local settings edit survives a relaunch, while retry stays false;
+- a later operator settings change does not overwrite that lifecycle's seat-local values;
 - a call with a second uid leaves the first seat dir and its `settings.json` bytes in place;
 - with `XDG_STATE_HOME` unset and `COTAL_HOME=<svc>`, `XDG_CONFIG_HOME=<svc>/config` as a service
   unit sets them, `rmSync(<svc>, { recursive: true, force: true })` (what `uninstall` does to
@@ -414,7 +422,7 @@ Each refusal case throws its message:
 
 - `apiKeys`, or `oauth.json` present;
 - `extensions: ["x/../../e.ts"]`;
-- a relative `sessionDir`;
+- any custom `sessionDir`, relative or absolute;
 - a relative `XDG_STATE_HOME`, and nothing is created under the cwd;
 - no `HOME` and no forwarded `PI_CODING_AGENT_DIR`;
 - a symlinked seat root;
@@ -696,3 +704,9 @@ drops all Windows support. Each entry gives the choice, the reason, and what los
    and case-insensitive env lookup from the #45 review. Their reasons were Windows file-name
    rules, case-insensitive file systems and Windows env casing, and the hex leaf needed a manager
    reader change.
+9. **Managed session directory (RIG-4721 option A).** Reject any custom `sessionDir`, including
+   absolute paths. Accepting an absolute path could share session state across lifecycles or leave
+   fork parents outside the retained seat state. Unmanaged operator sessions keep their setting.
+10. **Seat-local settings (RIG-4721 option A).** On the first launch, copy operator settings with
+    retry disabled; on same-lifecycle relaunch preserve seat-local edits, forcing only retry off.
+    Later operator edits to other keys apply to new lifecycle seats, not existing ones.
