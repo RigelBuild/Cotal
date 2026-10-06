@@ -20,6 +20,7 @@ if (mode !== "clean" && mode !== "signal" && mode !== "unowned") {
 
 const port = await pickFreePort();
 const storeDir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+// SMOKE_BROKER_UNADOPTED_OK — `unowned` mode deliberately skips teardown to reproduce the leak.
 const broker = spawn("nats-server", ["-js", "-sd", storeDir, "-p", String(port), "-a", "127.0.0.1"], { stdio: "ignore" });
 const release = mode === "unowned" ? () => {} : teardownOnSignal(broker, storeDir);
 
