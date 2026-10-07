@@ -132,7 +132,7 @@ its own `settingsManager` to `createAgentSession` (`core/sdk.js`), and `Extensio
 no settings, so the extension cannot see it. Managed mode therefore requires the Pi CLI: the check
 fails unless `process.env.PI_CODING_AGENT === "true"`, which only `cli.js` sets. An SDK host given
 a managed env fails closed at load. This narrows the contract instead of proving the effective
-value (Open questions, 1).
+value (Resolved decisions, 11).
 
 **Where the checks sit.** The check runs at every point where Pi can reach a provider, and every
 failure closes the same one-way gate. Nothing throws. A factory throw fails closed only in the CLI:
@@ -764,8 +764,9 @@ In `pi-sdk.smoke.ts` (existing smokes use `SettingsManager.inMemory`):
 ## Resolved decisions
 
 Matt approved the RIG-4543 recommendation on 2026-10-06 ("Recommendation lgtm") and RIG-4669
-option 1, the HOME/XDG state root ("Opt 1"). He ruled in RIG-4707 that Cotal is Linux-only and
-drops all Windows support. Each entry gives the choice, the reason, and what lost.
+option 1, the HOME/XDG state root ("Opt 1"), and RIG-4809 option A on 2026-10-07. He ruled in
+RIG-4707 that Cotal is Linux-only and drops all Windows support. Each entry gives the choice,
+the reason, and what lost.
 
 1. **Carrier: per-seat Pi agent dir.** It uses only documented Pi inputs (`PI_CODING_AGENT_DIR`,
    `retry.enabled`). Rejected:
@@ -817,7 +818,7 @@ drops all Windows support. Each entry gives the choice, the reason, and what los
    `session_before_tree`, so a host that loads the extension fails closed even if it never binds.
    The file checks equal Pi's effective settings only for a host that builds its
    `SettingsManager` from the files, so managed mode requires the CLI marker (Approach, Host
-   contract; Open questions). A project file edited mid-session ends the seat before Pi reloads
+   contract; decision 11). A project file edited mid-session ends the seat before Pi reloads
    it, a false positive in the safe direction. Rejected: a check at load and `session_start` only,
    because a host that never calls `bindExtensions` gets no session-cwd check; a load-time throw,
    because an SDK host drops the extension and runs ungated.
@@ -841,21 +842,9 @@ drops all Windows support. Each entry gives the choice, the reason, and what los
     from the seat file alone and forces only retry off. Seat-local edits survive, and a later
     operator edit, even a malformed one, cannot fail recovery. Operator edits apply to new
     lifecycle seats only.
-
-## Open questions
-
-1. **SDK hosts in managed mode (Matt's decision).** The extension cannot read the
-   `SettingsManager` an SDK host passes to `createAgentSession`, so it cannot prove retry is off
-   there (Approach, Host contract). This record designs against option A.
-   - **A (recommended): narrow the contract and check a marker.** Managed mode requires
-     `PI_CODING_AGENT=true`, which only `cli.js` sets. A plain SDK host given a managed env fails
-     closed at load. Cost: the marker is a declaration, not proof. Child processes inherit it, and
-     a host that sets it but passes its own settings runs with whatever retry those hold.
-   - **B: narrow the contract in prose only.** No marker check. An SDK host given a managed env is
-     unsupported and fails open if it passes retry-on settings. Cost: a silent hole for any future
-     SDK launcher.
-   - **C: ask Pi upstream for an extension-visible effective retry setting**, such as retry state
-     on `ExtensionContext`, and verify it once it exists. Cost: blocked on upstream, as in
-     decision 1; A or B still applies until then.
-
-   Decision needed: approve A, or choose B or C.
+11. **Host contract: the Pi CLI marker (RIG-4809 option A).** Managed mode requires
+    `PI_CODING_AGENT=true`, which only `cli.js` sets. A plain SDK host given a managed env fails
+    closed at load. Accepted cost: the marker is a declaration, not proof. Child processes inherit
+    it, and a host that sets it but passes its own settings runs with whatever retry those hold.
+    Rejected: a prose-only contract (B), which fails open for a future SDK launcher; waiting for an
+    upstream extension-visible retry setting (C), which blocks as decision 1 does.
