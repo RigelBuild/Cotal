@@ -953,6 +953,162 @@ cell("the enumerator refuses a loop-spawned broker owned only after the loop", (
   assert.equal(isAdopted(found[1]!), true, "a registration inside the loop owns every child");
 });
 
+// A helper called twice launches two children, but one later registration owns only the last.
+cell("the enumerator refuses a helper's repeated launch with one later teardown", () => {
+  const found = plantedSites("repeated-helper-launch",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `let child;\n` +
+    `function start() { child = spawn("nats-server", ["-sd", sd]); }\n` +
+    `start(); start();\n` +
+    `teardownOnSignal(child);\n`);
+  assert.equal(found.length, 1);
+  assert.equal(found[0]!.owned, false, "one registration cannot own both helper launches");
+});
+
+// One helper call site inside a loop launches repeatedly unless teardown shares that loop.
+cell("the enumerator rejects a helper call repeated by an enclosing loop", () => {
+  const found = plantedSites("helper-call-loop",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `let repeated;\n` +
+    `function startRepeated() { repeated = spawn("nats-server", ["-sd", sd]); }\n` +
+    `for (const _ of [1, 2]) startRepeated();\n` +
+    `teardownOnSignal(repeated);\n` +
+    `let single;\n` +
+    `function startSingle() { single = spawn("nats-server", ["-sd", sd]); }\n` +
+    `startSingle();\n` +
+    `teardownOnSignal(single);\n`);
+  assert.equal(found.length, 2);
+  assert.equal(found[0]!.owned, false, "the loop repeats the helper call before one later registration");
+  assert.equal(isAdopted(found[1]!), true, "a single helper call still owns its child");
+});
+
+// A return or throw after spawning skips a later registration on that path.
+cell("the enumerator refuses teardown skipped by an early function exit", () => {
+  const found = plantedSites("early-exit-registration",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `function start(ready: boolean) {\n` +
+    `  const child = spawn("nats-server", ["-sd", sd]);\n` +
+    `  if (!ready) return;\n` +
+    `  teardownOnSignal(child);\n` +
+    `}\n` +
+    `start(process.env.READY === "1");\n` +
+    `function alsoThrows(ready: boolean) {\n` +
+    `  const child = spawn("nats-server", ["-sd", sd]);\n` +
+    `  if (!ready) throw new Error("not ready");\n` +
+    `  teardownOnSignal(child);\n` +
+    `}\n` +
+    `alsoThrows(process.env.READY === "1");\n`);
+  assert.equal(found.length, 2);
+  assert.equal(found[0]!.owned, false, "a return can skip the registration");
+  assert.equal(found[1]!.owned, false, "a throw can skip the registration");
+});
+
+// Recursive frames overwrite a shared child binding before the outer frame registers it.
+cell("the enumerator refuses recursive launches sharing one child binding", () => {
+  const found = plantedSites("recursive-shared-child",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `let child;\n` +
+    `function startDirect(depth: number) {\n` +
+    `  child = spawn("nats-server", ["-sd", sd]);\n` +
+    `  if (depth) startDirect(depth - 1);\n` +
+    `  teardownOnSignal(child);\n` +
+    `}\n` +
+    `startDirect(1);\n` +
+    `function startIndirect(depth: number) {\n` +
+    `  child = spawn("nats-server", ["-sd", sd]);\n` +
+    `  if (depth) recur(depth - 1);\n` +
+    `  teardownOnSignal(child);\n` +
+    `}\n` +
+    `function recur(depth: number) { if (depth) startIndirect(depth); }\n` +
+    `startIndirect(1);\n`);
+  assert.equal(found.length, 2);
+  assert.equal(found[0]!.owned, false, "direct recursion overwrites the child before outer registration");
+  assert.equal(found[1]!.owned, false, "indirect recursion overwrites the child before outer registration");
+});
+
+// Loop transfers and process.exit can bypass a later registration; opposite branches stay exclusive.
+cell("the enumerator refuses teardown skipped by loop transfers and process exit", () => {
+  const found = plantedSites("loop-transfer-exits",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `function continued(items: { skip: boolean }[]) {\n` +
+    `  for (const item of items) { const child = spawn("nats-server", ["-sd", sd]); if (item.skip) continue; teardownOnSignal(child); }\n` +
+    `}\n` +
+    `continued([]);\n` +
+    `function broken(items: { skip: boolean }[]) {\n` +
+    `  for (const item of items) { const child = spawn("nats-server", ["-sd", sd]); if (item.skip) break; teardownOnSignal(child); }\n` +
+    `}\n` +
+    `broken([]);\n` +
+    `function labeledContinue(items: { skip: boolean }[]) {\n` +
+    `  outer: for (const item of items) { const child = spawn("nats-server", ["-sd", sd]); if (item.skip) continue outer; teardownOnSignal(child); }\n` +
+    `}\n` +
+    `labeledContinue([]);\n` +
+    `function labeledBreak(items: { skip: boolean }[]) {\n` +
+    `  outer: for (const item of items) { const child = spawn("nats-server", ["-sd", sd]); if (item.skip) break outer; teardownOnSignal(child); }\n` +
+    `}\n` +
+    `labeledBreak([]);\n` +
+    `function exitsProcess() { const child = spawn("nats-server", ["-sd", sd]); if (process.env.EXIT) process.exit(1); teardownOnSignal(child); }\n` +
+    `exitsProcess();\n` +
+    `function oppositeBranches(ready: boolean) { let child; if (ready) { child = spawn("nats-server", ["-sd", sd]); } else return; teardownOnSignal(child); }\n` +
+    `oppositeBranches(true);\n`);
+  assert.equal(found.length, 6);
+  found.slice(0, 5).forEach((site, index) => assert.equal(site.owned, false, `exit path ${index} skips registration`));
+  assert.equal(isAdopted(found[5]!), true, "a return in the branch opposite the spawn cannot skip registration");
+});
+
+// Caller exits after a helper returns a child leave that launch without teardown.
+cell("the enumerator refuses helper launches skipped by caller exits", () => {
+  const found = plantedSites("caller-exits-helper-return",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `function start() { return spawn("nats-server", ["-sd", sd]); }\n` +
+    `function run(ready: boolean) { const child = start(); if (!ready) return; teardownOnSignal(child); }\n` +
+    `run(Boolean(process.env.READY));\n` +
+    `let shared;\n` +
+    `function startShared() { shared = spawn("nats-server", ["-sd", sd]); }\n` +
+    `function middleShared() { startShared(); }\n` +
+    `function runShared(ready: boolean) { middleShared(); if (!ready) return; teardownOnSignal(shared); }\n` +
+    `runShared(Boolean(process.env.READY));\n`);
+  assert.equal(found.length, 2);
+  assert.equal(found[0]!.owned, false, "caller return skips registration of the helper result");
+  assert.equal(found[1]!.owned, false, "caller return skips registration through an intermediate helper");
+});
+
+// An intermediate helper can throw after starting a broker but before returning to its caller.
+cell("the enumerator refuses helper launches skipped by intermediate exits", () => {
+  const found = plantedSites("intermediate-helper-exit",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `let child;\n` +
+    `function start() { child = spawn("nats-server", ["-sd", sd]); }\n` +
+    `function middle() { start(); }\n` +
+    `function prepare(ready: boolean) { middle(); if (!ready) throw new Error("not ready"); }\n` +
+    `function run(ready: boolean) { prepare(ready); teardownOnSignal(child); }\n` +
+    `run(Boolean(process.env.READY));\n` +
+    `let processChild;\n` +
+    `function startProcess() { processChild = spawn("nats-server", ["-sd", sd]); }\n` +
+    `function prepareProcess(ready: boolean) { startProcess(); if (!ready) process.exit(1); }\n` +
+    `function runProcess(ready: boolean) { prepareProcess(ready); teardownOnSignal(processChild); }\n` +
+    `runProcess(Boolean(process.env.READY));\n`);
+  assert.equal(found.length, 2);
+  assert.equal(found[0]!.owned, false, "intermediate throw bypasses teardown");
+  assert.equal(found[1]!.owned, false, "intermediate process exit bypasses teardown");
+});
+
+// A caller loop can continue after the helper returns, before teardown of that iteration.
+cell("the enumerator refuses helper launches skipped by caller continue", () => {
+  const found = plantedSites("caller-continue-helper-return",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `function start() { return spawn("nats-server", ["-sd", sd]); }\n` +
+    `function run(items: { skip: boolean }[]) { for (const item of items) { const child = start(); if (item.skip) continue; teardownOnSignal(child); } }\n` +
+    `run([]);\n` +
+    `let shared;\n` +
+    `function startShared() { shared = spawn("nats-server", ["-sd", sd]); }\n` +
+    `function middleShared() { startShared(); }\n` +
+    `function runShared(items: { skip: boolean }[]) { for (const item of items) { middleShared(); if (item.skip) continue; teardownOnSignal(shared); } }\n` +
+    `runShared([]);\n`);
+  assert.equal(found.length, 2);
+  assert.equal(found[0]!.owned, false, "caller continue skips registration of the helper result");
+  assert.equal(found[1]!.owned, false, "caller continue skips registration through an intermediate helper");
+});
+
 // A write the parser cannot evaluate replaces the binding's provenance with an unproven value.
 cell("the enumerator drops token provenance on compound and destructuring writes", () => {
   const found = plantedSites("compound-write",
@@ -990,6 +1146,17 @@ cell("the enumerator refuses teardown in an uncalled object property", () => {
   assert.equal(found[0]!.owned, false, "an arrow property nothing calls registers no teardown");
   assert.equal(found[1]!.owned, false, "a method nothing calls registers no teardown");
   assert.equal(isAdopted(found[2]!), true, "a called property still owns its broker");
+});
+
+// The skipped initializer must retain every write before its declaration, not just declarations.
+cell("the enumerator keeps an intervening assignment before a conditional var initializer", () => {
+  const found = plantedSites("conditional-var-assignment",
+    `var sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `sd = "/plain";\n` +
+    `if (process.env.ISOLATE) { var sd = join(tmpdir(), SMOKE_BROKER_TOKEN); }\n` +
+    `const child = spawn("nats-server", ["-sd", sd]); teardownOnSignal(child);\n`);
+  assert.equal(found.length, 1);
+  assert.equal(found[0]!.tokened, false, "the skipped initializer leaves the plain assignment live");
 });
 
 // `build().cwd` vouches only for the function the call actually resolves to.
