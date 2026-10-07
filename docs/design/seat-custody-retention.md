@@ -90,15 +90,18 @@ fail closed, because an agent that shares the manager's uid can leave the delega
   fails at its first use of it and takes the startup failure path.
 - **The launch fence admits a custodian before it spawns.** Each seat has a fence file,
   `<root>/.launch-<id>`, outside the seat directory so that it outlives the release rename.
-  `launchSeat` creates it with `wx`, owned by the manager uid with mode `0644`, before it creates
-  the seat directory. The custodian's first filesystem operation opens the fence read-only without
-  `O_CREAT` (libuv adds `O_CLOEXEC`, so the child never inherits the lock), takes an exclusive
-  `flock` and reads the fence through that fd. If the open fails, the lock is not taken within
-  `CONFIRM_TIMEOUT_MS`, or the fence reads `sealed`, the custodian exits with no child, no socket
-  and no record. Otherwise it holds the lock until `ready`, or until its startup-failure SIGKILL is
-  sent; the kernel drops the lock if it exits. A rename after the open cannot hide a seal, because
-  the read goes through the fd. An agent-uid process that holds the lock only makes release
-  refuse, which leaves the seat retained and the release retryable.
+  `launchSeat` creates it with `wx`, owned by the manager uid with mode `0644`. It then takes the
+  fence's exclusive `flock`, reads it, and refuses with no path created if it reads `sealed`. It
+  holds that lock while it creates the seat directory (and, under layer 3, the seat cgroup), and
+  drops it just before it spawns the custodian. A release that seals first therefore leaves nothing
+  for the launcher to create. The custodian's first filesystem operation opens the fence read-only
+  without `O_CREAT` (libuv adds `O_CLOEXEC`, so the child never inherits the lock), takes an
+  exclusive `flock` and reads the fence through that fd. If the open fails, the lock is not taken
+  within `CONFIRM_TIMEOUT_MS`, or the fence reads `sealed`, the custodian exits with no child, no
+  socket and no record. Otherwise it holds the lock until `ready`, or until its startup-failure
+  SIGKILL is sent; the kernel drops the lock if it exits. A rename after the open cannot hide a
+  seal, because the read goes through the fd. An agent-uid process that holds the lock only makes
+  release refuse, which leaves the seat retained and the release retryable.
 - **A launcher timeout is not a disappearance proof.** `launchSeat` stops waiting after ten
   seconds and throws while its detached custodian may still be starting. The durable in-flight
   state is the reserved reference on the slot row, written before the spawn (Layer 2), plus the
@@ -370,9 +373,9 @@ needs a pid the agent cannot forge, misses `setsid` escapees, and dies with the 
 - **Deletion.** No seat directory, creds file, secret store entry, durable or ACL row is deleted
   before `reaped` or a durable release record exists. Ledger revoke, issuance retirement and
   broker eviction run before proof.
-- **Launch fence.** Only `launchSeat` creates a seat directory. A custodian spawns only while it
-  holds the unsealed fence lock. Release seals the fence, and removes an empty seat cgroup, before
-  it writes its intent.
+- **Launch fence.** Only `launchSeat` creates a seat directory, and only while it holds the
+  unsealed fence lock. A custodian spawns only while it holds the unsealed fence lock. Release
+  seals the fence, and removes an empty seat cgroup, before it writes its intent.
 - **References.** A reference reaches the slot row before its spawn, or the spawn does not happen.
   A row reference is replaced only after its seat is proved gone.
 - **Schemas.** `record.json` stays at version 1. The closed slot-row schema in
@@ -423,7 +426,8 @@ export function spawnPinned(file: string, args: string[], opts: { name: string; 
 - In `runCustodian`, delete `mkdirSync(dirname(launch.socket), …)`. Admit through the fence
   (Layer 1) before the socket unlink and the spawn. Read `processStartToken(process.pid)` and
   `bootToken()` before the spawn; read `childStart` after acquisition under the Layer 1 rule.
-- In `launchSeat`, create the fence with `wx` before the seat directory, and pass `fence` in the
+- In `launchSeat`, create the fence with `wx`, then hold its lock and check it is unsealed while
+  creating the seat directory; drop the lock before the custodian spawn. Pass `fence` in the
   launch payload.
 - Replace `import * as pty from "@lydell/node-pty"` in `custodian.ts` with `spawnPinned`, and drop
   `@lydell/node-pty` from `packages/seat/package.json`. Never open a handle by pid. Apply the
@@ -652,6 +656,10 @@ private async opReleaseSeat(args: Record<string, unknown>, caller: EpCaller): Pr
   releases the seat, then releases the hold after the rename. No child marker, `seat.sock`,
   `record.json`, `<root>/<id>` or `.released-<id>` exists. Making the custodian ignore a `sealed`
   fence turns it red (the child writes its marker).
+- **Late launcher.** The seam holds `launchSeat` after it creates the fence and before it takes
+  the lock; the test completes the release, then releases the hold. The launcher refuses, and
+  neither `<root>/<id>` nor a seat cgroup exists. Making `launchSeat` skip the seal check turns it
+  red (the seat directory reappears).
 - **Launch in progress.** The seam holds a custodian after admission. The release refuses with
   `launch-in-progress` and writes no record. Making `sealSeatLaunch` skip the lock turns it red.
 - **Rowless lifecycle.** The slot written by T3 releases like any other.
