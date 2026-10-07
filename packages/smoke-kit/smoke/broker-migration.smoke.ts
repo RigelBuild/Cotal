@@ -1055,6 +1055,40 @@ cell("the enumerator refuses teardown skipped by loop transfers and process exit
   assert.equal(isAdopted(found[5]!), true, "a return in the branch opposite the spawn cannot skip registration");
 });
 
+// Caller exits after a helper returns a child leave that launch without teardown.
+cell("the enumerator refuses helper launches skipped by caller exits", () => {
+  const found = plantedSites("caller-exits-helper-return",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `function start() { return spawn("nats-server", ["-sd", sd]); }\n` +
+    `function run(ready: boolean) { const child = start(); if (!ready) return; teardownOnSignal(child); }\n` +
+    `run(Boolean(process.env.READY));\n` +
+    `let shared;\n` +
+    `function startShared() { shared = spawn("nats-server", ["-sd", sd]); }\n` +
+    `function middleShared() { startShared(); }\n` +
+    `function runShared(ready: boolean) { middleShared(); if (!ready) return; teardownOnSignal(shared); }\n` +
+    `runShared(Boolean(process.env.READY));\n`);
+  assert.equal(found.length, 2);
+  assert.equal(found[0]!.owned, false, "caller return skips registration of the helper result");
+  assert.equal(found[1]!.owned, false, "caller return skips registration through an intermediate helper");
+});
+
+// A caller loop can continue after the helper returns, before teardown of that iteration.
+cell("the enumerator refuses helper launches skipped by caller continue", () => {
+  const found = plantedSites("caller-continue-helper-return",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `function start() { return spawn("nats-server", ["-sd", sd]); }\n` +
+    `function run(items: { skip: boolean }[]) { for (const item of items) { const child = start(); if (item.skip) continue; teardownOnSignal(child); } }\n` +
+    `run([]);\n` +
+    `let shared;\n` +
+    `function startShared() { shared = spawn("nats-server", ["-sd", sd]); }\n` +
+    `function middleShared() { startShared(); }\n` +
+    `function runShared(items: { skip: boolean }[]) { for (const item of items) { middleShared(); if (item.skip) continue; teardownOnSignal(shared); } }\n` +
+    `runShared([]);\n`);
+  assert.equal(found.length, 2);
+  assert.equal(found[0]!.owned, false, "caller continue skips registration of the helper result");
+  assert.equal(found[1]!.owned, false, "caller continue skips registration through an intermediate helper");
+});
+
 // A write the parser cannot evaluate replaces the binding's provenance with an unproven value.
 cell("the enumerator drops token provenance on compound and destructuring writes", () => {
   const found = plantedSites("compound-write",

@@ -686,6 +686,29 @@ function callRepeats(file: ts.SourceFile, fn: ts.Node, registrationOffset: numbe
     return parentFunction !== undefined && callRepeats(file, parentFunction, registrationOffset, defs, [...stack, fn]);
   });
 }
+/** Caller-side call sites on a path to the helper that contains a spawn. */
+function callsThrough(
+  file: ts.SourceFile,
+  caller: ts.Node,
+  target: ts.Node,
+  defs: Map<string, Binding[]>,
+  stack: readonly ts.Node[] = [],
+): ts.CallExpression[] {
+  if (caller === target || stack.includes(caller)) return [];
+  const result: ts.CallExpression[] = [];
+  const visit = (node: ts.Node): void => {
+    if (node !== caller && ts.isFunctionLike(node)) return;
+    if (ts.isCallExpression(node)) {
+      const callee = calledFunction(node, defs);
+      if (callee === target || callee !== undefined && callsThrough(file, callee, target, defs, [...stack, caller]).length > 0) {
+        result.push(node);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(caller);
+  return result;
+}
 /** The registration at `call` runs once per broker spawned at `spawnOffset`. */
 function coRuns(file: ts.SourceFile, spawnOffset: number, call: ts.CallExpression, defs: Map<string, Binding[]>, stack: readonly ts.Node[] = []): boolean {
   for (let node = nodeAt(file, spawnOffset); node.parent !== undefined && !ts.isFunctionLike(node); node = node.parent) {
@@ -719,7 +742,11 @@ function coRuns(file: ts.SourceFile, spawnOffset: number, call: ts.CallExpressio
     if (launches === null || launches.length !== 1) return false;
     if (callRepeats(file, spawnFunction, call.getStart(file), defs)) return false;
   }
-  if (callFunction !== undefined && contains(callFunction, spawnOffset)
+  if (spawnFunction !== undefined && callFunction !== undefined && !contains(callFunction, spawnOffset)) {
+    const helperCalls = callsThrough(file, callFunction, spawnFunction, defs);
+    if (helperCalls.length === 0) return false;
+    if (helperCalls.some((helperCall) => exitsBetween(file, callFunction!, helperCall.getStart(file), call.getStart(file)))) return false;
+  } else if (callFunction !== undefined && contains(callFunction, spawnOffset)
     && exitsBetween(file, callFunction, spawnOffset, call.getStart(file))) return false;
   if (callFunction === undefined || contains(callFunction, spawnOffset)) return true;
   const calls = invocations(callFunction, defs);
