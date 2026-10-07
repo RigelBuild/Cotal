@@ -181,7 +181,7 @@ export class RuntimeReapUnproven extends Error {
   writes the new reference. A `RuntimeReapUnproven` aborts the restart or resume before spawn; the
   row keeps the predecessor reference, and the existing failure path retires the lifecycle, whose
   terminal retains it. Without containment every in-place restart and resume therefore ends
-  retained (Open forks, item 1).
+  retained (RIG-4804 item 1).
 - Inside the `driveStaticRetirement` executor, the reap target is `slot.row.runtime`. A differing
   caller reference (for example the old handle reference that `freeSlot` copies into the
   `retiring` hold after a failed restart) is logged and never reaped and never thrown as a plain
@@ -262,7 +262,7 @@ caller; RIG-4431). `CustodialPtyRuntime.adopt` derives the socket from
 `socketPath(root, reference.id)`, refuses a record whose `id` differs from `reference.id`, and its
 result never feeds a reap, release or status outcome. The manager still cannot authenticate the
 listener against the seat's own agent, which shares the custodian's uid and can replace
-`seat.sock`. That residual is scoped to the seat's own session (Open forks, item 4).
+`seat.sock`. That residual is scoped to the seat's own session (RIG-4804 item 4).
 
 ### Operator release
 
@@ -599,7 +599,7 @@ the record-less cell red; spawning the child without `inSeatCgroup` turns the fe
   creates the seat directory owned by `agentUid` and spawns the custodian with Node's `uid` and
   `gid` options. `CustodianLaunch` gains `adopterUid`, the manager's uid, and the custodian peer
   check in `handle` compares `cred.uid` with `launch.adopterUid` on every frame, so the agent uid
-  cannot send `stop` (RIG-4740 row 1). With a shared uid the check is unchanged (Open forks, item 2).
+  cannot send `stop` (RIG-4740 row 1). With a shared uid the check is unchanged (RIG-4804 item 2).
 - **Delegated CI proof.** The `live` job in `.github/workflows/ci.yml` creates a CI agent user and
   runs `pnpm smoke:lifecycle-e2e` under `sudo systemd-run --scope -p Delegate=yes` with
   `COTAL_SEAT_AGENT_UID` set to that user. All 30 cells pass there. A new cell asserts a
@@ -639,27 +639,19 @@ the record-less cell red; spawning the child without `inSeatCgroup` turns the fe
   automatically.
 - **RIG-4740.** A on all five rows: manager-only stop authority, revocation and eviction before
   proof, `refused` with a retained reason, a retained count, one T1–T6 stack.
-
-## Open forks
-
-1. **Predecessor on restart and resume.** The default above proves the predecessor before
-   replacing the single row reference, so without containment every in-place restart and every
-   maintenance resume ends retained, and single-uid smokes that restart or resume change outcome.
-   The alternative adds `predecessors?: RuntimeReference[]` to the closed slot-row schema, keeps
-   restart working, and reaps or releases every listed seat at the terminal; it costs a core
-   schema change that older managers reject.
-2. **Stop authority with a shared uid.** RIG-4740 row 1 needs an identity the agent cannot hold.
-   With one uid there is none, and the agent can `kill(2)` its seat anyway. The default keeps
-   today's uid-plus-token check in single-uid mode as a stated residual.
-3. **Sibling seats under one agent uid.** T6 uses one agent uid for every seat, so a compromised
-   seat can still signal or read `/proc` of sibling seats and write their directories. The peer
-   check guards only the socket. RIG-4747 was closed for the orion wave without a production
-   boundary; per-seat uids or a broker would be new scope.
-4. **Adoption authenticity.** The default binds adoption to the reserved id and keeps it out of
-   every proof path, leaving a same-uid impersonation residual for RIG-4431.
-5. **Release key and status carrier.** The default stores the release record at the lifecycle
-   kind's `.status` key (caller-readable) and adds optional `retainedReason` plus
-   `retainedCustody` to the status schema. A private key kind, or carrying the reason only in
-   `lastError`, are the alternatives.
-6. **Distinct-uid launch.** T6 launches the custodian from a root manager. The signer-isolation
-   helper (`cotal-seat-launch`) is the other path and is not implemented.
+- **RIG-4804.** The default on all six remaining forks:
+  1. **Predecessor on restart and resume.** Prove the predecessor before replacing the single row
+     reference. Without containment, in-place restart and maintenance resume end retained, and
+     single-uid smokes that restart or resume change outcome. The slot-row schema is unchanged.
+  2. **Stop authority with a shared uid.** Single-uid mode keeps today's uid-plus-token check as a
+     stated residual; the agent can `kill(2)` its seat anyway.
+  3. **Sibling seats under one agent uid.** T6 uses one agent uid for every seat. A compromised
+     seat can still signal sibling seats, read their `/proc` entries and write their directories.
+     This is an accepted residual; per-seat uids or a broker are out of scope.
+  4. **Adoption authenticity.** Adoption binds to the reserved id and stays out of every proof
+     path; the same-uid impersonation residual is deferred to RIG-4431.
+  5. **Release key and status carrier.** The release record lives at the lifecycle kind's
+     `.status` key (caller-readable); the status schema gains optional `retainedReason` and
+     `retainedCustody`.
+  6. **Distinct-uid launch.** T6 launches the custodian from a root manager; the
+     `cotal-seat-launch` helper is not used.
