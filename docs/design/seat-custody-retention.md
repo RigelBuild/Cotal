@@ -499,10 +499,12 @@ adds the capability as a source patch at the pinned revision:
   headers only), linking `-lutil`, into `build/Release/linux-<arch>/pty.node`. It checks the ELF
   machine as it does for `peercred.node`. [INFERENCE: T1 verifies] These flags match upstream's
   `binding.gyp` with `node_addon_api_except`.
-- **Floor.** The `@lydell` prebuild needs at most `GLIBC_2.28`, `GLIBCXX_3.4.22` and
-  `CXXABI_1.3.9`. [INFERENCE: T1 verifies] A build on the `ubuntu-latest` runners would bind
-  `forkpty` at `GLIBC_2.34`. So both native jobs build inside the `manylinux_2_28` image for their
-  arch, and fail when `readelf -V` shows `pty.node` needing a version above that floor.
+- **Floor (RIG-4832 question 2, B).** Both native jobs build on their existing runners
+  (`ubuntu-latest`, `ubuntu-24.04-arm`), not in a `manylinux` image. This raises the floor above
+  the `@lydell` prebuild's `GLIBC_2.28`, `GLIBCXX_3.4.22` and `CXXABI_1.3.9`: `forkpty` alone binds
+  at `GLIBC_2.34`. [INFERENCE: T1 verifies] T1 measures the highest `GLIBC_`, `GLIBCXX_` and
+  `CXXABI_` versions `readelf -V` reports for `pty.node` on each arch. It pins them as a ceiling the
+  native job fails above, and states the minimum glibc in the seat package README and changeset.
 - **CI and pack.** The `seat-native-linux-x64` and `seat-native-linux-arm64` jobs in `ci.yml` and
   `changesets.yml` upload the whole `build/Release/linux-<arch>/` directory. `SEAT_NATIVE_X64` and
   `SEAT_NATIVE_ARM64` name that directory, and `seat-assemble-natives.mjs` copies both `.node`
@@ -763,3 +765,6 @@ writing the release record before the cgroup `rmdir` turns the release/join cell
      `retainedCustody`.
   6. **Distinct-uid launch.** T6 launches the custodian from a root manager; the
      `cotal-seat-launch` helper is not used.
+- **RIG-4832.** 1. A: the node-pty pidfd patch is a vendored source patch at the pinned revision,
+  built in the seat package's native jobs. 2. B: `pty.node` builds on the plain runners, and the
+  seat accepts the higher glibc floor that results (T1, Floor).
