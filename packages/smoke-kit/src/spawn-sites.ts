@@ -574,7 +574,7 @@ function guardConjuncts(branch: ts.Node): ts.Expression[] | undefined {
   return condition === undefined ? undefined : split(condition);
 }
 
-/** A return or throw after the spawn can skip its teardown registration. */
+/** An exit or loop transfer before registration can bypass it. */
 function exitsBetween(file: ts.SourceFile, fn: ts.Node, spawnOffset: number, callOffset: number): boolean {
   const spawn = nodeAt(file, spawnOffset);
   let found = false;
@@ -586,12 +586,35 @@ function exitsBetween(file: ts.SourceFile, fn: ts.Node, spawnOffset: number, cal
         || ts.isConditionalExpression(parent) && (left === parent.whenTrue && right === parent.whenFalse
           || left === parent.whenFalse && right === parent.whenTrue));
   };
+  const transferTarget = (node: ts.BreakStatement | ts.ContinueStatement): ts.Node | undefined => {
+    if (node.label !== undefined) {
+      for (let parent = node.parent; parent !== undefined && parent !== fn; parent = parent.parent) {
+        if (ts.isLabeledStatement(parent) && parent.label.text === node.label.text) return parent.statement;
+      }
+      return undefined;
+    }
+    for (let parent = node.parent; parent !== undefined && parent !== fn; parent = parent.parent) {
+      if (ts.isIterationStatement(parent, false) || ts.isBreakStatement(node) && ts.isSwitchStatement(parent)) return parent;
+    }
+    return undefined;
+  };
+  const exits = (node: ts.Node): boolean => ts.isReturnStatement(node) || ts.isThrowStatement(node)
+    || ts.isBreakStatement(node) || ts.isContinueStatement(node)
+    || ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)
+      && ts.isIdentifier(node.expression.expression) && node.expression.expression.text === "process"
+      && node.expression.name.text === "exit";
   const visit = (node: ts.Node): void => {
     if (found || node !== fn && ts.isFunctionLike(node)) return;
-    if ((ts.isReturnStatement(node) || ts.isThrowStatement(node)) && node.getStart(file) > spawnOffset && node.end < callOffset) {
+    if (exits(node) && node.getStart(file) > spawnOffset && node.end < callOffset) {
+      const transferLeavesRegistration = (ts.isBreakStatement(node) || ts.isContinueStatement(node))
+        && transferTarget(node) !== undefined && contains(transferTarget(node)!, callOffset);
+      const terminalExit = ts.isReturnStatement(node) || ts.isThrowStatement(node)
+        || ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)
+          && ts.isIdentifier(node.expression.expression) && node.expression.expression.text === "process";
       const exitBranches = skippableBranches(node, fn);
       const spawnBranches = skippableBranches(spawn, fn);
-      if (!exitBranches.some((exit) => spawnBranches.some((started) => exclusive(exit, started)))) found = true;
+      if ((terminalExit || transferLeavesRegistration)
+        && !exitBranches.some((exit) => spawnBranches.some((started) => exclusive(exit, started)))) found = true;
     }
     ts.forEachChild(node, visit);
   };
@@ -599,6 +622,52 @@ function exitsBetween(file: ts.SourceFile, fn: ts.Node, spawnOffset: number, cal
   return found;
 }
 
+const functionNodes = new WeakMap<ts.SourceFile, ReadonlyMap<string, ts.Node>>();
+
+/** Resolve a local call to its function declaration or function-valued variable. */
+function calledFunction(call: ts.CallExpression, defs: Map<string, Binding[]>): ts.Node | undefined {
+  if (!ts.isIdentifier(call.expression)) return undefined;
+  const file = call.getSourceFile();
+  let nodes = functionNodes.get(file);
+  if (nodes === undefined) {
+    const collected = new Map<string, ts.Node>();
+    const visit = (node: ts.Node): void => {
+      if (ts.isFunctionLike(node)) {
+        const binding = functionBinding(node);
+        if (binding !== undefined) collected.set(`${binding.name}:${binding.offset}`, node);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(file);
+    nodes = collected;
+    functionNodes.set(file, nodes);
+  }
+  const offset = call.expression.getStart(file);
+  const bindings = resolvedBindings(call.expression.text, defs, scopesAt(file, offset), offset);
+  return bindings.length === 1 ? nodes.get(`${call.expression.text}:${bindings[0]!.offset}`) : undefined;
+}
+
+/** Whether code between this spawn and teardown can re-enter its function. */
+function reentersBeforeTeardown(
+  file: ts.SourceFile,
+  fn: ts.Node,
+  spawnOffset: number,
+  callOffset: number,
+  defs: Map<string, Binding[]>,
+  stack: readonly ts.Node[] = [],
+): boolean {
+  if (stack.includes(fn)) return true;
+  const visit = (node: ts.Node, start: number, end: number): boolean => {
+    if (node !== fn && ts.isFunctionLike(node)) return false;
+    if (ts.isCallExpression(node) && node.getStart(file) > start && node.getStart(file) < end) {
+      const target = calledFunction(node, defs);
+      if (target === fn) return true;
+      if (target !== undefined && reentersBeforeTeardown(file, target, target.getStart(file), target.end, defs, [...stack, fn])) return true;
+    }
+    return ts.forEachChild(node, (child) => visit(child, start, end)) ?? false;
+  };
+  return visit(fn, spawnOffset, callOffset);
+}
 /** A call is repeated when its site or any caller runs in a loop without the registration. */
 function callRepeats(file: ts.SourceFile, fn: ts.Node, registrationOffset: number, defs: Map<string, Binding[]>, stack: readonly ts.Node[] = []): boolean {
   if (stack.includes(fn)) return true;
@@ -638,6 +707,11 @@ function coRuns(file: ts.SourceFile, spawnOffset: number, call: ts.CallExpressio
     && !(guardConjuncts(branch)?.every(implied) ?? false))) return false;
   let spawnFunction: ts.Node | undefined = nodeAt(file, spawnOffset).parent;
   while (spawnFunction !== undefined && !ts.isFunctionLike(spawnFunction)) spawnFunction = spawnFunction.parent;
+  const childBinding = child !== undefined && ts.isIdentifier(child)
+    ? visibleBindings(child.text, defs, scopesAt(file, spawnOffset), spawnOffset)[0]
+    : undefined;
+  if (spawnFunction !== undefined && childBinding !== undefined && !childBinding.scopes.includes(spawnFunction)
+    && reentersBeforeTeardown(file, spawnFunction, spawnOffset, call.getStart(file), defs)) return false;
   let callFunction: ts.Node | undefined = call.parent;
   while (callFunction !== undefined && !ts.isFunctionLike(callFunction)) callFunction = callFunction.parent;
   if (spawnFunction !== undefined && !contains(spawnFunction, call.getStart(file))) {

@@ -1003,6 +1003,58 @@ cell("the enumerator refuses teardown skipped by an early function exit", () => 
   assert.equal(found[1]!.owned, false, "a throw can skip the registration");
 });
 
+// Recursive frames overwrite a shared child binding before the outer frame registers it.
+cell("the enumerator refuses recursive launches sharing one child binding", () => {
+  const found = plantedSites("recursive-shared-child",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `let child;\n` +
+    `function startDirect(depth: number) {\n` +
+    `  child = spawn("nats-server", ["-sd", sd]);\n` +
+    `  if (depth) startDirect(depth - 1);\n` +
+    `  teardownOnSignal(child);\n` +
+    `}\n` +
+    `startDirect(1);\n` +
+    `function startIndirect(depth: number) {\n` +
+    `  child = spawn("nats-server", ["-sd", sd]);\n` +
+    `  if (depth) recur(depth - 1);\n` +
+    `  teardownOnSignal(child);\n` +
+    `}\n` +
+    `function recur(depth: number) { if (depth) startIndirect(depth); }\n` +
+    `startIndirect(1);\n`);
+  assert.equal(found.length, 2);
+  assert.equal(found[0]!.owned, false, "direct recursion overwrites the child before outer registration");
+  assert.equal(found[1]!.owned, false, "indirect recursion overwrites the child before outer registration");
+});
+
+// Loop transfers and process.exit can bypass a later registration; opposite branches stay exclusive.
+cell("the enumerator refuses teardown skipped by loop transfers and process exit", () => {
+  const found = plantedSites("loop-transfer-exits",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `function continued(items: { skip: boolean }[]) {\n` +
+    `  for (const item of items) { const child = spawn("nats-server", ["-sd", sd]); if (item.skip) continue; teardownOnSignal(child); }\n` +
+    `}\n` +
+    `continued([]);\n` +
+    `function broken(items: { skip: boolean }[]) {\n` +
+    `  for (const item of items) { const child = spawn("nats-server", ["-sd", sd]); if (item.skip) break; teardownOnSignal(child); }\n` +
+    `}\n` +
+    `broken([]);\n` +
+    `function labeledContinue(items: { skip: boolean }[]) {\n` +
+    `  outer: for (const item of items) { const child = spawn("nats-server", ["-sd", sd]); if (item.skip) continue outer; teardownOnSignal(child); }\n` +
+    `}\n` +
+    `labeledContinue([]);\n` +
+    `function labeledBreak(items: { skip: boolean }[]) {\n` +
+    `  outer: for (const item of items) { const child = spawn("nats-server", ["-sd", sd]); if (item.skip) break outer; teardownOnSignal(child); }\n` +
+    `}\n` +
+    `labeledBreak([]);\n` +
+    `function exitsProcess() { const child = spawn("nats-server", ["-sd", sd]); if (process.env.EXIT) process.exit(1); teardownOnSignal(child); }\n` +
+    `exitsProcess();\n` +
+    `function oppositeBranches(ready: boolean) { let child; if (ready) { child = spawn("nats-server", ["-sd", sd]); } else return; teardownOnSignal(child); }\n` +
+    `oppositeBranches(true);\n`);
+  assert.equal(found.length, 6);
+  found.slice(0, 5).forEach((site, index) => assert.equal(site.owned, false, `exit path ${index} skips registration`));
+  assert.equal(isAdopted(found[5]!), true, "a return in the branch opposite the spawn cannot skip registration");
+});
+
 // A write the parser cannot evaluate replaces the binding's provenance with an unproven value.
 cell("the enumerator drops token provenance on compound and destructuring writes", () => {
   const found = plantedSites("compound-write",
