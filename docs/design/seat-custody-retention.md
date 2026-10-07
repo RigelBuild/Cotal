@@ -59,8 +59,7 @@ fail closed, because an agent that shares the manager's uid can leave the delega
   names the child only if "the zombie process was not reaped elsewhere in the program". A parent
   and liveness check does not repair this: with `CLONE_PARENT` a seat process can create a process
   whose parent is the custodian, and that process can take the freed pid. [INFERENCE: T1 confirms]
-  This source is microsoft/node-pty `main`, which `@lydell/node-pty` repackages; T1 checks the
-  pinned `1.2.0-beta.12`.
+  The pinned `node-pty@1.2.0-beta.12` source has the same order.
 - **Identities are read before the spawn.** `processStartToken(process.pid)` and `bootToken()` move
   before `pty.spawn`, so a missing custodian identity fails with no child. `childStart` is read
   after acquisition and kept only if the handle still reports the child live after the read.
@@ -85,17 +84,28 @@ fail closed, because an agent that shares the manager's uid can leave the delega
 - **A fast exit is not an acquisition failure.** A handle captured at spawn stays valid after the
   child exits and reports it gone. The custodian marks the child exited and sends nothing. The
   "natural exit" and "unadopted" cells keep launching children that exit at once.
-- **Nothing recreates a removed seat directory.** `writeRecord` stops creating its parent in every
-  mode (the isolation design already drops it). The launcher creates the seat directory. A
-  custodian whose directory was removed fails at bind or `writeRecord` and takes the startup
-  failure path. This is what lets a release settle a launch that outlived its launcher.
+- **The custodian creates no directory.** `runCustodian` drops its
+  `mkdirSync(dirname(launch.socket), …)`, and `writeRecord` drops its parent `mkdirSync` in every
+  mode. Only `launchSeat` creates the seat directory, so a custodian whose directory was removed
+  fails at its first use of it and takes the startup failure path.
+- **The launch fence admits a custodian before it spawns.** Each seat has a fence file,
+  `<root>/.launch-<id>`, outside the seat directory so that it outlives the release rename.
+  `launchSeat` creates it with `wx`, owned by the manager uid with mode `0644`, before it creates
+  the seat directory. The custodian's first filesystem operation opens the fence read-only without
+  `O_CREAT` (libuv adds `O_CLOEXEC`, so the child never inherits the lock), takes an exclusive
+  `flock` and reads the fence through that fd. If the open fails, the lock is not taken within
+  `CONFIRM_TIMEOUT_MS`, or the fence reads `sealed`, the custodian exits with no child, no socket
+  and no record. Otherwise it holds the lock until `ready`, or until its startup-failure SIGKILL is
+  sent; the kernel drops the lock if it exits. A rename after the open cannot hide a seal, because
+  the read goes through the fd. An agent-uid process that holds the lock only makes release
+  refuse, which leaves the seat retained and the release retryable.
 - **A launcher timeout is not a disappearance proof.** `launchSeat` stops waiting after ten
   seconds and throws while its detached custodian may still be starting. The durable in-flight
   state is the reserved reference on the slot row, written before the spawn (Layer 2), plus the
-  seat directory. The manager needs no handle to the late custodian: its terminal reaps the row
-  reference, which returns `retained` or `absent` without containment, and both stay fail-closed.
-  A late record or socket changes nothing. Release settles the launch by removing the directory
-  (Operator release); after that, no custodian from that launch can bind or write a record.
+  fence and the seat directory. The manager needs no handle to the late custodian: its terminal
+  reaps the row reference, which returns `retained` or `absent` without containment, and both stay
+  fail-closed. Release seals the fence (Operator release), so no custodian of that launch can
+  spawn afterwards.
 - **The stop reply covers only the first send.** `case "stop"` replies `{ ok: true, op: "stop" }`
   after the SIGTERM of a graceful stop or the SIGKILL of a hard stop; a failed send other than
   "child gone" replies `{ ok: false, error }`. A failed delayed SIGKILL is logged to
@@ -278,19 +288,28 @@ A release is an operator's attestation. It is not a proof, and it never sends a 
    `ownerInstanceId` must equal this manager's stable `managerInstanceId` (an absent
    `ownerInstanceId` counts as this manager's, as in reconcile). A restarted manager keeps that id,
    so it can release what its predecessor process retained.
-3. **It writes the intent before any deletion.**
-   1. Run the read-only checks. Under layer 3 the release refuses while `populated 1`.
-   2. Read the release record for this lifecycle. If present, compare the stable fields
-      (principal, alias, lifecycle UID, operator, reason, `ownerInstanceId`), reuse its timestamp
-      and continue; reject a different intent. Otherwise create it atomically. A concurrent create
-      loser rereads and compares before deleting anything.
-   3. Remove the seat directory: rename it to `<root>/.released-<id>`, then remove the tombstone.
-      `ENOENT` on the rename is success. The rename settles a launch that outlived its launcher.
-   4. Re-drive the terminal with `surfaceFailure`.
+3. **It seals the launch before it writes the intent.**
+   1. Run the read-only checks. Read the release record for this lifecycle. If present, compare
+      the stable fields (principal, alias, lifecycle UID, operator, reason, `ownerInstanceId`) and
+      reuse its timestamp; reject a different intent before anything changes.
+   2. Seal the launch with `sealSeatLaunch`. It opens or creates the fence and takes its lock,
+      retrying for up to `CONFIRM_TIMEOUT_MS`; a lock still held refuses with
+      `launch-in-progress`. Under the lock, a layer 3 seat cgroup must read `populated 0` and is
+      then removed with `rmdir`; `populated 1` or `EBUSY` refuses with `populated`. Then it writes
+      `sealed` to the fence and syncs it. A refusal writes no intent and deletes no custody, so
+      the seat stays retained and the release can be retried.
+   3. If no release record exists, create it atomically. A concurrent create loser rereads and
+      compares before deleting anything.
+   4. Remove the seat directory: rename it to `<root>/.released-<id>`, then remove the tombstone.
+      `ENOENT` on the rename is success. The sealed fence stays, so `launchSeat` cannot reuse the
+      id and a late custodian still reads `sealed`.
+   5. Re-drive the terminal with `surfaceFailure`.
 
-   In the terminal, a release record for this lifecycle satisfies the process step: it removes a
-   still-present seat directory, then an empty seat cgroup, and never reaps. A crash at any point
-   resumes from the durable record; a failure before the record exists deletes nothing.
+   After the seal, no custodian of this launch can spawn, and no launcher can join the seat
+   cgroup because it no longer exists. So the intent is written only when nothing can repopulate
+   the seat. In the terminal, a release record for this lifecycle satisfies the process step: it
+   removes a still-present seat directory and never reaps. A crash after the record resumes from
+   it; a crash before the record leaves a sealed, retained seat that a retry releases.
 4. **The release record is separate from the lifecycle audit.** `evictAndAudit` writes the `v: 1`
    audit, which `sameAudit` compares field by field. The release record lives at
    `recordStatusKey(RECORD_KINDS.lifecycle, [owner, actor, lifecycleUid])`, the unused `.status`
@@ -307,13 +326,15 @@ proof only if the agent cannot leave it.
   `/proc/self/cgroup`, under `/sys/fs/cgroup`. The path is derived, never read from `record.json`.
 - **Entry.** `launchSeat` creates the seat cgroup before it spawns the custodian and refuses if it
   already exists. After the spawn it writes the custodian's pid into the seat cgroup's
-  `cgroup.procs`. The custodian forks nothing until `/proc/self/cgroup` names the seat cgroup; if
-  that is not true by `CONFIRM_TIMEOUT_MS` from its start, it exits with no child. A failed move
-  makes `launchSeat` throw.
-- **Launch/reap fence.** A reap that finds the cgroup empty and removes it before the custodian
-  joins leaves the move to fail with `ENOENT`, so the custodian exits with no child. If the
-  custodian joined first, the cgroup is populated and `rmdir` fails. No process can start outside
-  the cgroup after the reap accepted its empty state as proof.
+  `cgroup.procs`. The custodian takes the fence lock (Layer 1), then forks nothing until
+  `/proc/self/cgroup` names the seat cgroup; if that is not true by `CONFIRM_TIMEOUT_MS` from its
+  start, it exits with no child. A failed move makes `launchSeat` throw.
+- **Launch/reap fence.** A reap or a release that finds the cgroup empty and removes it before the
+  custodian joins leaves the move to fail with `ENOENT`, so the custodian exits with no child. If
+  the custodian joined first, the cgroup is populated and `rmdir` fails. No process can start
+  outside the cgroup after a reap or release accepted its empty state. Release removes the cgroup
+  before it writes its intent, so a join in that window refuses the release instead of leaving an
+  intent that can never finish.
 - **Containment.** Cgroup v2 migration requires write access to the common ancestor's
   `cgroup.procs` (kernel `admin-guide/cgroup-v2`). `seatCgroupContained` must prove the agent cannot
   write that file at the base or any ancestor, using its actual uid, groups, ACLs and capabilities,
@@ -349,6 +370,9 @@ needs a pid the agent cannot forge, misses `setsid` escapees, and dies with the 
 - **Deletion.** No seat directory, creds file, secret store entry, durable or ACL row is deleted
   before `reaped` or a durable release record exists. Ledger revoke, issuance retirement and
   broker eviction run before proof.
+- **Launch fence.** Only `launchSeat` creates a seat directory. A custodian spawns only while it
+  holds the unsealed fence lock. Release seals the fence, and removes an empty seat cgroup, before
+  it writes its intent.
 - **References.** A reference reaches the slot row before its spawn, or the spawn does not happen.
   A row reference is replaced only after its seat is proved gone.
 - **Schemas.** `record.json` stays at version 1. The closed slot-row schema in
@@ -365,19 +389,45 @@ needs a pid the agent cannot forge, misses `setsid` escapees, and dies with the 
 
 ### T1: the custodian keeps the record and pins its child (`@cotal-ai/seat`)
 
-**Interfaces.** In T1, `StopMode`, the `stop` op, `SeatClient.stop`, `SeatHandle.stop`,
-`CustodianLaunch` and `SeatRecord` keep their shapes; T5 and T6 extend `CustodianLaunch`. The
-pinned handle is internal to `runCustodian`, returned by the patched native PTY spawn with the
-child. `protocol.ts` keeps `GRACE_MS` and `CONFIRM_TIMEOUT_MS`.
+**Interfaces.** In T1, `StopMode`, the `stop` op, `SeatClient.stop`, `SeatHandle.stop` and
+`SeatRecord` keep their shapes. `CustodianLaunch` gains `fence` (the fence path); T5 and T6 extend
+it further. `protocol.ts` keeps `GRACE_MS` and `CONFIRM_TIMEOUT_MS`.
+
+```ts
+// packages/seat/src/record.ts
+export function fencePath(root: string, id: string): string; // `${root}/.launch-${id}`
+
+// packages/seat/src/peercred.ts; packages/seat/native/peercred.c gains flock, pidfd_send_signal and poll
+export function tryLockFd(fd: number): boolean;                                        // flock(LOCK_EX | LOCK_NB); false on EWOULDBLOCK
+export function pidfdSignal(pidfd: number, sig: "SIGTERM" | "SIGKILL"): "sent" | "gone"; // ESRCH is "gone"
+export function pidfdExited(pidfd: number): boolean;                                   // poll(POLLIN, 0)
+
+// packages/seat/src/pty.ts
+export interface ChildHandle { readonly pid: number; signal(sig: "SIGTERM" | "SIGKILL"): "sent" | "gone"; exited(): boolean }
+export interface PinnedPty {
+  readonly pid: number; readonly handle: ChildHandle;
+  onData(cb: (data: string) => void): void;
+  onExit(cb: (e: { exitCode: number; signal?: number }) => void): void;
+  write(data: string): void; resize(cols: number, rows: number): void;
+}
+export function ptyNativePath(arch?: string): string; // build/Release/linux-<arch>/pty.node
+export function spawnPinned(file: string, args: string[], opts: { name: string; cols: number; rows: number; cwd?: string; env: Record<string, string> }): PinnedPty; // throws when fork returned no pidfd
+```
+
+`PinnedPty` has no `kill` or `destroy`, so no custodian path can reach node-pty's pid-based sends.
 
 **Edits.**
 
 - In `settleTerminal`, delete the `unlinkSync(launch.recordPath)` and exited-leader
   `proc.kill("SIGKILL")` blocks.
-- In `runCustodian`, read `processStartToken(process.pid)` and `bootToken()` before `pty.spawn`;
-  read `childStart` after acquisition under the Layer 1 rule.
-- Take the handle from the patched native spawn; never open one by pid. Apply the Layer 1
-  fail-closed rule on failure.
+- In `runCustodian`, delete `mkdirSync(dirname(launch.socket), …)`. Admit through the fence
+  (Layer 1) before the socket unlink and the spawn. Read `processStartToken(process.pid)` and
+  `bootToken()` before the spawn; read `childStart` after acquisition under the Layer 1 rule.
+- In `launchSeat`, create the fence with `wx` before the seat directory, and pass `fence` in the
+  launch payload.
+- Replace `import * as pty from "@lydell/node-pty"` in `custodian.ts` with `spawnPinned`, and drop
+  `@lydell/node-pty` from `packages/seat/package.json`. Never open a handle by pid. Apply the
+  Layer 1 fail-closed rule on failure.
 - Route `stopChild`, the startup-confirm timeout, the `armUnattended` stop and every startup
   failure (including the listen `error` event) through the handle. Make `childGone()` read the
   handle's exit state.
@@ -409,9 +459,10 @@ child. `protocol.ts` keeps `GRACE_MS` and `CONFIRM_TIMEOUT_MS`.
 - **Startup failures after pinning stop the child.** One cell forces the listen `error` event;
   another fails after bind, before `writeRecord`. The child ignores SIGHUP and SIGTERM; `launchSeat`
   throws, no record exists, and the child is gone. Removing either SIGKILL path turns its cell red.
-- **A removed directory stops a late custodian.** The seam holds the custodian after bind; the test
-  removes the seat directory and releases the hold. No record exists and the child is gone.
-  Restoring the parent `mkdirSync` in `writeRecord` turns it red.
+- **A removed directory stops a late custodian.** The seam holds the custodian before its first
+  filesystem operation; the test removes the seat directory, keeps the unsealed fence and releases
+  the hold. No record exists, the directory is not recreated and the child is gone. Restoring the
+  `mkdirSync` in `runCustodian` turns it red.
 - **A reused pid is never signalled.** Inside `unshare --user --map-root-user --pid --fork
   --mount-proc`, a C fixture child creates a `CLONE_PARENT` sibling and exits at once. After
   node-pty reaps it, the sibling writes the child's pid to `ns_last_pid` and creates a second
@@ -420,6 +471,53 @@ child. `protocol.ts` keeps `GRACE_MS` and `CONFIRM_TIMEOUT_MS`.
   after the hold, with parent and liveness checks, turns it red. Measured here only: a write of 41
   to `ns_last_pid` gave the next process pid 42 (kernel `7.2.6`). [INFERENCE: T1 verifies] CI
   runners allow unprivileged user namespaces.
+
+**Native spawn.** The pinned `@lydell/node-pty` `1.2.0-beta.12` exposes only `spawn(): IPty`
+with `pid` and `kill`, and its platform packages carry only a prebuilt `pty.node`.
+`build-native.mjs` builds only `peercred.c`, and the CI native jobs ship only `peercred.node`. T1
+adds the capability as a source patch at the pinned revision:
+
+- **Source.** Vendor the Linux files of upstream `node-pty@1.2.0-beta.12`, which `@lydell`
+  repackages (its `lib/index.js` and `lib/unixTerminal.js` match upstream byte for byte), into
+  `packages/seat/native/node-pty/`: `src/unix/pty.cc`,
+  `lib/{unixTerminal,terminal,eventEmitter2,utils}.js` and `LICENSE`. `UPSTREAM.json` records the
+  tarball URL, its integrity
+  (`sha512-uExTCG/4VmSJa4+TjxFwPXv8BfacmfFEBL6JpxCMDghcwqzvD0yTcGmZ1fKOK6HY33tp0CelLblqTECJizc+Yw==`)
+  and each file's upstream sha256. The committed files carry `pidfd.patch`. `build-native.mjs`
+  reverse-applies the patch to a copy and refuses to build unless every file matches its upstream
+  sha256. The vendored `lib/` ships through `files`.
+- **Patch.** In `PtyFork`, the parent calls `syscall(SYS_pidfd_open, pid, 0)` right after
+  `forkpty` returns and before `SetupExitCallback(napiEnv, cb, pid)` starts the `waitpid` thread,
+  so the unreaped child still owns the pid. The returned object gains `pidfd`; a failed open omits
+  it. In `lib/unixTerminal.js`, the native lookup loads `build/Release/linux-<process.arch>/pty.node`
+  from the seat package root (the layout `nativeHelperPath` uses), and the constructor keeps
+  `term.pidfd`. The raw syscall keeps glibc's `pidfd_open` wrapper out of the symbol floor. It
+  needs Linux 5.3; on an older kernel acquisition fails and the custodian fails closed.
+- **Build.** `build-native.mjs` also compiles `pty.cc` with `c++ -shared -fPIC -O2
+  -fstack-protector-strong -std=gnu++17 -DNAPI_CPP_EXCEPTIONS -DNODE_GYP_MODULE_NAME=pty`, the
+  Node headers it already uses and `node-addon-api` (a seat devDependency pinned at `7.1.1`,
+  headers only), linking `-lutil`, into `build/Release/linux-<arch>/pty.node`. It checks the ELF
+  machine as it does for `peercred.node`. [INFERENCE: T1 verifies] These flags match upstream's
+  `binding.gyp` with `node_addon_api_except`.
+- **Floor.** The `@lydell` prebuild needs at most `GLIBC_2.28`, `GLIBCXX_3.4.22` and
+  `CXXABI_1.3.9`. [INFERENCE: T1 verifies] A build on the `ubuntu-latest` runners would bind
+  `forkpty` at `GLIBC_2.34`. So both native jobs build inside the `manylinux_2_28` image for their
+  arch, and fail when `readelf -V` shows `pty.node` needing a version above that floor.
+- **CI and pack.** The `seat-native-linux-x64` and `seat-native-linux-arm64` jobs in `ci.yml` and
+  `changesets.yml` upload the whole `build/Release/linux-<arch>/` directory. `SEAT_NATIVE_X64` and
+  `SEAT_NATIVE_ARM64` name that directory, and `seat-assemble-natives.mjs` copies both `.node`
+  files. `SHIPPED_LINUX_NATIVES` in `assert-shipped-natives.mjs` covers both files for each arch,
+  and `ci-seat-pack.sh` lists and checks both.
+- **Load smoke.** From the packed tarball, installed without a toolchain, on x64
+  (`bin/smoke/seat-installed-dist.smoke.ts`) and on arm64 (the `seat-linux-arm64` job):
+  `spawnPinned` starts `sh -c 'read x'`; the `Pid` line of `/proc/self/fdinfo/<pidfd>` equals the
+  child pid; `signal("SIGKILL")` returns `sent`; after the exit, `exited()` is true and a second
+  send returns `gone`. Resolving `@lydell/node-pty` from the installed seat fails.
+- **Mutations.** In `packages/seat/smoke/mutations/packaging.json`: shipping the `@lydell`
+  prebuilt `pty.node` in place of the built one turns the load smoke red; restoring
+  `@lydell/node-pty` in the seat dependencies turns the resolve check red. In
+  `bin/smoke/mutations/seat-native-ci.json`: dropping `pty.node` from either native job's upload
+  turns `bin/smoke/seat-native-ci.smoke.ts` red.
 
 ### T2: the reap sends no numeric signal (`@cotal-ai/seat`)
 
@@ -506,9 +604,10 @@ asserts `retained`.
 
 ```ts
 // packages/seat/src/reap.ts
-export type SeatReleaseCheck = { ok: true; advisory: string } | { ok: false; reason: "populated"; detail: string };
+export type SeatReleaseCheck = { ok: true; advisory: string } | { ok: false; reason: "populated" | "launch-in-progress"; detail: string };
 export function checkSeatRelease(root: string, id: string, opts?: { cgroup?: SeatCgroup }): SeatReleaseCheck; // read-only
-export function removeSeatCustody(root: string, id: string): void; // rename to .released-<id>, then remove; ENOENT is success
+export async function sealSeatLaunch(root: string, id: string, opts?: { cgroup?: SeatCgroup }): Promise<SeatReleaseCheck>; // fence lock, empty cgroup rmdir, "sealed"
+export function removeSeatCustody(root: string, id: string): void; // rename to .released-<id>, then remove; ENOENT is success; keeps the fence
 
 // implementations/manager/src/static-lifecycle.ts
 export interface StaticLifecycleReleaseSpec {
@@ -547,8 +646,12 @@ private async opReleaseSeat(args: Record<string, unknown>, caller: EpCaller): Pr
 - **Crash and retry.** A crash after the record, or after removal, finishes on retry; a retry with
   the same operator and reason reuses the intent; a different reason or operator is rejected
   without deletion; a concurrent create loser compares before removing.
-- **Late custodian.** A custodian held before bind, released after the rename, writes no record
-  and its child is gone.
+- **Late custodian.** The seam holds a custodian before its first filesystem operation; the test
+  releases the seat, then releases the hold after the rename. No child marker, `seat.sock`,
+  `record.json`, `<root>/<id>` or `.released-<id>` exists. Making the custodian ignore a `sealed`
+  fence turns it red (the child writes its marker).
+- **Launch in progress.** The seam holds a custodian after admission. The release refuses with
+  `launch-in-progress` and writes no record. Making `sealSeatLaunch` skip the lock turns it red.
 - **Rowless lifecycle.** The slot written by T3 releases like any other.
 - **Refusal.** Under layer 3, a populated cgroup is refused.
 
@@ -584,10 +687,14 @@ it reads `record.json`.
 - **Launch/reap fence.** The seam holds the custodian before the move; the test reaps (empty
   cgroup, `reaped`), then releases the hold. The move fails, the custodian exits, and no child
   exists.
+- **Release/join race.** The seam holds a launcher before the move and holds the release between
+  its `populated 0` read and its `rmdir`. The test releases the launcher, then the release. The
+  release refuses with `populated`, no release record exists, and the terminal stays `retained`.
 
 **Mutations.** Reading `populated 1` as empty turns the populated cell red; skipping
 `seatCgroupContained` turns the shared-uid cell red; reading `record.json` before the cgroup turns
-the record-less cell red; spawning the child without `inSeatCgroup` turns the fence cell red.
+the record-less cell red; spawning the child without `inSeatCgroup` turns the fence cell red;
+writing the release record before the cgroup `rmdir` turns the release/join cell red.
 
 ### T6: contained proof, manager side and delegated CI (`@cotal-ai/manager`, `@cotal-ai/seat`)
 
@@ -610,18 +717,19 @@ the record-less cell red; spawning the child without `inSeatCgroup` turns the fe
 
 ## Tasks
 
-- [ ] T1 custodian keeps `record.json`; identities before spawn; handle captured in the native
-      spawn; every stop, liveness read and startup failure through it; `writeRecord` stops
-      creating its parent; cells and seat changeset.
+- [ ] T1 custodian keeps `record.json`; identities before spawn; launch fence; no custodian
+      `mkdirSync`; patched `pty.node` built, packed and load-smoked on x64 and arm64; every stop,
+      liveness read and startup failure through the handle; cells and seat changeset.
 - [ ] T2 `reapSeat` sends no record-derived signal; stop only by request; forged-record (pgid
       leader), setsid and foreign-boot cells; seat changeset.
 - [ ] T3 fatal reservation; predecessor proof; row-only reap; `spawnCustodied` records `got`;
       rowless slot; revoke and evict before proof; `recordRetainedTerminal`, `retainedReason`,
       `retainedCustody` and CLI status; cells and manager changeset.
 - [ ] T4 `release-seat` with verified operator, `ownerInstanceId`, release key in the executor
-      grant, rename removal; cells; seat, manager and core changesets.
-- [ ] T5 seat cgroup with launcher move, custodian membership wait and fence; cgroup before
-      record; cells; seat changeset.
+      grant, `sealSeatLaunch` before the intent, rename removal; cells; seat, manager and core
+      changesets.
+- [ ] T5 seat cgroup with launcher move, custodian membership wait and fence; release removes the
+      empty cgroup under the fence lock; cgroup before record; cells; seat changeset.
 - [ ] T6 distinct-uid launch, `adopterUid` peer check, delegated CI job with lifecycle-e2e green;
       manager and seat changesets.
 
