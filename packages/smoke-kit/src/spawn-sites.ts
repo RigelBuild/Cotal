@@ -186,7 +186,7 @@ type Binding = {
   /** A declaration without an initializer: a placeholder, never a path a broker starts with. */
   readonly uninitialized: boolean;
   /** A conditional assignment leaves the previous value live outside the branch that may skip it. */
-  readonly alternative?: { readonly binding: Binding; readonly start: number; readonly end: number };
+  alternative?: { readonly binding: Binding; readonly start: number; readonly end: number };
 };
 
 const SHORT_CIRCUIT: readonly ts.SyntaxKind[] = [
@@ -221,6 +221,7 @@ function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding
     defs.set(name, list);
   };
   const plain = { token: false, hoisted: false, uninitialized: false };
+  const varAlternatives: Array<{ readonly name: string; readonly binding: Binding; readonly branch: ts.Node }> = [];
   const visit = (node: ts.Node, parentScopes: readonly ts.Node[]): void => {
     const scopes = isLexicalScope(node) ? [...parentScopes, node] : parentScopes;
     if (ts.isVariableDeclaration(node)) {
@@ -232,18 +233,15 @@ function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding
       const location = { scopes: declarationScopes, offset: node.getStart(file), valueScopes: scopes, valueOffset };
       // A for-of/for-in binding has no initializer but the loop always assigns it.
       const uninitialized = node.initializer === undefined && !ts.isForInStatement(node.parent.parent) && !ts.isForOfStatement(node.parent.parent);
-      // A `var` initializer in a branch is a skippable write: the earlier value, or the hoisted undefined, stays live.
+      // A `var` initializer in a branch is a skippable write. Resolve its fallback after collecting assignments.
       const varBranch = node.initializer !== undefined && declarationScopes !== scopes
         ? skippableBranch(node, declarationScopes[declarationScopes.length - 1])
         : undefined;
-      const varAlternative = (name: string): Pick<Binding, "alternative"> => {
-        if (varBranch === undefined) return {};
-        const prior = (defs.get(name) ?? []).filter((binding) => binding.scopes.length === declarationScopes.length
-          && binding.scopes.every((scope, index) => declarationScopes[index] === scope)).at(-1)
-          ?? { ...plain, ...location, value: "", uninitialized: true };
-        return { alternative: { binding: prior, start: varBranch.getStart(file), end: varBranch.end } };
+      const addVariable = (name: string, binding: Binding): void => {
+        add(name, binding);
+        if (varBranch !== undefined) varAlternatives.push({ name, binding, branch: varBranch });
       };
-      if (ts.isIdentifier(node.name)) add(node.name.text, { ...plain, ...location, value, uninitialized, ...varAlternative(node.name.text) });
+      if (ts.isIdentifier(node.name)) addVariable(node.name.text, { ...plain, ...location, value, uninitialized });
       if (ts.isObjectBindingPattern(node.name)) {
         for (const element of node.name.elements) {
           const property = element.propertyName ?? element.name;
@@ -257,7 +255,7 @@ function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding
             ? moduleCall.arguments[0]!.text
             : "";
           const kitToken = source === "@cotal-ai/smoke-kit" && property.text === "SMOKE_BROKER_TOKEN";
-          add(element.name.text, { ...plain, ...location, token: kitToken, ...varAlternative(element.name.text),
+          addVariable(element.name.text, { ...plain, ...location, token: kitToken,
             value: kitToken ? "" : value === "" ? "" : `(${value}).${property.text}` });
         }
       }
@@ -277,7 +275,7 @@ function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding
       // The name belongs to the scope the declaration sits in, not to the function's own body.
       const declarationScopes = parentScopes.filter((scope) => ts.isSourceFile(scope) || ts.isFunctionLike(scope));
       const offset = node.getStart(file);
-      add(node.name.text, { ...plain, value: "", scopes: declarationScopes, offset, valueScopes: declarationScopes, valueOffset: offset, hoisted: true });
+      add(node.name.text, { ...plain, value: "", scopes: declarationScopes, valueScopes: declarationScopes, valueOffset: offset, offset, hoisted: true });
     }
 
     ts.forEachChild(node, (child) => visit(child, scopes));
@@ -340,6 +338,16 @@ function bindings(src: string): { file: ts.SourceFile; defs: Map<string, Binding
   };
   visit(file, []);
   collectAssignments(file, []);
+  for (const { name, binding, branch } of varAlternatives) {
+    const prior = (defs.get(name) ?? []).filter((candidate) => candidate !== binding && candidate.offset < binding.offset
+      && !contains(branch, candidate.offset)
+      && candidate.scopes.length === binding.scopes.length
+      && candidate.scopes.every((scope, index) => binding.scopes[index] === scope))
+      .reduce<Binding | undefined>((latest, candidate) => latest === undefined || candidate.offset > latest.offset ? candidate : latest, undefined)
+      ?? { ...plain, value: "", scopes: binding.scopes, offset: binding.offset, valueScopes: binding.valueScopes,
+        valueOffset: binding.valueOffset, uninitialized: true };
+    binding.alternative = { binding: prior, start: branch.getStart(file), end: branch.end };
+  }
   return { file, defs };
 }
 
@@ -566,7 +574,50 @@ function guardConjuncts(branch: ts.Node): ts.Expression[] | undefined {
   return condition === undefined ? undefined : split(condition);
 }
 
-/** The registration at `call` runs once per broker spawned at `spawnOffset` (no loop or guard skips it). */
+/** A return or throw after the spawn can skip its teardown registration. */
+function exitsBetween(file: ts.SourceFile, fn: ts.Node, spawnOffset: number, callOffset: number): boolean {
+  const spawn = nodeAt(file, spawnOffset);
+  let found = false;
+  const exclusive = (left: ts.Node, right: ts.Node): boolean => {
+    const parent = left.parent;
+    return parent !== undefined && right.parent === parent
+      && (ts.isIfStatement(parent) && (left === parent.thenStatement && right === parent.elseStatement
+        || left === parent.elseStatement && right === parent.thenStatement)
+        || ts.isConditionalExpression(parent) && (left === parent.whenTrue && right === parent.whenFalse
+          || left === parent.whenFalse && right === parent.whenTrue));
+  };
+  const visit = (node: ts.Node): void => {
+    if (found || node !== fn && ts.isFunctionLike(node)) return;
+    if ((ts.isReturnStatement(node) || ts.isThrowStatement(node)) && node.getStart(file) > spawnOffset && node.end < callOffset) {
+      const exitBranches = skippableBranches(node, fn);
+      const spawnBranches = skippableBranches(spawn, fn);
+      if (!exitBranches.some((exit) => spawnBranches.some((started) => exclusive(exit, started)))) found = true;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(fn);
+  return found;
+}
+
+/** A call is repeated when its site or any caller runs in a loop without the registration. */
+function callRepeats(file: ts.SourceFile, fn: ts.Node, registrationOffset: number, defs: Map<string, Binding[]>, stack: readonly ts.Node[] = []): boolean {
+  if (stack.includes(fn)) return true;
+  const calls = invocations(fn, defs);
+  if (calls === null) return true;
+  return calls.some((caller) => {
+    if (contains(fn, caller)) return false;
+    let site: ts.Node = nodeAt(file, caller);
+    while (!ts.isCallExpression(site) && site.parent !== undefined && site.parent.getStart(file) === caller) site = site.parent;
+    if (!ts.isCallExpression(site)) return true;
+    let parentFunction: ts.Node | undefined;
+    for (let node = site.parent; node !== undefined; node = node.parent) {
+      if (ts.isIterationStatement(node, false) && !contains(node, registrationOffset)) return true;
+      if (ts.isFunctionLike(node)) { parentFunction = node; break; }
+    }
+    return parentFunction !== undefined && callRepeats(file, parentFunction, registrationOffset, defs, [...stack, fn]);
+  });
+}
+/** The registration at `call` runs once per broker spawned at `spawnOffset`. */
 function coRuns(file: ts.SourceFile, spawnOffset: number, call: ts.CallExpression, defs: Map<string, Binding[]>, stack: readonly ts.Node[] = []): boolean {
   for (let node = nodeAt(file, spawnOffset); node.parent !== undefined && !ts.isFunctionLike(node); node = node.parent) {
     if (ts.isIterationStatement(node, false) && !contains(node, call.getStart(file))) return false;
@@ -585,16 +636,25 @@ function coRuns(file: ts.SourceFile, spawnOffset: number, call: ts.CallExpressio
     || single(conjunct) && spawnGuards.some((guard) => ts.isIdentifier(guard) && guard.text === conjunct.text));
   if (skippableBranches(call, undefined).some((branch) => !contains(branch, spawnOffset)
     && !(guardConjuncts(branch)?.every(implied) ?? false))) return false;
-  let fn: ts.Node | undefined = call.parent;
-  while (fn !== undefined && !ts.isFunctionLike(fn)) fn = fn.parent;
-  if (fn === undefined || contains(fn, spawnOffset)) return true;
-  const calls = invocations(fn, defs);
+  let spawnFunction: ts.Node | undefined = nodeAt(file, spawnOffset).parent;
+  while (spawnFunction !== undefined && !ts.isFunctionLike(spawnFunction)) spawnFunction = spawnFunction.parent;
+  let callFunction: ts.Node | undefined = call.parent;
+  while (callFunction !== undefined && !ts.isFunctionLike(callFunction)) callFunction = callFunction.parent;
+  if (spawnFunction !== undefined && !contains(spawnFunction, call.getStart(file))) {
+    const launches = invocations(spawnFunction, defs);
+    if (launches === null || launches.length !== 1) return false;
+    if (callRepeats(file, spawnFunction, call.getStart(file), defs)) return false;
+  }
+  if (callFunction !== undefined && contains(callFunction, spawnOffset)
+    && exitsBetween(file, callFunction, spawnOffset, call.getStart(file))) return false;
+  if (callFunction === undefined || contains(callFunction, spawnOffset)) return true;
+  const calls = invocations(callFunction, defs);
   if (calls === null) return true;
-  if (stack.includes(fn)) return false;
+  if (stack.includes(callFunction)) return false;
   return calls.some((caller) => {
     let site: ts.Node = nodeAt(file, caller);
     while (!ts.isCallExpression(site) && site.parent !== undefined && site.parent.getStart(file) === caller) site = site.parent;
-    return !contains(fn, caller) && ts.isCallExpression(site) && coRuns(file, spawnOffset, site, defs, [...stack, fn]);
+    return !contains(callFunction, caller) && ts.isCallExpression(site) && coRuns(file, spawnOffset, site, defs, [...stack, callFunction]);
   });
 }
 
