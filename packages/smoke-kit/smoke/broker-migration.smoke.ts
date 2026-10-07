@@ -1072,6 +1072,26 @@ cell("the enumerator refuses helper launches skipped by caller exits", () => {
   assert.equal(found[1]!.owned, false, "caller return skips registration through an intermediate helper");
 });
 
+// An intermediate helper can throw after starting a broker but before returning to its caller.
+cell("the enumerator refuses helper launches skipped by intermediate exits", () => {
+  const found = plantedSites("intermediate-helper-exit",
+    `const sd = join(tmpdir(), SMOKE_BROKER_TOKEN);\n` +
+    `let child;\n` +
+    `function start() { child = spawn("nats-server", ["-sd", sd]); }\n` +
+    `function middle() { start(); }\n` +
+    `function prepare(ready: boolean) { middle(); if (!ready) throw new Error("not ready"); }\n` +
+    `function run(ready: boolean) { prepare(ready); teardownOnSignal(child); }\n` +
+    `run(Boolean(process.env.READY));\n` +
+    `let processChild;\n` +
+    `function startProcess() { processChild = spawn("nats-server", ["-sd", sd]); }\n` +
+    `function prepareProcess(ready: boolean) { startProcess(); if (!ready) process.exit(1); }\n` +
+    `function runProcess(ready: boolean) { prepareProcess(ready); teardownOnSignal(processChild); }\n` +
+    `runProcess(Boolean(process.env.READY));\n`);
+  assert.equal(found.length, 2);
+  assert.equal(found[0]!.owned, false, "intermediate throw bypasses teardown");
+  assert.equal(found[1]!.owned, false, "intermediate process exit bypasses teardown");
+});
+
 // A caller loop can continue after the helper returns, before teardown of that iteration.
 cell("the enumerator refuses helper launches skipped by caller continue", () => {
   const found = plantedSites("caller-continue-helper-return",
