@@ -36,8 +36,10 @@ settings files are never written.
 
 **Carrier: a per-seat agent dir (decision 1).** It combines two documented Pi features:
 
-- `getAgentDir` (`config.js`) honors `PI_CODING_AGENT_DIR`;
-- `SettingsManager.getRetryEnabled` returns `this.settings.retry?.enabled ?? true`.
+- `getAgentDir` (`config.js`) honors `PI_CODING_AGENT_DIR`:
+  `const envDir = process.env[ENV_AGENT_DIR]; if (envDir) { return expandTildePath(envDir); }`;
+- `SettingsManager.getRetryEnabled` (`core/settings-manager.js`) is
+  `return this.settings.retry?.enabled ?? true;`.
 
 `_prepareRetry` and `_willRetryAfterAgentEnd` re-read `getRetrySettings()` on every attempt, so a
 correct file at every read is enough. `piConnector.buildLaunch` converges a seat dir:
@@ -118,7 +120,8 @@ managed transcript must stay under the seat's `sessions` link, so:
   dir for the session cwd under the seat dir. This catches every source, including `/resume` of a
   file elsewhere and an in-memory session, whose dir is `""` (`SessionManager.inMemory`).
 
-Pi's `getDefaultSessionDirPath` is not exported, and `ReadonlySessionManager` omits
+Pi's `getDefaultSessionDirPath` is not exported, and `ReadonlySessionManager`
+(`core/session-manager.d.ts`) is `Pick<SessionManager, "getCwd" | "getSessionDir" | …>` without
 `usesDefaultSessionDir`, so `seatDefaultSessionDir` copies its rule:
 ``join(resolve(agentDir), "sessions", `--${resolve(cwd).replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`)``.
 The runtime pin keeps the copy exact.
@@ -359,8 +362,12 @@ export function convergeSeatAgentDir(seatDir: string, operatorDir: string): void
    `extensions`, `skills`, `prompts` and `themes`. Pi resolves a relative user-scope entry against
    the agent dir (`getBaseDirForScope`, `core/package-manager.js`), which is `seatDir`.
    - Strip one leading `!`/`+`/`-` marker.
+   - Convert a `file:` URL with `fileURLToPath` first, as Pi's `normalizePath` does
+     (`utils/paths.js`: `if (/^file:\/\//.test(normalized)) { return fileURLToPath(normalized); }`).
+     `isLocalPath` counts `file:` as local. A malformed URL throws. The converted path is then
+     checked like any other entry.
    - Skip non-local sources (the `isLocalPath` prefixes in `utils/paths.js`), `~` paths and
-     absolute paths.
+     absolute paths, including a converted `file:` URL.
    - For each remaining entry, compute `r = relative(seatDir, resolve(seatDir, e))`. Throw unless
      `r` is non-empty and contained: `r !== ".."`, `!r.startsWith("../")` and `!isAbsolute(r)`.
      This is the one-direction `contained` predicate inside `overlaps`
@@ -458,6 +465,7 @@ Launch cells run `buildLaunch` with a temp `HOME`, a temp `XDG_STATE_HOME`, temp
 - after the first launch, an operator `settings.json` that does not parse, or that gains `apiKeys`,
   `sessionDir` or an escaping entry, neither fails a relaunch nor changes the seat file;
 - a seat-file-only entry `extensions: ["mine/x.ts"]` links `mine` to `<operatorDir>/mine`;
+- `extensions: ["file:///outside/e.ts"]` is treated as an absolute entry and links nothing;
 - a planted link with a wrong target is swapped to the expected one;
 - a call with a second uid leaves the first seat dir and its `settings.json` bytes in place;
 - with `XDG_STATE_HOME` unset and `COTAL_HOME=<svc>`, `XDG_CONFIG_HOME=<svc>/config` as a service
@@ -477,6 +485,7 @@ Each refusal case throws its message:
 
 - `apiKeys`, or `oauth.json` present;
 - `extensions: ["x/../../e.ts"]`;
+- `extensions: ["file://bad%"]`, a malformed URL;
 - an operator `sessionDir`, relative or absolute, at first launch;
 - a seat file with `sessionDir` or `apiKeys`; a planted session-state file survives byte-for-byte;
 - `PI_CODING_AGENT_SESSION_DIR` forwarded through `envAllow`;
