@@ -21,3 +21,10 @@ export const QUARANTINED = {
   "smoke:console-attach": { reason: "RIG-4872: passes but leaks a seat custodian on CI (shard 2)", recheckBy: "2026-11-15" },
   "smoke:codex-host": { reason: "RIG-4872: flaky; approval presence wait timed out on CI run 37970832138, passed on 37964440191", recheckBy: "2026-11-15" },
 };
+
+/** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */
+/** @type {Record<string, { reason: string; recheckBy: string }>} */
+export const LIVE_QUARANTINED = {
+  "smoke:lifecycle-e2e": { reason: "RIG-4872: despawn cannot prove a pty seat gone until RIG-4320 lands", recheckBy: "2026-11-15" },
+  "smoke:herdr-e2e:live": { reason: "RIG-4872: herdr server not running when the manager starts", recheckBy: "2026-11-15" },
+};

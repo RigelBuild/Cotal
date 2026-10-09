@@ -23,7 +23,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { readCiSuites, ciChainBody } from "./ci-suites.mjs";
-import { QUARANTINED } from "./ci-quarantine.mjs";
+import { LIVE_QUARANTINED, QUARANTINED } from "./ci-quarantine.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -267,15 +267,22 @@ if (exemptionReviews.examined !== EXPECTED_EXEMPTIONS) {
   console.log(`  ✓ all ${exemptionReviews.examined} UNGATED exemptions have a current recheckBy date`);
 }
 
-const quarantine = reviewExemptions(QUARANTINED, today);
+const quarantine = reviewExemptions({ ...QUARANTINED, ...LIVE_QUARANTINED }, today);
 const ciSuites = new Set(readCiSuites());
 const quarantineStale = Object.keys(QUARANTINED).filter((s) => !ciSuites.has(s));
-if (quarantine.invalid.length || quarantine.expired.length || quarantineStale.length) {
+// A ci.yml smoke step that may fail without failing the job must carry a dated LIVE_QUARANTINED entry.
+const softSteps = [...readFileSync(join(wfDir, "ci.yml"), "utf8").matchAll(/continue-on-error:\s*true\s*\n\s*run:\s*pnpm\s+(smoke\S*)/g)].map((m) => m[1]);
+const liveDrift = [
+  ...softSteps.filter((s) => !(s in LIVE_QUARANTINED)).map((s) => `${s}: continue-on-error in ci.yml without a LIVE_QUARANTINED entry`),
+  ...Object.keys(LIVE_QUARANTINED).filter((s) => !softSteps.includes(s)).map((s) => `${s}: in LIVE_QUARANTINED but no continue-on-error step runs it`),
+];
+if (quarantine.invalid.length || quarantine.expired.length || quarantineStale.length || liveDrift.length) {
   fail++;
   console.log(`  ✗ FAIL: CI quarantine needs review (bin/smoke/ci-quarantine.mjs):`);
   for (const s of quarantine.invalid) console.log(`      ${s}: invalid recheckBy`);
   for (const s of quarantine.expired) console.log(`      ${s}: past recheckBy ${today}; fix it or re-date with the decision`);
   for (const s of quarantineStale) console.log(`      ${s}: not a CI smoke suite`);
+  for (const s of liveDrift) console.log(`      ${s}`);
 } else {
   console.log(`  ✓ ${quarantine.examined} quarantined CI suite(s) have a current recheckBy date`);
 }
