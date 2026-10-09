@@ -21,6 +21,7 @@ import { reapSmokeBrokers, reportReaped } from "./reap-smoke-brokers.mjs";
 import { reapRunCustodians, reportCustodians } from "./reap-seat-custodians.mjs";
 import { neverRanBlock } from "./shard-never-ran.mjs";
 import { parseSentinel } from "./sentinel.mjs";
+import { QUARANTINED } from "./ci-quarantine.mjs";
 
 const shard = Number(process.argv[2]);
 const count = Number(process.argv[3]);
@@ -97,6 +98,11 @@ async function main() {
   for (let i = 0; i < mine.length; i++) {
     const cmd = mine[i];
     const [bin, ...args] = cmd.split(/\s+/);
+    const held = QUARANTINED[args[0]];
+    if (held) {
+      console.log(`\n===== ${cmd} ===== QUARANTINED, not run: ${held.reason} (recheck by ${held.recheckBy})`);
+      continue;
+    }
     console.log(`\n===== ${cmd} =====`);
     // shell:true on Windows so `pnpm` resolves to pnpm.cmd; the tokens are our own fixed script names.
     const r = await runSuite(bin, args);

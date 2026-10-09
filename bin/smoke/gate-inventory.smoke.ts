@@ -23,6 +23,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { readCiSuites, ciChainBody } from "./ci-suites.mjs";
+import { QUARANTINED } from "./ci-quarantine.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -264,6 +265,19 @@ if (exemptionReviews.examined !== EXPECTED_EXEMPTIONS) {
   }
 } else {
   console.log(`  ✓ all ${exemptionReviews.examined} UNGATED exemptions have a current recheckBy date`);
+}
+
+const quarantine = reviewExemptions(QUARANTINED, today);
+const ciSuites = new Set(readCiSuites());
+const quarantineStale = Object.keys(QUARANTINED).filter((s) => !ciSuites.has(s));
+if (quarantine.invalid.length || quarantine.expired.length || quarantineStale.length) {
+  fail++;
+  console.log(`  ✗ FAIL: CI quarantine needs review (bin/smoke/ci-quarantine.mjs):`);
+  for (const s of quarantine.invalid) console.log(`      ${s}: invalid recheckBy`);
+  for (const s of quarantine.expired) console.log(`      ${s}: past recheckBy ${today}; fix it or re-date with the decision`);
+  for (const s of quarantineStale) console.log(`      ${s}: not a CI smoke suite`);
+} else {
+  console.log(`  ✓ ${quarantine.examined} quarantined CI suite(s) have a current recheckBy date`);
 }
 
 // THE REVERSE DIRECTION, and the gate needs both. Everything above asks "is this script reached?".
