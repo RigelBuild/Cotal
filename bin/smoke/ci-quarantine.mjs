@@ -19,4 +19,5 @@ export const QUARANTINED = {
   "smoke:backup-perms:live": { reason: "RIG-4872/#643: zero-delivery consumer frontier 1 !== 2 on CI (shard 3)", recheckBy: "2026-11-15" },
   "smoke:console-control": { reason: "RIG-4872: passes but leaks a seat custodian on CI (shard 2)", recheckBy: "2026-11-15" },
   "smoke:console-attach": { reason: "RIG-4872: passes but leaks a seat custodian on CI (shard 2)", recheckBy: "2026-11-15" },
+  "smoke:codex-host": { reason: "RIG-4872: flaky; approval presence wait timed out on CI run 37970832138, passed on 37964440191", recheckBy: "2026-11-15" },
 };
