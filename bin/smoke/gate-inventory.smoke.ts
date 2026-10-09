@@ -270,11 +270,15 @@ if (exemptionReviews.examined !== EXPECTED_EXEMPTIONS) {
 const quarantine = reviewExemptions({ ...QUARANTINED, ...LIVE_QUARANTINED }, today);
 const ciSuites = new Set(readCiSuites());
 const quarantineStale = Object.keys(QUARANTINED).filter((s) => !ciSuites.has(s));
-// A ci.yml smoke step that may fail without failing the job must carry a dated LIVE_QUARANTINED entry.
-const softSteps = [...readFileSync(join(wfDir, "ci.yml"), "utf8").matchAll(/continue-on-error:\s*true\s*\n\s*run:\s*pnpm\s+(smoke\S*)/g)].map((m) => m[1]);
+// A ci.yml step that may fail without failing the job must carry a dated LIVE_QUARANTINED entry for
+// every smoke it runs. Steps are split at `- ` list items, so key order and multi-command runs count.
+const softBlocks = readFileSync(join(wfDir, "ci.yml"), "utf8").split(/\n(?=\s*- )/).filter((b) => /^\s*continue-on-error:\s*true\b/m.test(b));
+const softSteps = softBlocks.flatMap((b) => suitesIn(b));
+const softUnnamed = softBlocks.filter((b) => suitesIn(b).length === 0).map((b) => `${b.trim().split("\n")[0]}: continue-on-error step runs no recognised smoke`);
 const liveDrift = [
   ...softSteps.filter((s) => !(s in LIVE_QUARANTINED)).map((s) => `${s}: continue-on-error in ci.yml without a LIVE_QUARANTINED entry`),
   ...Object.keys(LIVE_QUARANTINED).filter((s) => !softSteps.includes(s)).map((s) => `${s}: in LIVE_QUARANTINED but no continue-on-error step runs it`),
+  ...softUnnamed,
 ];
 if (quarantine.invalid.length || quarantine.expired.length || quarantineStale.length || liveDrift.length) {
   fail++;
