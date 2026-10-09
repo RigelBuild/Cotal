@@ -22,6 +22,7 @@ import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
+import { parse as parseYaml } from "yaml";
 import { readCiSuites, ciChainBody } from "./ci-suites.mjs";
 import { LIVE_QUARANTINED, QUARANTINED } from "./ci-quarantine.mjs";
 
@@ -270,15 +271,41 @@ if (exemptionReviews.examined !== EXPECTED_EXEMPTIONS) {
 const quarantine = reviewExemptions({ ...QUARANTINED, ...LIVE_QUARANTINED }, today);
 const ciSuites = new Set(readCiSuites());
 const quarantineStale = Object.keys(QUARANTINED).filter((s) => !ciSuites.has(s));
-// A ci.yml step that may fail without failing the job must carry a dated LIVE_QUARANTINED entry for
-// every smoke it runs. Steps are split at `- ` list items, so key order and multi-command runs count.
-const softBlocks = readFileSync(join(wfDir, "ci.yml"), "utf8").split(/\n(?=\s*- )/).filter((b) => /^\s*continue-on-error:\s*true\b/m.test(b));
-const softSteps = softBlocks.flatMap((b) => suitesIn(b));
-const softUnnamed = softBlocks.filter((b) => suitesIn(b).length === 0).map((b) => `${b.trim().split("\n")[0]}: continue-on-error step runs no recognised smoke`);
+// A ci.yml job or step that may fail without failing ci-ok must carry a dated LIVE_QUARANTINED entry
+// for every smoke it runs; a soft scope that runs no recognised smoke is itself a finding.
+type Step = { name?: string; run?: string; "continue-on-error"?: unknown };
+type Job = { "continue-on-error"?: unknown; steps?: Step[] };
+const softSmokes = (workflow: string): { suites: string[]; unnamed: string[] } => {
+  const suites: string[] = [];
+  const unnamed: string[] = [];
+  const jobs = (parseYaml(workflow) as { jobs?: Record<string, Job> }).jobs ?? {};
+  for (const [id, job] of Object.entries(jobs)) {
+    const jobSoft = job["continue-on-error"] !== undefined && job["continue-on-error"] !== false;
+    const scopes = jobSoft ? [{ label: `job ${id}`, run: (job.steps ?? []).map((s) => s.run ?? "").join("\n") }] : [];
+    for (const step of job.steps ?? [])
+      if (!jobSoft && step["continue-on-error"] !== undefined && step["continue-on-error"] !== false)
+        scopes.push({ label: `${id} / ${step.name ?? "unnamed step"}`, run: step.run ?? "" });
+    for (const { label, run } of scopes) {
+      const found = suitesIn(run);
+      if (found.length === 0) unnamed.push(`${label}: continue-on-error runs no recognised smoke`);
+      suites.push(...found);
+    }
+  }
+  return { suites, unnamed };
+};
+const softControl = softSmokes(
+  "jobs:\n  a:\n    steps:\n      - run: pnpm smoke:x && pnpm smoke:y\n        continue-on-error: true\n      - name: s\n        continue-on-error: true\n        run: |\n          - list text\n          pnpm smoke:z\n  b:\n    continue-on-error: true\n    steps:\n      - run: echo hi\n",
+);
+const softControlOk =
+  JSON.stringify(softControl.suites) === JSON.stringify(["smoke:x", "smoke:y", "smoke:z"]) &&
+  JSON.stringify(softControl.unnamed) === JSON.stringify(["job b: continue-on-error runs no recognised smoke"]);
+const soft = [softSmokes(readFileSync(join(wfDir, "ci.yml"), "utf8"))];
+const softSteps = soft.flatMap((s) => s.suites);
 const liveDrift = [
-  ...softSteps.filter((s) => !(s in LIVE_QUARANTINED)).map((s) => `${s}: continue-on-error in ci.yml without a LIVE_QUARANTINED entry`),
-  ...Object.keys(LIVE_QUARANTINED).filter((s) => !softSteps.includes(s)).map((s) => `${s}: in LIVE_QUARANTINED but no continue-on-error step runs it`),
-  ...softUnnamed,
+  ...(softControlOk ? [] : [`soft-step control misread its fixture: ${JSON.stringify(softControl)}`]),
+  ...softSteps.filter((s) => !(s in LIVE_QUARANTINED)).map((s) => `${s}: continue-on-error in a workflow without a LIVE_QUARANTINED entry`),
+  ...Object.keys(LIVE_QUARANTINED).filter((s) => !softSteps.includes(s)).map((s) => `${s}: in LIVE_QUARANTINED but no continue-on-error scope runs it`),
+  ...soft.flatMap((s) => s.unnamed),
 ];
 if (quarantine.invalid.length || quarantine.expired.length || quarantineStale.length || liveDrift.length) {
   fail++;
