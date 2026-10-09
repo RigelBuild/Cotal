@@ -53,7 +53,6 @@ const flagToOpKey: Record<string, string> = {
   name: "identity",
   opt: "launchOptions",
   "share-tools": "shareTools",
-  continue: "continueSession",
   "allow-subscribe": "allowSubscribe",
   "allow-publish": "allowPublish",
   "no-events": "events",
