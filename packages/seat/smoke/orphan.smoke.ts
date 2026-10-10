@@ -354,9 +354,9 @@ setInterval(() => {}, 1000);
       MAX_SOCKET_PATH: MAX,
       atLimit,
     });
-    // `pastLimit.ok === false` is not enough on its own: a mis-built path is also false. Require the
-    // reason to be truncation, so this cell cannot pass for the wrong reason.
-    check("...and one byte past it is silently truncated, which is why the refusal exists", !pastLimit.ok && /truncated/.test(pastLimit.why), {
+    // `pastLimit.ok === false` is not enough on its own: a mis-built path is also false. Require
+    // truncation (Node 22) or the EINVAL newer Node returns instead; either way the exact path is unusable.
+    check("...and one byte past it is truncated or refused, which is why the refusal exists", !pastLimit.ok && /truncated|listen EINVAL/.test(pastLimit.why), {
       firstTruncating: typeof MAX === "number" ? MAX + 1 : undefined,
       pastLimit,
     });
