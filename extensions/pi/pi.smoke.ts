@@ -340,7 +340,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   driver.bind(host);
   driver.onSessionStart(context());
   mesh.items.push(item("m2"));
-  driver.onIncoming();
+  driver.onIncoming(mesh.items.at(-1)!);
   driver.onMentionWake(item("mention", { kind: "channel", channel: "general", mentionsMe: true }));
   ok(host.sent.length === 1, "new traffic and a mention cannot race a second unconfirmed trigger");
 }
@@ -362,7 +362,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   driver.onAgentEnd([{ role: "assistant", stopReason: "aborted" }], ctx);
   ok(driver.state === "held" && mesh.drained.length === 0, "abort retains confirmed work and enters held");
   mesh.items.push(item("m2"));
-  driver.onIncoming();
+  driver.onIncoming(mesh.items.at(-1)!);
   ok(host.sent.length === 1, "new traffic cannot auto-replay while held");
   const continuation = context();
   driver.onAgentStart(continuation);
@@ -441,6 +441,176 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   confirm(driver, details);
   driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], retry);
   ok(mesh.drained.join() === "m1" && driver.state === "idle", "the automatic retry commits only at its later clean boundary");
+}
+
+// A provider error retains the old batch, but a later DM starts a new turn with both items.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const first = startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  driver.onContext([{ role: "custom", customType: "cotal-inbox", details: first }]);
+  driver.onProviderResponse(429);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
+  ok(driver.state === "held" && mesh.drained.length === 0, "provider error retains the first DM");
+  mesh.items.push(item("m2"));
+  driver.onIncoming(mesh.items.at(-1)!);
+  ok(host.sent.length === 2 && host.sent[1]?.details.ids.join() === "m1,m2", "a new DM wakes and resends retained delivery");
+  const retry = startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  confirm(driver, retry);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
+  ok(mesh.drained.join() === "m1,m2", "a clean retry commits both DMs once");
+
+  const accepted = new FakeMesh();
+  accepted.items = [item("confirmed")];
+  const acceptedHost = new FakeHost();
+  const acceptedContext = context();
+  const acceptedDriver = new PiDriver(accepted as unknown as MeshAgent);
+  acceptedDriver.bind(acceptedHost);
+  acceptedDriver.onSessionStart(acceptedContext);
+  const acceptedBatch = startBatch(acceptedDriver, acceptedHost);
+  acceptedDriver.onAgentStart(acceptedContext);
+  confirm(acceptedDriver, acceptedBatch);
+  acceptedDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], acceptedContext);
+  accepted.items.push(item("fresh"));
+  acceptedDriver.onIncoming(accepted.items.at(-1)!);
+  ok(acceptedHost.sent.at(-1)?.details.ids.join() === "confirmed,fresh" && accepted.drained.length === 0,
+    "a prior provider acceptance cannot acknowledge an error-ended batch before replay");
+
+  const waiting = new FakeMesh();
+  waiting.items = [item("old")];
+  const waitingHost = new FakeHost();
+  const waitingContext = context();
+  const waitingDriver = new PiDriver(waiting as unknown as MeshAgent);
+  waitingDriver.bind(waitingHost);
+  waitingDriver.onSessionStart(waitingContext);
+  startBatch(waitingDriver, waitingHost);
+  waitingDriver.onAgentStart(waitingContext);
+  waitingDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], waitingContext);
+  waiting.items.push(item("new"));
+  waitingDriver.onIncoming(waiting.items.at(-1)!);
+  ok(waitingHost.sent.at(-1)?.details.ids.join() === "old,new", "new inbound replays retained and newly arrived traffic");
+  startBatch(waitingDriver, waitingHost);
+  waitingDriver.onAgentStart(waitingContext);
+  waitingDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], waitingContext);
+  waitingDriver.onWake();
+  ok(waitingDriver.state === "held" && waitingHost.sent.length === 2 && waiting.drained.length === 0,
+    "another provider error waits for a genuinely new item rather than looping");
+  waiting.items.push(item("later"));
+  waitingDriver.onIncoming(waiting.items.at(-1)!);
+  ok(waitingHost.sent.at(-1)?.details.ids.join() === "old,new,later", "later inbound retries the entire uncommitted batch");
+
+  const crowded = new FakeMesh();
+  crowded.items = Array.from({ length: 33 }, (_, index) => item(`queued-${index}`));
+  const crowdedHost = new FakeHost();
+  const crowdedContext = context();
+  const crowdedDriver = new PiDriver(crowded as unknown as MeshAgent);
+  crowdedDriver.bind(crowdedHost);
+  crowdedDriver.onSessionStart(crowdedContext);
+  startBatch(crowdedDriver, crowdedHost);
+  crowdedDriver.onAgentStart(crowdedContext);
+  crowdedDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], crowdedContext);
+  crowdedDriver.onWake();
+  ok(crowdedDriver.state === "held" && crowdedHost.sent.length === 1,
+    "a generic wake cannot retry stale unbatched backlog after a provider error");
+  crowdedDriver.onIncoming(crowded.items[32]!);
+  ok(crowdedDriver.state === "held" && crowdedHost.sent.length === 1,
+    "redelivery of stale unbatched traffic cannot retry a provider error");
+  const fresh = item("queued-new");
+  crowded.items.push(fresh);
+  crowdedDriver.onIncoming(fresh);
+  ok(crowdedHost.sent.length === 2, "a genuinely new delivery wakes a full held batch");
+  const staleMesh = new FakeMesh();
+  staleMesh.items = [item("old")];
+  const staleHost = new FakeHost();
+  const staleContext = context();
+  const staleDriver = new PiDriver(staleMesh as unknown as MeshAgent);
+  staleDriver.bind(staleHost);
+  staleDriver.onSessionStart(staleContext);
+  startBatch(staleDriver, staleHost);
+  staleDriver.onAgentStart(staleContext);
+  staleDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], staleContext);
+  staleDriver.onAgentStart(staleContext);
+  staleDriver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], staleContext);
+  const afterWatchdog = item("after-watchdog");
+  staleMesh.items.push(afterWatchdog);
+  staleDriver.onIncoming(afterWatchdog);
+  ok(staleDriver.state === "held" && staleHost.sent.length === 1,
+    "a later unconfirmed hold cannot inherit error-retry eligibility");
+  const channelMesh = new FakeMesh();
+  channelMesh.items = [item("before-channel")];
+  const channelHost = new FakeHost();
+  const channelDriver = new PiDriver(channelMesh as unknown as MeshAgent);
+  channelDriver.bind(channelHost);
+  const channelContext = context();
+  channelDriver.onSessionStart(channelContext);
+  startBatch(channelDriver, channelHost);
+  channelDriver.onAgentStart(channelContext);
+  channelDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], channelContext);
+  const channel = item("channel-post", { kind: "channel", channel: "general" });
+  channelMesh.items.push(channel);
+  channelDriver.onIncoming(channel);
+  ok(channelHost.sent.at(-1)?.details.ids.join() === "before-channel,channel-post",
+    "a new automatic channel post wakes retained delivery");
+  const pullOnly = new FakeMesh();
+  pullOnly.items = [item("retained")];
+  const pullHost = new FakeHost();
+  const pullDriver = new PiDriver(pullOnly as unknown as MeshAgent);
+  pullDriver.bind(pullHost);
+  const pullContext = context();
+  pullDriver.onSessionStart(pullContext);
+  startBatch(pullDriver, pullHost);
+  pullDriver.onAgentStart(pullContext);
+  pullDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], pullContext);
+  const ambient = item("quiet", { kind: "channel", channel: "quiet" });
+  pullOnly.items.push(ambient);
+  pullOnly.pullOnly.add(ambient.id);
+  pullDriver.onIncoming(ambient);
+  ok(pullDriver.state === "held" && pullHost.sent.length === 1,
+    "pull-only ambient cannot wake an error-held automatic delivery");
+
+  const overflowMesh = new FakeMesh();
+  overflowMesh.items = [item("overflow-old")];
+  const overflowHost = new FakeHost();
+  const overflowContext = context();
+  const overflowDriver = new PiDriver(overflowMesh as unknown as MeshAgent);
+  overflowDriver.bind(overflowHost);
+  overflowDriver.onSessionStart(overflowContext);
+  startBatch(overflowDriver, overflowHost);
+  overflowDriver.onAgentStart(overflowContext);
+  overflowDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], overflowContext);
+  overflowDriver.onBeforeCompact("overflow", true);
+  const overflowNew = item("overflow-new");
+  overflowMesh.items.push(overflowNew);
+  overflowDriver.onIncoming(overflowNew);
+  ok(overflowDriver.state === "held" && overflowHost.sent.length === 1,
+    "provider overflow continuation retains ownership despite new inbound");
+  const racing = new FakeMesh();
+  racing.items = [item("first")];
+  const raceHost = new FakeHost();
+  const raceDriver = new PiDriver(racing as unknown as MeshAgent);
+  raceDriver.bind(raceHost);
+  const raceContext = context();
+  raceDriver.onSessionStart(raceContext);
+  startBatch(raceDriver, raceHost);
+  raceDriver.onAgentStart(raceContext);
+  raceDriver.onProviderResponse(429);
+  racing.items.push(item("between"));
+  raceDriver.onIncoming(racing.items.at(-1)!);
+  raceDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], raceContext);
+  ok(raceHost.sent.at(-1)?.details.ids.join() === "first,between" && raceHost.sent.length === 2,
+    "a DM arriving between provider failure and agent end retries retained delivery");
+  const raceBatch = startBatch(raceDriver, raceHost);
+  raceDriver.onAgentStart(raceContext);
+  confirm(raceDriver, raceBatch);
+  raceDriver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], raceContext);
+  ok(racing.drained.join() === "first,between", "a clean turn acknowledges both messages after the race");
 }
 
 // An unconfirmed error with no automatic continuation remains observably held without a timer.
@@ -574,7 +744,7 @@ for (const assistant of [
   await new Promise((resolve) => setTimeout(resolve, 120));
   ok(driver.state === "held" && mesh.drained.length === 0, "watchdog expiry holds without acknowledgement");
   mesh.items.push(item("new"));
-  driver.onIncoming();
+  driver.onIncoming(mesh.items.at(-1)!);
   ok(host.sent.length === 1, "watchdog hold blocks a competing dispatch");
   driver.onMessageStart({ role: "custom", customType: "cotal-inbox", details });
   confirm(driver, details);

@@ -105,7 +105,7 @@ function createRuntime(config: AgentConfig, control: { path: string; token: stri
     personaCleaned: false,
   };
 
-  mesh.on("incoming", () => driver.onIncoming());
+  mesh.on("incoming", (item: InboxItem) => driver.onIncoming(item));
   mesh.on("wake", () => driver.onWake());
   mesh.on("mention-wake", (item: InboxItem) => driver.onMentionWake(item));
   mesh.start();
