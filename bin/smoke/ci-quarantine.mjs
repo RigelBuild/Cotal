@@ -10,7 +10,6 @@ export const QUARANTINED = {
   "smoke:egress-guard-differential": { reason: "RIG-4872: predecessor resolver returns null for 1698fe253 on CI (shard 0)", recheckBy: "2026-11-15" },
   "smoke:delivery-starvation": { reason: "RIG-4872: F3/F5 shard-takeover cells fail", recheckBy: "2026-11-15" },
   "smoke:codex-events-lifecycle": { reason: "RIG-4872: broker-outage IDLE setup cells fail", recheckBy: "2026-11-15" },
-  "smoke:manager-stop-spare-guard": { reason: "RIG-4872: live-PTY spare-stop census and frozen #1343 inventory are stale", recheckBy: "2026-11-15" },
   "smoke:upgrade-section": { reason: "RIG-4872: flaky ACCEPT CONTROL exit-reader cells", recheckBy: "2026-11-15" },
   "smoke:backup-perms:live": { reason: "RIG-4872/#643: zero-delivery consumer frontier 1 !== 2 on CI (shard 3)", recheckBy: "2026-11-15" },
   "smoke:console-control": { reason: "RIG-4922: graceful-stop cells (y, seat3 leaves) failed in mutation-reproof run 38051239634; custodian leak fixed", recheckBy: "2026-11-15" },

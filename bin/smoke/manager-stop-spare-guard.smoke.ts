@@ -55,7 +55,6 @@ const FROZEN_DROPPED = [
   "bin/smoke/spawn-detach-live.smoke.ts",
   "implementations/cli/smoke/scatter-pinned-probe.smoke.ts",
   "implementations/manager/smoke/boot-self-heal-gate.smoke.ts",
-  "implementations/manager/smoke/cli-on-instance-live.smoke.ts",
   "implementations/manager/smoke/manager-deregister.smoke.ts",
   "implementations/manager/smoke/manager-restart-live.smoke.ts",
 ] as const;
