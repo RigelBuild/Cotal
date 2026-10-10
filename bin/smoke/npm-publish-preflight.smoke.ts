@@ -303,7 +303,7 @@ check(
 );
 
 // The preflight derives its package set from the Changesets fixed group; count from the same source.
-const FIXED_GROUP = (JSON.parse(readFileSync(join(ROOT, ".changeset", "config.json"), "utf8")) as { fixed: string[][] }).fixed.flat().length;
+const FIXED_GROUP = new Set((JSON.parse(readFileSync(join(ROOT, ".changeset", "config.json"), "utf8")) as { fixed: string[][] }).fixed.flat()).size;
 const allPresent = await repositoryEntrypoint("all-present");
 check(
   "all-present repository entrypoint returns the named no-op verdict",
