@@ -15,7 +15,6 @@ export const QUARANTINED = {
   "smoke:presence-render-census": { reason: "RIG-4872: manifest anchor no longer present in cli down.ts", recheckBy: "2026-11-15" },
   "smoke:manager-stop-spare-guard": { reason: "RIG-4872: live-PTY spare-stop census and frozen #1343 inventory are stale", recheckBy: "2026-11-15" },
   "smoke:upgrade-section": { reason: "RIG-4872: flaky ACCEPT CONTROL exit-reader cells", recheckBy: "2026-11-15" },
-  "smoke:entrypoint-guard": { reason: "RIG-4872: verify-publish-closure symlink self-test fails on CI (shard 1)", recheckBy: "2026-11-15" },
   "smoke:backup-perms:live": { reason: "RIG-4872/#643: zero-delivery consumer frontier 1 !== 2 on CI (shard 3)", recheckBy: "2026-11-15" },
   "smoke:console-control": { reason: "RIG-4872: passes but leaks a seat custodian on CI (shard 2)", recheckBy: "2026-11-15" },
   "smoke:console-attach": { reason: "RIG-4872: passes but leaks a seat custodian on CI (shard 2)", recheckBy: "2026-11-15" },
