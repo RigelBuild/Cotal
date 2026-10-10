@@ -123,7 +123,7 @@ export function sendComplete(argv: string[]): CompletionResult {
   if (positionals.length <= 1)
     return {
       items: [
-        { value: "dm", description: "unicast to an agent" },
+        { value: "dm", description: "unicast to a peer" },
         { value: "msg", description: "broadcast to a channel" },
         { value: "ask", description: "anycast to a role" },
       ],

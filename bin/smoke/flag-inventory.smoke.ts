@@ -38,7 +38,7 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
   up: {
     flags: [
       "channels:string", "detach:boolean", "dry-run:boolean", "file:string:f", "host:string",
-      "idp:string", "max-sessions:string", "open:boolean", "runtime:string", "server:string", "space:string",
+      "idp:string", "max-sessions:string", "no-manager:boolean", "open:boolean", "runtime:string", "server:string", "space:string",
       // The optional PUBLIC remote-exchange face, threaded to the auth-service daemon.
       // `--advertised-server` (2026-08): with --exchange-public-port, the broker address the public
       // discovery bundle advertises - what participants dial, which is not the address the callout
@@ -103,7 +103,7 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
   spawn: {
     flags: [
       "agent:string", "allow-publish:string", "allow-stale:string", "allow-subscribe:string",
-      "config:string", "creds:string", "cwd:string", "detach:boolean:d", "dry-run:boolean",
+      "config:string", "continue:string", "creds:string", "cwd:string", "detach:boolean:d", "dry-run:boolean",
       "events:boolean", "file:string:f", "live-only:boolean", "model:string", "name:string", "no-events:boolean",
       "on:string", "opt:string", "prompt:string", "resume:string", "role:string", "runtime:string",
       "server:string", "share-tools:string", "space:string", "subscribe:string", "variant:string",
@@ -240,9 +240,9 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
   // flag; resume/journal/answer name an existing run positionally.
   run: {
     flags: [
-      "admit-publish:string", "admit-read:string", "artifact:string", "by:string", "creds:string",
-      "endpoint:string", "file:string:f", "local:boolean", "reason:string", "server:string", "space:string",
-      "timeout:string", "value:string",
+      "admit-publish:string", "admit-read:string", "adopt:string", "artifact:string", "by:string", "creds:string",
+      "discard-approvals:boolean", "endpoint:string", "file:string:f", "local:boolean", "reason:string", "release:string",
+      "server:string", "space:string", "timeout:string", "value:string",
     ],
     positionals: true,
   },

@@ -179,7 +179,8 @@ console.log("4. every send waits for the same participant start, and a refusal r
   const app = render(
     <App ep={ep as unknown as CotalEndpoint} canWrite canControl={false}
       makeParticipant={() => (++starts === 1 ? new RefusedParticipant() : new StartedParticipant()) as unknown as CotalEndpoint} />,
-    { stdin, stdout, patchConsole: false, exitOnCtrlC: false },
+    // Ink writes no interactive frame while CI is set (is-in-ci); debug mode writes every frame.
+    { stdin, stdout, patchConsole: false, exitOnCtrlC: false, debug: true },
   );
   await wait(250);
   stdin.write("c");

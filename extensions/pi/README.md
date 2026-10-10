@@ -10,6 +10,7 @@ The package does not bundle Pi.
   Node 22.19 or newer.
 - `pi` on `PATH` for managed spawning.
 
+
 ## Use
 
 The published `cotal-ai` binary registers the connector:

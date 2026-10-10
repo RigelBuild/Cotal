@@ -703,7 +703,7 @@ async function resolveRunControlTarget(values: RunValues): Promise<ControlTarget
   const creds = readFileSync(path, "utf8");
   const nc = await dialerFor(mesh.server)({
     servers: mesh.server,
-    ...standaloneConnectOpts({ creds, tls: mesh.tlsRequired }),
+    ...standaloneConnectOpts({ creds, tls: mesh.tlsRequired === true }),
     maxReconnectAttempts: 0,
   });
   try {

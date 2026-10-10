@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { isReachable } from "@cotal-ai/core";
 import { pickFreePort } from "../../packages/core/smoke/_free-port.js";
 import { CotalEndpoint, DEV_OWNER, eventChannel, principalKey } from "@cotal-ai/core";
@@ -14,6 +14,7 @@ import { fauxToolCall } from "@earendil-works/pi-ai";
 import cotalMesh from "./src/extension.js";
 import { piConnector } from "./src/connector.js";
 import { SMOKE_BROKER_TOKEN, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { resolveNatsServer } from "../../implementations/cli/src/lib/nats-bin.js";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
 import {
   AuthStorage,
@@ -337,12 +338,13 @@ try {
   const brokerRoot = process.env.PI_EVENTS_TEST_SERVER ? undefined : mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
   const port = brokerRoot ? await pickFreePort() : undefined;
   const server = process.env.PI_EVENTS_TEST_SERVER ?? `nats://127.0.0.1:${port}`;
+  const brokerPath = brokerRoot ? (await resolveNatsServer()).bin : undefined;
   let broker: ReturnType<typeof spawn> | undefined;
-  if (brokerRoot && port) broker = spawn("nats-server", ["-js", "-p", String(port), "-sd", brokerRoot], { stdio: "ignore" });
+  if (brokerRoot && port && brokerPath) broker = spawn(brokerPath, ["-js", "-p", String(port), "-sd", brokerRoot], { stdio: "ignore" });
   const releaseBroker = broker && brokerRoot ? teardownOnSignal(broker, brokerRoot) : undefined;
   const root = mkdtempSync(join(tmpdir(), "cotal-pi-events-sdk-"));
-  const keys = ["COTAL_SPACE", "COTAL_NAME", "COTAL_ID", "COTAL_SERVERS", "COTAL_EVENTS", "COTAL_WORKSPACE_ROOT", "COTAL_PI_EXPECTED_SESSION", "COTAL_PI_FRESH_SESSION"] as const;
-  const prior = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const savedCotalEnv = Object.entries(process.env).filter(([key]) => key.startsWith("COTAL_"));
+  for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
   const space = process.env.PI_EVENTS_TEST_SPACE ?? `pi_events_${randomUUID().replace(/-/g, "")}`;
   const actor = `pi_${randomUUID().replace(/-/g, "")}`;
   Object.assign(process.env, {
@@ -382,8 +384,14 @@ try {
     const deathRoot = join(root, "process-death");
     mkdirSync(deathRoot);
     const runDeath = (stage: "crash" | "recover"): Promise<number | null> => new Promise((done, reject) => {
+      const childEnv = { ...process.env };
+      for (const key of Object.keys(childEnv)) if (key.startsWith("COTAL_")) delete childEnv[key];
+      Object.assign(childEnv, {
+        COTAL_PI_EXPECTED_SESSION: "", COTAL_PI_FRESH_SESSION: "", PI_EVENTS_DEATH_STAGE: stage,
+        PI_EVENTS_DEATH_ROOT: deathRoot, PI_EVENTS_TEST_SERVER: server,
+      });
       const child = spawn(process.execPath, ["--import", "tsx", fileURLToPath(import.meta.url)], {
-        env: { ...process.env, COTAL_PI_EXPECTED_SESSION: "", COTAL_PI_FRESH_SESSION: "", PI_EVENTS_DEATH_STAGE: stage, PI_EVENTS_DEATH_ROOT: deathRoot, PI_EVENTS_TEST_SERVER: server },
+        env: childEnv,
         stdio: ["ignore", "pipe", "pipe"],
       });
       let output = "";
@@ -444,7 +452,7 @@ try {
     const heldLock = await acquirePrincipalLock(lockPath);
     assert.ok(existsSync(lockPath), "Pi event writer holds its principal lock while publishing");
     const challenger = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e",
-      `import { acquirePrincipalLock } from ${JSON.stringify(resolve(import.meta.dirname, "../connector-core/src/agui-wal-path.ts"))};` +
+      `import { acquirePrincipalLock } from ${JSON.stringify(pathToFileURL(resolve(import.meta.dirname, "../connector-core/src/agui-wal-path.ts")).href)};` +
       `await acquirePrincipalLock(${JSON.stringify(lockPath)});`], { stdio: ["ignore", "ignore", "pipe"] });
     let refusal = "";
     challenger.stderr.on("data", (data: Buffer) => { refusal += data.toString(); });
@@ -597,10 +605,8 @@ try {
     native?.dispose();
     provider.unregister();
     await observer.stop();
-    for (const key of keys) {
-      if (prior[key] === undefined) delete process.env[key];
-      else process.env[key] = prior[key];
-    }
+    for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
+    Object.assign(process.env, Object.fromEntries(savedCotalEnv));
     rmSync(root, { recursive: true, force: true });
     if (broker) await killAndAwaitExit(broker);
     releaseBroker?.();

@@ -7,7 +7,7 @@
  * the control-auth checks are the regression guard for the local (macOS/Linux) validate loop
  * (`node:net` abstracts AF_UNIX ↔ named pipe, so the auth logic exercises identically). The pieces
  * that are inherently win32 (the ConPTY argv round-trip, orphan reap, named-pipe squat) are
- * logged-and-skipped off Windows; Windows CI is the oracle for those.
+ * logged-and-skipped off Windows; they are not exercised by Linux CI.
  *
  *   A. resolveOnPath resolves against the PASSED env (not global process.env), and on win32 prefers a
  *      real `.exe` over a `.cmd` shim. [WS1 / security: executable selection stays in P3 isolation]
@@ -32,6 +32,7 @@ import { connect, createServer } from "node:net";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolveOnPath } from "@cotal-ai/workspace";
+import type { AgentHandle } from "@cotal-ai/core";
 import { launchEnv, controlEndpoint, startControlServer, type MeshAgent } from "@cotal-ai/connector-core";
 import { quoteCmdArg, buildCmdCommandLine, resolveComspec, preparePtyLaunch } from "../src/runtime/windows-launch.js";
 import { controlShutdown } from "../src/control-shutdown.js";
@@ -98,7 +99,7 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
     writeFileSync(join(onlyCmd, "bar.cmd"), "@echo off\r\n");
     check("a bare name resolves to its .cmd shim when that's all there is", (resolveOnPath("bar", { PATH: onlyCmd, PATHEXT: ".COM;.EXE;.BAT;.CMD" }) ?? "").toLowerCase().endsWith(".cmd"));
   } else {
-    console.log("· .exe-over-.cmd preference is win32-only — skipped (CI is the oracle)");
+    console.log("· .exe-over-.cmd preference is win32-only — not exercised by Linux CI");
   }
 }
 
@@ -170,9 +171,9 @@ const PRESERVE_MATRIX = [
   "tab\there", // VERIFY — tab is a CRT separator; quoted should preserve
 ];
 
-function launchCapture(command: string, args: string[], env: NodeJS.ProcessEnv, cwd: string): Promise<string> {
+function launchCapture(command: string, args: string[], env: NodeJS.ProcessEnv, cwd: string, expectedOutput?: string): Promise<string> {
   return new Promise((resolve) => {
-    let h: ReturnType<ReturnType<typeof createRuntime>["spawn"]>;
+    let h: AgentHandle;
     try {
       // `process.env` values are `string | undefined`; a LaunchSpec carries only the defined ones,
       // which is also what the child would receive, since node drops an undefined entry.
@@ -184,18 +185,30 @@ function launchCapture(command: string, args: string[], env: NodeJS.ProcessEnv, 
     }
     const sess = h.attach();
     let buf = "";
-    sess.onData((b) => {
-      buf += b.toString("utf8");
-    });
-    sess.onExit(() => resolve(buf));
-    setTimeout(() => {
+    let stopping = false;
+    const timer = setTimeout(() => {
       try {
         h.stop({ graceful: false });
       } catch {
         /* gone */
       }
-      resolve(buf);
+      resolve(`TIMED OUT waiting for PTY exit: ${buf}`);
     }, 8000);
+    sess.onData((b) => {
+      buf += b.toString("utf8");
+      if (expectedOutput && buf.includes(expectedOutput) && !stopping) {
+        stopping = true;
+        try {
+          h.stop({ graceful: false });
+        } catch {
+          /* exit may already be in flight */
+        }
+      }
+    });
+    sess.onExit(() => {
+      clearTimeout(timer);
+      resolve(buf);
+    });
   });
 }
 
@@ -210,6 +223,10 @@ if (isWin) {
 
   for (const arg of PRESERVE_MATRIX) {
     const out = await launchCapture(shim, [arg], env, dir);
+    if (out.startsWith("TIMED OUT")) {
+      check(`shim exited for ${JSON.stringify(arg)}`, false);
+      continue;
+    }
     const m = out.match(/__ARGV__(.*)__END__/s);
     if (!m) {
       check(`shim launched + argv captured for ${JSON.stringify(arg)} (got: ${JSON.stringify(out.slice(0, 80))})`, false);
@@ -233,6 +250,10 @@ if (isWin) {
   ];
   for (const args of MULTI_ARG_MATRIX) {
     const out = await launchCapture(shim, args, env, dir);
+    if (out.startsWith("TIMED OUT")) {
+      check(`multi-arg shim exited for ${JSON.stringify(args)}`, false);
+      continue;
+    }
     const m = out.match(/__ARGV__(.*)__END__/s);
     if (!m) {
       check(`multi-arg shim launched + captured for ${JSON.stringify(args)} (got: ${JSON.stringify(out.slice(0, 80))})`, false);
@@ -251,12 +272,12 @@ if (isWin) {
   // quoting the win32 matrix exercises end-to-end is still covered locally by section B above.
   const dir = mkdtempSync(join(tmpdir(), "cotal-shim-"));
   const shim = join(dir, "shim.sh");
-  writeFileSync(shim, "#!/bin/sh\necho COTAL_SHIM_OK\n", { mode: 0o755 });
-  const out = await launchCapture(shim, [], { ...process.env }, dir);
-  check("PtyRuntime launches a command and streams its output (POSIX passthrough)", out.includes("COTAL_SHIM_OK"));
+  writeFileSync(shim, "#!/bin/sh\necho COTAL_SHIM_OK\nread reply\n", { mode: 0o755 });
+  const out = await launchCapture(shim, [], { ...process.env }, dir, "COTAL_SHIM_OK");
+  check("PtyRuntime launches, streams output, and exits (POSIX passthrough)", out.includes("COTAL_SHIM_OK") && !out.startsWith("TIMED OUT"));
   // preparePtyLaunch is a passthrough on POSIX — assert that so the import is exercised everywhere.
   eq("preparePtyLaunch is a passthrough on POSIX", preparePtyLaunch("claude", ["--x"], {}), { command: "claude", args: ["--x"] });
-  console.log("· cmd.exe argv round-trip matrix is win32-only — skipped (CI is the oracle)");
+  console.log("· cmd.exe argv round-trip matrix is win32-only — not exercised by Linux CI");
 }
 
 // =================================================================================================
@@ -338,7 +359,7 @@ if (isWin) {
   }
   rmSync(dir, { recursive: true, force: true, maxRetries: 10 });
 } else {
-  console.log("· orphan-on-kill is win32-only (the cmd.exe grandchild layer) — skipped (CI is the oracle)");
+  console.log("· orphan-on-kill is win32-only (the cmd.exe grandchild layer) — not exercised by Linux CI");
 }
 
 // =================================================================================================
@@ -465,7 +486,7 @@ if (isWin) {
   check(`fatal bind: a squatted managed listener exits(1) (got status ${res.status})`, res.status === 1);
   squatter.close();
 } else {
-  console.log("· fatal-bind-on-squat needs a live named-pipe squatter (EADDRINUSE) — win32-only, skipped (CI is the oracle)");
+  console.log("· fatal-bind-on-squat needs a live named-pipe squatter (EADDRINUSE) — not exercised by Linux CI");
 }
 
 // =================================================================================================

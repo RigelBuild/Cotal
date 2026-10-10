@@ -225,7 +225,17 @@ c("the baseline/spawn command vocabularies are frozen",
 throws("pushing a command into the baseline vocabulary throws (no post-import grant widening)",
   () => (BASELINE_SELF_LIFECYCLE_COMMANDS as unknown as string[]).push("attach"));
 c("the minted baseline/spawn surfaces are unchanged after the attempted push (private snapshots)",
-  baselineCallerCapabilities().length === 6 && spawnCallerCapabilities("u_abc").length === 7);
+  JSON.stringify(baselineCallerCapabilities()) === JSON.stringify([
+    { endpoint: "delivery", command: "join" },
+    { endpoint: "delivery", command: "leave" },
+    { endpoint: "delivery", command: "list" },
+    ...["stop", "turn-pending", "turn-yield", "run-answer"].map((command) => ({ endpoint: "manager", command, target: { mode: "self" } })),
+  ])
+  && JSON.stringify(spawnCallerCapabilities("u_abc")) === JSON.stringify([
+    { endpoint: "manager", command: "spawn" },
+    ...["despawn", "attach"].map((command) => ({ endpoint: "manager", command, target: { mode: "owner", tOwner: "u_abc" } })),
+    ...["define-persona", "inspect", "list-personas", "show-persona"].map((command) => ({ endpoint: "manager", command })),
+  ]), { baseline: baselineCallerCapabilities(), spawn: spawnCallerCapabilities("u_abc") });
 c("CREDENTIAL_LIFETIMES and every policy are frozen",
   Object.isFrozen(CREDENTIAL_LIFETIMES) && Object.values(CREDENTIAL_LIFETIMES).every((p) => Object.isFrozen(p)));
 throws("nulling a one-shot TTL throws (a non-expiring provisioner credential cannot be minted in)",

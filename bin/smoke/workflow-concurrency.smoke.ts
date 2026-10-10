@@ -1,42 +1,7 @@
 /**
- * Every workflow that can be pushed to `main` must QUEUE its runs, never evict them.
- *
- * #976 measured the defect: a concurrency group holds ONE pending run by default, so with a run in
- * flight and a run queued, a third push CANCELS the queued one rather than making it wait. Thirteen
- * of twenty-nine consecutive main runs finished with zero jobs. `cancel-in-progress: false` does not
- * prevent that and is what made it look intended. `queue: max` is the part that makes them wait.
- *
- * #980 fixed `ci.yml`. This file exists because that was not enough and could not have been noticed
- * by reading `ci.yml`: `windows.yml` carried the identical shape while its own comment claimed to
- * follow ci.yml's rule, and `changesets.yml` and `installer.yml` carried it in a DIFFERENT shape,
- * the short `concurrency: <string>` form, which silently selects the evicting defaults. The release
- * workflow was one of them. Three identical defects in two spellings, one fixed, is a state a
- * comment cannot hold and a check can.
- *
- * WHAT THIS DOES NOT CLAIM. It reads the workflow text and evaluates the two expression forms this
- * repo uses. It does not run GitHub's expression engine, does not talk to the API, and cannot tell
- * you a queued run actually waited. That property is only observable on `main` after a merge, which
- * is exactly why it needs a static guard: the behaviour it protects cannot be tested on the pull
- * request that changes it.
- *
- * It also refuses rather than guesses. An expression it does not recognise is a FAILURE, not a skip,
- * because a skip is how a reader turns into a green that means nothing.
- *
- * THREE HOLES, NAMED because an unnamed limit gets rediscovered as a surprise. None of them can
- * produce a pass while a workflow is broken, which is the property that matters, and all three fail
- * in the safe direction:
- *
- *   - JOB-LEVEL `concurrency:` is not read at all. Only the top-level block is. A job that declares
- *     its own group is outside this guard entirely.
- *   - `on:` detection is indentation-driven, so a workflow writing its triggers in a shape this
- *     reader does not follow is misclassified. That moves the population counts in section A rather
- *     than passing quietly, so the failure is loud and lands on the count cell.
- *   - The PR half of the rule is unasserted. Section B requires `max` on push and says nothing about
- *     whether a pull_request supersedes, so a workflow could stop superseding without reddening
- *     anything here. That is a scope limit of this test, not a defect in the workflows.
- *
- * Run: pnpm smoke:workflow-concurrency
- * Prove: pnpm mutation-proof --config bin/smoke/mutations/workflow-concurrency.json
+ * Guards main-push concurrency. Reads top-level groups only; trigger detection is indentation-based.
+ * PR superseding is not asserted; unknown expressions fail closed.
+ * Run: pnpm smoke:workflow-concurrency; prove: pnpm mutation-proof --config bin/smoke/mutations/workflow-concurrency.json.
  */
 import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -57,30 +22,10 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   }
 }
 
-/** The population this file is asserting over. A count that drifts is a workflow added or removed,
- *  and either deserves a human deciding whether it needs the queue rule, so the numbers are exact
- *  rather than floors. Without them a rename makes every check below vacuously true.
- *
- *  Bumped for `mutation-reproof.yml` (#1272, closing #1217): the mutation-reproof gate that re-proves
- *  fixtures whose guarded source changed. It is the 7th workflow and is push-to-main startable (its
- *  `changed` job runs on push to main), so both the total and the push-to-main count move by one.
- *  It declares NO concurrency group, so EXPECTED_GROUPED is unchanged — see the note below for why a
- *  group was considered and deliberately not added here.
- *
- *  Bumped for `attribution.yml` (the 8th): it runs on pull_request only, so it is not push-to-main
- *  startable and neither of the other two counts moves. Its group keys on the PR ref and cancels
- *  in progress, which is the only policy a PR-only workflow needs. */
-const EXPECTED_WORKFLOWS = 8;
-const EXPECTED_PUSH_TO_MAIN = 6;
-/** Of those, the ones that declare a concurrency group and therefore CAN evict. Every push-to-main
- *  workflow carries one now: `docs.yml` and `mutation-reproof.yml` were groupless until 2026-09-10,
- *  when every pushed pull-request head kept its own 12-shard reproof matrix and its own docs build
- *  queued against the org's 20 concurrent-job cap. Both now use the CI policy: a pull-request push
- *  supersedes the run already going for that ref, a merge to main queues (`queue: max`) instead of
- *  evicting, which the checks below hold them to. The scheduled reproof sweep keys its group on
- *  `refs/heads/main` like a merge, so a sweep and a merge queue behind each other rather than
- *  running side by side; a manual `workflow_dispatch` sweep joins the same queue. */
-const EXPECTED_GROUPED = 6;
+/** Pin the workflow population so removal or addition needs deliberate review. */
+const EXPECTED_WORKFLOWS = 7;
+const EXPECTED_PUSH_TO_MAIN = 5;
+const EXPECTED_GROUPED = 5;
 
 /** What a concurrency key can be: absent, a literal, or one of the expressions this repo uses.
  *  `unknown` is deliberately terminal. */

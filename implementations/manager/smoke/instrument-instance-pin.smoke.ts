@@ -51,6 +51,8 @@ import {
   type EpCaller,
   type ResolvedService,
   type EpError,
+  registry,
+  type Connector,
 } from "@cotal-ai/core";
 import { authDir, saveSpaceAuth, recordMesh, connectOrThrow } from "@cotal-ai/workspace";
 import { Manager } from "../src/manager.js";
@@ -203,6 +205,9 @@ try {
 
   const root1 = mkRoot("ws1"), root2 = mkRoot("ws2");
   for (const r of [root1, root2]) recordMesh({ space, server: SERVERS, root: r, mode: "auth", ts: new Date().toISOString() });
+  // Managers subscribe the class spawn/launch rail only with an available connector; nothing launches.
+  const probeConnector: Connector = { kind: "connector", name: "pin-probe", requires: ["node"], buildLaunch: () => ({ command: "node", args: ["-e", ""] }) };
+  registry.register(probeConnector);
   m1 = new Manager({ space, servers: SERVERS, runtime: "pty", workspaceRoot: root1 });
   m2 = new Manager({ space, servers: SERVERS, runtime: "pty", workspaceRoot: root2 });
   /**

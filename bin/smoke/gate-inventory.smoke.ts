@@ -22,7 +22,9 @@ import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
+import { parse as parseYaml } from "yaml";
 import { readCiSuites, ciChainBody } from "./ci-suites.mjs";
+import { LIVE_QUARANTINED, QUARANTINED } from "./ci-quarantine.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -62,12 +64,10 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const BROKEN = "BROKEN:";
 
 type UngatedExemption = { reason: string; recheckBy: string };
-// 26 → 25: `smoke:delivery-broker-coupling` left the untriaged set by being gated, not by being
-// re-explained. It had been exempt as debt while silently grading nothing, the daemon it spawned
-// refused at startup, and the refusal satisfied its own "exits when the broker is gone" assertion.
-const EXPECTED_EXEMPTIONS = 25;
+// Ten recovered suites move into CI; five live recovery suites remain visible debt.
+const EXPECTED_EXEMPTIONS = 15;
 const standing = (reason: string): UngatedExemption => ({ reason, recheckBy: "2026-11-30" });
-const untriagedExemption = (reason: string): UngatedExemption => ({ reason, recheckBy: "2026-09-30" });
+const brokenExemption = (reason: string): UngatedExemption => ({ reason: `${BROKEN} ${reason}`, recheckBy: "2026-11-30" });
 
 const UNGATED: Record<string, UngatedExemption> = {
   // Need external tooling no CI runner has.
@@ -76,12 +76,11 @@ const UNGATED: Record<string, UngatedExemption> = {
   "smoke:codex-tui-live": standing("needs a codex TUI session"),
   "smoke:jcode-live": standing("needs an installed, authenticated jcode CLI (COTAL_E2E_JCODE=1)"),
   "smoke:down-manifest-usermode:live": standing("needs a claude CLI on PATH to boot a real connector child"),
-  "smoke:backup-usermode:live": untriagedExemption("BROKEN: red; cause unconfirmed (measured on a host with a live stack); #1285; already-red so it cannot enter CI"),
-  // These four are #643's to fix (backup live coverage that can fail), not an inventory mystery.
-  "smoke:backup-perms:live": untriagedExemption("BROKEN: red on CI at 2850a5a2e (backup-live.smoke.ts:125 zero-delivery New consumer preserves its creation frontier, 1 !== 2); #643; already-red so it cannot enter CI"),
-  "smoke:backup-restore:live": untriagedExemption("BROKEN: never executed; blocked behind failing backup-perms:live on the && chain at 2850a5a2e; status unknown; #643"),
-  "smoke:backup-conservation:live": untriagedExemption("BROKEN: never executed; blocked behind failing backup-perms:live on the && chain at 2850a5a2e; status unknown; #643"),
-  "smoke:backup-faults:live": untriagedExemption("BROKEN: never executed; blocked behind failing backup-perms:live on the && chain at 2850a5a2e; status unknown; #643"),
+  "smoke:backup-usermode:live": brokenExemption("RIG-4260: backup inventory mismatch; preserve owner-secret restore refusal coverage"),
+  "smoke:backup-restore:live": brokenExemption("RIG-4260: blocked by backup-perms in the old chain; restore needs JetStream storage and user-auth service"),
+  "smoke:backup-conservation:live": brokenExemption("RIG-4260: blocked by backup-perms in the old chain; underscore space name is refused"),
+  "smoke:backup-faults:live": brokenExemption("RIG-4260: backup fault and replay scenarios still need independent repair"),
+  "smoke:lifecycle-files": brokenExemption("RIG-4260: manager lifecycle survivor and snapshot assertions need a delivery daemon"),
   // A STANDING DECISION, and only for the REAL-SESSION arm. The same suite is GATED as
   // `smoke:agui-map`, pointed at a fixture DERIVED from a real session by
   // `scripts/redact-claude-session.mjs` (whitelist by construction, identifiers pseudonymised
@@ -96,16 +95,6 @@ const UNGATED: Record<string, UngatedExemption> = {
   // `smoke:user-spawn:live` left this list when it was gated: it had thrown at section B1e on a
   // missing explicit `tls` and stopped after 14 of its 66 cells, and being ungated is why nobody
   // heard about it. "Too slow for the gate" was 105 seconds.
-  // Untriaged debt. These are the ones that should shrink.
-  "smoke:attention": untriagedExemption("UNTRIAGED"),
-  "smoke:attention:auth": untriagedExemption("UNTRIAGED"),
- "smoke:delivery-boot-retry:auth": untriagedExemption("UNTRIAGED"),
-  "smoke:delivery-old-manager": untriagedExemption("UNTRIAGED"),
-  "smoke:feedback": untriagedExemption("UNTRIAGED"),
-  "smoke:lifecycle-files": untriagedExemption("UNTRIAGED"), "smoke:manager-console": untriagedExemption("UNTRIAGED"),
-  "smoke:plane3-activation:auth": untriagedExemption("UNTRIAGED"),
-  "smoke:plane3-gate:auth": untriagedExemption("UNTRIAGED"),
-  "smoke:self-serve-join-coverage:auth": untriagedExemption("UNTRIAGED"),
 };
 
 /**
@@ -279,6 +268,56 @@ if (exemptionReviews.examined !== EXPECTED_EXEMPTIONS) {
   console.log(`  ✓ all ${exemptionReviews.examined} UNGATED exemptions have a current recheckBy date`);
 }
 
+const quarantine = reviewExemptions({ ...QUARANTINED, ...LIVE_QUARANTINED }, today);
+const ciSuites = new Set(readCiSuites());
+const quarantineStale = Object.keys(QUARANTINED).filter((s) => !ciSuites.has(s));
+// A ci.yml job or step that may fail without failing ci-ok must carry a dated LIVE_QUARANTINED entry
+// for every smoke it runs; a soft scope that runs no recognised smoke is itself a finding.
+type Step = { name?: string; run?: string; "continue-on-error"?: unknown };
+type Job = { "continue-on-error"?: unknown; steps?: Step[] };
+const softSmokes = (workflow: string): { suites: string[]; unnamed: string[] } => {
+  const suites: string[] = [];
+  const unnamed: string[] = [];
+  const jobs = (parseYaml(workflow) as { jobs?: Record<string, Job> }).jobs ?? {};
+  for (const [id, job] of Object.entries(jobs)) {
+    const jobSoft = job["continue-on-error"] !== undefined && job["continue-on-error"] !== false;
+    const scopes = jobSoft ? [{ label: `job ${id}`, run: (job.steps ?? []).map((s) => s.run ?? "").join("\n") }] : [];
+    for (const step of job.steps ?? [])
+      if (!jobSoft && step["continue-on-error"] !== undefined && step["continue-on-error"] !== false)
+        scopes.push({ label: `${id} / ${step.name ?? "unnamed step"}`, run: step.run ?? "" });
+    for (const { label, run } of scopes) {
+      const found = suitesIn(run);
+      if (found.length === 0) unnamed.push(`${label}: continue-on-error runs no recognised smoke`);
+      suites.push(...found);
+    }
+  }
+  return { suites, unnamed };
+};
+const softControl = softSmokes(
+  "jobs:\n  a:\n    steps:\n      - run: pnpm smoke:x && pnpm smoke:y\n        continue-on-error: true\n      - name: s\n        continue-on-error: true\n        run: |\n          - list text\n          pnpm smoke:z\n  b:\n    continue-on-error: true\n    steps:\n      - run: echo hi\n",
+);
+const softControlOk =
+  JSON.stringify(softControl.suites) === JSON.stringify(["smoke:x", "smoke:y", "smoke:z"]) &&
+  JSON.stringify(softControl.unnamed) === JSON.stringify(["job b: continue-on-error runs no recognised smoke"]);
+const soft = [softSmokes(readFileSync(join(wfDir, "ci.yml"), "utf8"))];
+const softSteps = soft.flatMap((s) => s.suites);
+const liveDrift = [
+  ...(softControlOk ? [] : [`soft-step control misread its fixture: ${JSON.stringify(softControl)}`]),
+  ...softSteps.filter((s) => !(s in LIVE_QUARANTINED)).map((s) => `${s}: continue-on-error in a workflow without a LIVE_QUARANTINED entry`),
+  ...Object.keys(LIVE_QUARANTINED).filter((s) => !softSteps.includes(s)).map((s) => `${s}: in LIVE_QUARANTINED but no continue-on-error scope runs it`),
+  ...soft.flatMap((s) => s.unnamed),
+];
+if (quarantine.invalid.length || quarantine.expired.length || quarantineStale.length || liveDrift.length) {
+  fail++;
+  console.log(`  ✗ FAIL: CI quarantine needs review (bin/smoke/ci-quarantine.mjs):`);
+  for (const s of quarantine.invalid) console.log(`      ${s}: invalid recheckBy`);
+  for (const s of quarantine.expired) console.log(`      ${s}: past recheckBy ${today}; fix it or re-date with the decision`);
+  for (const s of quarantineStale) console.log(`      ${s}: not a CI smoke suite`);
+  for (const s of liveDrift) console.log(`      ${s}`);
+} else {
+  console.log(`  ✓ ${quarantine.examined} quarantined CI suite(s) have a current recheckBy date`);
+}
+
 // THE REVERSE DIRECTION, and the gate needs both. Everything above asks "is this script reached?".
 // This asks "does this chain entry resolve?" — a composite naming a script that does not exist.
 // pnpm fails loudly on it, so it is not silent like the others, but it is the same family and it
@@ -369,13 +408,17 @@ if (staleAllowlist.length) {
 const untriaged = ungated.filter((s) => UNGATED[s]?.reason === "UNTRIAGED");
 console.log(`\n  ${untriaged.length} of the ungated set are UNTRIAGED debt (not a failure; the number should go down).`);
 
-// The debt-with-a-fuse class, named so the list can say how much of itself is broken rather than
-// merely excluded. Reported, not enforced, for the same reason as UNTRIAGED: every entry here is
-// an exclusion someone already accepted, and failing the gate on it would block CI on debt that
-// was consciously taken. What was missing was never enforcement — it was the COUNT. `smoke:auth`
-// sat in this list for six weeks with its cause correctly written in its own reason string, and
-// nothing anywhere said "one suite here is broken and is supposed to stop being broken".
+// This classification is pinned so a renamed reason cannot silently turn a broken suite into a
+// standing exemption. The suite remains excluded until its own assertions pass.
 const broken = ungated.filter((s) => (UNGATED[s]?.reason ?? "").startsWith(BROKEN)).sort();
+const expectedBroken = [
+  "smoke:backup-conservation:live", "smoke:backup-faults:live", "smoke:backup-restore:live",
+  "smoke:backup-usermode:live", "smoke:lifecycle-files",
+];
+if (broken.join() !== expectedBroken.join()) {
+  fail++;
+  console.log(`  ✗ FAIL: BROKEN exemptions changed: expected ${expectedBroken.join(", ")}, found ${broken.join(", ")}`);
+}
 console.log(`  ${broken.length} are BROKEN — red or flaky, and expected to be fixed and removed, not kept:`);
 for (const s of broken) console.log(`      ${s} — ${(UNGATED[s]?.reason ?? "").slice(BROKEN.length).trim()}`);
 

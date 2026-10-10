@@ -27,9 +27,12 @@ test("feed output is one line and labels every remote item as untrusted", () => 
   assert.equal(output.includes("\n"), false);
 });
 
-test("a failed subscription does not stop later subscriptions", async () => {
+test("a failed subscription does not stop later subscriptions", async (t) => {
   const subscriptions = [sub("https://one.example/rss"), sub("https://two.example/rss")];
   const delivered: string[] = [];
+  const errors: string[] = [];
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "error", (message: string) => errors.push(message));
   const count = await runPass(subscriptions, new Set(), async (_channel, text) => {
     if (text.includes("first")) throw new Error("publish failed");
     delivered.push(text);
@@ -40,6 +43,7 @@ test("a failed subscription does not stop later subscriptions", async () => {
   assert.equal(count, 1);
   assert.equal(delivered.length, 1);
   assert.match(delivered[0]!, /second/);
+  assert.deepEqual(errors, ["  ✗ Fixture: publish failed"]);
 });
 
 test("recurring iCal events expand into distinct future instances", () => {

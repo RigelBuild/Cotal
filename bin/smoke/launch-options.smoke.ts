@@ -62,7 +62,8 @@ eq("undefined bag → []", connectorLaunchOptions("t", undefined), []);
 // -- B. per-connector consumption (RAW — every well-shaped flag renders) ----------------------------
 const base = {
   space: "smoke", name: "t", role: "worker", id: "id1", creds: "/tmp/none.creds",
-  servers: "nats://127.0.0.1:1", subscribe: ["general"], allowSubscribe: ["general"], allowPublish: [],
+  servers: "nats://127.0.0.1:1", subscribe: ["general"], allowSubscribe: ["general"], allowPublish: [], events: false,
+  workspaceRoot: "/tmp/launch-options-smoke",
 };
 const argPair = (args: readonly string[], flag: string, val: string): boolean => {
   const i = args.indexOf(flag);

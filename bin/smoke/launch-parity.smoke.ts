@@ -42,7 +42,7 @@ process.env.COTAL_CAPABILITIES = "spawn";
  *  Types are erased at runtime, so this list is the golden — a StartAgentOpts change must
  *  consciously edit it. */
 const START_OP_KEYS = new Set([
-  "name", "identity", "agent", "defaultAgent", "role", "config", "model", "variant", "launchOptions", "resume", "events", "cwd",
+  "name", "identity", "agent", "defaultAgent", "role", "config", "model", "variant", "launchOptions", "resume", "continueSession", "events", "cwd",
   "prompt", "subscribe", "allowSubscribe", "allowPublish", "shareTools",
 ]);
 
@@ -56,6 +56,7 @@ const flagToOpKey: Record<string, string> = {
   "allow-subscribe": "allowSubscribe",
   "allow-publish": "allowPublish",
   "no-events": "events",
+  continue: "continueSession",
 };
 
 // 1 — spawn parses the whole shared grammar.

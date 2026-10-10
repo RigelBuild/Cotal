@@ -624,6 +624,8 @@ for (const assistant of [
   const oldAgentFile = process.env.COTAL_AGENT_FILE;
   const oldName = process.env.COTAL_NAME;
   const oldUid = process.env.COTAL_LIFECYCLE_UID;
+  const oldSessionState = process.env.COTAL_PI_SESSION_STATE;
+  delete process.env.COTAL_PI_SESSION_STATE;
   process.env.COTAL_AGENT_FILE = join(agentDir, "legacy.md");
   process.env.COTAL_NAME = "legacy";
   process.env.COTAL_LIFECYCLE_UID = "12345678901234567890123456";
@@ -633,6 +635,7 @@ for (const assistant of [
   if (oldAgentFile === undefined) delete process.env.COTAL_AGENT_FILE; else process.env.COTAL_AGENT_FILE = oldAgentFile;
   if (oldName === undefined) delete process.env.COTAL_NAME; else process.env.COTAL_NAME = oldName;
   if (oldUid === undefined) delete process.env.COTAL_LIFECYCLE_UID; else process.env.COTAL_LIFECYCLE_UID = oldUid;
+  if (oldSessionState === undefined) delete process.env.COTAL_PI_SESSION_STATE; else process.env.COTAL_PI_SESSION_STATE = oldSessionState;
   rmSync(root, { recursive: true, force: true });
 }
 
@@ -647,6 +650,8 @@ for (const assistant of [
     "COTAL_CONTROL_SOCKET",
     "COTAL_CONTROL_TOKEN",
     "COTAL_LAUNCH_MATERIAL",
+    "COTAL_ACCEPTED_TOKEN",
+    "COTAL_CREDS",
   ] as const;
   const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   for (const key of keys) delete process.env[key];
