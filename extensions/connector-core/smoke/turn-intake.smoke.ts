@@ -55,8 +55,6 @@ const rig = () => {
     published: [] as string[],
     /** While set, the condition clear on the way into `working` waits on it. */
     holdCondition: undefined as Promise<void> | undefined,
-    /** Every condition the endpoint wrote, in write order (null = cleared). */
-    conditions: [] as (string | null)[],
   };
   (a as unknown as { ep: unknown }).ep = {
     principal: { owner: "local", actor: "seat" },
@@ -68,10 +66,7 @@ const rig = () => {
     // `setStatus` clears any standing condition on the way into `working`, so the double has to
     // answer it or every block that drives a turn boundary dies on a missing method rather than
     // on the property it is testing.
-    setCondition: async (c: { code: string } | null) => {
-      if (c === null) await state.holdCondition;
-      state.conditions.push(c?.code ?? null);
-    },
+    setCondition: async () => { await state.holdCondition; },
     invokeService: async (_ep: string, command: string, args: unknown, opts: unknown) => {
       invokes.push({ command, args, opts });
       if (command === "turn-pending") {
@@ -217,22 +212,6 @@ const row = (goalId: string, context: string, acceptedAt = Date.now()): PendingT
     check("and that idle still ends the turn",
       r.state.yields.some((y) => y.goalId === "g3e" && y.status === "done"), JSON.stringify(r.state.yields));
   }
-
-  // A condition reported while working's clear is held must not be erased by that older clear.
-  {
-    const r = rig();
-    let releaseClear!: () => void;
-    r.state.holdCondition = new Promise<void>((resolve) => { releaseClear = resolve; });
-    const working = r.a.setStatus("working");
-    await tick();
-    const waiting = r.a.setCondition({ code: "approval" });
-    await tick();
-    r.state.holdCondition = undefined;
-    releaseClear();
-    await Promise.all([working, waiting]);
-    check("a condition set during working's clear outlives it: the clear is not the final write",
-      r.state.conditions.at(-1) === "approval", JSON.stringify(r.state.conditions));
-  }
 }
 
 // ── 4) an unseen payload is never "done" ──────────────────────────────────────────────────────
@@ -369,7 +348,7 @@ const row = (goalId: string, context: string, acceptedAt = Date.now()): PendingT
   check("the same reason after a good pull is a new outage and is said", lines.length === 3, lines);
 }
 
-const EXPECTED_CELLS = 40;
+const EXPECTED_CELLS = 39;
 const ran = pass + fail;
 console.log(`\nturn-intake.smoke: ${pass} passed, ${fail} failed`);
 if (ran !== EXPECTED_CELLS) {

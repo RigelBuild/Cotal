@@ -334,8 +334,8 @@ export class MeshAgent extends EventEmitter {
   private lastConnectionError?: string;
   private endpointNoticeLog = new Map<string, { lastLoggedAt: number; suppressed: number }>();
   private _status: PresenceStatus = "idle";
-  /** Tail of the ordered status writes; see {@link inStatusOrder}. Never rejects. */
-  private statusWrites: Promise<void> = Promise.resolve();
+  /** Bumped by every status write, so a write whose condition clear was overtaken can skip publishing. */
+  private statusRevision = 0;
   private _attention: AttentionMode = "open"; // F3: fail-open default; reset to open on SessionStart
   private _recallCursor: RecallMark = { ts: 0, id: "" };
   /** Recall items stamped ahead of this session's clock that it has already handed over. They are
@@ -1837,38 +1837,19 @@ export class MeshAgent extends EventEmitter {
   }
 
   async setStatus(status: PresenceStatus, activity?: string): Promise<void> {
-    const ready = this.connectedForWrite();
-    return this.inStatusOrder(() => this.writeStatus(ready, status, activity));
-  }
-
-  /** Runs status and condition writes one at a time, in call order. `working` awaits a condition
-   *  clear first, so an unordered `idle` could publish before it and be overwritten. A failed write
-   *  does not block later ones. */
-  private inStatusOrder(write: () => Promise<void>): Promise<void> {
-    const run = this.statusWrites.then(write);
-    this.statusWrites = run.catch(() => undefined);
-    return run;
-  }
-
-  /** The connect wait starts at call time, so a queued write's grace does not stack behind earlier
-   *  ones during an outage. Handled here so it cannot reject unobserved while it queues. */
-  private connectedForWrite(): Promise<void> {
-    const ready = this.requireConnected();
-    ready.catch(() => undefined);
-    return ready;
-  }
-
-  private async writeStatus(ready: Promise<void>, status: PresenceStatus, activity?: string): Promise<void> {
-    await ready;
+    await this.requireConnected();
     const prev = this._status;
+    // Assigned before any await: hosts fire working and idle without awaiting each other, and the
+    // later call must see the earlier transition, not the status from before it.
+    this._status = status;
+    const revision = ++this.statusRevision;
     try {
       if (prev !== "working" && status === "working") await this.ep.setCondition(null);
-      await this.publishStatus(status, activity);
+      // A newer write published during the clear; publishing this one now would overwrite it.
+      if (revision === this.statusRevision) await this.publishStatus(status, activity);
     } finally {
-      // The transition is a fact about the SEAT, not about whether its presence row was written:
-      // assigning before the writes meant one failed publish (which every adapter swallows) left
-      // `_status` idle with no boundary run, and the next real turn end saw no transition at all.
-      this._status = status;
+      // The boundary runs whether or not the presence row was written: one failed publish (which
+      // every adapter swallows) must not leave the next real turn end with no transition.
       // The turn relay's boundary: an adapter funnels its turn-end through this transition (Stop
       // hooks set idle), so the automatic `done` yield and the immediate re-poll live here once
       // instead of per connector. `waiting` is not a boundary — a seat blocked on a permission has
@@ -1888,17 +1869,10 @@ export class MeshAgent extends EventEmitter {
    * than an ending.
    */
   async resetStatus(status: PresenceStatus, activity?: string): Promise<void> {
-    const ready = this.connectedForWrite();
-    return this.inStatusOrder(() => this.writeResetStatus(ready, status, activity));
-  }
-
-  private async writeResetStatus(ready: Promise<void>, status: PresenceStatus, activity?: string): Promise<void> {
-    await ready;
-    try {
-      await this.publishStatus(status, activity);
-    } finally {
-      this._status = status;
-    }
+    await this.requireConnected();
+    this._status = status;
+    ++this.statusRevision;
+    await this.publishStatus(status, activity);
   }
 
   private async publishStatus(status: PresenceStatus, activity?: string): Promise<void> {
@@ -1908,7 +1882,7 @@ export class MeshAgent extends EventEmitter {
 
   /** Relay a harness-reported condition into presence, or clear it. */
   async setCondition(condition: PresenceCondition | null): Promise<void> {
-    return this.inStatusOrder(() => this.ep.setCondition(condition));
+    await this.ep.setCondition(condition);
   }
 
   /** The working→idle boundary: yield `done` for every SURFACED turn (its payload was in the
