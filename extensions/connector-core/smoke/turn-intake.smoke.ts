@@ -22,6 +22,7 @@
  */
 import { MeshAgent } from "../src/agent.js";
 import type { AgentConfig } from "../src/config.js";
+import type { PresenceCondition } from "@cotal-ai/core";
 
 let pass = 0, fail = 0;
 const check = (name: string, cond: boolean, extra?: unknown) => {
@@ -61,6 +62,7 @@ const rig = () => {
     // `setStatus` clears any standing condition on the way into `working`, so the double has to
     // answer it or every block that drives a turn boundary dies on a missing method rather than
     // on the property it is testing.
+    get conditionWrites() { return state.conditions.length; },
     setCondition: async (c: unknown) => { state.conditions.push(c); },
     invokeService: async (_ep: string, command: string, args: unknown, opts: unknown) => {
       invokes.push({ command, args, opts });
@@ -320,19 +322,20 @@ const row = (goalId: string, context: string, acceptedAt = Date.now()): PendingT
   check("the same reason after a good pull is a new outage and is said", lines.length === 3, lines);
 }
 
-// ── 7) the turn-start clear is ordered before a condition raised in the same tick ─────────────
+// ── 7) the turn-start clear yields to a condition written while it awaited the link ────────────
 {
-  console.log("7 — a condition raised right after the turn starts survives the turn-start clear");
+  console.log("7 — a turn start clears a stale condition, but not one raised in the same tick");
+  const approval = { code: "approval", source: "item/commandExecution/requestApproval", since: 1 } satisfies PresenceCondition;
+  const solo = rig();
+  await solo.a.setStatus("working");
+  check("an uncontended turn start clears the standing condition", solo.state.conditions.at(-1) === null, solo.state.conditions);
   const { a, state } = rig();
-  const approval = { code: "approval", source: "item/commandExecution/requestApproval", since: 1 };
-  const started = a.setStatus("working");
-  const raised = a.setCondition(approval as never);
-  await Promise.all([started, raised]);
+  await Promise.all([a.setStatus("working"), a.setCondition(approval)]);
   check("the approval raised in the turn-start tick is the last condition written",
     state.conditions.at(-1) === approval, state.conditions);
 }
 
-const EXPECTED_CELLS = 38;
+const EXPECTED_CELLS = 39;
 const ran = pass + fail;
 console.log(`\nturn-intake.smoke: ${pass} passed, ${fail} failed`);
 if (ran !== EXPECTED_CELLS) {

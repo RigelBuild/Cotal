@@ -334,8 +334,6 @@ export class MeshAgent extends EventEmitter {
   private lastConnectionError?: string;
   private endpointNoticeLog = new Map<string, { lastLoggedAt: number; suppressed: number }>();
   private _status: PresenceStatus = "idle";
-  /** Counts condition writes, so a turn-start clear can tell it was overtaken by a newer one. */
-  private conditionWrites = 0;
   private _attention: AttentionMode = "open"; // F3: fail-open default; reset to open on SessionStart
   private _recallCursor: RecallMark = { ts: 0, id: "" };
   /** Recall items stamped ahead of this session's clock that it has already handed over. They are
@@ -1839,12 +1837,11 @@ export class MeshAgent extends EventEmitter {
   async setStatus(status: PresenceStatus, activity?: string): Promise<void> {
     // A condition the host raises while this awaits the link (an approval right after turn/started)
     // is newer than the turn start, so the turn-start clear must not erase it.
-    const conditionWrites = this.conditionWrites;
+    const conditionWrites = this.ep.conditionWrites;
     await this.requireConnected();
     const prev = this._status;
     try {
-      if (prev !== "working" && status === "working" && conditionWrites === this.conditionWrites) {
-        this.conditionWrites++;
+      if (prev !== "working" && status === "working" && conditionWrites === this.ep.conditionWrites) {
         await this.ep.setCondition(null);
       }
       await this.publishStatus(status, activity);
@@ -1887,7 +1884,6 @@ export class MeshAgent extends EventEmitter {
 
   /** Relay a harness-reported condition into presence, or clear it. */
   async setCondition(condition: PresenceCondition | null): Promise<void> {
-    this.conditionWrites++;
     await this.ep.setCondition(condition);
   }
 
