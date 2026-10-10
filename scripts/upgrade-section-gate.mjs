@@ -673,10 +673,14 @@ if (process.argv.includes("--self-test")) {
     skip("ACCEPT CONTROL for the exit reader: a real refusal is still EXIT 1");
     skip("ACCEPT CONTROL for the exit reader: a clean range is still EXIT 0");
   } else {
+    // Release commits by SHA: a fork clone carries no upstream tags, so tag names exit 2 there.
+    const V0_48_1 = "887a7a17b706c9ae3226c48991d71e3ecf1d8c62";
+    const V0_48_2 = "13e4413822374b23de761c4d30a25e7b6a496cd5";
+    const V0_49_0 = "a707174bbfd94deea7c45b8f475df2543ddbe41a";
     cell("ACCEPT CONTROL for the exit reader: a real refusal is still EXIT 1",
-      runSelf(["--range", "v0.48.2..v0.49.0"]) === 1);
+      runSelf(["--range", `${V0_48_2}..${V0_49_0}`]) === 1);
     cell("ACCEPT CONTROL for the exit reader: a clean range is still EXIT 0",
-      runSelf(["--range", "v0.48.1..v0.48.2"]) === 0);
+      runSelf(["--range", `${V0_48_1}..${V0_48_2}`]) === 0);
   }
 
   // THE SHALLOW GUARD, GRADED IN A REAL SHALLOW CLONE RATHER THAN BY MOCKING THE PROBE. Building
