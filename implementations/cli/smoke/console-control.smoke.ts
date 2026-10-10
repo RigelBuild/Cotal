@@ -283,8 +283,8 @@ try {
   console.error("  ✗ scenario threw:", (e as Error).stack ?? (e as Error).message);
 } finally {
   try { await session?.close(); } catch { /* down */ }
-  try { await m1.stop(); } catch { /* down */ }
-  try { await m2.stop(); } catch { /* down */ }
+  try { await m1.stop({ withAgents: true }); } catch { /* down */ }
+  try { await m2.stop({ withAgents: true }); } catch { /* down */ }
   try { await poster?.stop(); } catch { /* down */ }
   try { await watcher?.stop(); } catch { /* down */ }
   srv.kill("SIGTERM");
