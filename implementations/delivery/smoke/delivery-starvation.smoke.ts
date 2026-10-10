@@ -836,8 +836,9 @@ try {
   const boundDuringOverlap = await obsG.controlSubs(accountG.account.pub);
   // Wake it only once the replacement is READY. Sol's boundary is stated exactly this way: the
   // replacement is already serving before the loser's create is refused.
-  signalGroup(incumbent, "SIGCONT");
+  // Set BEFORE waking: the loser cannot run until SIGCONT, so its verdict lands after this deadline.
   const undecidedUntil = Date.now() + QUIESCE_HOLD_MS;
+  signalGroup(incumbent, "SIGCONT");
   check("G4 the replacement acquires the shard and becomes ready", replacementUp, tail(replacement));
   const replacementLease = await readLease(spaceG, credsPathG);
   check("G5 the replacement's lease is live and ready, the winner is SERVING",
