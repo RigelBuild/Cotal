@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const CI = join(ROOT, ".github", "workflows", "ci.yml");
-const CHANGESETS = join(ROOT, ".github", "workflows", "changesets.yml");
+const CHANGESETS = join(ROOT, ".github", "workflows", "changesets.yml.disabled");
 const PKG = join(ROOT, "package.json");
 
 const BUILDERS = ["seat-native-linux-x64", "seat-native-linux-arm64"] as const;

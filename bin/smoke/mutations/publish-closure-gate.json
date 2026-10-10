@@ -2,7 +2,7 @@
   "suite": [
     "bin/smoke/publish-closure-gate.smoke.ts",
     "scripts/verify-publish-closure.mjs",
-    ".github/workflows/changesets.yml"
+    ".github/workflows/changesets.yml.disabled"
   ],
   "guard": "The post-publish closure gate checks every package in the lockstep group against the registry, validates response bodies, and gates the GitHub Release on the result",
   "command": "pnpm smoke:publish-closure-gate",
@@ -19,7 +19,7 @@
   "mutations": [
     {
       "name": "the closure-gate step is removed from the workflow",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "        id: closure-gate\n",
       "replace": "        id: old-check\n",
       "expectRed": "the version job has a step with id 'closure-gate'",
@@ -27,7 +27,7 @@
     },
     {
       "name": "the release step stops referencing the closure-gate output",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "steps.closure-gate.outputs.closure_ok == 'true'",
       "replace": "true",
       "expectRed": "the release step's 'if' references the closure-gate step output",
@@ -35,7 +35,7 @@
     },
     {
       "name": "the closure-gate step stops invoking verify-publish-closure.mjs",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "          node scripts/verify-publish-closure.mjs \"$version\"\n",
       "replace": "          echo \"skipping closure check\"\n",
       "expectRed": "the closure-gate step invokes verify-publish-closure.mjs",
@@ -67,7 +67,7 @@
     },
     {
       "name": "the UNSETTLED quiet skip starts failing the job",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "            echo \"UNSETTLED — the registry has not converged. Skipping the Release.\"\n",
       "replace": "            echo \"UNSETTLED — the registry has not converged. Skipping the Release.\"\n            exit 1\n",
       "expectRed": "the closure-gate step handles exit code 2 (UNSETTLED) without failing",
@@ -75,7 +75,7 @@
     },
     {
       "name": "the NONE quiet skip starts failing the job",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "            echo \"NONE — this push published nothing. Skipping the Release.\"\n",
       "replace": "            echo \"NONE — this push published nothing. Skipping the Release.\"\n            exit 1\n",
       "expectRed": "the closure-gate step handles exit code 3 (NONE) without failing",
@@ -83,7 +83,7 @@
     },
     {
       "name": "the PARTIAL branch stops failing the job",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "            echo \"PARTIAL PUBLISH — failing the job.\"\n            exit 1\n",
       "replace": "            echo \"PARTIAL PUBLISH — failing the job.\"\n",
       "expectRed": "the closure-gate step branches on exit code 1 (PARTIAL) to fail the job",
@@ -91,7 +91,7 @@
     },
     {
       "name": "an unexpected exit code stops failing the job",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "            echo \"Unexpected exit code $rc from verify-publish-closure.mjs — failing the job.\"\n            exit 1\n",
       "replace": "            echo \"Unexpected exit code $rc from verify-publish-closure.mjs — failing the job.\"\n",
       "expectRed": "the closure-gate step fails the job on an unexpected exit code",
@@ -99,7 +99,7 @@
     },
     {
       "name": "a separator-based failing exit is added to the UNSETTLED branch",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "            echo \"UNSETTLED — the registry has not converged. Skipping the Release.\"",
       "replace": "            echo \"UNSETTLED — the registry has not converged. Skipping the Release.\"; exit 1",
       "expectRed": "the closure-gate step handles exit code 2 (UNSETTLED) without failing",
@@ -108,7 +108,7 @@
     },
     {
       "name": "the PARTIAL branch exits 0 instead of failing",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "            echo \"PARTIAL PUBLISH — failing the job.\"\n            exit 1",
       "replace": "            echo \"PARTIAL PUBLISH — failing the job.\"\n            exit 0",
       "expectRed": "the closure-gate step branches on exit code 1 (PARTIAL) to fail the job",
@@ -117,7 +117,7 @@
     },
     {
       "name": "a reachable keyword-position failure is added to the UNSETTLED branch",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "            echo \"UNSETTLED — the registry has not converged. Skipping the Release.\"",
       "replace": "            echo \"UNSETTLED — the registry has not converged. Skipping the Release.\"\n            if true; then exit 1; fi",
       "expectRed": "the closure-gate step handles exit code 2 (UNSETTLED) without failing",
@@ -126,7 +126,7 @@
     },
     {
       "name": "the PARTIAL branch's exit is moved inside a string",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "            echo \"PARTIAL PUBLISH — failing the job.\"\n            exit 1",
       "replace": "            echo \"PARTIAL PUBLISH; exit 1\"",
       "expectRed": "the closure-gate step branches on exit code 1 (PARTIAL) to fail the job",
@@ -135,7 +135,7 @@
     },
     {
       "name": "a quiet failure with no failure word is added to the UNSETTLED branch",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "            echo \"UNSETTLED — the registry has not converged. Skipping the Release.\"",
       "replace": "            echo \"UNSETTLED — the registry has not converged. Skipping the Release.\"\n            test 1 -eq 2",
       "expectRed": "the closure-gate step handles exit code 2 (UNSETTLED) without failing",
@@ -153,7 +153,7 @@
     },
     {
       "name": "the UNSETTLED arm stops ending the step and falls out of the chain again",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "            echo \"UNSETTLED — the registry has not converged. Skipping the Release.\"\n            exit 0\n",
       "replace": "            echo \"UNSETTLED — the registry has not converged. Skipping the Release.\"\n",
       "expectRed": "the quiet-skip arms (UNSETTLED, NONE) end the step themselves rather than falling out of the chain",
@@ -162,7 +162,7 @@
     },
     {
       "name": "the NONE arm stops ending the step and falls out of the chain again",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "            echo \"NONE — this push published nothing. Skipping the Release.\"\n            exit 0\n",
       "replace": "            echo \"NONE — this push published nothing. Skipping the Release.\"\n",
       "expectRed": "the quiet-skip arms (UNSETTLED, NONE) end the step themselves rather than falling out of the chain",
@@ -170,7 +170,7 @@
     },
     {
       "name": "a trap above the branch chain turns every quiet skip into a job failure",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "          rc=$?\n          set -e\n",
       "replace": "          rc=$?\n          set -e\n          trap \"exit 1\" EXIT\n",
       "expectRed": "running the whole gate step leaves the job red only on PARTIAL and an unexpected code",
@@ -179,7 +179,7 @@
     },
     {
       "name": "the rc-0 arm stops publishing closure_ok, so no Release is ever cut",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "            echo \"closure_ok=true\" >> \"$GITHUB_OUTPUT\"\n",
       "replace": "            echo \"closure_verified=true\" >> \"$GITHUB_OUTPUT\"\n",
       "expectRed": "only a PUBLISHED verdict publishes closure_ok=true, so only it can cut a Release",
@@ -188,7 +188,7 @@
     },
     {
       "name": "the PARTIAL arm publishes closure_ok before failing",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "            echo \"PARTIAL PUBLISH — failing the job.\"\n            exit 1\n",
       "replace": "            echo \"closure_ok=true\" >> \"$GITHUB_OUTPUT\"\n            echo \"PARTIAL PUBLISH — failing the job.\"\n            exit 1\n",
       "expectRed": "only a PUBLISHED verdict publishes closure_ok=true, so only it can cut a Release",
@@ -197,7 +197,7 @@
     },
     {
       "name": "both quiet arms are replaced by a failing catch-all, the comparisons left in a comment",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "          elif [ \"$rc\" -eq 2 ]; then\n            # The quiet skips end the step here rather than falling out of the `fi`. A version-PR\n            # push that publishes nothing must not red the job, and leaving that outcome to be\n            # decided by whatever follows made it a property of the whole script instead of the\n            # arm: a later line, or a trap installed above, silently turned the skip into a\n            # failure with the branch itself still reading as correct (#1518).\n            echo \"UNSETTLED — the registry has not converged. Skipping the Release.\"\n            exit 0\n          elif [ \"$rc\" -eq 3 ]; then\n            echo \"NONE — this push published nothing. Skipping the Release.\"\n            exit 0\n",
       "replace": "          # quiet skips handled below: [ \"$rc\" -eq 2 ] and [ \"$rc\" -eq 3 ]\n          elif [ \"$rc\" -ge 2 ]; then\n            echo \"no publish - failing the job.\"\n            exit 1\n",
       "expectRed": "running the whole gate step leaves the job red only on PARTIAL and an unexpected code",

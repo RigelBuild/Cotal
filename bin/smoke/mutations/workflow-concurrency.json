@@ -15,7 +15,7 @@
     "",
     "The three mutations cover the concurrency failures this guard must reject.",
     "",
-    "M1 restores the short `concurrency: <string>` form. This is the shape changesets.yml and",
+    "M1 restores the short `concurrency: <string>` form on installer.yml. This is the shape changesets.yml and",
     "installer.yml sat in, and it is the dangerous one precisely because it reads as a deliberate",
     "minimal choice while selecting cancel-in-progress false and queue single, the evicting",
     "defaults. A reader scanning for a wrong VALUE finds nothing to object to.",
@@ -31,11 +31,11 @@
   ],
   "mutations": [
     {
-      "name": "changesets.yml goes back to the short concurrency form",
-      "file": ".github/workflows/changesets.yml",
-      "find": "concurrency:\n  group: ${{ github.workflow }}-${{ github.ref }}\n  cancel-in-progress: false\n  queue: max\n",
+      "name": "installer.yml goes back to the short concurrency form",
+      "file": ".github/workflows/installer.yml",
+      "find": "concurrency:\n  group: ${{ github.workflow }}-${{ github.ref }}\n  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n  # Tracks the line above: `queue: max` with `cancel-in-progress: true` is a validation error.\n  queue: ${{ github.event_name == 'pull_request' && 'single' || 'max' }}\n",
       "replace": "concurrency: ${{ github.workflow }}-${{ github.ref }}\n",
-      "expectRed": "changesets.yml: uses the mapping form",
+      "expectRed": "installer.yml: uses the mapping form",
       "cell": "uses the mapping form, so it can carry"
     },
     {

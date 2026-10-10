@@ -11,7 +11,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const CHANGESETS = join(ROOT, ".github", "workflows", "changesets.yml");
+const CHANGESETS = join(ROOT, ".github", "workflows", "changesets.yml.disabled");
 
 let pass = 0;
 let fail = 0;
