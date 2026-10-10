@@ -90,6 +90,8 @@ const tail = (d: Daemon): string => d.stderr.trimEnd().split("\n").slice(-4).joi
  *  particular description of who took it: the phrasings differ between the pre-fix and post-fix
  *  daemon, and a cell keyed to one of them grades nothing against the other. */
 const DECIDED = /exiting so the holder is single/;
+/** The G loser's hold between quiescing and its ownership read; no verdict can precede wake + hold. */
+const QUIESCE_HOLD_MS = 5000;
 
 const space = `delivery-starve-${randomUUID().slice(0, 8)}`;
 // Cell B runs in its OWN space. The delivery lease is per-space with a 30s bucket TTL, so a second
@@ -202,8 +204,8 @@ function spawnDaemon(inSpace: string, creds: string, via: string = SERVERS, extr
   // returns to its own event loop, which is earlier than any timer poll could manage. It is still
   // only best effort: being early in the PARENT says nothing about the CHILD, which has been running
   // since it wrote those bytes, so a daemon can already have printed its next line before this
-  // handler is reached at all (measured at 3 of 8 and 6 of 8 by two reviewers). The cell that used
-  // to depend on winning that race has been deleted; what remains is used for context, never to pass.
+  // handler is reached at all (measured at 3 of 8 and 6 of 8 by two reviewers). G7d does not depend
+  // on winning that race: the daemon's quiesce hold keeps it undecided while the cell samples.
   const sink = (b: Buffer) => {
     const text = b.toString();
     d.stderr += text;
@@ -428,6 +430,18 @@ async function openObserver(inSpace: string): Promise<{
     },
     close: async () => { try { await nc.drain(); } catch { /* already gone */ } },
   };
+}
+
+/** Poll the broker until `d` is up AND some daemon holds a ready lease, so a frozen incumbent is
+ *  only woken once the replacement has provably won the shard, not merely printed its sweeps line. */
+async function untilReadyLease(d: Daemon, inSpace: string, creds: string, timeoutMs = 30_000): Promise<boolean> {
+  if (!(await untilUp(d, timeoutMs))) return false;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && !d.exited) {
+    if ((await readLease(inSpace, creds))?.info.ready === true) return true;
+    await wait(200);
+  }
+  return false;
 }
 
 async function readLease(inSpace: string, credsFile: string): Promise<{ info: DeliveryLeaseInfo; revision: number } | undefined> {
@@ -734,11 +748,13 @@ try {
   check("F2 its lease is live and ready before the handover", beforeHandover?.info.ready === true, beforeHandover);
 
   // Take the shard away from underneath it, exactly as an operator-driven replacement does: delete
-  // the row, then let a SECOND daemon win the atomic create. The first daemon's next renew fails,
-  // it re-reads, and it finds the shard held by someone else.
+  // the row, then let a SECOND daemon win the atomic create. Frozen across that, as in G: the lease
+  // watch would otherwise re-acquire the empty key before the replacement boots (cell H's path).
+  signalGroup(holder, "SIGSTOP");
   await deleteLease(spaceF, credsPathF);
   const winner = spawnDaemon(spaceF, credsPathF);
-  const winnerUp = await untilUp(winner);
+  const winnerUp = await untilReadyLease(winner, spaceF, credsPathF);
+  signalGroup(holder, "SIGCONT");
   check("F3 a replacement daemon acquires the shard", winnerUp, tail(winner));
   const winnerLease = await readLease(spaceF, credsPathF);
   check("F4 the replacement's lease is live and ready", winnerLease?.info.ready === true, winnerLease);
@@ -746,8 +762,8 @@ try {
   // The loser must now exit on its own. That is the single-holder guarantee, and it is preserved.
   const loserExited = await untilExit(holder, 45_000);
   check("F5 the displaced daemon exits so the holder is single", loserExited, tail(holder));
-  check("F6 and it says the shard is held by another daemon rather than claiming a broker loss",
-    /taken shard|is held by/.test(holder.stderr) && !holder.stderr.includes("exiting (coupled to the broker)"), tail(holder));
+  check("F6 and it exits on an ownership decision rather than claiming a broker loss",
+    DECIDED.test(holder.stderr) && !holder.stderr.includes("exiting (coupled to the broker)"), tail(holder));
 
   // THE CELL. Read the lease from the BROKER after the loser has finished shutting down. Its
   // shutdown path runs asynchronously after the exit, so settle past it before reading.
@@ -783,7 +799,8 @@ try {
   console.log("\nG. the losing daemon stops serving the shard before the winner starts");
   // Clear the previous cell's expired-but-not-yet-TTL'd row so the incumbent can claim the slot now.
   await deleteLease(spaceG, credsPathG);
-  const incumbent = spawnDaemon(spaceG, credsPathG);
+  // The hold keeps the loser quiesced and undecided long enough to sample, so G7d is not a race.
+  const incumbent = spawnDaemon(spaceG, credsPathG, SERVERS, { COTAL_SMOKE_DELIVERY_QUIESCE_HOLD_MS: String(QUIESCE_HOLD_MS) });
   const incumbentUp = await untilUp(incumbent);
   check("G1 the incumbent daemon comes up and holds the shard", incumbentUp, tail(incumbent));
   if (!incumbentUp) throw new Error("the arbitration cell needs a daemon that was running; it never came up");
@@ -810,15 +827,22 @@ try {
   // under test, a live process that still believes it owns a shard somebody else now holds. It is
   // also the incident's own condition, which is the point of the whole issue.
   signalGroup(incumbent, "SIGSTOP");
+  // G7d's deadline assumes the hold starts after SIGCONT. A stopped child writes nothing, so drain
+  // the pipe and refuse to grade if an earlier quiesce (and so an earlier hold) already began.
+  await wait(500);
+  check("G3b the incumbent had not quiesced before the freeze, so its hold starts after the wake",
+    !incumbent.stderr.includes("stopped serving shard"), tail(incumbent));
   await deleteLease(spaceG, credsPathG);
   const replacement = spawnDaemon(spaceG, credsPathG);
-  const replacementUp = await untilUp(replacement);
+  const replacementUp = await untilReadyLease(replacement, spaceG, credsPathG);
   // OBSERVE THE OVERLAP WHILE IT IS HELD STILL. The replacement is bound and ready; the incumbent is
   // frozen and still bound. That is the two-responder state, and it is stationary because one of the
   // two processes cannot run, so it is read here, deliberately, rather than chased later.
   const boundDuringOverlap = await obsG.controlSubs(accountG.account.pub);
   // Wake it only once the replacement is READY. Sol's boundary is stated exactly this way: the
   // replacement is already serving before the loser's create is refused.
+  // Set BEFORE waking: the loser cannot run until SIGCONT, so its verdict lands after this deadline.
+  const undecidedUntil = Date.now() + QUIESCE_HOLD_MS;
   signalGroup(incumbent, "SIGCONT");
   check("G4 the replacement acquires the shard and becomes ready", replacementUp, tail(replacement));
   const replacementLease = await readLease(spaceG, credsPathG);
@@ -859,8 +883,8 @@ try {
   // loaded box, and it was the reasoning behind a cell that reddened on CI for the wrong reason.
   //
   // The freeze is still worth keeping: when it does win it holds the quiesced state still and makes
-  // the sampled reading below meaningful. But nothing PASSES on it any more. G8/G9 grade the
-  // ordering the daemon itself recorded, which no scheduler can alter.
+  // the sampled reading below meaningful. G7d does not need it: it only counts readings answered
+  // inside the daemon's quiesce hold. G8/G9 grade the ordering the daemon itself recorded.
   //
   // SIGSTOP, WHEN IT DOES LAND, changes nothing about what the daemon DID. Its subscriptions are
   // already gone or already there; freezing a process does not unbind it, and the broker's answer is
@@ -874,8 +898,8 @@ try {
     // look impossible: synchronous in the PARENT says nothing about the CHILD, which has been
     // running freely since it wrote those bytes. A pipe read is not an execution fence. Measured by
     // two reviewers on the real suite and on an isolated primitive: the child had already decided in
-    // 3 of 8 and 6 of 8 trials respectively. Nothing asserts on `froze` any more, so losing this
-    // race now costs only the sampled context line below.
+    // 3 of 8 and 6 of 8 trials respectively. Nothing asserts on `froze`; G7d relies on the
+    // quiesce hold and its time bound instead.
     if (froze || !chunk.includes("stopped serving shard")) return;
     signalGroup(d, "SIGSTOP");
     froze = true;
@@ -908,6 +932,8 @@ try {
     // here - so that clause is the durable fact rather than the current phrasing.
     const decidedBefore = DECIDED.test(incumbent.stderr);
     const subs = await obsG.controlSubs(accountG.account.pub);
+    // Answered before wake + hold, the reading predates any verdict whatever the pipe delivered.
+    const inHold = Date.now() < undecidedUntil;
     const decidedAfter = DECIDED.test(incumbent.stderr);
     if (subs !== undefined) {
       answeredSubs += 1;
@@ -927,7 +953,7 @@ try {
         // So the loser must additionally not have DECIDED anything yet. Quiescing happens BEFORE the
         // ownership question is answered; unbinding via shutdown can only happen after.
         overlapEndedAlive = true;
-        if (!decidedBefore && !decidedAfter) overlapEndedUndecided = true;
+        if (inHold && !decidedBefore && !decidedAfter && !incumbent.exited) overlapEndedUndecided = true;
       }
     }
     // Three consistent readings of the held state is enough; it is frozen, not evolving.
@@ -949,35 +975,10 @@ try {
   check("G7c and never more than two, no third party is involved in this measurement",
     peakBound <= 2 && (boundDuringOverlap ?? 0) <= 2, { peakBound, boundDuringOverlap });
   // THE DISCRIMINATING ASSERTION. Pre-fix this is only reachable by dying.
-  check("G7d the overlap ENDED while the loser was still alive, not by the loser exiting",
-    overlapEndedAlive, { peakBound, answeredSubs, loserExited: incumbent.exited });
-  // THE DISCRIMINATING ASSERTION. Unbinding inside `shutdown()` also happens while the process is
-  // alive, so G7d alone is satisfied by the pre-fix behaviour, verified by disabling the quiesce
-  // call and watching every G cell stay green. What only the repair can do is stop serving BEFORE
-  // the ownership question has been answered at all, and G8/G9 below grade exactly that on the
-  // daemon's own transcript rather than on a sampled instant.
-  // G7e IS GONE, AND THE REASON MATTERS MORE THAN THE DELETION.
-  //
-  // It asked: at the instant the responder count fell to 1, had the daemon printed its ownership
-  // verdict yet? Answering that requires OUR READER to be scheduled between the daemon's two
-  // announcements, and it is not always: CI job 103789248360 reddened here with a tail showing the
-  // daemon had already decided. The SIGSTOP hook cannot prevent that, because it fires on a data
-  // event and the data event is itself the thing that arrived late; freezing a process after it has
-  // spoken does not unspeak it. A reviewer measured the race directly: stderr-triggered stop let the
-  // child decide first in 3 of 8 trials, an IPC-fenced leg in 0 of 8.
-  //
-  // MY FIRST REPAIR WAS TO REGRADE IT ON THE TRANSCRIPT ORDERING - quiesce line before verdict line,
-  // a fact fixed before this process reads a byte, so no scheduling luck can alter it. That is the
-  // right instrument, AND G9 TWENTY LINES BELOW ALREADY IS IT. I had written a second copy of a cell
-  // this suite already had, which would have been two names for one measurement and one more thing
-  // to keep in step. So the honest fix is a deletion: G8 and G9 carry the claim, on the durable
-  // evidence, and they always did.
-  //
-  // The sampled reading is kept as REPORTED CONTEXT below. When this process wins the race it is a
-  // genuinely stronger statement (the overlap ended while the daemon was still undecided); when it
-  // loses it says nothing at all. A cell whose truth depends on which process the scheduler favoured
-  // grades nothing, so it asserts nothing and is printed for whoever reads a future failure here.
-  console.log(`    · sampled-undecided reading: ${overlapEndedUndecided} (context only: races the daemon's own output; G8/G9 carry this claim on the transcript)`);
+  check("G7d the overlap ENDED while the loser was still alive and undecided, not by the loser exiting",
+    overlapEndedUndecided, { peakBound, answeredSubs, overlapEndedAlive, loserExited: incumbent.exited });
+  // Unbinding inside `shutdown()` also happens while alive, so G7d requires the overlap to end
+  // before any ownership verdict. The quiesce hold above makes that window wide enough to sample.
   check("G7f and serving never resumed during the arbitration, no re-arm without proof",
     !overlapReturned, { overlapReturned });
   // REQUIRES A READING. `peakPulls === undefined` means the sampler could not get an answer off the
@@ -991,8 +992,11 @@ try {
   // Said in the loser's own words too: it must announce going quiet, and it must do so BEFORE it
   // announces losing the shard. An implementation that quiesced only inside shutdown would exit
   // just as cleanly and still have served through the whole arbitration.
+  // The quiesce hold delays the verdict, so wait for it (or exit) before reading the order.
+  const decideBy = Date.now() + 30_000;
+  while (Date.now() < decideBy && !incumbent.exited && !DECIDED.test(incumbent.stderr)) await wait(50);
   const quiesceAt = incumbent.stderr.indexOf("stopped serving shard");
-  const lostAt = incumbent.stderr.search(/taken shard|is held by/);
+  const lostAt = incumbent.stderr.search(DECIDED);
   check("G8 the loser announced that it stopped serving", quiesceAt >= 0, tail(incumbent));
   check("G9 and it stopped serving BEFORE it concluded it had lost the shard, not as part of exiting",
     quiesceAt >= 0 && lostAt >= 0 && quiesceAt < lostAt, { quiesceAt, lostAt });
@@ -1355,7 +1359,7 @@ try {
   // 93 -> 98: P1-P5. The discriminator shipped unreachable and no cell noticed, because a branch
   // that only fires on a broken environment is never walked by a passing suite. It is a pure
   // function now precisely so it can be walked without one.
-  const EXPECTED_CELLS = 97;
+  const EXPECTED_CELLS = 98;
   check(`every cell ran (${EXPECTED_CELLS} before this sentinel)`, pass + fail === EXPECTED_CELLS, pass + fail);
 
   console.log(`\nDELIVERY-STARVATION SMOKE ${fail === 0 ? "OK ✅" : "FAILED ❌"}  (${pass} passed, ${fail} failed)`);

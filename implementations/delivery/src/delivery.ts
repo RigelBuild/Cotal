@@ -361,11 +361,22 @@ export async function runDelivery(args: ParsedArgs, store?: SecretStore): Promis
   }
 }
 
+/** Test hook: ms to hold between quiescing and the ownership read, so a live cell can observe the
+ *  quiesced, undecided state. Validated before start-up; capped well under the lease TTL. */
+function smokeQuiesceHoldMs(): number {
+  const raw = process.env.COTAL_SMOKE_DELIVERY_QUIESCE_HOLD_MS;
+  if (raw === undefined) return 0;
+  if (!/^\d+$/.test(raw) || Number(raw) > 5_000)
+    throw new Error(`delivery: COTAL_SMOKE_DELIVERY_QUIESCE_HOLD_MS must be an integer 0..5000 (got ${JSON.stringify(raw)})`);
+  return Number(raw);
+}
+
 async function runStartedDelivery(
   args: ParsedArgs,
   store: SecretStore | undefined,
   publishReleaser: (release: () => Promise<void>) => void,
 ): Promise<void> {
+  const quiesceHoldMs = smokeQuiesceHoldMs();
   const v = args.values as Values;
   const shard = v.shard ? Number(v.shard) : 0;
   const shards = v.shards ? Number(v.shards) : 1;
@@ -833,6 +844,9 @@ async function runStartedDelivery(
   /** Announce going quiet, once per quiesced episode. Same rule as {@link noteLease}: the renew ticks
    *  forever, and an operator needs the edge, not a log line per tick. */
   let quiesced = false;
+  const holdAfterQuiesce = async (): Promise<void> => {
+    if (quiesceHoldMs > 0) await new Promise((r) => setTimeout(r, quiesceHoldMs));
+  };
   const noteQuiesce = (): void => {
     if (quiesced) return;
     quiesced = true;
@@ -906,9 +920,11 @@ async function runStartedDelivery(
          catch { /* the row has moved on; the ownership read below is what decides */ }
        }
        noteQuiesce();
+       await holdAfterQuiesce();
      } catch (e) {
        console.error(`! delivery: could not quiesce Plane-3 on a lease watch event (${(e as Error).message})`);
      }
+     if (stopping) return;
      const reading = await readOwnLease();
      switch (leaseAction(reading)) {
        case "keep-serving":
@@ -1001,8 +1017,10 @@ async function runStartedDelivery(
           // on purpose rather than silently wedged, and because the live cell anchors on this line
           // to know when to start demanding that this process holds no Plane-3 bindings.
           noteQuiesce();
+          await holdAfterQuiesce();
         }
         catch (e) { console.error(`! delivery: could not quiesce Plane-3 while checking the lease (${(e as Error).message})`); }
+        if (stopping) return;
         const reading = await readOwnLease();
         switch (leaseAction(reading)) {
           case "keep-serving":
