@@ -827,6 +827,11 @@ try {
   // under test, a live process that still believes it owns a shard somebody else now holds. It is
   // also the incident's own condition, which is the point of the whole issue.
   signalGroup(incumbent, "SIGSTOP");
+  // G7d's deadline assumes the hold starts after SIGCONT. A stopped child writes nothing, so drain
+  // the pipe and refuse to grade if an earlier quiesce (and so an earlier hold) already began.
+  await wait(500);
+  check("G3b the incumbent had not quiesced before the freeze, so its hold starts after the wake",
+    !incumbent.stderr.includes("stopped serving shard"), tail(incumbent));
   await deleteLease(spaceG, credsPathG);
   const replacement = spawnDaemon(spaceG, credsPathG);
   const replacementUp = await untilReadyLease(replacement, spaceG, credsPathG);
@@ -1354,7 +1359,7 @@ try {
   // 93 -> 98: P1-P5. The discriminator shipped unreachable and no cell noticed, because a branch
   // that only fires on a broken environment is never walked by a passing suite. It is a pure
   // function now precisely so it can be walked without one.
-  const EXPECTED_CELLS = 97;
+  const EXPECTED_CELLS = 98;
   check(`every cell ran (${EXPECTED_CELLS} before this sentinel)`, pass + fail === EXPECTED_CELLS, pass + fail);
 
   console.log(`\nDELIVERY-STARVATION SMOKE ${fail === 0 ? "OK ✅" : "FAILED ❌"}  (${pass} passed, ${fail} failed)`);

@@ -366,8 +366,8 @@ export async function runDelivery(args: ParsedArgs, store?: SecretStore): Promis
 function smokeQuiesceHoldMs(): number {
   const raw = process.env.COTAL_SMOKE_DELIVERY_QUIESCE_HOLD_MS;
   if (raw === undefined) return 0;
-  if (!/^\d+$/.test(raw) || Number(raw) > 10_000)
-    throw new Error(`delivery: COTAL_SMOKE_DELIVERY_QUIESCE_HOLD_MS must be an integer 0..10000 (got ${JSON.stringify(raw)})`);
+  if (!/^\d+$/.test(raw) || Number(raw) > 5_000)
+    throw new Error(`delivery: COTAL_SMOKE_DELIVERY_QUIESCE_HOLD_MS must be an integer 0..5000 (got ${JSON.stringify(raw)})`);
   return Number(raw);
 }
 
