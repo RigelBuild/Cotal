@@ -51,6 +51,8 @@ const rig = () => {
     failStatusWrite: false,
     /** What the endpoint refuses the next pull with (undefined = it serves). */
     pullRefusal: undefined as string | undefined,
+    /** Every condition the agent wrote, in call order (null = clear). */
+    conditions: [] as unknown[],
   };
   (a as unknown as { ep: unknown }).ep = {
     principal: { owner: "local", actor: "seat" },
@@ -59,7 +61,7 @@ const rig = () => {
     // `setStatus` clears any standing condition on the way into `working`, so the double has to
     // answer it or every block that drives a turn boundary dies on a missing method rather than
     // on the property it is testing.
-    setCondition: async () => {},
+    setCondition: async (c: unknown) => { state.conditions.push(c); },
     invokeService: async (_ep: string, command: string, args: unknown, opts: unknown) => {
       invokes.push({ command, args, opts });
       if (command === "turn-pending") {
@@ -318,7 +320,19 @@ const row = (goalId: string, context: string, acceptedAt = Date.now()): PendingT
   check("the same reason after a good pull is a new outage and is said", lines.length === 3, lines);
 }
 
-const EXPECTED_CELLS = 37;
+// ── 7) the turn-start clear is ordered before a condition raised in the same tick ─────────────
+{
+  console.log("7 — a condition raised right after the turn starts survives the turn-start clear");
+  const { a, state } = rig();
+  const approval = { code: "approval", source: "item/commandExecution/requestApproval", since: 1 };
+  const started = a.setStatus("working");
+  const raised = a.setCondition(approval as never);
+  await Promise.all([started, raised]);
+  check("the approval raised in the turn-start tick is the last condition written",
+    state.conditions.at(-1) === approval, state.conditions);
+}
+
+const EXPECTED_CELLS = 38;
 const ran = pass + fail;
 console.log(`\nturn-intake.smoke: ${pass} passed, ${fail} failed`);
 if (ran !== EXPECTED_CELLS) {
