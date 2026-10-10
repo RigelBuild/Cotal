@@ -16,7 +16,7 @@ import {
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { PiDriver, type CotalBatchDetails, type PiContextLike } from "./driver.js";
 import { registerCotalTools } from "./tools.js";
-import { wrapped } from "./wrap.js";
+import { renderCotalInbox } from "./inbox-render.js";
 import { PiEvents } from "./events.js";
 
 const CUSTOM_TYPE = "cotal-inbox";
@@ -46,15 +46,6 @@ function runtimeKey(config: AgentConfig): string {
 
 function asContext(context: ExtensionContext): PiContextLike {
   return context;
-}
-
-function messageText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return String(content ?? "");
-  return content
-    .map((part) => (part && typeof part === "object" && "text" in part ? String((part as { text?: unknown }).text ?? "") : ""))
-    .filter(Boolean)
-    .join("\n");
 }
 
 function sessionStatePath(): string | undefined {
@@ -173,7 +164,7 @@ export default async function cotalMesh(pi: ExtensionAPI): Promise<void> {
   }
   runtime.driver.bind(pi);
   registerCotalTools(pi, runtime.mesh, runtime.config);
-  pi.registerMessageRenderer<CotalBatchDetails>(CUSTOM_TYPE, (message) => wrapped(messageText(message.content)));
+  pi.registerMessageRenderer<CotalBatchDetails>(CUSTOM_TYPE, renderCotalInbox);
   // The session carries the agent's mesh name, so /resume pickers and titles match `cotal ps`.
   const nameSession = async (): Promise<void> => {
     if (typeof pi.setSessionName !== "function" || pi.getSessionName?.() === config.name) return;
