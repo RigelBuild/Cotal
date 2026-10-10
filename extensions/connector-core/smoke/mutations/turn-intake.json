@@ -44,7 +44,7 @@
     {
       "name": "a lifecycle idle is routed through the turn boundary",
       "file": "extensions/connector-core/src/agent.ts",
-      "find": "  async resetStatus(status: PresenceStatus, activity?: string): Promise<void> {\n    await this.requireConnected();\n    this._status = status;\n    ++this.statusRevision;\n    await this.publishStatus(status, activity);\n  }",
+      "find": "  async resetStatus(status: PresenceStatus, activity?: string): Promise<void> {\n    await this.requireConnected();\n    this._status = status;\n    await this.publishStatus(++this.statusRevision, status, activity);\n  }",
       "replace": "  async resetStatus(status: PresenceStatus, activity?: string): Promise<void> {\n    await this.setStatus(status, activity);\n  }",
       "expectRed": "a lifecycle idle mid-turn yields nothing: a compaction is not a turn ending",
       "cell": "a lifecycle idle mid-turn yields nothing: a compaction is not a turn ending",
@@ -53,8 +53,8 @@
     {
       "name": "the boundary runs only after a successful publish, so a failed write swallows it",
       "file": "extensions/connector-core/src/agent.ts",
-      "find": "      if (revision === this.statusRevision) await this.publishStatus(status, activity);\n    } finally {",
-      "replace": "      if (revision === this.statusRevision) await this.publishStatus(status, activity);\n      if (prev === \"working\" && status === \"idle\") this.onTurnBoundary();\n    } finally {\n      if (false)",
+      "find": "      await this.publishStatus(revision, status, activity);\n    } finally {",
+      "replace": "      await this.publishStatus(revision, status, activity);\n      if (prev === \"working\" && status === \"idle\") this.onTurnBoundary();\n    } finally {\n      if (false)",
       "expectRed": "a failed presence write does not swallow the boundary",
       "cell": "a failed presence write does not swallow the boundary",
       "note": "Measured 2026-09-03: KILLED. turn-intake.smoke: 26 passed, 1 failed Named cell red: a failed presence write does not swallow the boundary Re-anchored 2026-09-22 after a condition-clearing call was added inside the try; the replace carries that call unchanged so the mutation still isolates the ordering alone."
@@ -98,11 +98,20 @@
     {
       "name": "a status write overtaken during its condition clear publishes anyway, overwriting the newer one",
       "file": "extensions/connector-core/src/agent.ts",
-      "find": "      if (revision === this.statusRevision) await this.publishStatus(status, activity);",
-      "replace": "      await this.publishStatus(status, activity);",
+      "find": "    if (revision < this.issuedRevision) return;\n",
+      "replace": "",
       "expectRed": "overlapping writes publish in call order: an idle fired mid-clear is the final row",
       "cell": "overlapping writes publish in call order: an idle fired mid-clear is the final row",
-      "note": "Codex fires working and idle without awaiting each other. working awaits its condition clear, so without the revision check it publishes after idle and the row stays working."
+      "note": "Codex fires working and idle without awaiting each other. working awaits its condition clear, so without the issued-revision check it publishes after idle and the row stays working."
+    },
+    {
+      "name": "the revision is claimed before the activity write, so a newer write that fails there suppresses the older one",
+      "file": "extensions/connector-core/src/agent.ts",
+      "find": "    if (activity !== undefined) await this.ep.setActivity(activity);\n    if (revision < this.issuedRevision) return;\n    this.issuedRevision = revision;\n",
+      "replace": "    if (revision < this.issuedRevision) return;\n    this.issuedRevision = revision;\n    if (activity !== undefined) await this.ep.setActivity(activity);\n",
+      "expectRed": "a newer write that failed before publishing does not suppress the older one",
+      "cell": "a newer write that failed before publishing does not suppress the older one",
+      "note": "The newer write must claim the revision only where the endpoint status changes; claiming it earlier lets a failed activity write leave the older status unpublished."
     }
   ],
   "why": [
