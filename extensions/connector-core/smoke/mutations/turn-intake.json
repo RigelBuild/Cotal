@@ -44,8 +44,8 @@
     {
       "name": "a lifecycle idle is routed through the turn boundary",
       "file": "extensions/connector-core/src/agent.ts",
-      "find": "  async resetStatus(status: PresenceStatus, activity?: string): Promise<void> {\n    await this.requireConnected();\n    try {\n      await this.publishStatus(status, activity);\n    } finally {\n      this._status = status;\n    }\n  }",
-      "replace": "  async resetStatus(status: PresenceStatus, activity?: string): Promise<void> {\n    await this.setStatus(status, activity);\n  }",
+      "find": "    return this.inStatusOrder(() => this.writeResetStatus(ready, status, activity));",
+      "replace": "    return this.inStatusOrder(() => this.writeStatus(ready, status, activity));",
       "expectRed": "a lifecycle idle mid-turn yields nothing: a compaction is not a turn ending",
       "cell": "a lifecycle idle mid-turn yields nothing: a compaction is not a turn ending",
       "note": "Measured 2026-09-03: KILLED. turn-intake.smoke: 26 passed, 1 failed Named cell red: a lifecycle idle mid-turn yields nothing: a compaction is not a turn ending"
@@ -94,6 +94,24 @@
       "expectRed": "the escalation is rendered after the context: the question, the step, and that it was escalated to this seat",
       "cell": "the escalation is rendered after the context: the question, the step, and that it was escalated to this seat",
       "note": "The runtime submits `{ checkpoint: { token, prompt, schema, deadlineAt, escalatedTo } }` and the seat read `ask` alone, so an addressee was woken with a context block and no question, auto-yielded done at its boundary, and the second pause ran to its own expiry over a question nobody was asked. The cell that covered the relay asserted what the runtime SUBMITTED; this one asserts what the seat RENDERS."
+    },
+    {
+      "name": "status writes run concurrently again, so an idle fired during working's condition clear is overwritten",
+      "file": "extensions/connector-core/src/agent.ts",
+      "find": "    const run = this.statusWrites.then(write);",
+      "replace": "    const run = write();",
+      "expectRed": "overlapping writes publish in call order: an idle fired mid-clear is the final row",
+      "cell": "overlapping writes publish in call order: an idle fired mid-clear is the final row",
+      "note": "RIG-4922. Codex fires turnStarted -> working and turnCompleted -> idle without awaiting each other. The working write awaits setCondition(null) first, so idle published before it and working won; the endpoint heartbeat then republished working forever and the boundary never ran."
+    },
+    {
+      "name": "condition writes bypass the status order again, so an older clear erases a newer condition",
+      "file": "extensions/connector-core/src/agent.ts",
+      "find": "    return this.inStatusOrder(() => this.ep.setCondition(condition));",
+      "replace": "    await this.ep.setCondition(condition);",
+      "expectRed": "a condition set during working's clear outlives it: the clear is not the final write",
+      "cell": "a condition set during working's clear outlives it: the clear is not the final write",
+      "note": "A working transition clears the condition at the head of the status order; a condition write outside that order lands first and is erased."
     }
   ],
   "why": [
