@@ -383,8 +383,12 @@ const isShallow = (): boolean => {
   }
 };
 
-const deepen = (depth: number): boolean =>
-  gitOk(["fetch", "--no-tags", `--deepen=${depth}`, "origin"]);
+// A pinned SHA off the default branch sits on its own shallow boundary, which a bare `--deepen`
+// of origin never moves; fetch that SHA's own history to the requested depth instead.
+const deepen = (ref: string, depth: number): boolean =>
+  ref === "HEAD"
+    ? gitOk(["fetch", "--no-tags", `--deepen=${depth}`, "origin"])
+    : gitOk(["fetch", "--no-tags", `--depth=${depth}`, "origin", ref]);
 
 /**
  * The source of the classifier as it stands at `ref`. `HEAD` means the WORKING TREE file, not the
@@ -444,7 +448,7 @@ const resolveBaseFor = (ref: string, opts: { fetch: boolean } = { fetch: true })
       return sha;
     }
     if (round >= DEEPEN_ROUNDS || !opts.fetch || !isShallow()) return null;
-    if (!deepen(DEEPEN_STEP)) return null;
+    if (!deepen(walk, DEEPEN_STEP * (round + 1))) return null;
   }
 };
 
