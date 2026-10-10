@@ -785,7 +785,8 @@ try {
   console.log("\nG. the losing daemon stops serving the shard before the winner starts");
   // Clear the previous cell's expired-but-not-yet-TTL'd row so the incumbent can claim the slot now.
   await deleteLease(spaceG, credsPathG);
-  const incumbent = spawnDaemon(spaceG, credsPathG);
+  // The hold keeps the loser quiesced and undecided long enough to sample, so G7d is not a race.
+  const incumbent = spawnDaemon(spaceG, credsPathG, SERVERS, { COTAL_SMOKE_DELIVERY_QUIESCE_HOLD_MS: "5000" });
   const incumbentUp = await untilUp(incumbent);
   check("G1 the incumbent daemon comes up and holds the shard", incumbentUp, tail(incumbent));
   if (!incumbentUp) throw new Error("the arbitration cell needs a daemon that was running; it never came up");
@@ -951,35 +952,10 @@ try {
   check("G7c and never more than two, no third party is involved in this measurement",
     peakBound <= 2 && (boundDuringOverlap ?? 0) <= 2, { peakBound, boundDuringOverlap });
   // THE DISCRIMINATING ASSERTION. Pre-fix this is only reachable by dying.
-  check("G7d the overlap ENDED while the loser was still alive, not by the loser exiting",
-    overlapEndedAlive, { peakBound, answeredSubs, loserExited: incumbent.exited });
-  // THE DISCRIMINATING ASSERTION. Unbinding inside `shutdown()` also happens while the process is
-  // alive, so G7d alone is satisfied by the pre-fix behaviour, verified by disabling the quiesce
-  // call and watching every G cell stay green. What only the repair can do is stop serving BEFORE
-  // the ownership question has been answered at all, and G8/G9 below grade exactly that on the
-  // daemon's own transcript rather than on a sampled instant.
-  // G7e IS GONE, AND THE REASON MATTERS MORE THAN THE DELETION.
-  //
-  // It asked: at the instant the responder count fell to 1, had the daemon printed its ownership
-  // verdict yet? Answering that requires OUR READER to be scheduled between the daemon's two
-  // announcements, and it is not always: CI job 103789248360 reddened here with a tail showing the
-  // daemon had already decided. The SIGSTOP hook cannot prevent that, because it fires on a data
-  // event and the data event is itself the thing that arrived late; freezing a process after it has
-  // spoken does not unspeak it. A reviewer measured the race directly: stderr-triggered stop let the
-  // child decide first in 3 of 8 trials, an IPC-fenced leg in 0 of 8.
-  //
-  // MY FIRST REPAIR WAS TO REGRADE IT ON THE TRANSCRIPT ORDERING - quiesce line before verdict line,
-  // a fact fixed before this process reads a byte, so no scheduling luck can alter it. That is the
-  // right instrument, AND G9 TWENTY LINES BELOW ALREADY IS IT. I had written a second copy of a cell
-  // this suite already had, which would have been two names for one measurement and one more thing
-  // to keep in step. So the honest fix is a deletion: G8 and G9 carry the claim, on the durable
-  // evidence, and they always did.
-  //
-  // The sampled reading is kept as REPORTED CONTEXT below. When this process wins the race it is a
-  // genuinely stronger statement (the overlap ended while the daemon was still undecided); when it
-  // loses it says nothing at all. A cell whose truth depends on which process the scheduler favoured
-  // grades nothing, so it asserts nothing and is printed for whoever reads a future failure here.
-  console.log(`    · sampled-undecided reading: ${overlapEndedUndecided} (context only: races the daemon's own output; G8/G9 carry this claim on the transcript)`);
+  check("G7d the overlap ENDED while the loser was still alive and undecided, not by the loser exiting",
+    overlapEndedUndecided, { peakBound, answeredSubs, overlapEndedAlive, loserExited: incumbent.exited });
+  // Unbinding inside `shutdown()` also happens while alive, so G7d requires the overlap to end
+  // before any ownership verdict. The quiesce hold above makes that window wide enough to sample.
   check("G7f and serving never resumed during the arbitration, no re-arm without proof",
     !overlapReturned, { overlapReturned });
   // REQUIRES A READING. `peakPulls === undefined` means the sampler could not get an answer off the
@@ -993,6 +969,9 @@ try {
   // Said in the loser's own words too: it must announce going quiet, and it must do so BEFORE it
   // announces losing the shard. An implementation that quiesced only inside shutdown would exit
   // just as cleanly and still have served through the whole arbitration.
+  // The quiesce hold delays the verdict, so wait for it (or exit) before reading the order.
+  const decideBy = Date.now() + 30_000;
+  while (Date.now() < decideBy && !incumbent.exited && !DECIDED.test(incumbent.stderr)) await wait(50);
   const quiesceAt = incumbent.stderr.indexOf("stopped serving shard");
   const lostAt = incumbent.stderr.search(DECIDED);
   check("G8 the loser announced that it stopped serving", quiesceAt >= 0, tail(incumbent));

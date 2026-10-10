@@ -833,6 +833,15 @@ async function runStartedDelivery(
   /** Announce going quiet, once per quiesced episode. Same rule as {@link noteLease}: the renew ticks
    *  forever, and an operator needs the edge, not a log line per tick. */
   let quiesced = false;
+  // SMOKE-ONLY: hold between quiescing and the ownership read so a live cell can observe the
+  // quiesced, undecided state without racing it. A live daemon never sets this.
+  const quiesceHoldRaw = process.env.COTAL_SMOKE_DELIVERY_QUIESCE_HOLD_MS;
+  const quiesceHoldMs = quiesceHoldRaw === undefined ? 0 : Number(quiesceHoldRaw);
+  if (!Number.isSafeInteger(quiesceHoldMs) || quiesceHoldMs < 0)
+    throw new Error(`delivery: COTAL_SMOKE_DELIVERY_QUIESCE_HOLD_MS must be a non-negative integer (got ${JSON.stringify(quiesceHoldRaw)})`);
+  const holdAfterQuiesce = async (): Promise<void> => {
+    if (quiesceHoldMs > 0) await new Promise((r) => setTimeout(r, quiesceHoldMs));
+  };
   const noteQuiesce = (): void => {
     if (quiesced) return;
     quiesced = true;
@@ -906,6 +915,7 @@ async function runStartedDelivery(
          catch { /* the row has moved on; the ownership read below is what decides */ }
        }
        noteQuiesce();
+       await holdAfterQuiesce();
      } catch (e) {
        console.error(`! delivery: could not quiesce Plane-3 on a lease watch event (${(e as Error).message})`);
      }
@@ -1001,6 +1011,7 @@ async function runStartedDelivery(
           // on purpose rather than silently wedged, and because the live cell anchors on this line
           // to know when to start demanding that this process holds no Plane-3 bindings.
           noteQuiesce();
+          await holdAfterQuiesce();
         }
         catch (e) { console.error(`! delivery: could not quiesce Plane-3 while checking the lease (${(e as Error).message})`); }
         const reading = await readOwnLease();
