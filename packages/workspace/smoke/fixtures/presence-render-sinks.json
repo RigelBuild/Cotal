@@ -1,10 +1,10 @@
 {
   "expected": {
-    "total": 387,
+    "total": 389,
     "honest-text": 34,
     "presence-only-glyph/count": 41,
     "command-ack": 10,
-    "non-render/control": 302
+    "non-render/control": 304
   },
   "renderers": [
     {
@@ -355,14 +355,14 @@
       "rationale": "AST candidate is status routing, process/HTTP state, lookup definition, styling, or data shaping rather than a human progress claim."
     },
     {
-      "path": "implementations/cli/src/commands/down.ts",
+      "path": "implementations/cli/src/lib/teardown-spare.ts",
       "kind": "derived-output",
       "anchor": "`could not list managed agents (${reply.error ?? \"invalid ps reply\"}); agents will still be spared`",
       "class": "non-render/control",
       "rationale": "Manager control-path failure while gathering the best-effort pre-stop inventory, not a rendered agent presence status."
     },
     {
-      "path": "implementations/cli/src/commands/down.ts",
+      "path": "implementations/cli/src/lib/teardown-spare.ts",
       "kind": "derived-output",
       "anchor": "`  ${facts.join(\"  ·  \")}`",
       "class": "non-render/control",
@@ -1080,7 +1080,21 @@
     {
       "path": "implementations/cli/src/commands/setup.ts",
       "kind": "derived-output",
-      "anchor": "`mesh     ${dim(mesh.reachable ? `${mesh.server} · space ${mesh.space}` : `down · start: ${cmd} up --detach`)}`",
+      "anchor": "`mesh     ${dim(meshLine)}`",
+      "class": "non-render/control",
+      "rationale": "AST candidate is status routing, process/HTTP state, lookup definition, styling, or data shaping rather than a human progress claim."
+    },
+    {
+      "path": "implementations/cli/src/commands/setup.ts",
+      "kind": "derived-output",
+      "anchor": "`${mesh.server} · space ${mesh.space} · selected (not probed)`",
+      "class": "non-render/control",
+      "rationale": "AST candidate is status routing, process/HTTP state, lookup definition, styling, or data shaping rather than a human progress claim."
+    },
+    {
+      "path": "implementations/cli/src/commands/setup.ts",
+      "kind": "derived-output",
+      "anchor": "`${mesh.server} · space ${mesh.space} · unreachable`",
       "class": "non-render/control",
       "rationale": "AST candidate is status routing, process/HTTP state, lookup definition, styling, or data shaping rather than a human progress claim."
     },

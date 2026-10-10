@@ -12,7 +12,6 @@ export const QUARANTINED = {
   "smoke:seat-orphan": { reason: "RIG-4872: one-byte-past-limit truncation cell fails", recheckBy: "2026-11-15" },
   "smoke:delivery-starvation": { reason: "RIG-4872: F3/F5 shard-takeover cells fail", recheckBy: "2026-11-15" },
   "smoke:codex-events-lifecycle": { reason: "RIG-4872: broker-outage IDLE setup cells fail", recheckBy: "2026-11-15" },
-  "smoke:presence-render-census": { reason: "RIG-4872: manifest anchor no longer present in cli down.ts", recheckBy: "2026-11-15" },
   "smoke:manager-stop-spare-guard": { reason: "RIG-4872: live-PTY spare-stop census and frozen #1343 inventory are stale", recheckBy: "2026-11-15" },
   "smoke:upgrade-section": { reason: "RIG-4872: flaky ACCEPT CONTROL exit-reader cells", recheckBy: "2026-11-15" },
   "smoke:entrypoint-guard": { reason: "RIG-4872: verify-publish-closure symlink self-test fails on CI (shard 1)", recheckBy: "2026-11-15" },
