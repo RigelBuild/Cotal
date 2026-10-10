@@ -15,7 +15,6 @@ export const QUARANTINED = {
   "smoke:backup-perms:live": { reason: "RIG-4872/#643: zero-delivery consumer frontier 1 !== 2 on CI (shard 3)", recheckBy: "2026-11-15" },
   "smoke:console-control": { reason: "RIG-4922: graceful-stop cells (y, seat3 leaves) failed in mutation-reproof run 38051239634; custodian leak fixed", recheckBy: "2026-11-15" },
   "smoke:attach-reconnect": { reason: "RIG-4922: cell B (detach key mid-reconnect) failed on main CI run 38022761542 at 88546942; first failure in 25 runs", recheckBy: "2026-11-15" },
-  "smoke:codex-host": { reason: "RIG-4872: flaky; approval presence wait timed out on CI run 37970832138, passed on 37964440191", recheckBy: "2026-11-15" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */

@@ -2471,6 +2471,11 @@ export class CotalEndpoint extends EventEmitter {
     await this.publishPresence();
   }
 
+  /** Advances on every condition write, so a caller can tell whether a newer one overtook it. */
+  get conditionWrites(): number {
+    return this.conditionRevision;
+  }
+
   /** Publish a harness-reported condition, or clear it. Core stores the relay without interpretation. */
   async setCondition(condition: PresenceCondition | null): Promise<void> {
     this.condition = condition ?? undefined;

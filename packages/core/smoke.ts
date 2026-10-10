@@ -234,7 +234,14 @@ try {
     }),
     bob.getRoster().find((peer) => peer.card.id === alice.card.id),
   );
-  await alice.setCondition(null);
+  const writesBeforeClear = alice.conditionWrites;
+  const clearing = alice.setCondition(null);
+  check(
+    "a condition write advances conditionWrites before its presence put settles",
+    alice.conditionWrites === writesBeforeClear + 1,
+    { before: writesBeforeClear, after: alice.conditionWrites },
+  );
+  await clearing;
   check(
     "presence condition clears explicitly",
     await until(() => bob.getRoster().find((peer) => peer.card.id === alice.card.id)?.condition === undefined),
@@ -432,7 +439,7 @@ try {
   if (brokerExited && storeRemoved) releaseBroker();
 }
 
-const EXPECTED_BEFORE_COUNT = 24;
+const EXPECTED_BEFORE_COUNT = 25;
 check(
   `every scenario cell ran — ${EXPECTED_BEFORE_COUNT} expected`,
   pass + fail === EXPECTED_BEFORE_COUNT,

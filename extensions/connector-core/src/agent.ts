@@ -1835,10 +1835,15 @@ export class MeshAgent extends EventEmitter {
   }
 
   async setStatus(status: PresenceStatus, activity?: string): Promise<void> {
+    // A condition the host raises while this awaits the link (an approval right after turn/started)
+    // is newer than the turn start, so the turn-start clear must not erase it.
+    const conditionWrites = this.ep.conditionWrites;
     await this.requireConnected();
     const prev = this._status;
     try {
-      if (prev !== "working" && status === "working") await this.ep.setCondition(null);
+      if (prev !== "working" && status === "working" && conditionWrites === this.ep.conditionWrites) {
+        await this.ep.setCondition(null);
+      }
       await this.publishStatus(status, activity);
     } finally {
       // The transition is a fact about the SEAT, not about whether its presence row was written:

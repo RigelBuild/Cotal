@@ -53,11 +53,11 @@
     {
       "name": "the status is assigned before its presence write, so a failed write swallows the boundary",
       "file": "extensions/connector-core/src/agent.ts",
-      "find": "    const prev = this._status;\n    try {\n      if (prev !== \"working\" && status === \"working\") await this.ep.setCondition(null);\n      await this.publishStatus(status, activity);\n    } finally {",
-      "replace": "    const prev = this._status;\n    if (prev !== \"working\" && status === \"working\") await this.ep.setCondition(null);\n    this._status = status;\n    await this.publishStatus(status, activity);\n    if (prev === \"working\" && status === \"idle\") this.onTurnBoundary();\n    if (false) {",
+      "find": "    const prev = this._status;\n    try {\n      if (prev !== \"working\" && status === \"working\" && conditionWrites === this.ep.conditionWrites) {\n        await this.ep.setCondition(null);\n      }\n      await this.publishStatus(status, activity);\n    } finally {",
+      "replace": "    const prev = this._status;\n    if (prev !== \"working\" && status === \"working\" && conditionWrites === this.ep.conditionWrites) {\n      await this.ep.setCondition(null);\n    }\n    this._status = status;\n    await this.publishStatus(status, activity);\n    if (prev === \"working\" && status === \"idle\") this.onTurnBoundary();\n    if (false) {",
       "expectRed": "a failed presence write does not swallow the boundary",
       "cell": "a failed presence write does not swallow the boundary",
-      "note": "Measured 2026-09-03: KILLED. turn-intake.smoke: 26 passed, 1 failed Named cell red: a failed presence write does not swallow the boundary Re-anchored 2026-09-22 after a condition-clearing call was added inside the try; the replace carries that call unchanged so the mutation still isolates the ordering alone."
+      "note": "Measured 2026-09-03: KILLED. turn-intake.smoke: 26 passed, 1 failed Named cell red: a failed presence write does not swallow the boundary Re-anchored 2026-09-22 after a condition-clearing call was added inside the try; the replace carries that call unchanged so the mutation still isolates the ordering alone. Re-anchored again when the clear gained its overtaken-by-a-newer-condition guard."
     },
     {
       "name": "the seat discards every pull refusal in silence",
@@ -94,6 +94,22 @@
       "expectRed": "the escalation is rendered after the context: the question, the step, and that it was escalated to this seat",
       "cell": "the escalation is rendered after the context: the question, the step, and that it was escalated to this seat",
       "note": "The runtime submits `{ checkpoint: { token, prompt, schema, deadlineAt, escalatedTo } }` and the seat read `ask` alone, so an addressee was woken with a context block and no question, auto-yielded done at its boundary, and the second pause ran to its own expiry over a question nobody was asked. The cell that covered the relay asserted what the runtime SUBMITTED; this one asserts what the seat RENDERS."
+    },
+    {
+      "name": "the turn-start clear ignores a condition raised while it awaited the link",
+      "file": "extensions/connector-core/src/agent.ts",
+      "find": "      if (prev !== \"working\" && status === \"working\" && conditionWrites === this.ep.conditionWrites) {\n",
+      "replace": "      if (prev !== \"working\" && status === \"working\") {\n",
+      "expectRed": "the approval raised in the turn-start tick is the last condition written",
+      "cell": "the approval raised in the turn-start tick is the last condition written"
+    },
+    {
+      "name": "a turn start stops clearing the standing condition",
+      "file": "extensions/connector-core/src/agent.ts",
+      "find": "      if (prev !== \"working\" && status === \"working\" && conditionWrites === this.ep.conditionWrites) {\n",
+      "replace": "      if (false) {\n",
+      "expectRed": "an uncontended turn start clears the standing condition",
+      "cell": "an uncontended turn start clears the standing condition"
     }
   ],
   "why": [
