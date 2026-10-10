@@ -734,11 +734,13 @@ try {
   check("F2 its lease is live and ready before the handover", beforeHandover?.info.ready === true, beforeHandover);
 
   // Take the shard away from underneath it, exactly as an operator-driven replacement does: delete
-  // the row, then let a SECOND daemon win the atomic create. The first daemon's next renew fails,
-  // it re-reads, and it finds the shard held by someone else.
+  // the row, then let a SECOND daemon win the atomic create. Frozen across that, as in G: the lease
+  // watch would otherwise re-acquire the empty key before the replacement boots (cell H's path).
+  signalGroup(holder, "SIGSTOP");
   await deleteLease(spaceF, credsPathF);
   const winner = spawnDaemon(spaceF, credsPathF);
   const winnerUp = await untilUp(winner);
+  signalGroup(holder, "SIGCONT");
   check("F3 a replacement daemon acquires the shard", winnerUp, tail(winner));
   const winnerLease = await readLease(spaceF, credsPathF);
   check("F4 the replacement's lease is live and ready", winnerLease?.info.ready === true, winnerLease);
@@ -747,7 +749,7 @@ try {
   const loserExited = await untilExit(holder, 45_000);
   check("F5 the displaced daemon exits so the holder is single", loserExited, tail(holder));
   check("F6 and it says the shard is held by another daemon rather than claiming a broker loss",
-    /taken shard|is held by/.test(holder.stderr) && !holder.stderr.includes("exiting (coupled to the broker)"), tail(holder));
+    DECIDED.test(holder.stderr) && !holder.stderr.includes("exiting (coupled to the broker)"), tail(holder));
 
   // THE CELL. Read the lease from the BROKER after the loser has finished shutting down. Its
   // shutdown path runs asynchronously after the exit, so settle past it before reading.
@@ -992,7 +994,7 @@ try {
   // announces losing the shard. An implementation that quiesced only inside shutdown would exit
   // just as cleanly and still have served through the whole arbitration.
   const quiesceAt = incumbent.stderr.indexOf("stopped serving shard");
-  const lostAt = incumbent.stderr.search(/taken shard|is held by/);
+  const lostAt = incumbent.stderr.search(DECIDED);
   check("G8 the loser announced that it stopped serving", quiesceAt >= 0, tail(incumbent));
   check("G9 and it stopped serving BEFORE it concluded it had lost the shard, not as part of exiting",
     quiesceAt >= 0 && lostAt >= 0 && quiesceAt < lostAt, { quiesceAt, lostAt });
