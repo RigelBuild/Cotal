@@ -334,6 +334,10 @@ export class MeshAgent extends EventEmitter {
   private lastConnectionError?: string;
   private endpointNoticeLog = new Map<string, { lastLoggedAt: number; suppressed: number }>();
   private _status: PresenceStatus = "idle";
+  /** Each status write takes the next revision at call time; `issuedRevision` is the newest one that
+   *  reached the endpoint, so an older write overtaken during its awaits does not overwrite it. */
+  private statusRevision = 0;
+  private issuedRevision = 0;
   private _attention: AttentionMode = "open"; // F3: fail-open default; reset to open on SessionStart
   private _recallCursor: RecallMark = { ts: 0, id: "" };
   /** Recall items stamped ahead of this session's clock that it has already handed over. They are
@@ -1837,14 +1841,16 @@ export class MeshAgent extends EventEmitter {
   async setStatus(status: PresenceStatus, activity?: string): Promise<void> {
     await this.requireConnected();
     const prev = this._status;
+    // Assigned before any await: hosts fire working and idle without awaiting each other, and the
+    // later call must see the earlier transition, not the status from before it.
+    this._status = status;
+    const revision = ++this.statusRevision;
     try {
       if (prev !== "working" && status === "working") await this.ep.setCondition(null);
-      await this.publishStatus(status, activity);
+      await this.publishStatus(revision, status, activity);
     } finally {
-      // The transition is a fact about the SEAT, not about whether its presence row was written:
-      // assigning before the writes meant one failed publish (which every adapter swallows) left
-      // `_status` idle with no boundary run, and the next real turn end saw no transition at all.
-      this._status = status;
+      // The boundary runs whether or not the presence row was written: one failed publish (which
+      // every adapter swallows) must not leave the next real turn end with no transition.
       // The turn relay's boundary: an adapter funnels its turn-end through this transition (Stop
       // hooks set idle), so the automatic `done` yield and the immediate re-poll live here once
       // instead of per connector. `waiting` is not a boundary — a seat blocked on a permission has
@@ -1865,15 +1871,14 @@ export class MeshAgent extends EventEmitter {
    */
   async resetStatus(status: PresenceStatus, activity?: string): Promise<void> {
     await this.requireConnected();
-    try {
-      await this.publishStatus(status, activity);
-    } finally {
-      this._status = status;
-    }
+    this._status = status;
+    await this.publishStatus(++this.statusRevision, status, activity);
   }
 
-  private async publishStatus(status: PresenceStatus, activity?: string): Promise<void> {
+  private async publishStatus(revision: number, status: PresenceStatus, activity?: string): Promise<void> {
     if (activity !== undefined) await this.ep.setActivity(activity);
+    if (revision < this.issuedRevision) return;
+    this.issuedRevision = revision;
     await this.ep.setStatus(status);
   }
 

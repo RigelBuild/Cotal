@@ -411,6 +411,9 @@ export async function runCodexHost(): Promise<void> {
     startDelayMs = 0;
     return new AguiEmitterHolder<CodexRecord>(
       async (rolloutPath: string) => {
+        // A resumed rollout can be found before `agent.start()` connects, and the holder is terminal
+        // on error, so wait for the link first, as the other connectors do.
+        await agent.whenConnected(20_000);
         // The test-only widening of this setup, at the top of it so a fixture's write lands in the
         // real window rather than beside it. Zero unless a test set it, and zero does not await.
         if (holderStartDelayMs > 0) await new Promise<void>((r) => setTimeout(r, holderStartDelayMs));
