@@ -53,7 +53,7 @@ const rig = () => {
     /** What the endpoint refuses the next pull with (undefined = it serves). */
     pullRefusal: undefined as string | undefined,
     /** Every condition the agent wrote, in call order (null = clear). */
-    conditions: [] as unknown[],
+    conditions: [] as (PresenceCondition | null)[],
   };
   (a as unknown as { ep: unknown }).ep = {
     principal: { owner: "local", actor: "seat" },
@@ -63,7 +63,7 @@ const rig = () => {
     // answer it or every block that drives a turn boundary dies on a missing method rather than
     // on the property it is testing.
     get conditionWrites() { return state.conditions.length; },
-    setCondition: async (c: unknown) => { state.conditions.push(c); },
+    setCondition: async (c: PresenceCondition | null) => { state.conditions.push(c); },
     invokeService: async (_ep: string, command: string, args: unknown, opts: unknown) => {
       invokes.push({ command, args, opts });
       if (command === "turn-pending") {
