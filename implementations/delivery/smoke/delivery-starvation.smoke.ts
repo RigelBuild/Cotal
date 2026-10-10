@@ -90,6 +90,8 @@ const tail = (d: Daemon): string => d.stderr.trimEnd().split("\n").slice(-4).joi
  *  particular description of who took it: the phrasings differ between the pre-fix and post-fix
  *  daemon, and a cell keyed to one of them grades nothing against the other. */
 const DECIDED = /exiting so the holder is single/;
+/** The G loser's hold between quiescing and its ownership read; no verdict can precede wake + hold. */
+const QUIESCE_HOLD_MS = 5000;
 
 const space = `delivery-starve-${randomUUID().slice(0, 8)}`;
 // Cell B runs in its OWN space. The delivery lease is per-space with a 30s bucket TTL, so a second
@@ -202,8 +204,8 @@ function spawnDaemon(inSpace: string, creds: string, via: string = SERVERS, extr
   // returns to its own event loop, which is earlier than any timer poll could manage. It is still
   // only best effort: being early in the PARENT says nothing about the CHILD, which has been running
   // since it wrote those bytes, so a daemon can already have printed its next line before this
-  // handler is reached at all (measured at 3 of 8 and 6 of 8 by two reviewers). The cell that used
-  // to depend on winning that race has been deleted; what remains is used for context, never to pass.
+  // handler is reached at all (measured at 3 of 8 and 6 of 8 by two reviewers). G7d does not depend
+  // on winning that race: the daemon's quiesce hold keeps it undecided while the cell samples.
   const sink = (b: Buffer) => {
     const text = b.toString();
     d.stderr += text;
@@ -428,6 +430,18 @@ async function openObserver(inSpace: string): Promise<{
     },
     close: async () => { try { await nc.drain(); } catch { /* already gone */ } },
   };
+}
+
+/** Poll the broker until `d` is up AND some daemon holds a ready lease, so a frozen incumbent is
+ *  only woken once the replacement has provably won the shard, not merely printed its sweeps line. */
+async function untilReadyLease(d: Daemon, inSpace: string, creds: string, timeoutMs = 30_000): Promise<boolean> {
+  if (!(await untilUp(d, timeoutMs))) return false;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && !d.exited) {
+    if ((await readLease(inSpace, creds))?.info.ready === true) return true;
+    await wait(200);
+  }
+  return false;
 }
 
 async function readLease(inSpace: string, credsFile: string): Promise<{ info: DeliveryLeaseInfo; revision: number } | undefined> {
@@ -739,7 +753,7 @@ try {
   signalGroup(holder, "SIGSTOP");
   await deleteLease(spaceF, credsPathF);
   const winner = spawnDaemon(spaceF, credsPathF);
-  const winnerUp = await untilUp(winner);
+  const winnerUp = await untilReadyLease(winner, spaceF, credsPathF);
   signalGroup(holder, "SIGCONT");
   check("F3 a replacement daemon acquires the shard", winnerUp, tail(winner));
   const winnerLease = await readLease(spaceF, credsPathF);
@@ -748,7 +762,7 @@ try {
   // The loser must now exit on its own. That is the single-holder guarantee, and it is preserved.
   const loserExited = await untilExit(holder, 45_000);
   check("F5 the displaced daemon exits so the holder is single", loserExited, tail(holder));
-  check("F6 and it says the shard is held by another daemon rather than claiming a broker loss",
+  check("F6 and it exits on an ownership decision rather than claiming a broker loss",
     DECIDED.test(holder.stderr) && !holder.stderr.includes("exiting (coupled to the broker)"), tail(holder));
 
   // THE CELL. Read the lease from the BROKER after the loser has finished shutting down. Its
@@ -786,7 +800,7 @@ try {
   // Clear the previous cell's expired-but-not-yet-TTL'd row so the incumbent can claim the slot now.
   await deleteLease(spaceG, credsPathG);
   // The hold keeps the loser quiesced and undecided long enough to sample, so G7d is not a race.
-  const incumbent = spawnDaemon(spaceG, credsPathG, SERVERS, { COTAL_SMOKE_DELIVERY_QUIESCE_HOLD_MS: "5000" });
+  const incumbent = spawnDaemon(spaceG, credsPathG, SERVERS, { COTAL_SMOKE_DELIVERY_QUIESCE_HOLD_MS: String(QUIESCE_HOLD_MS) });
   const incumbentUp = await untilUp(incumbent);
   check("G1 the incumbent daemon comes up and holds the shard", incumbentUp, tail(incumbent));
   if (!incumbentUp) throw new Error("the arbitration cell needs a daemon that was running; it never came up");
@@ -815,7 +829,7 @@ try {
   signalGroup(incumbent, "SIGSTOP");
   await deleteLease(spaceG, credsPathG);
   const replacement = spawnDaemon(spaceG, credsPathG);
-  const replacementUp = await untilUp(replacement);
+  const replacementUp = await untilReadyLease(replacement, spaceG, credsPathG);
   // OBSERVE THE OVERLAP WHILE IT IS HELD STILL. The replacement is bound and ready; the incumbent is
   // frozen and still bound. That is the two-responder state, and it is stationary because one of the
   // two processes cannot run, so it is read here, deliberately, rather than chased later.
@@ -823,6 +837,7 @@ try {
   // Wake it only once the replacement is READY. Sol's boundary is stated exactly this way: the
   // replacement is already serving before the loser's create is refused.
   signalGroup(incumbent, "SIGCONT");
+  const undecidedUntil = Date.now() + QUIESCE_HOLD_MS;
   check("G4 the replacement acquires the shard and becomes ready", replacementUp, tail(replacement));
   const replacementLease = await readLease(spaceG, credsPathG);
   check("G5 the replacement's lease is live and ready, the winner is SERVING",
@@ -862,8 +877,8 @@ try {
   // loaded box, and it was the reasoning behind a cell that reddened on CI for the wrong reason.
   //
   // The freeze is still worth keeping: when it does win it holds the quiesced state still and makes
-  // the sampled reading below meaningful. But nothing PASSES on it any more. G8/G9 grade the
-  // ordering the daemon itself recorded, which no scheduler can alter.
+  // the sampled reading below meaningful. G7d does not need it: it only counts readings answered
+  // inside the daemon's quiesce hold. G8/G9 grade the ordering the daemon itself recorded.
   //
   // SIGSTOP, WHEN IT DOES LAND, changes nothing about what the daemon DID. Its subscriptions are
   // already gone or already there; freezing a process does not unbind it, and the broker's answer is
@@ -877,8 +892,8 @@ try {
     // look impossible: synchronous in the PARENT says nothing about the CHILD, which has been
     // running freely since it wrote those bytes. A pipe read is not an execution fence. Measured by
     // two reviewers on the real suite and on an isolated primitive: the child had already decided in
-    // 3 of 8 and 6 of 8 trials respectively. Nothing asserts on `froze` any more, so losing this
-    // race now costs only the sampled context line below.
+    // 3 of 8 and 6 of 8 trials respectively. Nothing asserts on `froze`; G7d relies on the
+    // quiesce hold and its time bound instead.
     if (froze || !chunk.includes("stopped serving shard")) return;
     signalGroup(d, "SIGSTOP");
     froze = true;
@@ -911,6 +926,8 @@ try {
     // here - so that clause is the durable fact rather than the current phrasing.
     const decidedBefore = DECIDED.test(incumbent.stderr);
     const subs = await obsG.controlSubs(accountG.account.pub);
+    // Answered before wake + hold, the reading predates any verdict whatever the pipe delivered.
+    const inHold = Date.now() < undecidedUntil;
     const decidedAfter = DECIDED.test(incumbent.stderr);
     if (subs !== undefined) {
       answeredSubs += 1;
@@ -930,7 +947,7 @@ try {
         // So the loser must additionally not have DECIDED anything yet. Quiescing happens BEFORE the
         // ownership question is answered; unbinding via shutdown can only happen after.
         overlapEndedAlive = true;
-        if (!decidedBefore && !decidedAfter) overlapEndedUndecided = true;
+        if (inHold && !decidedBefore && !decidedAfter && !incumbent.exited) overlapEndedUndecided = true;
       }
     }
     // Three consistent readings of the held state is enough; it is frozen, not evolving.

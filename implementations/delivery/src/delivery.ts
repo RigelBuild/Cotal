@@ -361,11 +361,22 @@ export async function runDelivery(args: ParsedArgs, store?: SecretStore): Promis
   }
 }
 
+/** SMOKE-ONLY: ms to hold between quiescing and the ownership read, so a live cell can observe the
+ *  quiesced, undecided state. Validated before start-up side effects; capped so it cannot stall a daemon. */
+function smokeQuiesceHoldMs(): number {
+  const raw = process.env.COTAL_SMOKE_DELIVERY_QUIESCE_HOLD_MS;
+  if (raw === undefined) return 0;
+  if (!/^\d+$/.test(raw) || Number(raw) > 60_000)
+    throw new Error(`delivery: COTAL_SMOKE_DELIVERY_QUIESCE_HOLD_MS must be an integer 0..60000 (got ${JSON.stringify(raw)})`);
+  return Number(raw);
+}
+
 async function runStartedDelivery(
   args: ParsedArgs,
   store: SecretStore | undefined,
   publishReleaser: (release: () => Promise<void>) => void,
 ): Promise<void> {
+  const quiesceHoldMs = smokeQuiesceHoldMs();
   const v = args.values as Values;
   const shard = v.shard ? Number(v.shard) : 0;
   const shards = v.shards ? Number(v.shards) : 1;
@@ -833,12 +844,6 @@ async function runStartedDelivery(
   /** Announce going quiet, once per quiesced episode. Same rule as {@link noteLease}: the renew ticks
    *  forever, and an operator needs the edge, not a log line per tick. */
   let quiesced = false;
-  // SMOKE-ONLY: hold between quiescing and the ownership read so a live cell can observe the
-  // quiesced, undecided state without racing it. A live daemon never sets this.
-  const quiesceHoldRaw = process.env.COTAL_SMOKE_DELIVERY_QUIESCE_HOLD_MS;
-  const quiesceHoldMs = quiesceHoldRaw === undefined ? 0 : Number(quiesceHoldRaw);
-  if (!Number.isSafeInteger(quiesceHoldMs) || quiesceHoldMs < 0)
-    throw new Error(`delivery: COTAL_SMOKE_DELIVERY_QUIESCE_HOLD_MS must be a non-negative integer (got ${JSON.stringify(quiesceHoldRaw)})`);
   const holdAfterQuiesce = async (): Promise<void> => {
     if (quiesceHoldMs > 0) await new Promise((r) => setTimeout(r, quiesceHoldMs));
   };
@@ -919,6 +924,7 @@ async function runStartedDelivery(
      } catch (e) {
        console.error(`! delivery: could not quiesce Plane-3 on a lease watch event (${(e as Error).message})`);
      }
+     if (stopping) return;
      const reading = await readOwnLease();
      switch (leaseAction(reading)) {
        case "keep-serving":
@@ -1014,6 +1020,7 @@ async function runStartedDelivery(
           await holdAfterQuiesce();
         }
         catch (e) { console.error(`! delivery: could not quiesce Plane-3 while checking the lease (${(e as Error).message})`); }
+        if (stopping) return;
         const reading = await readOwnLease();
         switch (leaseAction(reading)) {
           case "keep-serving":
