@@ -14,7 +14,7 @@
   "mutations": [
     {
       "name": "the install-probe job is removed from changesets.yml",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "  install-probe:\n    if: github.event_name == 'push' || inputs.snapshot == ''\n    needs: [version]",
       "replace": "  install-probe-disabled:\n    if: github.event_name == 'push' || inputs.snapshot == ''\n    needs: [version]",
       "expectRed": "changesets.yml declares job install-probe",
@@ -22,7 +22,7 @@
     },
     {
       "name": "install-probe stops depending on version, so the probe can run before publish",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "  install-probe:\n    if: github.event_name == 'push' || inputs.snapshot == ''\n    needs: [version]",
       "replace": "  install-probe:\n    if: github.event_name == 'push' || inputs.snapshot == ''\n    needs: [seat-native-linux-x64]",
       "expectRed": "install-probe needs the version job",
@@ -30,7 +30,7 @@
     },
     {
       "name": "the probe script reference is removed from the install-probe job",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "        run: node scripts/post-publish-install-probe.mjs",
       "replace": "        run: echo 'probe disabled'",
       "expectRed": "install-probe runs the post-publish-install-probe script",
@@ -38,7 +38,7 @@
     },
     {
       "name": "the closure gate is removed from the version job",
-      "file": ".github/workflows/changesets.yml",
+      "file": ".github/workflows/changesets.yml.disabled",
       "find": "          node scripts/verify-publish-closure.mjs \"$version\"",
       "replace": "          echo 'closure gate disabled'",
       "expectRed": "the version job verifies publish closure before the Release",

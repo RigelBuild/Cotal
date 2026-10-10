@@ -6,6 +6,10 @@ Cotal uses [Changesets](https://github.com/changesets/changesets) to version and
 workspace packages under `packages/*`, `extensions/*`, and `implementations/*` to npm.
 `examples/**` is ignored, since it is not published.
 
+> **This fork does not publish.** The `@cotal-ai/*` npm packages belong to upstream `Cotal-AI/Cotal`.
+> Here the workflow is renamed `.github/workflows/changesets.yml.disabled`, so GitHub never runs
+> it. The smoke suites still read it. Restore the `.yml` name only with a Rigel npm scope repoint.
+
 ## 0.11 runtime migration
 
 The published binary no longer bundles the optional tmux and cmux runtimes. Existing operators

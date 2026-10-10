@@ -45,7 +45,7 @@ function check(name: string, condition: unknown, detail?: unknown): void {
 }
 
 // ================================================================ A. Workflow shape
-const workflowText = readFileSync(join(ROOT, ".github/workflows/changesets.yml"), "utf8");
+const workflowText = readFileSync(join(ROOT, ".github/workflows/changesets.yml.disabled"), "utf8");
 const workflow = parseYaml(workflowText);
 
 // Find the version job (the one with the publish and release steps)
