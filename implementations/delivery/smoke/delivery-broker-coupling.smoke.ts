@@ -45,7 +45,7 @@ let srv = spawn("nats-server", ["-c", join(dir, "server.conf")], { stdio: "ignor
 // left both behind. Killing the broker mid-test is this suite's SUBJECT, not its teardown: it proves
 // the daemon exits on its own once the broker is gone, and the ~10s wait for that is also why the
 // removal at the end of the `finally` is nowhere near the exit it follows.
-const releaseBroker = teardownOnSignal(srv, dir);
+let releaseBroker = teardownOnSignal(srv, dir);
 const credsPath = join(dir, "delivery.creds");
 
 let daemon: ReturnType<typeof spawn> | undefined;
@@ -152,6 +152,8 @@ try {
   // would be refused with "a live lease already exists" — measured, exactly that.
   rmSync(join(dir, "js"), { recursive: true, force: true });
   srv = spawn("nats-server", ["-c", join(dir, "server.conf")], { stdio: "ignore" });
+  releaseBroker();
+  releaseBroker = teardownOnSignal(srv, dir);
   let upAgain = false;
   for (let i = 0; i < 50; i++) { if (await isReachable(SERVERS)) { upAgain = true; break; } await wait(200); }
   if (!upAgain) throw new Error(`auth nats-server did not come back on ${PORT}`);

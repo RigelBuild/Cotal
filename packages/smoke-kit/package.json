@@ -9,6 +9,10 @@
     ".": {
       "types": "./src/index.ts",
       "import": "./src/index.ts"
+    },
+    "./spawn-sites": {
+      "types": "./src/spawn-sites.ts",
+      "import": "./src/spawn-sites.ts"
     }
   },
   "scripts": {

@@ -21,6 +21,7 @@
  * Keeps both boundaries honest, not decorative. Runs in the `check` gate and CI.
  * Run: pnpm smoke:core-boundary
  */
+import ts from "typescript";
 import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
@@ -68,9 +69,24 @@ if (srcRoots.length === 0) {
   process.exit(1);
 }
 
-// Specifier-shaped, so the rail is about what the file IMPORTS, not about the package being named
-// in prose. This file names it in its own docblock, and so does the kit's.
-const KIT_IMPORT = /(?:^|\n)[^\n]*(?:import|export|require)[^\n]*["']@cotal-ai\/smoke-kit["']/;
+// Resolve import specifiers across lines without matching the package name in comments or prose.
+function importsSmokeKit(source: string): boolean {
+  const file = ts.createSourceFile("shipped.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const privateSpecifier = (value: ts.Expression): boolean =>
+    ts.isStringLiteral(value) && (value.text === "@cotal-ai/smoke-kit" || value.text.startsWith("@cotal-ai/smoke-kit/"));
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) && privateSpecifier(node.moduleSpecifier)) found = true;
+    if (ts.isExportDeclaration(node) && node.moduleSpecifier !== undefined && privateSpecifier(node.moduleSpecifier)) found = true;
+    if (ts.isCallExpression(node) && node.arguments.length > 0
+      && (node.expression.kind === ts.SyntaxKind.ImportKeyword || ts.isIdentifier(node.expression) && node.expression.text === "require")
+      && privateSpecifier(node.arguments[0]!)) found = true;
+    if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument) && privateSpecifier(node.argument.literal)) found = true;
+    if (!found) ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return found;
+}
 // `bin` is the published `cotal-ai` package and has no `src` tree: its shipped entry points sit at
 // the top level, next to `smoke/` and `scripts/`, which are not shipped. Scanning the two entry
 // points by name rather than the directory keeps the exact package a customer installs in scope
@@ -81,7 +97,7 @@ if (binEntries.length !== 2) {
   process.exit(1);
 }
 const kitFiles = [...srcRoots.flatMap(tsFiles), ...binEntries];
-const kitOffenders = kitFiles.filter((f) => KIT_IMPORT.test(readFileSync(f, "utf8")));
+const kitOffenders = kitFiles.filter((f) => importsSmokeKit(readFileSync(f, "utf8")));
 if (kitOffenders.length) {
   failed = true;
   console.error("✗ @cotal-ai/smoke-kit is test-only and unpublished — no shipped file may import it:");
