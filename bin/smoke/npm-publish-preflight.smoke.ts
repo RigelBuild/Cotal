@@ -302,6 +302,8 @@ check(
   }, thisRelease) === "refused:no-github-publisher",
 );
 
+// The preflight derives its package set from the Changesets fixed group; count from the same source.
+const FIXED_GROUP = new Set((JSON.parse(readFileSync(join(ROOT, ".changeset", "config.json"), "utf8")) as { fixed: string[][] }).fixed.flat()).size;
 const allPresent = await repositoryEntrypoint("all-present");
 check(
   "all-present repository entrypoint returns the named no-op verdict",
@@ -311,7 +313,7 @@ check(
 );
 check(
   "all-present repository entrypoint prints the full fixed-group census",
-  allPresent.output.split("\n").filter((line) => line.includes("\tpresent\tnot-run\tnot-run")).length === 22,
+  allPresent.output.split("\n").filter((line) => line.includes("\tpresent\tnot-run\tnot-run")).length === FIXED_GROUP,
   allPresent.output,
 );
 check(
@@ -326,7 +328,7 @@ const mixedEntrypoint = await repositoryEntrypoint("mixed");
 check(
   "mixed repository entrypoint preserves the partial-publication refusal",
   mixedEntrypoint.code !== 0
-    && mixedEntrypoint.output.includes("publish preflight refused: 1/22 exact versions already exist"),
+    && mixedEntrypoint.output.includes(`publish preflight refused: 1/${FIXED_GROUP} exact versions already exist`),
   mixedEntrypoint.output,
 );
 check(
@@ -346,12 +348,12 @@ check(
 );
 check(
   "zero-present repository entrypoint derives and exchanges every fixed-group package",
-  zeroPresent.seen.filter((call) => call.url.startsWith("/-/npm/v1/oidc/token/exchange/package/")).length === 22,
+  zeroPresent.seen.filter((call) => call.url.startsWith("/-/npm/v1/oidc/token/exchange/package/")).length === FIXED_GROUP,
   zeroPresent.seen,
 );
 check(
   "zero-present repository entrypoint GETs trust for every fixed-group package",
-  zeroPresent.seen.filter((call) => call.method === "GET" && call.url.includes("/trust")).length === 22,
+  zeroPresent.seen.filter((call) => call.method === "GET" && call.url.includes("/trust")).length === FIXED_GROUP,
   zeroPresent.seen,
 );
 check(

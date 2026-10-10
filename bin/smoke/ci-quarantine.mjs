@@ -7,7 +7,6 @@
 
 /** @type {Record<string, { reason: string; recheckBy: string }>} */
 export const QUARANTINED = {
-  "smoke:npm-publish-preflight": { reason: "RIG-4872: repository-entrypoint census cells fail on CI (shard 3)", recheckBy: "2026-11-15" },
   "smoke:egress-guard-differential": { reason: "RIG-4872: predecessor resolver returns null for 1698fe253 on CI (shard 0)", recheckBy: "2026-11-15" },
   "smoke:seat-orphan": { reason: "RIG-4872: one-byte-past-limit truncation cell fails", recheckBy: "2026-11-15" },
   "smoke:delivery-starvation": { reason: "RIG-4872: F3/F5 shard-takeover cells fail", recheckBy: "2026-11-15" },
