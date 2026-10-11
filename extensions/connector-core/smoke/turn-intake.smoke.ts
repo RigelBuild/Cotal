@@ -51,15 +51,24 @@ const rig = () => {
     failStatusWrite: false,
     /** What the endpoint refuses the next pull with (undefined = it serves). */
     pullRefusal: undefined as string | undefined,
+    /** Every status the endpoint published, in write order, so a cell can read the final row. */
+    published: [] as string[],
+    /** While set, the next activity write rejects. */
+    failActivityWrite: false,
+    /** While set, the condition clear on the way into `working` waits on it. */
+    holdCondition: undefined as Promise<void> | undefined,
   };
   (a as unknown as { ep: unknown }).ep = {
     principal: { owner: "local", actor: "seat" },
-    setStatus: async () => { if (state.failStatusWrite) throw new Error("presence write failed"); },
-    setActivity: async () => {},
+    setStatus: async (status: string) => {
+      if (state.failStatusWrite) throw new Error("presence write failed");
+      state.published.push(status);
+    },
+    setActivity: async () => { if (state.failActivityWrite) throw new Error("activity write failed"); },
     // `setStatus` clears any standing condition on the way into `working`, so the double has to
     // answer it or every block that drives a turn boundary dies on a missing method rather than
     // on the property it is testing.
-    setCondition: async () => {},
+    setCondition: async () => { await state.holdCondition; },
     invokeService: async (_ep: string, command: string, args: unknown, opts: unknown) => {
       invokes.push({ command, args, opts });
       if (command === "turn-pending") {
@@ -182,6 +191,47 @@ const row = (goalId: string, context: string, acceptedAt = Date.now()): PendingT
     await tick();
     return r.state.yields.some((y) => y.goalId === "g3d" && y.status === "done");
   })(), "the yield after a failed presence write");
+
+  // Hosts fire working and idle without awaiting each other; holding working's condition clear makes
+  // the overlap deterministic, so an idle published early would be overwritten.
+  {
+    const r = rig();
+    r.state.pending = [row("g3e", "work")];
+    await r.poll();
+    r.a.commitSurfacedTurns(["g3e"]);
+    let releaseClear!: () => void;
+    r.state.holdCondition = new Promise<void>((resolve) => { releaseClear = resolve; });
+    const working = r.a.setStatus("working");
+    await tick();
+    const idle = r.a.setStatus("idle");
+    await tick();
+    r.state.holdCondition = undefined;
+    releaseClear();
+    await Promise.all([working, idle]);
+    await tick();
+    check("overlapping writes publish in call order: an idle fired mid-clear is the final row",
+      r.state.published.at(-1) === "idle" && r.a.status === "idle", JSON.stringify({ published: r.state.published, status: r.a.status }));
+    check("and that idle still ends the turn",
+      r.state.yields.some((y) => y.goalId === "g3e" && y.status === "done"), JSON.stringify(r.state.yields));
+  }
+
+  // A newer write that fails before reaching the endpoint must not suppress the older one.
+  {
+    const r = rig();
+    let releaseClear!: () => void;
+    r.state.holdCondition = new Promise<void>((resolve) => { releaseClear = resolve; });
+    const working = r.a.setStatus("working");
+    await tick();
+    r.state.failActivityWrite = true;
+    const waiting = r.a.setStatus("waiting", "approval").catch(() => undefined);
+    await waiting;
+    r.state.failActivityWrite = false;
+    r.state.holdCondition = undefined;
+    releaseClear();
+    await working;
+    check("a newer write that failed before publishing does not suppress the older one",
+      r.state.published.at(-1) === "working", JSON.stringify(r.state.published));
+  }
 }
 
 // ── 4) an unseen payload is never "done" ──────────────────────────────────────────────────────
@@ -318,7 +368,7 @@ const row = (goalId: string, context: string, acceptedAt = Date.now()): PendingT
   check("the same reason after a good pull is a new outage and is said", lines.length === 3, lines);
 }
 
-const EXPECTED_CELLS = 37;
+const EXPECTED_CELLS = 40;
 const ran = pass + fail;
 console.log(`\nturn-intake.smoke: ${pass} passed, ${fail} failed`);
 if (ran !== EXPECTED_CELLS) {
