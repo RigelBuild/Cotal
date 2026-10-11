@@ -1,5 +1,10 @@
 import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
+export interface WrappedText {
+  render(width: number): string[];
+  invalidate(): void;
+}
+
 /**
  * Pi TUI component for static Cotal text.
  *
@@ -7,7 +12,7 @@ import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
  * Use the host's own ANSI/grapheme-aware wrapper so Cotal and Pi cannot disagree
  * about the width of emoji, CJK, combining marks, or styled text.
  */
-export function wrapped(line: string): { render(width: number): string[]; invalidate(): void } {
+export function wrapped(line: string): WrappedText {
   return {
     invalidate(): void {},
     render(width: number): string[] {
