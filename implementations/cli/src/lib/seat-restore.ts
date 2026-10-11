@@ -1,7 +1,7 @@
 /**
  * Restore: the destination consumes an admitted seat checkpoint before the seat is alive.
  *
- * This is section 6 step 7 of `docs/design/session-recovery.md`, which that record gives as a shell
+ * This is section 6 step 7 of RigelBuild/docs `docs/designs/cotal/session-recovery.md`, which that record gives as a shell
  * sequence and calls manual only because no command carried it. Every rule stated there is a rule
  * here, and the reasons are the same ones measured there:
  *
