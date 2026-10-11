@@ -130,6 +130,26 @@ const statesByStream = Object.fromEntries(inventory.full.map((stream) => [stream
   last_seq: 20,
   consumer_count: byStream[stream].length,
 }]));
+const newFrontierInfo = consumer(chatStream(space), "fanout", fanoutDurableConfig(space), 0);
+newFrontierInfo.delivered = { ...newFrontierInfo.delivered, stream_seq: 1 };
+const newFrontierConsumers = { ...byStream, [chatStream(space)]: [newFrontierInfo] };
+const newFrontierCheckpoint = validatePersistentConsumerInventory(space, newFrontierConsumers, statesByStream)
+  .find((checkpoint) => checkpoint.name === "fanout")!;
+assert.equal(newFrontierCheckpoint.creationLowerBound, 2);
+assert.throws(
+  () => validatePersistentConsumerInventory(space, {
+    ...newFrontierConsumers,
+    [chatStream(space)]: [{ ...newFrontierInfo, delivered: { ...newFrontierInfo.delivered, stream_seq: Number.MAX_SAFE_INTEGER } }],
+  }, statesByStream),
+  /invalid delivered New frontier/,
+);
+assert.throws(
+  () => validatePersistentConsumerInventory(space, {
+    ...newFrontierConsumers,
+    [chatStream(space)]: [{ ...newFrontierInfo, delivered: { ...newFrontierInfo.delivered, stream_seq: -1 } }],
+  }, statesByStream),
+  /invalid delivered New frontier/,
+);
 const checkpoints = validatePersistentConsumerInventory(space, byStream, statesByStream);
 assert.equal(checkpoints.length, 5);
 const dmCheckpoint = checkpoints.find((checkpoint) => checkpoint.name.startsWith("dm_"))!;

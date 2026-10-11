@@ -423,11 +423,22 @@ export function validatePersistentConsumerInventory(
       const ackFloor = info.ack_floor.stream_seq;
       if (!Number.isSafeInteger(ackFloor) || ackFloor < 0)
         throw new Error(`${stream}/${info.name} has an invalid contiguous ACK floor`);
-      const creationLowerBound = info.config.deliver_policy === DeliverPolicy.StartSequence
-        ? info.config.opt_start_seq!
-        : info.config.deliver_policy === DeliverPolicy.New
-        ? Math.max(1, ackFloor + 1)
-        : 1;
+      let creationLowerBound = 1;
+      if (info.config.deliver_policy === DeliverPolicy.StartSequence) {
+        creationLowerBound = info.config.opt_start_seq!;
+      } else if (info.config.deliver_policy === DeliverPolicy.New) {
+        if (info.delivered.consumer_seq === 0) {
+          const deliveredStreamSequence = info.delivered.stream_seq;
+          if (!Number.isSafeInteger(deliveredStreamSequence) || deliveredStreamSequence < 0)
+            throw new Error(`${stream}/${info.name} has an invalid delivered New frontier`);
+          const deliveredSuccessor = deliveredStreamSequence + 1;
+          if (!Number.isSafeInteger(deliveredSuccessor))
+            throw new Error(`${stream}/${info.name} has an invalid delivered New frontier`);
+          creationLowerBound = deliveredSuccessor;
+        } else {
+          creationLowerBound = Math.max(1, ackFloor + 1);
+        }
+      }
       const checkpoint: PersistentConsumerCheckpoint = {
         stream,
         name: info.name,
