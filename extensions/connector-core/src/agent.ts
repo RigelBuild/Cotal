@@ -334,11 +334,11 @@ export class MeshAgent extends EventEmitter {
   private lastConnectionError?: string;
   private endpointNoticeLog = new Map<string, { lastLoggedAt: number; suppressed: number }>();
   private _status: PresenceStatus = "idle";
+  private _attention: AttentionMode = "open"; // F3: fail-open default; reset to open on SessionStart
   /** Each status write takes the next revision at call time; `issuedRevision` is the newest one that
    *  reached the endpoint, so an older write overtaken during its awaits does not overwrite it. */
   private statusRevision = 0;
   private issuedRevision = 0;
-  private _attention: AttentionMode = "open"; // F3: fail-open default; reset to open on SessionStart
   private _recallCursor: RecallMark = { ts: 0, id: "" };
   /** Recall items stamped ahead of this session's clock that it has already handed over. They are
    *  tracked by id rather than by {@link _recallCursor}, because a sender's clock must not be able to
