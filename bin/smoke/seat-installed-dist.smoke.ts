@@ -21,6 +21,8 @@ const check = (name: string, condition: unknown, detail?: unknown): void => {
 const run = (command: string, args: string[], cwd: string, isolatedHome = false) => {
   const env = { ...process.env };
   for (const key of Object.keys(env)) if (key.startsWith("COTAL_")) delete env[key];
+  // tsx's NODE_PATH reaches the whole pnpm store; an installed fixture resolves only its own tree.
+  delete env.NODE_PATH;
   return spawnSync(command, args, {
     cwd,
     encoding: "utf8",
@@ -35,13 +37,22 @@ const run = (command: string, args: string[], cwd: string, isolatedHome = false)
 };
 const output = (result: ReturnType<typeof run>) => `${result.stdout ?? ""}${result.stderr ?? ""}`;
 const writeElf = (arch: string, machine: number): void => {
-  const path = join(seatClone, "build", "Release", `linux-${arch}`, "peercred.node");
-  mkdirSync(dirname(path), { recursive: true });
-  const buffer = Buffer.alloc(20);
-  buffer[0] = 0x7f;
-  buffer.write("ELF", 1);
-  buffer.writeUInt16LE(machine, 18);
-  writeFileSync(path, buffer);
+  for (const file of ["peercred.node", "pty.node"]) {
+    const path = join(seatClone, "build", "Release", `linux-${arch}`, file);
+    mkdirSync(dirname(path), { recursive: true });
+    // The host arch ships the real build so the installed package can load it; the other arch is a
+    // header-only stand-in the pack gate accepts.
+    const built = join(ROOT, "packages", "seat", "build", "Release", `linux-${arch}`, file);
+    if (arch === process.arch && existsSync(built)) {
+      cpSync(built, path);
+      continue;
+    }
+    const buffer = Buffer.alloc(20);
+    buffer[0] = 0x7f;
+    buffer.write("ELF", 1);
+    buffer.writeUInt16LE(machine, 18);
+    writeFileSync(path, buffer);
+  }
 };
 
 try {
@@ -72,7 +83,11 @@ try {
   const files = listing.stdout.split(/\r?\n/).filter(Boolean);
   check("seat package inventory contains dist/index.js", files.includes("package/dist/index.js"), files);
   check("seat package inventory contains dist/index.d.ts", files.includes("package/dist/index.d.ts"), files);
-  check("seat package inventory contains both native helpers", ["x64", "arm64"].every((arch) => files.includes(`package/build/Release/linux-${arch}/peercred.node`)), files);
+  check(
+    "seat package inventory contains both native helpers",
+    ["x64", "arm64"].every((arch) => ["peercred.node", "pty.node"].every((file) => files.includes(`package/build/Release/linux-${arch}/${file}`))),
+    files,
+  );
 
   const workspace = new Map<string, string>();
   for (const parent of ["packages", "extensions", "implementations"]) {
@@ -113,6 +128,24 @@ try {
   check("fresh installed @cotal-ai/seat import succeeds", seatImport.status === 0, output(seatImport));
   const managerImport = run(process.execPath, ["--input-type=module", "-e", "await import('@cotal-ai/manager')"], installRoot);
   check("fresh installed @cotal-ai/manager import succeeds", managerImport.status === 0, output(managerImport));
+  // A seat-only install, as the arm64 load job does: the CLI closure's manager still depends on
+  // @lydell/node-pty, and npm hoists it beside the seat there.
+  const seatOnly = join(base, "seat-only");
+  mkdirSync(seatOnly);
+  writeFileSync(join(seatOnly, "package.json"), JSON.stringify({ name: "seat-only", private: true }));
+  const seatInstalled = run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", seatTarball], seatOnly, true);
+  check("the seat tarball installs alone with install scripts ignored", seatInstalled.status === 0, output(seatInstalled));
+  const pinned = run(
+    process.execPath,
+    [join(ROOT, "packages", "seat", "smoke", "fixtures", "pinned-load.mjs"), join(seatOnly, "node_modules", "@cotal-ai", "seat")],
+    seatOnly,
+  );
+  const report: unknown = JSON.parse(/^PINNED_LOAD (.*)$/m.exec(pinned.stdout ?? "")?.[1] ?? "null");
+  const field = (key: string): unknown => (typeof report === "object" && report !== null && key in report ? Reflect.get(report, key) : undefined);
+  check("installed spawnPinned names its child: the pidfd's fdinfo Pid is the child pid", field("pid") !== undefined && field("fdinfoPid") === field("pid"), output(pinned));
+  check("installed handle.signal(\"SIGKILL\") on the live child returns sent", field("first") === "sent", output(pinned));
+  check("after the exit, installed handle.exited() is true and a second send returns gone", field("exitedAfter") === true && field("second") === "gone", output(pinned));
+  check("@lydell/node-pty does not resolve from the installed seat", field("lydell") === "MODULE_NOT_FOUND", output(pinned));
   const help = run(process.execPath, [join(installRoot, "node_modules", "cotal-ai", "dist", "cotal.js"), "--help"], installRoot, true);
   // The banner's `cotal` word is wrapped in unconditional ANSI bold (workspace colors never check
   // TTY), so require the literal line after stripping escapes — not a loose substring that the

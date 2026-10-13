@@ -27,18 +27,21 @@
     "prepublishOnly": "node scripts/assert-shipped-natives.mjs && pnpm run build:ts"
   },
   "dependencies": {
-    "@lydell/node-pty": "1.2.0-beta.12",
     "@xterm/addon-serialize": "^0.13.0",
     "@xterm/headless": "^5.5.0"
   },
   "files": [
     "dist",
-    "build"
+    "build",
+    "native/node-pty/lib",
+    "native/node-pty/package.json",
+    "native/node-pty/LICENSE"
   ],
   "publishConfig": {
     "access": "public"
   },
   "devDependencies": {
-    "@cotal-ai/smoke-kit": "workspace:*"
+    "@cotal-ai/smoke-kit": "workspace:*",
+    "node-addon-api": "7.1.1"
   }
 }

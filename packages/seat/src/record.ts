@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -55,6 +55,11 @@ export function socketPath(root: string, id: string): string {
   return join(root, assertSeatId(id), "seat.sock");
 }
 
+/** The launch fence: beside the seat directory, so it outlives the release rename of that directory. */
+export function fencePath(root: string, id: string): string {
+  return join(root, `.launch-${assertSeatId(id)}`);
+}
+
 /** This boot's identity. Read at the moment a record is written and again when it is read back: a
  *  start token is ticks since THIS boot, so two records from different boots share a namespace they
  *  cannot distinguish on their own. Undefined where the kernel does not publish it, which leaves a
@@ -85,7 +90,6 @@ export function processStartToken(pid: number): string | undefined {
 }
 
 export function writeRecord(path: string, record: SeatRecord): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   writeFileSync(path, `${JSON.stringify(record)}\n`, { mode: 0o600, flag: "w" });
   chmodSync(path, 0o600);
   chmodSync(dirname(path), 0o700);

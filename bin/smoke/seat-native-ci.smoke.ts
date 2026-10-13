@@ -105,6 +105,46 @@ function hasBoth(got: string[], label: string, extra?: unknown): void {
   );
 }
 
+/** The `path:` of each upload-artifact step, in order. */
+function uploaded(body: string): string[] {
+  const paths: string[] = [];
+  const lines = body.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (!/uses:\s*actions\/upload-artifact@/.test(lines[i])) continue;
+    for (let j = i + 1; j < Math.min(i + 8, lines.length); j++) {
+      if (/^\s+-\s+(uses|name|run):/.test(lines[j])) break;
+      const p = lines[j].match(/^\s+path:\s*(\S+)\s*$/);
+      if (p) {
+        paths.push(p[1]);
+        break;
+      }
+    }
+  }
+  return paths;
+}
+
+/** A builder ships pty.node beside peercred.node only by uploading its whole linux-<arch>/ dir. */
+function shipsBothNatives(file: string, all: Map<string, string>): void {
+  for (const builder of BUILDERS) {
+    const body = all.get(builder) ?? "";
+    const arch = builder.replace("seat-native-linux-", "");
+    const paths = uploaded(body);
+    check(
+      `${file} ${builder} uploads the whole linux-${arch}/ directory (peercred.node and pty.node)`,
+      paths.length === 1 && paths[0] === `packages/seat/build/Release/linux-${arch}/`,
+      { paths },
+    );
+    const build = body.indexOf("pnpm --filter @cotal-ai/seat build");
+    const ceiling = body.indexOf("node packages/seat/scripts/assert-native-ceiling.mjs");
+    const upload = body.indexOf("actions/upload-artifact@");
+    check(
+      `${file} ${builder} enforces the native symbol-version ceiling before upload`,
+      build >= 0 && ceiling > build && upload > ceiling,
+      { build, ceiling, upload },
+    );
+  }
+}
+
 const ciText = readFileSync(CI, "utf8");
 const csText = readFileSync(CHANGESETS, "utf8");
 const ciJobs = jobs(ciText);
@@ -173,6 +213,22 @@ check(
   "changesets.yml snapshot job is bound to the npm-publish Environment",
   /^\s+environment:\s*npm-publish\s*$/m.test(snapshot),
   snapshot.match(/environment.*/)?.[0] ?? "no environment line",
+);
+
+console.log("\nD. Native builders ship pty.node, and ARM loads it");
+shipsBothNatives("ci.yml", ciJobs);
+shipsBothNatives("changesets.yml", csJobs);
+const nativeEnv = [...`${ciText}\n${csText}`.matchAll(/SEAT_NATIVE_(?:X64|ARM64):[ \t]*(.+?)[ \t]*$/gm)].map((m) => m[1]);
+check(
+  "SEAT_NATIVE_X64 and SEAT_NATIVE_ARM64 name the builder directory, not one file",
+  nativeEnv.length === 6 && nativeEnv.every((v) => /\/seat-native-linux-(x64|arm64)$/.test(v)),
+  nativeEnv,
+);
+check(
+  "ci.yml seat-linux-arm64 runs the pinned PTY load probe against the installed tarball",
+  /node src\/packages\/seat\/smoke\/fixtures\/pinned-load\.mjs "\$\{RUNNER_TEMP\}\/seat-prefix\/node_modules\/@cotal-ai\/seat"/.test(
+    ciJobs.get("seat-linux-arm64") ?? "",
+  ),
 );
 
 console.log(`\n${fail === 0 ? "SEAT NATIVE CI SMOKE OK" : "SEAT NATIVE CI SMOKE FAILED"}  (${pass} passed, ${fail} failed)`);

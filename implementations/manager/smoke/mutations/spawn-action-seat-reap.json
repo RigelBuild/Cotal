@@ -2,28 +2,39 @@
   "suite": [
     "implementations/manager/smoke/spawn-action.smoke.ts"
   ],
-  "guard": "the spawn-action suite reaps every seat the M5 crash stop deliberately detached, so the suite leaves no custodian behind (the CI shard-3 leak, #1791)",
+  "guard": "the spawn-action suite reaps every seat the M5 crash stop deliberately detached, so the suite leaves no custodian behind (the CI shard-3 leak, #1791), and the manager lets go of a seat whose child exited on its own",
   "command": "COTAL_RUN=sa1-mutation pnpm smoke:manager-spawn-action",
   "completionMarker": "teardown: no custodian of this run outlives the suite",
   "proveWith": "node scripts/mutation-proof.mjs --config implementations/manager/smoke/mutations/spawn-action-seat-reap.json",
   "why": [
     "The M5 leg's bare stop is the deliberate crash simulation: it releases the manager's custody handles so the goal stays orphaned for the successor to reconcile. Before this guard the suite returned green while nine detached custodians (one per live seat) waited out the ten-minute unattended window, holding ~65 MB each with no manager left to answer them.",
-    "The teardown reaps every remaining custody record in the run's private seat root (the reap verifies process start identity before signalling), then asserts two cells: no record left unsettled, and no custodian carrying this run's marker on the host. The first mutation removes the reap loop, which reintroduces the leak exactly as CI saw it and must redden the record cell. The second mutates the reap into a bare record deletion: the disk then looks settled while nine custodians keep running, so only the census cell can catch it, and it must go red on that cell."
+    "The teardown stops every seat whose socket remains in the run's private seat root through SeatClient (the custodian signals by pidfd), then asserts two cells: no live seat socket left, and no custodian carrying this run's marker on the host. The first mutation removes the stop loop, which reintroduces the leak exactly as CI saw it and must redden the socket cell. The second unlinks each socket instead of stopping the seat: the disk then looks settled while the custodians keep running, so only the census cell can catch it, and it must go red on that cell.",
+    "An authenticated controller holds a custodian open. The manager's handle for a seat whose child exited on its own (M3's `exit` connector) is that controller, and `onAgentExit` closes it. The third mutation drops that close: the custodian then stays resident with a dead child for the manager's whole life, so the M3 settle cell goes red."
   ],
   "mutations": [
     {
       "name": "the teardown never reaps (the leak reintroduced)",
       "file": "implementations/manager/smoke/spawn-action.smoke.ts",
-      "find": "const unsettled = readdirSync(seatRoot).filter((id) => /^[0-9a-f]{32}$/.test(id) && existsSync(join(seatRoot, id, \"record.json\")));",
+      "find": "const unsettled = readdirSync(seatRoot).filter((id) => /^[0-9a-f]{32}$/.test(id) && existsSync(join(seatRoot, id, \"seat.sock\")));",
       "replace": "const unsettled: string[] = [];",
-      "expectRed": "teardown: no live seat is left behind"
+      "expectRed": "teardown: no live seat is left behind",
+      "cell": "teardown: no live seat is left behind (every remaining seat was stopped through its socket)"
     },
     {
-      "name": "the teardown deletes records instead of proving the processes gone",
+      "name": "the teardown unlinks sockets instead of stopping the seats",
       "file": "implementations/manager/smoke/spawn-action.smoke.ts",
-      "find": "for (const id of unsettled) await reapSeat(seatRoot, id, { graceMs: 5_000 });",
-      "replace": "for (const id of unsettled) rmSync(join(seatRoot, id, \"record.json\"), { force: true });",
-      "expectRed": "teardown: no custodian of this run outlives the suite"
+      "find": "for (const id of unsettled) await stopSeat(id);",
+      "replace": "for (const id of unsettled) rmSync(join(seatRoot, id, \"seat.sock\"), { force: true });",
+      "expectRed": "teardown: no custodian of this run outlives the suite",
+      "cell": "teardown: no custodian of this run outlives the suite (the CI shard-3 leak, as a cell)"
+    },
+    {
+      "name": "the manager keeps a naturally exited seat's handle open",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    a.handle.release?.();\n    this.reapChildrenOf(this.managedPrincipal(a));",
+      "replace": "    this.reapChildrenOf(this.managedPrincipal(a));",
+      "expectRed": "M3 a seat whose child exited on its own is let go",
+      "cell": "M3 a seat whose child exited on its own is let go: its custodian settles while the manager runs"
     }
   ]
 }

@@ -264,7 +264,7 @@ jobs:
       - name: OpenCode cooperative-stop smoke test
         run: pnpm smoke:opencode-coop
 
-  # Native linux-x64 and linux-arm64 SO_PEERCRED helpers, then one pack on x64
+  # Native linux-x64 and linux-arm64 peercred.node and pty.node, then one pack on x64
   # that assembles BOTH into the tarball the ARM load job consumes unchanged.
   # The ARM load job must not rebuild. A queued-never-started job is not a measurement.
   seat-native-linux-x64:
@@ -281,10 +281,12 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Build host native
         run: pnpm --filter @cotal-ai/seat build
+      - name: Native symbol-version ceiling
+        run: node packages/seat/scripts/assert-native-ceiling.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: seat-native-linux-x64
-          path: packages/seat/build/Release/linux-x64/peercred.node
+          path: packages/seat/build/Release/linux-x64/
           if-no-files-found: error
           retention-days: 7
 
@@ -302,10 +304,12 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Build host native
         run: pnpm --filter @cotal-ai/seat build
+      - name: Native symbol-version ceiling
+        run: node packages/seat/scripts/assert-native-ceiling.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: seat-native-linux-arm64
-          path: packages/seat/build/Release/linux-arm64/peercred.node
+          path: packages/seat/build/Release/linux-arm64/
           if-no-files-found: error
           retention-days: 7
 
@@ -334,8 +338,8 @@ jobs:
           path: ${{ runner.temp }}/seat-native-linux-arm64
       - name: Assemble natives and pack
         env:
-          SEAT_NATIVE_X64: ${{ runner.temp }}/seat-native-linux-x64/peercred.node
-          SEAT_NATIVE_ARM64: ${{ runner.temp }}/seat-native-linux-arm64/peercred.node
+          SEAT_NATIVE_X64: ${{ runner.temp }}/seat-native-linux-x64
+          SEAT_NATIVE_ARM64: ${{ runner.temp }}/seat-native-linux-arm64
           SEAT_PACK_DEST: ${{ runner.temp }}/seat-pack
         run: sh scripts/ci-seat-pack.sh
       - uses: actions/upload-artifact@v4
@@ -420,6 +424,13 @@ jobs:
           if (err instanceof Error && err.stack) console.log(err.stack);
           process.exit(1);
           EOF
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: packages/seat/smoke/fixtures/pinned-load.mjs
+          sparse-checkout-cone-mode: false
+          path: src
+      - name: Pinned PTY load through the shipped pty.node
+        run: node src/packages/seat/smoke/fixtures/pinned-load.mjs "${RUNNER_TEMP}/seat-prefix/node_modules/@cotal-ai/seat"
 
   ci-ok:
     # Single required status. It owns the explicit live diagnosis too: adding a separate

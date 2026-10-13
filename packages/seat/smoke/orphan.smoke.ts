@@ -195,7 +195,8 @@ setInterval(() => {}, 1000);
       await until(() => gone(rec.childPid), 10_000),
       { child: state(rec.childPid) },
     );
-    check("O1 the custody record is gone, so nothing points at processes that no longer exist", !existsSync(join(root, rec.id, "record.json")));
+    // The record outlives the custodian: only a proved reap or a durable release removes a seat dir.
+    check("O1 unattended settle keeps the custody record and drops the socket", existsSync(join(root, rec.id, "record.json")) && !existsSync(rec.socket));
     kill(manager.pid as number);
     kill(rec.childPid);
     kill(rec.custodianPid);

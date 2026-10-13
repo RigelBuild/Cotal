@@ -12,7 +12,7 @@
     {
       "name": "M1 skip arm64 completeness in the pack gate",
       "file": "packages/seat/scripts/assert-shipped-natives.mjs",
-      "find": "  { arch: \"arm64\", elfMachine: 183 },",
+      "find": "  { arch: \"arm64\", elfMachine: 183, files: [\"peercred.node\", \"pty.node\"] },",
       "replace": "",
       "expectRed": "one-arch tree is refused before pack",
       "cell": "one-arch tree is refused before pack",
@@ -64,6 +64,34 @@
       "expectRed": "the tarball ships dist/index.js compiled by prepack",
       "cell": "the tarball ships dist/index.js compiled by prepack",
       "note": "Recreates 0.47.0: an assembled tree with no dist packs native helpers but omits its declared JavaScript entrypoint."
+    },
+    {
+      "name": "T1 ship the @lydell prebuilt pty.node in place of the built one",
+      "file": "packages/seat/scripts/build-native.mjs",
+      "find": "assertMachine(ptyOut, \"pty addon\");\n",
+      "replace": "assertMachine(ptyOut, \"pty addon\");\ncpSync(join(root, \"..\", \"..\", \"node_modules\", \".pnpm\", `@lydell+node-pty-linux-${arch}@1.2.0-beta.12`, \"node_modules\", \"@lydell\", `node-pty-linux-${arch}`, \"prebuilds\", `linux-${arch}`, \"pty.node\"), ptyOut);\n",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "the host-built pty.node pins its child: fdinfo Pid matches, SIGKILL is sent, then exited and gone",
+      "cell": "the host-built pty.node pins its child: fdinfo Pid matches, SIGKILL is sent, then exited and gone",
+      "note": "The upstream prebuilt spawns a PTY child but returns no pidfd, so spawnPinned refuses it."
+    },
+    {
+      "name": "T1 restore @lydell/node-pty in the seat dependencies",
+      "file": "packages/seat/package.json",
+      "find": "    \"@xterm/headless\": \"^5.5.0\"\n",
+      "replace": "    \"@xterm/headless\": \"^5.5.0\",\n    \"@lydell/node-pty\": \"1.2.0-beta.12\"\n",
+      "expectRed": "the seat declares no @lydell/node-pty dependency: its PTY is the vendored, pidfd-patched build",
+      "cell": "the seat declares no @lydell/node-pty dependency: its PTY is the vendored, pidfd-patched build",
+      "note": "A restored dependency puts node-pty's pid-addressed kill back in the installed closure."
+    },
+    {
+      "name": "T1 the pack gate forgets pty.node",
+      "file": "packages/seat/scripts/assert-shipped-natives.mjs",
+      "find": "  { arch: \"arm64\", elfMachine: 183, files: [\"peercred.node\", \"pty.node\"] },",
+      "replace": "  { arch: \"arm64\", elfMachine: 183, files: [\"peercred.node\"] },",
+      "expectRed": "a tree missing one arch's pty.node is refused before pack",
+      "cell": "a tree missing one arch's pty.node is refused before pack",
+      "note": "SHIPPED_LINUX_NATIVES must cover both files per arch, or a tarball without the arm64 PTY addon packs."
     }
   ]
 }
