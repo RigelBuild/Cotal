@@ -55,6 +55,10 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Ubuntu 24.04 runners block unprivileged user namespaces via AppArmor; the seat's
+      # reused-pid cell needs one to own ns_last_pid.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Cache nats-server
         id: nats
         uses: actions/cache@v4
@@ -158,6 +162,10 @@ jobs:
           echo "pnpm_target=$pnpm_target" >> "$GITHUB_OUTPUT"
           echo "pnpm_sha=$(/usr/bin/sha256sum "$pnpm_target" | /usr/bin/cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - run: pnpm install --frozen-lockfile
+      # Ubuntu 24.04 runners block unprivileged user namespaces via AppArmor; the seat's
+      # reused-pid cell needs one to own ns_last_pid.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Cache nats-server
         id: nats
         uses: actions/cache@v4

@@ -78,7 +78,8 @@ try {
 
   // The hook holds the manager between the launch and the throw, so the seat is observable here
   // exactly as the rollback will find it: custodian and child running, slot never activated.
-  const seats = readdirSync(seatRoot).filter((id) => existsSync(recordPath(seatRoot, id)));
+  // The root also holds `.launch-<id>` fences, which are not seat ids.
+const seats = readdirSync(seatRoot).filter((id) => /^[0-9a-f]{32}$/.test(id) && existsSync(recordPath(seatRoot, id)));
   if (seats.length !== 1) throw new Error(`expected one seat record under the custody root, found ${seats.length}: ${seats.join(", ")}`);
   const record = readRecord(recordPath(seatRoot, seats[0]!));
   pids.push(record.custodianPid, record.childPid);
