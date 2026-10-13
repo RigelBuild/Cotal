@@ -21,6 +21,7 @@ const check = (condition: unknown, message: string, detail?: unknown): void => {
 
 interface CrashHandle extends AgentHandle {
   crash(): void;
+  released: () => boolean;
 }
 
 const workspaceRoot = mkdtempSync(join(tmpdir(), "cotal-pi-recovery-"));
@@ -47,6 +48,7 @@ const handles: CrashHandle[] = [];
 const servers: Array<ReturnType<typeof startControlServer>> = [];
 const makeHandle = (name: string, spec: LaunchSpec): CrashHandle => {
   let running = true;
+  let released = false;
   const exits = new Set<() => void>();
   let ownedServer: ReturnType<typeof startControlServer> | undefined;
   if (spec.control) {
@@ -82,6 +84,10 @@ const makeHandle = (name: string, spec: LaunchSpec): CrashHandle => {
       for (const fn of [...exits]) fn();
     },
     waitForExit: async () => {},
+    release: () => {
+      released = true;
+    },
+    released: () => released,
     interrupt: () => {},
     attach: () => session,
     crash: () => {
@@ -161,6 +167,7 @@ for (let attempt = 1; attempt <= 3; attempt++) {
   const opts = spawnedOpts.at(-1)!;
   check(opts.continueSession === sessionId, `crash ${attempt} reopens the exact Pi session`);
   check(opts.resume === undefined && opts.prompt === undefined, `crash ${attempt} never replays fork source or initial prompt`);
+  check(handles.at(-2)!.released(), `crash ${attempt} closes the exited seat's handle`);
 }
 
 const inventory = (manager as unknown as { resumeEntry(agent: typeof managed): { launch: { sessionId?: string }; identity: { lifecycleUid: string }; name: string } }).resumeEntry(managed);
@@ -185,6 +192,7 @@ await waitFor(() => !agents.has(managed.name), "crash-loop retirement");
 check(spawnedOpts.length === 3, "the fourth crash starts no replacement process");
 check(!agents.has(managed.name), "crash-loop exhaustion retires the seat");
 check(!existsSync(statePath), "terminal cleanup removes the managed session-state carrier");
+check(handles.at(-1)!.released(), "crash-loop retirement closes the last exited seat's handle");
 
 // Deliberate terminal never restarts.
 const deliberateHandle = makeHandle("pi-stop", { command: "true", args: [], env: {} });
@@ -202,6 +210,32 @@ const before = spawnedOpts.length;
 (manager as unknown as { onAgentExit(agent: typeof deliberate): void }).onAgentExit(deliberate);
 check(spawnedOpts.length === before, "a deliberate terminal starts no replacement");
 check(!agents.has(deliberate.name), "a deliberate terminal follows normal cleanup");
+
+// A recovery that fails to relaunch retires the seat and still closes the exited seat's handle.
+const failingConnector: Connector = {
+  ...connector,
+  name: "smoke-pi-recovery-fails",
+  buildLaunch(): LaunchSpec {
+    throw new Error("relaunch refused");
+  },
+};
+registry.register(failingConnector);
+const failingHandle = makeHandle("pi-fail", { command: "true", args: [], env: {} });
+const failing = {
+  ...managed,
+  name: "pi-fail",
+  id: "failid",
+  agent: failingConnector.name,
+  handle: failingHandle,
+  terminalizing: false,
+  restart: { ...managed.restart, crashes: [], recovering: false, armed: true },
+};
+writeFileSync(statePath, JSON.stringify({ version: 1, sessionId, status: "running" }) + "\n");
+agents.set(failing.name, failing);
+(manager as unknown as { watchExit(agent: typeof failing): void }).watchExit(failing);
+failingHandle.crash();
+await waitFor(() => !agents.has(failing.name), "recovery-failure retirement");
+check(failingHandle.released(), "a failed recovery closes the exited seat's handle");
 
 for (const server of servers) try { server.close(); } catch { /* already closed */ }
 console.log(`pi session recovery smoke: ${checks} checks passed`);
