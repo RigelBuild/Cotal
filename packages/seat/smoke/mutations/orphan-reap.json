@@ -1,0 +1,33 @@
+{
+  "suite": [
+    "packages/seat/smoke/orphan.smoke.ts"
+  ],
+  "guard": "an unattended custodian retains its record, and reap never treats a process identity as proof that descendants are gone",
+  "command": "pnpm --filter @cotal-ai/seat build && pnpm smoke:seat-orphan",
+  "proveWith": "node scripts/mutation-proof.mjs --config packages/seat/smoke/mutations/orphan-reap.json",
+  "why": [
+    "The orphan suite reaps both an unattended seat after its custodian exits and a setsid escapee whose descendant remains alive."
+  ],
+  "mutations": [
+    {
+      "name": "an unattended settled record is not reported reaped",
+      "file": "packages/seat/src/reap.ts",
+      "find": "  return {\n    outcome: \"retained\",\n    reason: \"unprovable\",\n    stop,\n    detail: `seat ${id} has no contained cgroup proof; stop ${stop}`,\n  };",
+      "replace": "  return {\n    outcome: \"reaped\",\n    detail: `seat ${id}: uncontained process tree; stop ${stop}`,\n  } as SeatReapEvidence;",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "O1 a settled orphan reap retains the custody record",
+      "cell": "O1 a settled orphan reap retains the custody record",
+      "note": "Without cgroup proof, the stopped seat must remain retained."
+    },
+    {
+      "name": "a setsid escapee is not reported reaped",
+      "file": "packages/seat/src/reap.ts",
+      "find": "  return {\n    outcome: \"retained\",\n    reason: \"unprovable\",\n    stop,\n    detail: `seat ${id} has no contained cgroup proof; stop ${stop}`,\n  };",
+      "replace": "  return {\n    outcome: \"reaped\",\n    detail: `seat ${id}: empty process-group census; stop ${stop}`,\n  } as SeatReapEvidence;",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "setsid escapee retains the reap after its custodian exits",
+      "cell": "setsid escapee retains the reap after its custodian exits",
+      "note": "A grandchild outside the original session remains alive after the custodian exits."
+    }
+  ]
+}

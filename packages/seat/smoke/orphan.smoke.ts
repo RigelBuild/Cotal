@@ -40,7 +40,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as seat from "../src/index.js";
 import { makeSeatRoot, SEAT_MAX_SOCKET_PATH } from "@cotal-ai/smoke-kit";
-const { adoptSeatSync, launchSeat } = seat;
+const { adoptSeatSync, launchSeat, reapSeat, seatId, bootToken, processStartToken } = seat;
 
 /**
  * The surface this suite is about, resolved through the namespace so a tree with the fix reverted
@@ -195,13 +195,72 @@ setInterval(() => {}, 1000);
       await until(() => gone(rec.childPid), 10_000),
       { child: state(rec.childPid) },
     );
-    // The record outlives the custodian: only a proved reap or a durable release removes a seat dir.
+    // The record outlives the custodian; without containment, reaping cannot prove it gone.
     check("O1 unattended settle keeps the custody record and drops the socket", existsSync(join(root, rec.id, "record.json")) && !existsSync(rec.socket));
+    const reapEvidence = await reapSeat(root, rec.id).catch((e: Error) => e);
+    check(
+      "O1 a settled orphan reap retains the custody record",
+      !(reapEvidence instanceof Error) && reapEvidence.outcome === "retained" && reapEvidence.reason === "unprovable" && reapEvidence.stop === "no-custodian" && existsSync(join(root, rec.id, "record.json")),
+      reapEvidence instanceof Error ? reapEvidence.message : reapEvidence,
+    );
     kill(manager.pid as number);
     kill(rec.childPid);
     kill(rec.custodianPid);
   }
 
+  {
+    const dir = mkdtempSync(join(root, "setsid-escapee-"));
+    const childPidPath = join(dir, "child.pid");
+    const grandchildPidPath = join(dir, "grandchild.pid");
+    const child = spawn(process.execPath, [
+      "-e",
+      "const {spawn}=require('node:child_process'); const fs=require('node:fs'); const [childFile,grandFile]=process.argv.slice(1); fs.writeFileSync(childFile,String(process.pid)); const g=spawn(process.execPath,['-e',\"require('node:fs').writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)\",grandFile],{detached:true,stdio:'ignore'}); g.unref(); setTimeout(()=>process.exit(0),300);",
+      childPidPath,
+      grandchildPidPath,
+    ], { stdio: "ignore" });
+    child.unref();
+    const childPid = child.pid;
+    if (childPid === undefined) throw new Error("setsid fixture child did not expose its pid");
+    let grandchildPid: number | undefined;
+    try {
+      const childReady = await until(() => existsSync(childPidPath), 2_000);
+      const grandchildReady = await until(() => existsSync(grandchildPidPath), 2_000);
+      grandchildPid = Number(readFileSync(grandchildPidPath, "utf8"));
+      const childStat = readFileSync(`/proc/${childPid}/stat`, "utf8");
+      const grandchildStat = readFileSync(`/proc/${grandchildPid}/stat`, "utf8");
+      const childSession = Number(childStat.slice(childStat.lastIndexOf(") ") + 2).split(" ")[3]);
+      const grandchildSession = Number(grandchildStat.slice(grandchildStat.lastIndexOf(") ") + 2).split(" ")[3]);
+      check("setsid escapee fixture starts a separate session", childReady && grandchildReady && grandchildSession === grandchildPid && grandchildSession !== childSession, { childPid, childSession, grandchildPid, grandchildSession });
+      const id = seatId();
+      const boot = bootToken();
+      const childStart = processStartToken(childPid);
+      const record = {
+        version: 1,
+        id,
+        name: "orphan-setsid-escapee",
+        socket: join(root, id, "missing-seat.sock"),
+        token: "missing-token",
+        custodianPid: childPid,
+        childPid,
+        ...(childStart === undefined ? {} : { custodianStart: childStart, childStart }),
+        ...(boot === undefined ? {} : { bootId: boot }),
+      };
+      mkdirSync(join(root, id), { recursive: true, mode: 0o700 });
+      writeFileSync(join(root, id, "record.json"), `${JSON.stringify(record)}\n`);
+      await until(() => gone(childPid), 2_000);
+      const evidence = await reapSeat(root, id, { graceMs: 100 }).catch((e: Error) => e);
+      check(
+        "setsid escapee retains the reap after its custodian exits",
+        grandchildPid !== undefined && !(evidence instanceof Error) && evidence.outcome === "retained" && evidence.reason === "unprovable" && evidence.stop === "no-custodian" && !gone(grandchildPid),
+        { evidence: evidence instanceof Error ? evidence.message : evidence, grandchild: grandchildPid === undefined ? "missing" : state(grandchildPid) },
+      );
+    } finally {
+      try { process.kill(childPid, "SIGKILL"); } catch { /* already gone */ }
+      if (grandchildPid !== undefined) kill(grandchildPid);
+      await until(() => gone(childPid) && (grandchildPid === undefined || gone(grandchildPid)), 2_000);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
   {
     // O2. The bound must not fire under a seat that is merely BETWEEN controllers. A manager that
     // restarts detaches and re-adopts, and a custodian that counted from launch would kill a live
