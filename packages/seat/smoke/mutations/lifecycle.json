@@ -82,17 +82,17 @@
     {
       "name": "restoring group kill violates forged record protection",
       "file": "packages/seat/src/reap.ts",
-      "find": "  const stop = await requestStop(root, id, rec, opts.graceMs ?? 10_000);",
-      "replace": "  try { process.kill(-rec.childPid, \"SIGKILL\"); } catch { /* gone */ }\n  const stop = await requestStop(root, id, rec, opts.graceMs ?? 10_000);",
+      "find": "  const { stop, error } = await requestStop(root, id, rec, opts.graceMs ?? 10_000);",
+      "replace": "  // Mutation safety: never send to pid <= 1; a group send to 1 reaches every process of this uid.\n  if (rec.childPid > 1) try { process.kill(-rec.childPid, \"SIGKILL\"); } catch { /* gone */ }\n  const { stop, error } = await requestStop(root, id, rec, opts.graceMs ?? 10_000);",
       "afterRestore": "pnpm --filter @cotal-ai/seat build",
       "expectRed": "a forged same-uid record is retained and its process-group leader is never signalled",
       "cell": "a forged same-uid record is retained and its process-group leader is never signalled",
-      "note": "A same-uid record can forge a live pid and matching start token; numeric group signaling must remain absent."
+      "note": "A same-uid record can forge a live pid and matching start token; numeric group signaling must remain absent. The replace refuses pid <= 1, which as a group target would reach every process this uid owns."
     },
     {
       "name": "an empty session census returns reaped for a setsid escapee",
       "file": "packages/seat/src/reap.ts",
-      "find": "  return {\n    outcome: \"retained\",\n    reason: \"unprovable\",\n    stop,\n    detail: `seat ${id} has no contained cgroup proof; stop ${stop}`,\n  };",
+      "find": "  return {\n    outcome: \"retained\",\n    reason: \"unprovable\",\n    stop,\n    detail: `seat ${id} has no contained cgroup proof; stop ${stop}${error ? ` (${error})` : \"\"}`,\n  };",
       "replace": "  return {\n    outcome: \"reaped\",\n    detail: `seat ${id} has no process left in its group or session`,\n  } as SeatReapEvidence;",
       "afterRestore": "pnpm --filter @cotal-ai/seat build",
       "expectRed": "a setsid escapee keeps the reap retained and is never signalled",
@@ -206,6 +206,26 @@
       "expectRed": "a reused pid is never signalled: the process that retook the child's pid outlives the startup failure",
       "cell": "a reused pid is never signalled: the process that retook the child's pid outlives the startup failure",
       "note": "A pid-addressed send guarded by parent and liveness checks: a CLONE_PARENT process at the reused pid passes both."
+    },
+    {
+      "name": "write the custody record without the boot it belongs to",
+      "file": "packages/seat/src/custodian.ts",
+      "find": "    ...(bootId === undefined ? {} : { bootId }),\n",
+      "replace": "",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "the custodian stamps the boot its pids belong to",
+      "cell": "the custodian stamps the boot its pids belong to",
+      "note": "An unstamped record is refused by reapSeat, so every seat this custodian launches becomes unreapable rather than misreaped."
+    },
+    {
+      "name": "an unanswered stop request never times out",
+      "file": "packages/seat/src/reap.ts",
+      "find": "    timer = setTimeout(() => resolve({ stop: \"timeout\" }), timeoutMs);",
+      "replace": "    void timer; void timeoutMs;",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "a custodian socket that never answers times out the stop within graceMs, still retained",
+      "cell": "a custodian socket that never answers times out the stop within graceMs, still retained",
+      "note": "Without the bound a silent socket would hang the reap, and with it a manager terminal."
     }
   ]
 }

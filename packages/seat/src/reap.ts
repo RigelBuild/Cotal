@@ -17,24 +17,27 @@ export interface SeatReapOpts {
   graceMs?: number;
 }
 
+type StopResult = { stop: "requested" | "no-custodian" | "timeout"; error?: string };
+
 // The stop goes to the derived socket path, never to a pid from the record; the custodian sends it
 // through its own pinned handle.
-async function requestStop(root: string, id: string, record: SeatRecord, timeoutMs: number): Promise<"requested" | "no-custodian" | "timeout"> {
+async function requestStop(root: string, id: string, record: SeatRecord, timeoutMs: number): Promise<StopResult> {
   const client = new SeatClient({ ...record, socket: socketPath(root, id) });
   let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<"timeout">((resolve) => {
-    timer = setTimeout(() => resolve("timeout"), timeoutMs);
+  const timeout = new Promise<StopResult>((resolve) => {
+    timer = setTimeout(() => resolve({ stop: "timeout" }), timeoutMs);
   });
   try {
     return await Promise.race([
-      client.connect().then(async () => {
+      client.connect().then(async (): Promise<StopResult> => {
         await client.stop("hard");
-        return "requested" as const;
+        return { stop: "requested" };
       }),
       timeout,
     ]);
-  } catch {
-    return "no-custodian";
+  } catch (e) {
+    // A refused hello or stop lands here too; keep its message so the evidence does not hide it.
+    return { stop: "no-custodian", error: (e as Error).message };
   } finally {
     clearTimeout(timer);
     client.close();
@@ -104,11 +107,11 @@ export async function reapSeat(root: string, id: string, opts: SeatReapOpts = {}
     };
   }
 
-  const stop = await requestStop(root, id, rec, opts.graceMs ?? 10_000);
+  const { stop, error } = await requestStop(root, id, rec, opts.graceMs ?? 10_000);
   return {
     outcome: "retained",
     reason: "unprovable",
     stop,
-    detail: `seat ${id} has no contained cgroup proof; stop ${stop}`,
+    detail: `seat ${id} has no contained cgroup proof; stop ${stop}${error ? ` (${error})` : ""}`,
   };
 }

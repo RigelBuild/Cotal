@@ -4,7 +4,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { connect } from "node:net";
+import { connect, createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { adoptSeatSync, bootToken, launchSeat, processStartToken, reapSeat, seatId, SeatClient, type SeatRecord } from "../src/index.js";
@@ -448,6 +448,8 @@ await h.waitForExit();
     );
     check("the custodian stops its child on that request", await until(() => isGone(rec.childPid), 5_000), state(rec.childPid));
     check("the custody record is kept", existsSync(join(root, rec.id, "record.json")), rec.id);
+    // The custodian drops its socket only once it has settled; until then it still answers a stop.
+    await until(() => !existsSync(join(root, rec.id, "seat.sock")), 5_000);
     const second = await reapSeat(root, rec.id).catch((e: Error) => e);
     check(
       "a repeated reap keeps the custody record retained",
@@ -456,6 +458,49 @@ await h.waitForExit();
     );
     try { process.kill(-rec.childPid, "SIGKILL"); } catch { /* already gone */ }
     try { process.kill(rec.custodianPid, "SIGKILL"); } catch { /* already gone */ }
+  }
+
+  {
+    // Layer 2: an unreadable record (here a directory where the file should be) is retained, not absent.
+    const id = seatId();
+    mkdirSync(join(root, id, "record.json"), { recursive: true, mode: 0o700 });
+    const unreadable = await reapSeat(root, id).catch((e: Error) => e);
+    check(
+      "an unreadable custody record is retained, never absent",
+      !(unreadable instanceof Error) && unreadable.outcome === "retained" && unreadable.reason === "unprovable",
+      unreadable instanceof Error ? unreadable.message : unreadable,
+    );
+  }
+
+  {
+    // A socket that accepts and never answers bounds the stop request at graceMs.
+    const id = seatId();
+    mkdirSync(join(root, id), { recursive: true, mode: 0o700 });
+    const silent = createServer(() => {});
+    await new Promise<void>((r) => silent.listen(join(root, id, "seat.sock"), r));
+    // Forge only a pid this test owns, leading its own group: a mutant that signals record pids
+    // must never reach pid 1, -1 or any process outside this suite.
+    const decoy = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+    const decoyPid = decoy.pid;
+    if (decoyPid === undefined || decoyPid <= 1) throw new Error(`decoy sleeper has unusable pid ${String(decoyPid)}`);
+    const forged: SeatRecord = { version: 1, id, name: "silent", socket: join(root, id, "seat.sock"), token: "t", custodianPid: decoyPid, childPid: decoyPid };
+    writeFileSync(join(root, id, "record.json"), `${JSON.stringify(forged)}\n`);
+    const started = Date.now();
+    // Capped here so a missing bound shows as this cell failing, not a hung suite.
+    const silentReap = await Promise.race([
+      reapSeat(root, id, { graceMs: 300 }).catch((e: Error) => e),
+      wait(3_000).then(() => new Error("reap did not return within 3s")),
+    ]);
+    const took = Date.now() - started;
+    // unref: a hung client connection must not keep the suite alive under the mutation.
+    silent.close();
+    silent.unref();
+    try { process.kill(decoyPid, "SIGKILL"); } catch { /* already gone */ }
+    check(
+      "a custodian socket that never answers times out the stop within graceMs, still retained",
+      !(silentReap instanceof Error) && silentReap.outcome === "retained" && silentReap.stop === "timeout" && took < 2_000,
+      { evidence: silentReap instanceof Error ? silentReap.message : silentReap, took },
+    );
   }
 
   {

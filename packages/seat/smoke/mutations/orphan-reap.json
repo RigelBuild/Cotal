@@ -12,7 +12,7 @@
     {
       "name": "an unattended settled record is not reported reaped",
       "file": "packages/seat/src/reap.ts",
-      "find": "  return {\n    outcome: \"retained\",\n    reason: \"unprovable\",\n    stop,\n    detail: `seat ${id} has no contained cgroup proof; stop ${stop}`,\n  };",
+      "find": "  return {\n    outcome: \"retained\",\n    reason: \"unprovable\",\n    stop,\n    detail: `seat ${id} has no contained cgroup proof; stop ${stop}${error ? ` (${error})` : \"\"}`,\n  };",
       "replace": "  return {\n    outcome: \"reaped\",\n    detail: `seat ${id}: uncontained process tree; stop ${stop}`,\n  } as SeatReapEvidence;",
       "afterRestore": "pnpm --filter @cotal-ai/seat build",
       "expectRed": "O1 a settled orphan reap retains the custody record",
@@ -22,7 +22,7 @@
     {
       "name": "a setsid escapee is not reported reaped",
       "file": "packages/seat/src/reap.ts",
-      "find": "  return {\n    outcome: \"retained\",\n    reason: \"unprovable\",\n    stop,\n    detail: `seat ${id} has no contained cgroup proof; stop ${stop}`,\n  };",
+      "find": "  return {\n    outcome: \"retained\",\n    reason: \"unprovable\",\n    stop,\n    detail: `seat ${id} has no contained cgroup proof; stop ${stop}${error ? ` (${error})` : \"\"}`,\n  };",
       "replace": "  return {\n    outcome: \"reaped\",\n    detail: `seat ${id}: empty process-group census; stop ${stop}`,\n  } as SeatReapEvidence;",
       "afterRestore": "pnpm --filter @cotal-ai/seat build",
       "expectRed": "setsid escapee retains the reap after its custodian exits",
