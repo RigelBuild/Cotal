@@ -2,7 +2,7 @@
  * Seat checkpoints: the durable description of one preserved seat, sufficient to start it on
  * another host, plus the admission gates a destination runs before it launches anything.
  *
- * This is the machine-local half of `docs/design/session-recovery.md` sections 1.3 (steps 7 and 8),
+ * This is the machine-local half of RigelBuild/docs `docs/designs/cotal/session-recovery.md` sections 1.3 (steps 7 and 8),
  * 2.2 and 5.4. It lives in `@cotal-ai/workspace` because both the CLI (which cuts and admits) and
  * the manager (which owns the resume entry) depend on this package and never on each other.
  *

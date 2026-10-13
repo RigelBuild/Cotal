@@ -23,7 +23,7 @@ import {
  * This module DECIDES NOTHING ABOUT POSTURE. It reports problems as strings and absence as a list
  * of missing keys; whether that is a fail-soft `down` (the feed) or a loud throw (eviction) belongs
  * to the caller, because the two postures are deliberately different and flattening them here is
- * exactly the refactor `docs/design/u3-membership-sys-injection.md` §4 exists to prevent.
+ * exactly the refactor RigelBuild/docs `docs/designs/cotal/u3-membership-sys-injection.md` §4 exists to prevent.
  */
 
 /** The `$SYS` creds' source: the store to read them from, the SPACE they are scoped to, and whether
@@ -81,7 +81,7 @@ function rotationRefusal(root: string): string | undefined {
  *  so the operator whose observer is missing is handed a command, runs it, and is refused — with
  *  the refusal itself explaining that the remedy does not exist yet. That is advice which cannot
  *  succeed, the same defect `healMembershipDataCreds`'s own comment records, and it was reachable
- *  on a real root (`docs/design/space-segmentation-p7-p1.md` §6, probe-executed).
+ *  on a real root (RigelBuild/docs `docs/designs/cotal/space-segmentation-p7-p1.md` §6, probe-executed).
  *
  *  So the workstation arm consults the guard before naming its command, and where the guard would
  *  refuse it states the truth instead: the guard's own words, then the reason no other command can

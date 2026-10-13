@@ -788,8 +788,7 @@ if (process.argv.includes("--self-test")) {
   if (hostJob) {
     // A reader who cannot find the job name in the file learns nothing from a green cell, so the
     // ACCEPT leg is asserted first: the name really is present and really is what we think.
-    const docPaths = [join(repoRootForDocs(), "docs", "UPGRADING.md"),
-      join(repoRootForDocs(), "docs", "design", "upgrade-section-gate.md")];
+    const docPaths = [join(repoRootForDocs(), "docs", "UPGRADING.md")];
     for (const dp of docPaths) {
       if (!existsSync(dp)) { cell(`documentation present: ${dp}`, false, dp); continue; }
       const doc = readFileSync(dp, "utf8");
@@ -885,7 +884,7 @@ if (process.argv.includes("--self-test")) {
     staleJobClaims('"body": "CI runs it as a step of the `attribution` job, grading each\\nPR."',
       "attribution", ["unit", "ci-ok"]).length === 0);
 
-  const EXPECTED = 94;
+  const EXPECTED = 92;
   // A SKIP MUST BE JUSTIFIED BY THE REPOSITORY THE SUITE IS ACTUALLY IN, and this cell is the
   // only thing that checks it. Found by mutation: forcing the probe true on a healthy clone made
   // the suite skip two real cells and still print OK, because every other shallow cell reasons

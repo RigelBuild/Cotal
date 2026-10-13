@@ -1,6 +1,6 @@
 /**
  * The per-agent standing secrets' segmentation gate — series P1 of
- * `docs/design/space-segmentation-p7-p1.md` (§1's second inventory, §3's second placement, §4).
+ * RigelBuild/docs `docs/designs/cotal/space-segmentation-p7-p1.md` (§1's second inventory, §3's second placement, §4).
  * Hermetic — no broker, no network. The foundation's own rules are proved next door in
  * space-segmentation.smoke.ts; this asserts what P1 adds on top of it.
  *

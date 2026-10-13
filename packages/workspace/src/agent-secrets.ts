@@ -1,6 +1,6 @@
 /**
  * The per-agent standing secrets, keyed per space — series P1 of
- * `docs/design/space-segmentation-p7-p1.md` (§1's second inventory, §3's second placement).
+ * RigelBuild/docs `docs/designs/cotal/space-segmentation-p7-p1.md` (§1's second inventory, §3's second placement).
  *
  * `<name>.creds`, `<name>.actor-token`, `<name>.sentinel.creds`, their per-incarnation
  * `<name>.<lifecycleUid>.*` counterparts and the non-secret `<base>.auth-health.json` all sat

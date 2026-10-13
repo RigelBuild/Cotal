@@ -1,6 +1,6 @@
 /**
  * The space-segmentation foundation gate (P7/P1 shared design,
- * `docs/design/space-segmentation-p7-p1.md` §2 and §3). Hermetic — no broker, no network.
+ * RigelBuild/docs `docs/designs/cotal/space-segmentation-p7-p1.md` §2 and §3). Hermetic — no broker, no network.
  *
  * Four guarantees, none of which the codebase asserted before:
  *
