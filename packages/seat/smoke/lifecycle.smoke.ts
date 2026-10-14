@@ -71,8 +71,8 @@ type Owned = { pid: number; start: string | undefined };
 /** Pids a T1 cell leaves behind on purpose (or a mutant leaves by mistake); killed in `finally`. */
 const strays: Owned[] = [];
 const isGone = (pid: number): boolean => state(pid) === "gone" || state(pid) === "Z";
-/** Signal only the process this suite captured: a changed start token means the pid was reused.
- *  `group` sends to the process group that pid leads. */
+/** For pids that are not this suite's direct children (those go through their ChildProcess). A changed
+ *  start token means the pid was reused; `group` sends to the process group that pid leads. */
 const killOwned = (pid: number, start: string | undefined, group = false): void => {
   if (pid <= 1 || start === undefined || processStartToken(pid) !== start) return;
   try { process.kill(group ? -pid : pid, "SIGKILL"); } catch { /* already gone */ }
@@ -182,22 +182,15 @@ try {
     }, 10_000);
     check("isolated worker fixture armed", armed);
     const ids = JSON.parse(readFileSync(ready, "utf8")) as { workerPid: number; childPid: number; custodianPid: number; id: string };
-    killOwned(ids.workerPid, processStartToken(ids.workerPid));
+    owner.kill("SIGKILL");
     check("the fixture killed its actual worker process", await until(() => state(ids.workerPid) === "gone", 5_000), ids);
     check(
       "worker death leaves the custodial child PID running",
       await until(() => state(ids.childPid) !== "gone" && state(ids.childPid) !== "Z", 5_000),
       { child: state(ids.childPid), custodian: state(ids.custodianPid) },
     );
-    const adopted = adoptSeatSync({
-      version: 1,
-      id: ids.id,
-      name: "survive",
-      socket: join(root, ids.id, "seat.sock"),
-      token: JSON.parse(readFileSync(join(root, ids.id, "record.json"), "utf8")).token,
-      custodianPid: ids.custodianPid,
-      childPid: ids.childPid,
-    });
+    // The full on-disk record, so cleanup keeps the start tokens that prove these pids are ours.
+    const adopted = adoptSeatSync(JSON.parse(readFileSync(join(root, ids.id, "record.json"), "utf8")) as SeatRecord);
     handles.push(adopted);
     check("adopt: successor proxy talks to the surviving seat", (await adopted.attach().backlog()).length >= 0);
     adopted.stop({ graceful: false });
@@ -492,7 +485,6 @@ await h.waitForExit();
     const decoy = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
     const decoyPid = decoy.pid;
     if (decoyPid === undefined || decoyPid <= 1) throw new Error(`decoy sleeper has unusable pid ${String(decoyPid)}`);
-    const decoyStart = processStartToken(decoyPid);
     const forged: SeatRecord = { version: 1, id, name: "silent", socket: join(root, id, "seat.sock"), token: "t", custodianPid: decoyPid, childPid: decoyPid };
     writeFileSync(join(root, id, "record.json"), `${JSON.stringify(forged)}\n`);
     const started = Date.now();
@@ -506,7 +498,7 @@ await h.waitForExit();
     for (const c of accepted) c.destroy();
     silent.close();
     silent.unref();
-    killOwned(decoyPid, decoyStart);
+    decoy.kill("SIGKILL");
     check(
       "a custodian socket that never answers times out the stop within graceMs, still retained",
       !(silentReap instanceof Error) && silentReap.outcome === "retained" && silentReap.stop === "timeout" && took < 2_000,
@@ -539,7 +531,6 @@ await h.waitForExit();
     sleeper.unref();
     const sleeperPid = sleeper.pid;
     if (sleeperPid === undefined || sleeperPid <= 1) throw new Error("detached sleeper did not expose a usable pid");
-    const sleeperStart = processStartToken(sleeperPid);
     try {
       const started = await until(() => processStartToken(sleeperPid) !== undefined, 1_000);
       const start = processStartToken(sleeperPid);
@@ -570,7 +561,7 @@ await h.waitForExit();
         evidence instanceof Error ? evidence.message : evidence,
       );
     } finally {
-      killOwned(sleeperPid, sleeperStart);
+      sleeper.kill("SIGKILL");
       await until(() => isGone(sleeperPid), 2_000);
     }
   }

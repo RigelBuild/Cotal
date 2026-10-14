@@ -94,7 +94,8 @@ const until = async (p: () => boolean, ms: number): Promise<boolean> => {
   while (!p() && Date.now() < deadline) await wait(50);
   return p();
 };
-/** Signal only the process this suite captured: a changed start token means the pid was reused. */
+/** For pids that are not this suite's direct children (those go through their ChildProcess). A changed
+ *  start token means the pid was reused. */
 const kill = (pid: number, start: string | undefined): void => {
   if (pid <= 1 || start === undefined || processStartToken(pid) !== start) return;
   try {
@@ -167,7 +168,6 @@ setInterval(() => {}, 1000);
 `,
     );
     const manager = spawn(process.execPath, [managerSrc, JSON.stringify(rec)], { stdio: ["ignore", "pipe", "ignore"] });
-    const managerStart = processStartToken(manager.pid as number);
     const adopted = await new Promise<boolean>((r) => {
       const t = setTimeout(() => r(false), 30_000);
       manager.stdout?.on("data", (d: Buffer) => {
@@ -179,7 +179,7 @@ setInterval(() => {}, 1000);
     });
     check("O1 armed: a separate manager process adopted the seat", adopted);
     // The bound only starts once the controller is gone, so the window must be measured from HERE.
-    kill(manager.pid as number, managerStart);
+    manager.kill("SIGKILL");
     const killedAt = Date.now();
     const exited = await until(() => gone(rec.custodianPid), BOUND_MS * 4);
     const elapsed = Date.now() - killedAt;
