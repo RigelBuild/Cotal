@@ -103,6 +103,22 @@
       "replace": "",
       "expectRed": "peer uid: the custodian and its child run as the agent uid",
       "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T6-M3 read a seat file through a planted symlink",
+      "file": "packages/seat/src/record.ts",
+      "find": "  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);\n",
+      "replace": "  const fd = openSync(path, constants.O_RDONLY);\n",
+      "expectRed": "forged record: the agent's symlinked record.json is refused, not followed",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T6-M4 adopt the socket a record names",
+      "file": "packages/seat/src/launcher.ts",
+      "find": "  return { ...rec, socket: socketPath(root, id) };\n",
+      "replace": "  return rec;\n",
+      "expectRed": "forged record: adopt derives the socket from the root and id, not the record",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
     }
   ]
 }

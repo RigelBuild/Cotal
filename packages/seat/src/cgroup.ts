@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { accessSync, closeSync, constants, mkdirSync, openSync, readFileSync, rmdirSync, statfsSync, statSync, writeSync, type Stats } from "node:fs";
+import { accessSync, closeSync, constants, mkdirSync, openSync, readFileSync, realpathSync, rmdirSync, statfsSync, statSync, writeSync, type Stats } from "node:fs";
 import { dirname, join, posix } from "node:path";
 import { assertSeatId } from "./record.js";
 
@@ -40,13 +40,48 @@ export function resolveCgroupBase(): string | undefined {
     // Write access alone is not delegation: every scope under a user manager is owned by that user.
     const unit = posix.basename(base);
     if (!/\.(scope|service)$/.test(unit)) return undefined;
+    const systemctl = trustedSystemctl();
+    if (systemctl === undefined) return undefined;
     // The path, not the euid, names the owning manager: a mapped root in a user namespace has euid 0.
     const manager = /\/user@\d+\.service\//.test(base) ? ["--user"] : [];
-    const r = spawnSync("systemctl", [...manager, "show", unit, "-p", "Delegate", "--value"], { encoding: "utf8", timeout: 5_000 });
+    const r = spawnSync(systemctl, [...manager, "show", unit, "-p", "Delegate", "--value"], { encoding: "utf8", timeout: 5_000 });
     return r.status === 0 && r.stdout.trim() === "yes" ? base : undefined;
   } catch {
     return undefined;
   }
+}
+
+const SYSTEMCTL_PATHS = ["/usr/bin/systemctl", "/bin/systemctl", "/run/current-system/sw/bin/systemctl"];
+
+/** The uids that own the system's binaries: 0, plus the overflow uid inside a user namespace, where
+ *  real root is unmapped. Only a non-initial namespace's own root can map itself, never the outside root. */
+function systemOwners(): number[] {
+  const initial = /^\s*0\s+0\s+4294967295\s*$/.test(readFileSync("/proc/self/uid_map", "utf8"));
+  return initial ? [0] : [0, Number(readFileSync("/proc/sys/kernel/overflowuid", "utf8").trim())];
+}
+
+/** A root manager may run this, so never resolve it through an inherited PATH: the first fixed path
+ *  whose real file and every ancestor are system-owned and not group- or world-writable. A sticky
+ *  ancestor is accepted (the Nix store is 1775): no other user can replace root's entry in it. */
+function trustedSystemctl(): string | undefined {
+  const owners = systemOwners();
+  for (const candidate of SYSTEMCTL_PATHS) {
+    let real: string;
+    try {
+      real = realpathSync(candidate);
+    } catch {
+      continue;
+    }
+    let ok = true;
+    for (let p = real; ; p = dirname(p)) {
+      const st = statSync(p);
+      const sticky = p !== real && (st.mode & 0o1000) !== 0;
+      if (!owners.includes(st.uid) || ((st.mode & 0o022) !== 0 && !sticky)) ok = false;
+      if (!ok || p === dirname(p)) break;
+    }
+    if (ok) return real;
+  }
+  return undefined;
 }
 
 /** A caller-supplied seat cgroup must be this seat's cgroup under this process's own base, on

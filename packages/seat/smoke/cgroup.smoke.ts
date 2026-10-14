@@ -5,7 +5,7 @@ import { chmodSync, chownSync, closeSync, existsSync, mkdirSync, mkdtempSync, re
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { checkSeatRelease, launchSeat, processStartToken, reapSeat, sealSeatLaunch, seatCgroupContained, seatCgroupPath, seatCgroupPopulated, seatId, type SeatLaunchSpec } from "../src/index.js";
+import { checkSeatRelease, launchSeat, loadSeat, processStartToken, socketPath, reapSeat, sealSeatLaunch, seatCgroupContained, seatCgroupPath, seatCgroupPopulated, seatId, type SeatLaunchSpec } from "../src/index.js";
 import { removeSeatCgroup } from "../src/cgroup.js";
 import { setCustodianTestSeam, setLauncherTestSeam } from "../src/launcher.js";
 import { pidfdOpen, pidfdSignal } from "../src/peercred.js";
@@ -400,6 +400,36 @@ s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,
         check("peer uid: the launcher's uid gets the hello the agent uid was refused", ownReplies.length === 1 && ownReplies[0] === "ok", ownReplies);
         const cg = { path: seatCgroupPath(base, id), agentUid };
         check("peer uid: the seat survives the agent's stop", child !== undefined && !gone(child.pid) && seatCgroupPopulated(cg));
+        // The agent owns its seat directory. It forges the record two ways, as the agent uid.
+        const recPath = join(root, id, "record.json");
+        const original = readFileSync(recPath, "utf8");
+        const decoy = file("decoy.json");
+        writeFileSync(decoy, original);
+        const asAgentSh = (script: string, ...args: string[]): number | null =>
+          spawnSync(agentAs[0] ?? "", [...agentAs.slice(1), "sh", "-c", script, "sh", ...args], { stdio: "ignore", timeout: 15_000, env }).status;
+        const linked = asAgentSh('rm -f "$1" && ln -s "$2" "$1"', recPath, decoy);
+        let followed = "";
+        try {
+          loadSeat(root, id);
+          followed = "followed";
+        } catch (e) {
+          followed = (e as NodeJS.ErrnoException).code ?? (e as Error).message;
+        }
+        check("forged record: the agent's symlinked record.json is refused, not followed", linked === 0 && followed === "ELOOP", { linked, followed });
+        const forged = JSON.stringify({ ...JSON.parse(original), id: seatId(), socket: file("evil.sock") });
+        const swapped = asAgentSh('rm -f "$1" && printf %s "$2" > "$1"', recPath, forged);
+        let named = "";
+        try {
+          loadSeat(root, id);
+          named = "adopted";
+        } catch (e) {
+          named = (e as Error).message;
+        }
+        check("forged record: a record naming another seat is refused at adopt", swapped === 0 && /refusing to adopt/.test(named), { swapped, named });
+        const sameId = JSON.stringify({ ...JSON.parse(original), socket: file("evil.sock") });
+        asAgentSh('rm -f "$1" && printf %s "$2" > "$1"', recPath, sameId);
+        const loaded = loadSeat(root, id);
+        check("forged record: adopt derives the socket from the root and id, not the record", loaded.socket === socketPath(root, id), loaded.socket);
         const evidence = await reapSeat(root, id, { cgroup: cg });
         check("peer uid: the agent-uid seat is reaped through its cgroup", evidence.outcome === "reaped" && child !== undefined && gone(child.pid), evidence);
         break;

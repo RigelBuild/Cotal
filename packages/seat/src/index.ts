@@ -4,7 +4,7 @@ export { adoptSeat, adoptSeatSync, type SeatHandle, type SeatAttachSession } fro
 export { assertSeatId, bootToken, fencePath, processStartToken, readRecord, recordPath, seatId, socketPath, type SeatRecord } from "./record.js";
 export { ptyNativePath, spawnPinned, type ChildHandle, type PinnedPty } from "./pty.js";
 export { censusCustodians, checkSeatRelease, reapSeat, removeSeatCustody, sealSeatLaunch, type CustodianSighting, type SeatReapEvidence, type SeatReapOpts, type SeatReleaseCheck, type SeatRetainReason } from "./reap.js";
-export { resolveCgroupBase, seatCgroupContained, seatCgroupPath, seatCgroupPopulated, type SeatCgroup } from "./cgroup.js";
+export { idList, resolveCgroupBase, seatCgroupContained, seatCgroupPath, seatCgroupPopulated, type SeatCgroup } from "./cgroup.js";
 export { SeatClient } from "./client.js";
 export { runCustodian, type CustodianLaunch } from "./custodian.js";
 export { StartupConfirmMatcher, normalizeConfirmText, unmatchedConfirmMessage } from "./startup-confirm.js";

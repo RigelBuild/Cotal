@@ -19,7 +19,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync, statSync } from "node:fs";
 import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
@@ -36,7 +36,7 @@ import type { Connector, LaunchOpts, LaunchSpec } from "@cotal-ai/core";
 import { Manager } from "../src/manager.js";
 import { LegacyPtyRuntime } from "../src/runtime/pty.js";
 import { CustodialPtyRuntime } from "../src/runtime/custodial-pty.js";
-import { loadSeat } from "@cotal-ai/seat";
+import { launchSeat, loadSeat, seatCgroupContained, seatId } from "@cotal-ai/seat";
 import { registry } from "@cotal-ai/core";
 import { agentCredsDir, agentLifecycleSecretFilePaths, authDir, renewalRecordPath, saveSpaceAuth } from "@cotal-ai/workspace";
 import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
@@ -151,14 +151,18 @@ registry.register(wrongUidCon);
 registry.register(wrongUidRegCon);
 registry.register(bypassKindCon);
 
-const mgr = new Manager({ space, servers: SERVERS, runtime: "pty", workspaceRoot });
 // COTAL_SEAT_AGENT_UID selects the delegated proof (T6): the custodial runtime under its own cgroup,
 // seats under a distinct uid. Unset keeps the legacy pty, which has no seat a despawn must prove gone.
 const delegated = process.env.COTAL_SEAT_AGENT_UID !== undefined;
+if (delegated) {
+  // The agent uid traverses into its seat and creds; mkdtemp made the run dir 0700. The Manager builds
+  // its own runtime first, which refuses a root (default ~/.cotal) the agent cannot reach.
+  chmodSync(dir, 0o711);
+  process.env.COTAL_SEAT_ROOT = join(dir, "seats");
+}
+const mgr = new Manager({ space, servers: SERVERS, runtime: "pty", workspaceRoot });
 let custodial: CustodialPtyRuntime | undefined;
 if (delegated) {
-  // The agent uid traverses into its seat and creds; mkdtemp made the run dir 0700.
-  chmodSync(dir, 0o711);
   custodial = new CustodialPtyRuntime({ root: join(dir, "seats") });
   if (custodial.cgroupBase === undefined || custodial.agentUid === process.geteuid?.())
     throw new Error(`delegated mode needs a Delegate=yes scope and a distinct agent uid; got base ${String(custodial.cgroupBase)}, agent uid ${custodial.agentUid}`);
@@ -223,13 +227,44 @@ try {
     console.log("1b. delegated: the seat runs as the agent uid, which reads only its own creds and cannot drive the seat:");
     const seatsRoot = custodial.root;
     const rec = readdirSync(seatsRoot).filter((e) => !e.startsWith(".")).map((id) => loadSeat(seatsRoot, id)).find((r) => r.name === "w1");
-    const uidOfPid = (pid: number): number => Number(/^Uid:\s+\d+\s+(\d+)/m.exec(existsSync(`/proc/${pid}/status`) ? readFileSync(`/proc/${pid}/status`, "utf8") : "")?.[1] ?? "-1");
+    const statusOf = (pid: number): string => (existsSync(`/proc/${pid}/status`) ? readFileSync(`/proc/${pid}/status`, "utf8") : "");
+    const uidOfPid = (pid: number): number => Number(/^Uid:\s+\d+\s+(\d+)/m.exec(statusOf(pid))?.[1] ?? "-1");
     check("w1's agent process runs as the agent uid", rec !== undefined && uidOfPid(rec.childPid) === custodial.agentUid, rec && uidOfPid(rec.childPid));
+    // Read only to assert, never to signal: libuv's setgroups(0) leaves no manager group behind.
+    const groups = rec === undefined ? "none" : (/^Groups:(.*)$/m.exec(statusOf(rec.custodianPid))?.[1] ?? "none").trim();
+    check("w1's custodian carries no supplementary groups", groups === "", groups);
     const creds = credsFile("w1", uid1);
     const read = asAgent("process.stdout.write(String(require('fs').readFileSync(process.argv[1]).length))", creds);
     check("the agent uid reads its own creds file", read.status === 0 && Number(read.out) > 0, read);
+    const write = asAgent("require('fs').appendFileSync(process.argv[1], 'x')", creds);
+    const st = statSync(creds);
+    check("the agent uid cannot rewrite its creds file, which stays manager-owned and 0640",
+      write.status !== 0 && st.uid === process.geteuid?.() && (st.mode & 0o777) === 0o640, { write, uid: st.uid, mode: (st.mode & 0o777).toString(8) });
     const list = asAgent("require('fs').readdirSync(process.argv[1])", dirname(creds));
     check("the agent uid cannot list the creds directory", list.status !== 0, list);
+    // A seat whose root the agent cannot reach fails at construction, not at its first launch.
+    const sealed = mkdtempSync(join(dir, "sealed-"));
+    let refusal = "";
+    try {
+      new CustodialPtyRuntime({ root: join(sealed, "seats"), cgroupBase: custodial.cgroupBase, agentUid: custodial.agentUid });
+    } catch (e) {
+      refusal = (e as Error).message;
+    }
+    check("a custody root under a directory the agent cannot traverse is refused at construction", /cannot traverse/.test(refusal), refusal);
+    // The seat dir's owner is the launch uid. A runtime set to another uid must not prove containment for it.
+    const side = { kind: "pty" as const, id: seatId() };
+    launchSeat({ root: seatsRoot, name: "uid-side", id: side.id, spec: { command: process.execPath, args: ["-e", "setInterval(()=>{},1e9)"], env: { PATH: process.env.PATH ?? "" } }, cwd: "/", cgroupBase: custodial.cgroupBase, agentUid: custodial.agentUid });
+    const sidePath = `${String(custodial.cgroupBase)}/seat-${side.id}`;
+    // Another real user whose containment holds here, so only the launch-uid binding can keep the reap retained.
+    const otherUid = spawnSync("getent", ["passwd"], { encoding: "utf8" }).stdout.split("\n").map((l) => Number(l.split(":")[2]))
+      .find((u) => Number.isInteger(u) && u > 0 && u !== custodial?.agentUid && seatCgroupContained({ path: sidePath, agentUid: u }));
+    check("another uid whose seat containment would hold exists", otherUid !== undefined, otherUid);
+    const other = new CustodialPtyRuntime({ root: seatsRoot, cgroupBase: custodial.cgroupBase, agentUid: otherUid ?? custodial.agentUid });
+    const mismatched = await other.reap(side);
+    check("a seat launched under another uid reaps as retained, its cgroup left in place",
+      mismatched.outcome === "retained" && existsSync(sidePath), { mismatched, cgroup: existsSync(sidePath) });
+    const matched = await custodial.reap(side);
+    check("the launching uid's runtime reaps it through its cgroup", matched.outcome === "reaped" && !existsSync(sidePath), matched);
     if (rec) {
       // One connection per op: the custodian closes the socket after a peer uid mismatch.
       const PEER =
