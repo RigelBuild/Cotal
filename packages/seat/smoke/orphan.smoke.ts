@@ -34,11 +34,12 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as seat from "../src/index.js";
+import { pidfdOpen, pidfdSignal } from "../src/peercred.js";
 import { makeSeatRoot, SEAT_MAX_SOCKET_PATH } from "@cotal-ai/smoke-kit";
 const { adoptSeatSync, launchSeat, reapSeat, seatId, bootToken, processStartToken } = seat;
 
@@ -94,14 +95,18 @@ const until = async (p: () => boolean, ms: number): Promise<boolean> => {
   while (!p() && Date.now() < deadline) await wait(50);
   return p();
 };
-/** For pids that are not this suite's direct children (those go through their ChildProcess). A changed
- *  start token means the pid was reused. */
+/** For pids that are not this suite's direct children. The pidfd pins one process before its start
+ *  token is checked, so a reused pid is never signalled. */
 const kill = (pid: number, start: string | undefined): void => {
-  if (pid <= 1 || start === undefined || processStartToken(pid) !== start) return;
+  if (pid <= 1 || start === undefined) return;
+  const fd = pidfdOpen(pid);
+  if (fd === undefined) return;
   try {
-    process.kill(pid, "SIGKILL");
+    if (processStartToken(pid) === start) pidfdSignal(fd, "SIGKILL");
   } catch {
     /* already gone */
+  } finally {
+    closeSync(fd);
   }
 };
 

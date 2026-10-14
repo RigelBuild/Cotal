@@ -2,13 +2,14 @@
  * Seat behavior cells plus worker-death survival and wait-exit close settlement.
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { connect, createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { adoptSeatSync, bootToken, launchSeat, processStartToken, reapSeat, seatId, SeatClient, type SeatRecord } from "../src/index.js";
 import { setCustodianTestSeam } from "../src/launcher.js";
+import { pidfdOpen, pidfdSignal } from "../src/peercred.js";
 import type { CustodianTestSeam } from "../src/custodian.js";
 import { GRACE_MS } from "../src/protocol.js";
 import { makeSeatRoot } from "@cotal-ai/smoke-kit";
@@ -71,11 +72,17 @@ type Owned = { pid: number; start: string | undefined };
 /** Pids a T1 cell leaves behind on purpose (or a mutant leaves by mistake); killed in `finally`. */
 const strays: Owned[] = [];
 const isGone = (pid: number): boolean => state(pid) === "gone" || state(pid) === "Z";
-/** For pids that are not this suite's direct children (those go through their ChildProcess). A changed
- *  start token means the pid was reused; `group` sends to the process group that pid leads. */
-const killOwned = (pid: number, start: string | undefined, group = false): void => {
-  if (pid <= 1 || start === undefined || processStartToken(pid) !== start) return;
-  try { process.kill(group ? -pid : pid, "SIGKILL"); } catch { /* already gone */ }
+/** For pids that are not this suite's direct children. The pidfd pins one process before its start
+ *  token is checked, so a reused pid is never signalled. */
+const killOwned = (pid: number, start: string | undefined): void => {
+  if (pid <= 1 || start === undefined) return;
+  const fd = pidfdOpen(pid);
+  if (fd === undefined) return;
+  try {
+    if (processStartToken(pid) === start) pidfdSignal(fd, "SIGKILL");
+  } catch { /* already gone */ } finally {
+    closeSync(fd);
+  }
 };
 /** The pid a fixture child wrote, with its start token read at once so a later kill can prove it. */
 const readPid = (path: string): Owned | undefined => {
@@ -432,7 +439,8 @@ await h.waitForExit();
       name: "reap-live",
       spec: {
         command: process.execPath,
-        args: ["-e", "require('child_process').spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' }); setInterval(()=>{},1000)"],
+        // The descendant exits when its parent's pipe closes, so cleanup needs no group signal.
+        args: ["-e", "require('child_process').spawn(process.execPath, ['-e', 'process.stdin.on(\"end\",()=>process.exit(0));process.stdin.resume()'], { stdio: ['pipe', 'ignore', 'ignore'] }); setInterval(()=>{},1000)"],
         env: { PATH: process.env.PATH ?? "" },
       },
       cwd: process.cwd(),
@@ -457,7 +465,7 @@ await h.waitForExit();
       !(second instanceof Error) && second.outcome === "retained" && second.reason === "unprovable" && second.stop === "no-custodian",
       second instanceof Error ? second.message : second,
     );
-    killOwned(rec.childPid, rec.childStart, true);
+    killOwned(rec.childPid, rec.childStart);
     killOwned(rec.custodianPid, rec.custodianStart);
   }
 

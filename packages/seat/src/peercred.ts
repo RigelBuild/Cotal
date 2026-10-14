@@ -16,6 +16,7 @@ type PeercredNative = {
   tryLockFd: (fd: number) => boolean;
   pidfdSignal: (pidfd: number, sig: "SIGTERM" | "SIGKILL") => "sent" | "gone";
   pidfdExited: (pidfd: number) => boolean;
+  pidfdOpen: (pid: number) => number | null;
 };
 
 export const LINUX_NATIVE_ARCHES = ["x64", "arm64"] as const;
@@ -75,6 +76,11 @@ export function tryLockFd(fd: number): boolean {
 /** pidfd_send_signal; ESRCH is "gone", any other failure throws. */
 export function pidfdSignal(pidfd: number, sig: "SIGTERM" | "SIGKILL"): "sent" | "gone" {
   return loadNative().pidfdSignal(pidfd, sig);
+}
+
+/** pidfd_open; undefined when no process has that pid. The caller owns and must close the fd. */
+export function pidfdOpen(pid: number): number | undefined {
+  return loadNative().pidfdOpen(pid) ?? undefined;
 }
 
 /** poll(POLLIN, 0) on the pidfd: true once the process it names has exited. */
