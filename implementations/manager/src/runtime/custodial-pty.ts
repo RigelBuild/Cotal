@@ -45,7 +45,9 @@ export class CustodialPtyRuntime implements ReleasableRuntime {
     this.agentUid = opts.agentUid ?? envAgentUid() ?? euid;
     // Fail at construction, not at the first spawn: launchSeat would refuse every seat anyway.
     if (this.agentUid !== euid && euid !== 0) throw new Error(`seat agent uid ${this.agentUid} differs from this manager's uid ${euid}; a distinct agent uid needs a manager running with euid 0`);
-    this.cgroupBase = opts.cgroupBase ?? (process.platform === "linux" ? resolveCgroupBase() : undefined);
+    // An explicit base still needs the operator's delegation declaration, or layer 3 stays off.
+    const declared = process.env[CGROUP_DELEGATED_ENV] === "1";
+    this.cgroupBase = process.platform !== "linux" || !declared ? undefined : (opts.cgroupBase ?? resolveCgroupBase());
     if (process.platform === "linux" && this.cgroupBase === undefined)
       console.error(`custodial pty: no delegated cgroup v2 base (set ${CGROUP_DELEGATED_ENV}=1 in a Delegate=yes unit whose own cgroup this euid can write); seat cgroups are off and reaps of live seats stay retained`);
     mkdirSync(this.root, { recursive: true, mode: 0o700 });
