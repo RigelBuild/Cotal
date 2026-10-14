@@ -13,8 +13,8 @@
     {
       "name": "retire the lifecycle without reaping the orphan process",
       "file": "implementations/manager/src/manager.ts",
-      "find": "      await this.reapOrphanSeat(a, cur.row.runtime);\n",
-      "replace": "\n",
+      "find": "      if (released === undefined) await this.reapOrphanSeat(a, cur.row.runtime);\n",
+      "replace": "      if (released === undefined) void 0;\n",
       "expectRed": "successor reaps the orphan by the row's reference and RETAINS it (unprovable, refused, release remedy)",
       "cell": "successor reaps the orphan by the row's reference and RETAINS it (unprovable, refused, release remedy)"
     }

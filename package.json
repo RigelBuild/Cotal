@@ -290,6 +290,7 @@
     "smoke:lifecycle-files": "tsx implementations/manager/smoke/lifecycle-file-ownership.smoke.ts",
     "smoke:static-lifecycle": "tsx implementations/manager/smoke/static-lifecycle.smoke.ts",
     "smoke:custody-fail-closed": "pnpm --filter @cotal-ai/seat build && tsx implementations/manager/smoke/custody-fail-closed.smoke.ts",
+    "smoke:seat-release": "pnpm --filter @cotal-ai/seat build && tsx implementations/manager/smoke/seat-release.smoke.ts",
     "smoke:events-grant": "tsx implementations/manager/smoke/events-grant-acl.smoke.ts",
     "smoke:manifest-launch": "tsx implementations/manager/smoke/manifest-launch.smoke.ts",
     "smoke:own-agent-control": "tsx implementations/manager/smoke/own-agent-control.smoke.ts",

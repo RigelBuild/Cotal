@@ -13,8 +13,8 @@
     "M1 puts the restated 18 back into managerShippedSurface. The invoke cell compares live resolve",
     "size to that count, so it goes red on the named mismatch. Unique code-only return, not a comment.",
     "",
-    "M2 restores revision 17 after the retained-custody status fields are the next shipped",
-    "surface change. The status output contract changed, so 17 would name the preceding surface.",
+    "M2 restores revision 18 after release-seat is the next shipped surface change. A new admin",
+    "command changed the document, so 18 would name the preceding surface.",
     "The named revision cell runs after the service has published and a generic client has",
     "resolved the actual shipped document.",
     "",
@@ -34,12 +34,12 @@
       "cell": "the resolved surface matches the shipped cluster document"
     },
     {
-      "name": "M2 keep revision 17 after the retained-custody status fields are added",
+      "name": "M2 keep revision 18 after release-seat is added",
       "file": "implementations/manager/src/manager-service-contract.ts",
-      "find": "    revision: 18,",
-      "replace": "    revision: 17,",
-      "expectRed": "the retained-custody status fields advance the manager cluster revision",
-      "cell": "the retained-custody status fields advance the manager cluster revision"
+      "find": "    revision: 19,",
+      "replace": "    revision: 18,",
+      "expectRed": "the release-seat command advances the manager cluster revision",
+      "cell": "the release-seat command advances the manager cluster revision"
     },
     {
       "name": "M3 compile every contract pair at module scope again",

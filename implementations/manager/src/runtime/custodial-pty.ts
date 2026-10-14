@@ -2,8 +2,8 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { AgentHandle, AttachSession, LaunchSpec, RuntimeReference } from "@cotal-ai/core";
-import type { CustodialRuntime, RuntimeReapEvidence } from "./index.js";
-import { adoptSeatSync, launchSeat, loadSeat, reapSeat, seatId, unsupportedTransport } from "@cotal-ai/seat";
+import type { ReleasableRuntime, RuntimeReapEvidence, RuntimeReleaseCheck } from "./index.js";
+import { adoptSeatSync, checkSeatRelease, launchSeat, loadSeat, reapSeat, removeSeatCustody, sealSeatLaunch, seatId, unsupportedTransport } from "@cotal-ai/seat";
 
 function defaultCustodyRoot(): string {
   return join(homedir(), ".cotal", "seats");
@@ -15,7 +15,7 @@ function defaultCustodyRoot(): string {
  * `createRuntime("pty")` does not construct this class off Linux. Spawn and
  * adopt still throw the named transport error if it is instantiated there.
  */
-export class CustodialPtyRuntime implements CustodialRuntime {
+export class CustodialPtyRuntime implements ReleasableRuntime {
   readonly kind = "pty" as const;
   readonly supportsRelease = true;
 
@@ -61,6 +61,21 @@ export class CustodialPtyRuntime implements CustodialRuntime {
     if (evidence.outcome === "absent") return { outcome: "absent" };
     if (evidence.outcome === "reaped") return { outcome: "reaped", detail: evidence.detail };
     return { outcome: "retained", reason: evidence.reason, detail: evidence.detail };
+  }
+
+  checkRelease(reference: RuntimeReference): RuntimeReleaseCheck {
+    if (reference.kind !== "pty") throw new Error(`cannot release runtime kind "${reference.kind}" with pty`);
+    return checkSeatRelease(this.root, reference.id);
+  }
+
+  sealRelease(reference: RuntimeReference): Promise<RuntimeReleaseCheck> {
+    if (reference.kind !== "pty") throw new Error(`cannot release runtime kind "${reference.kind}" with pty`);
+    return sealSeatLaunch(this.root, reference.id);
+  }
+
+  removeCustody(reference: RuntimeReference): void {
+    if (reference.kind !== "pty") throw new Error(`cannot release runtime kind "${reference.kind}" with pty`);
+    removeSeatCustody(this.root, reference.id);
   }
 }
 

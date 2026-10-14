@@ -126,11 +126,21 @@ function pidLive(pid: number | undefined): boolean {
   }
 }
 
-// Test seam: index.ts does not re-export this and the package `exports` map names only ".", so an
-// installed consumer cannot reach it.
+// Test seams: index.ts does not re-export these and the package `exports` map names only ".", so an
+// installed consumer cannot reach them.
 let testSeam: CustodianTestSeam | undefined;
 export function setCustodianTestSeam(seam: CustodianTestSeam | undefined): void {
   testSeam = seam;
+}
+
+/** `afterFence`: pause after creating the fence, before its lock. `failMkdir`: throw at the seat mkdir. */
+export interface LauncherTestSeam {
+  afterFence?: { reached: string; release: string };
+  failMkdir?: boolean;
+}
+let launcherSeam: LauncherTestSeam | undefined;
+export function setLauncherTestSeam(seam: LauncherTestSeam | undefined): void {
+  launcherSeam = seam;
 }
 
 export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
@@ -147,12 +157,22 @@ export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
   // `wx+` (O_CREAT|O_EXCL, read-write): an existing fence is an id an earlier launch or release used.
   const fenceFd = openSync(fence, "wx+", 0o644);
   try {
+    const hold = launcherSeam?.afterFence;
+    if (hold) {
+      writeFileSync(hold.reached, String(process.pid));
+      const holdBy = Date.now() + CONFIRM_TIMEOUT_MS;
+      while (!existsSync(hold.release)) {
+        if (Date.now() >= holdBy) throw new Error("test seam launcher hold was never released");
+        spawnSync("sleep", ["0.025"], { stdio: "ignore" });
+      }
+    }
     const lockDeadline = Date.now() + CONFIRM_TIMEOUT_MS;
     while (!tryLockFd(fenceFd)) {
       if (Date.now() >= lockDeadline) throw new Error(`seat ${id} launch fence ${fence} stayed locked for ${CONFIRM_TIMEOUT_MS}ms; refusing to create the seat`);
       spawnSync("sleep", ["0.025"], { stdio: "ignore" });
     }
     if (readFileSync(fenceFd, "utf8").trim() === "sealed") throw new Error(`seat ${id} launch fence ${fence} is sealed; the seat was released`);
+    if (launcherSeam?.failMkdir) throw new Error("test seam: seat mkdir failed");
     mkdirSync(dirname(recPath), { mode: 0o700 });
   } finally {
     closeSync(fenceFd);

@@ -30,7 +30,7 @@
  *   manager.lifecycle despawn / attach / input             (owner-mode terminal/interactive)
  *   manager.self     stop                                  (self-mode halt; baseline)
  *   manager.persona  definePersona                         (privileged-grade; ownership-checked)
- *   manager.admin    purge / launch / resume family        (operator instruments only)
+ *   manager.admin    purge / launch / resume family / release-seat (operator instruments only)
  *   manager.run      run-start / run-resume / run-answer   (the `run` capability + privileged instrument)
  *                    run-status / run-ps ride manager.read
  */
@@ -479,6 +479,15 @@ const PURGE_OUTPUT_SCHEMA = {
   type: "object", additionalProperties: false, required: ["chat"],
   properties: { chat: { type: "integer", minimum: 0 }, dm: { type: "integer", minimum: 0 } },
 } as const;
+// The operator is the verified caller, so the input carries no operator field.
+const RELEASE_SEAT_INPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["alias", "lifecycleUid", "reason"],
+  properties: { alias: { type: "string", minLength: 1 }, lifecycleUid: { type: "string", minLength: 1 }, reason: { type: "string", minLength: 1 } },
+} as const;
+const RELEASE_SEAT_OUTPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["alias", "lifecycleUid", "phase", "advisory"],
+  properties: { alias: { type: "string" }, lifecycleUid: { type: "string" }, phase: { type: "string" }, advisory: { type: "string" } },
+} as const;
 
 const CHANNEL_LIST = { type: "array", items: { type: "string" } } as const;
 const PERSONA_INPUT_SCHEMA = {
@@ -746,6 +755,7 @@ const ROWS: CommandRow[] = [
   { name: "prepare-preservation", capability: "manager.admin", input: ATTEMPT_INPUT_SCHEMA, output: OPEN_OBJECT_SCHEMA, targeted: false, handler: "preparePreservation" },
   { name: "commit-preservation", capability: "manager.admin", input: ATTEMPT_INPUT_SCHEMA, output: OPEN_OBJECT_SCHEMA, targeted: false, handler: "commitPreservation" },
   { name: "abort-preservation", capability: "manager.admin", input: ATTEMPT_INPUT_SCHEMA, output: ATTEMPT_STATE_OUTPUT_SCHEMA, targeted: false, handler: "abortPreservation" },
+  { name: "release-seat", capability: "manager.admin", input: RELEASE_SEAT_INPUT_SCHEMA, output: RELEASE_SEAT_OUTPUT_SCHEMA, targeted: false, handler: "releaseSeat" },
 ];
 
 // WHEN THE COMPILE HAPPENS (#1323): every CLI invocation loads this module before its verb is
@@ -892,7 +902,7 @@ export function managerClusterDocument(): {
 } {
   return {
     urn: MANAGER_CLUSTER_URN,
-    revision: 18,
+    revision: 19,
     attributes: [],
     events: [],
     commands: ROWS.map((r) => ({
@@ -977,6 +987,7 @@ export interface ManagerServiceHandlers {
   preparePreservation(ctx: EpServeContext): unknown | Promise<unknown>;
   commitPreservation(ctx: EpServeContext): unknown | Promise<unknown>;
   abortPreservation(ctx: EpServeContext): unknown | Promise<unknown>;
+  releaseSeat(ctx: EpServeContext): unknown | Promise<unknown>;
 }
 
 /** Build the `EpCommandDef[]` `serveEndpoint` consumes: each command's provenance-branded compiled

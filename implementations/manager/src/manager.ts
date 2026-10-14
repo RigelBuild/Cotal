@@ -65,6 +65,7 @@ import type { ActionContext, AgentDef, AttachSession, Connector, ConnectorModelC
 import {
   createRuntime,
   isCustodialRuntime,
+  isReleasableRuntime,
   requireRuntimeAdopt,
   requireRuntimeReap,
   RuntimeReapUnproven,
@@ -177,6 +178,10 @@ import {
   staticLifecycleTransport,
   activateStaticLifecycle,
   runStaticTerminal,
+  readStaticRelease,
+  writeStaticRelease,
+  assertSameRelease,
+  type StaticLifecycleReleaseSpec,
   readStaticSlot,
   writeStaticSlotIntent,
   casStaticSlot,
@@ -2912,6 +2917,7 @@ export class Manager {
         return r.data;
       }),
       purge: (ctx) => this.serveGated(ctx, () => adminGated(ctx, async () => unwrap(await this.opPurge(args(ctx), callerOf(ctx))))),
+      releaseSeat: (ctx) => this.serveGated(ctx, () => adminGated(ctx, async () => unwrap(await this.opReleaseSeat(args(ctx), ctx.subject.caller)))),
       // launch is OWNER-EQUALITY on the ep door for every caller (freelance HIGH #2): the deploy
       // path is the only launch consumer and its spec stamps the CALLER's own owner, so
       // owner-equality always holds for a legitimate deploy; cross-owner launch was a ctl
@@ -7522,7 +7528,10 @@ export class Manager {
       const cur = await readStaticSlot(t, DEV_OWNER, a.name);
       if (cur === undefined || cur.row.lifecycleUid !== a.lifecycleUid)
         throw new Error(`the static slot for "${a.name}" left uid ${a.lifecycleUid} inside its own terminal; nothing is reaped or deleted`);
-      await this.reapOrphanSeat(a, cur.row.runtime);
+      // An operator release record satisfies the process step: remove any seat directory left, never reap.
+      const released = await readStaticRelease(t, DEV_OWNER, a.id, a.lifecycleUid);
+      if (released === undefined) await this.reapOrphanSeat(a, cur.row.runtime);
+      else if (cur.row.runtime !== undefined && isReleasableRuntime(this.runtime)) this.runtime.removeCustody(cur.row.runtime);
       const secrets = this.secrets;
       const files = a.secretPaths ?? agentLifecycleSecretFilePaths(this.workspaceRoot, this.space, a.name, a.lifecycleUid);
       if (files.creds) {
@@ -8064,6 +8073,53 @@ export class Manager {
     } catch (e) {
       return { ok: false, error: (e as Error).message };
     }
+  }
+
+  /** An operator's attestation that a retained seat's processes are gone (seat-custody-retention
+   *  § Operator release). It seals the launch before it writes the intent, and it never signals. */
+  private async opReleaseSeat(args: Record<string, unknown>, caller: EpCaller): Promise<ControlReply> {
+    const alias = String(args.alias);
+    const lifecycleUid = String(args.lifecycleUid);
+    const reason = String(args.reason);
+    if (!this.auth) return { ok: false, error: "release-seat: no space auth (an open mesh has no lifecycle registry)" };
+    const row = await this.readStaticReconcileSlot(alias);
+    if (row === undefined) return { ok: false, error: `release-seat: no static slot for "${alias}"` };
+    if (row.lifecycleUid !== lifecycleUid)
+      return { ok: false, error: `release-seat: the slot for "${alias}" is at uid ${row.lifecycleUid}, not ${lifecycleUid}; a release pins one incarnation` };
+    if (row.ownerInstanceId !== undefined && row.ownerInstanceId !== this.managerInstanceId)
+      return { ok: false, error: `release-seat: the slot belongs to manager instance ${row.ownerInstanceId}, not ${this.managerInstanceId}` };
+    const spec: StaticLifecycleReleaseSpec = {
+      v: 1, principal: principalKey(DEV_OWNER, row.actor).key, alias, lifecycleUid,
+      operator: { owner: caller.owner, actor: caller.actor, uid: caller.uid },
+      reason, ownerInstanceId: this.managerInstanceId, managerProcessUid: this.managerLifecycleUid, timestamp: new Date().toISOString(),
+    };
+    const pin = { owner: DEV_OWNER, actor: row.actor, lifecycleUid, alias };
+    const prior = await this.withLifecycleExecutor(pin, (t) => readStaticRelease(t, DEV_OWNER, row.actor, lifecycleUid));
+    if (prior !== undefined) {
+      assertSameRelease(prior, spec);
+      spec.timestamp = prior.timestamp;
+    }
+    // A retired slot is a release whose terminal already finished; only the same intent may see it.
+    if (row.phase === "retired") {
+      if (prior === undefined) return { ok: false, error: `release-seat: the slot for "${alias}" is already retired at uid ${lifecycleUid} without a release` };
+      return { ok: true, data: { alias, lifecycleUid, phase: "retired", advisory: "already released" } };
+    }
+    if (row.phase !== "terminalizing") return { ok: false, error: `release-seat: the slot for "${alias}" is ${row.phase}, not terminalizing; only a retained terminal is released` };
+    let advisory = `no custody reference; nothing to seal`;
+    if (row.runtime !== undefined) {
+      const runtime = this.runtime;
+      if (!isReleasableRuntime(runtime)) return { ok: false, error: `release-seat: runtime "${runtime.kind}" cannot seal ${row.runtime.kind}:${row.runtime.id}` };
+      const check = runtime.checkRelease(row.runtime);
+      if (!check.ok) return { ok: false, error: `release-seat refused: ${check.reason}: ${check.detail}` };
+      const sealed = await runtime.sealRelease(row.runtime);
+      if (!sealed.ok) return { ok: false, error: `release-seat refused: ${sealed.reason}: ${sealed.detail}` };
+      advisory = sealed.advisory;
+    }
+    if (prior === undefined) await this.withLifecycleExecutor(pin, (t) => writeStaticRelease(t, spec));
+    if (row.runtime !== undefined && isReleasableRuntime(this.runtime)) this.runtime.removeCustody(row.runtime);
+    console.error(`static release alias=${alias} uid=${lifecycleUid} operator=${caller.owner}.${caller.actor} reason=${JSON.stringify(reason)}: ${advisory}`);
+    await this.driveStaticRetirement({ id: row.actor, name: alias, lifecycleUid, runtime: row.runtime }, true);
+    return { ok: true, data: { alias, lifecycleUid, phase: "retired", advisory } };
   }
 
   /** Persist a peer-defined persona as config. After this, `start name` auto-discovers

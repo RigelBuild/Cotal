@@ -51,9 +51,10 @@ type LaunchPayload = CustodianLaunch & { testSeam?: CustodianTestSeam };
 export interface CustodianTestSeam {
   /** Drop the fork's pidfd, as a kernel without `pidfd_open` would. */
   dropPidfd?: boolean;
-  /** Pause at each `at`: write `reached`, then wait until `release` exists. `unpinned` pauses after
-   *  a failed pin, so a test child can arm its handlers before this process exits and hangs it up. */
-  holds?: Array<{ at: "before-fs" | "after-pin" | "unpinned"; reached: string; release: string }>;
+  /** Pause at each `at`: write `reached`, then wait until `release` exists, for up to `timeoutMs`
+   *  (default CONFIRM_TIMEOUT_MS). `unpinned` pauses after a failed pin, so a test child can arm its
+   *  handlers before this process exits and hangs it up. */
+  holds?: Array<{ at: "before-fs" | "after-pin" | "unpinned"; reached: string; release: string; timeoutMs?: number }>;
   /** Fail startup at this point, after the child is pinned. */
   fail?: "after-pin" | "listen-error" | "after-bind";
   /** Make the delayed SIGKILL of a graceful stop fail, as a send the kernel refused would. */
@@ -80,7 +81,7 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
     const hold = seam?.holds?.find((h) => h.at === at);
     if (!hold) return;
     writeFileSync(hold.reached, String(process.pid));
-    const deadline = Date.now() + CONFIRM_TIMEOUT_MS;
+    const deadline = Date.now() + (hold.timeoutMs ?? CONFIRM_TIMEOUT_MS);
     while (!existsSync(hold.release)) {
       if (Date.now() >= deadline) throw new Error(`test seam hold at ${at} was never released`);
       await sleep(25);
