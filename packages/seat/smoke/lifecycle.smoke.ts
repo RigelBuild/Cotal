@@ -484,7 +484,8 @@ await h.waitForExit();
     // A socket that accepts and never answers bounds the stop request at graceMs.
     const id = seatId();
     mkdirSync(join(root, id), { recursive: true, mode: 0o700 });
-    const silent = createServer(() => {});
+    const accepted: Array<{ destroy: () => void }> = [];
+    const silent = createServer((c) => { accepted.push(c); });
     await new Promise<void>((r) => silent.listen(join(root, id, "seat.sock"), r));
     // Forge only a pid this test owns, leading its own group: a mutant that signals record pids
     // must never reach pid 1, -1 or any process outside this suite.
@@ -501,7 +502,8 @@ await h.waitForExit();
       wait(3_000).then(() => new Error("reap did not return within 3s")),
     ]);
     const took = Date.now() - started;
-    // unref: a hung client connection must not keep the suite alive under the mutation.
+    // Drop accepted connections too: a reap stuck on one must not keep the suite alive under the mutation.
+    for (const c of accepted) c.destroy();
     silent.close();
     silent.unref();
     killOwned(decoyPid, decoyStart);
