@@ -121,7 +121,7 @@ jobs:
       - name: Seat cgroup custody (distinct uid)
         run: |
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin cotal-seat-agent
-          sudo env "PATH=$PATH" COTAL_SEAT_CGROUP_REQUIRE=1 COTAL_SEAT_SMOKE_AGENT_UID="$(id -u cotal-seat-agent)" ./node_modules/.bin/tsx packages/seat/smoke/cgroup.smoke.ts
+          sudo env "PATH=$PATH" COTAL_SEAT_CGROUP_REQUIRE=1 COTAL_SEAT_SMOKE_AGENT_UID="$(id -u cotal-seat-agent)" pnpm smoke:seat-cgroup
       - name: View smoke
         run: pnpm smoke:view
       - name: Verify Claude connector package

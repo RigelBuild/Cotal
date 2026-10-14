@@ -23,6 +23,13 @@ type Cell = (typeof CELLS)[number];
 const NEEDS_DISTINCT_UID: Record<Cell, boolean> = { refusal: false, "shared-uid": false, unprovable: false, "release-join": false, rollback: false, bounds: false, "wrong-base": false, "distinct-uid": true, setsid: true, recordless: true, fence: true };
 const REQUIRE = process.env.COTAL_SEAT_CGROUP_REQUIRE === "1";
 
+// Cells get no inherited COTAL_ connection material; they read only the COTAL_CG_ keys set below.
+const cellEnv = (): NodeJS.ProcessEnv => {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (key.startsWith("COTAL_")) delete env[key];
+  return env;
+};
+
 const ownCgroup = (): string => {
   const line = readFileSync("/proc/self/cgroup", "utf8").split("\n").find((l) => l.startsWith("0::"));
   if (line === undefined) throw new Error("no cgroup v2 line in /proc/self/cgroup");
@@ -75,7 +82,7 @@ function orchestrate(): void {
     const r = spawnSync(scope[0] ?? "", [...scope.slice(1), ...prefix, process.execPath, ...process.execArgv, SCRIPT, "--cell", cell], {
       encoding: "utf8",
       timeout: 120_000,
-      env: { ...process.env, COTAL_CG_PARENT: ownCgroup(), COTAL_CG_AGENT_UID: String(agent?.uid ?? ""), COTAL_CG_AGENT_GID: String(agent?.gid ?? "") },
+      env: { ...cellEnv(), COTAL_CG_PARENT: ownCgroup(), COTAL_CG_AGENT_UID: String(agent?.uid ?? ""), COTAL_CG_AGENT_GID: String(agent?.gid ?? "") },
     });
     process.stdout.write(r.stdout ?? "");
     if (r.stderr) process.stdout.write(r.stderr.split("\n").map((l) => (l ? `    | ${l}` : l)).join("\n"));

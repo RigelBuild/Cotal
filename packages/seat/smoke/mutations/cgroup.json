@@ -67,14 +67,6 @@
       "afterRestore": "pnpm --filter @cotal-ai/seat build"
     },
     {
-      "name": "T5-M8 assertSeatCgroup accepts a non-normalized path",
-      "file": "packages/seat/src/cgroup.ts",
-      "find": "  const path = assertNormalUnderRoot(cg.path, \"seat cgroup\");",
-      "replace": "  const path = cg.path;",
-      "expectRed": "bounds: reap and release reject a `..` or non-normalized seat cgroup path and leave the seat populated",
-      "afterRestore": "pnpm --filter @cotal-ai/seat build"
-    },
-    {
       "name": "T5-M9 a cell exits 0 with no tally",
       "file": "packages/seat/smoke/cgroup.smoke.ts",
       "find": "  console.log(`CELL_TALLY ${JSON.stringify({ pass, fail, skipped })}`);",

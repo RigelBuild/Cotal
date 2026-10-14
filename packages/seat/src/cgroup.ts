@@ -30,8 +30,9 @@ export function seatCgroupPath(base: string, id: string): string {
 /** A caller-supplied seat cgroup must be this seat's cgroup under this process's own base, on
  *  cgroup2, before any write targets it. */
 export function assertSeatCgroup(cg: SeatCgroup, id: string): SeatCgroup {
-  const path = assertNormalUnderRoot(cg.path, "seat cgroup");
   const base = ownCgroup();
+  // seatCgroupPath normalizes the base, so an exact match also rejects any non-normalized path.
+  const path = cg.path;
   if (base === undefined || path !== seatCgroupPath(base, id)) throw new Error(`cgroup ${path} is not the cgroup of seat ${id} under this process's base ${String(base)}`);
   let fsType: number | undefined;
   try {

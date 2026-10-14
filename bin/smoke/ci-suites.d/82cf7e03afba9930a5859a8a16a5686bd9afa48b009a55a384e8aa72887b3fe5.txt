@@ -1,3 +1,0 @@
-# Layer 3 seat custody (RIG-4320 T5): a contained per-seat cgroup proves a seat gone, a populated
-# one refuses release. Cells needing a distinct uid report skipped here; ci.yml runs them as root.
-smoke:seat-cgroup
