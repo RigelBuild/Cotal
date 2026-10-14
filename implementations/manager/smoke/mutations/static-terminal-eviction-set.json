@@ -29,8 +29,8 @@
     {
       "name": "an empty set falls back to the synthesized alias principal (the pre-narrowing demand)",
       "file": "implementations/manager/src/static-lifecycle.ts",
-      "find": "  if (holders.length === 0) {\n    log(`no credential-ledger row was ever released under uid ${args.lifecycleUid}; the barrier's eviction set is empty (SPEC 13.1)`);\n    return;\n  }",
-      "replace": "  if (holders.length === 0) holders = [`${args.owner}.${args.actor}`];",
+      "find": "  const result: EvictionResult = holders.length === 0\n    ? { principal, kicked: 0, remaining: 0, scanComplete: true, verifiedGone: true }\n    : await evict(principal);",
+      "replace": "  const result: EvictionResult = await evict(principal);",
       "expectRed": "a ledgerless orphan retires without a broker eviction",
       "cell": "a ledgerless orphan retires without a broker eviction (vacuous SPEC 13.1 set)"
     }

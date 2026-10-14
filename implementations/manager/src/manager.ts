@@ -1157,6 +1157,8 @@ export class Manager {
    *  delete the SUCCESSOR's standing authority. Keyed by (name, uid) so a later same-name lifecycle
    *  gets its own flight; a fresh trigger after settle re-drives only if the hold still stands. */
   private deprovisioningFlight = new Map<string, Promise<void>>();
+  /** In-flight static terminals per JSON [alias, lifecycleUid] (see {@link driveStaticRetirement}). */
+  private staticRetirementFlight = new Map<string, Promise<void>>();
   private readonly attach: AttachEndpoint;
   private ep!: CotalEndpoint;
   /** Space trust material when the mesh runs in auth mode (`.cotal/auth` present);
@@ -7504,6 +7506,23 @@ export class Manager {
    *  transport, and the footprint teardown is its cleanup step. A rowless lifecycle gets a slot
    *  first; a slot at another UID makes this teardown stale, so it touches nothing. */
   private async driveStaticRetirement(a: { id: string; name: string; lifecycleUid: string; secretPaths?: ManagedAgent["secretPaths"]; staticCredentialRenewal?: Promise<void>; runtime?: RuntimeReference }, surfaceFailure = false): Promise<void> {
+    // Single-flight per (name, lifecycleUid), as deprovision is: a reconcile retry, a sweep and a
+    // release must never run two terminals of one lifecycle at once.
+    const key = JSON.stringify([a.name, a.lifecycleUid]);
+    let flight = this.staticRetirementFlight.get(key);
+    if (flight === undefined) {
+      const started = this.runStaticRetirement(a).finally(() => {
+        if (this.staticRetirementFlight.get(key) === started) this.staticRetirementFlight.delete(key);
+      });
+      this.staticRetirementFlight.set(key, started);
+      flight = started;
+    }
+    if (surfaceFailure) return flight;
+    return flight.catch(() => {});
+  }
+
+  /** The terminal itself (wrapped by {@link driveStaticRetirement}'s single-flight); it always throws a failure. */
+  private async runStaticRetirement(a: { id: string; name: string; lifecycleUid: string; secretPaths?: ManagedAgent["secretPaths"]; staticCredentialRenewal?: Promise<void>; runtime?: RuntimeReference }): Promise<void> {
     // A renewal that published its flight before the synchronous terminal latch is accepted work.
     // Drain it before the durable terminal enumerates credential ids and before cleanup deletes its
     // material; a failed renewal must not block retirement because it may still have staged an id.
@@ -7529,7 +7548,7 @@ export class Manager {
       if (cur === undefined || cur.row.lifecycleUid !== a.lifecycleUid)
         throw new Error(`the static slot for "${a.name}" left uid ${a.lifecycleUid} inside its own terminal; nothing is reaped or deleted`);
       // An operator release record satisfies the process step: remove any seat directory left, never reap.
-      const released = await readStaticRelease(t, DEV_OWNER, a.id, a.lifecycleUid);
+      const released = await readStaticRelease(t, DEV_OWNER, a.id, a.lifecycleUid, { alias: a.name, ownerInstanceId: cur.row.ownerInstanceId ?? this.managerInstanceId });
       if (released === undefined) await this.reapOrphanSeat(a, cur.row.runtime);
       else if (cur.row.runtime !== undefined && isReleasableRuntime(this.runtime)) this.runtime.removeCustody(cur.row.runtime);
       const secrets = this.secrets;
@@ -7586,13 +7605,15 @@ export class Manager {
       const cur = this.retiring.get(a.name);
       if (cur && cur.lifecycleUid === a.lifecycleUid) this.retiring.delete(a.name); // ABA-guarded hold clear
     } catch (e) {
-      if (e instanceof RuntimeReapUnproven)
+      // A release may retire the slot while this attempt's reap was retaining it; a retired slot is not retained.
+      const now = e instanceof RuntimeReapUnproven ? await this.readStaticReconcileSlot(a.name).catch(() => undefined) : undefined;
+      if (e instanceof RuntimeReapUnproven && !(now?.lifecycleUid === a.lifecycleUid && now.phase === "retired"))
         this.recordRetainedTerminal({ owner: DEV_OWNER, alias: a.name, actor: a.id, lifecycleUid: a.lifecycleUid }, e);
       const h = this.retiring.get(a.name);
       if (h && h.lifecycleUid === a.lifecycleUid)
         h.lastError = `the static retirement did not complete (${(e as Error).message}); the name stays held - a same-name spawn retries the same terminal (op ${opId})`;
       console.error(`static retirement ${a.name} (${a.id}): ${(e as Error).message}`);
-      if (surfaceFailure) throw e;
+      throw e;
     }
   }
 
@@ -8094,7 +8115,7 @@ export class Manager {
       reason, ownerInstanceId: this.managerInstanceId, managerProcessUid: this.managerLifecycleUid, timestamp: new Date().toISOString(),
     };
     const pin = { owner: DEV_OWNER, actor: row.actor, lifecycleUid, alias };
-    const prior = await this.withLifecycleExecutor(pin, (t) => readStaticRelease(t, DEV_OWNER, row.actor, lifecycleUid));
+    const prior = await this.withLifecycleExecutor(pin, (t) => readStaticRelease(t, DEV_OWNER, row.actor, lifecycleUid, { alias, ownerInstanceId: row.ownerInstanceId ?? this.managerInstanceId }));
     if (prior !== undefined) {
       assertSameRelease(prior, spec);
       spec.timestamp = prior.timestamp;
@@ -8105,6 +8126,19 @@ export class Manager {
       return { ok: true, data: { alias, lifecycleUid, phase: "retired", advisory: "already released" } };
     }
     if (row.phase !== "terminalizing") return { ok: false, error: `release-seat: the slot for "${alias}" is ${row.phase}, not terminalizing; only a retained terminal is released` };
+    // A reference no durable row names is a seat this release would not seal or remove.
+    const unrecorded = this.unrecordedCustody.get(lifecycleUid);
+    if (unrecorded !== undefined)
+      return { ok: false, error: `release-seat refused: the runtime spawned ${unrecorded.kind}:${unrecorded.id} for "${alias}" at uid ${lifecycleUid}, which no durable row names; it cannot be sealed or removed` };
+    // No scheduled retry may start once the release is under way, and an attempt already in flight
+    // finishes first, so its retained outcome cannot land after this release retires the slot.
+    const item = this.staticReconcileItems.get(this.staticReconcileKey({ owner: DEV_OWNER, alias, lifecycleUid }));
+    if (item !== undefined) {
+      clearTimeout(item.timer);
+      item.timer = undefined;
+      item.nextRetryAt = undefined;
+    }
+    await this.staticRetirementFlight.get(JSON.stringify([alias, lifecycleUid]))?.catch(() => {});
     let advisory = `no custody reference; nothing to seal`;
     if (row.runtime !== undefined) {
       const runtime = this.runtime;

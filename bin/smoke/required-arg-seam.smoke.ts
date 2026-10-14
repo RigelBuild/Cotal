@@ -355,8 +355,8 @@ const SEAMS: Seam[] = [
   // implementations/auth/src/service.ts (+1 typechecked), and
   // implementations/runtime/src/run-command.ts (+1 typechecked): 164/122.
   // custody-fail-closed.smoke.ts (+3 smoke sites): 167/125.
-  // seat-release.smoke.ts (+2 smoke sites, both tls: false): 169/127.
-  { fn: "standaloneConnectOpts", key: "tls", sites: 169, untypecheckedSites: 127 },
+  // seat-release.smoke.ts (+3 smoke sites, all tls: false; one reads the lifecycle record via core readRecord): 170/128.
+  { fn: "standaloneConnectOpts", key: "tls", sites: 170, untypecheckedSites: 128 },
 ];
 
 /**
