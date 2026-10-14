@@ -83,11 +83,11 @@
       "name": "restoring group kill violates forged record protection",
       "file": "packages/seat/src/reap.ts",
       "find": "  const { stop, error } = await requestStop(root, id, rec, opts.graceMs ?? 10_000);",
-      "replace": "  // Mutation safety: never send to pid <= 1; a group send to 1 reaches every process of this uid.\n  if (rec.childPid > 1) try { process.kill(-rec.childPid, \"SIGKILL\"); } catch { /* gone */ }\n  const { stop, error } = await requestStop(root, id, rec, opts.graceMs ?? 10_000);",
+      "replace": "  // Mutation safety: send only to the exact process the record names (pid > 1, same start token),\n  // so a reused pid or pid 1 is never a group target.\n  const liveStart = (() => { try { const st = readFileSync(`/proc/${rec.childPid}/stat`, \"utf8\"); return st.slice(st.lastIndexOf(\") \") + 2).split(\" \")[19]; } catch { return undefined; } })();\n  if (rec.childPid > 1 && rec.childStart !== undefined && liveStart === rec.childStart) try { process.kill(-rec.childPid, \"SIGKILL\"); } catch { /* gone */ }\n  const { stop, error } = await requestStop(root, id, rec, opts.graceMs ?? 10_000);",
       "afterRestore": "pnpm --filter @cotal-ai/seat build",
       "expectRed": "a forged same-uid record is retained and its process-group leader is never signalled",
       "cell": "a forged same-uid record is retained and its process-group leader is never signalled",
-      "note": "A same-uid record can forge a live pid and matching start token; numeric group signaling must remain absent. The replace refuses pid <= 1, which as a group target would reach every process this uid owns."
+      "note": "A same-uid record can forge a live pid and matching start token; numeric group signaling must remain absent. The replace sends only when pid > 1 and the live start token matches the record, so a reused or init pid is never a group target."
     },
     {
       "name": "an empty session census returns reaped for a setsid escapee",

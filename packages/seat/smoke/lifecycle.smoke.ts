@@ -65,15 +65,23 @@ const root = makeSeatRoot("cotal-seat-life-");
 const handles: Array<{
   stop: (o?: { graceful?: boolean }) => void;
   close?: () => void;
-  record: { custodianPid: number; childPid: number };
+  record: { custodianPid: number; childPid: number; custodianStart?: string; childStart?: string };
 }> = [];
+type Owned = { pid: number; start: string | undefined };
 /** Pids a T1 cell leaves behind on purpose (or a mutant leaves by mistake); killed in `finally`. */
-const strays: number[] = [];
+const strays: Owned[] = [];
 const isGone = (pid: number): boolean => state(pid) === "gone" || state(pid) === "Z";
-const readPid = (path: string): number | undefined => {
+/** Signal only the process this suite captured: a changed start token means the pid was reused.
+ *  `group` sends to the process group that pid leads. */
+const killOwned = (pid: number, start: string | undefined, group = false): void => {
+  if (pid <= 1 || start === undefined || processStartToken(pid) !== start) return;
+  try { process.kill(group ? -pid : pid, "SIGKILL"); } catch { /* already gone */ }
+};
+/** The pid a fixture child wrote, with its start token read at once so a later kill can prove it. */
+const readPid = (path: string): Owned | undefined => {
   try {
     const n = Number(readFileSync(path, "utf8").trim());
-    return n > 0 ? n : undefined;
+    return n > 0 ? { pid: n, start: processStartToken(n) } : undefined;
   } catch {
     return undefined;
   }
@@ -89,7 +97,7 @@ const launchUnderSeam = (seam: CustodianTestSeam, id: string, args: string[]): s
   setCustodianTestSeam(seam);
   try {
     const rec: SeatRecord = launchSeat({ root, name: "t1-seam", id, spec: { command: process.execPath, args, env: { PATH: process.env.PATH ?? "" } }, cwd: process.cwd() });
-    strays.push(rec.custodianPid, rec.childPid);
+    strays.push({ pid: rec.custodianPid, start: rec.custodianStart }, { pid: rec.childPid, start: rec.childStart });
     return "";
   } catch (e) {
     return (e as Error).message;
@@ -174,7 +182,7 @@ try {
     }, 10_000);
     check("isolated worker fixture armed", armed);
     const ids = JSON.parse(readFileSync(ready, "utf8")) as { workerPid: number; childPid: number; custodianPid: number; id: string };
-    process.kill(ids.workerPid, "SIGKILL");
+    killOwned(ids.workerPid, processStartToken(ids.workerPid));
     check("the fixture killed its actual worker process", await until(() => state(ids.workerPid) === "gone", 5_000), ids);
     check(
       "worker death leaves the custodial child PID running",
@@ -216,7 +224,7 @@ try {
     h.attach().onExit(() => {
       fired = true;
     });
-    process.kill(rec.childPid, "SIGKILL");
+    killOwned(rec.childPid, rec.childStart);
     check(
       "onExit fires without an output subscription",
       await until(() => fired, 5_000),
@@ -456,8 +464,8 @@ await h.waitForExit();
       !(second instanceof Error) && second.outcome === "retained" && second.reason === "unprovable" && second.stop === "no-custodian",
       second instanceof Error ? second.message : second,
     );
-    try { process.kill(-rec.childPid, "SIGKILL"); } catch { /* already gone */ }
-    try { process.kill(rec.custodianPid, "SIGKILL"); } catch { /* already gone */ }
+    killOwned(rec.childPid, rec.childStart, true);
+    killOwned(rec.custodianPid, rec.custodianStart);
   }
 
   {
@@ -483,6 +491,7 @@ await h.waitForExit();
     const decoy = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
     const decoyPid = decoy.pid;
     if (decoyPid === undefined || decoyPid <= 1) throw new Error(`decoy sleeper has unusable pid ${String(decoyPid)}`);
+    const decoyStart = processStartToken(decoyPid);
     const forged: SeatRecord = { version: 1, id, name: "silent", socket: join(root, id, "seat.sock"), token: "t", custodianPid: decoyPid, childPid: decoyPid };
     writeFileSync(join(root, id, "record.json"), `${JSON.stringify(forged)}\n`);
     const started = Date.now();
@@ -495,7 +504,7 @@ await h.waitForExit();
     // unref: a hung client connection must not keep the suite alive under the mutation.
     silent.close();
     silent.unref();
-    try { process.kill(decoyPid, "SIGKILL"); } catch { /* already gone */ }
+    killOwned(decoyPid, decoyStart);
     check(
       "a custodian socket that never answers times out the stop within graceMs, still retained",
       !(silentReap instanceof Error) && silentReap.outcome === "retained" && silentReap.stop === "timeout" && took < 2_000,
@@ -527,7 +536,8 @@ await h.waitForExit();
     const sleeper = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { detached: true, stdio: "ignore" });
     sleeper.unref();
     const sleeperPid = sleeper.pid;
-    if (sleeperPid === undefined) throw new Error("detached sleeper did not expose its pid");
+    if (sleeperPid === undefined || sleeperPid <= 1) throw new Error("detached sleeper did not expose a usable pid");
+    const sleeperStart = processStartToken(sleeperPid);
     try {
       const started = await until(() => processStartToken(sleeperPid) !== undefined, 1_000);
       const start = processStartToken(sleeperPid);
@@ -558,7 +568,7 @@ await h.waitForExit();
         evidence instanceof Error ? evidence.message : evidence,
       );
     } finally {
-      try { process.kill(sleeperPid, "SIGKILL"); } catch { /* already gone */ }
+      killOwned(sleeperPid, sleeperStart);
       await until(() => isGone(sleeperPid), 2_000);
     }
   }
@@ -642,6 +652,7 @@ await h.waitForExit();
       const childReady = await until(() => existsSync(childPidPath), 2_000);
       const grandchildReady = await until(() => existsSync(grandchildPidPath), 2_000);
       const grandchildPid = Number(readFileSync(grandchildPidPath, "utf8"));
+      const grandchildStart = processStartToken(grandchildPid);
       check("setsid escapee fixture: grandchild starts in a new session", childReady && grandchildReady && state(grandchildPid) !== "gone", { childPid, grandchildPid });
       const id = seatId();
       const boot = bootToken();
@@ -666,7 +677,7 @@ await h.waitForExit();
         !(evidence instanceof Error) && evidence.outcome === "retained" && evidence.reason === "unprovable" && evidence.stop === "no-custodian" && state(grandchildPid) !== "gone" && state(grandchildPid) !== "Z",
         { evidence: evidence instanceof Error ? evidence.message : evidence, grandchild: state(grandchildPid) },
       );
-      try { process.kill(grandchildPid, "SIGKILL"); } catch { /* already gone */ }
+      killOwned(grandchildPid, grandchildStart);
       await until(() => isGone(grandchildPid), 2_000);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -703,7 +714,7 @@ await h.waitForExit();
       { custodian: state(rec.custodianPid), child: state(rec.childPid) },
     );
     mute.destroy();
-    try { process.kill(rec.custodianPid, "SIGKILL"); } catch { /* already gone */ }
+    killOwned(rec.custodianPid, rec.custodianStart);
   }
 
   {
@@ -751,8 +762,9 @@ await h.waitForExit();
     const release = join(dir, "release");
     const id = seatId();
     const err = launchUnderSeam({ dropPidfd: true, holds: [{ at: "unpinned", reached: join(dir, "reached"), release }] }, id, ["-e", ARMED_CHILD, pidf, mark, release]);
-    const pid = readPid(pidf);
-    if (pid !== undefined) strays.push(pid);
+    const owned = readPid(pidf);
+    if (owned !== undefined) strays.push(owned);
+    const pid = owned?.pid;
     await wait(300);
     check(
       "an unpinned child is never signalled: launch fails, no socket or record, the child lives unmarked",
@@ -768,8 +780,9 @@ await h.waitForExit();
     const release = join(dir, "release");
     const id = seatId();
     const err = launchUnderSeam({ fail, holds: [{ at: "after-pin", reached: join(dir, "reached"), release }] }, id, ["-e", ARMED_CHILD, pidf, join(dir, "term"), release]);
-    const pid = readPid(pidf);
-    if (pid !== undefined) strays.push(pid);
+    const owned = readPid(pidf);
+    if (owned !== undefined) strays.push(owned);
+    const pid = owned?.pid;
     check(
       `startup failure (${fail}) after pinning stops the child`,
       /custodian exited before ready/.test(err) && !existsSync(join(root, id, "record.json")) && pid !== undefined && (await until(() => isGone(pid), 5_000)),
@@ -791,8 +804,9 @@ await h.waitForExit();
       id,
       ["-e", ARMED_CHILD, pidf, join(dir, "term"), childRelease],
     );
-    const pid = readPid(pidf);
-    if (pid !== undefined) strays.push(pid);
+    const owned = readPid(pidf);
+    if (owned !== undefined) strays.push(owned);
+    const pid = owned?.pid;
     check(
       "a removed seat directory stops a late custodian: no record, no directory, the child is gone",
       err !== "" && !existsSync(join(root, id)) && pid !== undefined && (await until(() => isGone(pid), 5_000)),
@@ -864,9 +878,7 @@ console.log("PID_REUSE " + JSON.stringify({ error, child, reused, reusedAlive })
     );
   }
 } finally {
-  for (const pid of strays) {
-    try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
-  }
+  for (const { pid, start } of strays) killOwned(pid, start);
   for (const h of handles) {
     try {
       h.stop({ graceful: false });
@@ -878,19 +890,8 @@ console.log("PID_REUSE " + JSON.stringify({ error, child, reused, reusedAlive })
     } catch {
       /* gone */
     }
-    const childGone = state(h.record.childPid) === "gone" || state(h.record.childPid) === "Z";
-    const custodianGone = state(h.record.custodianPid) === "gone" || state(h.record.custodianPid) === "Z";
-    if (childGone && custodianGone) continue;
-    try {
-      process.kill(h.record.custodianPid, "SIGKILL");
-    } catch {
-      /* gone */
-    }
-    try {
-      process.kill(h.record.childPid, "SIGKILL");
-    } catch {
-      /* gone */
-    }
+    killOwned(h.record.custodianPid, h.record.custodianStart);
+    killOwned(h.record.childPid, h.record.childStart);
   }
   rmSync(root, { recursive: true, force: true });
 }

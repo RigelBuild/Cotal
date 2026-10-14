@@ -94,7 +94,9 @@ const until = async (p: () => boolean, ms: number): Promise<boolean> => {
   while (!p() && Date.now() < deadline) await wait(50);
   return p();
 };
-const kill = (pid: number): void => {
+/** Signal only the process this suite captured: a changed start token means the pid was reused. */
+const kill = (pid: number, start: string | undefined): void => {
+  if (pid <= 1 || start === undefined || processStartToken(pid) !== start) return;
   try {
     process.kill(pid, "SIGKILL");
   } catch {
@@ -165,6 +167,7 @@ setInterval(() => {}, 1000);
 `,
     );
     const manager = spawn(process.execPath, [managerSrc, JSON.stringify(rec)], { stdio: ["ignore", "pipe", "ignore"] });
+    const managerStart = processStartToken(manager.pid as number);
     const adopted = await new Promise<boolean>((r) => {
       const t = setTimeout(() => r(false), 30_000);
       manager.stdout?.on("data", (d: Buffer) => {
@@ -176,7 +179,7 @@ setInterval(() => {}, 1000);
     });
     check("O1 armed: a separate manager process adopted the seat", adopted);
     // The bound only starts once the controller is gone, so the window must be measured from HERE.
-    kill(manager.pid as number);
+    kill(manager.pid as number, managerStart);
     const killedAt = Date.now();
     const exited = await until(() => gone(rec.custodianPid), BOUND_MS * 4);
     const elapsed = Date.now() - killedAt;
@@ -203,9 +206,8 @@ setInterval(() => {}, 1000);
       !(reapEvidence instanceof Error) && reapEvidence.outcome === "retained" && reapEvidence.reason === "unprovable" && reapEvidence.stop === "no-custodian" && existsSync(join(root, rec.id, "record.json")),
       reapEvidence instanceof Error ? reapEvidence.message : reapEvidence,
     );
-    kill(manager.pid as number);
-    kill(rec.childPid);
-    kill(rec.custodianPid);
+    kill(rec.childPid, rec.childStart);
+    kill(rec.custodianPid, rec.custodianStart);
   }
 
   {
@@ -222,10 +224,12 @@ setInterval(() => {}, 1000);
     const childPid = child.pid;
     if (childPid === undefined) throw new Error("setsid fixture child did not expose its pid");
     let grandchildPid: number | undefined;
+    let grandchildStart: string | undefined;
     try {
       const childReady = await until(() => existsSync(childPidPath), 2_000);
       const grandchildReady = await until(() => existsSync(grandchildPidPath), 2_000);
       grandchildPid = Number(readFileSync(grandchildPidPath, "utf8"));
+      grandchildStart = processStartToken(grandchildPid);
       const childStat = readFileSync(`/proc/${childPid}/stat`, "utf8");
       const grandchildStat = readFileSync(`/proc/${grandchildPid}/stat`, "utf8");
       const childSession = Number(childStat.slice(childStat.lastIndexOf(") ") + 2).split(" ")[3]);
@@ -255,8 +259,8 @@ setInterval(() => {}, 1000);
         { evidence: evidence instanceof Error ? evidence.message : evidence, grandchild: grandchildPid === undefined ? "missing" : state(grandchildPid) },
       );
     } finally {
-      try { process.kill(childPid, "SIGKILL"); } catch { /* already gone */ }
-      if (grandchildPid !== undefined) kill(grandchildPid);
+      // The child exits on its own before the reap; only the captured grandchild is ours to stop.
+      if (grandchildPid !== undefined) kill(grandchildPid, grandchildStart);
       await until(() => gone(childPid) && (grandchildPid === undefined || gone(grandchildPid)), 2_000);
       rmSync(dir, { recursive: true, force: true });
     }
@@ -294,8 +298,8 @@ setInterval(() => {}, 1000);
       await until(() => gone(rec.custodianPid), BOUND_MS * 4),
       { custodian: state(rec.custodianPid) },
     );
-    kill(rec.childPid);
-    kill(rec.custodianPid);
+    kill(rec.childPid, rec.childStart);
+    kill(rec.custodianPid, rec.custodianStart);
   }
 
   {
@@ -330,8 +334,8 @@ setInterval(() => {}, 1000);
     // A census that claimed another run's custodians would SIGKILL a live seat in a parallel lane.
     check("O3 a census for a different run claims none of them", CENSUS(`${run}-other`).length === 0);
     for (const r of recs) {
-      kill(r.childPid);
-      kill(r.custodianPid);
+      kill(r.childPid, r.childStart);
+      kill(r.custodianPid, r.custodianStart);
     }
     delete process.env.COTAL_RUN;
   }
