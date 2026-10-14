@@ -183,6 +183,10 @@ const SERVED_INSTANCE = "s".repeat(26);
 const FOREIGN_INSTANCE = "f".repeat(26);
 const FOREIGN_REMEDY = "the owning manager must reconcile or an operator must perform an explicit CAS takeover";
 const FOREIGN_FAILURE_FACT = `static alias=foreign-owned phase=active disposition=refused remedy=${FOREIGN_REMEDY}`;
+// The retained-terminal shape the manager serves when a reap could not prove a seat gone.
+const RETAINED_REMEDY = "the seat is not proved gone; confirm its processes are gone, then call release-seat with this alias and lifecycleUid";
+const RETAINED_FAILURE_FACT = `static alias=retained-seat phase=terminalizing disposition=refused retainedReason=unprovable remedy=${RETAINED_REMEDY}`;
+const RETAINED_COUNT_FACT = "static retained custody 1";
 
 async function serveManagerWithForeignRefusal(): Promise<{ close(): Promise<void> }> {
   const nc = await connect({ servers: server });
@@ -278,6 +282,7 @@ async function serveManagerWithForeignRefusal(): Promise<{ close(): Promise<void
       classSpawn: true,
       staticReconciliation: {
         state: "failed",
+        retainedCustody: 1,
         failures: [{
           alias: "foreign-owned",
           actor: "a".repeat(26),
@@ -288,6 +293,17 @@ async function serveManagerWithForeignRefusal(): Promise<{ close(): Promise<void
           disposition: "refused",
           lastError: `the durable slot belongs to manager instance ${FOREIGN_INSTANCE}, not ${SERVED_INSTANCE}`,
           remedy: FOREIGN_REMEDY,
+        }, {
+          alias: "retained-seat",
+          actor: "b".repeat(26),
+          lifecycleUid: "r".repeat(26),
+          phase: "terminalizing",
+          attempts: 1,
+          maxAttempts: 4,
+          disposition: "refused",
+          retainedReason: "unprovable",
+          lastError: `runtime "pty" retained pty:${"c".repeat(32)} (unprovable), so the seat it addresses is NOT proved gone`,
+          remedy: RETAINED_REMEDY,
         }],
       },
     }),
@@ -456,6 +472,11 @@ try {
       benignRefusalText.includes("static reconciliation failed") &&
       benignRefusalText.includes(FOREIGN_FAILURE_FACT) &&
       benignRefusalText.includes("serve reachable"),
+    benignRefusalText);
+  check("a retained terminal renders its reason, the release remedy and the retained count",
+    benignRefusalText.includes(RETAINED_FAILURE_FACT) &&
+      benignRefusalText.includes(RETAINED_COUNT_FACT) &&
+      !benignRefusalText.includes("restart this manager"),
     benignRefusalText);
 
   console.log(`\nCOMPONENT HEALTH SMOKE OK ✅ (${pass} checks)`);

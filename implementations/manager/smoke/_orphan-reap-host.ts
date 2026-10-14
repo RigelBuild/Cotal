@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { existsSync, writeFileSync } from "node:fs";
 import { Manager, type SpawnHooks } from "../src/manager.js";
 import { evictDeniedPrincipalWithCreds, registry, type AgentHandle, type Connector, type EvictionResult, type LaunchOpts, type LaunchSpec, type Runtime } from "@cotal-ai/core";
+import { setCustodianTestSeam } from "../../../packages/seat/dist/launcher.js";
 
 const root = process.env.REPRO_ROOT!;
 const space = process.env.REPRO_SPACE!;
@@ -59,9 +60,26 @@ const hooks: SpawnHooks | undefined = process.env.REPRO_THROW_AFTER_LAUNCH === "
       },
     }
   : undefined;
+// Late readiness (spawn-window suite): hold the custodian before it writes its record, past the
+// launcher's ten-second bound. `@cotal-ai/seat` resolves to this same dist module by realpath, so
+// the seam set here is the one the runtime's launch reads.
+const holdDir = process.env.REPRO_SEAM_HOLD;
+if (holdDir) setCustodianTestSeam({ holds: [{ at: "before-fs", reached: join(holdDir, "reached"), release: join(holdDir, "release") }] });
 await manager.start();
 const managerInstanceId = (manager as unknown as { managerInstanceId: string }).managerInstanceId;
 process.stdout.write(`REPRO_MANAGER ${JSON.stringify({ managerPid: process.pid, managerInstanceId })}\n`);
+if (holdDir) {
+  // Report the operator view, and run one reconcile sweep when the suite asks for it.
+  const m = manager as unknown as { managerStatusData: () => { staticReconciliation: unknown }; reconcileStaticLifecycles: () => Promise<void> };
+  let swept = false;
+  setInterval(() => {
+    process.stdout.write(`REPRO_STATUS ${JSON.stringify(m.managerStatusData().staticReconciliation)}\n`);
+    if (!swept && existsSync(join(holdDir, "reconcile"))) {
+      swept = true;
+      void m.reconcileStaticLifecycles().then(() => process.stdout.write(`REPRO_RECONCILED\n`), (e: unknown) => process.stdout.write(`REPRO_RECONCILED ${String(e)}\n`));
+    }
+  }, 250);
+}
 if (process.env.REPRO_SPAWN === "1") {
   let reply = await manager.startAgent({ name: alias, agent: "orphan-reap-repro", cwd: repo, events: false }, undefined, hooks);
   for (let i = 0; !reply.ok && /reconcil|terminal|standing slot|held/i.test(reply.error ?? "") && i < 320; i++) { await wait(250); reply = await manager.startAgent({ name: alias, agent: "orphan-reap-repro", cwd: repo, events: false }, undefined, hooks); }

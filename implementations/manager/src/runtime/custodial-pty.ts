@@ -57,8 +57,10 @@ export class CustodialPtyRuntime implements CustodialRuntime {
     if (process.platform !== "linux") throw unsupportedTransport();
     if (reference.kind !== "pty") throw new Error(`cannot reap runtime kind "${reference.kind}" with pty`);
     const evidence = await reapSeat(this.root, reference.id);
-    // Only `reaped` proves a seat gone; until the manager types `retained`, it refuses as `absent` does.
-    return evidence.outcome === "reaped" ? { outcome: "reaped", detail: evidence.detail } : { outcome: "absent" };
+    // One to one: the seat's `stop` field describes the request it made and carries no proof.
+    if (evidence.outcome === "absent") return { outcome: "absent" };
+    if (evidence.outcome === "reaped") return { outcome: "reaped", detail: evidence.detail };
+    return { outcome: "retained", reason: evidence.reason, detail: evidence.detail };
   }
 }
 

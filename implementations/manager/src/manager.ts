@@ -178,6 +178,7 @@ import {
   activateStaticLifecycle,
   runStaticTerminal,
   readStaticSlot,
+  writeStaticSlotIntent,
   casStaticSlot,
   recordSlotCredential,
   appendStaticCredentialRow,
@@ -256,6 +257,11 @@ const STARTUP_RECONCILING = "startup static lifecycle reconciliation";
  *  leaves the durable alias held and requires a later manager start. */
 const STATIC_RECONCILE_RETRY_DELAYS_MS = [1_000, 5_000, 30_000] as const;
 const STATIC_RECONCILE_MAX_ATTEMPTS = STATIC_RECONCILE_RETRY_DELAYS_MS.length + 1;
+
+/** The remedy every retained terminal carries. A manager restart proves nothing about the seat, so
+ *  it is never offered here. */
+const RETAINED_CUSTODY_REMEDY =
+  "the seat is not proved gone; confirm its processes are gone, then call release-seat with this alias and lifecycleUid";
 
 type StaticReconcileItem = ManagerStaticReconciliationFailure & {
   owner: string;
@@ -1134,6 +1140,9 @@ export class Manager {
   /** Held as an instance field so broker-owning smokes can compress the schedule without changing
    *  production semantics. It is never a fence expiry: the durable non-retired row stays authoritative. */
   private staticReconcileRetryDelaysMs: readonly number[] = STATIC_RECONCILE_RETRY_DELAYS_MS;
+  /** A reference a mismatched spawn got but could not record on its slot row, keyed by lifecycle
+   *  UID, so the retained status can name the seat that may still run. Cleared on retirement. */
+  private readonly unrecordedCustody = new Map<string, RuntimeReference>();
   /** SINGLE-FLIGHT guard for {@link deprovision} (INT-2/C): one in-flight teardown per
    *  (name, lifecycleUid). The detached freeSlot teardown and every same-name-spawn nudge that
    *  re-drives it JOIN one promise instead of launching a SECOND, concurrent teardown. Without it,
@@ -3787,11 +3796,15 @@ export class Manager {
         const joinedAfter = this.ep.getRoster()
           .filter((p) => p.card.id === wanted && p.lifecycleUid === a.lifecycleUid)
           .reduce((max, p) => Math.max(max, p.ts), 0) + 1;
-        // Same ordering as the spawn path: the replacement seat's reference is recorded on the
-        // still-active slot before its processes exist, so a crash here never strands it.
+        // Same ordering as the spawn path: the predecessor seat is proved gone while the row still
+        // names it, then the replacement's reference is recorded on the still-active slot before its
+        // processes exist. Either step throwing spawns nothing.
         const custody = this.reserveCustody();
-        if (custody) await this.recordSlotCustody(a, custody);
-        const handle = await this.spawnCustodied(a.name, spec, a.launch.cwd, custody);
+        if (custody) {
+          await this.provePredecessor(a, custody);
+          await this.recordSlotCustody(a, custody);
+        }
+        const handle = await this.spawnCustodied(a.name, spec, a.launch.cwd, custody, a);
         replacement = handle;
         restart.sessionStatePath = spec.sessionStatePath ?? restart.sessionStatePath;
         if (continueSession !== undefined)
@@ -3824,7 +3837,6 @@ export class Manager {
         exited.release?.();
         restart.opts = opts;
         restart.recovering = false;
-        await this.recordSlotRuntime(a);
         if (continueSession !== undefined)
           console.error(`! ${a.name}: recovered Pi session ${continueSession} after crash (${restart.crashes.length}/${limit})`);
         else
@@ -4779,7 +4791,7 @@ export class Manager {
         workspaceRoot: this.workspaceRoot,
       };
       const spec = connector.buildLaunch(launchOpts);
-      const handle = await this.spawnCustodied(name, spec, cwd, custody);
+      const handle = await this.spawnCustodied(name, spec, cwd, custody, { id: identity.id, lifecycleUid });
       hooks?.onLaunched?.(); // P2 item 2: the "launched" progress edge (process spawned, pre-presence)
       const managed: ManagedAgent = {
         name,
@@ -5367,8 +5379,12 @@ export class Manager {
         return { ok: false, error: `connector ${connector.name} declares invalid readinessTimeoutMs ${JSON.stringify(connector.readinessTimeoutMs)}; expected a positive safe integer` };
       const resumeId = entry.identity.mode === "user" ? principalKey(entry.identity.owner, entry.identity.actor).key : entry.identity.id;
       const custody = this.reserveCustody();
-      if (custody) await this.recordSlotCustody({ name: entry.name, id: resumeId, lifecycleUid: entry.identity.lifecycleUid }, custody);
-      const handle = await this.spawnCustodied(entry.name, prepared.spec, entry.launch.cwd, custody);
+      const resumeSlot = { name: entry.name, id: resumeId, lifecycleUid: entry.identity.lifecycleUid };
+      if (custody) {
+        await this.provePredecessor(resumeSlot, custody);
+        await this.recordSlotCustody(resumeSlot, custody);
+      }
+      const handle = await this.spawnCustodied(entry.name, prepared.spec, entry.launch.cwd, custody, resumeSlot);
       const managed: ManagedAgent = {
         name: entry.name,
         role: entry.role,
@@ -5413,7 +5429,6 @@ export class Manager {
       };
       this.agents.set(entry.name, managed);
       if (this.resumeAttemptId) this.resumedAgentNames.add(entry.name);
-      await this.recordSlotRuntime(managed);
       const readiness = await this.awaitReadiness(managed, readinessTimeoutMs);
       if (!readiness.ok && !readiness.uncertain) return { ok: false, error: readiness.detail };
       if (!readiness.ok) {
@@ -5828,6 +5843,7 @@ export class Manager {
       state,
       ...(this.staticReconcileLastSweep ? { lastSweep: { ...this.staticReconcileLastSweep } } : {}),
       failures,
+      retainedCustody: failures.filter((item) => item.retainedReason !== undefined && item.disposition !== "recovered").length,
     };
   }
 
@@ -7344,31 +7360,40 @@ export class Manager {
     }
   }
 
-  /** Re-record the custody reference of a managed agent's CURRENT handle on its active slot: a
-   *  same-lifecycle restart or a resume binds a new custody under the old uid, and the successor's
-   *  reap must address the live one. Static auth only; a runtime without durable custody records
-   *  nothing (there is nothing to reap by reference). Loud on failure, never fatal to the bind: the
-   *  handle is already live and a stale reference is refused by identity at reap time. */
-  private async recordSlotRuntime(a: ManagedAgent): Promise<void> {
-    if (a.handle.reference === undefined) return;
-    await this.recordSlotCustody(a, a.handle.reference);
-  }
-
-  /** Record one custody reference on an agent's ACTIVE slot. Split from {@link recordSlotRuntime}
-   *  so a restart or a resume can record the reference it RESERVED before spawning, while no
-   *  handle exists yet. Static auth only; a runtime without durable custody reserves nothing. */
+  /** Record one custody reference on an agent's ACTIVE slot: a restart or a resume records the
+   *  reference it RESERVED before spawning, while no handle exists yet. Static auth only; a runtime
+   *  without durable custody reserves nothing. FATAL: a reservation the row does not carry would
+   *  launch a seat no successor can address, so a missing row, another lifecycle UID, a phase other
+   *  than `active` or a lost CAS throws and the caller spawns nothing. */
   private async recordSlotCustody(a: { name: string; id: string; lifecycleUid: string }, runtime: RuntimeReference): Promise<void> {
     if (!this.auth || this.userMode) return;
-    try {
-      await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: a.id, lifecycleUid: a.lifecycleUid, alias: a.name }, async (t) => {
-        const slot = await readStaticSlot(t, DEV_OWNER, a.name);
-        if (slot === undefined || slot.row.lifecycleUid !== a.lifecycleUid || slot.row.phase !== "active") return;
-        if (slot.row.runtime?.kind === runtime.kind && slot.row.runtime.id === runtime.id) return;
-        await casStaticSlot(t, { ...slot.row, runtime }, slot.revision);
-      });
-    } catch (e) {
-      console.error(`! ${a.name}: could not record the custody reference ${runtime.kind}:${runtime.id} on its static slot: ${(e as Error).message} - a successor reaps this seat only by an up-to-date reference`);
-    }
+    await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: a.id, lifecycleUid: a.lifecycleUid, alias: a.name }, async (t) => {
+      const slot = await readStaticSlot(t, DEV_OWNER, a.name);
+      if (slot === undefined || slot.row.lifecycleUid !== a.lifecycleUid || slot.row.phase !== "active")
+        throw new Error(
+          `cannot record the custody reference ${runtime.kind}:${runtime.id} for "${a.name}": the static slot is ` +
+            `${slot === undefined ? "absent" : `${slot.row.phase} at uid ${slot.row.lifecycleUid}`}, not active at uid ${a.lifecycleUid}; nothing is spawned under an unrecorded reference`,
+        );
+      if (slot.row.runtime?.kind === runtime.kind && slot.row.runtime.id === runtime.id) return;
+      await casStaticSlot(t, { ...slot.row, runtime }, slot.revision);
+    });
+  }
+
+  /** Prove the slot's CURRENT seat gone before a restart or a resume replaces its reference. The
+   *  row is the only reference authority: once {@link recordSlotCustody} overwrites it, nothing
+   *  addresses the predecessor again. An unproven reap throws {@link RuntimeReapUnproven}, the
+   *  caller spawns nothing, and the row keeps naming the predecessor for its terminal. */
+  private async provePredecessor(a: { name: string; id: string; lifecycleUid: string }, next: RuntimeReference): Promise<void> {
+    if (!this.auth || this.userMode) return;
+    const row = await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: a.id, lifecycleUid: a.lifecycleUid, alias: a.name }, async (t) =>
+      (await readStaticSlot(t, DEV_OWNER, a.name))?.row,
+    );
+    // A missing or foreign row is recordSlotCustody's refusal to make; there is no predecessor here.
+    if (row === undefined || row.lifecycleUid !== a.lifecycleUid) return;
+    const prior = row.runtime;
+    if (prior === undefined || (prior.kind === next.kind && prior.id === next.id)) return;
+    const evidence = await requireRuntimeReap(this.runtime, prior);
+    console.error(`${a.name}: predecessor seat ${prior.kind}:${prior.id} proved gone before its reference is replaced (${evidence.detail})`);
   }
 
   /** Mint the custody reference for a seat this manager is about to spawn, BEFORE the processes
@@ -7379,74 +7404,105 @@ export class Manager {
   }
 
   /** Spawn under a reserved reference and prove the runtime honoured it. A runtime that minted its
-   *  own id instead would leave every durable record addressing a seat that does not exist, so the
-   *  mismatch tears the new seat down and throws rather than returning an unaddressable handle. */
-  private async spawnCustodied(name: string, spec: LaunchSpec, cwd: string, reserved: RuntimeReference | undefined): Promise<AgentHandle> {
+   *  own id instead leaves the row addressing a seat that does not exist, so the mismatch RECORDS
+   *  the reference it got on the slot row (fatal CAS) and throws. It never reaps inline: the spawn's
+   *  rollback reaches the terminal, which reaps the row's reference, now `got`. */
+  private async spawnCustodied(name: string, spec: LaunchSpec, cwd: string, reserved: RuntimeReference | undefined, slot: { id: string; lifecycleUid: string }): Promise<AgentHandle> {
     const handle = this.runtime.spawn(name, spec, cwd, reserved);
     if (reserved === undefined) return handle;
     const got = handle.reference;
     if (got?.kind === reserved.kind && got.id === reserved.id) return handle;
-    // A live seat now exists under a reference no durable row names, and the rollback will reap the
-    // RESERVED one, which addresses nothing. `handle.stop` cannot close this: it is fire-and-forget
-    // over the seat socket and swallows its own errors, so it proves nothing about the process. Reap
-    // the reference the runtime ACTUALLY used — that path verifies identity and proves the exit —
-    // and carry what the proof said into the throw, so a mismatch never reports a disposal it did
-    // not make.
     let disposal: string;
     if (got === undefined) {
       try { handle.stop({ graceful: false }); } catch { /* reported below */ }
-      disposal = "the handle carries no reference, so nothing could reap it by identity and only a best-effort stop was issued";
+      disposal = "the handle carries no reference, so nothing can reap it by identity and only a best-effort stop was issued";
     } else {
       try {
-        const evidence = await requireRuntimeReap(this.runtime, got);
-        disposal = `the spawned seat was reaped (${evidence.detail})`;
+        await this.recordSpawnedReference(name, slot, got);
+        disposal = `${got.kind}:${got.id} is now recorded on the slot row, so the terminal addresses it`;
       } catch (e) {
-        // Two unrelated failures used to share one sentence here, and the difference is the part the
-        // reader has to act on. A runtime that cannot reap at all left nothing behind to find. An
-        // UNPROVEN reap may have left a live seat under a reference no durable row names, which is
-        // the one case where somebody has to go looking, so it says so and names what to look for.
-        disposal =
-          e instanceof RuntimeReapUnproven
-            ? `the spawned seat was NOT proved gone and may still be running as ${e.reference.kind}:${e.reference.id} (${e.message})`
-            : `the spawned seat could NOT be reaped: ${(e as Error).message}`;
+        // The row still names `reserved`; its terminal reaps that, finds it absent and retains the
+        // alias. Remember `got` so the retained status names the seat that may still be running.
+        this.unrecordedCustody.set(slot.lifecycleUid, got);
+        disposal = `${got.kind}:${got.id} could NOT be recorded on the slot row (${(e as Error).message}), so it may still be running and no durable row names it`;
       }
     }
     throw new Error(
       `runtime "${this.runtime.kind}" reserved custody ${reserved.kind}:${reserved.id} for "${name}" but spawned ` +
-        `${got ? `${got.kind}:${got.id}` : "a handle with no reference"}; the recorded reference would address no seat, so ${disposal}`,
+        `${got ? `${got.kind}:${got.id}` : "a handle with no reference"}; ${disposal}`,
     );
   }
 
-  /** The terminal's process step: an orphan (no live handle in THIS process) is reaped by the custody
-   *  reference the slot recorded, before its footprint goes. A successor must never retire a
-   *  lifecycle and free its alias while the predecessor's seat process is still running outside
-   *  every manager. The runtime verifies the process identity against its own record and proves the
-   *  exit; a runtime that cannot reap refuses by name and the lifecycle stays terminalizing. A row
-   *  with no recorded reference has nothing this manager can address. */
-  private async reapOrphanSeat(a: { name: string; runtime?: RuntimeReference }): Promise<void> {
-    if (a.runtime === undefined) {
-      // No reference reached this terminal. Under a custodying runtime that is either a row written
-      // before the reservation existed, or a caller that dropped the reference on the way here.
-      // Do not name the slot row: the row may well hold a reference this caller never read, and
-      // a diagnostic that guesses which is which sends the reader the wrong way.
-      if (isCustodialRuntime(this.runtime))
-        console.error(`static retirement ${a.name}: no custody reference reached this terminal, though runtime "${this.runtime.kind}" custodies its seats; any seat it launched is not addressable from here`);
+  /** CAS the reference a mismatched spawn actually got onto its own slot row, at `provisioning`
+   *  (the first spawn) or `active` (a restart or resume). Throws on any other row. */
+  private async recordSpawnedReference(name: string, slot: { id: string; lifecycleUid: string }, got: RuntimeReference): Promise<void> {
+    if (!this.auth || this.userMode) throw new Error("this mesh keeps no static slot row");
+    await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: slot.id, lifecycleUid: slot.lifecycleUid, alias: name }, async (t) => {
+      const cur = await readStaticSlot(t, DEV_OWNER, name);
+      if (cur === undefined || cur.row.lifecycleUid !== slot.lifecycleUid || (cur.row.phase !== "provisioning" && cur.row.phase !== "active"))
+        throw new Error(`the static slot is ${cur === undefined ? "absent" : `${cur.row.phase} at uid ${cur.row.lifecycleUid}`}, not live at uid ${slot.lifecycleUid}`);
+      await casStaticSlot(t, { ...cur.row, runtime: got }, cur.revision);
+    });
+  }
+
+  /** The terminal's process step: reap the seat the SLOT ROW names, the only reference authority.
+   *  A differing caller reference (for example the old handle reference a failed restart's hold
+   *  carries) is logged and never reaped: restart and resume proved it before replacing it. An
+   *  unproven reap throws {@link RuntimeReapUnproven} into driveStaticRetirement's catch, which
+   *  records the retained terminal and HOLDS the alias. */
+  private async reapOrphanSeat(a: { name: string; runtime?: RuntimeReference }, rowRuntime: RuntimeReference | undefined): Promise<void> {
+    if (a.runtime !== undefined && (rowRuntime === undefined || a.runtime.kind !== rowRuntime.kind || a.runtime.id !== rowRuntime.id))
+      console.error(`static retirement ${a.name}: the caller's reference ${a.runtime.kind}:${a.runtime.id} differs from the slot row's ${rowRuntime ? `${rowRuntime.kind}:${rowRuntime.id}` : "(none)"}; only the row's reference is reaped`);
+    if (rowRuntime === undefined) {
+      if (isCustodialRuntime(this.runtime)) throw new RuntimeReapUnproven(this.runtime.kind, undefined, "no-reference");
       return;
     }
-    // An unproven reap throws from here rather than printing, so it propagates into
-    // driveStaticRetirement's catch, which records the failure and HOLDS the name. That is the whole
-    // point of refusing: the alias must not be freed while a seat nobody proved gone may still run.
-    const evidence = await requireRuntimeReap(this.runtime, a.runtime);
+    const evidence = await requireRuntimeReap(this.runtime, rowRuntime);
     console.error(`static retirement ${a.name}: orphan seat process ${evidence.detail}`);
   }
 
+  /** Upsert the operator-visible item for a terminal whose seat is not proved gone, on live despawn
+   *  and reconcile alike. `members-remain` with budget left takes the ordinary retry rule; every
+   *  other reason, and an exhausted budget, is `refused` with the release remedy. */
+  private recordRetainedTerminal(row: Pick<StaticManagedSlotRow, "owner" | "alias" | "actor" | "lifecycleUid">, e: RuntimeReapUnproven): void {
+    const key = this.staticReconcileKey(row);
+    let item = this.staticReconcileItems.get(key);
+    if (!item) {
+      item = {
+        owner: row.owner,
+        alias: row.alias,
+        actor: row.actor,
+        lifecycleUid: row.lifecycleUid,
+        phase: "terminalizing",
+        attempts: 1,
+        maxAttempts: STATIC_RECONCILE_MAX_ATTEMPTS,
+        disposition: "retrying",
+      };
+      this.staticReconcileItems.set(key, item);
+    }
+    const got = this.unrecordedCustody.get(row.lifecycleUid);
+    item.phase = "terminalizing";
+    item.retainedReason = e.reason;
+    item.lastError = got === undefined ? e.message : `${e.message}; the runtime spawned ${got.kind}:${got.id}, which no durable row names`;
+    item.remedy = RETAINED_CUSTODY_REMEDY;
+    item.recoveredAt = undefined;
+    if (e.reason === "members-remain" && item.attempts < item.maxAttempts) {
+      if (this.staticReconcileSweepsInFlight > 0) item.disposition = "retry-scheduled";
+      else this.scheduleStaticReconcileRetry(key, item);
+    } else {
+      item.disposition = "refused";
+      item.nextRetryAt = undefined;
+    }
+    console.error(`! static retirement retained alias=${item.alias} uid=${item.lifecycleUid} reason=${e.reason} disposition=${item.disposition}: ${item.lastError}; NEXT: ${RETAINED_CUSTODY_REMEDY}`);
+  }
+
   /** The static F1 terminal for one departed incarnation (Unit B): delegates the gate/head CAS
-   *  sequence to the shared core saga over the executor transport; the footprint teardown (creds
-   *  file + broker durables/ACL) runs INSIDE the barrier as its cleanup step. On completion the
-   *  wire principal joins {@link retiredPrincipals} (the F5 refusal index) and the name hold
-   *  clears (ABA-guarded by uid). A PRE-UNIT-B lifecycle (no slot row — spawned before the
-   *  durable registry existed) has nothing to terminalize: its footprint teardown runs directly
-   *  and the hold clears, the honest upgrade path. */
+   *  sequence to the shared core saga over the executor transport; the footprint teardown runs
+   *  INSIDE the barrier as its cleanup step, after the ledger revoke and the eviction. A rowless
+   *  lifecycle (spawned before the durable registry existed) first gets a slot written for it, so it
+   *  terminalizes and retains like any other. A slot at another lifecycle UID means this teardown is
+   *  stale: it sends nothing and deletes nothing. On completion the wire principal joins
+   *  {@link retiredPrincipals} (the F5 refusal index) and the name hold clears (ABA-guarded by uid). */
   private async driveStaticRetirement(a: { id: string; name: string; lifecycleUid: string; secretPaths?: ManagedAgent["secretPaths"]; staticCredentialRenewal?: Promise<void>; runtime?: RuntimeReference }, surfaceFailure = false): Promise<void> {
     // A renewal that published its flight before the synchronous terminal latch is accepted work.
     // Drain it before the durable terminal enumerates credential ids and before cleanup deletes its
@@ -7460,13 +7516,17 @@ export class Manager {
       auth: this.auth!,
       log: (line) => console.error(`static retirement ${a.name}: ${line}`),
     });
-    const cleanup = async (): Promise<void> => {
+    const cleanup = async (rowRuntime: RuntimeReference | undefined): Promise<void> => {
       // SPEC 13.15: every issuance bound to this incarnation's ledger family is retired here,
       // inside the barrier and after the ledger rows were revoked (the source is frozen first,
       // then the index is walked). A retirement that lost is surfaced, never skipped: an active
       // attempt row on a retired lifecycle would authorize a run the credential no longer can.
       const retired = await this.withIssuer((i) => i.store.retireSource({ space: this.space, bucket: epAuthBucket(this.space), key: `cred.${a.lifecycleUid}` }));
       if (retired > 0) console.error(`static retirement ${a.name}: retired ${retired} issuance(s) bound to uid ${a.lifecycleUid}`);
+      // Revocation, eviction and issuance retirement ran first; the footprint below goes only once
+      // the seat is proved gone. An unproven reap keeps the creds file, the secret store entry, the
+      // broker durables and the ACL row for the retained seat.
+      await this.reapOrphanSeat(a, rowRuntime);
       const secrets = this.secrets;
       const files = a.secretPaths ?? agentLifecycleSecretFilePaths(this.workspaceRoot, this.space, a.name, a.lifecycleUid);
       if (files.creds) {
@@ -7475,33 +7535,46 @@ export class Manager {
       }
       await this.deprovisionBroker(a);
     };
-    // The process goes before its footprint: reap the orphan seat by reference, then tear down.
-    const reapThenCleanup = async (): Promise<void> => {
-      await this.reapOrphanSeat(a);
-      await cleanup();
-    };
     try {
-      await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: a.id, lifecycleUid: a.lifecycleUid, alias: a.name }, async (t) => {
-        const slot = await readStaticSlot(t, DEV_OWNER, a.name);
-        if (slot === undefined || slot.row.lifecycleUid !== a.lifecycleUid) {
-          // No durable registration for THIS incarnation: a pre-Unit-B spawn (or a slot already
-          // replaced by a successor — then this stale teardown must not touch the registry at all).
-          await reapThenCleanup();
-          return;
+      const retired = await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: a.id, lifecycleUid: a.lifecycleUid, alias: a.name }, async (t) => {
+        let slot = await readStaticSlot(t, DEV_OWNER, a.name);
+        if (slot !== undefined && slot.row.lifecycleUid !== a.lifecycleUid) {
+          // A successor holds the alias: this uid's slot was retired and replaced, so this stale
+          // teardown must not touch the registry, the seat or the footprint.
+          console.error(`static retirement ${a.name} (${a.id}): the slot is at uid ${slot.row.lifecycleUid}, not ${a.lifecycleUid}; this stale teardown sends nothing and deletes nothing`);
+          return false;
         }
+        if (slot === undefined) {
+          // A pre-Unit-B lifecycle has no slot row. Write one so the terminal (and a retained
+          // outcome's release coordinate) exists for it like for any other lifecycle.
+          await writeStaticSlotIntent(t, {
+            owner: DEV_OWNER, alias: a.name, actor: a.id, lifecycleUid: a.lifecycleUid,
+            managerInstance: this.managerLifecycleUid, ownerInstanceId: this.managerInstanceId,
+            ...(a.runtime ? { runtime: a.runtime } : {}),
+          });
+          slot = await readStaticSlot(t, DEV_OWNER, a.name);
+          if (slot === undefined) throw new Error(`the static slot for "${a.name}" vanished right after its terminal intent was written`);
+        }
+        const rowRuntime = slot.row.runtime;
         await runStaticTerminal(
           t,
           {
             owner: DEV_OWNER, alias: a.name, actor: a.id, lifecycleUid: a.lifecycleUid, opId,
             managerInstance: this.managerInstanceId, managerProcessUid: this.managerLifecycleUid,
           },
-          { cleanup: reapThenCleanup, evict, log: (line) => console.error(`static retirement ${a.name}: ${line}`) },
+          { cleanup: () => cleanup(rowRuntime), evict, log: (line) => console.error(`static retirement ${a.name}: ${line}`) },
         );
+        return true;
       });
-      this.retiredPrincipals.add(principalKey(DEV_OWNER, a.id).key);
+      if (retired) {
+        this.unrecordedCustody.delete(a.lifecycleUid);
+        this.retiredPrincipals.add(principalKey(DEV_OWNER, a.id).key);
+      }
       const cur = this.retiring.get(a.name);
       if (cur && cur.lifecycleUid === a.lifecycleUid) this.retiring.delete(a.name); // ABA-guarded hold clear
     } catch (e) {
+      if (e instanceof RuntimeReapUnproven)
+        this.recordRetainedTerminal({ owner: DEV_OWNER, alias: a.name, actor: a.id, lifecycleUid: a.lifecycleUid }, e);
       const h = this.retiring.get(a.name);
       if (h && h.lifecycleUid === a.lifecycleUid)
         h.lastError = `the static retirement did not complete (${(e as Error).message}); the name stays held - a same-name spawn retries the same terminal (op ${opId})`;
@@ -7716,10 +7789,15 @@ export class Manager {
           item.disposition = "recovered";
           item.recoveredAt = new Date().toISOString();
           item.lastError = undefined;
+          item.retainedReason = undefined;
+          item.remedy = undefined;
           console.error(`✓ static reconcile recovered alias=${item.alias} phase=retired uid=${item.lifecycleUid} attempts=${item.attempts}/${item.maxAttempts}`);
         }
         return true;
       } catch (error) {
+        // driveStaticRetirement already recorded the retained terminal on this same item; the
+        // refused-foreign and retry-exhausted arms below must not overwrite it.
+        if (error instanceof RuntimeReapUnproven) return false;
         item.lastError = (error as Error).message;
         try {
           const fresh = await this.readStaticReconcileSlot(item.alias);

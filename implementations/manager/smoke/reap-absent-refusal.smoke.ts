@@ -7,18 +7,15 @@
  * record that exists at another path. Both of the manager's rendering sites used to turn that into
  * "already forgotten" and carry on, so an alias could be freed over a seat nobody proved gone.
  *
- * The refusal lives in `requireRuntimeReap` rather than at the callsites, which is what makes the
- * census exhaustive: `absent` never reaches a caller, so no caller can describe it as success.
+ * The refusal lives in `requireRuntimeReap` rather than at the callsites: `absent` and `retained`
+ * never reach a caller, so no caller can describe either as success.
  *
  * Deliberately broker-free and process-free. The property is about what one function returns versus
  * throws, and the heavy orphan-seat smokes cannot drive a missing record reliably.
  *
  * Run: pnpm smoke:reap-absent-refusal
  */
-import { readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { requireRuntimeReap } from "../src/runtime/index.js";
+import { requireRuntimeReap, RuntimeReapUnproven } from "../src/runtime/index.js";
 
 let pass = 0, fail = 0;
 const check = (name: string, condition: boolean, extra?: unknown) => {
@@ -79,21 +76,36 @@ check(
   nonCustodialThrew === undefined ? null : String((nonCustodialThrew as Error).message),
 );
 
-// (d) the census the issue asked for, stated before measuring: after the fix NO site renders an
-// absent outcome, because absent cannot reach one. A sample would not have caught the second site.
-const here = dirname(fileURLToPath(import.meta.url));
-const managerSrc = readFileSync(resolve(here, "..", "src", "manager.ts"), "utf8");
-const renderings = managerSrc.split('outcome === "absent"').length - 1;
-const callsites = managerSrc.split("requireRuntimeReap(").length - 1;
+// (d) a `retained` outcome refuses too, carrying its reason and the reference. A runtime that read
+// the record but could not prove the processes gone has proved nothing more than `absent` did.
+let retainedThrew: unknown;
+let retainedReturned: unknown;
+try {
+  retainedReturned = await requireRuntimeReap(
+    runtimeWith(async () => ({ outcome: "retained", reason: "unprovable", detail: "no contained cgroup proof; stop requested" })),
+    reference as never,
+  );
+} catch (e) { retainedThrew = e; }
 check(
-  "#1554: NO site in manager.ts renders an absent outcome as prose (expected 0)",
-  renderings === 0,
-  { renderings },
+  "RETAINED: an unprovable retained outcome throws RuntimeReapUnproven instead of returning",
+  retainedThrew instanceof RuntimeReapUnproven && retainedReturned === undefined,
+  { threw: retainedThrew === undefined ? null : String(retainedThrew), retainedReturned },
 );
 check(
-  "CONTROL: the census can still see the reap callsites it is scoped to (expected 2)",
-  callsites === 2,
-  { callsites },
+  "RETAINED: the refusal carries reason \"unprovable\" and the exact reference",
+  retainedThrew instanceof RuntimeReapUnproven && retainedThrew.reason === "unprovable" &&
+    retainedThrew.reference?.kind === reference.kind && retainedThrew.reference.id === reference.id,
+  retainedThrew instanceof RuntimeReapUnproven ? { reason: retainedThrew.reason, reference: retainedThrew.reference } : null,
+);
+check(
+  "RETAINED: the refusal message names the reference and keeps the runtime's detail",
+  retainedThrew instanceof Error && retainedThrew.message.includes(reference.id) && retainedThrew.message.includes("no contained cgroup proof"),
+  retainedThrew instanceof Error ? retainedThrew.message : null,
+);
+check(
+  "#1554: the absent refusal is the same typed error, reason \"absent\"",
+  threw instanceof RuntimeReapUnproven && threw.reason === "absent" && threw.reference?.id === reference.id,
+  threw instanceof RuntimeReapUnproven ? { reason: threw.reason } : String(threw),
 );
 
 console.log(`\nREAP-ABSENT-REFUSAL ${fail === 0 ? "OK ✅" : "FAILED ❌"}  (${pass} passed, ${fail} failed)`);

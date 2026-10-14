@@ -17,22 +17,38 @@ export function requireRuntimeAdopt(runtime: Runtime, reference: RuntimeReferenc
  *  could not be read. That is a statement about ADDRESSABILITY, not about liveness, and the two are
  *  not the same fact: a custodian that dies after spawning its child and before writing the record
  *  leaves a LIVE seat and no record, and a stale or wrong reference looks for a record that exists
- *  at a different path. `reaped`: every process the record named was signalled and verified gone, or
- *  found already gone by identity. Only `reaped` proves anything about a process. */
-export type RuntimeReapEvidence = { outcome: "absent" } | { outcome: "reaped"; detail: string };
+ *  at a different path. `retained`: the record was read, but nothing on this host could prove the
+ *  seat's processes gone (`unprovable`), or a contained group still held members at the bound
+ *  (`members-remain`). `reaped`: the seat's processes were proved gone. Only `reaped` proves
+ *  anything about a process. */
+export type RuntimeReapEvidence =
+  | { outcome: "absent" }
+  | { outcome: "reaped"; detail: string }
+  | { outcome: "retained"; reason: "unprovable" | "members-remain"; detail: string };
 
-/** A reap that could not PROVE the seat gone, thrown by {@link requireRuntimeReap} on an `absent`
- *  outcome so no caller can render it as a disposal it did not make. Carries the reference so the
- *  operator has the one thing that lets them go look: what to search for. */
+/** Why a reap did not prove a seat gone. `no-reference`: no custody reference reached the reap at
+ *  all, so there was nothing to address. The other three are the runtime's own outcomes. */
+export type RuntimeUnprovenReason = "absent" | "no-reference" | "unprovable" | "members-remain";
+
+/** A reap that could not PROVE the seat gone, thrown by {@link requireRuntimeReap} on an `absent` or
+ *  `retained` outcome so no caller can render it as a disposal it did not make. Carries the
+ *  reference (when one existed) and the reason, so the operator has what to search for and why. */
 export class RuntimeReapUnproven extends Error {
-  readonly reference: RuntimeReference;
-  constructor(runtimeKind: string, reference: RuntimeReference) {
-    super(
-      `runtime "${runtimeKind}" holds no custody record for ${reference.kind}:${reference.id}, so the seat it addresses is NOT proved gone; ` +
-        `a custodian that died before writing its record leaves a live seat behind this same outcome`,
-    );
+  readonly reference: RuntimeReference | undefined;
+  readonly reason: RuntimeUnprovenReason;
+  constructor(runtimeKind: string, reference: RuntimeReference | undefined, reason: RuntimeUnprovenReason, detail?: string) {
+    const ref = reference === undefined ? "no custody reference" : `${reference.kind}:${reference.id}`;
+    const why =
+      reason === "absent"
+        ? `runtime "${runtimeKind}" holds no custody record for ${ref}, so the seat it addresses is NOT proved gone; ` +
+          `a custodian that died before writing its record leaves a live seat behind this same outcome`
+        : reason === "no-reference"
+          ? `runtime "${runtimeKind}" custodies its seats, but no custody reference reached this reap, so any seat it launched is NOT proved gone`
+          : `runtime "${runtimeKind}" retained ${ref} (${reason}), so the seat it addresses is NOT proved gone`;
+    super(detail === undefined ? why : `${why}: ${detail}`);
     this.name = "RuntimeReapUnproven";
     this.reference = reference;
+    this.reason = reason;
   }
 }
 
@@ -66,8 +82,8 @@ export function isCustodialRuntime(runtime: Runtime): runtime is CustodialRuntim
 }
 
 /** Reap an orphaned custody by reference, or refuse by name when this runtime does not custody its
- *  own processes. Absent means REFUSE, never "assume gone": the lifecycle stays held rather than
- *  retiring over a live seat. */
+ *  own processes. Absent and retained mean REFUSE, never "assume gone": the lifecycle stays held
+ *  rather than retiring over a live seat. */
 export async function requireRuntimeReap(
   runtime: Runtime,
   reference: RuntimeReference,
@@ -75,11 +91,10 @@ export async function requireRuntimeReap(
   if (!isCustodialRuntime(runtime))
     throw new Error(`runtime "${runtime.kind}" does not support reap; the orphaned process for ${reference.kind}:${reference.id} cannot be proved gone`);
   const evidence = await runtime.reap(reference);
-  // The refusal this function's contract promises, made structural: `absent` never leaves here, so
-  // the return type carries no branch a caller could render as success. Placing it at the callsites
-  // instead left each one free to describe an unread record as a reaped process, which is what both
-  // of them did.
-  if (evidence.outcome === "absent") throw new RuntimeReapUnproven(runtime.kind, reference);
+  // The refusal this function's contract promises, made structural: only `reaped` leaves here, so
+  // the return type carries no branch a caller could render as success.
+  if (evidence.outcome === "absent") throw new RuntimeReapUnproven(runtime.kind, reference, "absent");
+  if (evidence.outcome === "retained") throw new RuntimeReapUnproven(runtime.kind, reference, evidence.reason, evidence.detail);
   return evidence;
 }
 
