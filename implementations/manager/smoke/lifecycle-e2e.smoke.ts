@@ -34,6 +34,7 @@ import {
 } from "@cotal-ai/core";
 import type { Connector, LaunchOpts, LaunchSpec } from "@cotal-ai/core";
 import { Manager } from "../src/manager.js";
+import { LegacyPtyRuntime } from "../src/runtime/pty.js";
 import { registry } from "@cotal-ai/core";
 import { agentCredsDir, agentLifecycleSecretFilePaths, authDir, renewalRecordPath, saveSpaceAuth } from "@cotal-ai/workspace";
 import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
@@ -149,6 +150,9 @@ registry.register(wrongUidRegCon);
 registry.register(bypassKindCon);
 
 const mgr = new Manager({ space, servers: SERVERS, runtime: "pty", workspaceRoot });
+// Footprint teardown needs a seat this host can prove gone; before cgroup custody (T5) only the
+// non-custodial pty has none to prove. The custodial retained outcome is custody-fail-closed's.
+(mgr as unknown as { runtime: unknown }).runtime = new LegacyPtyRuntime();
 
 try {
   let up = false;
