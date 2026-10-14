@@ -56,7 +56,7 @@ import { killOwned, owned, type Owned } from "./_owned-kill.js";
 let failures = 0;
 let ran = 0;
 /** Intent, not a measurement: one per cell assertion below. A shortfall means a cell stopped running. */
-const EXPECTED_CHECKS = 18;
+const EXPECTED_CHECKS = 21;
 function check(label: string, cond: boolean, extra?: unknown): void {
   console.log(`${cond ? "✓" : "✗"} ${label}${cond ? "" : ` — ${JSON.stringify(extra) ?? ""}`}`);
   ran++;
@@ -78,7 +78,7 @@ const space = `custody-${randomUUID().slice(0, 8)}`;
 const auth = await createSpaceAuth(space);
 const { servers: SERVERS, stop: stopBroker } = await bootBroker(auth);
 const workspaceRoot = mkdtempSync(join(tmpdir(), "cotal-custody-ws-"));
-const ALIASES = ["retainer", "membersok", "membersmax", "predkept", "fatalres", "failrestart", "othref", "lateref", "membersweep", "clearme", "laterfail", "escalate"];
+const ALIASES = ["retainer", "membersok", "membersmax", "predkept", "fatalres", "failrestart", "othref", "lateref", "membersweep", "clearme", "laterfail", "retryret", "retrymove", "escalate"];
 mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
 for (const alias of ALIASES)
   writeFileSync(join(workspaceRoot, ".cotal", "agents", `${alias}.md`), `---\nname: ${alias}\nrole: worker\nsubscribe: [general]\nallowSubscribe: [general]\nallowPublish: [general]\n---\nbody\n`);
@@ -134,6 +134,10 @@ const M = mgr as unknown as {
   staticReconcileSweepsInFlight: number;
   releaseStaticReconcileSweep: () => void;
   driveStaticRetirement: (a: { id: string; name: string; lifecycleUid: string }) => Promise<void>;
+  retryStaticReconcile: (key: string) => Promise<void>;
+  userMode: boolean;
+  unrecordedCustody: Map<string, RuntimeReference>;
+  spawnCustodied: (name: string, spec: unknown, cwd: string, reserved: RuntimeReference, slot: { id: string; lifecycleUid: string }) => Promise<AgentHandle>;
   staticReconcileRetryDelaysMs: readonly number[];
   staticLifecycleEvict?: (principal: string) => Promise<EvictionResult>;
   withLifecycleExecutor: Executor;
@@ -456,6 +460,40 @@ try {
     const it = item("laterfail");
     check("later failure: a retained item that then exhausts its budget stays refused with the release remedy, never restart",
       failSlotCasFor === undefined && it?.disposition === "refused" && REMEDY.test(it.remedy ?? "") && /forced slot CAS/.test(it.lastError ?? ""), it);
+  }
+
+  // ── No static row: a mismatched spawn is reaped inline, never recorded ─────
+  {
+    const reserved: RuntimeReference = { kind: "pty", id: randomUUID().replaceAll("-", "") };
+    const got: RuntimeReference = { kind: "pty", id: randomUUID().replaceAll("-", "") };
+    const uid = mintLifecycleUid();
+    const mark = reaps.length;
+    spawnAs = got;
+    M.userMode = true;
+    const outcome = await M.spawnCustodied("nostatic", {}, workspaceRoot, reserved, { id: newIdentity().id, lifecycleUid: uid }).then(() => "spawned", (e: unknown) => String(e));
+    M.userMode = false;
+    check("no static row: a mismatched spawn reaps got inline before failing, and unrecordedCustody stays untouched",
+      /spawned seat was reaped/.test(outcome) && reaps.slice(mark).join() === got.id && !M.unrecordedCustody.has(uid), { outcome, reaps: reaps.slice(mark) });
+  }
+
+  // ── A retry from a retained item finds the row retired, or moved ───────────
+  for (const [alias, label] of [["retryret", "retired"], ["retrymove", "moved"]] as const) {
+    const a = await spawnLive(alias);
+    const { id, lifecycleUid } = a;
+    plans.set(refOf(a).id, [UNPROVABLE]);
+    M.despawnAuthorized(a, false, false, "smoke");
+    await until(() => item(alias)?.retainedReason !== undefined, 30_000);
+    const counted = M.managerStatusData().staticReconciliation.retainedCustody;
+    await withExecutor(alias, id, lifecycleUid, async (t) => {
+      const slot = await readStaticSlot(t, DEV_OWNER, alias);
+      if (slot === undefined) throw new Error(`${alias} slot missing`);
+      await casStaticSlot(t, label === "retired" ? { ...slot.row, phase: "retired" } : { ...slot.row, lifecycleUid: mintLifecycleUid() }, slot.revision);
+    });
+    await M.retryStaticReconcile(JSON.stringify([DEV_OWNER, alias, lifecycleUid]));
+    const it = item(alias);
+    const after = M.managerStatusData().staticReconciliation.retainedCustody;
+    check(`retry from retained, row ${label}: retainedReason${label === "retired" ? " and remedy are" : " is"} cleared and retainedCustody drops it`,
+      it !== undefined && it.retainedReason === undefined && (label === "moved" || it.remedy === undefined) && after === counted - 1, { it, counted, after });
   }
 
   // ── Failed escalation (real custodial pty, no layer 3) ─────────────────────
