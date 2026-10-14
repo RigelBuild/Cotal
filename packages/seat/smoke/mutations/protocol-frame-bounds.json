@@ -31,7 +31,7 @@
       "name": "M3 put launch payload on argv",
       "file": "packages/seat/src/launcher.ts",
       "find": "  const child = spawn(process.execPath, [custodianEntry(), RUN_MARKER_FLAG, run], {",
-      "replace": "  const child = spawn(process.execPath, [custodianEntry(), RUN_MARKER_FLAG, run, payload], {",
+      "replace": "  const child = spawn(process.execPath, [custodianEntry(), RUN_MARKER_FLAG, run, readFileSync(`/proc/self/fd/${launchFd}`, \"utf8\")], {",
       "afterRestore": "pnpm --filter @cotal-ai/seat build",
       "expectRed": "launch payload is not on the custodian cmdline",
       "cell": "launch payload is not on the custodian cmdline",
