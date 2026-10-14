@@ -45,7 +45,7 @@ import { bootBroker } from "./_boot-broker.js";
 let failures = 0;
 let ran = 0;
 /** Intent, not a measurement: one per cell assertion below. A shortfall means a cell stopped running. */
-const EXPECTED_CHECKS = 29;
+const EXPECTED_CHECKS = 30;
 function check(label: string, cond: boolean, extra?: unknown): void {
   console.log(`${cond ? "✓" : "✗"} ${label}${cond ? "" : ` — ${JSON.stringify(extra) ?? ""}`}`);
   ran++;
@@ -70,7 +70,7 @@ const space = `release-${randomUUID().slice(0, 8)}`;
 const auth = await createSpaceAuth(space);
 const { servers: SERVERS, stop: stopBroker } = await bootBroker(auth);
 const workspaceRoot = mkdtempSync(join(tmpdir(), "cotal-release-ws-"));
-const ALIASES = ["rel", "succ", "authz", "wrong", "foreign", "store", "crash", "after", "busy", "grant", "race", "unrec", "badnull", "badfield", "badalias", "badneg", "badfrac", "preflight"];
+const ALIASES = ["rel", "succ", "authz", "wrong", "foreign", "store", "crash", "after", "busy", "grant", "race", "unrec", "badnull", "badfield", "badalias", "badneg", "badfrac", "preflight", "nudge"];
 mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
 for (const alias of ALIASES)
   writeFileSync(join(workspaceRoot, ".cotal", "agents", `${alias}.md`), `---\nname: ${alias}\nrole: worker\nsubscribe: [general]\nallowSubscribe: [general]\nallowPublish: [general]\n---\nbody\n`);
@@ -84,6 +84,7 @@ function gate(): Gate {
   return { promise, resolve };
 }
 let reapHold: { id: string; reached: Gate; release: Gate } | undefined;
+let sealHold: { id: string; reached: Gate; release: Gate } | undefined;
 // ── A releasable fake runtime: every reap is unprovable; the seat is a real directory ──
 const UNPROVABLE: RuntimeReapEvidence = { outcome: "retained", reason: "unprovable", detail: "fake: no contained proof" };
 let sealOverride: RuntimeReleaseCheck | undefined;
@@ -106,7 +107,17 @@ const fakeRuntime: ReleasableRuntime = {
     return UNPROVABLE;
   },
   checkRelease: (ref) => checkSeatRelease(seatRoot, ref.id),
-  sealRelease: async (ref) => sealOverride ?? sealSeatLaunch(seatRoot, ref.id),
+  sealRelease: async (ref) => {
+    const sealed = sealOverride ?? sealSeatLaunch(seatRoot, ref.id);
+    // Park the release after its seal and before its record write.
+    const hold = sealHold;
+    if (hold !== undefined && hold.id === ref.id) {
+      sealHold = undefined;
+      hold.reached.resolve();
+      await hold.release.promise;
+    }
+    return sealed;
+  },
   removeCustody: (ref) => {
     if (failRemoveOnce) {
       failRemoveOnce = false;
@@ -134,6 +145,7 @@ type Seams = {
   despawnAuthorized: (a: Managed, graceful: boolean, trackNonAdmin: boolean, caller: string) => unknown;
   deprovision: (a: { id: string; name: string; lifecycleUid: string; runtime?: RuntimeReference }) => Promise<void>;
   driveStaticRetirement: (a: { id: string; name: string; lifecycleUid: string; runtime?: RuntimeReference }, surfaceFailure: boolean) => Promise<void>;
+  runStaticRetirement: (a: { id: string; name: string; lifecycleUid: string; runtime?: RuntimeReference }) => Promise<void>;
   unrecordedCustody: Map<string, RuntimeReference>;
   staticReconcileItems: Map<string, { alias: string; lifecycleUid: string; disposition: string }>;
   retryStaticReconcile: (key: string) => Promise<void>;
@@ -451,10 +463,10 @@ try {
       return row;
     };
     let terminals = 0;
-    const drive = M.driveStaticRetirement.bind(mgr);
-    M.driveStaticRetirement = (a, surface) => {
+    const run = M.runStaticRetirement.bind(mgr);
+    M.runStaticRetirement = (a) => {
       if (a.name === "preflight") terminals++;
-      return drive(a, surface);
+      return run(a);
     };
     const retry = M.retryStaticReconcile(key);
     await reached.promise;
@@ -463,10 +475,35 @@ try {
     resume.resolve();
     await retry;
     const out = await pending;
-    M.driveStaticRetirement = drive;
+    M.runStaticRetirement = run;
     const it = item(M, "preflight");
     check("pre-flight retry: a retry parked before its terminal and a concurrent release run one terminal, retired and recovered",
       out.ok && terminals === 1 && (await readSlot("preflight"))?.phase === "retired" && it?.disposition === "recovered" && it.retainedReason === undefined, { out, terminals, it });
+  }
+
+  // ── A same-name spawn nudge during a release never starts a terminal before the record ──
+  {
+    const r = await retain(M, mgr, "nudge");
+    const entries: boolean[] = [];
+    const run = M.runStaticRetirement.bind(mgr);
+    M.runStaticRetirement = async (a) => {
+      if (a.name === "nudge") entries.push((await readRelease(r)) !== undefined);
+      return run(a);
+    };
+    const reached = gate();
+    const resume = gate();
+    sealHold = { id: r.ref.id, reached, release: resume };
+    const pending = release(M, argsOf(r));
+    await reached.promise;
+    const spawn = await mgr.startAgent({ name: "nudge", agent: "smoke-release", events: false });
+    await sleep(300);
+    const early = [...entries];
+    resume.resolve();
+    const out = await pending;
+    M.runStaticRetirement = run;
+    check("same-name nudge: a spawn during a held release is refused, starts no terminal before the record, and the release runs the one terminal to retired",
+      !spawn.ok && early.length === 0 && out.ok && entries.length === 1 && entries[0] === true && (await readSlot("nudge"))?.phase === "retired" && !seatDir(r),
+      { spawn, early, entries, out });
   }
 
   // ── Successor release ──────────────────────────────────────────────────────

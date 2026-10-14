@@ -274,8 +274,6 @@ type StaticReconcileItem = ManagerStaticReconciliationFailure & {
   timer?: ReturnType<typeof setTimeout>;
   flight?: Promise<boolean>;
   retryFlight?: Promise<void>;
-  /** Set while an operator release runs: no retry or sweep may enter a terminal of this lifecycle. */
-  releasePending?: boolean;
 };
 
 /** The STABLE retirement opId for one lifecycle (#29 piece 3): deterministic from the uid, so a
@@ -1161,6 +1159,8 @@ export class Manager {
   private deprovisioningFlight = new Map<string, Promise<void>>();
   /** In-flight static terminals per JSON [alias, lifecycleUid] (see {@link driveStaticRetirement}). */
   private staticRetirementFlight = new Map<string, Promise<void>>();
+  /** JSON [alias, lifecycleUid] of releases in progress: only the release's own terminal may start. */
+  private staticReleasePending = new Set<string>();
   private readonly attach: AttachEndpoint;
   private ep!: CotalEndpoint;
   /** Space trust material when the mesh runs in auth mode (`.cotal/auth` present);
@@ -5842,7 +5842,7 @@ export class Manager {
    *  clear, so recovery is visible without becoming stale process-lifetime history. */
   private staticReconciliationStatus(): ManagerStaticReconciliationStatus {
     const failures = [...this.staticReconcileItems.values()]
-      .map(({ owner: _owner, timer: _timer, flight: _flight, retryFlight: _retryFlight, releasePending: _releasePending, ...item }) => ({ ...item }))
+      .map(({ owner: _owner, timer: _timer, flight: _flight, retryFlight: _retryFlight, ...item }) => ({ ...item }))
       .sort((a, b) => a.alias.localeCompare(b.alias));
     const state: ManagerStaticReconciliationStatus["state"] =
       failures.some((item) => item.disposition === "retrying") ? "retrying" :
@@ -7507,10 +7507,17 @@ export class Manager {
   /** The static F1 terminal for one departed incarnation: the core saga runs over the executor
    *  transport, and the footprint teardown is its cleanup step. A rowless lifecycle gets a slot
    *  first; a slot at another UID makes this teardown stale, so it touches nothing. */
-  private async driveStaticRetirement(a: { id: string; name: string; lifecycleUid: string; secretPaths?: ManagedAgent["secretPaths"]; staticCredentialRenewal?: Promise<void>; runtime?: RuntimeReference }, surfaceFailure = false): Promise<void> {
+  private async driveStaticRetirement(a: { id: string; name: string; lifecycleUid: string; secretPaths?: ManagedAgent["secretPaths"]; staticCredentialRenewal?: Promise<void>; runtime?: RuntimeReference }, surfaceFailure = false, release = false): Promise<void> {
     // Single-flight per (name, lifecycleUid), as deprovision is: a reconcile retry, a sweep and a
     // release must never run two terminals of one lifecycle at once.
     const key = JSON.stringify([a.name, a.lifecycleUid]);
+    // A terminal started while a release is pending would read no release record; the alias stays held.
+    if (!release && this.staticReleasePending.has(key)) {
+      const refused = new Error(`static retirement of "${a.name}" at uid ${a.lifecycleUid} refused: an operator release of this lifecycle is in progress`);
+      if (surfaceFailure) throw refused;
+      console.error(`! ${refused.message}`);
+      return;
+    }
     let flight = this.staticRetirementFlight.get(key);
     if (flight === undefined) {
       const started = this.runStaticRetirement(a).finally(() => {
@@ -7818,8 +7825,8 @@ export class Manager {
    *  map from the still-authoritative durable row. */
   private attemptStaticReconcile(key: string, item: StaticReconcileItem, row: StaticManagedSlotRow, countAttempt = true): Promise<boolean> {
     if (item.flight) return item.flight;
-    // An admitted retry that read the slot before a release began must not start a terminal that reads no release.
-    if (item.releasePending) return Promise.resolve(false);
+    // Refuse here as well, so a release-pending refusal neither burns budget nor schedules a retry.
+    if (this.staticReleasePending.has(JSON.stringify([row.alias, row.lifecycleUid]))) return Promise.resolve(false);
     if (item.timer) return Promise.resolve(false);
     // A timer/retry driver increments before its mandatory durable re-read, then calls with
     // countAttempt=false. Let that already-consumed budget entry enter the terminal. Only a fresh
@@ -8134,11 +8141,13 @@ export class Manager {
     const unrecorded = this.unrecordedCustody.get(lifecycleUid);
     if (unrecorded !== undefined)
       return { ok: false, error: `release-seat refused: the runtime spawned ${unrecorded.kind}:${unrecorded.id} for "${alias}" at uid ${lifecycleUid}, which no durable row names; it cannot be sealed or removed` };
-    // Mark the item first, so no retry or sweep starts a terminal; then wait out any attempt already
-    // admitted. No terminal ever waits on this release, so the waits cannot deadlock.
+    // Mark first, so no other path starts a terminal; then wait out any terminal already admitted.
+    // No terminal ever waits on this release, so the waits cannot deadlock.
+    const flightKey = JSON.stringify([alias, lifecycleUid]);
+    if (this.staticReleasePending.has(flightKey)) return { ok: false, error: `release-seat: a release of "${alias}" at uid ${lifecycleUid} is already in progress` };
+    this.staticReleasePending.add(flightKey);
     const item = this.staticReconcileItems.get(this.staticReconcileKey({ owner: DEV_OWNER, alias, lifecycleUid }));
     if (item !== undefined) {
-      item.releasePending = true;
       clearTimeout(item.timer);
       item.timer = undefined;
       item.nextRetryAt = undefined;
@@ -8146,7 +8155,7 @@ export class Manager {
     try {
       await item?.retryFlight?.catch(() => {});
       await item?.flight?.catch(() => {});
-      await this.staticRetirementFlight.get(JSON.stringify([alias, lifecycleUid]))?.catch(() => {});
+      await this.staticRetirementFlight.get(flightKey)?.catch(() => {});
       let advisory = `no custody reference; nothing to seal`;
       if (row.runtime !== undefined) {
         const runtime = this.runtime;
@@ -8160,10 +8169,10 @@ export class Manager {
       if (prior === undefined) await this.withLifecycleExecutor(pin, (t) => writeStaticRelease(t, spec));
       if (row.runtime !== undefined && isReleasableRuntime(this.runtime)) this.runtime.removeCustody(row.runtime);
       console.error(`static release alias=${alias} uid=${lifecycleUid} operator=${caller.owner}.${caller.actor} reason=${JSON.stringify(reason)}: ${advisory}`);
-      await this.driveStaticRetirement({ id: row.actor, name: alias, lifecycleUid, runtime: row.runtime }, true);
+      await this.driveStaticRetirement({ id: row.actor, name: alias, lifecycleUid, runtime: row.runtime }, true, true);
       return { ok: true, data: { alias, lifecycleUid, phase: "retired", advisory } };
     } finally {
-      if (item !== undefined) item.releasePending = undefined;
+      this.staticReleasePending.delete(flightKey);
     }
   }
 
