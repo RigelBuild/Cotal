@@ -274,6 +274,8 @@ type StaticReconcileItem = ManagerStaticReconciliationFailure & {
   timer?: ReturnType<typeof setTimeout>;
   flight?: Promise<boolean>;
   retryFlight?: Promise<void>;
+  /** Set while an operator release runs: no retry or sweep may enter a terminal of this lifecycle. */
+  releasePending?: boolean;
 };
 
 /** The STABLE retirement opId for one lifecycle (#29 piece 3): deterministic from the uid, so a
@@ -5840,7 +5842,7 @@ export class Manager {
    *  clear, so recovery is visible without becoming stale process-lifetime history. */
   private staticReconciliationStatus(): ManagerStaticReconciliationStatus {
     const failures = [...this.staticReconcileItems.values()]
-      .map(({ owner: _owner, timer: _timer, flight: _flight, retryFlight: _retryFlight, ...item }) => ({ ...item }))
+      .map(({ owner: _owner, timer: _timer, flight: _flight, retryFlight: _retryFlight, releasePending: _releasePending, ...item }) => ({ ...item }))
       .sort((a, b) => a.alias.localeCompare(b.alias));
     const state: ManagerStaticReconciliationStatus["state"] =
       failures.some((item) => item.disposition === "retrying") ? "retrying" :
@@ -7816,6 +7818,8 @@ export class Manager {
    *  map from the still-authoritative durable row. */
   private attemptStaticReconcile(key: string, item: StaticReconcileItem, row: StaticManagedSlotRow, countAttempt = true): Promise<boolean> {
     if (item.flight) return item.flight;
+    // An admitted retry that read the slot before a release began must not start a terminal that reads no release.
+    if (item.releasePending) return Promise.resolve(false);
     if (item.timer) return Promise.resolve(false);
     // A timer/retry driver increments before its mandatory durable re-read, then calls with
     // countAttempt=false. Let that already-consumed budget entry enter the terminal. Only a fresh
@@ -8130,30 +8134,37 @@ export class Manager {
     const unrecorded = this.unrecordedCustody.get(lifecycleUid);
     if (unrecorded !== undefined)
       return { ok: false, error: `release-seat refused: the runtime spawned ${unrecorded.kind}:${unrecorded.id} for "${alias}" at uid ${lifecycleUid}, which no durable row names; it cannot be sealed or removed` };
-    // No scheduled retry may start once the release is under way, and an attempt already in flight
-    // finishes first, so its retained outcome cannot land after this release retires the slot.
+    // Mark the item first, so no retry or sweep starts a terminal; then wait out any attempt already
+    // admitted. No terminal ever waits on this release, so the waits cannot deadlock.
     const item = this.staticReconcileItems.get(this.staticReconcileKey({ owner: DEV_OWNER, alias, lifecycleUid }));
     if (item !== undefined) {
+      item.releasePending = true;
       clearTimeout(item.timer);
       item.timer = undefined;
       item.nextRetryAt = undefined;
     }
-    await this.staticRetirementFlight.get(JSON.stringify([alias, lifecycleUid]))?.catch(() => {});
-    let advisory = `no custody reference; nothing to seal`;
-    if (row.runtime !== undefined) {
-      const runtime = this.runtime;
-      if (!isReleasableRuntime(runtime)) return { ok: false, error: `release-seat: runtime "${runtime.kind}" cannot seal ${row.runtime.kind}:${row.runtime.id}` };
-      const check = runtime.checkRelease(row.runtime);
-      if (!check.ok) return { ok: false, error: `release-seat refused: ${check.reason}: ${check.detail}` };
-      const sealed = await runtime.sealRelease(row.runtime);
-      if (!sealed.ok) return { ok: false, error: `release-seat refused: ${sealed.reason}: ${sealed.detail}` };
-      advisory = sealed.advisory;
+    try {
+      await item?.retryFlight?.catch(() => {});
+      await item?.flight?.catch(() => {});
+      await this.staticRetirementFlight.get(JSON.stringify([alias, lifecycleUid]))?.catch(() => {});
+      let advisory = `no custody reference; nothing to seal`;
+      if (row.runtime !== undefined) {
+        const runtime = this.runtime;
+        if (!isReleasableRuntime(runtime)) return { ok: false, error: `release-seat: runtime "${runtime.kind}" cannot seal ${row.runtime.kind}:${row.runtime.id}` };
+        const check = runtime.checkRelease(row.runtime);
+        if (!check.ok) return { ok: false, error: `release-seat refused: ${check.reason}: ${check.detail}` };
+        const sealed = await runtime.sealRelease(row.runtime);
+        if (!sealed.ok) return { ok: false, error: `release-seat refused: ${sealed.reason}: ${sealed.detail}` };
+        advisory = sealed.advisory;
+      }
+      if (prior === undefined) await this.withLifecycleExecutor(pin, (t) => writeStaticRelease(t, spec));
+      if (row.runtime !== undefined && isReleasableRuntime(this.runtime)) this.runtime.removeCustody(row.runtime);
+      console.error(`static release alias=${alias} uid=${lifecycleUid} operator=${caller.owner}.${caller.actor} reason=${JSON.stringify(reason)}: ${advisory}`);
+      await this.driveStaticRetirement({ id: row.actor, name: alias, lifecycleUid, runtime: row.runtime }, true);
+      return { ok: true, data: { alias, lifecycleUid, phase: "retired", advisory } };
+    } finally {
+      if (item !== undefined) item.releasePending = undefined;
     }
-    if (prior === undefined) await this.withLifecycleExecutor(pin, (t) => writeStaticRelease(t, spec));
-    if (row.runtime !== undefined && isReleasableRuntime(this.runtime)) this.runtime.removeCustody(row.runtime);
-    console.error(`static release alias=${alias} uid=${lifecycleUid} operator=${caller.owner}.${caller.actor} reason=${JSON.stringify(reason)}: ${advisory}`);
-    await this.driveStaticRetirement({ id: row.actor, name: alias, lifecycleUid, runtime: row.runtime }, true);
-    return { ok: true, data: { alias, lifecycleUid, phase: "retired", advisory } };
   }
 
   /** Persist a peer-defined persona as config. After this, `start name` auto-discovers

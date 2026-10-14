@@ -250,7 +250,7 @@ export async function readStaticRelease(
   const op = o.operator;
   if (o.v !== 1 || !["principal", "alias", "lifecycleUid", "reason", "ownerInstanceId", "managerProcessUid", "timestamp"].every((k) => isString(o, k)) ||
     typeof op !== "object" || op === null || !["owner", "actor", "uid"].every((k) => isString(op as Record<string, unknown>, k)) ||
-    typeof o.observedSpecRevision !== "number")
+    !(typeof o.observedSpecRevision === "number" && Number.isSafeInteger(o.observedSpecRevision) && o.observedSpecRevision >= 0))
     throw new EpEnvelopeError("failed-precondition", `release record ${key} is malformed: it is not a v1 release with every field and the operator triple`);
   const rec = raw as StaticLifecycleReleaseSpec;
   if (rec.principal !== `${owner}.${actor}` || rec.lifecycleUid !== lifecycleUid ||

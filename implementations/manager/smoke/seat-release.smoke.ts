@@ -45,7 +45,7 @@ import { bootBroker } from "./_boot-broker.js";
 let failures = 0;
 let ran = 0;
 /** Intent, not a measurement: one per cell assertion below. A shortfall means a cell stopped running. */
-const EXPECTED_CHECKS = 26;
+const EXPECTED_CHECKS = 29;
 function check(label: string, cond: boolean, extra?: unknown): void {
   console.log(`${cond ? "✓" : "✗"} ${label}${cond ? "" : ` — ${JSON.stringify(extra) ?? ""}`}`);
   ran++;
@@ -70,7 +70,7 @@ const space = `release-${randomUUID().slice(0, 8)}`;
 const auth = await createSpaceAuth(space);
 const { servers: SERVERS, stop: stopBroker } = await bootBroker(auth);
 const workspaceRoot = mkdtempSync(join(tmpdir(), "cotal-release-ws-"));
-const ALIASES = ["rel", "succ", "authz", "wrong", "foreign", "store", "crash", "after", "busy", "grant", "race", "unrec", "badnull", "badfield", "badalias"];
+const ALIASES = ["rel", "succ", "authz", "wrong", "foreign", "store", "crash", "after", "busy", "grant", "race", "unrec", "badnull", "badfield", "badalias", "badneg", "badfrac", "preflight"];
 mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
 for (const alias of ALIASES)
   writeFileSync(join(workspaceRoot, ".cotal", "agents", `${alias}.md`), `---\nname: ${alias}\nrole: worker\nsubscribe: [general]\nallowSubscribe: [general]\nallowPublish: [general]\n---\nbody\n`);
@@ -135,6 +135,9 @@ type Seams = {
   deprovision: (a: { id: string; name: string; lifecycleUid: string; runtime?: RuntimeReference }) => Promise<void>;
   driveStaticRetirement: (a: { id: string; name: string; lifecycleUid: string; runtime?: RuntimeReference }, surfaceFailure: boolean) => Promise<void>;
   unrecordedCustody: Map<string, RuntimeReference>;
+  staticReconcileItems: Map<string, { alias: string; lifecycleUid: string; disposition: string }>;
+  retryStaticReconcile: (key: string) => Promise<void>;
+  readStaticReconcileSlot: (alias: string) => Promise<StaticManagedSlotRow | undefined>;
   managerStatusData: () => ManagerStatus;
   managerServiceDefs: () => EpCommandDef[];
 };
@@ -416,6 +419,8 @@ try {
     ["badnull", "a JSON null", () => null],
     ["badfield", "a missing field", (s: Record<string, unknown>) => { const { reason: _, ...rest } = s; return rest; }],
     ["badalias", "a mismatched alias", (s: Record<string, unknown>) => ({ ...s, alias: "someone-else" })],
+    ["badneg", "observedSpecRevision -1", (s: Record<string, unknown>) => ({ ...s, observedSpecRevision: -1 })],
+    ["badfrac", "observedSpecRevision 1.5", (s: Record<string, unknown>) => ({ ...s, observedSpecRevision: 1.5 })],
   ] as const) {
     const r = await retain(M, mgr, alias);
     const good = {
@@ -426,6 +431,42 @@ try {
     const terminal = await M.driveStaticRetirement({ id: r.id, name: alias, lifecycleUid: r.uid, runtime: r.ref }, true).then(() => "retired", (e: unknown) => String(e));
     check(`malformed release (${label}): the terminal refuses, the slot stays terminalizing, and the seat directory and creds remain`,
       /release record .* is (malformed|mismatched)/.test(terminal) && (await readSlot(alias))?.phase === "terminalizing" && seatDir(r) && r.creds !== undefined && existsSync(r.creds), terminal);
+  }
+
+  // ── A retry admitted before the release started never runs a terminal blind to it ──
+  {
+    const r = await retain(M, mgr, "preflight");
+    const key = JSON.stringify([DEV_OWNER, "preflight", r.uid]);
+    // Park the retry after its durable re-read returns, before it can enter a terminal.
+    const reached = gate();
+    const resume = gate();
+    const read = M.readStaticReconcileSlot.bind(mgr);
+    M.readStaticReconcileSlot = async (alias) => {
+      const row = await read(alias);
+      if (alias === "preflight" && M.readStaticReconcileSlot !== read) {
+        M.readStaticReconcileSlot = read;
+        reached.resolve();
+        await resume.promise;
+      }
+      return row;
+    };
+    let terminals = 0;
+    const drive = M.driveStaticRetirement.bind(mgr);
+    M.driveStaticRetirement = (a, surface) => {
+      if (a.name === "preflight") terminals++;
+      return drive(a, surface);
+    };
+    const retry = M.retryStaticReconcile(key);
+    await reached.promise;
+    const pending = release(M, argsOf(r));
+    await sleep(300);
+    resume.resolve();
+    await retry;
+    const out = await pending;
+    M.driveStaticRetirement = drive;
+    const it = item(M, "preflight");
+    check("pre-flight retry: a retry parked before its terminal and a concurrent release run one terminal, retired and recovered",
+      out.ok && terminals === 1 && (await readSlot("preflight"))?.phase === "retired" && it?.disposition === "recovered" && it.retainedReason === undefined, { out, terminals, it });
   }
 
   // ── Successor release ──────────────────────────────────────────────────────
