@@ -87,6 +87,22 @@
       "find": "      case \"skipped\":\n        break;\n      case \"refusal\": {",
       "replace": "      case \"skipped\":\n        break;\n      case \"refusal\": {\n        break;",
       "expectRed": "cell refusal ran no passing check and did not report a skip"
+    },
+    {
+      "name": "T6-M1 the custodian serves its own uid, not the adopter's",
+      "file": "packages/seat/src/custodian.ts",
+      "find": "if (cred.uid !== launch.adopterUid) {",
+      "replace": "if (cred.uid !== process.getuid?.()) {",
+      "expectRed": "peer uid: a stop from the agent uid, and its hello with the right token, both get peer uid mismatch",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T6-M2 spawn the custodian as the launcher, not the agent uid",
+      "file": "packages/seat/src/launcher.ts",
+      "find": "    ...(agent ? { uid: agent.uid, gid: agent.gid } : {}),\n",
+      "replace": "",
+      "expectRed": "peer uid: the custodian and its child run as the agent uid",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
     }
   ]
 }

@@ -1,12 +1,12 @@
 import { spawn, spawnSync } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertSeatId, capabilityToken, fencePath, recordPath, seatId, socketPath, type SeatRecord, readRecord } from "./record.js";
 import { CONFIRM_TIMEOUT_MS, unattendedMs, assertSocketPathFits, unsupportedTransport } from "./protocol.js";
 import { tryLockFd } from "./peercred.js";
 import type { CustodianTestSeam } from "./custodian.js";
-import { createSeatCgroup, moveIntoSeatCgroup, ownCgroup, removeSeatCgroup, type SeatCgroup } from "./cgroup.js";
+import { createSeatCgroup, idList, moveIntoSeatCgroup, ownCgroup, removeSeatCgroup, type SeatCgroup } from "./cgroup.js";
 
 export interface SeatLaunchSpec {
   command: string;
@@ -27,6 +27,9 @@ export interface LaunchSeatOpts {
   /** Layer 3: the manager's delegated cgroup. The seat cgroup `<base>/seat-<id>` must not exist yet;
    *  the custodian is moved into it and spawns no child outside it. */
   cgroupBase?: string;
+  /** The uid the custodian and its child run as. Omitted is this process's euid. A distinct uid needs
+   *  euid 0: the seat directory is chowned to it and the custodian is spawned with its uid and gid. */
+  agentUid?: number;
 }
 
 function packageRoot(): string {
@@ -181,7 +184,19 @@ export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
 
 function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): SeatRecord {
   if (process.platform !== "linux") throw unsupportedTransport();
+  const euid = process.geteuid?.() ?? -1;
+  const agentUid = opts.agentUid ?? euid;
+  if (!Number.isInteger(agentUid) || agentUid < 0) throw new Error(`agent uid ${agentUid} is not a uid`);
+  let agent: { uid: number; gid: number } | undefined;
+  if (agentUid !== euid) {
+    if (euid !== 0) throw new Error(`a seat under agent uid ${agentUid} needs a manager with euid 0, not ${euid}`);
+    const gid = idList("-g", agentUid)?.[0];
+    if (gid === undefined) throw new Error(`agent uid ${agentUid} has no primary gid in the user database`);
+    agent = { uid: agentUid, gid };
+  }
   mkdirSync(opts.root, { recursive: true, mode: 0o700 });
+  // The agent must reach its own seat directory and the fence; 0711 lets it traverse, not list.
+  if (agent) chmodSync(opts.root, 0o711);
   const id = assertSeatId(opts.id ?? seatId());
   const token = capabilityToken();
   const socket = assertSocketPathFits(socketPath(opts.root, id));
@@ -207,9 +222,10 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
     if (opts.cgroupBase !== undefined) {
       // A reap or release derives the path from its own base, so a seat under any other base is unreapable.
       if (opts.cgroupBase !== ownCgroup()) throw new Error(`cgroup base ${opts.cgroupBase} is not this process's cgroup ${String(ownCgroup())}`);
-      cgroup = created.cgroup = createSeatCgroup(opts.cgroupBase, id, process.geteuid?.() ?? -1);
+      cgroup = created.cgroup = createSeatCgroup(opts.cgroupBase, id, agentUid);
     }
     mkdirSync(dirname(recPath), { mode: 0o700 });
+    if (agent) chownSync(dirname(recPath), agent.uid, agent.gid);
   } finally {
     closeSync(fenceFd);
   }
@@ -233,6 +249,7 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
     // run marker, so it cannot read an override the caller set.
     unattendedMs: unattendedMs(),
     ...(cgroup ? { cgroup: cgroup.path } : {}),
+    adopterUid: euid,
     ...(testSeam ? { testSeam } : {}),
   });
   // Payload carries spec.env (provider keys) and the capability token.
@@ -251,6 +268,7 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
     // COTAL_RUN is re-exported so a custodian's own descendants stay attributable to the same run,
     // and so `/proc/<pid>/environ` answers the same question argv does for a reader who can read it.
     env: { PATH: process.env.PATH ?? "", COTAL_RUN: run },
+    ...(agent ? { uid: agent.uid, gid: agent.gid } : {}),
   });
   closeSync(launchFd);
   try {

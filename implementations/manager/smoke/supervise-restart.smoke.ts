@@ -259,7 +259,7 @@ try {
   // Let the `fail` seat's terminal finish on the non-custodial runtime before the swap.
   const retiring = (manager as unknown as { retiring: Map<string, unknown> }).retiring;
   for (const until = Date.now() + 15_000; retiring.has("fail") && Date.now() < until;) await wait(100);
-  (manager as unknown as { runtime: unknown }).runtime = new CustodialPtyRuntime(seatRoot);
+  (manager as unknown as { runtime: unknown }).runtime = new CustodialPtyRuntime({ root: seatRoot });
   const custodyGoal = "spawn-custody".padEnd(43, "k");
   const custodySpawned = await call("spawn", {
     name: "custody", agent: "supervise-stub", cwd: repoRoot, events: false, supervise: { restarts: 2, windowMs: 60_000 },

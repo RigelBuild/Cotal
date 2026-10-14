@@ -18,9 +18,9 @@ if (process.platform !== "linux") {
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const DIST = join(dirname(SCRIPT), "..", "dist");
-const CELLS = ["refusal", "shared-uid", "unprovable", "release-join", "rollback", "bounds", "wrong-base", "distinct-uid", "setsid", "recordless", "fence"] as const;
+const CELLS = ["refusal", "shared-uid", "unprovable", "release-join", "rollback", "bounds", "wrong-base", "distinct-uid", "setsid", "recordless", "fence", "peer-uid"] as const;
 type Cell = (typeof CELLS)[number];
-const NEEDS_DISTINCT_UID: Record<Cell, boolean> = { refusal: false, "shared-uid": false, unprovable: false, "release-join": false, rollback: false, bounds: false, "wrong-base": false, "distinct-uid": true, setsid: true, recordless: true, fence: true };
+const NEEDS_DISTINCT_UID: Record<Cell, boolean> = { refusal: false, "shared-uid": false, unprovable: false, "release-join": false, rollback: false, bounds: false, "wrong-base": false, "distinct-uid": true, setsid: true, recordless: true, fence: true, "peer-uid": true };
 const REQUIRE = process.env.COTAL_SEAT_CGROUP_REQUIRE === "1";
 
 // Cells get no inherited COTAL_ connection material; they read only the COTAL_CG_ keys set below.
@@ -231,6 +231,19 @@ if (reached) setReleaseTestSeam({ afterPopulated: { reached, release } });
 writeFileSync(out, JSON.stringify(await sealSeatLaunch(root, id, { cgroup: { path, agentUid: Number(uid) } })));
 `,
   );
+  // One connection per op: the custodian closes a socket after a peer uid mismatch. No dist import,
+  // so the agent uid needs no read access to the build.
+  const peerRunner = runner(
+    "peer.cjs",
+    `const net=require("net");const fs=require("fs");const [sock,token,out,...ops]=process.argv.slice(2);
+const frame=(v)=>{const b=Buffer.from(JSON.stringify(v));const h=Buffer.alloc(4);h.writeUInt32BE(b.length,0);return Buffer.concat([h,b]);};
+const one=(op)=>{const {promise,resolve}=Promise.withResolvers();const s=net.connect(sock);let buf=Buffer.alloc(0);const done=(r)=>{s.destroy();resolve(r);};
+s.on("error",(e)=>done("error:"+e.code));s.on("close",()=>done("closed"));
+s.on("data",(c)=>{buf=Buffer.concat([buf,c]);if(buf.length<4)return;const n=buf.readUInt32BE(0);if(buf.length<4+n)return;const r=JSON.parse(buf.subarray(4,4+n).toString());done(r.ok?"ok":r.error);});
+s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,op:"hello",token})));return promise;};
+(async()=>{const lines=[];for(const op of ops)lines.push(await one(op));fs.writeFileSync(out,lines.join("\\n")+"\\n");})();
+`,
+  );
   /** Run `then` (sh, args $2…) once `reached` exists; launchSeat blocks this event loop meanwhile. */
   const onReached = (reached: string, then: string, ...args: string[]): void => {
     const script = `i=0; while [ ! -e "$1" ] && [ $i -lt 1000 ]; do sleep 0.02; i=$((i+1)); done; ${then}`;
@@ -353,6 +366,42 @@ writeFileSync(out, JSON.stringify(await sealSeatLaunch(root, id, { cgroup: { pat
         const evidence = await reapSeat(root, id, { cgroup: cg });
         check("record-less seat: the reap is reaped, the child is gone and the cgroup removed",
           evidence.outcome === "reaped" && child !== undefined && gone(child.pid) && !existsSync(cg.path), evidence);
+        break;
+      }
+      case "peer-uid": {
+        // T6: the custodian runs as the agent uid and serves only the launcher's uid.
+        const id = seatId();
+        const agentAs = ["setpriv", "--reuid", String(agentUid), "--regid", String(agentGid), "--init-groups", "--"];
+        // The custodian itself runs as the agent, so it must be able to load the build (a 0700 home cannot).
+        const entry = join(DIST, "custodian.js");
+        if (spawnSync(agentAs[0] ?? "", [...agentAs.slice(1), process.execPath, "-e", "require('fs').readFileSync(process.argv[1])", entry], { stdio: "ignore", timeout: 15_000, env }).status !== 0) {
+          skipped = true;
+          console.log(`  - skipped: agent uid ${agentUid} cannot read ${entry}`);
+          break;
+        }
+        created.push(seatCgroupPath(base, id));
+        const rec = launchSeat({ root, name: "t6-peer-uid", id, spec: { command: process.execPath, args: ["-e", SLEEPER, file("pid")], env }, cwd: agentDir, cgroupBase: base, agentUid });
+        strays.push({ pid: rec.custodianPid, start: rec.custodianStart }, { pid: rec.childPid, start: rec.childStart });
+        await until(() => existsSync(file("pid")), 5_000);
+        const child = readPid(file("pid"));
+        if (child) strays.push(child);
+        const uidOf = (pid: number): number => Number(/^Uid:\s+\d+\s+(\d+)/m.exec(readOr(`/proc/${pid}/status`, ""))?.[1] ?? "-1");
+        check("peer uid: the custodian and its child run as the agent uid",
+          uidOf(rec.custodianPid) === agentUid && child !== undefined && uidOf(child.pid) === agentUid, { custodian: uidOf(rec.custodianPid), child: child && uidOf(child.pid) });
+        const ask = (as: string[], out: string, ...ops: string[]): string[] => {
+          spawnSync(as[0] ?? "", [...as.slice(1), process.execPath, peerRunner, rec.socket, rec.token, out, ...ops], { stdio: "ignore", timeout: 15_000, env });
+          return readOr(out, "").split("\n").filter((l) => l !== "");
+        };
+        // Same uid as the custodian: the refusal comes from adopterUid, not from socket permissions.
+        const agentReplies = ask(agentAs, file("peer-agent"), "stop", "hello");
+        check("peer uid: a stop from the agent uid, and its hello with the right token, both get peer uid mismatch",
+          agentReplies.length === 2 && agentReplies.every((r) => r === "peer uid mismatch"), agentReplies);
+        const ownReplies = ask(["env", "--"], file("peer-own"), "hello");
+        check("peer uid: the launcher's uid gets the hello the agent uid was refused", ownReplies.length === 1 && ownReplies[0] === "ok", ownReplies);
+        const cg = { path: seatCgroupPath(base, id), agentUid };
+        check("peer uid: the seat survives the agent's stop", child !== undefined && !gone(child.pid) && seatCgroupPopulated(cg));
+        const evidence = await reapSeat(root, id, { cgroup: cg });
+        check("peer uid: the agent-uid seat is reaped through its cgroup", evidence.outcome === "reaped" && child !== undefined && gone(child.pid), evidence);
         break;
       }
       case "fence": {

@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { closeSync, constants, mkdirSync, openSync, readFileSync, rmdirSync, statfsSync, statSync, writeSync, type Stats } from "node:fs";
+import { accessSync, closeSync, constants, mkdirSync, openSync, readFileSync, rmdirSync, statfsSync, statSync, writeSync, type Stats } from "node:fs";
 import { dirname, join, posix } from "node:path";
 import { assertSeatId } from "./record.js";
 
@@ -25,6 +25,28 @@ export function ownCgroup(): string | undefined {
 
 export function seatCgroupPath(base: string, id: string): string {
   return `${assertNormalUnderRoot(base, "cgroup base")}/seat-${assertSeatId(id)}`;
+}
+
+/** The manager's layer 3 base: its own cgroup, on cgroup2, writable, and a unit systemd delegated
+ *  (`Delegate=yes`). Undefined when any of that is not true. */
+export function resolveCgroupBase(): string | undefined {
+  try {
+    if (statfsSync(CGROUP_ROOT).type !== CGROUP2_SUPER_MAGIC) return undefined;
+    const base = ownCgroup();
+    if (base === undefined) return undefined;
+    assertNormalUnderRoot(base, "cgroup base");
+    accessSync(base, constants.W_OK);
+    accessSync(join(base, "cgroup.procs"), constants.W_OK);
+    // Write access alone is not delegation: every scope under a user manager is owned by that user.
+    const unit = posix.basename(base);
+    if (!/\.(scope|service)$/.test(unit)) return undefined;
+    // The path, not the euid, names the owning manager: a mapped root in a user namespace has euid 0.
+    const manager = /\/user@\d+\.service\//.test(base) ? ["--user"] : [];
+    const r = spawnSync("systemctl", [...manager, "show", unit, "-p", "Delegate", "--value"], { encoding: "utf8", timeout: 5_000 });
+    return r.status === 0 && r.stdout.trim() === "yes" ? base : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** A caller-supplied seat cgroup must be this seat's cgroup under this process's own base, on
@@ -83,7 +105,8 @@ export function removeSeatCgroup(cg: SeatCgroup): void {
   rmdirSync(cg.path);
 }
 
-function idList(flag: "-g" | "-G", uid: number): number[] | undefined {
+/** `id -g` / `id -G` for `uid` from the user database. Undefined when it cannot be read. */
+export function idList(flag: "-g" | "-G", uid: number): number[] | undefined {
   const r = spawnSync("id", [flag, String(uid)], { encoding: "utf8", timeout: 5_000 });
   if (r.status !== 0) return undefined;
   const ids = r.stdout.trim().split(/\s+/).map(Number);

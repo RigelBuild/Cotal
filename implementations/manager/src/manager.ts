@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash, randomUUID, randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 import { credsAuthenticator } from "@nats-io/transport-node";
-import { existsSync, lstatSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, lstatSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { isAbsolute, join, dirname, resolve } from "node:path";
 import {
   CotalEndpoint,
@@ -73,6 +73,7 @@ import {
   type Runtime,
   type RuntimeMode,
 } from "./runtime/index.js";
+import { CustodialPtyRuntime } from "./runtime/custodial-pty.js";
 import { managedStaticCredOffTickRenewalDue } from "./renewal.js";
 import { AttachEndpoint, type SessionEstablishment } from "./attach-endpoint.js";
 import { makeManagerEndpointEvictionEvidence, makeManagerEndpointEvictor } from "./endpoint-evict.js";
@@ -4738,6 +4739,7 @@ export class Manager {
         credsPath = agentLifecycleSecretFilePaths(this.workspaceRoot, this.space, name, lifecycleUid).creds;
         await secrets.put(agentSecretKeyForFile(credsPath, this.space), creds);
         await materializeSecretToFile(secrets, agentSecretKeyForFile(credsPath, this.space), credsPath);
+        this.grantSeatCreds(credsPath);
         provisioned = { id: identity.id, name, lifecycleUid, secretPaths: { creds: credsPath }, ...(custody ? { runtime: custody } : {}) }; // footprint now exists — the finally rolls it back if the spawn throws
       }
       // Personal MCP servers the operator opted to share with manager-spawned agents of this type
@@ -7409,6 +7411,21 @@ export class Manager {
     return isCustodialRuntime(this.runtime) ? this.runtime.reserve() : undefined;
   }
 
+  /** A seat under a distinct agent uid reads this incarnation's creds file and nothing beside it:
+   *  the file is chowned to that uid, and each dir up to the workspace root gains traverse (x) only.
+   *  Rerun after every rewrite, because a rewrite is a fresh manager-owned file. */
+  private grantSeatCreds(credsPath: string): void {
+    const rt = this.runtime;
+    if (!(rt instanceof CustodialPtyRuntime) || rt.agentUid === process.geteuid?.()) return;
+    const top = resolve(this.workspaceRoot);
+    if (!resolve(credsPath).startsWith(`${top}/`)) throw new Error(`creds ${credsPath} is outside the workspace ${top}; not granting it to agent uid ${rt.agentUid}`);
+    chownSync(credsPath, rt.agentUid, -1);
+    for (let dir = dirname(resolve(credsPath)); ; dir = dirname(dir)) {
+      chmodSync(dir, (statSync(dir).mode & 0o7777) | 0o011);
+      if (dir === top) break;
+    }
+  }
+
   /** Spawn under a reserved reference. On a mismatch with a slot row, record `got` on the row and
    *  throw, so the terminal reaps `got`; without a row, reap `got` inline. */
   private async spawnCustodied(name: string, spec: LaunchSpec, cwd: string, reserved: RuntimeReference | undefined, slot: { id: string; lifecycleUid: string }): Promise<AgentHandle> {
@@ -7673,6 +7690,7 @@ export class Manager {
     const credsPath = a.secretPaths!.creds!;
     await secrets.put(agentSecretKeyForFile(credsPath, this.space), creds);
     await materializeSecretToFile(secrets, agentSecretKeyForFile(credsPath, this.space), credsPath);
+    this.grantSeatCreds(credsPath);
     console.error(`managed cred renewal ${a.name}: re-signed for the same identity (exp +${MANAGED_STATIC_TTL_SEC}s); the agent endpoint's source re-read adopts it`);
   }
 
