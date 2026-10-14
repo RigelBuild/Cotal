@@ -74,7 +74,7 @@ import {
   type RuntimeMode,
 } from "./runtime/index.js";
 import { CustodialPtyRuntime } from "./runtime/custodial-pty.js";
-import { idList } from "@cotal-ai/seat";
+import { agentCanReplace, agentPrimaryGid } from "@cotal-ai/seat";
 import { managedStaticCredOffTickRenewalDue } from "./renewal.js";
 import { AttachEndpoint, type SessionEstablishment } from "./attach-endpoint.js";
 import { makeManagerEndpointEvictionEvidence, makeManagerEndpointEvictor } from "./endpoint-evict.js";
@@ -7419,14 +7419,15 @@ export class Manager {
   private seatAgent(): { uid: number; gid: number } | undefined {
     const rt = this.runtime;
     if (!(rt instanceof CustodialPtyRuntime) || rt.agentUid === process.geteuid?.()) return undefined;
-    const gid = idList("-g", rt.agentUid)?.[0];
-    if (gid === undefined) throw new Error(`seat agent uid ${rt.agentUid} has no primary gid in the user database`);
+    const gid = agentPrimaryGid(rt.agentUid);
+    if (gid === undefined) throw new Error(`seat agent uid ${rt.agentUid} is not in /etc/passwd and COTAL_SEAT_AGENT_GID names no gid`);
     return { uid: rt.agentUid, gid };
   }
 
-  /** Every existing component from the workspace root down to `credsPath`, refusing a symlink. Run
-   *  before the store writes or materializes it, so a root manager never writes through a link. */
-  private credsComponents(credsPath: string): string[] {
+  /** Every component from the workspace root down to `credsPath`. Node has no openat, so the path is
+   *  made unswappable instead: each existing component is no symlink and owned by this euid, and no
+   *  directory from the file up to `/` is one the agent can rearrange. Run before the store writes. */
+  private credsComponents(credsPath: string, agent: { uid: number; gid: number }): string[] {
     const top = resolve(this.workspaceRoot);
     const path = resolve(credsPath);
     if (!path.startsWith(`${top}/`)) throw new Error(`creds ${credsPath} is outside the workspace ${top}; not granting it to the seat agent uid`);
@@ -7435,17 +7436,27 @@ export class Manager {
       out.push(p);
       if (p === top) break;
     }
+    const euid = process.geteuid?.();
     for (const p of out) {
       // throwIfNoEntry false: a component not created yet is fine; materialize creates it as a directory.
-      if (lstatSync(p, { throwIfNoEntry: false })?.isSymbolicLink())
-        throw new Error(`creds path component ${p} is a symlink; refusing to write or grant it for the seat agent uid`);
+      const st = lstatSync(p, { throwIfNoEntry: false });
+      if (st === undefined) continue;
+      if (st.isSymbolicLink()) throw new Error(`creds path component ${p} is a symlink; refusing to write or grant it for the seat agent uid`);
+      if (st.uid !== euid) throw new Error(`creds path component ${p} is owned by uid ${st.uid}, not this manager's ${String(euid)}; refusing to grant it to seat agent uid ${agent.uid}`);
+    }
+    for (let dir = dirname(path); ; dir = dirname(dir)) {
+      const st = lstatSync(dir, { throwIfNoEntry: false });
+      if (st !== undefined && agentCanReplace(st, agent.uid, agent.gid))
+        throw new Error(`seat agent uid ${agent.uid} can write ${dir} above its creds ${credsPath}; refusing to write or grant them`);
+      if (dir === dirname(dir)) break;
     }
     return out;
   }
 
-  /** Distinct agent uid only, before the creds are stored or materialized: refuse a symlinked component. */
+  /** Distinct agent uid only, before the creds are stored or materialized: refuse a swappable path. */
   private checkSeatCredsPath(credsPath: string): void {
-    if (this.seatAgent() !== undefined) this.credsComponents(credsPath);
+    const agent = this.seatAgent();
+    if (agent !== undefined) this.credsComponents(credsPath, agent);
   }
 
   /** A seat under a distinct agent uid reads this incarnation's creds file and cannot rewrite it: the
@@ -7455,7 +7466,7 @@ export class Manager {
   private grantSeatCreds(credsPath: string): void {
     const agent = this.seatAgent();
     if (agent === undefined) return;
-    const [file, ...dirs] = this.credsComponents(credsPath);
+    const [file, ...dirs] = this.credsComponents(credsPath, agent);
     if (file === undefined) return;
     const ffd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {

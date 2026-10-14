@@ -6,7 +6,7 @@ import { assertSeatId, capabilityToken, fencePath, readSeatFileNoFollow, recordP
 import { CONFIRM_TIMEOUT_MS, unattendedMs, assertSocketPathFits, unsupportedTransport } from "./protocol.js";
 import { tryLockFd } from "./peercred.js";
 import type { CustodianTestSeam } from "./custodian.js";
-import { createSeatCgroup, idList, moveIntoSeatCgroup, ownCgroup, removeSeatCgroup, type SeatCgroup } from "./cgroup.js";
+import { agentPrimaryGid, createSeatCgroup, moveIntoSeatCgroup, ownCgroup, removeSeatCgroup, type SeatCgroup } from "./cgroup.js";
 
 export interface SeatLaunchSpec {
   command: string;
@@ -190,8 +190,8 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
   let agent: { uid: number; gid: number } | undefined;
   if (agentUid !== euid) {
     if (euid !== 0) throw new Error(`a seat under agent uid ${agentUid} needs a manager with euid 0, not ${euid}`);
-    const gid = idList("-g", agentUid)?.[0];
-    if (gid === undefined) throw new Error(`agent uid ${agentUid} has no primary gid in the user database`);
+    const gid = agentPrimaryGid(agentUid);
+    if (gid === undefined) throw new Error(`agent uid ${agentUid} is not in /etc/passwd and COTAL_SEAT_AGENT_GID names no gid`);
     agent = { uid: agentUid, gid };
   }
   mkdirSync(opts.root, { recursive: true, mode: 0o700 });

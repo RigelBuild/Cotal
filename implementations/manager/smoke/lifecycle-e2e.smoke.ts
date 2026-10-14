@@ -19,7 +19,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync, statSync } from "node:fs";
+import { chmodSync, chownSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync, statSync } from "node:fs";
 import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
@@ -251,6 +251,30 @@ try {
       refusal = (e as Error).message;
     }
     check("a custody root under a directory the agent cannot traverse is refused at construction", /cannot traverse/.test(refusal), refusal);
+    const refuse = (build: () => void): string => {
+      try {
+        build();
+        return "accepted";
+      } catch (e) {
+        return (e as Error).message;
+      }
+    };
+    const agentGid = Number(spawnSync("id", ["-g", String(custodial.agentUid)], { encoding: "utf8" }).stdout.trim());
+    // An agent-owned root would let the agent swap a seat entry for a directory it owns, forging the launch uid.
+    const owned = join(dir, "agent-owned-seats");
+    mkdirSync(owned);
+    chmodSync(owned, 0o711);
+    chownSync(owned, custodial.agentUid, agentGid);
+    const ownedRefusal = refuse(() => new CustodialPtyRuntime({ root: owned, cgroupBase: custodial?.cgroupBase, agentUid: custodial?.agentUid }));
+    check("an agent-owned custody root is refused at construction", /must be a directory owned by uid/.test(ownedRefusal), ownedRefusal);
+    // A creds ancestor the agent's group can write could be swapped between the check and the grant.
+    const swappable = join(workspaceRoot, "agent-writable");
+    mkdirSync(swappable);
+    chmodSync(swappable, 0o770);
+    chownSync(swappable, process.geteuid?.() ?? 0, agentGid);
+    const credsCheck = mgr as unknown as { checkSeatCredsPath: (p: string) => void };
+    const credsRefusal = refuse(() => credsCheck.checkSeatCredsPath(join(swappable, "creds", "x.creds")));
+    check("creds under a directory the agent can write are refused before any write", /can write .*agent-writable/.test(credsRefusal), credsRefusal);
     // The seat dir's owner is the launch uid. A runtime set to another uid must not prove containment for it.
     const side = { kind: "pty" as const, id: seatId() };
     launchSeat({ root: seatsRoot, name: "uid-side", id: side.id, spec: { command: process.execPath, args: ["-e", "setInterval(()=>{},1e9)"], env: { PATH: process.env.PATH ?? "" } }, cwd: "/", cgroupBase: custodial.cgroupBase, agentUid: custodial.agentUid });

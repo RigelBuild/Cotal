@@ -5,7 +5,7 @@ import { chmodSync, chownSync, closeSync, existsSync, mkdirSync, mkdtempSync, re
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { checkSeatRelease, launchSeat, loadSeat, processStartToken, socketPath, reapSeat, sealSeatLaunch, seatCgroupContained, seatCgroupPath, seatCgroupPopulated, seatId, type SeatLaunchSpec } from "../src/index.js";
+import { checkSeatRelease, launchSeat, loadSeat, resolveCgroupBase, processStartToken, socketPath, reapSeat, sealSeatLaunch, seatCgroupContained, seatCgroupPath, seatCgroupPopulated, seatId, type SeatLaunchSpec } from "../src/index.js";
 import { removeSeatCgroup } from "../src/cgroup.js";
 import { setCustodianTestSeam, setLauncherTestSeam } from "../src/launcher.js";
 import { pidfdOpen, pidfdSignal } from "../src/peercred.js";
@@ -553,6 +553,21 @@ s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,
           rejected && existsSync(sibling) && !fenceSealed(id), { rejected, sibling: existsSync(sibling) });
         rmdirSync(sibling);
         rmdirSync(dirname(sibling));
+        // The base is decided from the filesystem alone, so a base this euid cannot fully write is none.
+        const subtree = join(base, "cgroup.subtree_control");
+        const mode = statSync(subtree).mode & 0o777;
+        const resolvedAs = resolveCgroupBase();
+        let unwritable: string | undefined = "unchanged";
+        if (euid !== 0) {
+          chmodSync(subtree, 0o444);
+          try {
+            unwritable = resolveCgroupBase();
+          } finally {
+            chmodSync(subtree, mode);
+          }
+        }
+        check("wrong base: resolveCgroupBase returns this cell's own scope, and none once its subtree_control is unwritable",
+          resolvedAs === base && (euid === 0 || unwritable === undefined), { resolvedAs, unwritable, euid });
         break;
       }
       default:

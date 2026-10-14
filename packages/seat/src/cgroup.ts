@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { accessSync, closeSync, constants, mkdirSync, openSync, readFileSync, realpathSync, rmdirSync, statfsSync, statSync, writeSync, type Stats } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, rmdirSync, statfsSync, statSync, writeSync, type Stats } from "node:fs";
 import { dirname, join, posix } from "node:path";
 import { assertSeatId } from "./record.js";
 
@@ -27,61 +27,43 @@ export function seatCgroupPath(base: string, id: string): string {
   return `${assertNormalUnderRoot(base, "cgroup base")}/seat-${assertSeatId(id)}`;
 }
 
-/** The manager's layer 3 base: its own cgroup, on cgroup2, writable, and a unit systemd delegated
- *  (`Delegate=yes`). Undefined when any of that is not true. */
+/** The manager's layer 3 base: its own cgroup, on cgroup2, whose directory, `cgroup.procs` and
+ *  `cgroup.subtree_control` this euid can write. Undefined when any of that is not true. Decided from
+ *  the filesystem alone: a privileged manager runs nothing to find it. */
 export function resolveCgroupBase(): string | undefined {
   try {
     if (statfsSync(CGROUP_ROOT).type !== CGROUP2_SUPER_MAGIC) return undefined;
     const base = ownCgroup();
     if (base === undefined) return undefined;
     assertNormalUnderRoot(base, "cgroup base");
-    accessSync(base, constants.W_OK);
-    accessSync(join(base, "cgroup.procs"), constants.W_OK);
-    // Write access alone is not delegation: every scope under a user manager is owned by that user.
-    const unit = posix.basename(base);
-    if (!/\.(scope|service)$/.test(unit)) return undefined;
-    const systemctl = trustedSystemctl();
-    if (systemctl === undefined) return undefined;
-    // The path, not the euid, names the owning manager: a mapped root in a user namespace has euid 0.
-    const manager = /\/user@\d+\.service\//.test(base) ? ["--user"] : [];
-    const r = spawnSync(systemctl, [...manager, "show", unit, "-p", "Delegate", "--value"], { encoding: "utf8", timeout: 5_000 });
-    return r.status === 0 && r.stdout.trim() === "yes" ? base : undefined;
+    for (const p of [base, join(base, "cgroup.procs"), join(base, "cgroup.subtree_control")]) accessSync(p, constants.W_OK);
+    return base;
   } catch {
     return undefined;
   }
 }
 
-const SYSTEMCTL_PATHS = ["/usr/bin/systemctl", "/bin/systemctl", "/run/current-system/sw/bin/systemctl"];
-
-/** The uids that own the system's binaries: 0, plus the overflow uid inside a user namespace, where
- *  real root is unmapped. Only a non-initial namespace's own root can map itself, never the outside root. */
-function systemOwners(): number[] {
-  const initial = /^\s*0\s+0\s+4294967295\s*$/.test(readFileSync("/proc/self/uid_map", "utf8"));
-  return initial ? [0] : [0, Number(readFileSync("/proc/sys/kernel/overflowuid", "utf8").trim())];
+/** The agent uid's primary gid from `/etc/passwd`, read without running anything; for a uid not
+ *  listed there, `COTAL_SEAT_AGENT_GID`. Undefined when neither names one. */
+export function agentPrimaryGid(uid: number): number | undefined {
+  let passwd = "";
+  try {
+    passwd = readFileSync("/etc/passwd", "utf8");
+  } catch {
+    // An unreadable database is a uid that is not listed.
+  }
+  const fields = passwd.split("\n").map((l) => l.split(":")).find((f) => f.length >= 4 && f[2] === String(uid));
+  const raw = fields === undefined ? process.env.COTAL_SEAT_AGENT_GID : fields[3];
+  const gid = raw === undefined || raw === "" ? NaN : Number(raw);
+  return Number.isInteger(gid) && gid >= 0 ? gid : undefined;
 }
 
-/** A root manager may run this, so never resolve it through an inherited PATH: the first fixed path
- *  whose real file and every ancestor are system-owned and not group- or world-writable. A sticky
- *  ancestor is accepted (the Nix store is 1775): no other user can replace root's entry in it. */
-function trustedSystemctl(): string | undefined {
-  const owners = systemOwners();
-  for (const candidate of SYSTEMCTL_PATHS) {
-    let real: string;
-    try {
-      real = realpathSync(candidate);
-    } catch {
-      continue;
-    }
-    let ok = true;
-    for (let p = real; ; p = dirname(p)) {
-      const st = statSync(p);
-      const sticky = p !== real && (st.mode & 0o1000) !== 0;
-      if (!owners.includes(st.uid) || ((st.mode & 0o022) !== 0 && !sticky)) ok = false;
-      if (!ok || p === dirname(p)) break;
-    }
-    if (ok) return real;
-  }
-  return undefined;
+/** Whether the agent (uid, primary gid; libuv clears supplementary groups at spawn) can replace an
+ *  entry of directory `st`. A sticky world-writable dir lets it replace only its own entries. */
+export function agentCanReplace(st: Stats, uid: number, gid: number): boolean {
+  if (st.uid === uid && (st.mode & 0o200) !== 0) return true;
+  if (st.gid === gid && (st.mode & 0o020) !== 0) return true;
+  return (st.mode & 0o002) !== 0 && (st.mode & 0o1000) === 0;
 }
 
 /** A caller-supplied seat cgroup must be this seat's cgroup under this process's own base, on
@@ -140,23 +122,17 @@ export function removeSeatCgroup(cg: SeatCgroup): void {
   rmdirSync(cg.path);
 }
 
-/** `id -g` / `id -G` for `uid` from the user database. Undefined when it cannot be read. */
-export function idList(flag: "-g" | "-G", uid: number): number[] | undefined {
-  const r = spawnSync("id", [flag, String(uid)], { encoding: "utf8", timeout: 5_000 });
-  if (r.status !== 0) return undefined;
-  const ids = r.stdout.trim().split(/\s+/).map(Number);
-  return ids.length > 0 && ids.every((n) => Number.isInteger(n) && n >= 0) ? ids : undefined;
-}
-
-function writableBy(st: Stats, uid: number, groups: readonly number[]): boolean {
+function writableBy(st: Stats, uid: number, gid: number): boolean {
   if (st.mode & 0o002) return true;
-  if (st.mode & 0o020 && groups.includes(st.gid)) return true;
+  if (st.mode & 0o020 && st.gid === gid) return true;
   return st.uid === uid && (st.mode & 0o200) !== 0;
 }
 
 // Exit 10: a write landed, so the agent can migrate. Exit 11: every write was refused. Anything
 // else (no setpriv, no CAP_SETUID, unknown user) is an attempt that never ran.
 const MIGRATION_PROBE = 'for f; do if { echo $$ > "$f"; } 2>/dev/null; then exit 10; fi; done; exit 11';
+// Fixed paths only: a root manager never resolves a program through an inherited PATH.
+const SETPRIV_PATHS = ["/usr/bin/setpriv", "/bin/setpriv", "/run/current-system/sw/bin/setpriv"];
 
 /**
  * True only when the agent uid provably cannot write `cgroup.procs` at the base or any ancestor,
@@ -173,24 +149,26 @@ export function seatCgroupContained(cg: SeatCgroup): boolean {
   } catch {
     return false;
   }
-  const groups = idList("-G", uid);
-  const gid = idList("-g", uid)?.[0];
-  if (groups === undefined || gid === undefined) return false;
+  const gid = agentPrimaryGid(uid);
+  const setpriv = SETPRIV_PATHS.find((p) => existsSync(p));
+  if (gid === undefined || setpriv === undefined) return false;
   const procs: string[] = [];
   for (let dir = dirname(cg.path); ; dir = dirname(dir)) {
     if (dir !== CGROUP_ROOT && !dir.startsWith(`${CGROUP_ROOT}/`)) return false;
     const file = join(dir, "cgroup.procs");
     try {
-      if (writableBy(statSync(file), uid, groups)) return false;
+      if (writableBy(statSync(file), uid, gid)) return false;
     } catch {
       return false;
     }
     procs.push(file);
     if (dir === CGROUP_ROOT) break;
   }
-  const probe = spawnSync("setpriv", ["--reuid", String(uid), "--regid", String(gid), "--init-groups", "--", "sh", "-c", MIGRATION_PROBE, "sh", ...procs], {
+  // The custodian runs with no supplementary groups, so the probe clears them too.
+  const probe = spawnSync(setpriv, ["--reuid", String(uid), "--regid", String(gid), "--clear-groups", "--", "/bin/sh", "-c", MIGRATION_PROBE, "sh", ...procs], {
     stdio: "ignore",
     timeout: 5_000,
+    env: {},
   });
   return probe.status === 11;
 }
