@@ -77,9 +77,24 @@
     {
       "name": "T5-M9 a cell exits 0 with no tally",
       "file": "packages/seat/smoke/cgroup.smoke.ts",
-      "find": "  console.log(`CELL_TALLY ${JSON.stringify({ pass, fail })}`);",
+      "find": "  console.log(`CELL_TALLY ${JSON.stringify({ pass, fail, skipped })}`);",
       "replace": "  void pass;",
       "expectRed": "with 0 tally line(s), none well-formed"
+    },
+    {
+      "name": "T5-M10 accept a seat cgroup under any base",
+      "file": "packages/seat/src/cgroup.ts",
+      "find": "  if (base === undefined || path !== seatCgroupPath(base, id)) throw",
+      "replace": "  if (base === undefined || !path.endsWith(`/seat-${id}`)) throw",
+      "expectRed": "wrong base: reap, check and seal reject a normalized seat cgroup under a sibling base and leave it",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M11 a cell returns early with no checks",
+      "file": "packages/seat/smoke/cgroup.smoke.ts",
+      "find": "      case \"skipped\":\n        break;\n      case \"refusal\": {",
+      "replace": "      case \"skipped\":\n        break;\n      case \"refusal\": {\n        break;",
+      "expectRed": "cell refusal ran no passing check and did not report a skip"
     }
   ]
 }

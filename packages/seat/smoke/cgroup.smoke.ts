@@ -1,7 +1,7 @@
 // Layer 3 (T5): per-seat cgroup v2 custody. The orchestrator runs every cell in its own fresh
 // delegated scope, so no cell creates a cgroup under this process's own scope.
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, chownSync, closeSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, closeSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -18,9 +18,9 @@ if (process.platform !== "linux") {
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const DIST = join(dirname(SCRIPT), "..", "dist");
-const CELLS = ["refusal", "shared-uid", "unprovable", "release-join", "rollback", "bounds", "distinct-uid", "setsid", "recordless", "fence"] as const;
+const CELLS = ["refusal", "shared-uid", "unprovable", "release-join", "rollback", "bounds", "wrong-base", "distinct-uid", "setsid", "recordless", "fence"] as const;
 type Cell = (typeof CELLS)[number];
-const NEEDS_DISTINCT_UID: Record<Cell, boolean> = { refusal: false, "shared-uid": false, unprovable: false, "release-join": false, rollback: false, bounds: false, "distinct-uid": true, setsid: true, recordless: true, fence: true };
+const NEEDS_DISTINCT_UID: Record<Cell, boolean> = { refusal: false, "shared-uid": false, unprovable: false, "release-join": false, rollback: false, bounds: false, "wrong-base": false, "distinct-uid": true, setsid: true, recordless: true, fence: true };
 const REQUIRE = process.env.COTAL_SEAT_CGROUP_REQUIRE === "1";
 
 const ownCgroup = (): string => {
@@ -79,11 +79,17 @@ function orchestrate(): void {
     });
     process.stdout.write(r.stdout ?? "");
     if (r.stderr) process.stdout.write(r.stderr.split("\n").map((l) => (l ? `    | ${l}` : l)).join("\n"));
-    // A cell passes only on exit 0 with exactly one well-formed tally; anything else is a failure.
+    // A cell passes only on exit 0 with exactly one well-formed tally that ran a check or says it skipped.
     const tallies = (r.stdout ?? "").split("\n").filter((l) => l.startsWith("CELL_TALLY "));
     const t = tallies.length === 1 ? parseTally(tallies[0]?.slice("CELL_TALLY ".length) ?? "") : undefined;
     if (r.status !== 0 || t === undefined) {
       console.log(`  ✗ FAIL: cell ${cell} exited ${String(r.status ?? r.signal)} with ${tallies.length} tally line(s)${t === undefined ? ", none well-formed" : ""}`);
+      fail++;
+    } else if (t.skipped) {
+      if (REQUIRE) fail++;
+      else skip++;
+    } else if (t.pass === 0) {
+      console.log(`  ✗ FAIL: cell ${cell} ran no passing check and did not report a skip`);
       fail++;
     }
     pass += t?.pass ?? 0;
@@ -93,17 +99,17 @@ function orchestrate(): void {
   process.exitCode = fail === 0 ? 0 : 1;
 }
 
-function parseTally(text: string): { pass: number; fail: number } | undefined {
+function parseTally(text: string): { pass: number; fail: number; skipped: boolean } | undefined {
   let v: unknown;
   try {
     v = JSON.parse(text);
   } catch {
     return undefined;
   }
-  if (typeof v !== "object" || v === null || !("pass" in v) || !("fail" in v)) return undefined;
-  const { pass, fail } = v;
+  if (typeof v !== "object" || v === null || !("pass" in v) || !("fail" in v) || !("skipped" in v)) return undefined;
+  const { pass, fail, skipped } = v;
   const count = (n: unknown): n is number => typeof n === "number" && Number.isInteger(n) && n >= 0;
-  return count(pass) && count(fail) ? { pass, fail } : undefined;
+  return count(pass) && count(fail) && typeof skipped === "boolean" ? { pass, fail, skipped } : undefined;
 }
 
 async function runCell(cell: string | undefined): Promise<void> {
@@ -225,8 +231,18 @@ writeFileSync(out, JSON.stringify(await sealSeatLaunch(root, id, { cgroup: { pat
   };
   const fenceSealed = (id: string): boolean => readOr(join(root, `.launch-${id}`), "") === "sealed";
 
+  let skipped = false;
   try {
+    // Without a distinct agent uid, asAgent runs as the manager, which would pass these cells vacuously.
+    const known = CELLS.find((c) => c === cell);
+    if (known !== undefined && NEEDS_DISTINCT_UID[known] && !(agentUid > 0 && agentUid !== euid && agentGid >= 0)) {
+      skipped = true;
+      console.log(`  - skipped: needs a distinct uid, got agent uid ${agentUid} with euid ${euid}`);
+      cell = "skipped";
+    }
     switch (cell) {
+      case "skipped":
+        break;
       case "refusal": {
         // T4's deferred cell: under layer 3 a populated cgroup refuses the release.
         const id = seatId();
@@ -431,6 +447,28 @@ writeFileSync(out, JSON.stringify(await sealSeatLaunch(root, id, { cgroup: { pat
           refused && seatCgroupPopulated({ path: real, agentUid: euid }) && !fenceSealed(id));
         break;
       }
+      case "wrong-base": {
+        // A normalized seat cgroup under a sibling, not this process's base, names no seat of ours.
+        const id = seatId();
+        const sibling = `${base}/x/seat-${id}`;
+        mkdirSync(sibling, { recursive: true });
+        const cg = { path: sibling, agentUid: euid };
+        const rejected = (await reapSeat(root, id, { cgroup: cg }).then(() => false, () => true)) &&
+          (() => {
+            try {
+              checkSeatRelease(root, id, { cgroup: cg });
+              return false;
+            } catch {
+              return true;
+            }
+          })() &&
+          (await sealSeatLaunch(root, id, { cgroup: cg }).then(() => false, () => true));
+        check("wrong base: reap, check and seal reject a normalized seat cgroup under a sibling base and leave it",
+          rejected && existsSync(sibling) && !fenceSealed(id), { rejected, sibling: existsSync(sibling) });
+        rmdirSync(sibling);
+        rmdirSync(dirname(sibling));
+        break;
+      }
       default:
         throw new Error(`unknown cell ${String(cell)}`);
     }
@@ -450,5 +488,5 @@ writeFileSync(out, JSON.stringify(await sealSeatLaunch(root, id, { cgroup: { pat
     rmSync(root, { recursive: true, force: true });
     rmSync(agentDir, { recursive: true, force: true });
   }
-  console.log(`CELL_TALLY ${JSON.stringify({ pass, fail })}`);
+  console.log(`CELL_TALLY ${JSON.stringify({ pass, fail, skipped })}`);
 }

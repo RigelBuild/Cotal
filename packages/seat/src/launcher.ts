@@ -6,7 +6,7 @@ import { assertSeatId, capabilityToken, fencePath, recordPath, seatId, socketPat
 import { CONFIRM_TIMEOUT_MS, unattendedMs, assertSocketPathFits, unsupportedTransport } from "./protocol.js";
 import { tryLockFd } from "./peercred.js";
 import type { CustodianTestSeam } from "./custodian.js";
-import { createSeatCgroup, moveIntoSeatCgroup, removeSeatCgroup, type SeatCgroup } from "./cgroup.js";
+import { createSeatCgroup, moveIntoSeatCgroup, ownCgroup, removeSeatCgroup, type SeatCgroup } from "./cgroup.js";
 
 export interface SeatLaunchSpec {
   command: string;
@@ -204,7 +204,11 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
     if (readFileSync(fenceFd, "utf8").trim() === "sealed") throw new Error(`seat ${id} launch fence ${fence} is sealed; the seat was released`);
     if (launcherSeam?.failMkdir) throw new Error("test seam: seat mkdir failed");
     // Under the fence lock, so a release that sealed first leaves no cgroup to create.
-    if (opts.cgroupBase !== undefined) cgroup = created.cgroup = createSeatCgroup(opts.cgroupBase, id, process.geteuid?.() ?? -1);
+    if (opts.cgroupBase !== undefined) {
+      // A reap or release derives the path from its own base, so a seat under any other base is unreapable.
+      if (opts.cgroupBase !== ownCgroup()) throw new Error(`cgroup base ${opts.cgroupBase} is not this process's cgroup ${String(ownCgroup())}`);
+      cgroup = created.cgroup = createSeatCgroup(opts.cgroupBase, id, process.geteuid?.() ?? -1);
+    }
     mkdirSync(dirname(recPath), { mode: 0o700 });
   } finally {
     closeSync(fenceFd);

@@ -16,14 +16,23 @@ function assertNormalUnderRoot(path: string, what: string): string {
   return path;
 }
 
+/** This process's own cgroup: `/sys/fs/cgroup` plus the `0::` line of `/proc/self/cgroup`. For the
+ *  manager it is the delegated base; for a custodian it is the cgroup it has joined. */
+export function ownCgroup(): string | undefined {
+  const line = readFileSync("/proc/self/cgroup", "utf8").split("\n").find((l) => l.startsWith("0::"));
+  return line === undefined ? undefined : `${CGROUP_ROOT}${line.slice(3)}`;
+}
+
 export function seatCgroupPath(base: string, id: string): string {
   return `${assertNormalUnderRoot(base, "cgroup base")}/seat-${assertSeatId(id)}`;
 }
 
-/** A caller-supplied seat cgroup must name exactly this seat on cgroup2 before any write targets it. */
+/** A caller-supplied seat cgroup must be this seat's cgroup under this process's own base, on
+ *  cgroup2, before any write targets it. */
 export function assertSeatCgroup(cg: SeatCgroup, id: string): SeatCgroup {
   const path = assertNormalUnderRoot(cg.path, "seat cgroup");
-  if (!path.endsWith(`/seat-${assertSeatId(id)}`)) throw new Error(`cgroup ${path} is not the cgroup of seat ${id}`);
+  const base = ownCgroup();
+  if (base === undefined || path !== seatCgroupPath(base, id)) throw new Error(`cgroup ${path} is not the cgroup of seat ${id} under this process's base ${String(base)}`);
   let fsType: number | undefined;
   try {
     fsType = statfsSync(path).type;
@@ -57,8 +66,7 @@ function writeExisting(path: string, text: string): void {
 }
 
 export function inSeatCgroup(cg: Pick<SeatCgroup, "path">): boolean {
-  const line = readFileSync("/proc/self/cgroup", "utf8").split("\n").find((l) => l.startsWith("0::"));
-  return line !== undefined && `${CGROUP_ROOT}${line.slice(3)}` === cg.path;
+  return ownCgroup() === cg.path;
 }
 
 export function seatCgroupPopulated(cg: SeatCgroup): boolean {
