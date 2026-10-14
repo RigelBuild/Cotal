@@ -519,8 +519,8 @@ try {
       { out, rec, slot: await readSlot("succ") });
   }
 } finally {
-  await mgr.stop().catch(() => {});
-  await successor?.stop().catch(() => {});
+  await mgr.stop({ withAgents: true }).catch(() => {});
+  await successor?.stop({ withAgents: true }).catch(() => {});
   await stopBroker();
   rmSync(workspaceRoot, { recursive: true, force: true });
   rmSync(seatRoot, { recursive: true, force: true });

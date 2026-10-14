@@ -40,6 +40,8 @@ const SPARE_COVERAGE = new Set([
   "implementations/manager/smoke/start-model-preflight.smoke.ts",
   "implementations/manager/smoke/preserve-state.smoke.ts",
   "implementations/manager/smoke/lease-loss-keeps-serving.smoke.ts",
+  // Successor release needs the retained seat to outlive its manager's spare stop.
+  "implementations/manager/smoke/seat-release.smoke.ts",
 ]);
 
 /**
