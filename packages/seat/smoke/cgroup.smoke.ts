@@ -1,11 +1,11 @@
 // Layer 3 (T5): per-seat cgroup v2 custody. The orchestrator runs every cell in its own fresh
 // delegated scope, so no cell creates a cgroup under this process's own scope.
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, chownSync, closeSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, closeSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { checkSeatRelease, launchSeat, loadSeat, resolveCgroupBase, processStartToken, socketPath, reapSeat, sealSeatLaunch, seatCgroupContained, seatCgroupPath, seatCgroupPopulated, seatId, type SeatLaunchSpec } from "../src/index.js";
+import { CGROUP_DELEGATED_ENV, checkSeatRelease, launchSeat, loadSeat, resolveCgroupBase, trustedSetpriv, processStartToken, socketPath, reapSeat, sealSeatLaunch, seatCgroupContained, seatCgroupPath, seatCgroupPopulated, seatId, type SeatLaunchSpec } from "../src/index.js";
 import { removeSeatCgroup } from "../src/cgroup.js";
 import { setCustodianTestSeam, setLauncherTestSeam } from "../src/launcher.js";
 import { pidfdOpen, pidfdSignal } from "../src/peercred.js";
@@ -21,6 +21,7 @@ const DIST = join(dirname(SCRIPT), "..", "dist");
 const CELLS = ["refusal", "shared-uid", "unprovable", "release-join", "rollback", "bounds", "wrong-base", "distinct-uid", "setsid", "recordless", "fence", "peer-uid"] as const;
 type Cell = (typeof CELLS)[number];
 const NEEDS_DISTINCT_UID: Record<Cell, boolean> = { refusal: false, "shared-uid": false, unprovable: false, "release-join": false, rollback: false, bounds: false, "wrong-base": false, "distinct-uid": true, setsid: true, recordless: true, fence: true, "peer-uid": true };
+const NEEDS_CONTAINMENT: ReadonlySet<Cell> = new Set<Cell>(["distinct-uid", "setsid", "recordless", "fence"]);
 const REQUIRE = process.env.COTAL_SEAT_CGROUP_REQUIRE === "1";
 
 // Cells get no inherited COTAL_ connection material; they read only the COTAL_CG_ keys set below.
@@ -259,6 +260,11 @@ s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,
       skipped = true;
       console.log(`  - skipped: needs a distinct uid, got agent uid ${agentUid} with euid ${euid}`);
       cell = "skipped";
+    } else if (known !== undefined && NEEDS_CONTAINMENT.has(known) && trustedSetpriv() === undefined) {
+      // Containment is never proven without a root-owned setpriv; a mapped user namespace has none.
+      skipped = true;
+      console.log("  - skipped: setpriv not provably root-owned in this namespace");
+      cell = "skipped";
     }
     switch (cell) {
       case "skipped":
@@ -431,7 +437,10 @@ s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,
         const loaded = loadSeat(root, id);
         check("forged record: adopt derives the socket from the root and id, not the record", loaded.socket === socketPath(root, id), loaded.socket);
         const evidence = await reapSeat(root, id, { cgroup: cg });
-        check("peer uid: the agent-uid seat is reaped through its cgroup", evidence.outcome === "reaped" && child !== undefined && gone(child.pid), evidence);
+        if (trustedSetpriv() === undefined) {
+          console.log("  - setpriv not provably root-owned in this namespace: containment is unproven, so the reap must stay retained");
+          check("peer uid: with containment unproven the agent-uid seat reap is retained, not reaped", evidence.outcome === "retained", evidence);
+        } else check("peer uid: the agent-uid seat is reaped through its cgroup", evidence.outcome === "reaped" && child !== undefined && gone(child.pid), evidence);
         break;
       }
       case "fence": {
@@ -553,9 +562,13 @@ s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,
           rejected && existsSync(sibling) && !fenceSealed(id), { rejected, sibling: existsSync(sibling) });
         rmdirSync(sibling);
         rmdirSync(dirname(sibling));
-        // The base is decided from the filesystem alone, so a base this euid cannot fully write is none.
+        // The base needs the operator's delegation declaration and this euid's write access to it.
         const subtree = join(base, "cgroup.subtree_control");
         const mode = statSync(subtree).mode & 0o777;
+        const declared = process.env[CGROUP_DELEGATED_ENV];
+        delete process.env[CGROUP_DELEGATED_ENV];
+        const undeclared = resolveCgroupBase();
+        process.env[CGROUP_DELEGATED_ENV] = "1";
         const resolvedAs = resolveCgroupBase();
         let unwritable: string | undefined = "unchanged";
         if (euid !== 0) {
@@ -566,8 +579,18 @@ s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,
             chmodSync(subtree, mode);
           }
         }
+        if (declared === undefined) delete process.env[CGROUP_DELEGATED_ENV];
+        else process.env[CGROUP_DELEGATED_ENV] = declared;
+        check("wrong base: resolveCgroupBase is none without the delegation declaration", undeclared === undefined, undeclared);
         check("wrong base: resolveCgroupBase returns this cell's own scope, and none once its subtree_control is unwritable",
           resolvedAs === base && (euid === 0 || unwritable === undefined), { resolvedAs, unwritable, euid });
+        // A setpriv this user could replace, or reached through a link into such a file, is never run.
+        const planted = file("setpriv");
+        writeFileSync(planted, "#!/bin/sh\nexit 11\n", { mode: 0o755 });
+        const link = file("setpriv-link");
+        symlinkSync(planted, link);
+        check("setpriv trust: a setpriv in a user-owned dir, directly or through a fixed-looking link, is refused",
+          trustedSetpriv([planted]) === undefined && trustedSetpriv([link]) === undefined, { planted: trustedSetpriv([planted]), link: trustedSetpriv([link]) });
         break;
       }
       default:

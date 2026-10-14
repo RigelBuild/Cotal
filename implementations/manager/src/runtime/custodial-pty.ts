@@ -3,7 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import type { AgentHandle, AttachSession, LaunchSpec, RuntimeReference } from "@cotal-ai/core";
 import type { ReleasableRuntime, RuntimeReapEvidence, RuntimeReleaseCheck } from "./index.js";
-import { adoptSeatSync, agentCanReplace, agentPrimaryGid, checkSeatRelease, launchSeat, loadSeat, reapSeat, removeSeatCustody, resolveCgroupBase, sealSeatLaunch, seatCgroupPath, seatId, unsupportedTransport, type SeatCgroup } from "@cotal-ai/seat";
+import { adoptSeatSync, agentCanReplace, agentPrimaryGid, CGROUP_DELEGATED_ENV, checkSeatRelease, launchSeat, loadSeat, reapSeat, removeSeatCustody, resolveCgroupBase, sealSeatLaunch, seatCgroupPath, seatId, unsupportedTransport, type SeatCgroup } from "@cotal-ai/seat";
 
 function defaultCustodyRoot(): string {
   return join(homedir(), ".cotal", "seats");
@@ -47,7 +47,7 @@ export class CustodialPtyRuntime implements ReleasableRuntime {
     if (this.agentUid !== euid && euid !== 0) throw new Error(`seat agent uid ${this.agentUid} differs from this manager's uid ${euid}; a distinct agent uid needs a manager running with euid 0`);
     this.cgroupBase = opts.cgroupBase ?? (process.platform === "linux" ? resolveCgroupBase() : undefined);
     if (process.platform === "linux" && this.cgroupBase === undefined)
-      console.error("custodial pty: no writable cgroup v2 base for this process (run under Delegate=yes); seat cgroups are off and reaps of live seats stay retained");
+      console.error(`custodial pty: no delegated cgroup v2 base (set ${CGROUP_DELEGATED_ENV}=1 in a Delegate=yes unit whose own cgroup this euid can write); seat cgroups are off and reaps of live seats stay retained`);
     mkdirSync(this.root, { recursive: true, mode: 0o700 });
     if (this.agentUid !== euid) assertCustodyRoot(this.root, this.agentUid, euid);
   }
@@ -142,7 +142,7 @@ function assertCustodyRoot(root: string, agentUid: number, euid: number): void {
   if (!st.isDirectory() || st.uid !== euid) throw new Error(`custody root ${root} must be a directory owned by uid ${euid}, not ${st.uid}; refusing a root seat agent uid ${agentUid} could rearrange`);
   for (let dir = top; ; dir = dirname(dir)) {
     const d = statSync(dir);
-    if (agentCanReplace(d, agentUid, gid))
+    if (agentCanReplace(d, agentUid))
       throw new Error(`seat agent uid ${agentUid} can write ${dir}, at or above the custody root ${root}; set COTAL_SEAT_ROOT to a root it cannot rearrange`);
     // Spawned with no supplementary groups: only the owner, primary group and other bits apply.
     const bit = d.uid === agentUid ? 0o100 : d.gid === gid ? 0o010 : 0o001;

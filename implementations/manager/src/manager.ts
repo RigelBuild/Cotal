@@ -7446,7 +7446,7 @@ export class Manager {
     }
     for (let dir = dirname(path); ; dir = dirname(dir)) {
       const st = lstatSync(dir, { throwIfNoEntry: false });
-      if (st !== undefined && agentCanReplace(st, agent.uid, agent.gid))
+      if (st !== undefined && agentCanReplace(st, agent.uid))
         throw new Error(`seat agent uid ${agent.uid} can write ${dir} above its creds ${credsPath}; refusing to write or grant them`);
       if (dir === dirname(dir)) break;
     }

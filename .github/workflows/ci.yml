@@ -123,7 +123,7 @@ jobs:
         run: |
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin cotal-seat-agent
           d="$GITHUB_WORKSPACE"; while [ "$d" != / ]; do sudo chmod o+x "$d"; d="$(dirname "$d")"; done
-          sudo env "PATH=$PATH" COTAL_SEAT_CGROUP_REQUIRE=1 COTAL_SEAT_SMOKE_AGENT_UID="$(id -u cotal-seat-agent)" pnpm smoke:seat-cgroup
+          sudo env "PATH=$PATH" COTAL_SEAT_CGROUP_DELEGATED=1 COTAL_SEAT_CGROUP_REQUIRE=1 COTAL_SEAT_SMOKE_AGENT_UID="$(id -u cotal-seat-agent)" pnpm smoke:seat-cgroup
       - name: View smoke
         run: pnpm smoke:view
       - name: Verify Claude connector package
@@ -262,7 +262,7 @@ jobs:
         run: |
           id -u cotal-seat-e2e >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin cotal-seat-e2e
           d="$GITHUB_WORKSPACE"; while [ "$d" != / ]; do sudo chmod o+x "$d"; d="$(dirname "$d")"; done
-          sudo systemd-run --scope -p Delegate=yes --quiet -- env "PATH=$PATH" COTAL_SEAT_AGENT_UID="$(id -u cotal-seat-e2e)" pnpm smoke:lifecycle-e2e
+          sudo systemd-run --scope -p Delegate=yes --quiet -- env "PATH=$PATH" COTAL_SEAT_CGROUP_DELEGATED=1 COTAL_SEAT_AGENT_UID="$(id -u cotal-seat-e2e)" pnpm smoke:lifecycle-e2e
       - name: Runtime smoke tests (tmux, orca, herdr)
         run: pnpm smoke:runtime
       # Runs BEFORE the soak because it grades the soak's own instrument: the wait behind the

@@ -36,7 +36,7 @@ import type { Connector, LaunchOpts, LaunchSpec } from "@cotal-ai/core";
 import { Manager } from "../src/manager.js";
 import { LegacyPtyRuntime } from "../src/runtime/pty.js";
 import { CustodialPtyRuntime } from "../src/runtime/custodial-pty.js";
-import { launchSeat, loadSeat, seatCgroupContained, seatId } from "@cotal-ai/seat";
+import { launchSeat, loadSeat, seatCgroupContained, seatId, trustedSetpriv } from "@cotal-ai/seat";
 import { registry } from "@cotal-ai/core";
 import { agentCredsDir, agentLifecycleSecretFilePaths, authDir, renewalRecordPath, saveSpaceAuth } from "@cotal-ai/workspace";
 import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
@@ -55,11 +55,13 @@ const freePort = (): Promise<number> =>
 const PORT = await freePort();
 const SERVERS = `nats://127.0.0.1:${PORT}`;
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
-let pass = 0, fail = 0;
+let pass = 0, fail = 0, skipped = 0;
 const check = (name: string, cond: boolean, extra?: unknown) => {
   if (cond) { pass++; console.log(`  ✓ ${name}`); }
   else { fail++; console.log(`  ✗ FAIL: ${name}`, extra ?? ""); }
 };
+const skip = (name: string, why: string) => { skipped++; console.log(`  - skipped: ${name}: ${why}`); };
+const NO_PROOF = "setpriv not provably root-owned in this namespace";
 
 const space = `life-${randomUUID().slice(0, 8)}`;
 const auth = await createSpaceAuth(space);
@@ -169,6 +171,9 @@ if (delegated) {
 }
 (mgr as unknown as { runtime: unknown }).runtime = custodial ?? new LegacyPtyRuntime();
 console.log(`runtime: ${custodial ? `custodial, agent uid ${custodial.agentUid}, cgroup base ${String(custodial.cgroupBase)}` : "legacy pty"}`);
+// Teardown of a custodial seat needs the containment proof; without a root-owned setpriv it fails closed.
+const proven = custodial === undefined || trustedSetpriv() !== undefined;
+if (!proven) console.log(`containment: ${NO_PROOF}; seat teardown is expected to stay retained`);
 /** Run `node -e script ...args` as the agent uid; the exit status and stdout. */
 const asAgent = (script: string, ...args: string[]): { status: number | null; out: string } => {
   const uid = String(custodial?.agentUid);
@@ -275,20 +280,38 @@ try {
     const credsCheck = mgr as unknown as { checkSeatCredsPath: (p: string) => void };
     const credsRefusal = refuse(() => credsCheck.checkSeatCredsPath(join(swappable, "creds", "x.creds")));
     check("creds under a directory the agent can write are refused before any write", /can write .*agent-writable/.test(credsRefusal), credsRefusal);
+    // A POSIX ACL can grant the agent through a named entry the mode's group bits (the mask) bound,
+    // so g+w is refused whatever the dir's gid. A gid the agent is not in stands in for that ACL.
+    const otherGid = agentGid === 0 ? 1 : 0;
+    const masked = join(workspaceRoot, "acl-mask");
+    mkdirSync(masked);
+    chmodSync(masked, 0o770);
+    chownSync(masked, process.geteuid?.() ?? 0, otherGid);
+    const maskedRefusal = refuse(() => credsCheck.checkSeatCredsPath(join(masked, "creds", "x.creds")));
+    check("creds under a root-owned dir with g+w for another gid are refused (the ACL mask bounds named entries)", /can write .*acl-mask/.test(maskedRefusal), maskedRefusal);
+    const maskedRoot = join(dir, "acl-mask-seats");
+    mkdirSync(maskedRoot);
+    chmodSync(maskedRoot, 0o771);
+    chownSync(maskedRoot, process.geteuid?.() ?? 0, otherGid);
+    const maskedRootRefusal = refuse(() => new CustodialPtyRuntime({ root: maskedRoot, cgroupBase: custodial?.cgroupBase, agentUid: custodial?.agentUid }));
+    check("a root-owned custody root with g+w for another gid is refused at construction", /can write .*acl-mask-seats/.test(maskedRootRefusal), maskedRootRefusal);
     // The seat dir's owner is the launch uid. A runtime set to another uid must not prove containment for it.
-    const side = { kind: "pty" as const, id: seatId() };
-    launchSeat({ root: seatsRoot, name: "uid-side", id: side.id, spec: { command: process.execPath, args: ["-e", "setInterval(()=>{},1e9)"], env: { PATH: process.env.PATH ?? "" } }, cwd: "/", cgroupBase: custodial.cgroupBase, agentUid: custodial.agentUid });
-    const sidePath = `${String(custodial.cgroupBase)}/seat-${side.id}`;
-    // Another real user whose containment holds here, so only the launch-uid binding can keep the reap retained.
-    const otherUid = spawnSync("getent", ["passwd"], { encoding: "utf8" }).stdout.split("\n").map((l) => Number(l.split(":")[2]))
-      .find((u) => Number.isInteger(u) && u > 0 && u !== custodial?.agentUid && seatCgroupContained({ path: sidePath, agentUid: u }));
-    check("another uid whose seat containment would hold exists", otherUid !== undefined, otherUid);
-    const other = new CustodialPtyRuntime({ root: seatsRoot, cgroupBase: custodial.cgroupBase, agentUid: otherUid ?? custodial.agentUid });
-    const mismatched = await other.reap(side);
-    check("a seat launched under another uid reaps as retained, its cgroup left in place",
-      mismatched.outcome === "retained" && existsSync(sidePath), { mismatched, cgroup: existsSync(sidePath) });
-    const matched = await custodial.reap(side);
-    check("the launching uid's runtime reaps it through its cgroup", matched.outcome === "reaped" && !existsSync(sidePath), matched);
+    if (!proven) skip("launch-uid binding on reap", NO_PROOF);
+    else {
+      const side = { kind: "pty" as const, id: seatId() };
+      launchSeat({ root: seatsRoot, name: "uid-side", id: side.id, spec: { command: process.execPath, args: ["-e", "setInterval(()=>{},1e9)"], env: { PATH: process.env.PATH ?? "" } }, cwd: "/", cgroupBase: custodial.cgroupBase, agentUid: custodial.agentUid });
+      const sidePath = `${String(custodial.cgroupBase)}/seat-${side.id}`;
+      // Another real user whose containment holds here, so only the launch-uid binding can keep the reap retained.
+      const otherUid = spawnSync("getent", ["passwd"], { encoding: "utf8" }).stdout.split("\n").map((l) => Number(l.split(":")[2]))
+        .find((u) => Number.isInteger(u) && u > 0 && u !== custodial?.agentUid && seatCgroupContained({ path: sidePath, agentUid: u }));
+      check("another uid whose seat containment would hold exists", otherUid !== undefined, otherUid);
+      const other = new CustodialPtyRuntime({ root: seatsRoot, cgroupBase: custodial.cgroupBase, agentUid: otherUid ?? custodial.agentUid });
+      const mismatched = await other.reap(side);
+      check("a seat launched under another uid reaps as retained, its cgroup left in place",
+        mismatched.outcome === "retained" && existsSync(sidePath), { mismatched, cgroup: existsSync(sidePath) });
+      const matched = await custodial.reap(side);
+      check("the launching uid's runtime reaps it through its cgroup", matched.outcome === "reaped" && !existsSync(sidePath), matched);
+    }
     if (rec) {
       // One connection per op: the custodian closes the socket after a peer uid mismatch.
       const PEER =
@@ -313,14 +336,23 @@ try {
   // here would catch a contract/handler disagreement (see manifest-launch.smoke.ts's header for
   // the escape that shape produced). The door-level suites are manager-service-ops/-invoke.
   (mgr as unknown as { opStop: (a: Record<string, unknown>, c: string, admin: boolean) => unknown }).opStop({ name: "w1", graceful: false }, callerId, true);
-  check("dm_local- durable gone after despawn", await until(() => consumerExists(DM, dmDurable(DEV_OWNER, id1, uid1)), false), await footprint(id1, uid1, "w1"));
-  check("dlv_local- durable gone after despawn", await until(() => consumerExists(DLV, dlvDurable(DEV_OWNER, id1, uid1)), false));
-  check("read-ACL row gone after despawn", await until(() => aclPresent(id1, uid1), false));
-  check("creds file gone after despawn", await until(async () => existsSync(credsFile("w1", uid1)), false));
-  if (seat1) {
-    const s = seat1;
-    check("delegated: w1's seat cgroup is removed and its agent process is gone after despawn",
-      await until(async () => !existsSync(s.path) && !existsSync(`/proc/${s.childPid}/status`), true), s);
+  if (proven) {
+    check("dm_local- durable gone after despawn", await until(() => consumerExists(DM, dmDurable(DEV_OWNER, id1, uid1)), false), await footprint(id1, uid1, "w1"));
+    check("dlv_local- durable gone after despawn", await until(() => consumerExists(DLV, dlvDurable(DEV_OWNER, id1, uid1)), false));
+    check("read-ACL row gone after despawn", await until(() => aclPresent(id1, uid1), false));
+    check("creds file gone after despawn", await until(async () => existsSync(credsFile("w1", uid1)), false));
+    if (seat1) {
+      const s = seat1;
+      check("delegated: w1's seat cgroup is removed and its agent process is gone after despawn",
+        await until(async () => !existsSync(s.path) && !existsSync(`/proc/${s.childPid}/status`), true), s);
+    }
+  } else {
+    // Fail closed: with no containment proof the despawn reap is retained, so nothing is torn down.
+    await wait(3000);
+    const fp = await footprint(id1, uid1, "w1");
+    check("unproven containment: w1's despawn is retained, its creds, durables and seat cgroup kept",
+      fp.creds && fp.dm && seat1 !== undefined && existsSync(seat1.path), { fp, seat1 });
+    skip("despawn teardown of w1's footprint and seat cgroup", NO_PROOF);
   }
 
   // 3 — FAILED launch: process exits on arrival → {ok:false} + footprint rolled back.
@@ -333,7 +365,8 @@ try {
   await wait(2500);
   // The failed spawn's uid never came back, so sweep by prefix: no `bad1.<uid>.creds` (nor any
   // other `bad1.`-based secret) may remain.
-  check("bad1 creds file not left behind", !readdirSync(agentCredsDir(workspaceRoot, space)).some((f) => f.startsWith("bad1.")));
+  if (proven) check("bad1 creds file not left behind", !readdirSync(agentCredsDir(workspaceRoot, space)).some((f) => f.startsWith("bad1.")));
+  else skip("bad1 rollback teardown", NO_PROOF);
 
   // 3b — UNCERTAIN: a process that runs but never joins presence → neither started nor failed within the
   // backstop → {ok:false} uncertain, and the agent is KEPT (not deprovisioned; it may still be booting).
@@ -393,12 +426,17 @@ try {
   check("w2 footprint exists before stop", (await footprint(id2, uid2, "w2")).dm, await footprint(id2, uid2, "w2"));
   await mgr.stop({ withAgents: true }); // awaits teardownManagedAgents → deprovision
   const fp2 = await footprint(id2, uid2, "w2");
-  check("w2 dm_ durable gone after explicit stop", !fp2.dm, fp2);
-  check("w2 dlv_ durable gone after explicit stop", !fp2.dlv, fp2);
-  check("w2 read-ACL row gone after explicit stop", !fp2.acl, fp2);
-  check("w2 creds file gone after explicit stop", !fp2.creds, fp2);
+  if (proven) {
+    check("w2 dm_ durable gone after explicit stop", !fp2.dm, fp2);
+    check("w2 dlv_ durable gone after explicit stop", !fp2.dlv, fp2);
+    check("w2 read-ACL row gone after explicit stop", !fp2.acl, fp2);
+    check("w2 creds file gone after explicit stop", !fp2.creds, fp2);
+  } else {
+    check("unproven containment: stop({ withAgents }) retains w2, its creds kept", fp2.creds, fp2);
+    skip("explicit-stop teardown of w2's footprint", NO_PROOF);
+  }
 
-  console.log(`\nLIFECYCLE E2E ${fail === 0 ? "OK ✅" : "FAILED ❌"}  (${pass} passed, ${fail} failed)`);
+  console.log(`\nLIFECYCLE E2E ${fail === 0 ? "OK ✅" : "FAILED ❌"}  (${pass} passed, ${fail} failed${skipped ? `, ${skipped} skipped` : ""})`);
   if (fail) process.exitCode = 1;
 } catch (e) {
   console.error("  ✗ scenario threw:", (e as Error).stack ?? (e as Error).message);
