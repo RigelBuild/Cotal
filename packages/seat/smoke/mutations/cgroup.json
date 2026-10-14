@@ -21,8 +21,8 @@
     {
       "name": "T5-M2 skip seatCgroupContained",
       "file": "packages/seat/src/reap.ts",
-      "find": " && seatCgroupContained(cg)) return reapCgroup(",
-      "replace": ") return reapCgroup(",
+      "find": " && seatCgroupContained(cg)) {\n    const evidence = await reapCgroup(",
+      "replace": ") {\n    const evidence = await reapCgroup(",
       "expectRed": "migration attempt, shared uid: the reap is retained, not reaped, and the seat cgroup is not removed",
       "afterRestore": "pnpm --filter @cotal-ai/seat build"
     },
@@ -49,6 +49,37 @@
       "replace": "    ftruncateSync(fd, 0);\n    writeSync(fd, \"sealed\", 0);\n    fsyncSync(fd);\n    const refusal = cg === undefined ? undefined : await removeEmptyCgroup(id, cg);\n    if (refusal !== undefined) return refusal;",
       "expectRed": "release/join race: the release refuses with populated, writes no seal, and the seat stays live",
       "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M6 no seat cgroup rollback on a failed launch",
+      "file": "packages/seat/src/launcher.ts",
+      "find": "        removeSeatCgroup(created.cgroup);",
+      "replace": "        void created.cgroup;",
+      "expectRed": "launch rollback: a failed move throws and leaves no seat cgroup, no record and no child",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M7 seatCgroupPath accepts any base",
+      "file": "packages/seat/src/cgroup.ts",
+      "find": "return `${assertNormalUnderRoot(base, \"cgroup base\")}/seat-",
+      "replace": "return `${base}/seat-",
+      "expectRed": "bounds: seatCgroupPath rejects a `..` base, a trailing slash, a `.` segment and the bare root",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M8 assertSeatCgroup accepts a non-normalized path",
+      "file": "packages/seat/src/cgroup.ts",
+      "find": "  const path = assertNormalUnderRoot(cg.path, \"seat cgroup\");",
+      "replace": "  const path = cg.path;",
+      "expectRed": "bounds: reap and release reject a `..` or non-normalized seat cgroup path and leave the seat populated",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M9 a cell exits 0 with no tally",
+      "file": "packages/seat/smoke/cgroup.smoke.ts",
+      "find": "  console.log(`CELL_TALLY ${JSON.stringify({ pass, fail })}`);",
+      "replace": "  void pass;",
+      "expectRed": "with 0 tally line(s), none well-formed"
     }
   ]
 }

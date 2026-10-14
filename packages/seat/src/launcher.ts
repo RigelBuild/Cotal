@@ -6,7 +6,7 @@ import { assertSeatId, capabilityToken, fencePath, recordPath, seatId, socketPat
 import { CONFIRM_TIMEOUT_MS, unattendedMs, assertSocketPathFits, unsupportedTransport } from "./protocol.js";
 import { tryLockFd } from "./peercred.js";
 import type { CustodianTestSeam } from "./custodian.js";
-import { createSeatCgroup, moveIntoSeatCgroup, type SeatCgroup } from "./cgroup.js";
+import { createSeatCgroup, moveIntoSeatCgroup, removeSeatCgroup, type SeatCgroup } from "./cgroup.js";
 
 export interface SeatLaunchSpec {
   command: string;
@@ -138,11 +138,13 @@ export function setCustodianTestSeam(seam: CustodianTestSeam | undefined): void 
 }
 
 /** `afterFence`: pause after creating the fence, before its lock. `failMkdir`: throw at the seat mkdir.
- *  `beforeMove`: pause after spawning the custodian, before moving it into the seat cgroup. */
+ *  `beforeMove`: pause after spawning the custodian, before moving it into the seat cgroup.
+ *  `failMove`: throw in place of that move. */
 export interface LauncherTestSeam {
   afterFence?: { reached: string; release: string };
   failMkdir?: boolean;
   beforeMove?: { reached: string; release: string };
+  failMove?: boolean;
 }
 let launcherSeam: LauncherTestSeam | undefined;
 export function setLauncherTestSeam(seam: LauncherTestSeam | undefined): void {
@@ -160,6 +162,24 @@ function holdLauncher(hold: { reached: string; release: string }): void {
 }
 
 export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
+  const created: { cgroup?: SeatCgroup } = {};
+  try {
+    return launchInto(opts, created);
+  } catch (e) {
+    // rmdir only, never a kill: an empty cgroup goes, so a pending custodian finds it gone and exits.
+    if (created.cgroup) {
+      try {
+        removeSeatCgroup(created.cgroup);
+      } catch (rm) {
+        const code = (rm as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "EBUSY") throw rm;
+      }
+    }
+    throw e;
+  }
+}
+
+function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): SeatRecord {
   if (process.platform !== "linux") throw unsupportedTransport();
   mkdirSync(opts.root, { recursive: true, mode: 0o700 });
   const id = assertSeatId(opts.id ?? seatId());
@@ -184,7 +204,7 @@ export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
     if (readFileSync(fenceFd, "utf8").trim() === "sealed") throw new Error(`seat ${id} launch fence ${fence} is sealed; the seat was released`);
     if (launcherSeam?.failMkdir) throw new Error("test seam: seat mkdir failed");
     // Under the fence lock, so a release that sealed first leaves no cgroup to create.
-    if (opts.cgroupBase !== undefined) cgroup = createSeatCgroup(opts.cgroupBase, id, process.geteuid?.() ?? -1);
+    if (opts.cgroupBase !== undefined) cgroup = created.cgroup = createSeatCgroup(opts.cgroupBase, id, process.geteuid?.() ?? -1);
     mkdirSync(dirname(recPath), { mode: 0o700 });
   } finally {
     closeSync(fenceFd);
@@ -241,6 +261,7 @@ export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
     // A reap or release that removed the empty cgroup first makes this throw ENOENT; the custodian
     // then sees the cgroup gone and exits with no child.
     if (child.pid === undefined) throw new Error("custodian spawn returned no pid; no seat cgroup move");
+    if (launcherSeam?.failMove) throw new Error("test seam: seat cgroup move failed");
     moveIntoSeatCgroup(cgroup, child.pid);
   }
   const deadline = Date.now() + 10_000;

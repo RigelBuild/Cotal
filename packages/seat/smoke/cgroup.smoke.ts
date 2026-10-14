@@ -5,7 +5,8 @@ import { chmodSync, chownSync, closeSync, existsSync, mkdtempSync, readFileSync,
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { checkSeatRelease, launchSeat, processStartToken, reapSeat, removeSeatCgroup, sealSeatLaunch, seatCgroupContained, seatCgroupPath, seatCgroupPopulated, seatId, type SeatLaunchSpec } from "../src/index.js";
+import { checkSeatRelease, launchSeat, processStartToken, reapSeat, sealSeatLaunch, seatCgroupContained, seatCgroupPath, seatCgroupPopulated, seatId, type SeatLaunchSpec } from "../src/index.js";
+import { removeSeatCgroup } from "../src/cgroup.js";
 import { setCustodianTestSeam, setLauncherTestSeam } from "../src/launcher.js";
 import { pidfdOpen, pidfdSignal } from "../src/peercred.js";
 import { makeSeatRoot } from "@cotal-ai/smoke-kit";
@@ -17,9 +18,9 @@ if (process.platform !== "linux") {
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const DIST = join(dirname(SCRIPT), "..", "dist");
-const CELLS = ["refusal", "shared-uid", "unprovable", "release-join", "distinct-uid", "setsid", "recordless", "fence"] as const;
+const CELLS = ["refusal", "shared-uid", "unprovable", "release-join", "rollback", "bounds", "distinct-uid", "setsid", "recordless", "fence"] as const;
 type Cell = (typeof CELLS)[number];
-const NEEDS_DISTINCT_UID: Record<Cell, boolean> = { refusal: false, "shared-uid": false, unprovable: false, "release-join": false, "distinct-uid": true, setsid: true, recordless: true, fence: true };
+const NEEDS_DISTINCT_UID: Record<Cell, boolean> = { refusal: false, "shared-uid": false, unprovable: false, "release-join": false, rollback: false, bounds: false, "distinct-uid": true, setsid: true, recordless: true, fence: true };
 const REQUIRE = process.env.COTAL_SEAT_CGROUP_REQUIRE === "1";
 
 const ownCgroup = (): string => {
@@ -78,18 +79,31 @@ function orchestrate(): void {
     });
     process.stdout.write(r.stdout ?? "");
     if (r.stderr) process.stdout.write(r.stderr.split("\n").map((l) => (l ? `    | ${l}` : l)).join("\n"));
-    const tally = (r.stdout ?? "").split("\n").find((l) => l.startsWith("CELL_TALLY "));
-    if (r.status !== 0 && tally === undefined) {
-      console.log(`  ✗ FAIL: cell ${cell} exited ${String(r.status ?? r.signal)} with no tally`);
+    // A cell passes only on exit 0 with exactly one well-formed tally; anything else is a failure.
+    const tallies = (r.stdout ?? "").split("\n").filter((l) => l.startsWith("CELL_TALLY "));
+    const t = tallies.length === 1 ? parseTally(tallies[0]?.slice("CELL_TALLY ".length) ?? "") : undefined;
+    if (r.status !== 0 || t === undefined) {
+      console.log(`  ✗ FAIL: cell ${cell} exited ${String(r.status ?? r.signal)} with ${tallies.length} tally line(s)${t === undefined ? ", none well-formed" : ""}`);
       fail++;
-      continue;
     }
-    const t = JSON.parse((tally ?? "CELL_TALLY {}").slice("CELL_TALLY ".length)) as { pass?: number; fail?: number };
-    pass += t.pass ?? 0;
-    fail += t.fail ?? 0;
+    pass += t?.pass ?? 0;
+    fail += t?.fail ?? 0;
   }
   console.log(`\nSEAT CGROUP ${fail === 0 ? "OK" : "FAILED"} (${pass} passed, ${fail} failed, ${skip} skipped)`);
   process.exitCode = fail === 0 ? 0 : 1;
+}
+
+function parseTally(text: string): { pass: number; fail: number } | undefined {
+  let v: unknown;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (typeof v !== "object" || v === null || !("pass" in v) || !("fail" in v)) return undefined;
+  const { pass, fail } = v;
+  const count = (n: unknown): n is number => typeof n === "number" && Number.isInteger(n) && n >= 0;
+  return count(pass) && count(fail) ? { pass, fail } : undefined;
 }
 
 async function runCell(cell: string | undefined): Promise<void> {
@@ -371,6 +385,50 @@ writeFileSync(out, JSON.stringify(await sealSeatLaunch(root, id, { cgroup: { pat
         check("release/join race: the release refuses with populated, writes no seal, and the seat stays live",
           parsed.ok === false && parsed.reason === "populated" && !fenceSealed(id) && err === "" && existsSync(file("pid")) && existsSync(path),
           { result, err, fence: readOr(join(root, `.launch-${id}`), "none") });
+        break;
+      }
+      case "rollback": {
+        const id = seatId();
+        const path = seatCgroupPath(base, id);
+        setLauncherTestSeam({ failMove: true });
+        let err = "";
+        try {
+          launch(id, { command: process.execPath, args: ["-e", SLEEPER, file("pid")], env });
+        } catch (e) {
+          err = (e as Error).message;
+        } finally {
+          setLauncherTestSeam(undefined);
+        }
+        // The custodian is past spawn and polls every 25ms; give it far longer than that to misbehave.
+        await wait(1_500);
+        check("launch rollback: a failed move throws and leaves no seat cgroup, no record and no child",
+          /seat cgroup move failed/.test(err) && !existsSync(path) && !existsSync(file("pid")) && !existsSync(join(root, id, "record.json")),
+          { err, cgroup: existsSync(path), child: existsSync(file("pid")) });
+        break;
+      }
+      case "bounds": {
+        const id = seatId();
+        launch(id, { command: process.execPath, args: ["-e", SLEEPER, file("pid")], env });
+        const real = seatCgroupPath(base, id);
+        const throws = (f: () => unknown): boolean => {
+          try {
+            f();
+            return false;
+          } catch {
+            return true;
+          }
+        };
+        const rejects = async (f: () => Promise<unknown>): Promise<boolean> => f().then(() => false, () => true);
+        check("bounds: seatCgroupPath rejects a `..` base, a trailing slash, a `.` segment and the bare root",
+          throws(() => seatCgroupPath(`${base}/..`, id)) && throws(() => seatCgroupPath(`${base}/`, id)) &&
+            throws(() => seatCgroupPath(`${base}/./x`, id)) && throws(() => seatCgroupPath("/sys/fs/cgroup", id)));
+        // The same seat cgroup, spelled through `..`: no kill, no rmdir, no release may follow it.
+        const dotted = { path: `${base}/x/../seat-${id}`, agentUid: euid };
+        const doubled = { path: `${base}//seat-${id}`, agentUid: euid };
+        const refused = (await rejects(() => reapSeat(root, id, { cgroup: dotted }))) && (await rejects(() => reapSeat(root, id, { cgroup: doubled }))) &&
+          throws(() => checkSeatRelease(root, id, { cgroup: dotted })) && (await rejects(() => sealSeatLaunch(root, id, { cgroup: doubled })));
+        check("bounds: reap and release reject a `..` or non-normalized seat cgroup path and leave the seat populated",
+          refused && seatCgroupPopulated({ path: real, agentUid: euid }) && !fenceSealed(id));
         break;
       }
       default:

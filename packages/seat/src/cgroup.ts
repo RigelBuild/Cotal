@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { closeSync, constants, mkdirSync, openSync, readFileSync, rmdirSync, statfsSync, statSync, writeSync, type Stats } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, posix } from "node:path";
 import { assertSeatId } from "./record.js";
 
 const CGROUP_ROOT = "/sys/fs/cgroup";
@@ -9,9 +9,29 @@ const CGROUP2_SUPER_MAGIC = 0x63677270;
 /** A layer 3 seat cgroup: `<base>/seat-<id>`, and the uid the seat's agent runs as. */
 export interface SeatCgroup { readonly path: string; readonly agentUid: number }
 
+// A base or path that is not already normalized could name a cgroup other than the one it reads as.
+function assertNormalUnderRoot(path: string, what: string): string {
+  const normal = path === posix.normalize(path) && !path.endsWith("/") && !path.split("/").includes("..");
+  if (!normal || !path.startsWith(`${CGROUP_ROOT}/`)) throw new Error(`${what} ${path} is not a normalized path below ${CGROUP_ROOT}`);
+  return path;
+}
+
 export function seatCgroupPath(base: string, id: string): string {
-  if (!base.startsWith(`${CGROUP_ROOT}/`)) throw new Error(`cgroup base ${base} is not under ${CGROUP_ROOT}`);
-  return `${base}/seat-${assertSeatId(id)}`;
+  return `${assertNormalUnderRoot(base, "cgroup base")}/seat-${assertSeatId(id)}`;
+}
+
+/** A caller-supplied seat cgroup must name exactly this seat on cgroup2 before any write targets it. */
+export function assertSeatCgroup(cg: SeatCgroup, id: string): SeatCgroup {
+  const path = assertNormalUnderRoot(cg.path, "seat cgroup");
+  if (!path.endsWith(`/seat-${assertSeatId(id)}`)) throw new Error(`cgroup ${path} is not the cgroup of seat ${id}`);
+  let fsType: number | undefined;
+  try {
+    fsType = statfsSync(path).type;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  if (fsType !== undefined && fsType !== CGROUP2_SUPER_MAGIC) throw new Error(`seat cgroup ${path} is not on cgroup2`);
+  return cg;
 }
 
 /** `mkdir` without `recursive`, so an existing seat cgroup throws `EEXIST`. */

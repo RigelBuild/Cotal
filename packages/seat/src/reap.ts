@@ -6,7 +6,7 @@ import { RUN_MARKER_FLAG } from "./launcher.js";
 import { CONFIRM_TIMEOUT_MS, GRACE_MS, unsupportedTransport } from "./protocol.js";
 import { SeatClient } from "./client.js";
 import { tryLockFd } from "./peercred.js";
-import { killSeatCgroup, removeSeatCgroup, seatCgroupContained, seatCgroupPopulated, type SeatCgroup } from "./cgroup.js";
+import { assertSeatCgroup, killSeatCgroup, removeSeatCgroup, seatCgroupContained, seatCgroupPopulated, type SeatCgroup } from "./cgroup.js";
 
 /** `unprovable`: nothing on this host can prove the seat's processes gone. `members-remain`: a
  *  contained seat cgroup still held tasks at the bound. */
@@ -23,13 +23,8 @@ export interface SeatReapOpts {
   cgroup?: SeatCgroup;
 }
 
-// The caller derives the path; a cgroup that does not name this seat must never receive a kill.
-function assertSeatCgroup(cg: SeatCgroup, id: string): SeatCgroup {
-  if (!cg.path.endsWith(`/seat-${assertSeatId(id)}`)) throw new Error(`cgroup ${cg.path} is not the cgroup of seat ${id}`);
-  return cg;
-}
-
-async function reapCgroup(id: string, cg: SeatCgroup, graceMs: number): Promise<SeatReapEvidence> {
+// `undefined`: a concurrent reap or release removed the cgroup, so there is no seat cgroup to prove.
+async function reapCgroup(id: string, cg: SeatCgroup, graceMs: number): Promise<SeatReapEvidence | undefined> {
   try {
     killSeatCgroup(cg);
     const deadline = Date.now() + graceMs;
@@ -37,7 +32,9 @@ async function reapCgroup(id: string, cg: SeatCgroup, graceMs: number): Promise<
     if (seatCgroupPopulated(cg)) throw new Error(`still reads populated 1 after ${graceMs}ms`);
     removeSeatCgroup(cg);
   } catch (e) {
-    return { outcome: "retained", reason: "members-remain", stop: "no-custodian", detail: `seat ${id} cgroup ${cg.path}: ${(e as Error).message}` };
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return undefined;
+    return { outcome: "retained", reason: "members-remain", stop: "no-custodian", detail: `seat ${id} cgroup ${cg.path}${code ? ` (${code})` : ""}: ${(e as Error).message}` };
   }
   return { outcome: "reaped", detail: `seat ${id} cgroup ${cg.path} killed, read populated 0 and was removed` };
 }
@@ -119,7 +116,10 @@ export function censusCustodians(run?: string): CustodianSighting[] {
 export async function reapSeat(root: string, id: string, opts: SeatReapOpts = {}): Promise<SeatReapEvidence> {
   if (process.platform !== "linux") throw unsupportedTransport();
   const cg = opts.cgroup;
-  if (cg !== undefined && existsSync(assertSeatCgroup(cg, id).path) && seatCgroupContained(cg)) return reapCgroup(id, cg, opts.graceMs ?? GRACE_MS);
+  if (cg !== undefined && existsSync(assertSeatCgroup(cg, id).path) && seatCgroupContained(cg)) {
+    const evidence = await reapCgroup(id, cg, opts.graceMs ?? GRACE_MS);
+    if (evidence !== undefined) return evidence;
+  }
   const path = recordPath(root, id);
   let rec: SeatRecord;
   try {
