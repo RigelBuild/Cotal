@@ -116,6 +116,12 @@ jobs:
         run: pnpm smoke:update-concurrency
       - name: Unit tests
         run: pnpm test
+      # Layer 3 cells need a delegated cgroup and a distinct agent uid. Root gets both: a system
+      # scope with Delegate=yes, and a created user. REQUIRE turns any skipped cell into a failure.
+      - name: Seat cgroup custody (distinct uid)
+        run: |
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin cotal-seat-agent
+          sudo env "PATH=$PATH" COTAL_SEAT_CGROUP_REQUIRE=1 COTAL_SEAT_SMOKE_AGENT_UID="$(id -u cotal-seat-agent)" ./node_modules/.bin/tsx packages/seat/smoke/cgroup.smoke.ts
       - name: View smoke
         run: pnpm smoke:view
       - name: Verify Claude connector package

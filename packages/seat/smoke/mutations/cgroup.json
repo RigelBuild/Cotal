@@ -1,0 +1,54 @@
+{
+  "suite": [
+    "packages/seat/smoke/cgroup.smoke.ts"
+  ],
+  "guard": "layer 3 seat custody: only a contained seat cgroup proves a seat gone, a populated cgroup refuses a release, and no custodian child starts outside a seat cgroup a reap or release already removed",
+  "command": "pnpm --filter @cotal-ai/seat build && COTAL_SEAT_CGROUP_REQUIRE=1 pnpm smoke:seat-cgroup",
+  "proveWith": "node scripts/mutation-proof.mjs --config packages/seat/smoke/mutations/cgroup.json",
+  "why": [
+    "Each cell runs in its own delegated scope; the distinct-uid cells need root with a created agent user, or a mapped user namespace.",
+    "COTAL_SEAT_CGROUP_REQUIRE=1 makes a skipped cell fail, so a mutation cannot survive on a host that skips its cell."
+  ],
+  "mutations": [
+    {
+      "name": "T5-M1 read populated 1 as empty",
+      "file": "packages/seat/src/cgroup.ts",
+      "find": "return /^populated 1$/m.test(",
+      "replace": "return /^populated 2$/m.test(",
+      "expectRed": "refusal: checkSeatRelease refuses a populated seat cgroup",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M2 skip seatCgroupContained",
+      "file": "packages/seat/src/reap.ts",
+      "find": " && seatCgroupContained(cg)) return reapCgroup(",
+      "replace": ") return reapCgroup(",
+      "expectRed": "migration attempt, shared uid: the reap is retained, not reaped, and the seat cgroup is not removed",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M3 read record.json before the cgroup",
+      "file": "packages/seat/src/reap.ts",
+      "find": "  const cg = opts.cgroup;\n  if (cg !== undefined && existsSync(",
+      "replace": "  if (!existsSync(recordPath(root, id))) return { outcome: \"absent\" };\n  const cg = opts.cgroup;\n  if (cg !== undefined && existsSync(",
+      "expectRed": "record-less seat: the reap is reaped, the child is gone and the cgroup removed",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M4 spawn the child without inSeatCgroup",
+      "file": "packages/seat/src/custodian.ts",
+      "find": "  if (launch.cgroup !== undefined) {\n    const cgroup = { path: launch.cgroup };",
+      "replace": "  if (launch.cgroup === \"never\") {\n    const cgroup = { path: launch.cgroup };",
+      "expectRed": "launch/reap fence: the reap of the empty cgroup is reaped, the move fails with ENOENT and no child exists",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M5 seal the fence before the cgroup rmdir",
+      "file": "packages/seat/src/reap.ts",
+      "find": "    const refusal = cg === undefined ? undefined : await removeEmptyCgroup(id, cg);\n    if (refusal !== undefined) return refusal;\n    ftruncateSync(fd, 0);\n    writeSync(fd, \"sealed\", 0);\n    fsyncSync(fd);",
+      "replace": "    ftruncateSync(fd, 0);\n    writeSync(fd, \"sealed\", 0);\n    fsyncSync(fd);\n    const refusal = cg === undefined ? undefined : await removeEmptyCgroup(id, cg);\n    if (refusal !== undefined) return refusal;",
+      "expectRed": "release/join race: the release refuses with populated, writes no seal, and the seat stays live",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    }
+  ]
+}
