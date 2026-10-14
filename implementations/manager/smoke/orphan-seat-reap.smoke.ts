@@ -1,15 +1,6 @@
 /**
- * A crashed manager's custodied seat is addressed by its successor, and the successor never retires
- * the lifecycle over a seat it cannot prove gone. Real manager processes on the production
- * custodial pty runtime, a real custodian + child pair, an ephemeral auth broker.
- *
- * The slot row records the seat's custody reference, and the successor's terminal reaps by that
- * reference after it verify-evicts the orphan's broker rails. Without contained (cgroup) custody
- * nothing on this host proves the seat's processes gone, so the reap returns `unprovable` and the
- * terminal RETAINS: the slot stays terminalizing, the creds file stays, and the sweep reports the
- * alias failed with the release remedy. Linux only, like the custodian.
- *
- * Run: pnpm smoke:orphan-seat-reap
+ * A successor reaps a crashed manager's custodied seat by the slot row's reference and, with no
+ * cgroup proof on this host, RETAINS the lifecycle instead of retiring it. Linux only.
  */
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";

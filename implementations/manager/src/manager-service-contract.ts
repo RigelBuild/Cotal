@@ -874,8 +874,7 @@ export const MANAGER_STATUS_CONTRACT: { input: CompiledContract; output: Compile
  *  directory before a placed workflow spawn launches there.
  *
  *  18 = manager `status` adds `staticReconciliation.retainedCustody` and a failure's
- *  `retainedReason`: a terminal whose seat is not proved gone. A changed output contract is a
- *  changed described surface even though the command name is unchanged. */
+ *  `retainedReason`: a terminal whose seat is not proved gone. */
 export function managerClusterDocument(): {
   urn: string;
   revision: number;

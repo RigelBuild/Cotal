@@ -1,25 +1,6 @@
 /**
- * A spawn that LAUNCHED its seat and then threw is rolled back by the manager that launched it,
- * and the rollback addresses the seat by the reference the spawn reserved before it decides
- * anything about the lifecycle.
- *
- * The two sibling suites both cover a manager that DIED: `orphan-seat-reap` kills it after a
- * completed spawn, `orphan-seat-spawn-window` kills it inside `runtime.spawn`. Neither reaches
- * this path, because in both the reap is driven by a SUCCESSOR reading the slot row. Here the
- * manager survives its own failure: the throw lands in `startAgent`'s catch and the `finally`
- * drives the orphan rollback in-process, where the handle exists only in a local that is already
- * out of scope. `reapOrphanSeat` reaps only the slot row's reference, which the spawn reserved.
- * Without contained custody that reap returns `unprovable`, so the rollback RETAINS: the alias
- * stays held with the release remedy, never retired or freed over a seat it cannot prove gone.
- *
- * The throw is injected at `onLaunched`, the production progress callback the spawn-as-action
- * seam passes into `startAgent`. It fires between the launch and the slot activation CAS, so a
- * throw there reaches the same catch and the same rollback as a CAS that refuses the slot. The
- * CAS refusal itself needs a second writer to change the row mid-spawn, and every writer that
- * does so in production is a successor terminal that reaps the seat itself, which is the one
- * thing this suite has to rule out.
- *
- * Run: pnpm smoke:orphan-seat-rollback
+ * A spawn that launched its seat and then threw (injected at `onLaunched`) is rolled back in-process
+ * by reaping the reserved reference; with no cgroup proof the rollback RETAINS the alias.
  */
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";

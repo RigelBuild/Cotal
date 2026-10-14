@@ -103,11 +103,8 @@ try {
   await killChild(third.child);
   await wait(20_000); // the killed successor's liveness lease must lapse before the instance starts again
 
-  // ── Late readiness: the custodian is held before it writes its record, past the launcher's
-  // ten-second bound. The spawn fails, its rollback reaps the reserved reference (the record is not
-  // there yet, or it cannot be proved gone) and the lifecycle is retained. Once the custodian does
-  // come up, the next reconcile reaps a live record and is STILL retained, never retired over it.
-  // The hold is released as soon as the spawn fails: the custodian abandons a hold after 15s.
+  // ── Late readiness: the custodian is held past the launcher's bound, so the spawn fails and
+  // retains; once the record appears, reconcile still retains. Release the hold before its 15s abort.
   const holdDir = join(dir, "late-hold"); mkdirSync(holdDir);
   const late = await startManager("late-readiness", true, { alias: "lateworker", seamHold: holdDir });
   type LateStatus = { failures: Array<{ alias: string; lifecycleUid: string; disposition: string; retainedReason?: string; remedy?: string }>; retainedCustody: number };

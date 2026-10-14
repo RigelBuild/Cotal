@@ -1,20 +1,6 @@
 /**
- * The manager stands fail-closed on seat custody (seat-custody-retention § T3). Over a real JWT
- * broker with real provisioning and key-pinned `lifecycle-executor` credentials, a FAKE custodial
- * runtime scripts each reap outcome, so every cell drives the manager's own code paths:
- *
- *  - Retained terminal: a live despawn whose reap is `retained`/`unprovable` keeps the slot
- *    terminalizing and the footprint, after revoking and evicting.
- *  - Members remain: `members-remain` then `reaped` retries, cleans up once after the proof, and
- *    recovers; an exhausted budget is `refused` with the release remedy, never `retry-exhausted`.
- *  - Predecessor kept / Reservation is fatal / Failed restart: the restart proves the old seat gone
- *    before it records the new reference, and records it before it spawns.
- *  - Spawned under another reference: the row names what the runtime actually spawned.
- *  - Rowless lifecycle and No reference: the terminal writes a row, or refuses without one.
- *  - Failed escalation: the REAL custodial pty runtime with a SIGTERM-ignoring child whose delayed
- *    SIGKILL send fails; nothing proves the seat gone, so the terminal retains.
- *
- * Run: pnpm smoke:custody-fail-closed   (needs nats-server + node on PATH; boots its own broker)
+ * The manager stands fail-closed on seat custody (seat-custody-retention § T3): a fake custodial
+ * runtime scripts each reap outcome over a real broker; the escalation cell runs the real pty runtime.
  */
 import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -70,7 +56,7 @@ import { killOwned, owned, type Owned } from "./_owned-kill.js";
 let failures = 0;
 let ran = 0;
 /** Intent, not a measurement: one per cell assertion below. A shortfall means a cell stopped running. */
-const EXPECTED_CHECKS = 14;
+const EXPECTED_CHECKS = 18;
 function check(label: string, cond: boolean, extra?: unknown): void {
   console.log(`${cond ? "✓" : "✗"} ${label}${cond ? "" : ` — ${JSON.stringify(extra) ?? ""}`}`);
   ran++;
@@ -92,7 +78,7 @@ const space = `custody-${randomUUID().slice(0, 8)}`;
 const auth = await createSpaceAuth(space);
 const { servers: SERVERS, stop: stopBroker } = await bootBroker(auth);
 const workspaceRoot = mkdtempSync(join(tmpdir(), "cotal-custody-ws-"));
-const ALIASES = ["retainer", "membersok", "membersmax", "predkept", "fatalres", "failrestart", "othref", "escalate"];
+const ALIASES = ["retainer", "membersok", "membersmax", "predkept", "fatalres", "failrestart", "othref", "lateref", "membersweep", "clearme", "laterfail", "escalate"];
 mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
 for (const alias of ALIASES)
   writeFileSync(join(workspaceRoot, ".cotal", "agents", `${alias}.md`), `---\nname: ${alias}\nrole: worker\nsubscribe: [general]\nallowSubscribe: [general]\nallowPublish: [general]\n---\nbody\n`);
@@ -144,6 +130,10 @@ const M = mgr as unknown as {
   managerInstanceId: string;
   agents: Map<string, Managed>;
   retiring: Map<string, { lifecycleUid: string }>;
+  staticReconcileItems: Map<string, { alias: string; attempts: number; maxAttempts: number }>;
+  staticReconcileSweepsInFlight: number;
+  releaseStaticReconcileSweep: () => void;
+  driveStaticRetirement: (a: { id: string; name: string; lifecycleUid: string }) => Promise<void>;
   staticReconcileRetryDelaysMs: readonly number[];
   staticLifecycleEvict?: (principal: string) => Promise<EvictionResult>;
   withLifecycleExecutor: Executor;
@@ -177,10 +167,21 @@ M.deprovisionBroker = async (a) => {
 };
 // A one-shot forced CAS failure on one alias's slot row, injected at the executor transport.
 let failSlotCasFor: string | undefined;
+// One-shot: on the second slot read inside one executor call, a racing writer swaps the row's reference.
+let swapRuntimeOn: { alias: string; to: RuntimeReference } | undefined;
 const withLifecycleExecutor = M.withLifecycleExecutor.bind(mgr);
-M.withLifecycleExecutor = (pin, fn) =>
-  withLifecycleExecutor(pin, (t) => fn({
+M.withLifecycleExecutor = (pin, fn) => {
+  let slotReads = 0;
+  return withLifecycleExecutor(pin, (t) => fn({
     ...t,
+    getRecord: async (key) => {
+      const swap = swapRuntimeOn;
+      if (swap === undefined || key !== staticSlotKey(DEV_OWNER, swap.alias) || ++slotReads !== 2) return t.getRecord(key);
+      swapRuntimeOn = undefined;
+      const cur = await readStaticSlot(t, DEV_OWNER, swap.alias);
+      if (cur !== undefined) await casStaticSlot(t, { ...cur.row, runtime: swap.to }, cur.revision);
+      return t.getRecord(key);
+    },
     updateRecord: (key, value, rev) => {
       if (failSlotCasFor !== undefined && key === staticSlotKey(DEV_OWNER, failSlotCasFor)) {
         failSlotCasFor = undefined;
@@ -189,6 +190,7 @@ M.withLifecycleExecutor = (pin, fn) =>
       return t.updateRecord(key, value, rev);
     },
   }));
+};
 
 const quiet: Connector = { kind: "connector", name: "smoke-custody", requires: ["node"], buildLaunch: () => ({ command: "true", args: [], env: {} }) };
 // A child that ignores SIGTERM, so a graceful stop depends on the delayed SIGKILL.
@@ -397,6 +399,63 @@ try {
     const it = item("noref");
     check("no reference: a row with no runtime is refused as no-reference, and the creds file remains",
       it?.disposition === "refused" && it.retainedReason === "no-reference" && existsSync(creds) && (await readSlot("noref"))?.phase === "terminalizing", it);
+  }
+
+  // ── Late reference: the terminal reaps the row's reference as it stands after the latch ─
+  {
+    const a = await spawnLive("lateref");
+    const early = refOf(a);
+    const late: RuntimeReference = { kind: "pty", id: randomUUID().replaceAll("-", "") };
+    plans.set(early.id, [{ outcome: "reaped", detail: "fake: stale reference" }]);
+    plans.set(late.id, [UNPROVABLE]);
+    const mark = reaps.length;
+    swapRuntimeOn = { alias: "lateref", to: late };
+    M.despawnAuthorized(a, false, false, "smoke");
+    await until(() => item("lateref")?.retainedReason !== undefined || reaps.length > mark && swapRuntimeOn === undefined && M.retiring.get("lateref") === undefined, 30_000);
+    check("late reference: a reference recorded before the latch is the one reaped, and it retains",
+      swapRuntimeOn === undefined && reaps.slice(mark).includes(late.id) && !reaps.slice(mark).includes(early.id) && item("lateref")?.retainedReason === "unprovable", { reaps: reaps.slice(mark), late, early, it: item("lateref") });
+  }
+
+  // ── Members remain while a sweep is in flight, outside its plan ────────────
+  {
+    const a = await spawnLive("membersweep");
+    plans.set(refOf(a).id, [MEMBERS, { outcome: "reaped", detail: "fake: group empty" }]);
+    M.staticReconcileSweepsInFlight++;
+    M.despawnAuthorized(a, false, false, "smoke");
+    await until(() => item("membersweep")?.retainedReason !== undefined, 30_000);
+    M.releaseStaticReconcileSweep();
+    await until(() => item("membersweep")?.disposition === "recovered", 30_000);
+    check("members remain during a sweep: the sweep's end arms the deferred retry, and the item recovers",
+      item("membersweep")?.disposition === "recovered" && (await readSlot("membersweep"))?.phase === "retired", item("membersweep"));
+  }
+
+  // ── A retained item clears when a direct terminal retires the lifecycle ────
+  {
+    const a = await spawnLive("clearme");
+    const { id, lifecycleUid } = a;
+    plans.set(refOf(a).id, [UNPROVABLE, { outcome: "reaped", detail: "fake: gone later" }]);
+    M.despawnAuthorized(a, false, false, "smoke");
+    await until(() => item("clearme")?.retainedReason !== undefined, 30_000);
+    await M.driveStaticRetirement({ id, name: "clearme", lifecycleUid });
+    const it = item("clearme");
+    check("retired clears retained: a direct terminal that retires marks the item recovered and clears retainedReason and remedy",
+      (await readSlot("clearme"))?.phase === "retired" && it?.disposition === "recovered" && it.retainedReason === undefined && it.remedy === undefined && it.lastError === undefined, it);
+  }
+
+  // ── A later non-reap failure keeps the retained remedy ─────────────────────
+  {
+    const a = await spawnLive("laterfail");
+    plans.set(refOf(a).id, [UNPROVABLE, { outcome: "reaped", detail: "fake: gone later" }]);
+    M.despawnAuthorized(a, false, false, "smoke");
+    await until(() => item("laterfail")?.retainedReason !== undefined, 30_000);
+    const held = [...M.staticReconcileItems.values()].find((i) => i.alias === "laterfail");
+    if (held === undefined) throw new Error("laterfail has no reconcile item");
+    held.attempts = held.maxAttempts - 1;
+    failSlotCasFor = "laterfail";
+    await M.reconcileStaticLifecycles();
+    const it = item("laterfail");
+    check("later failure: a retained item that then exhausts its budget stays refused with the release remedy, never restart",
+      failSlotCasFor === undefined && it?.disposition === "refused" && REMEDY.test(it.remedy ?? "") && /forced slot CAS/.test(it.lastError ?? ""), it);
   }
 
   // ── Failed escalation (real custodial pty, no layer 3) ─────────────────────
