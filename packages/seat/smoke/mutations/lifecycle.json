@@ -102,8 +102,8 @@
     {
       "name": "a foreign-boot record cannot throw",
       "file": "packages/seat/src/reap.ts",
-      "find": "  const stop = await requestStop(root, id, rec, opts.graceMs ?? 10_000);",
-      "replace": "  if (rec.bootId !== undefined && rec.bootId !== readFileSync(\"/proc/sys/kernel/random/boot_id\", \"utf8\").trim()) throw new Error(\"foreign boot\");\n  const stop = await requestStop(root, id, rec, opts.graceMs ?? 10_000);",
+      "find": "  const { stop, error } = await requestStop(root, id, rec, opts.graceMs ?? 10_000);",
+      "replace": "  if (rec.bootId !== undefined && rec.bootId !== readFileSync(\"/proc/sys/kernel/random/boot_id\", \"utf8\").trim()) throw new Error(\"foreign boot\");\n  const { stop, error } = await requestStop(root, id, rec, opts.graceMs ?? 10_000);",
       "afterRestore": "pnpm --filter @cotal-ai/seat build",
       "expectRed": "a foreign boot record is retained instead of throwing",
       "cell": "a foreign boot record is retained instead of throwing",
