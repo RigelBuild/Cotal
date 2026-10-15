@@ -14,7 +14,7 @@
  *     shipped cluster document's command set), each with a recompiled input/output contract whose
  *     closureDigest MATCHES the registered declaration.
  *  2. invoke "status" (untargeted, void) returns the typed ManagerStatus.
- *  3. invoke "spawn" (the 16-field launch) boots a REAL agent; the recompiled input contract
+ *  3. invoke "spawn" (the 17-field launch) boots a REAL agent; the recompiled input contract
  *     gates a bad field pre-publish (the caller's own closed schema, fetched not hand-written).
  *  4. invoke targeted "despawn" (owner mode) tears the agent down; a targeted command invoked
  *     without a target, and an untargeted one WITH a target, both refuse at the generic layer.
@@ -107,7 +107,7 @@ try {
 
   console.log("1. resolveService: describe + fetch + recompile the full surface (no hand-imported schemas)");
   const service = await resolveService(nc, space, MANAGER_ENDPOINT, caller, { deadlineMs: 10_000 });
-  check("execution status advances the manager cluster revision and retains cancel, transcript-receive, goal-result and resolve-cwd", shipped.revision === 27 && service.commands.has("cancel") && service.commands.has("transcript-receive") && service.commands.has("goal-result") && service.commands.has("resolve-cwd"), shipped);
+  check("execution status advances the manager cluster revision and retains cancel, transcript-receive, goal-result and resolve-cwd", shipped.revision === 28 && service.commands.has("cancel") && service.commands.has("transcript-receive") && service.commands.has("goal-result") && service.commands.has("resolve-cwd"), shipped);
   check("the resolved surface matches the shipped cluster document", service.commands.size === shipped.commandCount && shipped.names.every((n) => service.commands.has(n)) && service.commands.has("status") && service.commands.has("spawn") && service.commands.has("despawn"), [...service.commands.keys()].sort());
   const statusCmd = service.commands.get("status")!;
   check("status resolved: untargeted, read capability, recompiled contracts carry closure digests",

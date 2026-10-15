@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { hardenPrivate, loadAgentFile, mkSecretDir, registry, writeSecretFile, type Connector, type LaunchOpts, type LaunchSpec } from "@cotal-ai/core";
-import { aclEnv, connectorLaunchOptions, controlEndpoint, eventChannel, launchEnv, materialEnv } from "@cotal-ai/connector-core";
+import { aclEnv, connectorLaunchOptions, controlEndpoint, eventChannel, launchArmsEvents, launchEnv, materialEnv } from "@cotal-ai/connector-core";
 
 // The pi extension bundle, copied into dist at build so the published package is self-contained.
 const STANDALONE = fileURLToPath(
@@ -18,7 +18,7 @@ const PI_PROVIDER_KEYS = [
 ] as const;
 
 export const ompConnector: Connector = {
-  kind: "connector", name: "omp", requires: ["omp"], supportsResume: true, supportsSessionContinuation: true, eventChannel,
+  kind: "connector", name: "omp", requires: ["omp"], supportsResume: true, supportsSessionContinuation: true, supportsPrompt: true, eventChannel,
   buildLaunch(opts: LaunchOpts): LaunchSpec {
     if (opts.resume && opts.continueSession) throw new Error("omp connector: resume (fork source) and continueSession (same session) are mutually exclusive");
     if (opts.variant) throw new Error("omp connector: model variants (variant) are not implemented");
@@ -49,7 +49,7 @@ export const ompConnector: Connector = {
       ...materialEnv({ creds: opts.creds, servers: opts.servers, controlToken: control.token, eventsRequired: opts.eventsRequired, userAuth: opts.userAuth }),
       COTAL_SPACE: opts.space, COTAL_NAME: opts.name,
     };
-    if (opts.events !== false) {
+    if (launchArmsEvents(opts)) {
       if (!opts.workspaceRoot) throw new Error("omp connector: events were requested without workspaceRoot for the durable event log");
       env.COTAL_EVENTS = "1"; env.COTAL_WORKSPACE_ROOT = opts.workspaceRoot;
     }

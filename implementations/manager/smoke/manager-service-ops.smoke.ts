@@ -323,6 +323,9 @@ try {
     const rEmpty = await blankRefusal("resume", "");
     check("an empty resume is bad-request at the spawn contract, naming the field",
       rEmpty?.startsWith("bad-request") === true && rEmpty.includes("/resume"), rEmpty);
+    const rEmptyContinue = await blankRefusal("continueSession", "");
+    check("an empty continueSession is bad-request at the raw spawn contract, naming the field",
+      rEmptyContinue?.startsWith("bad-request") === true && rEmptyContinue.includes("/continueSession"), rEmptyContinue);
     const rEmptyRole = await blankRefusal("role", "   ");
     check("a whitespace-only role is bad-request at the spawn contract, naming the field",
       rEmptyRole?.startsWith("bad-request") === true && rEmptyRole.includes("/role"), rEmptyRole);

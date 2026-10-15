@@ -31,9 +31,29 @@ export function available(): boolean {
   }
 }
 
-function run(args: string[], options: { encoding: "utf8" } | { stdio: "ignore" } = { encoding: "utf8" }): string {
-  const result = execFileSync("zellij", args, options);
+type RunOptions = { encoding: "utf8"; timeoutMs?: number } | { stdio: "ignore"; timeoutMs?: number };
+
+function run(args: string[], options: RunOptions = { encoding: "utf8" }): string {
+  const { timeoutMs, ...execOptions } = options;
+  const result = execFileSync("zellij", args, {
+    ...execOptions,
+    ...(timeoutMs === undefined ? {} : { timeout: timeoutMs, killSignal: "SIGKILL" as const }),
+  });
   return typeof result === "string" ? result.trim() : "";
+}
+
+
+/** Read the active viewport of a terminal pane, bounded so a startup watch cannot stall the manager. */
+export function dumpScreen(session: string, paneId: string, timeoutMs = 1_000): string | undefined {
+  if (paneState(session, paneId, timeoutMs) === "exited") return undefined;
+  let screen: string;
+  try {
+    screen = run(actionArgs(session, ["dump-screen", "--pane-id", paneId]), { encoding: "utf8", timeoutMs });
+  } catch (error) {
+    if (paneState(session, paneId, timeoutMs) === "exited") return undefined;
+    throw error;
+  }
+  return paneState(session, paneId, timeoutMs) === "exited" ? undefined : screen;
 }
 
 function actionArgs(session: string, action: string[]): string[] {
@@ -57,12 +77,13 @@ function isNoSessionsError(error: unknown): boolean {
 
 // Only zellij's own "no sessions" answer means absent; any other probe failure throws, so a
 // failed probe can never read as a confirmed exit.
-function sessionExists(session: string): boolean {
+function sessionExists(session: string, timeoutMs?: number): boolean {
   let listing: string;
   try {
     listing = execFileSync("zellij", ["list-sessions", "--no-formatting"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
+      ...(timeoutMs === undefined ? {} : { timeout: timeoutMs, killSignal: "SIGKILL" as const }),
     });
   } catch (error) {
     if (isNoSessionsError(error)) return false;
@@ -78,9 +99,9 @@ export function ensureSession(session: string): void {
   run(["attach", "--create-background", session], { stdio: "ignore" });
 }
 
-function clientAttached(session: string): boolean {
+function clientAttached(session: string, timeoutMs?: number): boolean {
   try {
-    return run(actionArgs(session, ["list-clients"]))
+    return run(actionArgs(session, ["list-clients"]), timeoutMs === undefined ? undefined : { encoding: "utf8", timeoutMs })
       .split("\n")
       .some((line) => /^\d/.test(line.trim()));
   } catch {
@@ -94,10 +115,11 @@ export function scriptAttachArgs(session: string): string[] {
   return ["-qec", `stty cols 1000 rows 500; exec zellij attach ${session}`, "/dev/null"];
 }
 
-export function ensureClient(session: string): void {
-  if (!sessionExists(session))
+export function ensureClient(session: string, timeoutMs?: number): void {
+  const deadline = Date.now() + (timeoutMs ?? 3_000);
+  if (!sessionExists(session, timeoutMs))
     throw new Error(`zellij runtime: session ${JSON.stringify(session)} does not exist`);
-  if (clientAttached(session)) return;
+  if (clientAttached(session, timeoutMs)) return;
   const env = { ...process.env };
   delete env.ZELLIJ;
   delete env.ZELLIJ_PANE_ID;
@@ -106,10 +128,11 @@ export function ensureClient(session: string): void {
   client.on("error", () => {});
   if (!client.pid) throw new Error("zellij runtime: could not start a headless script client");
   client.unref();
-  for (let attempt = 0; attempt < 30; attempt++) {
-    if (clientAttached(session)) return;
+  while (Date.now() < deadline) {
+    const remaining = Math.max(1, deadline - Date.now());
+    if (clientAttached(session, Math.min(timeoutMs ?? remaining, remaining))) return;
     try {
-      execFileSync("sleep", ["0.1"], { stdio: "ignore" });
+      execFileSync("sleep", ["0.1"], { stdio: "ignore", timeout: Math.min(100, remaining), killSignal: "SIGKILL" });
     } catch {
       break;
     }
@@ -142,9 +165,10 @@ export function listTabs(session: string): ZellijTab[] {
   });
 }
 
-export function listPanes(session: string): ZellijPane[] {
-  if (!sessionExists(session)) return [];
-  const rows = parseArray(run(actionArgs(session, ["list-panes", "--json", "--all"])), "pane list");
+export function listPanes(session: string, timeoutMs?: number): ZellijPane[] {
+  if (!sessionExists(session, timeoutMs)) return [];
+  const options = timeoutMs === undefined ? undefined : { encoding: "utf8" as const, timeoutMs };
+  const rows = parseArray(run(actionArgs(session, ["list-panes", "--json", "--all"]), options), "pane list");
   return rows.flatMap((row): ZellijPane[] => {
     if (typeof row !== "object" || row === null || Array.isArray(row)) return [];
     const id = Reflect.get(row, "id");
@@ -217,10 +241,11 @@ function newPane(session: string, args: string[]): string {
   return id;
 }
 
-export function closePane(session: string, paneId: string): void {
-  if (!sessionExists(session)) return;
-  ensureClient(session);
-  run(actionArgs(session, ["close-pane", "-p", paneId]), { stdio: "ignore" });
+export function closePane(session: string, paneId: string, timeoutMs?: number): void {
+  if (!sessionExists(session, timeoutMs)) return;
+  ensureClient(session, timeoutMs);
+  const options = timeoutMs === undefined ? { stdio: "ignore" as const } : { stdio: "ignore" as const, timeoutMs };
+  run(actionArgs(session, ["close-pane", "-p", paneId]), options);
 }
 
 export function closeTab(session: string, tabId: string): void {
@@ -228,24 +253,29 @@ export function closeTab(session: string, tabId: string): void {
   ensureClient(session);
   run(actionArgs(session, ["close-tab", "--tab-id", tabId]), { stdio: "ignore" });
 }
-
 export function buildWriteArgs(paneId: string, input: string): string[] {
   return ["write", "-p", paneId, input];
 }
 
-export function writePane(session: string, paneId: string, input: string): void {
-  if (!sessionExists(session)) return;
-  ensureClient(session);
-  run(actionArgs(session, buildWriteArgs(paneId, input)), { stdio: "ignore" });
+export function writePane(session: string, paneId: string, input: string, timeoutMs?: number): void {
+  if (!sessionExists(session, timeoutMs)) return;
+  ensureClient(session, timeoutMs);
+  const options = timeoutMs === undefined ? { stdio: "ignore" as const } : { stdio: "ignore" as const, timeoutMs };
+  run(actionArgs(session, buildWriteArgs(paneId, input)), options);
 }
 
+export function writeKeyDown(session: string, paneId: string, timeoutMs?: number): void {
+  const options = timeoutMs === undefined ? { stdio: "ignore" as const } : { stdio: "ignore" as const, timeoutMs };
+  ensureClient(session, timeoutMs);
+  run(actionArgs(session, ["write", "-p", paneId, "27", "91", "66"]), options);
+}
 export function interruptPane(session: string, paneId: string): void {
   writePane(session, paneId, "3");
 }
 
-export function paneState(session: string, paneId: string): "running" | "exited" {
-  if (!sessionExists(session)) return "exited";
-  const pane = listPanes(session).find((candidate) => candidate.id === paneId && !candidate.is_plugin);
+export function paneState(session: string, paneId: string, timeoutMs?: number): "running" | "exited" {
+  if (!sessionExists(session, timeoutMs)) return "exited";
+  const pane = listPanes(session, timeoutMs).find((candidate) => candidate.id === paneId && !candidate.is_plugin);
   return !pane || pane.exited || pane.exit_status !== null ? "exited" : "running";
 }
 

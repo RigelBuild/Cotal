@@ -34,7 +34,7 @@ function readCalls(logPath: string): string[][] {
 }
 
 async function withFakeZellij(
-  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane",
+  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable",
   run: (logPath: string, session: string) => void | Promise<void>,
 ): Promise<void> {
   // The fake is a shebang script Windows cannot exec, and zellij ships no Windows build.
@@ -51,12 +51,14 @@ async function withFakeZellij(
     mode: process.env.COTAL_ZELLIJ_TEST_MODE,
     session: process.env.COTAL_ZELLIJ_TEST_SESSION,
     log: process.env.COTAL_ZELLIJ_TEST_LOG,
+    screen: process.env.COTAL_ZELLIJ_TEST_SCREEN,
+    screenCount: process.env.COTAL_ZELLIJ_TEST_SCREEN_COUNT,
   };
   writeFileSync(executable, `#!/usr/bin/env node
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
 appendFileSync(process.env.COTAL_ZELLIJ_TEST_LOG, JSON.stringify(args) + "\\n");
-if (args[0] === "--version") { console.log("zellij 0.45.1"); process.exit(0); }
+if (process.env.COTAL_ZELLIJ_TEST_MODE === "unavailable") process.exit(1);
 if (args[0] === "list-sessions") {
   const mode = process.env.COTAL_ZELLIJ_TEST_MODE;
   if (mode === "no-server") { console.error("No active zellij sessions found."); process.exit(1); }
@@ -77,6 +79,13 @@ if (action === "list-tabs") {
   console.log(JSON.stringify([{ tab_id: 77, name: "confirm-agent", active: true }]));
   process.exit(0);
 }
+if (action === "dump-screen") {
+  const countPath = process.env.COTAL_ZELLIJ_TEST_SCREEN_COUNT;
+  const reads = Number(readFileSync(countPath, "utf8") || "0") + 1;
+  writeFileSync(countPath, String(reads));
+  console.log(process.env.COTAL_ZELLIJ_TEST_SCREEN ?? (reads >= 3 ? "Continue?" : "booting"));
+  process.exit(0);
+}
 if (action === "list-panes") {
   const mode = process.env.COTAL_ZELLIJ_TEST_MODE;
   console.log(JSON.stringify(mode === "partial-tab" ? [] : [{
@@ -84,13 +93,14 @@ if (action === "list-panes") {
   }, ...(mode === "dropped-pane" ? [{ id: 78, tab_id: 77, title: "", is_plugin: false, exited: false, exit_status: null }] : [])]));
   process.exit(0);
 }
-process.exit(0);
 `);
   chmodSync(executable, 0o755);
-  process.env.PATH = `${bin}:${saved.PATH ?? ""}`;
+  process.env.PATH = `${bin}:${saved.PATH ?? "/usr/bin:/bin"}`;
   process.env.COTAL_ZELLIJ_TEST_MODE = mode;
   process.env.COTAL_ZELLIJ_TEST_SESSION = session;
   process.env.COTAL_ZELLIJ_TEST_LOG = logPath;
+  process.env.COTAL_ZELLIJ_TEST_SCREEN_COUNT = `${logPath}.screen-count`;
+  writeFileSync(`${logPath}.screen-count`, "0");
   try {
     await run(logPath, session);
   } finally {
@@ -102,6 +112,10 @@ process.exit(0);
     else process.env.COTAL_ZELLIJ_TEST_SESSION = saved.session;
     if (saved.log === undefined) delete process.env.COTAL_ZELLIJ_TEST_LOG;
     else process.env.COTAL_ZELLIJ_TEST_LOG = saved.log;
+    if (saved.screen === undefined) delete process.env.COTAL_ZELLIJ_TEST_SCREEN;
+    else process.env.COTAL_ZELLIJ_TEST_SCREEN = saved.screen;
+    if (saved.screenCount === undefined) delete process.env.COTAL_ZELLIJ_TEST_SCREEN_COUNT;
+    else process.env.COTAL_ZELLIJ_TEST_SCREEN_COUNT = saved.screenCount;
     rmSync(bin, { recursive: true, force: true });
   }
 }
@@ -291,19 +305,67 @@ await withFakeZellij("partial-tab", (logPath, session) => {
 });
 
 await withFakeZellij("confirm", async (logPath, session) => {
+  process.env.COTAL_ZELLIJ_TEST_SCREEN = "Continue?";
   const handle = new ZellijRuntime(session).spawn(
     "confirm-agent",
     { command: "sleep", args: ["600"], confirm: "Continue?" },
     process.cwd(),
   );
-  await new Promise<void>((resolve) => setTimeout(resolve, 5_250));
-  const writes = readCalls(logPath).filter((args) => args[3] === "write");
+  await new Promise<void>((resolve) => setTimeout(resolve, 850));
+  const calls = readCalls(logPath);
   handle.stop({ graceful: false });
   check(
-    "confirm sends five Enter presses to the spawned pane",
-    writes.length === 5 && writes.every((args) => args.slice(4).join(" ") === "-p terminal_77 13"),
+    "confirm sends one Enter only after the pane displays the prompt",
+    calls.filter((args) => args[3] === "write" && args.includes("13")).length === 1 &&
+      calls.some((args) => args[3] === "dump-screen"),
   );
 });
+await withFakeZellij("confirm", async (logPath, session) => {
+  process.env.COTAL_ZELLIJ_TEST_SCREEN = "Choose config?";
+  const handle = new ZellijRuntime(session).spawn(
+    "confirm-agent",
+    {
+      command: "sleep",
+      args: ["600"],
+      confirm: "Continue?",
+      confirmBefore: [{ prompt: "Choose config?", key: "Down" }],
+    },
+    process.cwd(),
+  );
+  await new Promise<void>((resolve) => setTimeout(resolve, 1_400));
+  process.env.COTAL_ZELLIJ_TEST_SCREEN = "Continue?";
+  await new Promise<void>((resolve) => setTimeout(resolve, 900));
+  const calls = readCalls(logPath);
+  handle.stop({ graceful: false });
+  check(
+    "confirm answers ordered choice with Down and then final prompt with Enter",
+    calls.some((args) => args[3] === "write" && args.includes("27") && args.includes("91") && args.includes("66")) &&
+      calls.some((args) => args[3] === "write" && args.includes("13")),
+  );
+});
+
+await withFakeZellij("confirm", (logPath, session) => {
+  let refused = false;
+  try {
+    new ZellijRuntime(session).spawn("confirm-agent", {
+      command: "sleep", args: ["600"], confirmBefore: [{ prompt: "Choose config?", key: "Enter" }],
+    }, process.cwd());
+  } catch (error) {
+    refused = error instanceof Error && error.name === "SpawnRefused";
+  }
+  check("startup choices without final confirm are refused before creating a tab", refused &&
+    !readCalls(logPath).some((args) => args[3] === "new-tab"));
+});
+await withFakeZellij("unavailable", (logPath, session) => {
+  let refused = false;
+  try {
+    new ZellijRuntime(session).spawn("worker", { command: "sleep", args: ["600"] }, process.cwd());
+  } catch (error) {
+    refused = error instanceof Error && error.name === "SpawnRefused";
+  }
+  check("unavailable Zellij fails with SpawnRefused", refused && readCalls(logPath).length === 1);
+});
+
 
 await withFakeZellij("dropped-pane", (logPath, session) => {
   const id = zellij.createPane(session, "77", "/work", "exec agent", { stacked: true });

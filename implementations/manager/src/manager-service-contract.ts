@@ -336,7 +336,7 @@ const SPAWN_INPUT_SCHEMA = {
     // agent the CLI found them with.
     resumeClaim: nonBlank(),
     resumeAgent: nonBlank(),
-    continueSession: { type: "string" },
+    continueSession: nonBlank(),
     events: { type: "boolean" },
     cwd: nonBlank(),
     prompt: nonBlank(),
@@ -1059,7 +1059,10 @@ export const MANAGER_STATUS_CONTRACT: { input: CompiledContract; output: Compile
  *
  *  27 = manager `status` adds `lastSweep.error`: why a static reconciliation sweep stopped before
  *  it planned any alias. A changed output contract is a changed described surface even though the
- *  command name is unchanged. */
+ *  command name is unchanged.
+ *
+ *  28 = `spawn` refuses blank `continueSession` values, matching its `resume` field. A changed input
+ *  contract is a changed described surface even though the command name is unchanged. */
 export function managerClusterDocument(): {
   urn: string;
   revision: number;
@@ -1077,7 +1080,7 @@ export function managerClusterDocument(): {
 } {
   return {
     urn: MANAGER_CLUSTER_URN,
-    revision: 27,
+    revision: 28,
     attributes: [],
     events: [],
     commands: ROWS.map((r) => ({
