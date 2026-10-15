@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { LaunchSpec } from "@cotal-ai/core";
 import { buildNewPaneArgs, buildNewTabArgs } from "./src/driver.js";
 import { parseZellijPlacement } from "./src/placement.js";
@@ -34,7 +34,7 @@ function readCalls(logPath: string): string[][] {
 }
 
 async function withFakeZellij(
-  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable",
+  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable" | "slow-probe" | "no-client" | "slow-client",
   run: (logPath: string, session: string) => void | Promise<void>,
 ): Promise<void> {
   // The fake is a shebang script Windows cannot exec, and zellij ships no Windows build.
@@ -59,6 +59,7 @@ import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
 appendFileSync(process.env.COTAL_ZELLIJ_TEST_LOG, JSON.stringify(args) + "\\n");
 if (process.env.COTAL_ZELLIJ_TEST_MODE === "unavailable") process.exit(1);
+if (process.env.COTAL_ZELLIJ_TEST_MODE === "slow-probe") Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600);
 if (args[0] === "list-sessions") {
   const mode = process.env.COTAL_ZELLIJ_TEST_MODE;
   if (mode === "no-server") { console.error("No active zellij sessions found."); process.exit(1); }
@@ -68,7 +69,9 @@ if (args[0] === "list-sessions") {
 }
 const action = args[3];
 if (action === "list-clients") {
-  console.log(process.env.COTAL_ZELLIJ_TEST_MODE === "missing-session" ? "not found" : "1");
+  const mode = process.env.COTAL_ZELLIJ_TEST_MODE;
+  if (mode === "slow-client") Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600);
+  console.log(mode === "missing-session" || mode === "no-client" || mode === "slow-client" ? "not found" : "1");
   process.exit(0);
 }
 if (action === "new-tab") { console.log("77"); process.exit(0); }
@@ -354,6 +357,71 @@ await withFakeZellij("confirm", (logPath, session) => {
     refused = error instanceof Error && error.name === "SpawnRefused";
   }
   check("startup choices without final confirm are refused before creating a tab", refused &&
+    !readCalls(logPath).some((args) => args[3] === "new-tab"));
+});
+await withFakeZellij("slow-probe", (logPath, session) => {
+  const started = Date.now();
+  let failed = false;
+  try {
+    zellij.dumpScreen(session, "terminal_77", Date.now() + 1_000);
+  } catch {
+    failed = true;
+  }
+  const elapsed = Date.now() - started;
+  check("a confirm screen read shares one deadline across its zellij calls", failed && elapsed < 1_500, { elapsed });
+  check("a confirm screen read past its deadline starts no headless client",
+    !readCalls(logPath).some((args) => args[0] === "attach"));
+});
+// script(1) runs its command through the login shell, so a stand-in client keeps the fake on PATH.
+const fakeScript = (bin: string): string => {
+  const path = join(bin, "script");
+  writeFileSync(path, `#!/bin/sh\necho script >> "$COTAL_ZELLIJ_TEST_LOG"\nsleep 10\n`);
+  chmodSync(path, 0o755);
+  return path;
+};
+await withFakeZellij("slow-client", (logPath, session) => {
+  process.env.COTAL_ZELLIJ_SCRIPT = fakeScript(dirname(logPath));
+  let refusal = "";
+  try {
+    zellij.ensureClient(session, Date.now() + 300);
+  } catch (error) {
+    refusal = error instanceof Error ? error.message : String(error);
+  }
+  delete process.env.COTAL_ZELLIJ_SCRIPT;
+  check("a deadline that expires during the client probe starts no headless client",
+    refusal.includes("deadline passed before a client could start") && !readFileSync(logPath, "utf8").includes("script"), refusal);
+});
+await withFakeZellij("no-client", (logPath, session) => {
+  const stand = fakeScript(dirname(logPath));
+  process.env.COTAL_ZELLIJ_SCRIPT = stand;
+  const scriptPids = (): number[] => readdirSync("/proc").filter((entry) => /^\d+$/.test(entry)).flatMap((entry) => {
+    try {
+      const argv = readFileSync(`/proc/${entry}/cmdline`, "utf8").split("\0");
+      return argv.some((arg) => arg === stand) ? [Number(entry)] : [];
+    } catch {
+      return [];
+    }
+  });
+  let failed = false;
+  try {
+    zellij.ensureClient(session, Date.now() + 400);
+  } catch {
+    failed = true;
+  }
+  const deadline = Date.now() + 2_000;
+  while (scriptPids().length > 0 && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  delete process.env.COTAL_ZELLIJ_SCRIPT;
+  check("a bounded attach that never sees a client kills the script client it started",
+    failed && readFileSync(logPath, "utf8").includes("script") && scriptPids().length === 0, scriptPids());
+});
+await withFakeZellij("confirm", (logPath, session) => {
+  let refused = false;
+  try {
+    new ZellijRuntime(session).spawn("confirm-agent", { command: "sleep", args: ["600"], confirm: "" }, process.cwd());
+  } catch (error) {
+    refused = error instanceof Error && error.name === "SpawnRefused";
+  }
+  check("a blank final confirm is refused before creating a tab", refused &&
     !readCalls(logPath).some((args) => args[3] === "new-tab"));
 });
 await withFakeZellij("unavailable", (logPath, session) => {

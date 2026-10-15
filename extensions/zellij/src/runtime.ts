@@ -15,7 +15,7 @@ import {
 } from "@cotal-ai/core";
 import * as zellij from "./driver.js";
 import { readZellijPlacement, type AgentPlacement } from "./placement.js";
-const CONFIRM_CALL = { timeoutMs: 1_000 };
+const CONFIRM_BUDGET_MS = 1_000;
 
 export interface PrivateLauncher {
   /** Runs the launcher script from `cwd`, so zellij's fallback pane title reads `./<agent>`. */
@@ -148,13 +148,13 @@ export class ZellijRuntime implements Runtime {
 
     const startedPane = paneId;
     watch?.({
-      read: () => zellij.dumpScreen(this.session, startedPane, CONFIRM_CALL.timeoutMs),
-      enter: () => zellij.writePane(this.session, startedPane, "13", CONFIRM_CALL.timeoutMs),
-      down: () => zellij.writeKeyDown(this.session, startedPane, CONFIRM_CALL.timeoutMs),
+      read: () => zellij.dumpScreen(this.session, startedPane, Date.now() + CONFIRM_BUDGET_MS),
+      enter: () => zellij.writePane(this.session, startedPane, "13", Date.now() + CONFIRM_BUDGET_MS),
+      down: () => zellij.writeKeyDown(this.session, startedPane, Date.now() + CONFIRM_BUDGET_MS),
       fail: (message) => {
         console.error(`zellij runtime: "${name}": ${message}`);
         try {
-          zellij.closePane(this.session, startedPane, CONFIRM_CALL.timeoutMs);
+          zellij.closePane(this.session, startedPane, Date.now() + CONFIRM_BUDGET_MS);
         } catch (error) {
           console.error(`zellij runtime: failed to close pane for "${name}":`, error);
         }
