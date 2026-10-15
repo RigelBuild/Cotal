@@ -19,7 +19,7 @@ on:
       - '.github/workflows/installer.yml'
   push:
     branches:
-      - main
+      - rigel-release
     paths:
       - 'install.sh'
       - 'install/**'

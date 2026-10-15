@@ -3,7 +3,7 @@ name: Mutation reproof
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [rigel-release]
   schedule:
     - cron: '17 5 * * *'
   workflow_dispatch:

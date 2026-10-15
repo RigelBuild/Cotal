@@ -4,7 +4,7 @@ on:
   pull_request:
   push:
     branches:
-      - main
+      - rigel-release
 
 # A new push to a PR supersedes the run already going; a merge to main does not.
 #
