@@ -99,8 +99,8 @@
     {
       "name": "T6-M2 spawn the custodian as the launcher, not the agent uid",
       "file": "packages/seat/src/launcher.ts",
-      "find": "  const argv = agent && setpriv\n",
-      "replace": "  const argv = false && setpriv\n",
+      "find": "[setpriv, \"--reuid\", String(agent.uid), \"--regid\", String(agent.gid), \"--clear-groups\",",
+      "replace": "[setpriv, \"--clear-groups\",",
       "expectRed": "peer uid: the custodian and its child run as the agent uid",
       "afterRestore": "pnpm --filter @cotal-ai/seat build"
     },
