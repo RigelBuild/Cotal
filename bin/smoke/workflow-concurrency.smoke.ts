@@ -1,5 +1,5 @@
 /**
- * Guards main-push concurrency. Reads top-level groups only; trigger detection is indentation-based.
+ * Guards release-branch push concurrency. Reads top-level groups only; trigger detection is indentation-based.
  * PR superseding is not asserted; unknown expressions fail closed.
  * Run: pnpm smoke:workflow-concurrency; prove: pnpm mutation-proof --config bin/smoke/mutations/workflow-concurrency.json.
  */
@@ -25,6 +25,8 @@ function check(name: string, cond: boolean, extra?: unknown): void {
 /** Pin the workflow population so removal or addition needs deliberate review. */
 const EXPECTED_WORKFLOWS = 6;
 const EXPECTED_PUSH_TO_MAIN = 4;
+// Rigel merges land here; fork `main` mirrors upstream and runs upstream's workflows.
+const RELEASE_BRANCH = "rigel-release";
 const EXPECTED_GROUPED = 4;
 
 /** What a concurrency key can be: absent, a literal, or one of the expressions this repo uses.
@@ -53,7 +55,7 @@ function resolve(raw: string): Resolved {
 
 interface Wf {
   file: string;
-  /** True when a push to `main` can start this workflow. */
+  /** True when a push to the release branch can start this workflow. */
   pushesMain: boolean;
   /** True when the file uses the short `concurrency: <string>` form, which cannot carry `queue`. */
   shortForm: boolean;
@@ -62,7 +64,7 @@ interface Wf {
   queue?: string;
 }
 
-/** Read the `concurrency:` block and whether `push:` names `main`.
+/** Read the `concurrency:` block and whether `push:` names the release branch.
  *
  *  Indentation-driven rather than a YAML parse: `bin/` declares no YAML dependency and reaching for
  *  a transitive one would make this guard's own resolution a thing that can break silently. The
@@ -82,8 +84,8 @@ function parse(file: string): Wf {
       if (/^\S/.test(l) && l.trim() !== "") break; // dedent to a new top-level key
       if (/^\s{2}push:/.test(l)) inPush = true;
       else if (/^\s{2}\S/.test(l)) inPush = false;
-      if (inPush && /^\s+-\s*main\s*$/.test(l)) wf.pushesMain = true;
-      if (inPush && /branches:\s*\[.*\bmain\b.*\]/.test(l)) wf.pushesMain = true;
+      if (inPush && l.replace(/^\s+-\s*/, "").trim() === RELEASE_BRANCH && /^\s+-/.test(l)) wf.pushesMain = true;
+      if (inPush && /branches:\s*\[(.*)\]/.exec(l)?.[1]?.split(",").some((b) => b.trim() === RELEASE_BRANCH)) wf.pushesMain = true;
     }
   }
 
@@ -115,14 +117,14 @@ const pushers = all.filter((w) => w.pushesMain);
 console.log("A. the population, so no check below can pass by finding nothing");
 check(`exactly ${EXPECTED_WORKFLOWS} workflow files (update deliberately if you added one)`,
   files.length === EXPECTED_WORKFLOWS, { found: files.length, files });
-check(`exactly ${EXPECTED_PUSH_TO_MAIN} of them can be started by a push to main`,
+check(`exactly ${EXPECTED_PUSH_TO_MAIN} of them can be started by a push to ${RELEASE_BRANCH}`,
   pushers.length === EXPECTED_PUSH_TO_MAIN, { found: pushers.map((w) => w.file) });
 
 const grouped = pushers.filter((w) => w.hasConcurrency);
 check(`exactly ${EXPECTED_GROUPED} of those declare a concurrency group, so only those can evict`,
   grouped.length === EXPECTED_GROUPED, { found: grouped.map((w) => w.file) });
 
-console.log("\nB. every push-to-main workflow that HAS a group queues rather than evicts");
+console.log("\nB. every release-push workflow that HAS a group queues rather than evicts");
 // A workflow with no group cannot evict: nothing is grouped, so nothing is ever pending behind
 // anything. It is checked above by count rather than waived silently here, so removing a group
 // somewhere else shows up as a moved number rather than as one fewer cell.
@@ -137,7 +139,7 @@ for (const w of grouped) {
   if (!q) continue;
   check(`${w.file}: \`queue\` is a form this check understands`, q.kind !== "unknown", { raw: w.queue });
   const onPush = q.kind === "literal" ? q.value : q.kind === "byEvent" ? q.push : undefined;
-  check(`${w.file}: resolves to \`max\` on a push to main (got ${onPush ?? "unresolvable"})`, onPush === "max");
+  check(`${w.file}: resolves to \`max\` on a push to ${RELEASE_BRANCH} (got ${onPush ?? "unresolvable"})`, onPush === "max");
 }
 
 console.log("\nC. nothing can resolve to the forbidden pairing");
