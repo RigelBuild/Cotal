@@ -6,7 +6,7 @@ import { assertSeatId, capabilityToken, fencePath, readSeatFileNoFollow, recordP
 import { CONFIRM_TIMEOUT_MS, unattendedMs, assertSocketPathFits, unsupportedTransport } from "./protocol.js";
 import { tryLockFd } from "./peercred.js";
 import type { CustodianTestSeam } from "./custodian.js";
-import { agentPrimaryGid, createSeatCgroup, moveIntoSeatCgroup, ownCgroup, removeSeatCgroup, type SeatCgroup } from "./cgroup.js";
+import { agentPrimaryGid, createSeatCgroup, moveIntoSeatCgroup, ownCgroup, removeSeatCgroup, trustedSetpriv, type SeatCgroup } from "./cgroup.js";
 
 export interface SeatLaunchSpec {
   command: string;
@@ -274,13 +274,20 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
   } finally {
     closeSync(fenceFd);
   }
-  const child = spawn(process.execPath, [custodianEntry(), RUN_MARKER_FLAG, run], {
+  const custodianArgv = [process.execPath, custodianEntry(), RUN_MARKER_FLAG, run];
+  // An agent that can never gain a capability cannot bypass the seat cgroup's mode bits, which is what
+  // makes a reap provable. With no trusted setpriv the seat still launches, but never reads as contained.
+  const setpriv = agent ? trustedSetpriv() : undefined;
+  const argv = agent && setpriv
+    ? [setpriv, "--reuid", String(agent.uid), "--regid", String(agent.gid), "--clear-groups", "--no-new-privs", "--bounding-set=-all", "--", ...custodianArgv]
+    : custodianArgv;
+  const child = spawn(argv[0] ?? "", argv.slice(1), {
     detached: true,
     stdio: [launchFd, "ignore", "ignore"],
     // COTAL_RUN is re-exported so a custodian's own descendants stay attributable to the same run,
     // and so `/proc/<pid>/environ` answers the same question argv does for a reader who can read it.
     env: { PATH: process.env.PATH ?? "", COTAL_RUN: run },
-    ...(agent ? { uid: agent.uid, gid: agent.gid } : {}),
+    ...(agent && !setpriv ? { uid: agent.uid, gid: agent.gid } : {}),
   });
   closeSync(launchFd);
   child.unref();

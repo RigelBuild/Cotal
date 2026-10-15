@@ -99,8 +99,8 @@
     {
       "name": "T6-M2 spawn the custodian as the launcher, not the agent uid",
       "file": "packages/seat/src/launcher.ts",
-      "find": "    ...(agent ? { uid: agent.uid, gid: agent.gid } : {}),\n",
-      "replace": "",
+      "find": "  const argv = agent && setpriv\n",
+      "replace": "  const argv = false && setpriv\n",
       "expectRed": "peer uid: the custodian and its child run as the agent uid",
       "afterRestore": "pnpm --filter @cotal-ai/seat build"
     },
@@ -118,6 +118,22 @@
       "find": "  return { ...rec, socket: socketPath(root, id) };\n",
       "replace": "  return rec;\n",
       "expectRed": "forged record: adopt derives the socket from the root and id, not the record",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T6-M5 launch the agent without no_new_privs or an empty bounding set",
+      "file": "packages/seat/src/launcher.ts",
+      "find": "\"--clear-groups\", \"--no-new-privs\", \"--bounding-set=-all\", \"--\", ...custodianArgv]",
+      "replace": "\"--clear-groups\", \"--\", ...custodianArgv]",
+      "expectRed": "no_new_privs: the custodian and its child run with NoNewPrivs 1 and an empty bounding set",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T6-M6 containment ignores members that can gain a capability",
+      "file": "packages/seat/src/cgroup.ts",
+      "find": "  return probe.status === 11 && membersCannotGainCaps(cg.path);\n",
+      "replace": "  return probe.status === 11;\n",
+      "expectRed": "no_new_privs: a seat member without no_new_privs makes seatCgroupContained false",
       "afterRestore": "pnpm --filter @cotal-ai/seat build"
     }
   ]

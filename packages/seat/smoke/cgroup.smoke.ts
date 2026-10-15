@@ -188,15 +188,21 @@ async function runCell(cell: string | undefined): Promise<void> {
   chmodSync(agentDir, 0o777);
   const created: string[] = [];
   const env = { PATH: process.env.PATH ?? "" };
-  const asAgent = (args: string[]): SeatLaunchSpec =>
-    agentUid > 0 && agentUid !== euid
-      ? { command: "setpriv", args: ["--reuid", String(agentUid), "--regid", String(agentGid), "--init-groups", "--", process.execPath, ...args], env }
-      : { command: process.execPath, args, env };
-  const launch = (id: string, spec: SeatLaunchSpec) => {
+  const launch = (id: string, spec: SeatLaunchSpec, uid?: number) => {
     created.push(seatCgroupPath(base, id));
-    const rec = launchSeat({ root, name: `t5-${String(cell)}`, id, spec, cwd: agentDir, cgroupBase: base });
+    const rec = launchSeat({ root, name: `t5-${String(cell)}`, id, spec, cwd: agentDir, cgroupBase: base, ...(uid === undefined ? {} : { agentUid: uid }) });
     strays.push({ pid: rec.custodianPid, start: rec.custodianStart }, { pid: rec.childPid, start: rec.childStart });
     return rec;
+  };
+  // The whole seat runs as the agent uid, through the launcher's own privilege drop.
+  const launchAsAgent = (id: string, args: string[]) => launch(id, { command: process.execPath, args, env }, agentUid);
+  const capsOf = (pid: number): { nnp: string; bnd: string } => {
+    const status = readOr(`/proc/${pid}/status`, "");
+    return { nnp: /^NoNewPrivs:\s+(\d+)$/m.exec(status)?.[1] ?? "?", bnd: /^CapBnd:\s+(\S+)$/m.exec(status)?.[1] ?? "?" };
+  };
+  const cannotGainCaps = (pid: number): boolean => {
+    const c = capsOf(pid);
+    return c.nnp === "1" && /^0+$/.test(c.bnd);
   };
   const file = (name: string): string => join(agentDir, name);
   const IGNORE = "process.on('SIGHUP',()=>{});process.on('SIGTERM',()=>{});";
@@ -254,7 +260,7 @@ s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,
 
   let skipped = false;
   try {
-    // Without a distinct agent uid, asAgent runs as the manager, which would pass these cells vacuously.
+    // Without a distinct agent uid, launchAsAgent runs as the manager, which would pass these cells vacuously.
     const known = CELLS.find((c) => c === cell);
     if (known !== undefined && NEEDS_DISTINCT_UID[known] && !(agentUid > 0 && agentUid !== euid && agentGid >= 0)) {
       skipped = true;
@@ -317,15 +323,26 @@ s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,
         const before = statSync(procs);
         // Group-writable for a group the agent is not in: still no grant.
         chmodSync(procs, 0o664);
-        launch(id, asAgent(["-e", MIGRATE_CHILD, file("pid"), file("mark"), base]));
+        const rec = launchAsAgent(id, ["-e", MIGRATE_CHILD, file("pid"), file("mark"), base]);
         await until(() => existsSync(file("pid")), 5_000);
         const child = readPid(file("pid"));
         if (child) strays.push(child);
         const cg = { path: seatCgroupPath(base, id), agentUid };
+        check("no_new_privs: the custodian and its child run with NoNewPrivs 1 and an empty bounding set",
+          cannotGainCaps(rec.custodianPid) && child !== undefined && cannotGainCaps(child.pid), { custodian: capsOf(rec.custodianPid), child: child && capsOf(child.pid) });
         const groups = spawnSync("id", ["-G", String(agentUid)], { encoding: "utf8" }).stdout.trim().split(/\s+/).map(Number);
         check("migration attempt, distinct uid: the write to base cgroup.procs fails with a group-writable ancestor",
           /^denied:EACCES/.test(readOr(file("mark"), "")) && !groups.includes(before.gid), { mark: readOr(file("mark"), "none"), groups, gid: before.gid });
         check("migration attempt, distinct uid: seatCgroupContained is true", seatCgroupContained(cg));
+        // A member that could still gain a capability can leave, whatever the mode bits say.
+        const capable = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { uid: agentUid, gid: agentGid, stdio: "ignore" });
+        const capableExit = new Promise<void>((resolve) => capable.once("exit", () => resolve()));
+        writeFileSync(join(cg.path, "cgroup.procs"), String(capable.pid));
+        const withCapable = seatCgroupContained(cg);
+        capable.kill("SIGKILL");
+        await capableExit;
+        check("no_new_privs: a seat member without no_new_privs makes seatCgroupContained false", !withCapable, capable.pid && capsOf(capable.pid));
+        check("no_new_privs: with that member gone seatCgroupContained is true again", seatCgroupContained(cg));
         check("migration attempt, distinct uid: the child is alive in the seat cgroup before the kill",
           child !== undefined && !gone(child.pid) && seatCgroupPopulated(cg));
         // The same ancestor granted to the agent's own group is a grant the agent can use.
@@ -341,7 +358,7 @@ s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,
       }
       case "setsid": {
         const id = seatId();
-        launch(id, asAgent(["-e", SETSID_CHILD, file("pid"), file("gpid")]));
+        launchAsAgent(id, ["-e", SETSID_CHILD, file("pid"), file("gpid")]);
         await until(() => existsSync(file("pid")) && existsSync(file("gpid")), 5_000);
         const grand = readPid(file("gpid"));
         if (grand) strays.push(grand);
@@ -363,7 +380,7 @@ s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,
       }
       case "recordless": {
         const id = seatId();
-        launch(id, asAgent(["-e", SLEEPER, file("pid")]));
+        launchAsAgent(id, ["-e", SLEEPER, file("pid")]);
         await until(() => existsSync(file("pid")), 5_000);
         const child = readPid(file("pid"));
         if (child) strays.push(child);
@@ -453,7 +470,7 @@ s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,
         setLauncherTestSeam({ beforeMove: { reached, release } });
         let err = "";
         try {
-          launch(id, asAgent(["-e", SLEEPER, file("pid")]));
+          launchAsAgent(id, ["-e", SLEEPER, file("pid")]);
         } catch (e) {
           err = (e as Error).message;
         } finally {

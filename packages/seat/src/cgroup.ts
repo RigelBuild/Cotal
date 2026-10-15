@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { accessSync, closeSync, constants, mkdirSync, openSync, readFileSync, realpathSync, rmdirSync, statfsSync, statSync, writeSync, type Stats } from "node:fs";
+import { accessSync, closeSync, constants, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmdirSync, statfsSync, statSync, writeSync, type Stats } from "node:fs";
 import { dirname, join, posix } from "node:path";
 import { assertSeatId } from "./record.js";
 
@@ -198,5 +198,25 @@ export function seatCgroupContained(cg: SeatCgroup): boolean {
     timeout: 5_000,
     env: {},
   });
-  return probe.status === 11;
+  return probe.status === 11 && membersCannotGainCaps(cg.path);
+}
+
+/** Every process in the seat cgroup, nested cgroups included, runs with `no_new_privs` and an empty
+ *  bounding set, so none can gain the `CAP_DAC_OVERRIDE` that bypasses the mode bits checked above.
+ *  Both are irreversible and inherited, so a live read cannot be forged by the agent. */
+function membersCannotGainCaps(dir: string): boolean {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory() && !membersCannotGainCaps(join(dir, entry.name))) return false;
+  }
+  for (const pid of readFileSync(join(dir, "cgroup.procs"), "utf8").split("\n").filter((l) => l !== "")) {
+    let status: string;
+    try {
+      status = readFileSync(`/proc/${pid}/status`, "utf8");
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT" || (e as NodeJS.ErrnoException).code === "ESRCH") continue;
+      return false;
+    }
+    if (!/^NoNewPrivs:\s+1$/m.test(status) || !/^CapBnd:\s+0+$/m.test(status)) return false;
+  }
+  return true;
 }
