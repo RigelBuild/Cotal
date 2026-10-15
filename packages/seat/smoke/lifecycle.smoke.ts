@@ -563,9 +563,11 @@ await h.waitForExit();
       const pgid = Number(stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[2]);
       check("forged-record fixture: detached sleeper is its own process-group leader", pgid === sleeperPid, { sleeperPid, pgid });
       const evidence = await reapSeat(root, id, { graceMs: 100 }).catch((e: Error) => e);
+      // A SIGKILL lands asynchronously, so give a signalled sleeper time to die before calling it untouched.
+      const died = await until(() => state(sleeperPid) === "gone" || state(sleeperPid) === "Z", 1_000);
       check(
         "a forged same-uid record is retained and its process-group leader is never signalled",
-        !(evidence instanceof Error) && evidence.outcome === "retained" && evidence.reason === "unprovable" && evidence.stop === "no-custodian" && state(sleeperPid) !== "gone" && state(sleeperPid) !== "Z",
+        !(evidence instanceof Error) && evidence.outcome === "retained" && evidence.reason === "unprovable" && evidence.stop === "no-custodian" && !died,
         evidence instanceof Error ? evidence.message : evidence,
       );
     } finally {
