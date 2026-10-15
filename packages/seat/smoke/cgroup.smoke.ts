@@ -337,10 +337,14 @@ s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,
         // A member that could still gain a capability can leave, whatever the mode bits say.
         const capable = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { uid: agentUid, gid: agentGid, stdio: "ignore" });
         const capableExit = new Promise<void>((resolve) => capable.once("exit", () => resolve()));
-        writeFileSync(join(cg.path, "cgroup.procs"), String(capable.pid));
-        const withCapable = seatCgroupContained(cg);
-        capable.kill("SIGKILL");
-        await capableExit;
+        let withCapable: boolean;
+        try {
+          writeFileSync(join(cg.path, "cgroup.procs"), String(capable.pid));
+          withCapable = seatCgroupContained(cg);
+        } finally {
+          capable.kill("SIGKILL");
+          await capableExit;
+        }
         check("no_new_privs: a seat member without no_new_privs makes seatCgroupContained false", !withCapable, capable.pid && capsOf(capable.pid));
         check("no_new_privs: with that member gone seatCgroupContained is true again", seatCgroupContained(cg));
         check("migration attempt, distinct uid: the child is alive in the seat cgroup before the kill",

@@ -276,8 +276,9 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
   }
   const custodianArgv = [process.execPath, custodianEntry(), RUN_MARKER_FLAG, run];
   // An agent that can never gain a capability cannot bypass the seat cgroup's mode bits, which is what
-  // makes a reap provable. With no trusted setpriv the seat still launches, but never reads as contained.
+  // makes a reap provable. No trusted setpriv means no distinct-uid seat at all.
   const setpriv = agent ? trustedSetpriv() : undefined;
+  if (agent && !setpriv) throw new Error("no root-owned setpriv: refusing to launch a seat under a distinct agent uid without no_new_privs");
   const argv = agent && setpriv
     ? [setpriv, "--reuid", String(agent.uid), "--regid", String(agent.gid), "--clear-groups", "--no-new-privs", "--bounding-set=-all", "--", ...custodianArgv]
     : custodianArgv;
@@ -287,7 +288,6 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
     // COTAL_RUN is re-exported so a custodian's own descendants stay attributable to the same run,
     // and so `/proc/<pid>/environ` answers the same question argv does for a reader who can read it.
     env: { PATH: process.env.PATH ?? "", COTAL_RUN: run },
-    ...(agent && !setpriv ? { uid: agent.uid, gid: agent.gid } : {}),
   });
   closeSync(launchFd);
   child.unref();

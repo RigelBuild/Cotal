@@ -205,10 +205,16 @@ export function seatCgroupContained(cg: SeatCgroup): boolean {
  *  bounding set, so none can gain the `CAP_DAC_OVERRIDE` that bypasses the mode bits checked above.
  *  Both are irreversible and inherited, so a live read cannot be forged by the agent. */
 function membersCannotGainCaps(dir: string): boolean {
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (entry.isDirectory() && !membersCannotGainCaps(join(dir, entry.name))) return false;
+  let subdirs: string[];
+  let pids: string[];
+  try {
+    subdirs = readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
+    pids = readFileSync(join(dir, "cgroup.procs"), "utf8").split("\n").filter((l) => l !== "");
+  } catch {
+    return false; // a cgroup that cannot be read, or vanished mid-walk, proves nothing
   }
-  for (const pid of readFileSync(join(dir, "cgroup.procs"), "utf8").split("\n").filter((l) => l !== "")) {
+  if (!subdirs.every((d) => membersCannotGainCaps(join(dir, d)))) return false;
+  for (const pid of pids) {
     let status: string;
     try {
       status = readFileSync(`/proc/${pid}/status`, "utf8");
