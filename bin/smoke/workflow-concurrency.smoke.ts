@@ -85,7 +85,7 @@ function parse(file: string): Wf {
       if (/^\s{2}push:/.test(l)) inPush = true;
       else if (/^\s{2}\S/.test(l)) inPush = false;
       if (inPush && l.replace(/^\s+-\s*/, "").trim() === RELEASE_BRANCH && /^\s+-/.test(l)) wf.pushesMain = true;
-      if (inPush && /branches:\s*\[(.*)\]/.exec(l)?.[1]?.split(",").some((b) => b.trim() === RELEASE_BRANCH)) wf.pushesMain = true;
+      if (inPush && /branches:\s*\[(.*)\]/.exec(l)?.[1]?.split(",").some((b) => b.trim().replace(/^(['"])(.*)\1$/, "$2") === RELEASE_BRANCH)) wf.pushesMain = true;
     }
   }
 
