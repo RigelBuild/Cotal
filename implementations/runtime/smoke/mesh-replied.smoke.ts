@@ -11,7 +11,7 @@
  *
  * The far side is the same suite-served MANAGER-SHAPED goal endpoint the turn suite drives (the
  * runtime never imports `@cotal-ai/manager`), scripting each turn's terminal in the real shapes:
- * a currency-proving `succeeded` or a goal-bound hold's deny.
+ * a currency-proving `succeeded`, a goal-bound hold's deny, or a caller's mediated cancel.
  *
  * Run: pnpm smoke:runtime-mesh-replied   (needs nats-server on PATH)
  */
@@ -50,6 +50,8 @@ import {
   bindGoal,
   createGoal,
   commitGoalResult,
+  readGoalResult,
+  requestGoalCancel,
   mintCheckpoint,
   expireCheckpoint,
   goalRefOf,
@@ -62,7 +64,7 @@ import {
   type EpCaller,
   type Presence,
 } from "@cotal-ai/core";
-import { type JournalEntry } from "@cotal-ai/lang";
+import { type EffectContext, type JournalEntry } from "@cotal-ai/lang";
 import { MeshHandler, EpfSettleWatcher, startRun } from "../src/index.js";
 import { pickFreePort } from "./_free-port.js";
 import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
@@ -168,15 +170,37 @@ const TURN_OUTPUT = {
 } as const;
 
 const cc = (root: unknown) => compileContract({ root: root as Record<string, unknown> });
+// A completed run despawns the seats it spawned, so the stand-in serves the manager's despawn too.
+const DESPAWN_INPUT = { type: "object", additionalProperties: false, properties: { graceful: { type: "boolean" } } } as const;
+const DESPAWN_OUTPUT = {
+  type: "object", additionalProperties: false, required: ["name", "stopped", "graceful"],
+  properties: { name: { type: "string" }, stopped: { type: "boolean" }, graceful: { type: "boolean" } },
+} as const;
+// The published manager cancel schemas (SPEC 13.6 item 4), without importing the manager.
+const CANCEL_INPUT = {
+  type: "object", additionalProperties: false, required: ["goalId"],
+  properties: { goalId: { type: "string", minLength: 1 }, mode: { enum: ["graceful", "terminate"] } },
+} as const;
+const CANCEL_OUTPUT = {
+  type: "object", additionalProperties: false, required: ["goalId", "state"],
+  properties: { goalId: { type: "string" }, state: { enum: ["succeeded", "failed", "cancelled", "expired", "uncertain"] } },
+} as const;
 const COMPILED = {
   spawn: { input: cc(SPAWN_INPUT), output: cc(SPAWN_OUTPUT) },
   turn: { input: cc(TURN_INPUT), output: cc(TURN_OUTPUT) },
+  despawn: { input: cc(DESPAWN_INPUT), output: cc(DESPAWN_OUTPUT) },
+  cancel: { input: cc(CANCEL_INPUT), output: cc(CANCEL_OUTPUT) },
 };
+const CANCEL_COMMAND = { name: "cancel", class: "ephemeral" as const, targeted: false, capability: "manager.lifecycle", inputDigest: COMPILED.cancel.input.closureDigest, outputDigest: COMPILED.cancel.output.closureDigest };
+// One list owns both registration and serving, so omitting cancel restores the original gap.
+const CANCEL_COMMANDS: typeof CANCEL_COMMAND[] = [CANCEL_COMMAND];
 const DOCUMENT = {
   urn: "ai.cotal.test.repliedmgr", revision: 1, attributes: [], events: [],
   commands: [
     { name: "spawn", class: "ephemeral" as const, targeted: false, capability: "manager.spawn", inputDigest: COMPILED.spawn.input.closureDigest, outputDigest: COMPILED.spawn.output.closureDigest },
     { name: "turn", class: "ephemeral" as const, targeted: true, modes: ["owner", "any"], capability: "manager.lifecycle", inputDigest: COMPILED.turn.input.closureDigest, outputDigest: COMPILED.turn.output.closureDigest },
+    { name: "despawn", class: "ephemeral" as const, targeted: true, modes: ["owner", "any"], capability: "manager.lifecycle", inputDigest: COMPILED.despawn.input.closureDigest, outputDigest: COMPILED.despawn.output.closureDigest },
+    ...CANCEL_COMMANDS,
   ],
 };
 const ROOT_DIGEST = contractDigest(DOCUMENT);
@@ -188,7 +212,7 @@ const artifactIndex = new Map<string, unknown>();
 {
   const values: unknown[] = [];
   const seen = new Set<string>();
-  for (const source of [SPAWN_INPUT, SPAWN_OUTPUT, TURN_INPUT, TURN_OUTPUT]) {
+  for (const source of [SPAWN_INPUT, SPAWN_OUTPUT, TURN_INPUT, TURN_OUTPUT, DESPAWN_INPUT, DESPAWN_OUTPUT, CANCEL_INPUT, CANCEL_OUTPUT]) {
     const rootDigest = contractDigest(source);
     if (seen.has(rootDigest)) continue;
     seen.add(rootDigest);
@@ -336,9 +360,21 @@ const turnHandler = async (ctx: EpServeContext): Promise<unknown> => {
   return acceptance;
 };
 
+const cancelHandler = async (ctx: EpServeContext): Promise<unknown> => {
+  const { goalId, mode = "graceful" } = (ctx.request.args ?? {}) as { goalId: string; mode?: "graceful" | "terminate" };
+  await requestGoalCancel(goalCtx, { request: ctx.subject, goalId, mode });
+  const { fact } = await commitGoalResult(goalCtx, { ref: goalRefOf(ctx.subject, goalId), now: Date.now(), cause: "cancel", committer: { instanceId: MGR_IID, epoch: EXEC_EPOCH } });
+  return { goalId, state: fact.state };
+};
+
 const defs: EpCommandDef[] = [
   { command: "spawn", contract: COMPILED.spawn, handler: spawnHandler },
   { command: "turn", contract: COMPILED.turn, handler: turnHandler },
+  { command: "despawn", contract: COMPILED.despawn, handler: (ctx: EpServeContext) => {
+    const t = ctx.request.target as { owner: string; actor: string };
+    return { name: `${t.owner}.${t.actor}`, stopped: true, graceful: ((ctx.request.args ?? {}) as { graceful?: unknown }).graceful !== false };
+  } },
+  ...CANCEL_COMMANDS.map(({ name }) => ({ command: name, contract: COMPILED.cancel, handler: cancelHandler })),
 ];
 const serve = serveEndpoint(nc, SPACE, grant, defs, { public: true }, {
   resolveTarget: (t) => mappings.get(`${t.owner}.${t.actor}`),
@@ -615,13 +651,64 @@ const adoptedPending = (runId: string, d: { agent: string; persona: string }, sp
   s.cancel("race decided elsewhere");
   const got = await withDeadline(p, 20_000, "the cancelled turn");
   c("the turn unwinds as Cancelled", (got as { name?: string } | undefined)?.name === "Cancelled", JSON.stringify(got));
+  const cancelledWinner = await readGoalResult(goalCtx, { endpoint: EP, caller: CALLER, goalId: token("s") });
+  console.log(JSON.stringify({ scenario: "replied-case9", phase: "after-cancel", winner: cancelledWinner?.state ?? "absent" }));
   await wait(2_500); // the seat's yield lands on the relay after the run moved on
+  const lateWinner = await readGoalResult(goalCtx, { endpoint: EP, caller: CALLER, goalId: token("s") });
+  console.log(JSON.stringify({ scenario: "replied-case9", phase: "after-late-complete", winner: lateWinner?.state ?? "absent" }));
   const W = token("t");
   const w = safe(h.wait({ event: { event: "replied", agent: d!.agent }, timeout: "2s" } as never, stepCtx(W).ctx));
   await armPending(12);
   await armPending(4);
   const r = await withDeadline(w, 30_000, "the replied wait over a cancelled turn");
   c("the late yield is not a reply: the wait rides its timeout to null", r === null, JSON.stringify(r));
+}
+
+// The public bind seam holds the observer until the real completion has won on the plane.
+{
+  console.log("• 9b — a completed turn cancelled before its observer continues is not a reply");
+  const h = mk("rp-9b");
+  const d = await spawnSeat(h, "r9b-spawn");
+  const T = token("r9b-turn");
+  turnEndings.push({ state: "succeeded", status: "done", note: "completed before local cancellation", delayMs: 50 });
+  const s = stepCtx(T, { key: { scope: [], kind: "turn", name: "", occurrence: 0 } });
+  let reachedBind!: (value: boolean) => void;
+  const bound = new Promise<boolean>((resolve) => { reachedBind = resolve; });
+  let releaseBind!: () => void;
+  const bindGate = new Promise<void>((resolve) => { releaseBind = resolve; });
+  const baseCtx = s.ctx as EffectContext;
+  const ctx: EffectContext = {
+    ...baseCtx,
+    bind: async (external) => {
+      await baseCtx.bind(external);
+      reachedBind(true);
+      await bindGate;
+    },
+  };
+  const p = safe(h.turn({ agent: { agent: d!.agent, persona: d!.persona }, deadline: "5m" } as never, ctx));
+  try {
+    const entered = await withDeadline(bound, 20_000, "the completion-before-cancel bind");
+    const winner = await withDeadline((async () => {
+      for (let i = 0; i < 200; i += 1) {
+        const fact = await readGoalResult(goalCtx, { endpoint: EP, caller: CALLER, goalId: T });
+        if (fact !== undefined) return fact;
+        await wait(50);
+      }
+      return undefined;
+    })(), 20_000, "the completion-before-cancel winner");
+    c("the bound turn's real succeeded winner precedes local cancellation", entered === true && winner?.state === "succeeded", { entered: entered === true, winner: winner?.state ?? "absent" });
+  } finally {
+    s.cancel("race decided elsewhere");
+    releaseBind();
+  }
+  await armPending(6);
+  const got = await withDeadline(p, 20_000, "the completion-before-cancel turn");
+  c("the completed-before-cancel turn still unwinds as Cancelled", (got as { name?: string } | undefined)?.name === "Cancelled");
+  const w = safe(h.wait({ event: { event: "replied", agent: d!.agent }, timeout: "2s" } as never, stepCtx(token("r9b-wait")).ctx));
+  await armPending(12);
+  await armPending(4);
+  const r = await withDeadline(w, 30_000, "the replied wait over a completion-before-cancel turn");
+  c("the completed-before-cancel turn is not a reply: the wait rides its timeout to null", r === null);
 }
 
 // ── 10) a discharged (race-lost) turn leaves the registry an adopted run rebuilt ──────────────
@@ -665,7 +752,7 @@ const adoptedPending = (runId: string, d: { agent: string; persona: string }, sp
 await Promise.allSettled(terminals);
 await serve.stop().catch(() => { /* teardown */ });
 await nc.close();
-const EXPECTED_CELLS = 23;
+const EXPECTED_CELLS = 26;
 const ran = ok + fail;
 console.log(`mesh-replied.smoke: ${ok} passed, ${fail} failed`);
 if (ran !== EXPECTED_CELLS) {

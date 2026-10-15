@@ -54,14 +54,7 @@ export function ensureSession(session: string, cwd: string): void {
 /** True if a window named `name` exists in `session`. Name-based — fragile under renames; prefer
  *  {@link windowAliveRef} when you hold a stable `@N` ID. Kept for name-based discovery/cleanup. */
 export function windowAlive(session: string, name: string): boolean {
-  try {
-    const out = execFileSync("tmux", ["list-windows", "-t", session, "-F", "#W"], {
-      encoding: "utf8",
-    });
-    return out.split("\n").map((l) => l.trim()).includes(name);
-  } catch {
-    return false;
-  }
+  return listWindows(session).includes(name);
 }
 
 /** True if a window with the stable ID `windowId` (`@N`) still exists. Window IDs are server-global,
@@ -69,13 +62,81 @@ export function windowAlive(session: string, name: string): boolean {
  *  (name match). (Don't use `display-message -t`: for a stale target it silently falls back to the
  *  current window instead of erroring, so it can't detect a closed window.) */
 export function windowAliveRef(windowId: string): boolean {
+  return windowLines("#{window_id}").includes(windowId);
+}
+
+/** True when a tmux call failed because no server is listening on its socket. tmux reports that
+ *  as `no server running on <socket>`, and the socket path may itself hold those words, so only the
+ *  start of stderr counts. A missing socket or an unsafe socket directory is a failed call. */
+function noServer(err: unknown): boolean {
+  return String((err as { stderr?: unknown }).stderr ?? "").startsWith("no server running on ");
+}
+
+/** A failed tmux call's text: tmux's stderr, then Node's message, which names the command. */
+function failureText(err: unknown): string {
+  const e = err as { stderr?: unknown; message?: unknown };
+  return `${String(e.stderr ?? "")} ${String(e.message ?? "")}`.trim();
+}
+
+/** The running tmux server's pid, or undefined when no server is running. */
+export function serverPid(opts: { timeoutMs?: number } = {}): string | undefined {
   try {
-    return execFileSync("tmux", ["list-windows", "-a", "-F", "#{window_id}"], { encoding: "utf8" })
+    return execFileSync("tmux", ["display-message", "-p", "#{pid}"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: opts.timeoutMs,
+      // SIGKILL, because Node waits for a timed-out child to exit, and one that handles SIGTERM would
+      // outlast the timeout.
+      killSignal: "SIGKILL",
+    }).trim();
+  } catch (err) {
+    if (noServer(err)) return undefined;
+    throw new Error(`tmux: couldn't read the server pid: ${failureText(err)}`, { cause: err });
+  }
+}
+
+/** Sessions holding window `windowId` (a window can be linked into more than one), or none once its
+ *  server no longer lists it. Like {@link paneState}, a failed listing throws instead of reading as
+ *  gone. */
+export function windowSessions(windowId: string): string[] {
+  return windowLines("#{window_id} #{session_name}")
+    .filter((l) => l.startsWith(`${windowId} `))
+    .map((l) => l.slice(windowId.length + 1));
+}
+
+/** Every window on the server in `format`, one line for each session holding it, or none when no
+ *  server is running. A failed listing throws instead of reading as no windows. */
+function windowLines(format: string): string[] {
+  try {
+    return execFileSync("tmux", ["list-windows", "-a", "-F", format], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: EXIT_PROBE_MS,
+    })
       .split("\n")
-      .map((l) => l.trim())
-      .includes(windowId);
-  } catch {
-    return false;
+      .filter(Boolean);
+  } catch (err) {
+    if (noServer(err)) return [];
+    throw new Error(`tmux: couldn't list windows: ${failureText(err)}`, { cause: err });
+  }
+}
+
+/** The window holding pane `paneId`, or undefined once its server no longer lists the pane. A pane
+ *  that exited under `remain-on-exit` is still listed, so it still has a window. Like
+ *  {@link paneState}, a failed listing throws instead of reading as gone. */
+export function paneWindow(paneId: string): string | undefined {
+  try {
+    return execFileSync("tmux", ["list-panes", "-a", "-F", "#{pane_id} #{window_id}"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: EXIT_PROBE_MS,
+    })
+      .split("\n")
+      .find((l) => l.startsWith(`${paneId} `))
+      ?.slice(paneId.length + 1);
+  } catch (err) {
+    if (noServer(err)) return undefined;
+    throw new Error(`tmux: couldn't list the window holding pane ${paneId}: ${failureText(err)}`, { cause: err });
   }
 }
 
@@ -90,6 +151,7 @@ export function paneState(paneId: string): PaneState {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: EXIT_PROBE_MS,
+      killSignal: "SIGKILL",
     });
     for (const line of panes.split("\n")) {
       const [id, dead] = line.trim().split(/\s+/);
@@ -97,13 +159,31 @@ export function paneState(paneId: string): PaneState {
     }
     return "exited";
   } catch (err) {
-    const e = err as { stderr?: unknown; message?: unknown };
-    const message = `${String(e.stderr ?? "")} ${String(e.message ?? "")}`;
     // No tmux server means no pane can still exist. Other failures (including permission/socket
     // errors) are unknown and must fail the preservation cut closed.
-    if (/no server running/i.test(message)) return "exited";
-    throw new Error(`tmux: couldn't prove pane ${paneId} exited: ${message.trim()}`, { cause: err });
+    if (noServer(err)) return "exited";
+    throw new Error(`tmux: couldn't prove pane ${paneId} exited: ${failureText(err)}`, { cause: err });
   }
+}
+
+/** The text pane `paneId` (`%N`) of the server whose pid is `server` shows now, or undefined once it
+ *  has exited or that server is gone. */
+export function capturePane(paneId: string, server: string): string | undefined {
+  let screen: string;
+  try {
+    screen = execFileSync("tmux", ["capture-pane", "-p", "-t", paneId], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: EXIT_PROBE_MS,
+      killSignal: "SIGKILL",
+    });
+  } catch (err) {
+    if (paneState(paneId) === "exited") return undefined;
+    throw err;
+  }
+  // capture-pane also reads a pane kept after its process exited (`remain-on-exit`); a pane still
+  // running on `server` after the capture was running during it. A later server reuses pane ids.
+  return paneState(paneId) === "exited" || serverPid({ timeoutMs: EXIT_PROBE_MS }) !== server ? undefined : screen;
 }
 
 /** Bounded polling over tmux's authoritative pane inventory. */
@@ -125,11 +205,11 @@ export async function waitForPaneExit(
   }
 }
 
+/** True when a close failed because its window or session is already gone. tmux reports that as
+ *  `can't find window: <target>` or `can't find session: <name>`, and the socket path or the target
+ *  may itself hold those words, so only the start of stderr counts. */
 function isWindowGone(err: unknown): boolean {
-  // Use both stderr (captured when stdio:"pipe") and message (contains the command + code).
-  const e = err as { stderr?: unknown; message?: unknown };
-  const msg = `${String(e.stderr ?? "")}${String(e.message ?? "")}`;
-  return /can't find window|can't find session|no current window|session not found/i.test(msg);
+  return /^can't find (window|session): /.test(String((err as { stderr?: unknown }).stderr ?? ""));
 }
 
 /** The stable refs for a freshly-opened window: its window ID (`@N`) and the ID of its initial
@@ -138,6 +218,9 @@ function isWindowGone(err: unknown): boolean {
 export interface WindowRefs {
   windowId: string;
   paneId: string;
+  /** The tmux server's pid. Window and pane IDs restart with a new server, so a reference that
+   *  outlives this server must carry it. */
+  serverPid: string;
 }
 
 /** Open a new tmux window `name` in `session` running `command` (a shell string).
@@ -155,12 +238,12 @@ export function openWindow(
   const args = ["new-window", "-t", `${session}:`, "-n", name, "-c", cwd];
   if (!(opts.focus ?? false)) args.push("-d");
   // -P -F prints the new window + pane IDs before returning — stable across renames and reorders.
-  args.push("-P", "-F", "#{window_id} #{pane_id}", command);
+  args.push("-P", "-F", "#{window_id} #{pane_id} #{pid}", command);
   const out = execFileSync("tmux", args, { encoding: "utf8" }).trim();
-  const [windowId, paneId] = out.split(/\s+/);
-  if (!windowId || !paneId)
+  const [windowId, paneId, serverPid] = out.split(/\s+/);
+  if (!windowId || !paneId || !serverPid)
     throw new Error(`tmux: couldn't read window/pane IDs from new-window ("${out}")`);
-  return { windowId, paneId };
+  return { windowId, paneId, serverPid };
 }
 
 /** Split `target` (a window ID `@N`, or session:window) creating a new pane running `command`.
@@ -191,6 +274,13 @@ export function selectWindow(target: string): void {
   execFileSync("tmux", ["select-window", "-t", target], { stdio: "ignore" });
 }
 
+/** tmux arguments that run command `args` only on the server whose pid is `server`, when one is given.
+ *  A later server reuses window and pane ids, so an id kept from an earlier server can name another
+ *  window; tmux checks its pid in the same command. */
+function onServer(server: string | undefined, args: string[]): string[] {
+  return server === undefined ? args : ["if-shell", "-F", `#{==:#{pid},${server}}`, args.map(shellQuote).join(" ")];
+}
+
 /** Kill a tmux window by target (window ID `@N`, or `session:name`). Idempotent: already-gone is a no-op. */
 export function closeWindow(target: string): void {
   try {
@@ -201,39 +291,58 @@ export function closeWindow(target: string): void {
   }
 }
 
-/** Window names open in `session`, or `[]` if unreachable. */
-export function listWindows(session: string): string[] {
+/** Kill pane `paneId` (`%N`) wherever it is now, on server `opts.server` only when given. Idempotent:
+ *  already-gone is a no-op. */
+export function closePane(paneId: string, opts: { timeoutMs?: number; server?: string } = {}): void {
   try {
-    return execFileSync("tmux", ["list-windows", "-t", session, "-F", "#W"], {
-      encoding: "utf8",
-    })
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean);
-  } catch {
-    return [];
+    execFileSync("tmux", onServer(opts.server, ["kill-pane", "-t", paneId]), {
+      stdio: "pipe",
+      timeout: opts.timeoutMs,
+      killSignal: "SIGKILL",
+    });
+  } catch (err) {
+    // The socket path may hold these words too, so only the start of stderr counts.
+    if (/^can't find pane: /.test(String((err as { stderr?: unknown }).stderr ?? ""))) return;
+    throw err;
   }
+}
+
+/** Kill window `windowId` (`@N`) only while `session` holds it and pane `paneId` (`%N`) is in it or
+ *  gone, and report whether it was killed. tmux checks and kills in one command, so a pane or window
+ *  that moves after the caller's own listing cannot pass a stale check and lose its window. */
+export function closeWindowIfHeld(session: string, windowId: string, paneId: string): boolean {
+  // Non-empty while any session lists the pane in another window.
+  const paneElsewhere = `#{S:#{W:#{P:#{?#{==:#{pane_id},${paneId}},#{?#{==:#{window_id},${windowId}},,1},}}}}`;
+  // kill-window's own exact (`=`) target checks the session: if-shell runs its command even when its
+  // `-t` names no window. tmux quotes a command string as sh does.
+  const kill = `kill-window -t ${shellQuote(`=${session}:${windowId}`)}`;
+  try {
+    const out = execFileSync("tmux", ["if-shell", "-F", `#{?${paneElsewhere},0,1}`, kill, "display-message -p refused"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return out.trim() !== "refused";
+  } catch (err) {
+    if (isWindowGone(err)) return false;
+    throw err;
+  }
+}
+
+/** Window names open in `session`, or none once no server is running. */
+export function listWindows(session: string): string[] {
+  // tmux escapes a tab in a session name, so the first tab ends it; a window name can hold one.
+  const prefix = `${session}\t`;
+  return windowLines("#{session_name}\t#{window_name}")
+    .filter((l) => l.startsWith(prefix))
+    .map((l) => l.slice(prefix.length));
 }
 
 /** Stable window IDs (`@N`) of every window in `session` whose name is exactly `label`. */
 export function windowRefs(session: string, label: string): string[] {
-  try {
-    return execFileSync(
-      "tmux",
-      ["list-windows", "-t", session, "-F", "#{window_id} #{window_name}"],
-      { encoding: "utf8" },
-    )
-      .split("\n")
-      .filter(Boolean)
-      .flatMap((line) => {
-        const sp = line.indexOf(" ");
-        const id = line.slice(0, sp);
-        const name = line.slice(sp + 1).trim();
-        return name === label ? [id] : [];
-      });
-  } catch {
-    return [];
-  }
+  return windowLines("#{window_id}\t#{session_name}\t#{window_name}").flatMap((l) => {
+    const tab = l.indexOf("\t");
+    return l.slice(tab + 1) === `${session}\t${label}` ? [l.slice(0, tab)] : [];
+  });
 }
 
 /** Render `env` as shell-safe `KEY='value'` pairs. tmux (like cmux) shell-renders env into the
@@ -272,12 +381,15 @@ export function mergedCommand(
  *  process argument — visible to any local `ps`/`tmux list-panes` — so passing the rendered `env`
  *  inline would leak the agent's creds + control token (and any model-provider key). Instead the body
  *  lives in a fresh 0o700 temp dir as a 0o600 (owner-only) script; tmux only ever sees `bash <path>`,
- *  and the secrets are read from the file, never the command line. */
-export function privateLaunch(commandBody: string): string {
+ *  and the secrets are read from the file, never the command line. The script removes its directory
+ *  before it execs, so the secrets stay on disk only until bash opens it, and exits instead of running
+ *  the agent when the removal fails; a caller whose tmux command fails removes `dir` itself, since
+ *  nothing will run the script. */
+export function privateLaunch(commandBody: string): { command: string; dir: string } {
   const dir = mkdtempSync(join(tmpdir(), "cotal-tmux-"));
   const scriptPath = join(dir, "launch.sh");
-  writeFileSync(scriptPath, `#!/usr/bin/env bash\nexec ${commandBody}\n`, { mode: 0o600 });
-  return `bash ${shellQuote(scriptPath)}`;
+  writeFileSync(scriptPath, `#!/usr/bin/env bash\nrm -rf -- ${shellQuote(dir)} || exit\nexec ${commandBody}\n`, { mode: 0o600 });
+  return { command: `bash ${shellQuote(scriptPath)}`, dir };
 }
 
 /** Type literal text into a tmux target.
@@ -286,8 +398,12 @@ export function send(text: string, target: string): void {
   execFileSync("tmux", ["send-keys", "-l", "-t", target, "--", text], { stdio: "ignore" });
 }
 
-/** Send a named key sequence (e.g. `"Enter"`, `"C-c"`) to a tmux target.
- *  `--` guards against key names starting with `-`. */
-export function sendKey(key: string, target: string): void {
-  execFileSync("tmux", ["send-keys", "-t", target, "--", key], { stdio: "ignore" });
+/** Send a named key sequence (e.g. `"Enter"`, `"C-c"`) to a tmux target, on server `opts.server` only
+ *  when given. `--` guards against key names starting with `-`. */
+export function sendKey(key: string, target: string, opts: { timeoutMs?: number; server?: string } = {}): void {
+  execFileSync("tmux", onServer(opts.server, ["send-keys", "-t", target, "--", key]), {
+    stdio: "ignore",
+    timeout: opts.timeoutMs,
+    killSignal: "SIGKILL",
+  });
 }

@@ -94,7 +94,7 @@ export function epAuthBucket(space: string): string {
   return `cotal_auth_${token(space)}`;
 }
 
-/** The per-space SESSION ledger store (P2 item 6, §13.6): the `session.<id>` rows the manager's
+/** The per-space SESSION ledger store (§13.6): the `session.<id>` rows the manager's
  *  session plane CASes over. DEDICATED — split out of the auth bucket deliberately. KV reads are
  *  subject-BLIND (a `STREAM.MSG.GET` on a bucket serves any key, the campaign's known vector class),
  *  so co-locating session rows with credentials + gates would let the standing session-ledger cred read
@@ -366,7 +366,7 @@ export async function createEndpointStreams(
   // create-or-verify with a fail-loud drift check of its own.
   await ensureIssuedStores(jsm, kvm, space);
   await ensureAdmissionStore(jsm, kvm, space);
-  // P2 item 6: the DEDICATED §13.6 session ledger bucket. The eps byte SUBJECTS stay core-only and
+  // The DEDICATED §13.6 session ledger bucket. The eps byte SUBJECTS stay core-only and
   // uncaptured (above), but the `session.<id>` ledger rows are a captured authority KV — kept in
   // their own bucket so the manager's standing session-ledger cred's bucket-blind STREAM.MSG.GET reads
   // ONLY session rows (the §13.9 subject-blindness structural fix). Provisioned here so every mesh
@@ -513,7 +513,7 @@ export async function ensureAuthorityStores(jsm: JetStreamManager, kvm: Kvm, spa
   assertAuthorityStoreBinding(authCfg, authBucket);
 }
 
-/** Create (idempotently) the per-space SESSION ledger store (P2 item 6, §13.6): the DEDICATED
+/** Create (idempotently) the per-space SESSION ledger store (§13.6): the DEDICATED
  *  {@link sessionsBucket} the manager's session plane CASes `session.<id>` rows over. Kept OUT of
  *  {@link ensureAuthorityStores} deliberately — the auth path never touches session rows, and the
  *  manager provisions this store from its own boot — but it wears the SAME authority-store shape as
@@ -1006,6 +1006,11 @@ export function runJournalConsumerConfig(
     ack_wait: nanos(opts.ackWaitMs ?? 60_000),
     deliver_policy: DeliverPolicy.All,
     max_ack_pending: opts.maxAckPending ?? 1000,
+    // In MEMORY, because its state is worthless once the replay that made it is done, and a
+    // file-backed one gives the broker a directory to lose. Every replay on a takeover reuses this
+    // name, so a create can share `obs/<durable>` with the removal of an earlier consumer of the name
+    // and fail with the broker's ENOENT from its store, which the replay raises as the step's failure.
+    mem_storage: true,
     // A REAPER, because nothing else is one. This consumer is created, read and deleted inside a
     // single replay, so it should never outlive one — but a delete can fail, and the stream cannot
     // clean up after it: WFJ sets neither `max_consumers` nor `consumer_limits`, which normalize to
@@ -1278,9 +1283,9 @@ export function commitPrincipalGrants(space: string, endpoint: string, connId: s
   return { publish, subscribe: [`_INBOX_${assertInboxConnId(connId)}.>`] };
 }
 
-/** The SELF-MEDIATED GOAL-WRITER profile (P2 item 2 "spawn becomes an action"): a standing
+/** The SELF-MEDIATED GOAL-WRITER profile: a standing
  *  connection that both BINDS a goal at accept AND COMMITS its terminal, for an endpoint that
- *  accepts action goals INLINE on its ephemeral serve handler (Model B) rather than through a
+ *  accepts action goals INLINE on its ephemeral serve handler rather than through a
  *  separate canonicalizer + effects executor. It is exactly {@link commitPrincipalGrants} (the
  *  `goal.*.*.*.*.result` terminal + `$KV.<records>.goal.<e>.>` record write + the two leader-served
  *  `STREAM.MSG.GET` fencing reads the substrate uses) PLUS the ONE row commitPrincipalGrants
@@ -1288,7 +1293,7 @@ export function commitPrincipalGrants(space: string, endpoint: string, connId: s
  *  (`epf.<e>.goal.*.*.*.*.bind`) — so this single principal owns the whole `accepted → terminal`
  *  goal-fact chain of its OWN endpoint. The endpoint's SERVE credential
  *  ({@link import("./endpoint-grants.js").epServePublishRows}) holds NONE of these: a serve
- *  connection is broker-DENIED every goal write, which is the item-2 privilege separation (the
+ *  connection is broker-DENIED every goal write, which is the privilege separation (the
  *  dedicated writer is minted on a distinct connection, the serve rails stay serve-only). All of
  *  commitPrincipalGrants' D32 residuals carry unchanged (payload-blind create-only publish; raw
  *  `$KV` cannot enforce the per-key CAS the substrate layers on). **THREE body-selected
@@ -1302,10 +1307,27 @@ export function commitPrincipalGrants(space: string, endpoint: string, connId: s
  *  base are inert for a goal-only endpoint (the manager writes none) but are the commit-principal
  *  profile's standard ceiling; a tighter goal-only ceiling is a follow-up if the panel prefers it. */
 export function goalWriterGrants(space: string, endpoint: string, connId: string): { publish: string[]; subscribe: string[] } {
+  const { bindLeaf, indexRow, base } = selfMediatedGoalWriterRows(space, endpoint, connId);
+  // The own-gate currency belt is a body-selected leader read on the auth store. It is
+  // a fast-fail read; barrier revocation is the durable fence.
+  const gateRead = `${JSAPI}.STREAM.MSG.GET.KV_${epAuthBucket(space)}`;
+  return { publish: [bindLeaf, indexRow, gateRead, ...base.publish], subscribe: base.subscribe };
+}
+
+/** Fixed manager goal rows without an auth-store read. The stock environment manager must
+ * skip the optional gate belt; barrier revocation and verified eviction remain the fence. */
+export function environmentManagerGoalWriterGrants(space: string, connId: string): { publish: string[]; subscribe: string[] } {
+  const { bindLeaf, indexRow, base } = selfMediatedGoalWriterRows(space, "manager", connId);
+  return { publish: [bindLeaf, indexRow, ...base.publish], subscribe: base.subscribe };
+}
+
+function selfMediatedGoalWriterRows(space: string, endpoint: string, connId: string): {
+  bindLeaf: string; indexRow: string; base: { publish: string[]; subscribe: string[] };
+} {
   const base = commitPrincipalGrants(space, endpoint, connId);
   const e = endpointToken(endpoint);
   const bindLeaf = `${spacePrefix(space)}.epf.${e}.goal.*.*.*.*.bind`;
-  // must-5 Q-B — the reconcile index: the goal-writer records each accepted goal under
+  // The reconcile index: the goal-writer records each accepted goal under
   // `goalidx.<e>.<caller triple>.<goalId>` (create-only) before the bind and deletes it at the
   // terminal, so a successor incarnation can settle orphaned goals. Key-pinned to THIS endpoint's
   // index subtree; the goal-writer holds NO records CONSUMER.CREATE (the boot sweep enumerates the
@@ -1318,18 +1340,10 @@ export function goalWriterGrants(space: string, endpoint: string, connId: string
   // overlay inherits them. They were duplicated here while the commit builder listed only three of
   // the six, which made the overlay look like their source — a grant the SPEC gives every commit
   // principal reading as a privilege of this one profile.
-  // must-5 (a) — the own-gate currency belt: the manager reads its OWN issuance gate
-  // (`epgate.<e>.<iid>`) over this connection before the first-terminal-fact CAS and skips a
-  // superseded commit. The auth store is `allow_direct=false`, so the read is a body-selected
-  // leader `STREAM.MSG.GET` that cannot be key-pinned to the single gate key — the SAME residual
-  // class the `endpoint-serve-executor` carries (reads any auth-bucket row = gate + ledger
-  // metadata, never bearer bytes), here on a standing rather than one-shot connection. The manager
-  // reads ONLY `epgate.<e>.<iid>`; (a) is the fast-fail belt, (b) barrier-revoke is the durable fence.
-  const gateRead = `${JSAPI}.STREAM.MSG.GET.KV_${epAuthBucket(space)}`;
-  return { publish: [bindLeaf, indexRow, gateRead, ...base.publish], subscribe: base.subscribe };
+  return { bindLeaf, indexRow, base };
 }
 
-/** The manager's SESSION-LEDGER rows (P2 item 6): the standing connection that owns the §13.6
+/** The manager's SESSION-LEDGER rows: the standing connection that owns the §13.6
  *  session ledger and NOTHING else. It holds NO session rail — not the wildcard it used to hold,
  *  not an exact one. That is the whole point of the split.
  *
@@ -1338,7 +1352,7 @@ export function goalWriterGrants(space: string, endpoint: string, connId: string
  *  serving a session is gone. So it is standing and renewable, while the rails it records are
  *  per-session, exact-subject, and die with their session ({@link import("./provision.js").Profile}
  *  `session-serving` / `session-caller`). An earlier revision fused the two into one standing
- *  credential carrying `eps.<endpoint>.*.<epoch>.{in,out}`, which contradicted §13.9:2753 ("no
+ *  credential carrying `eps.<endpoint>.*.<epoch>.{in,out}`, which contradicted §13.9 ("no
  *  standing EPS grant exists on either side") and let one credential read and write every live
  *  session's bytes at that epoch. Splitting on the lifetime boundary is what removes the wildcard:
  *  the standing half no longer has rails to widen.

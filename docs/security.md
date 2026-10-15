@@ -84,6 +84,12 @@ The guarantees, at a glance, each enforced by the broker per
   provisioner-created bind-only consumers, so an agent cannot read someone else's inbox or
   steal another role's work; durable-channel backstop reads are re-authorized by a trusted
   reader ([delivery daemon](delivery-daemon.md)).
+- **Carried resume transcripts**: a transcript carried to another manager travels through a
+  bucket that only the target manager instance's transfer reader can read, and the operator's
+  writer is pinned to that one transcript. Seats and peers hold no grant on any transfer bucket,
+  and the carried seat runs in its own Claude home, so no other seat's Claude lists or finds the
+  transcript. Seats on one host still run as one OS user, so a process that opens another seat's
+  home by path can read it. See [connecting Claude](connect-claude.md).
 - **Transport secrecy (optional)**: `cotals://` enforces TLS for the hop to the broker.
   It protects that hop, not the broker itself.
 
@@ -146,6 +152,21 @@ The guarantees, at a glance, each enforced by the broker per
   agent-config keys). The boundary is *who* may spawn (the authenticated caller, gated by the
   capability), not *which* flags they pass. Grant `spawn` as host-launch authority, not a narrow
   "add a teammate" permission ([run a mesh](run-a-mesh.md#spawning-agents)).
+- **Seat reap by process-group membership:** a manager reaping a custodied PTY seat
+  (`reapSeat` in `@cotal-ai/seat`) signals the custodian and the child only while each still
+  carries the start identity in its custody record. The child's descendants are not in that
+  record, so the reap signals the child's process group and then kills any member still left,
+  with group membership as the only evidence for those members. The kernel refuses
+  `setpgid(2)` into a group in another session, so a process outside the child's session cannot
+  join the group and get killed this way. A member pid that exits and is reused by an unrelated
+  process between the reap's `/proc` read and its signal would still be signalled.
+- **Same-uid rewrite of a seat custody record:** the custody record (`record.json`, `0600` in a
+  `0700` directory) carries no authentication, and a reap trusts the pids and start tokens it
+  names. A process running as the same uid can rewrite them, and the next legitimate reap then
+  signals the processes it chose. Each forged pid must carry its real start token, and a record
+  from another boot signals nothing, but a same-uid process can read both from `/proc`. This stays
+  inside the same-uid boundary under *Adversaries*: such a process can already reach the
+  account signer in the default compositions.
 
 ## Prompt-facing data
 

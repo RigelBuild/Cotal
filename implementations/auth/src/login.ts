@@ -19,8 +19,8 @@
  * by bending the reference client.
  *
  * `idpUrl` throughout is the IdP's AUTH BASE URL — every endpoint resolves under it (Better
- * Auth: `<origin>/api/auth`). Same origin posture as the JWKS pin: https, or loopback http for
- * local dev; embedded `user:pass@` credentials are refused (the @-confusion host spoof).
+ * Auth: `<origin>/api/auth`). Same origin posture as the JWKS pin: https, or http on a loopback IP
+ * literal for local dev; embedded `user:pass@` credentials are refused (the @-confusion host spoof).
  *
  * Every IdP request carries a hard per-request timeout ({@link idpFetch}) — Node's global fetch
  * has none, and the poll deadline is only checked between polls, so a hung IdP would otherwise
@@ -31,7 +31,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { decodeJwt } from "jose";
-import { mkSecretDir, writeSecretFileAtomic, type AuthSpaceCatalogAccount, type AuthSpaceCatalogResult } from "@cotal-ai/core";
+import { isLoopbackLiteral, mkSecretDir, writeSecretFileAtomic, type AuthSpaceCatalogAccount, type AuthSpaceCatalogResult } from "@cotal-ai/core";
 import { acquireLock } from "@cotal-ai/workspace";
 
 /** A cached IdP login. `token` is the IdP session bearer (Better Auth: `session.token`) — an
@@ -85,13 +85,14 @@ export interface DeviceLoginOpts {
   idpUrl: string;
   /** The OAuth client id this CLI presents; the IdP may pin it via its validateClient hook. */
   clientId: string;
-  /** Shows the human the verification URL + code. Called exactly once, before polling starts. */
-  onPrompt: (prompt: DeviceLoginPrompt) => void;
+  /** Shows the human the verification URL + code. Called exactly once; polling starts only after
+   *  it settles, a rejection fails the login, and the device code's lifetime bounds it. */
+  onPrompt: (prompt: DeviceLoginPrompt) => void | Promise<void>;
 }
 
-/** Normalize + guard the IdP base URL: https (or loopback http for dev), no query/hash, no
- *  trailing slash — the normalized string is also the session-cache key, so `…/api/auth` and
- *  `…/api/auth/` must land on the same entry. */
+/** Normalize + guard the IdP base URL: https (or http on a loopback IP literal for dev), no
+ *  query/hash, no trailing slash — the normalized string is also the session-cache key, so
+ *  `…/api/auth` and `…/api/auth/` must land on the same entry. */
 export function normalizeIdpUrl(idpUrl: string): string {
   let u: URL;
   try {
@@ -99,11 +100,10 @@ export function normalizeIdpUrl(idpUrl: string): string {
   } catch {
     throw new Error(`idp url "${idpUrl}" is not a valid URL`);
   }
-  // WHATWG URL keeps the brackets on an IPv6 hostname — "[::1]", not "::1" (same set as the
-  // issuer's pinned-JWKS origin guard).
-  const loopback = u.hostname === "127.0.0.1" || u.hostname === "[::1]" || u.hostname === "localhost";
-  if (u.protocol !== "https:" && !(u.protocol === "http:" && loopback))
-    throw new Error(`idp url must be https (or loopback http for local dev) - got "${idpUrl}"`);
+  // `localhost` gets no exception: this base also derives the pinned JWKS origin, and a hosts
+  // entry would then choose the key the callout trusts.
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && isLoopbackLiteral(u.hostname)))
+    throw new Error(`idp url must be https (or http on a loopback IP literal such as 127.0.0.1 for local dev) - got "${idpUrl}"`);
   // A query/hash would be silently DROPPED by the normalization below — and a silently altered
   // auth base is a different IdP than the operator asked for. Refuse instead.
   if (u.search !== "" || u.hash !== "")
@@ -233,20 +233,30 @@ export async function deviceLogin(opts: DeviceLoginOpts): Promise<IdpSession> {
     (grant.interval !== undefined && !sane(grant.interval, 300))
   )
     throw new Error(`idp login: ${base} returned a malformed device grant - refusing to poll on it`);
-  opts.onPrompt({
-    verificationUri: grant.verification_uri,
-    verificationUriComplete: grant.verification_uri_complete,
-    userCode: grant.user_code,
-    expiresInSec: grant.expires_in,
-  });
-
+  const expired = `idp login: the device code expired after ${grant.expires_in}s without approval - run \`cotal login\` again`;
+  // The code's lifetime runs from the grant, so a prompt that never settles fails the login at
+  // expiry instead of holding it open.
   const deadline = Date.now() + grant.expires_in * 1000;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      opts.onPrompt({
+        verificationUri: grant.verification_uri,
+        verificationUriComplete: grant.verification_uri_complete,
+        userCode: grant.user_code,
+        expiresInSec: grant.expires_in,
+      }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(expired)), deadline - Date.now()); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+
   // RFC 8628 §3.5: poll at the server's interval; `slow_down` adds 5s to it, permanently.
   let intervalSec = Math.max(1, grant.interval || 5);
   for (;;) {
     await new Promise((r) => setTimeout(r, intervalSec * 1000));
-    if (Date.now() > deadline)
-      throw new Error(`idp login: the device code expired after ${grant.expires_in}s without approval - run \`cotal login\` again`);
+    if (Date.now() > deadline) throw new Error(expired);
     const poll = await idpFetch(`${base}/device/token`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -380,7 +390,7 @@ function catalogUrlFromLink(idpUrl: string, link: string | null): string | undef
     } catch {
       return undefined;
     }
-    const loopback = url.protocol === "http:" && (url.hostname === "127.0.0.1" || url.hostname === "[::1]");
+    const loopback = url.protocol === "http:" && isLoopbackLiteral(url.hostname);
     if (url.origin !== origin || (url.protocol !== "https:" && !loopback) || url.username || url.password)
       return undefined;
     return url.toString();

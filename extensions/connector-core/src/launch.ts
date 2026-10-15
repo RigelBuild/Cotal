@@ -138,10 +138,19 @@ export const OPERATOR_ENV_KEEP = [
  *  Windows spells these `Path`/`ComSpec`/`windir`, so a canonical-only copy would either miss them
  *  (a plain read of `process.env.SystemRoot` differs from `process.env.systemroot`) or, worse, emit
  *  BOTH `Path` and `PATH` - a case-duplicate Windows process creation chokes on. Keying off the
- *  source env's actual casing (one entry per lowercased name) forwards each var exactly once. */
+ *  source env's actual casing (one entry per lowercased name) forwards each var exactly once.
+ *
+ *  An `envAllow` name in the `COTAL_` namespace outside {@link OPERATOR_ENV_KEEP} throws. A connector
+ *  sets those names per seat and only when the launch has a value, so a forwarded one would stand in
+ *  for a role, model or read set this launch never had. */
 export function launchEnv(
   opts: { providerKeys?: readonly string[]; mcpKeys?: readonly string[]; envAllow?: readonly string[] } = {},
 ): Record<string, string> {
+  for (const k of opts.envAllow ?? []) {
+    const name = k.toUpperCase();
+    if (name.startsWith("COTAL_") && !OPERATOR_ENV_KEEP.some((keep) => keep === name))
+      throw new Error(`spawn.env cannot list "${k}": the launcher sets COTAL_ names for each seat, and only the machine-wide ones such as COTAL_HOME cross from the spawning process`);
+  }
   const env: Record<string, string> = {};
   const sourceKey = new Map<string, string>();
   for (const k of Object.keys(process.env)) sourceKey.set(k.toLowerCase(), k);
@@ -161,8 +170,9 @@ export function launchEnv(
  *  so the spawned session's runtime read/post set matches the creds the manager minted from the
  *  same policy. Without it a manifest-spawned agent — whose materialized persona carries no access
  *  frontmatter — has no channel set to read, so it joins nothing even though its creds authorize
- *  channels. Empty/absent lists are omitted: the connector then defers to the persona file or the
- *  join link, preserving the persona-spawn path unchanged. */
+ *  channels. An absent read or post list is omitted, so the connector defers to the persona file or
+ *  the join link. An empty one is forwarded as an empty value: the launcher resolved no channels and
+ *  minted the creds from that, so the session must not fall back to the persona's list. */
 export function aclEnv(opts: {
   subscribe?: string[];
   allowSubscribe?: string[];
@@ -170,9 +180,9 @@ export function aclEnv(opts: {
   capabilities?: string[];
 }): Record<string, string> {
   const env: Record<string, string> = {};
-  if (opts.subscribe?.length) env.COTAL_SUBSCRIBE = opts.subscribe.join(",");
-  if (opts.allowSubscribe?.length) env.COTAL_ALLOW_SUBSCRIBE = opts.allowSubscribe.join(",");
-  if (opts.allowPublish?.length) env.COTAL_ALLOW_PUBLISH = opts.allowPublish.join(",");
+  if (opts.subscribe) env.COTAL_SUBSCRIBE = opts.subscribe.join(",");
+  if (opts.allowSubscribe) env.COTAL_ALLOW_SUBSCRIBE = opts.allowSubscribe.join(",");
+  if (opts.allowPublish) env.COTAL_ALLOW_PUBLISH = opts.allowPublish.join(",");
   // Control-plane capabilities (e.g. `spawn`) gate cotal_spawn/cotal_persona in the connector's tool
   // list. Forward them on the same rail as the read/post ACL, or a manifest-spawned agent (no persona
   // file) gets `config.capabilities = []` and the tools stay hidden even though its creds authorize them.
@@ -256,6 +266,13 @@ export function materialEnv(opts: {
   // this is the caller-side half of the same rule.
   if (Object.keys(material).length === 0) return {};
   return { [LAUNCH_MATERIAL_ENV]: writeLaunchMaterial(material) };
+}
+
+/** Whether a launch arms the event plane. `events: false` opts out only when the registration
+ *  allows it: the session arms from `eventsRequired` in the material whatever the flag says, so a
+ *  launch that honoured the opt-out would hand an armed session no workspace root. */
+export function launchArmsEvents(opts: { events?: boolean; eventsRequired?: boolean }): boolean {
+  return opts.events !== false || opts.eventsRequired === true;
 }
 
 /** The per-agent EVENT channel and its classifier, RE-EXPORTED FROM CORE.
@@ -385,6 +402,9 @@ export function eventChannelForName(
   return eventChannel(only);
 }
 
+/** A `${VAR}` or `${VAR:-default}` reference, the form Claude expands in an MCP server config. */
+export const ENV_REFERENCE = /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}/g;
+
 /** The environment-variable NAMES a set of shared MCP server specs reference via `${VAR}` /
  *  `${VAR:-default}` (in command/args/env/url/headers). The single source of which operator vars
  *  a shared server needs: forwarded BY NAME through {@link launchEnv} (`mcpKeys`), never
@@ -394,7 +414,7 @@ export function mcpServerEnvKeys(servers: Record<string, McpServerSpec>): string
   const names = new Set<string>();
   const scan = (s: string | undefined): void => {
     if (!s) return;
-    for (const m of s.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}/g)) names.add(m[1]);
+    for (const m of s.matchAll(ENV_REFERENCE)) names.add(m[1]);
   };
   for (const spec of Object.values(servers)) {
     scan(spec.command);

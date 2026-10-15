@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { DEFAULT_SERVER, DEFAULT_SPACE, type SpaceAuth } from "@cotal-ai/core";
+import { DEFAULT_SERVER, DEFAULT_SPACE, personaDir, type SpaceAuth } from "@cotal-ai/core";
 import { accountInventory, authDir, findCotalRoot, hasUserAuthState, listSpaceAccounts, loadSpaceAuth, soleSpaceOf, userAuthSpacesOnDisk } from "./auth-paths.js";
 import {
   canonicalRoot,
@@ -154,18 +154,9 @@ export function isWorkspaceTargetError(e: unknown): e is MeshTargetError {
   );
 }
 
-/** `<root>/.cotal/agents` — a mesh's persona catalog. Exported because registration
- *  (`cotal meshes add`) builds a target by hand and must resolve it to the same path this does. */
-export function personaDir(root: string): string {
-  return join(root, ".cotal", "agents");
-}
+// Core owns the catalog location; re-exported so workspace consumers keep it beside `personaRoot`.
+export { personaDir };
 
-/** Refuse to resolve a single mesh when ROOT's on-disk account inventory says it hosts more than
- *  one tenant (or an unreadable one). The disk is the tenant authority ahead of the registry: a
- *  broker with several account records is several tenants even if only one is registered, so any
- *  path that would otherwise auto-pick (a bare local root, a `--server` that names this broker)
- *  must refuse here. `--space` is the way to name one. A root with 0 or 1 accounts (open or
- *  single-tenant) passes untouched. */
 /** Load a space's composed trust, converting a COMPOSITION failure into a typed target error. The
  *  record can pass the on-disk shape gate yet fail to compose - a malformed account JWT, or a
  *  well-formed one signed by a foreign operator - and `loadSpaceAuth` throws a raw error there.
@@ -180,6 +171,12 @@ function loadTrustOrThrow(root: string, space: string): SpaceAuth | undefined {
   }
 }
 
+/** Refuse to resolve a single mesh when ROOT's on-disk account inventory says it hosts more than
+ *  one tenant (or an unreadable one). The disk is the tenant authority ahead of the registry: a
+ *  broker with several account records is several tenants even if only one is registered, so any
+ *  path that would otherwise auto-pick (a bare local root, a `--server` that names this broker)
+ *  must refuse here. `--space` is the way to name one. A root with 0 or 1 accounts (open or
+ *  single-tenant) passes untouched. */
 function assertRootIsSingleTenant(root: string): void {
   // `accountInventory`'s readdir can THROW (EACCES/ELOOP on `.cotal/auth`): it lets that propagate
   // so the broker-wide guards fail CLOSED, but the resolver is a presentation surface and must

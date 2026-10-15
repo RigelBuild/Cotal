@@ -1,7 +1,6 @@
 import { jetstreamManager } from "@nats-io/jetstream";
 import { Kvm } from "@nats-io/kv";
 import {
-  authorizeServeGrant,
   contractArtifactCanonicalBytes,
   contractRefToHex,
   contractStoreContext,
@@ -9,13 +8,15 @@ import {
   endpointRegistrationBarrier,
   epAuthBucket,
   fetchContractArtifact,
+  foreignSlotHeldFrom,
   provisionEndpointGateOpen,
   publishContractArtifact,
   readEndpointGateGeneration,
   recordsBucket,
-  registerServiceInstance,
+  registerServingInstance,
   serveIssuanceGateKv,
   standaloneConnectOpts,
+  type EpServeGrant,
   type RemoteManagerAuthorityMaterial,
 } from "@cotal-ai/core";
 import { MANAGER_ENDPOINT, managerAuthorityContractSource, managerClusterArtifacts } from "./manager-service-contract.js";
@@ -36,10 +37,10 @@ export async function registerRemoteManagerAuthority(args: {
    *  here. A participant reaches its host through whatever the record says, so this can be a
    *  `wss://` edge; hardcoding `false` would send the prepare credential to it in the clear. */
   tlsRequired: boolean;
-  evict: (principal: string) => Promise<boolean>;
+  evict: (principals: readonly string[]) => Promise<boolean[]>;
   /** Host-side guarded repair for a foreign manager slot holder, used once before a retry. */
   reconcileForeignRegistration?: (instanceId: string) => Promise<void>;
-}): Promise<{ registrationRevision: number; processEpoch: number; serveGrant: Awaited<ReturnType<typeof authorizeServeGrant>> }> {
+}): Promise<{ registrationRevision: number; processEpoch: number; serveGrant: EpServeGrant }> {
   // The transport follows the RECORDED URL: a remote broker is commonly published through an HTTPS
   // edge, and the raw node transport refuses `ws://`/`wss://` outright instead of dialing it.
   const nc = await dialerFor(args.server)({
@@ -61,8 +62,7 @@ export async function registerRemoteManagerAuthority(args: {
       return bytes ? JSON.parse(new TextDecoder().decode(bytes)) : undefined;
     };
     const principal = `${args.owner}.${args.serveActor}`;
-    const fence = serveIssuanceGateKv(authKv, args.space, { endpoint: MANAGER_ENDPOINT, instanceId: args.instanceId });
-    if ((await fence.observe()) === null)
+    if ((await serveIssuanceGateKv(authKv, args.space, { endpoint: MANAGER_ENDPOINT, instanceId: args.instanceId }).observe()) === null)
       await provisionEndpointGateOpen(authKv, { endpoint: MANAGER_ENDPOINT, instanceId: args.instanceId, principal });
     const authority = { authorize: (endpoint: string, owner: string) => ({ authorized: endpoint === MANAGER_ENDPOINT && owner === args.owner, revision: 0 }) };
     const barrier = endpointRegistrationBarrier(authKv, args.space, {
@@ -71,7 +71,7 @@ export async function registerRemoteManagerAuthority(args: {
       opId: args.instanceId,
       evict: args.evict,
     });
-    const register = () => registerServiceInstance(recordsKv, {
+    const register = () => registerServingInstance(recordsKv, {
       space: args.space,
       spec: { endpoint: MANAGER_ENDPOINT, owner: args.owner, clusterDigests: [artifacts.closureDigest], protocol: { v: 1 } },
       instanceId: args.instanceId,
@@ -85,31 +85,19 @@ export async function registerRemoteManagerAuthority(args: {
       observeHolderGeneration: (holderInstanceId) =>
         readEndpointGateGeneration(authKv, { endpoint: MANAGER_ENDPOINT, instanceId: holderInstanceId }),
     });
+    let registered: Awaited<ReturnType<typeof register>>;
     try {
-      await register();
+      registered = await register();
     } catch (error) {
-      const match = (error as Error).message.match(/concurrent registration for endpoint "manager" \(instance "([a-z0-9]{26,32})"\) holds the governance slot/);
-      if (!match || !args.reconcileForeignRegistration) throw error;
-      await args.reconcileForeignRegistration(match[1]!);
-      await register();
+      // Only a holder whose gate is still at the slot's stamp left a frozen registration the host
+      // can reconcile; every other refusal is about this registrant's view of that gate.
+      const held = foreignSlotHeldFrom(error);
+      if (held?.condition !== "in-flight" || !args.reconcileForeignRegistration) throw error;
+      await args.reconcileForeignRegistration(held.holderInstanceId);
+      registered = await register();
     }
-    const observed = await fence.observe();
-    if (observed === null) throw new Error("remote manager issuance gate vanished after registration");
-    const serveGrant = await authorizeServeGrant(recordsKv, {
-      space: args.space,
-      endpoint: MANAGER_ENDPOINT,
-      instanceId: args.instanceId,
-      epoch: observed.processEpoch,
-      holder: { owner: args.owner },
-      authority,
-      readProcessEpoch: async () => {
-        const current = await fence.observe();
-        if (!current) throw new Error("remote manager issuance gate vanished");
-        return current.processEpoch;
-      },
-      readClusterArtifact,
-    });
-    return { registrationRevision: observed.registrationRevision, processEpoch: observed.processEpoch, serveGrant };
+    const { registrationRevision, processEpoch, grant } = registered;
+    return { registrationRevision, processEpoch, serveGrant: grant };
   } finally {
     await nc.drain().catch(() => nc.close());
   }

@@ -1,9 +1,8 @@
 import { spawn } from "node:child_process";
 import { closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
-import { pathToFileURL } from "node:url";
 import { registry, type Command, type Connector, type ParsedArgs } from "@cotal-ai/core";
-import { RESERVED_CONNECTOR_NAMES, beginExtensionNpmMutation, bindExtensionPeers, cacheCommand, cacheConnector, cacheExtension, cacheLocalProcess, cmdSpawnSpec, extensionLocalProcesses, extensionPackageDir, extensionProvides, extensionsDir, extensionsManifestPath, installedExtensionVersion, loadExtensionsManifest, loadMeshes, localProcessPath, parsePid, probeLiveness, provenance, saveExtensionsManifest, type InstalledExtension, type LocalProcess, type LocalProcessContext } from "@cotal-ai/workspace";
+import { RESERVED_CONNECTOR_NAMES, beginExtensionNpmMutation, bindExtensionPeers, cacheCommand, cacheConnector, cacheExtension, cacheLocalProcess, cmdSpawnSpec, extensionLocalProcesses, extensionPackageDir, extensionProvides, extensionsDir, extensionsManifestPath, importExtensionEntry, installedExtensionVersion, loadExtensionsManifest, loadMeshes, localProcessPath, parsePid, probeLiveness, provenance, saveExtensionsManifest, type InstalledExtension, type LocalProcess, type LocalProcessContext } from "@cotal-ai/workspace";
 import { c } from "../ui.js";
 import { cotalRoot } from "../lib/paths.js";
 import { resolveSpace } from "../lib/status.js";
@@ -42,10 +41,12 @@ export function isPathSpec(spec: string, absolute: (p: string) => boolean = isAb
 
 export async function ext(args: ParsedArgs): Promise<void> {
   const [sub, ...rest] = args.positionals;
+  const json = args.values.json === true;
+  if (json && sub !== undefined && sub !== "list") throw new Error(`ext ${sub}: --json is taken by the list only`);
   // Bare `cotal ext` lists the inventory: it is the most natural probe for "what's installed / where",
   // and these extensions never appear in `npm list -g` (they live in a cotal-owned prefix, not npm's
   // global tree), so erroring here left the honest answer undiscoverable.
-  if (!sub) return list();
+  if (!sub) return list(json);
   if (sub === "add" && rest[0]) return addExtension(rest[0]);
   if (sub === "__update-add" && rest[0] && rest[1]) {
     if (Number(process.env[EXT_UPDATE_PARENT_ENV]) !== process.ppid)
@@ -55,7 +56,7 @@ export async function ext(args: ParsedArgs): Promise<void> {
     return addExtension(rest[1], rest[0], true);
   }
   if (sub === "remove" && rest[0]) return remove(rest[0]);
-  if (sub === "list" && !rest.length) return list();
+  if (sub === "list" && !rest.length) return list(json);
   // `cotal ext root` prints just the prefix path — a one-line scripting primitive (cf. `npm root -g`,
   // `brew --prefix`) so tooling can locate the store without parsing the human inventory.
   if (sub === "root" && !rest.length) {
@@ -66,7 +67,7 @@ export async function ext(args: ParsedArgs): Promise<void> {
     const { repair, reset, force } = args.values as { repair?: boolean; reset?: boolean; force?: boolean };
     return runSeed({ repair, reset, force });
   }
-  throw new Error("usage: cotal ext <add <npm-package> | remove <name> | list | root | seed [--repair|--reset|--force]>");
+  throw new Error("usage: cotal ext <add <npm-package> | remove <name> | list [--json] | root | seed [--repair|--reset|--force]>");
 }
 
 async function npm(args: string[], cwd: string): Promise<{ status: number | null; output: string }> {
@@ -112,24 +113,6 @@ async function npm(args: string[], cwd: string): Promise<{ status: number | null
   } finally {
     if (!published && !preservePending) mutation.clear();
   }
-}
-
-/** Import an installed extension package (its declared entry) so it self-registers. */
-async function importExtension(pkg: string): Promise<void> {
-  const dir = extensionPackageDir(pkg);
-  const meta = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as {
-    main?: string;
-    exports?: unknown;
-  };
-  // Entry resolution: the common cases (exports["."] as string or {import|default}, else main).
-  let entry = meta.main ?? "index.js";
-  const dot = (meta.exports as Record<string, unknown> | undefined)?.["."];
-  if (typeof dot === "string") entry = dot;
-  else if (dot && typeof dot === "object") {
-    const d = dot as Record<string, string>;
-    entry = d.import ?? d.default ?? entry;
-  } else if (typeof meta.exports === "string") entry = meta.exports;
-  await import(pathToFileURL(join(dir, entry)).href);
 }
 
 /** Rebuild each installed package's private links after npm mutates the shared prefix. Keeping the
@@ -263,6 +246,9 @@ export async function addExtension(spec: string, expectedPkg?: string, borrowMut
   } catch (e) {
     fail(pkg, `has unreadable package metadata: ${(e as Error).message}`);
   }
+  if (typeof pkgMeta.version !== "string" || !pkgMeta.version) {
+    fail(pkg, `declares no "version" - the manifest pins an extension's version and every load checks the installed package against it`);
+  }
 
   // Shared @cotal-ai/* packages must be PEER dependencies — a regular dependency vendors a second
   // copy: core's would swallow the extension's registrations into its own registry singleton, and
@@ -285,11 +271,8 @@ export async function addExtension(spec: string, expectedPkg?: string, borrowMut
   // Import once; every registration must LAND IN OUR REGISTRY. Runtime-only and other provider
   // packages are first-class extensions too; commands are only the display/dispatch subset.
   const before = new Set(registry.all().map((ext) => `${ext.kind}:${ext.name}`));
-  try {
-    await importExtension(pkg);
-  } catch (e) {
-    fail(pkg, `failed to import: ${(e as Error).message}`);
-  }
+  const version = pkgMeta.version;
+  await importExtensionEntry(pkg, version, "the add was rolled back; replace this build");
   const contributed = registry.all().filter((ext) => !before.has(`${ext.kind}:${ext.name}`));
   if (!contributed.length) {
     fail(pkg, `imported cleanly but registered no extensions in THIS CLI's registry - if it bundles its own @cotal-ai/core, make core a peerDependency`);
@@ -314,7 +297,6 @@ export async function addExtension(spec: string, expectedPkg?: string, borrowMut
   const commands = contributed.filter((ext): ext is Command => ext.kind === "command");
   const connectors = contributed.filter((ext): ext is Connector => ext.kind === "connector");
   const localProcesses = contributed.filter((ext): ext is LocalProcess => ext.kind === "local-process");
-  const version = pkgMeta.version ?? "0.0.0";
   const entry: InstalledExtension = {
     pkg,
     version,
@@ -448,16 +430,10 @@ function describeProcess({ provider, context, pidPath }: ExtensionProcess): stri
   const raw = readFileSync(pidPath, "utf8").trim();
   if (raw.startsWith("removing:"))
     return `${provider.name} (extension-removal reservation) in ${context.root} - clean ${pidPath} if its owner is gone`;
-  // "stale pidfile" is advice to delete it, so it must not be printed about a process that is
-  // merely unsignalable: the shared probe calls that alive, the old inline try/catch called it stale.
+  // "stale pidfile" is advice to delete the record, so only a pid proven dead gets it. Content
+  // parsePid rejects and a pid whose liveness the kernel would not answer may each front a live
+  // process, so they are named as such instead.
   const pid = parsePid(raw);
-  // THREE labels, because two of them are advice and the third must not be. "stale pidfile" tells the
-  // operator to clean it; saying that about a record whose liveness the kernel would not answer for
-  // invites deleting a live holder. Indeterminate says so instead.
-  // FOUR labels. I wrote three and left `undefined` falling into "stale pidfile", which is the same
-  // defect one state over: content parsePid rejects is UNATTRIBUTABLE by this PR's own contract, and
-  // "stale" is advice to delete it. `down` refuses such a record correctly, so this line was telling
-  // the operator to run a command that would then refuse them.
   const liveness = pid === undefined ? undefined : probeLiveness(pid);
   const state =
     pid === undefined ? `UNATTRIBUTABLE pidfile content ${JSON.stringify(raw)} - it may front a live process nobody can identify; inspect it, do not clean it blindly`
@@ -467,21 +443,37 @@ function describeProcess({ provider, context, pidPath }: ExtensionProcess): stri
   return `${provider.name} (${state}) in ${context.root} - run there: cotal down ${provider.name}`;
 }
 
-function list(): void {
-  const { extensions } = loadExtensionsManifest();
+/** The installed extensions. `--json` prints one {@link extensionRow} per line and nothing else, so a
+ *  line reader never meets the header or footer, and an empty prefix prints nothing. */
+function list(json: boolean): void {
+  const rows = loadExtensionsManifest().extensions.map(extensionRow);
+  if (json) {
+    for (const row of rows) console.log(JSON.stringify(row));
+    return;
+  }
   // Lead with the store's real location and its ownership, so the inventory is self-explaining: these
   // packages are cotal-managed and kept out of npm's global prefix by design, which is exactly why
   // `npm list -g` never shows them. Resolve the path dynamically — never hard-code it.
   console.log(c.dim(`Extension root: ${extensionsDir()}`));
   console.log(c.dim("Managed by `cotal ext`; kept separate from npm's global prefix, so `npm list -g` does not include these."));
   console.log("");
-  if (!extensions.length) {
+  if (!rows.length) {
     console.log(c.dim("(no extensions installed - add one with `cotal ext add <npm-package>`)"));
     return;
   }
-  for (const e of extensions) {
-    console.log(`${c.bold(e.pkg)}@${e.version}  ${c.dim(extensionProvides(e).map((ref) => `${ref.kind}:${ref.name}`).join(", "))}`);
-  }
+  for (const row of rows) console.log(`${c.bold(row.pkg)}@${row.version}  ${c.dim(row.provides.join(", "))}`);
   console.log("");
   console.log(c.dim("Manage with `cotal ext add`/`cotal ext remove`; `cotal ext --help` for all commands."));
+}
+
+/** One `cotal ext list --json` row: what the table shows, plus the spec `ext add` recorded and whether
+ *  the built-in seed installed the entry, which the table leaves out. */
+function extensionRow(e: InstalledExtension) {
+  return {
+    pkg: e.pkg,
+    version: e.version,
+    spec: e.spec,
+    seeded: e.source === "seeded",
+    provides: extensionProvides(e).map((ref) => `${ref.kind}:${ref.name}`),
+  };
 }

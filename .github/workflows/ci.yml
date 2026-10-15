@@ -5,6 +5,13 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      acquisition:
+        description: Generate the fixed validator comparison lock for source review only
+        required: true
+        type: choice
+        options: [validators-0155]
 
 # A new push to a PR supersedes the run already going; a merge to main does not.
 #
@@ -19,7 +26,7 @@ on:
 # result of any kind. It happened to 13 of 29 consecutive main runs. `queue: max` is the part that
 # actually makes them wait, FIFO, up to 100 deep.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-r2
+  group: ${{ github.workflow }}-${{ github.ref }}-r2${{ github.event_name == 'workflow_dispatch' && format('-acquire-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
   # `queue: max` with `cancel-in-progress: true` is a validation error, so this tracks the line
   # above: a PR keeps the default single slot and supersedes, main queues instead of evicting.
@@ -36,9 +43,12 @@ concurrency:
 #             bin/smoke/shard.mjs (each smoke still runs in its own broker; shards are on separate
 #             runners, so no cross-smoke port contention).
 #   • live  — the Linux-only live/lifecycle e2es (real broker + real agents, tmux/cmux/opencode).
-# `ci-ok` fans them back in for a single required status.
+# `ci-ok` fans them back in to one status. That status is advisory: `attribution` is the only
+# required status context on main, so a red `ci-ok` reports and the merge can still proceed. See
+# docs/design/upgrade-section-gate.md for why it was not made required.
 jobs:
   unit:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     timeout-minutes: 20
     runs-on: ubuntu-latest
     env:
@@ -112,6 +122,17 @@ jobs:
         run: pnpm smoke:update-concurrency
       - name: Unit tests
         run: pnpm test
+      - name: Validator lock acquisition source controls
+        run: node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs
+      - name: Remaining schema direct-engine diagnostic
+        if: ${{ !cancelled() }}
+        run: pnpm smoke:schema-remaining15-diagnostic
+      - name: Remaining schema schemasafe comparison
+        if: ${{ !cancelled() }}
+        run: pnpm smoke:schema-remaining15-schemasafe-comparison
+      - name: Released schemasafe public-error diagnostic
+        if: ${{ !cancelled() }}
+        run: pnpm smoke:schema-schemasafe-public-errors
       - name: View smoke
         run: pnpm smoke:view
       - name: Verify Claude connector package
@@ -124,6 +145,7 @@ jobs:
         run: pnpm smoke:broker-disclosure
 
   smoke:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     name: smoke (shard ${{ matrix.shard }}/4)
     # Shard 2/4 runs ~39-40 min, so the previous 40 left a median margin of 15 seconds and
     # cancelled healthy runs (#1220 died at 40m18s). Sized at ~1.5x the slowest observed
@@ -136,6 +158,12 @@ jobs:
         shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v6
+        with:
+          # egress-guard-differential resolves the predecessor commit of the egress classifier and
+          # diffs HEAD's verdicts against it. A depth-1 clone reaches no role-carrying ancestor of
+          # agui.ts, so the resolver cell fails with "deepen the checkout" and takes shard 0 with
+          # it. Same reason the unit job pins this.
+          fetch-depth: 0
       - uses: pnpm/action-setup@v6.0.8
         with:
           standalone: true
@@ -182,6 +210,7 @@ jobs:
         run: /usr/bin/git --no-replace-objects show "$GITHUB_SHA:bin/smoke/verify-shard-inputs.sh" | /usr/bin/bash --noprofile --norc -s -- "$GITHUB_SHA" ${{ matrix.shard }} 4 ci "${{ steps.smoke-tools.outputs.node_path }}" "${{ steps.smoke-tools.outputs.node_target }}" "${{ steps.smoke-tools.outputs.node_sha }}" "${{ steps.smoke-tools.outputs.pnpm_path }}" "${{ steps.smoke-tools.outputs.pnpm_target }}" "${{ steps.smoke-tools.outputs.pnpm_sha }}"
 
   live:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     timeout-minutes: 25
     runs-on: ubuntu-latest
     steps:
@@ -222,6 +251,8 @@ jobs:
           herdr --version
       - name: Build
         run: pnpm build
+      - name: Web console auth
+        run: pnpm smoke:web-console-auth
       - name: Spawn manifest live smoke
         run: pnpm smoke:spawn-manifest:live
       - name: Cooperative-stop live smoke
@@ -263,11 +294,14 @@ jobs:
         run: pnpm smoke:cmux
       - name: OpenCode cooperative-stop smoke test
         run: pnpm smoke:opencode-coop
+      - name: Transport liveness unit baseline
+        run: pnpm smoke:transport-liveness
 
   # Native linux-x64 and linux-arm64 SO_PEERCRED helpers, then one pack on x64
   # that assembles BOTH into the tarball the ARM load job consumes unchanged.
   # The ARM load job must not rebuild. A queued-never-started job is not a measurement.
   seat-native-linux-x64:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     name: seat native (linux-x64)
     timeout-minutes: 15
     runs-on: ubuntu-latest
@@ -289,6 +323,7 @@ jobs:
           retention-days: 7
 
   seat-native-linux-arm64:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     name: seat native (linux-arm64)
     timeout-minutes: 15
     runs-on: ubuntu-24.04-arm
@@ -310,6 +345,7 @@ jobs:
           retention-days: 7
 
   seat-pack:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     name: seat pack (assembled)
     timeout-minutes: 20
     needs: [seat-native-linux-x64, seat-native-linux-arm64]
@@ -346,6 +382,7 @@ jobs:
           retention-days: 7
 
   seat-linux-arm64:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     name: seat load (linux-arm64, same artifact)
     timeout-minutes: 15
     needs: [seat-pack]
@@ -422,12 +459,15 @@ jobs:
           EOF
 
   ci-ok:
-    # Single required status. It owns the explicit live diagnosis too: adding a separate
+    # One aggregate status, advisory on main: no ruleset requires it, and `attribution` is the only
+    # required context. A ruleset that did require it would have to name the check run
+    # `ci-ok (live outcome classified)`, since a context spelled `ci-ok` matches nothing.
+    # It owns the explicit live diagnosis too: adding a separate
     # always-running dependent job was measured on PR #1043 and left a superseded run queued
     # through TWO later runner jobs, which held the replacement run behind it. ARM validation
     # jobs may sit on ci-ok's needs as long as they are not always-running aggregates.
     name: ci-ok (live outcome classified)
-    if: always()
+    if: ${{ always() && github.event_name != 'workflow_dispatch' }}
     needs: [unit, smoke, live, seat-pack, seat-linux-arm64]
     runs-on: ubuntu-latest
     permissions:
@@ -457,3 +497,35 @@ jobs:
         run: |
           echo "unit=${{ needs.unit.result }} smoke=${{ needs.smoke.result }} live=${{ needs.live.result }} seat-pack=${{ needs.seat-pack.result }} seat-linux-arm64=${{ needs.seat-linux-arm64.result }}"
           [ "${{ needs.unit.result }}" = "success" ] && [ "${{ needs.smoke.result }}" = "success" ] && [ "${{ needs.live.result }}" = "success" ] && [ "${{ needs.seat-pack.result }}" = "success" ] && [ "${{ needs.seat-linux-arm64.result }}" = "success" ]
+
+  validator-lock-acquisition:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.acquisition == 'validators-0155' }}
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6.0.8
+        with:
+          version: 11.28.2
+          run_install: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Generate fixed validator lock for review
+        env:
+          ACQUISITION_MODE: ${{ inputs.acquisition }}
+        run: node scripts/ci-validator-lock-acquisition.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validator-lock-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/validator-lock-${{ github.run_id }}-${{ github.run_attempt }}/core-package.json
+            ${{ runner.temp }}/validator-lock-${{ github.run_id }}-${{ github.run_attempt }}/pnpm-lock.yaml
+            ${{ runner.temp }}/validator-lock-${{ github.run_id }}-${{ github.run_attempt }}/source.diff
+            ${{ runner.temp }}/validator-lock-${{ github.run_id }}-${{ github.run_attempt }}/receipt.json
+          if-no-files-found: error
+          retention-days: 7

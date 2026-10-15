@@ -25,7 +25,7 @@ import {
 } from "@cotal-ai/core";
 import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
 import { askManager, epRailFailure } from "../src/lib/control.js";
-import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { SMOKE_BROKER_TOKEN, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
 
 let pass = 0, fail = 0;
 const c = (name: string, cond: boolean, extra?: unknown) => {
@@ -93,7 +93,7 @@ console.log("epRailFailure polarity (hand-built errors, one per producer shape):
   c("answered ok:false describe pinned: still no 'did not answer'", p.unanswered === false && !VERDICT.test(p.error ?? ""), p);
 }
 {
-  // endpoint-contract-store.ts:234 a store read AFTER an answered describe (unmarked `unavailable`).
+  // endpoint-contract-store.ts:225 a store read AFTER an answered describe (unmarked `unavailable`).
   const r = epRailFailure(ep("unavailable", "the contract-store read for abc failed (a failed observation is never absence, SPEC 13.7): stream not found"));
   c("post-describe store read (`unavailable`, unmarked): unanswered=false, NO verdict", r.unanswered === false && r.error?.startsWith("unavailable: the contract-store read") === true && !VERDICT.test(r.error), r);
   // endpoint-verbs.ts epCall `one`: a VALID reply landed with no budget left to verify currency (unmarked `deadline-exceeded`).
@@ -242,7 +242,7 @@ try {
   }
   await nc.drain();
 } finally {
-  broker.kill("SIGTERM");
+  await killAndAwaitExit(broker);
   rmSync(sd, { recursive: true, force: true });
   releaseBroker(); // last: ownership is held until this teardown has actually finished
 }

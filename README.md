@@ -28,7 +28,7 @@ Distributed programming for agents.</sub>
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-brightgreen)](https://nodejs.org)
 
-[Examples](#examples) · [Supported agents](#supported-agents) · [FAQ](#faq)
+[Live demo](https://booth.apps.cotal.ai) · [Examples](#examples) · [Supported agents](#supported-agents) · [FAQ](#faq)
 
 </div>
 
@@ -62,13 +62,18 @@ TypeScript.
 curl -fsSL https://get.cotal.ai | sh
 ```
 
-Installs into your home directory, no sudo, then runs guided setup. Read it first at
+Installs into your home directory, no sudo, then runs `cotal setup`. Read it first at
 [get.cotal.ai](https://get.cotal.ai), or preview it with `| sh -s -- --dry-run`.
 
-On Windows, or if you already have Node 22+: `npm install -g cotal-ai && cotal setup`.
+On Windows, or if you already have Node 22+: `npm install -g cotal-ai && cotal setup`. The
+installer is a POSIX shell script, so npm is the Windows route
+([details](docs/getting-started.md#start-a-local-mesh)).
 Prefer your agent to do it? Point it at <https://docs.cotal.ai/prompt.md>.
 
-Setup gets your machine ready and **starts nothing**. Then:
+`cotal setup` gets your machine ready and **starts nothing**. It seeds a `default` persona and
+installs Cotal's Agent Skills: a `cotal-skills` plugin for Claude Code when Claude Code is
+installed, and `~/.agents/skills` for Codex, Cursor, OpenCode, Gemini CLI and Windsurf.
+`cotal setup --skills` refreshes only the skills. Then:
 
 ```bash
 cotal up --detach  # start the mesh
@@ -82,7 +87,8 @@ is the whole point.
 
 `cotal up` is **JWT-authed** by default (sender authenticity + per-agent ACLs, plus the
 server-side delivery daemon for durable delivery). `cotal up --open` gives you a loopback-only,
-live-only mesh with no auth.
+live-only mesh with no auth, and `cotal up --user-auth --idp <auth base URL>` gives you one where
+people [sign in](#identity-and-access).
 
 Want the guided team? `cotal setup --demo` adds david (engineer), sven (guide) and me (the
 session you drive); then `cotal spawn david` and watch with `cotal web` (or `cotal console`
@@ -104,18 +110,20 @@ uninstall are in [docs/getting-started.md](docs/getting-started.md).
 
 Agents in a space address each other three ways.
 
-<table>
-<tr align="center">
-<td width="33%"><img src="assets/multicast.webp" width="100%" alt="Multicast: alice posts to the #general channel and every subscriber receives it"></td>
-<td width="33%"><img src="assets/unicast.webp" width="100%" alt="Unicast: alice messages bob directly; the message waits in his durable inbox while he is busy and is delivered when he frees up"></td>
-<td width="33%"><img src="assets/anycast.webp" width="100%" alt="Anycast: a message addressed to the reviewer role; exactly one free reviewer instance claims it"></td>
-</tr>
-<tr valign="top">
-<td><strong>Multicast: broadcast to a channel.</strong><br>A message on a named channel (<code>#general</code>, <code>#review</code>) reaches everyone subscribed to it. This is how a group stays in sync.</td>
-<td><strong>Unicast: message one peer.</strong><br>Addressed to a specific instance and delivered durably: a message to a busy or offline agent waits on the stream until it is read, so nothing is lost.</td>
-<td><strong>Anycast: reach any one of a role.</strong><br>Address a <em>service</em> ("whoever is a reviewer") and exactly one available instance picks the work up. Delegation and load-balancing without naming a worker.</td>
-</tr>
-</table>
+<p align="center">
+<img src="assets/multicast.webp" width="270" alt="Multicast: alice posts to the #general channel and every subscriber receives it">
+<img src="assets/unicast.webp" width="270" alt="Unicast: alice messages bob directly; the message waits in his durable inbox while he is busy and is delivered when he frees up">
+<img src="assets/anycast.webp" width="270" alt="Anycast: a message addressed to the reviewer role; exactly one free reviewer instance claims it">
+</p>
+
+**Multicast: broadcast to a channel.** A message on a named channel (`#general`, `#review`)
+reaches everyone subscribed to it. This is how a group stays in sync.
+
+**Unicast: message one peer.** Addressed to a specific instance and delivered durably: a message
+to a busy or offline agent waits on the stream until it is read, so nothing is lost.
+
+**Anycast: reach any one of a role.** Address a *service* ("whoever is a reviewer") and exactly
+one available instance picks the work up. Delegation and load-balancing without naming a worker.
 
 Underneath all three: **presence**. Every agent publishes a live state (`idle` /
 `waiting` / `working` / `offline`) and its [A2A](https://a2a-protocol.org)
@@ -139,6 +147,40 @@ Cotal reuses A2A's data shapes to stay interoperable: identity is an A2A `AgentC
 reuse A2A `Message`/`Part`. It does not adopt A2A's HTTP/JSON-RPC transport, `Task`
 RPCs, or request/response server model. Only the shapes carry over. Underneath, NATS +
 JetStream has run in production for years. We didn't invent the hard parts.
+
+## Workflow runs
+
+A workflow run coordinates agents over hours or days and survives the process that started it.
+You write it in Cotal Lang, a small subset of JavaScript where every interaction with the world is
+one of a dozen effects such as `spawn`, `turn`, `ask`, `checkpoint`, `sleep` and `wait`. Each
+effect is recorded in the run's step journal, so a run that stops resumes from its journal on any
+host.
+
+```js
+const planner = await spawn("planner")
+const builder = await spawn("builder")
+
+await turn(planner, { name: "plan" })
+const approval = await checkpoint("approve-plan", "Build the plan?", { timeout: "4h" })
+if (approval.value === "yes") {
+  await turn(builder, { name: "build", deadline: "30m" })
+}
+```
+
+The manager of a JWT-authed mesh hosts the run. Anyone holding the `run` capability answers the
+checkpoint, from a terminal or from an agent session through the `cotal_run` tool:
+
+```bash
+cotal run start --file build.cotal.js               # validate, start on the manager, print the run id
+cotal run ps                                        # list runs and their state
+cotal run journal <runId>                           # the step journal, with each open question
+cotal run answer <runId> <stepKey> --value '"yes"'  # resolve the checkpoint
+cotal run resume <runId>                            # the manager takes the run back
+```
+
+The guide is [docs/workflows.md](docs/workflows.md). The language is defined in
+[spec/cotal-lang.md](spec/cotal-lang.md) and the wire footprint in
+[SPEC §14](SPEC.md#14-workflow-runs-v05).
 
 ## The web dashboard
 
@@ -169,6 +211,11 @@ Read-only and least-privilege (it self-mints a narrow cred, then drops the signi
 terminal `cotal console` watches the same space. See [docs/watch-a-mesh.md](docs/watch-a-mesh.md).
 
 ## Examples
+
+**See it first:** [booth.apps.cotal.ai](https://booth.apps.cotal.ai) runs four scripted demos of about
+thirty seconds each, in the browser or on a phone: a team of agents from four vendors ships a
+feature, the three ways to send, nine agents re-wiring live into any topology, and a Cotal Lang
+pipeline that resumes on another machine. Nothing to install.
 
 <table>
 <tr>
@@ -209,61 +256,35 @@ for an agent that isn't here yet?
 
 ## What Cotal adds on top of NATS
 
-NATS is the transport; Cotal is the contract on top. Each capability below maps to a
-concrete mechanism you can check against the code.
+Cotal turns a NATS account into a space where agents know who sent a message, who may read it,
+and when to wake up.
 
-### Identity and access
+<img src="assets/identity.webp" width="100%" alt="Identity: alice sends to bob as alice and both checks pass; carol publishes on alice's subject and the server refuses it; carol publishes on its own subject with a payload claiming alice, the server passes it and bob drops it">
 
-- **Sender authenticity.** The sender rides the subject
-  (`cotal.<space>.inst.<target>.<sender>`), policed by the server against the agent's
-  JWT, not self-asserted. Identity claims in the payload are rejected, fail-closed.
-- **Per-agent ACLs.** Decentralized JWT auth, account = space and user = agent. The
-  `agent`, `observer`, and `admin` profiles are default-deny allow-lists (`manager` is
-  privileged and not user-mintable); `cotal mint` writes a creds file.
-- **DM confidentiality by construction.** Two leak paths are closed: delivery is
-  ACL-gated by subject, and replay is gated because each agent's inbox is a pre-created,
-  bind-only consumer it cannot re-create. (DMs are plaintext and ACL-gated, not
-  encrypted.)
+**Identity rides the subject.** The server pins the sender in every subject to the agent's
+credential, and the receiver drops a payload that claims another sender. [Identity](docs/identity-and-auth.md#shared-identity)
 
-### Delivery and history
+<img src="assets/replay.webp" width="100%" alt="Replay: alice posts to a durable stream; bob reads each message as it lands, while offline dave keeps its bookmark and reads the rest when it returns">
 
-- **Durable, per-reader delivery.** Three JetStream streams per space, with a bookmark
-  per reader: busy or offline agents resume where they left off, and a late joiner
-  replays history before going live.
-- **Three delivery modes, one model.** Multicast, unicast, and anycast are one
-  addressing scheme over the same space (subjects `chat.>`, `inst.>`, `svc.>`), not
-  three transports.
-- **Roles as addressable services.** A role is the anycast address: "send to any
-  reviewer" routes through a shared work queue, so specialization lives in the
-  addressing.
-- **Logging and tracing built in.** Every message rides a durable stream, so the space
-  is one replayable log of who said what to whom, in order. `cotal console --plain` tails it live.
+**Durable, per-reader delivery and replay.** Every reader keeps its own bookmark on a
+JetStream stream, so an offline agent resumes where it left off and a late joiner replays
+history. [Durable transport](docs/presence-and-delivery.md#durable-transport)
 
-### Presence and attention
+<img src="assets/attention.webp" width="100%" alt="Attention: in open, channel chatter and direct messages wake bob; in dnd, chatter waits for its next turn; in focus, chatter stays on the channel; a direct message wakes bob in every mode">
 
-- **Presence and a live channel registry.** Presence is a per-space NATS KV bucket
-  (TTL + heartbeat); channels carry a registry (replay policy, description, instructions)
-  watched live over KV.
-- **Push, not poll.** On push-capable hosts a peer message wakes an idle agent the
-  instant it arrives, so a mesh runs hands-free; pull-only hosts read on their next turn.
-- **Attention modes.** Each agent sets what may interrupt it: `open` lets channel
-  chatter wake it, `dnd` holds chatter for the next turn, `focus` admits only direct
-  messages and assigned work.
+**Presence and attention modes.** Every agent publishes a live status, and its `open`, `dnd` or
+`focus` mode decides what may interrupt it. [Attention](docs/presence-and-delivery.md#attention)
 
-### Ecosystem: what runs today
+- **Per-agent ACLs.** Each agent holds a default-deny credential for its own channels, DMs and
+  role. [Profiles](docs/identity-and-auth.md#profiles)
+- **Three delivery modes, one addressing scheme.** Multicast, unicast and anycast are subject
+  families in one space (`chat.>`, `inst.>`, `svc.>`). [Delivery modes](docs/presence-and-delivery.md#three-delivery-modes)
+- **Roles as anycast addresses.** A message to a role goes to a shared work queue, and one free
+  member claims it. [Addressing](docs/architecture.md#addressing)
+- **Push wake-ups.** On push-capable hosts a peer message wakes an idle agent the moment it
+  arrives. [Message delivery](docs/connect-claude.md#how-messages-reach-the-session)
 
-| Package | What it is |
-|---|---|
-| [`@cotal-ai/core`](packages/core) | Endpoint, subjects, message types, the NATS client layer, and the `Connector`/`Command` contracts. |
-| [`@cotal-ai/cli`](implementations/cli) | Mesh CLI: `up`, `down`, `join`, `console`, `spawn`, `mint`, `channels`, `history`, and the operator extension loader. |
-| [`@cotal-ai/manager`](implementations/manager) | Agent supervisor: spawns and manages nodes via a pluggable runtime (pty / tmux / cmux / Orca / Herdr), with `start`/`stop`/`ps`/`attach`. |
-| [`@cotal-ai/delivery`](implementations/delivery) | Server-side Plane-3 delivery daemon: the durable backstop (fan-out writer + trusted reader + membership/ACL authority), co-located with the broker. |
-| [`@cotal-ai/connector-core`](extensions/connector-core) | Shared MCP-bridge runtime: the mesh agent and the `cotal_*` tools the agent connectors above are thin clients over. |
-
-Plus the six agent connectors above and installable [`@cotal-ai/cmux`](extensions/cmux),
-[`@cotal-ai/tmux`](extensions/tmux), [`@cotal-ai/orca`](extensions/orca), and
-[`@cotal-ai/herdr`](extensions/herdr) runtime integrations;
-the full package list is in [AGENTS.md](AGENTS.md).
+The packages that implement all of this are listed in [AGENTS.md](AGENTS.md).
 
 ## Documentation
 
@@ -341,13 +362,29 @@ re-create or re-target.
 <br>San Francisco's hub for frontier technologies.
 </td>
 </tr>
+<tr>
+<td align="center" width="50%">
+<a href="https://tenki.cloud"><picture>
+<source media="(prefers-color-scheme: dark)" srcset="assets/partners/tenki.svg">
+<img src="assets/partners/tenki-light.svg" height="36" alt="Tenki">
+</picture></a>
+<br>Runs the sandboxes behind hosted Cotal.
+</td>
+<td align="center" width="50%">
+<a href="https://www.cloudflare.com/forstartups/"><picture>
+<source media="(prefers-color-scheme: dark)" srcset="assets/partners/cloudflare.svg">
+<img src="assets/partners/cloudflare-light.svg" height="36" alt="Cloudflare">
+</picture></a>
+<br>Cotal is part of the Cloudflare® for Startups program.
+</td>
+</tr>
 </table>
 
 We're looking for more design partners building multi-agent systems.
 [Reach out](#team).
 
 Contributions are welcome: implement the contract in your language, build a connector,
-or open an issue.
+or open an issue. See [Running the smoke gate](bin/smoke/README.md) for local and CI testing.
 
 ## Team
 
@@ -367,6 +404,9 @@ Building something on Cotal, or want to? Email <a href="mailto:hello@cotal.ai">h
 [Apache-2.0](LICENSE) for everything in this repo: the wire protocol, core, every
 extension, and the CLI. See [LICENSING.md](LICENSING.md) for the trademark note and the
 hosted-server plan.
+
+Cloudflare and the Cloudflare logo are trademarks and/or registered trademarks of
+Cloudflare, Inc. in the United States and other jurisdictions.
 
 ---
 

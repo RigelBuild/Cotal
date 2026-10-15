@@ -45,6 +45,8 @@ import {
   headBeginRetirement,
   headCompleteRetirement,
   type EvictionResult,
+  STATIC_SLOT_PREFIX,
+  walkKvLatest,
 } from "@cotal-ai/core";
 import type { KV } from "@nats-io/kv";
 
@@ -78,6 +80,9 @@ export interface StaticSlotObservationDetail extends EpErrorDetail {
   headRevision?: number;
   readOrder: ["slot", "head"];
   consistency: "ordered-not-atomic";
+  /** Present only when the slot row names a different manager instance as its owner: the name
+   *  belongs to that sibling, so the miss is neither absence nor this manager's contradiction. */
+  ownerInstanceId?: string;
 }
 
 /** Stable string projection for callers that render only `error.message`. The structured detail is
@@ -107,23 +112,14 @@ function boundedStaticRead<T>(record: "slot" | "head", read: Promise<T>): Promis
     .catch((error) => { throw new StaticSlotReadError(record, error); });
 }
 
-/** Point-read one durable slot, then its principal-keyed lifecycle head. Absence is returned only
- * after the slot read itself succeeded; callers must surface a store failure rather than converting
- * an unknown observation into `not-found`, which is the ambiguity this projection removes. */
-export async function observeStaticSlot(
-  recordsKv: KV,
-  owner: string,
-  alias: string,
-  managerInstanceId: string,
-): Promise<StaticSlotObservationDetail | undefined> {
-  const t = staticLifecycleTransport(recordsKv, recordsKv);
-  const slot = await boundedStaticRead("slot", readStaticSlot(t, owner, alias));
-  if (slot === undefined) return undefined;
-  // `inspect` remains an instance-local reader. A sibling manager's durable row is not a miss on
-  // this manager becoming global by accident. Legacy rows predate multi-manager ownership and keep
-  // the existing single-manager interpretation used by boot reconciliation.
-  if (slot.row.ownerInstanceId !== undefined && slot.row.ownerInstanceId !== managerInstanceId) return undefined;
-  const head = await boundedStaticRead("head", headCandidate(t, slot.row.owner, slot.row.actor));
+/** Build the `StaticSlotObservationDetail` projection from an already-read slot row and its
+ * optional already-read lifecycle head. Shared by the single-alias `observeStaticSlot` and the
+ * multi-row `listStaticSlotObservations` enumeration, so the two never drift on which fields the
+ * head contributes. */
+function projectStaticSlotObservation(
+  slot: { row: StaticManagedSlotRow; revision: number },
+  head: { mapping: LifecycleMapping; revision: number } | undefined,
+): StaticSlotObservationDetail {
   return {
     kind: STATIC_SLOT_OBSERVATION_DETAIL,
     name: slot.row.alias,
@@ -144,11 +140,62 @@ export async function observeStaticSlot(
   };
 }
 
+/** Whether a durable static slot row belongs to a sibling manager instance. A legacy row with no
+ *  `ownerInstanceId` predates multi-manager ownership and counts as this instance's. Every reader
+ *  that decides ownership calls this one rule, because the boot sweep terminalizes the rows it
+ *  believes are its own and `inspect`, `slots` and reconcile must agree with it. */
+export function ownedBySibling(row: StaticManagedSlotRow, managerInstanceId: string): boolean {
+  return row.ownerInstanceId !== undefined && row.ownerInstanceId !== managerInstanceId;
+}
+
+/** Point-read one durable slot, then its principal-keyed lifecycle head. Absence is returned only
+ * after the slot read itself succeeded; callers must surface a store failure rather than converting
+ * an unknown observation into `not-found`, which is the ambiguity this projection removes. */
+export async function observeStaticSlot(
+  recordsKv: KV,
+  owner: string,
+  alias: string,
+  managerInstanceId: string,
+): Promise<StaticSlotObservationDetail | undefined> {
+  const t = staticLifecycleTransport(recordsKv, recordsKv);
+  const slot = await boundedStaticRead("slot", readStaticSlot(t, owner, alias));
+  if (slot === undefined) return undefined;
+  // `inspect` remains an instance-local reader: a sibling manager's durable row never becomes this
+  // manager's own contradiction. A nonretired one still says the name belongs elsewhere, so it is
+  // returned labelled with its owner instead of collapsing into a `not-found` that a caller cannot
+  // tell from absence (#443).
+  const sibling = ownedBySibling(slot.row, managerInstanceId) ? slot.row.ownerInstanceId : undefined;
+  if (sibling !== undefined && slot.row.phase === "retired") return undefined;
+  const head = await boundedStaticRead("head", headCandidate(t, slot.row.owner, slot.row.actor));
+  return { ...projectStaticSlotObservation(slot, head), ...(sibling !== undefined ? { ownerInstanceId: sibling } : {}) };
+}
+
+/** Enumerate every nonretired durable static slot this manager instance owns, projected the same
+ * way `observeStaticSlot` projects one. It reads the rows through {@link walkStaticSlots}, the
+ * enumeration the boot sweep in `Manager.reconcileStaticLifecycles` also uses. Sibling-owned rows
+ * ({@link ownedBySibling}) and `retired` rows are dropped BEFORE the head read, so N slot rows cost
+ * N slot reads plus only the survivors' head reads. Sorted by alias. */
+export async function listStaticSlotObservations(
+  recordsKv: KV,
+  owner: string,
+  managerInstanceId: string,
+): Promise<StaticSlotObservationDetail[]> {
+  const t = staticLifecycleTransport(recordsKv, recordsKv);
+  const survivors = (await walkStaticSlots(recordsKv, owner))
+    .filter(({ row }) => !ownedBySibling(row, managerInstanceId) && row.phase !== "retired");
+  const out: StaticSlotObservationDetail[] = [];
+  for (const slot of survivors) {
+    const head = await boundedStaticRead("head", headCandidate(t, slot.row.owner, slot.row.actor));
+    out.push(projectStaticSlotObservation(slot, head));
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+
 function sameAudit(a: StaticLifecycleAuditSpec, b: StaticLifecycleAuditSpec): boolean {
   return a.v === b.v && a.principal === b.principal && a.alias === b.alias && a.lifecycleUid === b.lifecycleUid &&
-    a.managerInstance === b.managerInstance && a.managerProcessUid === b.managerProcessUid && a.retirementOpId === b.retirementOpId &&
-    a.broker.kicked === b.broker.kicked && a.broker.remaining === b.broker.remaining &&
-    a.broker.scanComplete === b.broker.scanComplete && a.broker.verifiedGone === b.broker.verifiedGone;
+    a.managerInstance === b.managerInstance && a.retirementOpId === b.retirementOpId;
 }
 
 /** The terminal barrier's verified-eviction step, over the SPEC'S TARGET SET.
@@ -204,7 +251,9 @@ async function evictAndAudit(
     try { value = JSON.parse(new TextDecoder().decode(existing.value)); }
     catch { throw new EpEnvelopeError("failed-precondition", `lifecycle audit ${key} conflict is malformed`); }
     if (!sameAudit(value as StaticLifecycleAuditSpec, spec)) throw new EpEnvelopeError("already-exists", `lifecycle audit ${key} records different evidence`);
-    // Timestamp may differ only after the stable manager identities and retirement op prove the same retry.
+    // The first attempt's record stands. A retry can run in a later manager process, or after an
+    // earlier attempt already kicked the connections, so the process uid, broker counts and timestamp
+    // describe only the attempt that wrote the record; the retirement op identifies the retirement.
   }
 }
 
@@ -224,6 +273,12 @@ export function staticLifecycleTransport(recordsKv: KV, authKv: KV): LifecycleSt
   };
 }
 
+function slotOf(key: string, entry: LifecycleKvEntry): { row: StaticManagedSlotRow; revision: number } {
+  if (entry.operation !== "PUT")
+    throw new EpEnvelopeError("failed-precondition", `the static slot row ${key} carries a ${entry.operation} marker; a slot row is never deleted (corruption, not absence)`);
+  return { row: parseStaticSlotRow(entry.value, key), revision: entry.revision };
+}
+
 /** Read one slot row (DEL/PURGE marker = corruption, never absence — supervision state is
  *  CASed over, never deleted). */
 export async function readStaticSlot(
@@ -233,10 +288,18 @@ export async function readStaticSlot(
 ): Promise<{ row: StaticManagedSlotRow; revision: number } | undefined> {
   const key = staticSlotKey(owner, alias);
   const entry = await t.getRecord(key);
-  if (!entry) return undefined;
-  if (entry.operation !== "PUT")
-    throw new EpEnvelopeError("failed-precondition", `the static slot row ${key} carries a ${entry.operation} marker; a slot row is never deleted (corruption, not absence)`);
-  return { row: parseStaticSlotRow(entry.value, key), revision: entry.revision };
+  return entry ? slotOf(key, entry) : undefined;
+}
+
+/** Read every slot row of `owner` in one walk of its `STATIC_SLOT_PREFIX` key range. The walk keeps
+ *  markers, because a reader that skipped one would report a corrupt row as absent where
+ *  {@link readStaticSlot} refuses it. It reads over `STREAM.MSG.GET`, the verb every point read
+ *  already holds: `.keys()` would bind an ephemeral ordered CONSUMER, which the goal-writer's
+ *  standing connection is deliberately denied on the records stream (SPEC 13.9 site 3 /
+ *  nats-server#8274: a CONSUMER.CREATE body is not subject-ACL confinable, so a durable minted
+ *  there would outlive the connection). */
+export async function walkStaticSlots(recordsKv: KV, owner: string): Promise<{ row: StaticManagedSlotRow; revision: number }[]> {
+  return (await walkKvLatest(recordsKv, `${STATIC_SLOT_PREFIX}.${owner}.>`)).map((e) => slotOf(e.key, e));
 }
 
 /** Persist the F3 durable OUTER spawn intent — phase `provisioning`, written BEFORE the head
@@ -452,7 +515,7 @@ export async function runStaticTerminal(
       await casStaticSlot(t, { ...cur.row, phase: "retired" }, cur.revision);
     return "retired";
   }
-  if (gate.row.state === "frozen" && gate.row.op?.kind === "activation") {
+  if (gate.row.state === "frozen" && gate.row.op.kind === "activation") {
     // A crashed ACTIVATION. Two durable shapes, decided by the head (§13.1: the saga writes the
     // head BEFORE its reopen):
     const head = await headCandidate(t, args.owner, args.actor);
@@ -472,18 +535,18 @@ export async function runStaticTerminal(
         await casStaticSlot(t, { ...cur.row, phase: "retired" }, cur.revision);
       return "retired";
     }
-  } else if (gate.row.state === "frozen" && gate.row.op?.kind !== "retirement") {
-    throw lifecycleBlocked("failed-precondition", `the issuance gate for ${args.lifecycleUid} is frozen by a ${gate.row.op?.kind ?? "<unknown>"} (op ${gate.row.op?.opId ?? "<none>"}); a foreign barrier is in flight - refuse (SPEC 13.1)`, {
-      blockedOp: (gate.row.op?.kind === "takeover" || gate.row.op?.kind === "registration" || gate.row.op?.kind === "activation") ? gate.row.op.kind : "registration",
-      headState: "retiring",
-      ...(gate.row.op?.opId !== undefined ? { opId: gate.row.op.opId } : {}),
-      remedy: gate.row.op?.kind === "registration" ? "cotal reconcile-gate" : "retry",
+  } else if (gate.row.state === "frozen" && gate.row.op.kind !== "retirement") {
+    throw lifecycleBlocked("failed-precondition", `the issuance gate for ${args.lifecycleUid} is frozen by a ${gate.row.op.kind} (op ${gate.row.op.opId}); a foreign barrier is in flight - refuse (SPEC 13.1)`, {
+      blockedOp: gate.row.op.kind,
+      gateState: "frozen",
+      opId: gate.row.op.opId,
+      remedy: gate.row.op.kind === "registration" ? "cotal reconcile-gate" : "retry",
     });
-  } else if (gate.row.state === "frozen" && gate.row.op?.opId !== args.opId) {
-    throw lifecycleBlocked("failed-precondition", `the issuance gate for ${args.lifecycleUid} is frozen by retirement op ${gate.row.op?.opId ?? "<none>"}, not ${args.opId}; one retirement at a time (SPEC 13.1)`, {
+  } else if (gate.row.state === "frozen" && gate.row.op.opId !== args.opId) {
+    throw lifecycleBlocked("failed-precondition", `the issuance gate for ${args.lifecycleUid} is frozen by retirement op ${gate.row.op.opId}, not ${args.opId}; one retirement at a time (SPEC 13.1)`, {
       blockedOp: "retirement",
-      headState: "retiring",
-      ...(gate.row.op?.opId !== undefined ? { opId: gate.row.op.opId } : {}),
+      gateState: "frozen",
+      opId: gate.row.op.opId,
       remedy: "retry",
     });
   }

@@ -1,7 +1,7 @@
 {
   "name": "@cotal-ai/zellij",
   "description": "Cotal Zellij integration: runtime provider for spawning agents in Zellij panes.",
-  "version": "0.53.0",
+  "version": "0.82.0",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

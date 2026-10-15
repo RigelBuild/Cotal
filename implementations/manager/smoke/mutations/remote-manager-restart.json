@@ -12,7 +12,7 @@
       "name": "remote registration drops host eviction wiring",
       "file": "implementations/manager/src/remote-register.ts",
       "find": "      evict: args.evict,",
-      "replace": "      evict: async () => false,",
+      "replace": "      evict: async (principals) => principals.map(() => false),",
       "expectRed": "same remote manager instance restarts after clean expired-executor deregistration",
       "cell": "same remote manager instance restarts after clean expired-executor deregistration",
       "afterRestore": "pnpm --filter @cotal-ai/core build && pnpm --filter @cotal-ai/auth build && pnpm --filter @cotal-ai/manager build"
@@ -20,8 +20,8 @@
     {
       "name": "clean stop reuses the stale remote executor",
       "file": "implementations/manager/src/manager.ts",
-      "find": "    if (this.remoteAuthority && (!this.remoteExecutorCreds || inspectCredHealth(this.remoteExecutorCreds).state !== \"healthy\"))\n      await this.renewRemoteExecutor(true);",
-      "replace": "",
+      "find": "      if (this.leaseStopping) await this.renewRemoteExecutor(true);",
+      "replace": "      if (this.leaseStopping) await this.renewRemoteStandingBundle(true);",
       "expectRed": "stock clean stop refreshes the executor and deregisters after its retained credential expires",
       "cell": "stock clean stop refreshes the executor and deregisters after its retained credential expires",
       "afterRestore": "pnpm --filter @cotal-ai/manager build"
@@ -29,17 +29,20 @@
     {
       "name": "host eviction skips caller-family membership",
       "file": "implementations/auth/src/manager-maintenance.ts",
-      "find": "    if (!holders.has(r.principal!))\n      throw new EpEnvelopeError(\"permission-denied\", `manager maintenance may evict only a holder enumerated in ${epcredFamilyPrefix(\"manager\", r.targetInstanceId)}; ${r.principal} is outside that family`);",
+      "find": "    if (outside.length > 0)\n      throw new EpEnvelopeError(\"permission-denied\", `manager maintenance may evict only holders enumerated in ${epcredFamilyPrefix(\"manager\", r.targetInstanceId)}; outside that family: ${outside.join(\", \")}`);",
       "replace": "",
       "expectRed": "host maintenance refuses a principal outside the caller instance family",
       "cell": "host maintenance refuses a principal outside the caller instance family",
-      "afterRestore": "pnpm --filter @cotal-ai/core build && pnpm --filter @cotal-ai/auth build"
+      "afterRestore": "pnpm --filter @cotal-ai/core build && pnpm --filter @cotal-ai/auth build",
+      "command": "pnpm --filter @cotal-ai/core build && pnpm --filter @cotal-ai/auth build && pnpm smoke:manager-service-authority",
+      "completionMarker": "manager-service-authority:",
+      "note": "This entry is graded by the auth smoke alone: it is a counting suite whose summary line prints whether it passes or fails, so it can carry its own completion marker. The shared command chains this smoke before the acceptance suite with `&&`, so under the shared marker a real kill here never reaches the acceptance banner and grades INCONCLUSIVE."
     },
     {
       "name": "host reconciliation skips the affirmative liveness guard",
       "file": "packages/core/src/endpoint-reconcile.ts",
       "find": "  const liveness = await opts.probeHolder(row.principal);",
-      "replace": "  const liveness = { state: \"gone\" as const, detail: \"mutant skipped the oracle\" };",
+      "replace": "  const liveness = { state: \"gone\", detail: \"mutant skipped the oracle\" } as HolderLiveness;",
       "expectRed": "a foreign manager gets in only after the holder is proven gone",
       "cell": "a foreign manager gets in only after the holder is proven gone",
       "afterRestore": "pnpm --filter @cotal-ai/core build && pnpm --filter @cotal-ai/auth build && pnpm --filter @cotal-ai/manager build"

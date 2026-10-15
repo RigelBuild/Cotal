@@ -120,20 +120,20 @@ check(
 const sent = await agent.dm("agent-id", "please review");
 check(
   "DM to an agent by exact instance id is sent",
-  sent.peer.card.kind === "agent" && unicastTargets.join(",") === "agent-id:please review",
+  sent.peer?.card.kind === "agent" && unicastTargets.join(",") === "agent-id:please review",
   unicastTargets,
 );
 const operatorSent = await agent.dm("operator-id", "please review");
 check(
   "DM to an operator endpoint that reads direct messages is sent",
-  operatorSent.peer.card.role === "operator" &&
+  operatorSent.peer?.card.role === "operator" &&
     unicastTargets.join(",") === "agent-id:please review,operator-id:please review",
   unicastTargets,
 );
 const hostSent = await agent.dm("host-id", "please review");
 check(
   "DM to a consuming studio host endpoint is sent",
-  hostSent.peer.card.role === "host" &&
+  hostSent.peer?.card.role === "host" &&
     unicastTargets.join(",") === "agent-id:please review,operator-id:please review,host-id:please review",
   unicastTargets,
 );

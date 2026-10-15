@@ -256,7 +256,7 @@ export const RECORD_KINDS: Record<string, RecordKindDef> = {
     mediation: "mediated",
   },
   goalidx: {
-    // The MANAGER-ENDPOINT reconcile index (P2 item 2 must-5, Q-B): one atomic unsplit key per
+    // The MANAGER-ENDPOINT reconcile index: one atomic unsplit key per
     // IN-FLIGHT action goal, `goalidx.<e>.<cOwner>.<cActor>.<cUid>.<goalId>`, written CREATE-ONLY
     // by the goal-writer BEFORE the goal bind and DELETED at the terminal. It is the endpoint's
     // OWN durable list of accepted-but-unterminal goals: a successor incarnation (a manager
@@ -652,7 +652,7 @@ export interface MergedRecord<S = unknown, T = unknown> {
   staleProjection: boolean;
 }
 
-function decodeEntry<T>(e: KvEntry, key: string): T {
+export function decodeEntry<T>(e: KvEntry, key: string): T {
   try {
     return e.json<T>();
   } catch (err) {

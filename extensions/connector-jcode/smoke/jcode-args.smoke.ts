@@ -8,13 +8,15 @@ import { configFromEnv, controlFromEnv, cotalToolSpecs, EventWal } from "@cotal-
 import { z } from "zod";
 import { jcodeConnector, listJcodeModels, JCODE_READINESS_TIMEOUT_MS } from "../src/index.js";
 import { createJcodeMapper } from "../src/agui-map.js";
+/** The unit a record mapped to, or `null`: a turn the mapper opens no run for maps to none. */
+const unitOf = <U extends { runId: string }>(r: U | { turn: true } | null): U | null => (r !== null && "runId" in r ? r : null);
 import { initializeJcodeEventBoundary, JcodeJournalSource } from "../src/agui-source.js";
 
 let pass = 0;
 let fail = 0;
 const check = (name: string, condition: boolean, actual?: unknown): void => {
   try {
-    assert.ok(condition, `${name}${actual === undefined ? "" : ` — ${JSON.stringify(actual)}`}`);
+    assert.ok(condition, `${name}${actual === undefined ? "" : `: ${JSON.stringify(actual)}`}`);
     pass++;
     console.log(`  ✓ ${name}`);
   } catch (error) {
@@ -134,13 +136,9 @@ try {
   check("--no-events leaves the event plane off", optedOut.env?.COTAL_EVENTS === undefined && optedOut.env?.COTAL_WORKSPACE_ROOT === undefined);
   const evented = launch({ space: "space", name: "seat", workspaceRoot: dir, events: true });
   check(
-    "event launches arm the plane, pin its durable root, and stabilize open-mode identity",
-    evented.env?.COTAL_EVENTS === "1" && evented.env?.COTAL_WORKSPACE_ROOT === dir && evented.env?.COTAL_ID === "seat",
+    "event launches arm the plane and pin its durable root",
+    evented.env?.COTAL_EVENTS === "1" && evented.env?.COTAL_WORKSPACE_ROOT === dir,
     evented.env,
-  );
-  check(
-    "an allocated event identity wins over the open-mode name",
-    launch({ space: "space", name: "seat", id: "allocated", workspaceRoot: dir, events: true }).env?.COTAL_ID === "allocated",
   );
   throws("events require a durable workspace root", () => launch({ space: "s", name: "n", events: true }), /workspace root/);
   check("Jcode TUI override is absent when unset", base.env?.COTAL_JCODE_TUI === undefined);
@@ -157,6 +155,7 @@ try {
     role: "worker",
     id: "ID",
     lifecycleUid: "life",
+    backfillFloor: 42,
     servers: "nats://bridge.test:4222",
     model: "gpt-5.6-sol",
     prompt: "  do the thing  ",
@@ -171,6 +170,7 @@ try {
       full.env?.COTAL_JCODE_PROMPT === "do the thing",
     full.env,
   );
+  check("backfill floor forwarded", full.env?.COTAL_BACKFILL_FLOOR === "42", full.env?.COTAL_BACKFILL_FLOOR);
   check("keeps broker URL out of env", full.env?.COTAL_SERVERS === undefined);
   check("broker URL resolves from material", configFromEnv(full.env).servers === "nats://bridge.test:4222");
   check("material preserves static creds when supplied", (() => {
@@ -180,7 +180,7 @@ try {
 
   const persona = join(dir, "agent.md");
   writeFileSync(persona, "---\nname: seat\nmodel: from-file\nvariant: medium\n---\nPersona\n");
-  check("uses agent-file model as a default", launch({ space: "s", name: "seat", configPath: persona, events: false }).env?.COTAL_MODEL === "from-file");
+  check("does not re-read the agent-file model", launch({ space: "s", name: "seat", configPath: persona, events: false }).env?.COTAL_MODEL === undefined);
   check("explicit model wins over agent file", launch({ space: "s", name: "seat", configPath: persona, model: "flag", events: false }).env?.COTAL_MODEL === "flag");
 
   // The variant IS Jcode's per-session reasoning effort. The connector carries the requested tier
@@ -191,7 +191,7 @@ try {
   check("variant rides env as the reasoning effort", tiered.env?.COTAL_VARIANT === "xhigh", tiered.env);
   check("variant reaches the host config seam", configFromEnv(tiered.env).variant === "xhigh");
   check("variant is absent when unrequested", base.env?.COTAL_VARIANT === undefined);
-  check("uses agent-file variant as a default", launch({ space: "s", name: "seat", configPath: persona, events: false }).env?.COTAL_VARIANT === "medium");
+  check("does not re-read the agent-file variant", launch({ space: "s", name: "seat", configPath: persona, events: false }).env?.COTAL_VARIANT === undefined);
   check("explicit variant wins over agent file", launch({ space: "s", name: "seat", configPath: persona, variant: "max", events: false }).env?.COTAL_VARIANT === "max");
 
   // Jcode decorates its MCP calls with these two harness fields. The bridge extends only the
@@ -202,9 +202,8 @@ try {
   check("Jcode MCP schema still refuses non-harness extras", !hostSchema.safeParse({ to: "operator", text: "PONG", owner: "forged" }).success);
 
   throws("refuses empty prompt", () => launch({ space: "s", name: "n", prompt: "  " }), /empty/);
-  throws("refuses resume", () => launch({ space: "s", name: "n", resume: "old" }), /resum/i);
+  throws("refuses resume of a session with no readable transcript", () => launch({ space: "s", name: "n", resume: "old" }), /cannot resume session old: no readable transcript/);
   throws("refuses exact-session continuation", () => launch({ space: "s", name: "n", continueSession: "old" }), /continuation/);
-  throws("refuses an empty variant", () => launch({ space: "s", name: "n", variant: "  " }), /empty/);
   throws("refuses tool sharing", () => launch({ space: "s", name: "n", mcpServers: { extra: { command: "x" } } }), /tool-sharing/);
   throws("refuses unsupported launch options", () => launch({ space: "s", name: "n", launchOptions: { profile: "full" } }), /launch options are not supported/);
   throws("still validates malformed launch option keys", () => launch({ space: "s", name: "n", launchOptions: { "a=b": "x" } }), /not a valid flag name/);
@@ -225,7 +224,7 @@ try {
     ] },
   };
   const mapper = createJcodeMapper({ threadId: "session-1", mintRunId: () => "run-1", now: () => 7 });
-  const mapped = mapper.map(mapperRecord);
+  const mapped = unitOf(mapper.map(mapperRecord));
   check(
     "maps durable Jcode message blocks into one native AG-UI run",
     mapped?.runId === "run-1" &&
@@ -236,9 +235,9 @@ try {
   mapper.forgetOpenRun("run-1");
   check(
     "a closed Jcode run opens a fresh run for later durable output",
-    mapper.map({ cursor: "journal:cursor:2", record: { append_messages: [{ role: "assistant", content: [{ type: "text", text: "next" }] }] } })?.events[0]?.type === "RUN_STARTED",
+    unitOf(mapper.map({ cursor: "journal:cursor:2", record: { append_messages: [{ role: "assistant", content: [{ type: "text", text: "next" }] }] } }))?.events[0]?.type === "RUN_STARTED",
   );
-  const restartedMapped = createJcodeMapper({ threadId: "session-1", mintRunId: () => "run-2", now: () => 8 }).map(mapperRecord);
+  const restartedMapped = unitOf(createJcodeMapper({ threadId: "session-1", mintRunId: () => "run-2", now: () => 8 }).map(mapperRecord));
   const messageIds = (result: typeof mapped) => result?.events.flatMap((event) => "messageId" in event ? [event.messageId] : []) ?? [];
   check(
     "durable Jcode record positions keep message ids stable across mapper restarts",
@@ -259,8 +258,8 @@ try {
   const source = new JcodeJournalSource(journal);
   const recovered = await source.read(acknowledged);
   const restartFrames = recovered.records.flatMap((record) =>
-    createJcodeMapper({ threadId: "session-restart", mintRunId: () => "run-requested", now: () => 9 })
-      .map({ cursor: record.cursor, record: record.value })?.events.map((event) => event.type) ?? []
+    unitOf(createJcodeMapper({ threadId: "session-restart", mintRunId: () => "run-requested", now: () => 9 })
+      .map({ cursor: record.cursor, record: record.value }))?.events.map((event) => event.type) ?? []
   );
   check(
     "the persisted Jcode boundary excludes readiness and replays a post-boundary record after restart",

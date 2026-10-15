@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import { randomBytes } from "node:crypto";
-import { canonicalLocalProcessPath, MANAGER_PIDFILE, type LocalProcessContext } from "./local-process.js";
+import { canonicalLocalProcessPath, MANAGER_PIDFILE, stopReservationPath, type LocalProcessContext } from "./local-process.js";
 import {
   assertRecordIdentity,
   identityPinPath,
@@ -27,6 +27,11 @@ import {
  * exact manager pid plus the live stop reservation's inode, so another attempt cannot replay it. */
 export const MANAGER_SHUTDOWN_INTENT = "manager.{space}.shutdown-intent";
 export const MANAGER_SPARE_CAPABILITY = "manager.{space}.spare-capability";
+
+/** What a manager's default stop does with its seats, as its spare capability records it. `release`
+ * leaves every seat running. `stop` also stops the seats that run inside the manager process (the
+ * in-process pty runtime), because they cannot outlive it, and releases the rest. */
+export type ManagerSpareSeats = "release" | "stop";
 
 interface PinnedManagerShutdownIntent {
   version: 1;
@@ -138,27 +143,30 @@ function publishAtomic(path: string, value: unknown): void {
   }
 }
 
-/** Publish that this exact manager process can release its local runtime custody without reaping. */
+/** Publish what a default stop of this exact manager process does with its seats; `false` removes
+ * the record. A `release` record keeps the version 1 shape. A `stop` record is version 2, which an
+ * older CLI refuses instead of reporting the seats it stopped as spared. */
 export function publishManagerSpareCapability(
   context: LocalProcessContext,
-  capable: boolean,
+  seats: ManagerSpareSeats | false,
   tokenAt: ProcessStartTokenReader = defaultStartToken,
 ): void {
   const path = canonicalLocalProcessPath(MANAGER_SPARE_CAPABILITY, context);
-  if (!capable) {
+  if (!seats) {
     rmSync(path, { force: true });
     return;
   }
   const process = recordedManagerProcess(context, tokenAt);
-  publishAtomic(path, { version: 1, process });
+  publishAtomic(path, seats === "release" ? { version: 1, process } : { version: 2, process, seats });
 }
 
-/** Refuse a bare stop before SIGTERM when this exact manager cannot safely spare its PTY child. */
+/** Refuse a bare stop before SIGTERM unless this exact manager published a spare capability, and
+ * return what its default stop does with its seats. */
 export function assertManagerCanSpare(
   context: LocalProcessContext,
   tokenAt: ProcessStartTokenReader = defaultStartToken,
   target?: ProcessIdentityRecord,
-): void {
+): ManagerSpareSeats {
   const expected = recordedManagerProcess(context, tokenAt);
   if (target && (target.pid !== expected.pid || target.token !== expected.token))
     throw new Error("refusing bare manager stop: stop attempt target does not match the recorded manager process");
@@ -177,9 +185,14 @@ export function assertManagerCanSpare(
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`refusing bare manager stop: malformed spare capability at ${path}`);
   const row = value as Record<string, unknown>;
   const process = row.process && typeof row.process === "object" && !Array.isArray(row.process) ? row.process as Record<string, unknown> : undefined;
-  if (Object.keys(row).sort().join(",") !== "process,version" || row.version !== 1 || !process ||
+  const keys = Object.keys(row).sort().join(",");
+  const seats: ManagerSpareSeats | undefined = row.version === 1 && keys === "process,version" ? "release"
+    : row.version === 2 && keys === "process,seats,version" && row.seats === "stop" ? "stop"
+    : undefined;
+  if (!seats || !process ||
       Object.keys(process).sort().join(",") !== "pid,token" || process.pid !== expected.pid || process.token !== expected.token)
     throw new Error(`refusing bare manager stop: spare capability at ${path} is malformed, stale, or belongs to a different manager process`);
+  return seats;
 }
 
 /**
@@ -195,7 +208,7 @@ export function armManagerShutdownIntent(
   tokenAt: ProcessStartTokenReader = defaultStartToken,
 ): void {
   const pidPath = canonicalLocalProcessPath(MANAGER_PIDFILE, context);
-  if (attempt.stopper.marker !== `${pidPath}.stopping`)
+  if (attempt.stopper.marker !== stopReservationPath(pidPath))
     throw new Error("cannot arm --with-agents: stop reservation marker is not this manager's; destructive policy was not published");
   let stopperPid: number | undefined;
   try { stopperPid = parsePid(readFileSync(attempt.stopper.marker, "utf8")); } catch { stopperPid = undefined; }
@@ -275,11 +288,11 @@ export function consumeManagerShutdownIntent(
       if (recordedPid !== pid)
         return { withAgents: false, warning: "ignored legacy manager shutdown intent because the manager pid record changed; managed agents were spared" };
       let reservationOwner: number | undefined;
-      try { reservationOwner = parsePid(readFileSync(`${pidPath}.stopping`, "utf8")); } catch { reservationOwner = undefined; }
+      try { reservationOwner = parsePid(readFileSync(stopReservationPath(pidPath), "utf8")); } catch { reservationOwner = undefined; }
       if (reservationOwner !== parsed.stopper.pid)
         return { withAgents: false, warning: "ignored stale legacy manager shutdown intent from a different stop attempt; managed agents were spared" };
       let reservation: string | undefined;
-      try { reservation = reservationIdentity(`${pidPath}.stopping`); } catch { reservation = undefined; }
+      try { reservation = reservationIdentity(stopReservationPath(pidPath)); } catch { reservation = undefined; }
       if (reservation !== parsed.stopper.reservation)
         return { withAgents: false, warning: "ignored legacy manager shutdown intent because its stop reservation inode changed; managed agents were spared" };
       if (probeLiveness(parsed.stopper.pid) === "dead")
@@ -290,7 +303,7 @@ export function consumeManagerShutdownIntent(
     if (targetVerdict.kind !== "match")
       return { withAgents: false, warning: `ignored manager shutdown intent with ${targetVerdict.kind} target identity; managed agents were spared` };
     let reservationOwner: number | undefined;
-    try { reservationOwner = parsePid(readFileSync(`${pidPath}.stopping`, "utf8")); } catch { reservationOwner = undefined; }
+    try { reservationOwner = parsePid(readFileSync(stopReservationPath(pidPath), "utf8")); } catch { reservationOwner = undefined; }
     if (reservationOwner !== parsed.stopper.pid)
       return { withAgents: false, warning: "ignored stale manager shutdown intent from a different stop attempt; managed agents were spared" };
     const stopperVerdict = assertRecordIdentity(parsed.stopper, tokenAt);

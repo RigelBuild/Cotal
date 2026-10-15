@@ -1,9 +1,9 @@
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { hardenPrivate, loadAgentFile, registry, writeSecretFile, type Connector, type LaunchOpts, type LaunchSpec } from "@cotal-ai/core";
-import { aclEnv, connectorLaunchOptions, controlEndpoint, eventChannel, launchEnv, materialEnv, mcpServerEnvKeys } from "@cotal-ai/connector-core";
+import { loadAgentFile, registry, writeLaunchArtifact, type Connector, type LaunchOpts, type LaunchSpec } from "@cotal-ai/core";
+import { aclEnv, connectorLaunchOptions, controlEndpoint, eventChannel, launchArmsEvents, launchEnv, materialEnv, mcpServerEnvKeys } from "@cotal-ai/connector-core";
+import { carriedForkRecord, claudeResumeTranscript, placeCarried, refuseCarriedLaunch } from "./carried.js";
+import { CLAUDE_WORKSPACE_TRUST_REPLIES } from "./trust.js";
 
 /** Name the cotal MCP server is registered under via --mcp-config (see buildLaunch). */
 const MCP_SERVER_NAME = "cotal";
@@ -111,12 +111,6 @@ const PLUGIN_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const MCP_CJS = resolve(PLUGIN_ROOT, "dist", "mcp.cjs");
 
 /**
- * The Claude Code connector: launches the real `claude` with the Cotal identity in
- * the environment and the mesh channel enabled, so the session joins the mesh and
- * wakes on incoming peer messages. Self-registers on import; the manager resolves it
- * by agent type "claude".
- */
-/**
  * Refuse a model this connector cannot serve, at LAUNCH, the way an unsupported `variant` is
  * refused below.
  *
@@ -148,6 +142,12 @@ function assertServableModel(model: string): void {
   );
 }
 
+/**
+ * The Claude Code connector: launches the real `claude` with the Cotal identity in
+ * the environment and the mesh channel enabled, so the session joins the mesh and
+ * wakes on incoming peer messages. Self-registers on import; the manager resolves it
+ * by agent type "claude".
+ */
 export const claudeConnector: Connector = {
   kind: "connector",
   name: "claude",
@@ -160,13 +160,15 @@ export const claudeConnector: Connector = {
   pluginRoot: PLUGIN_ROOT,
   requires: ["claude"],
   supportsResume: true, // renders `--resume <id> --fork-session` (fork-from, never hijack) — see buildLaunch
+  resumeTranscript: claudeResumeTranscript,
   supportsToolListAnnounce: true, // MCP McpServer.registerTool; SDK fires tools/list_changed
+  supportsPrompt: true, // a leading positional is auto-submitted as the first turn — see buildLaunch
   launchHint: "press Enter at the dev-channels prompt", // Claude Code opens on that one-time gate
 
   buildLaunch(opts: LaunchOpts): LaunchSpec {
     if (opts.continueSession) throw new Error("claude connector does not support exact-session continuation");
     if (opts.variant) throw new Error("claude connector: model variants are not supported");
-    // Operator MCP servers shared with this agent (default none — see the --mcp-config block).
+    // Operator MCP servers shared with this agent: the cotal config's list (see the --mcp-config block).
     const shared = opts.mcpServers ?? {};
     // Auth is CLAUDE_PROVIDER_KEYS: CLAUDE_CODE_OAUTH_TOKEN (the deploy-doc promise, required in
     // a container with no Keychain), ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN, and the cloud-provider
@@ -208,7 +210,7 @@ export const claudeConnector: Connector = {
     // next start, which then reads an already-published thread as virgin and republishes sequences
     // the stream has seen. Sent only when events are on, so a session that never emits carries no
     // path it has no use for.
-    if (opts.events !== false) {
+    if (launchArmsEvents(opts)) {
       env.COTAL_EVENTS = "1";
       if (!opts.workspaceRoot)
         throw new Error(
@@ -218,9 +220,14 @@ export const claudeConnector: Connector = {
         );
       env.COTAL_WORKSPACE_ROOT = opts.workspaceRoot;
     }
+    // A carried resume needs credentials its private home can use. Managed workspace trust is
+    // accepted through the native startup dialog below, without rewriting the manager's config.
+    const binary = opts.resolvedBinaries?.claude ?? "claude";
+    if (opts.carried) refuseCarriedLaunch(binary, env);
     if (opts.role) env.COTAL_ROLE = opts.role;
     if (opts.id) env.COTAL_ID = opts.id;
     if (opts.lifecycleUid) env.COTAL_LIFECYCLE_UID = opts.lifecycleUid;
+    if (opts.backfillFloor !== undefined) env.COTAL_BACKFILL_FLOOR = String(opts.backfillFloor);
     if (opts.acceptedToken) env.COTAL_ACCEPTED_TOKEN = opts.acceptedToken;
 
     // A leading positional is claude's first message, auto-submitted on start —
@@ -250,15 +257,29 @@ export const claudeConnector: Connector = {
     // mid-demo. Additive under the default permission mode — leaves other tools as-is.
     args.push("--allowedTools", "WebFetch(domain:github.com),WebFetch(domain:raw.githubusercontent.com)");
 
-    // Isolate the spawned session's MCP. --strict-mcp-config drops every ambient MCP source —
-    // including the operator's personal ~/.claude.json servers (e.g. a headless Chromium, a DB
-    // server) that a meshed teammate never needs and that, multiplied across several spawns on a
-    // busy machine, starve memory and kill the session before it registers presence — so the ONLY
-    // servers that load are the ones we name in --mcp-config: cotal (always, for its tools +
-    // presence) plus any the operator explicitly opted to share (`shared`, from the cotal config).
+    // Scope the spawned session's MCP. --strict-mcp-config drops every ambient MCP source, the
+    // plugin's own copy of the cotal server among them, so the ONLY servers that load are the ones we
+    // name in --mcp-config: cotal (always, for its tools + presence) plus the cotal config's share list
+    // (`shared`). First-run setup seeds that list with the operator's own ~/.claude.json servers so a
+    // seat keeps their tools; each boots once per spawn, and several spawns of a heavy one (a headless
+    // Chromium, a DB server) can starve memory before the session registers presence, which is why
+    // the list stays the operator's to trim.
     // The plugin itself stays enabled (its hooks + the dev-channels wake path are unaffected).
     // cotal is spread LAST so a shared server can never shadow the mesh server by reusing its name.
-    const mcpServers = { ...shared, [MCP_SERVER_NAME]: { command: "node", args: [MCP_CJS] } };
+    const mcpServers = { ...shared, [MCP_SERVER_NAME]: { command: "node", args: ["--optimize-for-size", "--max-semi-space-size=1", MCP_CJS] } };
+    // Every refusal below runs before the first private file is written, so a refused launch leaves
+    // none behind. An agent file carries identity (read in-session via COTAL_AGENT_FILE) plus a
+    // persona, which can only be applied to a `claude` session at launch.
+    const agentFile = opts.configPath ? resolve(opts.configPath) : undefined;
+    const def = agentFile ? loadAgentFile(agentFile) : undefined;
+    if (opts.model) assertServableModel(opts.model);
+    // Rendered to strings here, so a value that cannot become a flag argument refuses before any file
+    // exists. After the first write, only writeLaunchArtifact can throw, and it removes every file
+    // this launch wrote before it does.
+    const passthrough = connectorLaunchOptions("claude", opts.launchOptions).map(([k, v]) => [k, String(v)] as const);
+    // The private files this launch writes. The launcher that spawns the spec removes them once the
+    // child has exited (core launch-artifacts).
+    const artifacts: string[] = [];
     // Default (no shared servers): pass the config inline, unchanged. With shared servers, write it
     // to a file instead and pass the path. Either way the secret stays a `${VAR}` reference (Claude
     // expands it from the child env at launch — see the mcpKeys forwarding above), never the resolved
@@ -272,45 +293,25 @@ export const claudeConnector: Connector = {
     if (Object.keys(shared).length === 0) {
       mcpConfig = JSON.stringify({ mcpServers });
     } else {
-      // A private 0700 temp dir (unique per spawn) holds the 0600 config. mkdtemp can't be raced
-      // by a pre-created or symlinked path the way a predictable name in the world-writable tmpdir
-      // could, and a fresh file guarantees the 0600 mode applies on creation (mode is ignored on an
-      // overwrite). Left for the OS to reap: the file must outlive this call (Claude reads it at
-      // startup and on /mcp reconnect), and buildLaunch doesn't own the child's lifecycle.
-      const dir = mkdtempSync(join(tmpdir(), "cotal-mcp-"));
-      hardenPrivate(dir, "dir"); // win32: mkdtemp's 0700 is a no-op — harden the ACL before the config lands
-      mcpConfig = join(dir, "mcp.json");
-      writeSecretFile(mcpConfig, JSON.stringify({ mcpServers }, null, 2));
+      // A private 0700 temp dir (unique per spawn) holds the 0600 config. It must outlive this call
+      // (Claude reads it at startup and on /mcp reconnect), so it is a launch artifact the launcher
+      // removes after the child exits.
+      mcpConfig = writeLaunchArtifact(artifacts, "cotal-mcp-", "mcp.json", JSON.stringify({ mcpServers }, null, 2));
     }
     args.push("--strict-mcp-config", "--mcp-config", mcpConfig);
 
-    // An agent file carries identity (read in-session via COTAL_AGENT_FILE) plus
-    // persona + model, which can only be applied to a `claude` session at launch.
-    let model = opts.model;
-    if (opts.configPath) {
-      const path = resolve(opts.configPath);
-      env.COTAL_AGENT_FILE = path;
-      const def = loadAgentFile(path);
-      if (def.persona) {
-        // A persona can carry private project vocabulary or instructions. Passing its body through
-        // `--append-system-prompt` publishes it in the process argv to every same-host observer.
-        // Claude Code has a native file-shaped input, so write the text owner-only and expose only
-        // its path. No text-argv fallback: failing to create a private carrier refuses the launch.
-        // The file must outlive buildLaunch for startup and resume. LaunchSpec has no artifact-cleanup
-        // hook, so it follows this connector's private MCP config ownership: OS temporary-file reap.
-        const dir = mkdtempSync(join(tmpdir(), "cotal-claude-persona-"));
-        hardenPrivate(dir, "dir");
-        const personaFile = join(dir, "persona.md");
-        writeSecretFile(personaFile, def.persona);
-        args.push("--append-system-prompt-file", personaFile);
-      }
-      model ??= def.model;
+    if (agentFile) env.COTAL_AGENT_FILE = agentFile;
+    if (def?.persona) {
+      // A persona can carry private project vocabulary or instructions. Passing its body through
+      // `--append-system-prompt` publishes it in the process argv to every same-host observer.
+      // Claude Code has a native file-shaped input, so write the text owner-only and expose only
+      // its path. No text-argv fallback: failing to create a private carrier refuses the launch.
+      // The file must outlive buildLaunch for startup and resume, so it is a launch artifact too.
+      args.push("--append-system-prompt-file", writeLaunchArtifact(artifacts, "cotal-claude-persona-", "persona.md", def.persona));
     }
-    // The `--model` flag wins over the agent file, and applies even with no agent file.
-    if (model) {
-      assertServableModel(model);
-      args.push("--model", model);
-      env.COTAL_MODEL = model;
+    if (opts.model) {
+      args.push("--model", opts.model);
+      env.COTAL_MODEL = opts.model;
     }
 
     // Fork an existing session INTO the mesh (opts.resume, an opaque host-local id). `--fork-session`
@@ -319,27 +320,36 @@ export const claudeConnector: Connector = {
     // token (no shell), so a hostile-looking id can't inject. The persona prompt-file flag
     // above still applies, so the forked context runs under the current mesh persona.
     if (opts.resume) args.push("--resume", opts.resume, "--fork-session");
+    if (opts.carried) Object.assign(env, placeCarried(opts.carried.home, opts.carried.transcript, opts.resume, opts.carried.cwd));
 
     // Opaque connector options → native `claude` flags, RAW passthrough: `key=value` renders
     // `--key value`, and an empty value (`--opt foo=`) renders a bare boolean `--foo`. No allow-list,
     // no deny-list — the spawn capability is the trust boundary (see connectorLaunchOptions), not the
     // flag set. An operator can already run `claude` with any flag directly, and a peer's cotal_spawn
     // is gated by the spawn capability itself; every `claude` flag is forwarded verbatim.
-    for (const [k, v] of connectorLaunchOptions("claude", opts.launchOptions)) {
-      const val = String(v);
+    // A managed seat has no human at its terminal, so a permission prompt under the default mode
+    // is a prompt nobody answers: the seat's first mesh tool call stalled there and it looked dead
+    // to its peers. Bypass is the default; an operator who wants prompts back passes
+    // `--opt permission-mode=<mode>`, and either permission flag in the passthrough wins.
+    if (!passthrough.some(([k]) => k === "permission-mode" || k === "dangerously-skip-permissions"))
+      args.push("--permission-mode", "bypassPermissions");
+    for (const [k, val] of passthrough) {
       if (val === "") args.push(`--${k}`);
       else args.push(`--${k}`, val);
     }
 
     return {
-      command: opts.resolvedBinaries?.claude ?? "claude",
+      command: binary,
       args,
       env,
       // The dev-channels flag shows this one-time gate. Use its unique title rather than the generic
       // "Enter to confirm" footer, which the workspace-trust dialog also renders with a different
       // default action. The runtime presses Enter once when this connector-owned text appears.
       confirm: "WARNING: Loading development channels",
+      ...(opts.cwd ? { confirmBefore: CLAUDE_WORKSPACE_TRUST_REPLIES } : {}),
       control,
+      ...(opts.carried ? { resumeRecordPath: carriedForkRecord(opts.carried.home) } : {}),
+      ...(artifacts.length > 0 ? { artifacts } : {}),
     };
   },
 };

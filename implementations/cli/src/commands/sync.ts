@@ -1,13 +1,13 @@
 import { join } from "node:path";
-import { mkSecretDir, registry, resolveAuthProvider, writeSecretFileAtomic, type AuthProvider, type AuthSpaceCatalogAccount, type AuthSpaceCatalogResult, type FlagSpec, type FlagValues, type ParsedArgs, type SpaceCatalogConsumer } from "@cotal-ai/core";
+import { isLoopbackLiteral, mkSecretDir, registry, resolveAuthProvider, writeSecretFileAtomic, type AuthProvider, type AuthSpaceCatalogAccount, type AuthSpaceCatalogResult, type FlagSpec, type FlagValues, type ParsedArgs, type SpaceCatalogConsumer } from "@cotal-ai/core";
 import {
   clearCurrent,
-  findMesh,
   getCurrent,
   homeCotalDir,
   loadMeshes,
-  recordMesh,
-  removeMesh,
+  readMesh,
+  recordMeshes,
+  removeMeshes,
   userAuthStateDir,
   type MeshEntry,
 } from "@cotal-ai/workspace";
@@ -50,8 +50,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** Canonicalize an IdP identity for account binding with the same URL shape the stock provider
- * accepts: HTTPS, or loopback HTTP; no credentials, query, fragment, or trailing slash. This is not
- * a bundle validator. It compares already-validated registration trust to the proved account. */
+ * accepts: HTTPS, or HTTP on a loopback IP literal; no credentials, query, fragment, or trailing
+ * slash. This is not a bundle validator. It compares already-validated registration trust to the
+ * proved account. */
 function canonicalIdpUrl(raw: string, what: string): string {
   let url: URL;
   try {
@@ -59,9 +60,8 @@ function canonicalIdpUrl(raw: string, what: string): string {
   } catch {
     throw new Error(`${what} is not a valid URL`);
   }
-  const loopback = url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "localhost";
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))
-    throw new Error(`${what} must be https (or loopback http for local development)`);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopbackLiteral(url.hostname)))
+    throw new Error(`${what} must be https (or http on a loopback IP literal for local development)`);
   if (url.username || url.password || url.search || url.hash)
     throw new Error(`${what} must not contain credentials, a query, or a fragment`);
   return `${url.origin}${url.pathname.replace(/\/$/, "")}`;
@@ -178,12 +178,12 @@ function consume(result: AuthSpaceCatalogResult, force: boolean): CatalogDiff {
 }
 
 function applyResult(result: AuthSpaceCatalogResult): CatalogDiff {
-  const before = loadMeshes().filter((m) => m.origin === "catalog" && m.catalogOwner === result.account.ownerKey);
+  const loaded = loadMeshes();
+  const before = loaded.filter((m) => m.origin === "catalog" && m.catalogOwner === result.account.ownerKey);
   const priorByName = new Map(before.map((m) => [m.space, m]));
   const diff = emptyDiff();
   if (result.state === "failed") {
-    for (const old of before)
-      recordMesh({ ...old, ...(result.fetchedAt ? { catalogFetchedAt: result.fetchedAt } : {}), catalogError: result.error ?? "refresh failed" });
+    recordMeshes(before.map((old) => ({ ...old, ...(result.fetchedAt ? { catalogFetchedAt: result.fetchedAt } : {}), catalogError: result.error ?? "refresh failed" })));
     return diff;
   }
   if (result.snapshot === undefined) return diff;
@@ -198,25 +198,30 @@ function applyResult(result: AuthSpaceCatalogResult): CatalogDiff {
     clearCurrent();
     diff.selectionInvalidated = current;
   }
-  for (const old of before) {
-    if (nextSlugs.has(old.space)) continue;
-    removeMesh(old.space);
-    diff.removed.push(old.space);
-  }
-  for (const row of snapshot.spaces) {
-    const existing = findMesh(row.slug);
-    if (existing && (existing.origin !== "catalog" || existing.catalogOwner !== result.account.ownerKey)) {
-      diff.collisions.push(row.slug);
-      continue;
+  for (const old of before) if (!nextSlugs.has(old.space)) diff.removed.push(old.space);
+  removeMeshes(diff.removed);
+  const loadedByName = new Map(loaded.map((m) => [m.space, m]));
+  // Each row is checked just before its own write, because writers outside the catalog lock
+  // (`meshes add`, `up`) can record a space while this runs and their record must still win. They
+  // write the canonical file, which answers in one read; a pre-hex record only an older build writes,
+  // so the opening load answers for it.
+  function* entries(): Generator<MeshEntry> {
+    for (const row of snapshot.spaces) {
+      const existing = readMesh(row.slug) ?? loadedByName.get(row.slug);
+      if (existing && (existing.origin !== "catalog" || existing.catalogOwner !== result.account.ownerKey)) {
+        diff.collisions.push(row.slug);
+        continue;
+      }
+      const next = entryFor(result.account, row, result.fetchedAt);
+      const prior = priorByName.get(row.slug);
+      writeCatalogCredential(next, row);
+      if (!prior) diff.added.push(row.slug);
+      else if (sameEntry(prior, next)) diff.unchanged.push(row.slug);
+      else diff.changed.push(row.slug);
+      yield next;
     }
-    const next = entryFor(result.account, row, result.fetchedAt);
-    const prior = priorByName.get(row.slug);
-    writeCatalogCredential(next, row);
-    recordMesh(next);
-    if (!prior) diff.added.push(row.slug);
-    else if (sameEntry(prior, next)) diff.unchanged.push(row.slug);
-    else diff.changed.push(row.slug);
   }
+  recordMeshes(entries());
   for (const list of [diff.added, diff.changed, diff.removed, diff.unchanged, diff.collisions]) list.sort();
   return diff;
 }
@@ -252,9 +257,18 @@ export async function prepareCatalogCommand(args: ParsedArgs, diagnostics = fals
   catalogDiagnostics = [];
   const values = args.values as { space?: string };
   const requested = values.space ?? (command === "use" ? args.positionals[0] : undefined);
-  const named = requested ? findMesh(requested) : undefined;
   const current = !requested && command !== "meshes" ? getCurrent() : undefined;
-  const selected = current ? findMesh(current) : undefined;
+  let meshes: MeshEntry[];
+  try {
+    meshes = loadMeshes();
+  } catch {
+    // Applying a catalog reads this same registry, so none can apply while a record is unusable.
+    // Refusing here would pre-empt the command's own checks; a command that resolves its target
+    // through the registry still refuses the record by name.
+    return;
+  }
+  const named = requested ? meshes.find((m) => m.space === requested) : undefined;
+  const selected = current ? meshes.find((m) => m.space === current) : undefined;
   const target = named ?? selected;
   const targetCatalog = !diagnostics && target?.origin === "catalog" ? target : undefined;
   const force = Boolean(requested && !named);

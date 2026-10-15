@@ -5,6 +5,7 @@ import { mkSecretDir, writeSecretFileAtomic } from "@cotal-ai/core";
 import {
   MeshAgent,
   configFromEnv,
+  eventPlaneArmed,
   hasIdentity,
   startControlServer,
   type AgentConfig,
@@ -12,6 +13,7 @@ import {
   controlFromEnv,
   scrubLaunchMaterial,
   resolveEventsStateRoot,
+  eventPlaneStopped,
 } from "@cotal-ai/connector-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { PiDriver, type CotalBatchDetails, type PiContextLike } from "./driver.js";
@@ -124,7 +126,7 @@ export default async function cotalMesh(pi: ExtensionAPI): Promise<void> {
   }
 
   const config = configFromEnv();
-  const eventsEnabled = /^(1|true|yes|on)$/i.test(process.env.COTAL_EVENTS ?? "") || config.eventsRequired;
+  const eventsEnabled = eventPlaneArmed(config);
   if (eventsEnabled) resolveEventsStateRoot(process.env);
   // CLI startup opens/creates/forks the session BEFORE extension factories run, so the first
   // session_start may already be past. Pi publishes the active id through PI_SESSION_ID for exactly
@@ -153,7 +155,9 @@ export default async function cotalMesh(pi: ExtensionAPI): Promise<void> {
     runtime = createRuntime(config, control);
     runtimes.set(key, runtime);
   }
-  if (eventsEnabled) runtime.events ??= new PiEvents(runtime.mesh, config.space);
+  if (eventsEnabled) {
+    runtime.events ??= new PiEvents(runtime.mesh, config.space, eventPlaneStopped({ log: (line) => console.error(`Pi ${line}`) }));
+  }
   runtime.expectedSessionId = expectedSessionId;
   if (startupSessionId) {
     if (expectedSessionId && startupSessionId !== expectedSessionId)

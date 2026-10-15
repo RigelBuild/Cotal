@@ -19,7 +19,7 @@
  */
 import { decodeProtectedHeader, jwtVerify } from "jose";
 import type { CryptoKey, JWTVerifyGetKey } from "jose";
-import { assertDerivedOwnerToken, assertLifecycleToken, assertValidOwnerToken } from "@cotal-ai/core";
+import { assertDerivedOwnerToken, assertLifecycleToken, assertValidOwnerToken, credentialLifetime } from "@cotal-ai/core";
 
 /** Current normative token-shape version. Bump only with a SPEC change; validators reject
  *  anything else (older = downgrade, newer = from-the-future misconfig). */
@@ -29,34 +29,69 @@ export const USER_TOKEN_VER = 1;
  *  re-mint is the working revocation path. */
 export const MAX_TOKEN_TTL_SEC = 900;
 
+/** Clock skew both verifiers allow on `exp`, `nbf` and `iat`. A constant because a caller-supplied
+ *  `NaN` tolerance made each of those comparisons false and switched expiry off. */
+export const CLOCK_TOLERANCE_SEC = 5;
+
 /** The elevated per-connection profiles a bearer may request at exchange time (the "views"):
  *  read-only god view, space-history purge, channel delete, channel-registry writes, and the
- *  manifest-deploy preflight. Server-authored into `act.view` ONLY by the human exchange after a
- *  fresh ledger check against {@link VIEW_REQUIRED_SCOPE}; the callout mints the matching profile
+ *  manifest-deploy preflight. The narrowing manager-caller view is also available to an actor-secret
+ *  exchange. Views are server-authored after a fresh ledger check against {@link VIEW_REQUIRED_SCOPE};
+ *  the callout mints the matching profile
  *  instead of `agent`. A closed enum on BOTH the mint and validate side — an unknown view fails
  *  closed, never falls back to a profile. Deliberately NOT a generic `view=<profile>` passthrough:
  *  most profiles are daemon/provisioning surfaces that must never become human-requestable. */
-export const USER_TOKEN_VIEWS = ["admin", "purger", "channel-purger", "channel-writer", "deployer", "manager-service"] as const;
+export const USER_TOKEN_VIEWS = ["admin", "purger", "channel-purger", "channel-writer", "deployer", "manager-service", "manager-caller", "session-caller", "transfer-writer"] as const;
 export type UserTokenView = (typeof USER_TOKEN_VIEWS)[number];
 
-/** Human views the public exchange face will mint (still ledger-gated). Every other
- *  {@link USER_TOKEN_VIEWS} value stays loopback-only; a managed-agent secret exchange
- *  never mints a view on either face. */
-export const PUBLIC_EXCHANGE_VIEWS = ["channel-writer", "channel-purger"] as const satisfies readonly UserTokenView[];
+/** Views the public exchange face will mint (still ledger-gated). Every other
+ *  {@link USER_TOKEN_VIEWS} value stays loopback-only. An actor-secret exchange may request
+ *  only manager-caller, which narrows its existing command authority to one instance. */
+export const PUBLIC_EXCHANGE_VIEWS = ["channel-writer", "channel-purger", "manager-caller", "session-caller", "transfer-writer"] as const satisfies readonly UserTokenView[];
 
 /** The ONE central view policy table: which ledger capability each view's exchange requires (and
  *  the callout re-asserts, defense in depth). `admin` = operator authority (god-view read +
  *  destructive space writes); `deployer` is spawn-grade — deploying YOUR OWN team's manifest rides
  *  the same owner-domain model as own-agent stop/attach (the manager still enforces owner equality
  *  at launch, and the view's control grant is the PRIVILEGED tier, never the admin bypass). */
-export const VIEW_REQUIRED_SCOPE: Record<UserTokenView, "admin" | "spawn" | "supervise"> = {
+export const VIEW_REQUIRED_SCOPE: Record<UserTokenView, "admin" | "spawn" | "supervise" | undefined> = {
   admin: "admin",
   purger: "admin",
   "channel-purger": "admin",
   "channel-writer": "admin",
   deployer: "spawn",
   "manager-service": "supervise",
+  "manager-caller": undefined, // baseline self calls are allowed; command grants still derive from scope
+  // #2312: no ledger scope. The grant itself is the authority: the auth plane verifies the redeemed
+  // `session.<id>` row names THIS principal as holder, at the exchange and again at the callout mint.
+  "session-caller": undefined,
+  // #1499: the bytes a carried resume uploads are announced by `transcript-receive`, a
+  // `manager.admin` row, so writing them needs the same scope.
+  "transfer-writer": "admin",
 };
+
+/** The longest a bearer of `view` may live. A transfer-writer bearer is the user-mode form of the
+ *  one-shot `transfer-writer` credential, so it carries that profile's five minutes, and so does the
+ *  broker credential the callout binds to the bearer's expiry. */
+export function viewTtlCapSec(view: UserTokenView | undefined): number {
+  return view === "transfer-writer" ? credentialLifetime("transfer-writer").defaultTtlSeconds! : MAX_TOKEN_TTL_SEC;
+}
+
+/** The ONE object a `transfer-writer` bearer may upload (docs/design/resume-transfer.md section 6):
+ *  the manager instance whose transfer bucket holds it and the transcript's hex digest. */
+export interface UserTokenTransferWriter {
+  instanceId: string;
+  hex: string;
+}
+
+/** The ONE §13.6 session a `session-caller` bearer may open: the rail coordinates plus the grant
+ *  expiry (unix seconds) the minted connection is bound to, exactly what the static arm mints. */
+export interface UserTokenSession {
+  endpoint: string;
+  sessionId: string;
+  epoch: number;
+  exp: number;
+}
 
 /** The server-authored actor claim. `owner` restates `sub` (cross-checked); `actor` is the
  *  ledger-derived agent-instance id; `parent` is at most ONE spawner audit link; `view` is the
@@ -79,6 +114,12 @@ export interface UserTokenActor {
   credentialId?: string;
   /** Exchange-authorized elevated view ({@link USER_TOKEN_VIEWS}); absent = agent profile. */
   view?: UserTokenView;
+  /** The one manager instance a manager-caller bearer may address. */
+  managerInstanceId?: string;
+  /** The one session a session-caller bearer may open (#2312). */
+  session?: UserTokenSession;
+  /** The one object a transfer-writer bearer may upload (#1499). */
+  transferWriter?: UserTokenTransferWriter;
 }
 
 /** A fully validated user token, reduced to what the callout needs. */
@@ -113,6 +154,27 @@ export function assertCredentialIdClaim(v: unknown): asserts v is string {
     throw new Error(`user token: act.credentialId ${JSON.stringify(v)} is not a bounded dotted KV-safe credential id`);
 }
 
+/** Assert a `session` claim is the closed `{endpoint, sessionId, epoch, exp}` shape. Shared by the
+ *  issuer (mint side) and the validator so the inverse holds. THROWS. */
+export function assertSessionClaim(v: unknown): asserts v is UserTokenSession {
+  const o = v as Record<string, unknown>;
+  if (!o || typeof o !== "object" || Array.isArray(o)) throw new Error("user token: act.session must be an object");
+  for (const k of Object.keys(o)) if (!["endpoint", "sessionId", "epoch", "exp"].includes(k)) throw new Error(`user token: act.session carries the unknown field "${k}"`);
+  if (typeof o.endpoint !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(o.endpoint)) throw new Error("user token: act.session.endpoint is not an endpoint token");
+  if (typeof o.sessionId !== "string" || !/^[A-Za-z0-9_-]{22,128}$/.test(o.sessionId)) throw new Error("user token: act.session.sessionId is not a session id");
+  for (const k of ["epoch", "exp"] as const)
+    if (typeof o[k] !== "number" || !Number.isSafeInteger(o[k]) || (o[k] as number) < 0) throw new Error(`user token: act.session.${k} is not an unsigned integer`);
+}
+
+export function assertTransferWriterClaim(v: unknown): asserts v is UserTokenTransferWriter {
+  const o = v as Record<string, unknown>;
+  if (!o || typeof o !== "object" || Array.isArray(o)) throw new Error("user token: act.transferWriter must be an object");
+  for (const k of Object.keys(o)) if (!["instanceId", "hex"].includes(k)) throw new Error(`user token: act.transferWriter carries the unknown field "${k}"`);
+  if (typeof o.instanceId !== "string") throw new Error("user token: act.transferWriter.instanceId must be a string token");
+  assertLifecycleToken(o.instanceId, "user token act.transferWriter.instanceId");
+  if (typeof o.hex !== "string" || !/^[0-9a-f]{64}$/.test(o.hex)) throw new Error("user token: act.transferWriter.hex is not a sha256 hex digest");
+}
+
 export interface ValidateUserTokenOpts {
   /** The pinned verification key path: a `createRemoteJWKSet(new URL(<pinned origin>))` resolver
    *  or a local public key. The token itself NEVER influences where the key comes from. */
@@ -121,10 +183,6 @@ export interface ValidateUserTokenOpts {
   issuer: string;
   /** Exact expected audience — the space name. */
   audience: string;
-  /** Override of the {@link MAX_TOKEN_TTL_SEC} lifetime cap (tests only; keep short). */
-  maxTtlSec?: number;
-  /** Clock skew tolerance in seconds (default 5). */
-  clockToleranceSec?: number;
 }
 
 /** Validate a user bearer token. Returns the reduced, validated claims or THROWS — there is no
@@ -140,7 +198,7 @@ export async function validateUserToken(token: string, opts: ValidateUserTokenOp
     algorithms: ["EdDSA"],
     issuer: opts.issuer,
     audience: opts.audience,
-    clockTolerance: opts.clockToleranceSec ?? 5,
+    clockTolerance: CLOCK_TOLERANCE_SEC,
   });
 
   // jose's `audience` option is SET-MEMBERSHIP (an aud array containing the space passes) — the
@@ -156,11 +214,10 @@ export async function validateUserToken(token: string, opts: ValidateUserTokenOp
   // sails through exp/nbf checks, giving it an effective validity far beyond the cap and quietly
   // defeating the short-lived-token revocation lever. So: iat may not be in the future, and exp
   // may not sit further than the cap from now.
-  const maxTtl = opts.maxTtlSec ?? MAX_TOKEN_TTL_SEC;
-  const tol = opts.clockToleranceSec ?? 5;
+  const maxTtl = viewTtlCapSec((payload.act as UserTokenActor | undefined)?.view);
   const now = Math.floor(Date.now() / 1000);
-  if (payload.iat > now + tol) throw new Error("user token: iat is in the future");
-  if (payload.exp > now + maxTtl + tol)
+  if (payload.iat > now + CLOCK_TOLERANCE_SEC) throw new Error("user token: iat is in the future");
+  if (payload.exp > now + maxTtl + CLOCK_TOLERANCE_SEC)
     throw new Error(`user token: exp is more than the ${maxTtl}s cap past now - short-lived tokens are the revocation lever`);
   if (payload.exp - payload.iat > maxTtl)
     throw new Error(`user token: lifetime ${payload.exp - payload.iat}s exceeds the ${maxTtl}s cap - short-lived tokens are the revocation lever`);
@@ -193,6 +250,24 @@ export async function validateUserToken(token: string, opts: ValidateUserTokenOp
     throw new Error(
       `user token: act.view "${String(act.view)}" is not a known view (${USER_TOKEN_VIEWS.join(", ")}) - unknown views fail closed`,
     );
+  if (act.managerInstanceId !== undefined) {
+    if (typeof act.managerInstanceId !== "string")
+      throw new Error("user token: act.managerInstanceId must be a string token when present");
+    assertLifecycleToken(act.managerInstanceId, "user token act.managerInstanceId");
+  }
+  if (act.view === "manager-caller" && act.managerInstanceId === undefined)
+    throw new Error('user token: view "manager-caller" requires act.managerInstanceId');
+  if (act.managerInstanceId !== undefined && act.view !== "manager-caller")
+    throw new Error('user token: act.managerInstanceId is valid only with view "manager-caller"');
+  if (act.view === "session-caller" && act.session === undefined)
+    throw new Error('user token: view "session-caller" requires act.session');
+  if (act.session !== undefined) {
+    if (act.view !== "session-caller") throw new Error('user token: act.session is valid only with view "session-caller"');
+    assertSessionClaim(act.session);
+  }
+  if ((act.view === "transfer-writer") !== (act.transferWriter !== undefined))
+    throw new Error('user token: view "transfer-writer" and act.transferWriter come together or not at all');
+  if (act.transferWriter !== undefined) assertTransferWriterClaim(act.transferWriter);
   // Lifecycle claim (SPEC 13.1): grammar-asserted when present. Presence/absence POLICY lives at the
   // connect boundary (ledgerAuthorizeConnect requires it on EVERY bearer, views included) and the
   // mint boundary (the idp bridge and the agent exchange stamp it from the grant row); the validator
@@ -218,7 +293,7 @@ export async function validateUserToken(token: string, opts: ValidateUserTokenOp
     owner,
     space: opts.audience,
     scope,
-    act: { owner: act.owner, actor: act.actor, scope: act.scope, parent: act.parent, lifecycleUid: act.lifecycleUid, credentialId: act.credentialId, view: act.view },
+    act: { owner: act.owner, actor: act.actor, scope: act.scope, parent: act.parent, lifecycleUid: act.lifecycleUid, credentialId: act.credentialId, view: act.view, managerInstanceId: act.managerInstanceId, ...(act.session ? { session: act.session } : {}), ...(act.transferWriter ? { transferWriter: act.transferWriter } : {}) },
     credentialId: act.credentialId,
     ver: USER_TOKEN_VER,
     exp: payload.exp,

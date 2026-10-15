@@ -12,8 +12,8 @@ import {
   readSync,
   closeSync,
   lstatSync,
-  rmSync,
   realpathSync,
+  readdirSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import {
@@ -32,9 +32,14 @@ import {
   newIdentity,
   setupSpaceStreams,
   reconcileSpaceTtls,
+  ttlBuckets,
   standaloneConnectOpts,
+  requireBrokerFloor,
+  parseServerVersion,
+  presenceBucket,
   seedChannelRegistry,
   ensureDefaultDeliveryClass,
+  LEASE_TTL_MS,
   mkSecretDir,
   writeSecretFile,
   type AuthPrepared,
@@ -45,6 +50,8 @@ import {
   type CompletionResult,
 } from "@cotal-ai/core";
 import { connect } from "@nats-io/transport-node";
+import { jetstreamManager, StorageType } from "@nats-io/jetstream";
+import { Kvm } from "@nats-io/kv";
 import {
   assertSingleSpaceBroker,
   assertUserAuthInfo,
@@ -59,6 +66,7 @@ import {
   findMesh,
   getCurrent,
   loadMeshes,
+  localMeshesForRoot,
   connectionEvictorCredsKey,
   membershipConfigPath,
   membershipObserverCredsKey,
@@ -104,12 +112,11 @@ import {
   type RestoreListenerProof,
   readBrokerPolicy,
   writeBrokerPolicy,
-  removeIdentityPin,
-  writeIdentityPin,
-  localProcessPath,
-  MANAGER_PIDFILE,
-  assertManagerCanSpare,
-  verifyIdentityPin,
+  removePidPair,
+  writePidPair,
+  isLoopbackHost,
+  connectUserControlOrThrow,
+  userViewAuth,
 } from "@cotal-ai/workspace";
 import { ensureAuthService, resolveAuthProvider, stopAuthService } from "../lib/auth-proc.js";
 import { resolveSpace } from "../lib/status.js";
@@ -119,14 +126,14 @@ import { resolveNatsServer } from "../lib/nats-bin.js";
 import { cotalPath, cotalRoot } from "../lib/paths.js";
 import { renderDetachedSummary } from "../lib/up-report.js";
 import { detachedSystemdSupervisionWarning } from "../lib/systemd-supervision.js";
-import { deliveryUp, ensureControlPlane, stopDelivery } from "../lib/delivery-proc.js";
+import { deliveryStoppedByDown, deliveryUp, ensureControlPlane, ensureDelivery, stopDelivery } from "../lib/delivery-proc.js";
 import { RESPONDER_UNBOUND_CONSEQUENCE } from "../lib/delivery-responder.js";
 import { displayCmd } from "../lib/self-exec.js";
 import { liveManagerWouldApplyMaxSessions, managerHasDeliveryMarker, managerLogDisplayPath, managerRecordState, managerUp, stopManager } from "../lib/manager-proc.js";
-import { listManagerSeatsForSpare, printLegacyManagerSpareUncertainty, printSparedAgents, type SpareSeatRow } from "../lib/teardown-spare.js";
 import { loadManifest, type PreparedManifest } from "../lib/manifest/index.js";
 import { buildLaunchSpec, genRunId, manifestToChannels, preflightConnectors, writeLaunchSpec } from "../lib/manifest/apply.js";
 import { renderUpPlan, renderInherited, renderWarnings } from "../lib/manifest/render.js";
+import { idpUrlProblem, serverUrlProblems } from "../lib/manifest/resolve.js";
 import { failManifest } from "./topology.js";
 import { extensionNames, preflightRuntime } from "../ext-loader.js";
 import { completingFlagValue } from "../lib/completion.js";
@@ -585,14 +592,12 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
     if (values.file) {
       try {
         const prepared = loadManifest(resolve(values.file));
-        const space = values.space ?? prepared.manifest.space;
-        const open = Boolean(values.open) || prepared.manifest.broker?.auth === false;
-        ensureRootForSpace(!open, space);
+        ensureRootForSpace(values.space ?? prepared.manifest.space);
       } catch {
         // Manifest errors are reported by the -f path with the same load; do not double-print.
       }
     } else {
-      ensureRootForSpace(!values.open, spaceForRoot);
+      ensureRootForSpace(spaceForRoot);
     }
   }
 
@@ -719,8 +724,12 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
     // Gated on the ATTEMPT, not on holding the lock. The lock is now always held, and this refuses
     // whenever a journal exists — which is precisely the state a resume re-entry is in, so gating
     // it on the lock would refuse the very resume the lock is here to protect.
-    if (!resumeAttempt) assertOrdinaryUpAllowed(cotalRoot(), values["store-dir"] ? resolve(values["store-dir"]) : cotalPath("nats"));
-    let server = values.server ?? DEFAULT_SERVER;
+    // Without --server the default URL only seeds a first boot. A first boot that found it taken ran
+    // on a free port, which this root's record keeps; a re-run must start from that URL, or every
+    // lookup below misses its own mesh and the space claim refuses it (#3889).
+    const recordedSpace = values.space ?? resolveSpace(process.cwd());
+    const implicitServer = localMeshesForRoot(cotalRoot()).find((m) => m.space === recordedSpace)?.server ?? DEFAULT_SERVER;
+    let server = values.server ?? implicitServer;
     const host = values.host ?? "127.0.0.1";
     // `--host` is the BIND address; `server` is the URL the readiness probe, the mesh registry, and
     // every later client use. They must name the SAME address. Left independent, `--host <non-loopback>`
@@ -728,7 +737,53 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
     // SIGTERM'd a broker that had started perfectly — so `--host` alone could never succeed.
     // Derive the URL from `--host` when no explicit `--server` pins it, and refuse a contradicting
     // pair rather than starting a broker nothing can reach.
-    if (values.host) server = reconcileHostAndServer(values.host, values.server);
+    if (values.host) server = reconcileHostAndServer(values.host, values.server, "--host", "--server", implicitServer);
+    // A same-root repair reopens the store the mesh record names, ONCE, before the ordinary-up
+    // assertion below reads --store-dir (#2218): an ordinary `up` on a space whose broker died must
+    // not silently fall back to the root's default store while the record still names a custom one.
+    // Never runs during a resume attempt, which keeps its own store checks. The reachability probe
+    // here is reused as `listenerReachable` further down instead of probing twice.
+    let repairProbe: boolean | undefined;
+    if (!resumeAttempt) {
+      const repairSpace = values.space ?? resolveSpace(process.cwd());
+      const repairRoot = cotalRoot();
+      const heldForRepair = loadMeshes().find(
+        (m) => m.origin !== "manual" && m.origin !== "catalog" && m.server === server && m.root === repairRoot && m.space === repairSpace,
+      );
+      if (heldForRepair) {
+        repairProbe = await isReachable(server);
+        if (!repairProbe) {
+          if (values["store-dir"] !== undefined) {
+            const requestedStoreDir = resolve(values["store-dir"]);
+            if (heldForRepair.storeDir !== undefined && requestedStoreDir !== heldForRepair.storeDir) {
+              console.error(
+                c.red(
+                  `✗ mesh "${repairSpace}" is recorded at ${server} with store ${heldForRepair.storeDir} - a stopped broker can't change --store-dir (it is fixed at start); repair it with \`cotal up --store-dir ${heldForRepair.storeDir}\`, or \`cotal down\` it first`,
+                ),
+              );
+              process.exit(1);
+            }
+          } else if (heldForRepair.storeDir !== undefined) {
+            values["store-dir"] = heldForRepair.storeDir;
+            console.log(c.dim(`reopening the recorded store ${heldForRepair.storeDir}`));
+          } else {
+            const defaultStore = cotalPath("nats");
+            let hasEntries = false;
+            try {
+              hasEntries = readdirSync(join(defaultStore, "jetstream")).length > 0;
+            } catch { /* absent: no jetstream dir yet */ }
+            if (!hasEntries) {
+              console.error(
+                c.yellow(
+                  `! mesh "${repairSpace}" was recorded before the store directory was kept, so this repair opens ${defaultStore}; if the previous broker used --store-dir, stop this one with \`cotal down\` and repair with that flag (its Store Directory: line is in ${repairRoot}/.cotal/nats.log)`,
+                ),
+              );
+            }
+          }
+        }
+      }
+    }
+    if (!resumeAttempt) assertOrdinaryUpAllowed(cotalRoot(), values["store-dir"] ? resolve(values["store-dir"]) : cotalPath("nats"));
     const restoredAttempt = resumeAttempt ? pendingRestores.get(resumeAttempt) : undefined;
     if (restoredAttempt?.reentry) {
       if (!restoredAttempt.listenerProof)
@@ -755,7 +810,7 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
     }
     if (ordinaryAttempt?.journalState === "resume-committed")
       throw new Error(`resume attempt ${resumeAttempt} is manager-committed but has no adoptable bound listener; preserving the commit token and retained suppression`);
-    const listenerReachable = await isReachable(server);
+    const listenerReachable = repairProbe !== undefined ? repairProbe : await isReachable(server);
     if (resumeAttempt && listenerReachable)
       throw new Error(`resume attempt ${resumeAttempt} refuses the unproven occupied listener at ${server}`);
     if (listenerReachable) {
@@ -823,6 +878,17 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
         console.error(
           c.red(
             `✗ mesh "${held.space}" is already running at ${server} - a running broker can't change --max-file-store (it is fixed at start); \`cotal down\` it first, then \`cotal up --max-file-store ${maxFileStore}\``,
+          ),
+        );
+        process.exit(1);
+      }
+      // The store directory is fixed the same way: an explicit --store-dir on a live refresh can
+      // only be refused when it disagrees with what the running broker actually opened. Absent
+      // `held.storeDir` (a pre-field record) has nothing to compare against, so it is not checked.
+      if (values["store-dir"] !== undefined && held.storeDir !== undefined && resolve(values["store-dir"]) !== held.storeDir) {
+        console.error(
+          c.red(
+            `✗ mesh "${held.space}" is already running at ${server} - a running broker can't change --store-dir (it is fixed at start); \`cotal down\` it first, then \`cotal up --store-dir ${resolve(values["store-dir"])}\``,
           ),
         );
         process.exit(1);
@@ -911,6 +977,13 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
           // a same-root caller holds the space's signing material either way.
           reconcileCreds = await mintCreds(spaceAuth, newIdentity(), "provisioner");
         }
+        const v = await brokerVersion(server, held.space, reconcileCreds);
+        if (belowPresenceSafeBroker(v.version) && v.presenceFileBacked)
+          console.error(
+            c.yellow(
+              `! nats-server ${v.version} is below 2.14.5 and the presence bucket of "${held.space}" is file-backed: it can latch after a stall and close the mesh to new joins (#1356); put a nats-server 2.14.5 or newer on PATH (it wins over the bundled one)`,
+            ),
+          );
         for (const r of await reconcileSpaceTtls({ servers: server, space: held.space, creds: reconcileCreds }))
           console.log(c.dim(`  reconciled ${r.stream} TTL ${r.fromMs === 0 ? "none" : `${r.fromMs}ms`} -> ${r.toMs}ms`));
       } catch (e) {
@@ -922,7 +995,7 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
       // failure copy says "restart it with `cotal up`"), so a refresh must re-ensure the service —
       // never just reprint "already running" over a dead callout. No broker config is (re)written
       // here, so healing on a bare `cotal up` is safe: the mode can't drift, only the daemon heals.
-      let userAuth = held.userAuth;
+      let userAuth: UserAuthInfo | undefined;
       if (held.mode === "user") {
         const auth = await getSpaceAuth(workspaceSecretStore(root), held.space);
         if (!auth) {
@@ -963,10 +1036,13 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
         // delivery marker) is stopped and REPLACED by the ensure below carrying the requested runtime,
         // so that's not a reuse - don't claim the runtime is fixed. A dead/absent manager is (re)started
         // with it.
-        if (values.runtime && managerUp(held.space) && managerHasDeliveryMarker(held.space))
-          console.error(
-            c.dim(`! manager already running for "${held.space}" - its runtime is fixed at start; \`cotal down\` then \`cotal up --runtime ${values.runtime}\` to change it`),
-          );
+        if (values.runtime) {
+          const live = managerRecordState(undefined, undefined, held.space);
+          if (live.state === "alive" && managerHasDeliveryMarker(live.pid!, held.space))
+            console.error(
+              c.dim(`! manager already running for "${held.space}" - its runtime is fixed at start; \`cotal down\` then \`cotal up --runtime ${values.runtime}\` to change it`),
+            );
+        }
         // A repair replaces the manager, so it must carry the mesh's recorded exposure forward — a
         // bare `cotal up` here has no `--host` of its own, and dropping it silently moves the attach
         // face back to loopback while everything else keeps working.
@@ -980,16 +1056,17 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
           noManager,
         });
         if (!controlPlane) process.exitCode = 1;
+        // #883: a refresh that HEALED a missing manager must say so — the summary line otherwise reads
+        // identically to a refresh that found everything already up, and the operator cannot tell which
+        // world they are in without a second command. Only here does a started manager mean one was
+        // missing: a launch starts its manager as a matter of course (#2480).
+        if (controlPlane?.started) console.log(c.green(`✓ restored in the background: manager (pid ${controlPlane.pid})`));
       }
-      const heldAttachHost = attachHostFor(held.space, values.host);
-      const heldMaxSessions = maxSessionsFor(held.space, maxSessions);
       // A broker was already answering here — this branch starts nothing, so it must not claim the
-      // record as ours (see `Provenance`).
-      // `tlsRequired` is CARRIED FORWARD, not re-derived. This branch starts no listener, so it has
-      // no transport decision to record — and `recordOurMesh` writes the entry whole, so omitting
-      // the field here would erase the requirement on every bare refresh, exactly the way dropping
-      // `attachHost` would silently demote the mesh to loopback.
-      recordOurMesh({ space: held.space, server, root, mode: held.mode, ...(held.tlsRequired !== undefined ? { tlsRequired: held.tlsRequired } : {}), ...(userAuth ? { userAuth } : {}), ...(heldAttachHost ? { attachHost: heldAttachHost } : {}), ...(heldMaxSessions !== undefined ? { maxSessions: heldMaxSessions } : {}), ...(held.maxFileStore !== undefined ? { maxFileStore: held.maxFileStore } : {}), ts: new Date().toISOString() }, "refresh");
+      // record as ours (see `Provenance`), and it passes only what this invocation decided.
+      // `recordOurMesh` carries everything else (`tlsRequired`, the recorded host and session
+      // ceiling, the store) from the record as it stands at write time, not from `held`.
+      recordOurMesh({ space: held.space, server, root, mode: held.mode, ...(userAuth ? { userAuth } : {}), ...(values.host ? { attachHost: values.host } : {}), ...(maxSessions !== undefined ? { maxSessions } : {}), ts: new Date().toISOString() }, "refresh");
       return;
     }
     const who = held ? `mesh "${held.space}" (${held.root})` : "a broker not started here";
@@ -1021,8 +1098,19 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
     }
   }
 
+  const restored = resumeAttempt ? pendingRestores.get(resumeAttempt) : undefined;
+  const boundListener: DetachOpts["boundListener"] = restored ? {
+    serverName: restored.serverName,
+    serverNonce: restored.serverNonce,
+    onSpawn: (pid: number, startedAt: string) => bindSpawnedRestoreListener(restored, pid, startedAt, startupLock),
+    verify: async () => { await provePreparedRestoreListener(restored); },
+  } : ordinaryAttempt ? {
+    serverName: ordinaryAttempt.serverName,
+    serverNonce: ordinaryAttempt.serverNonce,
+    onSpawn: (pid: number, startedAt: string) => bindSpawnedOrdinaryResumeListener(ordinaryAttempt, pid, startedAt, startupLock),
+    verify: async () => { await verifySpawnedOrdinaryListener(ordinaryAttempt); },
+  } : undefined;
   if (values.detach) {
-    const restored = resumeAttempt ? pendingRestores.get(resumeAttempt) : undefined;
     const { pid, source, authService, controlPlane, delivery, manager } = await startMeshDetached({
       transport,
       server,
@@ -1043,22 +1131,7 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
       noManager,
       resumeAttempt,
       resumeCommitToken: restored?.managerCommit?.durableCommitToken ?? ordinaryAttempt?.managerCommit?.durableCommitToken,
-      ...(restored ? {
-        boundListener: {
-          serverName: restored.serverName,
-          serverNonce: restored.serverNonce,
-          onSpawn: (pid: number, startedAt: string) => bindSpawnedRestoreListener(restored, pid, startedAt, startupLock),
-          verify: async () => { await provePreparedRestoreListener(restored); },
-        },
-      } : ordinaryAttempt ? {
-        boundListener: {
-          serverName: ordinaryAttempt.serverName,
-          serverNonce: ordinaryAttempt.serverNonce,
-          onSpawn: (pid: number, startedAt: string) => bindSpawnedOrdinaryResumeListener(ordinaryAttempt, pid, startedAt, startupLock),
-          verify: async () => { await verifySpawnedOrdinaryListener(ordinaryAttempt); },
-        },
-      } : {}),
-      skipPostStart: Boolean(resumeAttempt),
+      boundListener,
     });
     // Transport policy is committed inside startMeshDetached before delivery launch (S5+S9).
     console.log(c.dim(`Started nats-server (${source}).`));
@@ -1067,10 +1140,10 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
     if (supervisionWarning) console.error(c.yellow(supervisionWarning));
     if (restored && process.env.COTAL_SMOKE_FAIL_AFTER_RESTORE_LISTENER_READY === "1")
       throw new Error("smoke-injected failure after restore listener readiness");
-    // A user mesh whose auth service never became ready is recorded + running (a re-`cotal up`
-    // heals it), but this `up` did NOT deliver what was asked — automation must see that in the
-    // exit code, not only in the red line above.
-    if (!authService) process.exitCode = 1;
+    // A user mesh whose auth service never became ready, or a mesh whose control plane is degraded,
+    // is recorded + running, but this `up` did NOT deliver what was asked — automation must see that
+    // in the exit code, as it does on a refresh, not only in the line printed above.
+    if (!authService || !controlPlane) process.exitCode = 1;
     await completeResumeActivation(
       resumeAttempt,
       controlPlane && authService,
@@ -1083,7 +1156,7 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
 
   const useAuth = !values.open;
   const space = values.space ?? resolveSpace(process.cwd());
-  ensureRootForSpace(useAuth, space); // may pin the cwd as this space's root — before any cotalPath use
+  ensureRootForSpace(space); // may pin the cwd as this space's root — before any cotalPath use
   refuseOpenOverUserState(Boolean(values.open), space);
   const storeDir = values["store-dir"] ? resolve(values["store-dir"]) : cotalPath("nats");
   if (values.__ordinaryResumeAttempt) {
@@ -1103,7 +1176,6 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
   assertServesDialHost(transport, new URL(server).hostname);
   const setup = useAuth ? await authSetup(storeDir, server, space, host, wantUser ? { idpUrl: values.idp } : undefined, transport, values["rotate-sys"], maxFileStore) : undefined;
   const port = Number(new URL(server).port) || 4222;
-  const restored = resumeAttempt ? pendingRestores.get(resumeAttempt) : undefined;
   // Both modes go through a RENDERER, never bare CLI flags. Open mode used to start from
   // `-js -sd … -p … -a …`, which never called a renderer at all — so the required transport union
   // protected the auth path and was silent on the open one, and a cert/key pair passed to an
@@ -1111,9 +1183,7 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
   const confPath = setup ? setup.confPath : writeOpenBrokerConf(storeDir, { port, host, transport, maxFileStore });
   const natsArgs = [
     "-c", confPath,
-    ...(restored ? ["--name", restored.serverName]
-      : ordinaryAttempt ? ["--name", ordinaryAttempt.serverName]
-      : []),
+    ...(boundListener ? ["--name", boundListener.serverName] : []),
   ];
   const { bin, source } = await resolveNatsServer();
 
@@ -1126,79 +1196,46 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
   const listenerStartedAt = new Date().toISOString();
   const child = spawn(bin, natsArgs, { stdio: "inherit" });
   let activationFinished = !resumeAttempt;
-  if (child.pid) writeFileSync(cotalPath("nats.pid"), String(child.pid));
-  writeIdentityPin(cotalPath("nats.pid"), child.pid ?? 0); // #969: pin pid to process start
-  if (restored && process.env.COTAL_SMOKE_EXIT_AFTER_RESTORE_LISTENER_SPAWN === "1") process.exit(87);
-  if (restored) try {
-    bindSpawnedRestoreListener(restored, child.pid ?? 0, listenerStartedAt, startupLock);
-  } catch (error) {
-    await stopUnboundRestoreListener(child);
-    removeMatchingNatsPid(child.pid ?? 0);
-    throw error;
-  }
-  if (ordinaryAttempt) try {
-    bindSpawnedOrdinaryResumeListener(ordinaryAttempt, child.pid ?? 0, listenerStartedAt, startupLock);
-  } catch (error) {
-    await stopUnboundRestoreListener(child);
-    removeMatchingNatsPid(child.pid ?? 0);
-    throw error;
-  }
+  await recordSpawnedListener(child, listenerStartedAt, boundListener);
   releaseStartupLock();
   child.on("error", (err) => {
     console.error(c.red(`Failed to start nats-server: ${err.message}`));
     if (!resumeAttempt) process.exit(1);
   });
-  // The control plane is coupled to the broker: stop the delivery daemon AND the detached manager
+  // The control plane is coupled to the broker: stop the detached manager AND the delivery daemon
   // (AND the space's user-auth service) when this `up` stops (Ctrl-C), so none outlives the broker
   // it serves — a surviving manager would reconnect-loop invisibly against the dead (or the NEXT)
   // broker (the documented orphan-supervisor failure mode). All kill by pidfile, symmetric; the
   // auth service's pid is space-scoped so no other space's daemon can ever be hit.
-  // stopDelivery is async (its creds delete goes through the secret store); the rest of the teardown
-  // must run even if it fails — the failure is logged, never swallowed silently, and the daemon kill
-  // itself happens inside stopDelivery's finally. Order preserved: delivery, manager, auth, broker.
-  // The manager stop is the SPARING one `cotal down` performs (#1307): the seat snapshot is taken
-  // while the manager still answers, the spare capability of the exact recorded process is asserted
-  // before any signal, and the seats left behind are reported with the reap route. Teardown is
-  // AWAITED before the broker is signalled — the same order the broker-exit handler below uses — so
-  // manager teardown never races a broker that is already going away.
+  // The manager goes first, in `cotal down`'s order, through the stop `cotal down` runs (#1307): it
+  // holds the stop reservation, asserts the exact manager can spare its seats before any signal,
+  // reports the seats left behind, and escalates a wedged manager to SIGKILL. When that stop throws
+  // the manager may still be serving, so NOTHING else is signalled — no delivery, no auth, no broker:
+  // the refusal is printed with the reap route and the latch is released, so the stack keeps running
+  // in the foreground; the operator ends it with `cotal down --with-agents` from another terminal,
+  // and the broker-exit handler below already ends `up` when the broker goes.
+  // stopDelivery and stopAuthService are the stops `cotal down delivery` and `cotal down auth`
+  // perform (reservation, SIGKILL escalation); the rest of the teardown must run even if one fails —
+  // the failure is logged, never swallowed silently. Teardown is AWAITED before the broker is
+  // signalled, so it never races a broker that is already going away.
   let stopping = false;
+  let teardown: Promise<void> | undefined;
   const stop = () => {
     if (stopping) return; // a second Ctrl-C during teardown must not start a second teardown
     stopping = true;
-    void (async () => {
-      const managerContext = { root: cotalRoot(), space };
-      let spared: SpareSeatRow[] | undefined;
-      let legacyManagerSpareUnverified = false;
-      const managerPidPath = localProcessPath(MANAGER_PIDFILE, managerContext);
-      if (existsSync(managerPidPath)) {
-        const pin = verifyIdentityPin(managerPidPath);
-        if (pin.kind === "legacy") legacyManagerSpareUnverified = true;
-        else if (pin.kind === "match") {
-          spared = await listManagerSeatsForSpare(managerContext);
-          try {
-            assertManagerCanSpare(managerContext, undefined, pin.record);
-          } catch (e) {
-            // THE CAPABILITY ASSERT IS THE SIGNAL GATE, the same rule bare `down` enforces inside
-            // its beforeSignal hook: a throw there signals nothing. Signal NOTHING here either — no
-            // manager, no delivery, no auth, no broker — print the refusal with the reap route, and
-            // release the latch so the stack keeps running in the foreground; the operator ends it
-            // with `cotal down --with-agents` from another terminal, and the broker-exit handler
-            // below already ends `up` when the broker goes.
-            console.error(c.red(`! teardown: ${(e as Error).message}`));
-            console.error(c.red(`the stack is still running; to take managed agents with it, run: cotal down --with-agents`));
-            stopping = false;
-            return;
-          }
-        }
-      }
-      await stopDelivery(undefined, undefined, space).catch((e: Error) => console.error(`! delivery teardown: ${e.message}`));
+    // Once the broker has exited, its handler below is already running this teardown and reads
+    // `stopping` when it is done.
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    teardown = (async () => {
       try {
-        await stopManager(undefined, undefined, undefined, space);
-        if (legacyManagerSpareUnverified) printLegacyManagerSpareUncertainty();
-        else if (spared) printSparedAgents(spared);
+        await stopManager(space);
       } catch (e) {
-        console.error(`! manager teardown: ${(e as Error).message}`);
+        console.error(c.red(`! teardown: ${(e as Error).message}`));
+        console.error(c.red(`the stack is still running; to take managed agents with it, run: cotal down --with-agents`));
+        stopping = false;
+        return;
       }
+      await stopDelivery(space).catch((e: Error) => console.error(`! delivery teardown: ${e.message}`));
       await stopAuthService(space).catch((e: Error) => console.error(`! auth teardown: ${e.message}`));
       child.kill("SIGTERM");
     })();
@@ -1207,95 +1244,116 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
   process.on("SIGTERM", stop);
   // The broker is gone — drop it from the registry (and the `current` pointer if it was the default)
   // so a later `cotal spawn` doesn't try to join a dead mesh.
-  child.on("exit", async (code) => {
-    removeIdentityPin(cotalPath("nats.pid")); rmSync(cotalPath("nats.pid"), { force: true });
-    // Logged, never silently swallowed; the daemon kill runs in stopDelivery's finally regardless.
-    await stopDelivery(undefined, undefined, space).catch((e: Error) => console.error(`! delivery teardown: ${e.message}`));
-    await stopManager(undefined, undefined, undefined, space).catch((e: Error) => console.error(`! manager teardown: ${e.message}`));
+  child.on("exit", async (code, signal) => {
+    if (failedListeners.has(child)) return;
+    removePidPair(cotalPath("nats.pid"), String(child.pid));
+    // One teardown at a time: a stop started while another is in flight is refused the reservation
+    // that one holds, so wait for a Ctrl-C teardown already running instead of racing it.
+    await teardown;
+    await stopDelivery(space).catch((e: Error) => console.error(`! delivery teardown: ${e.message}`));
+    await stopManager(space).catch((e: Error) => console.error(`! manager teardown: ${e.message}`));
     await stopAuthService(space).catch((e: Error) => console.error(`! auth teardown: ${e.message}`));
-    // Only unrecord if the registry still points at THIS broker. A newer broker for the same space
-    // (a concurrent `up`, or a different-port re-up that recorded after us) may have replaced our
-    // record — removing by name would clobber the live winner and hide it from the registry.
-    // …and only if it is still OUR kind of record. A concurrent `cotal meshes add --force` can
-    // replace it with a hand-registered one carrying the same server + root; that record outlives
-    // this broker by design (it is the operator's, and only they remove it), so unrecording it on
-    // our exit would delete a registration this process never owned.
-    const mine = findMesh(space);
-    if (mine && mine.origin !== "manual" && mine.server === server && mine.root === cotalRoot()) {
-      removeMesh(space);
-      if (getCurrent() === space) clearCurrent();
+    // Unrecording (and the exit code below) both depend on WHY the broker is gone. `stopping` is
+    // true only for the intended shutdown `stop()` drives (Ctrl-C, SIGTERM) — everything else here
+    // (a crash, an OOM kill, a signal from outside `up`) leaves the record and its store in place.
+    if (stopping) {
+      // Only unrecord if the registry still points at THIS broker. A newer broker for the same space
+      // (a concurrent `up`, or a different-port re-up that recorded after us) may have replaced our
+      // record — removing by name would clobber the live winner and hide it from the registry.
+      // …and only if it is still OUR kind of record. A concurrent `cotal meshes add --force` can
+      // replace it with a hand-registered one carrying the same server + root; that record outlives
+      // this broker by design (it is the operator's, and only they remove it), so unrecording it on
+      // our exit would delete a registration this process never owned.
+      const mine = findMesh(space);
+      if (mine && mine.origin !== "manual" && mine.server === server && mine.root === cotalRoot()) {
+        removeMesh(space);
+        if (getCurrent() === space) clearCurrent();
+      }
+      if (activationFinished) process.exit(code ?? 0);
+    } else {
+      // The record is kept ON PURPOSE: it still names the store this broker opened, so a repair
+      // `up` reopens that SAME store instead of falling back to the root's default, and a
+      // supervising unit's restart takes the refresh path against the recorded store rather than
+      // racing a second broker into existence. Foreground stdio is inherited (its own log lines
+      // are already on this terminal, above), so there is no `.cotal/nats.log` to name here.
+      const detail = signal ? `signal ${signal}` : `code ${code}`;
+      console.error(
+        c.red(
+          `✗ nats-server exited unexpectedly (${detail}); the mesh "${space}" stays recorded (\`cotal meshes\` lists it offline); log: see the terminal output above; repair: \`cotal up --server ${server} --space ${space}\``,
+        ),
+      );
+      // A foreground broker under `Restart=on-failure` must exit non-zero on a crash so the unit
+      // restarts it; exiting 0 here (as an unconditional `code ?? 0` used to) looked like a clean
+      // stop and left the unit sitting dead.
+      if (activationFinished) process.exit(code ?? 1);
     }
-    if (activationFinished) process.exit(code ?? 0);
   });
 
-  const ready = await waitReady(server, setup?.creds);
-  if (!ready) {
-    child.kill("SIGTERM");
-    const reason = `nats-server did not become ready at ${server}`;
-    // `startupLock` is already released by here on this path (and the helper then takes its own);
-    // passed anyway so the call stays correct if the release above ever moves.
-    markPendingResumeDegraded(resumeAttempt ?? "", reason, startupLock);
-    throw new Error(reason);
-  }
-  if (restored) await provePreparedRestoreListener(restored);
-  // Listener ready — commit the transport decision (S5: not before start).
-  commitTransportPolicy(meshRoot, transport);
+  await awaitSpawnedListener({ child, server, space, creds: setup?.creds, log: "the terminal output above", boundListener });
   {
-    if (!resumeAttempt) await postStart(server, space, setup, seedFile);
-    // USER MODE: the auth service comes up FIRST among the daemons — until its callout answers,
-    // every user-mode connect to this broker is denied, so `up` must not report a usable user mesh
-    // (nor let agents race it) on a half-started auth plane. (Foreground `up` doesn't exit here, so
-    // `ok` has no exit code to carry — the red consequence line above is the operator signal.)
-    const svc = await startUserAuthService(space, server, setup, publicExchange);
-    // Record BEFORE the control plane comes up: the manager's fail-closed mode detection requires
-    // an authoritative registry entry (marker-without-registry is a refused start, not a guess),
-    // so the record must exist by the time it boots. A manager/delivery failure after this leaves
-    // a recorded-but-degraded mesh — the documented, healable posture.
-    // Resolve exposure BEFORE recording. This path also serves a RESUME of an already-recorded mesh
-    // (`down --preserve-state` then a bare `up`), where the operator's `--host` lives only in the
-    // registry — and the record below is written whole, so reading it afterwards would find the
-    // field this very call had just erased.
-    const effectiveAttachHost = attachHostFor(space, values.host);
-    const effectiveMaxSessions = maxSessionsFor(space, maxSessions);
-    recordOurMesh({
-      space, server, root: cotalRoot(),
-      mode: setup?.prepared ? "user" : useAuth ? "auth" : "open",
-      // Written ALWAYS, as a boolean, unlike `attachHost` below. Absence and `false` resolve
-      // identically for clients, so an omitted field would be indistinguishable from a deliberate
-      // plaintext mesh — and this is the one field whose whole purpose is that the answer was
-      // stated rather than defaulted.
-      tlsRequired: transport.kind === "tls-required",
-      ...(svc.userAuth ? { userAuth: svc.userAuth } : {}),
-      // Only a real decision is persisted — an explicit `--host` now, or one carried forward from a
-      // previous launch. The bare case stays absent rather than recording the loopback default as
-      // though the operator had chosen it.
-      ...(effectiveAttachHost ? { attachHost: effectiveAttachHost } : {}),
-      ...(effectiveMaxSessions !== undefined ? { maxSessions: effectiveMaxSessions } : {}),
-      ...(maxFileStore !== undefined ? { maxFileStore } : {}),
-      ts: new Date().toISOString(),
-    }, "started");
-    // Bring up the delivery daemon WITH the server (auth mode only — it self-gates on `.cotal/auth`).
-    // It is part of the server, so `cotal up` starts it by default; open dev mode has no daemon.
-    // Class-2 credential renewal is NOT wired here: the MANAGER is the renewal owner (it is resident
-    // in every mesh mode — foreground, --detach, refresh — where this foreground process is not).
-    const controlPlane = await startDeliveryWithBroker(space, server, transport.kind === "tls-required", {
-      runtime: values.runtime,
-      // The address the broker was bound to. This is what lets `cotal attach` reach this manager
-      // from another machine; without it the attach face stays loopback-only, so exposing terminals
-      // is never a side effect of anything but the operator binding the mesh somewhere reachable.
-      attachHost: effectiveAttachHost,
-      maxSessions: effectiveMaxSessions,
-      noManager,
+    // A DAEMON THAT DIES UNDER THIS RUNNING BROKER IS RESTARTED HERE (#2469). It exits on its own once
+    // it cannot reach the broker, and a starved host makes a running broker look unreachable, so it can
+    // end while this broker serves on. Nothing else brings it back, and every static retirement then
+    // fails on the ctl.delivery-admin rail and holds its name until an operator re-runs `cotal up`. A
+    // clean exit or SIGTERM/SIGINT is a deliberate stop (`cotal down delivery`) and stays stopped, and so
+    // is the SIGKILL `down` escalates to when a starved daemon outlives its grace, also when either ends a
+    // replacement this loop is still waiting on: that attempt then fails, and retrying it would undo the
+    // stop. A failed attempt waits out the lease TTL, the longest a dead holder's lease blocks its
+    // replacement. No daemon is alive during that wait for `down` to signal, so a stop there shows only as
+    // the dead daemon's record going away. Recovery is announced only once the responder is bound.
+    const meshServing = () => !stopping && child.exitCode === null && child.signalCode === null;
+    let restartingDelivery = false;
+    let deliveryStopped = false;
+    const onDeliveryExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (code === 0 || signal === "SIGTERM" || signal === "SIGINT" || (signal !== null && deliveryStoppedByDown(space))) {
+        deliveryStopped = true;
+        return;
+      }
+      if (restartingDelivery || !meshServing()) return;
+      restartingDelivery = true;
+      console.error(c.yellow(`! delivery daemon exited (${signal ? `signal ${signal}` : `code ${code}`}) while nats-server is running - restarting it`));
+      void (async () => {
+        while (meshServing()) {
+          let failure: string;
+          try {
+            const ensured = await ensureDelivery({ space, server, tls: transport.kind === "tls-required", onDeliveryExit });
+            // An abnormal exit during this attempt was dropped above, so the record decides.
+            if (deliveryUp(space)) {
+              // An unbound responder was reported by ensureDelivery, and this daemon's exit re-arms the restart.
+              if (ensured.responderBound) console.error(c.green(`✓ delivery daemon running again${ensured.pid !== undefined ? ` (pid ${ensured.pid})` : ""}`));
+              break;
+            }
+            failure = "no delivery daemon is running after the attempt";
+          } catch (e) {
+            failure = (e as Error).message;
+          }
+          if (deliveryStopped) break;
+          console.error(c.yellow(`! delivery restart failed, retrying in ${LEASE_TTL_MS / 1000}s: ${failure}`));
+          const recorded = !deliveryStoppedByDown(space);
+          await new Promise((r) => setTimeout(r, LEASE_TTL_MS));
+          if (deliveryStopped || (recorded && deliveryStoppedByDown(space))) break;
+        }
+        restartingDelivery = false;
+      })();
+    };
+    const { authService, controlPlane } = await serveReadyListener({
+      child, server, space, storeDir, setup, seedFile, transport,
+      host: values.host,
+      maxSessions,
+      maxFileStore,
+      publicExchange,
       resumeAttempt,
       resumeCommitToken: restored?.managerCommit?.durableCommitToken ?? ordinaryAttempt?.managerCommit?.durableCommitToken,
-      wsPort: setup?.wsPort, // P2 item 6: the console session client's broker ws port
+      runtime: values.runtime,
+      noManager,
+      onDeliveryExit,
     });
     if (restored && process.env.COTAL_SMOKE_FAIL_AFTER_RESTORE_LISTENER_READY === "1")
       throw new Error("smoke-injected failure after restore listener readiness");
     await completeResumeActivation(
       resumeAttempt,
-      controlPlane && svc.ok,
-      !svc.ok ? "normal listener started but the user-auth service is unavailable" : "normal listener started but the control plane is degraded",
+      controlPlane !== undefined && authService,
+      !authService ? "normal listener started but the user-auth service is unavailable" : "normal listener started but the control plane is degraded",
       server,
       startupLock,
     );
@@ -1368,18 +1426,32 @@ async function resumeControlAuth(root: string, mode: "open" | "auth" | "user"): 
   };
 }
 
+/** The caller for the resume's admin-gated manager asks on a user mesh. The gate reads the CURRENT
+ *  ledger, so they ride the logged-in operator's manager view, the principal the preserve cut used:
+ *  a static instrument carries a caller the ledger has no row for. The view selects a registered
+ *  manager instance, so it is taken after the readiness wait. Each ask is its own connection and a
+ *  bearer lives no longer than the IdP proof behind it, so every call after the first takes a fresh
+ *  bearer from the view's source, pinned to the same principal and manager instance. */
+async function userManagerAuth(space: string): Promise<() => Promise<ControlAuth>> {
+  const conn = await connectUserControlOrThrow({ space });
+  const view = await userViewAuth(conn, "manager-caller");
+  let first: string | undefined = view.bearer;
+  return async () => {
+    const bearer = first ?? await view.source();
+    first = undefined;
+    return {
+      bearer,
+      sentinelCreds: view.sentinelCreds,
+      tls: conn.tls,
+      epCaller: { owner: view.owner, actor: view.actor, uid: view.lifecycleUid },
+      managerInstanceId: view.managerInstanceId,
+    };
+  };
+}
+
 function restoreListenerOwner(pid: number, nonce: string, startedAt: string): ProcessOwner {
   if (!Number.isInteger(pid) || pid <= 0) throw new Error("restore listener spawn returned no pid");
   return { pid, host: hostname(), startedAt, id: `restore-listener-${nonce}` };
-}
-
-function removeMatchingNatsPid(pid: number): void {
-  const path = cotalPath("nats.pid");
-  try {
-    const stat = lstatSync(path);
-    if (stat.isFile() && !stat.isSymbolicLink() && readFileSync(path, "utf8") === String(pid))
-      rmSync(path);
-  } catch { /* absent, changed, or not owned by this spawn */ }
 }
 
 function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
@@ -1396,13 +1468,25 @@ function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boole
   });
 }
 
-async function stopUnboundRestoreListener(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
+/** Listeners {@link stopFailedListener} is stopping. Their launch reports its own error, so the
+ *  foreground's broker-exit handler must not report that exit as a crash and exit first. */
+const failedListeners = new WeakSet<ChildProcess>();
+
+/**
+ * Stop a listener whose launch failed before it served. A signal is not proof of exit, so SIGTERM
+ * escalates to SIGKILL and `nats.pid` is removed only once the exit is observed. A listener that
+ * outlives both keeps its record and fails loud with its pid. A listener whose pid publish threw
+ * passes `published` false and leaves `nats.pid` as found.
+ */
+async function stopFailedListener(child: ChildProcess, published = true): Promise<void> {
+  failedListeners.add(child);
   child.kill("SIGTERM");
-  if (await waitForChildExit(child, 5_000)) return;
-  child.kill("SIGKILL");
-  if (!await waitForChildExit(child, 5_000))
-    throw new Error(`unbound restore listener process ${child.pid ?? "unknown"} did not exit`);
+  if (!await waitForChildExit(child, 5_000)) {
+    child.kill("SIGKILL");
+    if (!await waitForChildExit(child, 5_000))
+      throw new Error(`nats-server process ${child.pid ?? "unknown"} did not exit after SIGKILL`);
+  }
+  if (published) removePidPair(cotalPath("nats.pid"), String(child.pid));
 }
 
 function bindSpawnedRestoreListener(prepared: PreparedRestore, pid: number, startedAt: string, heldLock?: MaintenanceLock): void {
@@ -1631,6 +1715,7 @@ async function resumeProvenOrdinaryListener(pending: PendingOrdinaryResume, held
     ...(adoptAttachHost ? { attachHost: adoptAttachHost } : {}),
     ...(adoptMaxSessions !== undefined ? { maxSessions: adoptMaxSessions } : {}),
     ...(pending.maxFileStore !== undefined ? { maxFileStore: pending.maxFileStore } : {}),
+    storeDir: resolve(pending.storeDir),
     ts: new Date().toISOString(),
   }, "started");
   const controlPlane = await startDeliveryWithBroker(pending.space, pending.server, adoptedTlsRequired(pending.root), {
@@ -1642,7 +1727,7 @@ async function resumeProvenOrdinaryListener(pending: PendingOrdinaryResume, held
   });
   await completeResumeActivation(
     pending.attemptId,
-    controlPlane && svc.ok,
+    controlPlane !== undefined && svc.ok,
     !svc.ok ? "adopted resume listener has no user-auth service" : "adopted resume listener has a degraded control plane",
     pending.server,
     heldLock,
@@ -1684,6 +1769,7 @@ async function resumeProvenRestoreListener(prepared: PreparedRestore, heldLock?:
     ...(svc.userAuth ? { userAuth: svc.userAuth } : {}),
     ...(restoreAttachHost ? { attachHost: restoreAttachHost } : {}),
     ...(restoreMaxSessions !== undefined ? { maxSessions: restoreMaxSessions } : {}),
+    storeDir: resolve(prepared.targetPath),
     ts: new Date().toISOString(),
   }, "started");
   const controlPlane = await startDeliveryWithBroker(prepared.space, prepared.server, adoptedTlsRequired(prepared.root), {
@@ -1695,7 +1781,7 @@ async function resumeProvenRestoreListener(prepared: PreparedRestore, heldLock?:
   });
   await completeResumeActivation(
     prepared.attemptId,
-    controlPlane && svc.ok,
+    controlPlane !== undefined && svc.ok,
     !svc.ok ? "proven restore listener has no user-auth service" : "proven restore listener has a degraded control plane",
     prepared.server,
     heldLock,
@@ -1766,6 +1852,19 @@ async function completeResumeActivation(
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 150));
   }
+  let userAuth: (() => Promise<ControlAuth>) | undefined;
+  // The auth for one admin-gated ask. A failed user-mode renewal degrades the journal only where a
+  // refusal of that ask would.
+  const askAuth = async (degrade: boolean): Promise<ControlAuth> => {
+    if (pending.mode !== "user") return auth;
+    try {
+      userAuth ??= await userManagerAuth(pending.space);
+      return await userAuth();
+    } catch (e) {
+      if (degrade) markPendingResumeDegraded(attemptId, e instanceof Error ? e.message : String(e), heldLock);
+      throw e;
+    }
+  };
   const resumed = await askManager(
     pending.space,
     server,
@@ -1776,7 +1875,7 @@ async function completeResumeActivation(
         ? { ...(pending.inventory as Record<string, unknown>), agents: [] }
         : pending.inventory as Record<string, unknown>,
     },
-    auth,
+    await askAuth(true),
     "any",
     10 * 60 * 1000,
   );
@@ -1810,7 +1909,7 @@ async function completeResumeActivation(
       server,
       "commitResume",
       { attemptId },
-      auth,
+      await askAuth(true),
       "any",
       40_000,
     );
@@ -1844,7 +1943,7 @@ async function completeResumeActivation(
       server,
       "commitResume",
       { attemptId },
-      auth,
+      await askAuth(false),
       "any",
       40_000,
     );
@@ -1865,7 +1964,7 @@ async function completeResumeActivation(
     server,
     "finalizeResume",
     { attemptId, durableCommitToken: managerCommit.durableCommitToken },
-    auth,
+    await askAuth(false),
     "any",
     40_000,
   );
@@ -1982,6 +2081,16 @@ async function upManifest(file: string, opts: UpManifestFlags): Promise<void> {
     console.error(c.red(`✗ --idp is for user-auth spaces (this manifest's broker.auth is ${declaredStr}) - set broker.auth: "user" in the manifest, or drop --idp.`));
     process.exit(1);
   }
+  const idpProblem = opts.idp === undefined ? undefined : idpUrlProblem(opts.idp, "--idp");
+  if (idpProblem) {
+    console.error(c.red(`✗ ${idpProblem}`));
+    process.exit(1);
+  }
+  const serverProblems = opts.server === undefined ? [] : serverUrlProblems(opts.server, "--server");
+  if (serverProblems.length) {
+    for (const problem of serverProblems) console.error(c.red(`✗ ${problem}`));
+    process.exit(1);
+  }
   // Apply CLI overrides to one effective manifest (flag > manifest > default) so render + seed +
   // broker + launch all agree on the same values.
   const eff = applyUpOverrides(prepared, opts);
@@ -1991,7 +2100,7 @@ async function upManifest(file: string, opts: UpManifestFlags): Promise<void> {
   // an explicit `broker.servers` would otherwise bind one address and be probed at another.
   const server = m.broker?.host ? reconcileHostAndServer(m.broker.host, m.broker?.servers, "broker.host", "broker.servers") : (m.broker?.servers ?? DEFAULT_SERVER);
   const open = m.broker?.auth === false; // default is auth
-  const userAuth = m.broker?.auth === "user" ? { idpUrl: opts.idp ?? m.broker?.idp } : undefined; // flag > manifest
+  const userAuth = m.broker?.auth === "user" ? { idpUrl: m.broker.idp } : undefined;
   const runtime = m.runtime ?? "pty";
   // A manifest's agents are booted BY the manager `up -f` starts with the mesh, so `--no-manager`
   // against a manifest declaring agents asks for a boot that cannot deliver its own plan. Refused
@@ -2013,6 +2122,14 @@ async function upManifest(file: string, opts: UpManifestFlags): Promise<void> {
     // the applying command refuses. Validate against the effective server; still no writes.
     // Announce only AFTER the dial-host check so a wrong-SAN dry-run does not print TLS: serving.
     assertServesDialHost(opts.transport, new URL(server).hostname);
+    // Connector preflight on the dry-run path too (#315): the real route refuses a manifest at
+    // preflightConnectors before anything boots; a dry run that plans a launch the applying
+    // command refuses is the same green-lit-a-refusal failure class.
+    const dryConn = await preflightConnectors(prepared);
+    if (dryConn) {
+      console.error(c.red(`✗ connector preflight failed: ${dryConn}`));
+      process.exit(1);
+    }
     if (opts.transport.kind === "tls-required") announceTransport(opts.transport);
     console.log(renderUpPlan(eff, server));
     // The omission is part of the plan (#1417): a dry run that lists a manager the real boot
@@ -2067,7 +2184,7 @@ async function upManifest(file: string, opts: UpManifestFlags): Promise<void> {
   // A leftover detached manager (its broker is gone — the reachability check above proved nothing
   // lives at this address) would win the fresh mesh's lease and the launch manager would refuse.
   // Stop it, so the manager started below WITH the launch spec is THE manager.
-  await stopManager(undefined, undefined, undefined, m.space);
+  await stopManager(m.space);
   let pid: number;
   let controlPlane = false;
   let authService = true;
@@ -2100,15 +2217,16 @@ async function upManifest(file: string, opts: UpManifestFlags): Promise<void> {
   if (inherited) console.log("\n" + inherited);
   if (eff.warnings.length) console.log("\n" + renderWarnings(eff.warnings));
   console.log(c.dim(`\nWatch: \`cotal web\` (browser dashboard) or \`cotal console --space ${m.space}\` (terminal)   ·   Tear down: \`cotal down\``));
-  // A declared-user-auth manifest whose auth service never became ready: the mesh is up + recorded
-  // (re-`cotal up` heals), but this launch did not deliver a usable identity plane — exit non-zero
-  // so CI/wrappers don't read success (the red consequence line printed at the failure above).
-  if (!authService) process.exitCode = 1;
+  // A declared-user-auth manifest whose auth service never became ready, or a degraded control
+  // plane: the mesh is up + recorded, but this launch did not deliver what it declared — exit
+  // non-zero so CI/wrappers don't read success (the consequence line printed at the failure above).
+  if (!authService || !controlPlane) process.exitCode = 1;
 }
 
 /** CLI overrides for `up -f` — each wins over the manifest's own value (flag > manifest > default).
- *  `userAuth`/`idp` are consistency ASSERTIONS against the manifest, not overrides: the manifest
- *  declares the auth mode; a disagreeing flag is a hard error, never a silent re-mode. */
+ *  `userAuth` is a consistency ASSERTION against the manifest, not an override, and `idp` overrides
+ *  only on a user-auth manifest: the manifest declares the auth mode; a disagreeing flag is a hard
+ *  error, never a silent re-mode. */
 interface UpManifestFlags {
   /** The listener's transport, decided above the `--file` branch. NON-OPTIONAL: this path is one of
    *  the three that used to drop `--tls-cert`/`--tls-key` at the call boundary and serve plaintext. */
@@ -2140,6 +2258,7 @@ function applyUpOverrides(prepared: PreparedManifest, o: UpManifestFlags): Prepa
   if (o.server) broker.servers = o.server;
   if (o.host) broker.host = o.host;
   if (o.open) broker.auth = false;
+  if (o.idp) broker.idp = o.idp;
   return {
     ...prepared,
     manifest: {
@@ -2157,8 +2276,9 @@ function applyUpOverrides(prepared: PreparedManifest, o: UpManifestFlags): Prepa
  *  cotal_spawn find a manager without any setup side effect. Coupled to the broker by the
  *  daemon's watchdog + the `up`/`down` teardown. `mgr` rides through to the manager start — the
  *  `up -f` path hands THE manager its runtime + resolved launch spec here (one manager per space,
- *  so the launch can never be a second supervise). Returns whether the control plane came up, so a
- *  caller whose output claims a manager (the `up -f` launching line) can tell the truth. */
+ *  so the launch can never be a second supervise). Returns the control plane it ensured, or
+ *  `undefined` when it is degraded, so a caller whose output claims a manager (the `up -f` launching
+ *  line) can tell the truth. */
 async function startDeliveryWithBroker(
   space: string,
   server: string,
@@ -2190,8 +2310,10 @@ async function startDeliveryWithBroker(
     maxSessions?: number;
     /** #1417 broker-only mode: ensure the delivery daemon and not the manager. */
     noManager?: boolean;
+    /** #2469: the foreground owner's restart hook for a daemon this launch starts. */
+    onDeliveryExit?: (code: number | null, signal: NodeJS.Signals | null) => void;
   },
-): Promise<boolean> {
+): Promise<Awaited<ReturnType<typeof ensureControlPlane>> | undefined> {
   try {
     const plane = await ensureControlPlane({ space, server, tls: tlsRequired, ...(mgr ?? {}) });
     // #1576: `up` either BINDS the responder or SAYS SO HERE. The delivery daemon is a hard
@@ -2205,14 +2327,173 @@ async function startDeliveryWithBroker(
         c.yellow(`! delivery responder did not bind before this boot finished - ${RESPONDER_UNBOUND_CONSEQUENCE}`) +
           c.dim(`\n  The daemon process is running and the wait is open-ended; boot durable joins reconcile by themselves once it binds (agents do NOT need respawning).\n  Watch it with \`${displayCmd()} status --components\`.`),
       );
-    return true;
+    return plane;
   } catch (e) {
     // Non-fatal (live messaging is unaffected) — but never SILENT: without the manager,
     // `spawn --detach` / cotal_spawn have no responder, and the operator must hear it here,
     // not as an unexplained "no manager reachable" later.
     console.error(c.dim(`! control plane degraded: ${(e as Error).message} - durable delivery/manager may be down; start one with: cotal supervise`));
-    return false;
+    return undefined;
   }
+}
+
+/**
+ * Publish a spawned listener's pid, and bind a maintenance-bound one to its attempt, before anything
+ * waits on it. A launch that dies before its listener serves then leaves `nats.pid` for `cotal down`
+ * and a journal naming the exact process for recovery to adopt or retire. A publish or bind that
+ * throws stops the listener. Both launch modes call it right after the spawn.
+ */
+async function recordSpawnedListener(child: ChildProcess, startedAt: string, bound?: DetachOpts["boundListener"]): Promise<void> {
+  if (!child.pid) throw new Error("nats-server spawned with no pid");
+  try {
+    writePidPair(cotalPath("nats.pid"), child.pid); // #969/#1238: publish the pair by rename, never torn
+  } catch (error) {
+    // The entry at `nats.pid` may be the one that refused the publish (a directory there fails the
+    // rename), so it is left as found: unrecording would read it and throw over this error.
+    await stopFailedListener(child, false);
+    throw error;
+  }
+  if (!bound) return;
+  if (process.env.COTAL_SMOKE_EXIT_AFTER_RESTORE_LISTENER_SPAWN === "1") process.exit(87);
+  try {
+    bound.onSpawn(child.pid, startedAt);
+  } catch (error) {
+    await stopFailedListener(child);
+    throw error;
+  }
+}
+
+/**
+ * Everything between spawning a listener and serving it: readiness, the broker version read and a
+ * bound listener's identity check. Foreground `up` and {@link startMeshDetached} both call it, so a
+ * guard added here reaches both launch modes (#2924).
+ *
+ * A listener that never answers or whose version read throws is stopped and its `nats.pid` removed
+ * before `up` fails. Nothing has recorded the mesh yet, so a listener left running would hold the
+ * port with no registry entry. A bound listener that fails its identity check is kept: its
+ * maintenance journal is already bound to it.
+ */
+async function awaitSpawnedListener(l: {
+  child: ChildProcess;
+  server: string;
+  space: string;
+  creds?: string;
+  /** Where the listener's output goes, named when it never answers. */
+  log: string;
+  boundListener?: DetachOpts["boundListener"];
+}): Promise<void> {
+  const { child, server, space } = l;
+  let facts: BrokerFacts;
+  try {
+    if (!(await waitReady(server, l.creds))) throw new Error(`nats-server did not become reachable at ${server} - see ${l.log}`);
+    facts = await brokerVersion(server, space, l.creds);
+  } catch (e) {
+    await stopFailedListener(child);
+    throw e;
+  }
+  if (belowPresenceSafeBroker(facts.version) && facts.presenceFileBacked)
+    console.error(
+      c.yellow(
+        `! nats-server ${facts.version} is below 2.14.5 and the presence bucket of "${space}" is file-backed: it can latch after a stall and close the mesh to new joins (#1356); put a nats-server 2.14.5 or newer on PATH (it wins over the bundled one)`,
+      ),
+    );
+  if (l.boundListener) await l.boundListener.verify();
+}
+
+/**
+ * Everything a launch runs once its listener answers: the space setup, the user-auth service, the
+ * mesh record, the transport commit and the control plane. Foreground `up` and
+ * {@link startMeshDetached} both call it, so the two launch modes cannot drift apart (#2496).
+ *
+ * A fresh boot whose setup throws stops the listener and removes `nats.pid` before rethrowing the
+ * original error. Nothing has recorded the mesh yet, so a listener left running would hold the port
+ * with no registry entry for `cotal down` to reach. A channel seed with an unparseable value fails
+ * here. A resume keeps its listener: its maintenance journal is already bound to it.
+ */
+async function serveReadyListener(l: {
+  child: ChildProcess;
+  server: string;
+  space: string;
+  storeDir: string;
+  setup?: Awaited<ReturnType<typeof authSetup>>;
+  seedFile?: ChannelRegistryFile;
+  transport: BrokerTransport;
+  /** The raw `--host` flag, so the record can tell an operator's address from the loopback default. */
+  host?: string;
+  maxSessions?: number;
+  maxFileStore?: number;
+  publicExchange?: string[];
+  resumeAttempt?: string;
+  resumeCommitToken?: string;
+  runtime?: string;
+  launch?: string;
+  noManager?: boolean;
+  onDeliveryExit?: (code: number | null, signal: NodeJS.Signals | null) => void;
+}): Promise<{ authService: boolean; controlPlane: Awaited<ReturnType<typeof ensureControlPlane>> | undefined }> {
+  const { child, server, space, setup, transport } = l;
+  if (l.resumeAttempt) await recreateMemoryBuckets(server, space, setup);
+  else {
+    try {
+      await postStart(server, space, setup, l.seedFile);
+    } catch (e) {
+      await stopFailedListener(child);
+      throw e;
+    }
+  }
+  // USER MODE: the auth service comes up FIRST among the daemons — until its callout answers,
+  // every user-mode connect to this broker is denied, so `up` must not report a usable user mesh
+  // (nor let agents race it) on a half-started auth plane.
+  const svc = await startUserAuthService(space, server, setup, l.publicExchange);
+  // Record BEFORE the control plane comes up: the manager's fail-closed mode detection requires
+  // an authoritative registry entry (marker-without-registry is a refused start, not a guess),
+  // so the record must exist by the time it boots. A manager/delivery failure after this leaves
+  // a recorded-but-degraded mesh — the documented, healable posture.
+  // Resolve exposure BEFORE recording. A RESUME of an already-recorded mesh (`down
+  // --preserve-state` then a bare `up`) carries the operator's `--host` only in the registry, and
+  // the record below is written whole, so reading it afterwards would find the field this very call
+  // had just erased.
+  const attachHost = attachHostFor(space, l.host);
+  const maxSessions = maxSessionsFor(space, l.maxSessions);
+  recordOurMesh({
+    space, server, root: cotalRoot(),
+    mode: setup?.prepared ? "user" : setup ? "auth" : "open",
+    // Written ALWAYS, as a boolean, unlike `attachHost` below. Absence and `false` resolve
+    // identically for clients, so an omitted field would be indistinguishable from a deliberate
+    // plaintext mesh — and this is the one field whose whole purpose is that the answer was
+    // stated rather than defaulted.
+    tlsRequired: transport.kind === "tls-required",
+    ...(svc.userAuth ? { userAuth: svc.userAuth } : {}),
+    // Only a real decision is persisted — an explicit `--host` now, or one carried forward from a
+    // previous launch. The bare case stays absent rather than recording the loopback default as
+    // though the operator had chosen it.
+    ...(attachHost ? { attachHost } : {}),
+    ...(maxSessions !== undefined ? { maxSessions } : {}),
+    ...(l.maxFileStore !== undefined ? { maxFileStore: l.maxFileStore } : {}),
+    storeDir: l.storeDir,
+    ts: new Date().toISOString(),
+  }, "started");
+  // Commit the policy only for a listener that is up and recorded (S5), and before the control
+  // plane (S9). startDeliveryWithBroker is HANDED the transport decision, so it does not depend on
+  // the file at all.
+  commitTransportPolicy(cotalRoot(), transport);
+  // The delivery daemon self-gates on `.cotal/auth`, so an open mesh has none. Class-2 credential
+  // renewal is NOT wired here: the MANAGER is the renewal owner (it is resident in every mesh mode,
+  // where a foreground `up` process is not).
+  const controlPlane = await startDeliveryWithBroker(space, server, transport.kind === "tls-required", {
+    onDeliveryExit: l.onDeliveryExit,
+    runtime: l.runtime,
+    launch: l.launch,
+    // The address the broker was bound to. This is what lets `cotal attach` reach this manager
+    // from another machine; without it the attach face stays loopback-only, so exposing terminals
+    // is never a side effect of anything but the operator binding the mesh somewhere reachable.
+    attachHost,
+    maxSessions,
+    noManager: l.noManager,
+    resumeAttempt: l.resumeAttempt,
+    resumeCommitToken: l.resumeCommitToken,
+    wsPort: setup?.wsPort, // P2 item 6: the console session client's broker ws port
+  });
+  return { authService: svc.ok, controlPlane };
 }
 
 export interface DetachOpts {
@@ -2269,8 +2550,6 @@ export interface DetachOpts {
     onSpawn(pid: number, startedAt: string): void;
     verify(): Promise<void>;
   };
-  /** Preservation/restore already established every canonical stream before listener exposure. */
-  skipPostStart?: boolean;
 }
 
 /**
@@ -2293,7 +2572,7 @@ export async function startMeshDetached(
   if (opts.rotateSys && !useAuth)
     throw new Error("startMeshDetached: --rotate-sys is for auth meshes; an open mesh has no system account or $SYS credentials to rotate");
   const space = opts.space ?? resolveSpace(process.cwd());
-  ensureRootForSpace(useAuth, space); // may pin the cwd as this space's root — before any cotalPath use
+  ensureRootForSpace(space); // may pin the cwd as this space's root — before any cotalPath use
   refuseOpenOverUserState(Boolean(opts.open), space);
   const storeDir = opts.storeDir ? resolve(opts.storeDir) : cotalPath("nats");
   mkdirSync(storeDir, { recursive: true });
@@ -2321,101 +2600,34 @@ export async function startMeshDetached(
   const listenerStartedAt = new Date().toISOString();
   const child = spawn(bin, args, { detached: true, stdio: ["ignore", fd, fd] });
   closeSync(fd);
-  if (opts.boundListener) {
-    writeFileSync(cotalPath("nats.pid"), String(child.pid));
-  writeIdentityPin(cotalPath("nats.pid"), child.pid ?? 0); // #969: pin pid to process start
-    if (process.env.COTAL_SMOKE_EXIT_AFTER_RESTORE_LISTENER_SPAWN === "1") process.exit(87);
-    try {
-      opts.boundListener.onSpawn(child.pid ?? 0, listenerStartedAt);
-    } catch (error) {
-      await stopUnboundRestoreListener(child);
-      removeMatchingNatsPid(child.pid ?? 0);
-      throw error;
-    }
-  }
+  await recordSpawnedListener(child, listenerStartedAt, opts.boundListener);
   child.unref();
 
   let tailing = Boolean(opts.onLine);
   if (opts.onLine) tailLines(logPath, startOffset, opts.onLine, () => !tailing);
-
-  const ready = await waitReady(server, setup?.creds);
-  tailing = false;
-  if (!ready) {
-    child.kill("SIGTERM");
-    if (opts.boundListener) removeIdentityPin(cotalPath("nats.pid")); rmSync(cotalPath("nats.pid"), { force: true });
-    throw new Error(`nats-server did not become reachable at ${server} - see ${logPath}`);
+  try {
+    await awaitSpawnedListener({ child, server, space, creds: setup?.creds, log: logPath, boundListener: opts.boundListener });
+  } finally {
+    tailing = false;
   }
-  if (!opts.boundListener) writeFileSync(cotalPath("nats.pid"), String(child.pid));
-  writeIdentityPin(cotalPath("nats.pid"), child.pid ?? 0); // #969: pin pid to process start
-  if (opts.boundListener) await opts.boundListener.verify();
-  // POST-START MUST NOT LEAVE AN ORPHAN LISTENER.
-  //
-  // Everything above has already bound the port and written `nats.pid`, but NOTHING has recorded the
-  // mesh yet — `recordOurMesh` is below. So a throw between here and there used to exit non-zero
-  // while leaving a live broker holding the port with no registry entry, which `cotal down` cannot
-  // reach because `down` works from the registry. A third state between "started" and "refused",
-  // and the operator's only recourse is to hunt a pid.
-  //
-  // This is reachable BECAUSE of TLS and cannot happen on `main`: the post-start client verifies the
-  // certificate, so a private CA without `NODE_EXTRA_CA_CERTS` fails here — after the listener is up.
-  // The feature introduced the state, so the feature tears it down.
-  //
-  // Deliberately narrow: this is a teardown on the failure path, not a restructuring of the launch
-  // sequence. The listener is stopped and the pid file removed, then the original error is rethrown
-  // unchanged — the operator needs the certificate error, not a message about cleanup.
-  if (!opts.skipPostStart) {
-    try {
-      await postStart(server, space, setup, seedFile);
-    } catch (e) {
-      try { child.kill("SIGTERM"); } catch { /* already gone */ }
-      try { removeIdentityPin(cotalPath("nats.pid")); rmSync(cotalPath("nats.pid"), { force: true }); } catch { /* best effort */ }
-      throw e;
-    }
-  }
-  // USER MODE: the auth service comes up FIRST among the daemons (see the foreground path).
-  const svc = await startUserAuthService(space, server, setup, opts.publicExchange);
-  // Record BEFORE the control plane: the manager's fail-closed mode detection needs the
-  // authoritative registry entry at boot (marker-without-registry refuses). Detached: the entry
-  // outlives this process — `cotal down` removes it.
-  // Same capture-before-record as the foreground path: this also runs for a bare `up --detach` that
-  // RESUMES an already-recorded mesh, whose exposure decision exists only in the registry entry the
-  // call below rewrites.
-  const effectiveAttachHost = attachHostFor(space, opts.host);
-  const effectiveMaxSessions = maxSessionsFor(space, opts.maxSessions);
-  recordOurMesh({
-    space, server, root: cotalRoot(),
-    mode: setup?.prepared ? "user" : useAuth ? "auth" : "open",
-    // The detached listener is started from `transport` a few lines above, so this is the same
-    // decision that shaped the config file — not a re-derivation.
-    tlsRequired: transport.kind === "tls-required",
-    ...(svc.userAuth ? { userAuth: svc.userAuth } : {}),
-    // Persist only a real decision — declared now, or carried forward — never the loopback default.
-    ...(effectiveAttachHost ? { attachHost: effectiveAttachHost } : {}),
-    ...(effectiveMaxSessions !== undefined ? { maxSessions: effectiveMaxSessions } : {}),
-    ...(opts.maxFileStore !== undefined ? { maxFileStore: opts.maxFileStore } : {}),
-    ts: new Date().toISOString(),
-  }, "started");
-  // Commit policy BEFORE delivery launch (S9). Listener is proved; refuse paths never reach here.
-  // startDeliveryWithBroker is HANDED the transport decision, so it does not depend on the file at all.
-  commitTransportPolicy(cotalRoot(), transport);
-  // Bring up the delivery daemon WITH the detached broker (auth mode only; `cotal down` tears both down).
-  const controlPlane = await startDeliveryWithBroker(space, server, transport.kind === "tls-required", {
-    runtime: opts.runtime,
-    launch: opts.launch,
-    // See the foreground path: the broker's bind address is what makes attach reachable off-box.
-    attachHost: effectiveAttachHost,
-    maxSessions: effectiveMaxSessions,
-    noManager: opts.noManager,
+  const { authService, controlPlane } = await serveReadyListener({
+    child, server, space, storeDir, setup, seedFile, transport,
+    host: opts.host,
+    maxSessions: opts.maxSessions,
+    maxFileStore: opts.maxFileStore,
+    publicExchange: opts.publicExchange,
     resumeAttempt: opts.resumeAttempt,
     resumeCommitToken: opts.resumeCommitToken,
-    wsPort: setup?.wsPort, // P2 item 6: the console session client's broker ws port
+    runtime: opts.runtime,
+    launch: opts.launch,
+    noManager: opts.noManager,
   });
   return {
     server,
     pid: child.pid ?? 0,
     source,
-    controlPlane,
-    authService: svc.ok,
+    controlPlane: controlPlane !== undefined,
+    authService,
     delivery: useAuth && deliveryUp(space),
     manager: managerUp(space),
   };
@@ -2450,7 +2662,7 @@ function refuseOpenOverUserState(open: boolean, space: string): void {
  *  before the boot could reach the config render - so a `cotal up --space alpha` against a root that
  *  legitimately holds alpha and beta refused on ambiguity that its own `--space` had already
  *  resolved. The tenant list answers the real question without picking. */
-function ensureRootForSpace(_useAuth: boolean, space: string): void {
+function ensureRootForSpace(space: string): void {
   const root = cotalRoot();
   const cwd = process.cwd();
   // What spaces does this root already host? Prefer auth material; fall back to a live MeshEntry
@@ -2478,6 +2690,34 @@ function realpathSafe(p: string): string {
   }
 }
 
+/** The remedy for a hand-registered (`origin === "manual"`) space `claimSpace` refuses to touch.
+ *  Branches on whether the REGISTERED server is loopback, the one authority for that being
+ *  `isLoopbackHost` (`@cotal-ai/workspace`) — never a second opinion here.
+ *
+ *  Non-loopback: the mesh runs on another machine and this one does not take over its control
+ *  plane by deleting the registry route (that route is what attach, spawn-from-anywhere, and
+ *  every read verb hang off) or by forking the identity under a different `--space`. The actual
+ *  next step is running that control plane FROM here, against the broker the record already
+ *  names: `cotal supervise` (plus `cotal deliver` for the daemon). Dropping the record
+ *  (`meshes rm`) is a separate decision for a genuinely stale record, out of scope here.
+ *
+ *  Loopback: unchanged — a loopback registration this machine cannot reach the "real" mesh behind
+ *  (or is stale) keeps the original two-way remedy, byte for byte.
+ *
+ *  A server string `new URL` rejects is a record shape this function never validated before
+ *  (nothing here parsed it), so it keeps the loopback wording rather than growing a parser. */
+function manualClaimRemedy(space: string, server: string): string {
+  let loopback = true;
+  try {
+    loopback = isLoopbackHost(new URL(server).hostname);
+  } catch {
+    loopback = true;
+  }
+  if (!loopback)
+    return `\`cotal supervise --space ${space} --server ${server}\` to run its control plane from here (and \`cotal deliver --space ${space} --server ${server}\` for the daemon)`;
+  return `\`cotal meshes rm ${space}\` to drop that record first, or start this one under a different \`--space\``;
+}
+
 /** A space name maps to one mesh in the registry (the key `--space`/`use`/`down` act on). Before
  *  starting a broker, refuse to reuse a space already claimed by a DIFFERENT live mesh — a stale/dead
  *  holder is reclaimed. Re-`up`ping the same mesh (same server + root) is a refresh (port-reachable
@@ -2493,7 +2733,7 @@ export async function claimSpace(space: string, server: string, root: string): P
   // machine), the reclaim runs BEFORE this launch starts anything, and `cotal down` — what the
   // liveness branch below would advise — cannot stop a mesh this machine does not run.
   if (existing.origin === "manual" || existing.origin === "catalog")
-    throw new Error(`space "${space}" is registered to a mesh at ${existing.server} (${existing.root}) - it is ${existing.origin === "catalog" ? "owned by a signed-in space catalog" : "registered by hand"}, so \`cotal up\` neither takes it over nor reclaims the name: ${existing.origin === "catalog" ? "use a different `--space`, or remove access at the IdP and run `cotal sync`" : `\`cotal meshes rm ${space}\` to drop that record first, or start this one under a different \`--space\``}`);
+    throw new Error(`space "${space}" is registered to a mesh at ${existing.server} (${existing.root}) - it is ${existing.origin === "catalog" ? "owned by a signed-in space catalog" : "registered by hand"}, so \`cotal up\` neither takes it over nor reclaims the name: ${existing.origin === "catalog" ? "use a different `--space`, or remove access at the IdP and run `cotal sync`" : manualClaimRemedy(space, existing.server)}`);
   if (await isReachable(existing.server)) {
     throw new Error(`space "${space}" is already in use by a mesh at ${existing.server} (${existing.root}) - pick a different \`--space\`, or \`cotal down\` it first`);
   }
@@ -2540,10 +2780,6 @@ function journaledMaxFileStore(value: unknown): number | undefined {
   return value;
 }
 
-/** Record this mesh in the registry, and set it as the `current` default when there's no usable one
- *  — i.e. the first mesh, OR when `current` dangles at a space that's no longer in the registry (a
- *  ghost pointer is not a default). Never silently redirect a `current` that still resolves to a live
- *  mesh; just say another is the default and how to switch. */
 /**
  * Did THIS launch bring the broker up, or is it re-recording one that was already there?
  *
@@ -2562,19 +2798,24 @@ type Provenance = "started" | "refresh";
  *  need a live broker per case. */
 export const recordOurMeshForTest = (m: MeshEntry, provenance: Provenance): void => recordOurMesh(m, provenance);
 
+/** Record this mesh in the registry, and set it as the `current` default when there's no usable one
+ *  — i.e. the first mesh, OR when `current` dangles at a space that's no longer in the registry (a
+ *  ghost pointer is not a default). Never silently redirect a `current` that still resolves to a live
+ *  mesh; just say another is the default and how to switch. */
 function recordOurMesh(m: MeshEntry, provenance: Provenance): void {
   const cur = getCurrent();
   const usableCurrent = cur && findMesh(cur) ? cur : undefined; // compute before recording m
   const prior = findMesh(m.space);
   const origin = provenance === "refresh" && (prior?.origin === "manual" || prior?.origin === "catalog") ? prior.origin : "up";
-  // A REFRESH starts nothing: it concluded the mesh is up from reachability alone, and rebuilds `m`
-  // from what THIS launch knows, which is never the operator's past decisions. `origin` was already
-  // carried across for that reason; the overlay acceptance is the same class and was not, so a
-  // no-op refresh silently erased a consent the operator had given. A `started` takeover may
-  // replace it (that launch really is the mesh now); a refresh may not quietly drop it.
-  const unencryptedOverlay =
-    provenance === "refresh" && m.unencryptedOverlay === undefined ? prior?.unencryptedOverlay : m.unencryptedOverlay;
-  recordMesh({ ...m, origin, ...(unencryptedOverlay !== undefined ? { unencryptedOverlay } : {}) });
+  // A REFRESH starts nothing: it concluded the mesh is up from reachability alone, so `m` holds only
+  // what THIS launch decided, and every other field is the record as it stands now. That covers the
+  // operator's past decisions (origin, overlay consent, TLS requirement) and anything another writer
+  // committed while the refresh ensured the control plane; rebuilding from the refresh's earlier
+  // read reverted those and still exited 0. A `started` takeover may replace the record outright
+  // (that launch really is the mesh now).
+  if (provenance === "refresh" && !prior)
+    throw new Error(`mesh "${m.space}" was removed from the registry while \`cotal up\` refreshed it - not re-recording it from an earlier read`);
+  recordMesh(provenance === "refresh" ? { ...prior, ...m, origin } : { ...m, origin });
   if (!usableCurrent) {
     setCurrent(m.space);
     return;
@@ -2612,6 +2853,44 @@ async function waitReady(server: string, creds?: string): Promise<boolean> {
     await new Promise((r) => setTimeout(r, 200));
   }
   return false;
+}
+
+// SPEC §13.12: reads the connected broker's version, and refuses loud below the 2.12 floor
+// before any provisioning touches it (the same gate `requireBrokerFloor` enforces on every other
+// control-surface connection).
+type BrokerFacts = { version: string; presenceFileBacked: boolean };
+
+/** The broker's version, and whether `space`'s presence stream exists file-backed. Cotal creates
+ *  it in memory (#1356), so only a bucket an older cotal created is file-backed; an absent one
+ *  will be created in memory by `setupSpaceStreams`. */
+async function brokerVersion(server: string, space: string, creds?: string): Promise<BrokerFacts> {
+  const nc = await connect({ servers: server, ...standaloneConnectOpts({ creds, tls: false }) });
+  try {
+    requireBrokerFloor(nc);
+    const version = nc.info?.version ?? "";
+    let presenceFileBacked = false;
+    try {
+      const info = await (await jetstreamManager(nc)).streams.info(`KV_${presenceBucket(space)}`);
+      presenceFileBacked = info.config.storage === StorageType.File;
+    } catch (e) {
+      const err = e as { message?: string; api_error?: { err_code?: number } };
+      if (err.api_error?.err_code !== 10059 && !/stream not found/i.test(err.message ?? "")) throw e;
+    }
+    return { version, presenceFileBacked };
+  } finally {
+    await nc.drain();
+  }
+}
+
+// #1356: the presence bucket's file-backed latch is fixed in nats-server 2.14.5. Below that,
+// `cotal up` warns when the space's presence bucket is file-backed (never refuses: 2.14.0 meets the
+// SPEC §13.12 floor and is the bundled broker). A memory-backed bucket has no file store to latch.
+function belowPresenceSafeBroker(version: string): boolean {
+  const p = parseServerVersion(version);
+  if (!p) return false;
+  if (p.major !== 2) return p.major < 2;
+  if (p.minor !== 14) return p.minor < 14;
+  return p.patch < 5;
 }
 
 /** Wildcard binds mean "every interface", so they are NOT an address a client can be told to dial:
@@ -2664,12 +2943,12 @@ function assertBindableHost(host: string, source: string, urlSource: string): { 
  * They must name the same address. Left independent, `--host <non-loopback>` bound correctly and was
  * then probed at the loopback default: the probe found nothing, timed out, and the caller SIGTERM'd
  * a broker that had started perfectly, so `--host` alone could never succeed. With no explicit URL,
- * derive one from the host (keeping the URL's port); with both, refuse a contradicting pair rather
+ * derive one from the host (keeping the implicit URL's port); with both, refuse a contradicting pair rather
  * than starting a broker that nothing can reach.
  */
-function reconcileHostAndServer(host: string, explicitServer: string | undefined, source = "--host", urlSource = "--server"): string {
-  const url = new URL(explicitServer ?? DEFAULT_SERVER);
-  if (WILDCARD_HOSTS.has(host)) return explicitServer ?? DEFAULT_SERVER;
+function reconcileHostAndServer(host: string, explicitServer: string | undefined, source = "--host", urlSource = "--server", implicitServer = DEFAULT_SERVER): string {
+  const url = new URL(explicitServer ?? implicitServer);
+  if (WILDCARD_HOSTS.has(host)) return explicitServer ?? implicitServer;
   const { literal, hostname } = assertBindableHost(host, source, urlSource);
   if (!explicitServer) return `nats://${literal}:${url.port || "4222"}`;
   // NO parse on this path: `assertBindableHost` just parsed the identical literal above, so the
@@ -2738,6 +3017,22 @@ async function postStart(
   });
 }
 
+/** A resume or restore skips `postStart` because the preserved store already holds every canonical
+ *  stream. A memory-backed bucket is the exception: the broker stop that preserved the store emptied
+ *  it, stream and all (#1356 made presence memory-backed). Recreate those, and only those, from the
+ *  same `ttlBuckets` list `setupSpaceStreams` creates them from, before any daemon opens them. */
+async function recreateMemoryBuckets(server: string, space: string, setup?: { creds: string }): Promise<void> {
+  const nc = await connect({ servers: server, ...standaloneConnectOpts({ creds: setup?.creds, tls: false }) });
+  try {
+    requireBrokerFloor(nc);
+    const kvm = new Kvm(nc);
+    for (const [bucket, ttl, storage] of ttlBuckets(space))
+      if (storage === StorageType.Memory) await kvm.create(bucket, { ttl, storage });
+  } finally {
+    await nc.drain();
+  }
+}
+
 /** Load the declarative channels-config file to seed the registry. An explicit `--channels`
  *  path that's missing is a hard error; the default `.cotal/channels.json` is optional (absent
  *  ⇒ nothing to seed). */
@@ -2752,21 +3047,6 @@ function loadChannelsFile(explicit?: string): ChannelRegistryFile | undefined {
   return JSON.parse(readFileSync(path, "utf8")) as ChannelRegistryFile;
 }
 
-/** Ensure the space's trust material exists, render a server config, and mint a privileged
- *  setup creds (used to pre-create streams once the server is up). The account signing key
- *  in `.cotal/auth` is what `cotal mint` and the manager later use to issue per-agent creds.
- *
- *  USER MODE (`user` set): additionally run the registered auth provider's `prepareServer` over the
- *  SPACE-SCOPED state dir (`.cotal/auth/<space>/` — the multi-space-ready layout; nothing user-auth
- *  lives flat) and preload its extra account(s) into the broker config. The inverse is fail-closed:
- *  a space whose user-auth state exists MUST keep being started with --user-auth — regenerating the
- *  config without the callout account would silently break every sentinel connect.
- *
- *  `rotateSys` (`cotal up --rotate-sys`) is the class-3 renewal for an EXISTING space: rotate the
- *  system account, re-mint `membership-observer.creds` + `connection-evictor.creds` against the
- *  successor, and render the config from the ROTATED record so the broker this `up` starts is the one
- *  that trusts them. It belongs here because this is the single site that both owns the trust record
- *  and renders `server.conf`; anywhere else would publish creds the live broker cannot honor. */
 /**
  * Turn the `--tls-cert`/`--tls-key` pair into a validated {@link BrokerTransport}, or `plaintext`
  * when neither was given.
@@ -2971,6 +3251,21 @@ function writeOpenBrokerConf(storeDir: string, opts: { port: number; host: strin
   return confPath;
 }
 
+/** Ensure the space's trust material exists, render a server config, and mint a privileged
+ *  setup creds (used to pre-create streams once the server is up). The account signing key
+ *  in `.cotal/auth` is what `cotal mint` and the manager later use to issue per-agent creds.
+ *
+ *  USER MODE (`user` set): additionally run the registered auth provider's `prepareServer` over the
+ *  SPACE-SCOPED state dir (`.cotal/auth/<space>/` — the multi-space-ready layout; nothing user-auth
+ *  lives flat) and preload its extra account(s) into the broker config. The inverse is fail-closed:
+ *  a space whose user-auth state exists MUST keep being started with --user-auth — regenerating the
+ *  config without the callout account would silently break every sentinel connect.
+ *
+ *  `rotateSys` (`cotal up --rotate-sys`) is the class-3 renewal for an EXISTING space: rotate the
+ *  system account, re-mint `membership-observer.creds` + `connection-evictor.creds` against the
+ *  successor, and render the config from the ROTATED record so the broker this `up` starts is the one
+ *  that trusts them. It belongs here because this is the single site that both owns the trust record
+ *  and renders `server.conf`; anywhere else would publish creds the live broker cannot honor. */
 async function authSetup(
   storeDir: string,
   server: string,
@@ -3115,14 +3410,14 @@ async function authSetup(
  * malformed pid file refuses exactly like a live one, since "cannot tell" and "still running" have
  * the same consequence.
  *
- * WHAT IT CANNOT SEE, stated because an earlier version of this comment claimed otherwise: both
- * records are mutable, and neither is written by a broker started outside `cotal up`. Delete both
- * while the process lives, or run `nats-server -c <root>/.cotal/auth/server.conf` by hand, and this
- * returns success having probed nothing. The requested address is covered separately (an unidentified
- * listener there refuses the rotation rather than moving to a free port), which leaves a hand-started
- * broker on a DIFFERENT port as the honest residual. Closing that needs something a survivor holds
- * and cannot delete, an exclusive store lock, which does not exist today; until it does, do not run
- * `nats-server` against this root's config outside `cotal up`.
+ * WHAT IT CANNOT SEE: both records are mutable, and neither is written by a broker started outside
+ * `cotal up`. Delete both while the process lives, or run
+ * `nats-server -c <root>/.cotal/auth/server.conf` by hand, and this returns success having probed
+ * nothing. The requested address is covered separately (an unidentified listener there refuses the
+ * rotation rather than moving to a free port), which leaves a hand-started broker on a DIFFERENT port
+ * as the honest residual. Closing that needs something a survivor holds and cannot delete, an
+ * exclusive store lock, which does not exist today; until it does, do not run `nats-server` against
+ * this root's config outside `cotal up`.
  *
  * Not a general `up` guard: an ordinary boot adopting or replacing a listener is a supported flow with
  * its own claim machinery. This is specifically the precondition for retiring an authority.
@@ -3158,23 +3453,6 @@ async function assertRootBrokerStopped(root: string): Promise<void> {
   }
 }
 
-/** Mint the two scoped creds the delivery daemon's membership feed loads (broker-sourced graph
- *  membership), at the FRESH `cotal up` while the in-memory `$SYS` signing seed still exists:
- *   - `membership-observer.creds` — SYSTEM-account CONNZ reader (the only window it can be minted: the
- *     `$SYS` seed is never persisted).
- *   - `membership-rw.creds` — DATA-account members-read + feed-write.
- *   - `membership.json` — the DATA account id (the CONNZ/event subjects pin it; non-secret, but kept
- *     0600 alongside the creds).
- *  All 0600. Best-effort: a failure logs and leaves the feed disabled (the graph degrades to traffic-
- *  only, delivery is untouched). Runs only on a FRESH space (the `if (!auth)` branch); a normal down/up
- *  keeps `.cotal/auth` + these creds and reuses them. A space provisioned before this feature has no
- *  in-memory `$SYS` seed, so it gains membership only when its auth is regenerated (a fresh `.cotal/auth`)
- *  — a documented migration property, not a silent no-op.
- *  Coupling: `cotal clean all` deletes this identity-derived set (removeLocalState in clean.ts) —
- *  a cred added here must be added to that removal list too. `membership-rw.creds` is a MIGRATED kind:
- *  its write/read/delete all go through the {@link SecretStore} seam (here, the feed reader, and clean),
- *  so the renewal owner can re-sign it into a hosted store. The observer / evictor / config stay on the
- *  raw FS (static $SYS creds + non-secret config, not renewable kinds). */
 /** Provision the DATA-account half of the membership bundle, on EVERY `up` rather than only a fresh
  *  space. Idempotent: it writes only what is absent and is silent when both are present.
  *
@@ -3224,6 +3502,23 @@ async function healMembershipDataCreds(auth: SpaceAuth, root: string, space: str
   }
 }
 
+/** Mint the two scoped creds the delivery daemon's membership feed loads (broker-sourced graph
+ *  membership), at the FRESH `cotal up` while the in-memory `$SYS` signing seed still exists:
+ *   - `membership-observer.creds` — SYSTEM-account CONNZ reader (the only window it can be minted: the
+ *     `$SYS` seed is never persisted).
+ *   - `membership-rw.creds` — DATA-account members-read + feed-write.
+ *   - `membership.json` — the DATA account id (the CONNZ/event subjects pin it; non-secret, but kept
+ *     0600 alongside the creds).
+ *  All 0600. Best-effort: a failure logs and leaves the feed disabled (the graph degrades to traffic-
+ *  only, delivery is untouched). Runs only on a FRESH space (the `if (!auth)` branch); a normal down/up
+ *  keeps `.cotal/auth` + these creds and reuses them. A space provisioned before this feature has no
+ *  in-memory `$SYS` seed, so it gains membership only when its auth is regenerated (a fresh `.cotal/auth`)
+ *  — a documented migration property, not a silent no-op.
+ *  Coupling: `cotal clean all` deletes this identity-derived set (removeLocalState in clean.ts) —
+ *  a cred added here must be added to that removal list too. `membership-rw.creds` is a MIGRATED kind:
+ *  its write/read/delete all go through the {@link SecretStore} seam (here, the feed reader, and clean),
+ *  so the renewal owner can re-sign it into a hosted store. The observer / evictor / config stay on the
+ *  raw FS (static $SYS creds + non-secret config, not renewable kinds). */
 async function provisionMembershipCreds(auth: SpaceAuth, root: string, space: string): Promise<void> {
   try {
     const observer = await mintMembershipObserverCreds(auth, newIdentity());

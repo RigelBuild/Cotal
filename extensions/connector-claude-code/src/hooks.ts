@@ -25,6 +25,7 @@ import {
 } from "@cotal-ai/connector-core";
 import type { AguiEmitterHolder } from "@cotal-ai/connector-core";
 import type { ClaudeEntry } from "./agui-map.js";
+import { recordCarriedFork } from "./carried.js";
 
 /** A short, human-readable preview of a tool call: its most salient input, else compact JSON. */
 function toolDetail(name: unknown, input: unknown): { name: string; detail: string } | undefined {
@@ -103,8 +104,12 @@ function failureCondition(ev: HookEvent): PresenceCondition | undefined {
 }
 
 export interface ClaudeHandleDeps {
+  /** Launch environment for a hosted session's carried-fork record. Omitted uses the process env. */
+  env?: NodeJS.ProcessEnv;
   /** The session's AG-UI emitter, read lazily — `mcp.ts` assigns it after the handler exists. */
   events?: () => AguiEmitterHolder<ClaudeEntry, unknown> | undefined;
+  /** Told which inbox items a frame surfaced; pass {@link WakePolicy.surfaced}. */
+  surfaced?: (items: readonly InboxItem[]) => void;
 }
 
 /** Prefixed to a batch containing anything whose previous delivery went unconfirmed. */
@@ -198,17 +203,19 @@ export function createClaudeHandle(deps: ClaudeHandleDeps = {}): ClaudeHooks {
     holder.flush(path);
   };
 
-  const closeEvents = (timestamp: number, error?: { message: string; code?: string }): void => {
+  /** Resolves once the holder has taken the transcript's position for the terminal, so the hook
+   *  replies, and the harness goes on to the next turn, only after that. */
+  const closeEvents = (timestamp: number, error?: { message: string; code?: string }): Promise<void> => {
     const holder = events();
-    if (!holder) return;
+    if (!holder) return Promise.resolve();
     if (adoptedTranscript === undefined) {
       // Exactly one terminal should exist. If a malformed host sends two before SessionStart, the
       // first is the only one that can describe how that run ended; never turn an earlier error into
       // a later success by overwriting it.
       deferredClose ??= { timestamp, ...(error ? { error } : {}) };
-      return;
+      return Promise.resolve();
     }
-    holder.closeRun(timestamp, error);
+    return holder.closeRun(timestamp, error);
   };
   /**
    * Last tool Claude tried to use, captured on PreToolUse. When a permission Notification
@@ -218,6 +225,12 @@ export function createClaudeHandle(deps: ClaudeHandleDeps = {}): ClaudeHooks {
   let pendingTool: { name: string; detail: string } | undefined;
   /** SessionStart can arrive during an open turn, including after compaction. */
   let turnOpen = false;
+  /** A Notification raised a prompt in this turn that no main-agent tool batch has resolved yet. Kept
+   *  here rather than read off `agent.status`: relays overlap, and a batch that arrives while the
+   *  `waiting` write is still in flight would read `working` and miss the wait it resolves. It opens
+   *  only inside a turn and every terminal closes it, so a batch relayed after one cannot bring the
+   *  seat back. */
+  let promptOpen = false;
   /** Batches awaiting a delivery verdict, keyed by the EVENT OBJECT the control server passes to
    *  both `handle` and `onReply`. Frames are separate socket connections and can overlap (a
    *  `PreToolUse` from a parallel tool batch while a `UserPromptSubmit` reply is still being
@@ -271,6 +284,7 @@ export function createClaudeHandle(deps: ClaudeHandleDeps = {}): ClaudeHooks {
     // and go out on a later frame once a verdict frees capacity.
     if (!agent.holdInFlight(ids)) return undefined;
     inFlight.set(ev, { ids, agent });
+    deps.surfaced?.(items);
     // At-least-once, deliberately: an unconfirmed batch is re-surfaced rather than dropped, so a
     // reply that DID land but whose confirmation was lost shows the model the same message twice.
     // Say so, so a repeat reads as a repeat instead of as a peer sending twice.
@@ -301,6 +315,7 @@ export function createClaudeHandle(deps: ClaudeHandleDeps = {}): ClaudeHooks {
           // current boundary and never republish history. The holder carries the value opaquely to
           // the connector-owned source factory.
           adoptEvents(ev.transcript_path, ev.source);
+          recordCarriedFork(deps.env ?? process.env, ev);
           // Claude Code reports the session's actual model here (the ONLY hook that carries it; absent
           // after /clear or conversation recovery, so guard on string). Surface it in presence when the
           // operator didn't pin one. A mid-session /model switch fires no hook, so this holds until the
@@ -330,6 +345,7 @@ export function createClaudeHandle(deps: ClaudeHandleDeps = {}): ClaudeHooks {
         case "UserPromptSubmit": {
           turnOpen = true;
           pendingTool = undefined; // new turn — the previous block (if any) is resolved
+          promptOpen = false;
           flushEvents(ev.transcript_path);
           await safeStatus(agent, "working");
           // Run turns ride the same frame as peer messages: this is an injectable boundary, and
@@ -344,6 +360,15 @@ export function createClaudeHandle(deps: ClaudeHandleDeps = {}): ClaudeHooks {
           pendingTool = toolDetail(ev.tool_name, ev.tool_input);
           flushEvents(ev.transcript_path); // near-live: each tool boundary ships the turn so far
           return {};
+        case "PostToolBatch":
+          // Every tool in the batch resolved, so a prompt raised during it was answered and the turn
+          // went on. Left `waiting`, its Stop would be `waiting → idle`, which is no turn boundary:
+          // the run turn never yields and the condition outlives the turn. `working` also clears it.
+          // A subagent's batch carries `agent_id` and answers nothing the main agent is blocked on.
+          if (!promptOpen || ev.agent_id !== undefined) return {};
+          promptOpen = false;
+          await safeStatus(agent, "working");
+          return {};
         case "Notification": {
           // Claude Code's Notification carries the human-readable reason the session is
           // blocked in `message`. When a tool permission is pending, lead with *what* it's
@@ -354,20 +379,25 @@ export function createClaudeHandle(deps: ClaudeHandleDeps = {}): ClaudeHooks {
           const activity = pendingTool
             ? `${pendingTool.name}${pendingTool.detail ? `: ${pendingTool.detail}` : ""}`
             : msg;
-          await safeStatus(agent, "waiting", activity);
+          promptOpen = turnOpen;
+          // Both writes are queued before either settles, so a batch relayed meanwhile queues its
+          // `working` behind the condition; queued between them, the condition would outlive the turn.
+          const writes = [safeStatus(agent, "waiting", activity)];
           const notificationType = typeof ev.notification_type === "string" ? ev.notification_type : undefined;
           if (notificationType === "permission_prompt" || notificationType === "agent_needs_input")
-            await safeCondition(agent, {
+            writes.push(safeCondition(agent, {
               code: notificationType === "permission_prompt" ? "approval" : "input",
               source: notificationType,
               ...(msg ? { message: msg } : {}),
               since: Date.now(),
-            });
+            }));
+          await Promise.all(writes);
           return {};
         }
         case "Stop":
         case "StopFailure": // turn died on an API error — Stop won't fire, so reset here too
           turnOpen = false;
+          promptOpen = false;
           pendingTool = undefined; // turn ended — don't let a stale tool attach to an idle-wait notification
           flushEvents(ev.transcript_path);
           // THE TURN TERMINAL, and it has to be a second call rather than part of the flush. The
@@ -383,7 +413,7 @@ export function createClaudeHandle(deps: ClaudeHandleDeps = {}): ClaudeHooks {
           // killed by a rate limit or a billing error had simply finished. See {@link stopFailure}
           // for which signals count and why. `RUN_ERROR` closes the run on its own, so there is no
           // second terminal to follow it.
-          closeEvents(Date.now(), stopFailure(ev));
+          await closeEvents(Date.now(), stopFailure(ev));
           if (event === "StopFailure") await safeCondition(agent, failureCondition(ev) ?? null);
           await safeStatus(agent, "idle");
           // Now idle: if ambient channel chatter was held while we were busy, ask the channel to
@@ -398,6 +428,7 @@ export function createClaudeHandle(deps: ClaudeHandleDeps = {}): ClaudeHooks {
           return {};
         case "SessionEnd":
           turnOpen = false;
+          promptOpen = false;
           flushEvents(ev.transcript_path); // best-effort — the process may exit before it lands
           await safeStatus(agent, "offline");
           return {};
@@ -405,6 +436,14 @@ export function createClaudeHandle(deps: ClaudeHandleDeps = {}): ClaudeHooks {
           return {};
       }
     } catch {
+      // The `{}` below carries nothing, but its write still yields a delivered verdict. Drop this
+      // frame's record first, or onReply would ack a batch the model never saw. The ids go back to
+      // ordinary backlog and surface on a later frame.
+      const rec = inFlight.get(ev);
+      if (rec) {
+        inFlight.delete(ev);
+        if (rec.ids.length) rec.agent.releaseInFlight(rec.ids);
+      }
       return {}; // never block the session
     }
   };
@@ -451,6 +490,9 @@ export type ChannelNotify = (params: { content: string; meta: Record<string, str
 export interface WakePolicy {
   /** Flip once the MCP handshake confirms the client speaks `claude/channel`. */
   setChannelActive(active: boolean): void;
+  /** These items rode a hook frame, which spends the nudge that announced them. If that frame's
+   *  reply never reached the runtime, their next redelivery is news to the session again. */
+  surfaced(items: readonly InboxItem[]): void;
   /** Teardown: stop the retry timer. */
   stop(): void;
 }
@@ -485,6 +527,16 @@ export function createWakePolicy(agent: MeshAgent, notify: ChannelNotify, log: (
    *  unrelated push landing means the session woke for something else, and that notice carries no
    *  pull hint, so it reschedules this rather than discharging it. */
   let pendingMentionWake: { item: InboxItem; hint: string } | undefined;
+  /** Items a nudge announced that no hook frame has carried since, each mapped to the covered list of
+   *  the push that announced it. Each JetStream redelivery of a pending item re-emits `incoming`;
+   *  while the session still holds that nudge (a long tool call), printing it again only queues a
+   *  duplicate per ack wait (#2584). Recorded when the push is made, not when it resolves: a push
+   *  still queued behind a full stdout can complete after a frame carried the item and lost its
+   *  reply, and recording it then would bury the redelivery that recovers that loss. Keyed by the
+   *  item, so a message re-buffered after it left the inbox is announced afresh. */
+  const announced = new WeakMap<InboxItem, readonly InboxItem[]>();
+  /** Wake-eligible work, run turns included, that no live notice covers: what a retry still owes. */
+  const owed = (): number => agent.pendingWake((item) => announced.has(item));
 
   const clearRetry = (resetDelay: boolean): void => {
     if (retryTimer) clearTimeout(retryTimer);
@@ -497,7 +549,9 @@ export function createWakePolicy(agent: MeshAgent, notify: ChannelNotify, log: (
     // A focus-mode @mention is ack-dropped at ingest, not buffered, so `pendingWake()` is 0 for it and
     // JetStream will never redeliver it either: the push we just failed to make WAS its only notice.
     // Gating the retry on the inbox alone therefore drops precisely the wake with no other recovery.
-    if (agent.pendingWake() === 0 && !pendingMentionWake) return;
+    // An item a live notice still announces is owed nothing, so a rejection that a newer push
+    // superseded schedules no retry.
+    if (owed() === 0 && !pendingMentionWake) return;
     const delay = retryMs;
     retryMs = Math.min(retryMs * 2, NUDGE_RETRY_MAX_MS);
     retryTimer = setTimeout(() => {
@@ -506,15 +560,19 @@ export function createWakePolicy(agent: MeshAgent, notify: ChannelNotify, log: (
       // behind it — un-acked, it redelivers and re-announces itself — whereas the ack-dropped mention
       // has nothing but this timer. Checking the inbox first meant any buffered DM starved the
       // mention retry indefinitely, since the batch nudge kept succeeding and rescheduling itself.
+      // The retry stands in for lost notices, so its batch counts only what no live notice announces.
       if (pendingMentionWake) nudge(pendingMentionWake.item, pendingMentionWake.hint, true);
-      else if (agent.pendingWake() > 0) nudge();
+      else if (owed() > 0) nudge(undefined, undefined, false, agent.peekInbox("automatic").filter((it) => !announced.has(it)));
     }, delay);
     retryTimer.unref?.(); // a pending retry must never hold the process open
   };
 
-  const nudge = (item?: InboxItem, pullHint?: string, isMentionWake = false): void => {
+  const nudge = (item?: InboxItem, pullHint?: string, isMentionWake = false, batch?: readonly InboxItem[]): void => {
     if (!channelActive) return;
-    const n = agent.inboxCount("automatic");
+    // A batch notice announces every automatic item it counts.
+    const covered = item ? [item] : batch ?? agent.peekInbox("automatic");
+    const n = covered.length;
+    for (const it of covered) announced.set(it, covered);
     const content = pullHint
       ? `📨 ${pullHint}`
       : item
@@ -531,6 +589,9 @@ export function createWakePolicy(agent: MeshAgent, notify: ChannelNotify, log: (
         if (pendingMentionWake) scheduleRetry(); // someone else's success is not this one's delivery
       },
       (e: Error) => {
+        // The session never saw this push, so its redelivery is news again, unless a later push
+        // announced the item since.
+        for (const it of covered) if (announced.get(it) === covered) announced.delete(it);
         log(`channel nudge failed: ${e.message}`);
         scheduleRetry();
       },
@@ -543,6 +604,7 @@ export function createWakePolicy(agent: MeshAgent, notify: ChannelNotify, log: (
   // receive-time pull-only ambient never nudges (a quiet @mention remains automatic). `muted` never reaches
   // here (ack-dropped at ingest); in `focus`, ambient/mentions never reach "incoming" either.
   agent.on("incoming", (item: InboxItem) => {
+    if (announced.has(item)) return;
     const automatic = agent.inboxScope(item.recvKey) === "automatic";
     const directedOrMention = item.kind !== "channel" || item.mentionsMe;
     const ambientWakes = agent.attention === "open" && agent.status !== "working";
@@ -566,6 +628,9 @@ export function createWakePolicy(agent: MeshAgent, notify: ChannelNotify, log: (
         if (pendingMentionWake) nudge(pendingMentionWake.item, pendingMentionWake.hint, true);
         else if (agent.pendingWake() > 0) nudge();
       }
+    },
+    surfaced(items: readonly InboxItem[]): void {
+      for (const item of items) announced.delete(item);
     },
     stop(): void {
       clearRetry(true);

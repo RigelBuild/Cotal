@@ -15,6 +15,8 @@ export const QUARANTINED = {
   "smoke:turn-relay-auth": { reason: "flaky: JetStream heartbeats missed on CI run 38171320196; Cotal is unmaintained, off per Matt", recheckBy: "2026-11-30" },
   "smoke:delivery-renewal": { reason: "flaky: reloadCreds no responders on CI run 38171167895; Cotal is unmaintained, off per Matt", recheckBy: "2026-11-30" },
   "smoke:codex-host": { reason: "RIG-4872: flaky; approval presence wait timed out on CI run 37970832138, passed on 37964440191", recheckBy: "2026-11-15" },
+  "smoke:mutation-fixtures": { reason: "upstream: 91 dead mutation anchors on pristine main; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:required-arg-seam": { reason: "upstream: call-site pins 229/179 vs 247/193 and an unverifiable tls site in control-target.ts on pristine main; quarantined on sync per Matt", recheckBy: "2026-12-31" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */

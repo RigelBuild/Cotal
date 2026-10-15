@@ -27,8 +27,9 @@
 import { connect, jwtAuthenticator, type NatsConnection } from "@nats-io/transport-node";
 import { encodeUser } from "@nats-io/jwt";
 import { fromPublic, fromSeed } from "@nats-io/nkeys";
-import { EpEnvelopeError, assertInboxConnId, endpointToken, epAuthBucket, epfStreamName, newIdentity, recordsBucket, retirementFrontierStreams, spacePrefix, assertPoolToken, principalTags, principalKey, remoteManagerActors, remoteManagerRegistrationProof, type PlaneConnTuple } from "@cotal-ai/core";
+import { EpEnvelopeError, admissionBucket, sessionsBucket, assertInboxConnId, endpointToken, epAuthBucket, epcStreamName, epfStreamName, newIdentity, recordsBucket, retirementFrontierStreams, spacePrefix, assertPoolToken, principalTags, principalKey, remoteManagerActors, remoteManagerRegistrationProof, assertLifecycleToken, epcredFamilyPrefix, epgateKey, eprepairKey, GOVERN_HEAD, RECORD_KINDS, recordAtomicKey, recordSpecKey, recordStatusKey, BASELINE_LIFECYCLE_ENDPOINT, epCallerGrantRows, instanceOnlyManagerCapabilities, type EpCaller, type PlaneConnTuple } from "@cotal-ai/core";
 import { authConnectReaderGrants, openConnectReader, type ConnectReader } from "./connect-reader.js";
+import { environmentManagerAdmissionIndexBucket } from "./environment-manager-admission-index.js";
 
 /** Self-minted infra-credential TTL (fact-3 pin: SHORT expiry + in-process renewal, a bounded
  *  in-memory credential that closes with the service — never an unbounded persisted one). */
@@ -82,11 +83,35 @@ export function authorityWriterGrants(space: string, connId: string): { publish:
   };
 }
 
+/** Host-private environment reservation writer. It adds manager gates and multi-segment operation
+ * staging, never session release pins or a guest credential. */
+export function environmentManagerAdmissionWriterGrants(space: string, connId: string): { publish: string[]; subscribe: string[] } {
+  const base = authorityWriterGrants(space, connId);
+  return {
+    publish: [...base.publish,
+      `$KV.${epAuthBucket(space)}.epgate.manager.>`,
+      `$KV.${epAuthBucket(space)}.stage.*.environment-manager`,
+      `$KV.${epAuthBucket(space)}.stage.*.environment-manager-gate`,
+      `$KV.${epAuthBucket(space)}.stage.*.environment-bootstrap-mint`,
+    ],
+    subscribe: base.subscribe,
+  };
+}
+
+/** Dedicated private-index custody and creation. No auth-store, lifecycle or workload authority. */
+export function environmentManagerAdmissionIndexGrants(space: string, connId: string): { publish: string[]; subscribe: string[] } {
+  const bucket = environmentManagerAdmissionIndexBucket(space);
+  return { publish: ["$JS.API.INFO", `$JS.API.STREAM.CREATE.KV_${bucket}`, `$JS.API.STREAM.INFO.KV_${bucket}`,
+    `$JS.API.STREAM.MSG.GET.KV_${bucket}`, `$KV.${bucket}.manager.*`],
+  subscribe: [`_INBOX_${assertInboxConnId(connId)}.>`] };
+}
+
 /** The host-side REMOTE MANAGER ISSUER adds only the endpoint-instance gate/credential family
  * needed by the typed manager-service protocol. It carries no generic profile/mint endpoint; the
  * HTTP handler chooses fixed profiles and caller-generated nkeys. */
 export function remoteManagerIssuerGrants(space: string, connId: string): { publish: string[]; subscribe: string[] } {
   const base = authorityWriterGrants(space, connId);
+  const admission = `KV_${admissionBucket(space)}`;
   return {
     publish: [
       ...base.publish,
@@ -98,12 +123,106 @@ export function remoteManagerIssuerGrants(space: string, connId: string): { publ
       // issuance family is reachable through this server-side connection.
       `$KV.${epAuthBucket(space)}.epgate.manager.>`,
       `$KV.${epAuthBucket(space)}.epcred.manager.>`,
+      // Standing renewal re-derives the serve surface from the registered spec's content-addressed
+      // cluster artifacts: read-only Direct Get on the space's contract store, nothing else.
+      `$JS.API.DIRECT.GET.${epcStreamName(space)}.${spacePrefix(space)}.epc.>`,
+      `$JS.API.DIRECT.GET.${epcStreamName(space)}`,
+      // Run attempt authorization reads the run's admission record from the admission KV store:
+      `$JS.API.STREAM.INFO.${admission}`,
+      `$JS.API.STREAM.MSG.GET.${admission}`,
+      `$JS.API.DIRECT.GET.${admission}`,
+      `$JS.API.DIRECT.GET.${admission}.>`,
+      // #2312: user-mode session redemption leader-reads the ONE `session.<id>` row the manager's
+      // redemption wrote (body-selected MSG.GET, never DIRECT.GET; no write) plus the bind INFO.
+      `$JS.API.STREAM.INFO.KV_${sessionsBucket(space)}`,
+      `$JS.API.STREAM.MSG.GET.KV_${sessionsBucket(space)}`,
     ],
-    subscribe: base.subscribe,
+    subscribe: [...base.subscribe, ...servedRunRequestSubjects(space)],
   };
 }
 
+/** The PLATFORM READINESS reader (SPEC 13.9): `describe` and `status` of one manager instance on
+ * its `inst` rail only, the contract-store read `resolveService` verifies the describe answer with,
+ * and its own reply rail and inbox. No other command, instance, class route or store. */
+export function platformReadinessGrants(space: string, connId: string, caller: EpCaller, instanceId: string): { publish: string[]; subscribe: string[] } {
+  const rows = epCallerGrantRows(space, instanceOnlyManagerCapabilities(
+    ["describe", "status"].map((command) => ({ endpoint: BASELINE_LIFECYCLE_ENDPOINT, command })),
+    instanceId,
+  ), caller);
+  return {
+    publish: [`$JS.API.DIRECT.GET.${epcStreamName(space)}.${spacePrefix(space)}.epc.>`, ...rows.pub],
+    subscribe: [`_INBOX_${assertInboxConnId(connId)}.>`, ...rows.sub],
+  };
+}
+
+/** The manager request subjects whose served form a participant manager forwards for a run
+ *  admission, a resume or an answer (SPEC 14.8), on both routes a caller addresses a manager by.
+ *  The issuing host reads them and never replies: the broker let only the caller's ceiling publish
+ *  each one, so observing it is the host's own evidence that the caller asked. */
+export function servedRunRequestSubjects(space: string): string[] {
+  const p = spacePrefix(space);
+  const m = endpointToken("manager");
+  return [
+    ...["run-start", "run-resume", "run-answer"].flatMap((c) => [`${p}.ep.v1.inst.${m}.*.${c}.>`, `${p}.ep.v1.one.${m}.${c}.>`]),
+    // A managed seat answers on the legacy rail, the relay path; nothing else served there is forwarded.
+    `${p}.ep.inst.${m}.*.run-answer.>`,
+    `${p}.ep.one.${m}.run-answer.>`,
+  ];
+}
+
 export { remoteManagerRegistrationProof };
+
+/**
+ * The registration executor grant for one instance of an endpoint the AUTH PLANE self-authorizes
+ * (#399 M2): its own `(auth, instanceId)` at boot (`registerServiceInstance` +
+ * `authorizeServeGrant` + `writeServiceStatus` + the §13.7 contract-artifact publish), and a
+ * platform host's configured endpoint (SPEC 13.16, the registration and publish only). Mirrored
+ * from the manager's `endpointServeExecutorPermissions` (`packages/core/src/provision.ts:2426`)
+ * but built directly (the auth plane self-authorizes its own name with the space signing seed,
+ * exactly as the manager self-authorizes `manager`, so this rides the same self-minted
+ * `openAuthorityClient` door as the writer/barrier connections rather than a `mintCreds` profile).
+ * Key-pinned to exactly this instance's gate/cred/repair rows and its two `svc.<endpoint>.<instanceId>`
+ * record keys plus the endpoint's `govern.<endpoint>` head; the contract-artifact publish is the same
+ * single-token `epc.*` form {@link contractPublisherGrants} uses (never the wide `epc.>`).
+ */
+export function registrationExecutorGrants(space: string, connId: string, endpoint: string, instanceId: string): { publish: string[]; subscribe: string[] } {
+  const auth = `KV_${epAuthBucket(space)}`;
+  const records = `KV_${recordsBucket(space)}`;
+  const gateKey = epgateKey(endpoint, instanceId);
+  const credPrefix = epcredFamilyPrefix(endpoint, instanceId);
+  const repairKey = eprepairKey(endpoint, instanceId);
+  const recordKeys = [
+    recordSpecKey(RECORD_KINDS.svc, [endpoint, assertLifecycleToken(instanceId, "instanceId")]),
+    recordStatusKey(RECORD_KINDS.svc, [endpoint, assertLifecycleToken(instanceId, "instanceId")]),
+    recordAtomicKey(GOVERN_HEAD, [endpoint]),
+  ];
+  const inbox = assertInboxConnId(connId);
+  return {
+    publish: [
+      "$JS.API.INFO",
+      `$JS.API.STREAM.MSG.GET.${auth}`,
+      `$JS.API.STREAM.MSG.GET.${records}`,
+      // Registration Phase 2 enumerates the epcred family (`kv.keys('epcred.<endpoint>.<instanceId>.>')`)
+      // to revoke + verify-evict a superseded serve family before publishing a new spec (SPEC 13.1).
+      // `kv.keys()` opens an ephemeral ordered consumer, so the executor needs CONSUMER lifecycle on
+      // the auth stream, scoped the same as the manager's own mirror (`endpointServeExecutorPermissions`,
+      // provision.ts:2477-2479): the whole bucket, since a subject-wildcard consumer cannot be key-pinned
+      // tighter by a broker ACL.
+      `$JS.API.CONSUMER.CREATE.${auth}.>`,
+      `$JS.API.CONSUMER.INFO.${auth}.>`,
+      `$JS.API.CONSUMER.DELETE.${auth}.>`,
+      `$JS.API.DIRECT.GET.${recordsBucket(space)}`,
+      `$JS.API.DIRECT.GET.${recordsBucket(space)}.>`,
+      `$KV.${epAuthBucket(space)}.${gateKey}`,
+      `$KV.${epAuthBucket(space)}.${repairKey}`,
+      `$KV.${epAuthBucket(space)}.${credPrefix}.>`,
+      ...recordKeys.map((k) => `$KV.${recordsBucket(space)}.${k}`),
+      `${spacePrefix(space)}.epc.*`,
+      `$JS.API.DIRECT.GET.${epcStreamName(space)}.${spacePrefix(space)}.epc.>`,
+    ],
+    subscribe: [`_INBOX_${inbox}.>`],
+  };
+}
 
 /**
  * The BARRIER EXECUTOR's scoped credential grant (SPEC 13.9): the lifecycle-barrier surface —
@@ -236,6 +355,8 @@ export function barrierExecutorSettlementGrants(space: string, endpoint: string,
 }
 
 export interface AuthorityClientOpts {
+  /** Package-internal connection custody for an embedded auth context. */
+  onConnection?: (nc: NatsConnection, label: string) => void;
   server: string;
   space: string;
   dataAccount: { pub: string; signingSeed: string };
@@ -355,6 +476,7 @@ export async function openAuthorityClient(opts: AuthorityClientOpts): Promise<Au
     if (renewal !== undefined) clearInterval(renewal);
     throw e;
   }
+  opts.onConnection?.(nc, opts.label);
   let tuple: PlaneConnTuple | undefined;
   let gone: Promise<void> | undefined;
   if (opts.planeCandidate) {
@@ -377,7 +499,9 @@ export async function openAuthorityClient(opts: AuthorityClientOpts): Promise<Au
     ...(gone ? { gone } : {}),
     close: async () => {
       if (renewal !== undefined) clearInterval(renewal);
-      await nc.close().catch(() => {});
+      try { await nc.close(); }
+      catch (cause) { throw new Error(`auth connection ${opts.label} failed to close`, { cause }); }
+      await nc.closed();
     },
   };
 }
@@ -426,9 +550,14 @@ export async function openSupervisedConnectReader(
   void (async () => {
     for await (const s of c.nc.status()) {
       if (closed) break;
-      if (s.type === "disconnect" || s.type === "error") {
+      if (s.type === "disconnect") {
         reader = undefined;
-        opts.log(`${label}: connection lost (${s.type}) - connects DENY until the rebind shape proof passes`);
+        opts.log(`${label}: connection lost - connects DENY until the rebind shape proof passes`);
+      } else if (s.type === "error") {
+        // An -ERR leaves the bind as it was. nats.js reports every loss of the link as
+        // `disconnect`, the losses an -ERR causes included, and an -ERR that keeps the link up
+        // (a refused publish or subscribe) is followed by no `reconnect` that could restore it.
+        opts.log(`${label}: broker error (${s.error.message})`);
       } else if (s.type === "reconnect") {
         try {
           reader = await openConnectReader(c.nc, opts.space);

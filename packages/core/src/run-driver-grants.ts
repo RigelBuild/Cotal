@@ -22,11 +22,12 @@ import { epRequestGrantRows, epDescribeAllGrantRow, BASELINE_LIFECYCLE_ENDPOINT 
  * The run-stable caller triple used by durable actions. Actor and uid derive from the run id;
  * the trusted host supplies the admitted owner. Omitting owner preserves the static/local caller.
  * This validates the owner's grammar, not its authority: a program cannot choose its owner here.
+ * A platform `p_…` owner is admitted for the platform control manager's own runs (SPEC 13.1).
  * Goal facts key on this triple, so grants and effects must use the same original owner on resume.
  * Grammar: actor is `[A-Za-z0-9_]+` and uid is `[a-z0-9]{26,32}`, both satisfied by digest slices.
  */
 export function runDriverCaller(runId: string, owner: string = DEV_OWNER): EpCaller {
-  assertPrincipalOwnerToken(owner, { allowLocal: true });
+  assertPrincipalOwnerToken(owner, { allowLocal: true, allowPlatform: true });
   const h = createHash("sha256").update(assertIdToken(runId, "runId"), "utf8").digest("hex");
   return { owner, actor: `wf_${h.slice(0, 12)}`, uid: h.slice(12, 38) };
 }
@@ -53,7 +54,7 @@ export interface RunDriverGrantArgs {
 export function runDriverGrants(space: string, args: RunDriverGrantArgs, connId: string): { publish: string[]; subscribe: string[] } {
   const endpoint = endpointToken(args.endpoint);
   const run = assertIdToken(args.runId, "runId");
-  if (args.owner !== undefined) assertPrincipalOwnerToken(args.owner, { allowLocal: true });
+  if (args.owner !== undefined) assertPrincipalOwnerToken(args.owner, { allowLocal: true, allowPlatform: true });
   assertLifecycleToken(args.instanceId, "instanceId");
   if (!Number.isSafeInteger(args.epoch) || args.epoch < 0) throw new Error(`epoch ${args.epoch} is not an unsigned integer`);
   const records = recordsBucket(space);
@@ -126,10 +127,14 @@ export function runMediatorGrants(space: string, args: RunDriverGrantArgs, connI
     `$KV.${membersBucket(space)}.>`,
     `$JS.API.STREAM.MSG.GET.KV_${membersBucket(space)}`,
     // The manager's lifecycle commands, as the run's own caller: describe (the resolve), spawn
-    // (untargeted creation), turn and despawn (owner mode, pinned to the caller's owner).
+    // (untargeted creation), inspect (whether a seat whose presence lapsed is still running), turn
+    // and despawn (owner mode, pinned to the caller's owner), and the reserved goal cancel that
+    // withdraws a turn the run cancelled (untargeted: it reaches only the caller's own goals).
     epDescribeAllGrantRow(space, caller),
     ...epRequestGrantRows(space, { endpoint: BASELINE_LIFECYCLE_ENDPOINT, command: "spawn" }, caller),
+    ...epRequestGrantRows(space, { endpoint: BASELINE_LIFECYCLE_ENDPOINT, command: "inspect" }, caller),
     ...epRequestGrantRows(space, { endpoint: BASELINE_LIFECYCLE_ENDPOINT, command: "turn", target: { mode: "owner", tOwner: caller.owner } }, caller),
+    ...epRequestGrantRows(space, { endpoint: BASELINE_LIFECYCLE_ENDPOINT, command: "cancel" }, caller),
     ...epRequestGrantRows(space, { endpoint: BASELINE_LIFECYCLE_ENDPOINT, command: "despawn", target: { mode: "owner", tOwner: caller.owner } }, caller),
     // #1616 TARGET-BOUND PLACEMENT REACH. Minted ONLY when the program named an explicit target,
     // and then only for that ONE validated instance and only these three operations. `routes: []`

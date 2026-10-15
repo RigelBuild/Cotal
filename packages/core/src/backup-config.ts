@@ -22,6 +22,7 @@ import {
   spacePrefix,
   taskStream,
   artifactBucket,
+  isTransferStream,
   objectStoreStream,
 } from "./subjects.js";
 
@@ -31,7 +32,7 @@ export type SpaceBackupStreamClass = "messages" | "registry" | "authorization";
  *  bytes are neither transient (they outlive a session), derived (nothing can recompute them),
  *  nor a lease. Excluding them is a RETENTION decision — pin extends lifetime, not durability —
  *  and giving it an honest name keeps a later reader from reading it as "derived, so recoverable".*/
-export type SpaceBackupExcludedClass = "transient" | "derived" | "lease" | "control" | "artifact";
+export type SpaceBackupExcludedClass = "transient" | "derived" | "lease" | "control" | "artifact" | "transfer";
 
 export interface SpaceBackupStream {
   name: string;
@@ -83,11 +84,30 @@ export function spaceBackupInventory(space: string): SpaceBackupInventory {
   };
 }
 
-/** Reject a missing, foreign, or additional stream before selecting artifact components. */
-export function validateSpaceBackupInventory(space: string, actualNames: readonly string[]): SpaceBackupInventory {
-  const inventory = spaceBackupInventory(space);
-  const expected = [...inventory.full, ...inventory.excluded.map((s) => s.name)].sort();
+/** Reject a missing, foreign, or additional stream before selecting artifact components.
+ *
+ * `atRest` is for a STOPPED store reopened on a fresh broker, which is what backup reads. The
+ * presence bucket is memory-backed (#1356), and a memory stream does not survive the broker stop that
+ * makes a cut, so a transient stream may be absent there. One an older cotal created file-backed is
+ * still on disk and is accepted too. Every other stream stays exact. A live space, such as a restore
+ * after it recreates its infrastructure, is validated without `atRest`, and presence is required. */
+export function validateSpaceBackupInventory(
+  space: string,
+  actualNames: readonly string[],
+  options: { atRest?: boolean } = {},
+): SpaceBackupInventory {
+  const fixed = spaceBackupInventory(space);
+  // A resume transfer bucket exists per receiving manager instance, so it is matched by name shape.
+  // Its objects are deleted once staged and are not state to restore.
+  const transfers = actualNames.filter((name) => isTransferStream(space, name));
+  const inventory = { ...fixed, excluded: [...fixed.excluded, ...transfers.map((name) => ({ name, class: "transfer" as const }))] };
   const actual = [...actualNames].sort();
+  const optional = new Set(
+    options.atRest ? inventory.excluded.filter((s) => s.class === "transient").map((s) => s.name) : [],
+  );
+  const expected = [...inventory.full, ...inventory.excluded.map((s) => s.name)]
+    .filter((name) => !optional.has(name) || actual.includes(name))
+    .sort();
   if (new Set(actual).size !== actual.length)
     throw new Error("space backup inventory contains duplicate stream names");
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {

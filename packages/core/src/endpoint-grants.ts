@@ -31,6 +31,9 @@ export interface EpCapability {
   command: string;
   routes?: ("one" | "all")[];
   instanceId?: string;
+  /** Emit only the exact instance route. Requires `instanceId`; used by a manager-bound caller
+   *  whose credential must never retain the class or scatter rails. */
+  instanceOnly?: boolean;
   target?: EpTarget;
   /** Also grant the matching journal-submission append row (`epj`, §13.9 matrix). */
   journal?: boolean;
@@ -45,8 +48,8 @@ export interface EpCapability {
  *  a smuggled `.`/`*`/`>` that widens the minted permission beyond the grammar. */
 function targetGrantTokens(target: EpTarget, caller: EpCaller): string[] {
   if (target.mode === "self") return ["self"];
-  if (target.mode === "handle")
-    return ["handle", assertBoundedOwner(target.tOwner, "target owner"), assertBoundedOwner(target.tActor, "target actor"), assertLifecycleToken(target.tUid, "target lifecycleUid")];
+  if (target.mode === "handle" || target.mode === "exact")
+    return [target.mode, assertBoundedOwner(target.tOwner, "target owner"), assertBoundedOwner(target.tActor, "target actor"), assertLifecycleToken(target.tUid, "target lifecycleUid")];
   if (target.mode === "any" || target.mode === "ledger")
     return [target.mode, target.tOwner === "*" ? "*" : assertBoundedOwner(target.tOwner, "target owner")];
   if (target.tOwner !== caller.owner)
@@ -86,7 +89,9 @@ export function epRequestGrantRows(space: string, cap: EpCapability, caller: EpC
   const cmd = assertCommandToken(cap.command);
   const mid = cap.target ? `.${targetGrantTokens(cap.target, caller).join(".")}` : "";
   const tail = `${mid}.${callerBlock(caller)}.*`;
-  const rows = (cap.routes ?? ["one"]).map((r) => `${spacePrefix(space)}.${plane(caller)}.${r}.${e}.${cmd}${tail}`);
+  if (cap.instanceOnly && cap.instanceId === undefined)
+    throw new Error(`an instance-only capability on "${cap.endpoint}.${cap.command}" requires instanceId`);
+  const rows = cap.instanceOnly ? [] : (cap.routes ?? ["one"]).map((r) => `${spacePrefix(space)}.${plane(caller)}.${r}.${e}.${cmd}${tail}`);
   if (cap.instanceId)
     rows.push(`${spacePrefix(space)}.${plane(caller)}.inst.${e}.${assertLifecycleToken(cap.instanceId, "instanceId")}.${cmd}${tail}`);
   return rows;
@@ -117,7 +122,7 @@ export function epGoalProgressGrantRow(space: string, endpoint: string, caller: 
  *  it), so a `handle`-mode capability is refused here: handle rows are redemption-minted only
  *  (§13.2/§13.6), built by the redemption path through {@link epRequestGrantRows} directly.
  *  A goal-bearing capability ({@link GOAL_BEARING_COMMANDS}: spawn/launch) adds ONE per-endpoint
- *  {@link epGoalProgressGrantRow} — the caller may follow its OWN goal to terminal (P2 item 2, Q1);
+ *  {@link epGoalProgressGrantRow} — the caller may follow its OWN goal to terminal;
  *  it is the one read an invoke implies, because the subject pins the caller's own triple. Still
  *  NOT included: any OTHER `epe` subtree — those are minted per read capability by the granting
  *  authority (Appendix B), not implied by an invoke. */
@@ -131,6 +136,8 @@ export function epCallerGrantRows(
   for (const cap of caps) {
     if (cap.target?.mode === "handle")
       throw new Error(`a "handle"-mode capability on "${cap.endpoint}.${cap.command}" is redemption-minted only (SPEC 13.2), never a standing capability`);
+    if (cap.target?.mode === "exact")
+      throw new Error(`an "exact"-mode capability on "${cap.endpoint}.${cap.command}" is minted only through its owning profile (SPEC 13.2), never a standing capability`);
     pub.push(...epRequestGrantRows(space, cap, caller));
     if (cap.journal) pub.push(epJournalGrantRow(space, cap, caller));
     if (GOAL_BEARING_SET.has(cap.command) && !progressEndpoints.includes(cap.endpoint)) progressEndpoints.push(cap.endpoint);
@@ -195,8 +202,12 @@ export const BASELINE_SELF_LIFECYCLE_COMMANDS = Object.freeze(["stop", "turn-pen
  *  but killing a peer is denial; typing into a peer is control of it, and the two are different in
  *  kind. `input` therefore rides the operator instrument set only
  *  ({@link operatorInstrumentCapabilities}), where the holder is already the administrative
- *  authority for the domain. */
-export const SPAWN_CREATE_COMMANDS = Object.freeze(["spawn"] as const);
+ *  authority for the domain.
+ *
+ *  `resolve-agent` rides with `spawn` wherever it is minted: it answers which harness that
+ *  caller's `spawn` would launch, which a `spawn` holder already learns by spawning, and a
+ *  detached resume needs the answer before it carries the session. */
+export const SPAWN_CREATE_COMMANDS = Object.freeze(["spawn", "resolve-agent"] as const);
 export const SPAWN_OWNER_LIFECYCLE_COMMANDS = Object.freeze(["despawn", "attach"] as const);
 /** The two commands that WRITE INTO a seat, granted ONLY into operator-authorized credentials
  *  (see the note above for why `input` is not in the spawn set; `turn` is the same authority
@@ -215,7 +226,7 @@ export const OPERATOR_SEAT_COMMANDS = Object.freeze(["input", "turn"] as const);
  *  (`inspect` - the responder narrows the view to the caller's owner domain, like `ps`), and the
  *  persona-catalog reads (`list-personas` / `show-persona`). These ride the v0.3 privileged tier
  *  today; minting them with `spawn` keeps that tier's surface 1:1. */
-export const SPAWN_SERVICE_COMMANDS = Object.freeze(["define-persona", "inspect", "list-personas", "show-persona"] as const);
+export const SPAWN_SERVICE_COMMANDS = Object.freeze(["define-persona", "inspect", "list-personas", "show-persona", "goal-result"] as const);
 /** The `run` capability's commands (SPEC 14.3): the manager-hosted workflow-run surface. The
  *  three writes start a run, take one over and answer its open pause; the two reads list runs
  *  and render one run's record and journal. All UNTARGETED: a run is not an agent, so no target
@@ -228,7 +239,7 @@ export const RUN_READ_COMMANDS = Object.freeze(["run-status", "run-ps"] as const
 
 // ---- operator INSTRUMENT capability sets (the 1c grant-migration table's admin row) --------------
 /** The manager endpoint's read commands (`manager.read` class). */
-export const MANAGER_READ_COMMANDS = Object.freeze(["status", "ps", "inspect", "models", "list-personas", "show-persona"] as const);
+export const MANAGER_READ_COMMANDS = Object.freeze(["status", "ps", "slots", "inspect", "models", "list-personas", "show-persona", "goal-result"] as const);
 /** The manager endpoint's admin-class commands (`manager.admin`): capability-only + untargeted -
  *  the broker grant (who holds the row) IS the boundary; minted ONLY into operator instruments,
  *  NEVER an agent/spawn profile (the ratified 1c pin). */
@@ -236,11 +247,12 @@ export const MANAGER_ADMIN_COMMANDS = Object.freeze([
   "purge", "launch",
   "resume-preserved", "commit-resume", "finalize-resume",
   "prepare-preservation", "commit-preservation", "abort-preservation",
+  "transcript-receive",
 ] as const);
 
 /** The ACTION commands (§13.6): submitting one accepts a GOAL, so the caller may follow its OWN
- *  goal progress (P2 item 2). `spawn` (create) and `launch` (manifest) both serve as actions on
- *  the manager endpoint since 2a; a caller holding one of these capabilities is granted the
+ *  goal progress. `spawn` (create) and `launch` (manifest) both serve as actions on
+ *  the manager endpoint; a caller holding one of these capabilities is granted the
  *  per-goal live-progress read for that endpoint ({@link epGoalProgressGrantRow}), the one read an
  *  invoke DOES imply because it is bounded to the caller's OWN goal subtree. */
 export const GOAL_BEARING_COMMANDS = Object.freeze(["spawn", "launch"] as const);
@@ -273,7 +285,7 @@ const GOAL_BEARING_SET: ReadonlySet<string> = new Set(GOAL_BEARING_COMMANDS);
  *  it derives nothing from a descriptor, which is the part §13.7 forbids. `smoke:unfenced-responder`
  *  tripwires that pin so the version cannot move without this table being named. */
 export const REPEAT_SAFE_COMMANDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  [BASELINE_LIFECYCLE_ENDPOINT]: Object.freeze(["status", "ps", "inspect", "list-personas", "show-persona", "run-status", "run-ps"]),
+  [BASELINE_LIFECYCLE_ENDPOINT]: Object.freeze(["status", "ps", "slots", "inspect", "list-personas", "show-persona", "run-status", "run-ps", "goal-result"]),
   [BASELINE_DELIVERY_ENDPOINT]: Object.freeze(["list"]),
 });
 /** `describe` is a read on every endpoint by construction, so it is repeat-safe without one: no
@@ -360,11 +372,11 @@ export function runCallerCapabilities(callerOwner: string): EpCapability[] {
 }
 
 /** An operator INSTRUMENT's capability set (the 1c grant-migration table's admin row), per the
- *  instrument's v0.3 control tier - the SAME mint sites that grant a `ctl.<tier>` row today
- *  (`control-caller-*` / `deployer`) consume this for the ep rails; no new minting authority.
+ *  instrument's control tier - the `control-caller-*` / `deployer` / `teardown` mint sites consume
+ *  this for their ep rails; no new minting authority.
  *
  *  `privileged` (the ps/start instrument): the manager reads (incl. persona catalog list/show) +
- *  untargeted `spawn` + `define-persona` - structurally barred from cross-agent reach, exactly like its ctl row.
+ *  untargeted `spawn` + `define-persona` - structurally barred from cross-agent reach: no any-mode row.
  *
  *  `admin` (the stop/attach/deploy instrument): everything above plus ANY-mode `despawn`/`attach`
  *  (tOwner `"*"`), BOTH modes of `input` (which no other profile grants at all), and the
@@ -372,18 +384,19 @@ export function runCallerCapabilities(callerOwner: string): EpCapability[] {
  *  cross-agent terminal/interactive ops ride authz-mode `any` on the SAME commands (no wire
  *  synonym) - the any-mode subject row is minted ONLY into operator-authorized credentials: the
  *  `control-caller-admin`/`deployer`/`teardown` instruments AND an agent credential explicitly
- *  granted the `admin` capability (which by design mirrors the full admin instrument set - its
- *  ctl-tier equivalent already held `ctl.<admin>`, so this is parity, not a new escalation). An
- *  ordinary agent, incl. the `spawn` capability, never carries it. So the broker grant is the tier boundary exactly as
- *  `ctl.<admin>` is today, and the responder maps mode `any` to its admin authorization path. */
+ *  granted the `admin` capability (which by design mirrors the full admin instrument set, as its
+ *  v0.3 `ctl.<admin>` grant did, so this is parity, not a new escalation). An ordinary agent, incl.
+ *  the `spawn` capability, never carries it. So the broker grant is the tier boundary, and the
+ *  responder maps mode `any` to its admin authorization path. */
 export function operatorInstrumentCapabilities(tier: "privileged" | "admin", callerOwner?: string): EpCapability[] {
   const caps: EpCapability[] = [
     ...MANAGER_READ_SNAP.map((command) => ({
       endpoint: BASELINE_LIFECYCLE_ENDPOINT, command,
-      // `ps` is the CLASS-SCATTER read (P2 item 3, `cotal ps` default): the instrument publishes it
-      // on the `all` scatter rail to gather every instance's rows in a multi-manager space. The
+      // `ps` is the CLASS-SCATTER read (the `cotal ps` default): the instrument publishes it
+      // on the `all` scatter rail to gather every instance's rows in a multi-manager space. `slots`
+      // (`cotal ps --slots`, #1274) scatters the same way, one durable-row list per manager. The
       // other reads stay `one`-only (anycast, or `inst` when a resolve pins `--on`).
-      ...(command === "ps" ? { routes: ["one", "all"] as ("one" | "all")[] } : {}),
+      ...(command === "ps" || command === "slots" ? { routes: ["one", "all"] as ("one" | "all")[] } : {}),
     })),
     ...SPAWN_CREATE_SNAP.map((command) => ({ endpoint: BASELINE_LIFECYCLE_ENDPOINT, command })),
     { endpoint: BASELINE_LIFECYCLE_ENDPOINT, command: "define-persona" },
@@ -460,6 +473,12 @@ export function instancePinnedInstrumentCapabilities(tier: "privileged" | "admin
       ...tierCaps.map((cap) => ({ ...cap, instanceId: id })),
     ];
   });
+}
+
+/** Pin any capability set to one exact manager instance and remove every class/scatter route. */
+export function instanceOnlyManagerCapabilities(caps: EpCapability[], instanceId: string): EpCapability[] {
+  const id = assertLifecycleToken(instanceId, "instanceId");
+  return caps.map((cap) => ({ ...cap, endpoint: BASELINE_LIFECYCLE_ENDPOINT, routes: [], instanceId: id, instanceOnly: true }));
 }
 
 /** All BASELINE caller rows (Appendix B): the wildcard describe form + the baseline capability

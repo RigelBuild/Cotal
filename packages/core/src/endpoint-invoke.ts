@@ -1,5 +1,5 @@
 /**
- * The GENERIC caller path (control-surface P2 item 1, item 5): describe an endpoint, fetch its
+ * The GENERIC caller path: describe an endpoint, fetch its
  * registered contracts from the §13.7 content store, recompile the digest-matching validators,
  * and invoke a named command — WITHOUT the caller compiling the endpoint's schemas ahead of time.
  * This is what a `cotal describe`/`cotal invoke` CLI and every migrated control consumer ride, so
@@ -16,12 +16,17 @@
  *  - the invoke pins those digests, so the responder's digest-bound serve boundary honors exactly
  *    the schema the caller validated against.
  */
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { PermissionViolationError, type NatsConnection, type Subscription } from "@nats-io/transport-node";
 import { openPublishDenialWatch } from "./endpoint-publish-denial.js";
 import { jetstreamManager } from "@nats-io/jetstream";
-import { EpEnvelopeError, EP_UNBOUND_RESPONDER, EP_UNANSWERED, renderLifecycleBlocked, lifecycleBlockedFrom } from "./endpoint-envelope.js";
+import { EpEnvelopeError, EP_UNBOUND_RESPONDER, EP_UNANSWERED, renderLifecycleBlocked, lifecycleBlockedFrom, replyRefusedBeforeEffect, replyTargetUnmapped, unansweredRequest } from "./endpoint-envelope.js";
 import { compileContract, type CompiledContract } from "./schema-profile.js";
+import {
+  parseGoalResultFact,
+  type GoalResultFact,
+  type GoalRef,
+} from "./endpoint-action.js";
 import {
   contractStoreContext, fetchContractClosure, contractRefToHex, contractArtifactDigestHex,
   type ContractStoreContext, type ArtifactMemo,
@@ -80,7 +85,7 @@ export interface ResolvedService {
   caller: EpCaller;
   responder: { instanceId: string; epoch: number };
   commands: Map<string, ResolvedCommand>;
-  /** Set when the service was resolved PINNED to one instance's `inst` route (P2 item 3 `--on`):
+  /** Set when the service was resolved PINNED to one instance's `inst` route (`--on`):
    *  {@link invokeCommand} then routes commands to that exact instance, never the class `one` queue,
    *  so a multi-manager space can be addressed per-instance. Absent ⇒ class anycast (the default). */
   pinnedInstanceId?: string;
@@ -95,19 +100,21 @@ export interface ResolvedService {
  * publish on the caller's rail at any nonce — acceptance therefore checks the reply SUBJECT's
  * endpoint + nonce AND the body's echoed request id, not just "first `{ok:true}` on the rail".
  * A reply that fails any of these is IGNORED (not rejected: an attacker racing a wrong-nonce reply
- * must not be able to fail an honest describe), and the wait continues to the deadline.
+ * must not be able to fail an honest describe), and the wait continues to the deadline. A signal
+ * that aborts with a `TimeoutError` ends the wait as that deadline would.
  */
 export async function describeEndpoint(
   nc: NatsConnection,
   space: string,
   endpoint: string,
   caller: EpCaller,
-  opts: { deadlineMs?: number; instanceId?: string } = {},
+  opts: { deadlineMs?: number; instanceId?: string; signal?: AbortSignal } = {},
 ): Promise<{ answer: DescribeAnswer; responder: { instanceId: string; epoch: number } }> {
+  opts.signal?.throwIfAborted();
   const deadlineMs = opts.deadlineMs ?? 10_000;
   const n = nonce();
   const requestId = nonce();
-  // P2 item 3 `--on <instance>`: PIN the describe to one instance's `inst` route so a multi-manager
+  // `--on <instance>`: PIN the describe to one instance's `inst` route so a multi-manager
   // space resolves the exact instance addressed, not whichever wins the class `one` queue. Default =
   // class anycast (mode "one"), unchanged for every existing caller.
   const route: EpRoute = opts.instanceId !== undefined ? { mode: "inst", instanceId: opts.instanceId } : { mode: "one" };
@@ -125,12 +132,21 @@ export async function describeEndpoint(
   let timer: ReturnType<typeof setTimeout> | undefined;
   let retryTimer: ReturnType<typeof setInterval> | undefined;
   let denialWatch: { denied: Promise<never>; release(): void } | undefined;
+  let onAbort: (() => void) | undefined;
+  const startedAt = performance.now();
+  const unanswered = (ms: number) => new EpEnvelopeError("deadline-exceeded", `no describe reply from ${endpoint}${opts.instanceId !== undefined ? ` instance ${opts.instanceId}` : ""} within ${ms}ms on the ${rail} rail`, [{ kind: EP_UNANSWERED, endpoint, command: "describe", rail }]);
+  const cancelled = new Promise<never>((_, reject) => {
+    onAbort = () => reject(opts.signal?.reason?.name === "TimeoutError"
+      ? unanswered(Math.round(performance.now() - startedAt))
+      : new EpEnvelopeError("unavailable", `describe(${endpoint}) observation cancelled`));
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+  });
   try {
     // REGISTER THE PERMISSION WATCH BEFORE THE PUBLISH IT IS WATCHING. See
     // {@link openPublishDenialWatch}: a refused publish is otherwise indistinguishable
     // from an unanswered describe.
     denialWatch = openPublishDenialWatch(nc, subject, () => new EpEnvelopeError("permission-denied",
-      `the describe for ${endpoint} was REFUSED BY THE BROKER, not unanswered: this caller's credential does not authorize publishing to "${subject}"${opts.instanceId !== undefined ? ` (the instance rail for ${opts.instanceId}: an instance-addressed call needs a credential minted with that instance, not a class-rail one)` : ""}. The responder may be perfectly healthy; the grant is what is missing (SPEC 13.2)`), "describe");
+      `the describe for ${endpoint} was REFUSED BY THE BROKER, not unanswered: this caller's credential does not authorize publishing to "${subject}"${opts.instanceId !== undefined ? ` (the instance rail for ${opts.instanceId}: an instance-addressed call needs a credential minted with that instance, not a class-rail one)` : ""}. The responder may be perfectly healthy; the grant is what is missing (SPEC 13.2)`, undefined, "not-executed"), "describe");
     const got = new Promise<{ body: Record<string, unknown>; responder: { instanceId: string; epoch: number } }>((resolve, reject) => {
       sub = nc.subscribe(epCallerReplyFilter(space, caller), {
         callback: (err, msg) => {
@@ -165,8 +181,8 @@ export async function describeEndpoint(
         }
       }, DESCRIBE_RETRY_MS);
     });
-    const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new EpEnvelopeError("deadline-exceeded", `no describe reply from ${endpoint} within ${deadlineMs}ms on the ${rail} rail`, [{ kind: EP_UNANSWERED, endpoint, command: "describe", rail }])), deadlineMs); });
-    const { body: reply, responder } = await Promise.race([got, timeout, denialWatch.denied]);
+    const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(unanswered(deadlineMs)), deadlineMs); });
+    const { body: reply, responder } = await Promise.race([got, timeout, denialWatch.denied, cancelled]);
     if (reply.ok !== true) {
       // A responder ANSWERED with a refusal: it is rethrown under the responder's own code (which
       // may be `unavailable`) and deliberately without the EP_UNANSWERED marker the deadline above
@@ -179,16 +195,21 @@ export async function describeEndpoint(
     sub?.unsubscribe();
     if (timer !== undefined) clearTimeout(timer);
     if (retryTimer !== undefined) clearInterval(retryTimer);
+    if (onAbort) opts.signal?.removeEventListener("abort", onAbort);
     // Release on EVERY exit, success included. See {@link openPublishDenialWatch}.
     denialWatch?.release();
   }
 }
 
+/** The options one {@link resolveService} closure walk runs under: the resolve's shared artifact
+ *  memo, what remains of its deadline, and its abort signal. */
+interface ClosureWalk { artifactMemo: ArtifactMemo; walkBudgetMs: number; signal?: AbortSignal }
+
 /** Fetch + verify ONE cluster document from the store at its closure digest (two-stage §13.7:
  *  the manifest at the closure digest, whose `root` names the document artifact). A cluster
  *  document declares no by-digest child references, so its closure is {root}. */
-async function fetchClusterDocument(store: ContractStoreContext, closureDigest: string, artifactMemo?: ArtifactMemo): Promise<ClusterDocument> {
-  const { manifest, artifacts } = await fetchContractClosure(store, closureDigest, () => [], { ...(artifactMemo ? { artifactMemo } : {}) });
+async function fetchClusterDocument(store: ContractStoreContext, closureDigest: string, walk: ClosureWalk): Promise<ClusterDocument> {
+  const { manifest, artifacts } = await fetchContractClosure(store, closureDigest, () => [], walk);
   const rootBytes = artifacts.get(contractRefToHex(manifest.root));
   if (rootBytes === undefined)
     throw new EpEnvelopeError("failed-precondition", `the cluster manifest ${closureDigest} names root ${manifest.root} but the root artifact is absent from the fetched closure (SPEC 13.7)`);
@@ -198,11 +219,11 @@ async function fetchClusterDocument(store: ContractStoreContext, closureDigest: 
 /** Fetch a schema CLOSURE from the store and PROFILE-recompile it, binding every by-digest member.
  *  The recompiled contract's closureDigest MUST equal the digest we fetched at — a store that
  *  served bytes hashing to a different closure is a tamper/bug and fails loud (§13.7). */
-async function recompileClosure(store: ContractStoreContext, closureDigest: string, artifactMemo?: ArtifactMemo): Promise<CompiledContract> {
+async function recompileClosure(store: ContractStoreContext, closureDigest: string, walk: ClosureWalk): Promise<CompiledContract> {
   // Walk the schema closure, resolving `cotal:sha256:<hex>` refs a document makes (the profile's
   // reference form) so a multi-document schema bundle rebuilds. A recompiled contract carries the
   // registered digest, so an equality check below is the tamper boundary.
-  const { manifest, artifacts } = await fetchContractClosure(store, closureDigest, (bytes) => extractSchemaRefs(bytes), { ...(artifactMemo ? { artifactMemo } : {}) });
+  const { manifest, artifacts } = await fetchContractClosure(store, closureDigest, (bytes) => extractSchemaRefs(bytes), walk);
   const members: Record<string, unknown> = {};
   for (const [hex, bytes] of artifacts) members[`sha256:${hex}`] = JSON.parse(dec.decode(bytes));
   const rootRef = manifest.root;
@@ -281,9 +302,13 @@ export async function resolveService(
   space: string,
   endpoint: string,
   caller: EpCaller,
-  opts: { deadlineMs?: number; instanceId?: string } = {},
+  opts: { deadlineMs?: number; instanceId?: string; signal?: AbortSignal } = {},
 ): Promise<ResolvedService> {
-  const { answer, responder } = await describeEndpoint(nc, space, endpoint, caller, opts);
+  // `deadlineMs` bounds the WHOLE resolve: the describe spends from it, and each closure walk is
+  // budgeted with what remains, so a slow store read fails the resolve at the caller's deadline.
+  const startedAt = performance.now();
+  const deadlineMs = opts.deadlineMs ?? 10_000;
+  const { answer, responder } = await describeEndpoint(nc, space, endpoint, caller, { ...opts, deadlineMs });
   const store = await contractStoreContext(nc, space);
   const visible = new Set<string>(answer.descriptor.clusters.flatMap((cl) => cl.commands));
   // The store reads dominate a resolve's wall time and are all caller->broker round-trips, so they
@@ -292,7 +317,16 @@ export async function resolveService(
   // that is the whole latency). Each closure walk is still internally sequential and its §13.7
   // bounds are still counted per walk — the concurrency is BETWEEN walks, so no limit is widened.
   const artifactMemo: ArtifactMemo = new Map();
-  const docs = await pooled(answer.descriptor.clusters, RESOLVE_MAX_INFLIGHT_READS, (cl) => fetchClusterDocument(store, cl.digest, artifactMemo));
+  const walk = (): ClosureWalk => {
+    const walkBudgetMs = Math.floor(deadlineMs - (performance.now() - startedAt));
+    if (walkBudgetMs <= 0)
+      throw new EpEnvelopeError("deadline-exceeded", `resolving ${endpoint} exhausted its ${deadlineMs}ms deadline before a contract-store read`);
+    return { artifactMemo, walkBudgetMs, ...(opts.signal ? { signal: opts.signal } : {}) };
+  };
+  const docs = await pooled(answer.descriptor.clusters, RESOLVE_MAX_INFLIGHT_READS, (cl) => {
+    opts.signal?.throwIfAborted();
+    return fetchClusterDocument(store, cl.digest, walk());
+  });
   // Flattened in DOCUMENT ORDER first, then resolved concurrently and inserted in that same order:
   // when two clusters declare one command name, last-in-document-order still wins, exactly as the
   // sequential form did. Concurrency must not make the resolved surface depend on read timing.
@@ -300,11 +334,12 @@ export async function resolveService(
   // Each command needs two closures, so the pool runs at half the read bound to keep the in-flight
   // read count under it.
   const resolved = await pooled(declared, Math.max(1, RESOLVE_MAX_INFLIGHT_READS >> 1), async (cmd): Promise<ResolvedCommand> => {
+    opts.signal?.throwIfAborted();
     // Each command recompiles its OWN validators (cheap, CPU-only) even when two commands share a
     // closure digest: a compiled contract is not shared, only the artifact bytes behind it are.
     const [input, output] = await Promise.all([
-      recompileClosure(store, cmd.inputDigest, artifactMemo),
-      recompileClosure(store, cmd.outputDigest, artifactMemo),
+      recompileClosure(store, cmd.inputDigest, walk()),
+      recompileClosure(store, cmd.outputDigest, walk()),
     ]);
     return {
       command: cmd.name,
@@ -315,10 +350,18 @@ export async function resolveService(
       capability: cmd.capability,
     };
   });
+  opts.signal?.throwIfAborted();
   const commands = new Map<string, ResolvedCommand>();
   for (const rc of resolved) commands.set(rc.command, rc);
   return { endpoint: answer.descriptor.endpoint, owner: answer.descriptor.owner, caller, responder, commands, ...(opts.instanceId !== undefined ? { pinnedInstanceId: opts.instanceId } : {}) };
 }
+
+/** How many times a call is re-issued after a `not-executed` bind refusal. Every
+ *  re-issue is a first attempt, so this is a loop guard and not a duplication guard. Each attempt
+ *  splits with probability (m-1)/m in a space of m managers, so seventeen attempts leave a
+ *  three-manager space about 1 in 1000 where the unrepaired call failed 2 in 3 (#398). An attempt
+ *  costs an answered describe and invoke, never an elapsed deadline. */
+export const BIND_SPLIT_REISSUES = 16;
 
 /**
  * INVOKE one named command on a resolved service: validate nothing here (the compiled input
@@ -344,6 +387,7 @@ export async function invokeCommand(
   opts: {
     target?: EpVerbTarget;
     deadlineMs?: number;
+    signal?: AbortSignal;
     currentEpoch?: (instanceId: string) => Promise<number> | number;
     /** A caller-pinned envelope id (see {@link EpVerbOp.id}): a goal-accepting command binds its
      *  goal under it, which is what lets a durable caller resubmit idempotently. */
@@ -395,7 +439,7 @@ export async function invokeCommand(
     }
     return service.responder.epoch;
   };
-  // P2 item 3 `--on`: a PINNED service routes to its exact instance's `inst` rail (the same instance the
+  // `--on`: a PINNED service routes to its exact instance's `inst` rail (the same instance the
   // describe resolved to, at its resolved epoch), never the class `one` queue — so the command reaches
   // the addressed manager in a multi-manager space. Unpinned ⇒ class anycast `one` (unchanged). The
   // describeBound currency check still holds: an inst-routed reply carries that instance's id.
@@ -419,6 +463,7 @@ export async function invokeCommand(
     ...(opts.id !== undefined ? { id: opts.id } : {}),
   }, {
     deadlineMs: opts.deadlineMs ?? 10_000,
+    signal: opts.signal,
     currentEpoch: opts.currentEpoch ?? describeBound,
     // What the currency hook returns decides how a stale-epoch refusal is worded and marked: the
     // describe-bound default is this handle's own bind (a responder ahead of it is a successor and
@@ -427,111 +472,319 @@ export async function invokeCommand(
   });
 }
 
-/** Submit an ACTION command and FOLLOW its goal to the terminal (P2 item 2, 2b): since 2a a
- *  spawn/launch reply is the ACCEPTANCE (returned before the agent is live), so a consumer that
- *  wants the old block-until-outcome behaviour follows the caller-scoped progress subtree to the
- *  terminal here. The subscription opens BEFORE `submit` runs (a fast join could terminalize within
- *  milliseconds of the acceptance), buffering terminals by goalId. The reply is then RESOLVED from
- *  the terminal: `succeeded` → the terminal's data (today's live reply — name/id/role/agent/mode/
- *  lifecycleUid), `failed`/`uncertain`/`cancelled` → a non-ok reply carrying the cause. A reply with
- *  NO goalId (a refuse-at-accept, or a non-action command) passes through unchanged. UX is preserved:
- *  the call still returns on the real outcome. The caller needs the per-goal progress read row
- *  ({@link epGoalProgressGrantRow}) — minted with any goal-bearing capability. */
+/** The refusal a goal-following call meets on a handle whose endpoint serves no `goal-result`: an
+ *  accepted goal could never be read back to its terminal (SPEC 13.6), so nothing is submitted.
+ *  `undefined` when the handle can follow. */
+export function goalFollowRefusal(service: ResolvedService): EpAttributedReply | undefined {
+  if (service.commands.has("goal-result")) return undefined;
+  return {
+    reply: { v: 1, id: randomUUID(), ok: false, error: {
+      code: "failed-precondition", outcome: "not-executed",
+      message: `endpoint "${service.endpoint}" does not support "goal-result"; upgrade manager to enable durable goal following (SPEC 13.6)`,
+    } },
+    responder: { endpoint: service.endpoint, instanceId: service.responder.instanceId, epoch: service.responder.epoch },
+  };
+}
+
+/**
+ * {@link invokeCommand} with a SPEC 13.2 bind refusal repaired rather than surfaced.
+ *
+ * An unpinned handle binds the instance that answered its describe, and the invoke is a second,
+ * independent trip through the same class queue, so in a multi-instance space another member
+ * routinely receives it and refuses before dispatching. That refusal states the command did not
+ * run ({@link replyRefusedBeforeEffect}), so re-resolving and re-issuing is a first attempt and is
+ * safe for any command, mutations included. A targeted call that reaches a member holding no
+ * mapping for its target ({@link replyTargetUnmapped}) is re-issued the same way, because with an
+ * instance-local resolver only the member hosting the target can serve it. The re-issue repeats
+ * until a member serves the call or {@link BIND_SPLIT_REISSUES} runs out, and then the last refusal
+ * surfaces unchanged, or the last no-mapping refusal when there was one.
+ *
+ * `reresolve` defaults to a fresh class resolve as the handle's caller; a caller that memoizes its
+ * handle passes one that drops the memo first, so later calls do not start from the refused bind.
+ * When it throws, the refusal surfaces, because it states that nothing ran, which the resolve
+ * failure raised in its place would lose.
+ *
+ * A pinned handle is never repaired: it names its instance, so a refusal from it is that instance
+ * answering about itself, and re-resolving on the class rail would reach another one.
+ */
+export async function invokeRepairingSplit(
+  nc: NatsConnection,
+  space: string,
+  service: ResolvedService,
+  command: string,
+  args: Record<string, unknown> | undefined,
+  opts: Parameters<typeof invokeCommand>[5],
+  reresolve: () => Promise<ResolvedService> = () =>
+    resolveService(nc, space, service.endpoint, service.caller, { deadlineMs: opts.deadlineMs ?? 10_000, ...(opts.signal ? { signal: opts.signal } : {}) }),
+): Promise<EpAttributedReply> {
+  let handle = service;
+  // A member that looked the target up and found no mapping says more about it than a bind refusal,
+  // which says nothing, so a call that runs out of re-issues surfaces the latest such refusal.
+  let unmapped: EpAttributedReply | undefined;
+  for (let reissues = 0; ; reissues += 1) {
+    const r = await invokeCommand(nc, space, handle, command, args, opts);
+    if (replyTargetUnmapped(r.reply.error)) unmapped = r;
+    else if (r.reply.ok !== false || !replyRefusedBeforeEffect(r.reply.error)) return r;
+    if (handle.pinnedInstanceId !== undefined) return r;
+    if (reissues === BIND_SPLIT_REISSUES) return unmapped ?? r;
+    try {
+      handle = await reresolve();
+    } catch {
+      return unmapped ?? r;
+    }
+  }
+}
+
+export interface SubmitAndFollowGoalOptions {
+  /** Read through the current authorized transport. Cancellation owns this read, not the goal. */
+  reconcile?: (goalId: string, attributed: EpAttributedReply, context: {
+    caller: EpCaller; signal: AbortSignal; deadlineMs: number;
+  }) => Promise<{ goalId: string; result?: GoalResultFact } | undefined>;
+  currentNc?: () => NatsConnection | undefined;
+  onReconnect?: (handler: (newNc: NatsConnection) => void) => () => void;
+  signal?: AbortSignal;
+  /** Work that must finish before the submission and cannot itself carry out the command, such as
+   *  resolving the endpoint. It is given the follow's deadline as an epoch-ms time to spend, and its
+   *  failures surface unchanged. At the deadline its signal aborts with a `TimeoutError`, and only a
+   *  describe that drew no reply keeps its own error then. A stop, or the deadline otherwise, reports
+   *  `not-executed`. */
+  prepare?: (signal: AbortSignal, deadline: number) => Promise<void>;
+}
+
+/** Subscribe before a single submission, then observe its accepted goal through live progress and
+ *  mediated canonical reads. Local failures before an attributed reply throw; they never invent a
+ *  responder. Once accepted, observation failures retain that responder and never authorize retry.
+ *  A terminal other than `succeeded` keeps the acceptance as its data, so the caller still holds the
+ *  allocated identity of a goal that settled `uncertain` and may yet converge. */
 export async function submitAndFollowGoal(
   nc: NatsConnection,
   space: string,
   endpoint: string,
   caller: EpCaller,
   deadlineMs: number,
-  submit: () => Promise<EpAttributedReply>,
+  submit: (signal?: AbortSignal) => Promise<EpAttributedReply>,
+  opts?: SubmitAndFollowGoalOptions,
 ): Promise<EpAttributedReply> {
+  if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= 0)
+    throw new EpEnvelopeError("bad-request", "goal following requires a positive integer deadline", undefined, "not-executed");
+  const acceptingCaller = { ...caller };
   const terminals = new Map<string, { state: string; data?: unknown }>();
-  const waiters = new Map<string, () => void>();
-  const progressSubject = epGoalProgressGrantRow(space, endpoint, caller);
-  // A SUBSCRIPTION ERROR IS NOT ABSENCE OF NEWS, AND IT MUST NOT BE DISCARDED. If the broker
-  // refuses this subscription the caller can never hear ANY terminal for this goal - success as
-  // readily as failure - so waiting out the deadline reports "no terminal arrived" about a goal
-  // whose terminal may have been committed on time. Measured (#610): the manager bound the goal,
-  // earned ownership, committed the terminal and emitted it, while the caller sat denied and then
-  // printed a timeout. The broker's own wording for this is "a denied peer looks absent", which is
-  // exactly the confusion, and the operator response to the two is opposite: a timeout invites a
-  // retry (which duplicates the effect), a denial requires a grant.
+  const progressSubject = epGoalProgressGrantRow(space, endpoint, acceptingCaller);
+  const work = new AbortController();
+  const timers = new Set<ReturnType<typeof setTimeout>>();
+  let activeNc = nc;
+  let activeSub: Subscription | undefined;
+  let generation = 0;
+  let unbindReconnect: (() => void) | undefined;
+  let completed = false;
+  let stopped = opts?.signal?.aborted === true;
+  let submitted = false;
   let subError: Error | undefined;
-  const sub = nc.subscribe(progressSubject, {
-    callback: (err, m) => {
-      if (err) {
-        // Keep the FIRST error (later ones are consequences) and wake every waiter: once this
-        // subscription is refused, no further waiting can change the answer.
-        subError ??= err instanceof Error ? err : new Error(String(err));
-        for (const wake of waiters.values()) wake();
-        return;
-      }
-      let ev: { goalId?: unknown; phase?: unknown; state?: unknown; data?: unknown };
-      try { ev = JSON.parse(dec.decode(m.data)); } catch { return; }
-      if (ev && ev.phase === "terminal" && typeof ev.goalId === "string") {
-        terminals.set(ev.goalId, { state: String(ev.state), data: ev.data });
-        waiters.get(ev.goalId)?.();
-      }
-    },
-  });
+  let observationError: Error | undefined;
+  let wake: (() => void) | undefined;
+  let abortPhase: (() => void) | undefined;
+  let needsReconcile = false;
+  let reading = false;
+  let progressReady = false;
+  const aborted = new Promise<void>((resolve) => { abortPhase = resolve; });
+  const onAbort = () => {
+    stopped = true;
+    work.abort();
+    abortPhase?.();
+    wake?.();
+  };
+  const phaseError = (code: "unavailable" | "deadline-exceeded") => new EpEnvelopeError(code,
+    submitted
+      ? "the goal submission was interrupted while in flight; its outcome is unknown. It may have been accepted or executed; do NOT retry without inspecting 'ps'/'inspect' first (SPEC 13.6)"
+      : "goal observation stopped or exceeded its deadline before submission; the manager request WAS NOT RUN",
+    undefined, submitted ? "unknown" : "not-executed");
+  let deadline = Date.now() + deadlineMs;
+  const bounded = async <T>(operation: () => Promise<T>, until: number): Promise<T> => {
+    if (stopped || completed) throw phaseError("unavailable");
+    const remaining = until - Date.now();
+    if (remaining <= 0) throw phaseError("deadline-exceeded");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        operation(),
+        aborted.then(() => { throw phaseError("unavailable"); }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(phaseError("deadline-exceeded")), Math.min(remaining, 2_147_483_647));
+          timers.add(timer);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) { clearTimeout(timer); timers.delete(timer); }
+    }
+  };
+  const subscribe = (next: NatsConnection) => {
+    if (completed || stopped) return;
+    const mine = ++generation;
+    activeSub?.unsubscribe();
+    activeNc = next;
+    progressReady = false;
+    subError = undefined;
+    activeSub = next.subscribe(progressSubject, {
+      callback: (err, msg) => {
+        if (completed || stopped || mine !== generation) return;
+        if (err) { subError ??= err; wake?.(); return; }
+        let ev: { goalId?: unknown; phase?: unknown; state?: unknown; data?: unknown };
+        try { ev = JSON.parse(dec.decode(msg.data)); } catch { return; }
+        if (ev?.phase === "terminal" && typeof ev.goalId === "string") {
+          terminals.set(ev.goalId, { state: String(ev.state), data: ev.data });
+          wake?.();
+        }
+      },
+    });
+  };
+  const replaceConnection = (next: NatsConnection) => {
+    if (completed || stopped) return;
+    try { subscribe(next); }
+    catch (err) { subError = err instanceof Error ? err : new Error(String(err)); wake?.(); return; }
+    const mine = generation;
+    void bounded(() => next.flush(), deadline).then(() => {
+      if (completed || stopped || mine !== generation) return;
+      progressReady = true;
+      needsReconcile = true;
+      wake?.();
+    }, (err) => {
+      if (completed || stopped || mine !== generation) return;
+      subError = err instanceof Error ? err : new Error(String(err));
+      wake?.();
+    });
+  };
   try {
-    const attributed = await submit();
-    if (attributed.reply.ok !== true) return attributed; // refuse at accept — surface as-is
-    const acceptance = attributed.reply.data as { goalId?: unknown; readinessDeadlineMs?: unknown } | undefined;
+    opts?.signal?.addEventListener("abort", onAbort, { once: true });
+    if (stopped) throw phaseError("unavailable");
+    if (opts?.prepare) {
+      // The deadline first aborts the prepare's signal, so a describe the prepare started after other
+      // steps reports that it drew no reply. A prepare that ignores its signal is cut off a turn later.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([opts.prepare(work.signal, deadline), aborted, new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            work.abort(new DOMException("the goal follow's deadline passed", "TimeoutError"));
+            setImmediate(resolve);
+          }, Math.min(deadline - Date.now(), 2_147_483_647));
+        })]);
+        work.signal.throwIfAborted();
+      } catch (err) {
+        throw stopped ? phaseError("unavailable") : work.signal.aborted && !unansweredRequest(err) ? phaseError("deadline-exceeded") : err;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    subscribe(opts?.currentNc?.() ?? nc);
+    unbindReconnect = opts?.onReconnect?.(replaceConnection);
+    // A borrowed submit can publish on another connection. Confirm broker interest first,
+    // including a replacement that arrived while the first connection's flush was pending.
+    for (;;) {
+      const preparing = activeNc;
+      try { await bounded(() => preparing.flush(), deadline); }
+      catch (err) { if (!stopped && preparing !== activeNc) continue; throw err; }
+      if (stopped) throw phaseError("unavailable");
+      const current = opts?.currentNc?.();
+      if (current && current !== activeNc) subscribe(current);
+      if (preparing === activeNc) { progressReady = true; break; }
+    }
+    if (stopped) throw phaseError("unavailable");
+    submitted = true;
+    let attributed: EpAttributedReply;
+    try { attributed = await bounded(() => submit(work.signal), deadline); }
+    catch (err) {
+      if (stopped) throw phaseError("unavailable");
+      if (err instanceof EpEnvelopeError && err.outcome === "not-executed") throw err;
+      throw new EpEnvelopeError(err instanceof EpEnvelopeError ? err.code : "unavailable",
+        `${err instanceof Error ? err.message : String(err)}; the submission outcome is unknown. It may have been accepted or executed; do NOT retry without inspecting 'ps'/'inspect' first (SPEC 13.6)`, undefined, "unknown");
+    }
+    if (attributed.reply.ok !== true) return attributed;
+    const acceptance = attributed.reply.data as { goalId?: unknown; fingerprint?: unknown; readinessDeadlineMs?: unknown } | undefined;
     const goalId = acceptance?.goalId;
-    if (typeof goalId !== "string") return attributed; // not an action reply — pass through
-    // A bounded action's owner chooses its readiness budget at acceptance. The follow must outlive
-    // THAT accepted budget, not only the caller's generic request window: otherwise a connector can
-    // lawfully still be booting when its caller reports a timeout and invites a duplicate retry.
-    // Keep the explicit caller deadline as a floor for commands whose acceptance carries no bound.
+    if (typeof goalId !== "string") return attributed;
+    const acceptedFingerprint = typeof acceptance?.fingerprint === "string" ? acceptance.fingerprint : undefined;
     const readinessDeadlineMs = acceptance?.readinessDeadlineMs;
     const followDeadlineMs = typeof readinessDeadlineMs === "number"
       && Number.isSafeInteger(readinessDeadlineMs) && readinessDeadlineMs >= 0
-      ? Math.max(deadlineMs, readinessDeadlineMs + GOAL_FOLLOW_MARGIN_MS)
-      : deadlineMs;
-    // A denial that has ALREADY arrived must not be waited out: it is knowable now, and holding the
-    // caller to its deadline is what turns a grant problem into a retry (the cell that caught this
-    // measured 20004ms of a 20000ms budget with the right message attached to it).
-    const terminal = terminals.get(goalId) ?? (subError !== undefined ? undefined : await new Promise<{ state: string; data?: unknown } | undefined>((resolve) => {
-      const t = setTimeout(() => resolve(terminals.get(goalId)), followDeadlineMs);
-      waiters.set(goalId, () => { clearTimeout(t); resolve(terminals.get(goalId)); });
-    }));
-    if (terminal === undefined && subError !== undefined) {
-      // THE DISTINCT, ACTIONABLE FAILURE (#610). Deliberately NOT the deadline message below: this
-      // caller was never listening, so "no terminal arrived" would be a statement about the goal
-      // when the true statement is about this credential.
-      //
-      // SURFACING IS FOR EVERY ERROR; ONLY THE DIAGNOSIS IS NARROWED. Whether the subscription
-      // failed is knowable from `err` being present, so that decision must never key on the error's
-      // class: narrowing the SURFACE would re-create this very defect for every other class, which
-      // would fall back through to the silent timeout. What may key on the class is the CAUSE and
-      // the REMEDY, because "the broker refused your grant, ask for the row" is a specific claim
-      // and it is false for a transport failure. So an unrecognized class stays loud and says less,
-      // and never degrades to silence.
-      const refused = subError instanceof PermissionViolationError;
-      return { ...attributed, reply: { ...attributed.reply, ok: false, data: undefined, error: refused
-        ? { code: "permission-denied", message: `the goal "${goalId}" was accepted, but this caller is NOT PERMITTED to hear its outcome: the broker refused the per-goal progress subscription "${progressSubject}" (${subError.message}). THE GOAL IS UNAFFECTED - it may already have succeeded, and its terminal may have been committed on time; what failed is this credential's ability to observe it. Do NOT retry: a retry submits a second goal and duplicates the effect, and it will be just as unobservable. Read the outcome with 'ps'/'inspect', and grant this caller the per-goal progress read row so a following call can hear its own goal (SPEC 13.6)` }
-        : { code: "unavailable", message: `the goal "${goalId}" was accepted, but this caller's per-goal progress subscription "${progressSubject}" FAILED, so it cannot hear the outcome (${subError.name}: ${subError.message}). THE GOAL IS UNAFFECTED - it may already have succeeded, and its terminal may have been committed on time; what failed is this connection's ability to observe it. This is NOT a grant refusal, so changing ACLs is the wrong remedy. Do NOT retry: a retry submits a second goal and duplicates the effect. Read the outcome with 'ps'/'inspect' (SPEC 13.6)` } } };
+      ? Math.max(deadlineMs, readinessDeadlineMs + GOAL_FOLLOW_MARGIN_MS) : deadlineMs;
+    deadline = Date.now() + followDeadlineMs;
+    const reconcileAt = deadline - Math.min(deadlineMs, followDeadlineMs / 2);
+    let finalReadRequested = false;
+    const reconcile = async () => {
+      if (!opts?.reconcile || completed || stopped || reading || !progressReady) return;
+      reading = true;
+      needsReconcile = false;
+      try {
+        const result = await opts.reconcile(goalId, attributed, {
+          caller: { ...acceptingCaller }, signal: work.signal, deadlineMs: Math.max(1, deadline - Date.now()),
+        });
+        if (completed || stopped || Date.now() >= deadline) return;
+        if (!result || typeof result !== "object" || result.goalId !== goalId)
+          throw new EpEnvelopeError("internal", "goal-result reply is malformed or names a different goal; it cannot authorize this outcome (SPEC 13.6)");
+        if (result.result !== undefined) {
+          const ref: GoalRef = { endpoint, caller: acceptingCaller, goalId };
+          const fact = parseGoalResultFact(result.result, "goal-result reply", ref);
+          if (acceptedFingerprint !== undefined && fact.fingerprint !== acceptedFingerprint)
+            throw new EpEnvelopeError("internal", "goal result fingerprint does not match the accepted goal (SPEC 13.6)");
+          terminals.set(goalId, { state: fact.state, data: fact.data });
+        }
+      } catch (err) {
+        if (!completed && !stopped && Date.now() < deadline)
+          observationError = err instanceof Error ? err : new Error(String(err));
+      } finally {
+        reading = false;
+        if (!completed && !stopped) wake?.();
+      }
+    };
+    const current = opts?.currentNc?.();
+    if (current && current !== activeNc && !stopped) replaceConnection(current);
+    needsReconcile = true; // Also covers a terminal lost before the acceptance arrived.
+    while (!terminals.has(goalId) && !stopped && !observationError && !subError && Date.now() < deadline) {
+      if (!finalReadRequested && Date.now() >= reconcileAt) {
+        finalReadRequested = true;
+        needsReconcile = true;
+      }
+      if (needsReconcile && !reading) void reconcile();
+      if (terminals.has(goalId) || stopped || observationError || subError) break;
+      await new Promise<void>((resolve) => {
+        const until = finalReadRequested ? deadline : reconcileAt;
+        const timer = setTimeout(() => { timers.delete(timer); wake = undefined; resolve(); }, Math.max(0, Math.min(until - Date.now(), 2_147_483_647)));
+        timers.add(timer);
+        wake = () => { clearTimeout(timer); timers.delete(timer); wake = undefined; resolve(); };
+      });
     }
-    if (terminal === undefined)
-      // WHAT THIS PROVED: nothing about the goal. The goal was ACCEPTED (the submit above returned
-      // ok); only its terminal did not arrive here in time, which a slow runtime or a dropped
-      // progress subscription produces just as readily as a real failure. Observed live: seats that
-      // reported this had already come up and were messaging peers. So say the deadline is about
-      // the WAIT, not the work, and warn about the one action that turns a false negative into real
-      // damage: a retry, which submits a SECOND goal and duplicates whatever the first one did.
-      return { ...attributed, reply: { ...attributed.reply, ok: false, data: undefined, error: { code: "deadline-exceeded", message: `the goal "${goalId}" was accepted but produced no terminal within ${followDeadlineMs}ms; this is a timeout on the WAIT, not evidence the goal failed - it may already have succeeded, and may still succeed. Read its outcome with 'ps'/'inspect' before acting; do NOT retry on this alone, a retry submits a second goal and duplicates the effect (SPEC 13.6)` } } };
+    const terminal = terminals.get(goalId);
+    const observationFailure = (code: "unavailable" | "permission-denied" | "deadline-exceeded", reason: string) => ({
+      ...attributed,
+      reply: { ...attributed.reply, ok: false as const, data: undefined, error: {
+        code, outcome: "unknown" as const,
+        message: `the goal "${goalId}" was accepted, but ${reason}. THE GOAL IS UNAFFECTED - it may already have succeeded; this is not evidence the goal failed. Do NOT retry: another submission could duplicate the effect. Inspect 'ps'/'inspect' first (SPEC 13.6)`,
+      } },
+    });
+    if (stopped) return observationFailure("unavailable", "the endpoint was stopped while awaiting its outcome");
+    if (observationError) return observationFailure("unavailable", `following its outcome failed: ${observationError.message}`);
+    if (!terminal && subError) return subError instanceof PermissionViolationError
+      ? observationFailure("permission-denied", `this caller is NOT PERMITTED to hear its outcome: the broker refused the per-goal progress subscription \"${progressSubject}\" (${subError.message}); grant this caller the per-goal progress read row`)
+      : observationFailure("unavailable", `the per-goal progress subscription \"${progressSubject}\" FAILED (${subError.name}: ${subError.message}); this is NOT a grant refusal, so changing ACLs is the wrong remedy`);
+    if (!terminal) return observationFailure("deadline-exceeded", `no terminal arrived within ${followDeadlineMs}ms; this is a timeout on the WAIT`);
     if (terminal.state === "succeeded")
-      return { ...attributed, reply: { ...attributed.reply, ok: true, ...(terminal.data !== undefined ? { data: terminal.data } : { data: undefined }), error: undefined } };
+      return { ...attributed, reply: { ...attributed.reply, ok: true, data: terminal.data, error: undefined } };
     const d = (terminal.data ?? {}) as { error?: unknown; reason?: unknown; details?: unknown };
     const raw = typeof d.error === "string" ? d.error : typeof d.reason === "string" ? d.reason : `the goal settled ${terminal.state}`;
     const details = Array.isArray(d.details) ? d.details as import("./endpoint-error.js").EpErrorDetail[] : undefined;
     const message = renderLifecycleBlocked(raw, details ? { details } : undefined);
     const fromAccept = lifecycleBlockedFrom(attributed.reply.error);
     const merged = details ?? (fromAccept ? [fromAccept] : undefined);
-    return { ...attributed, reply: { ...attributed.reply, ok: false, data: undefined, error: { code: terminal.state, message, ...(merged ? { details: merged } : {}) } } };
+    return { ...attributed, reply: { ...attributed.reply, ok: false, error: { code: terminal.state, message, ...(merged ? { details: merged } : {}) } } };
   } finally {
-    sub.unsubscribe();
+    completed = true;
+    opts?.signal?.removeEventListener("abort", onAbort);
+    unbindReconnect?.();
+    activeSub?.unsubscribe();
+    for (const timer of timers) clearTimeout(timer);
+    timers.clear();
+    wake = undefined;
+    work.abort();
+    abortPhase?.();
   }
 }
 

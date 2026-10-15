@@ -11,8 +11,8 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
-import { loadAgentFile, registry, type Connector, type LaunchOpts, type LaunchSpec, type ModelCatalog, type ModelInfo } from "@cotal-ai/core";
-import { aclEnv, connectorLaunchOptions, controlEndpoint, eventChannel, launchEnv, materialEnv } from "@cotal-ai/connector-core";
+import { registry, type Connector, type LaunchOpts, type LaunchSpec, type ModelCatalog, type ModelInfo } from "@cotal-ai/core";
+import { aclEnv, connectorLaunchOptions, controlEndpoint, eventChannel, launchArmsEvents, launchEnv, materialEnv } from "@cotal-ai/connector-core";
 
 /** The bundled host loop (self-contained — core + connector-core inlined, see package.json's
  *  bundle script) run with this same node; from SOURCE (dev), the `.ts` entry through tsx. */
@@ -87,6 +87,12 @@ async function listCodexModels(): Promise<ModelCatalog> {
         clearTimeout(timer);
         reject(new Error(`codex app-server exited (${code}) before model/list answered`));
       });
+      // A write to a pipe the child already closed fails on stdin, which the ChildProcess does not
+      // forward; without this listener that `error` is uncaught and takes the manager down.
+      child.stdin!.on("error", (e) => {
+        clearTimeout(timer);
+        reject(new Error(`codex app-server stdin failed before model/list answered (${e.message})`));
+      });
       child.stdin!.write(
         JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "cotal", title: "Cotal", version: "0.0.0" } } }) + "\n",
       );
@@ -119,6 +125,7 @@ export const codexConnector: Connector = {
   requires: ["codex"],
   supportsModelVariant: true, // variant = Codex reasoning effort (minimal|low|medium|high|xhigh)
   supportsToolListAnnounce: true, // MCP McpServer.registerTool; SDK fires tools/list_changed
+  supportsPrompt: true, // Codex serves a first turn from an initial message — see buildLaunch
   // There is no first-run gate to press through here: the host joins the mesh FIRST (app-server,
   // credentials, tools) and only then hands the terminal to Codex, so the honest thing to tell
   // someone staring at a blank terminal is that the pause is the mesh, and the UI is coming.
@@ -171,6 +178,7 @@ export const codexConnector: Connector = {
     if (opts.role) env.COTAL_ROLE = opts.role;
     if (opts.id) env.COTAL_ID = opts.id;
     if (opts.lifecycleUid) env.COTAL_LIFECYCLE_UID = opts.lifecycleUid;
+    if (opts.backfillFloor !== undefined) env.COTAL_BACKFILL_FLOOR = String(opts.backfillFloor);
     if (opts.acceptedToken) env.COTAL_ACCEPTED_TOKEN = opts.acceptedToken;
     // The auto-submitted first turn. A prompt with no text in it cannot be submitted, so refuse the
     // launch rather than start a seat that quietly ignores what the operator passed.
@@ -213,7 +221,7 @@ export const codexConnector: Connector = {
     // That fallback is safe for an isolated codex home, which only ever has to be found by the
     // process that wrote it. It is not safe for the log, which exists to be found by a process
     // that has not started yet.
-    if (opts.events !== false) {
+    if (launchArmsEvents(opts)) {
       env.COTAL_EVENTS = "1";
       if (!opts.workspaceRoot)
         throw new Error(
@@ -225,18 +233,10 @@ export const codexConnector: Connector = {
     }
 
     // An agent file carries identity (read in-session via COTAL_AGENT_FILE) plus persona (the
-    // host injects it as thread developerInstructions) and model/variant defaults.
-    let model = opts.model;
-    let variant = opts.variant;
-    if (opts.configPath) {
-      const path = resolve(opts.configPath);
-      env.COTAL_AGENT_FILE = path;
-      const def = loadAgentFile(path);
-      model ??= def.model;
-      variant ??= def.variant;
-    }
-    if (model) env.COTAL_MODEL = model;
-    if (variant) env.COTAL_VARIANT = variant; // reasoning effort; unvalidated here, like the CLI itself
+    // host injects it as thread developerInstructions).
+    if (opts.configPath) env.COTAL_AGENT_FILE = resolve(opts.configPath);
+    if (opts.model) env.COTAL_MODEL = opts.model;
+    if (opts.variant) env.COTAL_VARIANT = opts.variant; // reasoning effort; unvalidated here, like the CLI itself
     // Opaque connector options → codex `-c key=value` config overrides on the app-server child,
     // RAW passthrough (the spawn capability is the trust boundary, not the key set — see
     // connectorLaunchOptions). The key-shape guard admits top-level config keys only (no dotted

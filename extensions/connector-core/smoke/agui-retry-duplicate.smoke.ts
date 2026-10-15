@@ -62,10 +62,11 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CotalEndpoint, isReachable, mintLifecycleUid, type Part } from "@cotal-ai/core";
-import { AguiEmitter, AguiEmitterHalted, aguiFrame, runFinished, runStarted } from "../src/agui.js";
+import { aguiFrame, runFinished, runStarted } from "../src/agui.js";
+import { AguiEmitter, AguiEmitterHalted } from "../src/agui-emitter.js";
 import { JsonlFileSource } from "../src/durable-source.js";
 import { EventWal } from "../src/event-wal.js";
-import { SMOKE_BROKER_TOKEN, teardownOnSignal, memorySubjectFrontier } from "@cotal-ai/smoke-kit";
+import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal, memorySubjectFrontier } from "@cotal-ai/smoke-kit";
 
 let ok = 0,
   fail = 0;
@@ -118,18 +119,6 @@ const dial = (servers: string): string => {
   if (!/^nats:\/\/127\.0\.0\.1:\d+$/.test(servers))
     throw new Error(`refusing a broker URL that is not an ephemeral loopback server: ${servers}`);
   return servers;
-};
-
-const freePort = async (): Promise<number> => {
-  const { createServer } = await import("node:net");
-  return new Promise((res, rej) => {
-    const s = createServer();
-    s.once("error", rej);
-    s.listen(0, "127.0.0.1", () => {
-      const p = (s.address() as { port: number }).port;
-      s.close(() => res(p));
-    });
-  });
 };
 
 const startStandalone = async (tag: string): Promise<string> => {

@@ -56,6 +56,10 @@ The **variant** is Codex's reasoning effort (`minimal` | `low` | `medium` | `hig
 Like the `codex` CLI itself, the connector does not validate model ids or efforts locally. An
 unknown value fails at request time, server-side.
 
+The catalog comes from a short-lived `codex app-server`. If it exits, closes its input, or does
+not answer `model/list` within 10 seconds, `cotal models` reports that as the Codex error and the
+manager keeps serving the other connectors.
+
 Model and variant are published on presence, which is where `cotal roster` and the web dashboard's
 `model · variant` badge read them from. The variant appears only when you asked for one (via
 `--variant` or `variant:` in the agent file): there is no way to read the effort back off a running
@@ -82,13 +86,16 @@ pipe, which is what lets Codex's own TUI attach to the very thread the mesh is d
   after the app-server, MCP surface, and mesh endpoint are all live (including the initial
   presence publish). If the broker cannot be reached, startup fails within 15 seconds with the
   broker address and latest connection error; it never opens an offline-looking TUI.
-- **At-least-once delivery.** A turn's surfaced messages are acked (by exact id) only when the
-  turn completes. A failed turn retries with backoff, and an interrupted turn leaves the batch to
-  redeliver. If the Codex app-server itself dies, the host restarts it in place (same mesh
-  identity, credential, and durable) and re-drives the un-acked batch into the new thread; a
-  crash *loop* (more than 3 in 2 minutes) is fatal rather than an endless respawn. (The shared
-  bounded-inbox overflow rule applies: under extreme bursts an evicted in-flight id cannot
-  redeliver.)
+- **At-least-once delivery.** A turn's surfaced messages are acked (by exact id) when the turn
+  completes, and also when the operator interrupts it (Escape in the attached TUI): that dismisses
+  the batch rather than redelivering it. A failed turn retries with backoff, and an unknown terminal
+  outcome (a missing or unrecognized status) leaves the batch un-acked with no retry of its own. If
+  the Codex app-server itself dies, the host restarts it in place (same mesh identity, credential,
+  and durable) and re-drives the un-acked batch into the new thread; a crash *loop* (more than 3 in
+  2 minutes) is fatal rather than an endless respawn. A retirement (the host shutting itself down)
+  interrupts any live turn too, but that batch stays un-acked and redelivery to it is not promised:
+  a later same-name spawn is a successor with its own delivery frontier. (The shared bounded-inbox
+  overflow rule applies: under extreme bursts an evicted in-flight id cannot redeliver.)
 - **Isolated, never written.** Each agent gets a private `CODEX_HOME` (one hashed directory
   per space+name under `.cotal/codex/`, rooted at the manager's workspace): your `~/.codex`
   config.toml, hooks, and MCP servers never load into a managed agent, and Codex's per-project
@@ -112,8 +119,9 @@ pipe, which is what lets Codex's own TUI attach to the very thread the mesh is d
   way, only the UI differs.
   **Which mode you get** is decided by whether *stdout* is a terminal, and `COTAL_CODEX_TUI=1|0`
   overrides that check when it would guess wrong (a wrapper that redirects output, a CI run that
-  wants deterministic text). It is read from the environment of **whichever process builds the
-  launch**, so set it in the right place:
+  wants deterministic text). The host refuses any value outside the on/off spellings in
+  [Configuration](config.md#environment-variables) when it starts. It is read from the environment
+  of **whichever process builds the launch**, so set it in the right place:
   - foreground `cotal spawn`: your own shell, per spawn;
   - detached (`-d`): the **manager's** environment, because the manager builds the launch. Set it
     where you start the manager (`COTAL_CODEX_TUI=0 cotal up`) and it applies to every codex agent
@@ -129,7 +137,9 @@ pipe, which is what lets Codex's own TUI attach to the very thread the mesh is d
 - **Presence from events.** working/idle/waiting are derived from the app-server event stream;
   approval requests relay an `approval` condition. A failed turn maps its native
   `codexErrorInfo` into the closed condition vocabulary and preserves that value in
-  `condition.source`. The model id is reported from the started thread.
+  `condition.source`. Presence writes leave the host in the order the events arrived, so a
+  turn that fails or asks for approval in the tick it started keeps its condition until the
+  next turn starts. The model id is reported from the started thread.
 
   `contextWindowExceeded` maps to `context`; `sessionBudgetExceeded` to `budget`;
   `usageLimitExceeded` to `billing`; `rateLimitExceeded` to `rate_limit`;
@@ -153,8 +163,11 @@ tool results are not republished onto this channel. That covers the tools you wa
 `shell` and `apply_patch` among them. The channel is
 `events.<owner>.<actor>`, named after the seat's principal, and the rules for it are the same on
 every connector: see [connect-claude.md](connect-claude.md#event-plane) for the channel, the grant,
-and how to read it. The launcher sets `COTAL_EVENTS` by default; pass `--no-events` to opt out. Your
-own `codex` publishes nothing unless its environment arms the plane.
+and how to read it. The launcher sets `COTAL_EVENTS` by default; pass `--no-events` to opt out on an
+unrestricted space. A registration that requires events refuses `--no-events`, and its launch
+always carries the flag and the workspace root the event log lives under. A hand-driven user-mode
+launch with `COTAL_EVENTS_REQUIRED=1` arms the plane without that flag.
+Your own `codex` publishes nothing unless its environment arms the plane.
 
 ```bash
 cotal spawn watcher --agent codex -d   # event plane armed; read it with `cotal console`
@@ -179,41 +192,34 @@ Eight things are specific to Codex and worth knowing before you read a stream:
 - **The stream starts where the seat binds to the file.** `thread/start` writes nothing to disk; the
   file appears when the thread is primed. The seat binds to it then, and publishes from that point
   forward. If the file is slow to appear the seat says so in its log and looks again at each turn
-  boundary, and whatever the thread wrote before the bind is not republished.
+  boundary, and whatever the thread wrote before the bind is not republished. A seat stopped before
+  it binds leaves without binding.
 - **Codex's built-in tools remain private to the host.** Web search, tool search and image generation
   record an end with no start, and nothing joins the two halves: the start-shaped record carries no
   call id and the end carries one. Rather than guess a pairing, the seat drops them, so those tool
   uses are absent from the stream while everything on the function-call path is present.
 - **Failed turns publish run errors.** Codex records a failure on
   the turn's own completion record, so a turn that hit a usage limit or an upstream error ends its
-  run with `RUN_ERROR` carrying the code Codex reported.
+  run with `RUN_ERROR` carrying the fixed message `run failed` and no code. Neither Codex's error
+  text nor its `codex_error_info` is published there: both are upstream values that can echo your
+  prompt or tool output, and the events channel has a different read ACL.
 - **No user-authored text is published, ever.** Your prompts, the peer messages injected into the
   thread, and the developer instructions the persona supplies are all withheld. The events channel
   carries a different read ACL from the channel you typed into, so republishing your own words there
   would widen who can read them. Assistant text, reasoning and tool activity are unaffected.
-- **Recovery after a broker outage.** Initial mesh absence still
+- **A broker outage can stop the plane.** Initial mesh absence still
   fails the host's readiness gate within 15 seconds, so it never opens an offline-looking TUI. Once
-  ready, the plane publishes through the seat's reconnecting mesh endpoint: an outage can stop an
-  emitter, and the first turn boundary after reconnect rebuilds it. A rebind DECLINES to publish two
-  things, and they are one rule rather than two exceptions. It declines what the thread wrote while
-  the seat was cut off. It also declines the
-  turn whose own boundary triggered it: Codex writes a turn's first record before it announces that
-  the turn started, and that announcement is what a rebind runs on, so the record is always behind
-  whatever boundary the rebind takes, and a run is never opened from the middle of a turn. The first
-  turn to start after the rebind is published in full. One case is different and is named here
-  rather than left to be discovered: if the emitter had already been publishing this thread and
-  then died, the seat's log carries its position, and the rebind CONTINUES that log rather than
-  starting where it binds. The rebind publishes the complete outage backlog once the plane is back,
-  including everything the thread wrote after the previous emitter became terminal. A backlog
-  written while the plane was terminal is not discarded; it is delivered on recovery. Tool
-  arguments and tool results are still not republished, on the live plane or on that backlog.
-  What the stream also does not carry is the session's own record of the user's words and the
-  developer instructions. The boundary rule is not confined to the seat whose emitter never
-  started. It changes WHICH RECORDS reach the stream, on every armed seat. A bind announces
+  ready, the plane publishes through the seat's reconnecting mesh endpoint, and an outage can stop
+  its emitter. The seat keeps running on every space, its log records `AG-UI emitter stopped` with
+  the delay before the plane is re-established, and the thread publishes again from its stored
+  cursor once that succeeds.
+  Tool arguments and tool results are not published. The stream also does not carry the
+  session's own record of the user's words and the developer instructions. A bind announces
   where the stream starts and the emitter's setup then runs before its first read; what the
-  thread appended inside that window used to land behind the cursor and be dropped, and it is
-  published now. A whole turn can sit in there, so the recovery path now covers a stretch of
-  the session it previously lost. Nothing is sent twice in either case.
+  thread appends inside that window is published rather than left behind the cursor, and a whole
+  turn can sit in there. Nothing is sent twice. The boundary itself is written to the log as soon
+  as the bind succeeds, so a host that dies before its first read still resumes from that boundary
+  rather than from wherever the file ends by the time it comes back.
 
   The grant still does not decide who may READ a plane. A spawn through the manager gives a seat
   publish rights on its own event channel and nothing else, and a spawn whose grant names a

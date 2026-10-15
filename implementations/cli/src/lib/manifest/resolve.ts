@@ -9,7 +9,7 @@
  */
 import { isAbsolute, resolve as resolvePath, dirname } from "node:path";
 import { parseDocument, LineCounter } from "yaml";
-import { assertValidChannel, assertValidName, isConcreteChannel } from "@cotal-ai/core";
+import { assertValidChannel, assertValidName, isConcreteChannel, isLoopbackLiteral } from "@cotal-ai/core";
 import { MeshManifestSchema, type RawManifest } from "./schema.js";
 import type { AgentPolicy, PersonaPermissions, ResolvedAgent, ResolvedChannel, ResolvedManifest } from "./model.js";
 import { ManifestError, type ManifestIssue } from "./errors.js";
@@ -164,6 +164,7 @@ function resolveAgents(
     name,
     agentType: connector(name, entry.agent),
     cwd: entry.cwd,
+    continuity: entry.continuity,
     persona: entry.persona ? personaPath(entry.persona) : undefined,
     model: entry.model,
     variant: entry.variant,
@@ -190,33 +191,59 @@ function invertPolicy(name: string, channels: ResolvedChannel[]): AgentPolicy {
 
 /** Reject inline credentials in the broker config: a `nats://user:pass@host` URL must use the
  *  auth creds/profile path, not embedded secrets (critic, round-6); `host` is a bind address, not
- *  a URL. Each server entry must parse as a URL (no silent fallback). */
+ *  a URL. Each server entry and `idp` must parse as a URL (no silent fallback). A message never
+ *  repeats a value. */
 function validateBroker(broker: NonNullable<RawManifest["broker"]>, add: (m: string, p?: (string | number)[]) => void): void {
   if (broker.host?.includes("://"))
     add(`broker.host is a bind address (e.g. 127.0.0.1), not a URL - drop the scheme`, ["broker", "host"]);
-  if (broker.servers)
-    for (const s of broker.servers.split(",").map((x) => x.trim()).filter(Boolean)) {
-      let u: URL;
-      try {
-        u = new URL(s);
-      } catch {
-        add(`broker.servers entry "${s}" is not a valid URL (e.g. nats://127.0.0.1:4222)`, ["broker", "servers"]);
-        continue;
-      }
-      if (u.username || u.password)
-        add(`broker.servers must not embed credentials ("${u.username}:***@…") - use auth creds/profile, not inline secrets`, ["broker", "servers"]);
-    }
+  if (broker.servers) for (const problem of serverUrlProblems(broker.servers, "broker.servers")) add(problem, ["broker", "servers"]);
   // `idp` pairs with user auth ONLY — on any other mode it would be silently ignored, and a
   // silently-ignored identity provider is exactly the kind of drift the no-fallback rule exists for.
   if (broker.idp !== undefined) {
     if (broker.auth !== "user")
       add(`broker.idp is for user-auth spaces - set broker.auth: "user" (or drop idp)`, ["broker", "idp"]);
-    try {
-      new URL(broker.idp);
-    } catch {
-      add(`broker.idp "${broker.idp}" is not a valid URL (Better Auth: <origin>/api/auth)`, ["broker", "idp"]);
-    }
+    const problem = idpUrlProblem(broker.idp, "broker.idp");
+    if (problem) add(problem, ["broker", "idp"]);
   }
+}
+
+/** Why a comma-separated `servers` list cannot serve as broker URLs; empty when it can. A list
+ *  naming no entry is refused, because an override that names none would silently fall back to
+ *  the default broker. A message names an entry by position and never repeats it: in the token
+ *  form `nats://<token>@host` the user part is the secret. `what` names its source, because
+ *  `--server` on `up -f` and `spawn -f` overrides `broker.servers` and must pass the same check. */
+export function serverUrlProblems(servers: string, what: string): string[] {
+  const entries = servers.split(",").map((x) => x.trim()).filter(Boolean);
+  if (!entries.length) return [`${what} names no server URL (e.g. nats://127.0.0.1:4222)`];
+  const problems: string[] = [];
+  for (const [i, s] of entries.entries()) {
+    let u: URL;
+    try {
+      u = new URL(s);
+    } catch {
+      problems.push(`${what} entry ${i + 1} is not a valid URL (e.g. nats://127.0.0.1:4222)`);
+      continue;
+    }
+    if (u.username || u.password) problems.push(`${what} entry ${i + 1} must not embed credentials - use auth creds/profile, not inline secrets`);
+  }
+  return problems;
+}
+
+/** Why `idp` cannot be an IdP base URL, or `undefined` when it can. The rules are the ones the auth
+ *  provider applies when the launch pins the IdP, so the dry run refuses every IdP URL the launch
+ *  would refuse. `what` names its source, because `up -f --idp` overrides `broker.idp` and must pass
+ *  the same check. The message never repeats the value, which may carry a credential. */
+export function idpUrlProblem(idp: string, what: string): string | undefined {
+  let u: URL;
+  try {
+    u = new URL(idp);
+  } catch {
+    return `${what} is not a valid URL (Better Auth: <origin>/api/auth)`;
+  }
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && isLoopbackLiteral(u.hostname)))
+    return `${what} must be https (or http on a loopback IP literal such as 127.0.0.1 for local dev)`;
+  if (u.search || u.hash) return `${what} must not carry a query or fragment`;
+  return u.username || u.password ? `${what} must not embed credentials - give the IdP base URL only` : undefined;
 }
 
 function dedupe<T>(xs: T[]): T[] {

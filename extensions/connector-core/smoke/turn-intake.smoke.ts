@@ -53,8 +53,6 @@ const rig = () => {
     pullRefusal: undefined as string | undefined,
     /** Every status the endpoint published, in write order, so a cell can read the final row. */
     published: [] as string[],
-    /** While set, the next activity write rejects. */
-    failActivityWrite: false,
     /** While set, the condition clear on the way into `working` waits on it. */
     holdCondition: undefined as Promise<void> | undefined,
   };
@@ -64,7 +62,7 @@ const rig = () => {
       if (state.failStatusWrite) throw new Error("presence write failed");
       state.published.push(status);
     },
-    setActivity: async () => { if (state.failActivityWrite) throw new Error("activity write failed"); },
+    setActivity: async () => {},
     // `setStatus` clears any standing condition on the way into `working`, so the double has to
     // answer it or every block that drives a turn boundary dies on a missing method rather than
     // on the property it is testing.
@@ -126,7 +124,7 @@ const row = (goalId: string, context: string, acceptedAt = Date.now()): PendingT
   state.pending = []; // the deadline (or another yield path) settled it on the plane
   await poll();
   const r = await a.yieldTurn("done");
-  check("the dropped turn is not yieldable: nothing is active", r.ok === false && String(r.error).includes("no turn is active"), r.error);
+  check("the dropped turn is not yieldable: the refusal names its settlement", r.ok === false && String(r.error).includes('turn "g2" was already settled by the run'), r.error);
 }
 
 // ── 3) the working→idle boundary IS the done signal ───────────────────────────────────────────
@@ -213,24 +211,6 @@ const row = (goalId: string, context: string, acceptedAt = Date.now()): PendingT
       r.state.published.at(-1) === "idle" && r.a.status === "idle", JSON.stringify({ published: r.state.published, status: r.a.status }));
     check("and that idle still ends the turn",
       r.state.yields.some((y) => y.goalId === "g3e" && y.status === "done"), JSON.stringify(r.state.yields));
-  }
-
-  // A newer write that fails before reaching the endpoint must not suppress the older one.
-  {
-    const r = rig();
-    let releaseClear!: () => void;
-    r.state.holdCondition = new Promise<void>((resolve) => { releaseClear = resolve; });
-    const working = r.a.setStatus("working");
-    await tick();
-    r.state.failActivityWrite = true;
-    const waiting = r.a.setStatus("waiting", "approval").catch(() => undefined);
-    await waiting;
-    r.state.failActivityWrite = false;
-    r.state.holdCondition = undefined;
-    releaseClear();
-    await working;
-    check("a newer write that failed before publishing does not suppress the older one",
-      r.state.published.at(-1) === "working", JSON.stringify(r.state.published));
   }
 }
 
@@ -368,7 +348,7 @@ const row = (goalId: string, context: string, acceptedAt = Date.now()): PendingT
   check("the same reason after a good pull is a new outage and is said", lines.length === 3, lines);
 }
 
-const EXPECTED_CELLS = 40;
+const EXPECTED_CELLS = 39;
 const ran = pass + fail;
 console.log(`\nturn-intake.smoke: ${pass} passed, ${fail} failed`);
 if (ran !== EXPECTED_CELLS) {

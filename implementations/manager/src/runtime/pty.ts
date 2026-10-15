@@ -1,8 +1,8 @@
 import * as pty from "@lydell/node-pty";
 import Headless from "@xterm/headless";
 import { SerializeAddon } from "@xterm/addon-serialize";
-import type { AgentHandle, AttachSession, LaunchSpec, Runtime, RuntimeReference } from "@cotal-ai/core";
-import { StartupConfirmMatcher, unmatchedConfirmMessage, unsupportedTransport } from "@cotal-ai/seat";
+import { SpawnRefused, type AgentHandle, type AttachSession, type LaunchSpec, type Runtime, type RuntimeReference } from "@cotal-ai/core";
+import { ConnectorDiagnosticReader, StartupConfirmGate, unsupportedTransport, preferSeatForOomKill } from "@cotal-ai/seat";
 import { preparePtyLaunch } from "./windows-launch.js";
 
 const DEFAULT_COLS = 120;
@@ -10,17 +10,14 @@ const DEFAULT_ROWS = 32;
 /** How many rows of history the attach-time screen mirror retains (see spawn) so a late attach
  *  still sees output that scrolled past. */
 const SCROLLBACK_ROWS = 1000;
-/** Bounded early-output window for the connector-declared startup confirmation prompt. */
-const CONFIRM_TIMEOUT_MS = 15_000;
 /** Grace window for a clean exit before a graceful stop escalates to SIGKILL. */
 const GRACE_MS = 3_000;
 
 /**
  * In-process node-pty ownership. The worker is the child's parent, so killing
- * the worker kills the seat. Production Linux pty goes through
- * `CustodialPtyRuntime`. Off Linux, `createRuntime("pty")` still spawns here;
- * `adopt` throws until that platform's custody transport lands. `legacy-pty-custody`
- * also instantiates this class on Linux as the honest M1 residual.
+ * the worker kills the seat. `createRuntime("pty")` spawns here on every
+ * platform; on Linux its subclass still adopts seats an earlier custodial
+ * manager launched. This class's own `adopt` throws.
  */
 export class LegacyPtyRuntime implements Runtime {
   readonly kind = "pty" as const;
@@ -31,6 +28,16 @@ export class LegacyPtyRuntime implements Runtime {
     // against `spec.env` (the env we actually launch with), not the manager's, so executable
     // selection stays inside P3 isolation.
     const { command, args } = preparePtyLaunch(spec.command, spec.args, spec.env ?? {});
+    // Honor LaunchSpec.confirm literally: match the connector-owned text in normalized early output,
+    // press Enter exactly once when it appears, and fail loud if the declared gate never materializes.
+    // Built before the child exists, so a prompt that cannot match is a refusal.
+    let confirmGate: StartupConfirmGate | undefined;
+    try {
+      if (spec.confirmBefore?.length && spec.confirm === undefined) throw new Error("startup choices require a final confirmation prompt");
+      confirmGate = spec.confirm === undefined ? undefined : new StartupConfirmGate(spec.confirm, spec.confirmBefore);
+    } catch (err) {
+      throw new SpawnRefused((err as Error).message);
+    }
     const proc = pty.spawn(command, args, {
       name: "xterm-256color",
       cols: DEFAULT_COLS,
@@ -42,6 +49,10 @@ export class LegacyPtyRuntime implements Runtime {
       // PATH) instead of silently inheriting the manager's env.
       env: spec.env ?? {},
     });
+    const oomPref = preferSeatForOomKill(proc.pid);
+    if (!oomPref.applied) {
+      console.error(`oom preference not applied to child ${proc.pid}: ${oomPref.reason}`);
+    }
 
     const dataSubs = new Set<(c: Buffer) => void>();
     const exitSubs = new Set<() => void>();
@@ -64,43 +75,29 @@ export class LegacyPtyRuntime implements Runtime {
     // used to drop them on the floor — leaving the manager unable to say why any seat had died.
     // Retained here so `exitInfo` can answer after the fact; stays undefined while the child lives,
     // because "not exited yet" and "exited cleanly" must never read the same.
-    let exit: { code?: number; signal?: number } | undefined;
-
-    // Honor LaunchSpec.confirm literally: match the connector-owned text in normalized early output,
-    // press Enter exactly once when it appears, and fail loud if the declared gate never materializes.
-    const confirmMatcher = spec.confirm ? new StartupConfirmMatcher(spec.confirm) : undefined;
-    let confirmTimer: ReturnType<typeof setTimeout> | undefined;
-    if (confirmMatcher) {
-      confirmTimer = setTimeout(() => {
-        if (!alive) return;
-        const message = unmatchedConfirmMessage(confirmMatcher.prompt, CONFIRM_TIMEOUT_MS);
-        term.write(`\r\n${message}\r\n`);
-        const b = Buffer.from(`\r\n${message}\r\n`, "utf8");
-        for (const fn of dataSubs) fn(b);
-        proc.kill(process.platform === "win32" ? undefined : "SIGTERM");
-      }, CONFIRM_TIMEOUT_MS);
-    }
+    let exit: { code?: number; signal?: number; diagnostic?: string } | undefined;
+    // Why the child ended, as far as its output and this runtime can say, carried on `exit` so the
+    // reap line and a launch failure can name it.
+    const diagnostic = new ConnectorDiagnosticReader();
 
     proc.onData((d) => {
       term.write(d); // mirror into the screen model for attach-time reconstruction
+      diagnostic.push(d);
       const b = Buffer.from(d, "utf8");
       for (const fn of dataSubs) fn(b);
-      if (confirmMatcher?.push(d)) {
-        proc.write("\r");
-        if (confirmTimer) clearTimeout(confirmTimer);
-        confirmTimer = undefined;
-      }
+      if (confirmGate?.push(d)) proc.write("\r");
     });
     proc.onExit(({ exitCode, signal }) => {
       alive = false;
       // `signal` is absent on an ordinary exit and 0 is a real exit code, so both are recorded as
       // present-or-absent rather than coalesced into one number.
-      exit = { code: exitCode, ...(signal === undefined ? {} : { signal }) };
-      if (confirmTimer) clearTimeout(confirmTimer);
+      const last = diagnostic.read();
+      exit = { code: exitCode, ...(signal === undefined ? {} : { signal }), ...(last ? { diagnostic: last } : {}) };
+      confirmGate?.disarm();
       for (const fn of exitSubs) fn();
     });
 
-    return {
+    const handle: AgentHandle = {
       name,
       kind: "pty",
       pid: proc.pid,
@@ -206,6 +203,19 @@ export class LegacyPtyRuntime implements Runtime {
         },
       }),
     };
+    confirmGate?.arm(diagnostic, {
+      report: (message) => {
+        const line = `\r\n${message}\r\n`;
+        term.write(line);
+        const b = Buffer.from(line, "utf8");
+        for (const fn of dataSubs) fn(b);
+      },
+      stop: () => handle.stop(),
+    }, {
+      read: () => alive ? Array.from({ length: term.rows }, (_, row) => term.buffer.active.getLine(term.buffer.active.baseY + row)?.translateToString(true) ?? "").join("\n") : undefined,
+      key: (key) => proc.write(key === "Down" ? "\x1b[B" : "\r"),
+    });
+    return handle;
   }
 
   adopt(_reference: RuntimeReference): AgentHandle {

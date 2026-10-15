@@ -17,7 +17,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import { open, type FileHandle } from "node:fs/promises";
 
 /**
@@ -42,9 +42,37 @@ export interface SourceRecord<T> {
   cursor: string;
 }
 
+/**
+ * One complete line of the source that is not a record, stepped over and reported.
+ *
+ * The writer is a process this reader does not own, and a write it cut short leaves bytes that
+ * never become a record: a full disk ends a write part way through one record, and the next append
+ * lands a whole record behind the fragment on the same line. Such a line is a hole in the record
+ * from the moment it is written. Reporting it names the hole; halting on it would end the plane
+ * for good at that byte, because every later start resumes at the same cursor and meets the same
+ * line (measured on two live sessions after one full disk).
+ */
+export interface SourceGap {
+  /** Byte offset of the line's first byte. */
+  offset: number;
+  /** The line's length in bytes, newline excluded. */
+  bytes: number;
+  /** Why the line is not a record: `not valid UTF-8` or `not a JSON record`, and nothing else.
+   *  Never built from the parser's message: that message quotes a span of the line, which is the
+   *  record's own text, and even a number read out of it can come from that span. */
+  reason: "not valid UTF-8" | "not a JSON record";
+}
+
 /** One read: the records that became available, and the cursor to resume from AFTER them. */
 export interface SourceRead<T> {
   records: SourceRecord<T>[];
+  /**
+   * Complete lines inside this read that were not records, in file order. The cursor is past them.
+   * Absent when every line was a record, so a consumer can tell "no gap" from "nobody looked".
+   * A consumer that never looks is the silent one, which is why the emitter refuses to advance
+   * over a gap it was given nowhere to report.
+   */
+  unreadable?: SourceGap[];
   /**
    * Pass to the next {@link DurableSource.read}. Advances ONLY past fully-consumed records.
    *
@@ -67,6 +95,22 @@ export interface DurableSource<T> {
    * MUST NOT return a partially-written record, and MUST NOT advance the cursor past one.
    */
   read(cursor: string | undefined): Promise<SourceRead<T>>;
+  /**
+   * The cursor after the last complete record now in the source, consuming nothing. A connector
+   * takes it when it reports a turn terminal, so the emitter can later tell which records the
+   * source held when the turn ended: see `AguiEmitter.queueTerminal`. The position is the
+   * source's AT THE CALL: a source that can read it synchronously does so before returning, so a
+   * record the session appends after the call is after the position.
+   */
+  end(): Promise<string>;
+}
+
+/** The file no longer has the identity or consumed prefix recorded by its cursor. */
+export class JsonlFileResetError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "JsonlFileResetError";
+  }
 }
 
 /**
@@ -79,8 +123,11 @@ export interface DurableSource<T> {
  * and the cursor advances only that far. A trailing fragment is left for the next read, when the
  * writer has finished it.
  *
- * Unparseable COMPLETE lines are a different case and are NOT skipped silently — they surface, so a
- * format change is loud rather than a quiet hole in the record.
+ * A COMPLETE line that is not a record is a different case: it is stepped over and reported as a
+ * {@link SourceGap} on the read, never dropped on the quiet. It used to halt the read instead, and
+ * that halt was permanent: the line never changes, the cursor never passes it, and every restart
+ * met it again. A reader that halts for good on one torn line of a file it does not write loses
+ * every record after it, which is the larger hole.
  */
 export class JsonlFileSource<T = unknown> implements DurableSource<T> {
   readonly kind = "jsonl-file";
@@ -128,8 +175,7 @@ export class JsonlFileSource<T = unknown> implements DurableSource<T> {
    *
    * `dev`/`ino` catch unlink-and-recreate, but **not an in-place rewrite** (`writeFileSync` with no
    * unlink keeps the inode), and that case resumes at a byte offset inside a different document and
-   * emits fragments of it as records (`fmae-rev-eng`, CONFIRMED). Size cannot catch it either when
-   * the replacement is larger.
+   * emits fragments of it as records. Size cannot catch it either when the replacement is larger.
    *
    * Note what this deliberately does NOT flag: a rewrite that reproduces the same preceding bytes.
    * There the consumed prefix is genuinely unchanged, so resuming is correct — the seal states an
@@ -172,17 +218,60 @@ export class JsonlFileSource<T = unknown> implements DurableSource<T> {
    * connector would duplicate the opaque cursor format and eventually drift from it.
    */
   async readFromBeginning(): Promise<SourceRead<T>> {
-    const fh = await open(this.path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-    let cursor: string;
-    try {
-      const st = await fh.stat();
-      cursor = `${String(st.dev)}:${String(st.ino)}:0:${await JsonlFileSource.sealAt(fh, 0)}`;
-    } finally {
-      await fh.close();
-    }
+    const cursor = await this.cursorAtBeginning();
     // A replacement between the two opens is detected by `read`'s file-identity check. Appends are
     // ordinary: starting at zero still means consuming every complete record now present.
     return this.read(cursor);
+  }
+
+  /** Cursor at byte zero for this file's current identity. */
+  async cursorAtBeginning(): Promise<string> {
+    const fh = await open(this.path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    try {
+      const st = await fh.stat();
+      return `${String(st.dev)}:${String(st.ino)}:0:${await JsonlFileSource.sealAt(fh, 0)}`;
+    } finally {
+      await fh.close();
+    }
+  }
+
+  /**
+   * The cursor at the last COMPLETE line boundary, minted exactly as a read mints one, so a later
+   * `read` from it resumes at the first record written after this moment.
+   *
+   * READ SYNCHRONOUSLY, before this returns: the moment is the call, not the thread pool's next
+   * turn. Issued asynchronously, the position was read after a record the caller appended right
+   * after calling, and a terminal reported before that record was placed after it. The read is a
+   * few small reads of a local file, the same bytes `read` reads.
+   */
+  end(): Promise<string> {
+    const fd = openSync(this.path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    try {
+      const st = fstatSync(fd);
+      const readAt = (len: number, position: number): Buffer => {
+        const buf = Buffer.allocUnsafe(len);
+        return buf.subarray(0, readSync(fd, buf, 0, len, position));
+      };
+      // The last complete line boundary, as `lastCompleteBoundary` finds it.
+      let at = 0;
+      const window = 64 * 1024;
+      for (let searched = 0; searched < st.size; ) {
+        const len = Math.min(window, st.size - searched);
+        const from = st.size - searched - len;
+        const idx = readAt(len, from).lastIndexOf(0x0a);
+        if (idx !== -1) {
+          at = from + idx + 1;
+          break;
+        }
+        searched += len;
+      }
+      // The seal over the window before it, as `sealAt` computes it.
+      const span = Math.min(at, 512);
+      const seal = createHash("sha256").update(readAt(span, at - span)).digest("hex").slice(0, 16);
+      return Promise.resolve(`${String(st.dev)}:${String(st.ino)}:${at}:${seal}`);
+    } finally {
+      closeSync(fd);
+    }
   }
 
   async read(cursor: string | undefined): Promise<SourceRead<T>> {
@@ -194,6 +283,8 @@ export class JsonlFileSource<T = unknown> implements DurableSource<T> {
     // adding this stops being a fix and becomes a compatibility argument with whoever is already
     // relying on the old behaviour. The same rule the maintenance reader already applies to its
     // resume document (`O_RDONLY | O_NOFOLLOW`), for the same reason.
+    // Invalid persisted state must refuse even when the file is temporarily absent.
+    const from = cursor === undefined ? undefined : JsonlFileSource.parseCursor(cursor);
     const fh = await open(this.path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     try {
       const st = await fh.stat();
@@ -207,22 +298,20 @@ export class JsonlFileSource<T = unknown> implements DurableSource<T> {
       // still appending: adopt at byte 1 of `{"i":1`, let the writer finish `2}\n`, and the source
       // emits `2}` while the real record is `{"i":12}`. That is the truncated-record corruption the
       // partial-line rule exists to prevent, reached through the adopt path instead of the read one.
-      if (cursor === undefined)
+      if (from === undefined)
         return { records: [], cursor: await here(await JsonlFileSource.lastCompleteBoundary(fh, size)) };
-
-      const from = JsonlFileSource.parseCursor(cursor);
 
       // Replacement is DETECTED by identity, not inferred from size — a replacement that is the
       // same size or larger looks exactly like an append, and resuming at the old offset emits
       // fragments of a document this reader has never seen. Re-adopting silently loses records and
       // restarting resends them, so neither is guessed here: the caller decides.
       if (from.dev !== dev || from.ino !== ino)
-        throw new Error(
+        throw new JsonlFileResetError(
           `JsonlFileSource: ${this.path} is not the file this cursor came from ` +
             `(cursor ${from.dev}:${from.ino}, now ${dev}:${ino}) — it was replaced or rotated`,
         );
       if (from.offset > size)
-        throw new Error(
+        throw new JsonlFileResetError(
           `JsonlFileSource: cursor offset ${from.offset} is past end ${size} for ${this.path} — the file was truncated`,
         );
       // The last 512 bytes of the consumed prefix must still be the bytes we consumed. dev/ino catch
@@ -231,7 +320,7 @@ export class JsonlFileSource<T = unknown> implements DurableSource<T> {
       // confined to bytes before `offset - 512` passes here. See `sealAt` for the bound and its edges.
       const seal = await JsonlFileSource.sealAt(fh, from.offset);
       if (seal !== from.seal)
-        throw new Error(
+        throw new JsonlFileResetError(
           `JsonlFileSource: the bytes before offset ${from.offset} in ${this.path} have changed ` +
             `(seal ${from.seal} -> ${seal}) — the file was rewritten in place, not appended to`,
         );
@@ -247,41 +336,42 @@ export class JsonlFileSource<T = unknown> implements DurableSource<T> {
       const lastNl = chunk.lastIndexOf(0x0a);
       if (lastNl === -1) return { records: [], cursor: await here(from.offset) };
 
-      // FATAL decode. `Buffer.toString("utf8")` substitutes U+FFFD for invalid bytes, so a
-      // malformed byte inside an otherwise valid JSON string survives `JSON.parse` as CHANGED DATA
-      // and would publish as if it were what the agent did. Silently rewriting a record is the same
-      // class of harm as consuming a truncated one.
-      let complete: string;
-      try {
-        complete = new TextDecoder("utf-8", { fatal: true }).decode(chunk.subarray(0, lastNl));
-      } catch (e) {
-        throw new Error(
-          `JsonlFileSource: invalid UTF-8 at offset ~${from.offset} in ${this.path}: ${(e as Error).message}`,
-        );
-      }
-
       // PER-RECORD CURSORS, AND THE ARITHMETIC IS IN BYTES BECAUSE THE FILE IS.
       //
-      // `complete` is a decoded STRING; the cursor is a BYTE offset. A record containing any
-      // non-ASCII character makes `line.length` smaller than the bytes it occupies, so walking the
-      // split with character lengths silently mis-places the cursor of every record after the first
-      // multi-byte one — and the resume then lands mid-record, which is precisely the truncated-read
-      // corruption the partial-line rule exists to prevent. The decode above was FATAL, so `line`
-      // re-encodes to exactly the bytes it came from; `Buffer.byteLength` is that re-encoding.
+      // The complete region is split on the newline BYTE and each line is decoded on its own, so a
+      // line's byte length is its own length and the cursor after it is exact whatever the line
+      // holds. Decoding a line is FATAL: `Buffer.toString("utf8")` substitutes U+FFFD for invalid
+      // bytes, so a malformed byte inside an otherwise valid JSON string would survive `JSON.parse`
+      // as CHANGED DATA and publish as if it were what the agent did.
+      //
+      // A line that does not decode, or decodes to something that is not JSON, is a GAP: reported
+      // with its offset and length, stepped over, and never a halt. The writer is not this process,
+      // and the shape a full disk leaves behind (part of one record glued to the next on one line)
+      // never becomes readable, so halting on it is halting for good at that byte while the records
+      // after it keep arriving unread.
       //
       // A blank line is not a record but it IS bytes, so it advances the offset like any other.
       const records: SourceRecord<T>[] = [];
+      const unreadable: SourceGap[] = [];
+      const decoder = new TextDecoder("utf-8", { fatal: true });
       let at = from.offset;
-      for (const line of complete.split("\n")) {
-        at += Buffer.byteLength(line, "utf8") + 1; // + the newline that terminated it
-        if (line.trim() === "") continue; // blank separators are not records
+      for (const line of JsonlFileSource.lines(chunk.subarray(0, lastNl))) {
+        const start = at;
+        at += line.length + 1; // + the newline that terminated it
+        if (JsonlFileSource.isBlank(line)) continue; // blank separators are not records
+        let text: string;
+        try {
+          text = decoder.decode(line);
+        } catch {
+          unreadable.push({ offset: start, bytes: line.length, reason: "not valid UTF-8" });
+          continue;
+        }
         let value: T;
         try {
-          value = JSON.parse(line) as T;
-        } catch (e) {
-          throw new Error(
-            `JsonlFileSource: unparseable complete line at offset ~${from.offset} in ${this.path}: ${(e as Error).message}`,
-          );
+          value = JSON.parse(text) as T;
+        } catch {
+          unreadable.push({ offset: start, bytes: line.length, reason: "not a JSON record" });
+          continue;
         }
         // One seal per record, computed by the SAME function the batch cursor uses. It is a 512-byte
         // read each, which is the honest cost of not having a second sealing path here — and two
@@ -300,9 +390,70 @@ export class JsonlFileSource<T = unknown> implements DurableSource<T> {
         throw new Error(
           `JsonlFileSource: internal cursor walk ended at ${at} but the batch ends at ${end} in ${this.path}`,
         );
-      return { records, cursor: await here(end) };
+      return { records, cursor: await here(end), ...(unreadable.length > 0 ? { unreadable } : {}) };
     } finally {
       await fh.close();
     }
+  }
+
+  /** The lines of `buf` as byte slices, split on the newline byte; `buf` carries no trailing newline. */
+  private static *lines(buf: Buffer): Generator<Buffer> {
+    let start = 0;
+    for (;;) {
+      const nl = buf.indexOf(0x0a, start);
+      if (nl === -1) {
+        yield buf.subarray(start);
+        return;
+      }
+      yield buf.subarray(start, nl);
+      start = nl + 1;
+    }
+  }
+
+  /** True when every byte is ASCII whitespace, including the empty line. */
+  private static isBlank(line: Buffer): boolean {
+    for (const b of line) if (b !== 0x20 && b !== 0x09 && b !== 0x0d && b !== 0x0b && b !== 0x0c) return false;
+    return true;
+  }
+}
+
+/**
+ * Substitutes a captured boundary for the caller's cursor on the ONE read where that cursor is
+ * `undefined` — a virgin log positioning itself for the first time.
+ *
+ * **Why this exists.** A lazily-built emitter's source otherwise positions itself on its own FIRST
+ * read, and that read happens only after everything else the bind does first: a mesh wait, the
+ * write-ahead log's directory, the subject frontier, the log open, a channel resolve, a
+ * single-replica preflight. Anything the session writes to its record file during that window lands
+ * behind the position the source discovers later, is treated as already published, and is dropped —
+ * silently, under a line that has by then already announced the stream as started. Measured on the
+ * Codex connector, the shape this wrapper first closed there: 17ms and 36ms on an idle machine, and
+ * a whole turn lost at a widened window.
+ *
+ * So the boundary is captured by the caller BEFORE the bind announces itself, and substituted here,
+ * on the one read that would otherwise ask the source where it currently ends.
+ *
+ * **The limit, stated once.** This positions only a log with no cursor. A log that already carries
+ * one is a resume, and passes through to the inner source untouched: a cursor written by a live
+ * emitter is the honest one, and overwriting it would re-read or skip a live session's records
+ * depending on which one it disagreed with. Nothing is written into the log by this wrapper itself;
+ * it only changes what is asked for, never what is stored.
+ */
+export class BoundStartSource<T> implements DurableSource<T> {
+  readonly kind: string;
+
+  constructor(
+    private readonly inner: DurableSource<T>,
+    private readonly start: string,
+  ) {
+    this.kind = inner.kind;
+  }
+
+  read(cursor: string | undefined): Promise<SourceRead<T>> {
+    return this.inner.read(cursor ?? this.start);
+  }
+
+  end(): Promise<string> {
+    return this.inner.end();
   }
 }

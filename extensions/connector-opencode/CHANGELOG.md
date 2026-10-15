@@ -1,5 +1,186 @@
 # @cotal-ai/connector-opencode
 
+## 0.82.0
+
+### Patch Changes
+
+- 45c0d12: On OpenCode 2.x, a peer batch is acked only by the end of an execution that started after the batch was submitted. An end observed while idle, a replay of one, or an end positioned before the running execution started (even after a late copy of an earlier start) no longer acks a newly submitted batch, and a failed prompt submission no longer lets a second batch into an execution that is still running.
+- c428383: The OpenCode launcher now stops its server on SIGINT or SIGTERM from the moment it starts it. The handler used to be installed only after the plugin's session handshake, so a graceful stop during the boot, which can take a minute on a cold server, ended the launcher and left the server running on the agent's database, with a `serve.pid` record that refused every later launch of that name until the server was killed by hand. One handler now stops the server and, once it runs, the TUI.
+- 3ed1942: The OpenCode launcher now records each server in a file of its own, `serve.<token>.pid` in the agent's directory, and removes only that file when the server exits. Every launch of a name used to share one `serve.pid`, and the launcher's exit handler removed it unconditionally, so a handler that ran after the next launch had started its server removed that server's record, and the launch after that started a second server on the same database. A launch now checks every record in the directory, including a `serve.pid` left by an earlier version, refuses while any names a running server, and removes the records of servers that are gone.
+- a33cd0b: The OpenCode 2.x adapter no longer starts a turn once its teardown has begun. A message handled after the disposer started, or a drive waiting on session creation when it started, used to be submitted to OpenCode as a new turn whose batch was never acked because the seat was going away. `drive` now refuses on entry and again after the session await, as the 1.x adapter does.
+
+## 0.81.1
+
+## 0.81.0
+
+### Minor Changes
+
+- a84a620: The OpenCode plugin holds a native prompt behind every turn end still settling on its session, not the latest alone, and a prompt already waiting follows each turn end reported while it waits. A turn that ends twice, by its error and by the idle that follows, had its barrier replaced by the later turn end, whose position read could answer first and delete it while the error's read was still pending, so a prompt typed in that window landed ahead of the error's position and the failed turn closed as a finish with its successor carrying the error; a prompt that arrived between the two ends waited on the first barrier alone and went through once that read answered, ahead of the idle's position.
+
+### Patch Changes
+
+- 37d6f81: The OpenCode 2.x connector refuses a session whose registration requires events, through the same arming decision the other connectors use. It refused only when `COTAL_EVENTS` was set, so launch material carrying `eventsRequired`, or `COTAL_EVENTS_REQUIRED=1` on the user-mode env fallback, started a session with no event plane on a space that requires one.
+- 1617637: On OpenCode 2.x, a message that arrives while a turn runs now goes out as the next turn as soon as that turn succeeds, fails or is interrupted. The adapter used to buffer it and wait for an unrelated arrival to wake the seat, so a role request could outlive its ack wait and be handed to another holder of the role. A boot prompt held back by a running turn goes out at the turn end the same way. When a turn ends before OpenCode answers the request that submitted it, the adapter waits for that answer before it submits again, so the boot prompt or a run turn is not sent twice. A failed turn's own batch is not resubmitted at once, so a turn that keeps failing does not loop. A turn-start or turn-end event that the session's durable event log places at or before the end of the last turn is ignored, as is a turn end with no turn running, so a replayed turn does not hold the seat busy, settle the next turn's messages before that turn runs, or resubmit a failed batch. A turn-start or turn-end event without a log position is ignored and logged, since it cannot be told from a replay.
+
+## 0.80.0
+
+### Minor Changes
+
+- fded3ab: A seat never leaves the mesh because its event plane stopped, and the plane comes back on its own. The emitter holder re-establishes the plane at once after any failure, then every second while it stays down, by a fresh start that replaces the emitter: it reopens the write-ahead log, settles any pending frame, and builds the connector's mapper from the run the log has open before reading on. A turn that ends while the plane is down keeps its terminal, as does one whose terminal's own log write failed, and the re-establish closes that run with it once it has read on; every turn that ends during one outage keeps its own terminal, placed on the last turn the source had begun at the position the terminal was reported at (a turn the mapper opens no run for takes its terminal and publishes nothing, and a repeated terminal replaces nothing), a terminal is owed to its run until the frame carrying it freezes, a terminal reported with the plane up goes to the emitter at the hook too so a flush still reading when the next prompt lands closes the turn with its own terminal, and when the next prompt was already written before the plane came back the failure is published in place of the finish that prompt would have synthesized, in a frame of the failed run and ahead of the next run's first. The mapper contract gains `{ turn: true }` for a record that begins a turn and opens no run. `DurableSource` gains `end()`, the cursor after the last complete record as of the call, which every connector's source implements; the holder's hooks gain `sourceEnd`, `closeRun` returns a promise that resolves once that position is read (the Claude Code hook awaits it before replying), and the emitter takes a `ReportedTerminal` through `queueTerminal`, with `waitingTerminals`, `takeOwed`, `unsettled` and `seedLastTurn` beside it. The wait between attempts is fixed: it neither doubles nor caps, so the plane is back within a second of the fault clearing. The pi adapter's start factory, re-entered by the re-establish, checks the native file instead of reading an acknowledged cursor as a vanished file, and seeds its mapper from the pending frame. A transcript line that is not a record is stepped over and reported on every connector, the jcode journal wrapper included, and one written past the position a terminal was reported at does not hold that terminal: it is placed after the records before it, as is a terminal reported past a record no read answers, such as an OpenCode part still filling when its turn died, which used to hold the turn end reading the session without end; the OpenCode source now reads every record at or before the end reported at a turn end as settled, so that part no longer stops the turns after it from publishing. A terminal reported while the very first start is still waiting on the broker reaches the emitter before its first read, where it used to be queued behind the flush that read past it and close the next turn. On a space that requires events the seat used to exit with code 1 instead; for Claude Code that exit was the "MCP server cotal has disconnected" banner, and Claude Code restarted the server on the next tool call. The `eventPlaneStopped` sink no longer takes `required` or `stopSeat`, the holder's `onError` receives the delay before the next re-establish (`0` for at once) and `retryMs` is that fixed wait, the Claude and OpenCode mappers take `resumeRunId`, and a reported unreadable-line reason carries no text from the record itself.
+
+## 0.79.0
+
+## 0.78.1
+
+## 0.78.0
+
+### Patch Changes
+
+- 5a147d5: On macOS and Linux, the process that becomes an OpenCode agent's `opencode serve` now writes its own pid to the agent's `serve.pid` before the server starts. Before, the launcher wrote the record only after the server had started, so a launcher killed in between left a server holding the agent's database with no record, and the next launch of that name started a second server on the same database. Windows still records the server from the launcher after the start.
+
+## 0.77.1
+
+### Patch Changes
+
+- a1948eb: The Codex and Jcode hosts now arm the event plane when the session's registration requires events, even without `COTAL_EVENTS`. They used to read only that flag, so a hand-driven user-mode launch with `COTAL_EVENTS_REQUIRED=1`, or a custom launcher that passed `eventsRequired` with events opted out, ran with no event plane and the required-events policy never applied. The Claude, OpenCode, Codex, Jcode and Pi launches that carry `eventsRequired` now also set `COTAL_EVENTS` and the workspace root when the launcher passed `events: false`, so the armed session has a place for its event log. Both decisions go through `launchArmsEvents` and `eventPlaneArmed` in `@cotal-ai/connector-core`; an OpenCode 2.x session still reads only `COTAL_EVENTS`.
+
+## 0.77.0
+
+## 0.76.0
+
+### Patch Changes
+
+- cfb6b52: An OpenCode launch no longer refuses to start because of a recorded server that exits during the liveness check. `ps` also fails for a pid that is gone by the time it runs, and that failure used to read as a server the platform could not inspect, so the launch failed with `agent "<name>" is already running`. The check now probes the pid again after a failed `ps`, and only a pid that is still present keeps the fail-closed answer.
+- ba76f78: An OpenCode seat whose turn outlasts the consumer's ack wait no longer loses the role request it is working on to another holder of the role. The connector acks a batch only when its turn ends, and the 60-second ack wait used to run out under a longer turn, so the broker handed the same anycast to a second worker while the first was still on it. The batch a turn carries is now held in flight, and while it is held the agent restarts each delivery's ack wait with JetStream's in-progress ack at half the wait. A failed turn or a stop releases the batch and a crashed seat stops renewing it, so it redelivers after one ack wait as before, and a success or a user Stop acks it. Queued messages are not renewed, and the bounded inbox no longer evicts a held message to make room for them, which had stopped its renewal and left the finished turn nothing to ack. Renewal stops for good once the agent can no longer vouch that it still holds a copy: the wait ran out between renewals, the link was down past it, or the copy's connection was torn down. A durable `Delivery` now carries `redelivery` (the broker's delivery count, the consumer's ack wait, and `working()`), an `InboxItem` carries `deliveryCount`, and a frame marks a copy the broker delivered more than once as redelivered. Delivery stays at-least-once: a request can still run twice, so work with side effects that must not repeat needs its own ownership or idempotency key.
+- d6c1c4d: An OpenCode agent launch no longer fails with `EISDIR` when an empty directory sits at the agent's `serve.pid`. The launcher now treats that directory as no record, removes it, and starts the server, and a directory that vanishes before that removal also counts as no record. A directory that holds files is refused with `ENOTEMPTY` and left in place, and an unreadable record still fails the launch.
+
+## 0.75.0
+
+### Patch Changes
+
+- 8bfe324: The OpenCode 1.x plugin's teardown comments no longer say a seat has two ways out. They now state that every way a running seat stops goes through `shutdown` and its shared teardown, which includes a required event plane that stopped for good and exits 1. No behavior changes.
+
+## 0.74.0
+
+### Patch Changes
+
+- ad81083: The connector on/off flags `COTAL_CHANNEL`, `COTAL_EVENTS`, `COTAL_EVENTS_REQUIRED`, `COTAL_CODEX_TUI` and `COTAL_JCODE_TUI` now share one parser in `@cotal-ai/connector-core`. It accepts `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` in any case, treats an unset or blank value as unset, and refuses anything else at startup with an error naming the variable and the value. Before, each connector kept its own copy and read any other value, such as `enabled`, `2` or `y`, as off without a word. The OpenCode 2.x adapter now refuses `COTAL_EVENTS=true` the same way it refuses `COTAL_EVENTS=1`, where before only `1` was refused.
+
+## 0.73.0
+
+## 0.72.1
+
+## 0.72.0
+
+## 0.71.0
+
+## 0.70.2
+
+## 0.70.1
+
+## 0.70.0
+
+### Minor Changes
+
+- 76113ce: `AguiEmitterHolder` now takes its hooks as one named object after the emitter factory, `new AguiEmitterHolder(startEmitter, { onError, onRunClosed, waitLive, runMeta })`, typed by the exported `AguiEmitterHolderHooks`, where only `onError` is required. Before, the four hooks were positional, and a `runMeta` provider passed third was accepted as `onRunClosed`: it typechecked, ran after the run had already closed, and its metadata was dropped with no error. A caller no longer fills earlier slots with `undefined` to reach a later hook. The Claude Code, Codex, jcode, OpenCode and pi connectors pass their hooks by name, with no change in behavior.
+
+### Patch Changes
+
+- 95788eb: A seat whose AG-UI event plane stops for good now follows the space's policy on every connector. On a space that requires events the seat stops, where Pi, Claude Code and OpenCode used to keep it running without events. On any other space the seat keeps running and its log records `AG-UI emitter stopped`, where Jcode used to stop the seat and refuse further turns. Codex no longer rebuilds a stopped plane at its next turn boundary on any space, and it now waits for the mesh before starting its emitter, as the other connectors do. The rule is `eventPlaneStopped` in connector-core, which each connector passes its log sink and its stop hook.
+- 3fbdbef: Comments in the OpenCode connector name the code they point at by symbol instead of by line number. Three of those line numbers had drifted onto unrelated code, so the 2.x session handshake comment and the turn-wedge stop cell's rationale sent a reader to the wrong place. They now cite `sessionReady` in plugin.ts, `clearErrorRetry` in `quiesce`, the `stopping` refusal in `drive`, `buildLaunch` in extension.ts and `modelReady` in plugin2.ts. No behavior changes.
+- 5a17a92: The OpenCode launcher's lifecycle now lives in `launch`, bundled as `dist/launch.js`, which takes the argv of the TUI to attach and, optionally, extra env for the server, built only once no seat of that name is running. `dist/serve.js` runs it with the `opencode` TUI, as before. The frontier-faces example ran a hand-kept copy of this lifecycle with its face viewer, and the copy had drifted: a face seat kept running after its server exited, refused to start over a `serve.pid` whose pid an unrelated process had reused, and passed the server password on the viewer's argv. It now calls `launch` with the face viewer, which reads the password from `OPENCODE_SERVER_PASSWORD`, and composes its persona file in that env step, so a refused second launch leaves the running seat's persona untouched.
+- edfb4cd: An OpenCode agent launch no longer fails with `ENOENT` when the previous launch of the same agent removes its `serve.pid` record while the new launch is checking it. The launcher now reads the record once, treats a record that is gone as no record, and removes a dead one without failing if it has already been removed.
+- b3f3ac8: Restate the comment above the OpenCode plugin's `shutdown` as the rule it carries: the exit waits for the shared teardown to settle and runs whether that teardown resolves or rejects. It no longer compares the exit with an earlier version, a comparison that suggested a teardown that throws keeps the process running. No behavior changes.
+
+## 0.69.0
+
+### Minor Changes
+
+- 5dfd357: The OpenCode launcher keeps the server password off command lines and stdout. The 1.x TUI reads it from its environment instead of `attach --password`, and the headless `[cotal-serve]` line now carries only `port` and `session`. A headless host that drives the server passes its own `OPENCODE_SERVER_PASSWORD` to the launcher; without one, the launcher mints a password per launch as before.
+
+### Patch Changes
+
+- 5838b9d: The OpenCode event mapper now exposes only what the plugin calls: `map` and `forgetOpenRun`. It dropped `closeOpenRun`, `openRun` and `diagnose`, which nothing shipped called. The run closes the record stream cannot see, at `session.idle` and `session.error`, go through the event holder and never went through the mapper, and `diagnose` could only ever report that no assistant record had arrived. No behavior changes.
+
+## 0.68.0
+
+### Minor Changes
+
+- 585fdb2: Connectors launch on the model and variant their launcher resolved. `LaunchOpts.model` and `LaunchOpts.variant` are now the launcher's resolved values (the flag, else the agent file's `model:` / `variant:`), and every connector renders them as given instead of reading the agent file again in `buildLaunch`. Before, a model the launcher did not resolve was taken from a later read of a file that could have changed since, so the seat could run a model the launcher never checked or recorded, and a supervised restart re-read it each time. The in-session config takes the model and variant from `COTAL_MODEL` / `COTAL_VARIANT` only, so the card and the orientation pin no longer report a model the seat was not launched on. The Hermes connector no longer falls back to `HERMES_MODEL` from the spawning process, including one `spawn.env` forwards; set the model with `--model` or the persona's `model:`. Code that calls `buildLaunch` directly must pass `model` and `variant` itself.
+
+### Patch Changes
+
+- ad30240: An OpenCode 1.x seat whose instance the host disposes now ends instead of staying up off the mesh. OpenCode disposes an instance while its server keeps running, for example after a global config change or on `POST /instance/dispose`, and the next request loaded the plugin again from its process-wide cache. That handed back the stopped seat: the server kept running with the agent off the mesh, every `cotal_*` tool and native prompt was refused, and the manager still listed the seat as running. `dispose` now runs the same teardown as a stop and then exits the server, and the launcher closes the attached TUI when its server exits, killing a stopped or unresponsive one after 3 seconds, so the manager sees the seat end.
+
+## 0.67.0
+
+### Patch Changes
+
+- 7f909a1: Remove sentences from the AG-UI holder and the Claude Code and OpenCode AG-UI mapper comments that described what earlier revisions of those comments got wrong. The comments now state only the current contract: the `boundPath` gate keeps start-once, the chain serializes hook events, the refusals live in `subject-frontier.ts` and `event-wal.ts`, the bracket interleave is open, OpenCode publishes `RUN_ERROR` through `AguiEmitterHolder.closeRun`, and the Claude Code mapper keeps its measured predicate counts. No behavior changes.
+
+## 0.66.1
+
+## 0.66.0
+
+## 0.65.0
+
+## 0.64.0
+
+### Patch Changes
+
+- 86ecb01: An OpenCode 1.x seat that has begun a cooperative stop now refuses a prompt typed into its TUI or posted to its server API. The refusal comes before OpenCode saves the prompt, so no model turn starts after the seat has announced it is leaving. OpenCode reports the reason, `the prompt was not run: this seat is shutting down`, as a `session.error` event for an asynchronous prompt and only in its server log for a synchronous one, which answers with a generic server error. Before, the stop fence returned early from `chat.message`, which OpenCode does not treat as a refusal, and the prompt ran a full turn while the seat was tearing down. A turn that was already running when the stop began is not cancelled.
+
+## 0.63.0
+
+## 0.62.0
+
+## 0.61.0
+
+## 0.60.0
+
+## 0.59.0
+
+### Patch Changes
+
+- 608f5f4: Re-attach doc comments that had drifted away from the declarations they document. A `/** */` block followed directly by another one documented nothing, so editor hovers and the published type declarations showed no doc for the intended declaration (for example `Manager`, the `plane3` field and `AclResolver`). Each such block now sits above its declaration, is merged into the block it duplicated, or is removed when its declaration no longer exists. A new `pnpm check:doc-comments` check, run as part of `check:docsbundle`, refuses a doc block followed directly by another in shipped source.
+- 5929b5b: A focus `@mention` wake on OpenCode 1.x is no longer lost when an ordinary inbox turn fails. The wake used to be handed to the turn driver and written back by hand at each exit that did not submit it, so a failed submission of a turn that carried no wake wrote an empty value over a wake that arrived while it was in flight, and the agent was never told it was mentioned. The `mention-wake` handler now records the wake in a pending slot, the driver only reads it, and only a submission that lands clears it, generation-checked so a wake that arrived meanwhile survives. Message bodies are still not buffered, so a channel with replay off still gives back nothing to recall.
+
+## 0.58.0
+
+## 0.57.0
+
+### Patch Changes
+
+- 93b98e9: Let a cooperative teardown publish departure after it has given up waiting on a presence write. Presence writes are serialized, so the departure publish queued behind the very write the teardown's intake bound had just abandoned: the wait ended, offline never published, the seat kept its last status until its presence TTL expired, and the plugin process never reached its exit. The agent gains `abandonPresenceWrites()`, which the teardown calls only on the path where it announces the bound expired; ordering behind writes that do settle inside the bound is unchanged (#2207).
+
+## 0.56.1
+
+### Patch Changes
+
+- 6b76946: A seat resumed from a preservation cut backfills its channels from the chat stream sequence its prior incarnation had reached instead of replaying the whole retained window.
+- baf7596: Fixed the OpenCode 2.x adapter dropping `cotal spawn --prompt`'s kickoff text: `plugin2.ts` now reads `COTAL_OPENCODE_PROMPT` and submits it as its first connector-driven turn, alongside the briefing and the persona as `system`, the same floor the 1.x plugin already runs. A failed first submission keeps the text for the next drive.
+
+## 0.56.0
+
+### Minor Changes
+
+- 7a43218: OpenCode support adds a new supported host line, `@opencode/cli` 2.x, alongside the existing 1.x line. A single directory plugin target now bundles both lines from one entry file. On 2.x the connector adds a 2.x viewer and the model, session, turn, prompt and model.request routes over the plugin's own event stream, since 2.x carries no AG-UI event plane. An unsupported OpenCode version is refused loud at spawn instead of silently degrading. Two 2.x limits: the event plane needs `--no-events`, and `cotal models` is refused because the 2.x catalog is served by a running opencode server rather than the CLI.
+
+### Patch Changes
+
+- e0ed0f5: Re-arm a focus @mention wake when its turn fails after the submission landed, so the seat is retried instead of left never told to look again.
+
+## 0.55.0
+
+### Patch Changes
+
+- a13c8bb: Capture the event plane's start boundary at adopt instead of at the emitter's first read, so a complete record written while the connector is still starting up (the mesh wait, log open, and preflight) is no longer silently dropped. Claude Code and OpenCode both wrap their session source with the shared `BoundStartSource`.
+- 647dcf2: The session-reset mutation fixture registers the removal of the settle barrier between the old holder's chain and the new session's frames, so the ordering cell is proved to notice it.
+- b58918f: The turn-wedge smoke grades the error-retry backoff under sustained failure: the doubling, one timer per window, the thirty-second ceiling, the reset after a completed turn, and a stop landing while a retry is pending.
+- d284ee6: A manifest or spawn prompt on a connector that cannot deliver one is refused at preflight (including `up -f --dry-run`), at spawn and in the manager, the way an unsupported model variant is: connectors now declare `supportsPrompt`, and claude, opencode, codex, jcode and pi declare it; hermes keeps its launch-time throw as the second line of defence.
+
+## 0.54.0
+
 ## 0.53.0
 
 ## 0.52.1

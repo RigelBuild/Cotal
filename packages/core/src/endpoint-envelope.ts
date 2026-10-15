@@ -16,12 +16,12 @@ import type { ValidateFunction } from "ajv/dist/2020.js";
 import { rawDigest, isContractDigest, isWellFormedUnicode } from "./canonical.js";
 import { assertCommandToken, assertIdToken, assertLifecycleToken, endpointToken, type ParsedEpRequest } from "./endpoint-subjects.js";
 import { SCHEMA_PROFILE } from "./schema-profile.js";
-import type { EndpointRef } from "./types.js";
+import type { ControlReply, EndpointRef } from "./types.js";
 // The error catalog + EpEnvelopeError live in a node-free module so the browser session bundle can
 // use them without dragging in schema-profile's load-time digest (node:crypto). Re-exported here so
 // every existing `@cotal-ai/core` consumer keeps its import path.
-import { EP_ERROR_CODES, EpEnvelopeError, type EpErrorCode, type EpError, type EpErrorDetail, type EpEffectOutcome } from "./endpoint-error.js";
-export { EP_ERROR_CODES, EpEnvelopeError, EP_UNBOUND_RESPONDER, respondedButUnbound, EP_UNANSWERED, unansweredRequest, unansweredRail, EP_REGISTRY_READ_FAILED, registryReadFailed, EP_BIND_REFUSED, replyRefusedBeforeEffect, bindRefusalMarked, EP_LIFECYCLE_BLOCKED, lifecycleBlocked, lifecycleBlockedDetail, lifecycleBlockedFrom, renderLifecycleBlocked, type EpErrorCode, type EpError, type EpErrorDetail, type EpUnboundResponderDetail, type EpUnansweredDetail, type EpRegistryReadFailedDetail, type EpBindRefusedDetail, type EpLifecycleBlockedDetail, type LifecycleBlockedFacts, type LifecycleBlockedOp, type LifecycleHeadState, type EpEffectOutcome } from "./endpoint-error.js";
+import { EP_ERROR_CODES, EpEnvelopeError, renderLifecycleBlocked, type EpErrorCode, type EpError, type EpErrorDetail, type EpEffectOutcome } from "./endpoint-error.js";
+export { EP_ERROR_CODES, EpEnvelopeError, EP_UNBOUND_RESPONDER, respondedButUnbound, EP_UNANSWERED, unansweredRequest, unansweredRail, EP_REGISTRY_READ_FAILED, registryReadFailed, EP_UNDECLARED_ARG, undeclaredArg, EP_BIND_REFUSED, replyRefusedBeforeEffect, bindRefusalMarked, EP_TARGET_UNMAPPED, replyTargetUnmapped, EP_LIFECYCLE_BLOCKED, lifecycleBlocked, lifecycleBlockedDetail, lifecycleBlockedFrom, renderLifecycleBlocked, type EpErrorCode, type EpError, type EpErrorDetail, type EpUnboundResponderDetail, type EpUnansweredDetail, type EpRegistryReadFailedDetail, type EpUndeclaredArgDetail, type EpBindRefusedDetail, type EpLifecycleBlockedDetail, type LifecycleBlockedFacts, type LifecycleBlockedOp, type LifecycleHeadState, type LifecycleGateState, type EpEffectOutcome } from "./endpoint-error.js";
 
 /** The envelope schema version — independent of the wire `protocolVersion`; starts at its own
  *  v1 inside the v0.4 revision. Other values are rejected (`unsupported-version`). */
@@ -41,8 +41,8 @@ export function isEpErrorCode(code: string): boolean {
   return EP_ERROR_SET.has(code) || EXTENSION_CODE.test(code);
 }
 
-function fail(code: EpErrorCode, message: string): never {
-  throw new EpEnvelopeError(code, message);
+function fail(code: EpErrorCode, message: string, outcome?: "not-executed"): never {
+  throw new EpEnvelopeError(code, message, undefined, outcome);
 }
 
 // ---- envelope types (§13.3 field tables) ----------------------------------------------------
@@ -133,6 +133,34 @@ export interface EndpointReply {
   error?: EpError;
   /** Opaque signed receipt slot (§13.10). */
   receipt?: string;
+}
+
+/** The {@link ControlReply} a caller hands on for an endpoint reply. Every caller converts here, so
+ *  whether it can act on a refusal's code, its details, or the acceptance a non-succeeded terminal
+ *  keeps depends on what the responder sent, never on which caller the reply went through. */
+export function controlReplyFrom(reply: EndpointReply): ControlReply {
+  if (reply.ok) return { ok: true, ...(reply.data !== undefined ? { data: reply.data } : {}) };
+  const { error } = reply;
+  if (!error) throw new Error(`endpoint reply ${reply.id} failed without an error`);
+  return {
+    ok: false,
+    error: renderLifecycleBlocked(error.message, error),
+    code: error.code,
+    ...(reply.data !== undefined ? { data: reply.data } : {}),
+    ...(error.details ? { details: error.details } : {}),
+  };
+}
+
+/** The {@link ControlReply} a caller hands on for an envelope error thrown instead of a reply. The
+ *  caller keeps its own `message`; the code and details come from here, so a refusal that arrives
+ *  as a throw is keyed on the same way as one that arrives as a reply. */
+export function controlReplyFromThrown(e: EpEnvelopeError, message: string): ControlReply {
+  return {
+    ok: false,
+    error: renderLifecycleBlocked(message, e),
+    code: e.code,
+    ...(e.details ? { details: e.details } : {}),
+  };
 }
 
 /** An event (incl. per-goal progress) on the `epe` plane. The publishing instance and epoch are
@@ -371,8 +399,8 @@ export function checkRequestSubjectAgreement(env: EndpointRequest, subject: Pars
     if (!env.target) fail("target-mismatch", `the "${t.mode}" form requires a body target (SPEC 13.3)`);
     if (env.target.owner !== t.tOwner)
       fail("target-mismatch", `target.owner "${env.target.owner}" does not equal the subject target owner "${t.tOwner}"`);
-    if (t.mode === "handle" && (env.target.actor !== t.tActor || env.target.lifecycleUid !== t.tUid))
-      fail("target-mismatch", "in handle mode the body target actor and lifecycleUid must equal the subject redemption triple");
+    if ((t.mode === "handle" || t.mode === "exact") && (env.target.actor !== t.tActor || env.target.lifecycleUid !== t.tUid))
+      fail("target-mismatch", `in ${t.mode} mode the body target actor and lifecycleUid must equal the subject target triple`);
   }
 
   const sender = `${subject.caller.owner}.${subject.caller.actor}`;
@@ -484,9 +512,7 @@ export function parseEndpointEvent(raw: unknown): EndpointEvent {
  * {@link import("./schema-profile.js").compileContract} still refuses `contract-invalid`, a false
  * positive fails a boot loudly rather than lying to a caller.
  *
- * WHAT THIS COMMENT USED TO CLAIM, AND WHY IT WAS WRONG. It said the deterministic profile bounds
- * "do the pre-emptive work", i.e. that registration-time bounds REPLACE request-path enforcement.
- * They do not, and that was disproved by execution rather than argued: a four-node schema —
+ * REGISTRATION-TIME PROFILE BOUNDS DO NOT REPLACE REQUEST-PATH ENFORCEMENT. A four-node schema —
  * trivially inside every byte, depth, ref-chain, node and closure bound — declaring
  * `uniqueItems: true` over an array of OBJECTS makes validation QUADRATIC IN THE CALLER'S DATA.
  * 3,000 valid objects measured 75ms and 5,000 measured 227ms, from ~54KB of entirely legitimate
@@ -571,7 +597,8 @@ export function assertArgsValid(validate: ValidateFunction, args: Record<string,
   reportValidateBudget("args", startedCpu, started);
   if (!okValid) {
     const first = validate.errors?.[0];
-    fail("bad-request", `args do not validate against the input schema${firstErrorDetail(first)}`);
+    // Refused before anything is published, so the outcome is known: the command did not run.
+    fail("bad-request", `args do not validate against the input schema${firstErrorDetail(first)}`, "not-executed");
   }
   return value;
 }

@@ -4,8 +4,11 @@ import { tmpdir } from "node:os";
 import {
   hardenPrivate,
   registry,
+  SpawnRefused,
+  confirmWatch,
   writeSecretFile,
   type AgentHandle,
+  type ConfirmPane,
   type LaunchSpec,
   type Runtime,
   type RuntimeProvider,
@@ -13,8 +16,9 @@ import {
 import * as herdr from "./driver.js";
 
 const GRACE_MS = 2_000;
-const CONFIRM_INTERVAL_MS = 1_000;
-const MAX_CONFIRMS = 5;
+/** Bounds every Herdr call the startup-confirm watch makes, because it polls on the manager's event
+ *  loop. */
+const CONFIRM_CALL = { timeoutMs: 1_000 };
 
 interface LauncherPayload {
   cwd: string;
@@ -65,7 +69,7 @@ export function privateLauncher(spec: LaunchSpec, cwd: string): PrivateLauncher 
 function layoutFromEnv(): "tab" | "split" {
   const raw = process.env.COTAL_HERDR_LAYOUT ?? "tab";
   if (raw === "tab" || raw === "split") return raw;
-  throw new Error(
+  throw new SpawnRefused(
     `herdr runtime: unknown COTAL_HERDR_LAYOUT ${JSON.stringify(raw)} (expected "tab" or "split")`,
   );
 }
@@ -102,10 +106,10 @@ export class HerdrRuntime implements Runtime {
 
   spawn(name: string, spec: LaunchSpec, cwd: string): AgentHandle {
     if (!/^[A-Za-z0-9_.-]+$/.test(name))
-      throw new Error(`herdr runtime: unsafe agent name ${JSON.stringify(name)} (allowed: letters, digits, _ . -)`);
+      throw new SpawnRefused(`herdr runtime: unsafe agent name ${JSON.stringify(name)} (allowed: letters, digits, _ . -)`);
     if (!herdr.available()) {
       const found = herdr.versionText();
-      throw new Error(
+      throw new SpawnRefused(
         `herdr runtime: no usable herdr on PATH - needs >= ${herdr.MIN_HERDR.join(".")}` +
           (found ? ` (found "${found}")` : " (herdr not installed or not on PATH)"),
       );
@@ -113,14 +117,24 @@ export class HerdrRuntime implements Runtime {
     // herdr silently substitutes $HOME for a bad --cwd; validate here so a bad workspace
     // fails loud at spawn instead of the agent starting somewhere else entirely (a non-directory
     // would otherwise die later, invisibly, at the launcher's chdir).
-    if (!isDirectory(cwd)) throw new Error(`herdr runtime: cwd ${JSON.stringify(cwd)} is not a directory`);
+    if (!isDirectory(cwd)) throw new SpawnRefused(`herdr runtime: cwd ${JSON.stringify(cwd)} is not a directory`);
     const layout = layoutFromEnv(); // before any side effects, so a bad value spawns nothing
-    herdr.ensureServer(this.session);
-
-    // `split` shares a tab, so the tab set has to be sampled BEFORE this agent adds its own.
-    const tabsBefore = layout === "split" ? herdr.tabIds(this.session) : [];
-
-    const launcher = privateLauncher(spec, cwd);
+    // Nothing has the spec's command until agentStart, so a failure before it (a confirm prompt that
+    // cannot match, a server that will not start, a launcher script that cannot be written) is a
+    // refusal.
+    let watch: ((pane: ConfirmPane) => void) | undefined;
+    let tabsBefore: string[];
+    let launcher: PrivateLauncher;
+    try {
+      if (spec.confirmBefore?.length && spec.confirm === undefined) throw new Error("startup choices require a final confirmation prompt");
+      watch = spec.confirm === undefined ? undefined : confirmWatch(spec.confirm, spec.confirmBefore);
+      herdr.ensureServer(this.session);
+      // `split` shares a tab, so the tab set has to be sampled BEFORE this agent adds its own.
+      tabsBefore = layout === "split" ? herdr.tabIds(this.session) : [];
+      launcher = privateLauncher(spec, cwd);
+    } catch (err) {
+      throw new SpawnRefused((err as Error).message);
+    }
     let agent: herdr.HerdrAgent | undefined;
     let startedTerminalId: string | undefined;
     try {
@@ -154,23 +168,31 @@ export class HerdrRuntime implements Runtime {
 
     /** The CURRENT pane id for this terminal — resolved fresh for every pane-scoped op, never
      *  the (possibly stale) id from spawn time. Gone terminal → HerdrCliError(pane_not_found). */
-    const currentPane = (): string => {
-      const info = herdr.agentInfo(session, terminalId);
+    const currentPane = (opts: { timeoutMs?: number } = {}): string => {
+      const info = herdr.agentInfo(session, terminalId, opts);
       if (!info) throw new herdr.HerdrCliError("pane_not_found", `terminal ${terminalId} is gone`);
       return info.paneId;
     };
 
-    if (spec.confirm) {
-      for (let i = 1; i <= MAX_CONFIRMS; i++) {
-        setTimeout(() => {
-          try {
-            herdr.sendKeys(session, currentPane(), "enter");
-          } catch {
-            /* pane may already be gone */
-          }
-        }, i * CONFIRM_INTERVAL_MS);
-      }
-    }
+    watch?.({
+      read: () => {
+        const info = herdr.agentInfo(session, terminalId, CONFIRM_CALL);
+        return info && herdr.readPane(session, info.paneId, CONFIRM_CALL);
+      },
+      enter: () => herdr.sendKeys(session, currentPane(CONFIRM_CALL), "enter", CONFIRM_CALL),
+      down: () => herdr.sendKeys(session, currentPane(CONFIRM_CALL), "down", CONFIRM_CALL),
+      fail: (message) => {
+        console.error(`herdr runtime: "${name}": ${message}`);
+        try {
+          herdr.closePane(session, currentPane(CONFIRM_CALL), CONFIRM_CALL);
+        } catch (err) {
+          if (!(err instanceof herdr.HerdrCliError && err.code === "pane_not_found"))
+            console.error(`herdr runtime: failed to close pane for "${name}":`, err);
+        } finally {
+          cleanupLauncher(launcher);
+        }
+      },
+    });
 
     return {
       name,

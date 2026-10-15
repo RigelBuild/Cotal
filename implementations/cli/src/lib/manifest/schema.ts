@@ -23,8 +23,11 @@ const AgentEntryObject = z
     agent: z.string().min(1).optional(),
     /** Working directory on the manager host; relative to its workspace, never this manifest. */
     cwd: z.string().min(1).refine((s) => !s.includes("\0"), "cwd must not contain a NUL byte").optional(),
-    model: z.string().min(1).optional(),
-    variant: z.string().min(1).optional(),
+    /** `exact` reopens the host session the manager last bound to this agent name; `none` (the
+     *  default) starts a new one. The manager owns the session id; a manifest never names one. */
+    continuity: z.enum(["none", "exact"]).optional(),
+    model: z.string().refine((s) => s.trim() !== "", "must not be empty").optional(),
+    variant: z.string().refine((s) => s.trim() !== "", "must not be empty").optional(),
     /** Opaque connector-specific launch options, merged per key over the persona's `launchOptions:`. */
     launchOptions: z.record(z.string(), z.unknown()).optional(),
     role: z.string().min(1).optional(),

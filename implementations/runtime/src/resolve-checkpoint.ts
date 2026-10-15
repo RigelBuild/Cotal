@@ -27,40 +27,29 @@
  * "the checkpoint named `approve` in this run". The journal is what maps one to the other, and it is
  * also what says whether that step is still open — which is the question a resolver most needs
  * answered before it collects a human's decision.
+ *
+ * **A settled step is never re-answered, but it can be AMENDED.** The pause stays settled and the run
+ * keeps the answer it acted on; {@link amendAcceptedAnswer} files a later position beside that
+ * answer, naming it, so a participant who changes their mind records it on the step that holds the
+ * original rather than somewhere else.
  */
 import {
   replayRunJournal,
   newTakeoverId,
   recordCheckpointAnswer,
   checkpointAnswerId,
+  newAmendmentId,
+  readCheckpointAnswer,
   readCheckpointSpec,
+  readCheckpointStatus,
   resumeCheckpoint,
   type CheckpointSettleFact,
+  type CheckpointSpecValue,
 } from "@cotal-ai/core";
 import type { JetStreamClient, JetStreamManager } from "@nats-io/jetstream";
 import type { KV } from "@nats-io/kv";
-import { journalEntryKeyString, type JournalEntry } from "@cotal-ai/lang";
-
-/** No open checkpoint (or ask) answers to this address in this run. */
-export class CheckpointNotOpen extends Error {
-  constructor(
-    readonly runId: string,
-    readonly stepKey: string,
-    readonly why: "unknown" | "settled" | "not-a-checkpoint" | "no-identity",
-  ) {
-    super(
-      `run ${runId} has no open checkpoint at ${stepKey}: ${
-        {
-          unknown: "no step is recorded under that key",
-          settled: "that step has already settled",
-          "not-a-checkpoint": "that step is neither a checkpoint nor an ask",
-          "no-identity": "that step is pending but carries no request id, so the checkpoint it is waiting on cannot be named",
-        }[why]
-      }`,
-    );
-    this.name = "CheckpointNotOpen";
-  }
-}
+import { CheckpointNotAmendable, openCheckpointToken, settledPauseToken, type JournalEntry } from "@cotal-ai/lang";
+import { delay } from "./delay.js";
 
 export interface ResolveCheckpointRequest {
   readonly runId: string;
@@ -139,14 +128,50 @@ export async function locateOpenCheckpoint(
 ): Promise<OpenCheckpoint> {
   const entries = await replayRunEntries(deps, req.runId, req.takeoverId);
   const token = openCheckpointToken(entries, req.runId, req.stepKey);
-  const spec = await readCheckpointSpec(deps.kv, { endpoint: deps.endpoint, token });
+  const spec = await readSpecPastTheMintWindow(deps, token);
   if (spec === undefined) {
     throw new Error(
-      `checkpoint "${token}" has a journal entry but no record on endpoint ${deps.endpoint}; `
+      `checkpoint "${token}" has a journal entry but no record on endpoint ${deps.endpoint} `
+      + `after ${MINT_WINDOW_ATTEMPTS} reads over ${(MINT_WINDOW_ATTEMPTS - 1) * MINT_WINDOW_STEP_MS}ms; `
       + `refusing to guess a presenter — reconcile the store before answering`,
     );
   }
   return { token, holder: spec.holder };
+}
+
+/** Reads long enough to tell a mint in flight from a torn store, and no longer.
+ *
+ *  `checkpoint` in the mesh handler appends the step's PENDING journal entry before it mints the
+ *  pause's record, deliberately: its own comment calls that the harmless direction, because a crash
+ *  between the two leaves an entry saying what it was going to ask rather than a pause nothing
+ *  records. The cost is a window in which the two halves this resolver needs are not both readable
+ *  yet, and one read cannot tell that window from the store being torn — the SAME observation means
+ *  either. What separates them is time: the window closes in a couple of round trips, and a torn
+ *  store never closes.
+ *
+ *  Bounded on purpose, both ways. Refusing on the first read turns a checkpoint that is about to be
+ *  answerable into "reconcile the store", which is the wrong instruction and, at the operator
+ *  surface, an answer a human has to give twice. Waiting without a bound would hang that human on a
+ *  pause that will never be answerable. The window is a KV create plus its status write on a loaded
+ *  host, so a low single-digit number of seconds covers it with room to spare.
+ *
+ *  Only the record is re-read. The token is a fact about the journal at the moment it was replayed,
+ *  and a replay binds its own consumer, so re-reading the journal per attempt would contend with
+ *  the driver for a staleness this call already carries either way. */
+const MINT_WINDOW_ATTEMPTS = 10;
+const MINT_WINDOW_STEP_MS = 200;
+
+async function readSpecPastTheMintWindow(
+  deps: ResolveCheckpointDeps,
+  token: string,
+): Promise<CheckpointSpecValue | undefined> {
+  const ref = { endpoint: deps.endpoint, token };
+  for (let i = 0; i < MINT_WINDOW_ATTEMPTS; i += 1) {
+    const spec = await readCheckpointSpec(deps.kv, ref);
+    if (spec !== undefined) return spec;
+    if (i + 1 < MINT_WINDOW_ATTEMPTS) await delay(MINT_WINDOW_STEP_MS);
+  }
+  return undefined;
 }
 
 /**
@@ -184,26 +209,61 @@ export async function answerOpenCheckpoint(
   return { token, answerId, settle };
 }
 
-/** The token of the open checkpoint (or ask attempt) at this address, or a loud refusal naming
- *  which it is not. An `ask` parks on the checkpoint plane too — one pause per attempt — and the
- *  CURRENT attempt's token rides the entry's external state as `askToken` (attempt 1 is the
- *  request id itself), so an answer always lands on the pause that is actually open. */
-export function openCheckpointToken(
-  entries: readonly JournalEntry[],
-  runId: string,
-  stepKey: string,
-): string {
-  // Append order, later record wins: a settled step has a settled entry written after its pending
-  // one, and answering the pending one would present a token whose pause is already over.
-  let entry: JournalEntry | undefined;
-  for (const e of entries) if (journalEntryKeyString(e) === stepKey) entry = e;
-  if (entry === undefined) throw new CheckpointNotOpen(runId, stepKey, "unknown");
-  if (entry.kind !== "checkpoint" && entry.kind !== "ask") throw new CheckpointNotOpen(runId, stepKey, "not-a-checkpoint");
-  if (entry.state !== "pending") throw new CheckpointNotOpen(runId, stepKey, "settled");
-  if (entry.requestId === undefined) throw new CheckpointNotOpen(runId, stepKey, "no-identity");
-  if (entry.kind === "ask" && typeof entry.external?.askToken === "string") return entry.external.askToken;
-  return entry.requestId;
+/** A settled pause's accepted answer: the token it settled under, the id the settle named, and who
+ *  answered. */
+export interface AcceptedAnswer {
+  readonly token: string;
+  readonly answerId: string;
+  readonly by: string;
 }
+
+/**
+ * The READ half of an amendment: replay the run's journal to the settled pause at `stepKey`, then
+ * read which answer its settlement accepted off the checkpoint's status record. Nothing is written.
+ * The status names the id for an `ask` as well as a checkpoint, where the journal's frozen result
+ * names it for a checkpoint only.
+ */
+export async function locateAcceptedAnswer(
+  deps: ResolveCheckpointDeps,
+  req: { readonly runId: string; readonly stepKey: string; readonly takeoverId: string },
+): Promise<AcceptedAnswer> {
+  const entries = await replayRunEntries(deps, req.runId, req.takeoverId);
+  const token = settledPauseToken(entries, req.runId, req.stepKey);
+  if (token === undefined) throw new CheckpointNotAmendable(req.runId, req.stepKey, "unanswered");
+  const status = await readCheckpointStatus(deps.kv, { endpoint: deps.endpoint, token });
+  const answerId = status?.value.state === "resumed" ? status.value.settledAnswerId : undefined;
+  if (answerId === undefined) throw new CheckpointNotAmendable(req.runId, req.stepKey, "unanswered");
+  const accepted = await readCheckpointAnswer(deps.kv, deps.endpoint, token, answerId);
+  if (accepted === undefined)
+    throw new Error(`checkpoint "${token}" settled naming the answer ${answerId}, which is not on record; reconcile the store before amending`);
+  return { token, answerId, by: accepted.by };
+}
+
+/**
+ * The WRITE half of an amendment: file a create-only answer record under the accepted answer's
+ * token that names it as `supersedes`, under a fresh id, so every call is its own filing. No token
+ * is presented, so the pause stays settled and the run never reads this record; the journal lists
+ * it under the step.
+ */
+export async function amendAcceptedAnswer(
+  deps: ResolveCheckpointDeps,
+  req: { readonly accepted: AcceptedAnswer; readonly by: string; readonly value?: unknown; readonly artifact?: string; readonly now: number },
+): Promise<{ readonly token: string; readonly answerId: string; readonly supersedes: string }> {
+  const { token, answerId: supersedes } = req.accepted;
+  const answerId = newAmendmentId();
+  await recordCheckpointAnswer(deps.kv, deps.endpoint, {
+    v: 1,
+    token,
+    answerId,
+    ...(req.value !== undefined ? { value: req.value } : {}),
+    ...(req.artifact !== undefined ? { artifact: req.artifact } : {}),
+    by: req.by,
+    at: req.now,
+    supersedes,
+  });
+  return { token, answerId, supersedes };
+}
+
 
 /** The run's step entries, in append order. Read-only: this replays under its own consumer name and
  *  activates nothing, so it never contends with the driver actually holding the run. */

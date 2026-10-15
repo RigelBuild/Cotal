@@ -113,7 +113,7 @@ declared item against the live mesh:
 |---|---|---|
 | Channel, brand-new | created + owned | Seeded and recorded in the ledger. |
 | Channel, already present | `exists-unmanaged` | Left untouched: card not mutated; the desired card is shown against the live one. |
-| Agent, not yet created | will-create | Booted and recorded. |
+| Agent, not yet created | will-create | Booted and recorded. A launch that settles uncertain (neither joined nor exited within the readiness window) is recorded too and listed as pending, because the manager keeps managing it and `down -f` must stop it. A launch that fails is not recorded: the summary opens with `! partial deploy` naming the failed agents and the command exits 1, while the ledger still owns what this run did create. |
 | Agent, already created, unchanged | already-owned | No-op. |
 | Agent, already created, policy changed | `stale` | Exits non-zero unless `--allow-stale <names>` (then it restarts). |
 
@@ -142,6 +142,32 @@ cotal ps --space research-team        # finds research-team's broker via the reg
 ```
 
 `--server` remains an explicit override for an off-registry broker.
+
+## Roster files
+
+A manager started with `cotal supervise --roster <file>` boots every agent the roster lists, which
+is how the [Docker deploy](deploy.md) runs a team in one container. A roster declares no channels:
+each agent's access comes from its persona file. Each entry starts one agent the way
+`cotal spawn --detach` does.
+
+```yaml
+agents:
+  - { name: planner, agent: claude,   role: planner }
+  - { name: builder, agent: opencode, cwd: services/api, share-tools: [tavily] }
+```
+
+| Key | Required | Meaning |
+|---|---|---|
+| `name` | yes | The persona to boot, `.cotal/agents/<name>.md`. The agent joins under that file's `name:` |
+| `agent` | yes | The connector, such as `claude` or `opencode`. There is no default |
+| `role` | no | Overrides the persona file's `role:` |
+| `config` | no | An agent file to load instead of `.cotal/agents/<name>.md`, by name or path |
+| `cwd` | no | The agent's working directory, resolved against the manager's workspace root. It must exist |
+| `share-tools` | no | The declared MCP servers to share, as a list. See [the config file](config.md#the-config-file) |
+
+Any other key, in an entry or beside `agents:`, is refused by name before the manager starts. A
+misspelling such as `share_tools` or `cdw` would otherwise boot the agent with the default it was
+meant to override.
 
 ---
 

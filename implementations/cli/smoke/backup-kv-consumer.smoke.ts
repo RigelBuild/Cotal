@@ -6,7 +6,6 @@
  * Run: pnpm smoke:backup-kv-consumer
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { createServer } from "node:net";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,17 +26,9 @@ import {
   writeMaintenanceResumeDocument,
 } from "@cotal-ai/workspace";
 import { backup } from "../src/commands/backup.js";
-import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-const freePort = (): Promise<number> => new Promise((resolve, reject) => {
-  const server = createServer();
-  server.once("error", reject);
-  server.listen(0, "127.0.0.1", () => {
-    const address = server.address();
-    server.close((error) => error ? reject(error) : resolve((address as { port: number }).port));
-  });
-});
 const awaitExit = (proc: ChildProcess, timeoutMs = 5_000): Promise<void> => new Promise((resolve) => {
   if (proc.exitCode !== null || proc.signalCode !== null) return resolve();
   proc.once("exit", () => resolve());
@@ -93,18 +84,15 @@ async function preservedFixture(label: string, residue: Residue): Promise<{
             const stream = args[0];
             const config = bucket._buildCC(">", KvWatchInclude.AllHistory, { headers_only: false });
             if (residue === "wrong-filter") config.filter_subject = "$KV.not_the_channel_registry.>";
-            const consumer = await realGet(stream, config);
-            // Simulate a process disappearing before its best-effort cleanup reaches the broker. The
-            // consumer and every config field are real; only this fixture's delete is suppressed so
-            // backup can inspect the residue after the connection is gone.
-            return Object.assign(Object.create(consumer as object), {
-              delete: async () => true,
-            });
+            return realGet(stream, config);
           },
         },
       },
     });
-    await liveKvEntries(victim);
+    // Simulate a process disappearing before its best-effort cleanup reaches the broker. The
+    // consumer and every config field are real; only this fixture's delete is suppressed so
+    // backup can inspect the residue after the connection is gone.
+    await liveKvEntries(victim, { deleteOwnConsumer: async () => true });
     await nc.close();
     await stopBroker();
 

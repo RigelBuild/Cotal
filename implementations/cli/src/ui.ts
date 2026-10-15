@@ -1,4 +1,4 @@
-import type { PresenceStatus } from "@cotal-ai/core";
+import { formatAge, presenceAges, type PresenceStamps, type PresenceStatus } from "@cotal-ai/core";
 import { c } from "@cotal-ai/workspace";
 
 // The ANSI helpers moved into `@cotal-ai/workspace` (stage 4), shared with @cotal-ai/web.
@@ -16,6 +16,35 @@ export function statusBadge(status: PresenceStatus): string {
     case "offline":
       return c.dim("⨯ offline");
   }
+}
+
+type DatedRow = PresenceStamps & { condition?: { code: string } };
+
+/** The facts a status word needs beside it (#618): the harness-reported condition and how long it has
+ *  held, then how long the status has stood (#578) and the age of the seat's last harness-reported
+ *  work event (`activeAt`). A failure 3s old and one 40m old, or a turn that stopped advancing and one
+ *  that is advancing, no longer render alike. The seat reports `activeAt` itself, so the status word
+ *  keeps its own progress wording. Unstyled, because the console styles them with Ink, where an ANSI
+ *  reset inside the text would end a highlighted row's styling. */
+export function presenceFacts(p: DatedRow, now = Date.now()): { condition: string; ages: string } {
+  const age = presenceAges(p, now);
+  const condition = p.condition ? ` (${p.condition.code}${age.conditionSince === undefined ? "" : ` for ${formatAge(age.conditionSince)}`})` : "";
+  const unchanged = age.statusSince === undefined ? "" : ` · unchanged for ${formatAge(age.statusSince)}`;
+  const active = age.activeAt === undefined ? "" : ` · active ${formatAge(age.activeAt)} ago`;
+  return { condition, ages: unchanged + active };
+}
+
+/** {@link presenceFacts} for ANSI output, with the ages dimmed. */
+export function presenceDetail(p: DatedRow, now = Date.now()): string {
+  const { condition, ages } = presenceFacts(p, now);
+  return condition + (ages && c.dim(ages));
+}
+
+/** The age that follows an activity (#544): a hook flips the status every turn and leaves the
+ *  activity alone, so the status age cannot date it. */
+export function activityAge(p: PresenceStamps, now = Date.now()): string {
+  const age = presenceAges(p, now).activitySince;
+  return age === undefined ? "" : ` (set ${formatAge(age)} ago)`;
 }
 
 /** A follow-up hint for failures whose signature is stale on-disk broker state: streams/durable

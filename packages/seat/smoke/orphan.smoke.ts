@@ -40,7 +40,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as seat from "../src/index.js";
 import { makeSeatRoot, SEAT_MAX_SOCKET_PATH } from "@cotal-ai/smoke-kit";
-const { adoptSeatSync, launchSeat } = seat;
+const { adoptSeatSync, launchSeat, reapSeat } = seat;
 
 /**
  * The surface this suite is about, resolved through the namespace so a tree with the fix reverted
@@ -195,7 +195,10 @@ setInterval(() => {}, 1000);
       await until(() => gone(rec.childPid), 10_000),
       { child: state(rec.childPid) },
     );
-    check("O1 the custody record is gone, so nothing points at processes that no longer exist", !existsSync(join(root, rec.id, "record.json")));
+    const orphanRecord = join(root, rec.id, "record.json");
+    const orphanSettled = !existsSync(rec.socket) && existsSync(orphanRecord);
+    const orphanReaped = orphanSettled ? await reapSeat(root, rec.id) : undefined;
+    check("O1 the custody record is gone, so nothing points at processes that no longer exist", Boolean(orphanSettled && orphanReaped?.outcome === "reaped" && !existsSync(orphanRecord)));
     kill(manager.pid as number);
     kill(rec.childPid);
     kill(rec.custodianPid);

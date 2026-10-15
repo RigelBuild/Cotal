@@ -1,5 +1,113 @@
 # @cotal-ai/tmux
 
+## 0.82.0
+
+## 0.81.1
+
+## 0.81.0
+
+## 0.80.0
+
+### Minor Changes
+
+- 5417401: Authorized managed Claude launches now accept the selected workspace through the native trust dialog. Startup choices are matched against the current screen and answered once before the existing development-channel confirmation. Foreground trust prompts are unchanged. No tool-permission bypass flag is added; accepting trust enables the checkout's own hooks and settings. Upgrade the connector, core and runtime together; older runtimes do not implement the new startup choices.
+
+## 0.79.0
+
+## 0.78.1
+
+## 0.78.0
+
+### Patch Changes
+
+- b4b8adc: The tmux driver's `closeWindow`, `closeWindowIfHeld` and `closePane`, and so the tmux runtime's stop and reap and the tmux `TerminalLayout`'s `close`, now read a target as already gone only from the start of tmux's own `can't find window: `, `can't find session: ` or `can't find pane: ` report, and throw on any other failure. Before, the phrase could match anywhere in stderr or the error message, so a close that failed on a missing socket or an unsafe socket directory, with one of those words in the socket path or the target, returned as a finished close, or for `closeWindowIfHeld` as a window it did not hold, while the window kept running.
+- 56f63a5: The tmux and cmux runtimes no longer leave a seat's launch script on disk. Each spawn wrote the seat's rendered launch env, including any model-provider keys and spawn env values it forwards, to an owner-only script in a temp directory and never removed it, so the values stayed there after the agent started and exited. The script now removes its directory before it starts the agent and does not start the agent when that removal fails, and a spawn whose tmux window or cmux tab fails to open removes it at once. `privateLaunch` and `paneCommand` now return the command together with the script's directory.
+- 2415517: `tmux.serverPid`, and so `TmuxRuntime.reap`, now throws a `tmux: couldn't read the server pid: ...` error with the original error as its cause when tmux cannot be queried, as the driver's other queries do. It used to rethrow the bare `Command failed: tmux display-message -p #{pid}` or `spawnSync tmux ENOENT` error. A server that is not running still reads as no server.
+
+## 0.77.1
+
+## 0.77.0
+
+## 0.76.0
+
+## 0.75.0
+
+## 0.74.0
+
+### Minor Changes
+
+- ac251fd: `Pane.confirm` is removed, and the tmux and cmux terminal-layout providers no longer press Enter in the panes they open. The flag carried no prompt text, so both providers pressed Enter five times, one second apart, and answered the first dialog a pane showed with its default, while a prompt that never appeared went unreported. Nothing in Cotal set it. A `Pane` literal that sets `confirm` no longer compiles; see the upgrading guide.
+
+## 0.73.0
+
+## 0.72.1
+
+## 0.72.0
+
+## 0.71.0
+
+### Patch Changes
+
+- 726a750: The tmux, cmux, Orca and Herdr runtimes now honour `LaunchSpec.confirm` as the PTY runtime does. Each reads its pane, presses Enter once when the declared prompt is on screen, and ends the seat with `Cotal startup confirmation failed: prompt "<prompt>" did not appear within 15000ms.` in the manager's log when it never appears. They used to press Enter five times on a one-second timer whatever the screen showed, so a dialog shown before the declared prompt was answered with its default. Core exports the shared `confirmWatch` they use.
+
+  Each backend call the watch makes times out after one second: the screen read, the terminal lookup, the Enter, and the close that ends a failed seat. A call that times out is killed with SIGKILL, because Node waits for a timed-out child to exit and a CLI that handles SIGTERM would keep the manager blocked past the timeout. The status probes and other CLI calls that share those helpers are killed the same way when they time out. No read starts once the 15 seconds are up, so a backend CLI that hangs fails the seat instead of stalling the manager. The tmux watch ends a failed seat by closing the seat's pane in whichever window holds it now, so a pane swapped into the seat's first window survives. It reads, presses Enter and closes only on the tmux server that opened the seat's window, so after a tmux restart it never types into or closes a new pane that reuses the seat's pane id.
+
+  A `confirm` prompt that is empty once ANSI codes and whitespace are removed, `""` included, is now refused before anything starts, and its launch files are removed. The PTY runtime used to start the child first and then throw, which left the child running with no handle to stop it and its launch files on disk, and every runtime treated `""` as no prompt.
+
+## 0.70.2
+
+## 0.70.1
+
+## 0.70.0
+
+## 0.69.0
+
+### Patch Changes
+
+- 09fccbd: The tmux driver's `windowAlive`, `windowAliveRef`, `listWindows` and `windowRefs`, and the tmux `TerminalLayout`'s `refs`, now throw when tmux cannot be queried. Before, a refused socket or a failing tmux binary read as no window, so a caller could not tell a live window from a closed one. Only a server that is not running reads as no windows, as `windowSessions` already did. A missing socket is a failed query, because a live server whose socket was removed reports it the same way. No server running is read only from the start of tmux's own `no server running on <socket>` report, so a socket path that contains those words no longer turns a failed query into absence, here or in `paneState`, `paneWindow` and `serverPid`. The session-scoped helpers now match a session by its exact name.
+
+## 0.68.0
+
+## 0.67.0
+
+## 0.66.1
+
+## 0.66.0
+
+## 0.65.0
+
+## 0.64.0
+
+## 0.63.0
+
+## 0.62.0
+
+### Patch Changes
+
+- 9236a12: Recover an ordinary resume whose coordinator and manager were both lost after the retained agents launched. The coordinator journals `resume-active` only after the manager's launch returns, so a crash in between left `resume-intent` behind a live agent, and the replacement manager refused it as `already live and this runtime cannot authoritatively adopt it`, leaving the journal degraded and the agent owned by nobody. On a static mesh the replacement manager now reads the seat reference the lost manager recorded on that agent's slot, reaps the seat through its runtime, waits for the principal to leave presence, and launches it again. A live principal with no such record, or one that stays live after the reap, is still refused. Tmux handles now carry a reference bound to the tmux server, window and pane, and the tmux runtime can reap by it, so a successor manager also closes the window of a tmux seat it retires instead of leaving it running. The reap closes that window even when the agent's pane already exited, since `remain-on-exit` or a second pane keeps the window open. It refuses a pane that has moved out of that window, whether it still runs or has exited, and a window that has moved out of the session, including one that moves while the reap runs.
+
+## 0.61.0
+
+## 0.60.0
+
+## 0.59.0
+
+### Patch Changes
+
+- 5f13124: Private launch files now have an owner. The Claude persona file, the Claude shared-server MCP config file and the pi persona file are listed on the new `LaunchSpec.artifacts`, and the launcher removes them once it has proved the agent process gone. On the default pty runtime the manager removes them when it sees the agent exit; on tmux, cmux, orca and herdr the manager removes them by polling the seat's status and waiting for the runtime's exit proof; the foreground `cotal spawn` removes them when its child exits. Every one of those launches also starts its child through the new core `reclaimWithChild`: a watcher started beside the child removes the files once the child's process is gone, and tries a failed removal again every five seconds until it succeeds, so a killed manager or foreground `cotal spawn` no longer strands them (POSIX; Windows has no shell for the watcher). Each directory name carries a random per-launch identity, so a stale path can never name a later launch's directory. The tmux, cmux, orca and herdr runtimes now throw the new core `SpawnRefused` for an unsafe name, an unreachable backend, (herdr) a missing working directory or an unknown layout, (orca) a working directory that is missing or outside any Orca worktree, and a launcher script they cannot write or (tmux, herdr) a session or server that will not start, all before the agent's command is handed to the backend, and the manager removes the files at once. A removal that fails, after an exit or after a refusal, is tried again until it succeeds. A batch resume removes the files of specs it built and never launched. Both connectors now refuse a bad model, prompt or launch option before writing anything. Any other spawn that throws is not proof that nothing started, so its files stay for the child's watcher, or for the OS temp reaper when no child started, as do a killed launcher's on Windows. A seat started under a custodian with `launchSeat` from `@cotal-ai/seat`, which the manager no longer does for a new launch, hands them to that custodian: a launch it refuses before any process started removes them at once, the custodian removes them when it sees the agent exit, a removal that fails stays on the custody record, and a reap that proves the seat gone removes what the record still lists from the temp dir the launch wrote to, so a successor with a different `TMPDIR` still removes them. Losing a custodian's connection no longer counts as the agent's exit. The docs now say that owner-private means any process running as the same user can read the file while it exists.
+
+## 0.58.0
+
+## 0.57.0
+
+## 0.56.1
+
+## 0.56.0
+
+## 0.55.0
+
+## 0.54.0
+
 ## 0.53.0
 
 ## 0.52.1

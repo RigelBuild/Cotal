@@ -22,23 +22,24 @@
  * submission path: `drive` is where this connector starts a turn, and `swapping`, `stopping`,
  * `busy` and `bootPrompt` decide whether IT submits one. The host's own prompt path is a different
  * road. A human typing in the attached TUI, or an API caller hitting the server directly, reaches
- * `chat.message` as a notification the connector cannot refuse: its hooks return `Promise<void>`
- * and influence the host by MUTATING the output object it is handed, and `chat.message`'s output
- * names no cancel and no skip. So a natively submitted prompt REACHES THE HOST whether or not this
- * connector is stopping, cutting over, busy, or holding the boot floor: none of those flags is
- * consulted on that path. What the host then does with it is OpenCode's business, not this
- * connector's, and it is not always a new model turn. At the pinned 1.16.2, a prompt arriving while
- * the session is already running is coalesced into the run in flight rather than starting a second
- * one, which is the same COALESCE behaviour `busy` exists to avoid provoking.
+ * `chat.message`. This connector's hooks return `Promise<void>` and influence the host by MUTATING
+ * the output object they are handed, and `chat.message`'s output names no cancel and no skip. So a
+ * natively submitted prompt REACHES THE HOST whether or not this connector is cutting over, busy,
+ * or holding the boot floor: none of those flags is consulted on that path. `stopping` is the
+ * exception: the `chat.message` entry in `hooks` refuses a prompt during teardown by rejecting.
+ * What the host does with an admitted prompt is OpenCode's business, not this connector's, and it
+ * is not always a new model turn. At the pinned 1.16.2, a prompt arriving while the session is
+ * already running is coalesced into the run in flight rather than starting a second one, which is
+ * the same COALESCE behaviour `busy` exists to avoid provoking.
  *
  * Read every ordering and precedence claim in this file with that scope: they are claims about
  * connector-submitted turns against each other, not about the host's turns. Where a specific
  * comment says "connector-submitted" it is inheriting this paragraph, not adding a new caveat.
- * Refusing or deferring native submission is separate work, tracked in #687.
  */
 import { loadAgentFile, type PresenceStatus } from "@cotal-ai/core";
 import {
   configFromEnv,
+  eventPlaneArmed,
   hasIdentity,
   MeshAgent,
   startControlServer,
@@ -50,6 +51,8 @@ import {
   WORKFLOW_STEER,
   AguiEmitter,
   AguiEmitterHolder,
+  eventPlaneStopped,
+  BoundStartSource,
   EventWal,
   FileSubjectFrontier,
   ensureEventWalDir,
@@ -95,6 +98,12 @@ export const WAL_REAPED = "opencode-wal-reaped";
  *  This is the token the reaping cell grades, because the lifetime is the claim and the deletion is
  *  only the easy half of it. */
 export const WAL_KEPT = "opencode-wal-kept";
+/** The shared shape of a pre-join model refusal: `"<model>: <detail>. Refusing before join"`.
+ *  Exported so the 2.x adapter's own check (a different route, `/api/model`) produces the same
+ *  sentence shape as `verifyServerModel` below without duplicating it. */
+export function modelRefusalSentence(selectedModel: string, detail: string): string {
+  return `${selectedModel}: ${detail}. Refusing before join`;
+}
 export async function verifyServerModel(serverUrl: string, serverAuth: string, selectedModel: string): Promise<void> {
   const response = await fetch(`${serverUrl}/provider`, {
     headers: { authorization: serverAuth },
@@ -106,7 +115,7 @@ export async function verifyServerModel(serverUrl: string, serverAuth: string, s
   const provider = selectedModel.slice(0, slash);
   const model = selectedModel.slice(slash + 1);
   if (slash < 1 || !model || !listing.all?.some((entry) => entry.id === provider && Object.hasOwn(entry.models ?? {}, model)))
-    throw new Error(`${selectedModel}: CLI opencode models --pure --verbose may list it; server /provider does not. Refusing before join`);
+    throw new Error(modelRefusalSentence(selectedModel, "CLI opencode models --pure --verbose may list it; server /provider does not"));
 }
 /**
  * How long one swap step may hold the chain, or a teardown may hold the process, before it is
@@ -137,6 +146,55 @@ const SWAP_SETTLE_MS = 10_000;
  */
 const INTAKE_SETTLE_MS = 1_000;
 
+/**
+ * Races `work` against a `ms` timeout so a stuck settle is abandoned out loud rather than waited on
+ * forever (see the note at its call sites in `quiesce`). Exported: the 2.x adapter's own teardown
+ * uses the same bounded-settle shape rather than a second copy of it.
+ */
+async function settleWithin(work: Promise<unknown> | undefined, ms: number, what: string): Promise<boolean> {
+  if (work === undefined) return true;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+    timer.unref?.();
+  });
+  try {
+    const settled = await Promise.race([work.then(() => true, () => true), expired]);
+    if (!settled)
+      log(
+        `${SETTLE_ABANDONED} ${what} did not settle within ${ms}ms, so it is abandoned: the WAIT ` +
+          `stopped, the work did not, and nothing here can cancel it. It may still publish, ` +
+          `possibly after frames from whatever replaced it, and a run it had open may stay open. ` +
+          `Ordering is guaranteed for a step that settles inside the bound, not for this one. The ` +
+          `plane continues rather than wedging every later step behind it.`,
+      );
+    return settled;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+export { settleWithin };
+
+/**
+ * The buffered-inbox + pending-run-turn composition that goes out ahead of a native prompt. Shared
+ * by the 1.x text-part mutator (`injectIntoPrompt` below) and the 2.x `session.hook("prompt")`
+ * mutator, so the two callers cannot drift on what "inject" means. Returns `undefined` when there is
+ * nothing to prepend.
+ */
+export function computeInjection(agent: MeshAgent): {
+  prefix: string;
+  surfacedIds: string[];
+  turnIds: string[];
+} | undefined {
+  const items = agent.peekInbox("automatic");
+  const turnPeek = agent.peekPendingTurns();
+  if (items.length === 0 && !turnPeek) return undefined;
+  const inj = items.length > 0 ? formatInjection(items) : undefined;
+  if (!inj && !turnPeek) return undefined;
+  const prefix = [inj, turnPeek?.text].filter(Boolean).join("\n\n");
+  return { prefix, surfacedIds: inj ? items.map((i) => i.recvKey) : [], turnIds: turnPeek?.goalIds ?? [] };
+}
+
 export const cotal: Plugin = async () => {
   // No identity → a plain `opencode`, not a launcher-spawned agent. Stay inert.
   if (!hasIdentity()) {
@@ -146,6 +204,8 @@ export const cotal: Plugin = async () => {
   if (guard.__cotalOpencodeHooks) return guard.__cotalOpencodeHooks; // one agent; reuse the hooks
   const config = configFromEnv();
   const control = controlFromEnv();
+  // Read before the agent start below is queued, so a bad value refuses with nothing started.
+  const eventsArmed = eventPlaneArmed(config);
   // Both readers of the launch material have now read it, so the pointer is dropped: the shells and
   // tools this seat runs from here on inherit no reference to its credential or control token.
   scrubLaunchMaterial();
@@ -178,6 +238,8 @@ export const cotal: Plugin = async () => {
    * a managed session.
    */
   let events: AguiEmitterHolder<OpenCodeRecord> | undefined;
+  /** Per session, the cursor of its end when the connector last reported a turn over. */
+  const turnEndedAt = new Map<string, string>();
   /** This principal's event WAL lock, taken by whichever holder started first and held until the
    *  FINAL event teardown. See the assignment site for why a retirement does not release it. */
   let eventLock: PrincipalLock | undefined;
@@ -214,10 +276,39 @@ export const cotal: Plugin = async () => {
     // mapper, and the two are assigned at different times because the mapper is built inside the
     // factory, keyed on the session the bus names.
     let mapper: OpenCodeMapper | undefined;
+    // ONE source for the holder's lifetime. The holder re-establishes a stopped plane by calling
+    // this factory again, and the boundary captured below is the position the thread adopted at;
+    // a second capture would sit at the re-establish, and every message between the two would be
+    // lost without a word. Same rule as the Claude Code connector's holder.
+    let source: BoundStartSource<OpenCodeRecord> | undefined;
     // Built LAZILY, on the first event that names a session: `start()` reaches the broker, and that
     // work must not run for a session that never emits.
     return new AguiEmitterHolder<OpenCodeRecord>(
       async (id: string) => {
+        // Captured as the FACTORY'S FIRST ACT, before the mesh wait below: a lazily-built source
+        // otherwise positions itself on its own first read, which happens only after the mesh wait
+        // and everything else this bind does first, and anything the session writes to its message
+        // list in that window is silently dropped.
+        const bound =
+          source ??
+          (source = await (async () => {
+            const session = new OpenCodeSessionSource({
+              // The session's end when its turn was last reported over: a part still filling then
+              // is settled by that, not by marks it will never get.
+              endedAt: () => turnEndedAt.get(id),
+              // The SUPPORTED surface. `opencodeApi` is the same authenticated HTTP client the rest
+              // of this plugin uses, and `/session/{id}/message` is the endpoint the SDK's
+              // `session.messages()` calls. The SQLite store behind it is OpenCode's private
+              // business and its schema migrates, so nothing here reads it.
+              read: () => opencodeApi<OpenCodeMessageWithParts[]>(`/session/${encodeURIComponent(id)}/message`, undefined, 30_000),
+              // A revert is a legitimate user action, so the divergence is RECORDED and the stream
+              // continues. The read itself is already correct without this, because the cursor is
+              // compared as an order and never dereferenced as an identity.
+              onVanished: (cursor) => log(`AG-UI: the resume cursor was removed from the session (revert): ${cursor}`),
+            });
+            const boundary = await session.read(undefined);
+            return new BoundStartSource(session, boundary.cursor);
+          })());
         // WAIT FOR THE MESH FIRST. This factory runs off the first `session.created` on the bus,
         // and the shim creates that session before the mesh link binds, so `AguiEmitter.start`
         // reached an endpoint that had not started and the holder died terminally for the rest of
@@ -251,36 +342,41 @@ export const cotal: Plugin = async () => {
         // expects an empty subject its own first session filled, and halts for good.
         const subjectFrontier = await FileSubjectFrontier.open(subjectPath, { space: config.space, principal });
         const wal = await EventWal.open(walPath, { space: config.space, threadId, principal, subjectMayExist: false });
-        mapper = createOpenCodeMapper({ threadId, mintRunId: () => randomUUID() });
+        // Seeded from the bracket state that will exist AFTER `start` settles a pending frame: a
+        // re-established plane starts with the log's run open, and a mapper that opened with none
+        // would drop every record until the next prompt, whose `RUN_STARTED` the brackets refuse.
+        const resumeRunId = wal.pending === null ? wal.brackets?.run : wal.pending.brackets.run;
+        mapper = createOpenCodeMapper({ threadId, mintRunId: () => randomUUID(), resumeRunId });
         return AguiEmitter.start<OpenCodeRecord>({
           endpoint: agent.ep,
           wal,
           subjectFrontier,
-          source: new OpenCodeSessionSource({
-            // The SUPPORTED surface. `opencodeApi` is the same authenticated HTTP client the rest of
-            // this plugin uses, and `/session/{id}/message` is the endpoint the SDK's
-            // `session.messages()` calls. The SQLite store behind it is OpenCode's private business
-            // and its schema migrates, so nothing here reads it.
-            read: () => opencodeApi<OpenCodeMessageWithParts[]>(`/session/${encodeURIComponent(id)}/message`, undefined, 30_000),
-            // A revert is a legitimate user action, so the divergence is RECORDED and the stream
-            // continues. The read itself is already correct without this, because the cursor is
-            // compared as an order and never dereferenced as an identity.
-            onVanished: (cursor) => log(`AG-UI: the resume cursor was removed from the session (revert): ${cursor}`),
-          }),
+          source: bound,
           map: mapper.map,
+          onUnreadable: (gap) => log(`AG-UI source: skipped an unreadable session record at offset ${gap.offset} (${gap.bytes} bytes): ${gap.reason}`),
         });
       },
-      // Required, and not defaulted to a swallow: this runs behind a bus handler that must not
-      // throw, so a failure reaches a human only if it is written somewhere. The holder is terminal
-      // on error and does not retry, so this line is the whole record of why events stopped.
-      (e: Error) => log(`AG-UI emitter stopped: ${e.message}`),
-      // The turn terminal closes a run the record stream never described, so without this the mapper
-      // would still believe that run is open, attribute the next records to it, and have the batch
-      // refused. Keyed on the id, so a newer run opened in between is left alone.
-      (runId: string) => mapper?.forgetOpenRun(runId),
+      {
+        onError: eventPlaneStopped({ log }),
+        // The session's end when `session.idle` or `session.error` reports the turn over: what
+        // names the turn a terminal held through an outage ends.
+        sourceEnd: async (sessionId: string) => {
+          const end = await new OpenCodeSessionSource({
+            read: () => opencodeApi<OpenCodeMessageWithParts[]>(`/session/${encodeURIComponent(sessionId)}/message`, undefined, 30_000),
+          }).end();
+          // Recorded for the session's source: every record at or before this end belongs to a
+          // turn that has ended, and is read as settled whatever its own marks say.
+          turnEndedAt.set(sessionId, end);
+          return end;
+        },
+        // The turn terminal closes a run the record stream never described, so without this the
+        // mapper would still believe that run is open, attribute the next records to it, and have
+        // the batch refused. Keyed on the id, so a newer run opened in between is left alone.
+        onRunClosed: (runId: string) => mapper?.forgetOpenRun(runId),
+      },
     );
   }
-  if (/^(1|true|yes|on)$/i.test(process.env.COTAL_EVENTS ?? "") || config.eventsRequired) events = newEventHolder();
+  if (eventsArmed) events = newEventHolder();
 
   /**
    * Give this principal's event WAL lock back, ONCE, at the final event teardown.
@@ -425,12 +521,17 @@ export const cotal: Plugin = async () => {
   // The boot turn's preconditions are met (session exists, mesh link up). Kept separate from the
   // text itself because the text must OUTLIVE a failed attempt: see `bootPending` below.
   let bootReady = false;
-  /** A wake nudge that has been handed to `drive` and not yet submitted. A focus @mention is
-   *  acked-and-dropped at ingest, so it is not in the inbox and `pendingForWake()` does not count
-   *  it; the nudge string exists only in the call that carries it. What is lost when that call
-   *  returns early is therefore the WAKE, and on a channel that permits replay the message itself
-   *  stays recallable through `cotal_inbox`, and the seat simply never learns to look. Held here
-   *  for the same reason the boot text is held: an early return must cost a retry, not the wake.
+  /** The focus @mention wake that is owed and not yet submitted. A focus @mention is acked-and-dropped
+   *  at ingest, so it is not in the inbox and `pendingForWake()` does not count it; this nudge is the
+   *  only thing that tells the seat to go and look. On a channel that permits replay the message
+   *  itself stays recallable through `cotal_inbox`; without the wake the seat never learns to look.
+   *
+   *  SET AT INGEST, READ BY `drive`, CLEARED ONLY BY A LANDED SUBMISSION (#719). The `mention-wake`
+   *  handler writes it and `drive` never takes it out: no exit of `drive` holds the wake, so no early
+   *  return, refusal or failed submission has anything to put back. It used to be handed to `drive`
+   *  as a parameter and parked back here by hand at every exit that did not submit it, and an exit
+   *  that parked the wrong value (a drive carrying no wake writing `undefined` back after an await)
+   *  erased a wake another caller had parked meanwhile.
    *
    *  ONE SLOT, AND THAT IS THE DESIGN RATHER THAN A LIMIT WORTH APOLOGISING FOR. A later nudge
    *  overwrites an earlier one here, and nothing is lost by that: the nudge names the SENDER and not
@@ -447,11 +548,17 @@ export const cotal: Plugin = async () => {
    *  must never happen is the slot reaching EMPTY while a caller's wake is still owed, because then
    *  no pull is ever triggered. The invariant is that at least one wake survives to fire, not that
    *  every wake is preserved. */
-  let pendingOverride: string | undefined;
+  let pendingWake: string | undefined;
   // BUMPED ON EVERY WRITE to the slot above. Value equality cannot stand in for identity here: two
   // @mentions from the same sender produce a BYTE-IDENTICAL nudge, so comparing the strings would
-  // report "still mine" about a different caller's input in exactly the case that matters.
-  let overrideSeq = 0;
+  // report "still the one I submitted" about a wake that arrived while the submission was in flight.
+  let wakeSeq = 0;
+  // WHAT THE CURRENT TURN SUBMITTED, so a `session.error` after a landed submission (#715) can tell
+  // whether a wake rode this turn. `pendingWake` cannot answer that: it is cleared once the
+  // submission lands, which is correct for a turn that finishes but leaves nothing for the error arm
+  // to re-arm from. Set beside that clear, read only by the `session.error` arm, and cleared by
+  // whichever of them runs first (the turn cannot both finish and fail).
+  let submittedWake: string | undefined;
   /**
    * Interactive work that has been admitted and has not finished. Teardown waits for THIS before it
    * attempts departure, which is a different thing from refusing new work: the fence closes the
@@ -515,11 +622,10 @@ export const cotal: Plugin = async () => {
   // hijacked or absent control plane.
   let controlServer: ReturnType<typeof startControlServer> | undefined;
   /**
-   * THE ONE TEARDOWN, because there are two ways out and an invariant that holds on one of them
-   * is not an invariant. `dispose` is the editor unloading the plugin; `shutdown` is the manager
-   * stopping a supervised seat over the control socket, which is the path a managed agent
-   * actually takes. Both must give the event work a bounded chance to settle before the process
-   * stops, so that wait lives here and neither caller owns a copy of it.
+   * THE ONE TEARDOWN, because a running seat stops in more than one way and an invariant that holds
+   * on only some of them is not an invariant. Every way it stops goes through `shutdown` and so
+   * through here, and each must give the event work a bounded chance to settle before the process
+   * stops, so that wait lives here and no caller owns a copy of it.
    *
    * A queued swap still holds a drain that flushes and closes a run, and it runs on its own chain
    * rather than on this one, so without waiting for it a stop can be followed by frames for a session
@@ -565,11 +671,10 @@ export const cotal: Plugin = async () => {
    *
    * THE PRINCIPAL LOCK GOES BACK ON THE LINE AFTER THEM, and this is the only place it does. A
    * lock is per PRINCIPAL while a holder is per THREAD, so a `/new` must keep it for the session
-   * that follows; only the final teardown may hand it back. Both ways out reach this routine, so a
-   * dispose that leaves its host process alive releases it exactly as a supervised stop does. That
-   * was the reachable failure: the lock was taken and never released, so its record went on naming
-   * a pid that was alive and no longer publishing, and a replacement process for this principal was
-   * refused its own event plane.
+   * that follows; only the final teardown may hand it back. Every stop reaches this routine, so a
+   * dispose releases it exactly as a supervised stop does. That was the reachable failure: the lock
+   * was taken and never released, so its record went on naming a pid that was alive and no longer
+   * publishing, and a replacement process for this principal was refused its own event plane.
    */
   const quiesce = async (): Promise<void> => {
     stopping = true;
@@ -603,12 +708,20 @@ export const cotal: Plugin = async () => {
     // so a straggler here can publish or SEND around it rather than merely out of order. An earlier
     // version of the generic line claimed the abandoned work was terminally silent, and this note
     // existed to contradict it; the contradiction is gone now that the line itself is accurate.
-    if (!settled)
+    if (!settled) {
       log(
         `admitted work outlived the ${INTAKE_SETTLE_MS}ms intake bound: the teardown stops waiting and ` +
           `ATTEMPTS the departure publish next, which is best effort and may not land; that work is ` +
           `NOT cancelled either, so it may still publish or send afterwards`,
       );
+      // AND THE ATTEMPT HAS TO BE ABLE TO RUN, which is a second thing from having stopped waiting.
+      // Presence writes are serialized agent-side, so departure would queue behind exactly the write
+      // this bound just abandoned: the wait ends, the publish does not happen, and the bound buys
+      // nothing. Releasing the chain here is what makes the line above true. It is deliberately
+      // inside this branch, because on the settled path the chain is already drained and departure
+      // must keep its ordering behind every write that DID land.
+      agent.abandonPresenceWrites();
+    }
     await safeStatus("offline");
     await settleWithin(swapChain, SWAP_SETTLE_MS, "swap chain at teardown");
     await settleWithin(events?.close(), SWAP_SETTLE_MS, "event holder at teardown");
@@ -617,16 +730,16 @@ export const cotal: Plugin = async () => {
     await agent.stop();
   };
   /**
-   * The manager's cooperative stop. `process.exit` is deliberately AFTER the shared teardown and
-   * not beside it: it used to sit in a `finally` around the presence and agent stop only, so it
-   * ran even when those threw and it ran before any event work could finish. An exit that cannot
-   * be delayed by the teardown is an exit that cannot honour it.
+   * Every way a running seat stops calls this, and an event plane that stopped for good on a space
+   * that requires events exits 1 through it. `process.exit` waits for the whole shared teardown,
+   * because an exit the teardown cannot delay cannot honour it. It runs once `quiesce` settles,
+   * whether it resolves or rejects, so a teardown that throws still ends the process.
    */
-  const shutdown = async (): Promise<void> => {
+  const shutdown = async (code = 0): Promise<void> => {
     try {
       await quiesce();
     } finally {
-      process.exit(0);
+      process.exit(code);
     }
   };
   if (control) {
@@ -740,50 +853,6 @@ export const cotal: Plugin = async () => {
   }
 
   /**
-   * A BOUNDED WAIT, and the bound is the whole point of it.
-   *
-   * Every swap queues behind the one before it, so a single step that never settles does not stall
-   * one session, it stalls every session swap for the life of the process and the plane goes quiet
-   * with nothing saying why. What is waited on ends in a broker publish, which is exactly the kind
-   * of work that hangs rather than fails.
-   *
-   * Waiting forever and giving up quietly are both worse than this. Giving up is SAID: the caller
-   * learns it did not settle, the line names the consequence rather than the timer, and it carries a
-   * token a cell can key on, so a plane that degraded is distinguishable from one that worked.
-   *
-   * THROWING WAS THE OTHER CANDIDATE AND IT WAS MEASURED, not argued. The chain itself is protected,
-   * `swapChain = swap.catch(...)` absorbs a rejection and the next swap still runs. But the same
-   * promise is awaited again by the invocation that created it, and the bus dispatches this handler
-   * as `void hook.event(...)`, so that second consumer turns the rejection into an UNHANDLED one.
-   * On node 22 an unhandled rejection terminates the process, which here is the editor the plugin
-   * is running inside. Reproduced in isolation with the same four lines: the process died and the
-   * liveness line after it never printed. So a throw does not fail loudly, it takes the host with
-   * it, and the repo's throw-rather-than-degrade rule does not ask for that.
-   */
-  async function settleWithin(work: Promise<unknown> | undefined, ms: number, what: string): Promise<boolean> {
-    if (work === undefined) return true;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const expired = new Promise<boolean>((resolve) => {
-      timer = setTimeout(() => resolve(false), ms);
-      timer.unref?.();
-    });
-    try {
-      const settled = await Promise.race([work.then(() => true, () => true), expired]);
-      if (!settled)
-        log(
-          `${SETTLE_ABANDONED} ${what} did not settle within ${ms}ms, so it is abandoned: the WAIT ` +
-            `stopped, the work did not, and nothing here can cancel it. It may still publish, ` +
-            `possibly after frames from whatever replaced it, and a run it had open may stay open. ` +
-            `Ordering is guaranteed for a step that settles inside the bound, not for this one. The ` +
-            `plane continues rather than wedging every later step behind it.`,
-        );
-      return settled;
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-    }
-  }
-
-  /**
    * A swap must not prompt into the new session halfway through its own cutover. `drive` is a TURN
    * SUBMISSION rather than an event-plane consumer, so routing by the holder's binding does not
    * reach it: started mid-cutover it runs against the new id while the replacement holder is not
@@ -805,7 +874,7 @@ export const cotal: Plugin = async () => {
     driving = false;
     primed = false;
     briefed = false;
-    surfaced = [];
+    abandonSurfaced();
     awaitingTurnEnd = false;
     clearInterruptIntent();
     clearErrorRetry(true);
@@ -842,12 +911,6 @@ export const cotal: Plugin = async () => {
     return sessionID ?? (await sessionReady);
   }
 
-  /** Drive a turn carrying the current inbox batch (and the boot briefing once) into the visible
-   *  session via the server API — server-side, so it can't race like the TUI input box, and the TUI
-   *  renders it live (it subscribes to that session's events). Surfaces the items but does NOT ack
-   *  them — ackSurfaced runs on turn completion, so a crash/error redelivers. `override` replaces
-   *  the body (a bare nudge, e.g. a focus @mention pull) and surfaces nothing to ack. Self-guards
-   *  re-entrancy and never prompts into a running turn (opencode would COALESCE onto it). */
   /** THE PHASE REFUSAL, as one predicate read twice rather than two copies of the same condition.
    *  `drive` reads it on entry and again after session creation resumes, and both readings have to
    *  mean the same thing: a copy is what lets a later change update one site and leave the other
@@ -874,9 +937,16 @@ export const cotal: Plugin = async () => {
    *  It answers WHETHER there is work, not HOW MUCH: the nudge slot holds at most one wake, so two
    *  callers' nudges read here as one. That is sound only because a wake is a hint rather than
    *  content; see the note on the slot itself. */
-  const workPending = (): boolean => bootPending() || pendingOverride !== undefined || pendingForWake() > 0;
+  const workPending = (): boolean => bootPending() || pendingWake !== undefined || pendingForWake() > 0;
 
-  async function drive(override?: string): Promise<void> {
+  /** Drive a turn carrying the current inbox batch (and the boot briefing once) into the visible
+   *  session via the server API — server-side, so it can't race like the TUI input box, and the TUI
+   *  renders it live (it subscribes to that session's events). Surfaces the items but does NOT ack
+   *  them — ackSurfaced runs on turn completion, so a crash/error redelivers. A pending wake
+   *  (`pendingWake`, a bare nudge for a focus @mention pull) replaces the body and surfaces nothing
+   *  to ack; it is read here and cleared only once its submission lands. Self-guards re-entrancy and
+   *  never prompts into a running turn (opencode would COALESCE onto it). */
+  async function drive(): Promise<void> {
     // THE REFUSALS LIVE HERE, at the one place this connector submits a turn, rather than at each
     // caller.
     //
@@ -889,31 +959,22 @@ export const cotal: Plugin = async () => {
     // Listing which callers are covered is what let that through; the condition is the state, so a
     // caller that reaches this line is refused by it. A prompt submitted natively in the host does
     // not route through `drive` at all; the fence note on the hook table below covers that path.
-    if (phaseClosed() || driving || busy) {
-      if (override !== undefined) {
-        pendingOverride = override;
-        overrideSeq += 1;
-      }
-      return;
-    }
+    // A refusal holds nothing: a pending wake stays in `pendingWake`, and the next turn end or wake
+    // drives it.
+    if (phaseClosed() || driving || busy) return;
     // THE BOOT TURN GOES FIRST AND IS RETRIED HERE. While it is pending, other work waits; once its
     // preconditions are met, whichever wake reaches this line carries it, so one early return no
     // longer decides whether the operator's prompt is ever submitted. "Other work" is not only an
-    // inbox batch: a focus @mention arrives as a nudge with no inbox entry behind it, so calling
-    // this a batch was wrong and the line that waits has to hold the nudge rather than discard it.
-    // CARRIED, not just passed: a nudge handed to an earlier call that could not run is picked up
-    // here rather than dropped, and a nudge this call cannot submit is put back before returning.
-    // "Picked up rather than dropped" is about the SLOT, not about every individual nudge: a later
-    // wake can overwrite an earlier one, which costs nothing because the wake is a hint and the
-    // bodies are recovered by the pull it triggers.
-    const carried = override ?? pendingOverride;
-    // WHAT THIS CALL IS ENTITLED TO CLEAR. Only a call that TOOK the value out of the slot may clear
-    // it, and only while no one has written since. A call handed its own `override` leaves whatever
-    // was parked for someone else alone.
-    const tookFromSlot = override === undefined && carried !== undefined;
-    const carriedSeq = overrideSeq;
-    // THE BOOT TEXT IS CARRIED WHENEVER THE BOOT IS PENDING, WITH OR WITHOUT A WAKE IN HAND, and
-    // the "with" is the whole correction. This line read `carried === undefined && bootPending()`,
+    // inbox batch: a focus @mention is a nudge with no inbox entry behind it, and it waits in
+    // `pendingWake` rather than in this call.
+    //
+    // READ, NOT TAKEN. The slot keeps the wake until a submission carrying it lands, so every return
+    // and the catch below leave it pending with nothing to put back. The generation is read with it
+    // so the clear after the submission can tell a wake that arrived meanwhile from this one.
+    const carried = pendingWake;
+    const carriedSeq = wakeSeq;
+    // THE BOOT TEXT IS CARRIED WHENEVER THE BOOT IS PENDING, WITH OR WITHOUT A WAKE PENDING, and the
+    // "with" is the whole correction. This line once read `carried === undefined && bootPending()`,
     // so a call holding a nudge took no boot text, fell into the branch below, and parked the nudge
     // straight back. Nothing could then empty the slot: emptying it takes a submission, a submission
     // takes `bootPrompt` cleared, and clearing it takes the boot submission this branch had just
@@ -923,22 +984,14 @@ export const cotal: Plugin = async () => {
     // before it was changed: the seat stayed online, nothing was logged, and the operator's own
     // spawn prompt was never submitted.
     const boot = bootPending() ? bootPrompt : undefined;
-    if (bootPrompt !== undefined && boot === undefined) {
-      pendingOverride = carried;
-      overrideSeq += 1;
-      // The boot text EXISTS but is not ready yet (no session, or the mesh link is still coming up),
-      // so there is nothing to compose with and whatever this call carried is held, not dropped. The
-      // boot task's own drive is what reaches the line above once the preconditions are met.
-      return;
-    }
+    // The boot text EXISTS but is not ready yet (no session, or the mesh link is still coming up), so
+    // there is nothing to compose with. The boot task's own drive reaches this line once the
+    // preconditions are met, and a pending wake waits in its slot until then.
+    if (bootPrompt !== undefined && boot === undefined) return;
     driving = true;
     try {
       const id = await ensureSession();
-      if (!id) {
-        pendingOverride = carried;
-        overrideSeq += 1;
-        return; // no visible session yet, retry on the next event/wake
-      }
+      if (!id) return; // no visible session yet, retry on the next event/wake
       // RECHECKED AFTER THE AWAIT, because the guard above is a read and this is a resume. Session
       // creation is a server round trip, so a drive admitted while the seat was running can park
       // here and come back after `quiesce` has set `stopping` and published departure. Submitting
@@ -950,11 +1003,7 @@ export const cotal: Plugin = async () => {
       // of the promise. A batch still held when the seat tears down does not survive the process:
       // measured, by restarting the identity on a fresh uid and then on the same one and finding the
       // message was owed to neither. Durability across a stop is a delivery question, not this one.
-      if (phaseClosed()) {
-        pendingOverride = carried;
-        overrideSeq += 1;
-        return;
-      }
+      if (phaseClosed()) return;
       const parts: { type: "text"; text: string }[] = [];
       let ids: string[] = [];
       // COMPOSED, NOT CHOSEN BETWEEN, and that is what lets a wake arrive at ANY point relative to
@@ -991,28 +1040,29 @@ export const cotal: Plugin = async () => {
       // persona once, as system (no --append-system-prompt). Append the orientation bootstrap so the
       // agent is told to orient first — gated on persona so we never replace OpenCode's default system.
       if (!primed && persona) body.system = `${persona}\n\n${ORIENTATION_BOOTSTRAP}\n\n${MESH_FIRST_STEER}\n\n${WORKFLOW_STEER}`;
+      if (!surface(ids)) return; // at the in-flight ceiling: the batch stays queued for a later turn
       busy = true;
-      surfaced = ids;
       // Arm BEFORE the await: a turn-end signal can land before the server request resolves, and
       // completeTurn bails unless armed — arming after would drop it and wedge the agent.
       awaitingTurnEnd = true;
       await opencodeApi(`/session/${encodeURIComponent(id)}/prompt_async`, { method: "POST", body: JSON.stringify(body) }, 10_000);
       // The submission landed with the run turns in its prompt — they are surfaced.
       if (turnIds.length) agent.commitSurfacedTurns(turnIds);
-      // CLEARED ONLY HERE, once the submission actually landed, so no early return can lose the wake
-      // it was carrying. Each return parks it explicitly and the catch does too, so every exit from
-      // this function either submits the wake or leaves it pending for the next drive.
+      // WHAT THIS TURN CARRIED, so the `session.error` arm can re-arm it if this turn fails instead
+      // of finishing (#715). `undefined` when no wake rode this submission.
+      submittedWake = carried;
       if (boot !== undefined) bootPrompt = undefined;
-      // OWNERSHIP-CHECKED, because the slot is shared and this clear sits AFTER an await. The value
-      // was read before that await; while it was outstanding another caller can have reached the
-      // entry guard and parked its OWN nudge here. Clearing on the strength of what THIS call took
-      // would then discard a different call's input, which is a lost update across an await and
-      // exactly the case the early returns exist to prevent.
+      // THE ONLY WRITE `drive` MAKES TO THE WAKE SLOT, and it sits after the submission landed, so
+      // every other exit leaves the wake pending for the next drive.
+      //
+      // GENERATION-CHECKED, because this clear sits AFTER an await. The value was read before that
+      // await; while it was outstanding the `mention-wake` handler can have written a NEW wake here.
+      // Clearing on the strength of what THIS call read would then discard a wake that was never
+      // submitted, which is a lost update across an await.
       //
       // BY GENERATION, NOT BY VALUE, and that distinction is load-bearing rather than fastidious:
       // two @mentions from the same sender produce a byte-identical nudge, so a value comparison
-      // would say "still mine" about someone else's input in precisely the case this guards. A call
-      // handed its own `override` never took the slot at all and so may not clear it either.
+      // would say "already submitted" about the later wake in precisely the case this guards.
       //
       // ONE SLOT IS DELIBERATE, NOT AN OVERSIGHT. A wake is not content: an @mention in focus is
       // acked at ingest, and where the channel permits replay it stays recallable, so any single
@@ -1021,23 +1071,16 @@ export const cotal: Plugin = async () => {
       // have observed, while erasing the LAST one loses the pull entirely. The
       // invariant is that at least one wake survives to fire, which this predicate gives; a queue
       // would preserve duplicates of an identical hint and buy nothing.
-      if (tookFromSlot && overrideSeq === carriedSeq) pendingOverride = undefined;
+      if (carried !== undefined && wakeSeq === carriedSeq) pendingWake = undefined;
       briefed = true;
       primed = true;
     } catch (e) {
       busy = false;
-      surfaced = [];
+      abandonSurfaced();
       awaitingTurnEnd = false;
-      // THE EXIT THAT IS NOT A RETURN, and the one this was missing. Each guarded return above puts
-      // the input back by hand; a failed submission left through here and put nothing back. That was
-      // only survivable for an input already parked: a wake nudge arrives as the PARAMETER, and
-      // `pendingOverride` is cleared just below on success, so on this path there was nothing
-      // holding it. `scheduleErrorRetry` then read `workPending()` as false, because a focus
-      // @mention has no boot text, nothing parked, and no inbox entry (its body is acked-and-dropped
-      // at ingest), so the seat was never retried and never told to go and look. Parking it here is
-      // what makes the retry below have something to carry.
-      pendingOverride = carried;
-      overrideSeq += 1;
+      // NOTHING TO PUT BACK. A failed submission did not land, so the wake it carried, and any wake
+      // that arrived while it was in flight, is still in `pendingWake`, and `workPending()` gives the
+      // retry below something to carry.
       log(`drive failed: ${(e as Error).message}`);
       scheduleErrorRetry();
     } finally {
@@ -1083,12 +1126,47 @@ export const cotal: Plugin = async () => {
   function ackSurfaced(): void {
     if (surfaced.length === 0) return;
     agent.drainInboxDeliveries(surfaced);
+    abandonSurfaced();
+  }
+
+  /** Stop holding the surfaced batch: its deliveries are no longer renewed, so whatever is still
+   *  unacked redelivers once its ack wait runs out. */
+  function abandonSurfaced(): void {
+    agent.releaseInFlight(surfaced);
     surfaced = [];
   }
 
-  function abandonSurfaced(): void {
-    surfaced = [];
+  /** Make `ids` the surfaced batch, HELD IN FLIGHT for as long as its turn runs. A turn outlasting
+   *  the consumer's ack wait is ordinary, and while the batch is held the agent restarts that wait,
+   *  so the broker does not hand a role request this seat is still working on to another reader of
+   *  its role. Refused at the hold ceiling, and then nothing may be surfaced. */
+  function surface(ids: string[]): boolean {
+    if (!agent.holdInFlight(ids)) return false;
+    agent.releaseInFlight(surfaced);
+    surfaced = ids;
+    return true;
   }
+
+  /**
+   * The turn end a session is still settling: the close whose position read has not answered. A
+   * next turn admitted before it answers puts the terminal after that turn's records, so every
+   * path that admits one waits here first: the event arms for the driven turn, and the prompt hook
+   * for a native one typed into the TUI or posted to the server.
+   */
+  const turnEnds = new Map<string, Promise<void>>();
+  const turnEnded = async (session: string | undefined, close: Promise<void> | undefined): Promise<void> => {
+    if (!close) return;
+    if (session === undefined) return close; // a session-less error names no session for a prompt to wait on
+    // Every turn end still settling, not the latest alone: one turn can end twice, by its error and
+    // by the idle that follows, and the later read can answer first, so the new barrier chains on
+    // the one held and removes itself only while it is still the entry.
+    const settled = Promise.all([turnEnds.get(session), close]).then(() => undefined);
+    const barrier = settled.finally(() => {
+      if (turnEnds.get(session) === barrier) turnEnds.delete(session);
+    });
+    turnEnds.set(session, barrier);
+    await barrier;
+  };
 
   /** Native TUI / API prompts enter through OpenCode's chat.message hook before the model loop
    *  starts. This is the real "next turn" boundary for human-typed input: prepend the buffered Cotal
@@ -1096,22 +1174,17 @@ export const cotal: Plugin = async () => {
    *  text part so we don't need to manufacture OpenCode's internal part IDs. */
   function injectIntoPrompt(output: { parts?: unknown[] }): void {
     if (driving || awaitingTurnEnd) return; // drive() already injected, or one surfaced batch is open
-    const items = agent.peekInbox("automatic");
-    const turnPeek = agent.peekPendingTurns();
-    if (items.length === 0 && !turnPeek) return;
-    const inj = items.length > 0 ? formatInjection(items) : undefined;
-    if (!inj && !turnPeek) return;
+    const computed = computeInjection(agent);
+    if (!computed) return;
     const textPart = output.parts?.find(
       (p): p is { type: "text"; text: string } =>
         typeof p === "object" && p !== null && (p as { type?: unknown }).type === "text" && typeof (p as { text?: unknown }).text === "string",
     );
-    if (!textPart) return;
-    const prefix = [inj, turnPeek?.text].filter(Boolean).join("\n\n");
-    textPart.text = `${prefix}\n\n${textPart.text}`;
+    if (!textPart || !surface(computed.surfacedIds)) return;
+    textPart.text = `${computed.prefix}\n\n${textPart.text}`;
     // The mutation IS the delivery here — the human's prompt runs with the prefix in place.
-    if (turnPeek) agent.commitSurfacedTurns(turnPeek.goalIds);
-    if (inj) {
-      surfaced = items.map((i) => i.recvKey);
+    if (computed.turnIds.length) agent.commitSurfacedTurns(computed.turnIds);
+    if (computed.surfacedIds.length) {
       awaitingTurnEnd = true;
       busy = true;
     }
@@ -1131,6 +1204,7 @@ export const cotal: Plugin = async () => {
       awaitingTurnEnd = false;
       ackSurfaced(); // our driven turn: ack the surfaced batch (the sole ack site)
     }
+    submittedWake = undefined; // the turn delivered — nothing left to re-arm (#715)
     clearInterruptIntent();
     clearErrorRetry(true);
     if (workPending()) void drive();
@@ -1150,15 +1224,17 @@ export const cotal: Plugin = async () => {
   agent.on("mention-wake", (item: InboxItem) => {
     // Focus: the @mention body was acked-and-dropped at ingest — wake a turn to PULL it (recall).
     //
-    // NO `busy` GUARD HERE, and its absence is the point rather than an omission. The handler above
-    // may return on `busy` because an `incoming` body is BUFFERED: it sits in the inbox and the next
+    // RECORDED FIRST AND UNCONDITIONALLY, whatever state the seat is in. The handler above may
+    // return on `busy` because an `incoming` body is BUFFERED: it sits in the inbox and the next
     // drive peeks it, so declining to drive now defers the work. This wake has nothing behind it:
     // the body was acked and dropped at ingest, so the nudge is the only copy this process will ever
-    // hold, and returning here does not defer it, it destroys it. `completeTurn` would then see
-    // `pendingForWake() === 0` and no parked override, so no later drive carries it and the seat is
-    // never told to look. Handing it to `drive` unconditionally is what makes the guard cost a
-    // retry instead of the wake: a refused call parks it in the slot and the next turn end drives it.
-    void drive(`📨 You were mentioned by ${fmtFrom(item)} on #${fmtChannel(item.channel)} — read it with cotal_inbox.`);
+    // hold, and not recording it does not defer it, it destroys it. `completeTurn` would then see
+    // `pendingForWake() === 0` and no pending wake, so no later drive carries it and the seat is
+    // never told to look. Written here, the wake is held whether or not the drive below can run: a
+    // refused or failed drive leaves it pending and the next turn end drives it.
+    pendingWake = `📨 You were mentioned by ${fmtFrom(item)} on #${fmtChannel(item.channel)} — read it with cotal_inbox.`;
+    wakeSeq += 1;
+    void drive();
   });
   agent.on("wake", () => {
     if (!busy) void drive();
@@ -1178,12 +1254,13 @@ export const cotal: Plugin = async () => {
   };
 
   /**
-   * EVERY WAY IN THROUGH THIS HOOK TABLE, FENCED BY MEMBERSHIP IN IT. The tool map is intake too, it
-   * does not arrive through this table, and it is fenced separately at its own wrap below. Once
-   * teardown has begun, admitting more work undoes the teardown: a late `permission.asked` or tool
-   * hook republishes presence over the offline record `quiesce` exists to publish, a part or idle
-   * enqueues holder work after the join has already snapshotted it, and a late `session.created`
-   * extends the very chain the join is waiting on.
+   * EVERY WAY IN THROUGH THIS HOOK TABLE, FENCED BY MEMBERSHIP IN IT. The tool map and the prompt
+   * hook are intake too and do not go through this table, because returning nothing refuses neither
+   * of them, so each is fenced at its own entry in `hooks` below. Once teardown has begun, admitting
+   * more work undoes the teardown: a late `permission.asked` or tool hook republishes presence over
+   * the offline record `quiesce` exists to publish, a part or idle enqueues holder work after the
+   * join has already snapshotted it, and a late `session.created` extends the very chain the join is
+   * waiting on.
    *
    * The refusal is applied by CONSTRUCTION rather than written at each entry, because writing it at
    * each entry is the mistake this file has now made twice: the guard was correct for every caller
@@ -1195,17 +1272,8 @@ export const cotal: Plugin = async () => {
    * hook when the flag flips; that work is what the joins in `quiesce` cover, and a hook that had
    * already passed this point still runs. The two together are the claim, and neither is it alone.
    *
-   * AND IT FENCES THIS CONNECTOR, NOT THE EDITOR. `@opencode-ai/plugin`'s `index.d.ts` types
-   * `chat.message` as `(input, output: { message; parts }) => Promise<void>`. A fenced hook
-   * returning early is that hook completing, and the `output` it was handed names no cancel and no
-   * skip, so this table does not stop a prompt submitted through the editor. Two hooks in that same
-   * file are handed one: `permission.ask` gets `status`, and `experimental.compaction.autocontinue`
-   * gets `enabled`, its doc comment saying `false` skips the synthetic continue turn. This
-   * connector implements neither. Cancelling a native turn would take the SDK's session `abort`,
-   * which this teardown does not call.
-   *
-   * WHETHER SUCH A TURN'S EVENTS SURVIVE IS TIMING. `quiesce` calls `agent.stop()` last, after the
-   * intake wait, the offline publish and the two settles, so holder work already queued when this
+   * WHETHER A RUNNING TURN'S EVENTS SURVIVE IS TIMING. `quiesce` calls `agent.stop()` last, after
+   * the intake wait, the offline publish and the two settles, so holder work already queued when this
    * flag flipped can still settle and publish through an endpoint that is still up. Work arriving
    * afterwards is refused at this table.
    */
@@ -1242,15 +1310,6 @@ export const cotal: Plugin = async () => {
     );
 
   const intake = {
-    "chat.message": async (input, output) => {
-      if (!ours(input.sessionID)) return;
-      // OpenCode exposes the selected model only on this prompt hook. Do not invent a pre-turn
-      // default: before the first prompt the dashboard truthfully shows "not reported".
-      if (input.model)
-        await track(agent.setModel(`${input.model.providerID}/${input.model.modelID}`, input.variant));
-      injectIntoPrompt(output);
-    },
-
     event: async ({ event }) => {
       // The server emits `permission.asked` (the SDK's `permission.updated` type ships but never
       // fires — #11616), so match the real runtime name out of band. With permission:"allow" this
@@ -1346,7 +1405,12 @@ export const cotal: Plugin = async () => {
           // Both land on the holder's chain in the order they were enqueued, so closing first would
           // terminate a run the records that follow still belong to.
           eventsFor(sessionID)?.flush(sessionID);
-          eventsFor(sessionID)?.closeRun(Date.now());
+          // The close's position read is awaited BEFORE the next turn is admitted, on every path
+          // that admits one: this arm for the driven turn, and the prompt hook for a native one.
+          // The position is the session's messages over HTTP, and a next prompt that lands before
+          // that read answers puts the terminal after the next turn's records, which closes that
+          // turn with it: a failed turn closed as a finish and its successor as the error.
+          await turnEnded(idleSession, eventsFor(sessionID)?.closeRun(Date.now()));
           await safeStatus("idle");
           completeTurn(); // the sole turn-end site: ack-on-surface + drive the next batch
           break;
@@ -1396,12 +1460,26 @@ export const cotal: Plugin = async () => {
           // so a reader can tell it from a turn that finished; an interrupted one closes with no
           // outcome, which says the run ended and does not claim it succeeded. `RUN_ERROR` closes a
           // run by itself, so no second terminal follows it.
-          eventHolder?.closeRun(Date.now(), interrupted ? undefined : runErrorOf(event.properties.error));
+          // Awaited for its position read, as the idle arm does, before the next turn is admitted.
+          await turnEnded(sessionID, eventHolder?.closeRun(Date.now(), interrupted ? undefined : runErrorOf(event.properties.error)));
           busy = false;
           if (awaitingTurnEnd) {
             awaitingTurnEnd = false;
-            if (interrupted) ackSurfaced(); // explicit user Stop/Cancel: treat the surfaced batch as dismissed, not failed
-            else abandonSurfaced(); // failed turn: leave inbox unacked so the batch can retry on a later safe turn
+            if (interrupted) {
+              ackSurfaced(); // explicit user Stop/Cancel: treat the surfaced batch as dismissed, not failed
+              submittedWake = undefined; // dismissed the same way as the batch it rode with, not re-armed
+            } else {
+              abandonSurfaced(); // failed turn: leave inbox unacked so the batch can retry on a later safe turn
+              // RE-ARM THE WAKE (#715): a landed submission clears `pendingWake`, so a turn that
+              // then fails would leave `workPending()` false and the retry below a no-op, unlike a
+              // submission that never lands, which leaves the wake pending. Only into an empty slot:
+              // a wake that arrived during the turn is already pending and is not overwritten.
+              if (submittedWake !== undefined && pendingWake === undefined) {
+                pendingWake = submittedWake;
+                wakeSeq += 1;
+              }
+              submittedWake = undefined;
+            }
           }
           await safeStatus("idle");
           if (!interrupted) scheduleErrorRetry();
@@ -1438,15 +1516,34 @@ export const cotal: Plugin = async () => {
     tool: fenceTools(buildCotalTools(agent, config)),
     ...fence(intake),
 
-    // The editor unloading the plugin. Same teardown as the manager's stop, minus the exit: see
-    // `quiesce`, which owns the join so that neither exit can drift from the other.
-    //
-    // NO CELL GRADES THE dispose CALLER SPECIFICALLY. The shared routine is graded through the
-    // manager's cooperative stop, which is the path a supervised seat takes and the one that has a
-    // harness; this caller reaches the same code. Filed as #632.
-    dispose: async () => {
-      await quiesce();
+    // THE PROMPT HOOK IS REFUSED BY REJECTING, because a hook that returns lets the prompt through.
+    // `chat.message`'s output names no cancel and no skip, but OpenCode awaits this hook before it
+    // saves the user message or starts the model loop, and a rejection fails the prompt there. So a
+    // prompt typed into the editor or posted to the server after the stop began starts no turn.
+    // Session `abort` cannot stand in for it: an idle session has no run yet for the abort to find.
+    // A turn already running when the stop began is not cancelled.
+    "chat.message": async (input, output) => {
+      if (stopping) throw new Error("the prompt was not run: this seat is shutting down");
+      if (!ours(input.sessionID)) return;
+      // A NATIVE PROMPT WAITS FOR EVERY TURN END STILL SETTLING. OpenCode awaits this hook before it
+      // saves the user message, so a prompt held here lands after the close's position read has
+      // answered, and the terminal keeps its own turn. A turn end reported while the prompt waits
+      // replaces the map entry, so the prompt follows each replacement until none remains.
+      for (let barrier = turnEnds.get(input.sessionID); barrier !== undefined; barrier = turnEnds.get(input.sessionID))
+        await barrier;
+      // OpenCode exposes the selected model only on this prompt hook. Do not invent a pre-turn
+      // default: before the first prompt the dashboard truthfully shows "not reported".
+      if (input.model)
+        await track(agent.setModel(`${input.model.providerID}/${input.model.modelID}`, input.variant));
+      injectIntoPrompt(output);
     },
+
+    // The host disposing this plugin's instance, which it does with its process still serving (a
+    // global config change, `POST /instance/dispose`). The next request loads the plugin again and
+    // gets the cached hooks back, so a dispose that left the process running would leave it serving
+    // a stopped seat. Nothing the teardown closes can be taken again in-process (the launch material
+    // is scrubbed at boot), so a dispose ends the process the way the manager's stop does.
+    dispose: shutdown,
   };
 
   guard.__cotalOpencodeHooks = hooks;

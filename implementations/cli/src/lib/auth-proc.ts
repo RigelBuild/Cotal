@@ -8,22 +8,22 @@
  */
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { closeSync, existsSync, ftruncateSync, linkSync, openSync, readdirSync, readFileSync, rmSync, writeSync } from "node:fs";
+import { closeSync, linkSync, openSync, readdirSync, readFileSync, rmSync, writeSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import { type AuthPrepared } from "@cotal-ai/core";
 import { spaceKey } from "@cotal-ai/workspace";
-import { parsePid, probeLiveness, type LivenessProbe, identityLegacyWarning, identityRefusal, identityUncertaintyRefusal, removeIdentityPin, verifyIdentityPin, writeIdentityPin } from "@cotal-ai/workspace";
-import type { SignalFn } from "./manager-proc.js";
+import { parsePid, probeLiveness, readPidfile, writePidPair, type LocalProcess } from "@cotal-ai/workspace";
+import { stopLocalProcess } from "./local-process-stop.js";
 
 import { selfArgv } from "./self-exec.js";
-import { cotalPath } from "./paths.js";
+import { cotalPath, cotalRoot } from "./paths.js";
 
 const PID_PATH = (space: string) => cotalPath(`auth-service.${spaceKey(space)}.pid`);
 const LOG_PATH = (space: string) => cotalPath(`auth-service.${spaceKey(space)}.log`);
 
 /** The pidfile to READ for a space's auth service: the canonical hex name, or the pre-hex
- *  `auth-service.<encoded>.pid` a build before the re-key wrote. `up`'s restart and its stop read
- *  this so an upgrade never orphans the live callout SIGNER of a pre-upgrade auth-service. Byte-
+ *  `auth-service.<encoded>.pid` a build before the re-key wrote. `up`'s restart reads this so an
+ *  upgrade never orphans the live callout SIGNER of a pre-upgrade auth-service. Byte-
  *  exact (a bare `existsSync` case-folds a sibling space's file on macOS/Windows); both present is
  *  ambiguous and fails loud. Starts always WRITE the canonical PID_PATH. */
 function readPidPath(space: string): string {
@@ -63,7 +63,8 @@ export function reclaimDeadLegacyPid(space: string): void {
   } catch {
     return; // parent dir gone → nothing to reclaim
   }
-  const trimmed = readFileSync(legacy, "utf8").trim();
+  const trimmed = readPidfile(legacy);
+  if (trimmed === undefined) return; // removed since the listing → nothing to reclaim
   if (trimmed === "") {
     rmSync(legacy, { force: true }); // empty = pre-protocol husk, safe to reclaim (as the canonical claim does)
     return;
@@ -87,9 +88,9 @@ export function reclaimDeadLegacyPid(space: string): void {
 
 /** True if the auth service we started for THIS space is still running (pid file + liveness). */
 export function authServiceUp(space: string): boolean {
-  const p = readPidPath(space);
-  if (!existsSync(p)) return false;
-  const pid = parsePid(readFileSync(p, "utf8")); // strict positive safe integer, or undefined
+  const raw = readPidfile(readPidPath(space));
+  if (raw === undefined) return false;
+  const pid = parsePid(raw); // strict positive safe integer, or undefined
   return pid !== undefined && probeLiveness(pid) === "alive"; // up only if provably present; dead/unknown → not up
 }
 
@@ -147,17 +148,23 @@ export function claimAuthPidSlot(space: string): { fd: number } | { livePid: num
 }
 
 /** Start the provider's daemon command detached (pid + log space-scoped), stopped by `cotal down`.
- *  The pid slot is claimed exclusively FIRST ({@link claimAuthPidSlot}); a held or contested slot
- *  yields to the existing daemon (the caller's ready() poll adjudicates liveness). */
+ *  The pid slot is claimed exclusively before the spawn ({@link claimAuthPidSlot}); a held or
+ *  contested slot yields to the existing daemon (the caller's ready() poll adjudicates liveness). */
 function startAuthServiceDetached(space: string, server: string, command: string, extraArgs: string[] = []): number {
-  reclaimDeadLegacyPid(space); // a pre-hex crash leaves a dead legacy pidfile; clear it or the
-                               // canonical claim below produces the both-present wedge readPidPath refuses
+  // The entry is validated BEFORE any pidfile work (#1629). The claim below publishes a pidfile that
+  // already names THIS launcher, which is alive and is not an auth service, and the reclaim deletes a
+  // pre-hex record. A refusal after them left the root changed: the claimed record read as a running
+  // service, so a retry started nothing and waited on readiness with no daemon behind it, and
+  // teardown signalled whichever process held the launcher's pid.
+  //
+  // Then: a pre-hex crash leaves a dead legacy pidfile; clear it or the canonical claim produces the
+  // both-present wedge readPidPath refuses.
+  const [node, ...self] = selfArgv();
+  reclaimDeadLegacyPid(space);
   const slot = claimAuthPidSlot(space);
   if (slot === undefined) return 0;
   if ("livePid" in slot) return slot.livePid;
   try {
-    // Before the log is opened, for the reason startManagerDetached states (#1629).
-    const [node, ...self] = selfArgv();
     const fd = openSync(LOG_PATH(space), "a");
     // Internal child re-exec (the `up` that reached here already seeded); the auth service does not
     // launch agents, so it skips the connector seed on boot (a direct `cotal auth-service` still seeds).
@@ -168,15 +175,12 @@ function startAuthServiceDetached(space: string, server: string, command: string
     });
     closeSync(fd);
     child.unref();
-    // Replace the launcher pid with the daemon child's pid through the exclusively-created fd,
-    // never a re-open (truncate first: the fd position sits past the launcher pid).
-    ftruncateSync(slot.fd, 0);
-    writeSync(slot.fd, String(child.pid), 0);
-    // #969: pin the daemon child's pid to its process start. Written AFTER the pid content is the
-    // final one, so a torn pairing (pin names a different pid) is the crash window, never a launch
-    // state - and the verify below refuses a torn pairing loud.
-    writeIdentityPin(PID_PATH(space), child.pid ?? 0);
-    return child.pid ?? 0;
+    // Replace the launcher pid with the daemon child's pid: the pair is published by rename over
+    // the claimed name (#969/#1238), so a crash never leaves a torn pairing - the verify below
+    // refuses a torn pairing loud regardless.
+    if (!child.pid) throw new Error("auth service spawned with no pid");
+    writePidPair(PID_PATH(space), child.pid);
+    return child.pid;
   } finally {
     closeSync(slot.fd);
   }
@@ -189,9 +193,9 @@ function startAuthServiceDetached(space: string, server: string, command: string
  *  to a pid nobody can attribute. */
 function authServiceWaitPid(space: string, launched: number | undefined): number | undefined {
   if (launched !== undefined && launched > 0) return launched;
-  const p = readPidPath(space);
-  if (!existsSync(p)) return undefined;
-  const pid = parsePid(readFileSync(p, "utf8"));
+  const raw = readPidfile(readPidPath(space));
+  if (raw === undefined) return undefined;
+  const pid = parsePid(raw);
   return pid !== undefined && probeLiveness(pid) === "alive" ? pid : undefined;
 }
 
@@ -223,56 +227,20 @@ export async function ensureAuthService(opts: {
   }
 }
 
-/** Stop THIS space's auth service if we started one. Scoped by the space-carrying pid file — never
- *  a root-global kill. Honors the same attribution contract as {@link claimAuthPidSlot}: it only
- *  removes a record it can ACT on. An empty slot is a husk (nothing to signal, safe to clear); a
- *  positive PID is signalled then removed; unattributable content (garbled, or a non-positive value
- *  that would make `process.kill` signal a whole process GROUP) is NEVER removed and fails loud -
- *  silently dropping it would orphan a live signer behind a torn/tampered pidfile while reporting a
- *  clean stop. */
-export async function stopAuthService(space: string, probe: LivenessProbe = probeLiveness, signal?: SignalFn): Promise<void> {
-  const send: SignalFn = signal ?? ((pid, sig) => process.kill(pid, sig));
-  const p = readPidPath(space); // find a pre-hex pidfile too, or an upgrade leaks the signer
-  if (!existsSync(p)) return;
-  const trimmed = readFileSync(p, "utf8").trim();
-  if (trimmed === "") {
-    rmSync(p, { force: true }); // empty husk: no process to signal
-    return;
-  }
-  const pid = parsePid(trimmed);
-  if (pid === undefined)
-    throw new Error(
-      `auth-service pidfile ${p} holds unattributable content ${JSON.stringify(trimmed)} - refusing to remove a record for a process it cannot identify or signal; inspect or remove it manually`,
-    );
-  // #969 OPEN-VERIFY-TERMINATE: identity before signal, the same rule as the manager and delivery
-  // helpers. A reused pid fronts an unrelated process; torn or unreadable identity evidence refuses.
-  // A legacy record warns and proceeds so the first teardown after an upgrade remains possible.
-  const identity = verifyIdentityPin(p);
-  if (identity.kind === "mismatch") throw identityRefusal("the user-auth service", p, identity.record, identity.liveToken);
-  if (identity.kind === "legacy") console.error(identityLegacyWarning("the user-auth service", p));
-  else if (identity.kind !== "match" && identity.kind !== "gone") throw identityUncertaintyRefusal("the user-auth service", p, identity);
-  try {
-    send(pid, "SIGTERM");
-  } catch (e) {
-    // ESRCH = already gone, so removing its record is safe. EPERM (exists, another user's) or any
-    // other errno means we could NOT stop it - removing the record would orphan a live signer while
-    // reporting a clean stop, so preserve it and fail loud.
-    if ((e as NodeJS.ErrnoException).code !== "ESRCH")
-      throw new Error(
-        `could not stop auth-service (pid ${pid}) at ${p} (${(e as NodeJS.ErrnoException).code ?? "unknown error"}) - refusing to remove a record for a process it could not signal; stop it manually`,
-      );
-  }
-  // A signal ACCEPTED is not a death. This deleted the record immediately after SIGTERM, so a
-  // service that ignores or is slow to handle it was reported stopped while still running, with its
-  // pidfile gone. Same shape as the manager and delivery helpers; proven with a child that installs
-  // a no-op SIGTERM handler. Preserve the record unless death is confirmed.
-  const deadline = Date.now() + 15_000;
-  // AWAIT: same reaping hazard as stopManager. A blocked event loop never reaps the child.
-  while (probe(pid) !== "dead" && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
-  if (probe(pid) !== "dead")
-    throw new Error(
-      `auth-service (pid ${pid}) accepted SIGTERM but its death could not be confirmed; its pidfile at ${p} was preserved rather than recording a stop that did not happen - check \`ps -p ${pid}\``,
-    );
-  removeIdentityPin(p); // proven death: the pin goes with the pidfile (#969)
-  rmSync(p, { force: true });
+/** The user-auth service as a local process: `cotal down` and `up`'s teardown stop it through this one
+ *  descriptor, so both take the same reservation, identity check and SIGKILL escalation. */
+export const AUTH_PROCESS: LocalProcess = {
+  kind: "local-process",
+  name: "auth",
+  label: "user-auth service",
+  order: 30,
+  pidFile: "auth-service.{space}.pid",
+  visibleWhen: "user-auth",
+};
+
+/** Stop THIS space's auth service with the stop `cotal down auth` runs. Scoped by the space-carrying
+ *  pidfile, never a root-global kill. Throws, with the record kept, when the stop is refused or the
+ *  death is not confirmed. */
+export async function stopAuthService(space: string): Promise<void> {
+  await stopLocalProcess(AUTH_PROCESS, { root: cotalRoot(), space });
 }

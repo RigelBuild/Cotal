@@ -11,7 +11,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect, PermissionViolationError } from "@nats-io/transport-node";
-import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import type { StatusStream } from "../src/endpoint-publish-denial.js";
+import { SMOKE_BROKER_TOKEN, teardownOnSignal, killAndAwaitExit } from "@cotal-ai/smoke-kit";
 import {
   compileContract, createSpaceAuth, describeEndpoint, DEV_OWNER, EpEnvelopeError, epCall, epCast,
   epProbeInstanceInterest, invokeCommand, isReachable, mintCreds, mintLifecycleUid, newIdentity, serverConfig,
@@ -33,7 +34,7 @@ const auth = await createSpaceAuth(space);
 const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
 writeFileSync(join(dir, "server.conf"), serverConfig(auth, [auth], { transport: { kind: "plaintext" }, port: PORT, storeDir: join(dir, "js") }));
 const srv = spawn("nats-server", ["-c", join(dir, "server.conf")], { stdio: "ignore" });
-const releaseBroker = teardownOnSignal(srv, dir);
+const releaseBroker = teardownOnSignal(srv);
 const IID = "i".repeat(26);
 const empty = compileContract({ root: { type: "null" } });
 const DEADLINE_MS = 800;
@@ -121,7 +122,7 @@ try {
   // An INDEPENDENT status iterator on the same connection records what the broker actually said,
   // so the cells assert against observed truth rather than against the verbs' own reports.
   const violations: string[] = [];
-  const seen = nc.status();
+  const seen = nc.status() as StatusStream;
   void (async () => { for await (const s of seen) if (s.type === "error" && s.error instanceof PermissionViolationError) violations.push(`${s.error.subject}`); })().catch(() => {});
 
   const cast = await caught(() => epCast(nc, space, { mode: "inst", instanceId: IID }, {
@@ -165,9 +166,10 @@ try {
   fail++;
   console.error("  ✗ scenario threw:", (e as Error).stack ?? (e as Error).message);
 } finally {
-  srv.kill("SIGKILL");
-  rmSync(dir, { recursive: true, force: true });
+  await killAndAwaitExit(srv, "SIGKILL");
   releaseBroker();
+  if (srv.exitCode === null && srv.signalCode === null) throw new Error("broker exit unproven; storage preserved");
+  rmSync(dir, { recursive: true, force: true });
 }
 
 console.log(`\nENDPOINT PUBLISH DENIAL SMOKE ${fail === 0 ? "OK ✅" : "FAILED"}  (${pass} passed, ${fail} failed)`);

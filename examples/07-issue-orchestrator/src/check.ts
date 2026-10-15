@@ -70,8 +70,8 @@ for (const [file, src] of Object.entries(sources)) {
 }
 
 // ---- 3. the four scripts ----------------------------------------------------------------------------
-// The simulator stamps `at` from its virtual clock; the type still asks for one.
-const done = { status: "done", at: 0 } as const;
+// The simulator stamps `at` from its virtual clock; the type no longer asks for one.
+const done = { status: "done" } as const;
 const S1 = "1111111111111111111111111111111111111111";
 const S2 = "2222222222222222222222222222222222222222";
 const M1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -229,7 +229,7 @@ for (const c of cases) {
         onLog: (l) => engineLogs.push([...l.values]),
       },
     ).done;
-    check("the compiled engine completes", engine.ok === true, engine.ok ? undefined : `${engine.code ?? ""} ${engine.message}`);
+    check("the compiled engine completes", engine.ok === true, engine.ok ? undefined : engine);
 
     const records = laneRecords(walkerLogs);
     check("one lane record", records.length === 1, records);

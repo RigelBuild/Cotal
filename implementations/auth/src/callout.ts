@@ -35,6 +35,7 @@ import { createAccount, createCurve, fromCurveSeed, fromPublic, fromSeed } from 
 import { assertInboxConnId, newIdentity, principalKey, principalTags, token } from "@cotal-ai/core";
 import type { JWTVerifyGetKey, CryptoKey } from "jose";
 import { validateUserToken, type ValidatedUserToken } from "./token.js";
+import { SESSION_EXP } from "./permissions.js";
 
 /** The one subject the callout serves (ADR-26). */
 export const AUTH_CALLOUT_SUBJECT = "$SYS.REQ.USER.AUTH";
@@ -166,7 +167,7 @@ export interface StartAuthCalloutOpts {
    *  it. The client picks and passes this nonce because neither it nor this callout knows the per-connect
    *  nkey pre-connect; core's `assertInboxConnId` rejects a nonce with subject metacharacters, so it
    *  cannot widen the grant. An absent/invalid nonce makes the builder throw → a signed deny. */
-  permissionsFor: (t: ValidatedUserToken, connId: string) => Record<string, unknown>;
+  permissionsFor: (t: ValidatedUserToken, connId: string) => Record<string, unknown> | Promise<Record<string, unknown>>;
   /** Diagnostics sink (default: console.error). Never carries bearer contents. */
   log?: (line: string) => void;
   /** Audit hook fired on each successful mint, BEFORE the response is sent — the minted user JWT
@@ -268,7 +269,11 @@ export function startAuthCallout(nc: CalloutConnection, opts: StartAuthCalloutOp
         // injected permissionsFor hook (which could be any implementation). assertInboxConnId throws on a
         // missing/wildcard name → the catch below turns it into a signed deny (fail-closed).
         const inboxNonce = assertInboxConnId(req.connect_opts?.name ?? "");
-        const perms = opts.permissionsFor(validated, inboxNonce);
+        const { [SESSION_EXP]: sessionExp, ...perms } = await opts.permissionsFor(validated, inboxNonce);
+        // #2312: a session-caller connection carries EXACTLY the static arm's expiry, the grant's,
+        // and only when the permission builder vouched for it from the live session row.
+        const exp = validated.act.view === "session-caller" ? sessionExp : validated.exp;
+        if (typeof exp !== "number" || !Number.isSafeInteger(exp)) throw new Error("callout: no bound expiry for this connection");
         // Stamp the principal into the minted JWT so the live identity is recoverable server-side: the
         // connection's `user_nkey` is a per-connect ephemeral the SERVER generated, not the principal,
         // so CONNZ-based attribution (the membership feed, live eviction) needs owner+actor carried
@@ -283,9 +288,9 @@ export function startAuthCallout(nc: CalloutConnection, opts: StartAuthCalloutOp
           fromPublic(req.user_nkey),
           fromPublic(opts.dataAccount.pub),
           { ...perms, tags: principalTags(validated.owner, validated.act.actor) },
-          { signer: userSigner, exp: validated.exp }, // NATS access dies with the bearer
+          { signer: userSigner, exp }, // NATS access dies with the bearer (a session-caller: with its grant)
         );
-        opts.onMint?.({ jwt: userJwt, principal: key, exp: validated.exp });
+        opts.onMint?.({ jwt: userJwt, principal: key, exp });
         await respond({ jwt: userJwt });
       } catch (e) {
         const reason = e instanceof Error ? e.message : String(e);

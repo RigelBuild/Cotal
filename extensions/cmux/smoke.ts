@@ -47,7 +47,7 @@ const cmd = paneCommand(
   { command: "/bin/echo", args: ["hi"], env: { COTAL_CONTROL_TOKEN: SECRET }, cwd: "/tmp" },
   false,
   true, // isolate (P3): the agent gets ONLY the connector-declared env
-);
+).command;
 
 ok("paneCommand returns a `bash <path>` invocation", /^bash '\/.*\/launch\.sh'$/.test(cmd));
 const scriptPath = cmd.replace(/^bash\s+(?:-l\s+)?'|'$/g, "");
@@ -62,7 +62,7 @@ try {
   /* best-effort cleanup */
 }
 
-if (process.platform !== "win32") {
+if ((process.platform as NodeJS.Platform) !== "win32") {
   const stubDir = mkdtempSync(join(tmpdir(), "cotal-cmux-wait-"));
   // The extension is load-bearing. This stub is written under TMPDIR and its body is CommonJS,
   // and node picks the module system for an extensionless file from the nearest package.json

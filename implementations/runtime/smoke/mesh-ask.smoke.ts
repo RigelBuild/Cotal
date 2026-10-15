@@ -60,6 +60,7 @@ import {
   bindGoal,
   createGoal,
   commitGoalResult,
+  requestGoalCancel,
   goalRefOf,
   submissionFingerprint,
   EpEnvelopeError,
@@ -143,10 +144,10 @@ const SPAWN_OUTPUT = {
   },
 } as const;
 const TURN_INPUT = {
-  type: "object", additionalProperties: false, required: ["payload", "deadlineMs"],
+  type: "object", additionalProperties: false, required: ["payload", "deadlineAt"],
   properties: {
     payload: { type: "string", minLength: 1, maxLength: 65536 },
-    deadlineMs: { type: "integer", minimum: 1 },
+    deadlineAt: { type: "integer", minimum: 1 },
     handoffFrom: { type: "string", minLength: 1, maxLength: 200 },
   },
 } as const;
@@ -164,15 +165,34 @@ const TURN_OUTPUT = {
 } as const;
 
 const cc = (root: unknown) => compileContract({ root: root as Record<string, unknown> });
+// A completed run despawns the seats it spawned, so the stand-in serves the manager's despawn too.
+const DESPAWN_INPUT = { type: "object", additionalProperties: false, properties: { graceful: { type: "boolean" } } } as const;
+const DESPAWN_OUTPUT = {
+  type: "object", additionalProperties: false, required: ["name", "stopped", "graceful"],
+  properties: { name: { type: "string" }, stopped: { type: "boolean" }, graceful: { type: "boolean" } },
+} as const;
+// A cancelled step withdraws its relay through the manager's reserved cancel (SPEC 13.6 item 4).
+const CANCEL_INPUT = {
+  type: "object", additionalProperties: false, required: ["goalId"],
+  properties: { goalId: { type: "string", minLength: 1 }, mode: { enum: ["graceful", "terminate"] } },
+} as const;
+const CANCEL_OUTPUT = {
+  type: "object", additionalProperties: false, required: ["goalId", "state"],
+  properties: { goalId: { type: "string" }, state: { enum: ["succeeded", "failed", "cancelled", "expired", "uncertain"] } },
+} as const;
 const COMPILED = {
   spawn: { input: cc(SPAWN_INPUT), output: cc(SPAWN_OUTPUT) },
   turn: { input: cc(TURN_INPUT), output: cc(TURN_OUTPUT) },
+  despawn: { input: cc(DESPAWN_INPUT), output: cc(DESPAWN_OUTPUT) },
+  cancel: { input: cc(CANCEL_INPUT), output: cc(CANCEL_OUTPUT) },
 };
 const DOCUMENT = {
   urn: "ai.cotal.test.askmgr", revision: 1, attributes: [], events: [],
   commands: [
     { name: "spawn", class: "ephemeral" as const, targeted: false, capability: "manager.spawn", inputDigest: COMPILED.spawn.input.closureDigest, outputDigest: COMPILED.spawn.output.closureDigest },
     { name: "turn", class: "ephemeral" as const, targeted: true, modes: ["owner", "any"], capability: "manager.lifecycle", inputDigest: COMPILED.turn.input.closureDigest, outputDigest: COMPILED.turn.output.closureDigest },
+    { name: "despawn", class: "ephemeral" as const, targeted: true, modes: ["owner", "any"], capability: "manager.lifecycle", inputDigest: COMPILED.despawn.input.closureDigest, outputDigest: COMPILED.despawn.output.closureDigest },
+    { name: "cancel", class: "ephemeral" as const, targeted: false, capability: "manager.lifecycle", inputDigest: COMPILED.cancel.input.closureDigest, outputDigest: COMPILED.cancel.output.closureDigest },
   ],
 };
 const ROOT_DIGEST = contractDigest(DOCUMENT);
@@ -184,7 +204,7 @@ const artifactIndex = new Map<string, unknown>();
 {
   const values: unknown[] = [];
   const seen = new Set<string>();
-  for (const source of [SPAWN_INPUT, SPAWN_OUTPUT, TURN_INPUT, TURN_OUTPUT]) {
+  for (const source of [SPAWN_INPUT, SPAWN_OUTPUT, TURN_INPUT, TURN_OUTPUT, DESPAWN_INPUT, DESPAWN_OUTPUT, CANCEL_INPUT, CANCEL_OUTPUT]) {
     const rootDigest = contractDigest(source);
     if (seen.has(rootDigest)) continue;
     seen.add(rootDigest);
@@ -263,7 +283,7 @@ const spawnHandler = async (ctx: EpServeContext): Promise<unknown> => {
 };
 
 /** Every relay the endpoint was handed, as submitted: the ask's payload is what the seat reads. */
-const turnInvokes: Array<{ goalId: string; payload: string; deadlineMs: number; target: { owner: string; actor: string; lifecycleUid: string } }> = [];
+const turnInvokes: Array<{ goalId: string; payload: string; deadlineAt: number; target: { owner: string; actor: string; lifecycleUid: string } }> = [];
 const turnAccepts = new Map<string, Record<string, unknown>>();
 /** Cell knob: refuse the next relay at accept, the way the real manager refuses a gone seat. */
 let refuseNextTurn: EpEnvelopeError | undefined;
@@ -272,7 +292,7 @@ const turnHandler = async (ctx: EpServeContext): Promise<unknown> => {
   const args = (ctx.request.args ?? {}) as Record<string, unknown>;
   const goalId = ctx.request.id;
   const t = ctx.request.target as { owner: string; actor: string; lifecycleUid: string };
-  turnInvokes.push({ goalId, payload: String(args.payload), deadlineMs: Number(args.deadlineMs), target: { owner: t.owner, actor: t.actor, lifecycleUid: t.lifecycleUid } });
+  turnInvokes.push({ goalId, payload: String(args.payload), deadlineAt: Number(args.deadlineAt), target: { owner: t.owner, actor: t.actor, lifecycleUid: t.lifecycleUid } });
   const { fingerprint } = submissionFingerprint(ctx.request as unknown, ctx.subject);
   const prior = turnAccepts.get(goalId);
   if (prior !== undefined) {
@@ -289,24 +309,37 @@ const turnHandler = async (ctx: EpServeContext): Promise<unknown> => {
   const ref = goalRefOf(ctx.subject, goalId);
   const b = await bindGoal(goalCtx, ref, fingerprint);
   if (!b.bound) throw new EpEnvelopeError("failed-precondition", `goal "${goalId}" is already bound (SPEC 13.6)`);
-  const deadlineMs = Number(args.deadlineMs);
+  const deadlineAt = Number(args.deadlineAt);
+  const acceptedAt = Date.now();
   await createGoal(goalCtx, ref, {
     fingerprint, command: "turn",
     caller: { id: `${ctx.subject.caller.owner}.${ctx.subject.caller.actor}`, lifecycleUid: ctx.subject.caller.uid },
-    acceptedEpoch: EXEC_EPOCH, requestId: goalId, sourceSeq: 0, acceptedAt: Date.now(), readinessDeadlineMs: deadlineMs,
+    acceptedEpoch: EXEC_EPOCH, requestId: goalId, sourceSeq: 0, acceptedAt, readinessDeadlineMs: deadlineAt - acceptedAt,
     target: { owner: t.owner, actor: t.actor, lifecycleUid: t.lifecycleUid, mappingRevision: 1 },
   });
   const acceptance = {
     name, owner: t.owner, actor: t.actor, uid: t.lifecycleUid, goalId, fingerprint,
-    deadlineAt: Date.now() + deadlineMs, executor: { lifecycleUid: MGR_IID, epoch: EXEC_EPOCH },
+    deadlineAt, executor: { lifecycleUid: MGR_IID, epoch: EXEC_EPOCH },
   };
   turnAccepts.set(goalId, acceptance);
   return acceptance;
 };
 
+const cancelHandler = async (ctx: EpServeContext): Promise<unknown> => {
+  const { goalId, mode = "graceful" } = (ctx.request.args ?? {}) as { goalId: string; mode?: "graceful" | "terminate" };
+  await requestGoalCancel(goalCtx, { request: ctx.subject, goalId, mode });
+  const { fact } = await commitGoalResult(goalCtx, { ref: goalRefOf(ctx.subject, goalId), now: Date.now(), cause: "cancel", committer: { instanceId: MGR_IID, epoch: EXEC_EPOCH } });
+  return { goalId, state: fact.state };
+};
+
 const defs: EpCommandDef[] = [
   { command: "spawn", contract: COMPILED.spawn, handler: spawnHandler },
   { command: "turn", contract: COMPILED.turn, handler: turnHandler },
+  { command: "despawn", contract: COMPILED.despawn, handler: (ctx: EpServeContext) => {
+    const t = ctx.request.target as { owner: string; actor: string };
+    return { name: `${t.owner}.${t.actor}`, stopped: true, graceful: ((ctx.request.args ?? {}) as { graceful?: unknown }).graceful !== false };
+  } },
+  { command: "cancel", contract: COMPILED.cancel, handler: cancelHandler },
 ];
 const serve = serveEndpoint(nc, SPACE, grant, defs, { public: true }, {
   resolveTarget: (t) => mappings.get(`${t.owner}.${t.actor}`),
@@ -717,14 +750,15 @@ const relayOf = (tok: unknown): { invoke?: (typeof turnInvokes)[number]; ask?: R
 {
   console.log("• 8 — outstandingPauseTokens reads the current attempt off the entry");
   const bare = { kind: "ask", requestId: token("f"), state: "pending" } as unknown as JournalEntry;
+  const attempt2 = createHash("sha256").update(`${token("f")}:ask-attempt-2`, "utf8").digest("base64url").slice(0, 43);
   const bound = {
     kind: "ask", requestId: token("f"), state: "pending",
-    external: { attempt: 2, askToken: token("g"), deadlineAt: 1 },
+    external: { attempt: 2, askToken: attempt2, deadlineAt: 1 },
   } as unknown as JournalEntry;
   c("a crash before the first bind re-arms attempt 1, the request id itself",
     outstandingPauseTokens([bare]).join() === token("f"), outstandingPauseTokens([bare]));
   c("a bound entry re-arms the CURRENT attempt's derived token",
-    outstandingPauseTokens([bound]).join() === token("g"), outstandingPauseTokens([bound]));
+    outstandingPauseTokens([bound]).join() === attempt2, outstandingPauseTokens([bound]));
 }
 
 // ── 9) an ask addresses an agent this run spawned: anything else refuses before a pause exists ─
@@ -824,16 +858,15 @@ const relayOf = (tok: unknown): { invoke?: (typeof turnInvokes)[number]; ask?: R
   // has moved on; `arm` attaches to the recorded pause either way, so the place a recomputed
   // instant showed was the relay: the seat's hold denied at now+timeout, the pause at the record.
   const recordedAt = Date.now() + 120_000;
-  const k5 = stepCtx(token("i5"), { asks: "Ship it?", addressee: name11, deadlineAt: recordedAt }, 1, "checkpoint");
+  const k5 = stepCtx(token("i5"), { attempt: 1, asks: "Ship it?", addressee: name11, deadlineAt: recordedAt }, 1, "checkpoint");
   const before5 = turnInvokes.length;
   const parked5 = h.checkpoint({ prompt: "Ship it?", timeout: "1h", onExpiry: "proceed", to: name11 } as never, k5.ctx)
     .then(() => "settled", (e: unknown) => `threw: ${(e as Error).message}`);
   for (let i = 0; i < 100 && turnInvokes.length === before5; i += 1) await wait(100);
   const relay5 = turnInvokes[before5];
-  const slack = relay5 === undefined ? undefined : Math.abs(relay5.deadlineMs - (recordedAt - Date.now()));
   c("a resumed escalation relays the RECORDED deadline, so the seat's hold and the pause deny at one instant",
-    relay5 !== undefined && slack !== undefined && slack < 15_000 && Object.keys(k5.bound).length === 0,
-    JSON.stringify({ deadlineMs: relay5?.deadlineMs, expected: recordedAt - Date.now(), rebound: k5.bound }));
+    relay5 !== undefined && relay5.deadlineAt === recordedAt && Object.keys(k5.bound).length === 0,
+    JSON.stringify({ deadlineAt: relay5?.deadlineAt, expected: recordedAt, rebound: k5.bound }));
   k5.cancel("the cell has what it came for");
   await withDeadline(parked5, 15_000, "the resumed escalation");
 

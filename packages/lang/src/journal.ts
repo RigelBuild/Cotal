@@ -15,7 +15,7 @@
 import { canonicalize } from "json-canonicalize";
 import { NotCrossable, assertCrossable, assertScopeValueCrossable, deepFreeze } from "./values.js";
 import { RuntimeFault } from "./errors.js";
-import { type JournalKind, type StepKey, stepKeyString } from "./keys.js";
+import { type JournalKind, type StepKey, scopeTraits, stepKeyString } from "./keys.js";
 import { EFFECT_KINDS } from "./primitives.js";
 
 export type EntryState = "pending" | "settled";
@@ -36,6 +36,13 @@ export interface EntryError {
    */
   readonly stack?: string;
   readonly detail?: Readonly<Record<string, unknown>>;
+  /**
+   * THE VALUE A PROGRAM THREW out of a scope, so a replay hands `catch` that value and not this
+   * record. Wrapped because `throw undefined` is legal and has no canonical form of its own: `{}` is
+   * that throw. Absent when the failure is not a value the program threw, or is one the record
+   * cannot carry.
+   */
+  readonly thrown?: { readonly value?: unknown };
 }
 
 export interface JournalEntry {
@@ -71,6 +78,12 @@ export interface JournalEntry {
   readonly error?: EntryError;
   /** The external resource this effect bound, so a crash mid-effect is recoverable. */
   readonly external?: Readonly<Record<string, unknown>>;
+  /**
+   * The binding of the hold opened for an at-most-once step (spec/cotal-lang.md §7.8). Its own
+   * field so the first attempt's `external` stays on the entry as the write's evidence. An entry
+   * carrying it is a held step.
+   */
+  readonly hold?: Readonly<Record<string, unknown>>;
   /**
    * WHAT THIS STEP HAS OBSERVED SO FAR, and the distinction this field exists to make is the whole
    * of #1459.
@@ -312,7 +325,7 @@ export function journalEntryKeyString(entry: JournalEntry): string {
  * `workerData` is a structured clone, which preserves `Date`, `NaN`, `-0`, an own `undefined` key
  * and a `Map`.
  */
-type RecordedField = "external" | "error.detail" | "result" | "observations";
+type RecordedField = "external" | "hold" | "error.detail" | "error.thrown" | "result" | "observations";
 
 /**
  * WHY EACH FIELD MATTERS, said in its own words. One sentence for all three would have to be vague
@@ -320,7 +333,9 @@ type RecordedField = "external" | "error.detail" | "result" | "observations";
  */
 const WHAT_THE_FIELD_IS: Record<RecordedField, string> = {
   external: "`external` is what a resume re-binds the handler's own record to",
+  hold: "`hold` is what a resume re-binds an at-most-once step's hold to",
   "error.detail": "`error.detail` is how a failed step explains itself, and a resume hands it to the program that catches it",
+  "error.thrown": "`error.thrown` is the value a program threw out of a scope, and a resume hands it back to the program that catches it",
   result: "`result` is what a resume hands back INSTEAD of running the step again",
   observations:
     "`observations` is the history of what a still-waiting step saw, and a resumed `waitUntil` hands the newest one to the program's own predicate",
@@ -339,13 +354,12 @@ function bindingWithoutCanonicalForm(entry: JournalEntry, field: RecordedField, 
   );
 }
 
-/** The entry kinds whose `result` is an assembly of branches rather than one handler's value. */
-const SCOPE_KINDS: ReadonlySet<string> = new Set(["parallel", "race", "fanOut", "conclave"]);
-
 /** What the crossing rule calls the value it is refusing, so its path reads as the record's own. */
 const LABEL_OF: Record<RecordedField, string> = {
   external: "the recorded binding",
+  hold: "the recorded hold binding",
   "error.detail": "the recorded failure detail",
+  "error.thrown": "the recorded thrown value",
   result: "the recorded result",
   observations: "the recorded observation",
 };
@@ -404,19 +418,39 @@ export class Journal {
       // `performEffect` and `performScope`. Those fence every shipped caller, exactly two of them,
       // both in perform.ts, but they fence it by ENUMERATION, and a record already written is behind
       // them either way. This door is the one a loaded journal cannot go around.
-      // TWO FIELDS, ONE RULE. `external` is what a resume re-binds to; `error.detail` is what a
+      // THREE FIELDS, ONE RULE. `external` is what a resume re-binds to; `error.detail` is what a
       // failed step reports itself with. Both are values a handler chose and both reached the record
       // with no domain check until the guards in `performEffect` and `performScope`. `detail` is the
       // second one and it is not hypothetical: a program that CATCHES an effect failure succeeds,
       // so a run can complete with an unreadable value sitting in a settled entry. Measured, and
       // through the worker that run dies on a structured-clone error naming a host algorithm.
-      for (const [field, value] of [["external", e.external], ["error.detail", e.error?.detail]] as const) {
+      // `error.thrown` is the third, the program's own value, which a resume hands to its `catch`.
+      // Its WRAPPER answers first: a replay reads `thrown.value`, so any shape but `{ value }`, or
+      // `{}` for `throw undefined`, would replay as `throw undefined` or as a host error the program
+      // catches, neither of which the run threw.
+      const thrown: unknown = e.error?.thrown;
+      if (thrown !== undefined && (thrown === null || Object.getPrototypeOf(thrown) !== Object.prototype || Object.keys(thrown).some((k) => k !== "value")))
+        throw bindingWithoutCanonicalForm(
+          e,
+          "error.thrown",
+          new NotCrossable("opaque", "`error.thrown` is not `{ value }`, or `{}` for `throw undefined`, so the value the program threw cannot be read from it"),
+        );
+      for (const [field, value] of [["external", e.external], ["error.detail", e.error?.detail], ["error.thrown", e.error?.thrown?.value]] as const) {
         if (value === undefined) continue;
         try {
           assertCrossable(value, LABEL_OF[field]);
         } catch (cause) {
           if (!(cause instanceof NotCrossable)) throw cause;
           throw bindingWithoutCanonicalForm(e, field, cause);
+        }
+      }
+      // AND A HOLD'S BINDING, which a resume re-binds the hold to exactly as it re-binds `external`.
+      if (e.hold !== undefined) {
+        try {
+          assertCrossable(e.hold, LABEL_OF.hold);
+        } catch (cause) {
+          if (!(cause instanceof NotCrossable)) throw cause;
+          throw bindingWithoutCanonicalForm(e, "hold", cause);
         }
       }
       // AND THE OBSERVATIONS, by the same rule and for a reason the other two do not cover: an
@@ -438,7 +472,7 @@ export class Journal {
       // list of branch NAMES (strings) and needs no exemption.
       if (e.result !== undefined) {
         try {
-          if (SCOPE_KINDS.has(e.kind)) {
+          if (scopeTraits(e.kind) !== undefined) {
             const assembled = e.result as { readonly branches?: unknown; readonly value?: unknown };
             if (assembled.branches !== undefined) assertCrossable(assembled.branches, "the recorded branch list");
             assertScopeValueCrossable(assembled.value, "the recorded result.value", e.kind);
@@ -563,7 +597,6 @@ export class Journal {
     return entry;
   }
 
-  /** Record the external resource the handler created, before its terminal is awaited. */
   /**
    * Point the pending entry at a NEW open identity, before the work under it is issued.
    *
@@ -585,12 +618,29 @@ export class Journal {
     this.byKey.set(k, next);
   }
 
+  /** Record the external resource the handler created, before its terminal is awaited. */
   async bind(key: StepKey, external: Readonly<Record<string, unknown>>): Promise<void> {
     if (this.readOnly) throw new JournalReadOnlyError(key);
     const k = Journal.keyOf(key);
     const entry = this.byKey.get(k);
     if (entry === undefined) throw new Error(`bind before begin for ${k}`);
     const next = { ...entry, external };
+    await this.persist(k, next);
+    this.byKey.set(k, next);
+  }
+
+  /** Record a hold's own binding, beside the first attempt's `external` rather than over it. */
+  async hold(key: StepKey, hold: Readonly<Record<string, unknown>>): Promise<void> {
+    if (this.readOnly) throw new JournalReadOnlyError(key);
+    const k = Journal.keyOf(key);
+    const entry = this.byKey.get(k);
+    if (entry === undefined) throw new Error(`hold before begin for ${k}`);
+    if (entry.state !== "pending")
+      throw new Error(`hold on a settled entry for ${k}; a hold binds only a step whose outcome is still unknown`);
+    // The seed check refuses a `hold` that is not crossable (L5024), so one written here would
+    // publish an entry this journal's own reload refuses.
+    assertCrossable(hold, `the hold binding of ${stepKeyString(key)}`);
+    const next = { ...entry, hold };
     await this.persist(k, next);
     this.byKey.set(k, next);
   }
@@ -756,17 +806,13 @@ export class Journal {
    * same key, and the interpreter counts the dispatch once. A pending entry still counts — the
    * effect was performed, which is exactly why it was written before the handler was called.
    *
-   * `conclave` is excluded because the interpreter does not count it either: it dispatches
-   * `openConclave` from the scope walker rather than through `performEffect`, so counting it here
-   * would make a resumed run's tally disagree with a fresh one's. That asymmetry is a real gap in
-   * what the ceiling sees and it is reported separately; this method mirrors the counter rather
-   * than quietly repairing it, because a seed that does not match the thing it seeds is worse than
-   * the gap it would paper over.
+   * A `conclave` counts, because its open is a dispatch and the interpreter counts it as one; the
+   * other scope kinds dispatch nothing of their own, so their entries do not.
    */
   dispatchedEffects(): number {
     let n = 0;
     for (const e of this.byKey.values()) {
-      if (e.kind !== "conclave" && (EFFECT_KINDS as readonly string[]).includes(e.kind)) n += 1;
+      if ((EFFECT_KINDS as readonly string[]).includes(e.kind)) n += 1;
     }
     return n;
   }

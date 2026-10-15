@@ -59,8 +59,11 @@ export interface ThreadItem {
   [k: string]: unknown;
 }
 
-/** Terminal turn statuses (`inProgress` is the only non-terminal one). */
-export type TurnStatus = "completed" | "interrupted" | "failed" | "inProgress";
+/** Terminal turn statuses (`inProgress` is the only non-terminal one). `unknown` is not a status
+ *  the wire sends; it is what a missing or unrecognized `turn.status` maps to, kept distinct from
+ *  `interrupted` so the host can treat an operator's Escape (a real interrupt) and a protocol
+ *  surprise (an unknown outcome) differently at the ack boundary. */
+export type TurnStatus = "completed" | "interrupted" | "failed" | "unknown" | "inProgress";
 
 interface Pending {
   resolve: (v: unknown) => void;
@@ -749,9 +752,6 @@ export class AppServerDriver extends EventEmitter {
     this.writeLine({ jsonrpc: "2.0", id, error: { code: -32601, message: "unsupported by the cotal host" } });
   }
 
-  /** Emit the terminals held while ownership was undecidable. Once no `turn/start` is outstanding
-   *  the ownership set is settled, so each held turn gets its true `owned` — including one that
-   *  completed before the response that claimed it ever arrived. */
   /** Tombstone a turn whose terminal has been seen, keeping only a short recent tail — a late
    *  `turn/started` follows its terminal by milliseconds, so unbounded history buys nothing while
    *  a long-lived agent would accumulate one entry per turn forever. */
@@ -764,6 +764,9 @@ export class AppServerDriver extends EventEmitter {
     }
   }
 
+  /** Emit the terminals held while ownership was undecidable. Once no `turn/start` is outstanding
+   *  the ownership set is settled, so each held turn gets its true `owned` — including one that
+   *  completed before the response that claimed it ever arrived. */
   private releaseBuffered(): void {
     if (this.pendingStarts.size > 0 || this.buffered.length === 0) return;
     const held = this.buffered;
@@ -824,8 +827,9 @@ export class AppServerDriver extends EventEmitter {
       case "turn/completed": {
         // Terminal events are correlated by EXACT turn id: a stale or duplicated terminal for a
         // turn that is not running must never close one that is. Fail closed on ambiguity: an
-        // unknown id is ignored, and a MISSING/unknown status is reported as "interrupted" (no
-        // ack -> redeliver) rather than assumed successful.
+        // unknown id is ignored, and a MISSING/unrecognized status maps to "unknown" (no ack ->
+        // redeliver, same as before, but never mistaken for a real operator interrupt) rather than
+        // assumed successful.
         //
         // `owned` is the load-bearing part once a UI is attached. A turn a human started in the
         // TUI reaches this host too, and its completion says nothing about the batch WE surfaced
@@ -844,7 +848,7 @@ export class AppServerDriver extends EventEmitter {
         const status: TurnStatus =
           turn.status === "completed" || turn.status === "failed" || turn.status === "interrupted"
             ? turn.status
-            : "interrupted";
+            : "unknown";
         const condition = status === "failed" ? codexCondition(turn.error) : undefined;
         // HOLD FIRST, decide later. While one of our `turn/start` requests is outstanding, an
         // unclaimed terminal is undecidable: it may belong to the turn that request is about to

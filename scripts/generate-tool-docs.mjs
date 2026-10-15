@@ -47,13 +47,13 @@ const ANNOTATIONS = {
     effect: "read-only",
     availability: "always",
     notes:
-      "Serves the version-exact docs bundled with this release (offline); `refresh: true` adds an opt-in pull from docs.cotal.ai that is version-gated, so it can never return docs for a different version.",
+      "Serves the version-exact docs bundled with this release (offline). The connector builds the docs and their search index when the tool is first called. `refresh: true` adds an opt-in pull from docs.cotal.ai that is version-gated, so it can never return docs for a different version.",
   },
   cotal_inbox: {
     effect: "clears only the messages it returns (nothing at all when peek is true)",
     availability: "always",
     notes:
-      "One call carries at most a receivable window; what does not fit stays buffered, is named in the reply, and comes back on the next call. OpenCode, Codex, Hermes, and Pi expose no arguments: automatic traffic remains connector-owned, while buffered quiet ambient is what this call returns and clears. In focus mode, normal channel recall is also shown read-only (replay-gated) and is never cleared by the read.",
+      "One call carries at most a receivable window; what does not fit stays buffered, is named in the reply, and comes back on the next call. A message larger than the window comes back in parts, one per call, and is cleared with its last part. A message with an empty id is tracked as itself, so it is held, named and read in parts like any other. OpenCode, Codex, Hermes, and Pi expose no arguments: automatic traffic remains connector-owned, while buffered quiet ambient is what this call returns and clears. In focus mode, normal channel recall is also shown read-only (replay-gated) and is never cleared by the read; an oversized recall message comes back in parts the same way, and later recall waits behind it until its last part goes out.",
   },
   cotal_send: {
     effect: "publishes to a channel",
@@ -70,7 +70,8 @@ const ANNOTATIONS = {
   cotal_status: {
     effect: "updates your own presence / attention",
     availability: "always",
-    notes: "With no arguments it just reports the current values.",
+    notes:
+      "With no arguments it just reports the current values. An activity with no status changes only the activity line; your status and any condition stay as they are.",
   },
   cotal_channel_info: {
     effect: "read-only",
@@ -95,7 +96,7 @@ const ANNOTATIONS = {
     availability:
       "capability-gated: injected only for personas declaring `capabilities: [spawn]` (auth mode); open mode is permissive",
     notes:
-      "Failure modes are distinct: a permission denial names the missing capability; an unreachable manager is reported as such; a lifecycle barrier that already holds the actor (frozen issuance gate, retiring alias) names the blocked op, head state, opId, and the remedy when one exists, rather than a wait-timeout.",
+      "Failure modes are distinct: a permission denial names the missing capability; an unreachable manager is reported as such; a lifecycle barrier that already holds the actor (frozen issuance gate, retiring alias) names the blocked op, head state, opId, and the remedy when one exists, rather than a wait-timeout. A launch that has not joined the mesh within its readiness window returns a pending result instead of an error: it names the allocated agent, its id, and its manager, and says to watch the roster, because spawning again starts a second agent.",
   },
   cotal_feedback: {
     effect: "sends data to an external HTTPS intake (network egress)",
@@ -116,7 +117,7 @@ const ANNOTATIONS = {
   cotal_run: {
     effect: "starts, resumes, or answers a durable workflow run hosted by the manager; `status`/`ps` are read-only",
     availability:
-      "capability-gated: injected only for personas declaring `capabilities: [run]` (auth mode). Open mode exposes the tool, but hosted runs require static authentication with issued caller authority; open and user-auth meshes refuse execution ([workflow setup](workflows.md#from-an-agent-session))",
+      "capability-gated: injected only for personas declaring `capabilities: [run]` (auth mode). Hosted runs require issued caller authority and an execution-capable manager. Managed user-auth agents use their own bearer command and selected participant manager, with current child and direct-parent `run` grants. Open meshes and execution-free control managers refuse execution ([workflow setup](workflows.md#from-an-agent-session))",
     notes:
       "`start` sends the program source inline and returns the run id at once; the manager validates first and a refusal lists every problem with its line, cause, and fix. The run continues on the manager after your session ends and is taken back after a manager restart. `answer` records you as the answerer: the manager takes your name from your credential, and the tool sends none.",
   },
@@ -132,6 +133,17 @@ const ANNOTATIONS = {
     availability: "capability-gated like cotal_spawn",
     notes:
       "Omit `name` to list spawnable names; pass `name` to show one card you own. Role, model, and description ride only on files you own; show of a name you do not own is not-found.",
+  },
+  cotal_describe: {
+    effect: "none; reads an endpoint's registered command surface",
+    availability: "any session whose credential carries caller rows for the endpoint (describe rides them)",
+    notes: "The surface is digest-verified against the contract store. Unknown fields in a reply are data.",
+  },
+  cotal_invoke: {
+    effect: "whatever the named command does",
+    availability: "only the commands your own credential has caller grants for; the broker refuses the rest",
+    notes:
+      "`not-executed` means the command did not run; `unknown` means it may have. A reply over 200,000 characters of JSON is refused, not cut; ask for a smaller page. An error's message and details are held to the same limit, whether the endpoint answered with the error or the call was refused before it was sent: a message or details over it are withheld with their size, and the code and outcome still come through. Arguments refused by the input schema report outcome `not-executed`.",
   },
   cotal_reconnect: {
     effect: "tears down and rebuilds your own mesh connection",
@@ -245,6 +257,18 @@ for (const s of specs) {
     lines.push("");
   } else {
     lines.push("No arguments.");
+    lines.push("");
+  }
+  if (s.name === "cotal_dm") {
+    lines.push(
+      "On success the tool answers `DM stored as seq <N> for <name> (recipient was <status> at send; delivery not confirmed).`, appending ` duplicate publication.` when the publish was a duplicate. `delivery not confirmed` is the strongest claim the sender can make: the stored sequence proves the broker accepted the message, the status names the recipient's roster state a moment before the publish, and neither is proof the recipient ever read it. When `to` names a peer with no roster row that sent you a DM or anycast, such as a one-shot [`cotal send`](cli.md#send), the DM goes to that sender's id and the status reads `recipient had no roster row at send`. The space's DM history keeps the DM, so an operator's DM view shows it, but it may never reach an inbox. A name that two such senders share is refused with their ids.",
+    );
+    lines.push("");
+  }
+  if (s.name === "cotal_anycast") {
+    lines.push(
+      "On success the tool answers `Request stored as seq <N> on the @<role> queue (<k> holders online at send; delivery not confirmed).`, appending ` duplicate publication.` when the publish was a duplicate. The sequence proves the broker stored the request on the role's work queue. A role is one `[A-Za-z0-9_-]` token, and any other spelling, `*` included, is refused before anything is sent. The count is the roster's live seats holding that role a moment before the publish, you included when you hold that role, since your own task consumer can take the request like any other holder's. While the presence view is not current the count reads `holders unknown at send: the presence view was not current`, because a partial roster cannot show that no holder exists. Neither the sequence nor the count proves a holder took the request.",
+    );
     lines.push("");
   }
 }

@@ -45,6 +45,14 @@ export interface SecretStore {
    *  renewal. Private perms / hardening beyond the atomicity guarantee remain the adapter's concern. */
   put(key: string, value: string): Promise<void>;
 
+  /** Store `value` under `key` only while `key` is absent, deciding that in one atomic step: of
+   *  concurrent creates of one key exactly one resolves `true`, and the others resolve `false` with
+   *  the winner's value untouched. A concurrent `get` observes the key absent or the complete value
+   *  (FS adapter → temp + exclusive link; a managed backend → a conditional create). A load-or-create
+   *  kind writes its first value here and adopts the stored one when it loses, because a read
+   *  followed by `put` lets two first callers each keep a value of their own. */
+  create(key: string, value: string): Promise<boolean>;
+
   /** Remove `key`. Idempotent. The ONLY portable contract is: after a successful `delete`,
    *  `get(key)` returns absent. This is NOT cryptographic shred, revocation, or credential kill —
    *  a backend may retain recoverable versions, and any already-issued NATS cred or signing seed
@@ -58,19 +66,22 @@ export interface SecretStore {
  *
  * Fingerprint-only `reloadCreds` is safe only when the renewal owner and the delivery daemon
  * genuinely read one store. This identity is that proof: it names the store, never a secret.
- * Two workstation filesystem stores agree only when they resolve the same directory. An
+ * Two workstation filesystem stores agree only when they name the same root AND carry the same
+ * `id`, a random value the store records inside its own directory. The root alone is a local path,
+ * and two hosts can mount different directories at one path (#2580). An
  * injected (hosted) store is identified by an operator-supplied coordinate, never guessed from
  * a local root. A store may declare this identity itself; otherwise the composition root must
  * provide it explicitly. There is no fallback between the two shapes.
  */
 export type SecretStoreIdentity =
-  | { kind: "fs"; root: string }
+  | { kind: "fs"; root: string; id: string }
   | { kind: "injected"; coordinate: string };
 
-/** Compare two store identities. Filesystem roots are compared after POSIX-style trailing-slash trim. */
+/** Compare two store identities. Filesystem identities match on root, after a POSIX-style
+ *  trailing-slash trim, and on id. */
 export function sameSecretStoreIdentity(a: SecretStoreIdentity, b: SecretStoreIdentity): boolean {
   if (a.kind !== b.kind) return false;
-  if (a.kind === "fs" && b.kind === "fs") return trimStorePath(a.root) === trimStorePath(b.root);
+  if (a.kind === "fs" && b.kind === "fs") return trimStorePath(a.root) === trimStorePath(b.root) && a.id === b.id;
   if (a.kind === "injected" && b.kind === "injected") return a.coordinate === b.coordinate;
   return false;
 }
@@ -81,7 +92,7 @@ function trimStorePath(p: string): string {
 
 /** Operator-facing label used in the divergence notice that names both stores. */
 export function formatSecretStoreIdentity(id: SecretStoreIdentity): string {
-  return id.kind === "fs" ? id.root : `injected:${id.coordinate}`;
+  return id.kind === "fs" ? `${id.root} (store ${id.id})` : `injected:${id.coordinate}`;
 }
 
 /**
@@ -94,11 +105,13 @@ export function parseSecretStoreIdentity(raw: unknown): SecretStoreIdentity {
   const o = raw as Record<string, unknown>;
   const keys = Object.keys(o);
   if (o.kind === "fs") {
-    if (keys.some((k) => k !== "kind" && k !== "root"))
-      throw new Error("secret-store identity of kind fs admits only {kind, root}");
+    if (keys.some((k) => k !== "kind" && k !== "root" && k !== "id"))
+      throw new Error("secret-store identity of kind fs admits only {kind, root, id}");
     if (typeof o.root !== "string" || !o.root.trim())
       throw new Error("secret-store identity of kind fs requires a non-blank root");
-    return { kind: "fs", root: o.root };
+    if (typeof o.id !== "string" || !o.id.trim())
+      throw new Error("secret-store identity of kind fs requires a non-blank id");
+    return { kind: "fs", root: o.root, id: o.id };
   }
   if (o.kind === "injected") {
     if (keys.some((k) => k !== "kind" && k !== "coordinate"))
@@ -109,6 +122,78 @@ export function parseSecretStoreIdentity(raw: unknown): SecretStoreIdentity {
   }
   throw new Error('secret-store identity kind must be "fs" or "injected"');
 }
+
+/**
+ * Name an injected store: its declared identity, else the coordinate in `COTAL_SECRET_STORE`. The
+ * manager and the delivery daemon both call this, because the store challenge compares their two
+ * answers and a second copy of the rule could name one shared store two ways.
+ */
+export function injectedSecretStoreIdentity(store: SecretStore): SecretStoreIdentity {
+  if (store.identity !== undefined) return parseSecretStoreIdentity(store.identity);
+  const coordinate = process.env.COTAL_SECRET_STORE;
+  if (!coordinate)
+    throw new Error(
+      "an injected SecretStore must declare its identity or name its coordinate in COTAL_SECRET_STORE so the manager and the delivery daemon name the same authority (never a silent local-root fallback)",
+    );
+  return { kind: "injected", coordinate };
+}
+
+/**
+ * The delivery daemon's answer to the `reloadStoreIdentity` challenge: the store it reloads from,
+ * PLUS the binding that says whose answer this is.
+ *
+ * The binding is why this is not just a {@link SecretStoreIdentity}. The delivery-admin rail is
+ * QUEUE-GROUPED, so a request lands on whichever bound responder the broker picks. Every process
+ * holding a `delivery` credential for the space can serve it, while only ONE of them holds the
+ * delivery lease and therefore actually reloads the standing credentials. Taking the first reply
+ * and calling it "the daemon's store" answers a question nobody asked: it reports the store of AN
+ * answerer, and a manager then decides whether to remint based on a process that may reload
+ * nothing. Carrying the answerer's identity and its lease claim lets the caller require that the
+ * store it compares against belongs to the process that reloads (#1694).
+ */
+export interface DaemonStoreAnswer {
+  /** The store the answering process reloads standing credentials from. */
+  identity: SecretStoreIdentity;
+  /** The answering endpoint's wire identity, so the answer names a process rather than a rail. */
+  responder: string;
+  /** Did the answering process say it held this space's delivery lease at the moment it answered?
+   *
+   *  THIS IS THE ANSWERER'S OWN CLAIM, NOT A VERIFIED FACT, and a caller that decides anything on
+   *  it alone is trusting a boolean the answerer chose. `false` is the honest reading for a
+   *  responder that does not own the shard, and it is useful exactly because an honest non-holder
+   *  sends it. A responder that is not honest can send `true`. A caller requiring the answer to
+   *  come from the process that reloads must verify the binding itself, by reading the lease row
+   *  and comparing its holder against {@link DaemonStoreAnswer.responder}. */
+  holdsDeliveryLease: boolean;
+}
+
+/** Parse a {@link DaemonStoreAnswer} off the wire through the same closed-parser discipline as
+ *  {@link parseSecretStoreIdentity}: a reply that cannot produce every field is a failure to
+ *  determine, raised here, never a partially trusted answer assembled by the caller. CLOSED means
+ *  closed in both directions: an unknown top-level key is refused rather than ignored, so a reply
+ *  carrying a field this version does not know about is a failure to determine instead of an
+ *  answer that was silently read as something narrower than it claimed to be.
+ *
+ *  A daemon older than #1694 replies with a bare identity and no binding. That lands here as a
+ *  parse failure, which is the intended reading: the caller cannot establish who answered, so it
+ *  must refuse rather than fall back to the unbound comparison this type exists to replace. */
+export function parseDaemonStoreAnswer(raw: unknown): DaemonStoreAnswer {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+    throw new Error("delivery-daemon store answer must be an object");
+  const o = raw as Record<string, unknown>;
+  const ADMITTED = ["identity", "responder", "holdsDeliveryLease"];
+  const unknown = Object.keys(o).filter((k) => !ADMITTED.includes(k));
+  if (unknown.length)
+    throw new Error(
+      `delivery-daemon store answer admits only {identity, responder, holdsDeliveryLease} (unknown: ${unknown.sort().join(", ")})`,
+    );
+  if (typeof o.responder !== "string" || !o.responder.trim())
+    throw new Error("delivery-daemon store answer requires a non-blank responder identity");
+  if (typeof o.holdsDeliveryLease !== "boolean")
+    throw new Error("delivery-daemon store answer requires holdsDeliveryLease as a boolean (an absent claim is not a false one)");
+  return { identity: parseSecretStoreIdentity(o.identity), responder: o.responder, holdsDeliveryLease: o.holdsDeliveryLease };
+}
+
 
 /**
  * The notice a manager logs when its remint store and the daemon's reload source are not one

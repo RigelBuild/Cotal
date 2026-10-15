@@ -22,28 +22,25 @@
  */import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
+import type { CotalEndpoint as CotalEndpointType, EpCaller, EpEnvelopeError as EpEnvelopeErrorType } from "@cotal-ai/core";
+import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
+
+const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+process.env.COTAL_HOME = join(dir, "home");
+const {
   isReachable, createSpaceAuth, serverConfig, setupSpaceStreams, mintCreds, newIdentity,
   mintLifecycleUid, DEV_OWNER, agentFilePath, CotalEndpoint, EpEnvelopeError,
-} from "@cotal-ai/core";
-import { authDir, saveSpaceAuth, recordMesh } from "@cotal-ai/workspace";
-import { Manager } from "../src/manager.js";
-import { MANAGER_ENDPOINT } from "../src/manager-service-contract.js";
-import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
+} = await import("@cotal-ai/core");
+const { authDir, saveSpaceAuth, recordMesh } = await import("@cotal-ai/workspace");
+const { Manager } = await import("../src/manager.js");
+const { MANAGER_ENDPOINT } = await import("../src/manager-service-contract.js");
 
 // A literal, not an import: the constant does not exist on tips predating the fence, and an import
 // would make this probe refuse to load on the very tip it is the baseline for.
 const EP_BIND_REFUSED = "ai.cotal.ep.bind-refused";
 
-const freePort = (): Promise<number> =>
-  new Promise((res, rej) => {
-    const s = createServer();
-    s.on("error", rej);
-    s.listen(0, "127.0.0.1", () => { const p = (s.address() as AddressInfo).port; s.close(() => res(p)); });
-  });
 const PORT = await freePort();
 const SERVERS = `nats://127.0.0.1:${PORT}`;
 
@@ -64,7 +61,6 @@ const check = (name: string, cond: boolean, extra?: unknown) => {
 
 const space = `epsplit-${randomUUID().slice(0, 8)}`;
 const auth = await createSpaceAuth(space);
-const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
 const mkRoot = (tag: string): string => {
   const r = join(dir, tag);
   mkdirSync(join(r, ".cotal", "agents"), { recursive: true });
@@ -78,7 +74,7 @@ const releaseBroker = teardownOnSignal(srv, dir);
 type MgrPriv = { managerInstanceId: string };
 let m1: InstanceType<typeof Manager> | undefined;
 let m2: InstanceType<typeof Manager> | undefined;
-let ep: CotalEndpoint | undefined;
+let ep: CotalEndpointType | undefined;
 
 try {
   let up = false;
@@ -166,7 +162,7 @@ try {
       // trials where it fired twice.
       const marks = (e instanceof EpEnvelopeError ? e.details ?? [] : []).map((d) => d.kind).filter(Boolean);
       if (marks.includes(EP_BIND_REFUSED)) bindRefused++;
-      refusedBeforeEffect = marks.includes(EP_BIND_REFUSED) && (e as EpEnvelopeError).outcome === "not-executed";
+      refusedBeforeEffect = marks.includes(EP_BIND_REFUSED) && (e as EpEnvelopeErrorType).outcome === "not-executed";
       outcomeStated = e instanceof EpEnvelopeError && e.outcome !== undefined;
       detail = e instanceof EpEnvelopeError
         ? `${e.code}|outcome=${e.outcome ?? "(absent)"}|${marks.join(",") || "(no details)"}`
@@ -202,11 +198,11 @@ try {
   check("the caller holds a resolved handle to rewrite (the forced case can be set up at all)",
     bound !== undefined, { cached: [...cache.keys()] });
   let forcedRecoveries = 0, forcedEffects = 0, forcedOk = false;
-  // THE REPAIR IS NOT GUARANTEED TO LAND, BY DESIGN. Core repairs a bind refusal exactly once and
-  // lets a second refusal surface, while in a two-manager space roughly half of all class-queue
-  // calls split (both stated in `endpoint.ts`). The re-issue therefore goes back through the same
-  // queue and is split again about half the time. Asserting that the repair always lands is
-  // asserting a coin comes up heads.
+  // THE REPAIR IS NOT GUARANTEED TO LAND, BY DESIGN. Core re-issues a bind refusal a bounded
+  // number of times and lets the last refusal surface, while in a two-manager space roughly half
+  // of all class-queue calls split (both stated in `endpoint.ts`). Each re-issue goes back through
+  // the same queue and can split again. Asserting that the repair always lands is asserting a coin
+  // comes up heads within the bound.
   let forcedRefusedBeforeEffect = false, forcedDetail = "", forcedUid = "", forcedBoundTo = "";
   let forcedInstalled = false;
   if (bound !== undefined) {
@@ -240,7 +236,7 @@ try {
       // the flake it caused required adding this line first.
       const thrown = (e instanceof EpEnvelopeError ? e.details ?? [] : []) as Array<{ kind?: string; boundTo?: { instanceId?: string } }>;
       const marks = thrown.map((d) => d.kind).filter(Boolean);
-      forcedRefusedBeforeEffect = marks.includes(EP_BIND_REFUSED) && (e as EpEnvelopeError).outcome === "not-executed";
+      forcedRefusedBeforeEffect = marks.includes(EP_BIND_REFUSED) && (e as EpEnvelopeErrorType).outcome === "not-executed";
       // Read here too, so this face is legible rather than blank. A resolve failure rethrows the
       // ORIGINAL refusal, whose bind is the one forced in, so the guard below correctly rejects it:
       // no re-issue went out. Left unassigned it stayed "", which is indistinguishable in the output
@@ -270,7 +266,7 @@ try {
   // A recovery is emitted ONLY on a reply the caller read as refused-before-effect, so counting one
   // proves the responder produced the marked refusal — this is the fence, observed and not inferred.
   check("FORCED SPLIT IS FENCED: the wrongly-bound call was refused before it ran, then repaired",
-    forcedRecoveries === 1, { forcedRecoveries });
+    forcedRecoveries >= 1, { forcedRecoveries });
   // BOTH OUTCOMES ARE CORRECT, so both pass: the repair either landed (one effect, caller told ok)
   // or was split again and refused (no effect, and the refusal states conclusively that nothing
   // ran). Grading the first alone reddened this suite on runs where the property it exists to
