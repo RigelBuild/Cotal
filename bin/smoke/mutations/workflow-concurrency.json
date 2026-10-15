@@ -2,7 +2,7 @@
   "suite": [
     "bin/smoke/workflow-concurrency.smoke.ts"
   ],
-  "guard": "every workflow a push to main can start either queues its runs or has no concurrency group at all, and no workflow can reach the queue:max plus cancel-in-progress:true pairing that fails validation",
+  "guard": "every workflow a push to rigel-release can start either queues its runs or has no concurrency group at all, and no workflow can reach the queue:max plus cancel-in-progress:true pairing that fails validation",
   "command": "pnpm smoke:workflow-concurrency",
   "completionMarker": "SUITE COMPLETE",
   "proveWith": "pnpm mutation-proof --config bin/smoke/mutations/workflow-concurrency.json",
