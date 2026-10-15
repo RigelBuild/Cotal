@@ -22,7 +22,7 @@ on:
       - 'assets/**'
       - '.github/workflows/docs.yml'
 
-# A new push to a PR supersedes the build already running for it; main builds queue.
+# A new push to a PR supersedes the build already running for it; rigel-release builds queue.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 # Same policy as ci.yml: a new push to a PR supersedes the reproof already running for that PR; a
-# merge to main queues behind the previous main run instead of evicting it. Without this block every
+# merge to rigel-release queues behind the previous release-branch run instead of evicting it. Without this block every
 # PR head kept its own 12-shard matrix queued, so a PR pushed three times held 36 shard jobs of the
 # org's 20-job concurrency cap, and on 2026-09-10 the queue reached 151 jobs with 24 of them for heads
 # their PRs no longer had.
