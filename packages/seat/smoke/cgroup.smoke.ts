@@ -5,7 +5,7 @@ import { chmodSync, chownSync, closeSync, existsSync, mkdirSync, mkdtempSync, re
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { CGROUP_DELEGATED_ENV, checkSeatRelease, launchSeat, loadSeat, resolveCgroupBase, trustedSetpriv, processStartToken, socketPath, reapSeat, sealSeatLaunch, seatCgroupContained, seatCgroupPath, seatCgroupPopulated, seatId, type SeatLaunchSpec } from "../src/index.js";
+import { CGROUP_DELEGATED_ENV, checkSeatRelease, launchSeat, loadSeat, resolveCgroupBase, trustedSetpriv, processStartToken, socketPath, reapSeat, sealSeatLaunch, seatCgroupContained, seatCgroupPath, seatCgroupPopulated, seatId, type SeatLaunchSpec, type SeatRecord } from "../src/index.js";
 import { removeSeatCgroup } from "../src/cgroup.js";
 import { setCustodianTestSeam, setLauncherTestSeam } from "../src/launcher.js";
 import { pidfdOpen, pidfdSignal } from "../src/peercred.js";
@@ -417,7 +417,14 @@ s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,
           break;
         }
         created.push(seatCgroupPath(base, id));
-        const rec = launchSeat({ root, name: "t6-peer-uid", id, spec: { command: process.execPath, args: ["-e", SLEEPER, file("pid")], env }, cwd: agentDir, cgroupBase: base, agentUid });
+        let rec: SeatRecord;
+        try {
+          rec = launchSeat({ root, name: "t6-peer-uid", id, spec: { command: process.execPath, args: ["-e", SLEEPER, file("pid")], env }, cwd: agentDir, cgroupBase: base, agentUid });
+        } catch (e) {
+          // A custodian left at the launcher's uid cannot write the agent-owned seat, so launch fails.
+          check("peer uid: the custodian and its child run as the agent uid", false, (e as Error).message);
+          break;
+        }
         strays.push({ pid: rec.custodianPid, start: rec.custodianStart }, { pid: rec.childPid, start: rec.childStart });
         await until(() => existsSync(file("pid")), 5_000);
         const child = readPid(file("pid"));
