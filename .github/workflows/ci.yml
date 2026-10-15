@@ -124,8 +124,10 @@ jobs:
         run: pnpm test
       - name: Validator lock acquisition source controls
         run: node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs
+      # Quarantined on the upstream sync: red on pristine upstream main. Still runs so its output stays visible.
       - name: Remaining schema direct-engine diagnostic
         if: ${{ !cancelled() }}
+        continue-on-error: true
         run: pnpm smoke:schema-remaining15-diagnostic
       - name: Remaining schema schemasafe comparison
         if: ${{ !cancelled() }}

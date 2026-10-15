@@ -55,23 +55,26 @@ const roster = [
   hostPresence,
 ];
 const unicastTargets: string[] = [];
-const endpoint: Pick<CotalEndpoint, "card" | "getRoster" | "unicast"> = {
+const sentMessage = (target: string, text: string): CotalMessage => {
+  unicastTargets.push(`${target}:${text}`);
+  return {
+    id: `message-${unicastTargets.length}`,
+    ts: Date.now(),
+    space: config.space,
+    from: { id: "caller-id", name: "caller" },
+    to: target,
+    parts: [{ kind: "text", text }],
+  };
+};
+const endpoint: Pick<CotalEndpoint, "card" | "getRoster" | "presenceView" | "unicast" | "unicastAttributed"> = {
   card: roster[0].card,
   getRoster: () => roster,
-  unicast: async (target, text): Promise<CotalMessage> => {
-    unicastTargets.push(`${target}:${text}`);
-    return {
-      id: `message-${unicastTargets.length}`,
-      ts: Date.now(),
-      space: config.space,
-      from: { id: "caller-id", name: "caller" },
-      to: target,
-      parts: [{ kind: "text", text }],
-    };
-  },
+  presenceView: () => ({ state: "current", fresh: true }),
+  unicast: async (target, text): Promise<CotalMessage> => sentMessage(target, text),
+  unicastAttributed: async (target, text) => ({ msg: sentMessage(target, text), ack: { seq: unicastTargets.length, duplicate: false } }),
 };
 const agent = new MeshAgent(config);
-const stage = agent as unknown as { _connected: boolean; ep: Pick<CotalEndpoint, "card" | "getRoster" | "unicast"> };
+const stage = agent as unknown as { _connected: boolean; ep: Pick<CotalEndpoint, "card" | "getRoster" | "presenceView" | "unicast" | "unicastAttributed"> };
 stage._connected = true;
 stage.ep = endpoint;
 const specs = cotalToolSpecs(config);

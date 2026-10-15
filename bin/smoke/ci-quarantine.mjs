@@ -18,6 +18,8 @@ export const QUARANTINED = {
   "smoke:mutation-fixtures": { reason: "upstream: 91 dead mutation anchors on pristine main; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:required-arg-seam": { reason: "upstream: call-site pins 229/179 vs 247/193 and an unverifiable tls site in control-target.ts on pristine main; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:instrument-instance-pin": { reason: "upstream: red on main CI runs 38756147210 and 38753177566; 2/61 fail locally on the merge; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:seat-exit-cause": { reason: "upstream: TypeError reading allowSubscribe on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:sys-rotation-e2e": { reason: "upstream: a plain cotal up no longer reports Started nats-server on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:web-echo-escaping": { reason: "upstream: 1/29 cells fail on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:manager-reconcile-startup": { reason: "upstream: red on main CI runs 38756147210 and 38753177566; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:manager-restart-live": { reason: "upstream: red on main CI runs 38756147210 and 38753177566; quarantined on sync per Matt", recheckBy: "2026-12-31" },
@@ -30,5 +32,6 @@ export const QUARANTINED = {
 /** @type {Record<string, { reason: string; recheckBy: string }>} */
 export const LIVE_QUARANTINED = {
   "smoke:lifecycle-e2e": { reason: "RIG-4872: despawn cannot prove a pty seat gone until RIG-4320 lands", recheckBy: "2026-11-15" },
+  "smoke:schema-remaining15-diagnostic": { reason: "upstream: dynamicRef cases fail on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:herdr-e2e:live": { reason: "RIG-4872: herdr server not running when the manager starts", recheckBy: "2026-11-15" },
 };
