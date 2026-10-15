@@ -16,6 +16,7 @@ export const QUARANTINED = {
   "smoke:delivery-renewal": { reason: "flaky: reloadCreds no responders on CI run 38171167895; Cotal is unmaintained, off per Matt", recheckBy: "2026-11-30" },
   "smoke:orphan-seat-spawn-window": { reason: "RIG-4320: expects lifecycle retirement after an unproven reap; the next custody PR rewrites it and lifts this", recheckBy: "2026-11-30" },
   "smoke:orphan-seat-rollback": { reason: "RIG-4320: expects lifecycle retirement after an unproven reap; the next custody PR rewrites it and lifts this", recheckBy: "2026-11-30" },
+  "smoke:orphan-seat-reap": { reason: "RIG-4320: expects lifecycle retirement after an unproven reap; the next custody PR rewrites it and lifts this", recheckBy: "2026-11-30" },
   "smoke:codex-host": { reason: "RIG-4872: flaky; approval presence wait timed out on CI run 37970832138, passed on 37964440191", recheckBy: "2026-11-15" },
 };
 
