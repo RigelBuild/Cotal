@@ -21,7 +21,8 @@ const DIST = join(dirname(SCRIPT), "..", "dist");
 const CELLS = ["refusal", "shared-uid", "unprovable", "release-join", "rollback", "bounds", "wrong-base", "distinct-uid", "setsid", "recordless", "fence", "peer-uid"] as const;
 type Cell = (typeof CELLS)[number];
 const NEEDS_DISTINCT_UID: Record<Cell, boolean> = { refusal: false, "shared-uid": false, unprovable: false, "release-join": false, rollback: false, bounds: false, "wrong-base": false, "distinct-uid": true, setsid: true, recordless: true, fence: true, "peer-uid": true };
-const NEEDS_CONTAINMENT: ReadonlySet<Cell> = new Set<Cell>(["distinct-uid", "setsid", "recordless", "fence"]);
+// Cells that launch a distinct-uid seat, which needs a root-owned setpriv to drop privileges through.
+const NEEDS_SETPRIV: ReadonlySet<Cell> = new Set<Cell>(["distinct-uid", "setsid", "recordless", "fence", "peer-uid"]);
 const REQUIRE = process.env.COTAL_SEAT_CGROUP_REQUIRE === "1";
 
 // Cells get no inherited COTAL_ connection material; they read only the COTAL_CG_ keys set below.
@@ -266,10 +267,19 @@ s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,
       skipped = true;
       console.log(`  - skipped: needs a distinct uid, got agent uid ${agentUid} with euid ${euid}`);
       cell = "skipped";
-    } else if (known !== undefined && NEEDS_CONTAINMENT.has(known) && trustedSetpriv() === undefined) {
-      // Containment is never proven without a root-owned setpriv; a mapped user namespace has none.
+    } else if (known !== undefined && NEEDS_SETPRIV.has(known) && trustedSetpriv() === undefined) {
+      // A mapped user namespace has no root-owned setpriv, so launchSeat must refuse the agent uid.
       skipped = true;
       console.log("  - skipped: setpriv not provably root-owned in this namespace");
+      if (known === "peer-uid") {
+        let refused = "";
+        try {
+          launch(seatId(), { command: process.execPath, args: ["-e", "0"], env }, agentUid);
+        } catch (e) {
+          refused = (e as Error).message;
+        }
+        check("no setpriv: launchSeat refuses a distinct agent uid", /no root-owned setpriv/.test(refused), refused);
+      }
       cell = "skipped";
     }
     switch (cell) {
@@ -458,10 +468,7 @@ s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,
         const loaded = loadSeat(root, id);
         check("forged record: adopt derives the socket from the root and id, not the record", loaded.socket === socketPath(root, id), loaded.socket);
         const evidence = await reapSeat(root, id, { cgroup: cg });
-        if (trustedSetpriv() === undefined) {
-          console.log("  - setpriv not provably root-owned in this namespace: containment is unproven, so the reap must stay retained");
-          check("peer uid: with containment unproven the agent-uid seat reap is retained, not reaped", evidence.outcome === "retained", evidence);
-        } else check("peer uid: the agent-uid seat is reaped through its cgroup", evidence.outcome === "reaped" && child !== undefined && gone(child.pid), evidence);
+        check("peer uid: the agent-uid seat is reaped through its cgroup", evidence.outcome === "reaped" && child !== undefined && gone(child.pid), evidence);
         break;
       }
       case "fence": {

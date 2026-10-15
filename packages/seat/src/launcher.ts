@@ -194,6 +194,10 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
     if (gid === undefined) throw new Error(`agent uid ${agentUid} is not in /etc/passwd and COTAL_SEAT_AGENT_GID names no gid`);
     agent = { uid: agentUid, gid };
   }
+  // An agent that can never gain a capability cannot bypass the seat cgroup's mode bits, which is what
+  // makes a reap provable. No trusted setpriv means no distinct-uid seat at all.
+  const setpriv = agent ? trustedSetpriv() : undefined;
+  if (agent && !setpriv) throw new Error("no root-owned setpriv: refusing to launch a seat under a distinct agent uid without no_new_privs");
   mkdirSync(opts.root, { recursive: true, mode: 0o700 });
   // The agent must reach its own seat directory and the fence; 0711 lets it traverse, not list.
   if (agent) chmodSync(opts.root, 0o711);
@@ -275,10 +279,6 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
     closeSync(fenceFd);
   }
   const custodianArgv = [process.execPath, custodianEntry(), RUN_MARKER_FLAG, run];
-  // An agent that can never gain a capability cannot bypass the seat cgroup's mode bits, which is what
-  // makes a reap provable. No trusted setpriv means no distinct-uid seat at all.
-  const setpriv = agent ? trustedSetpriv() : undefined;
-  if (agent && !setpriv) throw new Error("no root-owned setpriv: refusing to launch a seat under a distinct agent uid without no_new_privs");
   const argv = agent && setpriv
     ? [setpriv, "--reuid", String(agent.uid), "--regid", String(agent.gid), "--clear-groups", "--no-new-privs", "--bounding-set=-all", "--", ...custodianArgv]
     : custodianArgv;
