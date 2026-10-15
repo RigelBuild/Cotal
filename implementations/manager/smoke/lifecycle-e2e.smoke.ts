@@ -64,6 +64,10 @@ const NO_PROOF = "setpriv not provably root-owned in this namespace";
 
 const space = `life-${randomUUID().slice(0, 8)}`;
 const auth = await createSpaceAuth(space);
+// launchSeat refuses a distinct agent uid without a root-owned setpriv; the seat cgroup smoke proves
+// that refusal. Checked before the broker and temp dir exist, so the refusal leaks neither.
+if (process.env.COTAL_SEAT_AGENT_UID !== undefined && trustedSetpriv() === undefined)
+  throw new Error(`delegated mode needs a root-owned setpriv: ${NO_PROOF}`);
 const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
 const workspaceRoot = join(dir, "ws");
 mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
@@ -167,8 +171,6 @@ if (delegated) {
   custodial = new CustodialPtyRuntime({ root: join(dir, "seats") });
   if (custodial.cgroupBase === undefined || custodial.agentUid === process.geteuid?.())
     throw new Error(`delegated mode needs a Delegate=yes scope and a distinct agent uid; got base ${String(custodial.cgroupBase)}, agent uid ${custodial.agentUid}`);
-  // launchSeat refuses a distinct agent uid without one; the seat cgroup smoke proves that refusal.
-  if (trustedSetpriv() === undefined) throw new Error(`delegated mode needs a root-owned setpriv: ${NO_PROOF}`);
 }
 (mgr as unknown as { runtime: unknown }).runtime = custodial ?? new LegacyPtyRuntime();
 console.log(`runtime: ${custodial ? `custodial, agent uid ${custodial.agentUid}, cgroup base ${String(custodial.cgroupBase)}` : "legacy pty"}`);
