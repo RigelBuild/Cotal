@@ -607,6 +607,8 @@ smoke:web-seed:live
 # broker, including a caller-only COTAL_DEFAULT_AGENT crossing into an already-running manager.
 # Appended to preserve every existing shard assignment.
 smoke:persona-agent
+# Retired upstream (38087517f) but kept as a skip: removing a frozen line re-shards every suite below it.
+smoke:web-probe-target
 # The web runtime binds the requested remote host, rejects wildcard public URLs, and keeps the
 # loopback default when no host is supplied. Appended so every existing shard assignment remains
 # unchanged.

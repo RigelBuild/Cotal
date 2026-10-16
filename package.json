@@ -588,6 +588,7 @@
     "smoke:descendant-deny:auth": "tsx implementations/auth/smoke/descendant-deny.smoke.ts",
     "smoke:callout-deny:auth": "tsx implementations/auth/smoke/callout-deny.smoke.ts",
     "smoke:callout-shape": "tsx implementations/auth/smoke/callout-shape.smoke.ts",
+    "smoke:web-probe-target": "node -e \"import('./bin/smoke/sentinel.mjs').then((m) => m.skipSuite('retired upstream in 38087517f; the line holds the frozen shard index'))\"",
     "smoke:user-auth-launch:live": "tsx implementations/auth/smoke/user-auth-launch.smoke.ts",
     "smoke:remote-exchange:live": "tsx implementations/auth/smoke/remote-exchange.smoke.ts",
     "smoke:discovery-bundle-consumable:live": "tsx bin/smoke/discovery-bundle-consumable.smoke.ts",

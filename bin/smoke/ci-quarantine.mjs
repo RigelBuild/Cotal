@@ -26,6 +26,10 @@ export const QUARANTINED = {
   "smoke:up-tls-routes": { reason: "flaky: delivery-refresh-keeps-tls failed on #83 run 38791646907, passes locally on the merge and on main; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:orphan-seat-reap": { reason: "upstream: the in-process pty runtime has no custody reference, so the smoke dies reading ready.reference.id on pristine main; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:orphan-seat-spawn-window": { reason: "upstream: the in-process pty runtime has no custody reference, so the smoke dies reading ready.reference.id on pristine main; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:user-auth-launch:live": { reason: "upstream: the two foreground-spawn-beyond-grant cells fail on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:claude-hosted-presence": { reason: "upstream: exits 0 with no COTAL_SMOKE_SENTINEL on pristine main 8ca93e96, so the shard grades it failed; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:claude-hosted-types": { reason: "upstream: exits 0 with no COTAL_SMOKE_SENTINEL on pristine main 8ca93e96, so the shard grades it failed; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:transport-liveness:broker": { reason: "upstream: passes its cells, then never exits on pristine main 8ca93e96 (180s local timeout; hit the 60 min shard limit on CI); quarantined on sync per Matt", recheckBy: "2026-12-31" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */
