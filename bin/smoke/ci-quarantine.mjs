@@ -37,6 +37,16 @@ export const QUARANTINED = {
   "smoke:runtime-mesh-turn": { reason: "upstream: cancel is not in the manager surface, so the Cancelled cell fails on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:manager-stop-spare-guard": { reason: "upstream: 1/26 cells fail on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:delivery-explicit-space": { reason: "upstream: ensureControlPlane explicit-space cell fails on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:claude-hosted-session": { reason: "upstream: spawnSync git ENOENT on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:cli-on-instance": { reason: "upstream: red on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:legacy-packaged-manager": { reason: "upstream: the $0-relative pnpm launcher cell fails (also red on #83 CI shard 3) on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:mint-provision:auth": { reason: "upstream: red on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:mutation-metadata": { reason: "upstream: red on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:mutation-reproof": { reason: "upstream: the snapshot-install-failure UNMEASURED cell fails on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:orphan-seat-succession": { reason: "upstream: successor manager exits 1 on static reconcile (also red on #83 CI shard 2) on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:remote-manager-goal-reader": { reason: "upstream: describe reply subscription permissions violation on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:suite-ambient-env-self": { reason: "upstream: run-owned-agents.smoke.ts reads COTAL_ env before scrubbing (also red on #83 CI shard 0) on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:up-refresh-identity:live": { reason: "upstream: red on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */
