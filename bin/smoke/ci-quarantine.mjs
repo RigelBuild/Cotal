@@ -47,6 +47,7 @@ export const QUARANTINED = {
   "smoke:remote-manager-goal-reader": { reason: "upstream: describe reply subscription permissions violation on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:suite-ambient-env-self": { reason: "upstream: run-owned-agents.smoke.ts reads COTAL_ env before scrubbing (also red on #83 CI shard 0) on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:up-refresh-identity:live": { reason: "upstream: red on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:jcode-provider-permanent-refusal": { reason: "flaky upstream: timed out waiting for the permanent replacement refusal on #83 CI run 38978458326; passes 3/3 locally on the merge and on pristine main; quarantined on sync per Matt", recheckBy: "2026-12-31" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */
