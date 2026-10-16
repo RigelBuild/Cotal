@@ -30,6 +30,13 @@ export const QUARANTINED = {
   "smoke:claude-hosted-presence": { reason: "upstream: exits 0 with no COTAL_SMOKE_SENTINEL on pristine main 8ca93e96, so the shard grades it failed; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:claude-hosted-types": { reason: "upstream: exits 0 with no COTAL_SMOKE_SENTINEL on pristine main 8ca93e96, so the shard grades it failed; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:transport-liveness:broker": { reason: "upstream: passes its cells, then never exits on pristine main 8ca93e96 (180s local timeout; hit the 60 min shard limit on CI); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:presence-render-census": { reason: "upstream: manifest anchor `return r;` occurs twice in connector-core agent.ts on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:manager-caller-transport": { reason: "upstream: askHost cell hits a KV direct-get permissions violation on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:claude-workspace-trust": { reason: "upstream: exits 0 with no COTAL_SMOKE_SENTINEL on pristine main 8ca93e96, so the shard grades it failed; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:orphan-seat-rollback": { reason: "upstream: finds no seat record under the custody root on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:runtime-mesh-turn": { reason: "upstream: cancel is not in the manager surface, so the Cancelled cell fails on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:manager-stop-spare-guard": { reason: "upstream: 1/26 cells fail on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:delivery-explicit-space": { reason: "upstream: ensureControlPlane explicit-space cell fails on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */
