@@ -5,6 +5,21 @@ this repo. This is the **canonical** agent guide; `CLAUDE.md` points here.
 
 Keep your answers short and to the point.
 
+## This fork: broken tests are disabled, not fixed
+
+This is the Rigel fork. `main` mirrors upstream; our changes land on `rigel-release`.
+
+- **A test that fails or flakes on upstream code is disabled, never fixed.** Do not debug it,
+and do not file a question about it. This is a standing owner ruling.
+  - A smoke suite: add a `QUARANTINED` entry in `bin/smoke/ci-quarantine.mjs` with a `reason`
+  that names the evidence and a `recheckBy` date. Keep its line in `bin/smoke/ci-suites.txt`,
+  because removing a line re-shards every suite below it.
+  - A `ci.yml` smoke step: add `continue-on-error: true` and a matching `LIVE_QUARANTINED` entry.
+  - Mutation reproof does not run on upstream sync PRs; the daily `--all` sweep grades them
+  after the merge.
+- **A test for code we wrote is fixed.** Fix a race by waiting for the event, not with a retry
+or a quarantine.
+
 ## What this is
 
 **Cotal** is a standard wire interface for software, especially AI agents, to coordinate in
