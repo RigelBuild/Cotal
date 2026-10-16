@@ -14,7 +14,6 @@ export const QUARANTINED = {
   "smoke:attach-reconnect": { reason: "RIG-4922: cell B (detach key mid-reconnect) failed on main CI run 38022761542 at 88546942; first failure in 25 runs", recheckBy: "2026-11-15" },
   "smoke:turn-relay-auth": { reason: "flaky: JetStream heartbeats missed on CI run 38171320196; Cotal is unmaintained, off per Matt", recheckBy: "2026-11-30" },
   "smoke:delivery-renewal": { reason: "flaky: reloadCreds no responders on CI run 38171167895; Cotal is unmaintained, off per Matt", recheckBy: "2026-11-30" },
-  "smoke:jcode-empty-sessions": { reason: "flaky: listing-panic cell failed on cotal #76 run 38803157990; passed on #70, #72, #74 and #75 at the same jcode code", recheckBy: "2026-11-30" },
   "smoke:codex-host": { reason: "RIG-4872: flaky; approval presence wait timed out on CI run 37970832138, passed on 37964440191", recheckBy: "2026-11-15" },
 };
 
