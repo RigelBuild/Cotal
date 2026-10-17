@@ -12,8 +12,8 @@ import { fileURLToPath } from "node:url";
 
 const root = dirname(fileURLToPath(new URL(".", import.meta.url)));
 export const SHIPPED_LINUX_NATIVES = [
-  { arch: "x64", elfMachine: 62 },
-  { arch: "arm64", elfMachine: 183 },
+  { arch: "x64", elfMachine: 62, files: ["peercred.node", "pty.node"] },
+  { arch: "arm64", elfMachine: 183, files: ["peercred.node", "pty.node"] },
 ];
 
 export function elfMachine(path) {
@@ -24,35 +24,35 @@ export function elfMachine(path) {
   return buf.readUInt16LE(18);
 }
 
-export function shippedNativePath(pkgRoot, arch) {
-  return join(pkgRoot, "build", "Release", `linux-${arch}`, "peercred.node");
+export function shippedNativePath(pkgRoot, arch, file) {
+  return join(pkgRoot, "build", "Release", `linux-${arch}`, file);
 }
 
 export function assertShippedNatives(pkgRoot = root) {
   const missing = [];
   const wrong = [];
   for (const target of SHIPPED_LINUX_NATIVES) {
-    const path = shippedNativePath(pkgRoot, target.arch);
-    if (!existsSync(path)) {
-      missing.push(path);
-      continue;
-    }
-    let machine;
-    try {
-      machine = elfMachine(path);
-    } catch (err) {
-      wrong.push(`${path}: ${err instanceof Error ? err.message : String(err)}`);
-      continue;
-    }
-    if (machine !== target.elfMachine) {
-      wrong.push(
-        `${path}: ELF e_machine ${machine}, expected ${target.elfMachine} for linux-${target.arch}`,
-      );
+    for (const file of target.files) {
+      const path = shippedNativePath(pkgRoot, target.arch, file);
+      if (!existsSync(path)) {
+        missing.push(path);
+        continue;
+      }
+      let machine;
+      try {
+        machine = elfMachine(path);
+      } catch (err) {
+        wrong.push(`${path}: ${err instanceof Error ? err.message : String(err)}`);
+        continue;
+      }
+      if (machine !== target.elfMachine) {
+        wrong.push(`${path}: ELF e_machine ${machine}, expected ${target.elfMachine} for linux-${target.arch}`);
+      }
     }
   }
   if (missing.length === 0 && wrong.length === 0) return;
   for (const path of missing) {
-    console.error(`@cotal-ai/seat: SO_PEERCRED native helper missing at ${path}`);
+    console.error(`@cotal-ai/seat: native helper missing at ${path}`);
   }
   for (const line of wrong) console.error(`@cotal-ai/seat: ${line}`);
   console.error(

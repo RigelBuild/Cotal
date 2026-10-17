@@ -819,6 +819,7 @@ try {
         "prepare-preservation": attempt,
         "commit-preservation": attempt,
         "abort-preservation": attempt,
+        "release-seat": { alias: `no-such-agent-${randomUUID().slice(0, 6)}`, lifecycleUid: "no-such-lifecycle", reason: "pin probe" },
       };
       const notReached: string[] = [];
       const ranTwice: string[] = [];

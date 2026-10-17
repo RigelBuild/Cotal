@@ -2,29 +2,29 @@
   "suite": [
     "implementations/manager/smoke/orphan-seat-rollback.smoke.ts"
   ],
-  "guard": "a spawn that launched its seat and then threw is rolled back by the manager that launched it, and the seat process is proved gone before the lifecycle retires",
+  "guard": "a spawn that launched its seat and then threw is rolled back through the static terminal, which reaps the custody reference the spawn reserved on the slot row before launch, and retains the lifecycle when that seat is not proved gone",
   "command": "pnpm smoke:orphan-seat-rollback",
   "proveWith": "node scripts/mutation-proof.mjs --config implementations/manager/smoke/fixtures/orphan-seat-rollback.mutations.json",
   "why": [
-    "The suite parks a real manager in the onLaunched callback, after the seat's custodian and child exist and before the slot activation CAS, checks both processes are running, then releases it into a throw. The rollback runs in the same process, where the handle is gone with the stack frame.",
-    "The two sibling orphan-seat suites survive both mutations: in each of them the reap is driven by a SUCCESSOR that reads the custody reference off the slot row, and neither mutation touches that row."
+    "The suite parks a real manager in the onLaunched callback, after the seat custodian and child exist and before the slot activation CAS, then releases it into a throw. The rollback drives the static terminal in the same process.",
+    "Since T3 the terminal reaps only the slot row reference, never the caller reference, so the guarded facts are that the reservation is durably on the row before the spawn and that the terminal reaps from the row. Each mutation breaks one of them and the terminal retains as no-reference instead of addressing the launched seat."
   ],
   "mutations": [
     {
-      "name": "leave the reserved custody reference off the rollback object",
+      "name": "write the spawn intent without the reserved custody reference",
       "file": "implementations/manager/src/manager.ts",
-      "find": "provisioned = { id: identity.id, name, lifecycleUid, secretPaths: { creds: credsPath }, ...(custody ? { runtime: custody } : {}) };",
-      "replace": "provisioned = { id: identity.id, name, lifecycleUid, secretPaths: { creds: credsPath } };",
-      "expectRed": "the rollback reaps the launched seat by the reference the spawn reserved",
-      "cell": "the rollback reaps the launched seat by the reference the spawn reserved"
+      "find": "ownerInstanceId: this.managerInstanceId, runtime: custody }),",
+      "replace": "ownerInstanceId: this.managerInstanceId }),",
+      "expectRed": "the rollback reaps the reference the spawn reserved and RETAINS the lifecycle (unprovable, refused, release remedy)",
+      "cell": "the rollback reaps the reference the spawn reserved and RETAINS the lifecycle (unprovable, refused, release remedy)"
     },
     {
-      "name": "drop the custody reference on the way from deprovision to the static terminal",
+      "name": "the terminal reaps without the slot row reference",
       "file": "implementations/manager/src/manager.ts",
-      "find": "      return this.driveStaticRetirement(a);",
-      "replace": "      return this.driveStaticRetirement({ ...a, runtime: undefined });",
-      "expectRed": "the rollback reaps the launched seat by the reference the spawn reserved",
-      "cell": "the rollback reaps the launched seat by the reference the spawn reserved"
+      "find": "      if (released === undefined) await this.reapOrphanSeat(a, cur.row.runtime);\n",
+      "replace": "      if (released === undefined) await this.reapOrphanSeat(a, undefined);\n",
+      "expectRed": "the rollback reaps the reference the spawn reserved and RETAINS the lifecycle (unprovable, refused, release remedy)",
+      "cell": "the rollback reaps the reference the spawn reserved and RETAINS the lifecycle (unprovable, refused, release remedy)"
     }
   ]
 }

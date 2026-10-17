@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, openSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -73,6 +73,11 @@ export function socketPath(root: string, id: string): string {
   return join(root, assertSeatId(id), "seat.sock");
 }
 
+/** The launch fence: beside the seat directory, so it outlives the release rename of that directory. */
+export function fencePath(root: string, id: string): string {
+  return join(root, `.launch-${assertSeatId(id)}`);
+}
+
 /** This boot's identity. Read at the moment a record is written and again when it is read back: a
  *  start token is ticks since THIS boot, so two records from different boots share a namespace they
  *  cannot distinguish on their own. Undefined where the kernel does not publish it: a record written
@@ -104,14 +109,24 @@ export function processStartToken(pid: number): string | undefined {
 }
 
 export function writeRecord(path: string, record: SeatRecord): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   writeFileSync(path, `${JSON.stringify(record)}\n`, { mode: 0o600, flag: "w" });
   chmodSync(path, 0o600);
   chmodSync(dirname(path), 0o700);
 }
 
+/** Read a file in a seat directory without following a final symlink. The directory may be owned by
+ *  the agent uid, so a root reader must not be redirected through a link the agent planted. */
+export function readSeatFileNoFollow(path: string): string {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    return readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
 export function readRecord(path: string): SeatRecord {
-  const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<SeatRecord>;
+  const raw = JSON.parse(readSeatFileNoFollow(path)) as Partial<SeatRecord>;
   if (raw.version !== RECORD_VERSION) throw new Error(`unsupported seat record version ${String(raw.version)}`);
   if (typeof raw.id !== "string" || raw.id.length === 0) throw new Error("seat record missing id");
   if (typeof raw.name !== "string" || raw.name.length === 0) throw new Error("seat record missing name");

@@ -920,7 +920,8 @@ type ManagerServiceStatus = {
   staticReconciliation?: {
     state?: unknown;
     lastSweep?: { error?: unknown };
-    failures?: Array<{ alias?: unknown; phase?: unknown; disposition?: unknown; nextRetryAt?: unknown; remedy?: unknown }>;
+    retainedCustody?: unknown;
+    failures?: Array<{ alias?: unknown; phase?: unknown; disposition?: unknown; retainedReason?: unknown; nextRetryAt?: unknown; remedy?: unknown }>;
   };
 };
 
@@ -1011,10 +1012,13 @@ async function managerHealth(target: MeshTarget, context: LocalProcessContext, c
     } else {
       facts.push(`static reconciliation ${String(reconcile.state ?? "unreported")}`);
       if (typeof reconcile.lastSweep?.error === "string") facts.push(`static sweep error=${reconcile.lastSweep.error}`);
+      // Both retained fields are optional: an older manager reports neither.
+      if (typeof reconcile.retainedCustody === "number") facts.push(`static retained custody ${reconcile.retainedCustody}`);
       for (const failure of reconcile.failures ?? []) {
+        const retained = typeof failure.retainedReason === "string" ? ` retainedReason=${failure.retainedReason}` : "";
         const next = typeof failure.nextRetryAt === "string" ? ` nextRetryAt=${failure.nextRetryAt}` : "";
         const remedy = typeof failure.remedy === "string" ? ` remedy=${failure.remedy}` : "";
-        facts.push(`static alias=${String(failure.alias ?? "unreported")} phase=${String(failure.phase ?? "unreported")} disposition=${String(failure.disposition ?? "unreported")}${next}${remedy}`);
+        facts.push(`static alias=${String(failure.alias ?? "unreported")} phase=${String(failure.phase ?? "unreported")} disposition=${String(failure.disposition ?? "unreported")}${retained}${next}${remedy}`);
       }
     }
     facts.push("serve reachable");

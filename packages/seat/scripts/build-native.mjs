@@ -1,13 +1,17 @@
 #!/usr/bin/env node
 /**
- * Developer compile of the Linux SO_PEERCRED helper for THIS host arch.
+ * Developer compile of the Linux SO_PEERCRED helper and the pidfd-patched node-pty addon for THIS
+ * host arch.
  *
  * Customer `npm i` does not run this. A publishable tree is assembled in CI
  * from native linux-x64 and linux-arm64 builder artifacts. This script never
  * cross-compiles and never skips an arch: it only builds the host.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -54,33 +58,74 @@ function elfMachine(path) {
   return buf.readUInt16LE(18);
 }
 
-const outDir = join(releaseRoot, `linux-${arch}`);
-mkdirSync(outDir, { recursive: true });
-const out = join(outDir, "peercred.node");
-const args = ["-shared", "-fPIC", "-D_GNU_SOURCE", "-o", out, src, `-I${include}`];
-const result = spawnSync("cc", args, { cwd: root, encoding: "utf8" });
-if (result.status !== 0 || result.error) {
-  const detail = result.error
-    ? result.error.message
-    : `${result.stderr || result.stdout || `cc exited ${result.status ?? 1}`}`;
-  console.error(`@cotal-ai/seat: failed to compile the SO_PEERCRED helper for linux-${arch}.`);
-  console.error(`command: cc ${args.join(" ")}`);
+function compile(tool, args, what) {
+  const result = spawnSync(tool, args, { cwd: root, encoding: "utf8" });
+  if (result.status === 0 && !result.error) return;
+  const detail = result.error ? result.error.message : `${result.stderr || result.stdout || `${tool} exited ${result.status ?? 1}`}`;
+  console.error(`@cotal-ai/seat: failed to compile the ${what} for linux-${arch}.`);
+  console.error(`command: ${tool} ${args.join(" ")}`);
   console.error(detail.trim() || "(no compiler diagnostic)");
   console.error(
-    "A C compiler is required to BUILD this package from source. Published tarballs ship the prebuilt helpers and do not compile on install.",
+    "A C and C++ compiler is required to BUILD this package from source. Published tarballs ship the prebuilt helpers and do not compile on install.",
   );
   process.exit(result.status ?? 1);
 }
-let machine;
+
+function assertMachine(out, what) {
+  let machine;
+  try {
+    machine = elfMachine(out);
+  } catch (err) {
+    console.error(`@cotal-ai/seat: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+  if (machine !== expectedMachine) {
+    console.error(`@cotal-ai/seat: linux-${arch} ${what} at ${out} has ELF e_machine ${machine}, expected ${expectedMachine}.`);
+    process.exit(1);
+  }
+}
+
+const outDir = join(releaseRoot, `linux-${arch}`);
+mkdirSync(outDir, { recursive: true });
+const out = join(outDir, "peercred.node");
+compile("cc", ["-shared", "-fPIC", "-D_GNU_SOURCE", "-o", out, src, `-I${include}`], "SO_PEERCRED helper");
+assertMachine(out, "helper");
+
+// The vendored node-pty must be upstream plus pidfd.patch and nothing else: reverse the patch on a
+// copy and require every file to hash to its recorded upstream sha256.
+const vendor = join(root, "native", "node-pty");
+const upstream = JSON.parse(readFileSync(join(vendor, "UPSTREAM.json"), "utf8"));
+const pristine = mkdtempSync(join(tmpdir(), "cotal-seat-node-pty-"));
 try {
-  machine = elfMachine(out);
-} catch (err) {
-  console.error(`@cotal-ai/seat: ${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
-}
-if (machine !== expectedMachine) {
-  console.error(
-    `@cotal-ai/seat: linux-${arch} helper at ${out} has ELF e_machine ${machine}, expected ${expectedMachine}.`,
+  for (const file of Object.keys(upstream.files)) cpSync(join(vendor, file), join(pristine, file));
+  const reversed = spawnSync("patch", ["-R", "-p1", "-s", "-d", pristine, "-i", join(vendor, upstream.patch)], { encoding: "utf8" });
+  if (reversed.status !== 0 || reversed.error) {
+    console.error(`@cotal-ai/seat: ${upstream.patch} does not reverse-apply to native/node-pty: ${reversed.error?.message ?? reversed.stdout + reversed.stderr}`);
+    process.exit(1);
+  }
+  const drift = Object.entries(upstream.files).filter(
+    ([file, sha]) => createHash("sha256").update(readFileSync(join(pristine, file))).digest("hex") !== sha,
   );
-  process.exit(1);
+  if (drift.length > 0) {
+    console.error(
+      `@cotal-ai/seat: native/node-pty differs from node-pty@${upstream.version} plus ${upstream.patch}: ${drift.map(([f]) => f).join(", ")}`,
+    );
+    process.exit(1);
+  }
+} finally {
+  rmSync(pristine, { recursive: true, force: true });
 }
+
+const addonApi = dirname(createRequire(import.meta.url).resolve("node-addon-api/package.json"));
+const ptyOut = join(outDir, "pty.node");
+compile(
+  "c++",
+  [
+    "-shared", "-fPIC", "-O2", "-fstack-protector-strong", "-Wall", "-std=gnu++17",
+    "-DNAPI_CPP_EXCEPTIONS", "-DNODE_GYP_MODULE_NAME=pty",
+    `-I${include}`, `-I${addonApi}`,
+    "-o", ptyOut, join(vendor, "src", "unix", "pty.cc"), "-lutil",
+  ],
+  "pidfd-patched node-pty addon",
+);
+assertMachine(ptyOut, "pty addon");

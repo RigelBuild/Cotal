@@ -11,7 +11,13 @@ export interface PeerCredentials {
   gid: number;
 }
 
-type PeercredNative = { peercred: (fd: number) => PeerCredentials };
+type PeercredNative = {
+  peercred: (fd: number) => PeerCredentials;
+  tryLockFd: (fd: number) => boolean;
+  pidfdSignal: (pidfd: number, sig: "SIGTERM" | "SIGKILL") => "sent" | "gone";
+  pidfdExited: (pidfd: number) => boolean;
+  pidfdOpen: (pid: number) => number | null;
+};
 
 export const LINUX_NATIVE_ARCHES = ["x64", "arm64"] as const;
 
@@ -60,4 +66,24 @@ export function socketFd(sock: Socket): number {
 
 export function peerCredentials(sock: Socket): PeerCredentials {
   return loadNative().peercred(socketFd(sock));
+}
+
+/** flock(LOCK_EX | LOCK_NB); false when another open file description holds the lock. */
+export function tryLockFd(fd: number): boolean {
+  return loadNative().tryLockFd(fd);
+}
+
+/** pidfd_send_signal; ESRCH is "gone", any other failure throws. */
+export function pidfdSignal(pidfd: number, sig: "SIGTERM" | "SIGKILL"): "sent" | "gone" {
+  return loadNative().pidfdSignal(pidfd, sig);
+}
+
+/** pidfd_open; undefined when no process has that pid. The caller owns and must close the fd. */
+export function pidfdOpen(pid: number): number | undefined {
+  return loadNative().pidfdOpen(pid) ?? undefined;
+}
+
+/** poll(POLLIN, 0) on the pidfd: true once the process it names has exited. */
+export function pidfdExited(pidfd: number): boolean {
+  return loadNative().pidfdExited(pidfd);
 }

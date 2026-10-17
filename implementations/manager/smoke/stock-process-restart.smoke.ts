@@ -414,7 +414,7 @@ try {
     stealCli.code !== 0 && /hard-pinned|already held/i.test(stealCli.err + stealCli.out), { out: stealCli.out, err: stealCli.err });
 
   console.log("D2) runtime adoption on live/offline child -> verify same child PID/start and footprint");
-  const runtime = new CustodialPtyRuntime(seatRoot);
+  const runtime = new CustodialPtyRuntime({ root: seatRoot });
   const adoptedHandle = runtime.adopt(slotData.runtime);
   check("ADOPT: runtime adopt returns live proxy with SAME child PID", adoptedHandle.pid === childPid, { expected: childPid, got: adoptedHandle.pid });
   check("ADOPT: adopted child process still alive in kernel", typeof childPid === "number" && isProcessAlive(childPid));

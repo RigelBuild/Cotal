@@ -431,7 +431,10 @@ const SEAMS: Seam[] = [
   // reads the lease row back from the bucket and takes it over, so the fixture's renew and release
   // are judged from the broker rather than from the fixture's own bookkeeping. Under `smoke/`, so
   // both counts move by one. It states `tls: false`.
-  { fn: "standaloneConnectOpts", key: "tls", sites: 229, untypecheckedSites: 179 },
+  // 229/179 -> 235/185: the fork's custody suites add six smoke-side calls, three in
+  // implementations/manager/smoke/custody-fail-closed.smoke.ts and three in seat-release.smoke.ts
+  // (one reads the lifecycle record via core readRecord). All state `tls: false`.
+  { fn: "standaloneConnectOpts", key: "tls", sites: 235, untypecheckedSites: 185 },
 ];
 
 /**

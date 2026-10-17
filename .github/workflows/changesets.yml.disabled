@@ -38,10 +38,12 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Build host native
         run: pnpm --filter @cotal-ai/seat build
+      - name: Native symbol-version ceiling
+        run: node packages/seat/scripts/assert-native-ceiling.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: seat-native-linux-x64
-          path: packages/seat/build/Release/linux-x64/peercred.node
+          path: packages/seat/build/Release/linux-x64/
           if-no-files-found: error
           retention-days: 7
 
@@ -59,10 +61,12 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Build host native
         run: pnpm --filter @cotal-ai/seat build
+      - name: Native symbol-version ceiling
+        run: node packages/seat/scripts/assert-native-ceiling.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: seat-native-linux-arm64
-          path: packages/seat/build/Release/linux-arm64/peercred.node
+          path: packages/seat/build/Release/linux-arm64/
           if-no-files-found: error
           retention-days: 7
 
@@ -114,8 +118,8 @@ jobs:
           setupGitUser: true
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
-          SEAT_NATIVE_X64: ${{ runner.temp }}/seat-native-linux-x64/peercred.node
-          SEAT_NATIVE_ARM64: ${{ runner.temp }}/seat-native-linux-arm64/peercred.node
+          SEAT_NATIVE_X64: ${{ runner.temp }}/seat-native-linux-x64
+          SEAT_NATIVE_ARM64: ${{ runner.temp }}/seat-native-linux-arm64
 
       # Keep the "version packages" PR out of the generated release notes (excluded via .github/release.yml).
       - name: Label the release PR
@@ -311,8 +315,8 @@ jobs:
 
       - name: Preflight, build, assemble natives, and publish
         env:
-          SEAT_NATIVE_X64: ${{ runner.temp }}/seat-native-linux-x64/peercred.node
-          SEAT_NATIVE_ARM64: ${{ runner.temp }}/seat-native-linux-arm64/peercred.node
+          SEAT_NATIVE_X64: ${{ runner.temp }}/seat-native-linux-x64
+          SEAT_NATIVE_ARM64: ${{ runner.temp }}/seat-native-linux-arm64
         run: |
           node scripts/preflight-npm-publish.mjs
           pnpm build

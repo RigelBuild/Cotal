@@ -1,16 +1,9 @@
 /**
- * A spawn carrying `supervise` restarts the process in place until the budget is spent.
- *
- * Live: a JWT-auth scratch broker, the real Manager, a real stub process that joins presence.
- * SIGKILL is the crash. Identity and lifecycle stay. A pending turn is still pullable after the
- * first restart and yieldable from the replacement process. Spending the budget retires the seat
- * (supervise-crash-loop). A relaunch that never joins presence retires (supervise-recovery-failed).
- * A host that cannot honour the policy (user-mode, non-pty) refuses at accept.
- *
- * Run: pnpm smoke:manager-supervise-restart   (needs nats-server + node on PATH)
+ * A spawn carrying `supervise` restarts the process in place until the budget is spent, on the
+ * non-custodial pty runtime; on the custodial one, an unproven predecessor refuses the restart.
  */
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,7 +16,13 @@ import {
 import {
   authDir, saveSpaceAuth, agentLifecycleSecretFilePaths, recordMesh, removeMesh, userAuthStateDir, workspaceSecretStore,
 } from "@cotal-ai/workspace";
+import { readRecord, recordPath } from "@cotal-ai/seat";
+import { makeSeatRoot } from "@cotal-ai/smoke-kit";
 import { Manager } from "../src/manager.js";
+import type { ManagerStatus } from "../src/manager-service-contract.js";
+import { LegacyPtyRuntime } from "../src/runtime/pty.js";
+import { CustodialPtyRuntime } from "../src/runtime/custodial-pty.js";
+import { killOwned, owned, type Owned } from "./_owned-kill.js";
 import { MANAGER_ENDPOINT, MANAGER_CONTRACTS } from "../src/manager-service-contract.js";
 import { bootBroker } from "./_boot-broker.js";
 import { bootDeliveryDaemon } from "./_boot-delivery.js";
@@ -71,6 +70,9 @@ saveSpaceAuth(authDir(workspaceRoot), auth);
 writeFileSync(join(workspaceRoot, ".cotal", "agents", "seat.md"), "---\nname: seat\nrole: worker\n---\n");
 writeFileSync(join(workspaceRoot, ".cotal", "agents", "user.md"), "---\nname: user\nrole: worker\n---\n");
 writeFileSync(join(workspaceRoot, ".cotal", "agents", "ext.md"), "---\nname: ext\nrole: worker\n---\n");
+writeFileSync(join(workspaceRoot, ".cotal", "agents", "custody.md"), "---\nname: custody\nrole: worker\n---\n");
+const seatRoot = makeSeatRoot("seats-");
+const seatProcs: Array<Owned | undefined> = [];
 
 const spawnedOpts: LaunchOpts[] = [];
 const envFor = (o: LaunchOpts): Record<string, string> => ({
@@ -107,6 +109,9 @@ try {
   });
 
   manager = new Manager({ space, servers: broker.servers, runtime: "pty", workspaceRoot });
+  // Restart mechanics need a predecessor this host can prove gone. Before cgroup custody (T5) only
+  // the non-custodial pty runtime has none to prove; the custodial refusal is the last cell below.
+  (manager as unknown as { runtime: unknown }).runtime = new LegacyPtyRuntime();
   await manager.start();
   const M = manager as unknown as { agents: Map<string, ManagedRow> };
 
@@ -250,6 +255,37 @@ try {
     !M.agents.has("fail") && logs.some((l) => l.includes("this manager retired it after a supervised restart failed")),
     logs.filter((l) => /fail|reap|restart/i.test(l)).slice(-6));
 
+  // The real custodial pty: a crash's restart must prove its predecessor gone, and cannot yet.
+  // Let the `fail` seat's terminal finish on the non-custodial runtime before the swap.
+  const retiring = (manager as unknown as { retiring: Map<string, unknown> }).retiring;
+  for (const until = Date.now() + 15_000; retiring.has("fail") && Date.now() < until;) await wait(100);
+  (manager as unknown as { runtime: unknown }).runtime = new CustodialPtyRuntime({ root: seatRoot });
+  const custodyGoal = "spawn-custody".padEnd(43, "k");
+  const custodySpawned = await call("spawn", {
+    name: "custody", agent: "supervise-stub", cwd: repoRoot, events: false, supervise: { restarts: 2, windowMs: 60_000 },
+  }, { id: custodyGoal }).then((r) => r.reply, asValue);
+  const custodyReady = await resultOf(custodyGoal, 60_000);
+  const custodyRow = (M.agents as Map<string, ManagedRow & { handle: { reference?: { id: string } } }>).get("custody");
+  const custodyRef = custodyRow?.handle.reference;
+  let refused = false;
+  let custodyItem: ManagerStatus["staticReconciliation"]["failures"][number] | undefined;
+  // buildLaunch runs before the predecessor proof; only a new seat directory is a spawn.
+  const seatsBeforeCrash = readdirSync(seatRoot).length;
+  if ((custodySpawned as { ok?: boolean }).ok === true && custodyReady?.state === "succeeded" && custodyRef !== undefined) {
+    const rec = readRecord(recordPath(seatRoot, custodyRef.id));
+    const child = owned(rec.childPid, rec.childStart);
+    seatProcs.push(owned(rec.custodianPid, rec.custodianStart), child);
+    killOwned(child);
+    const status = (): ManagerStatus => (manager as unknown as { managerStatusData: () => ManagerStatus }).managerStatusData();
+    const until = Date.now() + 30_000;
+    while (Date.now() < until && (custodyItem = status().staticReconciliation.failures.find((f) => f.alias === "custody"))?.retainedReason === undefined) await wait(200);
+    refused = custodyItem?.retainedReason !== undefined;
+  }
+  c("custodial pty: a crash's restart is refused as retained, spawns nothing, and status carries the release remedy",
+    refused && custodyItem?.retainedReason === "unprovable" && readdirSync(seatRoot).length === seatsBeforeCrash && /release-seat/.test(custodyItem.remedy ?? ""),
+    { custodySpawned, custodyReady, custodyItem, seats: readdirSync(seatRoot).length - seatsBeforeCrash });
+  (manager as unknown as { runtime: unknown }).runtime = new LegacyPtyRuntime();
+
   const userRoot = mkdtempSync(join(tmpdir(), "cotal-supervise-user-"));
   mkdirSync(join(userRoot, ".cotal", "agents"), { recursive: true });
   saveSpaceAuth(authDir(userRoot), auth);
@@ -287,13 +323,14 @@ try {
   await runnerNc?.drain().catch(() => runnerNc?.close());
   await userMgr?.stop({ withAgents: true }).catch(() => {});
   await manager?.stop({ withAgents: true }).catch(() => {});
+  for (const p of seatProcs) killOwned(p);
   await delivery?.stop().catch(() => {});
   await broker.stop().catch(() => {});
   if (prevHome === undefined) delete process.env.COTAL_HOME;
   else process.env.COTAL_HOME = prevHome;
 }
 
-const EXPECTED = 21;
+const EXPECTED = 22;
 const ran = ok + fail;
 console.log(`supervise restart smoke: ${ok} passed, ${fail} failed`);
 if (ran !== EXPECTED) {

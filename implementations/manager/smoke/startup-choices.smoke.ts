@@ -26,7 +26,7 @@ const rows = (path: string): { key: string; phase: string }[] => {
 const failures: string[] = [];
 try {
   const runtimes: [string, Runtime][] = [["pty", new LegacyPtyRuntime()]];
-  if (process.platform === "linux") runtimes.push(["custody", new CustodialPtyRuntime(join(root, "seats"))]);
+  if (process.platform === "linux") runtimes.push(["custody", new CustodialPtyRuntime({ root: join(root, "seats") })]);
   else console.log(`SKIP custody: Linux-only seat transport (host: ${process.platform})`);
   if (tmuxAvailable()) runtimes.push(["tmux", new TmuxRuntime(session)]);
   else console.log("SKIP tmux: tmux is not installed; pane startup is not exercised");

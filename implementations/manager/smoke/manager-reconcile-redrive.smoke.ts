@@ -43,6 +43,7 @@ import {
 } from "@cotal-ai/core";
 import { authDir, createManagerInstanceIdentity, saveSpaceAuth, workspaceSecretStore } from "@cotal-ai/workspace";
 import { Manager } from "../src/manager.js";
+import { LegacyPtyRuntime } from "../src/runtime/pty.js";
 import { MANAGER_CONTRACTS, MANAGER_ENDPOINT, type ManagerStatus } from "../src/manager-service-contract.js";
 import {
   activateStaticLifecycle,
@@ -213,6 +214,10 @@ try {
   callerNc = await connect({ servers, ...standaloneConnectOpts({ creds: await mintCreds(auth, callerIdentity, "agent", { lifecycleUid: caller.uid, endpointCapabilities: [{ endpoint: MANAGER_ENDPOINT, command: "status" }] }), tls: false }), maxReconnectAttempts: 0 });
 
   manager = new Manager({ space, servers, runtime: "pty", workspaceRoot: root });
+  // These orphan rows carry no custody reference; a custodial runtime would rightly retain them as
+  // `no-reference` (custody-fail-closed covers that). This suite tests reconcile mechanics, so it
+  // runs the non-custodial pty runtime, whose reap has nothing to prove.
+  (manager as unknown as { runtime: LegacyPtyRuntime }).runtime = new LegacyPtyRuntime();
   const internals = manager as unknown as {
     staticLifecycleEvict?: (principal: string) => Promise<EvictionResult>;
     staticReconcileRetryDelaysMs: readonly number[];
@@ -332,6 +337,7 @@ try {
   let releaseShutdownFirst!: () => void;
   const shutdownFirstRelease = new Promise<void>((resolve) => { releaseShutdownFirst = resolve; });
   shutdownManager = new Manager({ space, servers, runtime: "pty", workspaceRoot: shutdownRoot });
+  (shutdownManager as unknown as { runtime: LegacyPtyRuntime }).runtime = new LegacyPtyRuntime();
   const shutdownInternals = shutdownManager as unknown as {
     staticLifecycleEvict?: (principal: string) => Promise<EvictionResult>;
     serviceServe?: unknown;

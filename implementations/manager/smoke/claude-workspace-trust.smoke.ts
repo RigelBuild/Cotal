@@ -74,7 +74,7 @@ try {
     if (!binary || !existsSync(binary)) throw new Error("--live requires COTAL_TEST_CLAUDE_BINARY naming the installed Claude binary");
     const runtimes: [string, Runtime][] = [
       ["pty", new LegacyPtyRuntime()],
-      ["custody", new CustodialPtyRuntime(join(root, "seats"))],
+      ["custody", new CustodialPtyRuntime({ root: join(root, "seats") })],
       ["tmux", new TmuxRuntime(tmuxSession)],
     ];
     const failures: string[] = [];

@@ -1,8 +1,10 @@
 export { MAX_SOCKET_PATH, PROTOCOL_VERSION, UNATTENDED_MS, assertSocketPathFits, unattendedMs, unsupportedTransport } from "./protocol.js";
 export { launchSeat, loadSeat, RUN_MARKER_FLAG, runMarker, runMarkerOf, type LaunchSeatOpts, type SeatLaunchSpec } from "./launcher.js";
 export { adoptSeat, adoptSeatSync, type SeatHandle, type SeatAttachSession } from "./handle.js";
-export { assertSeatId, bootToken, processStartToken, readRecord, recordPath, seatId, socketPath, type SeatRecord } from "./record.js";
-export { censusCustodians, drainSeats, identityVerdict, reapSeat, type CustodianSighting, type SeatInventoryEntry, type SeatReapEvidence } from "./reap.js";
+export { assertSeatId, bootToken, fencePath, processStartToken, readRecord, recordPath, seatId, socketPath, type SeatRecord } from "./record.js";
+export { ptyNativePath, spawnPinned, type ChildHandle, type PinnedPty } from "./pty.js";
+export { censusCustodians, checkSeatRelease, drainSeats, identityVerdict, reapSeat, removeSeatCustody, sealSeatLaunch, type CustodianSighting, type SeatInventoryEntry, type SeatReapEvidence, type SeatReapOpts, type SeatReleaseCheck, type SeatRetainReason } from "./reap.js";
+export { agentCanReplace, agentPrimaryGid, CGROUP_DELEGATED_ENV, resolveCgroupBase, trustedSetpriv, seatCgroupContained, seatCgroupPath, seatCgroupPopulated, type SeatCgroup } from "./cgroup.js";
 export { SeatClient } from "./client.js";
 export { peerCredentials, type PeerCredentials } from "./peercred.js";
 export { runCustodian, type CustodianLaunch } from "./custodian.js";

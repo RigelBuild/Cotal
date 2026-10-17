@@ -1,24 +1,31 @@
-import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
-import { dirname } from "node:path";
+import { closeSync, constants, existsSync, fsyncSync, ftruncateSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { setTimeout as sleep } from "node:timers/promises";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { discardSeatArtifacts } from "./artifacts.js";
-import { bootToken, exitPath, isSeatId, processStartToken, readRecord, recordPath, type SeatRecord } from "./record.js";
+import { assertSeatId, bootToken, exitPath, fencePath, isSeatId, processStartToken, readRecord, readSeatFileNoFollow, recordPath, socketPath, type SeatRecord } from "./record.js";
 import { RUN_MARKER_FLAG } from "./launcher.js";
-import { unsupportedTransport, type SeatExit } from "./protocol.js";
+import { CONFIRM_TIMEOUT_MS, GRACE_MS, unsupportedTransport, type SeatExit } from "./protocol.js";
+import { SeatClient } from "./client.js";
+import { tryLockFd } from "./peercred.js";
+import { assertSeatCgroup, killSeatCgroup, removeSeatCgroup, seatCgroupContained, seatCgroupPopulated, type SeatCgroup } from "./cgroup.js";
 
-/** What a reap proved. `absent`: no custody record exists for that seat id, so there is no process
- *  this package can address. `reaped`: every process the record names was either signalled and
- *  verified gone, or found already gone (its pid absent, held by a process with a different start
- *  identity, or recorded on an earlier boot, each of which is proof the recorded one exited). */
+/** `unprovable`: nothing on this host can prove the seat's processes gone. `members-remain`: a
+ *  contained seat cgroup still held tasks at the bound. */
+export type SeatRetainReason = "unprovable" | "members-remain";
+
 export type SeatReapEvidence =
   | { outcome: "absent" }
-  | { outcome: "reaped"; custodian: "signalled" | "gone"; child: "signalled" | "gone"; group: number; exit?: SeatExit; detail: string };
+  | { outcome: "reaped"; exit?: SeatExit; detail: string }
+  | { outcome: "retained"; reason: SeatRetainReason; stop: "requested" | "no-custodian" | "timeout"; detail: string };
 
 /** How the child ended, as its custodian recorded it; why a record that exists cannot be read; or
- *  neither when no record exists (the child was still running, or its custodian never wrote one). */
+ *  neither when no record exists (the child was still running, or its custodian never wrote one).
+ *  The seat directory may be agent-owned, so the read never follows a final symlink. */
 function recordedExit(file: string): { exit?: SeatExit; unreadable?: string } {
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(file, "utf8"));
+    raw = JSON.parse(readSeatFileNoFollow(file));
   } catch (e) {
     return (e as NodeJS.ErrnoException).code === "ENOENT" ? {} : { unreadable: (e as Error).message };
   }
@@ -33,58 +40,61 @@ function recordedExit(file: string): { exit?: SeatExit; unreadable?: string } {
   };
 }
 
-/** A pid's standing against a recorded start identity. `live` only when the process exists AND
- *  carries the recorded start token; a different token means the pid was reused by an unrelated
- *  process, which is never signalled. */
+/** A pid's standing against a recorded start identity: a read of `/proc`, never a send. `live`
+ *  only when the process exists AND carries the recorded start token. Advisory: a record's pids and
+ *  tokens are agent-writable, so this can never prove an exit or aim a signal. */
 export function identityVerdict(pid: number, start: string): "live" | "gone" {
   const now = processStartToken(pid);
   return now !== undefined && now === start ? "live" : "gone";
 }
 
-function processGroupOf(pid: number): number | undefined {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const after = stat.lastIndexOf(") ");
-    if (after < 0) return undefined;
-    const pgrp = Number(stat.slice(after + 2).split(" ")[2]);
-    return Number.isInteger(pgrp) ? pgrp : undefined;
-  } catch {
-    return undefined;
-  }
+export interface SeatReapOpts {
+  graceMs?: number;
+  /** The seat's derived cgroup. Contained, it decides the outcome before `record.json` is read. */
+  cgroup?: SeatCgroup;
 }
 
-/** Every live pid whose process group is `pgid`. Bounded by the process table; read once per poll. */
-function groupMembers(pgid: number): number[] {
-  const out: number[] = [];
-  for (const entry of readdirSync("/proc")) {
-    if (!/^\d+$/.test(entry)) continue;
-    const pid = Number(entry);
-    if (processGroupOf(pid) === pgid) out.push(pid);
-  }
-  return out;
-}
-
-function signal(pid: number, sig: NodeJS.Signals): "signalled" | "gone" {
+// `undefined`: a concurrent reap or release removed the cgroup, so there is no seat cgroup to prove.
+async function reapCgroup(id: string, cg: SeatCgroup, graceMs: number): Promise<SeatReapEvidence | undefined> {
   try {
-    process.kill(pid, sig);
-    return "signalled";
+    killSeatCgroup(cg);
+    const deadline = Date.now() + graceMs;
+    while (seatCgroupPopulated(cg) && Date.now() < deadline) await sleep(25);
+    if (seatCgroupPopulated(cg)) throw new Error(`still reads populated 1 after ${graceMs}ms`);
+    removeSeatCgroup(cg);
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ESRCH") return "gone";
-    throw new Error(`cannot signal pid ${pid}: ${(e as Error).message}`);
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return undefined;
+    return { outcome: "retained", reason: "members-remain", stop: "no-custodian", detail: `seat ${id} cgroup ${cg.path}${code ? ` (${code})` : ""}: ${(e as Error).message}` };
   }
+  return { outcome: "reaped", detail: `seat ${id} cgroup ${cg.path} killed, read populated 0 and was removed` };
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
+type StopResult = { stop: "requested" | "no-custodian" | "timeout"; error?: string };
 
-async function until(predicate: () => boolean, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() >= deadline) return false;
-    await sleep(50);
+// The stop goes to the derived socket path, never to a pid from the record; the custodian sends it
+// through its own pinned handle.
+async function requestStop(root: string, id: string, record: SeatRecord, timeoutMs: number): Promise<StopResult> {
+  const client = new SeatClient({ ...record, socket: socketPath(root, id) });
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<StopResult>((resolve) => {
+    timer = setTimeout(() => resolve({ stop: "timeout" }), timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      client.connect().then(async (): Promise<StopResult> => {
+        await client.stop("hard");
+        return { stop: "requested" };
+      }),
+      timeout,
+    ]);
+  } catch (e) {
+    // A refused hello or stop lands here too; keep its message so the evidence does not hide it.
+    return { stop: "no-custodian", error: (e as Error).message };
+  } finally {
+    clearTimeout(timer);
+    client.close();
   }
-  return true;
 }
 
 /** One live custodian as a census sees it: its pid and the run that started it. */
@@ -132,149 +142,208 @@ export function censusCustodians(run?: string): CustodianSighting[] {
   return out;
 }
 
-/** Why `rec`'s pids cannot be tied to the processes it recorded, or undefined when they can. A
- *  start token counts ticks since ITS OWN boot, so it only tells two processes apart within one boot,
- *  and a record may have outlived a reboot on disk. A record with no start identity or no boot
- *  identity proves nothing about whatever holds those pid numbers now, and neither does any record
- *  while this host's own `boot` is unknown, so such a record is neither signalled nor reported as
- *  running or gone. */
-function unprovedIdentity(id: string, rec: SeatRecord, boot: string | undefined): string | undefined {
-  if (rec.custodianStart === undefined)
-    return `seat ${id} record carries no process start identity; refusing to signal pid ${rec.custodianPid}/${rec.childPid} (a bare pid may belong to an unrelated process)`;
-  if (rec.bootId === undefined)
-    return `seat ${id} record carries no boot identity; refusing to signal pid ${rec.custodianPid}/${rec.childPid} (its start tokens cannot be compared across a reboot)`;
-  if (boot === undefined)
-    return `seat ${id}: this host publishes no boot identity; refusing to compare start tokens for pid ${rec.custodianPid}/${rec.childPid} (record boot ${rec.bootId} cannot be tied to this boot)`;
-  return undefined;
-}
-
-/** Whether `rec` was written on an earlier boot than `boot`, this host's. No process outlives a
- *  reboot, so every process it names is gone, and whatever holds those pid numbers now is one of this
- *  boot's and is never signalled. */
-function fromEarlierBoot(rec: SeatRecord, boot: string): boolean {
-  return rec.bootId !== boot;
-}
-
-/**
- * Reap one custodied seat: a crashed manager's orphan, a lingering custodian, or a cleanly exited seat
- * whose custodian unlinked its on-disk record.
- *
- * When the record exists on disk, it is verified against the live kernel state. When the on-disk record
- * is absent, `opts.pinnedRecord` allows the launching/adopting runtime to supply its authoritative pinned
- * start identities to execute the same kernel identity and group checks. An unknown reference with neither
- * on-disk file nor pinned record returns `absent` (failing closed as RuntimeReapUnproven).
- *
- * Signals the custodian and the child only while their current start identity matches the record. The
- * child's descendants are not in the record, so its process group is signalled by pgid and then swept by
- * membership alone, and the record's contents are trusted as written; docs/security.md lists both as
- * accepted residuals. Verifies the custodian, the child and the child's whole process group gone, then
- * removes the custody record directory.
- */
-export async function reapSeat(root: string, id: string, opts: { graceMs?: number; pinnedRecord?: SeatRecord } = {}): Promise<SeatReapEvidence> {
+/** Reap one seat. Only a contained seat cgroup can give `reaped`: a record's pids and start tokens
+ *  are agent-writable, so they can neither aim a send nor prove an exit. */
+export async function reapSeat(root: string, id: string, opts: SeatReapOpts = {}): Promise<SeatReapEvidence> {
   if (process.platform !== "linux") throw unsupportedTransport();
-  const graceMs = opts.graceMs ?? 10_000;
+  const cg = opts.cgroup;
+  if (cg !== undefined && existsSync(assertSeatCgroup(cg, id).path) && seatCgroupContained(cg)) {
+    const evidence = await reapCgroup(id, cg, opts.graceMs ?? GRACE_MS);
+    if (evidence?.outcome === "reaped") {
+      const after = afterProvedGone(root, id);
+      return { outcome: "reaped", ...(after.exit ? { exit: after.exit } : {}), detail: after.notes.length ? `${evidence.detail}; ${after.notes.join("; ")}` : evidence.detail };
+    }
+    if (evidence !== undefined) return evidence;
+  }
   const path = recordPath(root, id);
   let rec: SeatRecord;
   try {
     rec = readRecord(path);
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") {
-      if (opts.pinnedRecord && opts.pinnedRecord.id === id) {
-        rec = opts.pinnedRecord;
-      } else {
-        return { outcome: "absent" };
-      }
-    } else {
-      throw new Error(`seat ${id} record at ${path} is unreadable: ${(e as Error).message}`);
-    }
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { outcome: "absent" };
+    return {
+      outcome: "retained",
+      reason: "unprovable",
+      stop: "no-custodian",
+      detail: `seat ${id} record at ${path} is unreadable: ${(e as Error).message}`,
+    };
   }
-  const boot = bootToken();
-  const unproved = unprovedIdentity(id, rec, boot);
-  if (unproved !== undefined) throw new Error(unproved);
-  const custodianStart = rec.custodianStart!;
-  const earlierBoot = fromEarlierBoot(rec, boot!);
-  // Read before anything is signalled, so a SIGKILL sent below is never reported as how the child ended.
+
+  const { stop, error } = await requestStop(root, id, rec, opts.graceMs ?? 10_000);
+  return {
+    outcome: "retained",
+    reason: "unprovable",
+    stop,
+    detail: `seat ${id} has no contained cgroup proof; stop ${stop}${error ? ` (${error})` : ""}`,
+  };
+}
+
+/** Once a contained cgroup proved the seat gone: how its child ended, and the launch artifacts the
+ *  record still lists. The record is agent-writable, so only artifacts under this process's own temp
+ *  dir are removed; a record naming any other root is left for the operator. */
+function afterProvedGone(root: string, id: string): { exit?: SeatExit; notes: string[] } {
+  const path = recordPath(root, id);
   const recorded = recordedExit(exitPath(path));
-  const exit = recorded.exit;
-  // A pinned record without a child identity means the child was gone before custody began.
-  const childLive = (): boolean => !earlierBoot && rec.childStart !== undefined && identityVerdict(rec.childPid, rec.childStart) === "live";
-  const custodianLive = (): boolean => !earlierBoot && identityVerdict(rec.custodianPid, custodianStart) === "live";
-
-  // The child first: node-pty made it a session and process-group leader, so signalling the group
-  // takes its descendants (a connector host's TUI and bridges) with it. A child that is no longer a
-  // group leader is signalled alone and its group is not claimed.
-  let child: "signalled" | "gone" = "gone";
-  let groupKilled = false;
-  if (childLive()) {
-    const leader = processGroupOf(rec.childPid) === rec.childPid;
-    child = leader ? signal(-rec.childPid, "SIGKILL") : signal(rec.childPid, "SIGKILL");
-    groupKilled = leader && child === "signalled";
-  }
-  let custodian: "signalled" | "gone" = "gone";
-  if (custodianLive()) custodian = signal(rec.custodianPid, "SIGKILL");
-
-  const gone = (): boolean => !childLive() && !custodianLive();
-  if (!(await until(gone, graceMs)))
-    throw new Error(`seat ${id}: custodian ${rec.custodianPid} or child ${rec.childPid} still holds its recorded start identity ${graceMs}ms after SIGKILL; exit not proved`);
-  // The group after the leader: a member that re-parented to init keeps the pgid, and the pgid
-  // cannot be reused while any member lives, so an empty group is proof for the descendants.
-  // A retained record may outlive its original group and numeric PGID. Without a live leader
-  // identity, remaining members might belong to a later generation, so retain unproved custody.
-  let group = 0;
-  if (!earlierBoot && !groupKilled && processStartToken(rec.childPid) === undefined && groupMembers(rec.childPid).length > 0)
-    throw new Error(`seat ${id}: group ownership is unproved for absent leader ${rec.childPid}; custody retained`);
-  if (groupKilled) {
-    const empty = await until(() => {
-      const members = groupMembers(rec.childPid);
-      group = members.length;
-      if (members.length) for (const pid of members) signal(pid, "SIGKILL");
-      return members.length === 0;
-    }, graceMs);
-    if (!empty) throw new Error(`seat ${id}: ${group} process(es) still in group ${rec.childPid} ${graceMs}ms after SIGKILL; exit not proved`);
-  }
-  // The launch artifacts the record still lists, read again now that the custodian is proved gone and
-  // can no longer change it: ones it had not removed when it died, or could not remove. Never the
-  // pinned copy, which still lists what the custodian has since removed, so its names may have been
-  // reused. A failed removal keeps the record, so a later reap of this reference tries again.
+  const notes: string[] = [];
+  if (recorded.exit)
+    notes.push(`its custodian recorded exit code ${recorded.exit.code ?? "unknown"}${recorded.exit.signal === undefined ? "" : `, signal ${recorded.exit.signal}`}${recorded.exit.diagnostic ? `, diagnostic: ${recorded.exit.diagnostic}` : ""}`);
+  else if (recorded.unreadable !== undefined) notes.push(`its custodian's exit record is unreadable: ${recorded.unreadable}`);
   let latest: SeatRecord | undefined;
   try {
     latest = readRecord(path);
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "ENOENT")
-      throw new Error(`seat ${id}: exit proved, but its record at ${path} is unreadable: ${(e as Error).message}; custody record kept`);
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") notes.push(`record unreadable, launch artifacts not removed: ${(e as Error).message}`);
+  }
+  if (latest?.artifacts?.length) {
+    const own = resolve(tmpdir());
+    try {
+      if (latest.artifactRoot === undefined || resolve(latest.artifactRoot) !== own)
+        throw new Error(`record names artifact root ${String(latest.artifactRoot)}, not ${own}`);
+      discardSeatArtifacts(latest.artifacts, own);
+    } catch (e) {
+      notes.push(`launch artifacts not removed: ${(e as Error).message}`);
+    }
+  }
+  return { ...(recorded.exit ? { exit: recorded.exit } : {}), notes };
+}
+
+export type SeatReleaseCheck = { ok: true; advisory: string } | { ok: false; reason: "populated" | "launch-in-progress"; detail: string };
+
+/** Test seam: pause a release between its `populated 0` read and its `rmdir`. */
+export interface ReleaseTestSeam {
+  afterPopulated?: { reached: string; release: string };
+}
+let releaseSeam: ReleaseTestSeam | undefined;
+export function setReleaseTestSeam(seam: ReleaseTestSeam | undefined): void {
+  releaseSeam = seam;
+}
+
+function populatedRefusal(id: string, cg: SeatCgroup, why: string): SeatReleaseCheck {
+  return { ok: false, reason: "populated", detail: `seat ${id} cgroup ${cg.path} ${why}; a member could start the seat again` };
+}
+
+// A cgroup that is already gone is empty: nothing can join a path that no longer exists.
+function readsPopulated(cg: SeatCgroup): boolean {
+  try {
+    return seatCgroupPopulated(cg);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw e;
+  }
+}
+
+/** Under the fence lock: an empty seat cgroup is removed, so a later join fails with `ENOENT`. */
+async function removeEmptyCgroup(id: string, cg: SeatCgroup): Promise<SeatReleaseCheck | undefined> {
+  if (readsPopulated(cg)) return populatedRefusal(id, cg, "reads populated 1");
+  const hold = releaseSeam?.afterPopulated;
+  if (hold) {
+    writeFileSync(hold.reached, String(process.pid));
+    const holdBy = Date.now() + CONFIRM_TIMEOUT_MS;
+    while (!existsSync(hold.release)) {
+      if (Date.now() >= holdBy) throw new Error("test seam release hold was never released");
+      await sleep(25);
+    }
   }
   try {
-    discardSeatArtifacts(latest?.artifacts, latest?.artifactRoot);
+    removeSeatCgroup(cg);
   } catch (e) {
-    throw new Error(`seat ${id}: exit proved, but ${(e as Error).message}; custody record kept so a later reap retries`);
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "EBUSY") return populatedRefusal(id, cg, "refused rmdir with EBUSY");
+    if (code !== "ENOENT") throw e;
   }
-  const hadPath = existsSync(path);
-  const dir = dirname(path);
-  if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
-  // A child already gone when the reap began ended on its own, and its custodian's record is the
-  // only account of how, so a missing or unreadable one is said rather than left out.
-  const ended = exit
-    ? `; its custodian recorded exit code ${exit.code ?? "unknown"}${exit.signal === undefined ? "" : `, signal ${exit.signal}`}${exit.diagnostic ? `, diagnostic: ${exit.diagnostic}` : ""}`
-    : recorded.unreadable !== undefined
-      ? `; its custodian's exit record is unreadable: ${recorded.unreadable}`
-      : child === "gone"
-        ? "; no exit record from its custodian was found"
-        : "";
-  return {
-    outcome: "reaped",
-    custodian,
-    child,
-    group,
-    ...(exit ? { exit } : {}),
-    detail: `custodian ${rec.custodianPid} ${custodian}, child ${rec.childPid} ${child}${earlierBoot ? ` with boot ${rec.bootId}` : ""}${groupKilled || group > 0 ? `, group ${rec.childPid} empty` : ""}; custody record ${hadPath ? "removed" : "verified gone"}${ended}`,
-  };
+  return undefined;
+}
+
+function releaseAdvisory(root: string, id: string): string {
+  const census = process.platform === "linux" ? censusCustodians().length : 0;
+  return `advisory, not proof: seat directory ${existsSync(join(root, id)) ? "present" : "absent"}; ${census} live custodian(s) on this host`;
+}
+
+/** Read-only: a fence another open file holds locked is a launch still in progress, and a populated
+ *  seat cgroup is a seat that still runs. */
+export function checkSeatRelease(root: string, id: string, opts?: { cgroup?: SeatCgroup }): SeatReleaseCheck {
+  if (process.platform !== "linux") throw unsupportedTransport();
+  const cg = opts?.cgroup === undefined ? undefined : assertSeatCgroup(opts.cgroup, id);
+  if (cg !== undefined && readsPopulated(cg)) return populatedRefusal(id, cg, "reads populated 1");
+  const fence = fencePath(root, id);
+  let fd: number;
+  try {
+    fd = openSync(fence, "r");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, advisory: releaseAdvisory(root, id) };
+    throw e;
+  }
+  try {
+    if (!tryLockFd(fd)) return { ok: false, reason: "launch-in-progress", detail: `seat ${id} launch fence ${fence} is locked by a launch in progress` };
+  } finally {
+    closeSync(fd);
+  }
+  return { ok: true, advisory: releaseAdvisory(root, id) };
+}
+
+/** Seal the launch fence under its lock, so no launcher or custodian of this id can start a child.
+ *  An empty seat cgroup is removed first, under the same lock; a populated one refuses. */
+export async function sealSeatLaunch(root: string, id: string, opts?: { cgroup?: SeatCgroup }): Promise<SeatReleaseCheck> {
+  if (process.platform !== "linux") throw unsupportedTransport();
+  const cg = opts?.cgroup === undefined ? undefined : assertSeatCgroup(opts.cgroup, id);
+  const fence = fencePath(root, id);
+  const fd = openSync(fence, constants.O_RDWR | constants.O_CREAT, 0o644);
+  try {
+    const deadline = Date.now() + CONFIRM_TIMEOUT_MS;
+    while (!tryLockFd(fd)) {
+      if (Date.now() >= deadline) return { ok: false, reason: "launch-in-progress", detail: `seat ${id} launch fence ${fence} stayed locked for ${CONFIRM_TIMEOUT_MS}ms; a launch is in progress` };
+      await sleep(25);
+    }
+    const refusal = cg === undefined ? undefined : await removeEmptyCgroup(id, cg);
+    if (refusal !== undefined) return refusal;
+    ftruncateSync(fd, 0);
+    writeSync(fd, "sealed", 0);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  const dir = openSync(root, "r");
+  try {
+    fsyncSync(dir);
+  } finally {
+    closeSync(dir);
+  }
+  return { ok: true, advisory: releaseAdvisory(root, id) };
+}
+
+/** Remove the seat directory by rename, then delete the tombstone. The sealed fence stays. */
+export function removeSeatCustody(root: string, id: string): void {
+  const tombstone = join(root, `.released-${assertSeatId(id)}`);
+  // A crash between rename and delete leaves a tombstone, and a rename onto it would fail.
+  rmSync(tombstone, { recursive: true, force: true });
+  try {
+    renameSync(join(root, id), tombstone);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  rmSync(tombstone, { recursive: true, force: true });
+}
+
+/** Why `rec`'s pids cannot be tied to the processes it recorded, or undefined when they can. A
+ *  start token counts ticks since ITS OWN boot, so it only tells two processes apart within one boot,
+ *  and a record may have outlived a reboot on disk. A record with no start identity or no boot
+ *  identity proves nothing about whatever holds those pid numbers now, and neither does any record
+ *  while this host's own `boot` is unknown, so such a record is never reported as running or gone. */
+function unprovedIdentity(id: string, rec: SeatRecord, boot: string | undefined): string | undefined {
+  if (rec.custodianStart === undefined)
+    return `seat ${id} record carries no process start identity; pid ${rec.custodianPid}/${rec.childPid} may belong to an unrelated process`;
+  if (rec.bootId === undefined)
+    return `seat ${id} record carries no boot identity; pid ${rec.custodianPid}/${rec.childPid} start tokens cannot be compared across a reboot`;
+  if (boot === undefined)
+    return `seat ${id}: this host publishes no boot identity; record boot ${rec.bootId} for pid ${rec.custodianPid}/${rec.childPid} cannot be tied to this boot`;
+  return undefined;
 }
 
 /** One custody record as {@link drainSeats} found it. `live-child`: the child still holds its
- *  recorded start identity, so the seat is a running agent and is never signalled. `childless`: the
- *  child is gone, so a drain would retire the seat. `drained`: a drain proved the seat gone and
- *  removed its record. `refused`: the record could not be read, carries no start or boot identity,
- *  this host publishes no boot identity, or the reap did not prove exit; the record stays on disk. */
+ *  recorded start identity, so the seat is a running agent and is never stopped. `childless`: the
+ *  child is gone, so a drain would retire the seat. `drained`: a drain proved the seat gone.
+ *  `refused`: the record could not be read, carries no start or boot identity, this host publishes
+ *  no boot identity, or the reap did not prove the seat gone; the record stays on disk. */
 export interface SeatInventoryEntry {
   id: string;
   state: "live-child" | "childless" | "drained" | "refused";
@@ -288,13 +357,10 @@ export interface SeatInventoryEntry {
  * List the custody records under `root`, and with `drain` retire every seat whose child is gone
  * (#1391).
  *
- * A seat whose child still holds its recorded start identity is reported and left alone: it is a
- * running agent, and a manager may still adopt it. Only a seat whose child is proved gone reaches
- * {@link reapSeat}. A record is written once, and a start identity that is gone never comes back, so
- * the reap that follows finds the child gone too and signals at most a custodian whose identity
- * matches the record. A record from an earlier boot names processes that ended with that boot, so it
- * is childless and its reap signals nothing. A record that cannot be read or whose identity proves
- * nothing, or a reap that does not prove exit, is refused and left on disk for the operator.
+ * The listing only reads `/proc`; it never sends a signal. A seat whose child still holds its
+ * recorded start identity is reported and left alone. Only a seat whose child reads gone reaches
+ * {@link reapSeat}, which proves nothing without a contained seat cgroup, so such a drain asks the
+ * custodian to stop through its socket and reports the retained seat as `refused` for the operator.
  */
 export async function drainSeats(root: string, opts: { drain?: boolean; graceMs?: number } = {}): Promise<SeatInventoryEntry[]> {
   if (process.platform !== "linux") throw unsupportedTransport();
@@ -321,7 +387,8 @@ export async function drainSeats(root: string, opts: { drain?: boolean; graceMs?
       out.push({ ...seen, state: "refused", detail: unproved });
       continue;
     }
-    const earlierBoot = fromEarlierBoot(rec, boot!);
+    // No process outlives a reboot, so a record from an earlier boot names only gone processes.
+    const earlierBoot = rec.bootId !== boot;
     if (!earlierBoot && rec.childStart !== undefined && identityVerdict(rec.childPid, rec.childStart) === "live") {
       out.push({ ...seen, state: "live-child", detail: `child ${rec.childPid} is running; kept` });
       continue;
@@ -336,7 +403,9 @@ export async function drainSeats(root: string, opts: { drain?: boolean; graceMs?
       out.push(
         evidence.outcome === "reaped"
           ? { ...seen, state: "drained", detail: evidence.detail }
-          : { ...seen, state: "refused", detail: "record vanished before the reap; nothing was signalled" },
+          : evidence.outcome === "retained"
+            ? { ...seen, state: "refused", detail: `retained (${evidence.reason}): ${evidence.detail}` }
+            : { ...seen, state: "refused", detail: "record vanished before the reap; nothing was stopped" },
       );
     } catch (e) {
       out.push({ ...seen, state: "refused", detail: (e as Error).message });

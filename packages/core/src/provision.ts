@@ -2437,6 +2437,8 @@ function lifecycleExecutorPermissions(
   const recordKeys = [
     lifecycleHeadKey(pin.owner, pin.actor), uidReservationKey(pin.lifecycleUid), staticSlotKey(pin.owner, pin.alias),
     recordSpecKey(RECORD_KINDS.lifecycle, [pin.owner, pin.actor, pin.lifecycleUid]),
+    // The operator release record: the `.status` half of the same lifecycle kind.
+    recordStatusKey(RECORD_KINDS.lifecycle, [pin.owner, pin.actor, pin.lifecycleUid]),
   ];
   return {
     pub: {

@@ -29,7 +29,7 @@
  *   manager.lifecycle despawn / attach / input             (owner-mode terminal/interactive)
  *   manager.self     stop                                  (self-mode halt; baseline)
  *   manager.persona  definePersona                         (privileged-grade; ownership-checked)
- *   manager.admin    purge / launch / resume family / transcript-receive  (operator instruments only)
+ *   manager.admin    purge / launch / resume family / transcript-receive / release-seat (operator instruments only)
  *   manager.run      run-start / run-resume / run-answer   (the `run` capability + privileged instrument)
  *                    run-status / run-ps ride manager.read
  */
@@ -97,9 +97,11 @@ const STATUS_OUTPUT_SCHEMA = {
     staticReconciliation: {
       type: "object",
       additionalProperties: false,
-      required: ["state", "failures"],
+      required: ["state", "failures", "retainedCustody"],
       properties: {
         state: { enum: ["idle", "running", "retry-wait", "retrying", "recovered", "failed"] },
+        /** Items whose seat is not proved gone (`retainedReason` set) and not yet recovered. */
+        retainedCustody: { type: "integer", minimum: 0 },
         lastSweep: {
           type: "object",
           additionalProperties: false,
@@ -133,6 +135,7 @@ const STATUS_OUTPUT_SCHEMA = {
               nextRetryAt: { type: "string" },
               recoveredAt: { type: "string" },
               remedy: { type: "string" },
+              retainedReason: { enum: ["absent", "no-reference", "unprovable", "members-remain"] },
             },
           },
         },
@@ -178,10 +181,14 @@ export interface ManagerStaticReconciliationFailure {
   nextRetryAt?: string;
   recoveredAt?: string;
   remedy?: string;
+  /** Set while the terminal holds the lifecycle because its seat is not proved gone. */
+  retainedReason?: "absent" | "no-reference" | "unprovable" | "members-remain";
 }
 
 export interface ManagerStaticReconciliationStatus {
   state: "idle" | "running" | "retry-wait" | "retrying" | "recovered" | "failed";
+  /** Items with `retainedReason` set and a disposition other than `recovered`. */
+  retainedCustody: number;
   lastSweep?: ManagerStaticReconciliationSweep;
   failures: ManagerStaticReconciliationFailure[];
 }
@@ -596,6 +603,15 @@ const PURGE_OUTPUT_SCHEMA = {
   type: "object", additionalProperties: false, required: ["chat"],
   properties: { chat: { type: "integer", minimum: 0 }, dm: { type: "integer", minimum: 0 } },
 } as const;
+// The operator is the verified caller, so the input carries no operator field.
+const RELEASE_SEAT_INPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["alias", "lifecycleUid", "reason"],
+  properties: { alias: { type: "string", minLength: 1 }, lifecycleUid: { type: "string", minLength: 1 }, reason: { type: "string", minLength: 1 } },
+} as const;
+const RELEASE_SEAT_OUTPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["alias", "lifecycleUid", "phase", "advisory"],
+  properties: { alias: { type: "string" }, lifecycleUid: { type: "string" }, phase: { type: "string" }, advisory: { type: "string" } },
+} as const;
 
 const CHANNEL_LIST = { type: "array", items: { type: "string" } } as const;
 const PERSONA_INPUT_SCHEMA = {
@@ -934,6 +950,7 @@ const ROWS: CommandRow[] = [
   { name: "commit-preservation", capability: "manager.admin", input: ATTEMPT_INPUT_SCHEMA, output: OPEN_OBJECT_SCHEMA, targeted: false, handler: "commitPreservation" },
   { name: "abort-preservation", capability: "manager.admin", input: ATTEMPT_INPUT_SCHEMA, output: ATTEMPT_STATE_OUTPUT_SCHEMA, targeted: false, handler: "abortPreservation" },
   { name: "transcript-receive", capability: "manager.admin", input: TRANSCRIPT_RECEIVE_INPUT_SCHEMA, output: TRANSCRIPT_RECEIVE_OUTPUT_SCHEMA, targeted: false, handler: "transcriptReceive" },
+  { name: "release-seat", capability: "manager.admin", input: RELEASE_SEAT_INPUT_SCHEMA, output: RELEASE_SEAT_OUTPUT_SCHEMA, targeted: false, handler: "releaseSeat" },
 ];
 
 // WHEN THE COMPILE HAPPENS (#1323): every CLI invocation loads this module before its verb is
@@ -1062,7 +1079,13 @@ export const MANAGER_STATUS_CONTRACT: { input: CompiledContract; output: Compile
  *  command name is unchanged.
  *
  *  28 = `spawn` refuses blank `continueSession` values, matching its `resume` field. A changed input
- *  contract is a changed described surface even though the command name is unchanged. */
+ *  contract is a changed described surface even though the command name is unchanged.
+ *
+ *  29 = manager `status` adds `staticReconciliation.retainedCustody` and a failure's
+ *  `retainedReason`: a terminal whose seat is not proved gone.
+ *
+ *  30 = `release-seat` lets an operator release a retained seat's custody. A new served command
+ *  cannot fold into 29. */
 export function managerClusterDocument(): {
   urn: string;
   revision: number;
@@ -1080,7 +1103,7 @@ export function managerClusterDocument(): {
 } {
   return {
     urn: MANAGER_CLUSTER_URN,
-    revision: 28,
+    revision: 30,
     attributes: [],
     events: [],
     commands: ROWS.map((r) => ({
@@ -1168,6 +1191,7 @@ export interface ManagerServiceHandlers {
   commitPreservation(ctx: EpServeContext): unknown | Promise<unknown>;
   abortPreservation(ctx: EpServeContext): unknown | Promise<unknown>;
   transcriptReceive(ctx: EpServeContext): unknown | Promise<unknown>;
+  releaseSeat(ctx: EpServeContext): unknown | Promise<unknown>;
 }
 
 /** Build the `EpCommandDef[]` `serveEndpoint` consumes: each command's provenance-branded compiled

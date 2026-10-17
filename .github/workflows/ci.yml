@@ -65,6 +65,10 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Ubuntu 24.04 runners block unprivileged user namespaces via AppArmor; the seat's
+      # reused-pid cell needs one to own ns_last_pid.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Cache nats-server
         id: nats
         uses: actions/cache@v4
@@ -135,6 +139,14 @@ jobs:
       - name: Released schemasafe public-error diagnostic
         if: ${{ !cancelled() }}
         run: pnpm smoke:schema-schemasafe-public-errors
+      # Layer 3 cells need a delegated cgroup and a distinct agent uid. Root gets both: a system
+      # scope with Delegate=yes, and a created user. REQUIRE turns any skipped cell into a failure.
+      # The peer-uid cell runs the custodian as the agent, so every checkout ancestor gets o+x.
+      - name: Seat cgroup custody (distinct uid)
+        run: |
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin cotal-seat-agent
+          d="$GITHUB_WORKSPACE"; while [ "$d" != / ]; do sudo chmod o+x "$d"; d="$(dirname "$d")"; done
+          sudo env "PATH=$PATH" COTAL_SEAT_CGROUP_DELEGATED=1 COTAL_SEAT_CGROUP_REQUIRE=1 COTAL_SEAT_SMOKE_AGENT_UID="$(id -u cotal-seat-agent)" pnpm smoke:seat-cgroup
       - name: View smoke
         run: pnpm smoke:view
       - name: Verify Claude connector package
@@ -188,6 +200,10 @@ jobs:
           echo "pnpm_target=$pnpm_target" >> "$GITHUB_OUTPUT"
           echo "pnpm_sha=$(/usr/bin/sha256sum "$pnpm_target" | /usr/bin/cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - run: pnpm install --frozen-lockfile
+      # Ubuntu 24.04 runners block unprivileged user namespaces via AppArmor; the seat's
+      # reused-pid cell needs one to own ns_last_pid.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Cache nats-server
         id: nats
         uses: actions/cache@v4
@@ -272,6 +288,14 @@ jobs:
       - name: Manager lifecycle e2e (real broker + real agents)
         continue-on-error: true
         run: pnpm smoke:lifecycle-e2e
+      # T6 delegated proof: root manager in a Delegate=yes scope, seats under a created agent uid.
+      # Its own step and not quarantined: the legacy step above keeps RIG-4872's continue-on-error.
+      # The agent uid loads the custodian and the stub from the checkout, so every ancestor gets o+x.
+      - name: Manager lifecycle e2e, delegated (custodial pty, cgroups, distinct agent uid)
+        run: |
+          id -u cotal-seat-e2e >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin cotal-seat-e2e
+          d="$GITHUB_WORKSPACE"; while [ "$d" != / ]; do sudo chmod o+x "$d"; d="$(dirname "$d")"; done
+          sudo systemd-run --scope -p Delegate=yes --quiet -- env "PATH=$PATH" COTAL_SEAT_CGROUP_DELEGATED=1 COTAL_SEAT_AGENT_UID="$(id -u cotal-seat-e2e)" pnpm smoke:lifecycle-e2e
       - name: Runtime smoke tests (tmux, orca, herdr)
         run: pnpm smoke:runtime
       # Runs BEFORE the soak because it grades the soak's own instrument: the wait behind the
@@ -299,7 +323,7 @@ jobs:
       - name: Transport liveness unit baseline
         run: pnpm smoke:transport-liveness
 
-  # Native linux-x64 and linux-arm64 SO_PEERCRED helpers, then one pack on x64
+  # Native linux-x64 and linux-arm64 peercred.node and pty.node, then one pack on x64
   # that assembles BOTH into the tarball the ARM load job consumes unchanged.
   # The ARM load job must not rebuild. A queued-never-started job is not a measurement.
   seat-native-linux-x64:
@@ -317,10 +341,12 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Build host native
         run: pnpm --filter @cotal-ai/seat build
+      - name: Native symbol-version ceiling
+        run: node packages/seat/scripts/assert-native-ceiling.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: seat-native-linux-x64
-          path: packages/seat/build/Release/linux-x64/peercred.node
+          path: packages/seat/build/Release/linux-x64/
           if-no-files-found: error
           retention-days: 7
 
@@ -339,10 +365,12 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Build host native
         run: pnpm --filter @cotal-ai/seat build
+      - name: Native symbol-version ceiling
+        run: node packages/seat/scripts/assert-native-ceiling.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: seat-native-linux-arm64
-          path: packages/seat/build/Release/linux-arm64/peercred.node
+          path: packages/seat/build/Release/linux-arm64/
           if-no-files-found: error
           retention-days: 7
 
@@ -372,8 +400,8 @@ jobs:
           path: ${{ runner.temp }}/seat-native-linux-arm64
       - name: Assemble natives and pack
         env:
-          SEAT_NATIVE_X64: ${{ runner.temp }}/seat-native-linux-x64/peercred.node
-          SEAT_NATIVE_ARM64: ${{ runner.temp }}/seat-native-linux-arm64/peercred.node
+          SEAT_NATIVE_X64: ${{ runner.temp }}/seat-native-linux-x64
+          SEAT_NATIVE_ARM64: ${{ runner.temp }}/seat-native-linux-arm64
           SEAT_PACK_DEST: ${{ runner.temp }}/seat-pack
         run: sh scripts/ci-seat-pack.sh
       - uses: actions/upload-artifact@v4
@@ -459,6 +487,13 @@ jobs:
           if (err instanceof Error && err.stack) console.log(err.stack);
           process.exit(1);
           EOF
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: packages/seat/smoke/fixtures/pinned-load.mjs
+          sparse-checkout-cone-mode: false
+          path: src
+      - name: Pinned PTY load through the shipped pty.node
+        run: node src/packages/seat/smoke/fixtures/pinned-load.mjs "${RUNNER_TEMP}/seat-prefix/node_modules/@cotal-ai/seat"
 
   ci-ok:
     # One aggregate status, advisory on main: no ruleset requires it, and `attribution` is the only
