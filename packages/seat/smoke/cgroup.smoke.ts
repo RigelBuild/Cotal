@@ -1,11 +1,11 @@
 // Layer 3 (T5): per-seat cgroup v2 custody. The orchestrator runs every cell in its own fresh
 // delegated scope, so no cell creates a cgroup under this process's own scope.
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, chownSync, closeSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, closeSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { checkSeatRelease, launchSeat, processStartToken, reapSeat, sealSeatLaunch, seatCgroupContained, seatCgroupPath, seatCgroupPopulated, seatId, type SeatLaunchSpec } from "../src/index.js";
+import { CGROUP_DELEGATED_ENV, checkSeatRelease, launchSeat, loadSeat, resolveCgroupBase, trustedSetpriv, processStartToken, socketPath, reapSeat, sealSeatLaunch, seatCgroupContained, seatCgroupPath, seatCgroupPopulated, seatId, type SeatLaunchSpec, type SeatRecord } from "../src/index.js";
 import { removeSeatCgroup } from "../src/cgroup.js";
 import { setCustodianTestSeam, setLauncherTestSeam } from "../src/launcher.js";
 import { pidfdOpen, pidfdSignal } from "../src/peercred.js";
@@ -18,9 +18,11 @@ if (process.platform !== "linux") {
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const DIST = join(dirname(SCRIPT), "..", "dist");
-const CELLS = ["refusal", "shared-uid", "unprovable", "release-join", "rollback", "bounds", "wrong-base", "distinct-uid", "setsid", "recordless", "fence"] as const;
+const CELLS = ["refusal", "shared-uid", "unprovable", "release-join", "rollback", "bounds", "wrong-base", "distinct-uid", "setsid", "recordless", "fence", "peer-uid"] as const;
 type Cell = (typeof CELLS)[number];
-const NEEDS_DISTINCT_UID: Record<Cell, boolean> = { refusal: false, "shared-uid": false, unprovable: false, "release-join": false, rollback: false, bounds: false, "wrong-base": false, "distinct-uid": true, setsid: true, recordless: true, fence: true };
+const NEEDS_DISTINCT_UID: Record<Cell, boolean> = { refusal: false, "shared-uid": false, unprovable: false, "release-join": false, rollback: false, bounds: false, "wrong-base": false, "distinct-uid": true, setsid: true, recordless: true, fence: true, "peer-uid": true };
+// Cells that launch a distinct-uid seat, which needs a root-owned setpriv to drop privileges through.
+const NEEDS_SETPRIV: ReadonlySet<Cell> = new Set<Cell>(["distinct-uid", "setsid", "recordless", "fence", "peer-uid"]);
 const REQUIRE = process.env.COTAL_SEAT_CGROUP_REQUIRE === "1";
 
 // Cells get no inherited COTAL_ connection material; they read only the COTAL_CG_ keys set below.
@@ -187,15 +189,21 @@ async function runCell(cell: string | undefined): Promise<void> {
   chmodSync(agentDir, 0o777);
   const created: string[] = [];
   const env = { PATH: process.env.PATH ?? "" };
-  const asAgent = (args: string[]): SeatLaunchSpec =>
-    agentUid > 0 && agentUid !== euid
-      ? { command: "setpriv", args: ["--reuid", String(agentUid), "--regid", String(agentGid), "--init-groups", "--", process.execPath, ...args], env }
-      : { command: process.execPath, args, env };
-  const launch = (id: string, spec: SeatLaunchSpec) => {
+  const launch = (id: string, spec: SeatLaunchSpec, uid?: number) => {
     created.push(seatCgroupPath(base, id));
-    const rec = launchSeat({ root, name: `t5-${String(cell)}`, id, spec, cwd: agentDir, cgroupBase: base });
+    const rec = launchSeat({ root, name: `t5-${String(cell)}`, id, spec, cwd: agentDir, cgroupBase: base, ...(uid === undefined ? {} : { agentUid: uid }) });
     strays.push({ pid: rec.custodianPid, start: rec.custodianStart }, { pid: rec.childPid, start: rec.childStart });
     return rec;
+  };
+  // The whole seat runs as the agent uid, through the launcher's own privilege drop.
+  const launchAsAgent = (id: string, args: string[]) => launch(id, { command: process.execPath, args, env }, agentUid);
+  const capsOf = (pid: number): { nnp: string; bnd: string } => {
+    const status = readOr(`/proc/${pid}/status`, "");
+    return { nnp: /^NoNewPrivs:\s+(\d+)$/m.exec(status)?.[1] ?? "?", bnd: /^CapBnd:\s+(\S+)$/m.exec(status)?.[1] ?? "?" };
+  };
+  const cannotGainCaps = (pid: number): boolean => {
+    const c = capsOf(pid);
+    return c.nnp === "1" && /^0+$/.test(c.bnd);
   };
   const file = (name: string): string => join(agentDir, name);
   const IGNORE = "process.on('SIGHUP',()=>{});process.on('SIGTERM',()=>{});";
@@ -231,6 +239,19 @@ if (reached) setReleaseTestSeam({ afterPopulated: { reached, release } });
 writeFileSync(out, JSON.stringify(await sealSeatLaunch(root, id, { cgroup: { path, agentUid: Number(uid) } })));
 `,
   );
+  // One connection per op: the custodian closes a socket after a peer uid mismatch. No dist import,
+  // so the agent uid needs no read access to the build.
+  const peerRunner = runner(
+    "peer.cjs",
+    `const net=require("net");const fs=require("fs");const [sock,token,out,...ops]=process.argv.slice(2);
+const frame=(v)=>{const b=Buffer.from(JSON.stringify(v));const h=Buffer.alloc(4);h.writeUInt32BE(b.length,0);return Buffer.concat([h,b]);};
+const one=(op)=>{const {promise,resolve}=Promise.withResolvers();const s=net.connect(sock);let buf=Buffer.alloc(0);const done=(r)=>{s.destroy();resolve(r);};
+s.on("error",(e)=>done("error:"+e.code));s.on("close",()=>done("closed"));
+s.on("data",(c)=>{buf=Buffer.concat([buf,c]);if(buf.length<4)return;const n=buf.readUInt32BE(0);if(buf.length<4+n)return;const r=JSON.parse(buf.subarray(4,4+n).toString());done(r.ok?"ok":r.error);});
+s.on("connect",()=>s.write(frame(op==="stop"?{id:1,op:"stop",mode:"hard"}:{id:1,op:"hello",token})));return promise;};
+(async()=>{const lines=[];for(const op of ops)lines.push(await one(op));fs.writeFileSync(out,lines.join("\\n")+"\\n");})();
+`,
+  );
   /** Run `then` (sh, args $2…) once `reached` exists; launchSeat blocks this event loop meanwhile. */
   const onReached = (reached: string, then: string, ...args: string[]): void => {
     const script = `i=0; while [ ! -e "$1" ] && [ $i -lt 1000 ]; do sleep 0.02; i=$((i+1)); done; ${then}`;
@@ -240,11 +261,25 @@ writeFileSync(out, JSON.stringify(await sealSeatLaunch(root, id, { cgroup: { pat
 
   let skipped = false;
   try {
-    // Without a distinct agent uid, asAgent runs as the manager, which would pass these cells vacuously.
+    // Without a distinct agent uid, launchAsAgent runs as the manager, which would pass these cells vacuously.
     const known = CELLS.find((c) => c === cell);
     if (known !== undefined && NEEDS_DISTINCT_UID[known] && !(agentUid > 0 && agentUid !== euid && agentGid >= 0)) {
       skipped = true;
       console.log(`  - skipped: needs a distinct uid, got agent uid ${agentUid} with euid ${euid}`);
+      cell = "skipped";
+    } else if (known !== undefined && NEEDS_SETPRIV.has(known) && trustedSetpriv() === undefined) {
+      // A mapped user namespace has no root-owned setpriv, so launchSeat must refuse the agent uid.
+      skipped = true;
+      console.log("  - skipped: setpriv not provably root-owned in this namespace");
+      if (known === "peer-uid") {
+        let refused = "";
+        try {
+          launch(seatId(), { command: process.execPath, args: ["-e", "0"], env }, agentUid);
+        } catch (e) {
+          refused = (e as Error).message;
+        }
+        check("no setpriv: launchSeat refuses a distinct agent uid", /no root-owned setpriv/.test(refused), refused);
+      }
       cell = "skipped";
     }
     switch (cell) {
@@ -298,15 +333,30 @@ writeFileSync(out, JSON.stringify(await sealSeatLaunch(root, id, { cgroup: { pat
         const before = statSync(procs);
         // Group-writable for a group the agent is not in: still no grant.
         chmodSync(procs, 0o664);
-        launch(id, asAgent(["-e", MIGRATE_CHILD, file("pid"), file("mark"), base]));
+        const rec = launchAsAgent(id, ["-e", MIGRATE_CHILD, file("pid"), file("mark"), base]);
         await until(() => existsSync(file("pid")), 5_000);
         const child = readPid(file("pid"));
         if (child) strays.push(child);
         const cg = { path: seatCgroupPath(base, id), agentUid };
+        check("no_new_privs: the custodian and its child run with NoNewPrivs 1 and an empty bounding set",
+          cannotGainCaps(rec.custodianPid) && child !== undefined && cannotGainCaps(child.pid), { custodian: capsOf(rec.custodianPid), child: child && capsOf(child.pid) });
         const groups = spawnSync("id", ["-G", String(agentUid)], { encoding: "utf8" }).stdout.trim().split(/\s+/).map(Number);
         check("migration attempt, distinct uid: the write to base cgroup.procs fails with a group-writable ancestor",
           /^denied:EACCES/.test(readOr(file("mark"), "")) && !groups.includes(before.gid), { mark: readOr(file("mark"), "none"), groups, gid: before.gid });
         check("migration attempt, distinct uid: seatCgroupContained is true", seatCgroupContained(cg));
+        // A member that could still gain a capability can leave, whatever the mode bits say.
+        const capable = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { uid: agentUid, gid: agentGid, stdio: "ignore" });
+        const capableExit = new Promise<void>((resolve) => capable.once("exit", () => resolve()));
+        let withCapable: boolean;
+        try {
+          writeFileSync(join(cg.path, "cgroup.procs"), String(capable.pid));
+          withCapable = seatCgroupContained(cg);
+        } finally {
+          capable.kill("SIGKILL");
+          await capableExit;
+        }
+        check("no_new_privs: a seat member without no_new_privs makes seatCgroupContained false", !withCapable, capable.pid && capsOf(capable.pid));
+        check("no_new_privs: with that member gone seatCgroupContained is true again", seatCgroupContained(cg));
         check("migration attempt, distinct uid: the child is alive in the seat cgroup before the kill",
           child !== undefined && !gone(child.pid) && seatCgroupPopulated(cg));
         // The same ancestor granted to the agent's own group is a grant the agent can use.
@@ -322,7 +372,7 @@ writeFileSync(out, JSON.stringify(await sealSeatLaunch(root, id, { cgroup: { pat
       }
       case "setsid": {
         const id = seatId();
-        launch(id, asAgent(["-e", SETSID_CHILD, file("pid"), file("gpid")]));
+        launchAsAgent(id, ["-e", SETSID_CHILD, file("pid"), file("gpid")]);
         await until(() => existsSync(file("pid")) && existsSync(file("gpid")), 5_000);
         const grand = readPid(file("gpid"));
         if (grand) strays.push(grand);
@@ -344,7 +394,7 @@ writeFileSync(out, JSON.stringify(await sealSeatLaunch(root, id, { cgroup: { pat
       }
       case "recordless": {
         const id = seatId();
-        launch(id, asAgent(["-e", SLEEPER, file("pid")]));
+        launchAsAgent(id, ["-e", SLEEPER, file("pid")]);
         await until(() => existsSync(file("pid")), 5_000);
         const child = readPid(file("pid"));
         if (child) strays.push(child);
@@ -353,6 +403,79 @@ writeFileSync(out, JSON.stringify(await sealSeatLaunch(root, id, { cgroup: { pat
         const evidence = await reapSeat(root, id, { cgroup: cg });
         check("record-less seat: the reap is reaped, the child is gone and the cgroup removed",
           evidence.outcome === "reaped" && child !== undefined && gone(child.pid) && !existsSync(cg.path), evidence);
+        break;
+      }
+      case "peer-uid": {
+        // T6: the custodian runs as the agent uid and serves only the launcher's uid.
+        const id = seatId();
+        const agentAs = ["setpriv", "--reuid", String(agentUid), "--regid", String(agentGid), "--init-groups", "--"];
+        // The custodian itself runs as the agent, so it must be able to load the build (a 0700 home cannot).
+        const entry = join(DIST, "custodian.js");
+        if (spawnSync(agentAs[0] ?? "", [...agentAs.slice(1), process.execPath, "-e", "require('fs').readFileSync(process.argv[1])", entry], { stdio: "ignore", timeout: 15_000, env }).status !== 0) {
+          skipped = true;
+          console.log(`  - skipped: agent uid ${agentUid} cannot read ${entry}`);
+          break;
+        }
+        created.push(seatCgroupPath(base, id));
+        let rec: SeatRecord;
+        try {
+          rec = launchSeat({ root, name: "t6-peer-uid", id, spec: { command: process.execPath, args: ["-e", SLEEPER, file("pid")], env }, cwd: agentDir, cgroupBase: base, agentUid });
+        } catch (e) {
+          // A custodian left at the launcher's uid cannot write the agent-owned seat, so launch fails.
+          check("peer uid: the custodian and its child run as the agent uid", false, (e as Error).message);
+          break;
+        }
+        strays.push({ pid: rec.custodianPid, start: rec.custodianStart }, { pid: rec.childPid, start: rec.childStart });
+        await until(() => existsSync(file("pid")), 5_000);
+        const child = readPid(file("pid"));
+        if (child) strays.push(child);
+        const uidOf = (pid: number): number => Number(/^Uid:\s+\d+\s+(\d+)/m.exec(readOr(`/proc/${pid}/status`, ""))?.[1] ?? "-1");
+        check("peer uid: the custodian and its child run as the agent uid",
+          uidOf(rec.custodianPid) === agentUid && child !== undefined && uidOf(child.pid) === agentUid, { custodian: uidOf(rec.custodianPid), child: child && uidOf(child.pid) });
+        const ask = (as: string[], out: string, ...ops: string[]): string[] => {
+          spawnSync(as[0] ?? "", [...as.slice(1), process.execPath, peerRunner, rec.socket, rec.token, out, ...ops], { stdio: "ignore", timeout: 15_000, env });
+          return readOr(out, "").split("\n").filter((l) => l !== "");
+        };
+        // Same uid as the custodian: the refusal comes from adopterUid, not from socket permissions.
+        const agentReplies = ask(agentAs, file("peer-agent"), "stop", "hello");
+        check("peer uid: a stop from the agent uid, and its hello with the right token, both get peer uid mismatch",
+          agentReplies.length === 2 && agentReplies.every((r) => r === "peer uid mismatch"), agentReplies);
+        const ownReplies = ask(["env", "--"], file("peer-own"), "hello");
+        check("peer uid: the launcher's uid gets the hello the agent uid was refused", ownReplies.length === 1 && ownReplies[0] === "ok", ownReplies);
+        const cg = { path: seatCgroupPath(base, id), agentUid };
+        check("peer uid: the seat survives the agent's stop", child !== undefined && !gone(child.pid) && seatCgroupPopulated(cg));
+        // The agent owns its seat directory. It forges the record two ways, as the agent uid.
+        const recPath = join(root, id, "record.json");
+        const original = readFileSync(recPath, "utf8");
+        const decoy = file("decoy.json");
+        writeFileSync(decoy, original);
+        const asAgentSh = (script: string, ...args: string[]): number | null =>
+          spawnSync(agentAs[0] ?? "", [...agentAs.slice(1), "sh", "-c", script, "sh", ...args], { stdio: "ignore", timeout: 15_000, env }).status;
+        const linked = asAgentSh('rm -f "$1" && ln -s "$2" "$1"', recPath, decoy);
+        let followed = "";
+        try {
+          loadSeat(root, id);
+          followed = "followed";
+        } catch (e) {
+          followed = (e as NodeJS.ErrnoException).code ?? (e as Error).message;
+        }
+        check("forged record: the agent's symlinked record.json is refused, not followed", linked === 0 && followed === "ELOOP", { linked, followed });
+        const forged = JSON.stringify({ ...JSON.parse(original), id: seatId(), socket: file("evil.sock") });
+        const swapped = asAgentSh('rm -f "$1" && printf %s "$2" > "$1"', recPath, forged);
+        let named = "";
+        try {
+          loadSeat(root, id);
+          named = "adopted";
+        } catch (e) {
+          named = (e as Error).message;
+        }
+        check("forged record: a record naming another seat is refused at adopt", swapped === 0 && /refusing to adopt/.test(named), { swapped, named });
+        const sameId = JSON.stringify({ ...JSON.parse(original), socket: file("evil.sock") });
+        asAgentSh('rm -f "$1" && printf %s "$2" > "$1"', recPath, sameId);
+        const loaded = loadSeat(root, id);
+        check("forged record: adopt derives the socket from the root and id, not the record", loaded.socket === socketPath(root, id), loaded.socket);
+        const evidence = await reapSeat(root, id, { cgroup: cg });
+        check("peer uid: the agent-uid seat is reaped through its cgroup", evidence.outcome === "reaped" && child !== undefined && gone(child.pid), evidence);
         break;
       }
       case "fence": {
@@ -365,7 +488,7 @@ writeFileSync(out, JSON.stringify(await sealSeatLaunch(root, id, { cgroup: { pat
         setLauncherTestSeam({ beforeMove: { reached, release } });
         let err = "";
         try {
-          launch(id, asAgent(["-e", SLEEPER, file("pid")]));
+          launchAsAgent(id, ["-e", SLEEPER, file("pid")]);
         } catch (e) {
           err = (e as Error).message;
         } finally {
@@ -474,6 +597,35 @@ writeFileSync(out, JSON.stringify(await sealSeatLaunch(root, id, { cgroup: { pat
           rejected && existsSync(sibling) && !fenceSealed(id), { rejected, sibling: existsSync(sibling) });
         rmdirSync(sibling);
         rmdirSync(dirname(sibling));
+        // The base needs the operator's delegation declaration and this euid's write access to it.
+        const subtree = join(base, "cgroup.subtree_control");
+        const mode = statSync(subtree).mode & 0o777;
+        const declared = process.env[CGROUP_DELEGATED_ENV];
+        delete process.env[CGROUP_DELEGATED_ENV];
+        const undeclared = resolveCgroupBase();
+        process.env[CGROUP_DELEGATED_ENV] = "1";
+        const resolvedAs = resolveCgroupBase();
+        let unwritable: string | undefined = "unchanged";
+        if (euid !== 0) {
+          chmodSync(subtree, 0o444);
+          try {
+            unwritable = resolveCgroupBase();
+          } finally {
+            chmodSync(subtree, mode);
+          }
+        }
+        if (declared === undefined) delete process.env[CGROUP_DELEGATED_ENV];
+        else process.env[CGROUP_DELEGATED_ENV] = declared;
+        check("wrong base: resolveCgroupBase is none without the delegation declaration", undeclared === undefined, undeclared);
+        check("wrong base: resolveCgroupBase returns this cell's own scope, and none once its subtree_control is unwritable",
+          resolvedAs === base && (euid === 0 || unwritable === undefined), { resolvedAs, unwritable, euid });
+        // A setpriv this user could replace, or reached through a link into such a file, is never run.
+        const planted = file("setpriv");
+        writeFileSync(planted, "#!/bin/sh\nexit 11\n", { mode: 0o755 });
+        const link = file("setpriv-link");
+        symlinkSync(planted, link);
+        check("setpriv trust: a setpriv in a user-owned dir, directly or through a fixed-looking link, is refused",
+          trustedSetpriv([planted]) === undefined && trustedSetpriv([link]) === undefined, { planted: trustedSetpriv([planted]), link: trustedSetpriv([link]) });
         break;
       }
       default:

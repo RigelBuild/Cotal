@@ -86,6 +86,11 @@ jobs:
       # reused-pid cell needs one to own ns_last_pid.
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # The seat cgroup fixture runs its cells as root with this agent user, as the ci.yml step does.
+      - name: Seat cgroup agent user
+        run: |
+          id -u cotal-seat-agent >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin cotal-seat-agent
+          d="$GITHUB_WORKSPACE"; while [ "$d" != / ]; do sudo chmod o+x "$d"; d="$(dirname "$d")"; done
       - name: Cache nats-server
         id: nats
         uses: actions/cache@v4
@@ -176,6 +181,11 @@ jobs:
       # reused-pid cell needs one to own ns_last_pid.
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # The seat cgroup fixture runs its cells as root with this agent user, as the ci.yml step does.
+      - name: Seat cgroup agent user
+        run: |
+          id -u cotal-seat-agent >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin cotal-seat-agent
+          d="$GITHUB_WORKSPACE"; while [ "$d" != / ]; do sudo chmod o+x "$d"; d="$(dirname "$d")"; done
       - name: Cache nats-server
         id: nats
         uses: actions/cache@v4

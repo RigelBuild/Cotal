@@ -144,6 +144,8 @@ try {
           String((entry.frame as { content?: string }).content).includes("cotal_orientation"),
       ),
     );
+    // stderr is a pipe, so the note can land after the log entry above; wait for it, not one read.
+    await waitFor("empty-sessions fresh-session note", () => /started a fresh session/.test(empty.stderr()) || undefined).catch(() => undefined);
     const emptyErr = empty.stderr();
     const emptyReqs = entriesOf(empty.log).filter((entry) => entry.ev === "request");
     check("an empty sessions directory still starts a fresh session", /started a fresh session/.test(emptyErr), emptyErr);
@@ -176,6 +178,8 @@ try {
   const panicCreate = await waitFor("listing-panic create_session", () =>
     entriesOf(panicked.log).find((entry) => entry.ev === "session_path" && entry.req === "create_session"),
   ).catch(() => undefined);
+  // host.ts logs the fresh-session note after the listing failure, so wait for it, not one read.
+  await waitFor("listing-panic fresh-session note", () => /started a fresh session/.test(panicked.stderr()) || undefined).catch(() => undefined);
   const panicErr = panicked.stderr();
   check(
     "listing panic still starts a fresh session on a new harness",

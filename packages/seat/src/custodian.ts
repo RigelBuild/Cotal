@@ -45,6 +45,9 @@ export interface CustodianLaunch {
   unattendedMs?: number;
   /** The layer 3 seat cgroup the launcher moves this process into. No child is spawned outside it. */
   cgroup?: string;
+  /** The only uid whose connections this custodian serves: the launcher's. With a distinct agent uid
+   *  it is not this process's uid, so the agent cannot drive its own seat. */
+  adopterUid: number;
 }
 
 /** The stdin payload `launchSeat` writes: a launch plus the seam `setCustodianTestSeam` set. */
@@ -81,6 +84,7 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
     throw new Error(`custody transport unsupported on ${process.platform}`);
   }
   const startedAt = Date.now();
+  if (!Number.isInteger(launch.adopterUid) || launch.adopterUid < 0) throw new Error(`launch adopterUid ${String(launch.adopterUid)} is not a uid; starting no child`);
   const holdAt = async (at: "before-fs" | "after-pin" | "unpinned"): Promise<void> => {
     const hold = seam?.holds?.find((h) => h.at === at);
     if (!hold) return;
@@ -501,8 +505,7 @@ async function serveSeat(
     }
     try {
       const cred = peerCredentials(sock);
-      const uid = process.getuid?.();
-      if (uid === undefined || cred.uid !== uid) {
+      if (cred.uid !== launch.adopterUid) {
         send(sock, { id: req.id, ok: false, error: "peer uid mismatch" });
         sock.destroy();
         return;

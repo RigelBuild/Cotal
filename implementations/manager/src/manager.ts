@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash, randomUUID, randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 import { credsAuthenticator } from "@nats-io/transport-node";
-import { existsSync, lstatSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { closeSync, constants, existsSync, fchmodSync, fchownSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { isAbsolute, join, dirname, resolve } from "node:path";
 import {
   CotalEndpoint,
@@ -73,6 +73,8 @@ import {
   type Runtime,
   type RuntimeMode,
 } from "./runtime/index.js";
+import { CustodialPtyRuntime } from "./runtime/custodial-pty.js";
+import { agentCanReplace, agentPrimaryGid } from "@cotal-ai/seat";
 import { managedStaticCredOffTickRenewalDue } from "./renewal.js";
 import { AttachEndpoint, type SessionEstablishment } from "./attach-endpoint.js";
 import { makeManagerEndpointEvictionEvidence, makeManagerEndpointEvictor } from "./endpoint-evict.js";
@@ -3815,6 +3817,7 @@ export class Manager {
           await this.provePredecessor(a, custody);
           await this.recordSlotCustody(a, custody);
         }
+        if (a.secretPaths?.creds) this.grantSeatCreds(a.secretPaths.creds);
         const handle = await this.spawnCustodied(a.name, spec, a.launch.cwd, custody, a);
         replacement = handle;
         restart.sessionStatePath = spec.sessionStatePath ?? restart.sessionStatePath;
@@ -4736,8 +4739,10 @@ export class Manager {
         // LIFECYCLE-KEYED (SPEC 13.1 on the FS): the incarnation's cred file embeds its uid, so a
         // replayed/stale teardown can never address a same-name successor's credential.
         credsPath = agentLifecycleSecretFilePaths(this.workspaceRoot, this.space, name, lifecycleUid).creds;
+        this.checkSeatCredsPath(credsPath);
         await secrets.put(agentSecretKeyForFile(credsPath, this.space), creds);
         await materializeSecretToFile(secrets, agentSecretKeyForFile(credsPath, this.space), credsPath);
+        this.grantSeatCreds(credsPath);
         provisioned = { id: identity.id, name, lifecycleUid, secretPaths: { creds: credsPath }, ...(custody ? { runtime: custody } : {}) }; // footprint now exists — the finally rolls it back if the spawn throws
       }
       // Personal MCP servers the operator opted to share with manager-spawned agents of this type
@@ -5395,6 +5400,7 @@ export class Manager {
         await this.provePredecessor(resumeSlot, custody);
         await this.recordSlotCustody(resumeSlot, custody);
       }
+      if (entry.identity.mode === "static") this.grantSeatCreds(resolve(entry.identity.credential.path));
       const handle = await this.spawnCustodied(entry.name, prepared.spec, entry.launch.cwd, custody, resumeSlot);
       const managed: ManagedAgent = {
         name: entry.name,
@@ -7409,6 +7415,76 @@ export class Manager {
     return isCustodialRuntime(this.runtime) ? this.runtime.reserve() : undefined;
   }
 
+  /** The distinct agent uid of the custodial runtime, or undefined when seats share this uid. */
+  private seatAgent(): { uid: number; gid: number } | undefined {
+    const rt = this.runtime;
+    if (!(rt instanceof CustodialPtyRuntime) || rt.agentUid === process.geteuid?.()) return undefined;
+    const gid = agentPrimaryGid(rt.agentUid);
+    if (gid === undefined) throw new Error(`seat agent uid ${rt.agentUid} is not in /etc/passwd and COTAL_SEAT_AGENT_GID names no gid`);
+    return { uid: rt.agentUid, gid };
+  }
+
+  /** Every component from the workspace root down to `credsPath`. Node has no openat, so the path is
+   *  made unswappable instead: each existing component is no symlink and owned by this euid, and no
+   *  directory from the file up to `/` is one the agent can rearrange. Run before the store writes. */
+  private credsComponents(credsPath: string, agent: { uid: number; gid: number }): string[] {
+    const top = resolve(this.workspaceRoot);
+    const path = resolve(credsPath);
+    if (!path.startsWith(`${top}/`)) throw new Error(`creds ${credsPath} is outside the workspace ${top}; not granting it to the seat agent uid`);
+    const out: string[] = [];
+    for (let p = path; ; p = dirname(p)) {
+      out.push(p);
+      if (p === top) break;
+    }
+    const euid = process.geteuid?.();
+    for (const p of out) {
+      // throwIfNoEntry false: a component not created yet is fine; materialize creates it as a directory.
+      const st = lstatSync(p, { throwIfNoEntry: false });
+      if (st === undefined) continue;
+      if (st.isSymbolicLink()) throw new Error(`creds path component ${p} is a symlink; refusing to write or grant it for the seat agent uid`);
+      if (st.uid !== euid) throw new Error(`creds path component ${p} is owned by uid ${st.uid}, not this manager's ${String(euid)}; refusing to grant it to seat agent uid ${agent.uid}`);
+    }
+    for (let dir = dirname(path); ; dir = dirname(dir)) {
+      const st = lstatSync(dir, { throwIfNoEntry: false });
+      if (st !== undefined && agentCanReplace(st, agent.uid))
+        throw new Error(`seat agent uid ${agent.uid} can write ${dir} above its creds ${credsPath}; refusing to write or grant them`);
+      if (dir === dirname(dir)) break;
+    }
+    return out;
+  }
+
+  /** Distinct agent uid only, before the creds are stored or materialized: refuse a swappable path. */
+  private checkSeatCredsPath(credsPath: string): void {
+    const agent = this.seatAgent();
+    if (agent !== undefined) this.credsComponents(credsPath, agent);
+  }
+
+  /** A seat under a distinct agent uid reads this incarnation's creds file and cannot rewrite it: the
+   *  file stays manager-owned, group the agent's primary gid, 0640. Each dir up to the workspace root
+   *  gains group and other traverse (x), never read. Every change goes through an O_NOFOLLOW fd.
+   *  Run before every static seat launch: a rewrite or a later mkSecretDir drops the grant. */
+  private grantSeatCreds(credsPath: string): void {
+    const agent = this.seatAgent();
+    if (agent === undefined) return;
+    const [file, ...dirs] = this.credsComponents(credsPath, agent);
+    if (file === undefined) return;
+    const ffd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      fchownSync(ffd, process.geteuid?.() ?? 0, agent.gid);
+      fchmodSync(ffd, 0o640);
+    } finally {
+      closeSync(ffd);
+    }
+    for (const dir of dirs) {
+      const dfd = openSync(dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      try {
+        fchmodSync(dfd, (fstatSync(dfd).mode & 0o7777) | 0o011);
+      } finally {
+        closeSync(dfd);
+      }
+    }
+  }
+
   /** Spawn under a reserved reference. On a mismatch with a slot row, record `got` on the row and
    *  throw, so the terminal reaps `got`; without a row, reap `got` inline. */
   private async spawnCustodied(name: string, spec: LaunchSpec, cwd: string, reserved: RuntimeReference | undefined, slot: { id: string; lifecycleUid: string }): Promise<AgentHandle> {
@@ -7671,8 +7747,10 @@ export class Manager {
     );
     const secrets = this.secrets;
     const credsPath = a.secretPaths!.creds!;
+    this.checkSeatCredsPath(credsPath);
     await secrets.put(agentSecretKeyForFile(credsPath, this.space), creds);
     await materializeSecretToFile(secrets, agentSecretKeyForFile(credsPath, this.space), credsPath);
+    this.grantSeatCreds(credsPath);
     console.error(`managed cred renewal ${a.name}: re-signed for the same identity (exp +${MANAGED_STATIC_TTL_SEC}s); the agent endpoint's source re-read adopts it`);
   }
 

@@ -1,12 +1,12 @@
 import { spawn, spawnSync } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertSeatId, capabilityToken, fencePath, recordPath, seatId, socketPath, type SeatRecord, readRecord } from "./record.js";
+import { assertSeatId, capabilityToken, fencePath, readSeatFileNoFollow, recordPath, seatId, socketPath, type SeatRecord, readRecord } from "./record.js";
 import { CONFIRM_TIMEOUT_MS, unattendedMs, assertSocketPathFits, unsupportedTransport } from "./protocol.js";
 import { tryLockFd } from "./peercred.js";
 import type { CustodianTestSeam } from "./custodian.js";
-import { createSeatCgroup, moveIntoSeatCgroup, ownCgroup, removeSeatCgroup, type SeatCgroup } from "./cgroup.js";
+import { agentPrimaryGid, createSeatCgroup, moveIntoSeatCgroup, ownCgroup, removeSeatCgroup, trustedSetpriv, type SeatCgroup } from "./cgroup.js";
 
 export interface SeatLaunchSpec {
   command: string;
@@ -27,6 +27,9 @@ export interface LaunchSeatOpts {
   /** Layer 3: the manager's delegated cgroup. The seat cgroup `<base>/seat-<id>` must not exist yet;
    *  the custodian is moved into it and spawns no child outside it. */
   cgroupBase?: string;
+  /** The uid the custodian and its child run as. Omitted is this process's euid. A distinct uid needs
+   *  euid 0: the seat directory is chowned to it and the custodian is spawned with its uid and gid. */
+  agentUid?: number;
 }
 
 function packageRoot(): string {
@@ -181,7 +184,23 @@ export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
 
 function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): SeatRecord {
   if (process.platform !== "linux") throw unsupportedTransport();
+  const euid = process.geteuid?.() ?? -1;
+  const agentUid = opts.agentUid ?? euid;
+  if (!Number.isInteger(agentUid) || agentUid < 0) throw new Error(`agent uid ${agentUid} is not a uid`);
+  let agent: { uid: number; gid: number } | undefined;
+  if (agentUid !== euid) {
+    if (euid !== 0) throw new Error(`a seat under agent uid ${agentUid} needs a manager with euid 0, not ${euid}`);
+    const gid = agentPrimaryGid(agentUid);
+    if (gid === undefined) throw new Error(`agent uid ${agentUid} is not in /etc/passwd and COTAL_SEAT_AGENT_GID names no gid`);
+    agent = { uid: agentUid, gid };
+  }
+  // An agent that can never gain a capability cannot bypass the seat cgroup's mode bits, which is what
+  // makes a reap provable. No trusted setpriv means no distinct-uid seat at all.
+  const setpriv = agent ? trustedSetpriv() : undefined;
+  if (agent && !setpriv) throw new Error("no root-owned setpriv: refusing to launch a seat under a distinct agent uid without no_new_privs");
   mkdirSync(opts.root, { recursive: true, mode: 0o700 });
+  // The agent must reach its own seat directory and the fence; 0711 lets it traverse, not list.
+  if (agent) chmodSync(opts.root, 0o711);
   const id = assertSeatId(opts.id ?? seatId());
   const token = capabilityToken();
   const socket = assertSocketPathFits(socketPath(opts.root, id));
@@ -193,6 +212,9 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
   // `wx+` (O_CREAT|O_EXCL, read-write): an existing fence is an id an earlier launch or release used.
   const fenceFd = openSync(fence, "wx+", 0o644);
   let cgroup: SeatCgroup | undefined;
+  let launchFd: number | undefined;
+  const logPath = join(dirname(recPath), "custodian.log");
+  const run = runMarker();
   try {
     const hold = launcherSeam?.afterFence;
     if (hold) holdLauncher(hold);
@@ -207,45 +229,60 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
     if (opts.cgroupBase !== undefined) {
       // A reap or release derives the path from its own base, so a seat under any other base is unreapable.
       if (opts.cgroupBase !== ownCgroup()) throw new Error(`cgroup base ${opts.cgroupBase} is not this process's cgroup ${String(ownCgroup())}`);
-      cgroup = created.cgroup = createSeatCgroup(opts.cgroupBase, id, process.geteuid?.() ?? -1);
+      cgroup = created.cgroup = createSeatCgroup(opts.cgroupBase, id, agentUid);
     }
     mkdirSync(dirname(recPath), { mode: 0o700 });
+    const payload = JSON.stringify({
+      id,
+      name: opts.name,
+      command: opts.spec.command,
+      args: opts.spec.args,
+      env: opts.spec.env ?? {},
+      cwd: opts.cwd,
+      socket,
+      token,
+      recordPath: recPath,
+      fence,
+      logPath,
+      confirm: opts.spec.confirm,
+      run,
+      // Resolved HERE, not in the custodian: the custodian's environment is scrubbed to `PATH` plus the
+      // run marker, so it cannot read an override the caller set.
+      unattendedMs: unattendedMs(),
+      ...(cgroup ? { cgroup: cgroup.path } : {}),
+      adopterUid: euid,
+      ...(testSeam ? { testSeam } : {}),
+    });
+    // Payload carries spec.env (provider keys) and the capability token.
+    // argv is world-readable via /proc/<pid>/cmdline (0444). Inherit a 0600
+    // file as stdin so the JSON never appears on argv.
+    //
+    // The run marker is the one thing deliberately ON argv, because that is the point of it: a census
+    // must be able to attribute an orphan without the uid needed to read `/proc/<pid>/cwd`. It names a
+    // run, never a credential.
+    // Written, opened and unlinked while the seat directory is still ours: after the chown below the
+    // agent owns it and could plant a link here. Exclusive and no-follow regardless.
+    const launchPath = join(dirname(recPath), "launch.json");
+    const writeFd = openSync(launchPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try {
+      writeFileSync(writeFd, payload);
+    } finally {
+      closeSync(writeFd);
+    }
+    launchFd = openSync(launchPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    unlinkSync(launchPath);
+    if (agent) chownSync(dirname(recPath), agent.uid, agent.gid);
+  } catch (e) {
+    if (launchFd !== undefined) closeSync(launchFd);
+    throw e;
   } finally {
     closeSync(fenceFd);
   }
-  const logPath = join(dirname(recPath), "custodian.log");
-  const run = runMarker();
-  const payload = JSON.stringify({
-    id,
-    name: opts.name,
-    command: opts.spec.command,
-    args: opts.spec.args,
-    env: opts.spec.env ?? {},
-    cwd: opts.cwd,
-    socket,
-    token,
-    recordPath: recPath,
-    fence,
-    logPath,
-    confirm: opts.spec.confirm,
-    run,
-    // Resolved HERE, not in the custodian: the custodian's environment is scrubbed to `PATH` plus the
-    // run marker, so it cannot read an override the caller set.
-    unattendedMs: unattendedMs(),
-    ...(cgroup ? { cgroup: cgroup.path } : {}),
-    ...(testSeam ? { testSeam } : {}),
-  });
-  // Payload carries spec.env (provider keys) and the capability token.
-  // argv is world-readable via /proc/<pid>/cmdline (0444). Inherit a 0600
-  // file as stdin so the JSON never appears on argv.
-  //
-  // The run marker is the one thing deliberately ON argv, because that is the point of it: a census
-  // must be able to attribute an orphan without the uid needed to read `/proc/<pid>/cwd`. It names a
-  // run, never a credential.
-  const launchPath = join(dirname(recPath), "launch.json");
-  writeFileSync(launchPath, payload, { mode: 0o600 });
-  const launchFd = openSync(launchPath, "r");
-  const child = spawn(process.execPath, [custodianEntry(), RUN_MARKER_FLAG, run], {
+  const custodianArgv = [process.execPath, custodianEntry(), RUN_MARKER_FLAG, run];
+  const argv = agent && setpriv
+    ? [setpriv, "--reuid", String(agent.uid), "--regid", String(agent.gid), "--clear-groups", "--no-new-privs", "--bounding-set=-all", "--", ...custodianArgv]
+    : custodianArgv;
+  const child = spawn(argv[0] ?? "", argv.slice(1), {
     detached: true,
     stdio: [launchFd, "ignore", "ignore"],
     // COTAL_RUN is re-exported so a custodian's own descendants stay attributable to the same run,
@@ -253,11 +290,6 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
     env: { PATH: process.env.PATH ?? "", COTAL_RUN: run },
   });
   closeSync(launchFd);
-  try {
-    unlinkSync(launchPath);
-  } catch {
-    /* child still holds the fd */
-  }
   child.unref();
   if (cgroup) {
     const hold = launcherSeam?.beforeMove;
@@ -273,7 +305,8 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
     try {
       const rec = readRecord(recPath);
       if (rec.custodianPid > 0 && rec.childPid > 0) {
-        return rec;
+        // The record is agent-writable: the id, socket and token this launch generated win over its copies.
+        return { ...rec, id, socket, token };
       }
     } catch {
       /* record not written yet */
@@ -281,7 +314,7 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
     if (!pidLive(child.pid)) {
       let err = "";
       try {
-        err = readFileSync(logPath, "utf8").trim();
+        err = readSeatFileNoFollow(logPath).trim();
       } catch {
         /* no log */
       }
@@ -292,8 +325,12 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
   throw new Error(`custodian did not write a seat record at ${recPath}`);
 }
 
+/** The record of seat `id`, with its socket derived from the root and id. The seat directory may be
+ *  owned by the agent uid, so a record naming another seat, or another socket, is not trusted. */
 export function loadSeat(root: string, id: string): SeatRecord {
-  return readRecord(recordPath(root, id));
+  const rec = readRecord(recordPath(root, id));
+  if (rec.id !== id) throw new Error(`seat record at ${recordPath(root, id)} names seat ${rec.id}, not ${id}; refusing to adopt it`);
+  return { ...rec, socket: socketPath(root, id) };
 }
 
 export function readSeatFile(path: string): SeatRecord {

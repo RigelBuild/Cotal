@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { closeSync, constants, mkdirSync, openSync, readFileSync, rmdirSync, statfsSync, statSync, writeSync, type Stats } from "node:fs";
+import { accessSync, closeSync, constants, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmdirSync, statfsSync, statSync, writeSync, type Stats } from "node:fs";
 import { dirname, join, posix } from "node:path";
 import { assertSeatId } from "./record.js";
 
@@ -25,6 +25,51 @@ export function ownCgroup(): string | undefined {
 
 export function seatCgroupPath(base: string, id: string): string {
   return `${assertNormalUnderRoot(base, "cgroup base")}/seat-${assertSeatId(id)}`;
+}
+
+/** Set by the operator to declare that the manager's unit has `Delegate=yes`. A user-manager scope
+ *  is writable without delegation, so writability alone cannot show it, and nothing is run to ask. */
+export const CGROUP_DELEGATED_ENV = "COTAL_SEAT_CGROUP_DELEGATED";
+
+/** The manager's layer 3 base: its own cgroup, on cgroup2, declared delegated through
+ *  {@link CGROUP_DELEGATED_ENV}, and whose directory, `cgroup.procs` and `cgroup.subtree_control` this
+ *  euid can write. Undefined when any of that is not true. */
+export function resolveCgroupBase(): string | undefined {
+  if (process.env[CGROUP_DELEGATED_ENV] !== "1") return undefined;
+  try {
+    if (statfsSync(CGROUP_ROOT).type !== CGROUP2_SUPER_MAGIC) return undefined;
+    const base = ownCgroup();
+    if (base === undefined) return undefined;
+    assertNormalUnderRoot(base, "cgroup base");
+    for (const p of [base, join(base, "cgroup.procs"), join(base, "cgroup.subtree_control")]) accessSync(p, constants.W_OK);
+    return base;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The agent uid's primary gid from `/etc/passwd`, read without running anything; for a uid not
+ *  listed there, `COTAL_SEAT_AGENT_GID`. Undefined when neither names one. */
+export function agentPrimaryGid(uid: number): number | undefined {
+  let passwd = "";
+  try {
+    passwd = readFileSync("/etc/passwd", "utf8");
+  } catch {
+    // An unreadable database is a uid that is not listed.
+  }
+  const fields = passwd.split("\n").map((l) => l.split(":")).find((f) => f.length >= 4 && f[2] === String(uid));
+  const raw = fields === undefined ? process.env.COTAL_SEAT_AGENT_GID : fields[3];
+  const gid = raw === undefined || raw === "" ? NaN : Number(raw);
+  return Number.isInteger(gid) && gid >= 0 ? gid : undefined;
+}
+
+/** Whether the agent (uid, primary gid; libuv clears supplementary groups at spawn) can replace an
+ *  entry of directory `st`. Its owner can chmod it. The group bits of a dir with a POSIX ACL are the
+ *  ACL mask, which bounds every named-user and group entry, so any group write counts, whatever the
+ *  gid. A sticky dir lets the agent replace only its own entries. */
+export function agentCanReplace(st: Stats, uid: number): boolean {
+  if (st.uid === uid) return true;
+  return (st.mode & 0o022) !== 0 && (st.mode & 0o1000) === 0;
 }
 
 /** A caller-supplied seat cgroup must be this seat's cgroup under this process's own base, on
@@ -83,22 +128,39 @@ export function removeSeatCgroup(cg: SeatCgroup): void {
   rmdirSync(cg.path);
 }
 
-function idList(flag: "-g" | "-G", uid: number): number[] | undefined {
-  const r = spawnSync("id", [flag, String(uid)], { encoding: "utf8", timeout: 5_000 });
-  if (r.status !== 0) return undefined;
-  const ids = r.stdout.trim().split(/\s+/).map(Number);
-  return ids.length > 0 && ids.every((n) => Number.isInteger(n) && n >= 0) ? ids : undefined;
-}
-
-function writableBy(st: Stats, uid: number, groups: readonly number[]): boolean {
+function writableBy(st: Stats, uid: number, gid: number): boolean {
   if (st.mode & 0o002) return true;
-  if (st.mode & 0o020 && groups.includes(st.gid)) return true;
+  if (st.mode & 0o020 && st.gid === gid) return true;
   return st.uid === uid && (st.mode & 0o200) !== 0;
 }
 
 // Exit 10: a write landed, so the agent can migrate. Exit 11: every write was refused. Anything
 // else (no setpriv, no CAP_SETUID, unknown user) is an attempt that never ran.
 const MIGRATION_PROBE = 'for f; do if { echo $$ > "$f"; } 2>/dev/null; then exit 10; fi; done; exit 11';
+// Fixed paths only: a root manager never resolves a program through an inherited PATH.
+const SETPRIV_PATHS = ["/usr/bin/setpriv", "/bin/setpriv", "/run/current-system/sw/bin/setpriv"];
+
+/** The first fixed setpriv whose real file and every ancestor are owned by uid 0 and not group- or
+ *  world-writable; a sticky ancestor (the Nix store, 1775) may be. Inside a user namespace real
+ *  root reads as the overflow uid, so none passes there and nothing is contained. */
+export function trustedSetpriv(candidates: readonly string[] = SETPRIV_PATHS): string | undefined {
+  for (const candidate of candidates) {
+    let real: string;
+    try {
+      real = realpathSync(candidate);
+    } catch {
+      continue;
+    }
+    let ok = true;
+    for (let p = real; ok; p = dirname(p)) {
+      const st = statSync(p);
+      ok = st.uid === 0 && ((st.mode & 0o022) === 0 || (p !== real && st.isDirectory() && (st.mode & 0o1000) !== 0));
+      if (p === dirname(p)) break;
+    }
+    if (ok) return real;
+  }
+  return undefined;
+}
 
 /**
  * True only when the agent uid provably cannot write `cgroup.procs` at the base or any ancestor,
@@ -115,24 +177,52 @@ export function seatCgroupContained(cg: SeatCgroup): boolean {
   } catch {
     return false;
   }
-  const groups = idList("-G", uid);
-  const gid = idList("-g", uid)?.[0];
-  if (groups === undefined || gid === undefined) return false;
+  const gid = agentPrimaryGid(uid);
+  const setpriv = trustedSetpriv();
+  if (gid === undefined || setpriv === undefined) return false;
   const procs: string[] = [];
   for (let dir = dirname(cg.path); ; dir = dirname(dir)) {
     if (dir !== CGROUP_ROOT && !dir.startsWith(`${CGROUP_ROOT}/`)) return false;
     const file = join(dir, "cgroup.procs");
     try {
-      if (writableBy(statSync(file), uid, groups)) return false;
+      if (writableBy(statSync(file), uid, gid)) return false;
     } catch {
       return false;
     }
     procs.push(file);
     if (dir === CGROUP_ROOT) break;
   }
-  const probe = spawnSync("setpriv", ["--reuid", String(uid), "--regid", String(gid), "--init-groups", "--", "sh", "-c", MIGRATION_PROBE, "sh", ...procs], {
+  // The custodian runs with no supplementary groups, so the probe clears them too.
+  const probe = spawnSync(setpriv, ["--reuid", String(uid), "--regid", String(gid), "--clear-groups", "--", "/bin/sh", "-c", MIGRATION_PROBE, "sh", ...procs], {
     stdio: "ignore",
     timeout: 5_000,
+    env: {},
   });
-  return probe.status === 11;
+  return probe.status === 11 && membersCannotGainCaps(cg.path);
+}
+
+/** Every process in the seat cgroup, nested cgroups included, runs with `no_new_privs` and an empty
+ *  bounding set, so none can gain the `CAP_DAC_OVERRIDE` that bypasses the mode bits checked above.
+ *  Both are irreversible and inherited, so a live read cannot be forged by the agent. */
+function membersCannotGainCaps(dir: string): boolean {
+  let subdirs: string[];
+  let pids: string[];
+  try {
+    subdirs = readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
+    pids = readFileSync(join(dir, "cgroup.procs"), "utf8").split("\n").filter((l) => l !== "");
+  } catch {
+    return false; // a cgroup that cannot be read, or vanished mid-walk, proves nothing
+  }
+  if (!subdirs.every((d) => membersCannotGainCaps(join(dir, d)))) return false;
+  for (const pid of pids) {
+    let status: string;
+    try {
+      status = readFileSync(`/proc/${pid}/status`, "utf8");
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT" || (e as NodeJS.ErrnoException).code === "ESRCH") continue;
+      return false;
+    }
+    if (!/^NoNewPrivs:\s+1$/m.test(status) || !/^CapBnd:\s+0+$/m.test(status)) return false;
+  }
+  return true;
 }

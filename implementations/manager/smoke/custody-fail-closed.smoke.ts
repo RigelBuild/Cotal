@@ -517,7 +517,7 @@ try {
 
   // ── Failed escalation (real custodial pty, no layer 3) ─────────────────────
   {
-    M.runtime = new CustodialPtyRuntime(seatRoot);
+    M.runtime = new CustodialPtyRuntime({ root: seatRoot });
     setCustodianTestSeam({ failEscalation: true });
     const reply = await mgr.startAgent({ name: "escalate", agent: "smoke-custody-stubborn", events: false });
     const a = M.agents.get("escalate");
