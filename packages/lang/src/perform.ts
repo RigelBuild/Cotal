@@ -8,11 +8,11 @@
  * calls it directly. ONE function over ONE table: a second copy of a projection would be a
  * divergence the differential suite could only find program-by-program.
  */
-import { InterpreterDefect, RunDivergence, RuntimeFault, ScopeBranchMissing, UnwalkableScope, messageOf, stackOf } from "./errors.js";
-import { digest, requestId, stepKeyString, type KeyScope, type PathKind, type ScopeKind, type StepKey } from "./keys.js";
-import { Journal, JournalAppendRejected, RunClock, type EntryError } from "./journal.js";
+import { InterpreterDefect, RunDivergence, RuntimeFault, ScopeBranchMissing, UnwalkableScope, isStackExhaustion, messageOf, stackOf } from "./errors.js";
+import { atMostOnce, digest, holdRequestId, requestId, scopePathString, scopeTraits, stepKeyString, type KeyScope, type PathKind, type ScopeFrame, type ScopeKind, type StepKey } from "./keys.js";
+import { Journal, JournalAppendRejected, RunClock, type EntryError, type JournalEntry, type LookupVerdict } from "./journal.js";
 import { NotCrossable, assertCrossable, assertScopeValueCrossable, deepFreeze } from "./values.js";
-import { PRIMITIVES, type EffectKind } from "./primitives.js";
+import { HOLDABLE_KINDS, PRIMITIVES, type EffectKind } from "./primitives.js";
 import { parseDuration } from "./duration.js";
 import { notifyFactViolation } from "./notify-fact.js";
 import {
@@ -135,12 +135,6 @@ function serializeTurn(host: EffectHost, agent: string, dispatch: () => Promise<
 }
 
 /**
- * Perform one effect, or replay it.
- *
- * Everything durable happens here. A handler is called only in the `miss` and `pending` cases,
- * and in `pending` it is told to re-bind rather than re-issue.
- */
-/**
  * An `EffectError`'s `detail` is a RECORDED VALUE, and until this function it was the last one with
  * no domain check on it.
  *
@@ -173,13 +167,67 @@ function recordableError(e: EffectError, kind: string): { readonly error: EntryE
   }
 }
 
-export async function performEffect(
+/**
+ * L4028: an effect kind `once` does not admit (spec/cotal-lang.md §7.8), refused before its entry
+ * begins, so no handler method is called and a resume reaches the same refusal.
+ */
+function notHoldable(kind: EffectKind, path: readonly ScopeFrame[]): RuntimeFault {
+  return new RuntimeFault(
+    "L4028",
+    `\`${kind}\` runs inside \`once\` at ${scopePathString(path)}, and \`once\` admits only \`ask\`: a resume could not hold any other kind without dispatching it again or losing run state it builds. Move the \`${kind}\` outside the \`once\` that wraps the write.`,
+  );
+}
+
+/** L4011 for `once`'s body, raised by both engines before the scope's entry begins. */
+export function onceBodyNotCallable(): RuntimeFault {
+  return new RuntimeFault("L4011", "the body of `once` is not a function, so it cannot be called");
+}
+
+/**
+ * Count one live dispatch against the run's effect ceiling (L4009), before its entry is begun so a
+ * dispatch the ceiling stops leaves no pending entry for work nobody performed. Every path that
+ * dispatches counts here, because `Journal.dispatchedEffects` seeds the next activation from the
+ * entries those paths write, and a fresh run and a resumed one must reach the ceiling at the same step.
+ * Only a `miss` counts: a pending or refused key is already in that seed, and counting its
+ * re-entry again would fault a resumed run at a step where a fresh one goes on.
+ */
+function countEffect(host: EffectHost, verdict: LookupVerdict): void {
+  if (verdict.verdict !== "miss") return;
+  host.effectCount += 1;
+  if (host.effectCount > host.ceiling) {
+    throw new RuntimeFault(
+      "L4009",
+      `this run has performed more than ${host.ceiling} effects, which means a loop is not terminating. Add an exit condition or a permit.`,
+    );
+  }
+}
+
+/** A live step: its entry is begun (or recovered) and its handler context is ready. */
+type LiveStep = {
+  readonly key: StepKey;
+  readonly inputHash: string;
+  /** The entry a previous activation began and never settled, when this one is recovering it. */
+  readonly pending: JournalEntry | undefined;
+  readonly ctx: EffectContext;
+};
+
+/**
+ * Enter one step: allocate its key, serve or throw what the journal recorded for it, and otherwise
+ * run the checks that guard a new dispatch, begin its entry and hand the live step to `live`, which
+ * must reach its dispatch before its first await.
+ *
+ * ONE ENTRY FOR EVERY EFFECT, `waitUntil` included. A wait cannot go through {@link performEffect}
+ * as a whole, because a non-terminal observation leaves its entry pending, but nothing before its
+ * first observation differs, and a second copy of these rules is one that can change alone and
+ * leave one kind replaying, stopping or recovering differently from the rest.
+ */
+async function enterStep(
   host: EffectHost,
   kind: EffectKind,
   name: string,
   hashedInput: unknown,
-  perform: (ctx: EffectContext, inputHash: string) => Promise<unknown>,
   frame: EffectFrame,
+  live: (step: LiveStep) => Promise<unknown>,
 ): Promise<unknown> {
   const key = frame.keys.nextEffect(kind, name);
   const inputHash = digest(hashedInput ?? null);
@@ -225,20 +273,14 @@ export async function performEffect(
     throw new RunReleased(stop);
   }
 
-  host.effectCount += 1;
-  if (host.effectCount > host.ceiling) {
-    throw new RuntimeFault(
-      "L4009",
-      `this run has performed more than ${host.ceiling} effects, which means a loop is not terminating. Add an exit condition or a permit.`,
-    );
-  }
+  countEffect(host, verdict);
 
-  const resume = verdict.verdict === "pending" ? verdict.entry.external : undefined;
   // RECOVERY SUBMITS UNDER THE RECORDED IDENTITY. Re-deriving happens to agree whenever nothing
   // moved, which is exactly why it read as correct: the whole point of writing the id down is
   // the case where it does NOT agree, and a resumed run that re-derives is reissuing under an
   // identity the far side may never have seen. An entry with no recorded id predates this rule.
-  const recorded = verdict.verdict === "pending" && verdict.entry.requestId !== undefined ? verdict.entry : undefined;
+  const pending = verdict.verdict === "pending" ? verdict.entry : undefined;
+  const recorded = pending?.requestId !== undefined ? pending : undefined;
   const reqId = recorded?.requestId ?? requestId(host.options.runId, key, inputHash);
   // WHICH attempt is open, not merely which id. An id alone cannot say how much of an escalation
   // chain is already spent, and a recovery that cannot tell replays the hop: it mints again under
@@ -271,7 +313,7 @@ export async function performEffect(
     // so a resumed run reissues the same id rather than creating a second goal.
     requestId: reqId,
     attempt,
-    ...(resume !== undefined ? { resume } : {}),
+    ...(pending?.external !== undefined ? { resume: pending.external } : {}),
     // THE THIRD PATH INTO AN ENTRY, and until this line the only one with no rule. The other two sit
     // a few lines apart (the RESULT at the settle below, the ARGUMENTS in `dispatchPrimitive`), and
     // a handler's own `ctx.bind` reached `journal.bind` with nothing in between. Measured before this
@@ -292,6 +334,43 @@ export async function performEffect(
       await host.journal.bind(key, external);
     },
   };
+  // CALLED, NOT RETURNED. The cancellation check above has to share a synchronous turn with the
+  // dispatch it guards. Handing the step back to an awaiting caller reopens the gap that check
+  // closes: measured that way, a race's loser was dispatched with its signal already cancelled and
+  // settled `ok`.
+  return await live({ key, inputHash, pending, ctx });
+}
+
+/**
+ * Perform one effect, or replay it.
+ *
+ * Everything durable happens here. A handler is called only in the `miss` and `pending` cases,
+ * and in `pending` it is told to re-bind rather than re-issue.
+ */
+export async function performEffect(
+  host: EffectHost,
+  kind: EffectKind,
+  name: string,
+  hashedInput: unknown,
+  perform: (ctx: EffectContext, inputHash: string) => Promise<unknown>,
+  frame: EffectFrame,
+): Promise<unknown> {
+  return await enterStep(host, kind, name, hashedInput, frame, (step) => dispatchStep(host, step, perform, frame));
+}
+
+/**
+ * Dispatch a live step's handler and settle its entry with the outcome, or open the hold of a
+ * pending step that `once` forbids dispatching again.
+ */
+async function dispatchStep(
+  host: EffectHost,
+  { key, inputHash, pending, ctx }: LiveStep,
+  perform: (ctx: EffectContext, inputHash: string) => Promise<unknown>,
+  frame: EffectFrame,
+): Promise<unknown> {
+  // AT MOST ONCE (spec/cotal-lang.md §7.8): a pending step under `once` may already have written,
+  // so it is never dispatched again. Its outcome is unknown, and a hold asks for it.
+  if (pending !== undefined && atMostOnce(key.scope)) return await performHold(host, key, ctx.requestId, pending.hold, frame);
 
   // TWO FAILURE DOMAINS, AND THE TERMINAL APPEND IS NOT IN THE HANDLER'S.
   //
@@ -307,9 +386,6 @@ export async function performEffect(
     assertCrossable(result, `the result of ${stepKeyString(key)}`);
   } catch (e) {
     const endedAt = host.options.handler.now();
-    // A journal that just refused an append cannot be asked to record why. It leaves by its own
-    // door, unwrapped, before anything tries to settle on top of it.
-    if (e instanceof JournalAppendRejected) throw e;
     // A REFUSAL IS NOT A FAILURE. The handler attempted nothing, so recording `failed` would
     // replay a failure forever for work the world never saw (measured: the mesh handler's L5016
     // settled `failed`, and a run started before the durable-action surface landed could never
@@ -323,40 +399,112 @@ export async function performEffect(
       );
       throw new RunHeld(stepKeyString(key), e.message);
     }
-    if (e instanceof Cancelled) {
-      await host.journal.settle(key, { status: "cancelled" }, endedAt);
-      throw e;
-    }
-    // A handler may raise a language code directly, and it survives. The simulator's "unscripted
-    // effect" is L6001, and flattening that to a generic handler fault would tell a caller acting
-    // on `code` that the handler broke, when what actually happened is that their script is
-    // incomplete. Only the L-code shape is honoured: anything else a thrown object happens to
-    // call `code` (an errno, an HTTP status) is a handler fault and is recorded as one.
-    // Read defensively: a handler is other people's code and may throw a primitive, and reading
-    // `.code` or `.message` off `null` would replace its failure with the recorder's own.
-    const raised = (e as { code?: unknown } | null | undefined)?.code;
-    const carried = typeof raised === "string" && /^L\d{4}$/.test(raised) ? raised : null;
-    const recorded = e instanceof EffectError ? recordableError(e, "handler-fault") : undefined;
-    // THE STACK IS THE ONLY FIELD THAT NAMES THE HOST CODE. A handler fault happens outside both the
-    // program and the language, so `message` alone ("timeout") is the symptom with no origin, and
-    // the durable entry is usually the only look anyone gets at it. Read defensively, by the same
-    // rule as `messageOf` one line up: a primitive throw carries no stack and none is recorded.
-    const stack = stackOf(e);
-    const error: EntryError = {
-      ...(recorded !== undefined
-        ? recorded.error
-        : { code: carried ?? "L4000", kind: "handler-fault", message: messageOf(e) }),
-      ...(stack !== undefined ? { stack } : {}),
-    };
-    await host.journal.settle(key, { status: "failed", error }, endedAt);
-    frame.clock.advance(endedAt);
-    // THE CALLER AND THE RECORD SAY THE SAME THING. Rethrowing the handler's own error unchanged is
-    // right whenever the record kept it; when the detail forced a downgrade it is not, because the
-    // program would then catch an L6002 the journal has no L6002 for.
-    throw recorded?.faithful === true ? e : new EffectError(error.code, error.kind, error.message);
+    return await settleThrown(host, key, frame, e, endedAt);
   }
 
   const endedAt = host.options.handler.now();
+  await host.journal.settle(key, { status: "ok", result: deepFreeze(result) }, endedAt);
+  frame.clock.advance(endedAt);
+  return result;
+}
+
+/**
+ * Settle a step whose dispatch threw anything but a refusal, and rethrow what the program sees.
+ * {@link performEffect} and {@link performHold} differ only in what a refusal records.
+ */
+async function settleThrown(host: EffectHost, key: StepKey, frame: EffectFrame, e: unknown, endedAt: number): Promise<never> {
+  // A journal that just refused an append cannot be asked to record why. It leaves by its own
+  // door, unwrapped, before anything tries to settle on top of it.
+  if (e instanceof JournalAppendRejected) throw e;
+  if (e instanceof Cancelled) {
+    await host.journal.settle(key, { status: "cancelled" }, endedAt);
+    throw e;
+  }
+  // A handler may raise a language code directly, and it survives. The simulator's "unscripted
+  // effect" is L6001, and flattening that to a generic handler fault would tell a caller acting
+  // on `code` that the handler broke, when what actually happened is that their script is
+  // incomplete. Only the L-code shape is honoured: anything else a thrown object happens to
+  // call `code` (an errno, an HTTP status) is a handler fault and is recorded as one.
+  // Read defensively: a handler is other people's code and may throw a primitive, and reading
+  // `.code` or `.message` off `null` would replace its failure with the recorder's own.
+  const raised = (e as { code?: unknown } | null | undefined)?.code;
+  const carried = typeof raised === "string" && /^L\d{4}$/.test(raised) ? raised : null;
+  const recorded = e instanceof EffectError ? recordableError(e, "handler-fault") : undefined;
+  // THE STACK IS THE ONLY FIELD THAT NAMES THE HOST CODE. A handler fault happens outside both the
+  // program and the language, so `message` alone ("timeout") is the symptom with no origin, and
+  // the durable entry is usually the only look anyone gets at it. Read defensively, by the same
+  // rule as `messageOf` one line up: a primitive throw carries no stack and none is recorded.
+  const stack = stackOf(e);
+  const error: EntryError = {
+    ...(recorded !== undefined
+      ? recorded.error
+      : { code: carried ?? "L4000", kind: "handler-fault", message: messageOf(e) }),
+    ...(stack !== undefined ? { stack } : {}),
+  };
+  await host.journal.settle(key, { status: "failed", error }, endedAt);
+  frame.clock.advance(endedAt);
+  // THE CALLER AND THE RECORD SAY THE SAME THING. Rethrowing the handler's own error unchanged is
+  // right whenever the record kept it; when the detail forced a downgrade it is not, because the
+  // program would then catch an L6002 the journal has no L6002 for.
+  throw recorded?.faithful === true ? e : new EffectError(error.code, error.kind, error.message);
+}
+
+/**
+ * The hold of an at-most-once step (spec/cotal-lang.md §7.8): a checkpoint under the hold id
+ * whose answer becomes the step's result. The step's own handler method is never called here.
+ *
+ * A refused hold does not settle `refused`. That verdict means "never attempted" and dispatches,
+ * so recording it would turn a host that cannot open a checkpoint into the second write. The entry
+ * stays pending with the hold it had, and the next capable host opens the same hold.
+ */
+async function performHold(
+  host: EffectHost,
+  key: StepKey,
+  recorded: string,
+  resume: Readonly<Record<string, unknown>> | undefined,
+  frame: EffectFrame,
+): Promise<unknown> {
+  const step = stepKeyString(key);
+  const ctx: EffectContext = {
+    key,
+    signal: frame.signal,
+    requestId: holdRequestId(recorded),
+    attempt: 0,
+    ...(resume !== undefined ? { resume } : {}),
+    bind: (hold) => host.journal.hold(key, hold),
+  };
+  const prompt =
+    `The outcome of ${step} is unknown: it was dispatched under request id ${recorded} and never settled, `
+    + "so it is not dispatched again. Answer with the step's result; your answer becomes its value.";
+  let raw: CheckpointRaw;
+  try {
+    raw = await host.options.handler.checkpoint({ prompt }, ctx);
+    assertCrossable(raw, `the hold of ${step}`);
+    // A hold settles only on `resolved` or `expired`. Any other outcome is a handler fault, never
+    // an answer: read as one, it would record a result for the write that nobody gave.
+    const outcome: unknown = raw.outcome;
+    if (outcome !== "resolved" && outcome !== "expired")
+      throw new Error(`the hold of ${step} answered outcome ${JSON.stringify(outcome)}; a checkpoint answers "resolved" or "expired"`);
+  } catch (e) {
+    if (e instanceof EffectRefused) throw new RunHeld(step, e.message, true);
+    return await settleThrown(host, key, frame, e, host.options.handler.now());
+  }
+
+  const endedAt = host.options.handler.now();
+  if (raw.outcome === "expired") {
+    const error: EntryError = {
+      code: "L4027",
+      kind: "outcome-unknown",
+      message:
+        `L4027 At-most-once step's outcome was never settled\n\n  step  ${step}   request id ${recorded}\n\n`
+        + "The step was dispatched and its outcome never settled, and nobody answered its hold in time. It is not dispatched again.\n\n"
+        + `Options\n  catch it: \`e.code === "L4027"\` and check the far side for the write under request id ${recorded}`,
+    };
+    await host.journal.settle(key, { status: "failed", error }, endedAt);
+    frame.clock.advance(endedAt);
+    throw new EffectError(error.code, error.kind, error.message);
+  }
+  const result = raw.value ?? null;
   await host.journal.settle(key, { status: "ok", result: deepFreeze(result) }, endedAt);
   frame.clock.advance(endedAt);
   return result;
@@ -378,8 +526,9 @@ export async function performEffect(
  * the entry with {@link Journal.observe} and the entry STAYS PENDING. `lookup` answers `pending`
  * for it, which routes to the live path, so a resumed run OBSERVES AGAIN. Only the terminal
  * observation settles, because only that one is an answer. Everything else about the entry is the
- * ordinary contract: it begins before the first observation, it carries the request id a handler
- * waits under, and the two failure domains stay separate.
+ * ordinary contract, entered through {@link enterStep} like every other effect: it begins before
+ * the first observation, it carries the request id a handler waits under, and the two failure
+ * domains stay separate.
  *
  * WHO OWNS WHAT. The program owns the probe and the predicate; the runtime owns the cadence and
  * the deadline. A program that hand-rolled this with `sleep` in a loop owns all four, which is the
@@ -396,54 +545,26 @@ async function performWaitUntil(
   deadline: string,
   frame: Frame,
 ): Promise<unknown> {
-  const key = frame.keys.nextEffect("waitUntil", name);
-  const inputHash = digest(hashedInput ?? null);
-  const verdict = host.journal.lookup(key, inputHash);
+  // A SETTLED `waitUntil` replays like any other step, and it must: what settled it was the
+  // TERMINAL observation, which IS an answer, and re-observing a wait that already finished
+  // would re-ask a question the run has answered. Only the unfinished ones re-observe.
+  return await enterStep(host, "waitUntil", name, hashedInput, frame, (step) =>
+    observeUntil(host, step, name, probe, terminal, every, deadline, frame));
+}
 
-  switch (verdict.verdict) {
-    // A SETTLED `waitUntil` replays like any other step, and it must: what settled it was the
-    // TERMINAL observation, which IS an answer, and re-observing a wait that already finished
-    // would re-ask a question the run has answered. Only the unfinished ones re-observe.
-    case "replay":
-      if (verdict.entry.endedAt !== undefined) frame.clock.advance(verdict.entry.endedAt);
-      return verdict.entry.result;
-    case "replay-failed": {
-      if (verdict.entry.endedAt !== undefined) frame.clock.advance(verdict.entry.endedAt);
-      const e = verdict.entry.error as EntryError;
-      throw new EffectError(e.code, e.kind, e.message, e.detail);
-    }
-    case "replay-cancelled":
-      throw new Cancelled("this branch was cancelled on the recorded run");
-    case "diverged":
-      throw new RunDivergence(stepKeyString(key), verdict.recordedHash, verdict.programHash);
-    case "refused":
-    case "pending":
-    case "miss":
-      break;
-  }
-
-  if (frame.signal.cancelled) throw new Cancelled(frame.signal.reason ?? "cancelled");
-  const stop = host.options.shouldStop?.();
-  if (stop !== undefined) throw new RunReleased(stop);
-
-  host.effectCount += 1;
-  if (host.effectCount > host.ceiling) {
-    throw new RuntimeFault(
-      "L4009",
-      `this run has performed more than ${host.ceiling} effects, which means a loop is not terminating. Add an exit condition or a permit.`,
-    );
-  }
-
-  const recorded = verdict.verdict === "pending" ? verdict.entry : undefined;
-  const reqId = recorded?.requestId ?? requestId(host.options.runId, key, inputHash);
-  if (verdict.verdict === "miss" || verdict.verdict === "refused") {
-    await host.journal.begin(key, inputHash, host.options.handler.now(), reqId);
-    if (frame.signal.cancelled) {
-      await host.journal.settle(key, { status: "cancelled" }, host.options.handler.now());
-      throw new Cancelled(frame.signal.reason ?? "cancelled");
-    }
-  }
-
+/**
+ * Observe a live `waitUntil` until a terminal observation or the deadline settles its entry.
+ */
+async function observeUntil(
+  host: EffectHost,
+  { key, pending, ctx }: LiveStep,
+  name: string,
+  probe: (frame: EffectFrame) => Promise<unknown>,
+  terminal: ((frame: EffectFrame, observation: unknown) => Promise<unknown>) | undefined,
+  every: string,
+  deadline: string,
+  frame: Frame,
+): Promise<unknown> {
   // THE DEADLINE IS ABSOLUTE AND IT IS READ BACK, never recomputed from a clock that has moved.
   // Recomputing `now + deadline` on every activation is how an hour-long wait becomes immortal:
   // each crash would hand it a fresh hour, and a run that should have given up at 11:00 goes on
@@ -452,20 +573,10 @@ async function performWaitUntil(
   const startedAt = host.journal.get(key)?.startedAt ?? host.options.handler.now();
   const deadlineAt = startedAt + parseDuration(deadline);
 
-  let attempt = (recorded?.observations ?? []).length;
+  // Which observation this is, carried on the request. It is not `ctx.attempt`, the attempt the
+  // request id names, which every observation shares.
+  let attempt = (pending?.observations ?? []).length;
   for (;;) {
-    const ctx: EffectContext = {
-      key,
-      signal: frame.signal,
-      requestId: reqId,
-      attempt,
-      ...(recorded?.external !== undefined ? { resume: recorded.external } : {}),
-      bind: async (external) => {
-        assertCrossable(external, `the binding of ${stepKeyString(key)}`);
-        await host.journal.bind(key, external);
-      },
-    };
-
     // EACH OBSERVATION GETS ITS OWN KEY NAMESPACE, and this is the half of the fix that is easy
     // to miss. The probe reaches the world by performing effects, and those effects allocate keys
     // in the frame it runs in. Share one namespace across observations and observation 2's probe
@@ -642,6 +753,7 @@ export async function dispatchPrimitive(host: EffectHost, name: string, args: un
   const bag = args[spec.optionsAt];
   const stepName = (name === "checkpoint" ? args[0] : option(bag, "name")) as string | undefined;
   const handler = host.options.handler;
+  if (spec.kind !== null && !HOLDABLE_KINDS.has(spec.kind) && atMostOnce(frame.keys.path)) throw notHoldable(spec.kind, frame.keys.path);
 
   switch (name) {
     case "spawn": {
@@ -689,7 +801,7 @@ export async function dispatchPrimitive(host: EffectHost, name: string, args: un
         );
       const model = typeof spawnSubject === "string" ? undefined : (option(spawnSubject, "model") as string | undefined);
       const variant = typeof spawnSubject === "string" ? undefined : (option(spawnSubject, "variant") as string | undefined);
-      // Every accepted option is forwarded, including the three that are policy rather than
+      // Every accepted option is forwarded, including the four that are policy rather than
       // identity. Dropping them here would be silent: the validator accepts `permits`, so an
       // author who writes a budget gets no error and no budget. They are deliberately absent
       // from `hashedOptions` (§5.12) because they decide the INTERPRETATION of a result, not the
@@ -713,6 +825,7 @@ export async function dispatchPrimitive(host: EffectHost, name: string, args: un
           ? { supervise: option(bag, "supervise") as Record<string, unknown> }
           : {}),
         ...(option(bag, "onFork") !== undefined ? { onFork: option(bag, "onFork") as "respawn" | "adopt" } : {}),
+        ...(option(bag, "events") !== undefined ? { events: option(bag, "events") as boolean } : {}),
       };
       return await performEffect(host,
         "spawn",
@@ -1178,6 +1291,37 @@ function unwrapScope(e: unknown): { reason: unknown; facts: ScopeFacts } {
 }
 
 /**
+ * A value the PROGRAM threw out of a scope, recorded so a replay can hand it back. One the record
+ * cannot carry keeps the generic fault with the crossing rule's refusal as its message, and the live
+ * run is handed that fault too: a value only the live run could deliver is one its resume replaces.
+ */
+function thrownError(value: unknown): EntryError {
+  const fault = { code: "L4000", kind: "scope-fault", message: messageOf(value) };
+  if (value === undefined) return { ...fault, thrown: {} };
+  try {
+    assertCrossable(value, "the thrown value");
+  } catch (cause) {
+    if (!(cause instanceof NotCrossable)) throw cause;
+    // The refusal alone: a thrown function's text is the host's own source, and differs by engine.
+    return { ...fault, message: cause.message };
+  }
+  // A COPY: freezing the value itself would freeze a record the branch threw from outside it for
+  // the rest of the live run, where a resume, which never runs the branch, leaves it writable. And a
+  // copy in the journal's own encoding, JSON: one record held at two places in the value comes back
+  // from a durable store as two records, so a copy that kept them one would hand the live `catch` a
+  // fact its resume cannot.
+  return { ...fault, thrown: { value: deepFreeze(JSON.parse(JSON.stringify(value))) } };
+}
+
+/**
+ * What a failed scope throws, built from its record alone: a replay has nothing else, and a live run
+ * whose scope failed with a thrown value builds it here too, so `catch` binds the same value on both.
+ */
+function scopeFailure(e: EntryError): unknown {
+  return e.thrown !== undefined ? e.thrown.value : new EffectError(e.code, e.kind, e.message, e.detail);
+}
+
+/**
  * The digest fact, written wherever the loser set is: a race that FAILED owes its losers exactly
  * as a winning one does, so it carries the digest too, and `replay-failed` compares it.
  */
@@ -1213,6 +1357,8 @@ export async function performScope(
   /** The `branchDigest` over a named loser set. Absent where there is nothing to digest. */
   branchDigest?: (losers: readonly string[]) => string | undefined,
 ): Promise<unknown> {
+  if (scopeKey.kind === "conclave" && atMostOnce(scopeKey.scope)) throw notHoldable("conclave", scopeKey.scope);
+  const dispatches = scopeTraits(scopeKey.kind)?.dispatches === true;
   const inputHash = digest(
     subject === undefined
       ? { kind: scopeKey.kind, name: scopeKey.name }
@@ -1253,7 +1399,7 @@ export async function performScope(
     // So the walk enters the RECORDED WINNING branches and runs the ordinary hash and orphan
     // checks inside them, while the losers (decided, not removed) are accounted for as before.
     if (host.options.migration === true) {
-      if (subject !== undefined) throw new UnwalkableScope(stepKeyString(scopeKey), "conclave");
+      if (dispatches) throw new UnwalkableScope(stepKeyString(scopeKey), scopeKey.kind);
       // A SETTLED SCOPE CARRIES ITS ARM NAMES IN ONE OF TWO PLACES, and reading only the first
       // is what made a failed scope look like a scope with no arms. `result` holds them when the
       // scope succeeded; the `branches` FACT holds them when it failed, because `settle` writes
@@ -1280,13 +1426,15 @@ export async function performScope(
         // scope that carried it. A live scope wraps a branch's failure so it can record the
         // cancellation intent with it; a walk records nothing and cancels nobody, so the wrapper
         // would only hide a `RunDivergence` behind a generic scope fault.
-        throw unwrapScope(e).reason;
+        const reason = unwrapScope(e).reason;
+        // A VALUE THE PROGRAM THREW out of a scope recorded as failed is that failure walked again,
+        // so the record below delivers it, as it does for the live run and a resume: the raw value is
+        // one neither of them binds. An `Error` is never the program's own and keeps propagating,
+        // the walk's divergence and refusals among them.
+        if (reason instanceof Error || verdict.verdict !== "replay-failed") throw reason;
       }
       if (entry.endedAt !== undefined) frame.clock.advance(entry.endedAt);
-      if (verdict.verdict === "replay-failed") {
-        const e = entry.error as EntryError;
-        throw new EffectError(e.code, e.kind, e.message, e.detail);
-      }
+      if (verdict.verdict === "replay-failed") throw scopeFailure(entry.error as EntryError);
       return (entry.result as { value: unknown }).value;
     }
 
@@ -1297,10 +1445,7 @@ export async function performScope(
     //     reading as done.
     // (3) only now, the outcome.
     if (entry.endedAt !== undefined) frame.clock.advance(entry.endedAt);
-    if (verdict.verdict === "replay-failed") {
-      const e = entry.error as EntryError;
-      throw new EffectError(e.code, e.kind, e.message, e.detail);
-    }
+    if (verdict.verdict === "replay-failed") throw scopeFailure(entry.error as EntryError);
     return (entry.result as { value: unknown }).value;
   }
   if (verdict.verdict === "replay-cancelled") {
@@ -1314,13 +1459,17 @@ export async function performScope(
   // `runScope`'s replayed-branch tie-break is for.
   // A scope that CALLS THE HANDLER owes a durable request id exactly as an effect does, and for
   // the same reason: a crash between issuing the work and recording who issued it leaves real
-  // work (for `conclave`, a live channel with members joined) that nothing in the journal
-  // names. `subject` marks that scope, because `conclave` is the only one that dispatches from
-  // this path; the other three launch thunks and touch no handler of their own.
-  const dispatches = subject !== undefined;
+  // work (for `conclave`, a live channel with members joined) that nothing in the journal names.
   const resume = verdict.verdict === "pending" ? verdict.entry.external : undefined;
   const recorded = verdict.verdict === "pending" && verdict.entry.requestId !== undefined ? verdict.entry : undefined;
   const reqId = recorded?.requestId ?? requestId(host.options.runId, scopeKey, inputHash);
+  // A conclave's open is real work against the world, so the host's stop and the ceiling apply to
+  // it as they do to an effect (see {@link performEffect}).
+  if (dispatches) {
+    const stop = host.options.shouldStop?.();
+    if (stop !== undefined) throw new RunReleased(stop);
+    countEffect(host, verdict);
+  }
   if (verdict.verdict === "miss" || verdict.verdict === "refused") {
     await host.journal.begin(scopeKey, inputHash, host.options.handler.now(), dispatches ? reqId : undefined);
     // The same gap as {@link Interpreter.performEffect}'s begin, for the scope that DISPATCHES: a
@@ -1392,6 +1541,18 @@ export async function performScope(
     // A HELD RUN IS THE SAME SHAPE: the refusal's halt is not this scope's outcome. The refused
     // entry inside the branch is already settled; the scope stays pending and re-enters on resume.
     if (reason instanceof RunHeld) throw reason;
+    // A DIVERGENCE IS NOT AN OUTCOME EITHER. It is the journal saying this program is not the one
+    // that wrote it, and the interpreter already treats it as uncatchable (next to `RunReleased`
+    // and `Cancelled` there); recording it here would convert that run-level signal into a durable
+    // statement that the scope failed for a reason of its own, and the next resume would replay an
+    // `EffectError` a program's `try` could swallow, spending the loudness before anyone sees it.
+    // Settling nothing is the same shape `RunReleased` above takes: the scope stays pending, a
+    // resume re-enters it, and the step that broke diverges again.
+    if (reason instanceof RunDivergence) throw reason;
+    // A HOST STACK EXHAUSTION IS NOT AN OUTCOME EITHER (§9.2). How deep a branch got before the host
+    // ran out of stack is a fact about the host, so recording it would replay as a catchable
+    // `L4000` on a host with more stack, where the same branch succeeds.
+    if (isStackExhaustion(reason)) throw reason;
     // A CAPABILITY REFUSAL OF THE SCOPE'S OWN DISPATCH (a conclave's open): nothing was entered
     // and nothing was attempted, so the scope settles `refused` exactly as an effect does, and
     // the run is held for a host that can open it.
@@ -1404,11 +1565,7 @@ export async function performScope(
       );
       throw new RunHeld(stepKeyString(scopeKey), reason.message);
     }
-    // Same rule as the effect path's. The RETHROW below is deliberately left alone: this scope
-    // rethrows the raw reason, so a program catching a scope fault sees no language code where the
-    // effect path hands it one. That asymmetry predates this rule (measured with a plain throw on
-    // both paths) and it is recorded as a finding rather than repaired here, because repairing it
-    // moves the spec, the walker and the engine together.
+    // A handler's `EffectError` is recorded by the same rule as the effect path's.
     //
     // A `RuntimeFault` KEEPS ITS OWN CODE (#1519). It is a classified refusal the LANGUAGE raised
     // (`L3021` for a fanOut with no stable key), and flattening it to `L4000` wrote a code the spec
@@ -1418,19 +1575,28 @@ export async function performScope(
     // `runtime`, the kind a program's `catch` already binds for this class on both engines'
     // `toProgramError` (a fault the PROGRAM caused), so a reader branching on `kind` reads the same
     // verdict from the record that the program read live.
+    //
+    // A VALUE THE PROGRAM THREW IS RECORDED WHOLE (#2845). A replay delivers nothing but this
+    // record, and it used to deliver the generic fault where the live run had rethrown the value, so
+    // a resumed `catch` bound `{ code: "L4000", ... }` where the live one bound `"failure"`, and a
+    // program branching on it diverged. An `Error` is never the program's (it cannot construct one)
+    // and is still rethrown as itself: some classes that reach here unwind the run (the compiled
+    // engine's `EngineFault`), and an `EffectError` built from the record would make them catchable.
     const err: EntryError =
       reason instanceof EffectError
         ? recordableError(reason, "scope-fault").error
         : reason instanceof RuntimeFault
           ? { code: reason.code, kind: "runtime", message: messageOf(reason) }
-          : { code: "L4000", kind: "scope-fault", message: messageOf(reason) };
+          : reason instanceof Error
+            ? { code: "L4000", kind: "scope-fault", message: messageOf(reason) }
+            : thrownError(reason);
     // A rejecting branch cancels its siblings and can crash before they hear it, so a FAILED scope
     // carries the intent too, and a conclave that closed says so even when its body failed.
     await host.journal.settle(scopeKey, { status: "failed", error: err }, endedAt, {
       ...facts,
       ...digestFacts(branchDigest, facts.cancel?.losers),
     });
-    throw reason;
+    throw reason instanceof Error ? reason : scopeFailure(err);
   }
 
   // THE FACTS A SETTLED SCOPE CARRIES, assembled ONCE. Both the fence below and the success settle
@@ -1481,6 +1647,15 @@ export async function performScope(
   return outcome.value;
 }
 
+/**
+ * A HOST STACK EXHAUSTION AMONG THE JOINED BRANCHES leaves the scope bare (§9.2), whichever branch
+ * raised it and whatever another branch did first: a failure or a winner that settled earlier would
+ * otherwise carry it into a recorded outcome the program can catch.
+ */
+function throwIfStackExhausted(settled: readonly PromiseSettledResult<unknown>[]): void {
+  const exhausted = settled.find((r): r is PromiseRejectedResult => r.status === "rejected" && isStackExhaustion(r.reason));
+  if (exhausted !== undefined) throw exhausted.reason as Error;
+}
 
 export async function runScope(
   host: EffectHost,
@@ -1567,8 +1742,11 @@ export async function runScope(
         // in-flight entries `cancelled`, a durable fact about a run that was merely stopped, and
         // a resume then replays that cancellation into a healthy run. So the siblings run to
         // their own boundary (each releases there in turn, or finishes work already in flight)
-        // and the unwind propagates bare, with nothing cancelled and nothing settled.
-        if (e instanceof RunReleased || e instanceof RunHeld || e instanceof JournalAppendRejected) {
+        // and the unwind propagates bare, with nothing cancelled and nothing settled. A
+        // divergence is the same non-fact about the branches: it says the program is not the one
+        // that wrote this journal, so cancelling a sibling would record a consequence of the
+        // disagreement on a run the program has no standing to speak for.
+        if (e instanceof RunReleased || e instanceof RunHeld || e instanceof JournalAppendRejected || e instanceof RunDivergence || isStackExhaustion(e)) {
           await Promise.allSettled(running);
           throw e;
         }
@@ -1576,7 +1754,7 @@ export async function runScope(
         // failure, because a rejecting branch cancels its siblings and can crash before they
         // hear it, so a failed scope owes its losers exactly as a winning one does.
         for (const f of frames) f.signal.cancel("a sibling branch failed");
-        await Promise.allSettled(running);
+        throwIfStackExhausted(await Promise.allSettled(running));
         frame.clock.join(frames.map((f) => f.clock));
         const losers = branches.filter((k) => k !== failed);
         throw new ScopeFailed(e, { branches, cancel: { losers, issued: false } });
@@ -1630,11 +1808,19 @@ export async function runScope(
         () => onSettle(i, false),
         // A branch that rejected with `Cancelled` reached no outcome, and one that rejected with
         // a host-side unwind (a release, a held run, a refused append) reached none either:
-        // neither is a candidate, and neither may cancel the arms that are still running.
+        // neither is a candidate, and neither may cancel the arms that are still running. A
+        // diverging arm is in that set too: its rejection is a fact about the program, not an
+        // outcome this run reached, and the hoist below the settle surfaces it before any winner
+        // is chosen.
         (e: unknown) =>
           onSettle(
             i,
-            e instanceof Cancelled || e instanceof RunReleased || e instanceof RunHeld || e instanceof JournalAppendRejected,
+            e instanceof Cancelled ||
+              e instanceof RunReleased ||
+              e instanceof RunHeld ||
+              e instanceof JournalAppendRejected ||
+              e instanceof RunDivergence ||
+              isStackExhaustion(e),
           ),
       );
     });
@@ -1660,6 +1846,9 @@ export async function runScope(
     // defect the scope entry exists to prevent. A rejection is a settle.
     await Promise.race(running.map((p) => p.then(() => undefined, () => undefined)));
     const settled = await Promise.allSettled(running);
+    // A HOST STACK EXHAUSTION cancels no sibling (§9.2), so it leaves before the cancel below: that
+    // cancel reaches every arm's handlers, and a live handler would pass it on to external work.
+    throwIfStackExhausted(settled);
     // Every arm has settled, so whatever cut it did not get earlier no longer matters; the
     // signal still says cancelled, which is what a nested branch that outlives this line reads.
     for (const f of frames) f.signal.cancel("a sibling branch won the race");
@@ -1675,10 +1864,15 @@ export async function runScope(
     // decision this driver may keep (its own cell). A HELD run rides the same hoist: the refused
     // step is settled `refused` and heals only when a resume REACHES it, and a resume
     // short-circuits a settled scope, so a race that completed over a held arm would bury the
-    // heal forever.
+    // heal forever. A DIVERGENCE rides it too, and for the run's own sake rather than a step's:
+    // an arm whose journal lookup refused the program must not be discarded by the tie-break,
+    // because the winner scan's `find` below would otherwise drop the losing arm's rejection on
+    // the floor and hand the program a value recorded by a run this source no longer is. Measured
+    // before this line: a losing arm's divergence, a pure sibling winning, and the run COMPLETED.
     const refusedAppend = settled.find(
       (r): r is PromiseRejectedResult =>
-        r.status === "rejected" && (r.reason instanceof RunHeld || r.reason instanceof JournalAppendRejected),
+        r.status === "rejected" &&
+        (r.reason instanceof RunHeld || r.reason instanceof JournalAppendRejected || r.reason instanceof RunDivergence),
     );
     if (refusedAppend !== undefined) throw refusedAppend.reason as Error;
 
@@ -1785,14 +1979,14 @@ export async function runScope(
       frame.clock.join(frames.map((f) => f.clock));
       return { branches: branchKeys, value: results };
     } catch (e) {
-      // The same host-side rule as `parallel`: a release, a held run, or a refused append
-      // cancels nothing.
-      if (e instanceof RunReleased || e instanceof RunHeld || e instanceof JournalAppendRejected) {
+      // The same host-side rule as `parallel`: a release, a held run, a refused append, or a
+      // divergence cancels nothing.
+      if (e instanceof RunReleased || e instanceof RunHeld || e instanceof JournalAppendRejected || e instanceof RunDivergence || isStackExhaustion(e)) {
         await Promise.allSettled(launched);
         throw e;
       }
       for (const f of frames) f.signal.cancel("a sibling branch failed");
-      await Promise.allSettled(launched);
+      throwIfStackExhausted(await Promise.allSettled(launched));
       frame.clock.join(frames.map((f) => f.clock));
       const losers = branchKeys.filter((k) => k !== failed);
       throw new ScopeFailed(e, { branches: branchKeys, cancel: { losers, issued: false } });
@@ -1847,8 +2041,15 @@ export async function runScope(
     // this process is live and the world is reachable, and walking away from live membership on
     // an ordinary error would be the `spawn` leak in another shape.
     // A HOST-SIDE UNWIND leaves the close owed: closing would be a new action after the driver
-    // said stop, and the pending entry is exactly what "a close is still owed" looks like.
-    if (bodyError instanceof RunReleased || bodyError instanceof RunHeld || bodyError instanceof JournalAppendRejected)
+    // said stop, and the pending entry is exactly what "a close is still owed" looks like. A host
+    // stack exhaustion in the body is the same unwind (§9.2): closing after it would be a new effect
+    // on a run that must stop, and a close error would replace it with one a program can catch.
+    if (
+      bodyError instanceof RunReleased ||
+      bodyError instanceof RunHeld ||
+      bodyError instanceof JournalAppendRejected ||
+      isStackExhaustion(bodyError)
+    )
       throw bodyError;
     if (bodyError instanceof Cancelled) throw new ScopeFailed(bodyError, { closed: false });
 
@@ -1864,6 +2065,17 @@ export async function runScope(
 
     if (threw) throw new ScopeFailed(bodyError, { closed: true });
     return { branches: [branchKey], value, closed: true };
+  }
+
+  if (name === "once") {
+    // One body, the fixed branch `in`, as `conclave`'s, with no open and no close. `only` is
+    // ignored: a migration's walk always enters `in`, because one branch is never a loser.
+    const branch = frame.branch(scopeKind, scopeName, occurrence, "in");
+    try {
+      return { branches: ["in"], value: await (first as (f: Frame, a: unknown[]) => Promise<unknown>)(branch, []) };
+    } finally {
+      frame.clock.join([branch.clock]);
+    }
   }
 
   throw new InterpreterDefect(`the primitive ${name}`);

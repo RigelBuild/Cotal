@@ -2,10 +2,11 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
 import { userJcodeHome } from "@1jehuang/jcode-sdk";
-import { loadAgentFile, registry, type Connector, type LaunchOpts, type LaunchSpec, type ModelCatalog, type ModelInfo } from "@cotal-ai/core";
-import { aclEnv, connectorLaunchOptions, controlEndpoint, eventChannel, launchEnv, materialEnv } from "@cotal-ai/connector-core";
+import { registry, type Connector, type LaunchOpts, type LaunchSpec, type ModelCatalog, type ModelInfo } from "@cotal-ai/core";
+import { aclEnv, connectorLaunchOptions, controlEndpoint, eventChannel, launchArmsEvents, launchEnv, materialEnv } from "@cotal-ai/connector-core";
 import { parse as parseToml } from "smol-toml";
 import { JCODE_READINESS_TIMEOUT_MS } from "./readiness-bound.js";
+import { jcodeForkRecordPath, jcodeSeatHome, ownedJcodeFork, readJcodeForkSource } from "./session-fork.js";
 
 const FROM_BUILD = import.meta.url.includes("/dist/");
 const HOST_ENTRY = fileURLToPath(new URL(`./${FROM_BUILD ? "host.js" : "host-main.ts"}`, import.meta.url));
@@ -115,6 +116,10 @@ export const jcodeConnector: Connector = {
   // verbatim to Jcode, which owns the capability and ladder decisions.
   supportsModelVariant: true,
   supportsToolListAnnounce: true, // MCP McpServer.registerTool; SDK fires tools/list_changed
+  supportsPrompt: true, // Jcode serves a first turn from an initial message — see buildLaunch
+  // `--resume` forks the named session from the operator's Jcode home into the seat's private home
+  // before its instance starts (session-fork.ts). The seat owns the copy; the source is only read.
+  supportsResume: true,
   eventChannel,
   listModels: listJcodeModels,
   launchHint: "starting Jcode and joining the mesh (first boot can take several minutes)",
@@ -124,8 +129,12 @@ export const jcodeConnector: Connector = {
       throw new Error("jcode connector is not supported on Windows — Jcode's released Harness API bridge is a Unix-socket surface");
     if (opts.continueSession)
       throw new Error("jcode connector does not support exact-session continuation — its private Harness API instance is retired with the seat");
-    if (opts.resume)
-      throw new Error("jcode connector: resuming an existing session is not supported — the private Harness API instance never shares a session with another seat");
+    // Read the source here so a missing or unreadable transcript refuses before the seat launches. A
+    // seat that already owns its fork continues it without the source, which may since have gone.
+    const resumeHome = opts.resume ? userJcodeHome() : undefined;
+    const seatHome = jcodeSeatHome(opts.workspaceRoot ?? process.cwd(), opts.space, opts.name);
+    if (opts.resume && !ownedJcodeFork(seatHome, opts.resume))
+      readJcodeForkSource(resumeHome!, opts.resume);
     if (opts.mcpServers && Object.keys(opts.mcpServers).length > 0)
       throw new Error("jcode connector: tool-sharing (connectors.jcode.mcpServers) is not implemented — the connector owns the private MCP configuration that carries cotal_*");
 
@@ -140,9 +149,15 @@ export const jcodeConnector: Connector = {
       COTAL_JCODE_HOME: opts.workspaceRoot ?? process.cwd(),
     };
     if (opts.resolvedBinaries?.jcode) env.COTAL_JCODE_BIN = opts.resolvedBinaries.jcode;
+    // The host forks from the same home this launch validated, not from whatever its own env resolves.
+    if (opts.resume) {
+      env.COTAL_JCODE_RESUME = opts.resume;
+      env.COTAL_JCODE_RESUME_HOME = resumeHome!;
+    }
     if (opts.role) env.COTAL_ROLE = opts.role;
     if (opts.id) env.COTAL_ID = opts.id;
     if (opts.lifecycleUid) env.COTAL_LIFECYCLE_UID = opts.lifecycleUid;
+    if (opts.backfillFloor !== undefined) env.COTAL_BACKFILL_FLOOR = String(opts.backfillFloor);
     if (opts.acceptedToken) env.COTAL_ACCEPTED_TOKEN = opts.acceptedToken;
     // Like Codex, the TUI decision belongs to the process that builds this launch. A foreground
     // spawn reads the operator shell; a detached spawn is built in the manager and reads its env.
@@ -155,13 +170,9 @@ export const jcodeConnector: Connector = {
     // above is what lets the CLI or manager grant the matching subject. A grant alone is not a
     // request to publish. The workspace root rides with the arm because the durable cursor and WAL
     // must live somewhere a restarted host can find again.
-    if (opts.events !== false) {
+    if (launchArmsEvents(opts)) {
       if (!opts.workspaceRoot)
         throw new Error("jcode connector: events require a workspace root for durable AG-UI state");
-      // Open mode has no credential to supply a stable actor. The event plane refuses an endpoint
-      // that self-mints a new actor on every process, so use the managed seat name there. Auth modes
-      // already pass the allocated identity in `opts.id` and keep their principal-based channel.
-      if (!opts.id && !opts.creds && !opts.userAuth) env.COTAL_ID = opts.name;
       env.COTAL_EVENTS = "1";
       env.COTAL_WORKSPACE_ROOT = opts.workspaceRoot;
     }
@@ -173,25 +184,9 @@ export const jcodeConnector: Connector = {
       env.COTAL_JCODE_PROMPT = prompt;
     }
 
-    let model = opts.model;
-    let variant = opts.variant;
-    if (opts.configPath) {
-      const path = resolve(opts.configPath);
-      env.COTAL_AGENT_FILE = path;
-      const def = loadAgentFile(path);
-      model ??= def.model;
-      variant ??= def.variant;
-    }
-    if (model) env.COTAL_MODEL = model;
-    // The host applies the requested tier before its first turn. Do not drop a whitespace-only
-    // variant: that would make an operator's request look accepted while silently selecting the
-    // provider default.
-    if (variant !== undefined) {
-      variant = variant.trim();
-      if (!variant)
-        throw new Error("jcode connector: a model variant was given but it is empty — there is no reasoning effort to select");
-      env.COTAL_VARIANT = variant;
-    }
+    if (opts.configPath) env.COTAL_AGENT_FILE = resolve(opts.configPath);
+    if (opts.model) env.COTAL_MODEL = opts.model;
+    if (opts.variant) env.COTAL_VARIANT = opts.variant;
 
     // The Harness API exposes model selection, but no stable generic equivalent to arbitrary
     // CLI/config overrides. Do not accept `--opt` merely because Jcode's TUI has flags: an option
@@ -202,7 +197,8 @@ export const jcodeConnector: Connector = {
         `jcode connector: launch options are not supported by the Harness API host (first option: ${launchOptions[0][0]})`,
       );
 
-    return { command: HOST_COMMAND, args: [HOST_ENTRY], env, control };
+    // The fork's provenance is the seat's own record of it, written when the host forks.
+    return { command: HOST_COMMAND, args: [HOST_ENTRY], env, control, ...(opts.resume ? { resumeRecordPath: jcodeForkRecordPath(seatHome) } : {}) };
   },
 };
 

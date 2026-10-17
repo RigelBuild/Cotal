@@ -24,6 +24,7 @@
 import { strict as nodeAssert } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { skipSuite } from "@cotal-ai/smoke-kit";
 
 let cells = 0;
 const failures: string[] = [];
@@ -41,7 +42,7 @@ const failures: string[] = [];
  * probe that never ran leaves every later cell reading an absent value, which prints one cause as a
  * screenful of failures.
  */
-const assert = new Proxy(nodeAssert, {
+const assert: typeof nodeAssert = new Proxy(nodeAssert, {
   get(target, prop, receiver) {
     const value = Reflect.get(target, prop, receiver);
     if (typeof value !== "function") return value;
@@ -88,13 +89,9 @@ function hard(condition: unknown, name: string): asserts condition {
 /** The count is a FLOOR. A derived tally proves the suite RAN its assertions, not that it still
  *  CONTAINS them: delete one and the tally quietly reads lower and the shard still passes. Raise it
  *  deliberately when you add a cell; a drop means one vanished. */
-const EXPECTED_CELLS = 33;
+const EXPECTED_CELLS = 36;
 
-if (process.platform === "win32") {
-  console.log("✓ hermes injection framing skipped on Windows (the Hermes connector is Unix-only)");
-  console.log("COTAL_SMOKE_SENTINEL cells=1 passed=1 failed=0");
-  process.exit(0);
-}
+if (process.platform === "win32") skipSuite("the Hermes connector is Unix-only");
 
 const pkgDir = fileURLToPath(new URL("..", import.meta.url));
 const probe = fileURLToPath(new URL("./injection-framing.probe.py", import.meta.url));
@@ -196,6 +193,14 @@ assert.ok(subject.channel.startsWith("[channel from Ada] "),
   `a channel message keeps its own attribution: ${subject.channel}`);
 assert.ok(columnZeroLines(control.channel).length > 1,
   "refuse control: the pre-fix rendering forged on the channel branch too, or this grader is blind");
+
+// A backfilled item is framed as history, the prefix connector-core's fmtItem gives other
+// connectors (#2205); a live one is not.
+assert.ok(subject.historical.startsWith("[channel from Ada] (history) "),
+  `a historical item is framed as history: ${subject.historical}`);
+assert.ok(!subject.honest.includes("(history)"), `a live item is not framed as history: ${subject.honest}`);
+assert.ok(!control.historical.includes("(history)"),
+  "refuse control: the pre-fix rendering really did present a backfilled item as live, or this grader is blind");
 
 console.log("hermes injected frame: body and attribution both neutralized; the pre-fix control forged on every case");
 if (cells !== EXPECTED_CELLS) {

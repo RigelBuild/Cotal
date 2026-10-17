@@ -1,5 +1,175 @@
 # @cotal-ai/lang
 
+## 0.82.0
+
+## 0.81.1
+
+## 0.81.0
+
+## 0.80.0
+
+## 0.79.0
+
+### Patch Changes
+
+- aaa6bc9: A failure a bridged host handler throws now crosses into the engine thread as the class it was raised as, with that class's own fields, and is rebuilt with nothing defaulted. Before, an `EffectError` missing its `code` or `kind` was journaled as `L4000` / `handler-fault`, and an `EffectRefused` missing its `code` as `L5016`, while the in-process walker recorded the same failure with those fields absent. A bridged failure now journals the same as an in-process one.
+
+## 0.78.1
+
+## 0.78.0
+
+### Minor Changes
+
+- a74b832: `PrimitiveSpec.opensScope` is replaced by `scope`, the `ScopeKind` a primitive opens or `null`. A scope row in `PRIMITIVES` now has to name a member of `ScopeKind` to compile, and both engines read that kind from the table instead of casting the primitive's name to it, so a new scope primitive left out of the union no longer reaches the journal as a kind its readers do not know. Code that read `spec.opensScope` reads `spec.scope !== null`.
+
+### Patch Changes
+
+- 8b92413: The static captured-write check (L2032) now reads a scope's body position from the syntax table, as the argument just before the options bag. It used to name `fanOut` and `conclave` as the primitives whose body is the second argument, so a scope primitive added to the table with its body second had its first argument walked and a captured write in its body passed `validate` with no error. The five current scope primitives validate as before.
+- d04629a: Whether a scope calls the handler itself is now its own `dispatches` row in `scopeTraits`, and `performScope` reads it there. Before, it inferred dispatch from whether the scope hashes a subject, so changing `conclave`'s `hashesSubject` still typechecked and then silently dropped the conclave's durable request id, its cancel re-check after begin and its count against the effect ceiling (L4009), and let a migration walk into a settled conclave and call the handler's `openConclave` where it used to refuse with `UnwalkableScope`. Shipped behaviour is unchanged.
+- 905a78b: `waitUntil` now enters its step through the same code as every other effect. The replay verdicts, the cancellation checks, the host stop, request-id recovery and the `begin` append were written out a second time for `waitUntil`, so a rule changed in one copy could leave waits replaying, stopping or recovering differently from the rest. Behaviour is unchanged.
+
+## 0.77.1
+
+## 0.77.0
+
+## 0.76.0
+
+### Patch Changes
+
+- ea15e8d: A `conclave` now asks the host's stop before it opens, as every other effect does. A run whose driver has asked it to stop (an operator pause or a passed work horizon) is released (L5012) at the next conclave instead of opening it, and a program made only of conclaves no longer runs to completion after the stop. A settled conclave still replays under a stop.
+- 9adcf1c: `PRIMITIVES`, `EVENT_CONSTRUCTORS`, `PURE_PRIMITIVES` and `FORBIDDEN_NODES` are now frozen through every row and nested array. A write to a row, or to the `callee` a validation `LangError` carries, throws instead of changing what `validate` accepts or reports for the rest of the process.
+
+## 0.75.0
+
+## 0.74.0
+
+## 0.73.0
+
+## 0.72.1
+
+## 0.72.0
+
+## 0.71.0
+
+### Patch Changes
+
+- 3400d53: A value a program throws out of a concurrency scope now reaches `catch` as itself on resume, as it already did on the live run. The scope's `L4000` `scope-fault` record carries the value in a new `error.thrown` field, and a replay delivers that value instead of building the fault from the record. Before this, a `conclave` body that threw `"failure"` was caught as `"failure"` live and as `{ code: "L4000", kind: "scope-fault", message: "failure" }` on resume, on both engines, so a program that branched on the caught value diverged on the resume of unchanged source. The record carries a copy, and `catch` receives that copy deep-frozen like a scope's result, live, on resume and in a migration check's walk, while the thrown value itself is not frozen. The copy is the value as the journal's JSON reads it back, so a record held at two places in the thrown value arrives as two records, live as on a resume from a durable store. A resume refuses a loaded `error.thrown` that is not `{ value }` or `{}`, or whose value has no canonical form (L5024). A thrown value with no canonical form, such as a function, cannot be recorded, so the scope delivers its fault record in its place on the live run too.
+
+## 0.70.2
+
+## 0.70.1
+
+### Patch Changes
+
+- fe54eb0: `validate()` now refuses with L2032 a `parallel`, `race` or `fanOut` branch, or a `once` or `conclave` body, that writes a binding declared outside it through a destructuring target (`[n] = r`, `({ n } = r)`, `[o.a] = r`, nested, default and rest elements included) or through a `for (n of xs)` loop with no declaration. These writes used to validate clean and fail with L2032 only when the branch ran, after any effects dispatched before it.
+- 1ef1396: The run-time half of L2032 now gives the reason that fits the scope a write is refused in. A write from a `once` or `conclave` body, or from a `waitUntil` probe, to a binding declared or a value built outside it now says that a settled scope is replayed without entering its body, and that the value should be read out of the scope's result. That is what the static check already says for `once` and `conclave`. Before, the refusal described concurrent branches writing in completion order and suggested `race`, which only applies to `parallel`, `race` and `fanOut`. The walker and the compiled engine now share one write check and refuse the same binding write with the same message, so a program that catches L2032 reads the same text on both engines. The compiled engine used to word a binding write as a value write.
+
+## 0.70.0
+
+### Minor Changes
+
+- 83a6352: A run on the compiled engine no longer reports a value the program threw as a host hold or release. The worker thread used to copy `code`, `reason`, `step` and `kind` off whatever was thrown, and the host rebuilt `RunHeld` or `RunReleased` from the code alone, so `throw { code: "L5025", reason: "..." }` came back as a held run with the placeholder step `(step not carried)`, and `throw { code: "L5012", ... }` as a release. Both now fail as the plain value they are, as they do on the walker. `WorkerRunFailed` is now a union discriminated by `class` (`released`, `held`, `effect`, `too-large`, `rejected` or `error`). The thread picks the variant with `instanceof`, each variant requires its class's fields, and the host rebuilds the class with no defaults. `tooLarge` is replaced by the `too-large` variant's `stepKey`, `bytes` and `bound`. This breaks code that calls `runInWorker` itself: `code` now crosses only on the `effect` and `error` variants, so a caller that branched on `L5012`, `L5025`, `L5006` or `L5010` branches on `class` instead.
+
+## 0.69.0
+
+### Patch Changes
+
+- 1bdc7f2: A `conclave` now counts toward a run's `effectCeiling` (L4009). Opening one is a dispatch against the world, but it was counted neither by the live counter nor by the journal tally a resume seeds that counter from, so a program whose only effect was `conclave` could open any number of them, live or across a resume, without reaching the ceiling. It is counted once, before its entry begins, on both engines. A resume that re-enters a pending or refused step, a `conclave` or an effect, no longer counts it a second time, so a resumed run reaches the ceiling at the same step as a fresh one instead of faulting where the fresh run goes on. `spec/cotal-lang.md` §8.3 no longer excludes it.
+- 94996e5: The scope kinds' traits now come from one record keyed by `ScopeKind`, exported as `scopeTraits`, which returns a frozen row: whether a scope settles an assembly of branch outcomes, and whether a fork whose cut lies inside it re-enters it. The journal seed check, the scope value rule, the static captured-write check (L2032) and `planFork` read it instead of keeping their own kind lists, so a scope kind added to `ScopeKind` does not compile until it is classified. Before, a new kind compiled with a list missed and failed only at run time, for example a settled no-return scope of that kind refused at the journal seed with L5024. Shipped behaviour is unchanged.
+- f409b46: A `waitUntil` whose first observation is not terminal now waits out its cadence on a host that checks journal authority (a manager-hosted run, or `cotal run start --local`) and fails `L4023` at its deadline. Before, its second observation failed `L4000`: the interpreter sent the observation index as the effect's attempt, which the run authority refused, and the authority listed no pause token for a `waitUntil` cadence. Which pause tokens a step owns is now one table that the run authority, the adoption re-arm and a cancelled branch's discharge all read, so a cancelled `waitUntil` on a hosted run also releases its open cadence pause.
+
+## 0.68.0
+
+### Minor Changes
+
+- 6141e7b: The issuing host no longer signs an answering run operator for a checkpoint token a participant manager names. The manager's request now names the run and step it answers (`operator.answers: { runId, stepKey, amend? }`), and the host requires that run admitted on the manager's instance, reads the pause's token off the run's journal under a read it mints for that run, and requires a served answer to name the same run and step as the request it observed. Before, a manager could be issued the answer and settle writes for another instance's waiting pause. The pause lookups `openCheckpointToken`, `settledPauseToken`, `stepPauseToken`, `CheckpointNotOpen` and `CheckpointNotAmendable` move to `@cotal-ai/lang`; `@cotal-ai/runtime` still exports the first four. A participant manager and its issuing host must upgrade together.
+
+### Patch Changes
+
+- b38a683: A `conclave` body may no longer write a binding declared outside it, or a field of a record or array built outside it (L2032), on both engines, as `once` already could not. A settled `conclave` is replayed from its journal entry without entering its body, so the write happened on the live run and never on resume: the resumed run read the old value and diverged at the next effect that took it as input. Return the value from the body and assign the scope's result instead.
+- d5ea4d2: The cotal-lang spec's migrate orphan table has a `waitUntil` row. An orphaned `waitUntil` is ignored whether it settled or is still pending, and its recorded observations stay in the journal. This is what `cotal run migrate` already reported; the table's "any other kind" row required L5015, so an implementation written from the spec refused the same migrations. No behavior changes.
+- 54e0199: The cotal-lang spec lists the scopes and the traits in which they differ in one table (§7): what a scope settles, its verdict when a migration orphans it, and whether a fork re-enters it when the cut lies inside it or refuses the cut (L5020). The journal entry's `kind` field, the absence rule for a scope's settled value, the L2013 admission, the migrate orphan table and the fork cut rule cite that table or the primitive table instead of listing kinds, so a new scope is one row in each. No behavior changes.
+
+## 0.67.0
+
+### Patch Changes
+
+- 48f18d0: Remove sentences from shipped comments in core, lang, the CLI and the manager that described what earlier revisions of those comments claimed. The request-path validation note in `endpoint-envelope.ts` now states as current fact that registration-time profile bounds do not replace request-path enforcement, with the `uniqueItems` measurement under it. The barrier-window note in `endpoint-action.ts`, the lang worker header, the worker result backstop, the `--rotate-sys` broker check and the manager's goal-writer epoch belt keep their contract text and drop the history. No behavior changes.
+
+## 0.66.1
+
+## 0.66.0
+
+### Patch Changes
+
+- a9be586: Apply the driver's result bound on the compiled engine. A hosted run on language version 2 never received the result bound that `cotal run` and the manager derive from the broker's `max_payload`, so an oversized effect result was recorded when it fit the store, or released as the store's own L5010 when it did not. The bound now reaches the journal the worker thread builds, an oversized `ok` result is refused ahead of the settling append (L5006) as it is on version 1, and the host rebuilds that refusal as `EffectResultTooLarge`, so the driver releases the run instead of recording it as failed. `WorkerRunRequest` gains `resultBytes`, refused outside the bridged route, and `WorkerRunFailed` gains `tooLarge`.
+
+## 0.65.0
+
+### Minor Changes
+
+- 8577576: Add `once`, an at-most-once scope for cotal-lang steps that write to a far side. A resume that finds a step inside `once` begun and never settled does not dispatch it again: it opens a hold, a checkpoint minted under `holdRequestId` of the step's recorded request id, and the answer becomes the step's result, while an expired hold fails the step with the catchable L4027. A hold the host refuses leaves the step pending rather than refused, so no later host writes again, and its L5025 says so. A hold whose checkpoint answers an outcome other than `resolved` or `expired` fails the step as a handler fault. Only `ask` runs inside `once`; every other effect is refused before it begins (L4028), and a write from the body to a binding outside it is refused (L2032). The journal entry gains a `hold` field for the hold's own binding. The hosted runtime ends the held `ask`'s open attempt pause before the hold binds, and `cotal run answer`, `cotal run amend` and `cotal run journal` read a held step at its hold. A fork may cut inside `once`, and a migration ignores an orphaned `once`. `once` becomes a reserved name, so a program that declares its own `once` binding is refused (L2002). The design record is `docs/design/at-most-once-external-effect.md`.
+
+## 0.64.0
+
+### Patch Changes
+
+- eb2b2d5: A journal append the store refuses now crosses the worker effect bridge as the real `JournalAppendRejected` (or `EffectResultTooLarge`) in both directions. Before, the bridge flattened it into a plain `Error`, so when a host handler's `ctx.bind` was refused and the handler rethrew, the compiled engine settled the step `failed` as an L5010 handler fault and a program `try`/`catch` could catch it. The bridged route now matches the in-process interpreter: the entry stays pending, nothing is settled on top of it, and the run stops on the uncatchable L5010 path.
+
+## 0.63.0
+
+## 0.62.0
+
+### Patch Changes
+
+- 1b3ba08: A host stack overflow in a cotal-lang run is no longer catchable. A builtin that ran out of stack (for example `json.stringify` on an array nested a few thousand deep) used to raise a catchable L4016, so a program could branch on how much stack its host had, and a journal recorded on one host was refused with L5001 when resumed on a host with a larger stack. Both the tree-walker and the compiled engine now unwind the run through it, the same as the other faults a program cannot catch: a `finally` does not run past it, a `parallel`, `race` or other scope it fails inside settles nothing, even when another branch failed first, the overflow itself cancels no sibling, and a `conclave` whose body overflowed does not close. A resume on a host with more stack then proceeds instead of replaying a recorded scope failure.
+
+## 0.61.0
+
+## 0.60.0
+
+## 0.59.0
+
+### Patch Changes
+
+- acb713e: Keep the simulator in step with a program running behind the worker bridge. The bridge now reports when the thread has reacted to every message it was sent, and `SimHandler` waits for that before delivering its next wake, so a bridged simulation settles a `race` on the arm that finished first instead of the one declared first. Handlers gain an optional `useQuiescence` hook for this, and `RecordingHandler` forwards it, so a wrapped simulator keeps the same pacing. It returns a release that the bridge calls when it closes, including when the worker fails to start, so a `SimHandler` used for one bridged run can be reused for another run afterwards.
+- 77e2654: The record and array builtins refuse an argument of another kind in the language, so a program can no longer branch on an answer the host made up for a value it was never meant to take.
+
+  Each of these builtins read its record or array argument through a host operation that answers for any kind. Measured before the fix, on both engines: `map(5, f)` and `keys(5)` answered `[]`, `every(5, f)` answered true, `pick(5)` answered undefined, `has(f, "length")` answered true off the implementation's function wrapper, `keys("ab")` answered index strings, `concat("a", [1])` answered `"a1"` past L4018, and `keys(null)` refused with the host's error text.
+
+  `keys`, `values`, `entries`, `has` and both arguments of `merge` now take a record, and `map`, `filter`, `find`, `some`, `every`, `sort`, `slice`, `join`, `reverse`, `unique`, `sum`, `pick` and the first argument of `concat` take an array. Every other kind, a string, `null` and `undefined` included, is refused with L4016 naming the builtin and the kind, before the host is reached, as `len` already was. The refusal is catchable. The second argument of `concat` keeps the method's meaning. The spec's library-failure section, its replay posture and its change log carry the rule in the same change.
+
+- 608f5f4: Re-attach doc comments that had drifted away from the declarations they document. A `/** */` block followed directly by another one documented nothing, so editor hovers and the published type declarations showed no doc for the intended declaration (for example `Manager`, the `plane3` field and `AclResolver`). Each such block now sits above its declaration, is merged into the block it duplicated, or is removed when its declaration no longer exists. A new `pnpm check:doc-comments` check, run as part of `check:docsbundle`, refuses a doc block followed directly by another in shipped source.
+- 7b39a0b: `spawn` in a workflow program accepts `events`, the workflow form of `cotal spawn --no-events`. `events: false` starts the seat without its AG-UI event plane, so a hosted run can now start a connector that publishes none, such as Hermes. Before this the option was refused as an unknown key (L3011), and the same spawn without it was refused by the manager because an omitted `events` arms the plane. A value that is not a boolean is refused at the spawn. Like `supervise`, the option is launch policy and is not part of the step's input hash.
+
+## 0.58.0
+
+### Patch Changes
+
+- 4229e53: Forward `observe` through the worker bridge, so a `waitUntil` run hosted by a manager completes instead of failing with "host.options.handler.observe is not a function".
+
+## 0.57.0
+
+### Minor Changes
+
+- ae90f5d: The scripted turn no longer asks for a timestamp it discards: `SimScript`'s turn entries drop the unused `at` field, so a script author's previously valid `at` literal now fails to typecheck (#729). The simulator grades a scripted wait's delivered value and a scripted ask's two-minute clock instead of taking them on faith (#724). `EffectHandler`'s docblock and the docs now state the handler failure contract: a `bind` failure is a throw (#735).
+
+## 0.56.1
+
+## 0.56.0
+
+### Patch Changes
+
+- 493eef5: The tree-walker's `++` and `--` refuse an operand that is not already a number with L4018, the same sentence the compiled engine's `case "update"` throws, instead of reading it through a bare `Number(...)`: a record no longer decays to NaN and a numeric string no longer silently becomes a number, so `x++`, `x + 1` and `x += 1` agree (#646). The two declared divergences this covered are retired.
+
+## 0.55.0
+
+### Patch Changes
+
+- 2b28653: A `RunDivergence` raised inside a concurrency scope is no longer recorded as the scope's own outcome: `performScope`'s ladder rethrows it and settles nothing, so the scope entry stays pending and a resume re-enters it and diverges again at the step that broke, instead of replaying a recorded `L4000` scope-fault a program's `try`/`catch` can swallow. A divergence among a `race`'s settled arms is hoisted ahead of the winner scan beside a refused append and a held arm, so a losing arm's divergence is never discarded behind a winning sibling and the winner's value is never handed back over it. A divergence also cancels no sibling: `parallel`, `fanOut` and the `race` settle treat it like a release or a refused append, leave every other arm to run to its own boundary and rethrow bare, so a resume of the original source completes the run instead of replaying a cancellation the divergence recorded.
+
+## 0.54.0
+
 ## 0.53.0
 
 ## 0.52.1

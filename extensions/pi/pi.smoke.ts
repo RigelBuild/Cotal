@@ -14,6 +14,8 @@ import { piConnector } from "./src/connector.js";
 import { wrapped } from "./src/wrap.js";
 import { createPiMapper } from "./src/agui-map.js";
 import { renderCotalInbox } from "./src/inbox-render.js";
+/** The unit a record mapped to, or `null`: a turn the mapper opens no run for maps to none. */
+const unitOf = <U extends { runId: string }>(r: U | { turn: true } | null): U | null => (r !== null && "runId" in r ? r : null);
 import { PiSessionSource } from "./src/agui-source.js";
 
 let checks = 0;
@@ -239,7 +241,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
     const read = await source.read("pi:first-file");
     ok(read.records.length === 6, "first-file sentinel reads complete native JSONL lines but not trailing partial line");
     const map = createPiMapper("native");
-    const events = read.records.flatMap(({ value }) => map(value)?.events ?? []);
+    const events = read.records.flatMap(({ value }) => unitOf(map(value))?.events ?? []);
     ok(events.map((event) => event.type).join() ===
       "RUN_STARTED,TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,TOOL_CALL_START,TOOL_CALL_END,TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,RUN_FINISHED",
       "native assistant and tool records produce ordered, balanced AG-UI events without invented compaction turns");
@@ -250,14 +252,14 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
     ok(boundaryMap({ type: "message", id: "orphan", message: { role: "toolResult", toolCallId: "old-call" } }) === null,
       "a result for a call before the adopted boundary is not emitted as an orphan tool end");
     const failedMap = createPiMapper("failed");
-    const failure = failedMap({ type: "message", id: "error-call", timestamp: "2026-01-01T00:00:00.000Z", message: {
+    const failure = unitOf(failedMap({ type: "message", id: "error-call", timestamp: "2026-01-01T00:00:00.000Z", message: {
       role: "assistant", timestamp: 1_767_225_600_000, content: [{ type: "toolCall", id: "err-tool", name: "bash" }], stopReason: "error",
-    } });
+    } }));
     ok(failure?.events.map((event) => event.type).join() === "RUN_STARTED,TOOL_CALL_START,TOOL_CALL_END,RUN_ERROR",
       "failed assistant closes native tool brackets before the run error");
-    const recovered = failedMap({ type: "message", id: "later", timestamp: "2026-01-01T00:00:01.000Z", message: {
+    const recovered = unitOf(failedMap({ type: "message", id: "later", timestamp: "2026-01-01T00:00:01.000Z", message: {
       role: "assistant", timestamp: 1_767_225_601_000, content: [{ type: "text", text: "later answer" }], stopReason: "stop",
-    } });
+    } }));
     ok(recovered?.events[0]?.type === "RUN_STARTED" && recovered.events.at(-1)?.type === "RUN_FINISHED",
       "a native error does not silence the next completed turn");
   } finally {
@@ -706,7 +708,8 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   ok(racing.drained.join() === "first,between", "a clean turn acknowledges both messages after the race");
 }
 
-// An unconfirmed error with no automatic continuation remains observably held without a timer.
+// An unconfirmed error stays held during the fixed backoff window before the bounded
+// continuation fires (see the bounded-continuation cells below for what happens once it does).
 {
   const mesh = new FakeMesh();
   mesh.items = [item("m1")];
@@ -722,8 +725,155 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   await driver.flushPresence();
   ok(
     driver.state === "held" && mesh.drained.length === 0 && mesh.statuses.at(-1)?.status === "waiting",
-    "an error without continuation stays held and visible without time-based acknowledgement",
+    "an error before the backoff window elapses stays held and visible without time-based acknowledgement",
   );
+}
+
+// Issue #726 acceptance: a non-terminal error with one unconfirmed batch re-dispatches the exact
+// same retained batch content through the same host path, within the bounded backoff window.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
+  ok(driver.state === "held" && host.sent.length === 1, "a non-terminal error holds before the bounded continuation fires");
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  ok(
+    host.sent.length === 2 &&
+      host.sent[1]?.content === host.sent[0]?.content &&
+      host.sent[1]?.details.ids.join() === "m1",
+    "the bounded continuation re-dispatches the exact retained batch content within the backoff window",
+  );
+}
+
+// A continuation whose turn ends cleanly commits the retained batch once and returns to idle,
+// exactly as an externally-triggered continuation already does.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  ok(host.sent.length === 2, "the bounded continuation re-dispatches before the retry turn starts");
+  const continuation = context();
+  driver.onAgentStart(continuation);
+  const details = startBatch(driver, host);
+  confirm(driver, details);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], continuation);
+  ok(
+    mesh.drained.join() === "m1" && driver.state === "idle",
+    "a clean bounded continuation commits the retained batch once and returns to idle",
+  );
+}
+
+// Attempts spent: the same failure on every continuation ends in held with a presence and held
+// reason naming intervention and the attempt count; a bare wake still cannot send.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const retry = context();
+    driver.onAgentStart(retry);
+    driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], retry);
+  }
+  await driver.flushPresence();
+  ok(driver.state === "held", "attempts spent still ends in a safe held state");
+  const heldReason = driver.reason ?? "";
+  ok(/2 automatic continuation attempts/.test(heldReason), "the held reason names the spent attempt count");
+  ok(/intervention/i.test(heldReason), "the held reason names intervention rather than promising a continuation");
+  const lastPresence = mesh.statuses.at(-1);
+  ok(
+    lastPresence?.status === "waiting" && /intervention/i.test(lastPresence.activity ?? ""),
+    "the presence line also names intervention once attempts are spent",
+  );
+  const sentBeforeFreshInput = host.sent.length;
+  driver.onWake();
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  ok(host.sent.length === sentBeforeFreshInput, "a bare wake cannot dispatch once the continuation budget is spent");
+  // Fork (RIG-4249): a genuinely new automatic DM after a provider error still starts one fresh turn.
+  mesh.items.push(item("m2"));
+  driver.onIncoming(mesh.items.at(-1)!);
+  ok(host.sent.length === sentBeforeFreshInput + 1 && host.sent.at(-1)?.details.ids.join() === "m1,m2",
+    "a new DM after a spent provider-error budget retries the retained batch with the new traffic");
+}
+
+// Controls that must not weaken: zero batches still returns to idle on the same error boundary.
+{
+  const mesh = new FakeMesh();
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
+  ok(driver.state === "idle", "an error with zero batches still returns to idle, never a retry");
+}
+
+// Controls that must not weaken: a user abort holds without any automatic retry, even past the
+// backoff window.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const controller = new AbortController();
+  const ctx = context(controller.signal);
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  controller.abort();
+  driver.onAgentEnd([{ role: "assistant", stopReason: "aborted" }], ctx);
+  ok(driver.state === "held" && host.sent.length === 1, "an abort holds immediately without a retry");
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  ok(host.sent.length === 1, "an abort still has not auto-replayed past the backoff window");
+}
+
+// Controls that must not weaken: an external onAgentStart still releases the spent (post-budget)
+// held state, exactly as it releases a plain hold.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const retry = context();
+    driver.onAgentStart(retry);
+    driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], retry);
+  }
+  ok(driver.state === "held", "the spent state before external intervention is held");
+  const rescue = context();
+  driver.onAgentStart(rescue);
+  ok(driver.state !== "held", "an external onAgentStart releases the spent state exactly as it releases a plain hold");
 }
 
 // Managed shutdown is absorbing even when Pi reports late lifecycle events.
@@ -985,6 +1135,17 @@ for (const assistant of [
     ok(env.GROQ_API_KEY === "groq-test", "the declared provider key reaches Pi");
     ok(env.UNRELATED_SECRET === undefined, "an unrelated operator variable is withheld");
     ok(!("COTAL_CREDS" in env) && !("COTAL_LIFECYCLE_UID" in env), "ambient per-session COTAL_* is withheld");
+    const withFloor = piConnector.buildLaunch({
+      space: "test",
+      name: "pi-test",
+      configPath: agentFile,
+      workspaceRoot: root,
+      lifecycleUid: "life",
+      backfillFloor: 42,
+      events: false,
+    });
+    ok(withFloor.env?.COTAL_BACKFILL_FLOOR === "42", "backfill floor forwarded");
+    ok(!("COTAL_BACKFILL_FLOOR" in env), "no floor requested means no floor in the child env");
     ok(Boolean(launch.control?.path && launch.control.token), "managed Pi launches expose cooperative control");
     const freshSessionAt = launch.args.indexOf("--session-id");
     ok(

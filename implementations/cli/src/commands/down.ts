@@ -1,11 +1,8 @@
-import { closeSync, existsSync, linkSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { readFileSync, rmSync, statSync } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
 import { type CompletionResult, type ParsedArgs } from "@cotal-ai/core";
 import {
   abortMaintenanceCut,
-  assertManagerCanSpare,
-  armManagerShutdownIntent,
   acquireMaintenanceLock,
   assertSingleSpaceBroker,
   authDir,
@@ -13,7 +10,6 @@ import {
   clearPreservationCommitIntent,
   clearPreservationPrepareIntent,
   completeMaintenanceCut,
-  disarmManagerShutdownIntent,
   loadMeshes,
   meshesForRoot,
   localProcessPath,
@@ -33,6 +29,7 @@ import {
   DELIVERY_PIDFILE,
   MANAGER_DELIVERY_AWARE_MARKER,
   MANAGER_PIDFILE,
+  WEB_PIDFILE,
   type LocalProcess,
   type LocalProcessContext,
   MAINTENANCE_RESUME_DOCUMENT_VERSION,
@@ -66,19 +63,16 @@ import {
 import { extensionNames, localProcessSurface } from "../ext-loader.js";
 import { c } from "../ui.js";
 import { cotalRoot } from "../lib/paths.js";
-import { parsePid, probeLiveness, identityLegacyWarning, identityRefusal, identityUncertaintyRefusal, removeIdentityPin, verifyIdentityPin } from "@cotal-ai/workspace";
+import { parsePid, probeLiveness, readPidfile } from "@cotal-ai/workspace";
 import { resolveRuntimeSpace } from "../lib/status.js";
 import { downManifest } from "./down-manifest.js";
 import { askManager, resolveControlTarget } from "../lib/control.js";
 import { connectOrExit, userViewAuthOrExit } from "../lib/connect.js";
 import { waitForEndpointUnreachable } from "../lib/endpoint-cut.js";
 import { captureSeatCheckpoint } from "../lib/seat-capture.js";
-import {
-  listManagerSeatsForSpare,
-  printLegacyManagerSpareUncertainty,
-  printSparedAgents,
-  type SpareSeatRow,
-} from "../lib/teardown-spare.js";
+import { processRecorded, stopLocalProcess } from "../lib/local-process-stop.js";
+import { stopManager } from "../lib/manager-proc.js";
+import { removeDeliveryCredentials, stopDelivery } from "../lib/delivery-proc.js";
 
 /** The fields a checkpoint reads off one retained inventory entry. The manager owns
  *  `ManagerResumeAgent`; the CLI never imports it, because implementations do not depend on each
@@ -200,16 +194,6 @@ export async function down(args: ParsedArgs): Promise<void> {
     return;
   }
 
-  const managerComponent = selected.find((component) => component.name === "manager");
-  const managerContext = managerComponent ? contextFor(managerComponent) : undefined;
-  let spared: SpareSeatRow[] | undefined;
-  let legacyManagerSpareUnverified = false;
-  if (!values["with-agents"] && managerComponent && managerContext && processRecorded(managerComponent, managerContext)) {
-    const managerPidPath = localProcessPath(managerComponent.pidFile, managerContext);
-    const pin = verifyIdentityPin(managerPidPath);
-    if (pin.kind === "legacy") legacyManagerSpareUnverified = true;
-    else if (pin.kind === "match") spared = await listManagerSeatsForSpare(managerContext);
-  }
   let any = false;
   let allStopped = true;
   for (const component of selected) {
@@ -220,30 +204,9 @@ export async function down(args: ParsedArgs): Promise<void> {
     }
     try {
       const context = contextFor(component);
-      if (component.name === "manager" && processRecorded(component, context)) {
-        try {
-          await stopLocalProcess(component, context, {
-            beforeSignal: (attempt) => {
-              if (attempt.target.token === undefined) {
-                // Upgrade compatibility follows the shared identity contract: a live pre-pin record
-                // is signalled after the warning emitted by stopLocalProcess. Bare down cannot verify
-                // the newer spare capability. Destructive down uses the helper's reduced-guarantee
-                // pid + reservation-inode handoff. A present pin still takes the fully identity-bound
-                // paths below, and a mismatching pin was already refused before this hook.
-                if (!values["with-agents"])
-                  console.error(c.dim("could not verify that this legacy manager can spare its managed agents; signalling it for upgrade compatibility"));
-              }
-              if (values["with-agents"]) armManagerShutdownIntent(context, attempt);
-              else if (attempt.target.token !== undefined) assertManagerCanSpare(context, undefined, attempt.target);
-            },
-          });
-        } catch (e) {
-          disarmManagerShutdownIntent(context);
-          throw e;
-        }
-      } else {
-        await stopLocalProcess(component, context);
-      }
+      if (component.name === "manager") await stopManager(context.space, { withAgents: values["with-agents"] });
+      else if (component.name === "delivery") await stopDelivery(context.space, { preserveCredentials: !requested.length });
+      else await stopLocalProcess(component, context);
     } catch (e) {
       allStopped = false;
       console.error(c.red(`✗ ${(e as Error).message}`));
@@ -254,6 +217,9 @@ export async function down(args: ParsedArgs): Promise<void> {
     process.exitCode = 1;
     return;
   }
+
+  if (!requested.length && selected.some((component) => component.name === "delivery"))
+    await removeDeliveryCredentials(folderCtx().space);
 
   for (const component of selected) {
     for (const artifact of component.artifacts ?? []) rmSync(localProcessPath(artifact, contextFor(component)), { force: true });
@@ -292,8 +258,6 @@ export async function down(args: ParsedArgs): Promise<void> {
     console.error(c.red(`Nothing running for ${target} (no recorded pidfiles).`));
     process.exit(1);
   }
-  if (legacyManagerSpareUnverified) printLegacyManagerSpareUncertainty();
-  else if (spared) printSparedAgents(spared);
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -316,14 +280,10 @@ async function liveUnownedBrokers(context: LocalProcessContext): Promise<Array<{
   return live;
 }
 
-export function processRecorded(component: LocalProcess, context: LocalProcessContext): boolean {
-  return existsSync(localProcessPath(component.pidFile, context)) || (component.artifacts ?? []).map((artifact) => localProcessPath(artifact, context)).some(existsSync);
-}
-
 export function processAlive(component: LocalProcess, context: LocalProcessContext): boolean {
-  const pidPath = localProcessPath(component.pidFile, context);
-  if (!existsSync(pidPath)) return false;
-  const pid = parsePid(readFileSync(pidPath, "utf8"));
+  const raw = readPidfile(localProcessPath(component.pidFile, context));
+  if (raw === undefined) return false;
+  const pid = parsePid(raw);
   return pid !== undefined && isAlive(pid);
 }
 
@@ -336,165 +296,11 @@ export function processAlive(component: LocalProcess, context: LocalProcessConte
  *  out from under this": that read would let `cotal down nats` orphan a live auth signer behind a
  *  torn pidfile. Only an ESRCH-confirmed death (or no record) clears a dependant. */
 export function mayBeRunning(component: LocalProcess, context: LocalProcessContext): boolean {
-  const pidPath = localProcessPath(component.pidFile, context);
-  if (!existsSync(pidPath)) return false;
-  const raw = readFileSync(pidPath, "utf8");
-  if (raw.trim() === "") return false; // empty pre-protocol husk: no process behind it
+  const raw = readPidfile(localProcessPath(component.pidFile, context));
+  if (!raw) return false; // no record, or an empty pre-protocol husk: no process behind it
   const pid = parsePid(raw);
   if (pid === undefined) return true; // unattributable content: cannot prove it gone → may be running
   return probeLiveness(pid) !== "dead"; // alive OR unknown → may be running; only ESRCH clears it
-}
-
-export interface StopLocalProcessOptions {
-  /** Runs while this caller holds the `.stopping` reservation, after exact target verification and
-   * immediately before SIGTERM. Throwing aborts without signalling and preserves the pid record. */
-  beforeSignal?: (attempt: {
-    target: { pid: number; token: string } | { pid: number; token?: undefined };
-    stopper: { pid: number; marker: string };
-  }) => void;
-}
-
-/** Stop one recorded process and await its actual exit before the next dependency is stopped. */
-export async function stopLocalProcess(
-  component: LocalProcess,
-  context: LocalProcessContext,
-  options: StopLocalProcessOptions = {},
-): Promise<boolean> {
-  const pidPath = localProcessPath(component.pidFile, context);
-  const found = processRecorded(component, context);
-  if (!existsSync(pidPath)) return found;
-
-  const rawPid = readFileSync(pidPath, "utf8").trim();
-  if (rawPid.startsWith("removing:")) {
-    const owner = parsePid(rawPid.slice("removing:".length));
-    throw new Error(
-      owner && isAlive(owner)
-        ? `${component.name} extension removal is in progress (pid ${owner})`
-        : `${component.name} has a stale extension-removal reservation at ${pidPath} - remove that file and retry`,
-    );
-  }
-  const pid = parsePid(rawPid);
-  const marker = `${pidPath}.stopping`;
-  let markerFd: number | undefined;
-  for (;;) {
-    // ATOMIC publish (the pid-slot pattern): fill a private temp inode with our pid FIRST, then
-    // `link(2)` it as the marker - a no-overwrite atomic op. A contender therefore never observes an
-    // empty marker mid-publish; the old `openSync(marker,"wx")` then `writeFileSync` left exactly
-    // that window, and a reader in it saw owner=undefined and reclaimed a LIVE owner's reservation
-    // (mutual exclusion defeated). The published name and the held fd both keep the inode alive.
-    const temp = `${marker}.${process.pid}.${randomBytes(4).toString("hex")}`;
-    try {
-      markerFd = openSync(temp, "wx", 0o600);
-      writeFileSync(markerFd, String(process.pid));
-      linkSync(temp, marker); // EEXIST here = the marker is already held
-      rmSync(temp, { force: true });
-      break;
-    } catch (e) {
-      if (markerFd !== undefined) {
-        closeSync(markerFd);
-        markerFd = undefined;
-      }
-      try { rmSync(temp, { force: true }); } catch { /* never created, or already gone */ }
-      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-      let owner: number | undefined;
-      try {
-        owner = parsePid(readFileSync(marker, "utf8"));
-      } catch (readErr) {
-        if ((readErr as NodeJS.ErrnoException).code === "ENOENT") continue; // holder released between publish-refusal and read
-        throw readErr;
-      }
-      // The atomic publish above is what closes the race: a LIVE `down` holding the marker always
-      // wrote its own POSITIVE pid into it (no empty/partial window), so a live holder is always a
-      // valid pid that is alive/EPERM/unknown - and THOSE we never reclaim (that is the mutual
-      // exclusion). An UNATTRIBUTABLE marker (empty / 0 / negative / garbled) therefore cannot
-      // represent a live holder; it is a stale or crashed reservation, and reclaiming it is both safe
-      // and required so a crashed `down` never wedges the next one. So: reclaim an unattributable
-      // owner or a valid pid PROVEN dead (ESRCH); refuse only a valid pid that is alive or whose
-      // liveness we cannot confirm.
-      if (owner !== undefined && probeLiveness(owner) !== "dead")
-        throw new Error(`${component.name} is already being stopped by another \`cotal down\` (pid ${owner})`);
-      rmSync(marker, { force: true });
-    }
-  }
-  closeSync(markerFd);
-
-  let stopped = false;
-  try {
-    if (pid === undefined) {
-      // An EMPTY pidfile is a pre-protocol husk (no process behind it) and is safe to clear. Any
-      // OTHER unattributable content (garbled, fractional, out-of-range - anything `parsePid`
-      // rejects) may still front a LIVE process we cannot identify or signal; removing it would
-      // orphan that process while reporting a clean stop (the signer-orphan this slice must not do).
-      // Refuse loud and preserve it.
-      if (rawPid === "") {
-        console.log(c.dim(`${component.label} had an empty pidfile.`));
-        stopped = true; // husk cleared in `finally`
-        return true;
-      }
-      throw new Error(
-        `${component.label} has an unattributable pidfile at ${pidPath} (${JSON.stringify(rawPid)}) - it may still front a running process; refusing to remove it or report a clean stop. Stop that process and remove the file manually.`,
-      );
-    }
-    // #969 OPEN-VERIFY-TERMINATE: identity before signal, the same rule the manager, delivery and
-    // auth helpers apply. This is the path `cotal down` uses for the BROKER, the web dashboard and
-    // every extension component, so all four teardown surfaces share one identity rule.
-    const identity = verifyIdentityPin(pidPath);
-    if (identity.kind === "mismatch") throw identityRefusal(component.label, pidPath, identity.record, identity.liveToken);
-    if (identity.kind === "legacy") console.error(identityLegacyWarning(component.label, pidPath));
-    else if (identity.kind !== "match" && identity.kind !== "gone") throw identityUncertaintyRefusal(component.label, pidPath, identity);
-    // The beforeSignal hook authorizes an action against a LIVE exact process. A pinned record whose
-    // process is already ESRCH-gone needs no spare capability or destructive intent because no signal
-    // will be sent. Clear that stale record directly, preserving the hook's documented placement
-    // immediately before SIGTERM and avoiding a false "identity is not pinned" refusal on cleanup.
-    if (identity.kind === "gone") {
-      console.log(c.dim(`${component.label} (pid ${pid}) was not running.`));
-      stopped = true;
-      return true;
-    }
-    options.beforeSignal?.({
-      target: identity.kind === "match" ? identity.record : { pid },
-      stopper: { pid: process.pid, marker },
-    });
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch (e) {
-      // ONLY an ESRCH proves the process is already gone (safe to clear). EPERM (exists, another
-      // user's) or any other errno (EIO, argument errors, unknown) means we could NOT confirm death
-      // - reporting it stopped and removing its record would orphan a live process. Fail loud, keep
-      // the record. A two-state "not alive => gone" is exactly the bug: `unknown` is not `dead`.
-      if ((e as NodeJS.ErrnoException).code === "ESRCH") {
-        console.log(c.dim(`${component.label} (pid ${pid}) was not running.`));
-        stopped = true;
-        return true;
-      }
-      throw new Error(`could not signal ${component.label} (pid ${pid}) (${(e as NodeJS.ErrnoException).code ?? "unknown error"}) - refusing to report it stopped or remove its record; stop it manually`);
-    }
-    // Wait for CONFIRMED death (ESRCH), escalating to SIGKILL; `unknown`/`alive` both keep us
-    // waiting, and if death is never confirmed the record is preserved (never deleted on a guess).
-    const graceDeadline = Date.now() + 15_000;
-    while (probeLiveness(pid) !== "dead" && Date.now() < graceDeadline) await sleep(100);
-    if (probeLiveness(pid) !== "dead") {
-      try { process.kill(pid, "SIGKILL"); } catch { /* raced to exit */ }
-      const hardDeadline = Date.now() + 3_000;
-      while (probeLiveness(pid) !== "dead" && Date.now() < hardDeadline) await sleep(100);
-    }
-    if (probeLiveness(pid) !== "dead")
-      throw new Error(`${component.label} (pid ${pid}) did not exit, or its death could not be confirmed; its pidfile was preserved`);
-    stopped = true;
-    console.log(c.green(`✓ stopped ${component.label} (pid ${pid})`));
-    return true;
-  } finally {
-    // Remove the pidfile ONLY when we confirmed a clean stop: `stopped` is set exclusively on an
-    // ESRCH-proven death (already-gone, or a confirmed exit). Every other exit from the try above is
-    // a throw that must PRESERVE the record - an unattributable pidfile, a process we could not
-    // signal, or a death we could not confirm (`unknown`). The old `|| !isAlive(pid)` clause treated
-    // `unknown` as gone and deleted a live process's record; it is gone.
-    if (stopped) {
-      removeIdentityPin(pidPath); // proven death: the pin goes with the pidfile (#969)
-      rmSync(pidPath, { force: true });
-    }
-    rmSync(marker, { force: true });
-  }
 }
 
 /** The principal keys of every retained agent in a preservation inventory — the dot-form ids that
@@ -657,27 +463,40 @@ async function preserveStateDown(storeOverride?: string, sessionStores: readonly
         "any",
         60_000,
       );
-      if (!prepared.ok) throw new Error(prepared.error ?? "manager preservation prepare failed");
-      const plan = prepared.data as { inventory?: unknown; failures?: unknown[]; state?: string } | undefined;
-      if (!plan?.inventory || (plan.failures?.length ?? 0) !== 0 || (plan.state !== "prepared" && plan.state !== "preserved"))
-        throw new Error("manager returned an invalid or incomplete preservation plan");
-      const retainedPrincipals = retainedPrincipalKeys(plan.inventory);
-      let observed = await readPresenceWithoutConsumer(mesh.space, mesh.server);
-      retainedPrincipals.add(observed.managerId);
-      let unmanaged = observed.roster.filter((presence) => !retainedPrincipals.has(presence.card.id));
-      if (unmanaged.length) {
-        await sleep(11_000); // Let stopped predecessor presence and manager leases expire before refusing.
-        observed = await readPresenceWithoutConsumer(mesh.space, mesh.server);
+      let plan: { inventory?: unknown; failures?: unknown[]; state?: string } | undefined;
+      try {
+        if (!prepared.ok) throw new Error(prepared.error ?? "manager preservation prepare failed");
+        plan = prepared.data as { inventory?: unknown; failures?: unknown[]; state?: string } | undefined;
+        if (!plan?.inventory || (plan.failures?.length ?? 0) !== 0 || (plan.state !== "prepared" && plan.state !== "preserved"))
+          throw new Error("manager returned an invalid or incomplete preservation plan");
+        const retainedPrincipals = retainedPrincipalKeys(plan.inventory);
+        let observed = await readPresenceWithoutConsumer(mesh.space, mesh.server);
         retainedPrincipals.add(observed.managerId);
-        unmanaged = observed.roster.filter((presence) => !retainedPrincipals.has(presence.card.id));
+        let unmanaged = observed.roster.filter((presence) => !retainedPrincipals.has(presence.card.id));
+        if (unmanaged.length) {
+          await sleep(11_000); // Let stopped predecessor presence and manager leases expire before refusing.
+          observed = await readPresenceWithoutConsumer(mesh.space, mesh.server);
+          retainedPrincipals.add(observed.managerId);
+          unmanaged = observed.roster.filter((presence) => !retainedPrincipals.has(presence.card.id));
+        }
+        if (unmanaged.length)
+          throw new Error(`cannot preserve while unmanaged endpoints are live: ${unmanaged.map((presence) => `${presence.card.name} (${presence.card.id})`).join(", ")} (manager lease holder: ${observed.managerId})`);
+        // A seat that cannot be checkpointed is refused HERE, at prepare time, while every child is
+        // still running. This reads only the prepared inventory, so it needs nothing that stopping
+        // would provide, and refusing after the stack is down would cost the operator a running mesh
+        // to tell them the cut was never going to complete.
+        assertSeatsCheckpointable(plan.inventory);
+      } catch (cause) {
+        // A refused prepare (or a live-unmanaged / uncheckpointable refusal) must not leave the
+        // manager fenced in "preserving" mode with no running preservation to finish: abort the
+        // attempt (best effort, the same shape as the stale-inventory retry above) and clear the
+        // intent, so the operator is left with a running, unfenced mesh and the refusal reason.
+        try {
+          await askManager(target.space, target.server, "abortPreservation", { attemptId }, target.auth, "any", 30_000);
+        } catch { /* best effort - the fence dies with the manager */ }
+        clearPreservationPrepareIntent(lock);
+        throw cause;
       }
-      if (unmanaged.length)
-        throw new Error(`cannot preserve while unmanaged endpoints are live: ${unmanaged.map((presence) => `${presence.card.name} (${presence.card.id})`).join(", ")} (manager lease holder: ${observed.managerId})`);
-      // A seat that cannot be checkpointed is refused HERE, at prepare time, while every child is
-      // still running. This reads only the prepared inventory, so it needs nothing that stopping
-      // would provide, and refusing after the stack is down would cost the operator a running mesh
-      // to tell them the cut was never going to complete.
-      assertSeatsCheckpointable(plan.inventory);
       resume = writeMaintenanceResumeDocument(lock, {
         version: MAINTENANCE_RESUME_DOCUMENT_VERSION,
         inventory: plan.inventory as JsonValue,
@@ -945,8 +764,9 @@ async function assertControlPlaneQuiesced(space: string, server: string): Promis
   }
 }
 
-/** Read current KV subjects by Direct Get so the cut check leaves no ephemeral/native consumer. */
-/** Exported for the gated tombstone cell. A regression test for the lease walk has to run through
+/** Read current KV subjects by Direct Get so the cut check leaves no ephemeral/native consumer.
+ *
+ *  Exported for the gated tombstone cell. A regression test for the lease walk has to run through
  *  THIS function, not a transcription of it: a copy carries its own `allowEmpty` parameter, so it
  *  stays green when the argument at the real call site is removed and proves nothing about the fix. */
 export async function readPresenceWithoutConsumer(space: string, server: string): Promise<{ roster: Presence[]; managerId: string }> {
@@ -962,12 +782,13 @@ export async function readPresenceWithoutConsumer(space: string, server: string)
       directKvValue<T>(nc, stream, subject, allowEmpty);
     const bucket = presenceBucket(space);
     const stream = `KV_${bucket}`;
-    const info = await (await jetstreamManager(nc)).streams.info(stream, { subjects_filter: `$KV.${bucket}.>` });
+    const prefix = `$KV.${bucket}.`;
+    const info = await (await jetstreamManager(nc)).streams.info(stream, { subjects_filter: `${prefix}>` });
     const roster: Presence[] = [];
     for (const subject of Object.keys(info.state.subjects ?? {})) {
-      const presence = await directValue<Presence>(stream, subject, true);
-      if (!presence) continue; // A positively identified KV tombstone has no value bytes.
-      if (!presence.card?.id) throw new Error(`presence record ${subject} is malformed`);
+      const presence = await directValue<unknown>(stream, subject, true);
+      if (presence === undefined) continue; // A positively identified KV tombstone has no value bytes.
+      if (!isPresenceRow(presence, subject.slice(prefix.length))) throw new Error(`presence record ${subject} is malformed`);
       roster.push(presence);
     }
     // ENUMERATE THE PER-INSTANCE LEASE KEYS. P2 item 3 demoted this bucket from a single `lease` key to
@@ -1001,6 +822,19 @@ export async function readPresenceWithoutConsumer(space: string, server: string)
   }
 }
 
+/** Whether a decoded presence value carries a `card.id` equal to the KV `key` it was read under,
+ *  which the cut matches against the retained principals, and the string `card.name` its refusal
+ *  names. A participant may write any value under its own key, so only the key is the identity its
+ *  write grant proves. A value that fails refuses the inventory: reading it as absent would drop a
+ *  live participant from the unmanaged-endpoints refusal. */
+function isPresenceRow(value: unknown, key: string): value is Presence {
+  if (typeof value !== "object" || value === null) return false;
+  const card = (value as { card?: unknown }).card;
+  if (typeof card !== "object" || card === null) return false;
+  const { id, name } = card as { id?: unknown; name?: unknown };
+  return id === key && typeof name === "string";
+}
+
 /**
  * Compatibility inventory for `clean`; lifecycle commands use the registered descriptors above.
  *
@@ -1019,19 +853,31 @@ export function pidfileTargets(space: string, root: string): Array<[file: string
     ...every(MANAGER_DELIVERY_AWARE_MARKER, "manager delivery-aware marker"),
     ...every(DELIVERY_PIDFILE, "delivery daemon"),
     ...every("auth-service.{space}.pid", "user-auth service"),
-    ...every("web.pid", "web dashboard"),
+    ...every(WEB_PIDFILE, "web dashboard"),
     ...every("nats.pid", "nats-server"),
   ];
 }
 
-export type PidfileState = { pid?: number; live: boolean; note?: string };
+/** `liveness` keeps `probeLiveness`'s three states so each caller picks its direction: a presence
+ *  reader requires `"alive"`, a destructive guard proceeds only on `"dead"`. No record and an empty
+ *  husk are `"dead"`; unattributable content and a removal reservation are `"unknown"`, because
+ *  `cotal down` refuses them as possibly fronting a live process. */
+export type PidfileState = { pid?: number; liveness: "alive" | "dead" | "unknown"; note?: string };
 
 /** Shared hardened pid probe: positive integers only, and EPERM means the process exists. */
 export function pidfileState(path: string): PidfileState {
-  if (!existsSync(path)) return { live: false, note: "no pidfile" };
-  const raw = readFileSync(path, "utf8").trim();
-  if (raw.startsWith("removing:")) return { live: false, note: "extension removal in progress" };
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8").trim();
+  } catch (e) {
+    // A process removes its own record on exit, so the file can be gone by the time it is read.
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { liveness: "dead", note: "no pidfile" };
+    throw e;
+  }
+  if (raw.startsWith("removing:")) return { liveness: "unknown", note: "extension removal in progress" };
   const pid = parsePid(raw);
-  if (!pid) return { live: false, note: "bad pidfile" };
-  return isAlive(pid) ? { pid, live: true } : { pid, live: false, note: "stale pidfile" };
+  if (!pid) return { liveness: raw ? "unknown" : "dead", note: "bad pidfile" };
+  const liveness = probeLiveness(pid);
+  if (liveness === "alive") return { pid, liveness };
+  return { pid, liveness, note: liveness === "dead" ? "stale pidfile" : "liveness unknown" };
 }

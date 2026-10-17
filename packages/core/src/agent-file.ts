@@ -30,7 +30,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import type { EndpointKind } from "./types.js";
 import { assertValidName } from "./resolve.js";
-import { assertValidChannel, assertValidOwnerToken, channelInAllow, isConcreteChannel } from "./subjects.js";
+import { assertValidChannel, assertValidOwnerToken, channelInAllow, isConcreteChannel, resolveReadAcl } from "./subjects.js";
 
 export interface AgentDef {
   name: string;
@@ -74,9 +74,9 @@ export interface AgentDef {
    *  manifest `launchOptions:`, or a nested `launchOptions:` block here all feed the same bag. */
   launchOptions?: Record<string, unknown>;
   /** Capabilities this agent may exercise on the control plane (auth mode → minted into the
-   *  cred's publish allow-list). Today `spawn` is the only one: it grants publish to the
-   *  privileged control subject (start/purge/definePersona/named stop). Default-deny when
-   *  absent — nats-server, not a handler, is the boundary. Granting authority is operator-level
+   *  cred's publish allow-list). `spawn` grants the manager's `spawnCallerCapabilities` ep rows
+   *  and `run` the `runCallerCapabilities` rows (the run commands plus the spawn set). Default-deny
+   *  when absent — nats-server, not a handler, is the boundary. Granting authority is operator-level
    *  (`definePersona` is itself privileged), so no peer can self-grant via its own agent file.
    *  NOTE: because launchOptions is a raw passthrough, `spawn` is HOST-LAUNCH AUTHORITY — its holder
    *  can drive the connector's full launch surface on the manager host (Claude `--mcp-config` /
@@ -119,6 +119,16 @@ const AGENT_FILE_FENCE = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/;
 /** Named error prefix when a persona prompt starts with `---` but is not a closed, valid agent file. */
 export const PROMPT_FRONTMATTER = "prompt-frontmatter";
 
+/** Refuse a whitespace-only `model` or `variant`. Launchers and connectors read these as set or
+ *  absent, and a blank value is neither, so letting one through leaves each of them to drop, render
+ *  or refuse it on its own. */
+function assertLaunchSelectors(def: Pick<AgentDef, "model" | "variant">, where: string): void {
+  for (const k of ["model", "variant"] as const) {
+    const v = def[k];
+    if (v !== undefined && !v.trim()) throw new Error(`${where}: "${k}" must not be empty`);
+  }
+}
+
 /** Load and parse an agent definition file (Markdown + `---` frontmatter). */
 export function loadAgentFile(path: string): AgentDef {
   return parseAgentFileSource(readFileSync(path, "utf8"), path);
@@ -149,6 +159,9 @@ export function parseAgentFileSource(src: string, path: string): AgentDef {
   const name = str("name");
   if (!name) throw new Error(`agent file ${path}: "name" is required`);
   assertValidName(name);
+  const model = str("model");
+  const variant = str("variant");
+  assertLaunchSelectors({ model, variant }, `agent file ${path}`);
   const kind = str("kind");
   if (kind && kind !== "agent" && kind !== "endpoint")
     throw new Error(`agent file ${path}: "kind" must be "agent" or "endpoint"`);
@@ -181,13 +194,12 @@ export function parseAgentFileSource(src: string, path: string): AgentDef {
   // gets none, and the agent is reachable by DM/presence/anycast only. The old default put every
   // persona that forgot the field onto `general`, including DM-only reviewers and probes, and
   // minted the matching channel read row into its credential — a channel nobody chose.
-  const effSubscribe = subscribe ?? [];
-  const effAllow = allowSubscribe?.length ? allowSubscribe : effSubscribe;
-  for (const ch of effSubscribe)
-    if (!channelInAllow(effAllow, ch))
-      throw new Error(
-        `agent file ${path}: subscribe channel "${ch}" is not within allowSubscribe [${effAllow.join(", ")}]`,
-      );
+  let effAllow: string[];
+  try {
+    effAllow = resolveReadAcl(subscribe ?? [], allowSubscribe);
+  } catch (e) {
+    throw new Error(`agent file ${path}: ${(e as Error).message}`);
+  }
 
   // Per-channel attention defaults (quiet/muted): concrete channels within the read ACL (allowSubscribe)
   // — silencing a channel you can't read, or with a wildcard the ingest match would never hit, is a config error. A
@@ -236,8 +248,8 @@ export function parseAgentFileSource(src: string, path: string): AgentDef {
     allowPublish,
     quiet,
     muted,
-    model: str("model"),
-    variant: str("variant"),
+    model,
+    variant,
     launchOptions,
     capabilities: list("capabilities"),
     owner: str("owner"),
@@ -253,6 +265,7 @@ export function parseAgentFileSource(src: string, path: string): AgentDef {
 export function saveAgentFile(path: string, def: AgentDef): void {
   if (!def.name) throw new Error('saveAgentFile: "name" is required');
   assertValidName(def.name);
+  assertLaunchSelectors(def, "saveAgentFile");
   // The read set must be SAID, not inferred. A persona saved without one used to inherit a channel
   // nobody chose, and the file gave a later reader no way to tell a deliberate silence from a
   // forgotten field. Refusing here rather than filling in an empty list keeps that distinction:
@@ -387,6 +400,12 @@ export function composeWirePersona(args: WirePersonaArgs, existing?: AgentDef): 
   return def;
 }
 
+/** The persona catalog of a root, `<root>/.cotal/agents`. Every surface that loads, lists or names
+ *  a persona derives the directory from here, so moving the catalog moves all of them together. */
+export function personaDir(root: string): string {
+  return join(root, ".cotal", "agents");
+}
+
 /** Resolve a name-or-path to an agent file. A path (absolute, contains a slash — `/` or, on
  *  Windows, `\` — or ends in `.md`) is used as given; a bare name maps to the directory
  *  convention `<root>/.cotal/agents/<name>.md`. */
@@ -394,7 +413,7 @@ export function agentFilePath(root: string, nameOrPath: string): string {
   if (isAbsolute(nameOrPath)) return nameOrPath;
   if (nameOrPath.includes("/") || nameOrPath.includes("\\") || nameOrPath.endsWith(".md"))
     return resolve(root, nameOrPath);
-  return join(root, ".cotal", "agents", `${nameOrPath}.md`);
+  return join(personaDir(root), `${nameOrPath}.md`);
 }
 
 /** One `.cotal/agents/*.md` catalog entry. A malformed file is an `error` row, not a throw —
@@ -409,7 +428,7 @@ export interface PersonaCatalogEntry {
 /** The workspace persona catalog: every `.cotal/agents/*.md` under `root`, sorted by filename
  *  stem. Filesystem-only — no mesh. Missing directory ⇒ empty catalog, not an error. */
 export function listPersonaCatalog(root: string): PersonaCatalogEntry[] {
-  const dir = join(root, ".cotal", "agents");
+  const dir = personaDir(root);
   let files: string[];
   try {
     files = readdirSync(dir).filter((f) => f.endsWith(".md"));

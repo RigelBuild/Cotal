@@ -4,12 +4,18 @@ import { fileURLToPath } from "node:url";
 
 const docsDir = fileURLToPath(new URL("../docs/", import.meta.url));
 
+// docs/design holds working lane documents: frozen review artifacts with their
+// own vocabulary. The published-docs voice gate deliberately does not apply
+// there. Every other subdirectory of docs/ is scanned.
+const exemptDirs = new Set(["design"]);
+
 const files = [];
 const walk = (dir) => {
   for (const name of readdirSync(dir).sort()) {
     const path = join(dir, name);
     const rel = relative(docsDir, path);
     if (statSync(path).isDirectory()) {
+      if (exemptDirs.has(rel)) continue;
       walk(path);
     } else if (name.endsWith(".md")) {
       files.push(rel);
@@ -48,4 +54,4 @@ if (failures.length) {
   process.exit(1);
 }
 
-console.log(`check:docs-voice: ${files.length} pages passed`);
+console.log(`check:docs-voice: ${files.length} pages passed (docs/design exempt)`);

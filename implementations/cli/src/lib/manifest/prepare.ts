@@ -8,7 +8,7 @@
  * `include` a persona's own grants are inherited **only for channels the manifest does not declare**
  * (one authority per channel), concrete-only (wildcards rejected), and surfaced loudly.
  */
-import { isConcreteChannel, type AgentDef } from "@cotal-ai/core";
+import { isConcreteChannel, resolveReadAcl, type AgentDef } from "@cotal-ai/core";
 import { mergeLaunchOptions } from "@cotal-ai/workspace";
 import type { AgentPolicy, ResolvedAgent } from "./model.js";
 import type { ManifestIssue } from "./errors.js";
@@ -36,6 +36,8 @@ export interface PreparedAgent {
   agentType: string;
   /** Manager-host directory, forwarded without resolving on the deploying machine. */
   cwd?: string;
+  /** Session continuity mode, forwarded to the manager (which owns the session id). */
+  continuity?: "none" | "exact";
   /** Persona file path (or undefined for an inline agent). */
   persona?: string;
   /** Effective values (manifest override ?? persona default). */
@@ -101,7 +103,7 @@ export function prepareAgent(agent: ResolvedAgent, persona: AgentDef | undefined
   const inherited: InheritedScopes = { subscribe: [], allowSubscribe: [], allowPublish: [], capabilities: [] };
 
   if (agent.personaPermissions === "include" && persona) {
-    const personaAllowSub = persona.allowSubscribe ?? persona.subscribe ?? [];
+    const personaAllowSub = resolveReadAcl(persona.subscribe ?? [], persona.allowSubscribe);
     // Reject persona WILDCARD grants in v1 (they'd re-introduce wildcards via the persona file and
     // break the per-channel partition).
     for (const [field, list] of [["subscribe", persona.subscribe], ["allowSubscribe", personaAllowSub], ["allowPublish", persona.allowPublish]] as const)
@@ -143,6 +145,7 @@ export function prepareAgent(agent: ResolvedAgent, persona: AgentDef | undefined
       name: agent.name,
       agentType: agent.agentType,
       cwd: agent.cwd,
+      continuity: agent.continuity,
       persona: agent.persona,
       model,
       variant,

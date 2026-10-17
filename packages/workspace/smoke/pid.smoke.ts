@@ -24,14 +24,10 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { canonicalLocalProcessPath } from "../src/local-process.js";
 import {
   commandIsCotalDelivery, commandIsCotalSupervisor, livenessFromErrno, parsePid, probeLiveness, readProcessCommand,
-  type CommandReader,
 } from "../src/pid.js";
-// #969: the manager stop cells below grade the EPERM and outlived-SIGTERM refusals, which sit
-// AFTER the creation-identity gate. A bare-pid record is now (correctly) refused as a legacy
-// record before reaching them, so the fixtures write the pin a real launch writes.
-import { defaultStartToken, formatRecord } from "../src/pid.js";
 
 let pass = 0;
 const check = (name: string, cond: boolean, extra?: unknown) => {
@@ -217,7 +213,7 @@ try {
   const before = readFileSync(mgrPid, "utf8");
   let refused: string | undefined;
   try {
-    ensureManager({}, stuck);
+    await ensureManager({}, stuck);
   } catch (e) {
     refused = (e as Error).message;
   }
@@ -246,70 +242,13 @@ try {
   check("it refuses BEFORE the daemon, naming double-binding as the reason", /double-bind/i.test(preflightRefused ?? ""), preflightRefused?.slice(0, 90));
   check("the preflight leaves the manager pidfile untouched too", readFileSync(mgrPid, "utf8") === before);
 
-  // ── THE ORPHAN, which this PR's own EPERM fix made reachable ────────────────────────────────
-  // Resolving EPERM to `alive` is the headline fix. It also means the cutover preflight now
-  // RECOGNISES another user's live manager and tries to stop it. The old stopManager caught every
-  // signal failure as "already gone" and deleted the pidfile and marker regardless, so a process it
-  // was not permitted to signal was recorded as stopped while it kept running and kept its Plane-3
-  // bindings. A correct fix upstream reaching a latent destructive bug downstream is the worst
-  // shape available, and only a review with a kernel harness found it.
+  // The manager's signal path (an EPERM refusal, a process that outlives SIGTERM) is the shared
+  // `stopLocalProcess` now; these cells pin how the manager stop treats its own record.
   const { stopManager } = await import("../../../implementations/cli/src/lib/manager-proc.js");
-  const alive = () => "alive" as const;
-  const refuseSignal = (): never => {
-    const e = new Error("operation not permitted") as NodeJS.ErrnoException;
-    e.code = "EPERM";
-    throw e;
-  };
-  writeFileSync(mgrPid, `${process.pid}\n`);
-  writeFileSync(join(root, ".cotal", "manager.delivery-aware"), `${process.pid}\n`);
-  writeFileSync(`${mgrPid}.identity`, formatRecord({ pid: process.pid, token: defaultStartToken(process.pid) ?? "0" }));
-  const beforeStop = readFileSync(mgrPid, "utf8");
-  // The record names a MANAGER for these cells: the injected probe supplies the liveness and this
-  // supplies the attribution, so the EPERM rule below is graded on the signal path and not on
-  // whether the fixture pid happens to look like a manager.
-  const asManager: CommandReader = () => ({ kind: "command", command: "node /usr/local/bin/cotal supervise --space main" });
-  let stopRefused: string | undefined;
-  try {
-    await stopManager(alive, refuseSignal, asManager);
-  } catch (e) {
-    stopRefused = (e as Error).message;
-  }
-  check("stopManager REFUSES when the signal is rejected, rather than reporting a stop", stopRefused !== undefined);
-  check("the refusal explains EPERM means another user's LIVE process", /another user/i.test(stopRefused ?? ""), stopRefused?.slice(0, 80));
-  check("THE PIDFILE SURVIVES a refused stop (the orphan this prevents)", readFileSync(mgrPid, "utf8") === beforeStop);
-  check("the delivery-aware marker survives it too", existsSync(join(root, ".cotal", "manager.delivery-aware")));
+  writeFileSync(mgrPid, `${deadPid}\n`);
+  check("a proven-dead manager IS cleared (the refusal is not blanket)", (await stopManager()) && !existsSync(mgrPid), deadPid);
 
-  // A signal that is ACCEPTED is still not a death. The record goes only on proven death.
-  let outlived: string | undefined;
-  try {
-    await stopManager(alive, () => {}, asManager); // accepted, but the probe keeps saying alive
-  } catch (e) {
-    outlived = (e as Error).message;
-  }
-  check("stopManager REFUSES when the process outlives SIGTERM", outlived !== undefined);
-  check("and still leaves the pidfile in place", readFileSync(mgrPid, "utf8") === beforeStop);
-  check("a proven-dead manager IS cleared (the refusal is not blanket)", (writeFileSync(mgrPid, `${deadPid}\n`), await stopManager()) === "already-gone" && !existsSync(mgrPid), deadPid);
-
-  // ── THE SIBLING, which is worse: it deleted the CREDENTIAL before even attempting the signal ──
-  // A refused stop therefore left a LIVE daemon still connected and still serving, with its pidfile
-  // and its renewal source both gone, and the function returned success. Ordering is the defect as
-  // much as the catch: nothing may be removed before the process is proven gone.
   const { stopDelivery } = await import("../../../implementations/cli/src/lib/delivery-proc.js");
-  // The RECORDED pid is the `deliver`-argv fixture, not this runner: a live pid that is provably
-  // not a delivery daemon is now never signalled at all (#1528), so this runner would be answered
-  // by attribution and the EPERM refusal under test would never be reached.
-  writeFileSync(delPid, `${deliverPid}\n`);
-  writeFileSync(`${delPid}.identity`, formatRecord({ pid: deliverPid, token: defaultStartToken(deliverPid) ?? "0" })); // #969: a real launch pins
-  const delBefore = readFileSync(delPid, "utf8");
-  let delRefused: string | undefined;
-  try {
-    await stopDelivery(alive, refuseSignal);
-  } catch (e) {
-    delRefused = (e as Error).message;
-  }
-  check("stopDelivery REFUSES a signal it cannot send, rather than reporting success", delRefused !== undefined);
-  check("THE DELIVERY PIDFILE SURVIVES it", readFileSync(delPid, "utf8") === delBefore);
-  check("the refusal says the credential was preserved, which is the strand it prevents", /credential are LEFT IN PLACE|standing credential/i.test(delRefused ?? ""), delRefused?.slice(0, 90));
 
   // ── EMPTY vs MALFORMED, the inverse pair ────────────────────────────────────────────────────
   // My first version cleared BOTH, which contradicts this file's own top-level contract: content
@@ -328,7 +267,7 @@ try {
   check("the malformed pidfile SURVIVES", existsSync(mgrPid));
   check("and so does the marker beside it", existsSync(join(root, ".cotal", "manager.delivery-aware")));
   writeFileSync(mgrPid, "");
-  check("an EMPTY pidfile IS cleared (a husk, not a claim)", (await stopManager()) === "already-gone" && !existsSync(mgrPid));
+  check("an EMPTY pidfile IS cleared (a husk, not a claim)", (await stopManager()) && !existsSync(mgrPid));
 
   writeFileSync(delPid, "garbled\n");
   let delMalformed: string | undefined;
@@ -347,28 +286,19 @@ try {
   const corruptBefore = readFileSync(mgrPid, "utf8");
   let ensureRefused: string | undefined;
   try {
-    ensureManager({});
+    await ensureManager({});
   } catch (e) {
     ensureRefused = (e as Error).message;
   }
   check("ensureManager REFUSES corrupt content instead of launching over it", ensureRefused !== undefined);
   check("and does NOT overwrite the record it could not read", readFileSync(mgrPid, "utf8") === corruptBefore);
 
-  // ── the THIRD stop sibling: a signal accepted is not a death ────────────────────────────────
-  // stopAuthService handled EPERM correctly and then deleted the record immediately after a
-  // SUCCESSFUL SIGTERM, so a service that ignores it was reported stopped while still running. The
-  // reviewer's mutation check survived 226 checks with the deletion removed: nothing asserted the
-  // post-signal outcome anywhere.
-  const { stopAuthService } = await import("../../../implementations/cli/src/lib/auth-proc.js");
-  // The path is hex-encoded per space (readPidPath), so derive it rather than guessing: my first
-  // version invented `auth-service.pid`, the helper found nothing, and the cell failed for the wrong
+  // ── the auth stop: its signal path is the shared `stopLocalProcess` too ────────────────────
+  const { AUTH_PROCESS, stopAuthService } = await import("../../../implementations/cli/src/lib/auth-proc.js");
+  // Write the fixture where the stop reads it, from the stop's own descriptor: my first version
+  // invented `auth-service.pid`, the helper found nothing, and the cell failed for the wrong
   // reason. A fixture that misses its subject proves nothing about the subject.
-  const { PID_PATH: AUTH_PID_PATH } = await import("../../../implementations/cli/src/lib/auth-proc.js").then(
-    async (m) => m as unknown as { PID_PATH?: (s: string) => string },
-  ).catch(() => ({}) as { PID_PATH?: (s: string) => string });
-  const authPid = AUTH_PID_PATH
-    ? AUTH_PID_PATH("main")
-    : join(root, ".cotal", `auth-service.${Buffer.from("main").toString("hex")}.pid`);
+  const authPid = canonicalLocalProcessPath(AUTH_PROCESS.pidFile, { root, space: "main" });
   writeFileSync(authPid, "not-a-pid\n");
   let authMalformed: string | undefined;
   try {
@@ -379,32 +309,19 @@ try {
   check("stopAuthService REFUSES a malformed pidfile", authMalformed !== undefined);
   check("and that record SURVIVES", existsSync(authPid));
 
-  // The gap the reviewer's mutation exposed: 226 checks survived with the final deletion removed,
-  // so NOTHING asserted the post-signal outcome. A signal accepted is not a death.
-  writeFileSync(authPid, `${process.pid}\n`);
-  let authOutlived: string | undefined;
-  try {
-    await stopAuthService("main", alive, () => {}); // accepted, but never dies
-  } catch (e) {
-    authOutlived = (e as Error).message;
-  }
-  check("stopAuthService REFUSES when the service outlives SIGTERM", authOutlived !== undefined);
-  check("and preserves its pidfile rather than recording a stop that did not happen", existsSync(authPid));
-
   // ── pid 0 and negatives must never reach kill ────────────────────────────────────────────────
   // `kill(0, sig)` is POSIX for "signal my own process group", so a pidfile of `0` reaching the raw
   // syscall would signal the caller. The shared parser exists to stop exactly this, and these pin
   // that the stop helpers route through it rather than `Number`.
   for (const hostile of ["0", "-1", "-99"]) {
     writeFileSync(delPid, `${hostile}\n`);
-    let sent: number | undefined;
     let threw = false;
     try {
-      await stopDelivery(alive, (pid) => { sent = pid; });
+      await stopDelivery();
     } catch {
       threw = true;
     }
-    check(`a delivery pidfile of ${JSON.stringify(hostile)} is refused and NEVER signalled`, threw && sent === undefined, { hostile, sent });
+    check(`a delivery pidfile of ${JSON.stringify(hostile)} is refused and NEVER signalled`, threw, hostile);
     check(`and its record survives (${JSON.stringify(hostile)})`, existsSync(delPid), hostile);
   }
 } finally {

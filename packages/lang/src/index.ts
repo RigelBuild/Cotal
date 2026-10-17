@@ -158,16 +158,21 @@ export {
 export {
   DIGEST_PREFIX,
   KeyScope,
+  atMostOnce,
   branchKeys,
   digest,
+  holdRequestId,
   programHashOf,
   scopePathString,
+  scopeTraits,
   stepKeyEquals,
   stepKeyString,
   type ScopeFrame,
   type ScopeKind,
   type StepKey,
 } from "./keys.js";
+
+export { CheckpointNotAmendable, CheckpointNotOpen, openCheckpointToken, settledPauseToken, stepPauseToken } from "./pause-token.js";
 
 /**
  * The compiled engine's driver-facing surface: the transform that produces what the engine runs,

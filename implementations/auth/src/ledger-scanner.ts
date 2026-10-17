@@ -62,11 +62,12 @@
  *    class, excluded by the one-plane-per-space composition; a foreign re-resolution of the name is
  *    made loud by the per-message exact-prefix validation in the drain.
  */
-import { AckPolicy, DeliverPolicy, JetStreamApiCodes, JetStreamApiError, jetstream, jetstreamManager, type JetStreamClient, type JetStreamManager } from "@nats-io/jetstream";
+import { AckPolicy, DeliverPolicy, jetstream, jetstreamManager, type JetStreamClient, type JetStreamManager } from "@nats-io/jetstream";
 import type { NatsConnection } from "@nats-io/transport-node";
-import { EpEnvelopeError, assertInboxConnId, assertLifecycleToken, endpointToken, epAuthBucket, type PlaneConnTuple } from "@cotal-ai/core";
+import { EpEnvelopeError, assertInboxConnId, assertLifecycleToken, endpointToken, epAuthBucket, isConsumerNotFound, type PlaneConnTuple } from "@cotal-ai/core";
 import { openAuthorityClient, type AuthorityClient } from "./authority-client.js";
-import type { ScanGuard } from "./plane-claim.js";
+import { guardedScan, type ScanGuard } from "./plane-claim.js";
+import { serializedFor } from "./serialized.js";
 
 /** The ONE literal consumer name every scan over the auth stream reuses (the grant pins exactly
  *  this token). Scans over it serialize on the MODULE-LEVEL per-space chain below, never a
@@ -76,12 +77,6 @@ const SCANNER_CONSUMER_NAME = "cotal-ledger-scan";
 /** fact-5 ENFORCED (panel HIGH): the serialization critical section for a space's literal consumer
  *  name lives at MODULE level, keyed by space, shared by every instance for that space. */
 const SPACE_SCAN_CHAINS = new Map<string, Promise<unknown>>();
-const serializedForSpace = <T>(space: string, fn: () => Promise<T>): Promise<T> => {
-  const tail = SPACE_SCAN_CHAINS.get(space) ?? Promise.resolve();
-  const run = tail.then(fn, fn);
-  SPACE_SCAN_CHAINS.set(space, run.then(() => undefined, () => undefined));
-  return run;
-};
 /** Bounded inactivity (ns): a leaked orphan (a run that crashed before its unconditional delete)
  *  is broker-collected within this window, and the next run's pre-clean removes it by name. */
 const INACTIVE_THRESHOLD_NS = 30_000_000_000;
@@ -120,6 +115,8 @@ export interface RawScanEntry {
 /** The sealed auth-ledger scanner: CLOSED, validated ops only — no raw prefix, no NATS/JS handle,
  *  no credential. Each op forces its exact filter from a validated id. */
 export interface AuthLedgerScanner {
+  /** LastPerSubject over every `epgate.manager.<instanceId>` row for manager-caller selection. */
+  scanManagerGates(): Promise<RawScanEntry[]>;
   /** LastPerSubject over `cred.<lifecycleUid>.>` — the current last of every credential row in the
    *  agent family (markers included). */
   scanCredentialFamily(lifecycleUid: string): Promise<RawScanEntry[]>;
@@ -139,13 +136,6 @@ export interface AuthLedgerScanner {
   /** Tear down the owned credential+connection. */
   close(): Promise<void>;
 }
-
-/** STRUCTURAL not-found classification (not a message regex): @nats-io/jetstream@3.4.0 throws a
- *  ConsumerNotFoundError extends JetStreamApiError whose `.code` is the JS API err_code
- *  (`JetStreamApiCodes.ConsumerNotFound` = 10014); `.status` is the HTTP 404. The pre-clean proceeds
- *  ONLY on this exact structured shape — any other error fails the scan closed. */
-const isConsumerNotFound = (e: unknown): boolean =>
-  e instanceof JetStreamApiError && e.code === JetStreamApiCodes.ConsumerNotFound;
 
 /** The production scanner's BRAND (HIGH: security/distsys, site-1 re-verify): the ONLY way to be an
  *  AuthLedgerScanner the barrier registry accepts is to be built by {@link buildScanner} in THIS
@@ -189,10 +179,12 @@ export async function openAuthLedgerScannerCandidate(opts: {
   server: string;
   space: string;
   dataAccount: { pub: string; signingSeed: string };
+  onConnection?: import("./authority-client.js").AuthorityClientOpts["onConnection"];
   log: (line: string) => void;
 }): Promise<LedgerScannerCandidate> {
   const client: AuthorityClient = await openAuthorityClient({
     server: opts.server, space: opts.space, dataAccount: opts.dataAccount, label: `cotal:auth-scan:${opts.space}`,
+    onConnection: opts.onConnection,
     grants: (id) => authorityScannerGrants(opts.space, id), log: opts.log, planeCandidate: true,
   });
   // planeCandidate guarantees both (openAuthorityClient throws otherwise); the assert keeps the
@@ -252,19 +244,7 @@ function buildScanner(nc: NatsConnection, space: string, onClose: () => Promise<
   // Serialize every scan over the shared literal consumer name on the MODULE-LEVEL per-space
   // chain: a second caller (or a sibling instance) waits rather than colliding on
   // pre-clean/create/fetch/delete.
-  const serialized = <T>(fn: () => Promise<T>): Promise<T> => serializedForSpace(space, fn);
-  // The PLANE guard (#29 HIGH 3, SPEC 13.13), inside the serialized critical section: the claim
-  // is re-validated BEFORE the scan (refuse to enumerate under a lost claim) and AFTER it (a
-  // claim lost DURING the scan discards the result — a successor may already own the literal
-  // name). Intra-process serialization stays the module chain above; the guard is the
-  // CROSS-process authority.
-  const guarded = async <T>(fn: () => Promise<T>): Promise<T> => {
-    if (guard === undefined) return fn();
-    await guard.assertHeld("before");
-    const out = await fn();
-    await guard.assertHeld("after");
-    return out;
-  };
+  const serialized = <T>(fn: () => Promise<T>): Promise<T> => serializedFor(SPACE_SCAN_CHAINS, space, fn);
 
   // The RAW scan — MODULE-PRIVATE (a closure over the owned connection): no caller ever supplies
   // `prefix`; the closed ops below force it from a validated id.
@@ -390,14 +370,15 @@ function buildScanner(nc: NatsConnection, space: string, onClose: () => Promise<
   // freeze guarantees its ops are still the module's when an install seam asserts the brand — a
   // post-brand method swap throws (strict mode) instead of surviving as a silent-empty scanner.
   const scanner: AuthLedgerScanner = Object.freeze({
+    scanManagerGates: () => serialized(() => guardedScan(guard, () => scanOnce("epgate.manager."))),
     scanCredentialFamily: (lifecycleUid: string) =>
-      serialized(() => guarded(() => scanOnce(`cred.${assertLifecycleToken(lifecycleUid)}.`))),
+      serialized(() => guardedScan(guard, () => scanOnce(`cred.${assertLifecycleToken(lifecycleUid)}.`))),
     scanEndpointCredentialFamily: (endpoint: string, instanceId: string) =>
-      serialized(() => guarded(() => scanOnce(`epcred.${endpointToken(endpoint)}.${assertLifecycleToken(instanceId, "instanceId")}.`))),
+      serialized(() => guardedScan(guard, () => scanOnce(`epcred.${endpointToken(endpoint)}.${assertLifecycleToken(instanceId, "instanceId")}.`))),
     scanBysrc: (issuerKeyId: string, id: string) =>
-      serialized(() => guarded(() => scanOnce(`bysrc.${assertSegment(issuerKeyId, "issuerKeyId")}.${assertSegment(id, "handle id")}.`))),
-    scanStageFamily: () => serialized(() => guarded(() => scanOnce("stage."))),
-    scanSessions: () => serialized(() => guarded(() => scanOnce("session."))),
+      serialized(() => guardedScan(guard, () => scanOnce(`bysrc.${assertSegment(issuerKeyId, "issuerKeyId")}.${assertSegment(id, "handle id")}.`))),
+    scanStageFamily: () => serialized(() => guardedScan(guard, () => scanOnce("stage."))),
+    scanSessions: () => serialized(() => guardedScan(guard, () => scanOnce("session."))),
     close: onClose,
   });
   // BRAND the scanner with its exact space so the barrier registry's assertScannerSpace can reject a

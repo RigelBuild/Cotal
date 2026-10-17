@@ -1,0 +1,2 @@
+# Moved from the frozen list on the upstream sync; upstream appended it there.
+smoke:managed-retire-door:auth

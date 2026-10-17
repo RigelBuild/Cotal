@@ -27,7 +27,13 @@ You are a builder on a shared mesh of peer agents…   ← the body is the perso
 the session's system prompt at launch: the one field that *must* be applied at launch,
 because a session cannot change its system prompt afterward. Connectors that use an external
 prompt file write an owner-private temporary copy and pass only its path, so the persona body is not
-published in the agent process argv.
+published in the agent process argv. Owner-private means OS-user isolation: any process running as
+the same user can read that copy while it exists, as it can this agent file. The launcher removes the
+copy once it has proved the agent process gone. On every runtime, the default pty included, and in
+the foreground `cotal spawn`, a watcher started beside the agent also removes the copy once the agent
+process is gone, even when the launcher was killed. A launch refused before any process started
+removes it at once. A launch that failed before its agent started, and on Windows a killed launcher,
+leaves the copy for the OS temp reaper.
 
 ## Fields
 
@@ -35,20 +41,20 @@ Authoritative shape: [`agent-file.ts`](../packages/core/src/agent-file.ts).
 
 | Field | Type | Meaning |
 |---|---|---|
-| `name` | string, required | Display name → `card.name`. A launcher resolves a bare name to `.cotal/agents/<name>.md`. |
-| `role` | string | The addressable **service**: presence label *and* the anycast address ([SPEC §3](../SPEC.md#3-subject-layout)). |
+| `name` | string, required | Display name → `card.name`. A launcher resolves a bare name to `.cotal/agents/<name>.md`. At most 128 characters; the validator refuses longer names rather than minting a credential that would overflow the broker's CONNECT line. |
+| `role` | string | The addressable **service**: presence label *and* the anycast address ([SPEC §3](../SPEC.md#3-subject-layout)). One `[A-Za-z0-9_-]` token; any other spelling is refused when the agent joins. |
 | `kind` | `agent` \| `endpoint` | Participation class; default `agent`. |
 | `description` | string | One-line summary → `card.description`. |
 | `tags` | string[] | Capability tags → `card.tags`. |
 | `subscribe` | string[] | The **active read set**: channels subscribed at boot (mutable at runtime via join/leave). Must be ⊆ `allowSubscribe`. **Omitted ⇒ no channels**: an agent reads what it lists, and one that lists none joins none (still reachable by DM, anycast and presence). List `general` if you want it. |
-| `allowSubscribe` | string[] | The **read ACL**: channels it *may* read. Wildcard subtrees allowed (`team.>`). Omitted ⇒ same as `subscribe`. |
+| `allowSubscribe` | string[] | The **read ACL**: channels it *may* read. Wildcard subtrees allowed (`team.>`). Omitted or empty ⇒ same as `subscribe`. |
 | `allowPublish` | string[] | The **post ACL**: channels it may publish to. **Omitted ⇒ deny**; posting is the dangerous capability, declare it explicitly. |
 | `quiet` | string[] | Per-channel attention *default*: ambient stays buffered and pull-only until `cotal_inbox`; `@mention`s remain automatic. Concrete channels within the read ACL. |
 | `muted` | string[] | Per-channel attention *default*: dropped on receive, `@mentions` included. |
-| `model` | string | Model override handed to the agent CLI (Claude: `opus` / full id; OpenCode: `provider/model`). |
-| `variant` | string | Connector-defined model variant (e.g. an OpenCode variant, see `cotal models`). |
+| `model` | string | Model override handed to the agent CLI (Claude: `opus` / full id; OpenCode: `provider/model`). When the cotal config has a `modelPolicy` entry for the persona's role, the model must be one it allows, and a persona with no model is refused ([Model policy](config.md#model-policy)). A whitespace-only value is refused when the file loads. |
+| `variant` | string | Connector-defined model variant (e.g. an OpenCode variant, see `cotal models`). Checked against the role's `modelPolicy` variants when that entry lists any. A whitespace-only value is refused when the file loads. |
 | `agent` | string | The connector/harness this persona pins (`claude`, `jcode`, and so on). Precedence: explicit `--agent` > this field > `COTAL_DEFAULT_AGENT` > the product default, the same shape as `model`/`variant`, so the env var stays a *default* and cannot beat a deliberate per-persona pin. A value naming an unregistered connector fails the spawn loudly (no silent fallback). |
-| `launchOptions` | map | Opaque per-connector launch options forwarded **raw** to the harness (Claude flags, OpenCode agent config; Hermes and pi have no option surface and fail loud). A CLI `--opt key=value` overrides a key set here. See [run a mesh](run-a-mesh.md#spawning-agents). |
+| `launchOptions` | map | Opaque per-connector launch options forwarded **raw** to the harness (Claude flags, OpenCode agent config; Hermes and pi have no option surface and fail loud). A CLI `--opt key=value` overrides a key set here. A role with a `modelPolicy` entry launches without launch options ([Model policy](config.md#model-policy)). See [run a mesh](run-a-mesh.md#spawning-agents). |
 | `capabilities` | string[] | Control-plane capabilities minted into the cred. `spawn` grants the privileged control subject (spawn / named stop / persona definition), default-deny when absent, enforced by the broker, not a handler. `run` grants the manager's workflow-run commands (start, resume, answer, status, list) plus the spawn set a program's own spawns need, and injects the `cotal_run` tool. On a per-user-auth mesh, `role:<r>` additionally lets the agent delegate role `r` when spawning ([identity & auth](identity-and-auth.md)); `admin` is never a persona capability. |
 | `owner` | string | **Policy, not content**: set once by `definePersona` (owner = creator); only the owner (or admin) may redefine the file over the wire. Never write it by hand. |
 | *(any other key)* | string | Kept verbatim in `meta` so a connector can read its own launcher hints without core knowing them. The connector-owned keys are the exception: `connector`, `model`, `variant`, and `host` (the machine the session runs on) are overlaid from the live session, so a file cannot declare a harness or a host it is not on. |
@@ -120,3 +126,9 @@ catalog within a workspace, and `cotal_spawn` on a name that does not exist fail
 
 The operator-side counterpart is `cotal personas` (list / show / edit / new / rm); it reads and
 writes the selected mesh root's files directly, offline, with no broker connection ([CLI](cli.md)).
+
+On a user-auth mesh, spawning owned persona content requires its creator principal or a
+current admin grant. A hosted run uses its admitted caller for that decision. A foreign
+card refuses as not-found before connector loading or enrollment, including an explicit
+config path. Unowned operator files remain launchable. Manifest launches retain their
+separate owner authorization.

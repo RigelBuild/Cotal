@@ -11,10 +11,11 @@ operator-only maintenance verbs. Every command's full flag set is in the
 
 `cotal up` brings up the whole local stack and bare `cotal down` stops it. Managed
 agents stay running as unmanaged OS processes; pass `--with-agents` to take them
-with the stack. Ctrl-C on a foreground `up` follows the same sparing rule and
-prints the same report as bare down; when the manager cannot prove it can spare,
-Ctrl-C refuses the teardown and leaves the stack running, and you end it with
-`cotal down --with-agents`. A current manager proves that it can detach local PTY custody before
+with the stack. Seats of the built-in pty runtime run inside the manager process, so
+they stop with the manager either way. Ctrl-C on a foreground `up` stops the manager through the
+same stop as bare down and prints the same report; when that stop is refused, for example because
+the manager cannot prove it can spare, Ctrl-C leaves the stack running, and you end it with
+`cotal down --with-agents`. A current manager records what its stop does with its seats before
 bare down signals it. A pre-pin legacy manager instead receives a reduced-guarantee
 warning and is signalled according to the documented upgrade contract. Its running binary
 may still carry the older destructive SIGTERM handler, so the CLI does not claim its
@@ -25,6 +26,22 @@ pre-signal agent inventory was spared; those agents may have been reaped.
   ([what it does](delivery-daemon.md)).
 - **Manager**: a detached supervisor answering the control plane, so
   `cotal spawn --detach` and the `cotal_spawn` tool work right after `up`.
+
+Cotal creates the presence bucket in memory storage. Its records are liveness that every endpoint
+rewrites each heartbeat, so nothing is lost when a broker restart empties it, and nats-server's file
+store write latch cannot reach it. A broker stop removes the memory stream itself, so every `cotal up`,
+including the resume after `cotal down --preserve-state`, creates it again before any daemon starts.
+JetStream fixes a stream's storage class when it is created, so a presence bucket created file-backed
+by an older cotal stays file-backed until that stream is recreated.
+
+A file-backed presence bucket can remain open and watchable while refusing every write. A bound
+endpoint reports this as `presence-write-stuck` after one full presence TTL of consecutive failures.
+The roster is last-known while that condition is active. Restarting the broker clears nats-server's
+in-memory store latch and preserves the JetStream root. Current credentials split the required stream
+authority: the `cotal up` provisioner can create the presence stream but cannot delete it, while the
+teardown credential can delete it but cannot recreate it. Cotal therefore reports the condition but
+does not attempt an unsafe partial delete-and-recreate. Stop and restart the broker to recover.
+A broker below nats-server 2.14.5 carries the latch (nats-server fixed it in 2.14.5). When `cotal up` starts or finds such a broker and the space's presence bucket is file-backed, it says so. A memory-backed bucket gets no warning. A broker below the SPEC §13.12 floor of 2.12 is refused at connect with the floor sentence.
 
 Three modes:
 
@@ -96,10 +113,25 @@ reopens past the stamp (the successor's boot heal, or
 [Gate recovery](#gate-recovery).
 
 Standalone `cotal deliver --creds` is not a repair for that split. Production renewal needs
-the manager and the daemon to address one credential store. Separate host filesystems still
+the manager and the daemon to address one credential store. The manager renews its own service
+credential inside that credential's own window and re-dials its service connection with the
+renewed credential; if the connection closes and cannot be restored within about forty seconds
+it releases its lease and exits so a restart can serve, while a broker that is briefly gone is
+waited out. Separate host filesystems still
 leave manager root A writing and the daemon reloading root B; that composition is refused
-while the daemon stays up. Keep delivery on the broker host under `up`, and share one store
+while the daemon stays up. Before every remint the manager challenges the delivery daemon's
+store identity, and the answer must come from the process holding the delivery lease: the
+reply names the answering endpoint and the manager reads the lease row itself under its own
+credential, so a non-holder answering on the queue-grouped admin rail is refused instead of
+counting as the daemon's store. A rail that reports no responder is also settled from the
+lease row, so a live holder on record makes that outcome a refusal rather than an absent
+daemon. Keep delivery on the broker host under `up`, and share one store
 only when you are composing a hosted pair ([embedding](embedding.md#supervisor-signing-authority)).
+On the `--no-manager` split above, the manager host's manager stays off the daemon-credential
+renewal lease once its store check finds the daemon on another store. A filesystem store is named
+by its root and by a random id in `.cotal/store.id`, which the copied `.cotal/auth` does not carry,
+so this holds when both hosts use the same root path. `cotal doctor auth --fix` on
+the broker host then renews the daemon credentials once they pass their renewal point.
 
 ### Split host bind
 
@@ -119,9 +151,10 @@ cotal up --user-auth --idp https://idp.example/api/auth \
 ```
 
 The public listener itself still binds `127.0.0.1:7443`; configure the proxy to terminate TLS and
-forward to it. It serves only `/health`, `/jwks`, `/exchange`, and `/.well-known/cotal-mesh` with
-the documented methods. It needs no local file capability: the signed IdP JWT or managed-agent
-actor token is the proof, while the original loopback listener remains capability-gated. Add
+forward to it. It serves only `/health`, `/jwks`, `/exchange`, `/manager-service-authority`, and
+`/.well-known/cotal-mesh` with the documented methods. It needs no local file capability: the
+signed IdP JWT or managed-agent actor token is the proof, while the original loopback listener
+remains capability-gated. Add
 `--exchange-trusted-proxy` only when that listener is reachable exclusively through your trusted
 proxy; it keys failure throttling by the last `X-Forwarded-For` hop instead of the socket address.
 The well-known bundle includes IdP pins and a deny-all sentinel credential, so fetch it only from
@@ -152,22 +185,38 @@ server contract is in
 
 `cotal status` prints the detailed setup, process, registry, and live mesh status. Its Machine
 section names the running CLI's source checkout, installed package root, or npx package root beside
-the version. A stale Claude skills row names the installed and CLI versions it compared. `cotal
+the version. It has one row per installed connector, which reports whether the executables that
+connector declares in `requires` are on PATH. Status, setup and the manager's preflight resolve them
+the same way: an entry written as a path is checked as given, and a directory never counts as the
+executable. A connector whose setup provider reports health adds its
+own rows above those. The Claude Code connector reports its plugin and its skills plugin, and a stale
+skills row names the installed and CLI versions it compared. `cotal
 setup` (after the first run) prints the compact card.
 
 Before reporting ready, the manager resolves every installed connector's declared harness
 binaries against its own environment. A missing binary does not stop unrelated manager work: boot
 continues, but prints a named `connector <name> unavailable` line and records that reason in the
 manager's `status` response. Available connector rows record the absolute paths boot resolved.
-Spawn keeps the same pre-mint check as a backstop for connectors registered after boot.
+A spawned seat and a seat resumed after `cotal down --preserve-state` both launch from those paths,
+and both are refused with the recorded reason when their connector's row is unavailable.
+`cotal models` takes the same rule and reports that reason in place of the catalog, so it agrees
+with a launch about a harness installed or removed after boot. The manager looks again only when it
+restarts. A connector registered after boot has no row, so spawn, resume and `cotal models` check
+its binaries on PATH when they run.
 
 On an authenticated manager start, unfinished static lifecycle rows reconcile while the control
 endpoint is already serving. The manager `status` response reports
 the `staticReconciliation` state, the last sweep counts, and each failed alias with its durable
 phase and literal disposition. `cotal status --components` reports the state and per-alias failure
-details. A failed exact terminal is retried in the same process after 1, 5,
+details. A sweep that stops before it plans any alias, for example on a slot row carrying a DEL or
+PURGE marker, reports the state `failed` with the reason in the last sweep's `error`, and
+`cotal status --components` prints it as `static sweep error=<reason>`. The next manager start
+collects the rows again. A failed exact terminal is retried in the same process after 1, 5,
 and 30 seconds. Each attempt re-reads the durable slot and re-enters the same deterministic terminal
-operation; the delays only schedule work and never release the lifecycle fence.
+operation; the delays only schedule work and never release the lifecycle fence. The terminal's
+cleanup removes the lifecycle's credential file and its broker durables and read-ACL row as separate
+steps. A file that cannot be removed does not leave the broker footprint behind, and its failure
+keeps the alias held for the next attempt.
 
 On shutdown, the manager fences new reconciliation work and waits for an exact terminal that already
 started. The current serial sweep stops before its next alias, and startup cannot publish the manager
@@ -182,7 +231,8 @@ projection remains tracked by #1274.
 
 `cotal service install` is the supported way to run the manager as a user service
 ([CLI reference](cli.md#service)): a systemd user unit on Linux, a launchd agent on macOS, one
-per mesh, surviving logout and reboot when lingering is enabled with `--linger`. It installs only
+per mesh, surviving logout and reboot. On Linux that needs user lingering: install refuses while
+it is off and prints the root command that enables it. It installs only
 the manager; the units below remain the process models for every other component, and they are
 still **examples of process models** for those: copy them only after you decide which processes
 the unit should own.
@@ -214,6 +264,10 @@ that `cotal up` starts a local manager as well as the broker and delivery daemon
 `cotal up --no-manager` (add the flag to the unit's `ExecStart` too) on a host intended to be
 broker-only, so the unit and the host agree.
 
+Seats spawned by the built-in `pty` runtime run with `oom_score_adj` 500, so under memory
+pressure the kernel prefers a seat over the broker, manager and delivery daemon, which are left as
+they were started; the extension runtimes do not own the seat's process and get no preference.
+
 That `Type=simple` shape puts nats in the unit's cgroup with the foreground `up` process. A
 `Restart=always` (or `on-failure`) of **this** unit therefore restarts nats as well, so remote
 managers drop for the time it takes the broker to come back. Wrapping `cotal up --detach` in
@@ -228,6 +282,9 @@ restart, including the nats PID. Escaping that cgroup needs an explicit unit set
 install` covers only the manager, so for the broker and its siblings pick the example that
 matches the ownership you want, and treat
 `systemctl is-active` as unit health, not mesh health.
+
+A broker that crashes under that foreground `up` keeps its mesh record and exits non-zero, so the
+unit's restart takes the repair path against the recorded store rather than starting a second one.
 
 If the deployment deliberately uses `cotal up --detach` as a boot action, monitor observed state
 instead of the launcher's exit:
@@ -252,10 +309,11 @@ nothing about the other host.
 Stop one part without tearing down the mesh by naming its registered component: `cotal down
 manager`, `cotal down delivery`, or `cotal down web`. Component names from installed extensions
 join the same surface; `cotal down` with no names retains whole-stack behavior and
-leaves managed agents running as unmanaged OS processes. `cotal down --with-agents`
-is the previous reap. If a pinned manager has no spare-capability record, stop its managed agents
-explicitly before running that whole-stack command. The record is also absent when a manager predates
-capability reporting, and that older manager may not understand the reap request.
+leaves managed agents running as unmanaged OS processes, except pty seats, which stop with the
+manager. `cotal down --with-agents` is the previous reap. If a pinned manager has no
+spare-capability record, stop its managed agents explicitly before running that whole-stack
+command. A current manager always publishes the record, so it is absent only for an older manager,
+which may not understand the reap request.
 
 ## Remote supervised agents
 
@@ -269,8 +327,30 @@ ordinary derived owner, a fixed server-selected manager actor, and one opaque ma
 The host, not the participant, issues the public-nkey JWT material via the replay-safe,
 lifecycle-bound prepare → activate → renew exchange, plus a one-shot target-pinned retirement
 request for a host-managed terminal. It never exports the space signer, a static
-provisioner credential, or generic storage authority. The manager may provision only descendants
-of that same owner, with host validation at each provision.
+provisioner credential, or generic storage authority. Remote registration publishes its service
+status at the registered revision and current process epoch, so manager-caller selection can find it.
+Every manager-authority request carries the participant's fresh login proof and refuses a redirect,
+so a 3xx answer from the pinned endpoint fails the request rather than sending the proof on.
+
+Stock participant supervision asks its host to enroll a detached agent and to prepare its terminal
+retirement, over the same manager-authority transport. The stock auth service answers both when it
+runs with a public exchange face: it grants the agent under the participant's owner at a lifecycle
+UID it picks, bounded by the participant actor's own grant, provisions that UID's durables, and on
+retirement releases them and revokes the grant before the manager's terminal rail. It refuses a
+second enrollment of a name whose grant still stands until that agent's retirement is prepared. A
+host platform that keeps these writers in its own storage intercepts both requests on its own route
+instead. Copying host secrets or actor-ledger files to a participant is not supported. Foreground
+spawning and operator-local hosted managers use their existing paths.
+
+The remote manager that `cotal supervise` starts can host workflow runs through its host: the host
+admits each run and signs only the run's own driver, mediator and operator credentials. A logged-in
+user's `cotal run start` against it is admitted: the auth callout issues the user's manager
+connection, and the host binds each run to the owner who registered the manager. The run spawns
+agents that user owns, enrolled by the host like any detached spawn, with the reach the user's own
+row grants when the spawn runs. A spawn may be placed on that manager and on no other instance. The
+host's own manager refuses user-auth runs by name.
+[User-auth run start](design/user-auth-run-start.md)
+records the path.
 
 The registry entry decides the broker URL `supervise` dials, so a mesh published over `wss://` is
 dialed as a websocket. The manager-authority registration it runs first also takes its TLS
@@ -313,8 +393,9 @@ How a spawn resolves:
   a full id; OpenCode: `provider/model`). Connectors that expose a catalog report it via
   `cotal models --agent opencode`: model ids plus available variants; pick one with
   `--model provider/model --variant high`.
-- **Tools.** A spawned agent gets only the cotal tools by default; share your own MCP
-  servers deliberately with `--share-tools` ([config](config.md)).
+- **Tools.** A spawned Claude Code agent gets the cotal tools plus the MCP servers the cotal
+  config shares, which first-run `cotal setup` fills with your own; narrow them per spawn with
+  `--share-tools` ([config](config.md)).
 - **Launch options.** `--opt key=value` (repeatable) passes a native harness flag straight
   through; a persona or manifest `launchOptions:` mapping does the same declaratively (a
   `--opt` wins per key). It is a **raw passthrough**, with no allow/deny list: Claude renders
@@ -327,15 +408,32 @@ How a spawn resolves:
 Detach from an attached PTY with **Ctrl-]** (the agent keeps running); rebind it with
 `COTAL_DETACH_KEY=ctrl-<char>` when it clashes with a keybinding inside the agent's TUI.
 
-**Runtimes.** The manager spawns into a **pty** by default. On Linux a detached per-seat
-custodian owns that PTY, so replacing the manager worker does not close the seat. A custodian
-whose agent has exited exits a few seconds later on its own, and a manager that boots after a
-crash reaps the seats its predecessor left running. Other
-platforms still spawn the PTY in-process; `adopt` throws until their transport lands. Optional runtimes are installed
+**Runtimes.** The manager spawns into a **pty** by default. It spawns the PTY in-process on
+every platform, so replacing the manager worker closes its seats and the pty runtime gives no hot
+update. Any manager stop, bare `cotal down` included, stops and deprovisions those seats. A stopping
+manager refuses new spawns and first waits for the ones it already accepted, so their seats stop too. On Linux
+it can still adopt and reap seats that an earlier manager launched under a detached per-seat
+custodian, so those seats drain under the new manager; it starts no new custodian. A custodian whose agent has exited exits a few seconds later on its own. `cotal seats`
+lists the custodians left on the machine, and `cotal seats --drain` retires the ones whose agent
+has exited while keeping every seat whose agent still runs ([cli.md](cli.md#seats)). When a pty
+agent exits on its own, in-process or under a custodian, the manager logs a `seat reaped:` line
+with the exit code and, for a signalled child, the signal number. The line ends with the last line
+the child printed that starts with a connector's `[cotal-<name>]` or `[cotal-<name>/<part>]`
+prefix, cut to 240 characters, when it printed one. A custodian keeps the same record beside the
+seat's custody record, so a later reap of that seat, including one by a
+successor manager, reports how the child ended. When the custodian cannot write that record, it
+says why in the seat's `custodian.log`, and a later reap of a child that ended on its own reports
+the record as missing or unreadable. Optional runtimes are installed
 through the extension surface, for example `cotal ext add @cotal-ai/orca`, then selected with
 `--runtime orca` (similarly `@cotal-ai/tmux`, `@cotal-ai/cmux`, and `@cotal-ai/herdr`). They put teammates in native
-terminal surfaces rather than manager-owned PTYs. Runtime names are open-ended and resolved from
-the registry; a missing provider or app throws, never silently falls back
+terminal surfaces rather than manager-owned PTYs. Those surfaces stream no exit, so the manager
+asks the runtime every five seconds whether a seat's process has ended, and frees a seat that ended
+on its own once the runtime proves the exit. Its `seat reaped:` line says the exit detail is
+unavailable from that runtime. While a launch waits for readiness the manager asks every second and
+once more when the readiness window closes, so a seat whose process ends before it joins the mesh is
+reported as exited on launch, with no last output, rather than as uncertain. A runtime that has not
+proved that last exit a second after the window closes leaves the launch uncertain. Runtime names are
+open-ended and resolved from the registry; a missing provider or app throws, never silently falls back
 ([architecture](architecture.md)).
 
 ## Mesh registry
@@ -349,6 +447,11 @@ running mesh with the right credentials instead of mistaking the cwd for a space
   project. `--space <name>` overrides it for one command.
 - When one broker has records for several spaces, `cotal up --space <name>` refreshes that named
   space.
+- A refresh rewrites only what that command decided: the server, root and mode, the user-auth
+  endpoints, and an explicit `--host` or `--max-sessions`. Every other field, such as the TLS
+  requirement, is kept as the record stands when the refresh writes it, so a change another
+  command made during the refresh survives. If the record was removed during the refresh, `up`
+  fails instead of writing it back.
 - With no live selected default, a project with its own `.cotal/` resolves to that project's
   mesh; otherwise one running mesh is used automatically and several are an error.
 - `cotal meshes` lists them (a `*` marks the default); `cotal down` removes the entry.
@@ -375,6 +478,16 @@ without a terminal nothing prompts.
 
 `--root` is the local folder holding that mesh's `.cotal/auth` and `.cotal/agents` (its personas);
 the mode is inferred from what that folder holds.
+
+The instance identities of the manager and the user-auth service are not part of that folder.
+Each root keeps its own in `.cotal/space.<hex>/`, so `cotal supervise` or `cotal up --user-auth` in
+the root you copied the folder to starts an instance of its own. A root last run by an older Cotal
+still holds them in `.cotal/auth`, as `manager-instance.<hex>.json`, `manager-siblings.<hex>.json`
+and `space.<hex>/.cotal/auth/auth-instance.<hex>.json`. Delete those files from a copy of such a
+folder before the first `cotal supervise` or `cotal up` there. On the root itself, the first start
+moves each record to `.cotal/space.<hex>/`. It refuses and keeps both entries when either place
+holds a symlink or anything else that is not a regular file, or when the two places hold different
+records.
 
 **Know what you are copying.** For an authenticated mesh that folder carries the space's account
 **signing seed**, which is the authority to mint any identity in the space. A machine holding it
@@ -417,9 +530,10 @@ address spelling changes nothing: `[::ffff:192.168.1.10]`, `3232235786`, `0300.0
 
 A user-auth space's IdP pins are established where the mesh runs and are never guessed. Register
 one from **supplied** trust: `--user-auth-file bundle.json` (exported on the mesh's machine), or
-`--from https://…/.well-known/cotal-mesh`, which asks before it contacts the address at all,
-fetches the discovery document over HTTPS, shows you the pins, and asks again before adopting
-them. Redirects are refused because a 302 can walk a pinned fetch down to
+`--from https://auth.example`, which asks before it contacts the address at all, fetches the
+discovery document at `/.well-known/cotal-mesh` under that address over HTTPS, shows you the pins,
+and asks again before adopting them. A URL that already ends in `/.well-known/cotal-mesh` is
+fetched as given. Redirects are refused because a 302 can walk a pinned fetch down to
 plaintext or onto another host, and the pinned exchange must be an `https://` URL too. The one
 exception is an exchange on **this machine**, where nothing leaves the box: plain `http://` is
 accepted for a loopback *literal* (`127.0.0.1`, `::1`, and any spelling of them), but **not** for
@@ -447,17 +561,23 @@ This gate is on **registration**. `cotal join --creds --server <url>` deliberate
 explicit connection at face value and does not consult the registry, so it is not covered. Join
 that way only to an address you would have registered.
 
+The connection is still probed first, with the same second try at the longer budget the registry
+preflight uses, so a slow link reads as a connect that did not finish within that budget and a
+refused port reads as a broker that is not running.
+
 Records added this way are removed only by something that names them. A failed liveness probe
 does not delete any record: an unreachable broker, local or registered by hand, is shown as
 `offline` in `cotal meshes`. A bare command does not count that offline record as running;
 name it with `--space` to restart it. `cotal down` / `cotal clean all` still drop an `up` record for the
 project they are tearing down, and they leave a hand-registered one alone even when `--root`
-pointed at that project. A `cotal up` for that space refuses outright (naming `cotal meshes rm`) unless it is
-that same endpoint: finding a broker already answering there is a refresh that starts nothing and
-leaves the record's provenance alone, while actually starting the broker for that space, server and
-root makes this machine the one running it, so the record becomes an ordinary local one that
-`cotal down` clears. `cotal meshes rm` drops it and re-registering with `--force` replaces it. `rm`
-only forgets a mesh. To stop one running here, use `cotal down`.
+pointed at that project. A `cotal up` for that space refuses outright unless it is that same
+endpoint: finding a broker already answering there is a refresh that starts nothing and leaves the
+record's provenance alone, while actually starting the broker for that space, server and root
+makes this machine the one running it, so the record becomes an ordinary local one that
+`cotal down` clears. The refusal names `cotal supervise --space <s> --server <url>` (plus `cotal
+deliver`) when the registered broker is on another host, and `cotal meshes rm` when it is local.
+`cotal meshes rm` drops it and re-registering with `--force` replaces it. `rm` only forgets a
+mesh. To stop one running here, use `cotal down`.
 
 ## Watching
 
@@ -488,10 +608,14 @@ cotal up --detach
 cotal up --restore ./space-backup --detach
 ```
 
+A refused cut leaves the mesh running and unfenced: fix what the refusal names and run
+`cotal down --preserve-state` again.
+
 Use `--store-dir` on both preservation and backup for a custom JetStream store. A store cap set
 with `cotal up --max-file-store <bytes>` travels with the preserved state, and the resume renders it
 again. nats-server reads the cap once at start and refuses a config reload that changes it, so a new
-cap always needs a restart. `registry` is the
+cap always needs a restart. The cut records the chat stream's frontier per retained seat, so a
+resumed seat catches up from there instead of replaying its channels. `registry` is the
 only partial selection (`backup create ... --only registry`; `up --restore ... --restore-only
 registry`). Backup never stops or restarts a mesh implicitly, never opens the original store, and
 does not contain credentials or trust secrets. Backup/restore in every auth mode, open included,
@@ -575,14 +699,15 @@ resort, so do not swap it back into a live mesh casually.
 
 ## When something looks absent
 
-Permission denials are **loud, never silent**: an over-tight ACL rejects the endpoint call and
-also shows up as a logged denial, instead of returning an empty or incomplete result that looks
-successful. Check
+Permission denials are **loud, never silent**: an over-tight ACL rejects the endpoint call it
+refuses instead of returning an empty or incomplete result that looks successful, and a denial no
+call is waiting on, such as a refused subscription, shows up as a logged denial on the endpoint. Check
 `.cotal/manager.<key>.log`, `.cotal/delivery.<key>.log` (one pair per space, keyed as
 [Config](config.md#project-files) describes), and `.cotal/nats.log`; `cotal status` shows
 what is actually running. Those files live under the **project** `.cotal/`, not `~/.cotal`,
 unless the mesh root is the home directory. `cotal up --detach` redirects delivery and manager
 stdio onto those files, so an operator-created systemd unit around that launcher does not put
 the child logs in that unit's journal. `journalctl -u <unit>` can be empty while the crash
-reason is already in the project log. The access rules are collected in
+reason is already in the project log. Manager log lines start with the UTC time they were
+written. The access rules are collected in
 [Channels & permissions](channels-and-permissions.md).

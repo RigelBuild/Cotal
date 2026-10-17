@@ -13,6 +13,7 @@ import { reconcileSeededConnectors } from "./seed/reconcile.js";
 import { isAuthenticSeedChild } from "./seed/lock.js";
 import { cliVersion, extensionVersions } from "./lib/version.js";
 import { prepareCatalogCommand } from "./commands/sync.js";
+import { takeManagedHandoffCustody } from "./managed-handoff.js";
 
 /** Display order for the help groups — an explicit ranking, NOT registration order: modules
  *  self-register on import and the dev runner (tsx) doesn't guarantee entry-import evaluation
@@ -92,7 +93,7 @@ async function seedBoot(registry: Registry, argv: string[]): Promise<boolean> {
 
 function skipAutoReconcile(argv: string[]): boolean {
   const [name, sub] = argv;
-  if (name === undefined || name === "help" || name === "-h" || name === "--help" || name === "__complete") return true;
+  if (name === undefined || name === "help" || name === "-h" || name === "--help" || name === "__complete" || name === "completion") return true;
   if (argv.includes("--help") || argv.includes("-h")) return true; // command-specific help must not mutate state
   // A dry run promises to plan and print while mutating NOTHING, and the boot-gate reconcile is a
   // mutation of the operator-global seed store, manifest and npm prefix — it ran BEFORE the command
@@ -154,6 +155,9 @@ export interface RunCliOptions {
  *  The single entry point a composition root calls — no hardcoded command list.
  *  Parsing happens HERE, from the command's declared specs; `run` gets parsed args. */
 export async function runCli(registry: Registry, argv: string[], opts: RunCliOptions = {}): Promise<void> {
+  // Before anything that can exit, so every outcome leaves no handoff file and no child inherits
+  // the variable naming it.
+  takeManagedHandoffCustody(process.env);
   // `-v` / `--version` short-circuits before any extension seeding or dispatch: a side-effect-free
   // print of this binary's version plus each installed extension's, read straight off disk. First,
   // so it never triggers the connector reconcile. Plain text (no ANSI) — a `--version` line is

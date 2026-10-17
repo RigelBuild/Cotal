@@ -12,12 +12,16 @@
  *    client, they work on a turn someone typed into the attached TUI just as well as on a
  *    mesh-driven one;
  *  • ack-on-completion with EXACT ids: a turn's surfaced messages are drainInboxDeliveries-acked
- *    ONLY when the turn reaches `completed`. A `failed` turn (transient model/upstream error)
- *    leaves them un-acked and retries with bounded backoff; an `interrupted` turn leaves them
- *    for redelivery — matching the OpenCode connector's semantics — and an app-server CRASH
- *    restarts the child in place (same mesh lifecycle) and re-drives them. Attention modes
- *    hold: ambient drives only in `open`; dnd/focus hold it; a focus @mention wakes a pull
- *    turn (latched until a turn accepts it); quiet stays pull-only.
+ *    when the turn reaches `completed`, and also when an OPERATOR interrupts it (Escape in the
+ *    attached TUI) — that dismisses the batch rather than redelivering it, matching the OpenCode
+ *    connector's explicit-Stop semantics. A `failed` turn (transient model/upstream error) leaves
+ *    them un-acked and retries with bounded backoff; an `unknown` terminal (a missing or
+ *    unrecognized status) leaves them un-acked too, without backoff. The ONE `interrupted` this
+ *    host itself issues — `shutdown()`'s own `driver.interrupt()` — keeps today's un-acked
+ *    outcome: that is a retirement, not a restart, and redelivery to a later same-name spawn is
+ *    not promised. An app-server CRASH restarts the child in place (same mesh lifecycle) and
+ *    re-drives them. Attention modes hold: ambient drives only in `open`; dnd/focus hold it; a
+ *    focus @mention wakes a pull turn (latched until a turn accepts it); quiet stays pull-only.
  *  • presence falls out of the app-server event stream (turn → working, approval → waiting,
  *    item detail → activity), never self-guessed;
  *  • the per-agent CODEX_HOME (under `<workspaceRoot>/.cotal/codex/<name>`) isolates the
@@ -49,6 +53,8 @@ import { hardenPrivate, loadAgentFile } from "@cotal-ai/core";
 import {
   MeshAgent,
   configFromEnv,
+  envFlag,
+  eventPlaneArmed,
   feedbackLine,
   formatInjection,
   fmtFrom,
@@ -59,6 +65,7 @@ import {
   WORKFLOW_STEER,
   AguiEmitter,
   AguiEmitterHolder,
+  eventPlaneStopped,
   EventWal,
   FileSubjectFrontier,
   JsonlFileSource,
@@ -299,44 +306,33 @@ function mcpOverrides(mcp: CotalMcpEndpoint): [string, string][] {
  * So the boundary is captured at the bind, before the announcement, and substituted HERE, on the
  * one read that would otherwise ask the file where it currently ends.
  *
- * IT IS DELIBERATELY NOT WRITTEN INTO THE LOG. The log's cursor stays the emitter's own, and on a
- * log with nothing in it a start writes nothing at all: its recovery has no pending frame to fold,
- * so the position is first written by a PUMP, once one has actually read something. A start that
- * throws therefore leaves nothing behind, and so does a start that succeeded and then died before
- * its first read. Both leave the log virgin and the next bind boundaries at the file as it stands
- * then, which is this same window one level up. A start that throws is the ordinary case here and
- * not an edge: an armed seat whose broker is not up yet loses its emitter at launch and rebinds at
- * a later boundary. A boundary seeded before the start would outlive it, the later bind would read
- * a cursor and treat it as a RESUME, and everything the session wrote while the seat was cut off
- * would be republished onto a channel whose readers are not the input channel's.
- *
  * THE LIMIT, stated once and in one place: this positions the first read of a log that has no
  * cursor. A log that already carries one is a resume and passes through untouched, because a
  * cursor written by a live emitter is the honest one. Each bind builds its own source with its own
- * boundary, so a rebind never reuses an older one.
- *
- * Which makes the bind's own announcement precise for a fresh log and IMPRECISE for a resume, and
- * that is worth saying rather than covering. A bind onto a log that already carries a position
- * CONTINUES that log rather than starting here, and what it delivers is everything the thread
- * appended after that position. That includes what the thread wrote long after the previous
- * emitter was already dead, not merely what that emitter had read and had not sent, which is why
- * the docs state the reach of a recovery rather than describing it as a flush. Nothing is sent
- * twice either way. The line is left as it is because things outside this process parse it, and
- * because the case it is imprecise about is reachable only after an emitter really was publishing
- * this thread.
+ * boundary, so a later bind never reuses an older one.
  */
 class BoundStartSource<T> implements DurableSource<T> {
   readonly kind: string;
 
+  /** The boundary this wrapper captured, exposed so its OWNER can persist the boundary the SOURCE
+   *  itself substitutes rather than a copy captured beside it (#705). Two sources of truth would
+   *  drift exactly when one of them is removed. */
+  readonly start: string;
+
   constructor(
     private readonly inner: DurableSource<T>,
-    private readonly start: string,
+    start: string,
   ) {
     this.kind = inner.kind;
+    this.start = start;
   }
 
   read(cursor: string | undefined): Promise<SourceRead<T>> {
     return this.inner.read(cursor ?? this.start);
+  }
+
+  end(): Promise<string> {
+    return this.inner.end();
   }
 }
 
@@ -374,12 +370,12 @@ export async function runCodexHost(): Promise<void> {
 
   /** Publishes this thread's activity as AG-UI events on `events.<owner>.<actor>`.
    *
-   *  Armed by the launch (`COTAL_EVENTS`), so a seat the operator did not arm never reaches the
-   *  broker for an event plane it has no grant for. The emitter is built LAZILY on the first
-   *  adopt, because its source is the rollout file, whose path is not known until the thread
+   *  Armed by the launch or by a registration that requires events, so a seat with neither never
+   *  reaches the broker for an event plane it has no grant for. The emitter is built LAZILY on the
+   *  first adopt, because its source is the rollout file, whose path is not known until the thread
    *  exists, and because `start()` reaches the broker, work that must not run for a thread that
    *  never publishes. */
-  const eventsArmed = /^(1|true|yes|on)$/i.test(process.env.COTAL_EVENTS ?? "");
+  const eventsArmed = eventPlaneArmed(config);
   /** TEST ONLY, and the reason it exists rather than a fixture doing this from outside.
    *
    *  The window this whole boundary rule is about is the emitter's own asynchronous setup: the
@@ -397,6 +393,12 @@ export async function runCodexHost(): Promise<void> {
     const ms = Number(process.env.COTAL_EVENTS_TEST_START_DELAY_MS ?? "");
     return Number.isFinite(ms) && ms > 0 ? ms : 0;
   })();
+  // Test-only: holds the window between the persist and the first pump open so a fixture can
+  // read the log there. Unset is no wait and no call.
+  let postStartHoldMs = ((): number => {
+    const ms = Number(process.env.COTAL_EVENTS_TEST_POST_START_HOLD_MS ?? "");
+    return Number.isFinite(ms) && ms > 0 ? ms : 0;
+  })();
   let events: AguiEmitterHolder<CodexRecord> | undefined;
   let mapper: CodexMapper | undefined;
   /** The adopted rollout path. A holder binds to ONE path and dies on a second, so every flush
@@ -404,11 +406,12 @@ export async function runCodexHost(): Promise<void> {
    *  gets a new holder rather than a second adopt (see `bindEvents`). */
   let rollout: string | undefined;
   const newEventHolder = (startCursor: string): AguiEmitterHolder<CodexRecord> => {
-    // The widening belongs to the first bind only. A recovery holder must exercise the ordinary
-    // startup path; repeating the test delay there adds no coverage and turns every recovery proof
-    // into another artificial setup-window proof.
+    // The widening belongs to the first bind only: a restart's holder must exercise the ordinary
+    // startup path, and repeating the test delay there adds no coverage.
     const holderStartDelayMs = startDelayMs;
     startDelayMs = 0;
+    const holderPostStartHoldMs = postStartHoldMs;
+    postStartHoldMs = 0;
     return new AguiEmitterHolder<CodexRecord>(
       async (rolloutPath: string) => {
         // A resumed rollout can be found before `agent.start()` connects, and the holder is terminal
@@ -417,6 +420,10 @@ export async function runCodexHost(): Promise<void> {
         // The test-only widening of this setup, at the top of it so a fixture's write lands in the
         // real window rather than beside it. Zero unless a test set it, and zero does not await.
         if (holderStartDelayMs > 0) await new Promise<void>((r) => setTimeout(r, holderStartDelayMs));
+        // The launch binds while `agent.start()` is still connecting in the background, and a start
+        // against an unconnected endpoint is terminal for the holder, so it waits for the mesh as
+        // the OpenCode and Claude Code holders do.
+        await agent.whenConnected(MESH_READY_TIMEOUT_MS);
         // Throws rather than defaulting to the working directory: a write-ahead log written
         // somewhere no later start looks is a silent loss.
         const workspaceRoot = resolveEventsStateRoot(process.env);
@@ -435,23 +442,44 @@ export async function runCodexHost(): Promise<void> {
         // a pending terminal closes the WAL's run without passing through this new mapper.
         const resumeRunId = wal.pending === null ? wal.brackets?.run : wal.pending.brackets.run;
         mapper = createCodexMapper({ threadId, mintRunId: () => randomUUID(), resumeRunId });
-        return AguiEmitter.start<CodexRecord>({
-          endpoint: agent.ep,
-          wal,
-          subjectFrontier,
-          // `startCursor` is the boundary this bind captured before it announced itself. Nothing
+        // `startCursor` is the boundary this bind captured before it announced itself. Nothing
           // above writes it into the log: see `BoundStartSource` for what that buys and what it
-          // costs.
-          source: new BoundStartSource<CodexRecord>(new JsonlFileSource<CodexRecord>(rolloutPath), startCursor),
-          map: mapper.map,
-        });
+          // costs. The wrapper is held in a variable rather than inlined because the persist below
+          // keys on IT (#705), so removing the boundary substitution removes the persist with it
+          // instead of leaving an outer copy that keeps writing the same value.
+          const source = new BoundStartSource<CodexRecord>(new JsonlFileSource<CodexRecord>(rolloutPath), startCursor);
+          const em = await AguiEmitter.start<CodexRecord>({
+            endpoint: agent.ep,
+            wal,
+            subjectFrontier,
+            source,
+            map: mapper.map,
+            onUnreadable: (gap) => log(`AG-UI source: skipped an unreadable rollout record at offset ${gap.offset} (${gap.bytes} bytes): ${gap.reason}`),
+          });
+          // #705: persist the boundary THE SOURCE SUBSTITUTES into the log right after a successful
+          // start, and only when the log still has no cursor. Keyed on the wrapper itself, never on
+          // the outer `startCursor`, because the invariant that matters is "what the emitter will
+          // read is what the log now says", and only the source object knows the first half.
+          // After start is safe because `AguiEmitter.start` awaits `recover()`, which settles any
+          // pending frame before returning, so `advanceCursorOnly` never races a pending write.
+          // Without this, a host killed between this line and the emitter's first pump leaves a
+          // virgin log, and the next bind takes its boundary at the file's later end, dropping
+          // whatever the thread appended in between.
+          if (source instanceof BoundStartSource && wal.frontier.sourceCursor === undefined)
+            await wal.advanceCursorOnly(source.start);
+          // Test-only: holds the window between the persist above and the first pump open so a
+          // fixture can read the log there. Unset is no wait and no call.
+          if (holderPostStartHoldMs > 0)
+            await new Promise<void>((r) => setTimeout(r, holderPostStartHoldMs));
+          return em;
       },
-      // Required, and not defaulted to a swallow. The holder is terminal on error and does not
-      // retry, so this line is the whole record of why events stopped.
-      (e: Error) => log(`AG-UI emitter stopped: ${e.message}`),
-      // A turn terminal closes a run the record stream never described. Without this the mapper
-      // would attribute the next records to a run the published stream has already finished.
-      (runId: string) => mapper?.forgetOpenRun(runId),
+      {
+        onError: eventPlaneStopped({ log }),
+        sourceEnd: (rolloutPath: string) => new JsonlFileSource<CodexRecord>(rolloutPath).end(),
+        // A turn terminal closes a run the record stream never described. Without this the mapper
+        // would attribute the next records to a run the published stream has already finished.
+        onRunClosed: (runId: string) => mapper?.forgetOpenRun(runId),
+      },
     );
   };
 
@@ -464,6 +492,19 @@ export async function runCodexHost(): Promise<void> {
   let desired: Presence | undefined;
   let desiredCondition: PresenceCondition | null | undefined;
   let flushTimer: ReturnType<typeof setInterval> | undefined;
+  // Presence writes go out IN CALL ORDER. `agent.setStatus("working")` clears the condition before
+  // it publishes, and it awaits the connection first, so two fire-and-forget writes from one tick
+  // can land in either order. Measured: a turn that failed in the tick it started published its
+  // failure condition and then its own start's clear one millisecond later, and the presence
+  // bucket (history 1) dropped the condition revision before any watcher read it. The chain keeps
+  // the start's clear ahead of the failure's condition, so the condition is what the roster shows
+  // until the NEXT turn starts.
+  let presenceChain: Promise<void> = Promise.resolve();
+  const inOrder = (write: () => Promise<void>): Promise<void> => {
+    const next = presenceChain.then(write, write);
+    presenceChain = next.catch(() => {});
+    return next;
+  };
   function armStatusFlush(): void {
     if (flushTimer) return;
     flushTimer = setInterval(() => {
@@ -480,11 +521,10 @@ export async function runCodexHost(): Promise<void> {
       desiredCondition = undefined;
       clearInterval(flushTimer);
       flushTimer = undefined;
-      Promise.resolve()
-        .then(async () => {
-          if (wantCondition !== undefined) await agent.setCondition(wantCondition);
-          if (want) await agent.setStatus(want.status, want.activity);
-        })
+      inOrder(async () => {
+        if (wantCondition !== undefined) await agent.setCondition(wantCondition);
+        if (want) await agent.setStatus(want.status, want.activity);
+      })
         .catch(() => {
           if (!desired) desired = want;
           if (desiredCondition === undefined) desiredCondition = wantCondition;
@@ -498,12 +538,14 @@ export async function runCodexHost(): Promise<void> {
     if (!agent.connected) return armStatusFlush();
     const want = desired;
     desired = undefined;
-    try {
-      await agent.setStatus(status, activity);
-    } catch {
-      if (!desired) desired = want;
-      armStatusFlush();
-    }
+    await inOrder(async () => {
+      try {
+        await agent.setStatus(status, activity);
+      } catch {
+        if (!desired) desired = want;
+        armStatusFlush();
+      }
+    });
   };
 
   const safeCondition = async (condition: PresenceCondition | null): Promise<void> => {
@@ -511,12 +553,14 @@ export async function runCodexHost(): Promise<void> {
     if (!agent.connected) return armStatusFlush();
     const want = desiredCondition;
     desiredCondition = undefined;
-    try {
-      await agent.setCondition(condition);
-    } catch {
-      if (desiredCondition === undefined) desiredCondition = want;
-      armStatusFlush();
-    }
+    await inOrder(async () => {
+      try {
+        await agent.setCondition(condition);
+      } catch {
+        if (desiredCondition === undefined) desiredCondition = want;
+        armStatusFlush();
+      }
+    });
   };
 
   let ready = false; // thread up — never drive before then
@@ -626,9 +670,10 @@ export async function runCodexHost(): Promise<void> {
     try {
       for (;;) {
         const surfacedSet = new Set(surfaced);
+        // `surfaced` holds receive keys, so an empty-id item already in the turn is not steered twice.
         const items = agent
           .peekInbox("automatic")
-          .filter((i) => !surfacedSet.has(i.id) && (i.kind !== "channel" || i.mentionsMe));
+          .filter((i) => !surfacedSet.has(i.recvKey) && (i.kind !== "channel" || i.mentionsMe));
         if (items.length === 0 || !driver.busy) return;
         const inj = formatInjection(items);
         if (!inj) return;
@@ -648,11 +693,19 @@ export async function runCodexHost(): Promise<void> {
     }
   }
 
-  /** The single turn-boundary site. Ack ONLY a `completed` turn's surfaced ids (exact-id drain:
-   *  an overflow-evicted id is reported missing, never mis-acked positionally). `failed` (a
-   *  transient model/upstream error) and `interrupted` (an operator/shutdown cancel) both leave
-   *  the ids un-acked so the batch redelivers — failed with backoff, so a permanently failing
-   *  batch can't hot-loop. Waits for any in-flight steer RPC first, so the ack set is settled. */
+  /** The single turn-boundary site. Ack a `completed` turn's surfaced ids, and an `interrupted`
+   *  one too UNLESS this host is the one that issued the interrupt (exact-id drain: an
+   *  overflow-evicted id is reported missing, never mis-acked positionally). An operator's Escape
+   *  in the attached TUI ends the turn `interrupted` with `shuttingDown` still false — that batch
+   *  is DISMISSED, not redelivered, the same way OpenCode acks an explicit user Stop. The only
+   *  `interrupted` this host itself asks for is `shutdown()`'s own `driver.interrupt()`, which
+   *  sets `shuttingDown` first; that one keeps the un-acked outcome, because it is a retirement,
+   *  not a restart (see the shutdown note below on what that does and does not promise). `failed`
+   *  (a transient model/upstream error) leaves the ids un-acked so the batch redelivers with
+   *  backoff, so a permanently failing batch can't hot-loop; `unknown` (a missing or unrecognized
+   *  terminal status) also leaves them un-acked, without backoff — the protocol surprise gets no
+   *  benefit of the doubt, but it isn't punished as a failure either. Waits for any in-flight
+   *  steer RPC first, so the ack set is settled. */
   let boundaryGen = 0; // bumped per turn boundary: a boundary's ASYNC tail (flush/status/pump)
   // must no-op once a newer boundary exists, or T1's stale tail would overwrite T2's presence
   // and pump T2's failed batch past its backoff.
@@ -683,7 +736,11 @@ export async function runCodexHost(): Promise<void> {
       awaitingTurnEnd = false;
       const ids = surfaced;
       surfaced = [];
-      if (wasOpen && ids.length > 0 && status === "completed") agent.drainInboxDeliveries(ids); // the sole ack site
+      // An interrupt THIS host issued (shutdown()'s driver.interrupt()) sets `shuttingDown` before
+      // the RPC even goes out, so by the time this terminal arrives that latch already reads true
+      // — the sole discriminator between an operator's dismiss and a retirement's redeliver.
+      const dismissed = status === "completed" || (status === "interrupted" && !shuttingDown);
+      if (wasOpen && ids.length > 0 && dismissed) agent.drainInboxDeliveries(ids); // the sole ack site
       if (status === "failed") scheduleErrorRetry();
       else clearErrorRetry(true);
       void (async () => {
@@ -747,6 +804,10 @@ export async function runCodexHost(): Promise<void> {
     binding = true;
     try {
       const path = await waitForRollout(codexHome, threadId, { attempts, intervalMs: attempts > 1 ? 250 : 0 });
+      // A holder adopted on the way out is one nothing closes, and its start races `agent.stop()`.
+      // Shutdown's own drain and the boundary its interrupt delivers both call in here, and a
+      // launch's look can still be waiting when the shutdown begins.
+      if (shuttingDown) return;
       if (eventsThread !== threadId) return; // a newer thread arrived while this one waited
       if (path === undefined) {
         // THE PREDECESSOR IS STILL ENDED. Giving up on the new thread's file says nothing about the
@@ -776,6 +837,9 @@ export async function runCodexHost(): Promise<void> {
       // CAPTURED HERE, BEFORE THE ANNOUNCEMENT, and that placement is the fix. See
       // `BoundStartSource` for why the emitter cannot be left to position itself later.
       const startCursor = (await new JsonlFileSource<CodexRecord>(path).read(undefined)).cursor;
+      // Again after the last await: a shutdown that began during the drain or this read has already
+      // run its own drain, so the holder below would be one nothing closes.
+      if (shuttingDown) return;
       events = newEventHolder(startCursor);
       rollout = path;
       events.adopt(path);
@@ -790,7 +854,7 @@ export async function runCodexHost(): Promise<void> {
       // (the file is created by the primer inject and bound immediately after). On a late bind it
       // is the turns that ran while the file did not exist, and a reader comparing the panel to the
       // terminal deserves to know why they differ rather than to guess.
-      log(`AG-UI: publishing thread ${threadId} from ${path} (the stream starts here, anything already written is not republished)`);
+      log(`AG-UI: publishing thread ${threadId} from ${JSON.stringify(path)} (the stream starts here, anything already written is not republished)`);
     } finally {
       binding = false;
       const retry = missedBind;
@@ -807,24 +871,8 @@ export async function runCodexHost(): Promise<void> {
    *  nothing tells this process a record landed; the driver's own boundaries are the closest
    *  signal there is, and a flush is cheap and idempotent (the cursor decides what is new). */
   const flushEvents = (): void => {
-    // A DEAD HOLDER IS NOT A BINDING. The holder is TERMINAL on error, and one error it can take is
-    // the one that matters most here: `AguiEmitter.start` refuses an endpoint with no connection,
-    // and `agent.start()` connects in the BACKGROUND, so an armed seat whose broker was not up yet
-    // kills its own plane at launch. Nothing after that publishes, the mesh side recovers around it
-    // and looks healthy, and one line in the seat's own log is the whole trace. Flushing a corpse is
-    // silence with a heartbeat, so a death is treated as NO BINDING and the next boundary builds a
-    // new one. WHAT THE FRESH ADOPT THEN PUBLISHES DEPENDS ON WHETHER THE DEAD HOLDER EVER WROTE A
-    // POSITION, and saying only half of that here is what made this comment wrong. A log with no
-    // cursor in it is virgin: the new bind starts at the file's last complete record, so what the
-    // dead holder had not published is not recovered, which is the same stated limit a late bind
-    // carries. A log that carries one is a RESUME and continues it, so everything the thread
-    // appended after that position IS published, including what it appended while this plane was
-    // dead. `BoundStartSource` states that split once and in one place.
-    if (events?.failure !== undefined) {
-      log(`AG-UI: the emitter stopped (${events.failure.message}), rebinding at this boundary`);
-      events = undefined;
-      rollout = undefined;
-    }
+    // A dead holder stays bound and no boundary rebuilds it: its failure was answered once, by
+    // `eventPlaneStopped` under the space's policy, as on every other connector.
     if (rollout !== undefined) {
       events?.flush(rollout);
       return;
@@ -1068,8 +1116,7 @@ export async function runCodexHost(): Promise<void> {
   // none, so the host stays headless and keeps its line feed instead — the same peer either way,
   // only the UI differs. COTAL_CODEX_TUI decides explicitly when set (1/0), for callers that know
   // better than the tty check.
-  const tuiPref = process.env.COTAL_CODEX_TUI?.trim();
-  const wantTui = tuiPref ? /^(1|true|yes|on)$/i.test(tuiPref) : process.stdout.isTTY === true;
+  const wantTui = envFlag(process.env, "COTAL_CODEX_TUI") ?? process.stdout.isTTY === true;
   let tuiChild: ChildProcess | undefined;
   let tuiGen = 0; // bumped whenever an exit becomes EXPECTED (restart or shutdown)
 

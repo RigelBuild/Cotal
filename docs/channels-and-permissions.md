@@ -14,7 +14,7 @@ wildcard subtrees), declared in agent-file frontmatter and/or per-channel in a m
 | Verb | What it grants | Default | Declared in |
 |---|---|---|---|
 | `subscribe` | The **active read set**: channels the agent auto-listens to at boot. Must be within `allowSubscribe`. | none (list a channel to get it) | agent frontmatter, manifest channel list |
-| `allowSubscribe` | The **read ACL**: channels the agent *may* read (live and history). | falls back to `subscribe` | agent frontmatter, manifest channel list |
+| `allowSubscribe` | The **read ACL**: channels the agent *may* read (live and history). | falls back to `subscribe` when omitted or empty | agent frontmatter, manifest channel list |
 | `allowPublish` | The **post ACL**: channels the agent may post to. **Default-deny.** | deny (nobody posts unless listed) | agent frontmatter, manifest channel list |
 
 `subscribe` only sets what an agent tunes into; it never widens read. Read is `allowSubscribe`;
@@ -42,6 +42,9 @@ who isn't currently joined**; on a `live` channel a mention writes a durable cop
 mentioned target whose read ACL covers the channel, so "authorized to read" and "currently
 joined" are distinct.
 
+Receivers discard non-object JSON payloads, including `null`, before reading message fields.
+A malformed payload does not stop later live delivery or retained-message reads.
+
 ## Membership changes
 
 An agent **self-joins** a channel's live subscription on its own, with no manager, as long as the
@@ -61,6 +64,8 @@ by `replayWindow` (e.g. `"24h"`; [SPEC §7](../SPEC.md#7-channels)). `replay: fa
 control, not confidentiality**: any ACL holder can read the channel's retained content on demand
 regardless of the flag, so it hides history from a joiner's initial context, not from anyone who
 can read the channel. Confidential content uses a DM or anycast, never a no-replay channel.
+A managed seat resumed from a preservation cut (`cotal down --preserve-state`, then `cotal up`)
+backfills only what was posted after the cut, while a fresh joiner backfills the retained window.
 
 ## Common tasks
 

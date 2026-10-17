@@ -42,8 +42,11 @@ import {
   assertValidOwnerToken,
   mintLifecycleUid,
   mkSecretDir,
+  parseActorLedgerSource,
+  parsePrincipalKey,
   patternInAllow,
   writeSecretFile,
+  type IssuedSourceRef,
 } from "@cotal-ai/core";
 import { grantCommandLine } from "./grant-command.js";
 import type { ActorGrant } from "./idp.js";
@@ -70,21 +73,20 @@ export interface ActorRow {
    *
    *  LAYERS ABOVE DO, and that is the part a reader of this line will get wrong. Two of them:
    *
-   *   - `runActor` (`commands.ts`), behind `cotal actor grant`, fills every flag the operator omits
-   *     with the WIDEST value: `>` read, `>` post, `spawn,role:default` scope. So a row written by
-   *     that command without `--allow-subscribe` reads EVERY channel in the space, and because a
-   *     grant is an upsert of the whole row, omitting the flag on a RE-grant widens a previously
-   *     narrow row rather than leaving it alone.
+   *   - `runActor` (`commands.ts`), behind `cotal actor grant --full`, fills every flag the
+   *     operator omits with the WIDEST value: `>` read, `>` post, `spawn,role:default` scope.
+   *     Without `--full` it refuses an omitted flag, because a grant is an upsert of the whole row
+   *     and a dropped flag would widen a narrow row rather than leave it alone.
    *   - the spawn paths (`manager.ts`, the CLI's `spawn.ts`) fall back to `[]` for BOTH sets: an
    *     omitted read set is NO channel, not `general`. The post set is `[]` too, except where a
    *     spawn derives an events grant, which is appended to whatever the caller passed. Narrower,
    *     not wider, so not a hazard, but a reader asking "does anything default these before they
    *     land here" must be told both.
    *
-   *  Name the flag, or the row gets `>`. */
+   *  Name the flag: without it the grant refuses, and under `--full` the row gets `>`. */
   allowSubscribe: string[];
   /** Channel post ACL minted at connect. Explicit HERE (empty = cannot post anywhere), with the
-   *  same caveat as {@link ActorRow.allowSubscribe}: `cotal actor grant` supplies `>` for an
+   *  same caveat as {@link ActorRow.allowSubscribe}: `cotal actor grant --full` supplies `>` for an
    *  omitted `--allow-publish`. */
   allowPublish: string[];
   /** Role (scopes the TASK-queue consumer), when the actor serves one. */
@@ -303,7 +305,7 @@ export function grantActor(dir: string, row: Omit<ActorRow, "grantedAt">): Actor
  *  managed-row boundaries: authorship ({@link grantManagedActor}) and every agent bearer exchange
  *  ({@link ledgerAuthorizeAgentExchange}) — so narrowing or revoking a spawner bites its agents at
  *  their next refresh (≤ {@link AGENT_BEARER_TTL_SEC}s), instead of leaving them orphaned. */
-function assertWithinSpawnerGrant(
+export function assertWithinSpawnerGrant(
   dir: string,
   row: Pick<ActorRow, "owner" | "actor" | "scope" | "allowSubscribe" | "allowPublish" | "parent" | "role">,
   boundary: "spawn" | "exchange",
@@ -402,9 +404,12 @@ export function grantManagedActor(dir: string, row: Omit<ActorRow, "grantedAt"> 
   const shadowRefusal = () =>
     new Error(`actor "${row.actor}" already has an interactive grant - a managed agent cannot shadow it; revoke it first (\`cotal actor revoke ${row.actor}\`) or spawn under another name`);
   if (findIn(dir, "interactive", row.owner, row.actor)) throw shadowRefusal();
-  // Same rule as grantActor: every row carries a lifecycle UID; the spawn path passes the one it
-  // provisioned durables under, and a direct caller without one gets a fresh mint (never absent).
-  const full: ActorRow = { ...row, lifecycleUid: row.lifecycleUid ?? mintLifecycleUid(), grantedAt: new Date().toISOString() };
+  // The managed space REFUSES an absent lifecycle uid: the uid is the coordinate the spawn path
+  // provisioned broker durables under and stamps into the bearer, so a server-minted one would
+  // name a lifecycle nobody runs. Only the interactive grantActor mints its own.
+  if (row.lifecycleUid === undefined || row.lifecycleUid === "")
+    throw new Error("grantManagedActor: a managed grant must carry the lifecycle uid the spawn path provisioned under; the ledger never mints one");
+  const full: ActorRow = { ...row, lifecycleUid: row.lifecycleUid, grantedAt: new Date().toISOString() };
   writeRow(dir, "managed-agent", full);
   // Symmetric post-write compensation (see grantActor) — at most one surviving row per principal.
   if (findIn(dir, "interactive", row.owner, row.actor)) {
@@ -425,6 +430,13 @@ export function revokeManagedActor(dir: string, owner: string, actor: string): b
   return revokeIn(dir, "managed-agent", owner, actor);
 }
 
+/** Revoke a managed row only while it still names `lifecycleUid`: a caller releasing one lifecycle
+ *  must never remove the grant a same-name successor holds. */
+export function revokeManagedActorAt(dir: string, owner: string, actor: string, lifecycleUid: string): boolean {
+  if (findIn(dir, "managed-agent", owner, actor)?.lifecycleUid !== lifecycleUid) return false;
+  return revokeIn(dir, "managed-agent", owner, actor);
+}
+
 function revokeIn(dir: string, kind: ActorKind, owner: string, actor: string): boolean {
   const p = rowPath(dir, kind, owner, actor);
   if (!existsSync(p)) return false;
@@ -442,7 +454,7 @@ export function ledgerAuthorizeGrant(dir: string): (owner: string, actor: string
       if (findManagedActor(dir, owner, actor))
         throw new Error(`actor "${actor}" is a managed agent - it authenticates with its own spawn-time secret; interact with it via the mesh, or respawn it with \`cotal spawn\``);
       throw new Error(
-        `actor "${actor}" is not granted for this user - the mesh operator lets them in with \`cotal actor grant ${actor} --owner ${owner}\` (or --sub <their IdP subject>, printed by their \`cotal login\`), which is the FULL grant: all channels, may spawn. Narrow it by naming --allow-subscribe/--allow-publish/--scope, since an omitted flag is the wide default`,
+        `actor "${actor}" is not granted for this user - the mesh operator lets them in with \`cotal actor grant ${actor} --owner ${owner} --full\` (or --sub <their IdP subject>, printed by their \`cotal login\`), which is the FULL grant: all channels, may spawn. For a narrow row, name --scope, --allow-subscribe and --allow-publish instead of --full`,
       );
     }
     // MINT-boundary lifecycle stamp (SPEC 13.1): EVERY minted bearer - view or not - carries the
@@ -515,6 +527,11 @@ export function ledgerAclResolver(dir: string): AclResolver {
       throw new Error("bearer carries no lifecycle claim - re-exchange for a fresh bearer (lifecycle-bound from v0.4)");
     if (t.act.lifecycleUid !== row.lifecycleUid)
       throw new Error(`bearer lifecycle ${t.act.lifecycleUid} is not the actor's current incarnation - re-exchange for a fresh bearer`);
+    // Issuance eligibility is separate from envelope containment, which exempts an admin parent.
+    // Read the direct parent at this mint, never the bearer's audit link or a cached spawn grant.
+    const parent = row.kind === "managed-agent" && typeof row.parent === "string" ? parsePrincipalKey(row.parent) : null;
+    const parentHasRun = parent !== null && parent.owner === row.owner && parent.actor !== row.actor
+      && findActorUnified(dir, parent.owner, parent.actor)?.scope.includes("run") === true;
     return {
       allowSubscribe: row.allowSubscribe,
       allowPublish: row.allowPublish,
@@ -523,7 +540,21 @@ export function ledgerAclResolver(dir: string): AclResolver {
       // The CURRENT grant's capabilities, so the mint re-contains the bearer against the row
       // as of THIS read (the callout's fresh-row re-check), not only as of the connect gate.
       scope: row.scope,
+      kind: row.kind,
+      ...(row.kind === "managed-agent" ? { parentHasRun } : {}),
     };
+  };
+}
+
+/** Is an actor-ledger source live? True only when the ledger holds a row for the source's owner and
+ *  actor, in either space (interactive or managed), whose `lifecycleUid` equals the source's.
+ *  `revokeActor` deletes the row, and a re-grant that rotates the uid leaves a row with another uid,
+ *  so both read as dead on the next resolution. */
+export function ledgerActorSourceIsLive(dir: string): (source: IssuedSourceRef) => boolean {
+  return (source) => {
+    const parsed = parseActorLedgerSource(source);
+    if (parsed === undefined) return false;
+    return findActorUnified(dir, parsed.owner, parsed.actor)?.lifecycleUid === parsed.lifecycleUid;
   };
 }
 

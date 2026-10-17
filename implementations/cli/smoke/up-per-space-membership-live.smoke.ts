@@ -39,20 +39,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
-import { createServer, type AddressInfo } from "node:net";
 import { join, resolve as resolvePath } from "node:path";
 import { connect, credsAuthenticator } from "@nats-io/transport-node";
 import { makeScratch, assertScratchHeld } from "../../../bin/smoke/_scratch.js";
-
-const freePort = (): Promise<number> =>
-  new Promise((res, rej) => {
-    const s = createServer();
-    s.on("error", rej);
-    s.listen(0, "127.0.0.1", () => {
-      const p = (s.address() as AddressInfo).port;
-      s.close(() => res(p));
-    });
-  });
+import { freePort } from "@cotal-ai/smoke-kit";
 
 const scratch = makeScratch("cotal-p7-membership-");
 const home = mkdtempSync(join(scratch, "home-"));
@@ -70,7 +60,10 @@ const { authDir, saveBrokerAuth, saveSpaceAccountAuth, spaceMaterialDir } = awai
 
 const WT = resolvePath(import.meta.dirname, "..", "..", "..");
 const CLI = join(WT, "bin", "cotal.ts");
-const TSX = join(WT, "node_modules", ".bin", "tsx");
+// The `.bin/tsx` shim runs the script in a second process and relays only SIGINT and SIGTERM, so a
+// SIGKILL sent to it ends the wrapper and orphans the CLI. Loading tsx into node makes the child the
+// CLI itself.
+const TSX_IMPORT = import.meta.resolve("tsx");
 
 let pass = 0;
 const kids: ChildProcess[] = [];
@@ -84,7 +77,7 @@ const output = new WeakMap<ChildProcess, () => string>();
 const logOf = (cp: ChildProcess) => output.get(cp)?.() ?? "";
 
 function startUp(port: number, space: string): ChildProcess {
-  const cp = spawn(TSX, [CLI, "up", "--space", space, "--server", `nats://127.0.0.1:${port}`], {
+  const cp = spawn(process.execPath, ["--import", TSX_IMPORT, CLI, "up", "--space", space, "--server", `nats://127.0.0.1:${port}`], {
     cwd: root,
     env: { ...process.env, COTAL_HOME: home, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME, COTAL_SKIP_CONNECTOR_SEED: "1" },
     stdio: ["ignore", "pipe", "pipe"],

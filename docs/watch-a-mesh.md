@@ -33,7 +33,10 @@ cotal console                    # no --space on an open mesh → the admin over
 every space on the server (enumerated from its `CHAT_*` streams and presence buckets) with its
 agents, channels, and message counts. Pick one to drop into its console; `b` returns to the
 overview. `--space X` skips the picker. Under auth a server hosts a single space, so the console
-enters it directly (no overview).
+enters it directly (no overview). `D` deletes the selected space once you type its name. A space this
+host registered as a static-auth mesh on that server is deleted under a teardown minted from its trust
+material, which names the resume transfer buckets the space holds at that moment; any other space is
+deleted under the console's own connection, bare on an open mesh or your `--creds` file.
 
 **Lenses and keys** (TUI). The layout is a roster, a live feed, per-channel tabs, a golden-signal
 tiles strip, and toggleable lenses:
@@ -65,8 +68,8 @@ from the console. It is core's `clearChannel` (a filtered history purge plus the
 with the dashboard's per-action authority, a one-shot `channel-purger` credential minted from the
 resolved mesh's seed on a static mesh, a `channel-purger` view on a user mesh, a bare connection
 on an open one; no manager is involved. A wildcard is refused, so the one destructive control
-names one channel. A refusal, from the broker or the manager, lands on the status line. On a
-space with several managers, `D`, `:status`, and `a` are pinned to the manager hosting the seat and
+names one channel. A refusal, from the broker, the manager, or a user mesh's login, lands on the
+status line. On a space with several managers, `D`, `:status`, and `a` are pinned to the manager hosting the seat and
 `:ps` merges every manager's rows; `:spawn` and `:purge` ride the class queue, as `cotal spawn
 --detach` and `cotal purge` do without `--on`. A manager that does not answer keeps its last known
 rows and is named as silent. A manager that answers with an error is named with that error and its
@@ -121,15 +124,17 @@ cotal web --space main --creds ./admin.creds # use a cred you minted yourself
 ```
 
 Flags: `--space` (default `main`), `--server` (the mesh's broker, resolved from the registry),
-`--host` (HTTP bind and browser host, default `127.0.0.1`), `--port` (default `7799`), `--detach`
+`--host` (HTTP bind and browser host, default `127.0.0.1`), `--port` (1 to 65535, default `7799`), `--detach`
 (run in the background), `--no-open` (skip auto-launching the browser), `--creds` (override the
 self-minted cred). Remote exposure requires an explicit concrete `--host`; wildcard addresses
 `0.0.0.0` and `::` are refused because neither is a browser destination. Detached mode waits for
-the real HTTP server at the selected host before returning, logs to `<mesh-root>/.cotal/web.log`, and is stopped by
-`cotal down web` or bare `cotal down`. It requires a recorded mesh root; after `cotal up` records the
+the real HTTP server at the bound host and port before returning, logs to `<mesh-root>/.cotal/web.log`, and is stopped by
+`cotal down web` or bare `cotal down`. If the server is not ready before the deadline, the timeout error ends with `; last probe <url>: <outcome>`, where `<url>` is the bound probe address (`http://127.0.0.1:<port>/api/meta` on the default host), not the browser launch URL, and the outcome is a transport error such as `ECONNREFUSED`, an HTTP refusal status such as `HTTP 401`, or `answered space <space>, pid <pid>` when another process on the port answered with a different space or pid. A mismatched space is cut to 40 characters and a pid to 20 (a number or boolean too long for that is named by its type, and a value that is neither text nor a number is named by its type), and the `<url>: <outcome>` text is capped at 300 bytes, counting the `...` that marks a cut. On the default host it probes `127.0.0.1`, because a system
+resolver such as WSL2's may not answer the branded `cotal.localhost`. It requires a recorded mesh root; after `cotal up` records the
 mesh, it can be launched from any directory. The branded URL `http://cotal.localhost:7799/` resolves
-to loopback with no DNS setup in Chrome, Firefox, and Edge; Safari may not resolve `*.localhost`,
-so use `http://127.0.0.1:7799`. A custom `--port` uses the plain loopback address. An explicit
+to loopback with no DNS setup in Chrome, Firefox, and Edge. Safari and a system resolver such as
+WSL2's may not resolve `*.localhost`, so on this default the launch link is printed again at
+`http://127.0.0.1:7799/` with the same single-use token. A custom `--port` uses the plain loopback address. An explicit
 `--host` is also the advertised address and the only allowed browser Origin for that process.
 
 **The link is single-use, and the surface authenticates the caller.** Starting the dashboard prints a
@@ -167,10 +172,14 @@ DMs), the selected content in the centre, the NEEDS-YOU lane always on the right
 - **Monitor**: the all-activity feed (two-line messages with a delivery-mode badge, per-mode
   filter chips, and pause), the roster (status as shape *and* colour, role, a one-line activity,
   and the agent's harness: claude / opencode / hermes), and the golden-signal tiles
-  (working / waiting / idle / offline / oldest-unattended).
+  (working / waiting / idle / offline / oldest-unattended). The roster groups live peers by the
+  machine each one reports as its host, with a count per machine, so placement across machines
+  reads at a glance. A peer that reports no host, such as a manager, is listed last under *host
+  not reported*. Seats do not report which manager runs them, so the roster has no manager grouping.
 - **Channel view**: one channel's message list, members shown in the header.
 - **Direct messages**: a per-peer roll-up (one row per peer, not the n² pair list); expand a peer
-  for its conversations.
+  for its conversations. Threads key on authenticated ids, and every shown name, role, and status
+  comes from the roster by id, never from the message payload.
 - **Agent Detail.** A per-agent drill-down rendered from the peer's card: name, role, the harness
   and model, capabilities, and what it's working on or blocked on.
 - **Graph view** (`/graph`, linked from the Monitor header): the same feed as a live
@@ -205,9 +214,20 @@ A single peer whose own heartbeat lapses while the watch is live still drops out
 shorter than TCP-level detection never reconnects, which is why this is a freshness gate on the
 watch rather than a `connection` event.
 
-The all-activity read is bounded, so on a slow link it can
+**How the all-activity page is ordered.** When the page loads, the dashboard reads the newest chat
+messages in the order the broker stored them and the newest direct messages, orders the two sets
+together by `ts`, the time each sender wrote into its message, and keeps the newest of them. Chat
+and direct messages are stored in separate streams with no arrival order in common, so `ts` is the
+one key both carry. Where a sender's clock disagrees with the broker, messages can appear in an
+order different from the one they arrived in. Messages with the same `ts` keep the order the broker
+stored them in, and chat comes before direct messages.
+
+The all-activity read is bounded by an 8000 ms deadline, so on a slow link it can
 come back SHORT rather than late: the header then says `partial: activity`, and the page reports how
-many sources answered out of how many were asked and names the ones that did not. A short page and a
+many sources answered out of how many were asked and names the ones that did not. Each missing source
+also carries its reason in the response's `reasons` and in the line the server prints: `the read did
+not finish within <deadline>ms` when the deadline cut it, or `the read failed:` and the error when it was
+refused, such as a chat read whose filter list exceeds the broker's `max_payload`. A short page and a
 complete one are never the same bytes. On a link too slow to finish anything the honest answer is
 zero sources answered, and you keep looking at the last good data with the marker up. When the
 deadline wins, Cotal also cancels the unfinished history pulls and removes their ephemeral consumers;
@@ -241,11 +261,16 @@ less than a machine can spend. A larger body is refused with a `413` naming the 
 stops reading it rather than taking it all in first and complaining afterwards, and the connection
 that body arrived on is closed so the rest of it cannot be sent. It is never shortened to fit: a
 trimmed name is a name you did not type, which is the thing the paragraph above exists to prevent.
-Ordinary requests keep their connection as usual.
+Every other route takes no request body. It refuses an announced body before reading it with the
+same `413` and closed connection. A request the gate refuses is closed the same way when it
+announced a body, so a caller without a session cannot hold the dashboard reading an upload.
+Ordinary bodyless requests keep their connection as usual.
 
 **Message bodies render Markdown** (headings, lists, **bold**, `code`, blockquotes, links) across
 the Monitor, channel, and DM views, parsed and sanitized client-side. Agent text is untrusted, so
-raw HTML is stripped and only http(s)/mailto links survive. Long bodies still clamp to a few lines
+raw HTML is stripped and only http(s)/mailto links survive. A peer's name, role and activity show
+as plain text, including inside an attribute such as the activity's hover title. Long bodies still
+clamp to a few lines
 with a per-message *show more*; a channel-wide **expand / collapse all** in the header opens or
 closes every message at once.
 

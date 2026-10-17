@@ -21,7 +21,7 @@ import {
   type EpCaller, type EpRoute, type EpTarget,
 } from "./endpoint-subjects.js";
 import {
-  EpEnvelopeError, EP_UNBOUND_RESPONDER, EP_UNANSWERED, EP_REGISTRY_READ_FAILED, EP_BIND_REFUSED, registryReadFailed, bindRefusalMarked, parseEndpointReply, parseEndpointEvent, assertArgsValid, assertOutputValid,
+  EpEnvelopeError, EP_UNBOUND_RESPONDER, EP_UNANSWERED, EP_REGISTRY_READ_FAILED, EP_UNDECLARED_ARG, EP_BIND_REFUSED, registryReadFailed, bindRefusalMarked, parseEndpointReply, parseEndpointEvent, assertArgsValid, assertOutputValid,
   type EndpointRequest, type EndpointReply, type EndpointEvent, type EpCorrelation, type EpTargetBlock, type EpUnboundResponderDetail, type EpBindRefusedDetail,
   type EpUnansweredDetail, type EpRegistryReadFailedDetail, type EpErrorDetail, type EpBindBlock,
 } from "./endpoint-envelope.js";
@@ -36,7 +36,7 @@ import { freezeExpectedSet, registrationReconciler, serviceEpochReader, type Fro
  *  disagree. `self` carries no body target (the caller triple IS the target, §13.3). */
 export type EpVerbTarget =
   | { mode: "self" }
-  | { mode: "owner" | "any" | "child" | "ledger" | "handle"; owner: string; actor: string; lifecycleUid: string; mappingRevision?: number };
+  | { mode: "owner" | "any" | "child" | "ledger" | "handle" | "exact"; owner: string; actor: string; lifecycleUid: string; mappingRevision?: number };
 
 /** What every verb needs to address one command: the compiled §13.7 contracts (digests derive
  *  from `closureDigest`, exactly like the serve table), the caller triple the credential pins,
@@ -74,8 +74,8 @@ const nonce = (): string => randomBytes(24).toString("base64url"); // 32 tokens 
 
 function subjectTarget(t: EpVerbTarget): EpTarget {
   if (t.mode === "self") return { mode: "self" };
-  if (t.mode === "handle")
-    return { mode: "handle", tOwner: t.owner, tActor: t.actor, tUid: t.lifecycleUid };
+  if (t.mode === "handle" || t.mode === "exact")
+    return { mode: t.mode, tOwner: t.owner, tActor: t.actor, tUid: t.lifecycleUid };
   return { mode: t.mode, tOwner: t.owner };
 }
 
@@ -97,8 +97,26 @@ function buildRequest(
 ): { subject: string; requestId: string; n: string; body: Uint8Array } {
   // §13.7: the caller's own contract gates the args BEFORE publish — the same validator and the
   // same budget the responder runs, so a request this boundary admits pins digests the
-  // responder can honor or reject, never digests detached from the payload.
-  assertArgsValid(op.contract.input.validate, op.args);
+  // responder can honor or reject, never digests detached from the payload. The args are gated as
+  // the responder will parse them: JSON drops a key whose value is undefined, and validating the
+  // object itself refused, against an older responder's closed contract, a key that never reaches it.
+  let args: Record<string, unknown> | undefined;
+  try {
+    args = op.args === undefined ? undefined : JSON.parse(JSON.stringify(op.args)) as Record<string, unknown>;
+  } catch (e) {
+    // A value JSON cannot carry (a BigInt, a cycle, a throwing toJSON) is malformed args that never
+    // left this caller: a `not-executed` refusal like the contract check below, never an unknown outcome.
+    throw new EpEnvelopeError("bad-request", `args cannot be sent as JSON: ${e instanceof Error ? e.message : String(e)}`, undefined, "not-executed");
+  }
+  try {
+    assertArgsValid(op.contract.input.validate, args);
+  } catch (e) {
+    if (!(e instanceof EpEnvelopeError)) throw e;
+    // Nothing was published, so the refusal is `not-executed` (§13.3). A key the contract does not
+    // declare is marked, so a surface that knows both builds can name the version skew.
+    const property = op.contract.input.validate.errors?.[0]?.params?.additionalProperty;
+    throw new EpEnvelopeError(e.code, e.message, typeof property === "string" ? [{ kind: EP_UNDECLARED_ARG, property }] : undefined, "not-executed");
+  }
   // The responder refuses these too (§13.3), but a caller that would emit an unservable request
   // should not have to learn it from a round trip: `describe` is what produces a bind, and a
   // scatter addresses every incarnation, so neither can carry one.
@@ -131,7 +149,7 @@ function buildRequest(
     ...(op.goalId !== undefined ? { goalId: op.goalId } : {}),
     ...(op.target && op.target.mode !== "self" ? { target: bodyTarget(op.target) } : {}),
     ...(op.bind !== undefined ? { bind: { instanceId: assertLifecycleToken(op.bind.instanceId, "bind instanceId"), epoch: op.bind.epoch } } : {}),
-    ...(op.args !== undefined ? { args: op.args } : {}),
+    ...(args !== undefined ? { args } : {}),
     from: { id: `${op.caller.owner}.${op.caller.actor}`, name: op.name ?? op.caller.actor },
     ...(verb.deadlineMs !== undefined ? { deadlineMs: verb.deadlineMs } : {}),
     ...(op.correlation !== undefined ? { correlation: op.correlation } : {}),
@@ -396,8 +414,9 @@ export async function epCall(
   space: string,
   route: { mode: "one" } | { mode: "inst"; instanceId: string; epoch: number },
   op: EpVerbOp,
-  opts: { deadlineMs: number; currentEpoch?: (instanceId: string) => Promise<number> | number; currencyReference?: "bind" | "registry" },
+  opts: { deadlineMs: number; currentEpoch?: (instanceId: string) => Promise<number> | number; currencyReference?: "bind" | "registry"; signal?: AbortSignal },
 ): Promise<EpAttributedReply> {
+  opts.signal?.throwIfAborted();
   const deadlineMs = assertDeadline(opts.deadlineMs);
   if (route.mode === "one" && opts.currentEpoch === undefined)
     throw new EpEnvelopeError("bad-request", "epCall on the `one` rail requires opts.currentEpoch: the queue winner is not implicitly current, and a superseded-but-connected member's reply must be rejected (SPEC 13.2, the stale-reply rejection rule)");
@@ -412,7 +431,17 @@ export async function epCall(
   let sub: Subscription | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let denialWatch: { denied: Promise<never>; release(): void } | undefined;
+  let onAbort: (() => void) | undefined;
+  const cancelled = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new EpEnvelopeError("unavailable", `${op.endpoint}.${op.command} observation cancelled; the request may have executed`, undefined, "unknown"));
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+  });
   try {
+    // Register denial observation before publishing. Keep subscription and publication in the
+    // same promise executor: a closed/draining connection must not strand a rejected reply wait.
+    // The broker dropped the publish, so no responder received the command: `not-executed` (§13.3).
+    denialWatch = openPublishDenialWatch(nc, req.subject, () => new EpEnvelopeError("permission-denied",
+      `the call for ${op.endpoint}.${op.command} was REFUSED BY THE BROKER, not unanswered: this caller's credential does not authorize publishing to "${req.subject}"${route.mode === "inst" ? ` (the instance rail for ${route.instanceId}: an instance-addressed call needs a credential minted with that instance, not a class-rail one)` : ""}. The responder may be perfectly healthy; the grant is what is missing (SPEC 13.2)`, undefined, "not-executed"), "call");
     const outcome = new Promise<{ subject: string; data: Uint8Array }>((resolve, reject) => {
       sub = nc.subscribe(replySubjectFor(space, op.caller, req.n), {
         callback: (err, msg) => {
@@ -430,15 +459,11 @@ export async function epCall(
           resolve({ subject: msg.subject, data: msg.data });
         },
       });
+      opts.signal?.throwIfAborted();
+      nc.publish(req.subject, req.body, { reply: noRespReplyTo });
     });
-    // REGISTER THE PERMISSION WATCH BEFORE THE PUBLISH IT IS WATCHING. See
-    // {@link openPublishDenialWatch}: a refused publish is otherwise indistinguishable
-    // from an unanswered call.
-    denialWatch = openPublishDenialWatch(nc, req.subject, () => new EpEnvelopeError("permission-denied",
-      `the call for ${op.endpoint}.${op.command} was REFUSED BY THE BROKER, not unanswered: this caller's credential does not authorize publishing to "${req.subject}"${route.mode === "inst" ? ` (the instance rail for ${route.instanceId}: an instance-addressed call needs a credential minted with that instance, not a class-rail one)` : ""}. The responder may be perfectly healthy; the grant is what is missing (SPEC 13.2)`), "call");
-    nc.publish(req.subject, req.body, { reply: noRespReplyTo });
     const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new EpEnvelopeError("deadline-exceeded", `no reply to ${op.endpoint}.${op.command} within the ${deadlineMs}ms budget (SPEC 13.5)`, [unansweredDetail(op)])), deadlineMs); });
-    const msg = await Promise.race([outcome, timeout, denialWatch.denied]);
+    const msg = await Promise.race([outcome, timeout, denialWatch.denied, cancelled]);
     const attributed = parseAttributedReply(space, msg.subject, msg.data, req.requestId, op, expect);
     // Taken BEFORE the currency check below, because a responder that fenced on the bind settled
     // the same question better: it knows it did not run the command, where the check can only
@@ -506,6 +531,7 @@ export async function epCall(
     sub?.unsubscribe();
     if (timer !== undefined) clearTimeout(timer);
     denialWatch?.release();
+    if (onAbort) opts.signal?.removeEventListener("abort", onAbort);
   }
 }
 

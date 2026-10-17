@@ -1,5 +1,603 @@
 # @cotal-ai/delivery
 
+## 0.82.0
+
+### Patch Changes
+
+- Updated dependencies [4f52881]
+- Updated dependencies [6afa12f]
+- Updated dependencies [7c6c109]
+- Updated dependencies [9a93a58]
+  - @cotal-ai/core@0.82.0
+  - @cotal-ai/workspace@0.82.0
+
+## 0.81.1
+
+### Patch Changes
+
+- @cotal-ai/core@0.81.1
+- @cotal-ai/workspace@0.81.1
+
+## 0.81.0
+
+### Patch Changes
+
+- Updated dependencies [c166107]
+  - @cotal-ai/core@0.81.0
+  - @cotal-ai/workspace@0.81.0
+
+## 0.80.0
+
+### Patch Changes
+
+- Updated dependencies [5417401]
+- Updated dependencies [71e6311]
+- Updated dependencies [3614fdd]
+- Updated dependencies [e00402f]
+- Updated dependencies [80f66fd]
+- Updated dependencies [0835254]
+  - @cotal-ai/core@0.80.0
+  - @cotal-ai/workspace@0.80.0
+
+## 0.79.0
+
+### Patch Changes
+
+- fbc3e2d: Whether a consumer info or delete found no consumer is now decided by one predicate, `isConsumerNotFound` in `@cotal-ai/core`, which accepts only the broker's structured `ConsumerNotFound` error. It no longer accepts a bare `name` of `ConsumerNotFoundError` or a string `code`, so the run journal's replay cleanup no longer swallows those shapes. The stream, KV scan, run wait, delivery `pending` and auth scanner sites use it in place of their own copies, and `isJetStreamMissing`, the structured check it builds on, is exported beside it.
+- Updated dependencies [50747b1]
+- Updated dependencies [fbc3e2d]
+- Updated dependencies [c535d98]
+- Updated dependencies [36b03b0]
+- Updated dependencies [2bd492c]
+- Updated dependencies [5e9a618]
+- Updated dependencies [7cb89f9]
+- Updated dependencies [db962ae]
+- Updated dependencies [4aafb0d]
+- Updated dependencies [92590e8]
+- Updated dependencies [c03f2af]
+- Updated dependencies [79ace0f]
+  - @cotal-ai/workspace@0.79.0
+  - @cotal-ai/core@0.79.0
+
+## 0.78.1
+
+### Patch Changes
+
+- @cotal-ai/core@0.78.1
+- @cotal-ai/workspace@0.78.1
+
+## 0.78.0
+
+### Patch Changes
+
+- 87ef6f3: A hosted delivery `close()` whose lease release is in flight while the delivery connection drops now waits for the connection to reconnect, up to the broker-gone window (`COTAL_DELIVERY_BROKER_GONE_MS`, 15 seconds by default) counted from the drop, and repeats the release once on the reconnected connection before it decides. Before, a lease read or delete written to the dropped socket, or buffered while it was down, timed out after 5 seconds although the broker answered again, so `close()` rejected, every later `close()` and `drain()` returned that rejection, and a successor was refused until the bucket TTL expired the row. A release that still cannot be confirmed, including one whose connection does not come back within that window, still rejects.
+- Updated dependencies [a7f39aa]
+- Updated dependencies [981b567]
+- Updated dependencies [8344353]
+- Updated dependencies [f9a71ce]
+- Updated dependencies [b9499b3]
+- Updated dependencies [c2d8362]
+- Updated dependencies [70fb24e]
+- Updated dependencies [de3c0f7]
+- Updated dependencies [a32e955]
+- Updated dependencies [7d13389]
+  - @cotal-ai/workspace@0.78.0
+  - @cotal-ai/core@0.78.0
+
+## 0.77.1
+
+### Patch Changes
+
+- @cotal-ai/core@0.77.1
+- @cotal-ai/workspace@0.77.1
+
+## 0.77.0
+
+### Patch Changes
+
+- Updated dependencies [6861390]
+- Updated dependencies [7d1b600]
+  - @cotal-ai/core@0.77.0
+  - @cotal-ai/workspace@0.77.0
+
+## 0.76.0
+
+### Minor Changes
+
+- d153172: The manager and the delivery daemon now name an injected `SecretStore` through one rule, `injectedSecretStoreIdentity` in `@cotal-ai/core`: the store's declared identity, else the coordinate in `COTAL_SECRET_STORE`, else a refusal. Each package kept its own copy before, so a change to one could have made the store challenge report two names for one shared store, and both now refuse an unnamed store with the same message. `reloadStoreIdentityOf` from `@cotal-ai/delivery` takes `{ injected: true, store }` or `{ injected: false, identity }`. The daemon's injected cred source no longer carries an identity, which nothing read and which was blank when `COTAL_SECRET_STORE` was unset. See the upgrading guide.
+
+### Patch Changes
+
+- e1c317e: The `startDeliveryService` handle's `close()` and `drain()` now reject when the instance did not give its shard lease back: the lease row is still held after the close, by another holder or because the release did not commit, or the broker could not confirm the release. They used to resolve in every case, so a host that started a successor at once could be refused with "a live lease already exists" without any prior signal. The rest of the teardown still runs, and the bucket TTL still expires a row the instance left. A failed start keeps its own error and logs a release that also failed.
+- 9a7aec4: `cotal feedback-intake` now refuses a `--port` that is not a decimal number from 1 to 65535 before it probes the broker, with an error that names `--port`. An out-of-range port such as `70000` used to pass argument parsing, so the intake connected and announced itself on the mesh before `listen()` failed with `options.port should be >= 0 and < 65536`. A hex or exponent spelling such as `0x1f90` or `8080e0` was accepted and bound that port.
+- Updated dependencies [58a725f]
+- Updated dependencies [7829cbb]
+- Updated dependencies [8e0876b]
+- Updated dependencies [d85ca1a]
+- Updated dependencies [20c93a1]
+- Updated dependencies [715928c]
+- Updated dependencies [a4b0467]
+- Updated dependencies [08d92b7]
+- Updated dependencies [35fdda8]
+- Updated dependencies [7b34e9a]
+- Updated dependencies [d153172]
+- Updated dependencies [15d10c9]
+- Updated dependencies [0eb8eff]
+- Updated dependencies [ba76f78]
+- Updated dependencies [f2a4bde]
+- Updated dependencies [8be669e]
+- Updated dependencies [42b28aa]
+- Updated dependencies [720dbc3]
+  - @cotal-ai/core@0.76.0
+  - @cotal-ai/workspace@0.76.0
+
+## 0.75.0
+
+### Patch Changes
+
+- ed0785d: `@cotal-ai/core` exports `isAccountNkey`, the shape rule for an account nkey public key, and every site in core, `@cotal-ai/auth` and `@cotal-ai/delivery` that checks an account public key calls it. The run admission and run attempt parsers now refuse an `accountPublicKey` that is not an account nkey as a bad request. They accepted any non-empty string before, which only the later comparison with the assigned account refused.
+- Updated dependencies [6286d29]
+- Updated dependencies [ed0785d]
+- Updated dependencies [625659e]
+- Updated dependencies [0c924f4]
+- Updated dependencies [b48a740]
+- Updated dependencies [597fa25]
+- Updated dependencies [cb3a177]
+- Updated dependencies [5f5196f]
+- Updated dependencies [d269d1d]
+  - @cotal-ai/core@0.75.0
+  - @cotal-ai/workspace@0.75.0
+
+## 0.74.0
+
+### Patch Changes
+
+- Updated dependencies [f3e6f95]
+- Updated dependencies [328d59b]
+- Updated dependencies [ac251fd]
+- Updated dependencies [e3498d9]
+  - @cotal-ai/core@0.74.0
+  - @cotal-ai/workspace@0.74.0
+
+## 0.73.0
+
+### Patch Changes
+
+- 3bcc701: The delivery package no longer ships the broker-probe verdict that native transport health replaced. `brokerGoneVerdict`, `classifyProbe`, `DescheduleSampler` and the probe constants had no caller in the daemon, which decides broker loss from its resident connection, so they are deleted with the smoke cells and mutations that graded only them. `LoopLagMeter` now takes its interval as a required argument.
+- Updated dependencies [9873985]
+  - @cotal-ai/core@0.73.0
+  - @cotal-ai/workspace@0.73.0
+
+## 0.72.1
+
+### Patch Changes
+
+- Updated dependencies [07fe6b3]
+  - @cotal-ai/core@0.72.1
+  - @cotal-ai/workspace@0.72.1
+
+## 0.72.0
+
+### Patch Changes
+
+- 00defcd: `startDeliveryService` now builds its `HostedServiceHandle` from a result the delivery runner always returns, with no cast. The runner was typed `void | HostedServiceHandle` and the hosted entry narrowed it with `as HostedServiceHandle`, so a change that sent the hosted path into the CLI's run-until-signalled wait, or returned nothing on it, still typechecked and would have left `startDeliveryService` pending forever or resolving `undefined`. The CLI runner now owns that wait itself. Behaviour is unchanged.
+- 80e54e4: The delivery daemon's transport health no longer assigns `expired = false` on a reconnect. The assignment ran only after the guard that returns while a credential expiry is pending, so it always wrote `false` over `false` and read as if a reconnect cleared an expiry. Only a proved credential adoption clears it, as before. Behavior is unchanged.
+- Updated dependencies [c5a45ab]
+- Updated dependencies [18e7e91]
+  - @cotal-ai/core@0.72.0
+  - @cotal-ai/workspace@0.72.0
+
+## 0.71.0
+
+### Patch Changes
+
+- Updated dependencies [b9daf53]
+- Updated dependencies [3518435]
+- Updated dependencies [726a750]
+- Updated dependencies [518351a]
+  - @cotal-ai/core@0.71.0
+  - @cotal-ai/workspace@0.71.0
+
+## 0.70.2
+
+### Patch Changes
+
+- @cotal-ai/core@0.70.2
+- @cotal-ai/workspace@0.70.2
+
+## 0.70.1
+
+### Patch Changes
+
+- Updated dependencies [9c99ee5]
+- Updated dependencies [da6dba0]
+- Updated dependencies [032522a]
+- Updated dependencies [5c6c92d]
+- Updated dependencies [6d81d61]
+- Updated dependencies [66a0f19]
+- Updated dependencies [2be1384]
+- Updated dependencies [25237f0]
+- Updated dependencies [6bd6099]
+- Updated dependencies [ed1e171]
+  - @cotal-ai/core@0.70.1
+  - @cotal-ai/workspace@0.70.1
+
+## 0.70.0
+
+### Patch Changes
+
+- Updated dependencies [392bfeb]
+- Updated dependencies [66df6c0]
+- Updated dependencies [0ec35c2]
+- Updated dependencies [015f805]
+- Updated dependencies [2cbfe9c]
+- Updated dependencies [1b11c4e]
+- Updated dependencies [c088c5c]
+- Updated dependencies [b413e2a]
+- Updated dependencies [7986785]
+- Updated dependencies [12bfc34]
+- Updated dependencies [4dcfa0b]
+- Updated dependencies [fd07b1e]
+- Updated dependencies [8dc360c]
+- Updated dependencies [cce8dad]
+- Updated dependencies [c7e0c0a]
+- Updated dependencies [2639a13]
+- Updated dependencies [668f6b0]
+- Updated dependencies [15b7920]
+  - @cotal-ai/workspace@0.70.0
+  - @cotal-ai/core@0.70.0
+
+## 0.69.0
+
+### Minor Changes
+
+- 4500563: A filesystem SecretStore identity is now `{kind: "fs", root, id}`, where `id` is a random value the store records once in `store.id` inside its own directory. No key of a filesystem store and no `cotal deliver --creds` file may be that file under any name the filesystem resolves to it, compared by device and inode so a case-insensitive spelling or a link counts, and a `store.id` that is a symbolic link or holds anything but a lowercase UUID is refused, so neither a credential nor another key is ever published as the id. Two filesystem identities match only when both the root and the id match, so a manager on another host whose workspace root has the same path as the delivery daemon's no longer counts as the daemon's store, takes no daemon-credential renewal lease, and no longer blocks `cotal doctor auth --fix` on the broker host. A daemon answer with no `id` is refused, so the manager and the delivery daemon must run this release together. `FsSecretStore` takes the root its identity names as its second constructor argument instead of a full identity.
+
+### Patch Changes
+
+- cd45352: `docs/delivery-daemon.md` now describes the broker watch the delivery daemon runs. It no longer says a two-second authenticated broker probe is the active watch; after its start-up reachability check the daemon opens no other connection to check the broker. The page names the disconnect that starts the clock, the window (`COTAL_DELIVERY_BROKER_GONE_MS`, 15 seconds by default) that credits time the daemon itself was stalled, the absolute backstop (`COTAL_DELIVERY_BROKER_GONE_BACKSTOP_MS`, four times the window by default), the exit line each one logs, and how an expired credential is handled. No behavior changes.
+- Updated dependencies [f5cb8e1]
+- Updated dependencies [2d45766]
+- Updated dependencies [03a7405]
+- Updated dependencies [a256e2f]
+- Updated dependencies [3f3d04a]
+- Updated dependencies [4500563]
+- Updated dependencies [5eb1e24]
+- Updated dependencies [69232cd]
+- Updated dependencies [02c0a2d]
+- Updated dependencies [93716c3]
+- Updated dependencies [3a1716d]
+- Updated dependencies [9772fd4]
+- Updated dependencies [06429be]
+- Updated dependencies [adab793]
+- Updated dependencies [d29d4d3]
+- Updated dependencies [539266a]
+- Updated dependencies [b584718]
+- Updated dependencies [0c5b205]
+- Updated dependencies [98d2b41]
+  - @cotal-ai/workspace@0.69.0
+  - @cotal-ai/core@0.69.0
+
+## 0.68.0
+
+### Patch Changes
+
+- Updated dependencies [6141e7b]
+- Updated dependencies [4120c97]
+- Updated dependencies [218006f]
+- Updated dependencies [681c5b0]
+- Updated dependencies [585fdb2]
+- Updated dependencies [a5256fd]
+- Updated dependencies [0d806ae]
+- Updated dependencies [9b439e8]
+- Updated dependencies [41a7e66]
+- Updated dependencies [f018376]
+- Updated dependencies [6a1789b]
+- Updated dependencies [237c813]
+  - @cotal-ai/core@0.68.0
+  - @cotal-ai/workspace@0.68.0
+
+## 0.67.0
+
+### Patch Changes
+
+- Updated dependencies [48f18d0]
+- Updated dependencies [e85e1fd]
+- Updated dependencies [55061ff]
+- Updated dependencies [5b0da88]
+- Updated dependencies [e65ec69]
+- Updated dependencies [79e5268]
+- Updated dependencies [bb0b14e]
+- Updated dependencies [3069425]
+- Updated dependencies [ae5b3cd]
+- Updated dependencies [954a78b]
+- Updated dependencies [f389576]
+- Updated dependencies [562a56b]
+  - @cotal-ai/core@0.67.0
+  - @cotal-ai/workspace@0.67.0
+
+## 0.66.1
+
+### Patch Changes
+
+- Updated dependencies [568f718]
+  - @cotal-ai/workspace@0.66.1
+  - @cotal-ai/core@0.66.1
+
+## 0.66.0
+
+### Patch Changes
+
+- Updated dependencies [a07f732]
+- Updated dependencies [be53e2d]
+- Updated dependencies [658c1b8]
+- Updated dependencies [af779f9]
+  - @cotal-ai/core@0.66.0
+  - @cotal-ai/workspace@0.66.0
+
+## 0.65.0
+
+### Patch Changes
+
+- Updated dependencies [ba5468d]
+- Updated dependencies [451ffee]
+- Updated dependencies [f01aa7c]
+- Updated dependencies [2cef9e6]
+  - @cotal-ai/core@0.65.0
+  - @cotal-ai/workspace@0.65.0
+
+## 0.64.0
+
+### Patch Changes
+
+- Updated dependencies [6c79419]
+- Updated dependencies [d121d21]
+  - @cotal-ai/core@0.64.0
+  - @cotal-ai/workspace@0.64.0
+
+## 0.63.0
+
+### Patch Changes
+
+- Updated dependencies [62ebc6b]
+- Updated dependencies [22e210a]
+- Updated dependencies [cb6a0bf]
+- Updated dependencies [5738154]
+- Updated dependencies [101c9b0]
+- Updated dependencies [9d5cc09]
+- Updated dependencies [c975258]
+  - @cotal-ai/core@0.63.0
+  - @cotal-ai/workspace@0.63.0
+
+## 0.62.0
+
+### Patch Changes
+
+- Updated dependencies [bcf66d6]
+- Updated dependencies [97a2382]
+- Updated dependencies [877909b]
+- Updated dependencies [5ef9a67]
+- Updated dependencies [565036c]
+- Updated dependencies [9236a12]
+- Updated dependencies [b36bebf]
+  - @cotal-ai/core@0.62.0
+  - @cotal-ai/workspace@0.62.0
+
+## 0.61.0
+
+### Patch Changes
+
+- @cotal-ai/core@0.61.0
+- @cotal-ai/workspace@0.61.0
+
+## 0.60.0
+
+### Minor Changes
+
+- 6ca4d8e: Add the platform control authority: a closed `platform-control` view, beside the unchanged human `manager-service` view, that lets a host platform run one pooled control manager per assigned account without a human session (SPEC §13.1, §13.6, §13.9). `startAuthService` takes an optional `platformControl: { observeAssignment }` input, and the returned handle then carries `platformControlAuthority`, a typed in-process door served on no listener. It issues the existing manager-service request family under a host-derived `p_` platform owner (`platformControlOwner`), reads the backend's assignment fresh on every call, reuses the registration proof, process epoch and all-duty renewal unchanged, confines maintenance to the assigned instance, and refuses `prepare` and `activate` while a named predecessor manager is still registered. It refuses IdP tokens, another account, a stale assignment, another owner's instance, unknown fields (a nested `session` field included) and the managed-agent kinds. `@cotal-ai/core` adds the `PlatformControlAuthorityRequest`, `PlatformControlInnerRequest`, `PlatformControlAuthorityResult` and `PlatformControlAssignment` types, the `p_` owner grammar, and an opt-in `allowPlatform` on the principal owner checks and on CONNZ attribution (`principalFromConnz`). Only the platform family's own boundaries opt in: the issuance gate row, the credential holder row, the eviction and liveness sweeps with the delivery daemon's executors, the manager goal-index scanner, the run driver caller, and, for the platform holder only, the retirement target, retained-validation target and admin caller parsers. The membership feed and the message drop guards still refuse a `p_` owner. Presence has no owner check, so a platform endpoint's roster card appears under its `p_` owner. `startAuthService` also forwards a trusted-host `standingRenewableTtlSeconds` to the authority plane. The human remote-supervision path is unchanged.
+
+### Patch Changes
+
+- Updated dependencies [3b616a2]
+- Updated dependencies [6ca4d8e]
+  - @cotal-ai/core@0.60.0
+  - @cotal-ai/workspace@0.60.0
+
+## 0.59.0
+
+### Patch Changes
+
+- b669a73: `cotal deliver` takes `--root <dir>` to name the workspace root it serves instead of inheriting it from the working directory. Without the flag, a workstation daemon started from a directory with no `.cotal/` above it now refuses at start and names the directory it searched from. It used to read its credential and registry from that directory, dial the broker, and only then refuse on a missing `$SYS` observer. `@cotal-ai/workspace` adds `requireCotalRoot`, the same walk as `findCotalRoot` without the fallback to the start directory.
+- 972a76d: The delivery daemon now writes `• delivery: received SIGTERM, exiting (space <space>, shard <n>)` (or `SIGINT`) to its log before it tears down on a signal. A stop from `cotal down`, a service stop or Ctrl-C used to leave the log ending on routine work, which looked the same as a silent death. Every other deliberate exit already logged its reason. A SIGKILL, including the kernel OOM killer, still leaves no line.
+- 350c87b: The delivery daemon no longer exits when a credential adoption arrives while it is still starting. Its lease turns ready before the membership feed, the timer writer and the lease watch are up, so a manager's boot-time `reloadCreds` could land in that window and reconnect the daemon's connection under the lease watch it was still creating, which then timed out and stopped the daemon. Until start-up finishes, `reloadCreds` is now refused with nothing adopted, and the renewal owner records that refusal. The next renewal pass or the daemon's own 75% re-read adopts the re-signed credentials.
+- 06f48f4: CLI output is plain text when stdout is not a terminal or `NO_COLOR` is set to a non-empty value. The shared color helpers used to wrap every string in ANSI escapes, so `cotal --help`, `cotal status`, `cotal meshes` and the red error lines on stderr carried escapes into pipes and log files. The manager's and the delivery daemon's own always-on copies are gone; `cotal supervise` and `cotal feedback-intake` now print through the same helpers. The guided `cotal setup` and `cotal meshes add` prompts follow the same rule, so `FORCE_COLOR` now reaches them too. `FORCE_COLOR` turns color back on even when output is piped, unless it is `0` or `false`, and it takes precedence over `NO_COLOR`, the order Node uses.
+- fb1bc26: Let a credentialed peer ask which plane is broken, instead of guessing at its own credentials
+
+  The subjects that answer "is the manager alive" are owner-only, so a peer holding perfectly valid
+  credentials could not ask. When its join or its send failed, that peer could not tell a credential
+  problem from a dead manager, an unbound delivery daemon, or a broker that was entirely healthy, so
+  every failure presented as a credential failure, because that was the only hypothesis it was able to
+  form. A reporter running a 30-agent deployment for a week recorded six independent surfaces that each
+  reported success over a failure, including a `pgrep` that matched its own command line and therefore
+  failed in both directions. In every case diagnosis cost hours rather than minutes, and in every case
+  the missing piece was the same: nothing could be asked whether it was alive by anyone who did not own
+  it.
+
+  A read-only liveness surface now answers that question. A peer sends a presence probe on
+  `live.<plane>.<owner>.<actor>` and learns whether the manager and the delivery daemon have bound
+  responders for the space. It is shaped like the Synadia micro protocol's `$SRV.INFO`, a well-known,
+  read-only, presence-only request/reply probe, but it rides a Cotal subject inside the space rather
+  than the literal `$SRV` tree, which sits outside per-space account isolation and outside every grant
+  builder and subject audit the system already enforces.
+
+  Presence is the whole answer. The reply carries the plane, one responder verdict and an opaque
+  per-bind responder token (below), and nothing else: no holder, no pid, no workspace root, no
+  runtime, no roster, and no instance id, since the token is minted from nothing and names no
+  instance. That is why the probe is a
+  request rather than a lease read: the manager's lease row carries the operator's filesystem path and
+  a process id, so the responder reduces it to a single enum and the row never crosses the wire. A peer
+  gains no read of either lease bucket, cannot probe under another principal's identity, and cannot
+  subscribe the responder's serve filter to answer for a plane it does not own.
+
+  Unknown stays first class, reusing the classifier `cotal status` already grades by. Only the broker's
+  own no-responders answer becomes "unbound"; a timeout, a permission refusal or an unreadable reply
+  all become "unknown", because each is a failure to find out, and reporting a failure to find out as
+  health is the defect this surface exists to remove. A responder that cannot determine its own state
+  says so rather than guessing, and a reply is never counted as health merely for having arrived.
+
+  The reply also names which responder answered it, as an opaque per-bind token and not an identity.
+  Manager instances coexist per instance id, each responder answers only about itself, and the queue
+  group hands one probe to one arbitrary member, so two instances holding opposite verdicts made
+  identical probes alternate with nothing in the answer to say a second instance existed. With the
+  token a caller that probes more than once can tell two responders apart from one responder that
+  changed state. One probe still samples one responder and cannot report a split by itself.
+
+  SPEC §6.1 defines the `live` subjects, the `LivenessAnswer` reply and its grading, and the
+  message-flow docs page describes them.
+
+  A remote manager can now answer the probe it already binds. It runs the same start path as a local
+  supervisor, so it binds the manager plane's responder, and its credential carried neither the serve
+  subscription nor the bounded reply row. The subscription was denied and a peer asking about the
+  manager plane received the broker's own no-responders answer, which grades "unbound": a definite
+  verdict about a plane that was in fact bound, produced by a gap in a credential. Both rows are now
+  on that profile, pinned to the supervisor actor that does the serving.
+
+  The responder's rejection notice for a reply target outside the sender's own subtree now travels on
+  the endpoint's non-fatal warning channel. It was emitted on the `error` channel, and Node's
+  `EventEmitter` rethrows an `error` emitted with no listener attached, so an embedder that had not
+  attached one ended its process when a peer sent a probe naming such a target. The plane was then
+  genuinely unbound and the next probe reported it as such, so the notice manufactured the state it
+  described. The guard's behaviour is unchanged: the frame is dropped and the responder keeps serving.
+
+- 438e9ed: Close the pid record publish window. A launcher that died between removing the old identity pin and publishing the new pidfile left the old pid with no pin, which teardown signalled with only a legacy warning, even when the removed pin had been refusing a reused pid. The publish now renames a bridge pin holding the old and the new record's lines before the pidfile commit, and teardown checks the pidfile's pid against its own line, so every crash point leaves the old or the new complete record. Publishes of one pidfile are serialized by a lock, so a launcher and the daemon it starts can no longer overwrite each other's bridge or settled pin. A publish that cannot read a start token for the new process gives it a `-` pin line, so a crash after the commit reads the legacy record it was publishing, never the new pid beside the old pin. Replacing a legacy record carries its line as `-`, so an interrupted replace leaves it legacy, never torn. Teardown and a daemon's exit cleanup remove a record under the same lock, and only while the pidfile still names the pid they stopped, so a stop that races a publish can no longer leave the new pidfile with no pin. `removeIdentityPin` is deprecated in favor of `removePidPair` and stays exported unchanged for one minor line.
+- aa12a1a: Gate reconciliation no longer scales with credential family size. `cotal reconcile-gate`, manager boot self-heal and remote manager maintenance revoke the family's ledger rows 16 at a time, then verify-evict every distinct holder in one shared scan, KICK and verify sweep through the new `evictPrincipals` delivery-admin verb instead of one connection and one sweep per holder. The sweep keeps up to 16 KICK requests in flight, so a family whose holders are still connected no longer pays one broker round trip per connection. Holders a sweep verifies are still recorded durably when another holder is not verified, and an interrupted sweep records none.
+- Updated dependencies [70bcfe3]
+- Updated dependencies [1cf7f72]
+- Updated dependencies [5bec8b2]
+- Updated dependencies [6c01470]
+- Updated dependencies [cfc3b95]
+- Updated dependencies [b669a73]
+- Updated dependencies [350c87b]
+- Updated dependencies [608f5f4]
+- Updated dependencies [43c4179]
+- Updated dependencies [4a12111]
+- Updated dependencies [569cb6f]
+- Updated dependencies [b4c69bf]
+- Updated dependencies [f485c49]
+- Updated dependencies [5f13124]
+- Updated dependencies [fb1bc26]
+- Updated dependencies [c389563]
+- Updated dependencies [06f48f4]
+- Updated dependencies [eb2681e]
+- Updated dependencies [fb1bc26]
+- Updated dependencies [438e9ed]
+- Updated dependencies [446ed23]
+- Updated dependencies [15c16ff]
+- Updated dependencies [8ce6be3]
+- Updated dependencies [08194ec]
+- Updated dependencies [aa12a1a]
+- Updated dependencies [d90f9f2]
+- Updated dependencies [499bd8a]
+- Updated dependencies [569cb6f]
+- Updated dependencies [d0b1da3]
+- Updated dependencies [37075a2]
+- Updated dependencies [8d8d69a]
+- Updated dependencies [c7bfc2d]
+- Updated dependencies [6145abc]
+  - @cotal-ai/workspace@0.59.0
+  - @cotal-ai/core@0.59.0
+
+## 0.58.0
+
+### Patch Changes
+
+- 4aa8cf1: Add native-transport delivery health detection with explicit credential-expiry classification and regression coverage before replacing the daemon's periodic authenticated probe.
+- 59a7e64: Expose an account-scoped delivery service handle with explicit store identity and per-context close while retaining the CLI daemon runner. Close membership connections after disconnected drains so stopped contexts cannot reconnect when the broker returns. Keep health failures during asynchronous delivery startup local to that context and close resources returned after a failed start.
+- 576f622: A process's pidfile and its identity pin now publish as one rename-based transition, so a crash between the two writes never leaves a torn pair (old pid beside a new pin, or a new pid beside an old one). A crash still leaves one of the legacy shapes teardown already handles.
+- 59672dd: Register the remaining hosted-runtime smoke entrypoints in stable CI fragments and report native assertion counts through canonical completion markers. Refresh the explicit-TLS call-site census. Make the resume fixture retain its first successful held-slot observation or require durable completion with a new epoch, and exercise completion before the probe as a separate regression gate.
+- Updated dependencies [0589316]
+- Updated dependencies [59a7e64]
+- Updated dependencies [95ae645]
+- Updated dependencies [fba1537]
+- Updated dependencies [576f622]
+- Updated dependencies [2457692]
+- Updated dependencies [ee6de5d]
+- Updated dependencies [e9ef5b3]
+- Updated dependencies [7c54825]
+- Updated dependencies [2c31f95]
+- Updated dependencies [397bc60]
+- Updated dependencies [7b3924c]
+- Updated dependencies [1721738]
+  - @cotal-ai/core@0.58.0
+  - @cotal-ai/workspace@0.58.0
+
+## 0.57.0
+
+### Patch Changes
+
+- 15b4664: Restore the handover scenario cell F of the delivery starvation suite is about. Since the daemon began acting on the lease-watch event rather than waiting for its renew tick, a running holder re-took a deleted row before the replacement had finished starting, so there was no loser and three cells passed by reading the holder's own lease. F now freezes the holder across the handover the way cell G already did. Two matching repairs alongside it: the four wordings a losing daemon uses are one constant, since the lease-watch exit says the key was read `as held by` someone where the cells matched only `is held by`; and the suite waits for `close` rather than `exit` before grading a transcript, because a losing daemon's last line is the one naming who took its shard.
+- 42448fa: A DM send now reports the stored sequence and the recipient's status at send instead of a bare success, and `cotal deliver pending <name>` reads a recipient's held DMs from the broker.
+- Updated dependencies [e7c702a]
+- Updated dependencies [6f64bcc]
+- Updated dependencies [42448fa]
+- Updated dependencies [33357d9]
+  - @cotal-ai/core@0.57.0
+  - @cotal-ai/workspace@0.57.0
+
+## 0.56.1
+
+### Patch Changes
+
+- Updated dependencies [6b76946]
+  - @cotal-ai/core@0.56.1
+  - @cotal-ai/workspace@0.56.1
+
+## 0.56.0
+
+### Patch Changes
+
+- Updated dependencies [e506040]
+- Updated dependencies [8dc7c92]
+- Updated dependencies [99cad7b]
+- Updated dependencies [1218786]
+- Updated dependencies [ef8889d]
+  - @cotal-ai/core@0.56.0
+  - @cotal-ai/workspace@0.56.0
+
+## 0.55.0
+
+### Patch Changes
+
+- 065717c: `cotal deliver` now resolves the broker for `--space` through the mesh registry: a registered space is dialed at its recorded broker (with the record's TLS requirement), a mismatching `--server` or a record for another workspace root is refused before any dial, and an unreachable recorded broker is reported with its URL and the remedy that fits the record's origin. Spaces with no record keep the local-mesh default, and the hosted (injected-store) daemon still learns its target from argv alone.
+- 3e95455: `cotal deliver` no longer reports a refused lease write as "a live lease already exists". A CAS
+  conflict against a genuinely live lease still gets that message; a permission denial on the lease
+  write now names the refused operation and subject and says to use a credential holding the
+  `delivery` profile. Any other acquire failure is reported by shard and message, distinct from both.
+- Updated dependencies [888e9bc]
+- Updated dependencies [810814b]
+- Updated dependencies [8472dc3]
+- Updated dependencies [f272f71]
+- Updated dependencies [a83dd80]
+- Updated dependencies [db9a969]
+- Updated dependencies [d284ee6]
+- Updated dependencies [4f48629]
+- Updated dependencies [2e13607]
+- Updated dependencies [d3d6742]
+- Updated dependencies [fd58782]
+- Updated dependencies [357af9f]
+  - @cotal-ai/core@0.55.0
+  - @cotal-ai/workspace@0.55.0
+
+## 0.54.0
+
+### Patch Changes
+
+- Updated dependencies [e6badb8]
+- Updated dependencies [34beea1]
+- Updated dependencies [b4317fd]
+  - @cotal-ai/core@0.54.0
+  - @cotal-ai/workspace@0.54.0
+
 ## 0.53.0
 
 ### Patch Changes

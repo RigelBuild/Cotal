@@ -64,10 +64,23 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const BROKEN = "BROKEN:";
 
 type UngatedExemption = { reason: string; recheckBy: string };
-// Ten recovered suites move into CI; five live recovery suites remain visible debt.
-const EXPECTED_EXEMPTIONS = 15;
+// 26 → 25: `smoke:delivery-broker-coupling` left the untriaged set by being gated, not by being
+// re-explained. It had been exempt as debt while silently grading nothing, the daemon it spawned
+// refused at startup, and the refusal satisfied its own "exits when the broker is gone" assertion.
+// 25 → 15: the whole remaining untriaged set went the same way on 2026-10-01, ten suites run and
+// then gated. What is left is standing decisions plus the five BROKEN backup suites below.
+// 15 → 14 on the fork: `smoke:backup-perms:live` is gated (and held in ci-quarantine.mjs).
+const EXPECTED_EXEMPTIONS = 14;
 const standing = (reason: string): UngatedExemption => ({ reason, recheckBy: "2026-11-30" });
-const brokenExemption = (reason: string): UngatedExemption => ({ reason: `${BROKEN} ${reason}`, recheckBy: "2026-11-30" });
+const untriagedExemption = (reason: string): UngatedExemption => ({ reason, recheckBy: "2026-09-30" });
+/** The BROKEN class carried `untriagedExemption`, which says nobody has looked. Someone had: each
+ *  backup entry below names its issue, its commit, and the assertion that failed. What they need is a
+ *  fuse tied to the issue rather than a marker that misreports the state of the record. Premise
+ *  re-verified 2026-10-01: #643 and #1285 are both still OPEN, so every entry's stated cause still
+ *  holds and none of them can enter CI while red. Re-dated with that decision, not bumped. These
+ *  cannot be discharged by running them here: #1285 is under a standing instruction not to resume,
+ *  and the other four are live backup suites blocked behind it on the same chain. */
+const brokenExemption = (reason: string): UngatedExemption => ({ reason, recheckBy: "2026-11-30" });
 
 const UNGATED: Record<string, UngatedExemption> = {
   // Need external tooling no CI runner has.
@@ -76,11 +89,10 @@ const UNGATED: Record<string, UngatedExemption> = {
   "smoke:codex-tui-live": standing("needs a codex TUI session"),
   "smoke:jcode-live": standing("needs an installed, authenticated jcode CLI (COTAL_E2E_JCODE=1)"),
   "smoke:down-manifest-usermode:live": standing("needs a claude CLI on PATH to boot a real connector child"),
-  "smoke:backup-usermode:live": brokenExemption("RIG-4260: backup inventory mismatch; preserve owner-secret restore refusal coverage"),
-  "smoke:backup-restore:live": brokenExemption("RIG-4260: blocked by backup-perms in the old chain; restore needs JetStream storage and user-auth service"),
-  "smoke:backup-conservation:live": brokenExemption("RIG-4260: blocked by backup-perms in the old chain; underscore space name is refused"),
-  "smoke:backup-faults:live": brokenExemption("RIG-4260: backup fault and replay scenarios still need independent repair"),
-  "smoke:lifecycle-files": brokenExemption("RIG-4260: manager lifecycle survivor and snapshot assertions need a delivery daemon"),
+  "smoke:backup-usermode:live": brokenExemption("BROKEN: RIG-4260: backup inventory mismatch; preserve owner-secret restore refusal coverage"),
+  "smoke:backup-restore:live": brokenExemption("BROKEN: RIG-4260: blocked by backup-perms in the old chain; restore needs JetStream storage and user-auth service"),
+  "smoke:backup-conservation:live": brokenExemption("BROKEN: RIG-4260: blocked by backup-perms in the old chain; underscore space name is refused"),
+  "smoke:backup-faults:live": brokenExemption("BROKEN: RIG-4260: backup fault and replay scenarios still need independent repair"),
   // A STANDING DECISION, and only for the REAL-SESSION arm. The same suite is GATED as
   // `smoke:agui-map`, pointed at a fixture DERIVED from a real session by
   // `scripts/redact-claude-session.mjs` (whitelist by construction, identifiers pseudonymised
@@ -95,6 +107,14 @@ const UNGATED: Record<string, UngatedExemption> = {
   // `smoke:user-spawn:live` left this list when it was gated: it had thrown at section B1e on a
   // missing explicit `tls` and stopped after 14 of its 66 cells, and being ungated is why nobody
   // heard about it. "Too slow for the gate" was 105 seconds.
+  // Untriaged debt. These are the ones that should shrink, and on 2026-10-01 they shrank to none.
+  // All ten entries whose reason read only "UNTRIAGED" hit their recheckBy date and reddened this
+  // gate. Each was run: attention 14 checks, attention:auth 14, delivery-boot-retry:auth 4/0,
+  // delivery-old-manager 5/0, feedback 12 checks, lifecycle-files OK, manager-console OK,
+  // plane3-activation:auth 6/0, plane3-gate:auth 3/0, self-serve-join-coverage:auth 17/0. All ten
+  // passed, so all ten were GATED through `bin/smoke/ci-suites.d/` fragments rather than
+  // re-explained, which is the exit this gate asks for and the one that takes the count down instead
+  // of resetting its clock. `untriagedExemption` is kept because the next entry will want it.
 };
 
 /**
@@ -151,7 +171,12 @@ const pkg = JSON.parse(packageText) as { scripts: Record<string, string> };
 // THE AUDITED SET INCLUDES THE BARE `smoke` SCRIPT. An earlier version filtered on `smoke:` and so
 // could not see `"smoke": "tsx packages/core/smoke.ts"` — a real suite that nothing runs, invisible
 // to the audit BY CONSTRUCTION. Found by a second, independent derivation, not by this file.
-const all = new Set(Object.keys(pkg.scripts).filter((k) => (k === "smoke" || k.startsWith("smoke:")) && k !== "smoke:ci"));
+// `smoke:ci` is the gate, not a suite, and `smoke:ci:offline` is the same gate run without its
+// live-shaped suites (`bin/smoke/shard.mjs --offline`). Neither is a suite the gate could run, so
+// neither is audited; the offline script is named here rather than exempted in UNGATED because an
+// exemption is a suite the gate leaves out, and this is the gate leaving suites out.
+const GATE_SCRIPTS = new Set(["smoke:ci", "smoke:ci:offline"]);
+const all = new Set(Object.keys(pkg.scripts).filter((k) => (k === "smoke" || k.startsWith("smoke:")) && !GATE_SCRIPTS.has(k)));
 
 /** Suites INVOKED by a script body. Anchored on `pnpm [run] <name>`, because a script is reached by
  *  being invoked, not by being mentioned.
@@ -411,9 +436,10 @@ console.log(`\n  ${untriaged.length} of the ungated set are UNTRIAGED debt (not 
 // This classification is pinned so a renamed reason cannot silently turn a broken suite into a
 // standing exemption. The suite remains excluded until its own assertions pass.
 const broken = ungated.filter((s) => (UNGATED[s]?.reason ?? "").startsWith(BROKEN)).sort();
+// `smoke:lifecycle-files` left this set when upstream gated it (passed on 2026-10-01).
 const expectedBroken = [
   "smoke:backup-conservation:live", "smoke:backup-faults:live", "smoke:backup-restore:live",
-  "smoke:backup-usermode:live", "smoke:lifecycle-files",
+  "smoke:backup-usermode:live",
 ];
 if (broken.join() !== expectedBroken.join()) {
   fail++;

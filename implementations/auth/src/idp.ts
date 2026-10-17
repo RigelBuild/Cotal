@@ -29,7 +29,7 @@ import type { CryptoKey, JWTVerifyGetKey } from "jose";
 import { assertValidOwnerToken } from "@cotal-ai/core";
 import { deriveOwnerForIdpSubject } from "./derive.js";
 import type { UserTokenIssuer } from "./issuer.js";
-import { MAX_TOKEN_TTL_SEC, USER_TOKEN_VIEWS, VIEW_REQUIRED_SCOPE, type UserTokenView } from "./token.js";
+import { CLOCK_TOLERANCE_SEC, USER_TOKEN_VIEWS, VIEW_REQUIRED_SCOPE, viewTtlCapSec, type UserTokenSession, type UserTokenTransferWriter, type UserTokenView } from "./token.js";
 import { grantCommandLine } from "./grant-command.js";
 
 /** The pinned identity of ONE external IdP. All fields are operator config — nothing in here is
@@ -42,8 +42,6 @@ export interface IdpConfig {
   /** The pinned verification key path over the IdP's JWKS — a {@link pinnedJwksResolver} on the
    *  IdP's JWKS URL, or a local public key. The token never influences key resolution. */
   key: JWTVerifyGetKey | CryptoKey;
-  /** Clock skew tolerance in seconds (default 5). */
-  clockToleranceSec?: number;
 }
 
 /** What the operator's ledger grants a (owner, actor) pair — the ONLY source of `scope`/`parent`
@@ -107,11 +105,18 @@ export interface ExchangeResult {
 
 export interface IdpBridge {
   /** Exchange a verified IdP token for a Cotal user bearer bound to (derived owner, actor).
-   *  `view` requests an elevated per-connection profile ({@link USER_TOKEN_VIEWS}); it is
-   *  authorized HERE against the fresh ledger grant — scope must contain `admin` — and minted as
-   *  the server-authored `act.view` claim. Human exchanges only; the managed (agent-secret)
-   *  exchange path rejects views before it ever reaches a bridge. */
-  exchange(idpToken: string, req: { actor: string; ttlSec?: number; view?: UserTokenView }): Promise<ExchangeResult>;
+   *  `view` requests a per-connection profile ({@link USER_TOKEN_VIEWS}), authorized against
+   *  the fresh ledger grant and its explicit required-scope policy, then stamped into `act.view`.
+   *  This bridge handles human proofs only; the actor-secret handler separately allows the
+   *  narrowing manager-caller view. */
+  exchange(idpToken: string, req: {
+    actor: string; ttlSec?: number; view?: UserTokenView; managerInstanceId?: string;
+    /** #2312, required for view "session-caller": the identity plane's session decision for the
+     *  principal this bridge derived. Returns the session claim to stamp; throws to refuse. */
+    verifySession?: (p: { owner: string; actor: string; lifecycleUid: string }) => Promise<UserTokenSession>;
+    /** Required for view "transfer-writer": the one object the bearer may upload (#1499). */
+    transferWriter?: UserTokenTransferWriter;
+  }): Promise<ExchangeResult>;
 }
 
 /** Verify an external IdP JWT against the pinned config and return its `sub` AND `exp`. Same pinning
@@ -124,12 +129,11 @@ export async function verifyIdpToken(token: string, idp: IdpConfig): Promise<{ s
     throw new Error("idp token: embedded key material (jku/jwk/x5u/x5c) is rejected - keys resolve only via the pinned JWKS");
   if (header.alg !== "EdDSA") throw new Error(`idp token: alg must be EdDSA (got ${String(header.alg)})`);
 
-  const tol = idp.clockToleranceSec ?? 5;
   const { payload } = await jwtVerify(token, idp.key as JWTVerifyGetKey, {
     algorithms: ["EdDSA"],
     issuer: idp.issuer,
     audience: idp.audience,
-    clockTolerance: tol,
+    clockTolerance: CLOCK_TOLERANCE_SEC,
   });
 
   // jose's `audience` option is SET-MEMBERSHIP (an aud array containing the expected value
@@ -140,14 +144,12 @@ export async function verifyIdpToken(token: string, idp: IdpConfig): Promise<{ s
     throw new Error("idp token: aud must be exactly the configured audience - a multi-audience session proof is rejected");
   if (typeof payload.exp !== "number") throw new Error("idp token: exp is required - an IdP session proof must expire");
   if (typeof payload.iat !== "number") throw new Error("idp token: iat is required");
-  if (payload.iat > Math.floor(Date.now() / 1000) + tol) throw new Error("idp token: iat is in the future");
+  if (payload.iat > Math.floor(Date.now() / 1000) + CLOCK_TOLERANCE_SEC) throw new Error("idp token: iat is in the future");
   if (typeof payload.sub !== "string" || !payload.sub)
     throw new Error("idp token: sub must be a non-empty string user id - no coercion at a trust boundary");
   return { sub: payload.sub, exp: payload.exp };
 }
 
-/** Build an {@link IdpBridge}. Misconfig fails HERE, at construction — an empty pin would
- *  otherwise fail closed on every exchange with a far worse operator signal. */
 /**
  * The re-grant an elevated-view refusal points the operator at.
  *
@@ -186,6 +188,8 @@ function regrantRemedy(owner: string, actor: string, grant: ActorGrant, need: st
   );
 }
 
+/** Build an {@link IdpBridge}. Misconfig fails HERE, at construction — an empty pin would
+ *  otherwise fail closed on every exchange with a far worse operator signal. */
 export function createIdpBridge(opts: CreateIdpBridgeOpts): IdpBridge {
   if (!opts.space) throw new Error("idp bridge: a space is required");
   if (typeof opts.idp?.issuer !== "string" || !opts.idp.issuer)
@@ -218,7 +222,7 @@ export function createIdpBridge(opts: CreateIdpBridgeOpts): IdpBridge {
         if (!USER_TOKEN_VIEWS.includes(req.view))
           throw new Error(`view "${String(req.view)}" is not a known view (${USER_TOKEN_VIEWS.join(", ")})`);
         const need = VIEW_REQUIRED_SCOPE[req.view];
-        if (!(grant.scope ?? []).includes(need))
+        if (need !== undefined && !(grant.scope ?? []).includes(need))
           throw new Error(
             `the "${req.view}" view needs scope "${need}", which your grant lacks. Ask the mesh operator to re-grant the WHOLE ROW with "${need}" ADDED to its scope. This is not a scope edit: ` +
               regrantRemedy(owner, req.actor, grant, need),
@@ -241,7 +245,13 @@ export function createIdpBridge(opts: CreateIdpBridgeOpts): IdpBridge {
       const idpRemaining = idpExp - Math.floor(Date.now() / 1000);
       if (idpRemaining <= 0)
         throw new Error("idp bridge: the IdP session proof has expired - cannot mint a bearer");
-      const ttlSec = Math.min(req.ttlSec ?? MAX_TOKEN_TTL_SEC, idpRemaining);
+      let ttlSec = Math.min(req.ttlSec ?? viewTtlCapSec(req.view), idpRemaining);
+      let session: UserTokenSession | undefined;
+      if (req.view === "session-caller") {
+        if (!req.verifySession) throw new Error('view "session-caller" needs the identity plane\'s session decision - refusing to mint');
+        session = await req.verifySession({ owner, actor: req.actor, lifecycleUid: grant.lifecycleUid });
+        ttlSec = Math.min(ttlSec, Math.max(1, session.exp - Math.floor(Date.now() / 1000)));
+      }
       // Credential-BIND the bearer (SPEC 13.1, R1): the incarnation's live root credential id
       // rides act.credentialId — ensured (minted release-last on first exchange) BEFORE the
       // bearer bytes are signed, so the row the connect arm requires is durable before any
@@ -257,11 +267,14 @@ export function createIdpBridge(opts: CreateIdpBridgeOpts): IdpBridge {
         lifecycleUid: grant.lifecycleUid,
         credentialId,
         view: req.view,
+        managerInstanceId: req.managerInstanceId,
+        ...(session ? { session } : {}),
+        ...(req.transferWriter ? { transferWriter: req.transferWriter } : {}),
         ttlSec,
       });
       const { exp } = decodeJwt(token);
       if (typeof exp !== "number") throw new Error("idp bridge: minted bearer is missing exp - issuer contract violated");
-      return { token, owner, exp };
+      return { token, owner, exp, ...(req.managerInstanceId ? { managerInstanceId: req.managerInstanceId } : {}) };
     },
   };
 }

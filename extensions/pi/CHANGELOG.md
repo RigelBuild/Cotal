@@ -1,5 +1,122 @@
 # @cotal-ai/pi
 
+## 0.82.0
+
+## 0.81.1
+
+## 0.81.0
+
+## 0.80.0
+
+### Minor Changes
+
+- fded3ab: A seat never leaves the mesh because its event plane stopped, and the plane comes back on its own. The emitter holder re-establishes the plane at once after any failure, then every second while it stays down, by a fresh start that replaces the emitter: it reopens the write-ahead log, settles any pending frame, and builds the connector's mapper from the run the log has open before reading on. A turn that ends while the plane is down keeps its terminal, as does one whose terminal's own log write failed, and the re-establish closes that run with it once it has read on; every turn that ends during one outage keeps its own terminal, placed on the last turn the source had begun at the position the terminal was reported at (a turn the mapper opens no run for takes its terminal and publishes nothing, and a repeated terminal replaces nothing), a terminal is owed to its run until the frame carrying it freezes, a terminal reported with the plane up goes to the emitter at the hook too so a flush still reading when the next prompt lands closes the turn with its own terminal, and when the next prompt was already written before the plane came back the failure is published in place of the finish that prompt would have synthesized, in a frame of the failed run and ahead of the next run's first. The mapper contract gains `{ turn: true }` for a record that begins a turn and opens no run. `DurableSource` gains `end()`, the cursor after the last complete record as of the call, which every connector's source implements; the holder's hooks gain `sourceEnd`, `closeRun` returns a promise that resolves once that position is read (the Claude Code hook awaits it before replying), and the emitter takes a `ReportedTerminal` through `queueTerminal`, with `waitingTerminals`, `takeOwed`, `unsettled` and `seedLastTurn` beside it. The wait between attempts is fixed: it neither doubles nor caps, so the plane is back within a second of the fault clearing. The pi adapter's start factory, re-entered by the re-establish, checks the native file instead of reading an acknowledged cursor as a vanished file, and seeds its mapper from the pending frame. A transcript line that is not a record is stepped over and reported on every connector, the jcode journal wrapper included, and one written past the position a terminal was reported at does not hold that terminal: it is placed after the records before it, as is a terminal reported past a record no read answers, such as an OpenCode part still filling when its turn died, which used to hold the turn end reading the session without end; the OpenCode source now reads every record at or before the end reported at a turn end as settled, so that part no longer stops the turns after it from publishing. A terminal reported while the very first start is still waiting on the broker reaches the emitter before its first read, where it used to be queued behind the flush that read past it and close the next turn. On a space that requires events the seat used to exit with code 1 instead; for Claude Code that exit was the "MCP server cotal has disconnected" banner, and Claude Code restarted the server on the next tool call. The `eventPlaneStopped` sink no longer takes `required` or `stopSeat`, the holder's `onError` receives the delay before the next re-establish (`0` for at once) and `retryMs` is that fixed wait, the Claude and OpenCode mappers take `resumeRunId`, and a reported unreadable-line reason carries no text from the record itself.
+
+## 0.79.0
+
+## 0.78.1
+
+## 0.78.0
+
+## 0.77.1
+
+### Patch Changes
+
+- a1948eb: The Codex and Jcode hosts now arm the event plane when the session's registration requires events, even without `COTAL_EVENTS`. They used to read only that flag, so a hand-driven user-mode launch with `COTAL_EVENTS_REQUIRED=1`, or a custom launcher that passed `eventsRequired` with events opted out, ran with no event plane and the required-events policy never applied. The Claude, OpenCode, Codex, Jcode and Pi launches that carry `eventsRequired` now also set `COTAL_EVENTS` and the workspace root when the launcher passed `events: false`, so the armed session has a place for its event log. Both decisions go through `launchArmsEvents` and `eventPlaneArmed` in `@cotal-ai/connector-core`; an OpenCode 2.x session still reads only `COTAL_EVENTS`.
+
+## 0.77.0
+
+## 0.76.0
+
+## 0.75.0
+
+## 0.74.0
+
+### Patch Changes
+
+- ad81083: The connector on/off flags `COTAL_CHANNEL`, `COTAL_EVENTS`, `COTAL_EVENTS_REQUIRED`, `COTAL_CODEX_TUI` and `COTAL_JCODE_TUI` now share one parser in `@cotal-ai/connector-core`. It accepts `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` in any case, treats an unset or blank value as unset, and refuses anything else at startup with an error naming the variable and the value. Before, each connector kept its own copy and read any other value, such as `enabled`, `2` or `y`, as off without a word. The OpenCode 2.x adapter now refuses `COTAL_EVENTS=true` the same way it refuses `COTAL_EVENTS=1`, where before only `1` was refused.
+
+## 0.73.0
+
+## 0.72.1
+
+## 0.72.0
+
+## 0.71.0
+
+## 0.70.2
+
+## 0.70.1
+
+## 0.70.0
+
+### Minor Changes
+
+- 76113ce: `AguiEmitterHolder` now takes its hooks as one named object after the emitter factory, `new AguiEmitterHolder(startEmitter, { onError, onRunClosed, waitLive, runMeta })`, typed by the exported `AguiEmitterHolderHooks`, where only `onError` is required. Before, the four hooks were positional, and a `runMeta` provider passed third was accepted as `onRunClosed`: it typechecked, ran after the run had already closed, and its metadata was dropped with no error. A caller no longer fills earlier slots with `undefined` to reach a later hook. The Claude Code, Codex, jcode, OpenCode and pi connectors pass their hooks by name, with no change in behavior.
+
+### Patch Changes
+
+- 95788eb: A seat whose AG-UI event plane stops for good now follows the space's policy on every connector. On a space that requires events the seat stops, where Pi, Claude Code and OpenCode used to keep it running without events. On any other space the seat keeps running and its log records `AG-UI emitter stopped`, where Jcode used to stop the seat and refuse further turns. Codex no longer rebuilds a stopped plane at its next turn boundary on any space, and it now waits for the mesh before starting its emitter, as the other connectors do. The rule is `eventPlaneStopped` in connector-core, which each connector passes its log sink and its stop hook.
+- 8dbfb8e: A pi seat now marks a run turn as shown once the provider takes the request that carries it, instead of after the whole Pi turn ends. A `cotal_yield` made during that turn used to be refused with "no turn is active — nothing to yield", and the run then recorded `done` where the seat had said `blocked` or `handoff`. On a transport that reports the provider response, the unshown turn was also injected again after every response, so the Pi turn never ended and the run turn ran out its deadline. A transport without that report shows the turn when Pi runs a tool from the answer, or at the clean end of the turn.
+
+## 0.69.0
+
+## 0.68.0
+
+### Minor Changes
+
+- 585fdb2: Connectors launch on the model and variant their launcher resolved. `LaunchOpts.model` and `LaunchOpts.variant` are now the launcher's resolved values (the flag, else the agent file's `model:` / `variant:`), and every connector renders them as given instead of reading the agent file again in `buildLaunch`. Before, a model the launcher did not resolve was taken from a later read of a file that could have changed since, so the seat could run a model the launcher never checked or recorded, and a supervised restart re-read it each time. The in-session config takes the model and variant from `COTAL_MODEL` / `COTAL_VARIANT` only, so the card and the orientation pin no longer report a model the seat was not launched on. The Hermes connector no longer falls back to `HERMES_MODEL` from the spawning process, including one `spawn.env` forwards; set the model with `--model` or the persona's `model:`. Code that calls `buildLaunch` directly must pass `model` and `variant` itself.
+
+## 0.67.0
+
+## 0.66.1
+
+## 0.66.0
+
+## 0.65.0
+
+## 0.64.0
+
+## 0.63.0
+
+## 0.62.0
+
+## 0.61.0
+
+## 0.60.0
+
+### Patch Changes
+
+- 3b616a2: A manifest agent can declare `continuity: exact` to come back in its previous harness session. The manager records the session the connector proves over its authenticated control endpoint on the first launch, keeps that record current through crash recovery, preserved resume and stop, reopens it on every later launch and preserved resume under the same proof, and refuses one recorded for another space, connector or directory. A reopen fails when the harness no longer has the session rather than starting an empty one under the same id: connectors declare the new `supportsSessionReopen` capability and honor `LaunchOpts.reopenSession`, and Pi reopens with `--session`. Preflight refuses `exact` on a connector that cannot reopen an existing session.
+
+## 0.59.0
+
+### Patch Changes
+
+- 5f13124: Private launch files now have an owner. The Claude persona file, the Claude shared-server MCP config file and the pi persona file are listed on the new `LaunchSpec.artifacts`, and the launcher removes them once it has proved the agent process gone. On the default pty runtime the manager removes them when it sees the agent exit; on tmux, cmux, orca and herdr the manager removes them by polling the seat's status and waiting for the runtime's exit proof; the foreground `cotal spawn` removes them when its child exits. Every one of those launches also starts its child through the new core `reclaimWithChild`: a watcher started beside the child removes the files once the child's process is gone, and tries a failed removal again every five seconds until it succeeds, so a killed manager or foreground `cotal spawn` no longer strands them (POSIX; Windows has no shell for the watcher). Each directory name carries a random per-launch identity, so a stale path can never name a later launch's directory. The tmux, cmux, orca and herdr runtimes now throw the new core `SpawnRefused` for an unsafe name, an unreachable backend, (herdr) a missing working directory or an unknown layout, (orca) a working directory that is missing or outside any Orca worktree, and a launcher script they cannot write or (tmux, herdr) a session or server that will not start, all before the agent's command is handed to the backend, and the manager removes the files at once. A removal that fails, after an exit or after a refusal, is tried again until it succeeds. A batch resume removes the files of specs it built and never launched. Both connectors now refuse a bad model, prompt or launch option before writing anything. Any other spawn that throws is not proof that nothing started, so its files stay for the child's watcher, or for the OS temp reaper when no child started, as do a killed launcher's on Windows. A seat started under a custodian with `launchSeat` from `@cotal-ai/seat`, which the manager no longer does for a new launch, hands them to that custodian: a launch it refuses before any process started removes them at once, the custodian removes them when it sees the agent exit, a removal that fails stays on the custody record, and a reap that proves the seat gone removes what the record still lists from the temp dir the launch wrote to, so a successor with a different `TMPDIR` still removes them. Losing a custodian's connection no longer counts as the agent's exit. The docs now say that owner-private means any process running as the same user can read the file while it exists.
+- 8ce6be3: The 0.33.0 changelog entry "An agent now reads only the channels it lists" now carries a correction. It presented the read-set default-deny as new in 0.33.0, but that shipped in 0.28.0 with #821, so upgrading from 0.28.0 or later needs no migration for it. The correction names what 0.33.0 did change: the no-default-channel check in `multicast` now refuses only an omitted channel, so an explicit empty-string `channel` is no longer refused as if it were omitted, and its refusal is reworded; the `cotal_send`, `cotal_leave` and pi tool text; doc comments; and two regression suites. `docs/release.md` now describes how to correct a released entry.
+
+## 0.58.0
+
+## 0.57.0
+
+## 0.56.1
+
+### Patch Changes
+
+- 6b76946: A seat resumed from a preservation cut backfills its channels from the chat stream sequence its prior incarnation had reached instead of replaying the whole retained window.
+
+## 0.56.0
+
+## 0.55.0
+
+### Patch Changes
+
+- cb869b7: A pi seat held after a non-terminal `agent_end` (error or an unknown stop reason) with a Cotal batch pending now has a bounded exit: the driver retries the continuation itself a fixed number of times with a fixed backoff, through the same send path a human continuation uses, before holding for operator intervention with a presence that names the attempt count and what to do. User abort still holds without any automatic retry: the person who aborted is the party who continues. Fixes #726
+- d284ee6: A manifest or spawn prompt on a connector that cannot deliver one is refused at preflight (including `up -f --dry-run`), at spawn and in the manager, the way an unsupported model variant is: connectors now declare `supportsPrompt`, and claude, opencode, codex, jcode and pi declare it; hermes keeps its launch-time throw as the second line of defence.
+
+## 0.54.0
+
 ## 0.53.0
 
 ## 0.52.1
@@ -197,6 +314,17 @@
 
   Already-running agents are not narrowed retroactively: a live seat keeps the read ACL its credential
   was minted with, across renewal, until it is respawned.
+
+  **Correction:** the read-set default-deny described above is not new in 0.33.0. It shipped in 0.28.0
+  with 86f6b10 (#821, "Remove the implicit `general` channel floor"), and so did the refusal of a send
+  with no channel and the no-channel default for the seeded `default_agent`. Upgrading from 0.28.0 or
+  later needs no migration for it. What 0.33.0 changed is narrower. The no-default-channel check in
+  `multicast` now refuses only an omitted channel (`channel === undefined` where it was `!channel`), so
+  an explicit empty-string `channel` is no longer refused as if it were omitted, and the refusal now
+  says to name or join a channel. The `cotal_send` and `cotal_leave` tool descriptions and pi's send
+  call line no longer name `general` as a default or say the last channel cannot be left, doc comments
+  state the rule and the both-keys-omitted consequence, and the `smoke:no-implicit-general` and
+  `smoke:session-channels` suites guard it.
 
 ## 0.32.0
 

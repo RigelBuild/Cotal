@@ -1,9 +1,9 @@
 import { registry, type Command } from "@cotal-ai/core";
 import {
   serverFlag, spaceFlag, targetFlags,
-  DELIVERY_PIDFILE, MANAGER_DELIVERY_AWARE_MARKER, MANAGER_PIDFILE, MANAGER_SHUTDOWN_INTENT, MANAGER_SPARE_CAPABILITY,
   type LocalProcess,
 } from "@cotal-ai/workspace";
+import { MANAGER_PROCESS } from "./lib/manager-proc.js";
 import { up, upComplete, upFlags } from "./commands/up.js";
 import { runtimes } from "./commands/runtimes.js";
 import { down, downComplete } from "./commands/down.js";
@@ -34,6 +34,8 @@ import { backup, backupComplete, backupFlags } from "./commands/backup.js";
 import { update, updateFlags } from "./commands/update.js";
 import { service, serviceComplete } from "./commands/service.js";
 import { sync, syncFlags } from "./commands/sync.js";
+import { DELIVERY_PROCESS } from "./lib/delivery-proc.js";
+import { AUTH_PROCESS } from "./lib/auth-proc.js";
 
 /** The minimal mesh CLI: thin NATS clients (up/join/console), plus `spawn` — an agent launch
  *  (foreground or --detach) that reuses the connector's launch recipe. Self-registers on import;
@@ -57,9 +59,10 @@ const baseCommands: Command[] = [
     name: "ext",
     group: "Setup",
     summary: "operator-installed extensions - add commands, runtimes, and local process providers",
-    usage: "ext [add <npm-package> | remove <name> | list | root | seed [--repair|--reset|--force]]",
+    usage: "ext [add <npm-package> | remove <name> | list [--json] | root | seed [--repair|--reset|--force]]",
     positionals: "[add <npm-package> | remove <name> | list | root | seed]",
     flags: [
+      { name: "json", type: "boolean", description: "list: machine-readable, one JSON object per extension per line" },
       { name: "repair", type: "boolean", description: "seed: recover a lost ever-seeded authority from its durable backup" },
       { name: "reset", type: "boolean", description: "seed: discard the authority and re-seed all built-in connectors (resurrects removed ones)" },
       { name: "force", type: "boolean", description: "seed: re-seed the built-in connectors even when the stamp is current or a downgrade" },
@@ -120,7 +123,7 @@ const baseCommands: Command[] = [
     positionals: "<install | status | uninstall>",
     flags: [
       { name: "mesh", type: "string", value: "<name>", description: "the mesh whose manager the service runs (default: this folder's)" },
-      { name: "linger", type: "boolean", description: "install: also enable user lingering so the service starts at boot and survives logout (never enabled silently)" },
+      { name: "linger", type: "boolean", description: "install: when lingering is off, ask logind to enable it so the service starts at boot and survives logout (never enabled silently; install refuses without lingering)" },
       { name: "json", type: "boolean", description: "status: machine-readable output" },
     ],
     run: service,
@@ -180,7 +183,7 @@ const baseCommands: Command[] = [
     name: "meshes",
     group: "Mesh",
     summary: "list the meshes this machine knows (a `*` marks the `current` default a bare spawn joins); add/rm register one running elsewhere",
-    usage: "meshes [list] | meshes add [<space>] [--server <url>] [--root <dir>] [--mode auth|open] | meshes rm <space> …  (bare `meshes add` on a terminal is guided)",
+    usage: "meshes [list] [--json] | meshes add [<space>] [--server <url>] [--root <dir>] [--mode auth|open] | meshes rm <space> …  (bare `meshes add` on a terminal is guided)",
     positionals: "[list | add <space> | rm <space> …]",
     flags: meshesFlags,
     run: meshes,
@@ -253,6 +256,9 @@ const baseCommands: Command[] = [
       { name: "allow-publish", type: "string", value: "<a,b>", description: "agent profile: post ACL override (comma-separated); refused off it" },
       { name: "role", type: "string", value: "<role>", description: "agent profile: scopes its anycast task queue (svc_<role>); overrides the agent file; refused off it" },
       { name: "provision", type: "boolean", description: "agent profile: also pre-create the identity's bind-only DM/deliver durables (+ role task queue) on the live mesh, so the credential can consume; needs the broker reachable" },
+      { name: "expires-in", type: "string", value: "<seconds>", description: "bound the credential's lifetime (TTL in seconds, e.g. 3600); mutually exclusive with --expires-at" },
+      { name: "expires-at", type: "string", value: "<unix-seconds>", description: "bound the credential's lifetime (absolute exp, unix seconds); mutually exclusive with --expires-in" },
+      { name: "identity", type: "string", value: "<creds>", description: "re-mint for the existing nkey carried by this creds file (JWT + USER NKEY SEED), keeping the principal and its durables; default: a fresh identity" },
       spaceFlag,
       serverFlag,
     ],
@@ -474,30 +480,9 @@ const baseCommands: Command[] = [
 // TEMPLATES like `auth-service.{space}.pid` already was. A copied literal here is the defect this
 // closes: the manager and the daemon write one name and status/down looked up another.
 const baseProcesses: LocalProcess[] = [
-  {
-    kind: "local-process",
-    name: "manager",
-    label: "manager",
-    order: 10,
-    pidFile: MANAGER_PIDFILE,
-    artifacts: [MANAGER_DELIVERY_AWARE_MARKER, MANAGER_SHUTDOWN_INTENT, MANAGER_SPARE_CAPABILITY],
-  },
-  {
-    kind: "local-process",
-    name: "delivery",
-    label: "delivery daemon",
-    order: 20,
-    pidFile: DELIVERY_PIDFILE,
-    artifacts: ["delivery.creds"],
-  },
-  {
-    kind: "local-process",
-    name: "auth",
-    label: "user-auth service",
-    order: 30,
-    pidFile: "auth-service.{space}.pid",
-    visibleWhen: "user-auth",
-  },
+  MANAGER_PROCESS,
+  DELIVERY_PROCESS,
+  AUTH_PROCESS,
   {
     kind: "local-process",
     name: "nats",

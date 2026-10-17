@@ -35,6 +35,12 @@ assert.ok(configured.args.includes("--config") && configured.args[configured.arg
 assert.ok(configured.args.includes("--append-system-prompt"));
 assert.deepEqual(configured.args.slice(-1), ["do work"]);
 assert.ok(configured.args.includes("--model") && configured.args[configured.args.indexOf("--model") + 1] === "model-x");
+assert.equal(ompConnector.supportsPrompt, true);
+assert.equal(fresh.env.COTAL_EVENTS, undefined);
+const requiredEvents = launch({ ...base, eventsRequired: true, workspaceRoot: process.cwd() });
+assert.equal(requiredEvents.env.COTAL_EVENTS, "1");
+assert.equal(requiredEvents.env.COTAL_WORKSPACE_ROOT, process.cwd());
+assert.equal(launch({ ...base, events: true, workspaceRoot: process.cwd() }).env.COTAL_EVENTS, "1");
 assert.equal(launch({ ...base, resolvedBinaries: { omp: "/bin/omp" } }).command, "/bin/omp");
 assert.throws(() => launch({ ...base, launchOptions: { other: true } }), /unknown launch option.*other/i);
 const reapplied = launch({ ...base, resume: "source-id", launchOptions: { config: "/tmp/omp.yaml", reapplyConfig: "true" } });

@@ -62,10 +62,11 @@
  * fence that fails open when misconfigured is worse than one coordinate less addressable.
  */
 import { randomBytes } from "node:crypto";
-import { jetstream, jetstreamManager, type JetStreamClient, type JetStreamManager } from "@nats-io/jetstream";
+import { jetstream, jetstreamManager, type ConsumerInfo, type JetStreamClient, type JetStreamManager } from "@nats-io/jetstream";
 import { headers as natsHeaders, type NatsConnection } from "@nats-io/transport-node";
 import { wfjStreamName, wfjSubject, runJournalConsumerConfig } from "./endpoint-binding.js";
 import { isCasLoss } from "./endpoint-records.js";
+import { isConsumerNotFound } from "./jetstream-missing.js";
 
 /**
  * The successor's first act, and the only record the runtime layer writes that is not a step.
@@ -238,12 +239,6 @@ export class RunJournalReplayRaced extends Error {
 }
 
 /**
- * The replayed prefix does not start at the run's beginning.
- *
- * Its counts were consistent and its last sequence may well be the subject's true head — that is
- * exactly why this check exists separately from {@link RunJournalReplayIncomplete}.
- */
-/**
  * A takeover was attempted under a lease token older than the one the run is already held under.
  *
  * Terminal for this driver: it does not hold the lease, and the fix is not to try again but to stop
@@ -293,6 +288,12 @@ export class ActivationNotAuthorized extends Error {
   }
 }
 
+/**
+ * The replayed prefix does not start at the run's beginning.
+ *
+ * Its counts were consistent and its last sequence may well be the subject's true head — that is
+ * exactly why this check exists separately from {@link RunJournalReplayIncomplete}.
+ */
 export class RunJournalPrefixTruncated extends Error {
   constructor(
     readonly run: string,
@@ -328,14 +329,10 @@ export function assertReplayConsumerFresh(
   }
 }
 
-/**
- * Measured on the repo's broker floor: `name: "ConsumerNotFoundError"`, `code: 10014`.
- *
- * Exported so the one error the replay is allowed to swallow can be checked against a real one.
- */
-export function isConsumerNotFound(e: unknown): boolean {
-  const err = e as { name?: unknown; code?: unknown } | null | undefined;
-  return Number(err?.code) === 10014 || err?.name === "ConsumerNotFoundError";
+/** Measured on nats-server 2.15: a create whose config differs from the durable of that name is a
+ *  `JetStreamApiError` with `code: 10148`, and the client gives it no class of its own. */
+function isConsumerAlreadyExists(e: unknown): boolean {
+  return Number((e as { code?: unknown } | null | undefined)?.code) === 10148;
 }
 
 function isObj(v: unknown): v is Record<string, unknown> {
@@ -461,8 +458,16 @@ export async function replayRunJournal(
   const cfg = runJournalConsumerConfig(space, runId, takeoverId);
   const durable = cfg.durable_name as string;
   return await exclusively(`${stream}/${durable}`, async () => {
-    let created = await jsm.consumers.add(stream, cfg);
-    if (!replayConsumerIsFresh(created)) {
+    let created: ConsumerInfo | undefined;
+    try {
+      created = await jsm.consumers.add(stream, cfg);
+    } catch (e) {
+      // A durable of this name in a config this create cannot update to is refused rather than
+      // returned: one an earlier release left in FILE storage, before the replay asked for memory.
+      // It is the leftover described below, and it is removed and remade the same way.
+      if (!isConsumerAlreadyExists(e)) throw e;
+    }
+    if (created === undefined || !replayConsumerIsFresh(created)) {
       // A durable of this replay's OWN name, holding a tail, that no live replay in this process
       // owns: the deletion below did not run. A replay is interrupted by whatever ends its
       // connection — a drive's standing connection reconnecting under it, a host closing one on a
@@ -750,14 +755,6 @@ export interface ActivateOptions {
 }
 
 /**
- * Take a run over: replay its journal, then claim the subject with an activation record.
- *
- * Returns the appender that is now the run's single authorized writer, carrying the replayed prefix.
- * Throws {@link ActivationRaced} when the journal kept moving — the caller has driven nothing and
- * may try again while it holds the lease. It never throws {@link RunSuperseded}: not having won the
- * subject yet is not the same as having lost it.
- */
-/**
  * May this takeover activate over the activation the journal already holds?
  *
  * The fencing token orders LEASES, and by itself that is not the whole authority: two takeovers can
@@ -810,6 +807,14 @@ function lastActivation(records: readonly StoredRunJournalRecord[]): RunJournalA
   return undefined;
 }
 
+/**
+ * Take a run over: replay its journal, then claim the subject with an activation record.
+ *
+ * Returns the appender that is now the run's single authorized writer, carrying the replayed prefix.
+ * Throws {@link ActivationRaced} when the journal kept moving — the caller has driven nothing and
+ * may try again while it holds the lease. It never throws {@link RunSuperseded}: not having won the
+ * subject yet is not the same as having lost it.
+ */
 export async function activateRun(
   js: JetStreamClient,
   jsm: JetStreamManager,

@@ -14,10 +14,11 @@
     {
       "name": "PR pack drops the arm64 builder from needs",
       "file": ".github/workflows/ci.yml",
-      "find": "  seat-pack:\n    name: seat pack (assembled)\n    timeout-minutes: 20\n    needs: [seat-native-linux-x64, seat-native-linux-arm64]\n",
-      "replace": "  seat-pack:\n    name: seat pack (assembled)\n    timeout-minutes: 20\n    needs: [seat-native-linux-x64]\n",
+      "find": "  seat-pack:\n    if: ${{ github.event_name != 'workflow_dispatch' }}\n    name: seat pack (assembled)\n    timeout-minutes: 20\n    needs: [seat-native-linux-x64, seat-native-linux-arm64]\n",
+      "replace": "  seat-pack:\n    if: ${{ github.event_name != 'workflow_dispatch' }}\n    name: seat pack (assembled)\n    timeout-minutes: 20\n    needs: [seat-native-linux-x64]\n",
       "expectRed": "ci.yml seat-pack needs both native linux builders",
-      "cell": "ci.yml seat-pack needs both native linux builders"
+      "cell": "ci.yml seat-pack needs both native linux builders",
+      "afterRestore": "pnpm smoke:seat-native-ci"
     },
     {
       "name": "PR pack stops downloading the arm64 artifact",

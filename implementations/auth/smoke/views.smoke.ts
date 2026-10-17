@@ -25,7 +25,7 @@ import { SignJWT, decodeJwt, generateKeyPair, exportJWK } from "jose";
 import type { CryptoKey } from "jose";
 import {
   chatStream,
-  spacePrefix, mintLifecycleUid } from "@cotal-ai/core";
+  spacePrefix, mintLifecycleUid, mintSessionId } from "@cotal-ai/core";
 // One lifecycle for the smoke's minted agent grants (SPEC 13.1: grants are lifecycle-keyed).
 const smokeUid = mintLifecycleUid();
 import {
@@ -69,16 +69,35 @@ const OWNER = "u_" + "a".repeat(26);
 console.log("A. issuer ↔ validator view inverse");
 const signing = await generateSigningKey();
 const issuer = createUserTokenIssuer({ issuer: "https://views.test", key: signing });
+// The one session a session-caller bearer is bound to (#2312). In production the exchange stamps
+// what the identity plane read from the session row; here the issuer's own claim check is the gate.
+const SESSION = { endpoint: "manager", sessionId: mintSessionId(), epoch: 1, exp: Math.floor(Date.now() / 1000) + 300 };
+// The one object a transfer-writer bearer may upload (#1499).
+const TRANSFER = { instanceId: "m".repeat(26), hex: "a".repeat(64) };
 for (const view of USER_TOKEN_VIEWS) {
-  const token = await issuer.issue({ owner: OWNER, space: SPACE, actor: "cli", scope: [VIEW_REQUIRED_SCOPE[view]], view, lifecycleUid: smokeUid });
+  const required = VIEW_REQUIRED_SCOPE[view];
+  const token = await issuer.issue({ owner: OWNER, space: SPACE, actor: "cli", scope: required ? [required] : [], view, lifecycleUid: smokeUid, ...(view === "manager-caller" ? { managerInstanceId: "m".repeat(26) } : {}), ...(view === "session-caller" ? { session: SESSION } : {}), ...(view === "transfer-writer" ? { transferWriter: TRANSFER } : {}) });
   const v = await validateUserToken(token, { key: issuer.localKeySet(), issuer: "https://views.test", audience: SPACE });
-  check(`view "${view}" round-trips mint → validate (lifecycle claim intact)`, v.act.view === view && v.act.lifecycleUid === smokeUid, v.act);
+  const s = v.act.session;
+  const sessionIntact = view === "session-caller"
+    ? s !== undefined && s.endpoint === SESSION.endpoint && s.sessionId === SESSION.sessionId && s.epoch === SESSION.epoch && s.exp === SESSION.exp
+    : s === undefined;
+  check(`view "${view}" round-trips mint → validate (lifecycle${view === "session-caller" ? " and session" : ""} claim intact)`,
+    v.act.view === view && v.act.lifecycleUid === smokeUid && sessionIntact, v.act);
 }
 {
   const plain = await issuer.issue({ owner: OWNER, space: SPACE, actor: "cli", scope: ["spawn"] });
   const v = await validateUserToken(plain, { key: issuer.localKeySet(), issuer: "https://views.test", audience: SPACE });
   check("a view-less bearer stays view-less (agent profile default)", v.act.view === undefined);
 }
+await rejects("manager-caller refuses to mint without managerInstanceId",
+  () => issuer.issue({ owner: OWNER, space: SPACE, actor: "cli", view: "manager-caller", lifecycleUid: smokeUid }), "requires managerInstanceId");
+await rejects("managerInstanceId refuses to mint without manager-caller",
+  () => issuer.issue({ owner: OWNER, space: SPACE, actor: "cli", view: "admin", scope: ["admin"], lifecycleUid: smokeUid, managerInstanceId: "m".repeat(26) }), "valid only with view");
+await rejects("session-caller refuses to mint without a session claim",
+  () => issuer.issue({ owner: OWNER, space: SPACE, actor: "cli", view: "session-caller", lifecycleUid: smokeUid }), "come together or not at all");
+await rejects("a session claim refuses to mint with another view",
+  () => issuer.issue({ owner: OWNER, space: SPACE, actor: "cli", view: "admin", scope: ["admin"], lifecycleUid: smokeUid, session: SESSION }), "come together or not at all");
 await rejects(
   "an unknown view is rejected at MINT",
   () => issuer.issue({ owner: OWNER, space: SPACE, actor: "cli", scope: ["admin"], view: "root" as UserTokenView }),
@@ -112,8 +131,10 @@ await rejects(
 console.log("B. view → required-scope policy table");
 check('deployer is spawn-gated (own-team deploys are spawn-grade)', VIEW_REQUIRED_SCOPE.deployer === "spawn");
 check('manager-service is supervise-gated (remote manager authority is distinct)', VIEW_REQUIRED_SCOPE["manager-service"] === "supervise");
-for (const view of USER_TOKEN_VIEWS.filter((v) => v !== "deployer" && v !== "manager-service"))
+for (const view of USER_TOKEN_VIEWS.filter((v) => v !== "deployer" && v !== "manager-service" && v !== "manager-caller" && v !== "session-caller"))
   check(`${view} is admin-gated (operator authority)`, VIEW_REQUIRED_SCOPE[view] === "admin");
+check("manager-caller adds no capability requirement", VIEW_REQUIRED_SCOPE["manager-caller"] === undefined);
+check("session-caller adds no capability requirement (the redeemed session grant is the authority)", VIEW_REQUIRED_SCOPE["session-caller"] === undefined);
 check(
   "backup/restore are not name-only views (exact stream/session confinement needs operation-bound credentials)",
   !USER_TOKEN_VIEWS.some((view) => view === ("backup" as UserTokenView) || view === ("restore" as UserTokenView)),
@@ -124,11 +145,12 @@ console.log("C. callout profile switch");
 const CONN = "ibx" + "c".repeat(32);
 // `uid: null` (an explicit sentinel, not undefined - a default parameter would silently refill it)
 // builds the CLAIMLESS bearer shape for the refusal probes.
+const MANAGER_IID = "m".repeat(26);
 const tok = (view: UserTokenView | undefined, caps: string[], uid: string | null = smokeUid): ValidatedUserToken => ({
   owner: OWNER,
   space: SPACE,
   scope: caps,
-  act: { owner: OWNER, actor: "cli", scope: caps, ...(uid !== null ? { lifecycleUid: uid } : {}), ...(view ? { view } : {}) },
+  act: { owner: OWNER, actor: "cli", scope: caps, ...(uid !== null ? { lifecycleUid: uid } : {}), ...(view ? { view } : {}), ...(view === "manager-caller" ? { managerInstanceId: MANAGER_IID } : {}) },
   ver: 1,
   exp: Math.floor(Date.now() / 1000) + 60,
 });
@@ -141,7 +163,42 @@ const forView = calloutPermissions(() => {
   aclConsulted++;
   return { allowSubscribe: ["general"], allowPublish: ["general"], lifecycleUid: smokeUid, scope: rowScope };
 });
+let managerGate: "open" | "closed" | "foreign" = "open";
+const forManagerView = calloutPermissions(
+  () => ({ allowSubscribe: ["general"], allowPublish: ["general"], lifecycleUid: smokeUid, scope: rowScope }),
+  async (owner, instanceId) => {
+    if (managerGate === "closed") throw new Error(`manager instance ${instanceId} is not open at the permission mint`);
+    if (managerGate === "foreign") throw new Error(`manager instance ${instanceId} is not this owner's at the permission mint`);
+    if (owner !== OWNER || instanceId !== MANAGER_IID) throw new Error("manager gate fixture mismatch");
+  },
+);
 type Perms = { sub?: { allow?: string[] }; pub?: { allow?: string[] } };
+{
+  const manager = await forManagerView(tok("manager-caller", ["spawn"]), CONN) as Perms;
+  const pub = manager.pub?.allow ?? [];
+  const sub = manager.sub?.allow ?? [];
+  check("manager-caller emits manager instance rows only",
+    pub.some((s) => s.includes(`.ep.inst.manager.${MANAGER_IID}.describe.`))
+    && !pub.some((s) => s.includes(".ep.one.manager.") || s.includes(".ep.all.manager."))
+    && !pub.some((s) => /\.ep\.inst\.manager\.[*>]\./.test(s)), pub);
+  check("manager-caller retains contract reads, its reply rail, goal progress, and its own inbox",
+    pub.some((s) => s.includes("$JS.API.DIRECT.GET.EPC_"))
+    && sub.some((s) => s === `_INBOX_${CONN}.>`)
+    && sub.some((s) => s.includes(".ep.reply."))
+    && sub.some((s) => s.includes(".epe.manager.")), { pub, sub });
+  rowScope = ["spawn", "run", "admin", "role:default"];
+  const widened = await forManagerView(tok("manager-caller", ["spawn"]), CONN) as Perms;
+  check("widening the row after exchange adds no run or admin rows to the bearer",
+    !(widened.pub?.allow ?? []).some((s) => s.includes(".run-start.") || s.includes(".purge.")), widened.pub);
+  rowScope = ["spawn", "admin", "role:default"];
+  managerGate = "closed";
+  await rejects("manager-caller refuses when the gate is not open at the permission mint",
+    () => forManagerView(tok("manager-caller", ["spawn"]), CONN), "not open");
+  managerGate = "foreign";
+  await rejects("manager-caller refuses when the gate no longer belongs to the bearer's owner",
+    () => forManagerView(tok("manager-caller", ["spawn"]), CONN), "not this owner's");
+  managerGate = "open";
+}
 {
   const agent = forView(tok(undefined, ["spawn"]), CONN) as Perms;
   check("no view → agent profile (channel ACL resolver consulted)", aclConsulted === 1 && (agent.sub?.allow ?? []).length > 0);
@@ -365,6 +422,15 @@ console.log("E. connect-boundary lifecycle equality for views (real ledger dir)"
     let okB = true;
     try { authorize(vB); } catch { okB = false; }
     check("incarnation B's own admin-view bearer connects (the gate denies STALENESS, not views)", okB);
+
+    // Revocation of the actor record denies subsequent connect authorization at the ledger:
+    const { revokeActor } = await import("../src/ledger.js");
+    revokeActor(dir, OWNER, "cli");
+    await rejects(
+      "ledger connect authorization after revoke is refused",
+      () => authorize(vB),
+      'no longer) granted',
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -15,7 +15,7 @@
  * real file with the same bounded wait the startup path uses, and then still adopts at the end of
  * it: the copied history is the parent's, never republished here.
  */
-import { JsonlFileSource, type DurableSource, type SourceRead } from "@cotal-ai/connector-core";
+import { BoundStartSource, JsonlFileSource, type DurableSource, type SourceRead } from "@cotal-ai/connector-core";
 import type { ClaudeEntry } from "./agui-map.js";
 
 const STARTUP_TRANSCRIPT_WAIT_MS = 5_000;
@@ -95,6 +95,10 @@ class StartupClaudeTranscriptSource implements DurableSource<ClaudeEntry> {
     // cursor was durably folded, even a process launched as `startup` resumes strictly after it.
     return cursor === undefined ? this.readWhenReady() : this.file.read(cursor);
   }
+
+  end(): Promise<string> {
+    return this.file.end();
+  }
 }
 
 /** Build the transcript source for the exact source value Claude supplied on SessionStart. */
@@ -119,4 +123,26 @@ export function createClaudeTranscriptSource(
           `refusing to guess whether the transcript is new or retained`,
       );
   }
+}
+
+/**
+ * Same as {@link createClaudeTranscriptSource}, but for every retained-history mode also captures
+ * the adopt boundary BEFORE the caller's mesh wait, per `BoundStartSource`: a lazily-bound emitter
+ * would otherwise position itself on its own first read, which happens only after the mesh wait and
+ * everything else the bind does first, silently dropping anything the session wrote in between.
+ *
+ * `startup` already reads from byte zero and needs no boundary. `fork` waits for its copied file to
+ * appear before it knows its own boundary (`StartupClaudeTranscriptSource` in adopt-at-end mode) —
+ * this runs that SAME wait, once, right here, and the eventual first real read substitutes the
+ * captured cursor and goes straight to the file, never waiting twice.
+ */
+export async function createBoundClaudeTranscriptSource(
+  path: string,
+  sessionSource: unknown,
+  opts: ClaudeTranscriptSourceOpts = {},
+): Promise<DurableSource<ClaudeEntry>> {
+  const source = createClaudeTranscriptSource(path, sessionSource, opts);
+  if (sessionSource === "startup") return source; // from-beginning already; no boundary to capture
+  const boundary = await source.read(undefined);
+  return new BoundStartSource(source, boundary.cursor);
 }

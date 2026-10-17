@@ -40,6 +40,9 @@ export interface CachedCommand {
 export interface CachedConnector {
   readonly name: string;
   readonly requires: readonly string[];
+  /** The connector's declared setup provider, `null` when it declares none. Absent only in a
+   *  manifest written before this was cached. */
+  readonly setup?: ExtensionRef | null;
 }
 
 export interface InstalledExtension {
@@ -91,15 +94,15 @@ export function extensionMutationLockState(): ExtensionMutationLockState {
   return found.state === "active" ? { state: "active", owner: found.owner.pid } : { state: found.state };
 }
 
-/** Load the manifest. Missing file → no extensions. A CORRUPT file is a loud error (never treat
- *  installed extensions as absent — commands would silently vanish from help). */
+/** Load the manifest. Missing file → no extensions. A CORRUPT or unreachable file is a loud error
+ *  (never treat installed extensions as absent — commands would silently vanish from help). */
 export function loadExtensionsManifest(): ExtensionsManifest {
   const p = extensionsManifestPath();
-  if (!existsSync(p)) return { extensions: [] };
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(p, "utf8"));
   } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { extensions: [] };
     throw new Error(`corrupt extensions manifest ${p}: ${(e as Error).message} - fix or delete it, then \`cotal ext add\` again`);
   }
   const m = parsed as ExtensionsManifest;
@@ -142,7 +145,19 @@ export function cacheCommand(cmd: Command): CachedCommand {
 }
 
 export function cacheConnector(connector: Connector): CachedConnector {
-  return { name: connector.name, requires: [...(connector.requires ?? [])] };
+  return {
+    name: connector.name,
+    requires: [...(connector.requires ?? [])],
+    setup: connector.setup ? { kind: connector.setup.kind, name: connector.setup.name } : null,
+  };
+}
+
+/** True when an entry's connector metadata predates what `cacheConnector` records now: an advertised
+ *  connector with no cached entry, or one cached before setup providers were. Never throws. */
+export function connectorMetadataStale(ext: InstalledExtension): boolean {
+  return extensionProvides(ext).some((ref) =>
+    ref.kind === "connector" && ext.connectors?.find((connector) => connector.name === ref.name)?.setup === undefined,
+  );
 }
 
 /** Connector boot metadata from one installed package. An older manifest that advertised a
@@ -172,6 +187,8 @@ export function cacheLocalProcess(component: LocalProcess): LocalProcess {
   }
   if (component.rootedAt !== undefined && component.rootedAt !== "target")
     throw new Error(`local-process ${component.name} declares an unknown rootedAt ${JSON.stringify(component.rootedAt)} - only "target" is defined`);
+  if (component.isOwnCommand !== undefined)
+    throw new Error(`local-process ${component.name} declares isOwnCommand, which an installed extension's cached descriptor cannot carry`);
   return {
     kind: "local-process",
     name: component.name,
@@ -272,10 +289,32 @@ export function bindExtensionPeers(
   return bound;
 }
 
-/** The installed package's CURRENT version, read from disk (undefined when not installed). */
+/** An installed extension's package.json is present but is not JSON or names no version: the package
+ *  is installed and damaged, so it must never read as not installed. */
+export class CorruptExtensionPackageError extends Error {
+  constructor(pkg: string, path: string, reason: string) {
+    super(`extension ${pkg} has a corrupt package.json ${path}: ${reason} - re-add it with \`cotal ext add\`, or \`cotal ext seed --repair\` for a built-in`);
+  }
+}
+
+/** The installed package's CURRENT version, read from disk (undefined when not installed). Only a
+ *  missing package.json means not installed; one that cannot be reached or read throws, and one
+ *  that is not JSON or has no version throws {@link CorruptExtensionPackageError}. */
 export function installedExtensionVersion(pkg: string): string | undefined {
-  const p = join(extensionPackageDir(pkg), "package.json");
-  if (!existsSync(p)) return undefined;
-  const v = (JSON.parse(readFileSync(p, "utf8")) as { version?: string }).version;
-  return typeof v === "string" ? v : undefined;
+  const path = join(extensionPackageDir(pkg), "package.json");
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw e;
+  }
+  let version: unknown;
+  try {
+    version = (JSON.parse(raw) as { version?: unknown }).version;
+  } catch (e) {
+    throw new CorruptExtensionPackageError(pkg, path, (e as Error).message);
+  }
+  if (typeof version !== "string" || !version) throw new CorruptExtensionPackageError(pkg, path, 'no "version" string');
+  return version;
 }

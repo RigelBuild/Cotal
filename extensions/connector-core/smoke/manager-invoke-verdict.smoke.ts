@@ -27,7 +27,7 @@
  * No broker: the MeshAgent constructor builds an endpoint but never connects, so `ep` is swapped for
  * one that throws. Run: pnpm smoke:manager-invoke-verdict
  */
-import { EpEnvelopeError, EP_UNANSWERED, EP_UNBOUND_RESPONDER } from "@cotal-ai/core";
+import { EpEnvelopeError, EP_UNANSWERED, EP_UNBOUND_RESPONDER, managerCallerBinding } from "@cotal-ai/core";
 import { MeshAgent } from "../src/agent.js";
 import type { AgentConfig } from "../src/config.js";
 
@@ -94,7 +94,59 @@ check("...and core's account survives intact", split.includes("SAYS NOTHING ABOU
 const plain = await render(new Error("connection closed"));
 check("a non-envelope failure states no verdict at all", !SILENCE.test(plain) && plain === "connection closed", plain);
 
-const EXPECTED_CELLS = 8;
+// Constructed claims grade coordinate parsing only; broker signature checks and issuer policy
+// are not exercised by this file. No bearer command or connection is started here.
+const owner = `u_${"a".repeat(26)}`;
+const uid = "c".repeat(26), instanceId = "a".repeat(26);
+const managerConfig: AgentConfig = {
+  ...cfg, lifecycleUid: uid, managerInstanceId: instanceId,
+  userAuth: { owner, actor: "caller", sentinelCreds: "unused", bearerCmd: ["not-executed"] },
+};
+const claims = { sub: owner, aud: cfg.space, act: { owner, actor: "caller", lifecycleUid: uid, view: "manager-caller", managerInstanceId: instanceId } };
+const token = (value: unknown) => `unused.${Buffer.from(JSON.stringify(value)).toString("base64url")}.unused`;
+const expected = { space: cfg.space, owner, actor: "caller", lifecycleUid: uid, instanceId };
+const binding = managerCallerBinding(token(claims), expected);
+check("manager control binds the exact server-selected instance and caller", binding.instanceId === instanceId && binding.caller.owner === owner && binding.caller.actor === "caller" && binding.caller.uid === uid);
+check("an unpinned client uses the issuer's concrete selection", managerCallerBinding(token(claims), { ...expected, instanceId: undefined }).instanceId === instanceId);
+const wrongClaims = [
+  { ...claims, aud: "other-space" },
+  { ...claims, sub: `u_${"b".repeat(26)}` },
+  { ...claims, act: { ...claims.act, view: "admin" } },
+  { ...claims, act: { ...claims.act, owner: `u_${"b".repeat(26)}` } },
+  { ...claims, act: { ...claims.act, actor: "other" } },
+  { ...claims, act: { ...claims.act, lifecycleUid: "d".repeat(26) } },
+  { ...claims, act: { ...claims.act, managerInstanceId: "b".repeat(26) } },
+  { ...claims, act: { ...claims.act, managerInstanceId: undefined } },
+  { ...claims, act: { ...claims.act, managerInstanceId: "*" } },
+];
+for (const [index, value] of wrongClaims.entries()) {
+  let refused = false;
+  try { managerCallerBinding(token(value), expected); } catch { refused = true; }
+  check(`manager control refuses foreign or malformed coordinates ${index + 1}`, refused);
+}
+let malformedRefused = false;
+try { managerCallerBinding("not-a-bearer", expected); } catch { malformedRefused = true; }
+check("manager control refuses an unparseable bearer", malformedRefused);
+
+// This constructed endpoint grades dispatch only, not renewal or broker delivery. It deliberately
+// does not execute the submission: the bearer helper must not run before the follower owns it.
+const spawning = new MeshAgent(managerConfig);
+let followedOnMain = false;
+const standing = {
+  principal: { owner, actor: "caller" },
+  followServiceGoal: async (endpoint: string, submit: unknown, deadlineMs: number) => {
+    followedOnMain = endpoint === "manager" && typeof submit === "function" && deadlineMs >= 40_000;
+    return { reply: { ok: true, data: { name: "followed" } } };
+  },
+};
+(spawning as unknown as { ep: unknown }).ep = standing;
+(spawning as unknown as { _connected: boolean })._connected = true;
+const spawned = await spawning.spawn("reviewer");
+check("user spawn delegates follow to its standing endpoint before executing the bearer helper",
+  followedOnMain && spawned.ok && (spawned.data as { name?: string })?.name === "followed" &&
+  (spawning as unknown as { ep: unknown }).ep === standing);
+
+const EXPECTED_CELLS = 21;
 const ran = pass + fail;
 console.log(`\n${fail === 0 ? "PASS" : "FAIL"} — ${pass} passed, ${fail} failed`);
 if (ran !== EXPECTED_CELLS) {

@@ -43,18 +43,33 @@ boundary. The Pi-local ledger commits those IDs through `MeshAgent.drainInboxIds
 only exact matches even when quiet ambient is physically interleaved or older IDs were overflow-
 evicted. Missing confirmed IDs are marked handled and tombstoned so late copies cannot resurface.
 
-Pi emits `agent_end` to extensions without exposing whether it will retry. Error, abort, unknown
-reasons, and zero/missing-output `length` therefore retain the delivery association in `waiting`;
-a later `agent_start` proves continuation. After a provider-error end, a new automatic DM or
-channel post instead starts one fresh turn with the retained inbox items and the new traffic.
-Nothing is acknowledged until that turn reaches a clean boundary; another error returns to
-`waiting` without a timer loop. Non-aborted `stop`, `toolUse`, and positive-output `length` are
-locally provable terminal boundaries and may commit confirmed work.
+A run turn rides the batch that carries it and counts as shown once the provider takes that batch's
+request: at a successful `after_provider_response`, or, on a transport without that hook, when Pi
+runs a tool from the answer or reaches the clean terminal boundary. The seat can therefore
+`cotal_yield` it during the Pi turn that carries it. A batch the provider never takes leaves the run
+turn unshown, and a later batch carries it again.
+
+Pi emits `agent_end` to extensions without exposing whether it will retry. Error and unknown
+reasons, and zero/missing-output `length`, therefore retain the delivery association in `waiting`
+while the driver itself attempts the continuation: it re-dispatches the retained batch through the
+same send path, with a fixed backoff and a fixed attempt count, and each attempt's `agent_start`
+proves continuation the same way an externally-triggered one does. A clean terminal boundary on any
+attempt commits the retained work as usual. Once the attempts are spent, the driver holds with a
+presence that names the state as needing intervention, states the attempt count, and says what the
+intervention is: start a new turn in the session, or replace the seat. User abort never retries; it
+is identified from the `AbortSignal` captured while the turn is active and stays a plain hold, since
+the person who aborted is the party who continues. Non-aborted `stop`, `toolUse`, and positive-output
+`length` are locally provable terminal boundaries and may commit confirmed work.
+
+After a provider-error end, a new automatic DM or channel post also starts one fresh turn with the
+retained inbox items and the new traffic, before or after the attempts are spent. Nothing is
+acknowledged until that turn reaches a clean boundary; a bare wake or redelivered old traffic does
+not retry.
+
 `session_before_compact { reason: "overflow", willRetry: true }` identifies the overflow path but is
-not itself a terminal decision. User abort is identified from the `AbortSignal` captured while the
-turn is active. An abort or dispatch watchdog blocks automatic replay. In managed headless use,
-restart is the safe recovery because it terminates any possibly-live provider call before durable
-redelivery.
+not itself a terminal decision. An abort or dispatch watchdog blocks automatic replay. In managed
+headless use, restart is the safe recovery because it terminates any possibly-live provider call
+before durable redelivery.
 
 `reload`, `new`, `resume`, and `fork` tear down Pi's extension runtime. The adapter keeps its mesh,
 control listener, delivery association, and ordered presence chain in a process-global identity map,
@@ -72,6 +87,9 @@ Use `cotal spawn --agent pi --continue <pi-session-id>` to reopen that exact Pi 
 
 A managed seat names its Pi session after its Cotal agent name on the first `session_start` or `agent_start`, so session pickers and terminal titles show the same name as `cotal ps`.
 
+A manifest agent declared `continuity: exact` is reopened with `pi --session <id>`, which
+fails when Pi no longer has that session instead of creating an empty one under the same id.
+
 ## Event plane
 
 A managed Pi seat publishes AG-UI runs, completed assistant text messages, and tool start/end
@@ -80,7 +98,12 @@ session JSONL is the durable source; extension hooks only wake the reader after 
 The event plane is enabled by default. `--no-events` opts out only on unrestricted spaces.
 A registration that requires events arms the plane independently of the environment flag, and
 the seat must hold the channel's publish grant. An event-enabled launch needs a stable
-workspace root for its write-ahead log.
+workspace root for its write-ahead log. If the event plane stops, the seat keeps running on every
+space, and Pi's log records `AG-UI emitter stopped` with the reason and the delay before the
+extension re-establishes the plane. The re-establish is a fresh start of the same session: it
+settles any frame the outage left pending and rebuilds the mapper from the run and tool calls
+that frame opened, so a tool result written after the outage closes the call the plane came back
+with.
 
 Text is published at **completed-message granularity**, not as live token deltas. Pi emits
 live text updates before writing the assistant record, so those deltas cannot be recovered

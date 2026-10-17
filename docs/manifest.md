@@ -18,7 +18,7 @@ and teardown behavior are in the guide: [Define a team](define-a-team.md).
 | `apiVersion` | yes | Must be `cotal/v1`. |
 | `kind` | yes | Must be `Mesh`. |
 | `space` | yes | The space name (one per file; `spaces:` is not supported in v1). A space's auth is bound to one root; to run a non-default space in a checkout that already ran `cotal up` (which sets up `main`), use a fresh directory. |
-| `broker` | no | `servers` (comma-separated broker URLs: this sets the address/port; default `nats://127.0.0.1:4222`; **no embedded creds**), `host` (bind interface only, no scheme; does *not* set the port), `auth` (the auth mode: unset/`true`/`"static"` = per-agent JWT creds, the default; `false` = an open dev mesh; `"user"` = per-user auth, where people `cotal login` and every connect is authorized against the actor ledger; pair with `idp`), `idp` (with `auth: "user"`: the IdP auth base URL to pin on first enable). The port comes from `servers`/`--server`, never `host`/`--host`. |
+| `broker` | no | `servers` (comma-separated broker URLs: this sets the address/port; default `nats://127.0.0.1:4222`; **no embedded creds**), `host` (bind interface only, no scheme; does *not* set the port), `auth` (the auth mode: unset/`true`/`"static"` = per-agent JWT creds, the default; `false` = an open dev mesh; `"user"` = per-user auth, where people `cotal login` and every connect is authorized against the actor ledger; pair with `idp`), `idp` (with `auth: "user"`: the IdP auth base URL to pin on first enable; https, or http on a loopback IP literal such as `127.0.0.1`; **no embedded creds**, query or fragment). The port comes from `servers`/`--server`, never `host`/`--host`. |
 | `runtime` | no | Registered manager runtime name. `pty` is built in; optional providers such as `tmux`, `cmux`, `orca`, and `herdr` are installed with `cotal ext add`. |
 | `agent` | no | Default harness (`claude` / `opencode` / `hermes`) for agents that don't set their own. There is **no silent default**; an agent needs this or its own `agent:`. |
 | `personaPermissions` | no | `reject` (default): the manifest is the whole truth. `include`: a persona's own channel grants are inherited for channels the manifest doesn't declare. |
@@ -47,7 +47,7 @@ agents:
     prompt: Introduce yourself in #general and assign the first task.
 ```
 
-Per-agent keys: `persona`, `agent` (harness override), `cwd`, `model`, `variant`, `role`,
+Per-agent keys: `persona`, `agent` (harness override), `cwd`, `continuity`, `model`, `variant`, `role`,
 `description`, `instructions`, `prompt`, `capabilities` (`spawn`,
 [what it grants](identity-and-auth.md); on a per-user-auth mesh also `role:<r>`, so the
 agent may delegate that role when spawning; `admin` is never accepted from a manifest),
@@ -61,14 +61,40 @@ against the manager workspace, matching `cotal spawn --cwd`; an absolute path is
 as supplied. Omitting it keeps the manager workspace as the default. It is never resolved
 against the manifest or persona directory on the deploying machine. Changing `cwd` marks
 an already-deployed agent stale and requires a restart. Empty paths and NUL bytes are
-rejected. This field controls the directory only; it does not restore a harness session.
+rejected. This field controls the directory only; `continuity` restores a harness session.
+
+`continuity` says whether an agent keeps its harness session across launches. `none`, the
+default, starts a new session every time. `exact` reopens the session the manager last
+bound to this agent name, so after `cotal down` and `cotal up -f` the agent comes back
+with its previous context. The manager owns the session id: on the first launch it
+records the session the connector proves over its authenticated control endpoint in
+`<manager workspace>/.cotal/continuity/<name>.json`. A connector that offers no such proof
+fails the launch, and nothing is recorded. The record follows the agent: crash recovery
+updates it when it rebinds a session, and a stop or a preservation cut records the
+session the agent last ran, including one it switched to itself. Every later launch, and
+a preserved resume of the session that cut retained, reopens the session under the same
+proof and fails if the connector reports a different one. A resume that fails this proof
+stops the seat it started and frees it once its exit is proved; a seat whose stop cannot be
+proved stays managed, and the resume's error says so. A reopen also fails when the
+harness no longer has that session, for example after its transcript was deleted or when
+the agent never answered and so nothing was stored; the manager never starts an empty
+session under the old id, and a failed launch names the file to remove to start a new
+one. The manifest never names a session id, and the imperative `cotal spawn --resume`
+fork stays separate. A reopened session does not get the kickoff
+`prompt` again. The manager refuses to reopen a recorded session whose space, connector
+or resolved `cwd` differs from the declaration, and names the file to remove to start a
+new session. A connector that cannot reopen an existing session refuses the manifest at
+preflight (today only `pi` can). Switching `continuity` marks an already-deployed agent
+stale.
 
 `instructions` and `prompt` differ in kind: `instructions` become the session's **system
 prompt** (who the agent is), while `prompt` is a **kickoff message** auto-submitted once
 the session is up (what to do right now). This is the declarative form of `cotal spawn --prompt`.
 It is submitted on first boot and again on a stale-restart (it is part of the launch form,
 so changing it marks a running agent `stale` like any other launch field); a manager
-reclaiming a still-live session does not re-submit it.
+reclaiming a still-live session does not re-submit it. A connector that cannot deliver a
+kickoff prompt refuses the manifest at preflight (today: hermes), the same way an
+unsupported `variant:` is refused.
 
 ## Channel grants
 

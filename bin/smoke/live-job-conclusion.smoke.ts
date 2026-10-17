@@ -70,8 +70,16 @@ function workflowJobs(src: string): Array<{ name: string; body: string }> {
 }
 function jobLevelAlways(body: string): boolean {
   const header = body.split(/^    steps:\n/m)[0] ?? body;
-  return /^    if: always\(\)\s*$/m.test(header);
+  const conditions = header.split("\n").filter((line) => /^    if:/.test(line));
+  return conditions.length === 1 && (conditions[0] === "    if: always()" ||
+    conditions[0] === "    if: ${{ always() && github.event_name != 'workflow_dispatch' }}");
 }
+check("the aggregate reader recognizes only bare always or the fixed manual exclusion",
+  jobLevelAlways("    if: always()\n    steps:\n") &&
+    jobLevelAlways("    if: ${{ always() && github.event_name != 'workflow_dispatch' }}\n    steps:\n") &&
+    !jobLevelAlways("    if: ${{ always() && false }}\n    steps:\n") &&
+    !jobLevelAlways("    if: ${{ always() || true }}\n    steps:\n") &&
+    !jobLevelAlways("    if: always()\n    if: always()\n    steps:\n"));
 const jobs = workflowJobs(workflow);
 const ciOk = jobs.find((j) => j.name === "ci-ok");
 const alwaysJobs = jobs.filter((j) => jobLevelAlways(j.body)).map((j) => j.name);

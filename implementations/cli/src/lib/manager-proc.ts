@@ -6,12 +6,20 @@ import { selfArgv } from "./self-exec.js";
 import { resolveRuntimeSpace } from "./status.js";
 import { cotalRoot } from "./paths.js";
 import {
-  canonicalLocalProcessPath, commandIsCotalSupervisor, localProcessPath, parsePid, probeLiveness,
-  readProcessCommand, reclaimDeadPreUpgradeRecord,
-  MANAGER_DELIVERY_AWARE_MARKER, MANAGER_LOGFILE, MANAGER_PIDFILE,
-  type CommandReader, type LivenessProbe, type LocalProcessContext,
-  identityLegacyWarning, identityRefusal, identityUncertaintyRefusal, parsePositiveIntegerFlag, removeIdentityPin, verifyIdentityPin, writeIdentityPin,
+  assertManagerCanSpare, armManagerShutdownIntent, assertRecordIdentity, disarmManagerShutdownIntent,
+  canonicalLocalProcessPath, commandIsCotalSupervisor, identityRecord, localProcessPath, parsePid, probeLiveness,
+  readPidfile, readProcessCommand, readProcessRecord, reclaimDeadPreUpgradeRecord,
+  MANAGER_DELIVERY_AWARE_MARKER, MANAGER_LOGFILE, MANAGER_PIDFILE, MANAGER_SHUTDOWN_INTENT, MANAGER_SPARE_CAPABILITY,
+  type CommandReader, type LivenessProbe, type LocalProcess, type LocalProcessContext, type ManagerSpareSeats, type ProcessIdentityRecord,
+  type ProcessRecord, type ProcessRecordState,
+  parsePositiveIntegerFlag, verifyIdentityPin, writePidPair,
 } from "@cotal-ai/workspace";
+import { c } from "../ui.js";
+import { stopLocalProcess } from "./local-process-stop.js";
+import { listManagerSeatsForSpare, printLegacyManagerSpareUncertainty, printSparedAgents, type SpareSeatRow } from "./teardown-spare.js";
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /** The `--max-sessions` value a live `cotal supervise` argv is actually serving.
  *
  *  The manager reads that flag only at start. A refresh that records a different number while this
@@ -59,11 +67,9 @@ export const managerLogPath = (space: string, root: string = cotalRoot()): strin
 export const managerLogDisplayPath = (space: string, root: string = cotalRoot()): string =>
   relative(root, managerLogPath(space, root));
 
-/** Exported so the delivery cutover preflight can NAME the pid it refused on: an error that says
- *  "cannot be attributed" without saying which pid is not actionable. READ-resolving, so it also
- *  names a pre-segmentation `manager.pid` when that is the record actually on disk. */
-export const MANAGER_PID_PATH = (space: string = folderSpace()): string => localProcessPath(MANAGER_PIDFILE, ctx(space));
-const PID_PATH = MANAGER_PID_PATH;
+/** READ-resolving: also names a pre-segmentation `manager.pid` when that is what is on disk. */
+const PID_PATH = (space: string = folderSpace(), root: string = cotalRoot()): string =>
+  localProcessPath(MANAGER_PIDFILE, { root, space });
 /** Sibling marker of `manager.pid`: written by THIS build's manager (which no longer hosts Plane-3 —
  *  the server-side delivery daemon does). Its presence beside a live `manager.pid` proves the manager is
  *  "delivery-aware" / non-hosting. A live `manager.pid` WITHOUT this marker is an OLD (pre-delivery-daemon)
@@ -73,59 +79,14 @@ const PID_PATH = MANAGER_PID_PATH;
 const DELIVERY_AWARE_MARKER = (space: string = folderSpace()): string =>
   localProcessPath(MANAGER_DELIVERY_AWARE_MARKER, ctx(space));
 
-/** The recorded manager's state. THREE-VALUED liveness plus absent, because collapsing it to a
- *  boolean is what made this dangerous. Both collapses are silent and both are wrong:
- *    `!== "dead"`  -> an `unknown` reports UP forever; no retry clears it and nothing starts.
- *    `=== "alive"` -> an `unknown` reports DOWN and a second manager launches onto a possibly-live one.
- *  `unknown` is REACHABLE on a real kernel, not just under a test shim: a Linux seccomp filter
- *  (`SECCOMP_RET_ERRNO`) or an LSM policy can return an arbitrary errno for `kill(pid, 0)` without
- *  executing it at all, and libuv preserves it. Proven with a live seccomp BPF filter, not by
- *  interposition. So the caller has to SEE the third state and refuse.
- *
- *  `foreign` is the fifth: the recorded pid is ALIVE and is provably NOT a manager. A record
- *  outliving its process is the same class of defect one layer down from a service registration
- *  outliving its host, and it resolves the same way — the number is eventually reused by an
- *  unrelated process, and from `kill(pid, 0)` alone that reads as a healthy manager forever. */
-export type ManagerRecordState = "alive" | "dead" | "unknown" | "absent" | "unattributable" | "foreign";
-
-/** The recorded manager, with the evidence behind the verdict — callers that must EXPLAIN a refusal
- *  need the pid and the command line that earned it, and a bare state cannot carry them. */
-export interface ManagerRecord {
-  state: ManagerRecordState;
-  /** The recorded pid, when the file held one. */
-  pid?: number;
-  /** The live process's command line, when it was readable (present on `alive` and `foreign`). */
-  command?: string;
-}
-
-/** Read + attribute the manager record in one place, so every caller decides on the same evidence.
- *
- *  ATTRIBUTION MAY ONLY DOWNGRADE ON PROOF. A live pid is demoted to `foreign` when its command line
- *  was READ and does not name the manager daemon — never when the read failed, never on a platform
- *  that cannot look, never on a process that died during the read. The asymmetry is the safety
- *  argument, and it is the same one the liveness probe makes: absence of evidence must fail toward
- *  the old behaviour (trust the record), because the opposite error starts a second manager on top
- *  of a live one. */
+/** The recorded manager, attributed by {@link readProcessRecord} to a `cotal supervise` process. */
 export function managerRecordState(
   probe: LivenessProbe = probeLiveness,
   readCommand: CommandReader = readProcessCommand,
   space: string = folderSpace(),
-): ManagerRecord {
-  const p = PID_PATH(space);
-  if (!existsSync(p)) return { state: "absent" };
-  const raw = readFileSync(p, "utf8").trim();
-  if (raw === "") return { state: "absent" }; // a pre-protocol husk: nothing is behind it
-  const pid = parsePid(raw);
-  // NOT `absent`. Folding non-empty corrupt content into "no manager recorded" is what let the
-  // ensure paths OVERWRITE it and launch a replacement, which is the same defect as deleting it:
-  // that record may front a live process nobody can identify. `absent` means no pidfile (or an
-  // empty husk); corrupt content is its own state and every action path must refuse on it.
-  if (pid === undefined) return { state: "unattributable" };
-  const liveness = probe(pid);
-  if (liveness !== "alive") return { state: liveness, pid };
-  const cmd = readCommand(pid);
-  if (cmd.kind !== "command") return { state: "alive", pid }; // gone/unreadable: established nothing
-  return { state: commandIsCotalSupervisor(cmd.command) ? "alive" : "foreign", pid, command: cmd.command };
+  root: string = cotalRoot(),
+): ProcessRecord {
+  return readProcessRecord(PID_PATH(space, root), commandIsCotalSupervisor, probe, readCommand);
 }
 
 /** {@link managerRecordState}'s verdict alone, for the callers that only branch on it. */
@@ -133,12 +94,12 @@ export function managerLiveness(
   probe: LivenessProbe = probeLiveness,
   readCommand: CommandReader = readProcessCommand,
   space: string = folderSpace(),
-): ManagerRecordState {
+): ProcessRecordState {
   return managerRecordState(probe, readCommand, space).state;
 }
 
 /** One line describing what was found behind the record, for a caller that has to explain itself. */
-export function describeManagerRecord(r: ManagerRecord): string {
+export function describeManagerRecord(r: ProcessRecord): string {
   if (r.state === "absent") return "no manager pid recorded";
   if (r.state === "unattributable") return `the manager pidfile holds content that is not a pid`;
   const who = r.command !== undefined ? ` running \`${r.command}\`` : "";
@@ -154,20 +115,38 @@ export function managerUp(space: string = folderSpace()): boolean {
   return managerLiveness(probeLiveness, readProcessCommand, space) === "alive";
 }
 
+/** Whether a live `cotal supervise` process on this machine may be serving `space`. A supervisor
+ *  records its pid under whatever folder it was started from, so no one root's record can rule it
+ *  out; the process table can. One whose argv names no space serves what its folder or environment
+ *  selects, so it counts, and a process table that cannot be listed proves nothing. */
+export function supervisorMayServe(space: string): boolean {
+  const ps = spawnSync("ps", ["-A", "-ww", "-o", "args="], { encoding: "utf8" });
+  if (ps.error || ps.status !== 0) return true;
+  return ps.stdout.split("\n").some((command) => {
+    if (!commandIsCotalSupervisor(command)) return false;
+    const named = /(?:^|\s)--space(?:=|\s+)(\S+)/.exec(command)?.[1];
+    return named === undefined || named === space;
+  });
+}
 
 
-/** True if the live manager carries a delivery-aware marker BOUND to its current pid (i.e. it's THIS
- *  build, non-hosting). Fail-closed: the marker stores the pid it was written for, and this requires it
- *  to equal the live `manager.pid` — a stale marker left by a crash, a mismatch, or an unparseable file
- *  all read as NOT delivery-aware, so a live old hosting `manager.pid` can't be mistaken for non-hosting
- *  and the delivery preflight stops it. */
-export function managerHasDeliveryMarker(space: string = folderSpace()): boolean {
-  const markerPath = DELIVERY_AWARE_MARKER(space);
-  const pidPath = PID_PATH(space);
-  if (!existsSync(markerPath) || !existsSync(pidPath)) return false;
-  const markerPid = Number(readFileSync(markerPath, "utf8").trim());
-  const livePid = Number(readFileSync(pidPath, "utf8").trim());
-  return Number.isFinite(markerPid) && Number.isFinite(livePid) && markerPid === livePid;
+
+/** True if the manager at `pid` carries a delivery-aware marker BOUND to it (i.e. it's THIS build,
+ *  non-hosting). `pid` comes from the caller's own record read: the manager removes its record on exit
+ *  and a start replaces it, so reading the pidfile again here would answer about a different process
+ *  than the one the caller judged. Fail-closed: the marker stores the pid it was written for, and a
+ *  stale marker left by a crash, a mismatch, or an unparseable file all read as NOT delivery-aware, so
+ *  a live old hosting manager can't be mistaken for non-hosting and the delivery preflight stops it. */
+export function managerHasDeliveryMarker(pid: number, space: string = folderSpace()): boolean {
+  let markerPid: number;
+  try {
+    markerPid = Number(readFileSync(DELIVERY_AWARE_MARKER(space), "utf8").trim());
+  } catch (e) {
+    // A manager removes its marker on exit, so it can be gone by the time it is read.
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw e;
+  }
+  return markerPid === pid;
 }
 
 /** Start the control-plane manager detached (pid in `.cotal/manager.<spaceKey>.pid`, output to
@@ -193,15 +172,17 @@ export function startManagerDetached(
   o: ManagerStartOpts = {},
 ): number {
   const space = o.space ?? folderSpace();
-  // Clear a provably dead PRE-UPGRADE record before claiming the canonical slot, so an upgraded root
-  // does not end up holding both names and failing every later read as ambiguous. It refuses (throws)
-  // on a live or unattributable one rather than orphaning the daemon behind it.
+  // BEFORE ANY RECORD OR LOG IS TOUCHED. `selfArgv` refuses when this process was not started from
+  // the `cotal` entry (#1629), and a refusal must leave the root exactly as it found it. Computed after
+  // the reclaim below, a refused start deleted dead pre-upgrade records; computed after `openSync`, it
+  // created a manager log and leaked its descriptor.
+  //
+  // Then clear a provably dead PRE-UPGRADE record before claiming the canonical slot, so an upgraded
+  // root does not end up holding both names and failing every later read as ambiguous. It refuses
+  // (throws) on a live or unattributable one rather than orphaning the daemon behind it.
+  const [node, ...self] = selfArgv();
   reclaimDeadPreUpgradeRecord(MANAGER_PIDFILE, ctx(space));
   reclaimDeadPreUpgradeRecord(MANAGER_DELIVERY_AWARE_MARKER, ctx(space));
-  // BEFORE THE LOG IS OPENED. `selfArgv` refuses when this process was not started from the `cotal`
-  // entry (#1629), and a refusal must leave the root exactly as it found it: computing the argv after
-  // `openSync` would create a manager log and leak its descriptor on every refused start.
-  const [node, ...self] = selfArgv();
   const logPath = managerLogPath(space);
   // 0600: the manager prints its console URL here, and that URL carries the console token — a
   // standing credential for every agent's terminal on this mesh, at rest for the life of the file.
@@ -242,21 +223,16 @@ export function startManagerDetached(
   // CANONICAL path, never a pre-upgrade one: a start that kept writing the root-scoped name would
   // keep minting the very records this change ends.
   const pidPath = canonicalLocalProcessPath(MANAGER_PIDFILE, ctx(space));
-  writeFileSync(pidPath, String(child.pid));
-  // #969: pin the pid to the start of the process behind it, so a later teardown can refuse a pid
-  // that was reused by an unrelated process. Sibling of the pidfile (marker pattern); absent on a
-  // platform that cannot produce a start token, which reads as a legacy record to every reader.
-  writeIdentityPin(pidPath, child.pid ?? 0);
+  if (!child.pid) throw new Error("manager spawned with no pid");
+  // #969/#1238: publish the pair by rename (pidfile + sibling start-token pin), so a crash never
+  // leaves a torn pairing; a platform that cannot produce a start token still gets the legacy shape.
+  writePidPair(pidPath, child.pid);
   // Mark this manager as delivery-aware (non-hosting) so the delivery preflight can tell it apart from
   // an old Plane-3-hosting manager. Written next to the pid, removed together in stopManager / down.
   writeFileSync(canonicalLocalProcessPath(MANAGER_DELIVERY_AWARE_MARKER, ctx(space)), String(child.pid));
   return child.pid ?? 0;
 }
 
-/** Make the control plane available: reuse a manager already running for this folder, else start
- *  one detached. Best-effort — callers treat it as non-fatal. A caller that needs THE manager to
- *  carry a runtime/launch spec (`up -f`) must stop any leftover manager first — a reused one is
- *  taken as-is. */
 /** Refuse to stand a manager up OVER a record we cannot read or attribute.
  *
  *  Exported because `ensureManager` is not the only path that starts one: `cotal spawn -f` calls
@@ -273,7 +249,7 @@ export function assertManagerRecordReplaceable(
   const state = record.state;
   // The record this is about, named in full: on a root that hosts two spaces "the manager pidfile"
   // is not a location an operator can act on, and on an un-upgraded one it is not even this name.
-  const p = PID_PATH(space);
+  const p = record.path;
   // A FOREIGN record is replaceable, and saying what was found is the point of allowing it. The pid
   // is alive, so `probeLiveness` alone would have called this a healthy manager and every start
   // path would have skipped forever; it is provably not a manager, so nothing is orphaned by
@@ -285,29 +261,60 @@ export function assertManagerRecordReplaceable(
     );
   if (state === "unattributable")
     throw new Error(
-      `the manager pidfile at ${p} holds content that is not a pid (${JSON.stringify(readFileSync(p, "utf8").trim())}).\n` +
+      `the manager pidfile at ${p} holds content that is not a pid (${JSON.stringify(record.content)}).\n` +
         `Refusing to start a manager over it: that record may front a live process nobody can identify, and overwriting it would orphan the process while reporting a healthy control plane.\n` +
         `NEXT: find and stop that process, then remove \`${p}\` by hand.`,
     );
   if (state === "unknown")
     throw new Error(
-      `the recorded manager pid (${readFileSync(p, "utf8").trim()}) cannot be attributed: the kernel answered neither "running" nor "no such process" (a seccomp filter or LSM policy does this inside some sandboxes).\n` +
+      `the recorded manager pid (${record.pid}) cannot be attributed: the kernel answered neither "running" nor "no such process" (a seccomp filter or LSM policy does this inside some sandboxes).\n` +
         `Refusing to start a manager over it: it may still be running and bound to the control plane.\n` +
         `NEXT: verify with \`ps -p <pid>\`. If it is gone, remove \`${p}\` and re-run.`,
     );
 }
 
-export function ensureManager(
+/** Wait for the manager this process just started to come up. The manager publishes its spare
+ *  capability only after `start()` returns, bound to its own process identity, so only a capability
+ *  for the started identity proves that process came up. A concurrent `supervise` that takes over the
+ *  record publishes its own capability, which says nothing about the started process, so losing the
+ *  record refuses. No deadline: the manager bounds its own boot waits (the delivery-admin one alone
+ *  runs to a minute), so a deadline here could only misreport a slow boot. */
+async function awaitManagerUp(space: string, started: ProcessIdentityRecord | { pid: number }): Promise<void> {
+  const manager = `the manager started for space "${space}" (pid ${started.pid})`;
+  if (!("token" in started))
+    throw new Error(`cannot read the start identity of ${manager}, so its readiness cannot be told apart from another manager's. Its log is ${managerLogPath(space)}`);
+  for (;;) {
+    try {
+      assertManagerCanSpare(ctx(space), undefined, started);
+      return;
+    } catch {
+      // Not published for the started process yet, or the record names another one: decided below.
+    }
+    const identity = assertRecordIdentity(started).kind;
+    if (identity === "gone" || identity === "mismatch")
+      throw new Error(`${manager} exited before it came up. It logged its reason to ${managerLogPath(space)}`);
+    if (parsePid(readPidfile(PID_PATH(space)) ?? "") !== started.pid)
+      throw new Error(`${manager} lost ${PID_PATH(space)} to another process before it came up, so it is not the manager serving the space. Its log is ${managerLogPath(space)}`);
+    await sleep(200);
+  }
+}
+
+/** Make the control plane available: reuse a manager already running for this folder, else start
+ *  one detached and wait for it to come up, throwing when it exits or loses its record first.
+ *  Best-effort — callers treat it as non-fatal. A caller that needs THE manager to carry a
+ *  runtime/launch spec (`up -f`) must stop any leftover manager first — a reused one is taken as-is. */
+export async function ensureManager(
   o: ManagerStartOpts = {},
   probe: LivenessProbe = probeLiveness,
   readCommand: CommandReader = readProcessCommand,
-): { running: boolean } {
+): Promise<{ running: boolean; started: boolean; pid?: number }> {
   const space = o.space ?? folderSpace();
   const state = managerLiveness(probe, readCommand, space);
-  if (state === "alive") return { running: true };
+  if (state === "alive") return { running: true, started: false };
   assertManagerRecordReplaceable(probe, readCommand, space); // refuses on unknown / unattributable, reports foreign
-  startManagerDetached(o);
-  return { running: true };
+  const pid = startManagerDetached(o);
+  await awaitManagerUp(space, identityRecord(pid));
+  return { running: true, started: true, pid };
 }
 
 /** A signal, injectable for the same reason the probe is: `EPERM` from `kill` is producible only by
@@ -315,123 +322,61 @@ export function ensureManager(
  *  from a test. Production passes nothing. */
 export type SignalFn = (pid: number, signal: NodeJS.Signals) => void;
 
-/** What a stop actually achieved, because "void" let this function claim success it had not earned. */
-export type StopVerdict = "stopped" | "already-gone";
+/** The manager as `cotal down` registers it: its pidfile, and the records that die with its process. */
+export const MANAGER_PROCESS = {
+  kind: "local-process",
+  name: "manager",
+  label: "manager",
+  order: 10,
+  pidFile: MANAGER_PIDFILE,
+  artifacts: [MANAGER_DELIVERY_AWARE_MARKER, MANAGER_SHUTDOWN_INTENT, MANAGER_SPARE_CAPABILITY],
+} satisfies LocalProcess;
 
-/** Blocking sleep. DO NOT reintroduce this for death-waiting: it blocks the event loop, so a child
- *  of this process is never reaped, remains a signalable zombie, and reads `alive` forever. That
- *  turned `cotal up` + Ctrl-C into an exit-1 that left the broker running. Death-waits await. */
-// (sleepSync removed: see above.)
-
-/** Stop the detached (pty) manager if we started one, and remove its records ONLY once it is gone.
- *
- *  THIS USED TO CATCH EVERY SIGNAL FAILURE AS "already gone" AND DELETE THE RECORDS ANYWAY. That was
- *  survivable while `EPERM` was misread as dead, because the caller never got here: the cutover
- *  preflight skipped a manager it thought was not running. Resolving `EPERM` to `alive` (the fix this
- *  change exists for) makes the preflight recognise ANOTHER USER's live manager and call this, at
- *  which point the old code sent a signal it was not permitted to send, swallowed the refusal, and
- *  deleted the pidfile and marker of a process that was still running and still bound to Plane 3.
- *  A correct fix upstream reaching a latent destructive bug downstream is the worst shape available,
- *  so this refuses instead: records are removed only on proven death, never on a signal we could not
- *  send or a death we could not confirm. Found by review, with a kernel seccomp proof. */
+/** Stop the space's manager. This is the one manager stop: `cotal down`, every `cotal up` teardown and
+ *  the delivery cutover preflight run it, so each holds the stop reservation, refuses a concurrent stop,
+ *  and escalates a wedged manager to SIGKILL. A default stop signals only a manager that published the
+ *  capability to spare its managed agents, and reports the agents it left; `withAgents` arms their reap
+ *  instead. `pid` binds the stop to the manager the caller judged: a record a successor published since
+ *  is left whole and the stop returns false. Throws, with the records kept, when the stop is refused or
+ *  the death is not confirmed. */
 export async function stopManager(
-  probe: LivenessProbe = probeLiveness,
-  signal: SignalFn | undefined = undefined,
-  readCommand: CommandReader = readProcessCommand,
   space: string = folderSpace(),
-): Promise<StopVerdict> {
-  const send: SignalFn = signal ?? ((pid, sig) => process.kill(pid, sig));
-  const p = PID_PATH(space);
-  const marker = DELIVERY_AWARE_MARKER(space);
-  // Records are cleared only on PROVEN death; the identity pin is removed with them so the next
-  // start does not inherit a pin for a process that no longer exists (#969).
-  const clear = (): void => {
-    rmSync(marker, { force: true });
-    removeIdentityPin(p);
-    rmSync(p, { force: true });
-  };
-  if (!existsSync(p)) {
-    rmSync(marker, { force: true }); // a marker with no pid records nothing
-    return "already-gone";
+  { withAgents = false, pid }: { withAgents?: boolean; pid?: number } = {},
+): Promise<boolean> {
+  const context = ctx(space);
+  let spared: SpareSeatRow[] | undefined;
+  let spareSeats: ManagerSpareSeats | undefined;
+  let legacyManagerSpareUnverified = false;
+  if (!withAgents && existsSync(PID_PATH(space))) {
+    const pin = verifyIdentityPin(PID_PATH(space));
+    if (pin.kind === "legacy") legacyManagerSpareUnverified = true;
+    else if (pin.kind === "match") spared = await listManagerSeatsForSpare(context);
   }
-  const raw = readFileSync(p, "utf8").trim();
-  const pid = parsePid(raw);
-  if (pid === undefined) {
-    // An EMPTY pidfile is a pre-protocol husk with nothing behind it, and clearing it is safe. ANY
-    // OTHER unattributable content (garbled, fractional, out of range) may still front a LIVE
-    // process we cannot identify or signal, so removing it would orphan that process while
-    // reporting a clean stop. The contract at the top of pid.ts says such content is never a pid to
-    // delete a record against; this is that rule at the destructive end, matching down.ts:298-311
-    // and stopAuthService, which already refuse. My first version cleared it.
-    if (raw === "") {
-      clear();
-      return "already-gone";
-    }
-    throw new Error(
-      `the manager pidfile at ${p} is unattributable (${JSON.stringify(raw)}): it may still front a running process nobody can identify.\n` +
-        `Refusing to remove it or report a clean stop; the delivery-aware marker is preserved with it.\n` +
-        `NEXT: find and stop that process, then remove the file by hand.`,
-    );
-  }
-  const before = probe(pid);
-  if (before === "dead") {
-    clear();
-    return "already-gone";
-  }
-  // A LIVE pid that is provably NOT a manager is never signalled. The record outlived its process
-  // and the number was reused, so SIGTERM here would kill an unrelated process — the exact
-  // destructive shape the rest of this function refuses on doubt, reached through certainty. The
-  // record is removed because it is provably stale, and what was found is printed: an operator who
-  // is told only "already gone" will not know their pidfile was pointing at a stranger.
-  if (before === "alive") {
-    const cmd = readCommand(pid);
-    if (cmd.kind === "command" && !commandIsCotalSupervisor(cmd.command)) {
-      console.error(`! recorded manager pid ${pid} is alive but is running \`${cmd.command}\`, which is not a manager - not signalling it; removing the stale record instead.`);
-      clear();
-      return "already-gone";
-    }
-  }
-  if (before === "unknown")
-    throw new Error(
-      `refusing to stop manager pid ${pid}: its liveness cannot be determined (the kernel answered neither "running" nor "no such process"; a seccomp filter or LSM policy does this).\n` +
-        `The pidfile and delivery-aware marker are LEFT IN PLACE: deleting them would orphan a process that may still be bound to the control plane.\n` +
-        `NEXT: verify with \`ps -p ${pid}\`, then stop it yourself or remove \`${p}\` if it is gone.`,
-    );
-  // #969 OPEN-VERIFY-TERMINATE: establish target identity BEFORE any signal. A pinned record whose
-  // live process carries a DIFFERENT start means the pid was reused and fronts an unrelated process
-  // (attribution above cannot catch a reused pid that happens to run a supervisor-shaped command);
-  // a torn or unreadable pin cannot prove identity either. A legacy record warns and proceeds so an
-  // upgraded CLI can stop a manager launched before pins existed. A MATCH is fully verified.
-  const identity = verifyIdentityPin(p);
-  if (identity.kind === "mismatch") throw identityRefusal("the manager", p, identity.record, identity.liveToken);
-  if (identity.kind === "legacy") console.error(identityLegacyWarning("the manager", p));
-  else if (identity.kind !== "match" && identity.kind !== "gone") throw identityUncertaintyRefusal("the manager", p, identity);
-  try {
-    send(pid, "SIGTERM");
-  } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code;
-    if (code === "ESRCH") {
-      clear(); // died between the probe and the signal, which is an ordinary race and genuinely gone
-      return "already-gone";
-    }
-    throw new Error(
-      `refusing to stop manager pid ${pid}: the signal was rejected (${code ?? "unknown error"}).\n` +
-        `EPERM here means the process belongs to another user, so it is running and NOT ours to stop. The pidfile and marker are LEFT IN PLACE.\n` +
-        `NEXT: stop it as its owner, or remove \`${p}\` if you are certain it is gone.`,
-    );
-  }
-  // The signal was accepted, which is not the same as the process being gone. Prove it before
-  // removing the record, bounded, because a record deleted while its process lives is the defect.
-  // AWAIT, never a blocking sleep: this process spawned the manager, so the event loop must run
-  // for it to be reaped. A blocked loop leaves a zombie that still answers kill(pid,0).
-  for (let i = 0; i < 40 && probe(pid) === "alive"; i++) await new Promise((r) => setTimeout(r, 50));
-  const after = probe(pid);
-  if (after !== "dead")
-    throw new Error(
-      `manager pid ${pid} accepted SIGTERM but was still ${after === "alive" ? "running" : "unattributable"} after 2s.\n` +
-        `The pidfile and marker are LEFT IN PLACE rather than recording a stop that did not happen.\n` +
-        `NEXT: check \`ps -p ${pid}\` and stop it directly if it is wedged.`,
-    );
-  clear();
-  return "stopped";
+  const found = await stopLocalProcess(MANAGER_PROCESS, context, {
+    pid,
+    owns: commandIsCotalSupervisor,
+    beforeSignal: (attempt) => {
+      if (attempt.target.token === undefined) {
+        // Upgrade compatibility follows the shared identity contract: a live pre-pin record
+        // is signalled after the warning emitted by stopLocalProcess. A default stop cannot verify
+        // the newer spare capability. Destructive down uses the helper's reduced-guarantee
+        // pid + reservation-inode handoff. A present pin still takes the fully identity-bound
+        // paths below, and a mismatching pin was already refused before this hook.
+        if (!withAgents)
+          console.error(c.dim("could not verify that this legacy manager can spare its managed agents; signalling it for upgrade compatibility"));
+      }
+      if (withAgents) armManagerShutdownIntent(context, attempt);
+      else if (attempt.target.token !== undefined) spareSeats = assertManagerCanSpare(context, undefined, attempt.target);
+    },
+    // Disarmed by the attempt that armed it, inside its reservation: a stop refused the reservation
+    // never reaches this, so it cannot remove the intent of the stop that holds it.
+    afterFailedSignal: withAgents ? () => disarmManagerShutdownIntent(context) : undefined,
+  });
+  // A stop that found no record of its own leaves the artifacts: with `pid` they belong to the
+  // successor whose record it left.
+  if (!found) return false;
+  for (const artifact of MANAGER_PROCESS.artifacts) rmSync(localProcessPath(artifact, context), { force: true });
+  if (legacyManagerSpareUnverified) printLegacyManagerSpareUncertainty();
+  else if (spared) printSparedAgents(spared, spareSeats);
+  return found;
 }

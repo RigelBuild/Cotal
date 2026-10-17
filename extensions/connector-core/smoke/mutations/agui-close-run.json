@@ -2,7 +2,7 @@
   "suite": [
     "extensions/connector-core/smoke/agui-close-run.smoke.ts"
   ],
-  "guard": "closing a run out of band from the record stream publishes ONE terminal — RUN_FINISHED, or RUN_ERROR when the connector reports a failed turn — consumes no source record, and refuses every state where publishing would be a guess",
+  "guard": "closing a run out of band from the record stream publishes ONE terminal \u2014 RUN_FINISHED, or RUN_ERROR when the connector reports a failed turn \u2014 consumes no source record, and refuses every state where publishing would be a guess",
   "command": "pnpm smoke:agui-close-run",
   "completionMarker": "agui-close-run smoke:",
   "proveWith": "node scripts/mutation-proof.mjs --config extensions/connector-core/smoke/mutations/agui-close-run.json",
@@ -14,7 +14,7 @@
     "consumed that were never mapped, and a consumer would see no seq gap to notice it by.",
     "",
     "SPECIFIER BOUNDARY, checked rather than assumed. The suite imports the emitter and the holder",
-    "by RELATIVE SOURCE PATH (../src/agui.js, ../src/agui-holder.js), so the bytes mutated are the",
+    "by RELATIVE SOURCE PATH (../src/agui-emitter.js, ../src/agui-holder.js), so the bytes mutated are the",
     "bytes graded. There is no dist in the path and no build in the command. Its one package-name",
     "import is `type Part` from @cotal-ai/core, which is erased at compile time and carries no",
     "behaviour.",
@@ -32,9 +32,10 @@
     "turn to a holder that drops it on the floor publishes a finish, and that is indistinguishable on",
     "the wire from never having reported it.",
     "",
-    "K8 is the size bound on that same close. An oversized upstream detail used to make packUnits",
-    "refuse before beginSend, so the run got no terminal and the holder died. The bound is one call",
-    "on the shared close; skipping it restores the defect.",
+    "K8 is the confidentiality bound on that same close (#1431). The upstream failure detail is",
+    "untrusted free text, so the close publishes the fixed message in its place. Handing the upstream",
+    "message to the close instead restores the leak. The fixed message always fits, and the oversized",
+    "cells check that the close succeeds whatever the detail's size.",
     "",
     "K9 is the never-both-terminal property. Deleting this.run = undefined from the shared terminal",
     "arm of AguiBrackets.accept leaves the machine open, so a second close publishes a finish. The",
@@ -43,7 +44,7 @@
   "mutations": [
     {
       "name": "K1 the closing frame takes its cursor from a fresh source read, the copy-paste from pump",
-      "file": "extensions/connector-core/src/agui.ts",
+      "file": "extensions/connector-core/src/agui-emitter.ts",
       "find": "    const cursor = this.wal.frontier.sourceCursor;\n    if (cursor === undefined)",
       "replace": "    const cursor = (await this.source.read(this.wal.frontier.sourceCursor)).cursor;\n    if (cursor === undefined)",
       "expectRed": "close:the-source-cursor-is-REPUBLISHED-UNCHANGED",
@@ -52,7 +53,7 @@
     },
     {
       "name": "K2 mint a run id when none is open instead of answering null",
-      "file": "extensions/connector-core/src/agui.ts",
+      "file": "extensions/connector-core/src/agui-emitter.ts",
       "find": "    const runId = this.brackets.runId;\n    if (runId === undefined) return null;",
       "replace": "    const runId = this.brackets.runId ?? randomUUID();",
       "expectRed": "close:a-stream-at-a-stopping-point-answers-null-and-publishes-NOTHING",
@@ -61,7 +62,7 @@
     },
     {
       "name": "K3 drop the pending guard on the close",
-      "file": "extensions/connector-core/src/agui.ts",
+      "file": "extensions/connector-core/src/agui-emitter.ts",
       "find": "    if (this.wal.pending)\n      throw new Error(\n        `event emitter for ${this.channel}: a frame is still pending; recovery must settle it before a run can be closed`,\n      );",
       "replace": "",
       "expectRed": "close:a-PENDING-frame-refuses-the-close",
@@ -70,7 +71,7 @@
     },
     {
       "name": "K4 drop the halted guard on the close",
-      "file": "extensions/connector-core/src/agui.ts",
+      "file": "extensions/connector-core/src/agui-emitter.ts",
       "find": "  }): Promise<string | null> {\n    if (this.halted) throw this.halted;",
       "replace": "  }): Promise<string | null> {",
       "expectRed": "close:a-HALTED-emitter-refuses-to-close",
@@ -80,7 +81,7 @@
     {
       "name": "K5 drop the onRunClosed report",
       "file": "extensions/connector-core/src/agui-holder.ts",
-      "find": "      if (runId !== null) this.onRunClosed?.(runId);",
+      "find": "    if (runId !== null) this.hooks.onRunClosed?.(runId);\n",
       "replace": "",
       "expectRed": "holder:the-closed-run-is-reported-so-a-mapper-can-forget-it",
       "cell": "holder:the-closed-run-is-reported-so-a-mapper-can-forget-it",
@@ -88,30 +89,30 @@
     },
     {
       "name": "K6 the emitter ignores the failure it was handed and publishes a finish, which is the state this plane shipped in",
-      "file": "extensions/connector-core/src/agui.ts",
+      "file": "extensions/connector-core/src/agui-emitter.ts",
       "find": "    const event = o.error",
       "replace": "    const event = false",
-      "expectRed": "close:the-closing-frame-carries-exactly-one-RUN_ERROR-with-its-message-and-code",
-      "cell": "close:the-closing-frame-carries-exactly-one-RUN_ERROR-with-its-message-and-code",
+      "expectRed": "close:the-closing-frame-carries-exactly-one-RUN_ERROR-with-the-fixed-message-and-no-code",
+      "cell": "close:the-closing-frame-carries-exactly-one-RUN_ERROR-with-the-fixed-message-and-no-code",
       "note": "The pre-fix behaviour exactly: every close is a RUN_FINISHED, so a failed turn is published as one that ended and a reader cannot tell it from one that succeeded."
     },
     {
       "name": "K7 the holder drops the reason on the way to the emitter, so a reported failure closes as a finish",
       "file": "extensions/connector-core/src/agui-holder.ts",
-      "find": "      const runId = await emitter.closeRun({ timestamp, ...(error ? { error } : {}) });",
-      "replace": "      const runId = await emitter.closeRun({ timestamp });",
-      "expectRed": "holder:the-failure-reaches-the-wire-as-RUN_ERROR-with-the-reason-it-was-given",
-      "cell": "holder:the-failure-reaches-the-wire-as-RUN_ERROR-with-the-reason-it-was-given",
+      "find": "      runId = await emitter.closeRun({ timestamp: terminal.timestamp, ...(cotal ? { cotal } : {}), ...(terminal.error ? { error: terminal.error } : {}) });\n",
+      "replace": "      runId = await emitter.closeRun({ timestamp: terminal.timestamp, ...(cotal ? { cotal } : {}) });\n",
+      "expectRed": "holder:the-failure-reaches-the-wire-as-RUN_ERROR-with-the-fixed-message-and-no-code",
+      "cell": "holder:the-failure-reaches-the-wire-as-RUN_ERROR-with-the-fixed-message-and-no-code",
       "note": "A silent drop one layer above the emitter. The connector still believes it reported a failure, the emitter never hears about it, and the wire says the turn finished."
     },
     {
-      "name": "K8 skip the close-path bound so an oversized failure detail still throws in packUnits",
-      "file": "extensions/connector-core/src/agui.ts",
-      "find": "      ? boundRunErrorForFrame({\n          message: o.error.message,",
+      "name": "K8 the close publishes the upstream failure detail instead of the fixed message",
+      "file": "extensions/connector-core/src/agui-emitter.ts",
+      "find": "      ? runError({\n          message: RUN_ERROR_EGRESS_MESSAGE,",
       "replace": "      ? runError({\n          message: o.error.message,",
-      "expectRed": "close:an-oversized-failure-detail-still-emits-exactly-one-bounded-RUN_ERROR",
-      "cell": "close:an-oversized-failure-detail-still-emits-exactly-one-bounded-RUN_ERROR",
-      "note": "Restores the defect: unbounded upstream text is packed as-is, packUnits refuses before beginSend, no terminal, holder dies."
+      "expectRed": "close:a-short-failure-detail-is-replaced-by-the-fixed-message",
+      "cell": "close:a-short-failure-detail-is-replaced-by-the-fixed-message",
+      "note": "Restores #1431 on the out-of-band close: a short upstream detail fits the frame, so it would reach events.<owner>.<actor> verbatim."
     },
     {
       "name": "K9 delete this.run = undefined from the shared terminal arm of AguiBrackets.accept",

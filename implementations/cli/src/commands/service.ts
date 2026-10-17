@@ -1,27 +1,19 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { accessSync, constants, existsSync } from "node:fs";
-import { arch, cpus, homedir, totalmem } from "node:os";
-import { join } from "node:path";
+import { arch, cpus, homedir, totalmem, userInfo } from "node:os";
+import { delimiter, isAbsolute, join, resolve, sep } from "node:path";
 import type { CompletionResult, ParsedArgs } from "@cotal-ai/core";
-import {
-  commandIsCotalSupervisor,
-  findMesh,
-  localProcessPath,
-  MANAGER_PIDFILE,
-  parsePid,
-  probeLiveness,
-  readProcessCommand,
-  spaceKey,
-  spaceSegment,
-} from "@cotal-ai/workspace";
+import { findMesh, spaceKey, spaceSegment, type ProcessRecord } from "@cotal-ai/workspace";
+import { describeManagerRecord, managerRecordState } from "../lib/manager-proc.js";
 import { selfArgv } from "../lib/self-exec.js";
 import { resolveRuntimeSpace } from "../lib/status.js";
 import { c } from "../ui.js";
 
 /**
  * `cotal service` — run the workstation's manager as a user service, so it survives logout
- * and reboot. The manager is the only daemon this installs; the broker and every other
+ * and reboot. On Linux that holds only while the user lingers, so install refuses without it.
+ * The manager is the only daemon this installs; the broker and every other
  * component keep their existing lifecycle. The unit's ExecStart is this CLI's own argv plus
  * the `supervise` subcommand, so the supervised process is the same one the operator would
  * run by hand (`selfArgv()` refuses when this process is not the cotal entry).
@@ -119,23 +111,6 @@ function meshOf(values: { mesh?: string }): string {
   return values.mesh ?? resolveRuntimeSpace(process.cwd());
 }
 
-/** The manager's pid + attribution for an explicit root, mirroring `managerRecordState`
- *  (which resolves its root from cwd); `service status` must judge the unit's recorded root,
- *  not whatever folder the operator is standing in. */
-function managerHealthFor(root: string, mesh: string): { state: string; pid?: number } {
-  const pidPath = localProcessPath(MANAGER_PIDFILE, { root, space: mesh });
-  if (!existsSync(pidPath)) return { state: "absent" };
-  const raw = readFileSync(pidPath, "utf8").trim();
-  if (raw === "") return { state: "absent" };
-  const pid = parsePid(raw);
-  if (pid === undefined) return { state: "unattributable" };
-  const liveness = probeLiveness(pid);
-  if (liveness !== "alive") return { state: liveness, pid };
-  const cmd = readProcessCommand(pid);
-  if (cmd.kind !== "command") return { state: "alive", pid };
-  return { state: commandIsCotalSupervisor(cmd.command) ? "alive" : "foreign", pid };
-}
-
 /** `systemctl --user …`; a missing binary or a user session that cannot be reached is a
  *  hard refusal naming what is missing (no fallback). */
 function systemctl(args: string[]): { status: number | null; output: string } {
@@ -169,14 +144,16 @@ function humanBytes(n: number): string {
   return Number.isInteger(gib) ? `${gib} GiB` : `${gib.toFixed(1)} GiB`;
 }
 
-interface ServiceStatus {
-  installed: boolean;
-  mesh: string;
-  root?: string;
-  unit?: { name: string; state: string; enabled: boolean | "unknown" };
-  manager?: { state: string; pid?: number };
-  linger?: boolean;
-}
+type ServiceStatus =
+  | { installed: false; mesh: string }
+  | {
+      installed: true;
+      mesh: string;
+      root: string;
+      unit: { name: string; state: string; enabled: boolean | "unknown" };
+      manager: ProcessRecord;
+      linger?: boolean | { error: string };
+    };
 
 /** systemd state for one unit: `inactive`/`not-found` handled without throwing. */
 function systemdUnitStatus(unit: string): { state: string; enabled: boolean | "unknown" } {
@@ -187,16 +164,42 @@ function systemdUnitStatus(unit: string): { state: string; enabled: boolean | "u
   return { state: state === "not-found" ? "not-found" : state, enabled };
 }
 
-/** Read the provenance fields a unit/plist carries. */
+/** A unit file's comment syntax. The provenance header is written and read through the same one,
+ *  so a field reads back without the delimiters the writer wrapped it in. */
+interface CommentSyntax { open: string; close: string }
+const SYSTEMD_COMMENT: CommentSyntax = { open: "# ", close: "" };
+const LAUNCHD_COMMENT: CommentSyntax = { open: "<!-- ", close: " -->" };
+
+const comment = (syntax: CommentSyntax, text: string): string => `${syntax.open}${text}${syntax.close}`;
+
+const provenanceHeader = (syntax: CommentSyntax, mesh: string, root: string): string[] =>
+  [MARKER, `cotal-mesh: ${mesh}`, `cotal-root: ${root}`].map((text) => comment(syntax, text));
+
 /** Read the provenance fields a unit/plist carries. The marker must be a WHOLE LINE at the
  *  very start of the file, exactly as this command writes it: a substring anywhere else (a
  *  Description= that quotes the phrase, a comment mid-file) is how an operator-written unit
  *  comes to look owned, and looking owned is what uninstall keys on. */
-function readUnitFields(path: string, meshPrefix: string, rootPrefix: string, markerLine: string): { mesh?: string; root?: string; marked: boolean } {
+function readUnitFields(path: string, syntax: CommentSyntax): { mesh?: string; root?: string; marked: boolean } {
   const lines = readFileSync(path, "utf8").split("\n");
-  const mesh = lines.find((l) => l.startsWith(meshPrefix))?.slice(meshPrefix.length).trim();
-  const root = lines.find((l) => l.startsWith(rootPrefix))?.slice(rootPrefix.length).trim();
-  return { mesh, root, marked: lines[0] === markerLine };
+  const field = (name: string): string | undefined => {
+    const open = `${syntax.open}${name}: `;
+    const line = lines.find((l) => l.startsWith(open) && l.endsWith(syntax.close));
+    return line?.slice(open.length, line.length - syntax.close.length);
+  };
+  return { mesh: field("cotal-mesh"), root: field("cotal-root"), marked: lines[0] === comment(syntax, MARKER) };
+}
+
+/** The mesh and root an installed unit records, for `status`. Both are REQUIRED, never
+ *  synthesized: a unit with no recorded mesh is not provably this command's, so status does not
+ *  present one as its own, and a unit with no absolute recorded root names no pidfile to judge
+ *  its manager by (a blank or relative one resolves against the caller's directory, which may
+ *  belong to another mesh). */
+function recordedService(path: string, fields: { mesh?: string; root?: string }): { mesh: string; root: string } {
+  if (!fields.mesh)
+    throw new Error(`${path} carries no recorded mesh - it was not written by \`cotal service install\`; reinstall it under the mesh it should serve before removing or reading it as a service`);
+  if (!fields.root || !isAbsolute(fields.root))
+    throw new Error(`${path} records mesh "${fields.mesh}" but no absolute root, so its manager cannot be read - remove it with \`cotal service uninstall --mesh ${fields.mesh}\` and install it again`);
+  return { mesh: fields.mesh, root: fields.root };
 }
 
 export async function service(args: ParsedArgs): Promise<void> {
@@ -231,23 +234,65 @@ export async function service(args: ParsedArgs): Promise<void> {
  *  the pre-seeded connector store beside it. */
 const serviceStateDir = (unitDir: string, mesh: string): string => join(unitDir, "cotal-service", spaceKey(mesh));
 
-/** The 0600 EnvironmentFile a unit loads: per-mesh facts never ride ExecStart argv (command
- *  lines are a publication surface on a multi-user host). */
+/** The 0600 EnvironmentFile the systemd unit loads: per-mesh facts never ride ExecStart argv
+ *  (command lines are a publication surface on a multi-user host). */
 const envFileName = (mesh: string): string => `cotal-manager@${spaceKey(mesh)}.env`;
 
-function writeEnvFile(mesh: string, server: string, stateDir: string): string {
+/** The installing shell's PATH, which the unit pins. A service manager hands its units its own
+ *  PATH (the systemd user manager's `/usr/local/bin:/usr/bin`, launchd's `/usr/bin:/bin`), which
+ *  lacks `~/.local/bin` and Homebrew, so an inherited PATH boots a manager that reports a harness
+ *  unavailable even though the operator's shell resolves it. An entry that is not absolute (an
+ *  empty one means the current directory) is resolved against this shell's cwd, because the unit
+ *  starts in the mesh root, where the same spelling names another directory. An entry with a `..`
+ *  segment is pinned as the directory it reaches now, symlinks followed: the shell's lookup steps
+ *  up from a symlink's target, a lexical resolve from its name. A PATH set to the empty string is
+ *  one empty entry. Refused rather than guessed when unset, when a `..` entry reaches no
+ *  directory, when a resolved entry contains the separator, and when it holds a line break the
+ *  env file and plist cannot carry. */
+function installerPath(): string {
+  const raw = process.env.PATH;
+  if (raw === undefined) throw new Error("PATH is not set - `cotal service install` pins this shell's PATH into the unit so the manager resolves the same harness binaries");
+  const dirs = raw.split(delimiter).map((dir) => {
+    if (isAbsolute(dir)) return dir;
+    if (!dir.split(sep).includes("..")) return resolve(dir);
+    try {
+      // `.native` is libc realpath(3), which walks like the kernel; the JS one collapses `..` first.
+      return realpathSync.native(dir);
+    } catch {
+      throw new Error(`PATH entry "${dir}" has a ".." segment and reaches no directory from here - make it absolute or remove it`);
+    }
+  });
+  if (dirs.some((dir) => dir.includes(delimiter))) throw new Error(`PATH has a relative entry that resolves to a directory containing "${delimiter}" - run install from another directory or make the entry absolute`);
+  const pinned = dirs.join(delimiter);
+  if (/[\r\n]/.test(pinned)) throw new Error("PATH contains a line break - it cannot be pinned into the unit's environment");
+  return pinned;
+}
+
+/** The manager's environment in the unit. Both arms render this one list (systemd into the
+ *  EnvironmentFile, launchd into the plist's EnvironmentVariables), so a variable cannot reach
+ *  one platform's unit and miss the other's. */
+function unitEnv(mesh: string, server: string, stateDir: string, pathEnv: string): [name: string, value: string][] {
+  return [
+    ["PATH", pathEnv],
+    ["COTAL_SPACE", mesh],
+    // The REGISTERED server, never a default: a mesh on a non-default port would otherwise boot
+    // its unit into a permanent crash loop on the supervise target mismatch.
+    ["COTAL_SERVER", server],
+    ["COTAL_HOME", stateDir],
+    ["XDG_CONFIG_HOME", join(stateDir, "config")],
+    // Seeding ran synchronously in the installer; the unit must never start a lazy seed (a
+    // manager stopped mid-seed leaves a crash cursor every later manager refuses on).
+    ["COTAL_SKIP_CONNECTOR_SEED", "1"],
+  ];
+}
+
+function writeEnvFile(mesh: string, server: string, stateDir: string, pathEnv: string): string {
   const path = join(stateDir, envFileName(mesh));
   const body = [
     `# ${MARKER}`,
-    `COTAL_SPACE=${mesh}`,
-    // The REGISTERED server, never a default: a mesh on a non-default port would otherwise boot
-    // its unit into a permanent crash loop on the supervise target mismatch.
-    `COTAL_SERVER=${server}`,
-    `COTAL_HOME=${stateDir}`,
-    `XDG_CONFIG_HOME=${join(stateDir, "config")}`,
-    // Seeding ran synchronously in the installer; the unit must never start a lazy seed (a
-    // manager stopped mid-seed leaves a crash cursor every later manager refuses on).
-    `COTAL_SKIP_CONNECTOR_SEED=1`,
+    // Double-quoted with `"` `\` `` ` `` `$` escaped, the only characters systemd unescapes inside
+    // double quotes (it does no `$VAR` expansion here), so any value reaches the manager verbatim.
+    ...unitEnv(mesh, server, stateDir, pathEnv).map(([name, value]) => `${name}="${value.replace(/["\\`$]/g, "\\$&")}"`),
     ``,
   ].join("\n");
   writeFileSync(path, body, { mode: 0o600 });
@@ -302,18 +347,22 @@ function install(values: { mesh?: string; linger?: boolean }): void {
     throw new Error(`no mesh named "${mesh}" is registered - bring it up (\`cotal up\`) or register it (\`cotal meshes add\`) before \`cotal service install\``);
   const root = entry.root;
   const server = entry.server;
+  // Before the incumbent check: an operator told to stop their manager first should not then be
+  // refused for lingering and left with no manager at all.
+  if (process.platform === "linux") requireLinger(values);
   // The manager is a singleton per space. Installing over a live one (typically `up --detach`'s)
   // would put the unit in a crash-restart loop against a lease it can never take, so refuse with
   // the exact remedy before anything is written.
-  const incumbent = managerHealthFor(root, mesh);
+  const incumbent = managerRecordState(undefined, undefined, mesh, root);
   if (incumbent.state === "alive")
     throw new Error(`a manager for mesh "${mesh}" is already running (pid ${incumbent.pid}, started by \`cotal up\` or by hand) - stop it first: \`cotal down manager\``);
   if (incumbent.state === "unknown" || incumbent.state === "unattributable")
-    throw new Error(`the recorded manager for mesh "${mesh}" cannot be attributed (${incumbent.state}) - resolve \`${localProcessPath(MANAGER_PIDFILE, { root, space: mesh })}\` before installing the service`);
+    throw new Error(`the recorded manager for mesh "${mesh}" cannot be attributed (${incumbent.state}) - resolve \`${incumbent.path}\` before installing the service`);
   // BEFORE anything is written: a re-exec that silently does not happen would report a
   // healthy service over nothing, so the argv is proven here, not at unit start. The mesh
-  // facts do NOT ride this argv (see the EnvironmentFile below).
+  // facts do NOT ride this argv (see unitEnv).
   const exec = [...selfArgv(), "supervise"];
+  const pathEnv = installerPath();
   if (process.platform === "linux") {
     assertSystemdUser();
     const unit = systemdUnitName(mesh);
@@ -324,16 +373,18 @@ function install(values: { mesh?: string; linger?: boolean }): void {
     // leave a state directory that no unit file names, because uninstall works from the unit.
     snapshotMeshEntry(mesh, stateDir);
     preseedService(stateDir);
-    const envFile = writeEnvFile(mesh, server, stateDir);
+    const envFile = writeEnvFile(mesh, server, stateDir, pathEnv);
     const body = [
-      `# ${MARKER}`,
-      `# cotal-mesh: ${mesh}`,
-      `# cotal-root: ${root}`,
+      ...provenanceHeader(SYSTEMD_COMMENT, mesh, root),
       `# Restart=always/20s: measured for manager units in production - a manager exits`
       + ` for reasons that are not failures (broker restarts, host suspend), so on-failure/5s`
       + ` thrashes while always/20s converges.`,
+      `# StartLimit 20 starts per 30min: a manager that cannot start (a precondition only an operator`
+      + ` can fix) stops after 20 attempts, about seven minutes at 20s apart, instead of restarting forever.`,
       `[Unit]`,
       `Description=Cotal manager for mesh ${mesh}`,
+      `StartLimitIntervalSec=30min`,
+      `StartLimitBurst=20`,
       ``,
       `[Service]`,
       `Type=simple`,
@@ -350,13 +401,12 @@ function install(values: { mesh?: string; linger?: boolean }): void {
       ``,
     ].join("\n");
     mkdirSync(dir, { recursive: true });
-    if (existsSync(path) && !readUnitFields(path, "# cotal-mesh:", "# cotal-root:", `# ${MARKER}`).marked)
+    if (existsSync(path) && !readUnitFields(path, SYSTEMD_COMMENT).marked)
       throw new Error(`${path} already exists and was not written by \`cotal service install\` - remove it by hand if you want this command to own it`);
     writeFileSync(path, body);
     systemctl(["daemon-reload"]);
     const started = systemctl(["enable", "--now", unit]);
     if (started.status !== 0) throw new Error(`enabling ${unit} failed: ${started.output}`);
-    linger(values, mesh);
     console.log(c.green(`✓ service installed: ${unit}`) + c.dim(` - manager for mesh "${mesh}" under ${root} (env ${envFile})`));
     return;
   }
@@ -369,12 +419,9 @@ function install(values: { mesh?: string; linger?: boolean }): void {
     // Same validate-first rule as the Linux arm.
     snapshotMeshEntry(mesh, stateDir);
     preseedService(stateDir);
-    const envFile = writeEnvFile(mesh, server, stateDir);
     const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;");
     const body = [
-      `<!-- ${MARKER} -->`,
-      `<!-- cotal-mesh: ${mesh} -->`,
-      `<!-- cotal-root: ${root} -->`,
+      ...provenanceHeader(LAUNCHD_COMMENT, mesh, root),
       `<?xml version="1.0" encoding="UTF-8"?>`,
       `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`,
       `<plist version="1.0">`,
@@ -387,11 +434,7 @@ function install(values: { mesh?: string; linger?: boolean }): void {
       `  <key>WorkingDirectory</key><string>${esc(root)}</string>`,
       `  <key>EnvironmentVariables</key>`,
       `<dict>`,
-      `    <key>COTAL_SPACE</key><string>${esc(mesh)}</string>`,
-      `    <key>COTAL_SERVER</key><string>${esc(server)}</string>`,
-      `    <key>COTAL_HOME</key><string>${esc(stateDir)}</string>`,
-      `    <key>XDG_CONFIG_HOME</key><string>${esc(join(stateDir, "config"))}</string>`,
-      `    <key>COTAL_SKIP_CONNECTOR_SEED</key><string>1</string>`,
+      ...unitEnv(mesh, server, stateDir, pathEnv).map(([name, value]) => `    <key>${name}</key><string>${esc(value)}</string>`),
       `</dict>`,
       `  <key>RunAtLoad</key><true/>`,
       `  <key>KeepAlive</key><true/>`,
@@ -401,10 +444,9 @@ function install(values: { mesh?: string; linger?: boolean }): void {
       ``,
     ].join("\n");
     mkdirSync(dir, { recursive: true });
-    if (existsSync(path) && !readUnitFields(path, "<!-- cotal-mesh:", "<!-- cotal-root:", `<!-- ${MARKER} -->`).marked)
+    if (existsSync(path) && !readUnitFields(path, LAUNCHD_COMMENT).marked)
       throw new Error(`${path} already exists and was not written by \`cotal service install\` - remove it by hand if you want this command to own it`);
     writeFileSync(path, body);
-    void envFile;
     const loaded = run("launchctl", ["load", "-w", path]);
     if (loaded.status !== 0) throw new Error(`loading ${path} failed: ${loaded.output}`);
     console.log(c.green(`✓ service installed: ${label}`) + c.dim(` - manager for mesh "${mesh}" under ${root}`));
@@ -413,23 +455,43 @@ function install(values: { mesh?: string; linger?: boolean }): void {
   throw new Error(`\`cotal service\` is not supported on ${process.platform} - it needs systemd user units (Linux) or launchd agents (macOS)`);
 }
 
-/** Linger only when asked, never silently; report an already-lingering user instead of touching it. */
-function linger(values: { linger?: boolean }, mesh: string): void {
-  const current = run("loginctl", ["show-user", String(process.getuid?.() ?? ""), "--property=Linger", "--value"]);
-  const enabled = current.status === 0 && current.output.trim() === "yes";
-  if (values.linger) {
-    if (enabled) {
-      console.log(c.dim(`• lingering already enabled for this user`));
-      return;
-    }
-    const on = run("loginctl", ["enable-linger", String(process.getuid?.() ?? "")]);
-    if (on.status !== 0) throw new Error(`enabling linger failed: ${on.output}`);
-    console.log(c.dim(`• lingering enabled - the user manager now starts at boot`));
+/** Whether logind keeps this user's manager running without a session (lingering). Only a
+ *  query that exits 0 and prints `yes` or `no` is an answer. Anything else (logind unreachable,
+ *  no loginctl, other output) comes back as its error, because a Linger that could not be read
+ *  is not "off". */
+function readLinger(): boolean | { error: string } {
+  const q = run("loginctl", ["show-user", String(process.getuid?.() ?? ""), "--property=Linger", "--value"]);
+  if (q.status === 0 && (q.output === "yes" || q.output === "no")) return q.output === "yes";
+  const how = q.status !== null ? `exited ${q.status}: ${q.output || "no output"}`
+    : q.output ? `did not finish: ${q.output}` : "could not run (is loginctl installed?)";
+  return { error: `\`loginctl show-user --property=Linger\` ${how}` };
+}
+
+/** The root command that enables lingering. logind can refuse an unprivileged enable-linger
+ *  (`Access denied` over SSH), so this is printed for the operator; nothing here runs sudo. */
+const lingerRemedy = (): string => `sudo loginctl enable-linger ${userInfo().username}`;
+
+/** Without lingering systemd starts no user manager at boot and stops it at the user's last
+ *  logout, so an enabled user unit is inert at boot: installing one would report a service the
+ *  next reboot silently loses. Refuse BEFORE anything is written, with the root command that
+ *  fixes it. `--linger` asks logind first; lingering is never enabled silently. */
+function requireLinger(values: { linger?: boolean }): void {
+  const linger = readLinger();
+  if (typeof linger === "object")
+    throw new Error(`could not read whether this user lingers, so install cannot confirm the service would start at boot: ${linger.error} - make that query answer, then re-run this install`);
+  if (linger) {
+    console.log(c.dim(`• lingering is enabled for this user - the user manager starts at boot`));
     return;
   }
-  if (enabled) console.log(c.yellow(`! lingering is already enabled for this user (the service survives logout with or without it)`));
-  else console.log(c.dim(`• the service stops at this user's last logout - pass --linger to keep it running (and start it at boot)`));
-  void mesh;
+  if (values.linger) {
+    const on = run("loginctl", ["enable-linger", String(process.getuid?.() ?? "")]);
+    if (on.status === 0) {
+      console.log(c.dim(`• lingering enabled - the user manager now starts at boot`));
+      return;
+    }
+    throw new Error(`\`loginctl enable-linger\` was refused (${on.output || "no output"}), so the service would not be boot-persistent - enable lingering as root with \`${lingerRemedy()}\`, then re-run this install`);
+  }
+  throw new Error(`lingering is off for this user, so the service would not be boot-persistent: systemd starts no user manager at boot, and the last logout stops it - enable lingering as root with \`${lingerRemedy()}\` (or pass --linger), then re-run this install`);
 }
 
 function readStatus(values: { mesh?: string }): ServiceStatus {
@@ -439,37 +501,28 @@ function readStatus(values: { mesh?: string }): ServiceStatus {
     const unit = systemdUnitName(mesh);
     const path = join(userUnitDir(), unit);
     if (!existsSync(path)) return out;
-    const fields = readUnitFields(path, "# cotal-mesh:", "# cotal-root:", `# ${MARKER}`);
-    // The mesh field is REQUIRED, never synthesized: a unit with no recorded mesh is not
-    // provably this command's, so status does not present one as its own either.
-    if (!fields.mesh)
-      throw new Error(`${path} carries no recorded mesh - it was not written by \`cotal service install\`; reinstall it under the mesh it should serve before removing or reading it as a service`);
+    const recorded = recordedService(path, readUnitFields(path, SYSTEMD_COMMENT));
     const state = systemdUnitStatus(unit);
     return {
       installed: true,
-      mesh: fields.mesh,
-      ...(fields.root ? { root: fields.root } : {}),
+      ...recorded,
       unit: { name: unit, state: state.state, enabled: state.enabled },
-      ...(fields.root ? { manager: managerHealthFor(fields.root, fields.mesh) } : {}),
-      linger: run("loginctl", ["show-user", String(process.getuid?.() ?? ""), "--property=Linger", "--value"]).output.trim() === "yes",
+      manager: managerRecordState(undefined, undefined, recorded.mesh, recorded.root),
+      linger: readLinger(),
     };
   }
   if (process.platform === "darwin") {
     const label = launchdLabel(mesh);
     const path = join(launchAgentsDir(), `${label}.plist`);
     if (!existsSync(path)) return out;
-    const fields = readUnitFields(path, "<!-- cotal-mesh:", "<!-- cotal-root:", `<!-- ${MARKER} -->`);
-    // Same required-recorded-mesh rule as the Linux arm.
-    if (!fields.mesh)
-      throw new Error(`${path} carries no recorded mesh - it was not written by \`cotal service install\`; reinstall it under the mesh it should serve before removing or reading it as a service`);
+    const recorded = recordedService(path, readUnitFields(path, LAUNCHD_COMMENT));
     const listed = run("launchctl", ["list", label]);
     const pid = Number(listed.output.split("\t")[0]);
     return {
       installed: true,
-      mesh: fields.mesh,
-      ...(fields.root ? { root: fields.root } : {}),
+      ...recorded,
       unit: { name: label, state: listed.status === 0 ? (Number.isInteger(pid) && pid > 0 ? "running" : "loaded") : "not-loaded", enabled: listed.status === 0 },
-      ...(fields.root ? { manager: managerHealthFor(fields.root, fields.mesh) } : {}),
+      manager: managerRecordState(undefined, undefined, recorded.mesh, recorded.root),
     };
   }
   throw new Error(`\`cotal service\` is not supported on ${process.platform}`);
@@ -486,14 +539,14 @@ function status(values: { mesh?: string; json?: boolean }): void {
   if (!s.installed) {
     console.log(c.dim(`  service not installed for mesh "${s.mesh}" - install with: cotal service install --mesh ${s.mesh}`));
   } else {
-    const unit = s.unit!;
+    const unit = s.unit;
     console.log(`  ${"unit".padEnd(16)} ${unit.name}`);
     console.log(`  ${"unit state".padEnd(16)} ${unit.state === "active" ? c.green(unit.state) : c.yellow(unit.state)}`);
     console.log(`  ${"enabled".padEnd(16)} ${unit.enabled === true ? c.green("yes") : unit.enabled === false ? c.red("no") : c.dim("unknown")}`);
-    if (s.root) console.log(`  ${"root".padEnd(16)} ${s.root}`);
-    const mgr = s.manager!;
-    console.log(`  ${"manager".padEnd(16)} ${mgr.state === "alive" ? c.green(`running (pid ${mgr.pid})`) : c.yellow(mgr.state)}`);
-    if (s.linger !== undefined) console.log(`  ${"linger".padEnd(16)} ${s.linger ? c.green("enabled") : c.dim("disabled")}`);
+    console.log(`  ${"root".padEnd(16)} ${s.root}`);
+    const mgr = s.manager;
+    console.log(`  ${"manager".padEnd(16)} ${mgr.state === "alive" ? c.green(`running (pid ${mgr.pid})`) : c.yellow(describeManagerRecord(mgr))}`);
+    if (s.linger !== undefined) console.log(`  ${"linger".padEnd(16)} ${s.linger === true ? c.green("enabled") : s.linger === false ? c.yellow(`disabled - not boot-persistent; enable as root: ${lingerRemedy()}`) : c.yellow(`unknown - ${s.linger.error}`)}`);
   }
   console.log(`  ${"arch".padEnd(16)} ${facts.arch}`);
   console.log(`  ${"os".padEnd(16)} ${facts.os}`);
@@ -511,7 +564,7 @@ function uninstall(values: { mesh?: string }): void {
     const path = join(dir, unit);
     if (!existsSync(path))
       throw new Error(`no service unit for mesh "${mesh}" at ${path} - nothing installed by \`cotal service install\``);
-    const fields = readUnitFields(path, "# cotal-mesh:", "# cotal-root:", `# ${MARKER}`);
+    const fields = readUnitFields(path, SYSTEMD_COMMENT);
     if (!fields.marked)
       throw new Error(`${path} was not written by \`cotal service install\` (no provenance header) - this command refuses to remove operator-managed units`);
     // Provenance keys on the marker PLUS a recorded mesh equal to the one named, never the unit
@@ -531,9 +584,8 @@ function uninstall(values: { mesh?: string }): void {
     rmSync(serviceStateDir(dir, fields.mesh), { recursive: true, force: true });
     systemctl(["daemon-reload"]);
     systemctl(["reset-failed", unit]);
-    const lingerOn = run("loginctl", ["show-user", String(process.getuid?.() ?? ""), "--property=Linger", "--value"]).output.trim() === "yes";
     console.log(c.green(`✓ service removed: ${unit}`));
-    if (lingerOn) console.log(c.dim(`• lingering is still enabled for this user - turn it off with \`loginctl disable-linger\` if you no longer want it`));
+    if (readLinger() === true) console.log(c.dim(`• lingering is still enabled for this user - turn it off with \`loginctl disable-linger\` if you no longer want it`));
     return;
   }
   if (process.platform === "darwin") {
@@ -543,7 +595,7 @@ function uninstall(values: { mesh?: string }): void {
     const path = join(dir, `${label}.plist`);
     if (!existsSync(path))
       throw new Error(`no launchd agent for mesh "${mesh}" at ${path} - nothing installed by \`cotal service install\``);
-    const fields = readUnitFields(path, "<!-- cotal-mesh:", "<!-- cotal-root:", `<!-- ${MARKER} -->`);
+    const fields = readUnitFields(path, LAUNCHD_COMMENT);
     if (!fields.marked)
       throw new Error(`${path} was not written by \`cotal service install\` (no provenance header) - this command refuses to remove operator-managed units`);
     // Same mesh-pinned provenance rule as the Linux arm: the recorded mesh must be present and

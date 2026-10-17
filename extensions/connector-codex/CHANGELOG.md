@@ -1,5 +1,140 @@
 # @cotal-ai/connector-codex
 
+## 0.82.0
+
+## 0.81.1
+
+## 0.81.0
+
+## 0.80.0
+
+### Minor Changes
+
+- fded3ab: A seat never leaves the mesh because its event plane stopped, and the plane comes back on its own. The emitter holder re-establishes the plane at once after any failure, then every second while it stays down, by a fresh start that replaces the emitter: it reopens the write-ahead log, settles any pending frame, and builds the connector's mapper from the run the log has open before reading on. A turn that ends while the plane is down keeps its terminal, as does one whose terminal's own log write failed, and the re-establish closes that run with it once it has read on; every turn that ends during one outage keeps its own terminal, placed on the last turn the source had begun at the position the terminal was reported at (a turn the mapper opens no run for takes its terminal and publishes nothing, and a repeated terminal replaces nothing), a terminal is owed to its run until the frame carrying it freezes, a terminal reported with the plane up goes to the emitter at the hook too so a flush still reading when the next prompt lands closes the turn with its own terminal, and when the next prompt was already written before the plane came back the failure is published in place of the finish that prompt would have synthesized, in a frame of the failed run and ahead of the next run's first. The mapper contract gains `{ turn: true }` for a record that begins a turn and opens no run. `DurableSource` gains `end()`, the cursor after the last complete record as of the call, which every connector's source implements; the holder's hooks gain `sourceEnd`, `closeRun` returns a promise that resolves once that position is read (the Claude Code hook awaits it before replying), and the emitter takes a `ReportedTerminal` through `queueTerminal`, with `waitingTerminals`, `takeOwed`, `unsettled` and `seedLastTurn` beside it. The wait between attempts is fixed: it neither doubles nor caps, so the plane is back within a second of the fault clearing. The pi adapter's start factory, re-entered by the re-establish, checks the native file instead of reading an acknowledged cursor as a vanished file, and seeds its mapper from the pending frame. A transcript line that is not a record is stepped over and reported on every connector, the jcode journal wrapper included, and one written past the position a terminal was reported at does not hold that terminal: it is placed after the records before it, as is a terminal reported past a record no read answers, such as an OpenCode part still filling when its turn died, which used to hold the turn end reading the session without end; the OpenCode source now reads every record at or before the end reported at a turn end as settled, so that part no longer stops the turns after it from publishing. A terminal reported while the very first start is still waiting on the broker reaches the emitter before its first read, where it used to be queued behind the flush that read past it and close the next turn. On a space that requires events the seat used to exit with code 1 instead; for Claude Code that exit was the "MCP server cotal has disconnected" banner, and Claude Code restarted the server on the next tool call. The `eventPlaneStopped` sink no longer takes `required` or `stopSeat`, the holder's `onError` receives the delay before the next re-establish (`0` for at once) and `retryMs` is that fixed wait, the Claude and OpenCode mappers take `resumeRunId`, and a reported unreadable-line reason carries no text from the record itself.
+
+### Patch Changes
+
+- 109fa8f: `cotal models --agent codex` now reports a Codex catalog error when the `codex app-server` child closes its input before `model/list` is answered. The write to the closed pipe used to fail with an unhandled `EPIPE` that crashed the manager, so the call timed out and every later request found no manager until it was restarted.
+
+## 0.79.0
+
+### Patch Changes
+
+- ab9117c: A Codex seat that stops while its event plane is armed but not yet bound to a rollout file no longer binds on the way out. A bind that resumes after the seat began stopping now stands down, whether it was looking for the file or reading where to start in it, and whether shutdown's own drain, the turn boundary from shutdown's interrupt, or the launch started it. The seat no longer logs another `no rollout file yet` line while it exits, and no longer adopts an emitter that nothing closes while it leaves the mesh.
+
+## 0.78.1
+
+## 0.78.0
+
+## 0.77.1
+
+### Patch Changes
+
+- a1948eb: The Codex and Jcode hosts now arm the event plane when the session's registration requires events, even without `COTAL_EVENTS`. They used to read only that flag, so a hand-driven user-mode launch with `COTAL_EVENTS_REQUIRED=1`, or a custom launcher that passed `eventsRequired` with events opted out, ran with no event plane and the required-events policy never applied. The Claude, OpenCode, Codex, Jcode and Pi launches that carry `eventsRequired` now also set `COTAL_EVENTS` and the workspace root when the launcher passed `events: false`, so the armed session has a place for its event log. Both decisions go through `launchArmsEvents` and `eventPlaneArmed` in `@cotal-ai/connector-core`; an OpenCode 2.x session still reads only `COTAL_EVENTS`.
+
+## 0.77.0
+
+## 0.76.0
+
+## 0.75.0
+
+## 0.74.0
+
+### Patch Changes
+
+- ad81083: The connector on/off flags `COTAL_CHANNEL`, `COTAL_EVENTS`, `COTAL_EVENTS_REQUIRED`, `COTAL_CODEX_TUI` and `COTAL_JCODE_TUI` now share one parser in `@cotal-ai/connector-core`. It accepts `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` in any case, treats an unset or blank value as unset, and refuses anything else at startup with an error naming the variable and the value. Before, each connector kept its own copy and read any other value, such as `enabled`, `2` or `y`, as off without a word. The OpenCode 2.x adapter now refuses `COTAL_EVENTS=true` the same way it refuses `COTAL_EVENTS=1`, where before only `1` was refused.
+
+## 0.73.0
+
+## 0.72.1
+
+## 0.72.0
+
+## 0.71.0
+
+## 0.70.2
+
+## 0.70.1
+
+## 0.70.0
+
+### Minor Changes
+
+- 76113ce: `AguiEmitterHolder` now takes its hooks as one named object after the emitter factory, `new AguiEmitterHolder(startEmitter, { onError, onRunClosed, waitLive, runMeta })`, typed by the exported `AguiEmitterHolderHooks`, where only `onError` is required. Before, the four hooks were positional, and a `runMeta` provider passed third was accepted as `onRunClosed`: it typechecked, ran after the run had already closed, and its metadata was dropped with no error. A caller no longer fills earlier slots with `undefined` to reach a later hook. The Claude Code, Codex, jcode, OpenCode and pi connectors pass their hooks by name, with no change in behavior.
+
+### Patch Changes
+
+- 95788eb: A seat whose AG-UI event plane stops for good now follows the space's policy on every connector. On a space that requires events the seat stops, where Pi, Claude Code and OpenCode used to keep it running without events. On any other space the seat keeps running and its log records `AG-UI emitter stopped`, where Jcode used to stop the seat and refuse further turns. Codex no longer rebuilds a stopped plane at its next turn boundary on any space, and it now waits for the mesh before starting its emitter, as the other connectors do. The rule is `eventPlaneStopped` in connector-core, which each connector passes its log sink and its stop hook.
+
+## 0.69.0
+
+## 0.68.0
+
+### Minor Changes
+
+- 585fdb2: Connectors launch on the model and variant their launcher resolved. `LaunchOpts.model` and `LaunchOpts.variant` are now the launcher's resolved values (the flag, else the agent file's `model:` / `variant:`), and every connector renders them as given instead of reading the agent file again in `buildLaunch`. Before, a model the launcher did not resolve was taken from a later read of a file that could have changed since, so the seat could run a model the launcher never checked or recorded, and a supervised restart re-read it each time. The in-session config takes the model and variant from `COTAL_MODEL` / `COTAL_VARIANT` only, so the card and the orientation pin no longer report a model the seat was not launched on. The Hermes connector no longer falls back to `HERMES_MODEL` from the spawning process, including one `spawn.env` forwards; set the model with `--model` or the persona's `model:`. Code that calls `buildLaunch` directly must pass `model` and `variant` itself.
+
+## 0.67.0
+
+## 0.66.1
+
+## 0.66.0
+
+## 0.65.0
+
+## 0.64.0
+
+## 0.63.0
+
+## 0.62.0
+
+## 0.61.0
+
+## 0.60.0
+
+## 0.59.0
+
+### Patch Changes
+
+- 608f5f4: Re-attach doc comments that had drifted away from the declarations they document. A `/** */` block followed directly by another one documented nothing, so editor hovers and the published type declarations showed no doc for the intended declaration (for example `Manager`, the `plane3` field and `AclResolver`). Each such block now sits above its declaration, is merged into the block it duplicated, or is removed when its declaration no longer exists. A new `pnpm check:doc-comments` check, run as part of `check:docsbundle`, refuses a doc block followed directly by another in shipped source.
+
+## 0.58.0
+
+## 0.57.0
+
+## 0.56.1
+
+### Patch Changes
+
+- 6b76946: A seat resumed from a preservation cut backfills its channels from the chat stream sequence its prior incarnation had reached instead of replaying the whole retained window.
+
+## 0.56.0
+
+### Patch Changes
+
+- fdc2c35: The codex host persists the event plane's bind boundary into the log as soon as the start
+  succeeds, instead of waiting for the emitter's first read. A host that dies between a successful
+  bind and its first pump now resumes from the recorded boundary instead of taking a fresh one at
+  the file's later end, so it no longer drops what the thread wrote in between.
+- ff2851c: Compare receive keys in the codex steer filter, so an empty-id message already steered into a turn is not steered again.
+
+  `surfaced` holds receive keys (a minted one for an id-less delivery), but the steer filter tested the raw `item.id`. For a message whose wire id is the empty string that test never matched, so every pass of the steer loop re-admitted an already-steered empty-id item and injected it again into the live turn for as long as the turn stayed open. The filter now tests `item.recvKey` against the set, with a one-line comment stating that `surfaced` holds receive keys.
+
+## 0.55.0
+
+### Patch Changes
+
+- d5dd72a: The codex-host smoke tolerates a torn JSONL tail at every poll: the two remaining direct parse chains inside `waitFor` polls now read through `readJsonLines`, which drops a partial trailing line a live child is still appending.
+- 2525286: Every settle-dependent cell in the codex lifecycle smoke carries its wait's margin, so a timed-out wait fails as a timed-out wait.
+- 59ca157: The codex host logs the rollout path it publishes from as a quoted value, and the lifecycle smoke reads the path from that value instead of from the sentence around it.
+- d284ee6: A manifest or spawn prompt on a connector that cannot deliver one is refused at preflight (including `up -f --dry-run`), at spawn and in the manager, the way an unsupported model variant is: connectors now declare `supportsPrompt`, and claude, opencode, codex, jcode and pi declare it; hermes keeps its launch-time throw as the second line of defence.
+
+## 0.54.0
+
+### Patch Changes
+
+- cf0e1da: Dismiss a Codex turn's batch on an operator interrupt instead of redelivering it, and stop folding an unknown terminal status into "interrupted". Presence writes from the Codex host go out in call order, so a turn that fails or asks for approval in the tick it started no longer loses its condition to its own start.
+
 ## 0.53.0
 
 ## 0.52.1

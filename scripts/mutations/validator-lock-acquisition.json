@@ -1,0 +1,184 @@
+{
+  "grades": "tool",
+  "suite": [
+    "scripts/ci-validator-lock-acquisition.test.mjs"
+  ],
+  "guard": "four shipped entry admission guards and bounded returned-tool failure observations and supported fixed-policy CLI spellings and pre-bootstrap external config/default-hook/workspace custody",
+  "command": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs",
+  "progressPattern": "^ok [0-9]+ - ",
+  "completionMarker": "# tests 22",
+  "proveWith": "node scripts/mutation-proof.mjs --config scripts/mutations/validator-lock-acquisition.json",
+  "why": [
+    "Four runtime child controls require each designated guard message, not just a nonzero exit. Removing one guard reaches a later refusal with a different message and must redden its named control. No mutant admits the full acquisition path: later guards remain and each control supplies incomplete hosted context.",
+    "Three structural checks remain distinct from four runtime controls. Workflow jobs, event inputs, exact gates and artifact paths use the existing root yaml parser, not string includes or commented text.",
+    "Each mutation restores exact source through the maintained tool and then reruns the same full fourteen-control command. No build outputs are generated, no package install or engine imports. The completion marker is stock TAP total printed on pass and fail, not a success-only banner.",
+    "Own baseline, eight designated kills and full restored controls are required before separately admitted manual acquisition. Source-only author has run none of these. Tests do not prove valid acquisition, full tool/config/privacy custody or returned dependency graph.",
+    "Six added callbacks drive the same imported result handler used by run(), with pinned bracketed pnpm formatting, UNKNOWN, independent streams, privacy, scan/counter bounds, error precedence and success retention. No test acquires packages. All thirteen controls and seven mutation designs remain unexecuted by this source author.",
+    "The focused source control reads the actual unique shipped command definition before the older fixed-literal control. Reverting all four config spellings must redden that named control. It does not run pnpm, copy its parser or prove effective hosted policy. Fourteen callbacks and eight mutation designs remain unexecuted by this source author.",
+    "Eight new controls import the actual shipped preflight and use disposable absent/inert files, directories and dangling links. Two bounded fs-error/stability mocks drive that same helper, not copied admission rules. One child reaches the actual entry with complete early hosted context and empty PATH: designated preflight refusal must precede git/pnpm spawn. Native execution and mutation kills remain unperformed by the source author; no acquired packages or imported hooks are required. Global configDependencies is ignored by stock; local workspace byte admission protects that path. Global hook/server config is refused by whole-file presence."
+  ],
+  "mutations": [
+    {
+      "name": "acquisition entry omits its arguments guard",
+      "file": "scripts/ci-validator-lock-acquisition.mjs",
+      "find": "assert.equal(process.argv.length, 2, 'No command or package inputs are supported');",
+      "replace": "void 0;",
+      "cell": "the shipped acquisition path accepts no command or package argument",
+      "expectRed": "the shipped acquisition path accepts no command or package argument",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "acquisition entry omits its hosted event guard",
+      "file": "scripts/ci-validator-lock-acquisition.mjs",
+      "find": "assert.equal(process.env.GITHUB_ACTIONS, 'true', 'Acquisition requires GitHub Actions');",
+      "replace": "void 0;",
+      "cell": "the shipped acquisition path refuses local execution",
+      "expectRed": "the shipped acquisition path refuses local execution",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "acquisition entry omits its manual event guard",
+      "file": "scripts/ci-validator-lock-acquisition.mjs",
+      "find": "assert.equal(process.env.GITHUB_EVENT_NAME, 'workflow_dispatch', 'Acquisition requires manual dispatch');",
+      "replace": "void 0;",
+      "cell": "the shipped acquisition path refuses a nonmanual event",
+      "expectRed": "the shipped acquisition path refuses a nonmanual event",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "acquisition entry omits its fixed mode guard",
+      "file": "scripts/ci-validator-lock-acquisition.mjs",
+      "find": "assert.equal(process.env.ACQUISITION_MODE, 'validators-0155', 'Unknown acquisition mode');",
+      "replace": "void 0;",
+      "cell": "the shipped acquisition path refuses an unknown acquisition mode",
+      "expectRed": "the shipped acquisition path refuses an unknown acquisition mode",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "acquisition result omits the captured stderr observation",
+      "file": "scripts/ci-validator-lock-acquisition-observation.mjs",
+      "find": "stderr: streamObservation(result.stderr)",
+      "replace": "stderr: streamObservation(null)",
+      "cell": "shipped acquisition refusal retains closed pinned pnpm header shapes without captured tokens",
+      "expectRed": "shipped acquisition refusal retains closed pinned pnpm header shapes without captured tokens",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "acquisition result publishes arbitrary spawn error code",
+      "file": "scripts/ci-validator-lock-acquisition-observation.mjs",
+      "find": "? result.error.code : 'OTHER'",
+      "replace": "? result.error.code : result.error.code",
+      "cell": "shipped acquisition refusal keeps error precedence and emits only closed returned status fields",
+      "expectRed": "shipped acquisition refusal keeps error precedence and emits only closed returned status fields",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "acquisition observation claims a complete scan of truncated returned text",
+      "file": "scripts/ci-validator-lock-acquisition-observation.mjs",
+      "find": "scanComplete: state === 'TEXT' && value.length <= scanCharacters",
+      "replace": "scanComplete: state === 'TEXT'",
+      "cell": "shipped acquisition refusal bounds scanning and saturates counters without denying omitted shapes",
+      "expectRed": "shipped acquisition refusal bounds scanning and saturates counters without denying omitted shapes",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "acquisition command restores unsupported bare policy flags",
+      "file": "scripts/ci-validator-lock-acquisition.mjs",
+      "find": "  '--ignore-scripts', '--config.minimum-release-age=1440', '--config.minimum-release-age-strict=true',\n  '--config.minimum-release-age-ignore-missing-time=false', '--config.block-exotic-subdeps=true',",
+      "replace": "  '--ignore-scripts', '--minimum-release-age=1440', '--minimum-release-age-strict',\n  '--minimum-release-age-ignore-missing-time=false', '--block-exotic-subdeps',",
+      "cell": "the shipped acquisition command uses supported config spellings for all four fixed policies",
+      "expectRed": "the shipped acquisition command uses supported config spellings for all four fixed policies",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "preflight omits external config presence refusal",
+      "file": "scripts/ci-validator-lock-acquisition-preflight.mjs",
+      "find": "  requireAbsent(join(configDir, 'config.yaml'), 'External pnpm configuration is not admitted');",
+      "replace": "  void 0;",
+      "cell": "shipped preflight refuses regular directory and dangling external config before loading it",
+      "expectRed": "shipped preflight refuses regular directory and dangling external config before loading it",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "preflight ignores actual XDG configuration path",
+      "file": "scripts/ci-validator-lock-acquisition-preflight.mjs",
+      "find": "env.XDG_CONFIG_HOME ? join(env.XDG_CONFIG_HOME, 'pnpm') : join(home, '.config', 'pnpm')",
+      "replace": "join(home, '.config', 'pnpm')",
+      "cell": "shipped preflight refuses regular directory and dangling external config before loading it",
+      "expectRed": "shipped preflight refuses regular directory and dangling external config before loading it",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "preflight allows uncertain path inspection",
+      "file": "scripts/ci-validator-lock-acquisition-preflight.mjs",
+      "find": "      assert.fail('Cannot inspect acquisition preflight path');",
+      "replace": "      return;",
+      "cell": "shipped preflight refuses uncertain path inspection instead of treating it as absence",
+      "expectRed": "shipped preflight refuses uncertain path inspection instead of treating it as absence",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "preflight accepts nondirectory or symlink parents",
+      "file": "scripts/ci-validator-lock-acquisition-preflight.mjs",
+      "find": "    assert.ok(entry.isDirectory() && !entry.isSymbolicLink(), 'Cannot inspect acquisition preflight path');",
+      "replace": "    void 0;",
+      "cell": "shipped preflight refuses uncertain symlink and nondirectory parents",
+      "expectRed": "shipped preflight refuses uncertain symlink and nondirectory parents",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "preflight omits actual root and core default hook checks",
+      "file": "scripts/ci-validator-lock-acquisition-preflight.mjs",
+      "find": "      requireAbsent(join(directory, name), 'Default package hook is not admitted');",
+      "replace": "      void 0;",
+      "cell": "shipped preflight refuses actual root and core default hooks including dangling objects",
+      "expectRed": "shipped preflight refuses actual root and core default hooks including dangling objects",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "preflight omits selected core default hook paths",
+      "file": "scripts/ci-validator-lock-acquisition-preflight.mjs",
+      "find": "[root, join(root, 'packages', 'core')]",
+      "replace": "[root]",
+      "cell": "shipped preflight refuses actual root and core default hooks including dangling objects",
+      "expectRed": "shipped preflight refuses actual root and core default hooks including dangling objects",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "preflight omits exact reviewed workspace byte equality",
+      "file": "scripts/ci-validator-lock-acquisition-preflight.mjs",
+      "find": "  assert.ok(bytes.equals(reviewedWorkspace), 'Reviewed workspace settings differ');",
+      "replace": "  void 0;",
+      "cell": "shipped preflight refuses changed workspace config dependency and server declarations",
+      "expectRed": "shipped preflight refuses changed workspace config dependency and server declarations",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "preflight omits workspace read custody",
+      "file": "scripts/ci-validator-lock-acquisition-preflight.mjs",
+      "find": "    const before = fs.lstatSync(path);\n    assert.ok(before.isFile() && before.size === reviewedWorkspace.length);\n    bytes = fs.readFileSync(path);\n    const after = fs.lstatSync(path);\n    assert.ok(after.isFile() && after.ino === before.ino && after.size === before.size &&\n      after.mtimeMs === before.mtimeMs && bytes.length === before.size);",
+      "replace": "    bytes = fs.readFileSync(path);",
+      "cell": "shipped preflight refuses missing symlink directory and uncertain workspace input",
+      "expectRed": "shipped preflight refuses missing symlink directory and uncertain workspace input",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "preflight omits workspace postread stability",
+      "file": "scripts/ci-validator-lock-acquisition-preflight.mjs",
+      "find": "    assert.ok(after.isFile() && after.ino === before.ino && after.size === before.size &&\n      after.mtimeMs === before.mtimeMs && bytes.length === before.size);",
+      "replace": "    void 0;",
+      "cell": "shipped preflight refuses missing symlink directory and uncertain workspace input",
+      "expectRed": "shipped preflight refuses missing symlink directory and uncertain workspace input",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    },
+    {
+      "name": "acquisition entry omits preflight before first child",
+      "file": "scripts/ci-validator-lock-acquisition.mjs",
+      "find": "assertAcquisitionPreflight(root);",
+      "replace": "void 0;",
+      "cell": "the real acquisition entry calls preflight before any pnpm or git child",
+      "expectRed": "the real acquisition entry calls preflight before any pnpm or git child",
+      "afterRestore": "node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs"
+    }
+  ]
+}

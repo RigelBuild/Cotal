@@ -18,16 +18,16 @@
  * identical journals (entry sequences and step keys, not merely output).
  */
 
-import { InterpreterDefect, RuntimeFault } from "../errors.js";
+import { InterpreterDefect, RuntimeFault, isStackExhaustion } from "../errors.js";
 import { Cancelled, EffectError, type EffectHandler } from "../effects.js";
 import { arrayMethods, builtins, numberMethods, stringMethods, type Callable, type Method } from "../library.js";
 import type { Journal } from "../journal.js";
 import type { RunPins } from "../pins.js";
-import { NotCrossable, Prng, assertNoCode, birthDepth, born as stampBirth, deepFreeze, setOwn } from "../values.js";
+import { NotCrossable, Prng, assertNoCode, assertWritable, born as stampBirth, deepFreeze, setOwn } from "../values.js";
 import type { AgentHandleValue } from "../effects.js";
 import { digest, type ScopeKind } from "../keys.js";
 import { currentFrame, withFrame, type EngineFrame } from "./frame.js";
-import { dispatchPrimitive, freeConstructors, option, performScope, runScope, type EffectHost, type Frame as ScopeFrame } from "../perform.js";
+import { dispatchPrimitive, freeConstructors, onceBodyNotCallable, option, performScope, runScope, type EffectHost, type Frame as ScopeFrame } from "../perform.js";
 import { PRIMITIVES } from "../primitives.js";
 import type { RunOptions } from "../interpret.js";
 
@@ -70,7 +70,8 @@ export interface EngineCtx {
    * It is present ONLY on an ASSIGNMENT to a cell, never on the declaration's own initialising write,
    * and an absent OWN key there means the declaration has not run: L2004 naming the binding, in the
    * walker's assignment words, which are not the read's. The key is LEFT ABSENT by the refusal, so
-   * the declaration that has not run yet still initialises the binding when it does.
+   * the declaration that has not run yet still initialises the binding when it does. A write from
+   * inside a scope the binding was declared outside is L2032 naming it, as the walker's is.
    */
   set(o: unknown, k: unknown, v: unknown, binding?: string): unknown;
   /**
@@ -260,22 +261,6 @@ function buildCtx(run: EngineRun): CtxWithSteps {
     effectCount: run.journal.dispatchedEffects(),
   };
 
-  /** May this frame write into this container? The value half of freeze-on-share, whole. */
-  const assertWritable = (target: object, frame: { readonly depth: number }): void => {
-    if (Object.isFrozen(target)) {
-      throw new RuntimeFault(
-        "L2031",
-        "this value crossed an effect boundary and is frozen: what crossed is what the journal recorded, so it cannot change afterwards. Build a new value instead: `{ ...record, field: value }` or `[...list, item]`.",
-      );
-    }
-    if (birthDepth(target) < frame.depth) {
-      throw new RuntimeFault(
-        "L2032",
-        "this value was built outside this concurrent branch and is written inside it. Two branches writing one value is nondeterministic, and it is silent: live they write in completion order, on resume the recorded effects return instantly and they write in launch order, so the value differs and the run takes a path it never recorded. Build the value inside the branch and return it, and read it out of the combinator's result.",
-      );
-    }
-  };
-
   // A LOG LINE IS DATA on this engine: a function anywhere inside a logged value is refused HERE, in
   // the one sink every log line leaves through, before it reaches any transport - the in-process host
   // callback or the worker thread, which cannot even clone one (measured, unguarded: the thread died
@@ -425,6 +410,7 @@ function buildCtx(run: EngineRun): CtxWithSteps {
 
   /** `parallel`/`race` take a record or an array OF ARMS; the other two take data in that position. */
   const branchesOf = (name: string, first: unknown): unknown => {
+    if (name === "once") return asArm(first);
     if (name !== "parallel" && name !== "race") return first;
     if (Array.isArray(first)) return first.map(asArm);
     if (first === null || typeof first !== "object") return first;
@@ -491,13 +477,14 @@ function buildCtx(run: EngineRun): CtxWithSteps {
 
   const openScope = async (
     name: string,
+    scopeKind: ScopeKind,
     spec: NonNullable<(typeof PRIMITIVES)[string]>,
     args: unknown[],
     site: Site | undefined,
   ): Promise<unknown> => {
     const frame = currentFrame();
-    const scopeKind = name as ScopeKind;
     const first = args[0];
+    if (name === "once" && typeof first !== "function") throw onceBodyNotCallable();
     const bag = args[spec.optionsAt];
     const scopeName = (option(bag, "name") as string | undefined) ?? null;
     // Allocated HERE, synchronously, exactly as the walker allocates it: the occurrence is what
@@ -725,7 +712,7 @@ function buildCtx(run: EngineRun): CtxWithSteps {
           `cannot write \`${prop}\` of ${o === null ? "null" : typeof o === "undefined" ? "undefined" : `a ${typeof o}`}`,
         );
       }
-      assertWritable(o, currentFrame());
+      assertWritable(o, currentFrame(), binding);
       if (Array.isArray(o)) {
         if (prop === "length") {
           // `xs.length = n` truncates, as in JavaScript. A LONGER length is refused: JavaScript
@@ -821,7 +808,7 @@ function buildCtx(run: EngineRun): CtxWithSteps {
     async effect(name, args, site) {
       const spec = PRIMITIVES[name];
       if (spec === undefined) throw new RuntimeFault("L2001", `${name} is not a primitive`);
-      if (spec.opensScope) return await openScope(name, spec, args, site);
+      if (spec.scope !== null) return await openScope(name, spec.scope, spec, args, site);
       // A PROBE ARRIVES AS THE PROGRAM'S OWN CLOSURE and the shared seam calls it `(frame, args)`,
       // exactly as it calls a scope's arms, so it is adapted here for the same reason `asArm`
       // exists: the engine's closures speak the program's convention and the scope machinery speaks
@@ -948,11 +935,9 @@ function buildCtx(run: EngineRun): CtxWithSteps {
           return ~(v as number);
         case "update":
           // `x++`, `x--` and their compound cousins, on the slow path only: the transform emits a
-          // native increment when it can see the operand is a number. A DECLARED DIVERGENCE: the
-          // walker reads the operand through `Number(...)`, so `"5"++` answers 6 and a
-          // record settles as NaN, while `o + 1` and `x += 1` refuse on the very same values. That
-          // is the silent-coercion class, filed against the walker as issue #646, and it is not
-          // being built into the new engine for fidelity's sake.
+          // native increment when it can see the operand is a number. The walker refuses a
+          // non-number operand the same way, with this same sentence (`interpret.ts`,
+          // `refuseNonNumberUpdate`), so `x++`, `x + 1` and `x += 1` all answer one law now.
           if (typeof v !== "number") {
             throw new RuntimeFault(
               "L4018",
@@ -1066,7 +1051,7 @@ const UNCATCHABLE_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 function isUncatchable(e: unknown): boolean {
-  return e instanceof Error && UNCATCHABLE_NAMES.has(e.name);
+  return (e instanceof Error && UNCATCHABLE_NAMES.has(e.name)) || isStackExhaustion(e);
 }
 
 /** What the catch parameter binds to: a frozen record with a code, never the host's own object. */

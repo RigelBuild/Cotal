@@ -1,15 +1,23 @@
 // Sync the repo's canonical Markdown (/docs/*.md + /SPEC.md) into Starlight's
 // content collection. The repo files stay the single source of truth; this only
-// derives a frontmatter title from the first H1 and rewrites cross-links to
-// Starlight routes. Generated files are git-ignored (see .gitignore).
+// derives a frontmatter title from the H1 each page opens with and a description
+// from the first paragraph, and rewrites cross-links to Starlight routes. Generated
+// files are git-ignored (see .gitignore).
 //
-// The group map below IS the site's information architecture. It moves in lockstep
-// with docs/README.md (the docs index): a page added to /docs joins both in the
-// same change. Missing source files fail the sync loudly — no silent drift.
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, copyFileSync } from 'node:fs';
+// The group map below IS the site's information architecture. It publishes the same
+// pages docs/README.md (the docs index) links, and the sync refuses when the two
+// differ. Missing source files fail the sync loudly — no silent drift.
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, copyFileSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { marked } from 'marked';
+import { parse, postprocess, preprocess } from 'micromark';
+import { gfm } from 'micromark-extension-gfm';
+import { mdxjs } from 'micromark-extension-mdxjs';
+import { decodeString } from 'micromark-util-decode-string';
+import { normalizeUri } from 'micromark-util-sanitize-uri';
+import { parse as parseHtml, parseFragment } from 'parse5';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..', '..');
@@ -19,6 +27,7 @@ const pubDir = join(here, '..', 'public');
 
 // Where repo-relative (non-docs) links point on the web.
 const GITHUB_BLOB = 'https://github.com/Cotal-AI/Cotal/blob/main';
+const blobPath = new URL(`${GITHUB_BLOB}/`).pathname;
 
 // The Quickstart's paste-into-your-agent fence renders as the interactive
 // AgentPrompt card on the site (the page is emitted as MDX; the .md twin
@@ -50,6 +59,7 @@ const groups = [
       'docs/define-a-team.md',
       'docs/watch-a-mesh.md',
       'docs/deploy.md',
+      'docs/UPGRADING.md',
       'docs/examples.md',
       'docs/connectors.md',
       'docs/connect-claude.md',
@@ -58,6 +68,7 @@ const groups = [
       'docs/connect-hermes.md',
       'docs/connect-jcode.md',
       'docs/connect-pi.md',
+      'docs/authoring-a-connector.md',
       'docs/build-a-client.md',
       'docs/embedding.md',
     ],
@@ -102,71 +113,195 @@ const groups = [
 
 const sources = groups.flatMap((g) => g.files);
 
-// Slugs we publish, keyed by source basename (no extension).
-const knownSlugs = new Map(
-  sources.map((rel) => [basename(rel).replace(/\.md$/, ''), slugFor(basename(rel).replace(/\.md$/, ''))]),
-);
+// Slugs we publish, keyed by source path so a design note cannot take the route of a
+// published page that shares its name.
+const knownSlugs = new Map(sources.map((rel) => [rel, slugFor(basename(rel).replace(/\.md$/, ''))]));
 
-// Rewrite repo-relative links to site routes. Every link is first resolved
-// against its source file's directory to a repo-root-relative path (sources live
-// at different depths: docs/*.md vs the root SPEC.md), then mapped:
-//   docs/<page>.md, SPEC.md   → the published Starlight slug (docs/README.md → /)
+// The site publishes only SPEC.md and top-level docs pages, so one of these the group map
+// leaves out is drift, and every other repo file stays on GitHub.
+const isSitePage = (rel) => rel === 'SPEC.md' || /^docs\/[^/]+\.md$/.test(rel);
+
+// Rewrite repo-relative links to site routes. Every link is first resolved as a URL
+// against its source file's GitHub address (sources live at different depths:
+// docs/*.md vs the root SPEC.md), then its path, percent-decoded, is mapped:
+//   a group-map source        → the published Starlight slug (docs/README.md → /)
 //   spec/cotal.schema.json    → the published /cotal.schema.json
 //   assets/*                  → /assets/* (copied into public/ below)
 //   anything else in the repo → GitHub
-// Absolute URLs and same-page #anchors pass through. A doc link that resolves to
-// an unpublished page throws — no silent drift.
+// A query or fragment is kept. Absolute URLs and same-page #anchors pass through. A link
+// to an unpublished site page or to a missing repo path throws — no silent drift.
 // Seeded with images used by the hand-authored landing page (index.mdx), which
 // doesn't pass through this rewriter.
 const assetRefs = new Set(['assets/cotal-demo.webp']);
 
-function resolveRepoPath(srcDir, target) {
-  const out = srcDir ? srcDir.split('/') : [];
-  for (const part of target.split('/')) {
-    if (part === '' || part === '.') continue;
-    if (part === '..') {
-      if (out.length === 0) throw new Error(`link escapes the repo: ${target}`);
-      out.pop();
-    } else out.push(part);
+function rewriteTarget(target, rel) {
+  const url = new URL(target, `${GITHUB_BLOB}/${rel}`);
+  const path = decodeURIComponent(url.pathname);
+  if (!path.startsWith(blobPath)) throw new Error(`link escapes the repo: ${target}`);
+  const repoPath = path.slice(blobPath.length);
+  // Taken from the destination itself: URL getters drop an empty `?` or `#`.
+  const suffix = target.slice(target.search(/[?#]|$/));
+  if (repoPath === 'spec/cotal.schema.json') return `/cotal.schema.json${suffix}`;
+  if (repoPath.startsWith('assets/')) {
+    assetRefs.add(repoPath);
+    return url.href.slice(GITHUB_BLOB.length);
   }
-  return out.join('/');
+  if (repoPath === 'docs/README.md') return `/${suffix}`;
+  if (knownSlugs.has(repoPath)) return `/${knownSlugs.get(repoPath)}/${suffix}`;
+  if (isSitePage(repoPath)) throw new Error(`link to unpublished doc: ${target}`);
+  if (!existsSync(join(repoRoot, repoPath))) throw new Error(`link to missing file: ${target}`);
+  // Anything else in the repo (design notes, sources, examples, extension READMEs) → GitHub.
+  return url.href;
 }
 
-function rewriteLinks(md, srcDir) {
-  return md.replace(/\]\(([^)#]+?)(#[^)]*)?\)/g, (whole, target, anchor = '') => {
-    if (/^[a-z][a-z0-9+.-]*:/i.test(target) || target.startsWith('/')) return whole;
-    const repoPath = resolveRepoPath(srcDir, target);
-    if (repoPath === 'spec/cotal.schema.json') return `](/cotal.schema.json${anchor})`;
-    if (repoPath.startsWith('assets/')) {
-      assetRefs.add(repoPath);
-      return `](/${repoPath}${anchor})`;
+// Absolute URLs, site-root paths and same-page anchors already resolve on the site.
+const isRepoRelative = (target) =>
+  !/^[a-z][a-z0-9+.-]*:/i.test(target) && !target.startsWith('/') && !target.startsWith('#');
+
+// The attributes through which an HTML or JSX tag names a URL. A srcset lists candidates, each a
+// URL (a run of non-whitespace, less the commas that end it) and descriptors up to the next comma.
+const URL_ATTRS = new Set(['href', 'src', 'srcset']);
+const SRCSET_CANDIDATE = /([\t\n\f\r ,]*)([^\t\n\f\r ]+)(?<!,)([^,]*)/g;
+
+// The URL parser's first steps: it drops leading and trailing C0 controls and spaces and every
+// tab and newline, so a value is classified by the URL the browser resolves.
+const urlInput = (value) => value.replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, '').replace(/[\t\n\r]/g, '');
+
+function rewriteAttr(name, value, rel) {
+  const rewrite = (url) => {
+    const target = urlInput(url);
+    return isRepoRelative(target) ? rewriteTarget(target, rel) : url;
+  };
+  if (name !== 'srcset') return rewrite(value);
+  return value.replace(SRCSET_CANDIDATE, (_, lead, url, descriptors) => lead + rewrite(url) + descriptors);
+}
+
+// Character references for the markup characters, so the value parses back the same inside either quote.
+const escapeAttr = (value) => value.replace(/[&"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+// Raw HTML is parsed as the browser parses it, so a URL attribute is read decoded, as the browser
+// resolves it. One that changes is written back whole and double-quoted.
+function* htmlEdits(node, offset, rel) {
+  for (const { prefix, name, value } of node.attrs ?? []) {
+    const next = URL_ATTRS.has(name) ? rewriteAttr(name, value, rel) : value;
+    if (next === value) continue;
+    const source = prefix ? `${prefix}:${name}` : name;
+    const { startOffset, endOffset } = node.sourceCodeLocation.attrs[source];
+    yield [offset + startOffset, offset + endOffset, `${source}="${escapeAttr(next)}"`];
+  }
+  // A template holds its children in a separate content fragment, which the page ships too.
+  for (const child of (node.content ?? node).childNodes ?? []) yield* htmlEdits(child, offset, rel);
+}
+
+// The page is parsed as the site renders it (micromark with the page's syntax extensions), so
+// only real link and definition destinations and the URL attributes of HTML and JSX tags are
+// rewritten: code and MDX JavaScript keep their text, and titled, angle-bracket and
+// reference-style links are all seen. A destination is read as the site reads it, from the
+// parser's text, where a NUL is already U+FFFD: its backslash escapes and character references
+// are decoded and the result is percent-encoded as the renderer encodes it, so URL parsing
+// neither strips whitespace nor reads a backslash as a path separator. The rewritten one is
+// escaped so it parses back to the same address.
+function rewriteLinks(md, rel, extensions) {
+  // micromark skips one leading BOM and counts offsets from after it, so none may remain.
+  md = md.replace(/^\uFEFF+/, '');
+  const events = postprocess(parse({ extensions }).document().write(preprocess()(md, undefined, true)));
+  // A blockquote opens each line of the HTML in it with a `>` the browser never sees.
+  const html = md.split('');
+  for (const [kind, { type, start, end }] of events)
+    if (kind === 'enter' && type === 'blockQuotePrefix') html.fill(' ', start.offset, end.offset);
+  // Keyed by where each starts: parse5 rebuilds a misnested formatting element as a copy that
+  // carries the same source attributes, and a source attribute is rewritten once.
+  const edits = new Map();
+  let attr;
+  for (const [kind, token, context] of events) {
+    const { type, start, end } = token;
+    if (kind !== 'enter') continue;
+    if (type === 'resourceDestinationString' || type === 'definitionDestinationString') {
+      const target = normalizeUri(decodeString(context.sliceSerialize(token)));
+      if (!isRepoRelative(target)) continue;
+      edits.set(start.offset, [end.offset, rewriteTarget(target, rel).replace(/[&()]/g, '\\$&')]);
+    } else if (type === 'htmlFlow' || type === 'htmlText') {
+      const fragment = parseFragment(html.slice(start.offset, end.offset).join(''), { sourceCodeLocationInfo: true });
+      for (const [from, to, text] of htmlEdits(fragment, start.offset, rel)) edits.set(from, [to, text]);
+    } else if (type === 'mdxJsxFlowTagAttributeNamePrimary' || type === 'mdxJsxTextTagAttributeNamePrimary') {
+      attr = context.sliceSerialize(token).toLowerCase();
+    } else if (type === 'mdxJsxFlowTagAttributeValueLiteralValue' || type === 'mdxJsxTextTagAttributeValueLiteralValue') {
+      // JSX decodes character references but has no backslash escapes, so no backslash may start one.
+      const value = decodeString(context.sliceSerialize(token).replace(/\\/g, '\\\\'));
+      const next = URL_ATTRS.has(attr) ? rewriteAttr(attr, value, rel) : value;
+      if (next !== value) edits.set(start.offset, [end.offset, escapeAttr(next)]);
     }
-    if (repoPath === 'SPEC.md' || (repoPath.startsWith('docs/') && repoPath.endsWith('.md'))) {
-      const name = basename(repoPath).replace(/\.md$/, '');
-      if (name === 'README') return `](/${anchor})`;
-      if (!knownSlugs.has(name)) throw new Error(`link to unpublished doc: ${target}`);
-      return `](/${knownSlugs.get(name)}/${anchor})`;
-    }
-    // Anything else in the repo (sources, examples, extension READMEs) → GitHub.
-    return `](${GITHUB_BLOB}/${repoPath}${anchor})`;
-  });
+  }
+  let out = '';
+  let at = 0;
+  for (const [from, [to, text]] of [...edits].sort(([a], [b]) => a - b)) {
+    out += md.slice(at, from) + text;
+    at = to;
+  }
+  return out + md.slice(at);
 }
 
-function firstH1(md) {
-  const m = md.match(/^\s*#\s+(.+?)\s*$/m);
-  return m ? m[1].trim() : null;
+// The title comes from the lexed first block, so a `#` comment in a code fence is never read as the
+// H1. Starlight renders the title itself, so the H1 is dropped from the body. The lexer measures its
+// spans in the text after turning CR and CRLF into LF, so the body is cut from that same text.
+function splitH1(md, rel) {
+  const lf = md.replace(/\r\n?/g, '\n');
+  const [h1] = marked.lexer(lf);
+  if (h1?.type !== 'heading' || h1.depth !== 1) throw new Error(`page does not open with an H1: ${rel}`);
+  return { title: h1.text, body: lf.slice(h1.raw.length).replace(/^\n+/, '') };
 }
 
-function firstParagraph(md) {
-  const body = md.replace(/^\s*#\s+.+\n+/, '');
-  const m = body.match(/^(?!\s*[#>\-*`|!])\s*(\S.+?)(?:\n\s*\n|$)/s);
-  if (!m) return null;
-  return m[1].replace(/\s+/g, ' ').replace(/[*_`[\]]/g, '').slice(0, 160).trim();
+// A hard line break renders as a br with no text, but it separates the words on either side.
+const textOf = (node) =>
+  node.nodeName === '#text' ? node.value : node.nodeName === 'br' ? ' ' : (node.childNodes ?? []).map(textOf).join('');
+
+const graphemes = new Intl.Segmenter();
+
+// Every page opens with a banner blockquote and some with headings, so the description is the
+// first top-level paragraph after them that has text; an image alone has none. It is rendered and
+// read back as text, so a link keeps its label and loses its target. A long one is cut where the
+// character that crosses the limit begins, so the cut never splits an emoji or an accented letter.
+// When the first character crosses it alone, the cut would keep nothing.
+function firstParagraph(md, rel) {
+  for (const token of marked.lexer(md)) {
+    if (token.type !== 'paragraph') continue;
+    const text = textOf(parseFragment(marked.parser([token]))).replace(/\s+/g, ' ').trim();
+    if (!text) continue;
+    if (text.length <= 160) return text;
+    const cut = graphemes.segment(text).containing(159).index;
+    if (cut === 0) throw new Error(`first character of the description is too long to cut to 160 units: ${rel}`);
+    return `${text.slice(0, cut).replace(/\s+\S*$/, '')}…`;
+  }
+  throw new Error(`no paragraph with text to describe the page: ${rel}`);
 }
 
 function yamlEscape(s) {
   return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
+
+// The index also links design notes (docs/design/) and spec/ references, which stay on
+// GitHub, so only its links to SPEC.md and top-level docs pages must match the group map.
+// Readers follow the links of the rendered index on GitHub, and a hand-written reading of
+// its Markdown or HTML misses spellings a browser follows, so the index is rendered, parsed
+// as HTML, and each link resolved as a URL against the index's GitHub address. GitHub serves
+// a percent-encoded path as the same file, so paths are compared decoded. A link back to the
+// index itself, such as one to a heading, names no page.
+const indexUrl = new URL(`${GITHUB_BLOB}/docs/README.md`);
+const indexed = new Set();
+const visit = (node) => {
+  node.childNodes?.forEach(visit);
+  const href = (node.nodeName === 'a' || node.nodeName === 'area') && node.attrs.find((attr) => attr.name === 'href');
+  if (!href) return;
+  const url = new URL(href.value, indexUrl);
+  if (url.origin !== indexUrl.origin) return;
+  const path = decodeURIComponent(url.pathname);
+  if (!path.startsWith(blobPath) || path === indexUrl.pathname) return;
+  const rel = path.slice(blobPath.length);
+  if (isSitePage(rel)) indexed.add(rel);
+};
+visit(parseHtml(marked.parse(readFileSync(join(repoRoot, 'docs', 'README.md'), 'utf8'))));
+for (const rel of indexed) if (!sources.includes(rel)) throw new Error(`indexed but not in the group map: ${rel}`);
+for (const rel of sources) if (!indexed.has(rel)) throw new Error(`in the group map but not indexed: ${rel}`);
 
 // Clean generated markdown (keep hand-authored .mdx like index.mdx; the
 // generated getting-started.mdx is ours to remove).
@@ -192,21 +327,11 @@ for (const group of groups) {
     const src = join(repoRoot, rel);
     const name = basename(rel).replace(/\.md$/, '');
     const slug = slugFor(name);
-    let md = readFileSync(src, 'utf8');
-    const title = firstH1(md) ?? name;
-    const description = firstParagraph(md);
-    md = md.replace(/^\s*#\s+.+\n+/, ''); // drop the H1 (Starlight renders title)
-    const srcDir = dirname(rel);
-    md = rewriteLinks(md, srcDir === '.' ? '' : srcDir);
-    const fm = [
-      '---',
-      `title: ${yamlEscape(title)}`,
-      description ? `description: ${yamlEscape(description)}` : null,
-      '---',
-      '',
-    ]
-      .filter((l) => l !== null)
-      .join('\n');
+    const { title, body } = splitH1(readFileSync(src, 'utf8'), rel);
+    const description = firstParagraph(body, rel);
+    // The Quickstart is emitted as MDX, which has no indented code and reads braces and tags as JavaScript.
+    let md = rewriteLinks(body, rel, rel === QUICKSTART_SRC ? [mdxjs(), gfm()] : [gfm()]);
+    const fm = ['---', `title: ${yamlEscape(title)}`, `description: ${yamlEscape(description)}`, '---', ''].join('\n');
     let ext = 'md';
     let imports = '';
     if (rel === QUICKSTART_SRC) {

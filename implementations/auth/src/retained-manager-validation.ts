@@ -2,15 +2,17 @@ import {
   EpEnvelopeError,
   assertDerivedOwnerToken,
   assertLifecycleToken,
+  assertPrincipalOwnerToken,
   assertValidOwnerToken,
   remoteManagerActors,
+  parseRemoteManagerEnvelope,
   type RemoteRetainedAgentValidationRequest,
   type RemoteRetainedAgentValidationResult,
   type RetainedAgentAuthority,
 } from "@cotal-ai/core";
 import { createHmac, timingSafeEqual } from "node:crypto";
-
-const identityNames = ["supervisor", "executor", "serve", "goalWriter", "sessionLedger"] as const;
+import type { ObserveManagerGate } from "./managed-agent-enrollment.js";
+import { requireManagerAuthorityHolder, type ManagerAuthorityHolder } from "./platform-control.js";
 
 /** Host-authenticated, stateless proof for one activated manager registration. The account signing
  * seed is already held by the host authority plane and never crosses this seam. */
@@ -40,8 +42,10 @@ function requestError(what: string): never {
   throw new EpEnvelopeError("bad-request", `manager retained-agent validation request ${what}`);
 }
 
-/** Parse the secret-bearing retained-validation request without retaining unknown input fields. */
-export function parseRemoteRetainedAgentValidationRequest(raw: unknown): RemoteRetainedAgentValidationRequest {
+/** Parse the secret-bearing retained-validation request without retaining unknown input fields.
+ * `allowPlatform` admits a platform `p_…` target owner, for the platform control holder only
+ * (SPEC 13.1); the holder's owner-equality check still decides whether that target is its own. */
+export function parseRemoteRetainedAgentValidationRequest(raw: unknown, opts: { allowPlatform?: boolean } = {}): RemoteRetainedAgentValidationRequest {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) requestError("must be an object");
   const o = raw as Record<string, unknown>;
   const allowed = new Set([
@@ -49,34 +53,13 @@ export function parseRemoteRetainedAgentValidationRequest(raw: unknown): RemoteR
     "registrationProof", "serveEpoch", "identities", "target", "actorToken", "sentinelCreds",
   ]);
   for (const key of Object.keys(o)) if (!allowed.has(key)) requestError(`carries unknown field ${JSON.stringify(key)} (the protocol is closed)`);
-  if (o.v !== 1 || o.kind !== "manager-retained-agent-validation")
-    requestError('must carry { v: 1, kind: "manager-retained-agent-validation" }');
-  for (const key of ["space", "actor", "instanceId", "managerLifecycleUid", "requestId", "registrationProof", "actorToken", "sentinelCreds"] as const)
+  const envelope = parseRemoteManagerEnvelope(o, "manager-retained-agent-validation", "manager retained-agent validation");
+  for (const key of ["actorToken", "sentinelCreds"] as const)
     if (typeof o[key] !== "string" || o[key].length === 0) requestError(`requires non-empty ${key}`);
   if ((o.actorToken as string).length > 4096 || (o.sentinelCreds as string).length > 16 * 1024)
     requestError("secret material exceeds its bounded wire size");
-  assertValidOwnerToken(o.actor as string);
-  assertLifecycleToken(o.instanceId as string, "manager retained validation instanceId");
-  assertLifecycleToken(o.managerLifecycleUid as string, "manager retained validation lifecycleUid");
-  if (!/^[A-Za-z0-9_-]{22,64}$/.test(o.requestId as string)) requestError("requestId must be a 22-64 character idempotency token");
-  if (!/^sha256:[0-9a-f]{64}$/.test(o.registrationProof as string)) requestError("requires a sha256 registrationProof");
   if (typeof o.serveEpoch !== "number" || !Number.isSafeInteger(o.serveEpoch) || o.serveEpoch < 0)
     requestError("serveEpoch must be a non-negative safe integer");
-
-  const ids = o.identities;
-  if (ids === null || typeof ids !== "object" || Array.isArray(ids)) requestError("requires identities");
-  const idObj = ids as Record<string, unknown>;
-  if (Object.keys(idObj).sort().join(",") !== [...identityNames].sort().join(","))
-    requestError(`identities must contain exactly ${identityNames.join(", ")}`);
-  const identities = {} as RemoteRetainedAgentValidationRequest["identities"];
-  for (const name of identityNames) {
-    const item = idObj[name];
-    if (item === null || typeof item !== "object" || Array.isArray(item) || Object.keys(item as object).join(",") !== "id")
-      requestError(`identities.${name} must be exactly { id }`);
-    const id = (item as { id?: unknown }).id;
-    if (typeof id !== "string" || !/^U[A-Z2-7]{55}$/.test(id)) requestError(`identities.${name}.id must be a user nkey`);
-    identities[name] = { id };
-  }
 
   const target = o.target;
   if (target === null || typeof target !== "object" || Array.isArray(target) ||
@@ -86,7 +69,7 @@ export function parseRemoteRetainedAgentValidationRequest(raw: unknown): RemoteR
   if (typeof t.owner !== "string" || typeof t.actor !== "string" || typeof t.lifecycleUid !== "string")
     requestError("target must contain string owner, actor, and lifecycleUid");
   const parsedTarget = {
-    owner: assertDerivedOwnerToken(t.owner),
+    owner: opts.allowPlatform ? assertPrincipalOwnerToken(t.owner, { allowPlatform: true }) : assertDerivedOwnerToken(t.owner),
     actor: assertValidOwnerToken(t.actor),
     lifecycleUid: assertLifecycleToken(t.lifecycleUid, "manager retained validation target lifecycleUid"),
   };
@@ -94,43 +77,29 @@ export function parseRemoteRetainedAgentValidationRequest(raw: unknown): RemoteR
   return {
     v: 1,
     kind: "manager-retained-agent-validation",
-    space: o.space as string,
-    actor: o.actor as string,
-    instanceId: o.instanceId as string,
-    managerLifecycleUid: o.managerLifecycleUid as string,
-    requestId: o.requestId as string,
-    registrationProof: o.registrationProof as string,
+    ...envelope,
     serveEpoch: o.serveEpoch,
-    identities,
     target: parsedTarget,
     actorToken: o.actorToken as string,
     sentinelCreds: o.sentinelCreds as string,
   };
 }
 
-export interface AuthorizeRemoteRetainedAgentValidationArgs {
+export type AuthorizeRemoteRetainedAgentValidationArgs = ManagerAuthorityHolder & {
   request: RemoteRetainedAgentValidationRequest;
   space: string;
-  owner: string;
-  scope: string[];
   proofSecret: string | Uint8Array;
-  observeManagerGate: (instanceId: string) => Promise<{
-    state: "open" | "frozen" | "retired";
-    principal: string;
-    processEpoch: number;
-    registrationRevision: number;
-  } | null>;
-}
+  observeManagerGate: ObserveManagerGate;
+};
 
 /** Host policy authorizing one fresh, non-minting retained-agent continuity validation. */
 export async function authorizeRemoteRetainedAgentValidation(
   args: AuthorizeRemoteRetainedAgentValidationArgs,
 ): Promise<RemoteRetainedAgentValidationRequest> {
-  const r = parseRemoteRetainedAgentValidationRequest(args.request);
+  const r = parseRemoteRetainedAgentValidationRequest(args.request, { allowPlatform: args.holder === "platform" });
   if (r.space !== args.space)
     throw new EpEnvelopeError("permission-denied", `manager retained-agent validation request names space ${r.space}, not this host space ${args.space}`);
-  if (!args.scope.includes("supervise"))
-    throw new EpEnvelopeError("permission-denied", 'manager retained-agent validation needs scope "supervise"; spawn/admin do not imply it');
+  requireManagerAuthorityHolder(args, r.instanceId, 'manager retained-agent validation needs scope "supervise"; spawn/admin do not imply it');
   if (r.target.owner !== args.owner)
     throw new EpEnvelopeError("permission-denied", `manager retained-agent validation may target only its authenticated owner ${args.owner}, not ${r.target.owner}`);
   const actors = remoteManagerActors(r.instanceId);

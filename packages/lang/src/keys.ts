@@ -20,7 +20,40 @@ import type { EffectKind } from "./primitives.js";
 import { RuntimeFault } from "./errors.js";
 
 /** The concurrency combinators that open a scope. */
-export type ScopeKind = "parallel" | "race" | "fanOut" | "conclave";
+export type ScopeKind = "parallel" | "race" | "fanOut" | "conclave" | "once";
+
+/**
+ * The spec's §7 scope traits that readers branch on, one row per kind. Keyed by `ScopeKind`, so a
+ * kind added to the union does not compile until it has a row: a list per trait let a new kind
+ * compile with a list missed and fail at run time, on some paths only.
+ *
+ * `assembles`: the settled value is an assembly of branch outcomes, where a branch position may be
+ * absent. `conclave` and `once` settle their one body's own value.
+ *
+ * `reenters`: a fork whose cut lies inside the scope enters it again rather than refusing (L5020),
+ * which is sound only for a scope that decides nothing of its own.
+ *
+ * `dispatches`: the scope calls the handler itself, as `conclave` does to open its channel. It owes
+ * what an effect owes (a durable request id, the host's stop, the effect ceiling, a cancel re-check
+ * after its begin), and a migration cannot walk into it, because the handler's answer was never
+ * journalled.
+ *
+ * Each row is frozen because `scopeTraits` hands out the shared row, and a write to it would change
+ * the journal's crossing rule and the fork refusal for the whole process.
+ */
+const SCOPE_TRAITS: Readonly<Record<ScopeKind, { readonly assembles: boolean; readonly reenters: boolean; readonly dispatches: boolean }>> = {
+  parallel: Object.freeze({ assembles: true, reenters: true, dispatches: false }),
+  race: Object.freeze({ assembles: true, reenters: false, dispatches: false }),
+  fanOut: Object.freeze({ assembles: true, reenters: true, dispatches: false }),
+  conclave: Object.freeze({ assembles: false, reenters: false, dispatches: true }),
+  once: Object.freeze({ assembles: false, reenters: true, dispatches: false }),
+};
+
+/** A journal kind's scope traits, or undefined when it is not a scope. It takes a string because a
+ *  kind read back from a store is only that. */
+export function scopeTraits(kind: string): (typeof SCOPE_TRAITS)[ScopeKind] | undefined {
+  return Object.hasOwn(SCOPE_TRAITS, kind) ? SCOPE_TRAITS[kind as ScopeKind] : undefined;
+}
 
 /**
  * What may name a level of the scope PATH: a concurrency combinator, or a `waitUntil`.
@@ -93,6 +126,21 @@ export function requestId(runId: string, key: StepKey, inputHash: string, attemp
   return createHash("sha256")
     .update(canonicalize([runId, stepKeyString(key), inputHash, attempt]), "utf8")
     .digest("base64url");
+}
+
+/**
+ * The token a hold for an at-most-once step is minted under. Derived, not the recorded id, because
+ * the step's first dispatch may already have armed and settled a pause under that id, and a hold
+ * minted there would read that settle back as its own. A pure function of the recorded id, so a
+ * resume finds the same hold with nothing recorded before the mint.
+ */
+export function holdRequestId(requestId: string): string {
+  return createHash("sha256").update(canonicalize([requestId, "hold"]), "utf8").digest("base64url");
+}
+
+/** A step is at-most-once when any frame on its scope path is a `once`. */
+export function atMostOnce(scope: readonly ScopeFrame[]): boolean {
+  return scope.some((f) => f.kind === "once");
 }
 
 export function digest(value: unknown): string {

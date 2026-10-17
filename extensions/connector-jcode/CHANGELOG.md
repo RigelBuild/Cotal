@@ -1,5 +1,153 @@
 # @cotal-ai/connector-jcode
 
+## 0.82.0
+
+### Patch Changes
+
+- 8e5be08: A Jcode seat now passes its pre-join readiness proof when Jcode calls `cotal_orientation` through its deferred `mcp_call` tool. The proof matched only the completed tool's name, which is `mcp_call` on that path, so both readiness turns missed it and the seat exited without joining. The host now reads the call's streamed arguments and counts an `mcp_call` only when it names server `cotal` and tool `cotal_orientation`, and only for the `mcp_call` completion of that same call: a completion under another name, or a later call that reuses its id, does not count. An orientation call that fails or returns an MCP error result no longer counts on either path.
+
+## 0.81.1
+
+## 0.81.0
+
+## 0.80.0
+
+### Minor Changes
+
+- fded3ab: A seat never leaves the mesh because its event plane stopped, and the plane comes back on its own. The emitter holder re-establishes the plane at once after any failure, then every second while it stays down, by a fresh start that replaces the emitter: it reopens the write-ahead log, settles any pending frame, and builds the connector's mapper from the run the log has open before reading on. A turn that ends while the plane is down keeps its terminal, as does one whose terminal's own log write failed, and the re-establish closes that run with it once it has read on; every turn that ends during one outage keeps its own terminal, placed on the last turn the source had begun at the position the terminal was reported at (a turn the mapper opens no run for takes its terminal and publishes nothing, and a repeated terminal replaces nothing), a terminal is owed to its run until the frame carrying it freezes, a terminal reported with the plane up goes to the emitter at the hook too so a flush still reading when the next prompt lands closes the turn with its own terminal, and when the next prompt was already written before the plane came back the failure is published in place of the finish that prompt would have synthesized, in a frame of the failed run and ahead of the next run's first. The mapper contract gains `{ turn: true }` for a record that begins a turn and opens no run. `DurableSource` gains `end()`, the cursor after the last complete record as of the call, which every connector's source implements; the holder's hooks gain `sourceEnd`, `closeRun` returns a promise that resolves once that position is read (the Claude Code hook awaits it before replying), and the emitter takes a `ReportedTerminal` through `queueTerminal`, with `waitingTerminals`, `takeOwed`, `unsettled` and `seedLastTurn` beside it. The wait between attempts is fixed: it neither doubles nor caps, so the plane is back within a second of the fault clearing. The pi adapter's start factory, re-entered by the re-establish, checks the native file instead of reading an acknowledged cursor as a vanished file, and seeds its mapper from the pending frame. A transcript line that is not a record is stepped over and reported on every connector, the jcode journal wrapper included, and one written past the position a terminal was reported at does not hold that terminal: it is placed after the records before it, as is a terminal reported past a record no read answers, such as an OpenCode part still filling when its turn died, which used to hold the turn end reading the session without end; the OpenCode source now reads every record at or before the end reported at a turn end as settled, so that part no longer stops the turns after it from publishing. A terminal reported while the very first start is still waiting on the broker reaches the emitter before its first read, where it used to be queued behind the flush that read past it and close the next turn. On a space that requires events the seat used to exit with code 1 instead; for Claude Code that exit was the "MCP server cotal has disconnected" banner, and Claude Code restarted the server on the next tool call. The `eventPlaneStopped` sink no longer takes `required` or `stopSeat`, the holder's `onError` receives the delay before the next re-establish (`0` for at once) and `retryMs` is that fixed wait, the Claude and OpenCode mappers take `resumeRunId`, and a reported unreadable-line reason carries no text from the record itself.
+
+## 0.79.0
+
+## 0.78.1
+
+## 0.78.0
+
+## 0.77.1
+
+### Patch Changes
+
+- a1948eb: The Codex and Jcode hosts now arm the event plane when the session's registration requires events, even without `COTAL_EVENTS`. They used to read only that flag, so a hand-driven user-mode launch with `COTAL_EVENTS_REQUIRED=1`, or a custom launcher that passed `eventsRequired` with events opted out, ran with no event plane and the required-events policy never applied. The Claude, OpenCode, Codex, Jcode and Pi launches that carry `eventsRequired` now also set `COTAL_EVENTS` and the workspace root when the launcher passed `events: false`, so the armed session has a place for its event log. Both decisions go through `launchArmsEvents` and `eventPlaneArmed` in `@cotal-ai/connector-core`; an OpenCode 2.x session still reads only `COTAL_EVENTS`.
+
+## 0.77.0
+
+## 0.76.0
+
+## 0.75.0
+
+## 0.74.0
+
+### Patch Changes
+
+- ad81083: The connector on/off flags `COTAL_CHANNEL`, `COTAL_EVENTS`, `COTAL_EVENTS_REQUIRED`, `COTAL_CODEX_TUI` and `COTAL_JCODE_TUI` now share one parser in `@cotal-ai/connector-core`. It accepts `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` in any case, treats an unset or blank value as unset, and refuses anything else at startup with an error naming the variable and the value. Before, each connector kept its own copy and read any other value, such as `enabled`, `2` or `y`, as off without a word. The OpenCode 2.x adapter now refuses `COTAL_EVENTS=true` the same way it refuses `COTAL_EVENTS=1`, where before only `1` was refused.
+
+## 0.73.0
+
+## 0.72.1
+
+## 0.72.0
+
+## 0.71.0
+
+### Patch Changes
+
+- b9daf53: A whitespace-only `model` or `variant` is now refused everywhere a launch selector enters: a persona file's `model:`/`variant:` when it loads or is saved, `cotal spawn --model`, a manifest agent's `model`/`variant`, and every launch the manager admits, including a direct `Manager.startAgent` call. Before, the same blank value was dropped by the manager, rendered into the harness command and environment by the `claude`, `codex` and `opencode` connectors, and refused only by `jcode`, so one persona launched differently depending on who started it. The manager no longer coerces a blank model to absent, and the `jcode` connector no longer carries its own blank-variant check.
+
+## 0.70.2
+
+## 0.70.1
+
+## 0.70.0
+
+### Minor Changes
+
+- 76113ce: `AguiEmitterHolder` now takes its hooks as one named object after the emitter factory, `new AguiEmitterHolder(startEmitter, { onError, onRunClosed, waitLive, runMeta })`, typed by the exported `AguiEmitterHolderHooks`, where only `onError` is required. Before, the four hooks were positional, and a `runMeta` provider passed third was accepted as `onRunClosed`: it typechecked, ran after the run had already closed, and its metadata was dropped with no error. A caller no longer fills earlier slots with `undefined` to reach a later hook. The Claude Code, Codex, jcode, OpenCode and pi connectors pass their hooks by name, with no change in behavior.
+
+### Patch Changes
+
+- 95788eb: A seat whose AG-UI event plane stops for good now follows the space's policy on every connector. On a space that requires events the seat stops, where Pi, Claude Code and OpenCode used to keep it running without events. On any other space the seat keeps running and its log records `AG-UI emitter stopped`, where Jcode used to stop the seat and refuse further turns. Codex no longer rebuilds a stopped plane at its next turn boundary on any space, and it now waits for the mesh before starting its emitter, as the other connectors do. The rule is `eventPlaneStopped` in connector-core, which each connector passes its log sink and its stop hook.
+
+## 0.69.0
+
+## 0.68.0
+
+### Minor Changes
+
+- 585fdb2: Connectors launch on the model and variant their launcher resolved. `LaunchOpts.model` and `LaunchOpts.variant` are now the launcher's resolved values (the flag, else the agent file's `model:` / `variant:`), and every connector renders them as given instead of reading the agent file again in `buildLaunch`. Before, a model the launcher did not resolve was taken from a later read of a file that could have changed since, so the seat could run a model the launcher never checked or recorded, and a supervised restart re-read it each time. The in-session config takes the model and variant from `COTAL_MODEL` / `COTAL_VARIANT` only, so the card and the orientation pin no longer report a model the seat was not launched on. The Hermes connector no longer falls back to `HERMES_MODEL` from the spawning process, including one `spawn.env` forwards; set the model with `--model` or the persona's `model:`. Code that calls `buildLaunch` directly must pass `model` and `variant` itself.
+
+### Patch Changes
+
+- a96f1c6: A jcode seat now marks a run turn as shown once the Harness accepts the message that carries it, instead of after the whole host turn ends. A `cotal_yield` made during that turn used to be refused with "no turn is active — nothing to yield", and the run then recorded `done` where the seat had said `blocked` or `handoff`. A send the Harness never acknowledges, or one whose acknowledgement cannot be attributed to it, leaves the run turn unshown so the next turn carries it again. A peer message queued behind such a send now waits for that turn to end instead of being written into the session and delivered a second time later.
+
+## 0.67.0
+
+## 0.66.1
+
+## 0.66.0
+
+### Patch Changes
+
+- 84cead6: A foreground `cotal spawn` on an open mesh now publishes its AG-UI events. The launch passed the seat no id, so its endpoint made up a random actor for each process and the event emitter refused to start with `events are not available for a session with a self-minted identity`. The seat's Graph stayed empty although the spawn had succeeded. The foreground launcher now allocates an id on an open mesh, as the manager already does for detached seats, so this works for every connector with an event plane. The Jcode connector used to work around this by itself, using the seat name as its actor on an open mesh. That workaround is gone, and an open-mesh Jcode seat now gets the allocated id like every other seat.
+
+## 0.65.0
+
+## 0.64.0
+
+## 0.63.0
+
+## 0.62.0
+
+## 0.61.0
+
+## 0.60.0
+
+### Patch Changes
+
+- 74cb5a0: A Jcode seat that ends on a second private Harness disconnect, or on a recovery that fails, now names the Harness error its last failed turn reported on that final connector line as `last turn error: <message>`, when no turn has succeeded since. A turn the TUI owns counts both ways: its error is kept, and its success clears it. On a failed recovery the line reads `private Harness connection closed and recovery failed; last turn error: <message>; recovery error: <message>`, with the turn error first because the manager keeps only the first 240 characters of the line. The manager's `seat reaped:` line carries only the seat's last connector line, so a seat that died after a provider error used to be reaped with `private Harness connection closed after its one recovery attempt` alone, and finding the error meant reading the seat's private connector log.
+
+## 0.59.0
+
+### Patch Changes
+
+- e8b54de: The provider-disconnect and permanent-refusal smokes now give each bridge-recovery step the host's own 60 second recovery window, read from the host source instead of copied. They used to allow 20 seconds per step, so a loaded CI runner could red the first replacement attach while the host was still inside its window. Host behaviour is unchanged.
+- 569cb6f: The Jcode connector checks a resumed session's counts by how they are spelled, the way Jcode reads a u64: a count written with a fraction or an exponent (`1e20`, `1.0`) or as `-0` is refused before the seat launches instead of being forked as a number Jcode cannot load, and every other number is copied into the fork byte for byte. A source whose title is longer than the 1024 characters the manager records with the fork is refused before launch by name, rather than forking and leaving the seat's provenance off its resume document.
+- 569cb6f: The Jcode connector accepts `cotal spawn --resume <id>`. It forks the named session from the operator's Jcode home into the seat's private home before the seat's instance starts: a new session id whose parent is the source, carrying the source's messages, compaction state, system prompt and model. The source files are only read. A session with no readable transcript, or with a message, content block or compaction state that does not match Jcode's schema, is refused before the seat launches, naming the field. A live source is read until two reads agree and its journal is newer than its snapshot, so a checkpoint caught mid-way is neither lost nor applied twice. A seat relaunched under the same name continues its fork without reading the source again, and a first launch that fails after forking still briefs the seat on its next launch.
+- b4c69bf: A seat whose turn died on a harness-reported error now shows it on every operator surface. A Jcode seat relays the Harness error code, such as a provider `rate_limit`, as its presence `condition`, both for a turn the host drives and for one the TUI owns. `cotal ps` now carries that condition: the human row reads `waiting (rate_limit)` and `--json` rows include the `condition` object, alongside the roster, `cotal status` and `cotal endpoints`. The next turn clears the condition when it starts. Before, the seat read a bare `waiting` and the error was recorded only in its private connector log.
+
+  Presence gains an optional `activeAt`: the epoch ms of the last work event the harness reported, carried on the next heartbeat. A Jcode seat records every token and tool event of its session there. `cotal ps`, `cotal status`, `cotal endpoints` and `cotal_roster` now print a condition with its age and the age of the last work event, such as `waiting (rate_limit for 40m) · active 40m ago`, and `cotal ps --json` rows carry `activeAt`. A turn that stopped advancing while its process keeps heartbeating no longer reads like one that is still working.
+
+- 569cb6f: A `--resume` seat's fork provenance is recorded on the manager. `LaunchSpec` gains `resumeRecordPath`, where a connector whose seat forks after launch has it record the source session id, the source title and a SHA-256 of the transcript it read; the Hermes and Jcode connectors declare it. The manager reads that record once the seat has written it, keeps it on the seat's resume document (an optional `resumed` field, so earlier documents still resume), and adds a `resume` object to the `ps`/`inspect` row (manager cluster revision 20). `cotal ps --wide` prints `forked from <id>` with the title and hash, and the Hermes and Jcode seats print the same facts when they fork. The Jcode fork now carries a count above 2^53 byte for byte instead of rounding it, refuses a count outside the u64 range by name, and refuses a fork record that is not an object by name.
+
+## 0.58.0
+
+### Patch Changes
+
+- 7e1bc61: Wait for the observed post-join kickoff turn boundary in the provider-disconnect smoke fixture. Presence alone can precede that boundary, routing the test marker through a soft interrupt instead of the intended ordinary-turn disconnect trigger. Add a delayed-turn mutation and restored native checks. Connector behavior is unchanged.
+
+## 0.57.0
+
+### Patch Changes
+
+- e7c702a: The jcode connector now reports the provider route serving a seat's model to presence, and `cotal ps --wide`/`--json` surface it as `provider`.
+- ad809a2: Keep Jcode seats alive when session checkpoints interrupt tool observations or temporarily remove the journal. Validate the session snapshot, preserve pending journal reads, restore tool brackets from the event WAL, and publish explicit discontinuities without weakening event validation.
+
+## 0.56.1
+
+### Patch Changes
+
+- 6b76946: A seat resumed from a preservation cut backfills its channels from the chat stream sequence its prior incarnation had reached instead of replaying the whole retained window.
+
+## 0.56.0
+
+## 0.55.0
+
+### Patch Changes
+
+- 40e7428: Give a Jcode seat launched with no spawn `--prompt` a scheduled turn after join: the post-join notice is now delivered as the seat's first driven turn instead of a no-reply append, so a persona subscribed to nothing is never parked on an unread append.
+- 67bbcc5: Report a Jcode session-journal fold as a terminal event without stopping the seat.
+- d284ee6: A manifest or spawn prompt on a connector that cannot deliver one is refused at preflight (including `up -f --dry-run`), at spawn and in the manager, the way an unsupported model variant is: connectors now declare `supportsPrompt`, and claude, opencode, codex, jcode and pi declare it; hermes keeps its launch-time throw as the second line of defence.
+
+## 0.54.0
+
 ## 0.53.0
 
 ## 0.52.1

@@ -8,23 +8,13 @@
  * imported from `connector-core` and nothing about Claude goes back the other way.
  *
  * ---------------------------------------------------------------------------------------------
- * THREE THINGS THE PLAN DOES NOT SETTLE, RECORDED AS GAPS RATHER THAN DECIDED HERE.
+ * THREE THINGS THE PLAN DID NOT SETTLE.
  *
- * **(A) The run brackets have no vehicle, and this is a real plan defect, not a detail.** §3.1
- * sources `RUN_STARTED` from the `UserPromptSubmit` hook and `RUN_FINISHED` from the `Stop` hook
- * (`mcp.ts:72`, `:96`). But `[P6]`/§5.4 makes the durable plane READ A FILE, and the emitter's
- * mapper is `(record) => events` — a hook fires in a different process at a different time and
- * produces NO JSONL record, so there is no vehicle by which a hook-sourced event can enter a
- * record-sourced stream. The two halves of the design were specified against different inputs.
- *
- * What this file does instead is stated plainly so a ruling can replace it in one function:
- * **brackets are derived from the record stream.** A human prompt opens a run; the NEXT human
- * prompt closes the previous one. Two consequences, both of which a reader must know:
- *   1. `RUN_FINISHED` lags by one turn. It is emitted when the next turn starts, not when the turn
- *      ends, so a consumer sees the finish later than the `Stop` hook would have said it.
- *   2. **The last run of a session never closes.** There is no record after it to close it on.
- * Neither is silently absorbed: {@link closeOpenRun} exists so the connector's `Stop` hook can shut
- * the run at the real boundary once a vehicle is ruled, and until then the lag is honest.
+ * **(A) The record stream cannot see a turn end.** A hook fires in a different process and writes
+ * no JSONL record, so on records alone a run closes only when the next prompt opens one, and the
+ * last run of a session never closes. The `Stop` and `StopFailure` hooks therefore close the open
+ * run through the emitter holder (`AguiEmitterHolder.closeRun`) at the real boundary, and the
+ * holder reports the closed run back through {@link ClaudeMapper.forgetOpenRun}.
  *
  * **(B) `origin.kind === "human"` OPENS NO RUN IN ANY AGENT-DRIVEN SESSION — MEASURED on three, and
  * this is why the mapping smoke reads a real session rather than a fixture.** §3.1's rule is right
@@ -48,43 +38,34 @@
  * the predicate does select, on a session that contains the thing it selects. The three captures
  * here simply contain none. **Both numbers belong together; either alone misleads.**
  *
- * **THIS WAS A COVERAGE GAP, IT WAS RULED, AND THE RULING IS IMPLEMENTED BELOW.** It read: on
- * agent-driven sessions no run is ever opened and the connector emits nothing, because the mapping table
- * sent every non-`human` origin to *nothing*. The session it was derived from had a human typing 44 times alongside
- * its 3068 mesh messages; a spawned lane seat has **0 and 67**, so the open question was **what
- * opens a run when nobody types**.
+ * **WHAT OPENS A RUN WHEN NOBODY TYPES.** A mapping that sends every non-`human` origin to
+ * *nothing* opens no run on an agent-driven session, and the connector emits nothing there. The
+ * session the mapping was derived from had a human typing 44 times alongside its 3068 mesh
+ * messages; a spawned lane seat has **0 and 67**.
  *
- * **THE RULING: run-opening and attribution are two predicates, and that row was one predicate
- * doing both jobs.** A run opens on
- * `origin.kind ∈ { human, channel }`, ENUMERATED and never inferred; `task-notification` is named as
- * known-and-not-a-turn; absent `origin` gets its own enumeration over `promptSource`. Attribution
- * rides as `cotal.turnSource` — **a field on the run, never a gate on it**. The privacy argument is
- * untouched: a `RUN_STARTED` attributed to a peer republishes no message body, so a peer-initiated
- * turn can be a turn without re-emitting the peer's content. See {@link ORIGIN_RULE} and
- * {@link ABSENT_ORIGIN_RULE}, which are where this now lives.
+ * **THE RULE: run-opening and attribution are two predicates, not one doing both jobs.** A run
+ * opens only on an `origin.kind` that {@link ORIGIN_RULE} ENUMERATES as a turn, never on an
+ * inferred one; the same table names the kinds that are known and not a turn, and absent `origin`
+ * gets its own enumeration over `promptSource` in {@link ABSENT_ORIGIN_RULE}. Attribution rides as
+ * `cotal.turnSource` — **a field on the run, never a gate on it**. The privacy argument holds: a
+ * `RUN_STARTED` attributed to a peer republishes no message body, so a peer-initiated turn can be a
+ * turn without re-emitting the peer's content. The values live only in those two tables.
  *
- * **KEEP THIS PARAGRAPH HONEST.** Its earlier form said "no run is ever opened and the connector
- * emits nothing" and "escalated as a plan defect rather than decided here" — describing the state
- * before the ruling, directly above code that had already implemented it. A successor read it,
- * believed it over the code, and escalated a closed question as a live blocker; the measurement that
- * corrected it took one run of the real mapper (**67 runs / 5217 events** on the 5938-record
- * session, `diagnose()` → `null`). **A stale header is not a documentation defect, it is a false
- * claim about the function beneath it.** If the rule changes again, this paragraph changes with it.
+ * On the 5938-record session the real mapper opens **67 runs** and emits **5217 events**.
  *
  * **DO NOT "FIX" THIS BY TREATING ABSENT `origin` AS HUMAN.** In a Claude session `user` is also the
  * role of a TOOL RESULT: that predicate selects **825** of the interactive session's 892 user
  * entries, and the single non-tool-result among them is a **context-compaction summary**
  * (`isCompactSummary`), so the true human count is 0 and the predicate over-matches by 825. It would
  * not emit nothing — it would emit a flood, each entry opening a run, which looks like the connector
- * working. An earlier revision of this comment recorded (B) as HEADLESS-ONLY and asserted a human
- * turn is "a `user` entry with no `origin`"; both halves were wrong.
+ * working.
  *
- * **The rule is implemented exactly as RULED, and still not guessed at.** `promptSource` was
- * proposed as the selector and REJECTED: it is bounded by the partition it was inferred from, and
- * "sdk" also covers programmatic injection. It survives only inside {@link ABSENT_ORIGIN_RULE},
- * where there is no `origin.kind` to enumerate — a second table rather than a synthetic member,
- * because an enumeration over `origin.kind` cannot classify a record that has none. Every value
- * outside either table **fails loud** rather than being silently treated as not-a-turn.
+ * **The rule is not guessed at.** `promptSource` is not the selector: it is bounded by the
+ * partition it was inferred from, and "sdk" also covers programmatic injection. It is read only
+ * inside {@link ABSENT_ORIGIN_RULE}, where there is no `origin.kind` to enumerate — a second table
+ * rather than a synthetic member, because an enumeration over `origin.kind` cannot classify a
+ * record that has none. Every value outside either table **fails loud** rather than being silently
+ * treated as not-a-turn.
  *
  * **(C) `TOOL_CALL_RESULT.messageId` is unstated in §3.1's table** (the row names only
  * `toolCallId`) while the real schema REQUIRES it. It is keyed the same way every other message
@@ -132,8 +113,8 @@ export interface ClaudeEntry {
   origin?: { kind?: string };
   /**
    * Present on every submitted prompt and absent on tool results. **Not the run-opening gate** —
-   * it is `"system"` on task-notifications and caveats too. Read ONLY where `origin` is absent, and
-   * only for the value `"sdk"`. See `ABSENT_ORIGIN_RULE`.
+   * it is `"system"` on task-notifications and caveats too. Read ONLY where `origin` is absent,
+   * against the values `ABSENT_ORIGIN_RULE` enumerates.
    */
   promptSource?: string;
   /** The harness's own compaction record. A string-content `user` entry that is not a turn. */
@@ -168,7 +149,7 @@ export interface ClaudeEntry {
  */
 const ORIGIN_RULE: Record<string, "human" | "channel" | "auto-continuation" | null> = {
   human: "human",
-  channel: "channel", // a peer/mesh delivery IS a turn, the one change from the original table
+  channel: "channel", // a peer/mesh delivery IS a turn
   "task-notification": null, // known, and deliberately not a turn
   // MEASURED ON THIS MACHINE'S CORPUS, 237 session files and 531,882 records: 4 occurrences, every
   // one a standing goal the harness re-injects to continue work, all carrying
@@ -196,12 +177,11 @@ const ORIGIN_RULE: Record<string, "human" | "channel" | "auto-continuation" | nu
  * caveat>`, `/compact` command records, `<local-command-stdout>`, the caveat/heartbeat class §3.1
  * counts at 81.
  *
- * **THIS IS NOT `promptSource`-PRESENCE READMITTED, and the difference is the whole reason the first
- * attempt was wrong.** That predicate asked "is the field there?", and the field is there on
- * task-notifications and caveats as `"system"` — so it opened runs on harness plumbing. This asks
- * "is the value exactly `sdk`?", in a branch that only runs when `origin` is absent, against a
- * two-value measured population. Different predicate, different position, measured rather than
- * inferred from a partition of three captures.
+ * **THIS IS NOT `promptSource`-PRESENCE.** That predicate asks "is the field there?", and the field
+ * is there on task-notifications and caveats as `"system"`, so it would open runs on harness
+ * plumbing. This asks "is the value exactly `sdk`?", in a branch that only runs when `origin` is
+ * absent, against a two-value measured population. Different predicate, different position,
+ * measured rather than inferred from a partition of three captures.
  */
 const ABSENT_ORIGIN_RULE: Record<string, "sdk" | "human" | null> = {
   sdk: "sdk",
@@ -210,22 +190,23 @@ const ABSENT_ORIGIN_RULE: Record<string, "sdk" | "human" | null> = {
   // `origin` because the harness does not stamp one on this shape, not because nobody authored
   // them.
   //
-  // This is the case the previous table would have THROWN on, which is why it had to be read and
-  // not assumed. A throw here is a session that stops mapping mid-stream; attributing these to
-  // anything other than the person who typed them would be the confident wrong attribution the
-  // enumeration exists to prevent. Both failures were available, so the record was opened.
+  // Without this key the mapper THROWS on these records, which is why they were read and not
+  // assumed. A throw here is a session that stops mapping mid-stream; attributing these to anything
+  // other than the person who typed them would be the confident wrong attribution the enumeration
+  // exists to prevent.
   typed: "human",
-  // **NOT FROM MY CORPUS — FROM §3.1's, WHICH I CANNOT RE-READ.** My 88-session sweep finds this
-  // value on an absent-origin `user` record ZERO times in 129,910 records. §3.1's table records it
-  // 81 times, as "local-command caveats, heartbeats, resumed-session summaries", on a capture with
-  // 4728 `user` entries and 3068 `channel` deliveries — and **no session on this machine matches
-  // that shape**; the closest has 18 human and 0 channel. So the two measurements are over different
-  // corpora and one of them is gone.
+  // **FROM §3.1's CORPUS, NOT THE 88-SESSION SWEEP ABOVE**, which finds this value on an
+  // absent-origin `user` record ZERO times in 129,910 records. §3.1's table records it 81 times, as
+  // "local-command caveats, heartbeats, resumed-session summaries", on a capture with 4728 `user`
+  // entries and 3068 `channel` deliveries — and **no session in the sweep matches that shape**; the
+  // closest has 18 human and 0 channel. So the two measurements are over different corpora, and
+  // §3.1's capture is not available to re-read.
   //
   // It is entered as `null` — known, and NOT a turn — because §3.1 already classified it and a
-  // measurement I cannot repeat is still a measurement. Leaving it out would make the throw below
-  // fire in production on a class the plan documents, which is the one thing a fail-loud branch must
-  // not do: **a fail-loud branch is only safe if you know what is on the other side of it.**
+  // measurement that cannot be repeated is still a measurement. Leaving it out would make the throw
+  // below fire in production on a class the plan documents, which is the one thing a fail-loud
+  // branch must not do: **a fail-loud branch is only safe if you know what is on the other side of
+  // it.**
   system: null,
 };
 
@@ -244,8 +225,8 @@ const ABSENT_ORIGIN_RULE: Record<string, "sdk" | "human" | null> = {
 const runOpeningAttribution = (entry: ClaudeEntry): "human" | "channel" | "sdk" | "auto-continuation" | null => {
   const kind = entry.origin?.kind;
   if (kind === undefined) {
-    // ABSENT origin. Not an error — absence is a known shape — but no longer a blanket refusal
-    // either, because a headless prompt has no `origin` and IS a turn.
+    // ABSENT origin. Not an error — absence is a known shape — and not a blanket refusal either,
+    // because a headless prompt has no `origin` and IS a turn.
     const ps = entry.promptSource;
     if (ps === undefined) return null;
     if (!(ps in ABSENT_ORIGIN_RULE))
@@ -286,6 +267,13 @@ export interface ClaudeMapperOptions {
   /** Mints a `runId`. Connector-minted by §3.1, so every `RUN_STARTED` carries `runIdSource`. */
   mintRunId: () => string;
   /**
+   * The run the write-ahead log has open when this mapper is built, so a mapper built for a
+   * re-established plane attributes the next assistant records to it. Without it the mapper
+   * opens with no run, drops every assistant record until the next prompt, and that prompt's
+   * `RUN_STARTED` is refused by brackets that still hold the earlier run open.
+   */
+  resumeRunId?: string;
+  /**
    * Emit `REASONING_*` for `thinking` blocks. **Off by default (§7 Q1).** The `signature` is never
    * emitted at any setting (§3.5) and is not read by this module at all.
    */
@@ -298,20 +286,9 @@ export interface ClaudeMapperOptions {
   now?: () => number;
 }
 
-/** What {@link createClaudeMapper} returns: the mapper plus the out-of-band run close. */
+/** What {@link createClaudeMapper} returns: the mapper plus the report of a run the emitter closed. */
 export interface ClaudeMapper {
   map: RecordMapper<ClaudeEntry>;
-  /**
-   * Close the open run, if there is one, at a boundary the record stream cannot see — the `Stop`
-   * hook. Returns `null` when no run is open, so calling it twice is not an error and cannot
-   * manufacture a second `RUN_FINISHED` the bracket machine would refuse.
-   *
-   * It exists because gap (A) above is a gap: the durable plane has no way to hear a hook today,
-   * and this is the seam a ruling plugs into rather than a rewrite.
-   */
-  closeOpenRun: (timestamp: number, stopReason?: string) => { runId: string; events: AguiEvent[] } | null;
-  /** The run currently open, or `null`. Read-only view for a caller that needs to know. */
-  openRun: () => string | null;
   /**
    * Forget a run the EMITTER closed out of band, so this mapper stops treating it as open.
    *
@@ -329,19 +306,6 @@ export interface ClaudeMapper {
    * send. A run that is not the one named is left exactly as it is.
    */
   forgetOpenRun: (runId: string) => void;
-  /**
-   * **WHY THIS SESSION OPENED NO RUNS** — a sentence, or `null` once any run has opened.
-   *
-   * A mapper that opens zero runs is byte-indistinguishable from a session nobody prompted, and
-   * from a mapper that is simply broken. Refusing a record is a legitimate outcome; refusing it
-   * SILENTLY is not, and the silence is the defect, not the refusal. This is the production
-   * statement of that — it lives in the shipped mapper, not in a smoke summary, so the connector
-   * and any operator reading it get the same sentence the suite does.
-   *
-   * It is deliberately NOT a throw. Some sessions genuinely contain no prompt yet, and a mapper
-   * that threw on one would take down a live connector over an empty file.
-   */
-  diagnose: () => string | null;
 }
 
 /** Parse the entry timestamp, or say honestly that we used arrival time. */
@@ -361,32 +325,7 @@ function resultContent(raw: unknown): string {
 
 export function createClaudeMapper(opts: ClaudeMapperOptions): ClaudeMapper {
   const now = opts.now ?? (() => Date.now());
-  let open: string | null = null;
-
-  // The three counters `diagnose()` reports on. They count what was SEEN and what was REFUSED, so
-  // a zero-run session can say which of the two reasons it was.
-  let runsOpened = 0;
-  let promptShaped = 0; // string-content, non-compaction `user` records — candidates
-  let refusedUnattributable = 0; // ...of those, refused for want of an attribution
-
-  const closeOpenRun = (timestamp: number, stopReason?: string) => {
-    if (open === null) return null;
-    const runId = open;
-    open = null;
-    // No `outcome`. The Claude source reports that a turn ended and nothing more, so manufacturing
-    // a `success` would assert what it never said — the tolerated no-outcome case (§3.1).
-    return {
-      runId,
-      events: [
-        runFinished({
-          threadId: opts.threadId,
-          runId,
-          timestamp,
-          ...(stopReason ? { cotal: { stopReason } } : {}),
-        }),
-      ] as AguiEvent[],
-    };
-  };
+  let open: string | null = opts.resumeRunId ?? null;
 
   const map: RecordMapper<ClaudeEntry> = (entry) => {
     const { ts, arrival } = stampOf(entry, now);
@@ -404,8 +343,8 @@ export function createClaudeMapper(opts: ClaudeMapperOptions): ClaudeMapper {
       // DROPS REAL HUMAN TURNS. A `user` entry carries an array both when the harness reports tool
       // results and when a person attaches something to a prompt, and the second case is not rare:
       // 8 of them sit in this machine's corpus, every one a person sending an attachment with a
-      // question about it. The previous shape returned early on any array, so each of those turns
-      // produced NOTHING, which an observer reads as an agent that did work nobody asked for.
+      // question about it. Returning early on any array would make each of those turns produce
+      // NOTHING, which an observer reads as an agent that did work nobody asked for.
       //
       // The discriminator is the presence of a `tool_result` block, not the array-ness.
       const toolResults = Array.isArray(content) ? content.filter((b) => b.type === "tool_result" && b.tool_use_id) : [];
@@ -449,31 +388,28 @@ export function createClaudeMapper(opts: ClaudeMapperOptions): ClaudeMapper {
       //
       // A turn-initiating input opens a run whatever authored it: an external observer asks what
       // work this agent did and what triggered it, not whether a person typed it. So `"channel"` —
-      // a peer/mesh delivery — opens a run exactly as `"human"` does. That is the only change from
-      // §3.1, whose table sent every non-human origin to nothing and therefore emitted NOTHING on an
-      // agent-driven session.
+      // a peer/mesh delivery — opens a run exactly as `"human"` does, where §3.1's table sent every
+      // non-human origin to nothing and therefore emitted NOTHING on an agent-driven session.
       //
-      // **KEYED ON `origin.kind`, NOT ON `promptSource`, and the difference is a category error I
-      // made first.** `promptSource` is present on every submitted prompt in the captures available,
+      // **KEYED ON `origin.kind`, NOT ON `promptSource`, and keying on `promptSource` is a category
+      // error.** `promptSource` is present on every submitted prompt in the captures available,
       // so a partition of those captures suggests it as the discriminator — but the captures contain
       // no `task-notification` and no local-command caveats, and §3.1's own measurement does:
       // `task-notification` × 5 and 81 absent-origin entries (caveats, heartbeats, resumed-session
       // summaries), all of which carry `promptSource: "system"` too. **A predicate inferred from a
-      // partition is bounded by that partition's categories**, and this one would have opened runs
-      // on harness plumbing. `promptSource` is corroboration; it is not the gate.
+      // partition is bounded by that partition's categories**, and this one would open runs on
+      // harness plumbing. `promptSource` is corroboration; it is not the gate.
       //
       // Anything not enumerated FAILS LOUD — including a value a future harness adds.
-      promptShaped += 1;
       const turnSource = runOpeningAttribution(entry);
-      if (turnSource === null) {
-        refusedUnattributable += 1;
-        return null;
-      }
+      // A turn that opens no run is still a turn the harness ends with a terminal: reported as one,
+      // so the emitter counts it when it pairs terminals held through an outage with the turns the
+      // source shows, and the terminal of such a turn does not land on the next run that opens.
+      if (turnSource === null) return { turn: true as const };
 
-      const prior = closeOpenRun(ts);
+      const prior = open;
       const runId = opts.mintRunId();
       open = runId;
-      runsOpened += 1;
       const messageId = `${uuid}#0`;
 
       /**
@@ -484,12 +420,12 @@ export function createClaudeMapper(opts: ClaudeMapperOptions): ClaudeMapper {
        * the observer is entitled to the peer's words.
        *
        * §3.1's privacy argument is stated as already true — *"a `RUN_STARTED` attributed to a peer
-       * republishes no message body"* — and it was NOT: this branch emitted
-       * `TEXT_MESSAGE_CONTENT` with the peer's `content` verbatim, measured at 240 bytes in and 240
-       * bytes out on a real session. `events.<owner>.<actor>` carries a DIFFERENT read ACL from the
-       * channel the message arrived on, so that is a republication across an ACL boundary — the
-       * exact failure §3.1's non-human exclusion existed to prevent, which the ruling correctly
-       * moved off run-opening and which then had nothing enforcing it.
+       * republishes no message body"* — and this branch is what makes it true. Emitting
+       * `TEXT_MESSAGE_CONTENT` here would carry the peer's `content` verbatim, and
+       * `events.<owner>.<actor>` carries a DIFFERENT read ACL from the channel the message arrived
+       * on, so that is a republication across an ACL boundary — the exact failure §3.1's non-human
+       * exclusion exists to prevent, and which nothing else enforces once a peer delivery opens a
+       * run.
        *
        * So the run opens and the BODY IS WITHHELD. `cotal.turnSource` already tells a consumer a
        * peer began this turn, which is the fact an observer needs; the text is not.
@@ -505,11 +441,13 @@ export function createClaudeMapper(opts: ClaudeMapperOptions): ClaudeMapper {
       // The previous run's close rides the SAME unit as this run's open. They are one observation
       // of the source and must not be split across frames: a frame names ONE run (`packUnits`), so
       // returning them together lets the packer flush at the boundary, while returning them
-      // separately would need a record that does not exist.
+      // separately would need a record that does not exist. That close carries no `outcome`: a new
+      // prompt says a turn began and nothing about how the last one ended, so a `success` would
+      // assert what the source never said (the tolerated no-outcome case, §3.1).
       return {
         runId,
         events: [
-          ...(prior?.events ?? []),
+          ...(prior === null ? [] : [runFinished({ threadId: opts.threadId, runId: prior, timestamp: ts })]),
           runStarted({
             threadId: opts.threadId,
             runId,
@@ -583,27 +521,9 @@ export function createClaudeMapper(opts: ClaudeMapperOptions): ClaudeMapper {
     return runId === null ? null : { runId, events };
   };
 
-  const diagnose = (): string | null => {
-    if (runsOpened > 0) return null;
-    if (promptShaped === 0)
-      return (
-        `agui-map: no run opened — this session contains no prompt-shaped record at all ` +
-        `(no string-content, non-compaction \`user\` entry). Nothing was refused; there was nothing ` +
-        `to refuse.`
-      );
-    return (
-      `agui-map: NO RUN OPENED, and it was a refusal, not an empty session — ${refusedUnattributable} of ` +
-      `${promptShaped} prompt-shaped record(s) carry neither an \`origin.kind\` this mapper enumerates ` +
-      `nor \`promptSource: "sdk"\`, so none of them could be attributed and none opened a run. Every ` +
-      `event downstream of a run is therefore absent BY DECISION. If these are real prompts, the ` +
-      `harness has a provenance shape that has not been measured: measure it and add it to ` +
-      `ORIGIN_RULE or ABSENT_ORIGIN_RULE deliberately.`
-    );
-  };
-
   const forgetOpenRun = (runId: string): void => {
     if (open === runId) open = null;
   };
 
-  return { map, closeOpenRun, openRun: () => open, forgetOpenRun, diagnose };
+  return { map, forgetOpenRun };
 }

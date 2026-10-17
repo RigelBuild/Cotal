@@ -13,7 +13,8 @@
  *    RE-KEYS EVERY OWNER in the space (same human → different `u_…`), which is a migration, never an
  *    accident — hence load-or-create with no overwrite path.
  *
- * These SECRET kinds (plus `service-keys.json`, the daemon's key projection) read and write through
+ * These SECRET kinds (plus `service-keys.json`, the daemon's key projection, and a hosted plane's
+ * `instance.json`) read and write through
  * the {@link SecretStore} seam — the caller composes the store (locally the workspace's
  * `.cotal`-rooted filesystem store, so keys land byte-for-byte on today's paths; a hosted
  * composition injects KMS/Vault) and nothing here discovers one ambiently. The store's atomic
@@ -29,8 +30,8 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
-import { mkSecretDir, writeSecretFileAtomic, type SecretStore } from "@cotal-ai/core";
-import { spaceSegment } from "@cotal-ai/workspace";
+import { mkSecretDir, writeSecretFileAtomic, type SecretStore, type SpaceAuth } from "@cotal-ai/core";
+import { identityOf, loadAuthInstanceIdentity, removeAuthInstanceIdentity, spaceSegment, type AuthInstanceIdentity } from "@cotal-ai/workspace";
 import { createCalloutAuth, type CalloutAuth, type CalloutProvisionInput } from "./callout.js";
 import { normalizeIdpUrl } from "./login.js";
 import {
@@ -59,6 +60,8 @@ export const authCalloutKey = (space: string): string => `auth/${spaceSegment(sp
 export const authIssuerKey = (space: string): string => `auth/${spaceSegment(space)}/issuer.json`;
 export const authOwnerSecretKey = (space: string): string => `auth/${spaceSegment(space)}/owner-secret.json`;
 export const authServiceKeysKey = (space: string): string => `auth/${spaceSegment(space)}/service-keys.json`;
+/** A hosted plane's instance identity. A CLI root keeps its own as a file of the root instead. */
+export const authInstanceKey = (space: string): string => `auth/${spaceSegment(space)}/instance.json`;
 
 /** The pinned `iss` for a space's Cotal user bearers — a stable URN, deliberately NOT the auth
  *  service's URL (the service port is ephemeral; an issuer pin must never change across restarts).
@@ -90,6 +93,24 @@ async function readStoreValue<T extends { ver: number }>(store: SecretStore, key
   return raw === undefined ? undefined : parseStoreDoc<T>(raw, key, what);
 }
 
+/** The stored value of a generate-on-first-use kind, or on a fresh space `mint()`'s, published by
+ *  create-only write. Of concurrent first calls exactly one creates the key and the others adopt
+ *  it, so no caller keeps a value the store does not hold. */
+async function loadOrCreate<T>(
+  store: SecretStore,
+  key: string,
+  load: () => Promise<T | undefined>,
+  mint: () => Promise<{ value: T; doc: string }>,
+): Promise<T> {
+  const stored = await load();
+  if (stored !== undefined) return stored;
+  const { value, doc } = await mint();
+  if (await store.create(key, doc)) return value;
+  const winner = await load();
+  if (winner === undefined) throw new Error(`${key}: another caller created this entry first and it could not be read back - retry`);
+  return winner;
+}
+
 /** The file-side read, for the NON-SEAM kinds only (the IdP pin, service runtime discovery). */
 function readStoreFile<T extends { ver: number }>(path: string, what: string): T | undefined {
   if (!existsSync(path)) return undefined;
@@ -118,11 +139,10 @@ export async function loadCalloutAuth(store: SecretStore, space: string): Promis
  *  and persists; every later call returns the SAME account, so the broker config preload and
  *  previously-issued sentinel creds stay valid. Idempotent. */
 export async function ensureCalloutAuth(store: SecretStore, input: CalloutProvisionInput): Promise<CalloutAuth> {
-  const existing = await loadCalloutAuth(store, input.space);
-  if (existing) return existing;
-  const callout = await createCalloutAuth(input);
-  await store.put(authCalloutKey(input.space), JSON.stringify({ ver: STORE_VER, callout } satisfies CalloutFile, null, 2));
-  return callout;
+  return loadOrCreate(store, authCalloutKey(input.space), () => loadCalloutAuth(store, input.space), async () => {
+    const callout = await createCalloutAuth(input);
+    return { value: callout, doc: JSON.stringify({ ver: STORE_VER, callout } satisfies CalloutFile, null, 2) };
+  });
 }
 
 // ---- the user-bearer issuer signing keys ----
@@ -159,18 +179,16 @@ export async function loadIssuer(store: SecretStore, space: string): Promise<Use
  *  loud (the material belongs to another space/layout — never sign under a mismatched issuer). */
 export async function ensureIssuer(store: SecretStore, space: string): Promise<UserTokenIssuer> {
   const iss = spaceIssuer(space);
-  const existing = await loadIssuer(store, space);
-  if (existing) {
-    if (existing.issuer !== iss)
-      throw new Error(`${authIssuerKey(space)}: persisted issuer "${existing.issuer}" != this space's pin "${iss}" - the material belongs to a different space; refusing to mint under it`);
-    return existing;
-  }
-  const key = await generateSigningKey();
-  await store.put(
-    authIssuerKey(space),
-    JSON.stringify({ ver: STORE_VER, issuer: iss, activeKid: key.kid, keys: [await exportSigningKey(key)] } satisfies IssuerFile, null, 2),
-  );
-  return createUserTokenIssuer({ issuer: iss, key });
+  const issuer = await loadOrCreate(store, authIssuerKey(space), () => loadIssuer(store, space), async () => {
+    const key = await generateSigningKey();
+    return {
+      value: createUserTokenIssuer({ issuer: iss, key }),
+      doc: JSON.stringify({ ver: STORE_VER, issuer: iss, activeKid: key.kid, keys: [await exportSigningKey(key)] } satisfies IssuerFile, null, 2),
+    };
+  });
+  if (issuer.issuer !== iss)
+    throw new Error(`${authIssuerKey(space)}: persisted issuer "${issuer.issuer}" != this space's pin "${iss}" - the material belongs to a different space; refusing to mint under it`);
+  return issuer;
 }
 
 // ---- the owner-derivation secret ----
@@ -195,14 +213,46 @@ export async function loadOwnerSecret(store: SecretStore, space: string): Promis
 /** Load-or-create the per-space owner-derivation secret. There is deliberately NO regenerate path:
  *  a new secret re-keys every owner in the space (a migration, never an accident). */
 export async function ensureOwnerSecret(store: SecretStore, space: string): Promise<Uint8Array> {
-  const existing = await loadOwnerSecret(store, space);
-  if (existing) return existing;
-  const secret = randomBytes(32);
-  await store.put(
-    authOwnerSecretKey(space),
-    JSON.stringify({ ver: STORE_VER, secretB64: Buffer.from(secret).toString("base64") } satisfies OwnerSecretFile, null, 2),
-  );
-  return new Uint8Array(secret);
+  return loadOrCreate(store, authOwnerSecretKey(space), () => loadOwnerSecret(store, space), async () => {
+    const secret = randomBytes(32);
+    return {
+      value: new Uint8Array(secret),
+      doc: JSON.stringify({ ver: STORE_VER, secretB64: Buffer.from(secret).toString("base64") } satisfies OwnerSecretFile, null, 2),
+    };
+  });
+}
+
+// ---- the hosted auth plane's instance identity ----
+
+interface AuthInstanceFile extends AuthInstanceIdentity {
+  ver: number;
+}
+
+async function loadAuthInstance(store: SecretStore, space: string): Promise<AuthInstanceIdentity | undefined> {
+  const key = authInstanceKey(space);
+  const f = await readStoreValue<AuthInstanceFile>(store, key, "auth instance identity");
+  if (!f) return undefined;
+  const serveIdentity = identityOf(f.serveIdentity);
+  if (typeof f.instanceId !== "string" || !f.instanceId || !serveIdentity)
+    throw new Error(`${key}: malformed auth instance identity - restore it from backup; a new one registers a fresh instance that never fences this one`);
+  return { instanceId: f.instanceId, serveIdentity };
+}
+
+/** A hosted plane's instance identity (SPEC 13.6). Its serve seed is a private key, so it lives in
+ *  the injected store, never in the state dir the hosted contract calls non-secret. A record an
+ *  earlier release kept under `stateDir` moves into the store and is removed only once the store
+ *  holds it, so an upgraded context restarts as the same instance. A store and state dir that hold
+ *  different identities refuse: keeping either orphans the other's registration. */
+export async function claimAuthInstanceIdentity(store: SecretStore, space: string, stateDir: string, mint: () => AuthInstanceIdentity): Promise<AuthInstanceIdentity> {
+  const earlier = loadAuthInstanceIdentity(stateDir, space);
+  const identity = await loadOrCreate(store, authInstanceKey(space), () => loadAuthInstance(store, space), async () => {
+    const value = earlier ?? mint();
+    return { value, doc: JSON.stringify({ ver: STORE_VER, ...value } satisfies AuthInstanceFile, null, 2) };
+  });
+  if (earlier && (identity.instanceId !== earlier.instanceId || identity.serveIdentity.seed !== earlier.serveIdentity.seed))
+    throw new Error(`${authInstanceKey(space)} and the record under ${stateDir} hold different auth instance identities for space "${space}" - refusing to guess which is this context's. Remove the one that did not come from this context, then retry.`);
+  if (earlier) removeAuthInstanceIdentity(stateDir, space);
+  return identity;
 }
 
 // ---- the pinned external IdP ----
@@ -239,13 +289,13 @@ export function loadPinnedIdp(dir: string): PinnedIdp | undefined {
 }
 
 /** Pin-or-verify the space's IdP. First call REQUIRES a URL (there is no default IdP); later calls
- *  either omit it (reuse the pin) or must MATCH it — re-pointing a space at a different IdP re-keys
- *  every derived owner (the issuer is part of the derivation input), a migration this refuses to do
- *  as a flag side-effect. */
+ *  either omit it (reuse the pin) or must MATCH it once normalized — re-pointing a space at a
+ *  different IdP re-keys every derived owner (the issuer is part of the derivation input), a
+ *  migration this refuses to do as a flag side-effect. */
 export function ensurePinnedIdp(dir: string, idpUrl?: string): PinnedIdp {
   const existing = loadPinnedIdp(dir);
   if (existing) {
-    if (idpUrl !== undefined && idpUrl !== existing.url)
+    if (idpUrl !== undefined && normalizeIdpUrl(idpUrl) !== existing.url)
       throw new Error(
         `this space's IdP is pinned to ${existing.url}; --idp ${idpUrl} would re-key every derived owner. ` +
           `Re-pointing an IdP is a migration - remove ${join(dir, IDP_FILE)} deliberately if you mean it.`,
@@ -254,7 +304,7 @@ export function ensurePinnedIdp(dir: string, idpUrl?: string): PinnedIdp {
   }
   if (!idpUrl)
     throw new Error("user auth needs an IdP on first enable - run with --idp <auth base URL> (Better Auth: <origin>/api/auth)");
-  // Same normalization + scheme guard as `cotal login` (https, or loopback http for dev; no
+  // Same normalization + scheme guard as `cotal login` (https, or http on a loopback IP literal; no
   // query/hash/userinfo) — the pin and the login cache must key on the SAME canonical URL.
   const url = normalizeIdpUrl(idpUrl);
   const origin = new URL(url).origin;
@@ -273,6 +323,17 @@ export function ensurePinnedIdp(dir: string, idpUrl?: string): PinnedIdp {
  *  enter the service process. */
 export interface ServiceKeys {
   dataAccount: { pub: string; signingSeed: string };
+}
+
+/** The data account's signing context as core's mint takes it. Everything but the space, the account
+ *  pub and the signing seed stays blank because the mint reads nothing else. */
+export function dataAccountAuth(space: string, dataAccount: ServiceKeys["dataAccount"]): SpaceAuth {
+  return {
+    space,
+    operator: { seed: "", jwt: "" },
+    account: { pub: dataAccount.pub, seed: "", jwt: "", signingSeed: dataAccount.signingSeed, signingPub: "" },
+    sys: { pub: "", jwt: "" },
+  };
 }
 
 interface ServiceKeysFile extends ServiceKeys {

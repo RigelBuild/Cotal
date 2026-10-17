@@ -40,17 +40,17 @@
   ],
   "mutations": [
     {
-      "name": "H1 both start-once guards removed in one contiguous span, because they are adjacent and one find covers them",
+      "name": "H1 the started-emitter shortcut removed, so a same-path call starts a second emitter",
       "file": "extensions/connector-core/src/agui-holder.ts",
-      "find": "    if (this.emitter) return this.emitter;\n\n    if (this.boundPath === undefined) {\n",
-      "replace": "    if (true) {\n",
+      "find": "    if (this.emitter) return this.emitter;\n",
+      "replace": "",
       "expectRed": "lazy:a-second-adopt-of-the-SAME-path-does-not-start-a-second",
       "note": "Removing either guard alone survives, because the other answers for it. Removed together, a second adopt of the SAME path reaches `startEmitter` again. Also reds `lazy:a-flush-after-an-adopt-does-not-start-a-second`."
     },
     {
       "name": "H2 drop the first-adopt context before the connector-owned factory sees it",
       "file": "extensions/connector-core/src/agui-holder.ts",
-      "find": "this.emitter = await this.startEmitter(path, context);",
+      "find": "this.emitter = await this.startEmitter(path, this.startContext);",
       "replace": "this.emitter = await this.startEmitter(path, undefined);",
       "expectRed": "context:the-FIRST-adopt-context-reaches-the-start-factory",
       "note": "This is the one mechanism carrying Claude's SessionStart source through the generic holder; a later adopt remains unable to replace it."
@@ -58,10 +58,27 @@
     {
       "name": "H3 the queued step never waits for the endpoint to be live",
       "file": "extensions/connector-core/src/agui-holder.ts",
-      "find": "    if (!this.waitLive) return Promise.resolve();\n",
+      "find": "    if (!this.hooks.waitLive) return Promise.resolve();\n",
       "replace": "    return Promise.resolve();\n",
       "expectRed": "waitlive:a-pending-wait-HOLDS-the-pump",
       "note": "Also reds `waitlive:a-closeRun-is-HELD-by-a-pending-wait` and the rejecting-wait and shared-wait cells, since the wait is skipped for every step."
+    },
+    {
+      "name": "H4 start a recovered source at its end instead of byte zero",
+      "file": "extensions/connector-core/src/durable-source.ts",
+      "command": "pnpm smoke:durable-source",
+      "completionMarker": "durable-source smoke:",
+      "find": "      return `${String(st.dev)}:${String(st.ino)}:0:${await JsonlFileSource.sealAt(fh, 0)}`;",
+      "replace": "      return `${String(st.dev)}:${String(st.ino)}:${st.size}:${await JsonlFileSource.sealAt(fh, st.size)}`;",
+      "expectRed": "a beginning cursor reads retained complete records"
+    },
+    {
+      "name": "H5 running answers from the emitter again, ignoring the death record",
+      "file": "extensions/connector-core/src/agui-holder.ts",
+      "find": "    return this.dead === undefined && this.emitter !== undefined && !this.emitter.stopped;\n",
+      "replace": "    return this.emitter !== undefined && !this.emitter.stopped;\n",
+      "expectRed": "rebind:a-holder-killed-by-the-refusal-is-not-reported-running",
+      "note": "Reverts #553: a holder killed by the rebind refusal keeps reporting its unstopped emitter's state, so the health read lies. The refusal itself and the errors array are unchanged, only the getter's answer regresses."
     }
   ]
 }
