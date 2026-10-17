@@ -34,13 +34,14 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as seat from "../src/index.js";
+import { pidfdOpen, pidfdSignal } from "../src/peercred.js";
 import { makeSeatRoot, SEAT_MAX_SOCKET_PATH } from "@cotal-ai/smoke-kit";
-const { adoptSeatSync, launchSeat } = seat;
+const { adoptSeatSync, launchSeat, reapSeat, seatId, bootToken, processStartToken } = seat;
 
 /**
  * The surface this suite is about, resolved through the namespace so a tree with the fix reverted
@@ -94,11 +95,18 @@ const until = async (p: () => boolean, ms: number): Promise<boolean> => {
   while (!p() && Date.now() < deadline) await wait(50);
   return p();
 };
-const kill = (pid: number): void => {
+/** For pids that are not this suite's direct children. The pidfd pins one process before its start
+ *  token is checked, so a reused pid is never signalled. */
+const kill = (pid: number, start: string | undefined): void => {
+  if (pid <= 1 || start === undefined) return;
+  const fd = pidfdOpen(pid);
+  if (fd === undefined) return;
   try {
-    process.kill(pid, "SIGKILL");
+    if (processStartToken(pid) === start) pidfdSignal(fd, "SIGKILL");
   } catch {
     /* already gone */
+  } finally {
+    closeSync(fd);
   }
 };
 
@@ -176,7 +184,7 @@ setInterval(() => {}, 1000);
     });
     check("O1 armed: a separate manager process adopted the seat", adopted);
     // The bound only starts once the controller is gone, so the window must be measured from HERE.
-    kill(manager.pid as number);
+    manager.kill("SIGKILL");
     const killedAt = Date.now();
     const exited = await until(() => gone(rec.custodianPid), BOUND_MS * 4);
     const elapsed = Date.now() - killedAt;
@@ -195,13 +203,73 @@ setInterval(() => {}, 1000);
       await until(() => gone(rec.childPid), 10_000),
       { child: state(rec.childPid) },
     );
-    // The record outlives the custodian: only a proved reap or a durable release removes a seat dir.
+    // The record outlives the custodian; without containment, reaping cannot prove it gone.
     check("O1 unattended settle keeps the custody record and drops the socket", existsSync(join(root, rec.id, "record.json")) && !existsSync(rec.socket));
-    kill(manager.pid as number);
-    kill(rec.childPid);
-    kill(rec.custodianPid);
+    const reapEvidence = await reapSeat(root, rec.id).catch((e: Error) => e);
+    check(
+      "O1 a settled orphan reap retains the custody record",
+      !(reapEvidence instanceof Error) && reapEvidence.outcome === "retained" && reapEvidence.reason === "unprovable" && reapEvidence.stop === "no-custodian" && existsSync(join(root, rec.id, "record.json")),
+      reapEvidence instanceof Error ? reapEvidence.message : reapEvidence,
+    );
+    kill(rec.childPid, rec.childStart);
+    kill(rec.custodianPid, rec.custodianStart);
   }
 
+  {
+    const dir = mkdtempSync(join(root, "setsid-escapee-"));
+    const childPidPath = join(dir, "child.pid");
+    const grandchildPidPath = join(dir, "grandchild.pid");
+    const child = spawn(process.execPath, [
+      "-e",
+      "const {spawn}=require('node:child_process'); const fs=require('node:fs'); const [childFile,grandFile]=process.argv.slice(1); fs.writeFileSync(childFile,String(process.pid)); const g=spawn(process.execPath,['-e',\"require('node:fs').writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)\",grandFile],{detached:true,stdio:'ignore'}); g.unref(); setTimeout(()=>process.exit(0),300);",
+      childPidPath,
+      grandchildPidPath,
+    ], { stdio: "ignore" });
+    child.unref();
+    const childPid = child.pid;
+    if (childPid === undefined) throw new Error("setsid fixture child did not expose its pid");
+    let grandchildPid: number | undefined;
+    let grandchildStart: string | undefined;
+    try {
+      const childReady = await until(() => existsSync(childPidPath), 2_000);
+      const grandchildReady = await until(() => existsSync(grandchildPidPath), 2_000);
+      grandchildPid = Number(readFileSync(grandchildPidPath, "utf8"));
+      grandchildStart = processStartToken(grandchildPid);
+      const childStat = readFileSync(`/proc/${childPid}/stat`, "utf8");
+      const grandchildStat = readFileSync(`/proc/${grandchildPid}/stat`, "utf8");
+      const childSession = Number(childStat.slice(childStat.lastIndexOf(") ") + 2).split(" ")[3]);
+      const grandchildSession = Number(grandchildStat.slice(grandchildStat.lastIndexOf(") ") + 2).split(" ")[3]);
+      check("setsid escapee fixture starts a separate session", childReady && grandchildReady && grandchildSession === grandchildPid && grandchildSession !== childSession, { childPid, childSession, grandchildPid, grandchildSession });
+      const id = seatId();
+      const boot = bootToken();
+      const childStart = processStartToken(childPid);
+      const record = {
+        version: 1,
+        id,
+        name: "orphan-setsid-escapee",
+        socket: join(root, id, "missing-seat.sock"),
+        token: "missing-token",
+        custodianPid: childPid,
+        childPid,
+        ...(childStart === undefined ? {} : { custodianStart: childStart, childStart }),
+        ...(boot === undefined ? {} : { bootId: boot }),
+      };
+      mkdirSync(join(root, id), { recursive: true, mode: 0o700 });
+      writeFileSync(join(root, id, "record.json"), `${JSON.stringify(record)}\n`);
+      await until(() => gone(childPid), 2_000);
+      const evidence = await reapSeat(root, id, { graceMs: 100 }).catch((e: Error) => e);
+      check(
+        "setsid escapee retains the reap after its custodian exits",
+        grandchildPid !== undefined && !(evidence instanceof Error) && evidence.outcome === "retained" && evidence.reason === "unprovable" && evidence.stop === "no-custodian" && !gone(grandchildPid),
+        { evidence: evidence instanceof Error ? evidence.message : evidence, grandchild: grandchildPid === undefined ? "missing" : state(grandchildPid) },
+      );
+    } finally {
+      // The child exits on its own before the reap; only the captured grandchild is ours to stop.
+      if (grandchildPid !== undefined) kill(grandchildPid, grandchildStart);
+      await until(() => gone(childPid) && (grandchildPid === undefined || gone(grandchildPid)), 2_000);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
   {
     // O2. The bound must not fire under a seat that is merely BETWEEN controllers. A manager that
     // restarts detaches and re-adopts, and a custodian that counted from launch would kill a live
@@ -235,8 +303,8 @@ setInterval(() => {}, 1000);
       await until(() => gone(rec.custodianPid), BOUND_MS * 4),
       { custodian: state(rec.custodianPid) },
     );
-    kill(rec.childPid);
-    kill(rec.custodianPid);
+    kill(rec.childPid, rec.childStart);
+    kill(rec.custodianPid, rec.custodianStart);
   }
 
   {
@@ -271,8 +339,8 @@ setInterval(() => {}, 1000);
     // A census that claimed another run's custodians would SIGKILL a live seat in a parallel lane.
     check("O3 a census for a different run claims none of them", CENSUS(`${run}-other`).length === 0);
     for (const r of recs) {
-      kill(r.childPid);
-      kill(r.custodianPid);
+      kill(r.childPid, r.childStart);
+      kill(r.custodianPid, r.custodianStart);
     }
     delete process.env.COTAL_RUN;
   }

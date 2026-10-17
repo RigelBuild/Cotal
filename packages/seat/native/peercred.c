@@ -12,6 +12,9 @@
 #ifndef SYS_pidfd_send_signal
 #define SYS_pidfd_send_signal 424
 #endif
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
 
 static int int_arg(napi_env env, napi_callback_info info, size_t want, napi_value* argv, int32_t* out) {
   size_t argc = want;
@@ -96,6 +99,28 @@ static napi_value PidfdSignal(napi_env env, napi_callback_info info) {
   return NULL;
 }
 
+static napi_value PidfdOpen(napi_env env, napi_callback_info info) {
+  napi_value argv[1];
+  int32_t pid = 0;
+  if (!int_arg(env, info, 1, argv, &pid)) return NULL;
+  napi_value out;
+  if (pid <= 0) {
+    napi_throw_range_error(env, NULL, "pid must be positive");
+    return NULL;
+  }
+  long fd = syscall(SYS_pidfd_open, pid, 0);
+  if (fd >= 0) {
+    napi_create_int32(env, (int32_t)fd, &out);
+    return out;
+  }
+  if (errno == ESRCH) {
+    napi_get_null(env, &out);
+    return out;
+  }
+  napi_throw_error(env, NULL, strerror(errno));
+  return NULL;
+}
+
 static napi_value PidfdExited(napi_env env, napi_callback_info info) {
   napi_value argv[1];
   int32_t pidfd = 0;
@@ -127,6 +152,7 @@ static napi_value Init(napi_env env, napi_value exports) {
   export_fn(env, exports, "tryLockFd", TryLockFd);
   export_fn(env, exports, "pidfdSignal", PidfdSignal);
   export_fn(env, exports, "pidfdExited", PidfdExited);
+  export_fn(env, exports, "pidfdOpen", PidfdOpen);
   return exports;
 }
 
