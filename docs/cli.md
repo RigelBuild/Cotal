@@ -170,9 +170,9 @@ one manager. A manager without a
 custody generation is reported as `legacy`: it cannot preserve its manager-owned PTYs, so the
 command says that this is not a hot update and prints `exact`, `fork`, `fresh`, or `drain-only`
 for every seat. This report sends no stop, preservation-commit, or replacement command.
-It does not preserve a running PTY on a legacy manager. The built-in pty runtime spawns
-in-process on every platform and reports `legacy`. On Linux it still adopts seats that an earlier
-manager left under a detached custodian, but it starts no new custodian. An incompatible native
+It does not preserve a running PTY on a legacy manager. On Linux the built-in pty runtime runs
+every seat under a detached custodian and reports `custodied`; elsewhere it spawns in-process and
+reports `legacy`. An incompatible native
 `@lydell/node-pty` or ConPTY ABI break remains an explicit per-seat maintenance cut.
 
 With `--self`, the selected running manager is reported before any global install. When a newer

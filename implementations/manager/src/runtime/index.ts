@@ -129,10 +129,8 @@ export async function requireRuntimeReap(
 }
 
 /**
- * The built-in `pty` runtime on every platform. It spawns in-process and never starts a custodian
- * (#1391). On Linux it still adopts and reaps seats that an earlier `CustodialPtyRuntime` launched,
- * so a manager can drain custody records left by a pre-repair manager. It has no `reserve`, so the
- * manager records no custody reference for a new spawn.
+ * The built-in `pty` runtime off Linux: it spawns in-process with no custodian and no `reserve`, so
+ * the manager records no custody reference. Linux uses {@link CustodialPtyRuntime} directly.
  */
 class PtyRuntime extends LegacyPtyRuntime {
   private custodial?: CustodialPtyRuntime;
@@ -175,6 +173,9 @@ function createBackend(mode: RuntimeMode, session: string): Runtime {
           `where @lydell/node-pty's spawn-helper hangs before exec and every agent wedges at "starting…". ` +
           `Run the manager under node, or install and select an external runtime.`,
       );
+    // The fork's custody contract: every Linux seat runs under a custodian. Upstream's in-process
+    // default (#2351) would drop that, so PtyRuntime serves only the non-Linux path here.
+    if (process.platform === "linux") return new CustodialPtyRuntime();
     return new PtyRuntime();
   }
   let provider: RuntimeProvider;
