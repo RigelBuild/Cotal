@@ -56,7 +56,7 @@ import { killOwned, owned, type Owned } from "./_owned-kill.js";
 let failures = 0;
 let ran = 0;
 /** Intent, not a measurement: one per cell assertion below. A shortfall means a cell stopped running. */
-const EXPECTED_CHECKS = 21;
+const EXPECTED_CHECKS = 22;
 function check(label: string, cond: boolean, extra?: unknown): void {
   console.log(`${cond ? "✓" : "✗"} ${label}${cond ? "" : ` — ${JSON.stringify(extra) ?? ""}`}`);
   ran++;
@@ -78,7 +78,7 @@ const space = `custody-${randomUUID().slice(0, 8)}`;
 const auth = await createSpaceAuth(space);
 const { servers: SERVERS, stop: stopBroker } = await bootBroker(auth);
 const workspaceRoot = mkdtempSync(join(tmpdir(), "cotal-custody-ws-"));
-const ALIASES = ["retainer", "membersok", "membersmax", "predkept", "fatalres", "failrestart", "othref", "lateref", "membersweep", "clearme", "laterfail", "retryret", "retrymove", "escalate"];
+const ALIASES = ["retainer", "membersok", "membersmax", "predkept", "fatalres", "failrestart", "othref", "lateref", "membersweep", "clearme", "laterfail", "retryret", "retrymove", "escalate", "rekick"];
 mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
 for (const alias of ALIASES)
   writeFileSync(join(workspaceRoot, ".cotal", "agents", `${alias}.md`), `---\nname: ${alias}\nrole: worker\nsubscribe: [general]\nallowSubscribe: [general]\nallowPublish: [general]\n---\nbody\n`);
@@ -161,7 +161,14 @@ M.ep = {
   getRoster: (): Presence[] =>
     [...M.agents.values()].map((a): Presence => ({ card: { id: principalKey(DEV_OWNER, a.id).key, name: a.name, role: "worker", kind: "agent", description: "", tags: [] }, status: "idle", lifecycleUid: a.lifecycleUid, ts: 0 })),
 };
-M.staticLifecycleEvict = async (principal) => ({ principal, kicked: 1, remaining: 0, scanComplete: true, verifiedGone: true });
+// A real broker kicks a principal's connections once; a re-eviction finds none, so it reports kicked 0.
+const evictions = new Map<string, number[]>();
+M.staticLifecycleEvict = async (principal) => {
+  const seen = evictions.get(principal) ?? [];
+  const kicked = seen.length === 0 ? 1 : 0;
+  evictions.set(principal, [...seen, kicked]);
+  return { principal, kicked, remaining: 0, scanComplete: true, verifiedGone: true };
+};
 // Count footprint cleanup per alias: the broker teardown is the cleanup's last step.
 const cleanups = new Map<string, number>();
 const deprovisionBroker = M.deprovisionBroker.bind(mgr);
@@ -303,6 +310,18 @@ try {
     const done = item("membersok");
     check("members remain: the retry proves the seat gone, cleans up once, and recovers without retainedReason",
       done?.disposition === "recovered" && done.retainedReason === undefined && cleanups.get("membersok") === 1 && (await readSlot("membersok"))?.phase === "retired", { done, cleanups: cleanups.get("membersok") });
+  }
+
+  // ── Members remain, and the retry's eviction kicks nothing ─────────────────
+  {
+    const a = await spawnLive("rekick");
+    plans.set(refOf(a).id, [MEMBERS, { outcome: "reaped", detail: "fake: group empty" }]);
+    M.despawnAuthorized(a, false, false, "smoke");
+    await until(() => item("rekick")?.disposition === "recovered" || item("rekick")?.disposition === "refused", 30_000);
+    const done = item("rekick");
+    const kicks = [...evictions.entries()].find(([p]) => p.endsWith(a.id))?.[1];
+    check("members remain, re-kick 0: the retry's audit matches the first audit and the lifecycle retires",
+      done?.disposition === "recovered" && kicks !== undefined && kicks.length >= 2 && kicks.at(-1) === 0 && (await readSlot("rekick"))?.phase === "retired", { done, kicks });
   }
 
   // ── Members remain past the budget ─────────────────────────────────────────

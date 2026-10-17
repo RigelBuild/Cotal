@@ -34,6 +34,8 @@ import {
   SOURCE_ROOT,
   RECORD_KINDS,
   recordSpecKey,
+  recordStatusKey,
+  assertStatusValue,
   createRecordEntry,
   updateRecordEntry,
   runActivationSagaAtUid,
@@ -144,11 +146,12 @@ export async function observeStaticSlot(
   };
 }
 
+// A retry re-verifies eviction itself, so the first audit's broker evidence stands; kicked and the
+// process uid legitimately differ on a re-drive (a second eviction kicks 0; a successor has a new uid).
 function sameAudit(a: StaticLifecycleAuditSpec, b: StaticLifecycleAuditSpec): boolean {
   return a.v === b.v && a.principal === b.principal && a.alias === b.alias && a.lifecycleUid === b.lifecycleUid &&
-    a.managerInstance === b.managerInstance && a.managerProcessUid === b.managerProcessUid && a.retirementOpId === b.retirementOpId &&
-    a.broker.kicked === b.broker.kicked && a.broker.remaining === b.broker.remaining &&
-    a.broker.scanComplete === b.broker.scanComplete && a.broker.verifiedGone === b.broker.verifiedGone;
+    a.managerInstance === b.managerInstance && a.retirementOpId === b.retirementOpId &&
+    a.broker?.verifiedGone === true && a.broker.scanComplete === true && a.broker.remaining === 0;
 }
 
 /** The terminal barrier's verified-eviction step, over the SPEC'S TARGET SET.
@@ -174,18 +177,20 @@ async function evictAndAudit(
   evict: (principal: string) => Promise<EvictionResult>,
   log: (line: string) => void,
 ): Promise<void> {
-  if (holders.length === 0) {
+  // An empty set is the required eviction of nothing: record it, so the lifecycle always has the
+  // audit spec its release status (SPEC 13.4) observes.
+  if (holders.length === 0)
     log(`no credential-ledger row was ever released under uid ${args.lifecycleUid}; the barrier's eviction set is empty (SPEC 13.1)`);
-    return;
-  }
   // Every static ledger row of one lifecycle carries that incarnation's own principal (the mint
   // sites record exactly `principalKey(DEV_OWNER, actor)`), so the set is a singleton and the audit
   // record below is one row per lifecycle. A second holder means the ledger disagrees with the
   // incarnation it is keyed under: refuse rather than evict some of a set we cannot audit.
   if (holders.length > 1)
     throw new EpEnvelopeError("internal", `the ledger rows of uid ${args.lifecycleUid} name ${holders.length} holder principals (${holders.join(", ")}); a static lifecycle has exactly one (SPEC 13.1)`);
-  const principal = holders[0]!;
-  const result = await evict(principal);
+  const principal = holders[0] ?? `${args.owner}.${args.actor}`;
+  const result: EvictionResult = holders.length === 0
+    ? { principal, kicked: 0, remaining: 0, scanComplete: true, verifiedGone: true }
+    : await evict(principal);
   if (!result.verifiedGone || !result.scanComplete || result.remaining !== 0)
     throw new EpEnvelopeError("unavailable", `static retirement could not verify-evict ${principal}; the lifecycle remains terminalizing and the alias stays held (SPEC 13.1)`);
   const key = recordSpecKey(RECORD_KINDS.lifecycle, [args.owner, args.actor, args.lifecycleUid]);
@@ -204,7 +209,69 @@ async function evictAndAudit(
     try { value = JSON.parse(new TextDecoder().decode(existing.value)); }
     catch { throw new EpEnvelopeError("failed-precondition", `lifecycle audit ${key} conflict is malformed`); }
     if (!sameAudit(value as StaticLifecycleAuditSpec, spec)) throw new EpEnvelopeError("already-exists", `lifecycle audit ${key} records different evidence`);
-    // Timestamp may differ only after the stable manager identities and retirement op prove the same retry.
+    // Timestamp, process uid and kick count may differ only after the stable identities and op prove the same retry.
+  }
+}
+
+export interface StaticLifecycleReleaseSpec {
+  v: 1; principal: string; alias: string; lifecycleUid: string;
+  operator: { owner: string; actor: string; uid: string };
+  reason: string; ownerInstanceId: string; managerProcessUid: string; timestamp: string;
+}
+
+/** Throw `already-exists` unless `existing` records the same release intent as `spec`. The process
+ *  uid and timestamp differ on a successor's retry, so they are not compared. */
+export function assertSameRelease(existing: StaticLifecycleReleaseSpec, spec: StaticLifecycleReleaseSpec): void {
+  const same = existing.v === spec.v && existing.principal === spec.principal && existing.alias === spec.alias && existing.lifecycleUid === spec.lifecycleUid &&
+    existing.operator.owner === spec.operator.owner && existing.operator.actor === spec.operator.actor && existing.operator.uid === spec.operator.uid &&
+    existing.reason === spec.reason && existing.ownerInstanceId === spec.ownerInstanceId;
+  if (!same)
+    throw new EpEnvelopeError("already-exists", `lifecycle ${spec.lifecycleUid} was already released by ${existing.operator.owner}.${existing.operator.actor} for "${existing.reason}"; a different release intent is refused`);
+}
+
+const isString = (o: Record<string, unknown>, k: string): boolean => typeof o[k] === "string";
+
+/** Read the release record of one lifecycle. A record that is not a well-formed release of exactly
+ *  this lifecycle throws, so a terminal never removes custody on its word. */
+export async function readStaticRelease(
+  t: LifecycleStateTransport, owner: string, actor: string, lifecycleUid: string,
+  expect?: { readonly alias: string; readonly ownerInstanceId: string },
+): Promise<StaticLifecycleReleaseSpec | undefined> {
+  const key = recordStatusKey(RECORD_KINDS.lifecycle, [owner, actor, lifecycleUid]);
+  const entry = await t.getRecord(key);
+  if (!entry) return undefined;
+  if (entry.operation !== "PUT") throw new EpEnvelopeError("failed-precondition", `release record ${key} carries a ${entry.operation} marker; a release record is never deleted`);
+  let raw: unknown;
+  try { raw = JSON.parse(new TextDecoder().decode(entry.value)); }
+  catch { throw new EpEnvelopeError("failed-precondition", `release record ${key} is malformed: not JSON`); }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw))
+    throw new EpEnvelopeError("failed-precondition", `release record ${key} is malformed: not an object`);
+  const o = raw as Record<string, unknown>;
+  const op = o.operator;
+  if (o.v !== 1 || !["principal", "alias", "lifecycleUid", "reason", "ownerInstanceId", "managerProcessUid", "timestamp"].every((k) => isString(o, k)) ||
+    typeof op !== "object" || op === null || !["owner", "actor", "uid"].every((k) => isString(op as Record<string, unknown>, k)) ||
+    !(typeof o.observedSpecRevision === "number" && Number.isSafeInteger(o.observedSpecRevision) && o.observedSpecRevision >= 0))
+    throw new EpEnvelopeError("failed-precondition", `release record ${key} is malformed: it is not a v1 release with every field and the operator triple`);
+  const rec = raw as StaticLifecycleReleaseSpec;
+  if (rec.principal !== `${owner}.${actor}` || rec.lifecycleUid !== lifecycleUid ||
+    (expect !== undefined && (rec.alias !== expect.alias || rec.ownerInstanceId !== expect.ownerInstanceId)))
+    throw new EpEnvelopeError("failed-precondition", `release record ${key} is mismatched: it names ${rec.principal} "${rec.alias}" uid ${rec.lifecycleUid} of ${rec.ownerInstanceId}, not this lifecycle`);
+  return rec;
+}
+
+/** Create the release record as a SPEC 13.4 status of the lifecycle's audit spec (revision 0 if the
+ *  audit is not written yet). A create loser rereads and compares, so a different intent throws. */
+export async function writeStaticRelease(t: LifecycleStateTransport, spec: StaticLifecycleReleaseSpec): Promise<void> {
+  const owner = spec.principal.slice(0, spec.principal.indexOf("."));
+  const actor = spec.principal.slice(spec.principal.indexOf(".") + 1);
+  const audit = await t.getRecord(recordSpecKey(RECORD_KINDS.lifecycle, [owner, actor, spec.lifecycleUid]));
+  const value = assertStatusValue({ ...spec, observedSpecRevision: audit?.operation === "PUT" ? audit.revision : 0 });
+  try { await t.createRecord(recordStatusKey(RECORD_KINDS.lifecycle, [owner, actor, spec.lifecycleUid]), value); }
+  catch (e) {
+    if (!(e instanceof EpEnvelopeError) || e.code !== "conflict") throw e;
+    const existing = await readStaticRelease(t, owner, actor, spec.lifecycleUid, spec);
+    if (existing === undefined) throw new EpEnvelopeError("failed-precondition", `release record for ${spec.lifecycleUid} lost its create but cannot be read back`);
+    assertSameRelease(existing, spec);
   }
 }
 

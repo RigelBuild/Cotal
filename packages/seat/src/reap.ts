@@ -1,8 +1,14 @@
-import { readdirSync, readFileSync } from "node:fs";
-import { readRecord, recordPath, socketPath, type SeatRecord } from "./record.js";
+import { closeSync, constants, existsSync, fsyncSync, ftruncateSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
+import { setTimeout as sleep } from "node:timers/promises";
+import { join } from "node:path";
+import { assertSeatId, fencePath, readRecord, recordPath, socketPath, type SeatRecord } from "./record.js";
 import { RUN_MARKER_FLAG } from "./launcher.js";
-import { unsupportedTransport } from "./protocol.js";
+import { CONFIRM_TIMEOUT_MS, unsupportedTransport } from "./protocol.js";
 import { SeatClient } from "./client.js";
+import { tryLockFd } from "./peercred.js";
+
+/** A layer 3 seat cgroup. T5 builds it; until then a release that names one refuses. */
+export interface SeatCgroup { readonly path: string; readonly agentUid: number }
 
 /** `unprovable`: nothing on this host can prove the seat's processes gone. `members-remain`: a
  *  contained seat cgroup still held tasks at the bound. */
@@ -114,4 +120,76 @@ export async function reapSeat(root: string, id: string, opts: SeatReapOpts = {}
     stop,
     detail: `seat ${id} has no contained cgroup proof; stop ${stop}${error ? ` (${error})` : ""}`,
   };
+}
+
+export type SeatReleaseCheck = { ok: true; advisory: string } | { ok: false; reason: "populated" | "launch-in-progress"; detail: string };
+
+// Layer 3 is not built yet, so a caller that names a cgroup gets a refusal rather than a silent no-op.
+function refuseCgroup(opts: { cgroup?: SeatCgroup } | undefined): void {
+  if (opts?.cgroup !== undefined) throw new Error(`seat cgroup ${opts.cgroup.path}: layer 3 release is not supported by this build`);
+}
+
+function releaseAdvisory(root: string, id: string): string {
+  const census = process.platform === "linux" ? censusCustodians().length : 0;
+  return `advisory, not proof: seat directory ${existsSync(join(root, id)) ? "present" : "absent"}; ${census} live custodian(s) on this host`;
+}
+
+/** Read-only: a fence another open file holds locked is a launch still in progress. */
+export function checkSeatRelease(root: string, id: string, opts?: { cgroup?: SeatCgroup }): SeatReleaseCheck {
+  if (process.platform !== "linux") throw unsupportedTransport();
+  refuseCgroup(opts);
+  const fence = fencePath(root, id);
+  let fd: number;
+  try {
+    fd = openSync(fence, "r");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, advisory: releaseAdvisory(root, id) };
+    throw e;
+  }
+  try {
+    if (!tryLockFd(fd)) return { ok: false, reason: "launch-in-progress", detail: `seat ${id} launch fence ${fence} is locked by a launch in progress` };
+  } finally {
+    closeSync(fd);
+  }
+  return { ok: true, advisory: releaseAdvisory(root, id) };
+}
+
+/** Seal the launch fence under its lock, so no launcher or custodian of this id can start a child. */
+export async function sealSeatLaunch(root: string, id: string, opts?: { cgroup?: SeatCgroup }): Promise<SeatReleaseCheck> {
+  if (process.platform !== "linux") throw unsupportedTransport();
+  refuseCgroup(opts);
+  const fence = fencePath(root, id);
+  const fd = openSync(fence, constants.O_RDWR | constants.O_CREAT, 0o644);
+  try {
+    const deadline = Date.now() + CONFIRM_TIMEOUT_MS;
+    while (!tryLockFd(fd)) {
+      if (Date.now() >= deadline) return { ok: false, reason: "launch-in-progress", detail: `seat ${id} launch fence ${fence} stayed locked for ${CONFIRM_TIMEOUT_MS}ms; a launch is in progress` };
+      await sleep(25);
+    }
+    ftruncateSync(fd, 0);
+    writeSync(fd, "sealed", 0);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  const dir = openSync(root, "r");
+  try {
+    fsyncSync(dir);
+  } finally {
+    closeSync(dir);
+  }
+  return { ok: true, advisory: releaseAdvisory(root, id) };
+}
+
+/** Remove the seat directory by rename, then delete the tombstone. The sealed fence stays. */
+export function removeSeatCustody(root: string, id: string): void {
+  const tombstone = join(root, `.released-${assertSeatId(id)}`);
+  // A crash between rename and delete leaves a tombstone, and a rename onto it would fail.
+  rmSync(tombstone, { recursive: true, force: true });
+  try {
+    renameSync(join(root, id), tombstone);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  rmSync(tombstone, { recursive: true, force: true });
 }

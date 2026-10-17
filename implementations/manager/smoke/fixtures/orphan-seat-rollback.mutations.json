@@ -21,8 +21,8 @@
     {
       "name": "the terminal reaps without the slot row reference",
       "file": "implementations/manager/src/manager.ts",
-      "find": "      await this.reapOrphanSeat(a, cur.row.runtime);\n",
-      "replace": "      await this.reapOrphanSeat(a, undefined);\n",
+      "find": "      if (released === undefined) await this.reapOrphanSeat(a, cur.row.runtime);\n",
+      "replace": "      if (released === undefined) await this.reapOrphanSeat(a, undefined);\n",
       "expectRed": "the rollback reaps the reference the spawn reserved and RETAINS the lifecycle (unprovable, refused, release remedy)",
       "cell": "the rollback reaps the reference the spawn reserved and RETAINS the lifecycle (unprovable, refused, release remedy)"
     }

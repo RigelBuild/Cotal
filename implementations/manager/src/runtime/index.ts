@@ -81,6 +81,22 @@ export function isCustodialRuntime(runtime: Runtime): runtime is CustodialRuntim
   return typeof r.reserve === "function" && typeof r.reap === "function";
 }
 
+/** What a release check found. `advisory` is census text, never proof. */
+export type RuntimeReleaseCheck = { ok: true; advisory: string } | { ok: false; reason: "populated" | "launch-in-progress"; detail: string };
+
+/** A custodial backend an operator can release a retained seat from: check, seal its launch, then
+ *  remove its custody. None of these sends a signal. */
+export interface ReleasableRuntime extends CustodialRuntime {
+  checkRelease(reference: RuntimeReference): RuntimeReleaseCheck;
+  sealRelease(reference: RuntimeReference): Promise<RuntimeReleaseCheck>;
+  removeCustody(reference: RuntimeReference): void;
+}
+
+export function isReleasableRuntime(runtime: Runtime): runtime is ReleasableRuntime {
+  const r = runtime as Partial<ReleasableRuntime>;
+  return isCustodialRuntime(runtime) && typeof r.checkRelease === "function" && typeof r.sealRelease === "function" && typeof r.removeCustody === "function";
+}
+
 /** Reap an orphaned custody by reference, or refuse by name when this runtime does not custody its
  *  own processes. Absent and retained mean REFUSE, never "assume gone": the lifecycle stays held
  *  rather than retiring over a live seat. */

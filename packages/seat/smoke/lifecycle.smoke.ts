@@ -7,8 +7,8 @@ import { tmpdir } from "node:os";
 import { connect, createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { adoptSeatSync, bootToken, launchSeat, processStartToken, reapSeat, seatId, SeatClient, type SeatRecord } from "../src/index.js";
-import { setCustodianTestSeam } from "../src/launcher.js";
+import { adoptSeatSync, bootToken, launchSeat, processStartToken, reapSeat, removeSeatCustody, sealSeatLaunch, seatId, SeatClient, type SeatRecord } from "../src/index.js";
+import { setCustodianTestSeam, setLauncherTestSeam } from "../src/launcher.js";
 import { pidfdOpen, pidfdSignal } from "../src/peercred.js";
 import type { CustodianTestSeam } from "../src/custodian.js";
 import { GRACE_MS } from "../src/protocol.js";
@@ -837,6 +837,127 @@ await h.waitForExit();
     let refused = "";
     try { launchSeat({ root, name: "sealed", id: again, spec: { command: process.execPath, args: ["-e", ""], env: { PATH: process.env.PATH ?? "" } }, cwd: process.cwd() }); } catch (e) { refused = (e as Error).message; }
     check("a launch over an existing fence creates no seat directory", refused !== "" && !existsSync(join(root, again)), refused);
+  }
+
+  // ── T4 operator release ────────────────────────────────────────────────────
+  // launchSeat blocks this event loop, so a release that must land mid-launch runs in a runner process.
+  const releaseRunner = join(mkdtempSync(join(root, "t4-runner-")), "release.mjs");
+  writeFileSync(
+    releaseRunner,
+    `import { writeFileSync } from "node:fs";
+import { sealSeatLaunch, removeSeatCustody } from ${JSON.stringify(join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "index.js"))};
+const [root, id, out] = process.argv.slice(2);
+const sealed = await sealSeatLaunch(root, id);
+if (sealed.ok) removeSeatCustody(root, id);
+writeFileSync(out, JSON.stringify(sealed));
+`,
+  );
+  const releaseThen = 'NODE="$2"; shift 2; "$NODE" "$@"; : > "$5"';
+
+  {
+    const dir = mkdtempSync(join(root, "t4-late-custodian-"));
+    const pidf = join(dir, "pid");
+    const reached = join(dir, "reached");
+    const release = join(dir, "release");
+    const out = join(dir, "out.json");
+    const id = seatId();
+    onReached(reached, releaseThen, process.execPath, releaseRunner, root, id, out, release);
+    // The after-pin hold waits on the child's own marker, so a child that does spawn is always seen.
+    const childRelease = join(dir, "child-release");
+    const err = launchUnderSeam(
+      { holds: [{ at: "before-fs", reached, release }, { at: "after-pin", reached: join(dir, "pinned"), release: childRelease }] },
+      id,
+      ["-e", ARMED_CHILD, pidf, join(dir, "term"), childRelease],
+    );
+    await wait(300);
+    const child = readPid(pidf);
+    if (child !== undefined) strays.push(child);
+    check(
+      "late custodian: a release during its before-fs hold leaves no child, socket, record, seat directory or tombstone",
+      err !== "" && child === undefined && !existsSync(join(root, id, "seat.sock")) && !existsSync(join(root, id, "record.json")) && !existsSync(join(root, id)) && !existsSync(join(root, `.released-${id}`)),
+      { err, child, out: existsSync(out) ? readFileSync(out, "utf8") : "none" },
+    );
+  }
+
+  {
+    const dir = mkdtempSync(join(root, "t4-late-launcher-"));
+    const reached = join(dir, "reached");
+    const release = join(dir, "release");
+    const out = join(dir, "out.json");
+    const pidf = join(dir, "pid");
+    const id = seatId();
+    onReached(reached, releaseThen, process.execPath, releaseRunner, root, id, out, release);
+    setLauncherTestSeam({ afterFence: { reached, release } });
+    let err = "";
+    try {
+      const rec = launchSeat({ root, name: "t4-launcher", id, spec: { command: process.execPath, args: ["-e", ARMED_CHILD, pidf, join(dir, "term"), ""], env: { PATH: process.env.PATH ?? "" } }, cwd: process.cwd() });
+      strays.push({ pid: rec.custodianPid, start: rec.custodianStart }, { pid: rec.childPid, start: rec.childStart });
+    } catch (e) {
+      err = (e as Error).message;
+    } finally {
+      setLauncherTestSeam(undefined);
+    }
+    check("late launcher: a release between fence and lock refuses the launch and no seat directory appears",
+      /is sealed/.test(err) && !existsSync(join(root, id)), { err, dir: existsSync(join(root, id)), out: existsSync(out) ? readFileSync(out, "utf8") : "none" });
+  }
+
+  {
+    const id = seatId();
+    setLauncherTestSeam({ failMkdir: true });
+    let err = "";
+    try {
+      launchSeat({ root, name: "t4-mkdir", id, spec: { command: process.execPath, args: ["-e", ""], env: { PATH: process.env.PATH ?? "" } }, cwd: process.cwd() });
+    } catch (e) {
+      err = (e as Error).message;
+    } finally {
+      setLauncherTestSeam(undefined);
+    }
+    const sealed = await sealSeatLaunch(root, id);
+    check("failed launcher setup: the launch fails and a release in the same process takes the lock and seals",
+      /seat mkdir failed/.test(err) && sealed.ok && readFileSync(join(root, `.launch-${id}`), "utf8") === "sealed", { err, sealed });
+  }
+
+  {
+    // The custodian holds the fence lock from admission until ready; the release must wait it out.
+    const dir = mkdtempSync(join(root, "t4-in-progress-"));
+    const pidf = join(dir, "pid");
+    const reached = join(dir, "reached");
+    const release = join(dir, "release");
+    const id = seatId();
+    const seam: CustodianTestSeam = { holds: [{ at: "after-pin", reached, release, timeoutMs: 40_000 }] };
+    const runner = join(dir, "launch.mjs");
+    writeFileSync(
+      runner,
+      `import { setCustodianTestSeam, launchSeat } from ${JSON.stringify(join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "launcher.js"))};
+setCustodianTestSeam(${JSON.stringify(seam)});
+try { launchSeat({ root: ${JSON.stringify(root)}, name: "t4-progress", id: ${JSON.stringify(id)}, spec: { command: process.execPath, args: ${JSON.stringify(["-e", ARMED_CHILD, pidf, join(dir, "term"), ""])}, env: { PATH: process.env.PATH ?? "" } }, cwd: process.cwd() }); } catch {}
+`,
+    );
+    const launcher: ChildProcess = spawn(process.execPath, [runner], { stdio: "ignore" });
+    const held = await until(() => existsSync(reached), 10_000);
+    const sealed = held ? await sealSeatLaunch(root, id) : undefined;
+    writeFileSync(release, "");
+    await until(() => existsSync(join(root, id, "record.json")), 10_000);
+    const child = readPid(pidf);
+    if (child !== undefined) strays.push(child);
+    try {
+      const rec = JSON.parse(readFileSync(join(root, id, "record.json"), "utf8")) as SeatRecord;
+      strays.push({ pid: rec.custodianPid, start: rec.custodianStart });
+    } catch { /* no record: the custodian never got past the hold */ }
+    launcher.kill("SIGKILL");
+    check("launch in progress: a release refuses with launch-in-progress and leaves the fence unsealed",
+      held && sealed !== undefined && !sealed.ok && sealed.reason === "launch-in-progress" && readFileSync(join(root, `.launch-${id}`), "utf8") !== "sealed", { held, sealed });
+  }
+
+  {
+    const id = seatId();
+    mkdirSync(join(root, id));
+    writeFileSync(join(root, id, "record.json"), "{}");
+    writeFileSync(join(root, `.launch-${id}`), "sealed");
+    removeSeatCustody(root, id);
+    removeSeatCustody(root, id);
+    check("release removal: the seat directory and tombstone are gone, a repeat is success, and the sealed fence stays",
+      !existsSync(join(root, id)) && !existsSync(join(root, `.released-${id}`)) && readFileSync(join(root, `.launch-${id}`), "utf8") === "sealed");
   }
 
   {
