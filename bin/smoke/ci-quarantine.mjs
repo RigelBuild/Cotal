@@ -49,6 +49,16 @@ export const QUARANTINED = {
   "smoke:up-refresh-identity:live": { reason: "upstream: red on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:jcode-provider-permanent-refusal": { reason: "flaky upstream: timed out waiting for the permanent replacement refusal on #83 CI run 38978458326; passes 3/3 locally on the merge and on pristine main; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:remote-ef-accepted-goal": { reason: "flaky upstream: fetch ECONNREFUSED on #83 CI run 38983182111; fails 1/3 locally on pristine main 8ca93e96; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:remote-resume-completion": { reason: "flaky upstream: 4a witness-before-expiry cell failed on #83 CI run 38987352979; file byte-identical to pristine main 8ca93e96; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:opencode-run-error": { reason: "flaky upstream: twice:later reads cell fails 1/3 on pristine main 8ca93e96 and 2/3 on the merge (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:manager-two-root-renewal": { reason: "flaky upstream: fails 2/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:attach-open-mode": { reason: "flaky upstream: fails 2/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:web-history-cancellation": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:user-manager-transport": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:up-restore-reentry:live": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:setup-provider-pack": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:remote-ef-continuity": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:presence-watch-rebind": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */
