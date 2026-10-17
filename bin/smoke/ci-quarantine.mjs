@@ -20,6 +20,7 @@ export const QUARANTINED = {
   "smoke:instrument-instance-pin": { reason: "upstream: red on main CI runs 38756147210 and 38753177566; 2/61 fail locally on the merge; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:custody-exit-proof": { reason: "upstream asserts a numeric pid/pgid reap that the fork's custody contract (#72/#73) forbids; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:seat-reap-group-identity": { reason: "upstream asserts a numeric pid/pgid reap that the fork's custody contract (#72/#73) forbids; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:freeslot-barrier:live": { reason: "upstream expects a static orphan with no custody reference to retire; the fork's custody contract (#72/#73) refuses an unproven reap; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:seat-exit-cause": { reason: "upstream: TypeError reading allowSubscribe on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:sys-rotation-e2e": { reason: "upstream: a plain cotal up no longer reports Started nats-server on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:web-echo-escaping": { reason: "upstream: 1/29 cells fail on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
@@ -69,4 +70,5 @@ export const LIVE_QUARANTINED = {
   "smoke:lifecycle-e2e": { reason: "RIG-4872: despawn cannot prove a pty seat gone until RIG-4320 lands", recheckBy: "2026-11-15" },
   "smoke:schema-remaining15-diagnostic": { reason: "upstream: dynamicRef cases fail on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:herdr-e2e:live": { reason: "RIG-4872: herdr server not running when the manager starts", recheckBy: "2026-11-15" },
+  "smoke:up-stack:live": { reason: "upstream expects an in-process pty seat to die with the manager on Ctrl-C; fork pty seats run under a custodian (#72/#73); quarantined on sync per Matt", recheckBy: "2026-12-31" },
 };
