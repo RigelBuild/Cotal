@@ -92,9 +92,11 @@ const STATUS_OUTPUT_SCHEMA = {
     staticReconciliation: {
       type: "object",
       additionalProperties: false,
-      required: ["state", "failures"],
+      required: ["state", "failures", "retainedCustody"],
       properties: {
         state: { enum: ["idle", "running", "retry-wait", "retrying", "recovered", "failed"] },
+        /** Items whose seat is not proved gone (`retainedReason` set) and not yet recovered. */
+        retainedCustody: { type: "integer", minimum: 0 },
         lastSweep: {
           type: "object",
           additionalProperties: false,
@@ -126,6 +128,7 @@ const STATUS_OUTPUT_SCHEMA = {
               nextRetryAt: { type: "string" },
               recoveredAt: { type: "string" },
               remedy: { type: "string" },
+              retainedReason: { enum: ["absent", "no-reference", "unprovable", "members-remain"] },
             },
           },
         },
@@ -167,10 +170,14 @@ export interface ManagerStaticReconciliationFailure {
   nextRetryAt?: string;
   recoveredAt?: string;
   remedy?: string;
+  /** Set while the terminal holds the lifecycle because its seat is not proved gone. */
+  retainedReason?: "absent" | "no-reference" | "unprovable" | "members-remain";
 }
 
 export interface ManagerStaticReconciliationStatus {
   state: "idle" | "running" | "retry-wait" | "retrying" | "recovered" | "failed";
+  /** Items with `retainedReason` set and a disposition other than `recovered`. */
+  retainedCustody: number;
   lastSweep?: ManagerStaticReconciliationSweep;
   failures: ManagerStaticReconciliationFailure[];
 }
@@ -864,7 +871,10 @@ export const MANAGER_STATUS_CONTRACT: { input: CompiledContract; output: Compile
  *  without gaining any untargeted run command.
  *
  *  17 = `resolve-cwd` lets a caller ask one manager instance to canonicalize an absolute existing
- *  directory before a placed workflow spawn launches there. */
+ *  directory before a placed workflow spawn launches there.
+ *
+ *  18 = manager `status` adds `staticReconciliation.retainedCustody` and a failure's
+ *  `retainedReason`: a terminal whose seat is not proved gone. */
 export function managerClusterDocument(): {
   urn: string;
   revision: number;
@@ -882,7 +892,7 @@ export function managerClusterDocument(): {
 } {
   return {
     urn: MANAGER_CLUSTER_URN,
-    revision: 17,
+    revision: 18,
     attributes: [],
     events: [],
     commands: ROWS.map((r) => ({

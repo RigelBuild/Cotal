@@ -28,8 +28,8 @@
  * What runs here:
  *   SPARE phase: manager up, one live managed seat, then a plain `mgr.stop()`. The seat
  *   process and minted creds remain.
- *   REAP phase: a second manager on a separate root, `stop({ withAgents: true })`. That
- *   seat is dead and its creds are gone, while the independently spared seat remains.
+ *   REAP phase: a second manager on a separate root, `stop({ withAgents: true })`. That seat is
+ *   dead and its terminal ran; on the custodial pty it RETAINS (no cgroup proof), keeping creds.
  *
  * NAMED GAPS (deliberate, not oversights):
  *   - The CLI `down` surface itself is not driven here: this host must never run `cotal down`
@@ -315,6 +315,7 @@ try {
   const credsB = optsByName.get("seatB")?.creds;
   ok("seat B's creds file exists before explicit reap", credsB !== undefined && existsSync(credsB), { credsB });
   let reapError: string | undefined;
+  const reaper = mgr2;
   try {
     await mgr2.stop({ withAgents: true });
   } catch (e) {
@@ -323,7 +324,15 @@ try {
   mgr2 = undefined;
   ok("stop({ withAgents: true }) succeeds", reapError === undefined, { reapError });
   ok("#964: explicit stop kills the managed child", pidB !== undefined && (await until(() => !alive(pidB), 10_000)), { pidB });
-  ok("#964: explicit stop deprovisions the minted credential", credsB !== undefined && (await until(() => !existsSync(credsB), 10_000)), { credsB });
+  // A spared seat never reaches a terminal. On the custodial pty the explicit stop's terminal
+  // cannot prove the seat gone, so it holds the footprint and reports the release remedy.
+  type RetainedView = { staticReconciliation: { failures: Array<{ alias: string; disposition: string; retainedReason?: string; remedy?: string }> } };
+  const statusOf = (reaper as unknown as { managerStatusData: () => RetainedView }).managerStatusData.bind(reaper);
+  const seatBItem = () => statusOf().staticReconciliation.failures.find((f) => f.alias === "seatB");
+  ok("#964: explicit stop drives seat B's terminal, which retains it (unprovable, refused, release remedy) and keeps its creds",
+    (await until(() => seatBItem()?.retainedReason !== undefined, 10_000)) && seatBItem()?.retainedReason === "unprovable" &&
+      seatBItem()?.disposition === "refused" && /release-seat/.test(seatBItem()?.remedy ?? "") && credsB !== undefined && existsSync(credsB),
+    { item: seatBItem(), credsB });
   ok("#964: explicit reap does not kill the independently spared child", pidA !== undefined && alive(pidA), { pidA });
 
   ok("every cell ran (silently skipped cells must not read as green)", pass + fail === EXPECTED_CELLS - 1, { pass, fail, expected: EXPECTED_CELLS - 1 });

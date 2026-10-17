@@ -56,6 +56,7 @@ import {
 } from "@cotal-ai/core";
 import { authDir, saveManagerInstanceIdentity, saveSpaceAuth } from "@cotal-ai/workspace";
 import { Manager } from "../src/manager.js";
+import { LegacyPtyRuntime } from "../src/runtime/pty.js";
 import { MANAGER_ENDPOINT, MANAGER_CONTRACTS } from "../src/manager-service-contract.js";
 import { activateStaticLifecycle, casStaticSlot, readStaticSlot, staticLifecycleTransport } from "../src/static-lifecycle.js";
 import { bootBroker } from "./_boot-broker.js";
@@ -188,6 +189,10 @@ try {
   });
 
   manager = new Manager({ space, servers: broker.servers, runtime: "pty", workspaceRoot });
+  // These orphan rows carry no custody reference; a custodial runtime would rightly retain them as
+  // `no-reference` (custody-fail-closed covers that). This suite tests reconcile mechanics, so it
+  // runs the non-custodial pty runtime, whose reap has nothing to prove.
+  (manager as unknown as { runtime: LegacyPtyRuntime }).runtime = new LegacyPtyRuntime();
   const retirement = manager as unknown as {
     driveStaticRetirement(agent: { id: string; name: string; lifecycleUid: string }, orphan: boolean): Promise<void>;
   };
@@ -247,6 +252,7 @@ try {
   // pending-turn index holds nothing a predecessor accepted, so both doors have to refuse.
   {
     const booting = new Manager({ space, servers: broker.servers, runtime: "pty", workspaceRoot });
+    (booting as unknown as { runtime: LegacyPtyRuntime }).runtime = new LegacyPtyRuntime();
     const doors = booting as unknown as {
       turnPendingFor: (c: { owner: string; actor: string; uid: string }) => unknown;
       serveTurnYield: (c: { owner: string; actor: string; uid: string }, raw: Record<string, unknown>) => Promise<{ goalId: string; state: string }>;
@@ -369,6 +375,7 @@ try {
   // since: a predecessor's oldest turn served last, by a queue whose whole job is oldest-first.
   {
     const adopting = new Manager({ space, servers: broker.servers, runtime: "pty", workspaceRoot });
+    (adopting as unknown as { runtime: LegacyPtyRuntime }).runtime = new LegacyPtyRuntime();
     const doors = adopting as unknown as {
       managerInstanceId: string;
       goalWriter?: unknown;

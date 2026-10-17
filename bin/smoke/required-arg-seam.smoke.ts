@@ -354,7 +354,8 @@ const SEAMS: Seam[] = [
   // hosted-retirement-stock-supervise.acceptance.smoke.ts (+3 smoke sites),
   // implementations/auth/src/service.ts (+1 typechecked), and
   // implementations/runtime/src/run-command.ts (+1 typechecked): 164/122.
-  { fn: "standaloneConnectOpts", key: "tls", sites: 164, untypecheckedSites: 122 },
+  // custody-fail-closed.smoke.ts (+3 smoke sites): 167/125.
+  { fn: "standaloneConnectOpts", key: "tls", sites: 167, untypecheckedSites: 125 },
 ];
 
 /**

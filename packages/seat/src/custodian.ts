@@ -56,6 +56,8 @@ export interface CustodianTestSeam {
   holds?: Array<{ at: "before-fs" | "after-pin" | "unpinned"; reached: string; release: string }>;
   /** Fail startup at this point, after the child is pinned. */
   fail?: "after-pin" | "listen-error" | "after-bind";
+  /** Make the delayed SIGKILL of a graceful stop fail, as a send the kernel refused would. */
+  failEscalation?: boolean;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -393,6 +395,7 @@ async function serveSeat(
     killTimer = setTimeout(() => {
       if (!alive) return;
       try {
+        if (seam?.failEscalation) throw new Error("test seam: delayed SIGKILL send failed");
         child.signal("SIGKILL");
       } catch (e) {
         const note = `${JSON.stringify({ escalationFailed: (e as Error).message, childPid: proc.pid })}\n`;
