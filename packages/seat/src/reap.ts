@@ -1,14 +1,12 @@
-import { closeSync, constants, existsSync, fsyncSync, ftruncateSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
+import { closeSync, constants, existsSync, fsyncSync, ftruncateSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 import { join } from "node:path";
 import { assertSeatId, fencePath, readRecord, recordPath, socketPath, type SeatRecord } from "./record.js";
 import { RUN_MARKER_FLAG } from "./launcher.js";
-import { CONFIRM_TIMEOUT_MS, unsupportedTransport } from "./protocol.js";
+import { CONFIRM_TIMEOUT_MS, GRACE_MS, unsupportedTransport } from "./protocol.js";
 import { SeatClient } from "./client.js";
 import { tryLockFd } from "./peercred.js";
-
-/** A layer 3 seat cgroup. T5 builds it; until then a release that names one refuses. */
-export interface SeatCgroup { readonly path: string; readonly agentUid: number }
+import { assertSeatCgroup, killSeatCgroup, removeSeatCgroup, seatCgroupContained, seatCgroupPopulated, type SeatCgroup } from "./cgroup.js";
 
 /** `unprovable`: nothing on this host can prove the seat's processes gone. `members-remain`: a
  *  contained seat cgroup still held tasks at the bound. */
@@ -21,6 +19,24 @@ export type SeatReapEvidence =
 
 export interface SeatReapOpts {
   graceMs?: number;
+  /** The seat's derived cgroup. Contained, it decides the outcome before `record.json` is read. */
+  cgroup?: SeatCgroup;
+}
+
+// `undefined`: a concurrent reap or release removed the cgroup, so there is no seat cgroup to prove.
+async function reapCgroup(id: string, cg: SeatCgroup, graceMs: number): Promise<SeatReapEvidence | undefined> {
+  try {
+    killSeatCgroup(cg);
+    const deadline = Date.now() + graceMs;
+    while (seatCgroupPopulated(cg) && Date.now() < deadline) await sleep(25);
+    if (seatCgroupPopulated(cg)) throw new Error(`still reads populated 1 after ${graceMs}ms`);
+    removeSeatCgroup(cg);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return undefined;
+    return { outcome: "retained", reason: "members-remain", stop: "no-custodian", detail: `seat ${id} cgroup ${cg.path}${code ? ` (${code})` : ""}: ${(e as Error).message}` };
+  }
+  return { outcome: "reaped", detail: `seat ${id} cgroup ${cg.path} killed, read populated 0 and was removed` };
 }
 
 type StopResult = { stop: "requested" | "no-custodian" | "timeout"; error?: string };
@@ -95,10 +111,15 @@ export function censusCustodians(run?: string): CustodianSighting[] {
   return out;
 }
 
-/** Reap one seat. With no contained seat cgroup it sends no signal and never returns `reaped`: a
- *  record's pids and start tokens are agent-writable, so they can neither aim a send nor prove an exit. */
+/** Reap one seat. Only a contained seat cgroup can give `reaped`: a record's pids and start tokens
+ *  are agent-writable, so they can neither aim a send nor prove an exit. */
 export async function reapSeat(root: string, id: string, opts: SeatReapOpts = {}): Promise<SeatReapEvidence> {
   if (process.platform !== "linux") throw unsupportedTransport();
+  const cg = opts.cgroup;
+  if (cg !== undefined && existsSync(assertSeatCgroup(cg, id).path) && seatCgroupContained(cg)) {
+    const evidence = await reapCgroup(id, cg, opts.graceMs ?? GRACE_MS);
+    if (evidence !== undefined) return evidence;
+  }
   const path = recordPath(root, id);
   let rec: SeatRecord;
   try {
@@ -124,9 +145,49 @@ export async function reapSeat(root: string, id: string, opts: SeatReapOpts = {}
 
 export type SeatReleaseCheck = { ok: true; advisory: string } | { ok: false; reason: "populated" | "launch-in-progress"; detail: string };
 
-// Layer 3 is not built yet, so a caller that names a cgroup gets a refusal rather than a silent no-op.
-function refuseCgroup(opts: { cgroup?: SeatCgroup } | undefined): void {
-  if (opts?.cgroup !== undefined) throw new Error(`seat cgroup ${opts.cgroup.path}: layer 3 release is not supported by this build`);
+/** Test seam: pause a release between its `populated 0` read and its `rmdir`. */
+export interface ReleaseTestSeam {
+  afterPopulated?: { reached: string; release: string };
+}
+let releaseSeam: ReleaseTestSeam | undefined;
+export function setReleaseTestSeam(seam: ReleaseTestSeam | undefined): void {
+  releaseSeam = seam;
+}
+
+function populatedRefusal(id: string, cg: SeatCgroup, why: string): SeatReleaseCheck {
+  return { ok: false, reason: "populated", detail: `seat ${id} cgroup ${cg.path} ${why}; a member could start the seat again` };
+}
+
+// A cgroup that is already gone is empty: nothing can join a path that no longer exists.
+function readsPopulated(cg: SeatCgroup): boolean {
+  try {
+    return seatCgroupPopulated(cg);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw e;
+  }
+}
+
+/** Under the fence lock: an empty seat cgroup is removed, so a later join fails with `ENOENT`. */
+async function removeEmptyCgroup(id: string, cg: SeatCgroup): Promise<SeatReleaseCheck | undefined> {
+  if (readsPopulated(cg)) return populatedRefusal(id, cg, "reads populated 1");
+  const hold = releaseSeam?.afterPopulated;
+  if (hold) {
+    writeFileSync(hold.reached, String(process.pid));
+    const holdBy = Date.now() + CONFIRM_TIMEOUT_MS;
+    while (!existsSync(hold.release)) {
+      if (Date.now() >= holdBy) throw new Error("test seam release hold was never released");
+      await sleep(25);
+    }
+  }
+  try {
+    removeSeatCgroup(cg);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "EBUSY") return populatedRefusal(id, cg, "refused rmdir with EBUSY");
+    if (code !== "ENOENT") throw e;
+  }
+  return undefined;
 }
 
 function releaseAdvisory(root: string, id: string): string {
@@ -134,10 +195,12 @@ function releaseAdvisory(root: string, id: string): string {
   return `advisory, not proof: seat directory ${existsSync(join(root, id)) ? "present" : "absent"}; ${census} live custodian(s) on this host`;
 }
 
-/** Read-only: a fence another open file holds locked is a launch still in progress. */
+/** Read-only: a fence another open file holds locked is a launch still in progress, and a populated
+ *  seat cgroup is a seat that still runs. */
 export function checkSeatRelease(root: string, id: string, opts?: { cgroup?: SeatCgroup }): SeatReleaseCheck {
   if (process.platform !== "linux") throw unsupportedTransport();
-  refuseCgroup(opts);
+  const cg = opts?.cgroup === undefined ? undefined : assertSeatCgroup(opts.cgroup, id);
+  if (cg !== undefined && readsPopulated(cg)) return populatedRefusal(id, cg, "reads populated 1");
   const fence = fencePath(root, id);
   let fd: number;
   try {
@@ -154,10 +217,11 @@ export function checkSeatRelease(root: string, id: string, opts?: { cgroup?: Sea
   return { ok: true, advisory: releaseAdvisory(root, id) };
 }
 
-/** Seal the launch fence under its lock, so no launcher or custodian of this id can start a child. */
+/** Seal the launch fence under its lock, so no launcher or custodian of this id can start a child.
+ *  An empty seat cgroup is removed first, under the same lock; a populated one refuses. */
 export async function sealSeatLaunch(root: string, id: string, opts?: { cgroup?: SeatCgroup }): Promise<SeatReleaseCheck> {
   if (process.platform !== "linux") throw unsupportedTransport();
-  refuseCgroup(opts);
+  const cg = opts?.cgroup === undefined ? undefined : assertSeatCgroup(opts.cgroup, id);
   const fence = fencePath(root, id);
   const fd = openSync(fence, constants.O_RDWR | constants.O_CREAT, 0o644);
   try {
@@ -166,6 +230,8 @@ export async function sealSeatLaunch(root: string, id: string, opts?: { cgroup?:
       if (Date.now() >= deadline) return { ok: false, reason: "launch-in-progress", detail: `seat ${id} launch fence ${fence} stayed locked for ${CONFIRM_TIMEOUT_MS}ms; a launch is in progress` };
       await sleep(25);
     }
+    const refusal = cg === undefined ? undefined : await removeEmptyCgroup(id, cg);
+    if (refusal !== undefined) return refusal;
     ftruncateSync(fd, 0);
     writeSync(fd, "sealed", 0);
     fsyncSync(fd);

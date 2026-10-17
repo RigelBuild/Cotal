@@ -6,6 +6,7 @@ import { assertSeatId, capabilityToken, fencePath, recordPath, seatId, socketPat
 import { CONFIRM_TIMEOUT_MS, unattendedMs, assertSocketPathFits, unsupportedTransport } from "./protocol.js";
 import { tryLockFd } from "./peercred.js";
 import type { CustodianTestSeam } from "./custodian.js";
+import { createSeatCgroup, moveIntoSeatCgroup, ownCgroup, removeSeatCgroup, type SeatCgroup } from "./cgroup.js";
 
 export interface SeatLaunchSpec {
   command: string;
@@ -23,6 +24,9 @@ export interface LaunchSeatOpts {
    *  before its processes do. Omitted mints one here, as before. It names a directory under
    *  `root`, so it must carry the seat-id shape and must not already hold a record. */
   id?: string;
+  /** Layer 3: the manager's delegated cgroup. The seat cgroup `<base>/seat-<id>` must not exist yet;
+   *  the custodian is moved into it and spawns no child outside it. */
+  cgroupBase?: string;
 }
 
 function packageRoot(): string {
@@ -133,17 +137,49 @@ export function setCustodianTestSeam(seam: CustodianTestSeam | undefined): void 
   testSeam = seam;
 }
 
-/** `afterFence`: pause after creating the fence, before its lock. `failMkdir`: throw at the seat mkdir. */
+/** `afterFence`: pause after creating the fence, before its lock. `failMkdir`: throw at the seat mkdir.
+ *  `beforeMove`: pause after spawning the custodian, before moving it into the seat cgroup.
+ *  `failMove`: throw in place of that move. */
 export interface LauncherTestSeam {
   afterFence?: { reached: string; release: string };
   failMkdir?: boolean;
+  beforeMove?: { reached: string; release: string };
+  failMove?: boolean;
 }
 let launcherSeam: LauncherTestSeam | undefined;
 export function setLauncherTestSeam(seam: LauncherTestSeam | undefined): void {
   launcherSeam = seam;
 }
 
+// launchSeat is synchronous, so the hold sleeps in a child rather than on this event loop.
+function holdLauncher(hold: { reached: string; release: string }): void {
+  writeFileSync(hold.reached, String(process.pid));
+  const holdBy = Date.now() + CONFIRM_TIMEOUT_MS;
+  while (!existsSync(hold.release)) {
+    if (Date.now() >= holdBy) throw new Error("test seam launcher hold was never released");
+    spawnSync("sleep", ["0.025"], { stdio: "ignore" });
+  }
+}
+
 export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
+  const created: { cgroup?: SeatCgroup } = {};
+  try {
+    return launchInto(opts, created);
+  } catch (e) {
+    // rmdir only, never a kill: an empty cgroup goes, so a pending custodian finds it gone and exits.
+    if (created.cgroup) {
+      try {
+        removeSeatCgroup(created.cgroup);
+      } catch (rm) {
+        const code = (rm as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "EBUSY") throw rm;
+      }
+    }
+    throw e;
+  }
+}
+
+function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): SeatRecord {
   if (process.platform !== "linux") throw unsupportedTransport();
   mkdirSync(opts.root, { recursive: true, mode: 0o700 });
   const id = assertSeatId(opts.id ?? seatId());
@@ -156,16 +192,10 @@ export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
   const fence = fencePath(opts.root, id);
   // `wx+` (O_CREAT|O_EXCL, read-write): an existing fence is an id an earlier launch or release used.
   const fenceFd = openSync(fence, "wx+", 0o644);
+  let cgroup: SeatCgroup | undefined;
   try {
     const hold = launcherSeam?.afterFence;
-    if (hold) {
-      writeFileSync(hold.reached, String(process.pid));
-      const holdBy = Date.now() + CONFIRM_TIMEOUT_MS;
-      while (!existsSync(hold.release)) {
-        if (Date.now() >= holdBy) throw new Error("test seam launcher hold was never released");
-        spawnSync("sleep", ["0.025"], { stdio: "ignore" });
-      }
-    }
+    if (hold) holdLauncher(hold);
     const lockDeadline = Date.now() + CONFIRM_TIMEOUT_MS;
     while (!tryLockFd(fenceFd)) {
       if (Date.now() >= lockDeadline) throw new Error(`seat ${id} launch fence ${fence} stayed locked for ${CONFIRM_TIMEOUT_MS}ms; refusing to create the seat`);
@@ -173,6 +203,12 @@ export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
     }
     if (readFileSync(fenceFd, "utf8").trim() === "sealed") throw new Error(`seat ${id} launch fence ${fence} is sealed; the seat was released`);
     if (launcherSeam?.failMkdir) throw new Error("test seam: seat mkdir failed");
+    // Under the fence lock, so a release that sealed first leaves no cgroup to create.
+    if (opts.cgroupBase !== undefined) {
+      // A reap or release derives the path from its own base, so a seat under any other base is unreapable.
+      if (opts.cgroupBase !== ownCgroup()) throw new Error(`cgroup base ${opts.cgroupBase} is not this process's cgroup ${String(ownCgroup())}`);
+      cgroup = created.cgroup = createSeatCgroup(opts.cgroupBase, id, process.geteuid?.() ?? -1);
+    }
     mkdirSync(dirname(recPath), { mode: 0o700 });
   } finally {
     closeSync(fenceFd);
@@ -196,6 +232,7 @@ export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
     // Resolved HERE, not in the custodian: the custodian's environment is scrubbed to `PATH` plus the
     // run marker, so it cannot read an override the caller set.
     unattendedMs: unattendedMs(),
+    ...(cgroup ? { cgroup: cgroup.path } : {}),
     ...(testSeam ? { testSeam } : {}),
   });
   // Payload carries spec.env (provider keys) and the capability token.
@@ -222,6 +259,15 @@ export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
     /* child still holds the fd */
   }
   child.unref();
+  if (cgroup) {
+    const hold = launcherSeam?.beforeMove;
+    if (hold) holdLauncher(hold);
+    // A reap or release that removed the empty cgroup first makes this throw ENOENT; the custodian
+    // then sees the cgroup gone and exits with no child.
+    if (child.pid === undefined) throw new Error("custodian spawn returned no pid; no seat cgroup move");
+    if (launcherSeam?.failMove) throw new Error("test seam: seat cgroup move failed");
+    moveIntoSeatCgroup(cgroup, child.pid);
+  }
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     try {

@@ -1,4 +1,5 @@
 import { appendFileSync, chmodSync, closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { inSeatCgroup } from "./cgroup.js";
 import { createServer, type Socket } from "node:net";
 import { dropPidfdForTest, spawnPinned, type PinnedPty } from "./pty.js";
 import Headless from "@xterm/headless";
@@ -42,6 +43,8 @@ export interface CustodianLaunch {
    *  Resolved by the LAUNCHER, because the launcher scrubs the environment it hands this process
    *  (the child must not inherit the caller's), so an env override read here would never see one. */
   unattendedMs?: number;
+  /** The layer 3 seat cgroup the launcher moves this process into. No child is spawned outside it. */
+  cgroup?: string;
 }
 
 /** The stdin payload `launchSeat` writes: a launch plus the seam `setCustodianTestSeam` set. */
@@ -77,6 +80,7 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
   if (process.platform !== "linux") {
     throw new Error(`custody transport unsupported on ${process.platform}`);
   }
+  const startedAt = Date.now();
   const holdAt = async (at: "before-fs" | "after-pin" | "unpinned"): Promise<void> => {
     const hold = seam?.holds?.find((h) => h.at === at);
     if (!hold) return;
@@ -98,6 +102,16 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
     await sleep(25);
   }
   if (readFileSync(fenceFd, "utf8").trim() === "sealed") throw new Error(`launch fence ${launch.fence} is sealed; the seat was released, starting no child`);
+
+  // Membership is checked under the fence lock. A removed cgroup can never be joined, so it fails at once.
+  if (launch.cgroup !== undefined) {
+    const cgroup = { path: launch.cgroup };
+    while (!inSeatCgroup(cgroup)) {
+      if (!existsSync(cgroup.path)) throw new Error(`seat cgroup ${cgroup.path} was removed before this custodian joined it; starting no child`);
+      if (Date.now() >= startedAt + CONFIRM_TIMEOUT_MS) throw new Error(`custodian is not in seat cgroup ${cgroup.path} after ${CONFIRM_TIMEOUT_MS}ms; starting no child`);
+      await sleep(25);
+    }
+  }
 
   try {
     unlinkSync(launch.socket);
