@@ -3756,6 +3756,8 @@ export class Manager {
     if (!restart || !restart.armed || restart.recovering || a.terminalizing) return;
     const release = this.beginLifecycle();
     if (!release) return; // preservation owns the cut once the lifecycle fence closes
+    // The exited seat's controller; it must close on every outcome below so its custodian can settle.
+    const exited = a.handle;
     const now = Date.now();
     const limit = restart.policy?.restarts ?? SESSION_RESTART_LIMIT;
     const windowMs = restart.policy?.windowMs ?? SESSION_RESTART_WINDOW_MS;
@@ -3767,6 +3769,7 @@ export class Manager {
       restart.armed = false;
       this.freeSlot(a, true, supervised ? "supervise-crash-loop" : "pi-crash-loop");
       this.reapChildrenOf(this.managedPrincipal(a));
+      exited.release?.();
       release();
       return;
     }
@@ -3812,11 +3815,13 @@ export class Manager {
         }
         if (this.agents.get(a.name) !== a || a.terminalizing) {
           try { handle.stop({ graceful: false }); } catch { /* terminal path owns cleanup */ }
+          void handle.waitForExit?.().catch(() => undefined);
           return;
         }
         a.handle = handle;
         a.control = spec.control;
         replacement = undefined;
+        exited.release?.();
         restart.opts = opts;
         restart.recovering = false;
         await this.recordSlotRuntime(a);
@@ -3834,6 +3839,8 @@ export class Manager {
         // The replacement may be alive but unable to prove readiness. Stop it BEFORE
         // retiring credentials/durables; otherwise an untracked process survives under torn auth.
         try { replacement?.stop({ graceful: false }); } catch { /* terminal cleanup continues */ }
+        void replacement?.waitForExit?.().catch(() => undefined);
+        exited.release?.();
         this.freeSlot(a, true, supervised ? "supervise-recovery-failed" : "pi-recovery-failed");
         this.reapChildrenOf(this.managedPrincipal(a));
       } finally {
@@ -3868,6 +3875,8 @@ export class Manager {
       }
     }
     this.freeSlot(a, true, "process-exit");
+    // An open controller keeps the custodian resident; the stop paths close theirs in waitForExit.
+    a.handle.release?.();
     this.reapChildrenOf(this.managedPrincipal(a));
   }
 
