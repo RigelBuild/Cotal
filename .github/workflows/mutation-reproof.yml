@@ -46,11 +46,13 @@ jobs:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           set -euo pipefail
           # An upstream sync selects hundreds of fixtures and cannot finish in budget; the daily
           # --all sweep on rigel-release grades it after the merge.
-          if [ "$EVENT" = pull_request ] && [[ "$HEAD_REF" == */rig-5440-upstream-sync ]]; then
+          if [ "$EVENT" = pull_request ] && [ "$HEAD_REPO" = "$GITHUB_REPOSITORY" ] \
+            && [ "$HEAD_REF" = harness/rig-5440-upstream-sync ]; then
             echo "upstream sync PR ($HEAD_REF): changed-fixture reproof skipped"
             echo "shards=[]" >> "$GITHUB_OUTPUT"
             exit 0
