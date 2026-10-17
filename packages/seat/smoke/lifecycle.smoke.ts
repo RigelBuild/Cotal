@@ -651,52 +651,51 @@ await h.waitForExit();
     );
   }
   {
-    const dir = mkdtempSync(join(root, "setsid-escapee-"));
-    const childPidPath = join(dir, "child.pid");
-    const grandchildPidPath = join(dir, "grandchild.pid");
-    const child = spawn(process.execPath, [
-      "-e",
-      "const {spawn}=require('node:child_process'); const fs=require('node:fs'); const [childFile,grandFile]=process.argv.slice(1); fs.writeFileSync(childFile,String(process.pid)); const g=spawn(process.execPath,['-e',\"require('node:fs').writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)\",grandFile],{detached:true,stdio:'ignore'}); g.unref(); setTimeout(()=>process.exit(0),300);",
-      childPidPath,
-      grandchildPidPath,
-    ], { stdio: "ignore" });
-    child.unref();
-    const childPid = child.pid;
-    if (childPid === undefined) throw new Error("setsid fixture child did not expose its pid");
+    // A dead leader leaves no generation witness for its numeric group. Retain custody
+    // rather than signalling members whose relationship to the recorded leader is unproved.
+    const rec = launchSeat({
+      root,
+      name: "dead-leader-grandchild",
+      spec: {
+        command: process.execPath,
+        args: ["-e", "const c = require('child_process').spawn(process.execPath, ['-e', 'process.on(\"SIGHUP\", ()=>{}); setInterval(()=>{},1000)'], { stdio: 'ignore' }); c.on('spawn', () => { setTimeout(() => process.exit(0), 100); });"],
+        env: { PATH: process.env.PATH ?? "" },
+      },
+      cwd: process.cwd(),
+    });
+    await until(() => state(rec.childPid) === "gone" || state(rec.childPid) === "Z", 5_000);
+    await until(() => state(rec.custodianPid) === "gone" || state(rec.custodianPid) === "Z", 5_000);
+    const membersBefore = readdirSync("/proc").filter((e) => /^\d+$/.test(e)).filter((e) => {
+      try {
+        const stat = readFileSync(`/proc/${e}/stat`, "utf8");
+        return stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[2] === String(rec.childPid);
+      } catch {
+        return false;
+      }
+    });
+    const owned = membersBefore.map((pid) => ({ pid: Number(pid), start: processStartToken(Number(pid)) }));
+    check("instrument: grandchild lives after leader exit", owned.length >= 1 && owned.every((p) => p.start !== undefined), owned);
+    const realKill = process.kill;
+    const attempted: number[] = [];
+    let retainedUnprovable = false;
+    let reapError: string | undefined;
+    process.kill = ((pid: number) => {
+      attempted.push(pid);
+      throw new Error("fixture intercepted an unexpected signal");
+    }) as typeof process.kill;
     try {
-      const childReady = await until(() => existsSync(childPidPath), 2_000);
-      const grandchildReady = await until(() => existsSync(grandchildPidPath), 2_000);
-      const grandchildPid = Number(readFileSync(grandchildPidPath, "utf8"));
-      const grandchildStart = processStartToken(grandchildPid);
-      check("setsid escapee fixture: grandchild starts in a new session", childReady && grandchildReady && state(grandchildPid) !== "gone", { childPid, grandchildPid });
-      const id = seatId();
-      const boot = bootToken();
-      const childStart = processStartToken(childPid);
-      const record: SeatRecord = {
-        version: 1,
-        id,
-        name: "setsid-escapee",
-        socket: join(root, id, "missing-seat.sock"),
-        token: "missing-token",
-        custodianPid: childPid,
-        childPid,
-        ...(childStart === undefined ? {} : { custodianStart: childStart, childStart }),
-        ...(boot === undefined ? {} : { bootId: boot }),
-      };
-      mkdirSync(join(root, id), { recursive: true, mode: 0o700 });
-      writeFileSync(join(root, id, "record.json"), `${JSON.stringify(record)}\n`);
-      await until(() => isGone(childPid), 2_000);
-      const evidence = await reapSeat(root, id, { graceMs: 100 }).catch((e: Error) => e);
-      check(
-        "a setsid escapee keeps the reap retained and is never signalled",
-        !(evidence instanceof Error) && evidence.outcome === "retained" && evidence.reason === "unprovable" && evidence.stop === "no-custodian" && state(grandchildPid) !== "gone" && state(grandchildPid) !== "Z",
-        { evidence: evidence instanceof Error ? evidence.message : evidence, grandchild: state(grandchildPid) },
-      );
-      killOwned(grandchildPid, grandchildStart);
-      await until(() => isGone(grandchildPid), 2_000);
+      const evidence = await reapSeat(root, rec.id);
+      retainedUnprovable = evidence.outcome === "retained" && evidence.reason === "unprovable";
+    } catch (e) {
+      reapError = e instanceof Error ? e.message : String(e);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      process.kill = realKill;
     }
+    check("dead-leader group reap returns retained/unprovable evidence", retainedUnprovable, reapError);
+    check("surviving dead-leader group members keep identity and receive no signal",
+      attempted.length === 0 && owned.every((p) => p.start !== undefined && processStartToken(p.pid) === p.start),
+      { attempted, owned });
+    for (const p of owned) killOwned(p.pid, p.start);
   }
 
 
@@ -849,6 +848,31 @@ await h.waitForExit();
     let refused = "";
     try { launchSeat({ root, name: "sealed", id: again, spec: { command: process.execPath, args: ["-e", ""], env: { PATH: process.env.PATH ?? "" } }, cwd: process.cwd() }); } catch (e) { refused = (e as Error).message; }
     check("a launch over an existing fence creates no seat directory", refused !== "" && !existsSync(join(root, again)), refused);
+  }
+
+  {
+    // A custodian that refuses before it spawns frees the launch files: no child will ever read them,
+    // and the launcher handed them over once the custodian process existed.
+    const dir = mkdtempSync(join(root, "t1-seal-artifacts-"));
+    const reached = join(dir, "reached");
+    const release = join(dir, "release");
+    const artifact = mkdtempSync(join(tmpdir(), "cotal-seal-artifact-"));
+    writeFileSync(join(artifact, "persona.md"), "private\n");
+    const id = seatId();
+    onReached(reached, 'printf sealed > "$2"; : > "$3"', join(root, `.launch-${id}`), release);
+    setCustodianTestSeam({ holds: [{ at: "before-fs", reached, release }] });
+    let err = "";
+    try {
+      const rec = launchSeat({ root, name: "t1-seal-artifacts", id, spec: { command: process.execPath, args: ["-e", ""], env: { PATH: process.env.PATH ?? "" }, artifacts: [artifact] }, cwd: process.cwd() });
+      strays.push({ pid: rec.custodianPid, start: rec.custodianStart }, { pid: rec.childPid, start: rec.childStart });
+    } catch (e) {
+      err = (e as Error).message;
+    } finally {
+      setCustodianTestSeam(undefined);
+    }
+    const gone = await until(() => !existsSync(artifact), 5_000);
+    check("a custodian refused at its fence removes the launch artifacts it was handed", /is sealed/.test(err) && gone, { err, artifact: existsSync(artifact) });
+    rmSync(artifact, { recursive: true, force: true });
   }
 
   // ── T4 operator release ────────────────────────────────────────────────────

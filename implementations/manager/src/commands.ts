@@ -747,10 +747,9 @@ async function runDeregisterInstance(args: ParsedArgs): Promise<void> {
 }
 
 /**
- * `cotal seats`: the custody records an earlier Linux manager left when the pty runtime still
- * started a detached custodian per seat (#1391). Read-only unless `--drain`, which retires each seat
- * whose agent has exited and keeps every seat whose agent still runs. A refusal exits non-zero: it is
- * a record nothing could prove safe to remove, so an operator has to look at it.
+ * `cotal seats` lists Linux seat custody records. With `--drain`, it tries to reap seats whose
+ * child has exited. Without contained cgroup proof they stay retained; reaped records need an
+ * explicit release.
  */
 async function runSeats(args: ParsedArgs): Promise<void> {
   const root = custodyRoot();
@@ -829,8 +828,8 @@ const managerCommands: Command[] = [
     name: "seats",
     group: "Manager",
     summary:
-      "list the pty seat custodians an earlier Linux manager left on this machine - [--drain] retires each seat whose agent has exited and never signals one whose agent still runs",
-    flags: [{ name: "drain", type: "boolean", description: "retire every seat whose agent has exited; a seat whose agent still runs is kept" }],
+      "list Linux pty seat custody records - [--drain] tries to reap exited seats; without contained cgroup proof they stay retained",
+    flags: [{ name: "drain", type: "boolean", description: "try to reap exited seats; without contained cgroup proof they stay retained" }],
     run: runSeats,
   },
 ];

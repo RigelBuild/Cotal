@@ -51,19 +51,19 @@ silent degrade. First use of the helper is the right place for that refusal.
 
 The launcher owns no PTY and exits after writing a permissioned per-seat record. Each custodian
 owns exactly one pinned PTY child, its screen mirror, and exit observation; every signal it sends
-goes through the child's pidfd, never a bare pid. A manager worker connects to that custodian over a 0600 filesystem Unix socket
-authenticated by `SO_PEERCRED` uid match plus a per-seat capability token. Path possession is
-not enough. Child exit is pushed to every authenticated controller socket. After the child
-exits and the last authenticated client disconnects, the custodian closes the Unix server, unlinks the
-socket, keeps the record, and exits. The custody record stays until `reapSeat` proves the seat
-gone through its contained cgroup. An active child, or a still-connected observer of an exited
-child, keeps the process. A connected socket that never authenticated does not: it owns no
-session, no output subscription and no wait, so a settle owes it nothing. A seat whose child has
-already exited at listen stays up briefly so the launcher can adopt it.
+goes through the child's pidfd, never a bare pid. A manager worker connects to that custodian over
+a 0600 filesystem Unix socket authenticated by `SO_PEERCRED` uid match plus a per-seat capability
+token. Path possession is not enough. Child exit is pushed to every authenticated controller socket.
+After the child exits and the last authenticated client disconnects, the custodian closes the Unix
+server, unlinks the socket, keeps the record, and exits. An active child, or a still-connected
+observer of an exited child, keeps the process. A connected socket that never authenticated does
+not: it owns no session, no output subscription and no wait, so a settle owes it nothing. A seat
+whose child has already exited at listen stays up briefly so the launcher can adopt it.
 
-A reap never signals a numeric pid or process group. With a contained seat cgroup it kills and
-empties that cgroup and only then removes the record. Without one it asks the custodian to stop
-over its socket, and the seat is retained: the record stays on disk until an operator releases it.
+A reap never signals a numeric pid or process group. It proves a seat gone only through its
+contained cgroup. Without that proof it returns retained/unprovable, requesting a custodian stop
+when it can read the record. A reaped seat's record stays until explicit release with
+`removeSeatCustody`.
 
 A custodian with no authenticated controller stops its child and exits after `UNATTENDED_MS`
 (ten minutes, overridable at launch with `COTAL_SEAT_UNATTENDED_MS`). The window restarts at each

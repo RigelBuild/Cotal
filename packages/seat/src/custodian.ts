@@ -1,7 +1,7 @@
 import { appendFileSync, chmodSync, closeSync, existsSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { inSeatCgroup } from "./cgroup.js";
 import { createServer, type Socket } from "node:net";
-import { dropPidfdForTest, spawnPinned, type PinnedPty } from "./pty.js";
+import { dropPidfdForTest, NoChildStarted, spawnPinned, type PinnedPty } from "./pty.js";
 import Headless from "@xterm/headless";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { discardSeatArtifacts } from "./artifacts.js";
@@ -107,32 +107,6 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
   };
   await holdAt("before-fs");
 
-  // Admission. Read-only and without O_CREAT: a fence that is gone admits nothing, and the read goes
-  // through this fd so a rename after the open cannot hide a seal.
-  const fenceFd = openSync(launch.fence, "r");
-  const admitBy = Date.now() + CONFIRM_TIMEOUT_MS;
-  while (!tryLockFd(fenceFd)) {
-    if (Date.now() >= admitBy) throw new Error(`launch fence ${launch.fence} stayed locked for ${CONFIRM_TIMEOUT_MS}ms; starting no child`);
-    await sleep(25);
-  }
-  if (readFileSync(fenceFd, "utf8").trim() === "sealed") throw new Error(`launch fence ${launch.fence} is sealed; the seat was released, starting no child`);
-
-  // Membership is checked under the fence lock. A removed cgroup can never be joined, so it fails at once.
-  if (launch.cgroup !== undefined) {
-    const cgroup = { path: launch.cgroup };
-    while (!inSeatCgroup(cgroup)) {
-      if (!existsSync(cgroup.path)) throw new Error(`seat cgroup ${cgroup.path} was removed before this custodian joined it; starting no child`);
-      if (Date.now() >= startedAt + CONFIRM_TIMEOUT_MS) throw new Error(`custodian is not in seat cgroup ${cgroup.path} after ${CONFIRM_TIMEOUT_MS}ms; starting no child`);
-      await sleep(25);
-    }
-  }
-
-  try {
-    unlinkSync(launch.socket);
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-  }
-
   const note = (line: string): void => {
     try {
       if (launch.logPath) appendFileSync(launch.logPath, line, { mode: 0o600 });
@@ -151,23 +125,54 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
     }
   };
 
+  // Every throw from here to the spawn starts no child, so none will read the files. The launcher
+  // handed them over once it spawned this process, and no record exists for a reap to remove them.
   let confirmGate: StartupConfirmGate | undefined;
+  let fenceFd: number;
+  let custodianStart: string;
+  let bootId: string | undefined;
   try {
+    // Admission. Read-only and without O_CREAT: a fence that is gone admits nothing, and the read goes
+    // through this fd so a rename after the open cannot hide a seal.
+    fenceFd = openSync(launch.fence, "r");
+    const admitBy = Date.now() + CONFIRM_TIMEOUT_MS;
+    while (!tryLockFd(fenceFd)) {
+      if (Date.now() >= admitBy) throw new Error(`launch fence ${launch.fence} stayed locked for ${CONFIRM_TIMEOUT_MS}ms; starting no child`);
+      await sleep(25);
+    }
+    if (readFileSync(fenceFd, "utf8").trim() === "sealed") throw new Error(`launch fence ${launch.fence} is sealed; the seat was released, starting no child`);
+
+    // Membership is checked under the fence lock. A removed cgroup can never be joined, so it fails at once.
+    if (launch.cgroup !== undefined) {
+      const cgroup = { path: launch.cgroup };
+      while (!inSeatCgroup(cgroup)) {
+        if (!existsSync(cgroup.path)) throw new Error(`seat cgroup ${cgroup.path} was removed before this custodian joined it; starting no child`);
+        if (Date.now() >= startedAt + CONFIRM_TIMEOUT_MS) throw new Error(`custodian is not in seat cgroup ${cgroup.path} after ${CONFIRM_TIMEOUT_MS}ms; starting no child`);
+        await sleep(25);
+      }
+    }
+
+    try {
+      unlinkSync(launch.socket);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    }
+
     // Built before the child exists, so a prompt that cannot match starts nothing.
     if (launch.confirmBefore?.length && launch.confirm === undefined) throw new Error("startup choices require a final confirmation prompt");
     confirmGate = launch.confirm === undefined ? undefined : new StartupConfirmGate(launch.confirm, launch.confirmBefore);
+    // Read before the spawn so a missing custodian identity fails with no child.
+    const start = processStartToken(process.pid);
+    if (start === undefined) throw new Error(`cannot read the process start identity of custodian ${process.pid} from /proc`);
+    custodianStart = start;
+    bootId = bootToken();
+
+    if (seam?.dropPidfd) dropPidfdForTest();
+    if (typeof launch.args === "string") throw new Error("args as a string is not supported on unix.");
   } catch (e) {
-    // No child was started, so none will read the files.
     discardArtifacts(launch.artifacts);
     throw e;
   }
-  // Read before the spawn so a missing custodian identity fails with no child.
-  const custodianStart = processStartToken(process.pid);
-  if (custodianStart === undefined) throw new Error(`cannot read the process start identity of custodian ${process.pid} from /proc`);
-  const bootId = bootToken();
-
-  if (seam?.dropPidfd) dropPidfdForTest();
-  if (typeof launch.args === "string") throw new Error("args as a string is not supported on unix.");
   // A throw here sends nothing: without a pidfd this process cannot name the child, and its exit
   // hangs up the PTY instead.
   let proc: PinnedPty;
@@ -180,6 +185,9 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
       env: launch.env,
     });
   } catch (e) {
+    // Only a fork proved never to have run frees the files. Any other throw may come after the fork
+    // (an unpinned child), which can still be reading them, so they stay.
+    if (e instanceof NoChildStarted) discardArtifacts(launch.artifacts);
     await holdAt("unpinned");
     throw e;
   }

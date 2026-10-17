@@ -19,7 +19,7 @@ export const QUARANTINED = {
   "smoke:required-arg-seam": { reason: "upstream: call-site pins 229/179 vs 247/193 and an unverifiable tls site in control-target.ts on pristine main; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:instrument-instance-pin": { reason: "upstream: red on main CI runs 38756147210 and 38753177566; 2/61 fail locally on the merge; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:custody-exit-proof": { reason: "upstream asserts a numeric pid/pgid reap that the fork's custody contract (#72/#73) forbids; quarantined on sync per Matt", recheckBy: "2026-12-31" },
-  "smoke:seat-reap-group-identity": { reason: "upstream asserts a numeric pid/pgid reap that the fork's custody contract (#72/#73) forbids; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:seat-reap-group-identity": { reason: "upstream's 'ambiguous group ownership refuses reaping' cell expects a thrown refusal; the fork's custody contract (#72/#73) returns retained/unprovable evidence instead; quarantined unchanged on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:freeslot-barrier:live": { reason: "upstream expects a static orphan with no custody reference to retire; the fork's custody contract (#72/#73) refuses an unproven reap; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:seat-exit-cause": { reason: "upstream: TypeError reading allowSubscribe on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:sys-rotation-e2e": { reason: "upstream: a plain cotal up no longer reports Started nats-server on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },

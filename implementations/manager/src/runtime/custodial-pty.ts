@@ -27,11 +27,8 @@ function envAgentUid(): number | undefined {
 }
 
 /**
- * Linux custodial pty: a one-shot launcher starts a detached per-seat
- * custodian, then this process holds only a proxy AgentHandle.
- * `createRuntime("pty")` no longer spawns through this class (#1391); it uses
- * it only to adopt and reap seats a pre-repair manager left running. Spawn and
- * adopt throw the named transport error off Linux.
+ * Linux pty runtime. Each seat runs under a detached custodian.
+ * Linux `createRuntime("pty")` selects this class. Off Linux, spawn and adopt throw.
  */
 export class CustodialPtyRuntime implements ReleasableRuntime {
   readonly kind = "pty" as const;

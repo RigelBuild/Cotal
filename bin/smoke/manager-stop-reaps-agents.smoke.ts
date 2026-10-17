@@ -27,8 +27,8 @@
  *
  * What runs here:
  *   SPARE phase: manager up over the custodial pty runtime, one live managed seat, then a plain
- *   `mgr.stop()`. The seat process and minted creds remain. The default pty runtime keeps each
- *   PTY inside the manager process, so its seats cannot be spared and stop with it (#2440).
+ *   `mgr.stop()`. The seat process and minted creds remain. On Linux, each seat runs under a
+ *   detached custodian, so it can outlive the manager.
  *   REAP phase: a second manager on a separate root, `stop({ withAgents: true })`. That seat is
  *   dead and its terminal ran; on the custodial pty it RETAINS (no cgroup proof), keeping creds.
  *   A failed run then prints the delivery daemon's state before teardown kills it: exited (code and

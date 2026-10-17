@@ -57,7 +57,7 @@ import { requestDeliveryAdminZeroMemberships } from "./_fake-delivery-admin.js";
 let failures = 0;
 let ran = 0;
 /** Intent, not a measurement: one per cell assertion below. A shortfall means a cell stopped running. */
-const EXPECTED_CHECKS = 22;
+const EXPECTED_CHECKS = 24;
 function check(label: string, cond: boolean, extra?: unknown): void {
   console.log(`${cond ? "✓" : "✗"} ${label}${cond ? "" : ` — ${JSON.stringify(extra) ?? ""}`}`);
   ran++;
@@ -79,7 +79,7 @@ const space = `custody-${randomUUID().slice(0, 8)}`;
 const auth = await createSpaceAuth(space);
 const { servers: SERVERS, stop: stopBroker } = await bootBroker(auth);
 const workspaceRoot = mkdtempSync(join(tmpdir(), "cotal-custody-ws-"));
-const ALIASES = ["retainer", "membersok", "membersmax", "predkept", "fatalres", "failrestart", "othref", "lateref", "membersweep", "clearme", "laterfail", "retryret", "retrymove", "escalate", "rekick"];
+const ALIASES = ["retainer", "membersok", "membersmax", "predkept", "fatalres", "failrestart", "othref", "lateref", "membersweep", "clearme", "laterfail", "retryret", "retrymove", "escalate", "rekick", "unres", "unresfail"];
 mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
 for (const alias of ALIASES)
   writeFileSync(join(workspaceRoot, ".cotal", "agents", `${alias}.md`), `---\nname: ${alias}\nrole: worker\nsubscribe: [general]\nallowSubscribe: [general]\nallowPublish: [general]\n---\nbody\n`);
@@ -515,6 +515,48 @@ try {
     const after = M.managerStatusData().staticReconciliation.retainedCustody;
     check(`retry from retained, row ${label}: retainedReason${label === "retired" ? " and remedy are" : " is"} cleared and retainedCustody drops it`,
       it !== undefined && it.retainedReason === undefined && (label === "moved" || it.remedy === undefined) && after === counted - 1, { it, counted, after });
+  }
+
+  // ── An unreserved runtime's restart records the replacement's reference, or stops it ──────
+  {
+    // A runtime that names its seats but reserves nothing (as tmux does): the row learns the
+    // replacement's reference only after the spawn.
+    const spawned: AgentHandle[] = [];
+    M.runtime = {
+      kind: "pty",
+      spawn: (name: string) => {
+        const h = fakeHandle(name, { kind: "pty", id: randomUUID().replaceAll("-", "") });
+        spawned.push(h);
+        return h;
+      },
+    };
+    // A restart waits for a heartbeat newer than the exited seat's, so the roster must move.
+    const getRoster = M.ep.getRoster as () => Presence[];
+    M.ep.getRoster = (): Presence[] => getRoster().map((p) => ({ ...p, ts: Date.now() }));
+    try {
+      const a = await spawnLive("unres", true);
+      const prior = refOf(a);
+      M.onAgentExit(a);
+      await until(() => spawned.length === 2 && M.agents.get("unres")?.handle === spawned[1], 30_000);
+      const next = spawned[1]?.reference;
+      await until(async () => (await readSlot("unres"))?.runtime?.id === next?.id, 10_000);
+      const row = await readSlot("unres");
+      check("unreserved restart: the slot row names the replacement's reference, not the exited seat's",
+        next !== undefined && row?.runtime?.id === next.id && next.id !== prior.id, { row: row?.runtime, prior, next });
+
+      const b = await spawnLive("unresfail", true);
+      const before = spawned.length;
+      failSlotCasFor = "unresfail";
+      M.onAgentExit(b);
+      await until(() => spawned.length > before && !M.agents.has("unresfail"), 30_000);
+      const replacement = spawned[before];
+      check("unreserved restart, recording refused: the replacement is stopped through its handle and the seat is retired",
+        failSlotCasFor === undefined && replacement !== undefined && replacement.status() === "exited" && !M.agents.has("unresfail"),
+        { cas: failSlotCasFor, spawned: spawned.length - before, status: replacement?.status(), managed: M.agents.has("unresfail") });
+    } finally {
+      M.ep.getRoster = getRoster;
+      failSlotCasFor = undefined;
+    }
   }
 
   // ── Failed escalation (real custodial pty, no layer 3) ─────────────────────

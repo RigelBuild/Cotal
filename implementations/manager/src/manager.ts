@@ -600,7 +600,8 @@ export type FreeSlotCause =
   | "supervise-recovery-failed"
   | "session-bind-failed"
   | "resume-session-rebind-failed"
-  | "carried-fork-refused";
+  | "carried-fork-refused"
+  | "resume-custody-unrecorded";
 
 /** Operator-facing phrasing per cause. Kept beside the union so adding a member without a sentence
  *  is a type error rather than a blank in the log. The stop family's sentences carry the principal
@@ -615,6 +616,7 @@ const FREE_SLOT_CAUSE_TEXT: Record<Exclude<FreeSlotCause, FreeSlotStopCause>, st
   "session-bind-failed": "this manager stopped it: its host session could not be bound at launch",
   "resume-session-rebind-failed": "this manager stopped it: its host session could not be rebound on resume",
   "carried-fork-refused": "this manager stopped it: it recorded no fork of the carried transcript",
+  "resume-custody-unrecorded": "this manager stopped it: its custody reference could not be recorded on resume",
 };
 
 /** The stop family's sentences — the same job {@link FREE_SLOT_CAUSE_TEXT} does for the string
@@ -5128,6 +5130,11 @@ export class Manager {
         }
         a.handle = handle;
         a.control = spec.control;
+        // A runtime that names its seats without reserving the name (no custody reservation above)
+        // is recorded only now. Left unrecorded, the row keeps the exited seat's reference, and a
+        // successor would prove that one gone and retire the lifecycle over this live replacement.
+        // A refusal throws into the catch below, which stops the replacement through its handle.
+        if (custody === undefined) await this.recordSlotRuntime(a);
         replacement = undefined;
         exited.release?.();
         restart.opts = opts;
@@ -7092,6 +7099,16 @@ export class Manager {
       this.agents.set(entry.name, managed);
       this.reservedLive.add(entry.name);
       if (this.resumeAttemptId) this.resumedAgentNames.add(entry.name);
+      // As on restart: an unreserved runtime's reference is recorded once the seat exists. A row
+      // left on the previous seat's reference lets a successor retire this live one, so a refusal
+      // stops the seat here rather than leaving it running under a row that names another.
+      if (custody === undefined) {
+        try {
+          await this.recordSlotRuntime(managed);
+        } catch (error) {
+          return await this.stopFailedResume(managed, "resume-custody-unrecorded", `${managed.name} resumed, but ${rejectionText(error)}`);
+        }
+      }
       const readiness = await this.awaitReadiness(managed, readinessTimeoutMs);
       if (!readiness.ok && !readiness.uncertain) return { ok: false, error: readiness.detail };
       if (!readiness.ok) {
@@ -9360,8 +9377,18 @@ export class Manager {
     }
   }
 
-  /** Record a reserved reference on the ACTIVE slot before a restart or resume spawns. Fatal: any
-   *  refusal or lost CAS throws, so nothing spawns under a reference no row names. */
+  /** Re-record the custody reference of a managed agent's CURRENT handle on its active slot, after a
+   *  restart or resume spawned it under a runtime that reserved no reference first. A handle with
+   *  no reference records nothing (there is nothing to reap by reference). Throws like
+   *  {@link recordSlotCustody}; the caller stops the seat it just spawned. */
+  private async recordSlotRuntime(a: ManagedAgent): Promise<void> {
+    if (a.handle.reference === undefined) return;
+    await this.recordSlotCustody(a, a.handle.reference);
+  }
+
+  /** Record a reference on the ACTIVE slot: a reserved one before a restart or resume spawns, or an
+   *  unreserved handle's after. Fatal: any refusal or lost CAS throws, so no seat runs under a
+   *  reference no row names. */
   private async recordSlotCustody(a: { name: string; id: string; lifecycleUid: string }, runtime: RuntimeReference): Promise<void> {
     if (!this.auth || this.userMode) return;
     await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: a.id, lifecycleUid: a.lifecycleUid, alias: a.name }, async (t) => {
@@ -9369,7 +9396,7 @@ export class Manager {
       if (slot === undefined || slot.row.lifecycleUid !== a.lifecycleUid || slot.row.phase !== "active")
         throw new Error(
           `cannot record the custody reference ${runtime.kind}:${runtime.id} for "${a.name}": the static slot is ` +
-            `${slot === undefined ? "absent" : `${slot.row.phase} at uid ${slot.row.lifecycleUid}`}, not active at uid ${a.lifecycleUid}; nothing is spawned under an unrecorded reference`,
+            `${slot === undefined ? "absent" : `${slot.row.phase} at uid ${slot.row.lifecycleUid}`}, not active at uid ${a.lifecycleUid}`,
         );
       if (slot.row.runtime?.kind === runtime.kind && slot.row.runtime.id === runtime.id) return;
       await casStaticSlot(t, { ...slot.row, runtime }, slot.revision);

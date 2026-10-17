@@ -14,7 +14,6 @@ import {
 } from "@cotal-ai/core";
 import { CustodialPtyRuntime } from "./custodial-pty.js";
 import { LegacyPtyRuntime } from "./pty.js";
-import { unsupportedTransport } from "@cotal-ai/seat";
 
 export type { Runtime, RuntimeKind, AgentHandle, AttachSession } from "@cotal-ai/core";
 
@@ -128,27 +127,6 @@ export async function requireRuntimeReap(
   return evidence;
 }
 
-/**
- * The built-in `pty` runtime off Linux: it spawns in-process with no custodian and no `reserve`, so
- * the manager records no custody reference. Linux uses {@link CustodialPtyRuntime} directly.
- */
-class PtyRuntime extends LegacyPtyRuntime {
-  private custodial?: CustodialPtyRuntime;
-
-  private legacyCustody(): CustodialPtyRuntime {
-    if (process.platform !== "linux") throw unsupportedTransport();
-    return (this.custodial ??= new CustodialPtyRuntime());
-  }
-
-  override adopt(reference: RuntimeReference): AgentHandle {
-    return this.legacyCustody().adopt(reference);
-  }
-
-  reap(reference: RuntimeReference): Promise<RuntimeReapEvidence> {
-    return this.legacyCustody().reap(reference);
-  }
-}
-
 /** How a manager picks its backend. `auto` is the deterministic default — always `pty`. External
  *  runtimes are never auto-selected; choose one explicitly, which resolves
  *  the integration from the registry and fails loud if it isn't imported. No fallbacks. */
@@ -173,10 +151,9 @@ function createBackend(mode: RuntimeMode, session: string): Runtime {
           `where @lydell/node-pty's spawn-helper hangs before exec and every agent wedges at "starting…". ` +
           `Run the manager under node, or install and select an external runtime.`,
       );
-    // The fork's custody contract: every Linux seat runs under a custodian. Upstream's in-process
-    // default (#2351) would drop that, so PtyRuntime serves only the non-Linux path here.
+    // The fork's custody contract: every Linux seat runs under a custodian.
     if (process.platform === "linux") return new CustodialPtyRuntime();
-    return new PtyRuntime();
+    return new LegacyPtyRuntime();
   }
   let provider: RuntimeProvider;
   try {

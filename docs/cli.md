@@ -1592,25 +1592,24 @@ On a normal `SIGINT`/`SIGTERM`, the manager stops every seat and requires the se
 prove the seat is gone before it releases the manager lease or service registration. A stop that
 cannot prove exit fails loud and keeps manager authority instead of reporting a clean shutdown while
 an orphan still holds broker rails. When the runtime refuses the stop itself, the shutdown fails at
-once and its error names the refusal as `stop failed: <message>`. After an abrupt manager death, the same logical successor
-terminalizes only its own durable static slots, verify-evicts the predecessor's broker principal,
-records that result in the lifecycle's caller-readable audit detail, reaps the predecessor's seat
-process through the runtime's custody reference recorded on the slot (the pty runtime verifies the
-process start identity in its seat record, so a reused pid is never signalled), and only then
-retires the lifecycle and frees the alias. A runtime that custodies its seats reserves that
-reference before it launches one, and the manager records it on the slot's first durable row, so a
-manager that dies part-way through a spawn also leaves a seat its successor can address. A
-same-lifecycle restart or a resume records the new seat's reference on the slot the same way, and
-when the slot does not take it the restart or resume fails and stops any seat it started, so the
-slot never names a seat that has already exited while its replacement runs. A resumed seat keeps
-its retained credentials, so the resume frees it only once its exit is proved; a seat whose stop
-cannot be proved stays managed, and the resume's error says so, naming a stop the runtime refused
-as `stop failed: <message>`. A spawn
-that launched its seat and then failed is rolled back by the manager that launched it, and that
-rollback reaps the seat through the same reserved reference before the lifecycle retires. Missing or unverified broker evidence keeps the slot
-terminalizing, and so does a runtime that cannot reap by reference. While the name stays held, a
-same-name spawn or a resume re-drives that teardown with the same recorded reference, so it reaps
-the seat again or keeps the name held.
+once and its error names the refusal as `stop failed: <message>`. After an abrupt manager death, the
+same logical successor terminalizes only its own durable static slots. It verify-evicts the
+predecessor's broker principal and records that result in the lifecycle's caller-readable audit
+detail. It reaps the predecessor's seat through its custody reference on the slot. The pty runtime
+proves the seat gone only through its contained cgroup. Without one, it stays retained as
+unprovable. No numeric pid or process group is signalled. The custodian signals its child through a
+pidfd. The successor retires the lifecycle and frees the alias only after the seat is proved gone.
+The seat record stays until explicit release calls `removeSeatCustody`.
+
+A runtime that custodies its seats reserves the reference before launch and records it on the slot's
+first durable row. A successor can then address a seat if its manager dies during spawn. A restart
+or resume records the new seat's reference on the slot. If the slot does not take it, that operation
+fails and stops the seat it started. The slot never names an exited seat while its replacement runs.
+A resumed seat keeps its credentials until its exit is proved. If the stop cannot be proved, the seat
+stays managed and the resume error names the refusal as `stop failed: <message>`. A failed spawn is
+rolled back by the manager that launched it, which reaps through the same reserved reference before
+the lifecycle retires. Missing broker evidence, or a runtime that cannot reap by reference, keeps the
+slot terminalizing. A same-name spawn or resume re-drives teardown with the same reference.
 
 A `meshes add --mode user` entry is a **participant** registration, not hosting authority. A
 participant may run `supervise` only when the host advertises the remote manager authority service
@@ -1940,30 +1939,29 @@ cotal seats [--drain]
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--drain` | off | Retire every seat whose agent has exited. A seat whose agent still runs is kept |
+| `--drain` | off | Try to reap exited seats. Without contained cgroup proof, the seat stays retained |
 
-The pty runtime used to start a detached custodian process for every Linux seat. It now spawns
-in-process, but custodians that an earlier manager started keep running, and one whose agent has
-exited stays resident while a manager still holds its connection. This command lists the custody
-records under `COTAL_SEAT_ROOT` (default `~/.cotal/seats`), one line per seat:
+The Linux pty runtime starts each seat under a detached custodian and reports custody as
+`custodied`. Off Linux, it spawns in-process with no custodian and reports `legacy`. Custodians
+started by an earlier manager keep running, and one whose agent has exited stays resident while a
+manager still holds its connection. This command lists custody records under `COTAL_SEAT_ROOT`
+(default `~/.cotal/seats`), one line per seat:
 
 | State | Meaning |
 |---|---|
 | `live-child` | The agent process still runs. The seat is never signalled, and a manager can still adopt it |
-| `childless` | The agent has exited, or the record comes from an earlier boot. `--drain` retires the seat |
-| `drained` | `--drain` proved the custodian and the agent gone and removed the record |
-| `refused` | The record cannot be read, carries no start or boot identity, this host publishes no boot identity, or the reap could not prove the processes gone. The record stays on disk |
+| `childless` | The agent exited, or the record is from an earlier boot. Without proof, it stays retained |
+| `drained` | A contained cgroup proved the seat gone. The record stays until explicit release |
+| `refused` | Unreadable or incomplete identity, no host boot identity, or unproved reap; the record stays on disk |
 
-A drain signals only a custodian whose recorded start identity still matches the live process, so
-a reused pid is never touched. No process outlives a reboot, so a record from an earlier boot is
-reported childless and `--drain` removes it without signalling anything. A record with no start or
-boot identity is refused with or without `--drain`, and is never reported as running or exited.
-On a host that publishes no boot identity (`/proc/sys/kernel/random/boot_id`) every record is
-refused the same way, because no record can be tied to this boot.
-That refusal and an unreadable record signal nothing. A refusal from the reap itself can come after the drain already
-sent `SIGKILL` to the custodian. Its detail names the pid or process group the reap could not prove
-gone, so check those processes before you retry. The command exits non-zero when any record is
-refused. It is Linux-only and throws on other platforms.
+A reap never signals a numeric pid or process group. The custodian signals its child through a
+pinned pidfd. Only a contained seat cgroup proves the seat gone; without one, the reap returns
+retained/unprovable, even if it requested a stop. A reaped seat's record stays until explicit
+release. A record from an earlier boot is reported childless and stays on disk after `--drain`. A
+record with no start or boot identity is refused and is never reported as running or exited. A host
+with no boot identity (`/proc/sys/kernel/random/boot_id`) refuses every record. These refusals and
+unreadable records signal nothing. The command exits non-zero when any record is refused. It is
+Linux-only and throws on other platforms.
 
 ## send
 

@@ -43,6 +43,22 @@ export function dropPidfdForTest(): void {
   dropPidfd = true;
 }
 
+/** Thrown by {@link spawnPinned} only when the fork is proved not to have started a child: the
+ *  vendored node-pty refused before forking, or forkpty(3) itself failed. Any other throw may leave a
+ *  child running (one is forked before the pidfd and nonblocking checks), so callers must treat it as
+ *  a possibly live child. */
+export class NoChildStarted extends Error {
+  override name = "NoChildStarted";
+}
+
+/** The vendored node-pty's throws that come before, or from, a failed fork (lib/unixTerminal.js and
+ *  src/unix/pty.cc). Matched exactly: an unknown message is never taken as proof of no child. */
+const PRE_FORK_ERRORS: Readonly<Record<string, true>> = {
+  "args as a string is not supported on unix.": true,
+  "Usage: pty.fork(file, args, env, cwd, cols, rows, uid, gid, utf8, helperPath, onexit)": true,
+  "forkpty(3) failed.": true,
+};
+
 /** The pidfd stays open for the life of this process, so a send after exit reports `gone`. One
  *  custodian process pins one child; this is not a pool API. */
 export function spawnPinned(
@@ -55,7 +71,13 @@ export function spawnPinned(
   const { UnixTerminal } = require(join(packageRoot, "native", "node-pty", "lib", "unixTerminal.js")) as {
     UnixTerminal: new (file: string, args: string[], opts: object) => UnixTerminal;
   };
-  const term = new UnixTerminal(file, args, opts);
+  let term: UnixTerminal;
+  try {
+    term = new UnixTerminal(file, args, opts);
+  } catch (e) {
+    if (e instanceof Error && Object.hasOwn(PRE_FORK_ERRORS, e.message)) throw new NoChildStarted(e.message, { cause: e });
+    throw e;
+  }
   const pidfd = dropPidfd ? undefined : term._pidfd;
   if (typeof pidfd !== "number")
     throw new Error(`the PTY fork returned no pidfd for child ${term.pid}; refusing to custody a child this process cannot name`);

@@ -14,10 +14,8 @@ const SCROLLBACK_ROWS = 1000;
 const GRACE_MS = 3_000;
 
 /**
- * In-process node-pty ownership. The worker is the child's parent, so killing
- * the worker kills the seat. `createRuntime("pty")` spawns here on every
- * platform; on Linux its subclass still adopts seats an earlier custodial
- * manager launched. This class's own `adopt` throws.
+ * In-process node-pty runtime used off Linux, with no custodian.
+ * Linux `createRuntime("pty")` uses `CustodialPtyRuntime`; `adopt` throws here.
  */
 export class LegacyPtyRuntime implements Runtime {
   readonly kind = "pty" as const;
