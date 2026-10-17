@@ -20,7 +20,7 @@
  * Run: pnpm smoke:manager-spawn-action   (needs nats-server + node on PATH; boots its own broker)
  */
 import { spawn as spawnProc, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,7 +33,7 @@ import {
   type ActionContext, type Connector, type EpCaller, type GoalRef, type LaunchOpts, type LaunchSpec,
 } from "@cotal-ai/core";
 import { recordMesh } from "@cotal-ai/workspace";
-import { censusCustodians, reapSeat, runMarker } from "@cotal-ai/seat";
+import { SeatClient, censusCustodians, loadSeat, runMarker } from "@cotal-ai/seat";
 import { Manager } from "../src/manager.js";
 import { MANAGER_ENDPOINT, MANAGER_CONTRACTS } from "../src/manager-service-contract.js";
 import { launchEnv } from "@cotal-ai/connector-core"; // dev-only smoke import: the OS env allow-list a real connector supplies
@@ -216,6 +216,19 @@ try {
     const rx = await callSpawn({ name: "x1", agent: "exit" });
     const fx = await followGoal(acc(rx).goalId as string, 12_000);
     check("M3 process exit -> failed", fx.terminal?.state === "failed", fx.terminal);
+    // The manager must let go of a seat whose child exited on its own. An authenticated controller
+    // holds a custodian open, so a handle it never closes pins that custodian (and its socket) for
+    // the rest of the manager's life; the record stays, the socket goes once the custodian settles.
+    const x1Seat = readdirSync(seatRoot).find((id) => {
+      try { return JSON.parse(readFileSync(join(seatRoot, id, "record.json"), "utf8")).name === "x1"; } catch { return false; }
+    });
+    let x1Settled = false;
+    for (let i = 0; i < 100 && x1Seat !== undefined; i++) {
+      if ((x1Settled = !existsSync(join(seatRoot, x1Seat, "seat.sock")))) break;
+      await wait(50);
+    }
+    check("M3 a seat whose child exited on its own is let go: its custodian settles while the manager runs",
+      x1Seat !== undefined && x1Settled, { seat: x1Seat });
 
     const rw = await callSpawn({ name: "w1", agent: "stuck" });
     const fw = await followGoal(acc(rw).goalId as string, 12_000);
@@ -382,16 +395,18 @@ try {
   // The M5 crash stop detached the FIRST manager's seats on purpose: its goal had to stay orphaned
   // so the successor reconciles it. That detached set is now this suite's to dispose of, and no
   // manager alive owns it - `mgr` here is the successor, whose `withAgents` stop above reaches only
-  // its own (zero) agents. The root is this run's alone, so every custody record still in it is a
-  // seat this run launched whose custodian is alive (a settled custodian removes its own record);
-  // reap each by record - the reap verifies process identity before it signals anything - rather
-  // than leaving nine custodians x ~65 MB to the 10-minute unattended window (#1791). A reap that
-  // cannot PROVE a seat gone throws, which fails the suite loudly instead of quietly leaking.
-  const unsettled = readdirSync(seatRoot).filter((id) => /^[0-9a-f]{32}$/.test(id) && existsSync(join(seatRoot, id, "record.json")));
-  for (const id of unsettled) await reapSeat(seatRoot, id, { graceMs: 5_000 });
-  check("teardown: no live seat is left behind (every remaining custody record was reaped)",
-    readdirSync(seatRoot).filter((id) => existsSync(join(seatRoot, id, "record.json"))).length === 0,
-    { root: seatRoot, left: readdirSync(seatRoot) });
+  // its own (zero) agents. The root is this run's alone, so every custody socket still in it is a
+  // seat this run launched whose custodian is alive (a settled custodian unlinks its socket but keeps
+  // its record). Stop each through that socket, which signals by pidfd, rather than leaving nine
+  // custodians x ~65 MB to the 10-minute unattended window (#1791); without a seat cgroup no reap
+  // can prove a seat gone, so the directories are removed by hand after.
+  const unsettled = readdirSync(seatRoot).filter((id) => /^[0-9a-f]{32}$/.test(id) && existsSync(join(seatRoot, id, "seat.sock")));
+  for (const id of unsettled) await stopSeat(id);
+  const liveSockets = (): string[] => readdirSync(seatRoot).filter((id) => existsSync(join(seatRoot, id, "seat.sock")));
+  for (let i = 0; i < 100 && liveSockets().length > 0; i++) await wait(50);
+  check("teardown: no live seat is left behind (every remaining seat was stopped through its socket)",
+    liveSockets().length === 0,
+    { root: seatRoot, left: liveSockets() });
   check("teardown: no custodian of this run outlives the suite (the CI shard-3 leak, as a cell)",
     censusCustodians(runMarker()).length === 0,
     { run: runMarker(), live: censusCustodians(runMarker()).map((c) => c.pid) });
@@ -399,6 +414,17 @@ try {
   await wait(200);
   rmSync(workspaceRoot, { recursive: true, force: true });
   rmSync(seatRoot, { recursive: true, force: true });
+}
+
+async function stopSeat(id: string): Promise<void> {
+  const client = new SeatClient(loadSeat(seatRoot, id));
+  try {
+    await client.connect();
+    await client.stop("hard");
+    await client.waitExit();
+  } finally {
+    client.close();
+  }
 }
 
 process.exit(fail > 0 ? 1 : 0);

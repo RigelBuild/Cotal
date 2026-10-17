@@ -2,8 +2,10 @@ import { spawn, spawnSync } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertSeatId, capabilityToken, recordPath, seatId, socketPath, type SeatRecord, readRecord } from "./record.js";
-import { unattendedMs, assertSocketPathFits, unsupportedTransport } from "./protocol.js";
+import { assertSeatId, capabilityToken, fencePath, recordPath, seatId, socketPath, type SeatRecord, readRecord } from "./record.js";
+import { CONFIRM_TIMEOUT_MS, unattendedMs, assertSocketPathFits, unsupportedTransport } from "./protocol.js";
+import { tryLockFd } from "./peercred.js";
+import type { CustodianTestSeam } from "./custodian.js";
 
 export interface SeatLaunchSpec {
   command: string;
@@ -124,6 +126,13 @@ function pidLive(pid: number | undefined): boolean {
   }
 }
 
+// Test seam: index.ts does not re-export this and the package `exports` map names only ".", so an
+// installed consumer cannot reach it.
+let testSeam: CustodianTestSeam | undefined;
+export function setCustodianTestSeam(seam: CustodianTestSeam | undefined): void {
+  testSeam = seam;
+}
+
 export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
   if (process.platform !== "linux") throw unsupportedTransport();
   mkdirSync(opts.root, { recursive: true, mode: 0o700 });
@@ -134,7 +143,20 @@ export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
   // A reserved id is spawned once. Reusing one would launch a second custodian over a live seat's
   // record, and the reference the manager already recorded would then address the wrong processes.
   if (existsSync(recPath)) throw new Error(`seat ${id} already holds a custody record at ${recPath}; a custody id is used for one launch`);
-  mkdirSync(dirname(recPath), { recursive: true, mode: 0o700 });
+  const fence = fencePath(opts.root, id);
+  // `wx+` (O_CREAT|O_EXCL, read-write): an existing fence is an id an earlier launch or release used.
+  const fenceFd = openSync(fence, "wx+", 0o644);
+  try {
+    const lockDeadline = Date.now() + CONFIRM_TIMEOUT_MS;
+    while (!tryLockFd(fenceFd)) {
+      if (Date.now() >= lockDeadline) throw new Error(`seat ${id} launch fence ${fence} stayed locked for ${CONFIRM_TIMEOUT_MS}ms; refusing to create the seat`);
+      spawnSync("sleep", ["0.025"], { stdio: "ignore" });
+    }
+    if (readFileSync(fenceFd, "utf8").trim() === "sealed") throw new Error(`seat ${id} launch fence ${fence} is sealed; the seat was released`);
+    mkdirSync(dirname(recPath), { mode: 0o700 });
+  } finally {
+    closeSync(fenceFd);
+  }
   const logPath = join(dirname(recPath), "custodian.log");
   const run = runMarker();
   const payload = JSON.stringify({
@@ -147,12 +169,14 @@ export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
     socket,
     token,
     recordPath: recPath,
+    fence,
     logPath,
     confirm: opts.spec.confirm,
     run,
     // Resolved HERE, not in the custodian: the custodian's environment is scrubbed to `PATH` plus the
     // run marker, so it cannot read an override the caller set.
     unattendedMs: unattendedMs(),
+    ...(testSeam ? { testSeam } : {}),
   });
   // Payload carries spec.env (provider keys) and the capability token.
   // argv is world-readable via /proc/<pid>/cmdline (0444). Inherit a 0600

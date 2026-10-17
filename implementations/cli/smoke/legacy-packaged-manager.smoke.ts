@@ -171,26 +171,28 @@ try {
       `clone manifest keeps ${unresolvable.length} workspace: dependency the hand-built node_modules cannot resolve: ${unresolvable.map(([name]) => name).join(", ")}`,
     );
     const cloneModules = join(clone, "node_modules");
-    mkdirSync(join(cloneModules, "@lydell"), { recursive: true });
     mkdirSync(join(cloneModules, "@types"), { recursive: true });
     mkdirSync(join(cloneModules, "@xterm"), { recursive: true });
     mkdirSync(join(cloneModules, ".bin"), { recursive: true });
-    symlinkSync(join(repo, dir, "node_modules", "@lydell", "node-pty"), join(cloneModules, "@lydell", "node-pty"), "dir");
     for (const name of ["addon-serialize", "headless"])
       symlinkSync(join(repo, dir, "node_modules", "@xterm", name), join(cloneModules, "@xterm", name), "dir");
     symlinkSync(join(repo, "node_modules", "@types", "node"), join(cloneModules, "@types", "node"), "dir");
     symlinkSync(join(repo, "node_modules", "typescript"), join(cloneModules, "typescript"), "dir");
     symlinkSync(join(repo, "node_modules", ".bin", "tsc"), join(cloneModules, ".bin", "tsc"));
-    const cloneHost = join(clone, "build", "Release", `linux-${hostArch}`, "peercred.node");
-    mkdirSync(dirname(cloneHost), { recursive: true });
-    cpSync(hostHelper, cloneHost);
-    const dest = join(clone, "build", "Release", `linux-${nonHostArch}`, "peercred.node");
-    mkdirSync(dirname(dest), { recursive: true });
-    const buf = Buffer.alloc(20);
-    buf[0] = 0x7f;
-    buf.write("ELF", 1);
-    buf.writeUInt16LE(elfMachine[nonHostArch], 18);
-    writeFileSync(dest, buf);
+    // The pack gate requires peercred.node and pty.node per arch: the host's are real, the other
+    // arch's are ELF headers with the right machine, which is all the gate reads.
+    for (const file of ["peercred.node", "pty.node"]) {
+      const cloneHost = join(clone, "build", "Release", `linux-${hostArch}`, file);
+      mkdirSync(dirname(cloneHost), { recursive: true });
+      cpSync(join(dirname(hostHelper), file), cloneHost);
+      const dest = join(clone, "build", "Release", `linux-${nonHostArch}`, file);
+      mkdirSync(dirname(dest), { recursive: true });
+      const buf = Buffer.alloc(20);
+      buf[0] = 0x7f;
+      buf.write("ELF", 1);
+      buf.writeUInt16LE(elfMachine[nonHostArch], 18);
+      writeFileSync(dest, buf);
+    }
     return clone;
   };
   for (const name of needed) {

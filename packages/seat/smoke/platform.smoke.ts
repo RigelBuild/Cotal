@@ -72,7 +72,13 @@ if (process.platform !== "linux") {
   const manifest = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf8")) as {
     scripts?: { install?: string; prepack?: string; prepare?: string; prepublishOnly?: string; "build:ts"?: string };
     files?: string[];
+    dependencies?: Record<string, string>;
   };
+  check(
+    "the seat declares no @lydell/node-pty dependency: its PTY is the vendored, pidfd-patched build",
+    manifest.dependencies?.["@lydell/node-pty"] === undefined,
+    manifest.dependencies,
+  );
   check("customer install does not compile: package.json has no install script", manifest.scripts?.install === undefined, manifest.scripts);
   check(
     "prepack asserts shipped natives and compiles TypeScript only",
@@ -95,8 +101,9 @@ if (process.platform !== "linux") {
     !existsSync(join(pkgRoot, "binding.gyp")),
   );
   check(
-    "published files list is the prebuilt output, not the compiler sources",
-    JSON.stringify(manifest.files) === JSON.stringify(["dist", "build"]),
+    "published files list is the prebuilt output and the vendored node-pty runtime, not the compiler sources",
+    JSON.stringify(manifest.files) ===
+      JSON.stringify(["dist", "build", "native/node-pty/lib", "native/node-pty/package.json", "native/node-pty/LICENSE"]),
     manifest.files,
   );
 
@@ -205,15 +212,16 @@ if (process.platform !== "linux") {
 
   {
     const tree = mkdtempSync(join(tmpdir(), "cotal-seat-assert-"));
-    const writeElf = (arch: string, machine: number): string => {
-      const path = join(tree, "build", "Release", `linux-${arch}`, "peercred.node");
-      mkdirSync(dirname(path), { recursive: true });
-      const buf = Buffer.alloc(20);
-      buf[0] = 0x7f;
-      buf.write("ELF", 1);
-      buf.writeUInt16LE(machine, 18);
-      writeFileSync(path, buf);
-      return path;
+    const writeElf = (arch: string, machine: number): void => {
+      for (const file of ["peercred.node", "pty.node"]) {
+        const path = join(tree, "build", "Release", `linux-${arch}`, file);
+        mkdirSync(dirname(path), { recursive: true });
+        const buf = Buffer.alloc(20);
+        buf[0] = 0x7f;
+        buf.write("ELF", 1);
+        buf.writeUInt16LE(machine, 18);
+        writeFileSync(path, buf);
+      }
     };
     try {
       writeElf("x64", 62);
@@ -249,42 +257,87 @@ if (process.platform !== "linux") {
         stdout: both.stdout,
         stderr: both.stderr,
       });
+      rmSync(join(tree, "build", "Release", "linux-arm64", "pty.node"));
+      const noPty = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { assertShippedNatives } from ${JSON.stringify(join(pkgRoot, "scripts", "assert-shipped-natives.mjs"))}; assertShippedNatives(process.argv[1]);`,
+          tree,
+        ],
+        { encoding: "utf8" },
+      );
+      check(
+        "a tree missing one arch's pty.node is refused before pack",
+        noPty.status === 1 && /native helper missing at .*linux-arm64\/pty\.node/.test(`${noPty.stdout}\n${noPty.stderr}`),
+        { status: noPty.status, stdout: noPty.stdout, stderr: noPty.stderr },
+      );
     } finally {
       rmSync(tree, { recursive: true, force: true });
     }
   }
 
   {
-    const sources = mkdtempSync(join(tmpdir(), "cotal-seat-asm-src-"));
+    // The host build's pty.node must hand back a pidfd: a prebuilt without the patch spawns fine
+    // and only fails here.
+    // tsx's NODE_PATH reaches the whole pnpm store; drop it so resolution is the package's own.
+    const probe = spawnSync(process.execPath, [join(here, "fixtures", "pinned-load.mjs"), pkgRoot], {
+      encoding: "utf8",
+      timeout: 30_000,
+      env: childEnv({ NODE_PATH: "" }),
+    });
+    const line = /^PINNED_LOAD (.*)$/m.exec(probe.stdout ?? "")?.[1];
+    const report: unknown = line === undefined ? undefined : JSON.parse(line);
+    check(
+      "the host-built pty.node pins its child: fdinfo Pid matches, SIGKILL is sent, then exited and gone",
+      probe.status === 0 && typeof report === "object" && report !== null && "ok" in report && report.ok === true,
+      { status: probe.status, stdout: probe.stdout, stderr: probe.stderr },
+    );
+  }
+
+  const NATIVES = ["peercred.node", "pty.node"];
+  const backupNatives = (into: string): Array<{ dest: string; backup?: string }> => {
     const saved: Array<{ dest: string; backup?: string }> = [];
-    const writeElf = (arch: string, machine: number): string => {
-      const path = join(sources, `peercred-${arch}.node`);
+    for (const arch of ["x64", "arm64"]) {
+      for (const file of NATIVES) {
+        const dest = join(pkgRoot, "build", "Release", `linux-${arch}`, file);
+        const backup = existsSync(dest) ? join(into, `saved-${arch}-${file}`) : undefined;
+        if (backup) copyFileSync(dest, backup);
+        saved.push({ dest, backup });
+      }
+    }
+    return saved;
+  };
+  // A native builder artifact is its whole linux-<arch>/ directory: both .node files.
+  const writeBuilderDir = (under: string, arch: string, machine: number): string => {
+    const dir = join(under, `seat-native-linux-${arch}`);
+    mkdirSync(dir, { recursive: true });
+    for (const file of NATIVES) {
       const buf = Buffer.alloc(20);
       buf[0] = 0x7f;
       buf.write("ELF", 1);
       buf.writeUInt16LE(machine, 18);
-      writeFileSync(path, buf);
-      return path;
-    };
+      writeFileSync(join(dir, file), buf);
+    }
+    return dir;
+  };
+
+  {
+    const sources = mkdtempSync(join(tmpdir(), "cotal-seat-asm-src-"));
+    const saved = backupNatives(sources);
     try {
-      for (const arch of ["x64", "arm64"]) {
-        const dest = join(pkgRoot, "build", "Release", `linux-${arch}`, "peercred.node");
-        const backup = existsSync(dest) ? join(sources, `saved-${arch}.node`) : undefined;
-        if (backup) copyFileSync(dest, backup);
-        saved.push({ dest, backup });
-      }
-      const x64 = writeElf("x64", 62);
-      const arm64 = writeElf("arm64", 183);
+      for (const { dest } of saved) if (existsSync(dest)) rmSync(dest);
+      const x64 = writeBuilderDir(sources, "x64", 62);
+      const arm64 = writeBuilderDir(sources, "arm64", 183);
       const assembled = spawnSync(
         process.execPath,
         [join(pkgRoot, "..", "..", "scripts", "seat-assemble-natives.mjs"), "--x64", x64, "--arm64", arm64],
         { encoding: "utf8" },
       );
-      const destArm = join(pkgRoot, "build", "Release", "linux-arm64", "peercred.node");
-      const destX64 = join(pkgRoot, "build", "Release", "linux-x64", "peercred.node");
       check(
         "assemble copies both native builder artifacts",
-        assembled.status === 0 && existsSync(destX64) && existsSync(destArm),
+        assembled.status === 0 && saved.every(({ dest }) => existsSync(dest)),
         { status: assembled.status, stdout: assembled.stdout, stderr: assembled.stderr },
       );
     } finally {
@@ -298,17 +351,10 @@ if (process.platform !== "linux") {
 
   const packDir = mkdtempSync(join(tmpdir(), "cotal-seat-pack-"));
   const packState = mkdtempSync(join(tmpdir(), "cotal-seat-pack-state-"));
-  const savedPack: Array<{ dest: string; backup?: string }> = [];
+  const savedPack = backupNatives(packState);
   try {
-    for (const arch of ["x64", "arm64"]) {
-      const dest = join(pkgRoot, "build", "Release", `linux-${arch}`, "peercred.node");
-      const backup = existsSync(dest) ? join(packState, `saved-${arch}.node`) : undefined;
-      if (backup) copyFileSync(dest, backup);
-      savedPack.push({ dest, backup });
-    }
     const otherArch = process.arch === "x64" ? "arm64" : "x64";
-    const otherDest = join(pkgRoot, "build", "Release", `linux-${otherArch}`, "peercred.node");
-    if (existsSync(otherDest)) rmSync(otherDest);
+    for (const file of NATIVES) rmSync(join(pkgRoot, "build", "Release", `linux-${otherArch}`, file), { force: true });
 
     // Inspect a host-only tree without running prepack.
     const packed = spawnSync("pnpm", ["--config.ignore-scripts=true", "pack", "--pack-destination", packDir], {
@@ -326,8 +372,8 @@ if (process.platform !== "linux") {
       const files = listing.stdout.split("\n").filter(Boolean);
       check(
         "a host-only pack does not ship the other linux arch or an unkeyed helper",
-        files.includes(`package/build/Release/linux-${process.arch}/peercred.node`) &&
-          !files.includes(`package/build/Release/linux-${otherArch}/peercred.node`) &&
+        NATIVES.every((file) => files.includes(`package/build/Release/linux-${process.arch}/${file}`)) &&
+          !files.some((f) => f.startsWith(`package/build/Release/linux-${otherArch}/`)) &&
           !files.includes("package/build/Release/peercred.node"),
         files.filter((f) => f.includes("peercred") || f.includes("build/")),
       );
@@ -347,25 +393,20 @@ if (process.platform !== "linux") {
     );
     rmSync(refuseDir, { recursive: true, force: true });
 
-    const writePackedElf = (arch: string, machine: number): string => {
-      const path = join(packState, `peercred-${arch}.node`);
-      const buf = Buffer.alloc(20);
-      buf[0] = 0x7f;
-      buf.write("ELF", 1);
-      buf.writeUInt16LE(machine, 18);
-      writeFileSync(path, buf);
-      return path;
-    };
     const assembled = spawnSync(
       process.execPath,
-      [join(pkgRoot, "..", "..", "scripts", "seat-assemble-natives.mjs"), "--x64", writePackedElf("x64", 62), "--arm64", writePackedElf("arm64", 183)],
+      [
+        join(pkgRoot, "..", "..", "scripts", "seat-assemble-natives.mjs"),
+        "--x64",
+        writeBuilderDir(packState, "x64", 62),
+        "--arm64",
+        writeBuilderDir(packState, "arm64", 183),
+      ],
       { encoding: "utf8" },
     );
     check(
       "pack proof assembled both native builder artifacts",
-      assembled.status === 0 &&
-        existsSync(join(pkgRoot, "build", "Release", "linux-x64", "peercred.node")) &&
-        existsSync(join(pkgRoot, "build", "Release", "linux-arm64", "peercred.node")),
+      assembled.status === 0 && savedPack.every(({ dest }) => existsSync(dest)),
       { status: assembled.status, stdout: assembled.stdout, stderr: assembled.stderr },
     );
     rmSync(join(pkgRoot, "dist"), { recursive: true, force: true });
@@ -383,10 +424,17 @@ if (process.platform !== "linux") {
       const files = listing.stdout.split("\n").filter(Boolean);
       check(
         "the tarball ships keyed linux-x64 and linux-arm64 helpers",
-        files.includes("package/build/Release/linux-x64/peercred.node") &&
-          files.includes("package/build/Release/linux-arm64/peercred.node") &&
+        ["x64", "arm64"].every((arch) => NATIVES.every((file) => files.includes(`package/build/Release/linux-${arch}/${file}`))) &&
           !files.includes("package/build/Release/peercred.node"),
         files.filter((f) => f.includes("peercred") || f.includes("build/")),
+      );
+      check(
+        "the tarball ships the vendored node-pty runtime and not its C++ source",
+        files.includes("package/native/node-pty/lib/unixTerminal.js") &&
+          files.includes("package/native/node-pty/package.json") &&
+          files.includes("package/native/node-pty/LICENSE") &&
+          !files.some((f) => f.startsWith("package/native/node-pty/src/") || f === "package/native/node-pty/pidfd.patch"),
+        files.filter((f) => f.includes("native/")),
       );
       check("the tarball ships dist/index.js compiled by prepack", files.includes("package/dist/index.js"), files);
       check("the tarball ships dist/index.d.ts compiled by prepack", files.includes("package/dist/index.d.ts"), files);

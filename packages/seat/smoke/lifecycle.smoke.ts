@@ -7,7 +7,10 @@ import { tmpdir } from "node:os";
 import { connect } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { adoptSeatSync, launchSeat, reapSeat, seatId, SeatClient } from "../src/index.js";
+import { adoptSeatSync, launchSeat, reapSeat, seatId, SeatClient, type SeatRecord } from "../src/index.js";
+import { setCustodianTestSeam } from "../src/launcher.js";
+import type { CustodianTestSeam } from "../src/custodian.js";
+import { GRACE_MS } from "../src/protocol.js";
 import { makeSeatRoot } from "@cotal-ai/smoke-kit";
 
 if (process.platform !== "linux") {
@@ -64,7 +67,41 @@ const handles: Array<{
   close?: () => void;
   record: { custodianPid: number; childPid: number };
 }> = [];
-
+/** Pids a T1 cell leaves behind on purpose (or a mutant leaves by mistake); killed in `finally`. */
+const strays: number[] = [];
+const isGone = (pid: number): boolean => state(pid) === "gone" || state(pid) === "Z";
+const readPid = (path: string): number | undefined => {
+  try {
+    const n = Number(readFileSync(path, "utf8").trim());
+    return n > 0 ? n : undefined;
+  } catch {
+    return undefined;
+  }
+};
+// A seat child that ignores the PTY hangup, marks a SIGTERM instead of dying, records its pid and
+// then releases the custodian's seam hold, so no signal can land before its handlers are armed.
+const ARMED_CHILD =
+  "const fs=require('fs');const [pidf,mark,rel]=process.argv.slice(1);" +
+  "process.on('SIGHUP',()=>{});process.on('SIGTERM',()=>fs.writeFileSync(mark,'term'));" +
+  "fs.writeFileSync(pidf,String(process.pid));if(rel)fs.writeFileSync(rel,'');setInterval(()=>{},1000);";
+/** Launch under a test seam; a launch that should have failed but did not leaves its pids to `strays`. */
+const launchUnderSeam = (seam: CustodianTestSeam, id: string, args: string[]): string => {
+  setCustodianTestSeam(seam);
+  try {
+    const rec: SeatRecord = launchSeat({ root, name: "t1-seam", id, spec: { command: process.execPath, args, env: { PATH: process.env.PATH ?? "" } }, cwd: process.cwd() });
+    strays.push(rec.custodianPid, rec.childPid);
+    return "";
+  } catch (e) {
+    return (e as Error).message;
+  } finally {
+    setCustodianTestSeam(undefined);
+  }
+};
+/** Run `then` (sh, args $2…) once `reached` exists; launchSeat blocks this event loop meanwhile. */
+const onReached = (reached: string, then: string, ...args: string[]): void => {
+  const script = `i=0; while [ ! -e "$1" ] && [ $i -lt 1000 ]; do sleep 0.02; i=$((i+1)); done; ${then}`;
+  spawn("sh", ["-c", script, "sh", reached, ...args], { stdio: "ignore" }).unref();
+};
 const collect = async (h: ReturnType<typeof adoptSeatSync>, ms = 800): Promise<string> => {
   const sess = h.attach();
   let buf = "";
@@ -271,17 +308,18 @@ try {
     await h.waitForExit();
     check("natural exit: waitForExit resolves and status is exited", h.status() === "exited");
     h.close();
-    const recordGone = join(root, rec.id, "record.json");
+    const recordKept = join(root, rec.id, "record.json");
+    // The record outlives the custodian: only a proved reap or a durable release removes a seat dir.
     check(
-      "natural exit: custodian process, socket, and record converge without fixture kill",
+      "natural exit: custodian process and socket converge and the record is retained without fixture kill",
       await until(() => {
         const custodianGone = state(rec.custodianPid) === "gone" || state(rec.custodianPid) === "Z";
-        return custodianGone && !existsSync(rec.socket) && !existsSync(recordGone);
+        return custodianGone && !existsSync(rec.socket) && existsSync(recordKept);
       }, 5_000),
       {
         custodian: state(rec.custodianPid),
         socket: existsSync(rec.socket),
-        record: existsSync(recordGone),
+        record: existsSync(recordKept),
       },
     );
     handles.push(h);
@@ -383,7 +421,7 @@ await h.waitForExit();
       await until(() => state(rec.custodianPid) === "gone" || state(rec.custodianPid) === "Z", 20_000),
       state(rec.custodianPid),
     );
-    check("its socket and record are gone with it", !existsSync(rec.socket) && !existsSync(join(root, rec.id, "record.json")), rec.socket);
+    check("its socket is gone with it and its record is retained", !existsSync(rec.socket) && existsSync(join(root, rec.id, "record.json")), rec.socket);
   }
 
   {
@@ -555,7 +593,150 @@ await h.waitForExit();
     check("graceful stop: waitForExit resolves", h.status() === "exited");
     h.close();
   }
+
+  {
+    // Graceful escalation: a child that ignores SIGTERM still goes, by the pidfd SIGKILL after GRACE_MS.
+    const dir = mkdtempSync(join(root, "t1-grace-"));
+    const pidf = join(dir, "pid");
+    const mark = join(dir, "term");
+    const rec = launchSeat({ root, name: "grace-escalate", spec: { command: process.execPath, args: ["-e", ARMED_CHILD, pidf, mark, ""], env: { PATH: process.env.PATH ?? "" } }, cwd: process.cwd() });
+    const h = adoptSeatSync(rec);
+    handles.push(h);
+    await until(() => readPid(pidf) !== undefined, 5_000);
+    h.stop({ graceful: true });
+    const exited = await Promise.race([h.waitForExit().then(() => true), wait(GRACE_MS + 5_000).then(() => false)]);
+    check(
+      "graceful stop escalates: a child ignoring SIGTERM is gone after waitForExit",
+      exited && existsSync(mark) && (await until(() => isGone(rec.childPid), 2_000)),
+      { exited, sigterm: existsSync(mark), child: state(rec.childPid) },
+    );
+    h.close();
+  }
+
+  {
+    // A failed pin sends nothing: the child is named by no pidfd, so only the PTY hangup reaches it.
+    const dir = mkdtempSync(join(root, "t1-unpinned-"));
+    const pidf = join(dir, "pid");
+    const mark = join(dir, "term");
+    const release = join(dir, "release");
+    const id = seatId();
+    const err = launchUnderSeam({ dropPidfd: true, holds: [{ at: "unpinned", reached: join(dir, "reached"), release }] }, id, ["-e", ARMED_CHILD, pidf, mark, release]);
+    const pid = readPid(pidf);
+    if (pid !== undefined) strays.push(pid);
+    await wait(300);
+    check(
+      "an unpinned child is never signalled: launch fails, no socket or record, the child lives unmarked",
+      /returned no pidfd/.test(err) && !existsSync(join(root, id, "seat.sock")) && !existsSync(join(root, id, "record.json")) && pid !== undefined && !isGone(pid) && !existsSync(mark),
+      { err, pid, child: pid === undefined ? "none" : state(pid), sigterm: existsSync(mark) },
+    );
+  }
+
+  for (const fail of ["listen-error", "after-bind"] as const) {
+    // Every startup failure after pinning SIGKILLs the child through the pidfd before the custodian exits.
+    const dir = mkdtempSync(join(root, `t1-${fail}-`));
+    const pidf = join(dir, "pid");
+    const release = join(dir, "release");
+    const id = seatId();
+    const err = launchUnderSeam({ fail, holds: [{ at: "after-pin", reached: join(dir, "reached"), release }] }, id, ["-e", ARMED_CHILD, pidf, join(dir, "term"), release]);
+    const pid = readPid(pidf);
+    if (pid !== undefined) strays.push(pid);
+    check(
+      `startup failure (${fail}) after pinning stops the child`,
+      /custodian exited before ready/.test(err) && !existsSync(join(root, id, "record.json")) && pid !== undefined && (await until(() => isGone(pid), 5_000)),
+      { err, pid, child: pid === undefined ? "none" : state(pid) },
+    );
+  }
+
+  {
+    // The custodian creates no directory: a seat dir removed under a late custodian stays removed.
+    const dir = mkdtempSync(join(root, "t1-rmdir-"));
+    const pidf = join(dir, "pid");
+    const reached = join(dir, "reached");
+    const release = join(dir, "release");
+    const childRelease = join(dir, "child-release");
+    const id = seatId();
+    onReached(reached, 'rm -rf "$2"; : > "$3"', join(root, id), release);
+    const err = launchUnderSeam(
+      { holds: [{ at: "before-fs", reached, release }, { at: "after-pin", reached: join(dir, "pinned"), release: childRelease }] },
+      id,
+      ["-e", ARMED_CHILD, pidf, join(dir, "term"), childRelease],
+    );
+    const pid = readPid(pidf);
+    if (pid !== undefined) strays.push(pid);
+    check(
+      "a removed seat directory stops a late custodian: no record, no directory, the child is gone",
+      err !== "" && !existsSync(join(root, id)) && pid !== undefined && (await until(() => isGone(pid), 5_000)),
+      { err, dir: existsSync(join(root, id)), pid, child: pid === undefined ? "none" : state(pid) },
+    );
+  }
+
+  {
+    // A seal written after the launcher's check still stops the custodian before it spawns.
+    const dir = mkdtempSync(join(root, "t1-seal-"));
+    const pidf = join(dir, "pid");
+    const reached = join(dir, "reached");
+    const release = join(dir, "release");
+    const id = seatId();
+    onReached(reached, 'printf sealed > "$2"; : > "$3"', join(root, `.launch-${id}`), release);
+    const err = launchUnderSeam({ holds: [{ at: "before-fs", reached, release }] }, id, ["-e", ARMED_CHILD, pidf, join(dir, "term"), ""]);
+    await wait(300);
+    check(
+      "a sealed fence refuses the launch: no child, no socket, no record",
+      /is sealed/.test(err) && readPid(pidf) === undefined && !existsSync(join(root, id, "seat.sock")) && !existsSync(join(root, id, "record.json")),
+      { err, child: readPid(pidf) },
+    );
+    const again = seatId();
+    writeFileSync(join(root, `.launch-${again}`), "sealed");
+    let refused = "";
+    try { launchSeat({ root, name: "sealed", id: again, spec: { command: process.execPath, args: ["-e", ""], env: { PATH: process.env.PATH ?? "" } }, cwd: process.cwd() }); } catch (e) { refused = (e as Error).message; }
+    check("a launch over an existing fence creates no seat directory", refused !== "" && !existsSync(join(root, again)), refused);
+  }
+
+  {
+    // A reused pid is never signalled. Inside a fresh user+pid namespace the fixture's child exits at
+    // once and a CLONE_PARENT process retakes its pid; a startup failure must not reach that process.
+    const here = dirname(fileURLToPath(import.meta.url));
+    const dist = join(here, "..", "dist");
+    const dir = mkdtempSync(join(root, "t1-reuse-"));
+    const fixture = join(dir, "pid-reuse");
+    const cc = spawnSync("cc", ["-O2", "-o", fixture, join(here, "fixtures", "pid-reuse.c")], { encoding: "utf8" });
+    const runner = join(dir, "run.mjs");
+    writeFileSync(
+      runner,
+      `import { setCustodianTestSeam, launchSeat } from ${JSON.stringify(join(dist, "launcher.js"))};
+import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { setTimeout as sleep } from "node:timers/promises";
+const [root, fixture, dir] = process.argv.slice(2);
+const release = dir + "/release";
+spawn("sh", ["-c", 'i=0; while [ ! -e "$1/reused.pid" ] && [ $i -lt 400 ]; do sleep 0.02; i=$((i+1)); done; : > "$2"', "sh", dir, release], { stdio: "ignore" }).unref();
+setCustodianTestSeam({ fail: "after-pin", holds: [{ at: "after-pin", reached: dir + "/reached", release }] });
+let error = "";
+try { launchSeat({ root, name: "pid-reuse", spec: { command: fixture, args: [dir], env: { PATH: process.env.PATH ?? "" } }, cwd: dir }); } catch (e) { error = e.message; }
+await sleep(300);
+const read = (n) => { try { return Number(readFileSync(dir + "/" + n, "utf8").trim()); } catch { return undefined; } };
+const child = read("child.pid");
+const reused = read("reused.pid");
+let reusedAlive = false;
+try { const s = readFileSync("/proc/" + reused + "/stat", "utf8"); reusedAlive = s.slice(s.lastIndexOf(") ") + 2)[0] !== "Z"; } catch {}
+console.log("PID_REUSE " + JSON.stringify({ error, child, reused, reusedAlive }));
+`,
+    );
+    const ns = cc.status === 0
+      ? spawnSync("unshare", ["--user", "--map-root-user", "--pid", "--fork", "--mount-proc", process.execPath, runner, root, fixture, dir], { encoding: "utf8", timeout: 30_000 })
+      : undefined;
+    const line = (ns?.stdout ?? "").split("\n").find((l) => l.startsWith("PID_REUSE "));
+    const got = line ? (JSON.parse(line.slice("PID_REUSE ".length)) as { error: string; child?: number; reused?: number; reusedAlive: boolean }) : undefined;
+    check(
+      "a reused pid is never signalled: the process that retook the child's pid outlives the startup failure",
+      got !== undefined && /test seam: startup failure after pinning/.test(got.error) && got.child !== undefined && got.child === got.reused && got.reusedAlive,
+      { cc: cc.status === 0 ? "ok" : cc.stderr || cc.error?.message, status: ns?.status, stderr: ns?.stderr, got },
+    );
+  }
 } finally {
+  for (const pid of strays) {
+    try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+  }
   for (const h of handles) {
     try {
       h.stop({ graceful: false });

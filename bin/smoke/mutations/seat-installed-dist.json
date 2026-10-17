@@ -21,6 +21,24 @@
       "replace": "    \"build:ts\": \"node -e \\\"void 0\\\"\",",
       "expectRed": "fresh installed @cotal-ai/seat import succeeds",
       "cell": "fresh installed @cotal-ai/seat import succeeds"
+    },
+    {
+      "name": "T1 ship the @lydell prebuilt pty.node in place of the built one",
+      "file": "packages/seat/scripts/build-native.mjs",
+      "find": "assertMachine(ptyOut, \"pty addon\");\n",
+      "replace": "assertMachine(ptyOut, \"pty addon\");\ncpSync(join(root, \"..\", \"..\", \"node_modules\", \".pnpm\", `@lydell+node-pty-linux-${arch}@1.2.0-beta.12`, \"node_modules\", \"@lydell\", `node-pty-linux-${arch}`, \"prebuilds\", `linux-${arch}`, \"pty.node\"), ptyOut);\n",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "installed spawnPinned names its child: the pidfd's fdinfo Pid is the child pid",
+      "cell": "installed spawnPinned names its child: the pidfd's fdinfo Pid is the child pid",
+      "note": "The upstream prebuilt spawns but returns no pidfd; the installed load must refuse it."
+    },
+    {
+      "name": "T1 restore @lydell/node-pty in the seat dependencies",
+      "file": "packages/seat/package.json",
+      "find": "    \"@xterm/headless\": \"^5.5.0\"\n",
+      "replace": "    \"@xterm/headless\": \"^5.5.0\",\n    \"@lydell/node-pty\": \"1.2.0-beta.12\"\n",
+      "expectRed": "@lydell/node-pty does not resolve from the installed seat",
+      "cell": "@lydell/node-pty does not resolve from the installed seat"
     }
   ]
 }

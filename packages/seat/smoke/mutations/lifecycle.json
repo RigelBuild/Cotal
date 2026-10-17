@@ -77,9 +77,9 @@
       "find": "  const settleTerminal = (): void => {\n    if (alive || settling || !ready) return;",
       "replace": "  const settleTerminal = (): void => {\n    return;\n    if (alive || settling || !ready) return;",
       "afterRestore": "pnpm --filter @cotal-ai/seat build",
-      "expectRed": "natural exit: custodian process, socket, and record converge without fixture kill",
-      "cell": "natural exit: custodian process, socket, and record converge without fixture kill",
-      "note": "Deleting the owned terminal-settle transition leaves the Unix server, socket, record, and custodian process alive after waitForExit. The named cell must fail without fixture SIGKILL."
+      "expectRed": "natural exit: custodian process and socket converge and the record is retained without fixture kill",
+      "cell": "natural exit: custodian process and socket converge and the record is retained without fixture kill",
+      "note": "Deleting the owned terminal-settle transition leaves the Unix server, socket, and custodian process alive after waitForExit. The named cell must fail without fixture SIGKILL."
     },
     {
       "name": "M8 treat any live pid as the recorded process",
@@ -128,6 +128,96 @@
       "expectRed": "reapSeat signals a live seat by identity and proves it gone",
       "cell": "reapSeat signals a live seat by identity and proves it gone",
       "note": "A reader that rebuilds the record without the stamp makes every seat unreapable: the custodian writes the boot, readRecord forgets it, and reapSeat refuses the record it was handed."
+    },
+    {
+      "name": "T1 settle unlinks the custody record (natural exit)",
+      "file": "packages/seat/src/custodian.ts",
+      "find": "    dataSubs.clear();\n    try {\n      unlinkSync(launch.socket);",
+      "replace": "    dataSubs.clear();\n    unlinkSync(launch.recordPath);\n    try {\n      unlinkSync(launch.socket);",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "natural exit: custodian process and socket converge and the record is retained without fixture kill",
+      "cell": "natural exit: custodian process and socket converge and the record is retained without fixture kill",
+      "note": "Restoring the pre-T1 unlink forgets custody of a seat whose processes nothing has proved gone."
+    },
+    {
+      "name": "T1 settle unlinks the custody record (unadopted)",
+      "file": "packages/seat/src/custodian.ts",
+      "find": "    dataSubs.clear();\n    try {\n      unlinkSync(launch.socket);",
+      "replace": "    dataSubs.clear();\n    unlinkSync(launch.recordPath);\n    try {\n      unlinkSync(launch.socket);",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "its socket is gone with it and its record is retained",
+      "cell": "its socket is gone with it and its record is retained",
+      "note": "The same unlink on the unobserved-handoff settle path."
+    },
+    {
+      "name": "T1 drop the graceful SIGKILL escalation",
+      "file": "packages/seat/src/custodian.ts",
+      "find": "        child.signal(\"SIGKILL\");\n      } catch (e) {\n        const note = `${JSON.stringify({ escalationFailed",
+      "replace": "        void child;\n      } catch (e) {\n        const note = `${JSON.stringify({ escalationFailed",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "graceful stop escalates: a child ignoring SIGTERM is gone after waitForExit",
+      "cell": "graceful stop escalates: a child ignoring SIGTERM is gone after waitForExit",
+      "note": "Without the timer a SIGTERM-ignoring child outlives a graceful stop."
+    },
+    {
+      "name": "T1 kill an unpinned child by bare pid",
+      "file": "packages/seat/src/pty.ts",
+      "find": "  const pidfd = dropPidfd ? undefined : term._pidfd;\n",
+      "replace": "  const pidfd = dropPidfd ? undefined : term._pidfd;\n  if (typeof pidfd !== \"number\") process.kill(term.pid, \"SIGKILL\");\n",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "an unpinned child is never signalled: launch fails, no socket or record, the child lives unmarked",
+      "cell": "an unpinned child is never signalled: launch fails, no socket or record, the child lives unmarked",
+      "note": "The proc.kill fallback: a send by pid to a child this process cannot name."
+    },
+    {
+      "name": "T1 a listen error escapes the startup SIGKILL",
+      "file": "packages/seat/src/custodian.ts",
+      "find": "  listening.once(\"error\", reject);\n",
+      "replace": "",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "startup failure (listen-error) after pinning stops the child",
+      "cell": "startup failure (listen-error) after pinning stops the child",
+      "note": "An unhandled listen error kills the custodian without a send; the child ignores the hangup and survives."
+    },
+    {
+      "name": "T1 drop the startup-failure SIGKILL",
+      "file": "packages/seat/src/custodian.ts",
+      "find": "      proc.handle.signal(\"SIGKILL\");\n",
+      "replace": "      void proc;\n",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "startup failure (after-bind) after pinning stops the child",
+      "cell": "startup failure (after-bind) after pinning stops the child",
+      "note": "A failure after bind exits the custodian with the child still under it."
+    },
+    {
+      "name": "T1 the custodian recreates its seat directory",
+      "file": "packages/seat/src/custodian.ts",
+      "find": "  await holdAt(\"before-fs\");\n",
+      "replace": "  await holdAt(\"before-fs\");\n  (await import(\"node:fs\")).mkdirSync((await import(\"node:path\")).dirname(launch.socket), { recursive: true, mode: 0o700 });\n",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "a removed seat directory stops a late custodian: no record, no directory, the child is gone",
+      "cell": "a removed seat directory stops a late custodian: no record, no directory, the child is gone",
+      "note": "Restoring runCustodian's mkdirSync lets a late custodian resurrect a seat its manager already removed."
+    },
+    {
+      "name": "T1 the custodian ignores a sealed fence",
+      "file": "packages/seat/src/custodian.ts",
+      "find": "  if (readFileSync(fenceFd, \"utf8\").trim() === \"sealed\") throw",
+      "replace": "  if (false) throw",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "a sealed fence refuses the launch: no child, no socket, no record",
+      "cell": "a sealed fence refuses the launch: no child, no socket, no record",
+      "note": "A seal written after the launcher's check must still stop the spawn."
+    },
+    {
+      "name": "T1 open the startup-failure handle by pid after the hold",
+      "file": "packages/seat/src/custodian.ts",
+      "find": "      proc.handle.signal(\"SIGKILL\");\n",
+      "replace": "      const st = readFileSync(`/proc/${proc.pid}/stat`, \"utf8\").slice(readFileSync(`/proc/${proc.pid}/stat`, \"utf8\").lastIndexOf(\") \") + 2).split(\" \");\n      if (st[0] !== \"Z\" && Number(st[1]) === process.pid) process.kill(proc.pid, \"SIGKILL\");\n",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "a reused pid is never signalled: the process that retook the child's pid outlives the startup failure",
+      "cell": "a reused pid is never signalled: the process that retook the child's pid outlives the startup failure",
+      "note": "A pid-addressed send guarded by parent and liveness checks: a CLONE_PARENT process at the reused pid passes both."
     }
   ]
 }

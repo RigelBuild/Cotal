@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Copy native linux-x64 and linux-arm64 SO_PEERCRED helpers into @cotal-ai/seat
- * and refuse anything that is not ELF e_machine 62 plus 183.
+ * Copy the native linux-x64 and linux-arm64 builder directories (peercred.node and pty.node) into
+ * @cotal-ai/seat and refuse anything that is not ELF e_machine 62 plus 183.
  *
  * The PR pack proof, Changesets publish, and snapshot publish all run this
  * script. It does not compile. It does not run `pnpm build`.
@@ -26,7 +26,7 @@ const arm64 = arg("--arm64", "SEAT_NATIVE_ARM64");
 
 if (!x64 || !arm64) {
   console.error(
-    `@cotal-ai/seat: linux-arm64 helper was not assembled into the publish tree. Pass --x64 and --arm64 (or SEAT_NATIVE_X64 and SEAT_NATIVE_ARM64) with the native builder artifacts before pack or publish.`,
+    `@cotal-ai/seat: linux-arm64 helper was not assembled into the publish tree. Pass --x64 and --arm64 (or SEAT_NATIVE_X64 and SEAT_NATIVE_ARM64) naming the native builder artifact directories before pack or publish.`,
   );
   process.exit(1);
 }
@@ -47,7 +47,15 @@ for (const [arch, src] of [
 ]) {
   const dir = join(destRoot, `linux-${arch}`);
   mkdirSync(dir, { recursive: true });
-  copyFileSync(src, join(dir, "peercred.node"));
+  for (const file of ["peercred.node", "pty.node"]) {
+    const from = join(src, file);
+    // Refuse here: skipping would leave a stale host build in place for the assert to accept.
+    if (!existsSync(from)) {
+      console.error(`@cotal-ai/seat: linux-${arch} native builder artifact missing ${from}`);
+      process.exit(1);
+    }
+    copyFileSync(from, join(dir, file));
+  }
 }
 
 const assert = spawnSync(process.execPath, [join(repo, "packages", "seat", "scripts", "assert-shipped-natives.mjs")], {

@@ -4,8 +4,8 @@
 set -eu
 repo="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 cd "$repo"
-x64="${SEAT_NATIVE_X64:?SEAT_NATIVE_X64 is required (linux-x64 peercred.node from the native builder)}"
-arm64="${SEAT_NATIVE_ARM64:?SEAT_NATIVE_ARM64 is required (linux-arm64 peercred.node from the native builder)}"
+x64="${SEAT_NATIVE_X64:?SEAT_NATIVE_X64 is required (the linux-x64 native builder directory: peercred.node, pty.node)}"
+arm64="${SEAT_NATIVE_ARM64:?SEAT_NATIVE_ARM64 is required (the linux-arm64 native builder directory: peercred.node, pty.node)}"
 dest="${SEAT_PACK_DEST:?SEAT_PACK_DEST is required}"
 node "$repo/scripts/seat-assemble-natives.mjs" --x64 "$x64" --arm64 "$arm64"
 mkdir -p "$dest"
@@ -21,7 +21,7 @@ echo "platform-arch=$platform_arch"
 echo "tarball=$tarball"
 echo -n "pack_sha256="
 sha256sum "$tarball"
-tar -tzf "$tarball" | grep -E 'peercred|build/' || true
+tar -tzf "$tarball" | grep -E 'peercred|pty\.node|build/' || true
 if tar -tzf "$tarball" | grep -qx "package/build/Release/peercred.node"; then
   echo "unkeyed peercred.node must not ship"
   exit 2
@@ -32,7 +32,10 @@ mkdir -p "$tmp/extracted"
 tar -xzf "$tarball" -C "$tmp/extracted"
 test -d "$tmp/extracted/package" || { echo "tarball missing package/"; exit 2; }
 node "$repo/packages/seat/scripts/assert-shipped-natives.mjs" "$tmp/extracted/package"
-file "$tmp/extracted/package/build/Release/linux-x64/peercred.node"
-file "$tmp/extracted/package/build/Release/linux-arm64/peercred.node"
-readelf -h "$tmp/extracted/package/build/Release/linux-x64/peercred.node" | grep -E 'Machine|Class'
-readelf -h "$tmp/extracted/package/build/Release/linux-arm64/peercred.node" | grep -E 'Machine|Class'
+for arch in x64 arm64; do
+  for file in peercred.node pty.node; do
+    native="$tmp/extracted/package/build/Release/linux-$arch/$file"
+    file "$native"
+    readelf -h "$native" | grep -E 'Machine|Class'
+  done
+done

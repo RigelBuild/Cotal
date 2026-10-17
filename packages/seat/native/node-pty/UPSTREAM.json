@@ -1,0 +1,15 @@
+{
+  "package": "node-pty",
+  "version": "1.2.0-beta.12",
+  "tarball": "https://registry.npmjs.org/node-pty/-/node-pty-1.2.0-beta.12.tgz",
+  "integrity": "sha512-uExTCG/4VmSJa4+TjxFwPXv8BfacmfFEBL6JpxCMDghcwqzvD0yTcGmZ1fKOK6HY33tp0CelLblqTECJizc+Yw==",
+  "patch": "pidfd.patch",
+  "files": {
+    "src/unix/pty.cc": "19210adfdaba3cd09809b56bb3281b14e74a8e5efc1f35d467d3c423c30856db",
+    "lib/unixTerminal.js": "c3bb8dfceb9f99a5d7003041c0aff243eaa60f062538c88fc452c59ae516e74c",
+    "lib/terminal.js": "5ed5cd66a766afba4a04093284e999f8516d41936501839055800b10eca5d304",
+    "lib/eventEmitter2.js": "f1c14613aa90c10def4ca7238329270871997eb26f919f7074dc25533e3e75dd",
+    "lib/utils.js": "6981b69ce5b162393f59f3a541f0e188b9e70bb8300786d1d6be83a231eac7ca",
+    "LICENSE": "a3d60eaf32d2fb09c9d82ef39f14bd6e2c0f3ca7de30daa827486c0d6f8b6e9f"
+  }
+}

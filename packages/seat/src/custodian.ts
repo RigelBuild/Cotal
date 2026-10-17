@@ -1,10 +1,9 @@
-import { appendFileSync, chmodSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
-import { dirname } from "node:path";
-import * as pty from "@lydell/node-pty";
+import { dropPidfdForTest, spawnPinned, type PinnedPty } from "./pty.js";
 import Headless from "@xterm/headless";
 import { SerializeAddon } from "@xterm/addon-serialize";
-import { peerCredentials } from "./peercred.js";
+import { peerCredentials, tryLockFd } from "./peercred.js";
 import {
   CONFIRM_TIMEOUT_MS,
   DEFAULT_COLS,
@@ -32,6 +31,8 @@ export interface CustodianLaunch {
   socket: string;
   token: string;
   recordPath: string;
+  /** The launch fence (`<root>/.launch-<id>`): admission is its unsealed lock, held until ready. */
+  fence: string;
   logPath?: string;
   confirm?: string;
   /** Who started this custodian: the launcher's run marker, carried so a census can attribute an
@@ -43,40 +44,121 @@ export interface CustodianLaunch {
   unattendedMs?: number;
 }
 
+/** The stdin payload `launchSeat` writes: a launch plus the seam `setCustodianTestSeam` set. */
+type LaunchPayload = CustodianLaunch & { testSeam?: CustodianTestSeam };
+
+/** Test-only control points. A production launch never carries one. */
+export interface CustodianTestSeam {
+  /** Drop the fork's pidfd, as a kernel without `pidfd_open` would. */
+  dropPidfd?: boolean;
+  /** Pause at each `at`: write `reached`, then wait until `release` exists. `unpinned` pauses after
+   *  a failed pin, so a test child can arm its handlers before this process exits and hangs it up. */
+  holds?: Array<{ at: "before-fs" | "after-pin" | "unpinned"; reached: string; release: string }>;
+  /** Fail startup at this point, after the child is pinned. */
+  fail?: "after-pin" | "listen-error" | "after-bind";
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 function send(sock: Socket, msg: ServerMessage): void {
   if (!sock.writable) return;
   sock.write(encodeFrame(msg));
 }
 
-export async function runCustodian(launch: CustodianLaunch): Promise<void> {
+export function runCustodian(launch: CustodianLaunch): Promise<void> {
+  return custody(launch, undefined);
+}
+
+// The seam reaches here only from the stdin payload, never from the exported entry point.
+async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefined): Promise<void> {
   if (process.platform !== "linux") {
     throw new Error(`custody transport unsupported on ${process.platform}`);
   }
+  const holdAt = async (at: "before-fs" | "after-pin" | "unpinned"): Promise<void> => {
+    const hold = seam?.holds?.find((h) => h.at === at);
+    if (!hold) return;
+    writeFileSync(hold.reached, String(process.pid));
+    const deadline = Date.now() + CONFIRM_TIMEOUT_MS;
+    while (!existsSync(hold.release)) {
+      if (Date.now() >= deadline) throw new Error(`test seam hold at ${at} was never released`);
+      await sleep(25);
+    }
+  };
+  await holdAt("before-fs");
 
-  mkdirSync(dirname(launch.socket), { recursive: true, mode: 0o700 });
+  // Admission. Read-only and without O_CREAT: a fence that is gone admits nothing, and the read goes
+  // through this fd so a rename after the open cannot hide a seal.
+  const fenceFd = openSync(launch.fence, "r");
+  const admitBy = Date.now() + CONFIRM_TIMEOUT_MS;
+  while (!tryLockFd(fenceFd)) {
+    if (Date.now() >= admitBy) throw new Error(`launch fence ${launch.fence} stayed locked for ${CONFIRM_TIMEOUT_MS}ms; starting no child`);
+    await sleep(25);
+  }
+  if (readFileSync(fenceFd, "utf8").trim() === "sealed") throw new Error(`launch fence ${launch.fence} is sealed; the seat was released, starting no child`);
+
   try {
     unlinkSync(launch.socket);
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
   }
 
-  const proc = pty.spawn(launch.command, launch.args, {
-    name: "xterm-256color",
-    cols: DEFAULT_COLS,
-    rows: DEFAULT_ROWS,
-    cwd: launch.cwd,
-    env: launch.env,
-  });
-  // Pin both start identities NOW, before the child can exit and be reaped: a successor that finds
-  // these pids later must be able to tell this custodian and this child from an unrelated process
-  // that inherited the pid. A zombie still reports its start token, a reaped pid does not: a child
-  // whose exec failed can be gone already, and then the record carries no child identity, which a
-  // reader takes as "exited before custody began" (its exit is observed below like any other).
+  // Read before the spawn so a missing custodian identity fails with no child.
   const custodianStart = processStartToken(process.pid);
   if (custodianStart === undefined) throw new Error(`cannot read the process start identity of custodian ${process.pid} from /proc`);
-  const childStart = processStartToken(proc.pid);
   const bootId = bootToken();
 
+  if (seam?.dropPidfd) dropPidfdForTest();
+  if (typeof launch.args === "string") throw new Error("args as a string is not supported on unix.");
+  // A throw here sends nothing: without a pidfd this process cannot name the child, and its exit
+  // hangs up the PTY instead.
+  let proc: PinnedPty;
+  try {
+    proc = spawnPinned(launch.command, launch.args, {
+      name: "xterm-256color",
+      cols: DEFAULT_COLS,
+      rows: DEFAULT_ROWS,
+      cwd: launch.cwd,
+      env: launch.env,
+    });
+  } catch (e) {
+    await holdAt("unpinned");
+    throw e;
+  }
+  // From here until ready every failure stops the child through its pidfd, before any log write.
+  try {
+    await serveSeat(launch, proc, { custodianStart, bootId, fenceFd, holdAt, seam });
+  } catch (cause) {
+    try {
+      proc.handle.signal("SIGKILL");
+    } catch (e) {
+      throw new Error(`${(cause as Error).message}; and the startup SIGKILL failed: ${(e as Error).message}`);
+    }
+    throw cause;
+  }
+}
+
+async function serveSeat(
+  launch: CustodianLaunch,
+  proc: PinnedPty,
+  pinned: { custodianStart: string; bootId: string | undefined; fenceFd: number; holdAt: (at: "after-pin") => Promise<void>; seam: CustodianTestSeam | undefined },
+): Promise<void> {
+  const { custodianStart, bootId, seam } = pinned;
+  const child = proc.handle;
+  // Timer callbacks log through this: a throw there would end the custodian before the escalation.
+  const logNote = (note: string): void => {
+    if (!launch.logPath) return;
+    try {
+      appendFileSync(launch.logPath, note, { mode: 0o600 });
+    } catch {
+      /* best effort; the send already happened */
+    }
+  };
+  // A zombie still reports its start token; keep it only if the pidfd still reported the child live
+  // after the read, so the token cannot belong to a reused pid.
+  const childStartRead = processStartToken(proc.pid);
+  const childStart = child.exited() ? undefined : childStartRead;
+  await pinned.holdAt("after-pin");
+  if (seam?.fail === "after-pin") throw new Error("test seam: startup failure after pinning");
   const term = new Headless.Terminal({
     cols: DEFAULT_COLS,
     rows: DEFAULT_ROWS,
@@ -119,9 +201,9 @@ export async function runCustodian(launch: CustodianLaunch): Promise<void> {
       for (const [sub, socks] of dataSubs) {
         for (const sock of socks) send(sock, { event: "output", sub, data: encoded });
       }
-      if (launch.logPath) appendFileSync(launch.logPath, `${message}\n`, { mode: 0o600 });
-      proc.kill("SIGTERM");
-      killTimer = setTimeout(() => alive && proc.kill("SIGKILL"), GRACE_MS);
+      // Send before the log write, so a failed write cannot skip the stop.
+      stopFromTimer("startup-confirm timeout");
+      logNote(`${message}\n`);
     }, CONFIRM_TIMEOUT_MS);
   }
 
@@ -135,14 +217,8 @@ export async function runCustodian(launch: CustodianLaunch): Promise<void> {
     waiters.clear();
   };
 
-  const childGone = (): boolean => {
-    try {
-      const stat = readFileSync(`/proc/${proc.pid}/stat`, "utf8");
-      return (stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[0] ?? "") === "Z";
-    } catch {
-      return true;
-    }
-  };
+  // The pidfd, never `/proc/<pid>`: a reused pid must not read as this child still running.
+  const childGone = (): boolean => child.exited();
 
   const settleTerminal = (): void => {
     if (alive || settling || !ready) return;
@@ -180,11 +256,6 @@ export async function runCustodian(launch: CustodianLaunch): Promise<void> {
     } catch {
       /* already gone */
     }
-    try {
-      proc.kill("SIGKILL");
-    } catch {
-      /* already gone */
-    }
     server?.close();
     for (const sock of clients) {
       try {
@@ -199,11 +270,6 @@ export async function runCustodian(launch: CustodianLaunch): Promise<void> {
     dataSubs.clear();
     try {
       unlinkSync(launch.socket);
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-    }
-    try {
-      unlinkSync(launch.recordPath);
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
     }
@@ -240,7 +306,7 @@ export async function runCustodian(launch: CustodianLaunch): Promise<void> {
         // exit: without this the stop below kills the child and the settle refuses, which is the
         // orphan again with a dead child instead of a live one.
         seenClient = true;
-        stopChild("graceful");
+        stopFromTimer("unattended");
         // The settle runs off the child's exit. If the child ignores SIGTERM, `stopChild`'s own
         // SIGKILL escalation takes it within GRACE_MS and `markExited` follows from that.
         return;
@@ -314,15 +380,35 @@ export async function runCustodian(launch: CustodianLaunch): Promise<void> {
   }, 50);
   reap.unref();
 
+  // Every send goes through the pidfd. A first send that fails throws, so `stop` replies with the
+  // error; a failed delayed SIGKILL has no requester and is logged instead.
   const stopChild = (mode: "graceful" | "hard"): void => {
     if (!alive) return;
     if (mode === "hard") {
-      proc.kill("SIGKILL");
+      child.signal("SIGKILL");
       return;
     }
-    proc.kill("SIGTERM");
-    if (killTimer) clearTimeout(killTimer);
-    killTimer = setTimeout(() => alive && proc.kill("SIGKILL"), GRACE_MS);
+    child.signal("SIGTERM");
+    clearTimeout(killTimer);
+    killTimer = setTimeout(() => {
+      if (!alive) return;
+      try {
+        child.signal("SIGKILL");
+      } catch (e) {
+        const note = `${JSON.stringify({ escalationFailed: (e as Error).message, childPid: proc.pid })}\n`;
+        logNote(note);
+      }
+    }, GRACE_MS);
+  };
+  // A timer has no requester to reply to, and a throw here would kill the custodian with the child
+  // still under it: log the failed send instead.
+  const stopFromTimer = (why: string): void => {
+    try {
+      stopChild("graceful");
+    } catch (e) {
+      const note = `${JSON.stringify({ stopFailed: (e as Error).message, why, childPid: proc.pid })}\n`;
+      logNote(note);
+    }
   };
 
   const record: SeatRecord = {
@@ -530,8 +616,17 @@ export async function runCustodian(launch: CustodianLaunch): Promise<void> {
 
   const listening = server;
   if (!listening) throw new Error("custodian server missing");
-  await new Promise<void>((resolve, reject) => {
-    listening.once("error", reject);
+  // A listen `error` rejects into `runCustodian`'s catch, which sends the startup SIGKILL.
+  // Executor form: the repo's `lib` is ES2023, which has no `Promise.withResolvers`.
+  let resolve!: () => void;
+  let reject!: (e: Error) => void;
+  const listened = new Promise<void>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  listening.once("error", reject);
+  if (seam?.fail === "listen-error") setImmediate(() => listening.emit("error", new Error("test seam: listen error")));
+  else
     listening.listen(launch.socket, () => {
       // EVERY throw in here must reach `reject`. A callback is not on the promise's call stack, so an
       // exception raised inside it becomes an UNCAUGHT exception: it bypasses the `.catch` at the
@@ -547,37 +642,39 @@ export async function runCustodian(launch: CustodianLaunch): Promise<void> {
         if (typeof bound === "string" && bound !== launch.socket)
           throw new Error(`custodian bound ${bound} but was asked for ${launch.socket}; the path was truncated, so it would clean up a socket it never created`);
         chmodSync(launch.socket, 0o600);
+        if (seam?.fail === "after-bind") throw new Error("test seam: startup failure after bind");
         writeRecord(launch.recordPath, record);
         ready = true;
+        // Admission ends at ready. Nothing after writeRecord may throw: the launcher returns success
+        // once the record exists, and process exit drops the lock anyway.
+        try {
+          closeSync(pinned.fenceFd);
+        } catch {
+          /* the lock goes with the fd at exit */
+        }
         const announced = `${JSON.stringify({ ready: true, childPid: proc.pid, custodianPid: process.pid })}\n`;
-        if (launch.logPath) appendFileSync(launch.logPath, announced, { mode: 0o600 });
+        if (launch.logPath) logNote(announced);
         else process.stdout.write(announced);
         armUnobservedHandoff();
         armUnattended();
         settleTerminal();
         resolve();
       } catch (e) {
-        // The child outlives this process otherwise: nothing else holds its PTY.
-        try {
-          proc.kill("SIGKILL");
-        } catch {
-          /* already gone */
-        }
         reject(e as Error);
       }
     });
-  });
+  await listened;
 }
 
-function readLaunch(): CustodianLaunch {
+function readLaunch(): LaunchPayload {
   const raw = readFileSync(0, "utf8");
   if (!raw.trim()) throw new Error("custodian requires a JSON launch on stdin");
-  return JSON.parse(raw) as CustodianLaunch;
+  return JSON.parse(raw) as LaunchPayload;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const launch = readLaunch();
-  runCustodian(launch).catch((err) => {
+  const { testSeam, ...launch } = readLaunch();
+  custody(launch, testSeam).catch((err) => {
     const text = `${(err as Error).stack ?? (err as Error).message}\n`;
     try {
       if (launch.logPath) appendFileSync(launch.logPath, text, { mode: 0o600 });
