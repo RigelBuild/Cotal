@@ -52,6 +52,7 @@ import { staticLifecycleTransport, readStaticSlot, activateStaticLifecycle, casS
 import { setCustodianTestSeam } from "../../../packages/seat/dist/launcher.js";
 import { bootBroker } from "./_boot-broker.js";
 import { killOwned, owned, type Owned } from "./_owned-kill.js";
+import { requestDeliveryAdminZeroMemberships } from "./_fake-delivery-admin.js";
 
 let failures = 0;
 let ran = 0;
@@ -160,10 +161,7 @@ M.ep = {
   waitForPresenceSnapshot: () => Promise.resolve(),
   getRoster: (): Presence[] =>
     [...M.agents.values()].map((a): Presence => ({ card: { id: principalKey(DEV_OWNER, a.id).key, name: a.name, role: "worker", kind: "agent", description: "", tags: [] }, status: "idle", lifecycleUid: a.lifecycleUid, ts: 0 })),
-  // Delivery's lifecycle-exact inventory: this fake broker holds no rows beyond the launch policy.
-  requestDeliveryAdmin: async (op: string) => op === "lifecycleMemberships"
-    ? { ok: true, data: { complete: true, channels: [] } }
-    : { ok: false, error: `fake delivery admin: ${op} unsupported` },
+  requestDeliveryAdmin: requestDeliveryAdminZeroMemberships,
 };
 // A real broker kicks a principal's connections once; a re-eviction finds none, so it reports kicked 0.
 const evictions = new Map<string, number[]>();
