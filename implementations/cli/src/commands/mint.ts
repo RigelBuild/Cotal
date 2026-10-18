@@ -3,6 +3,7 @@ import { resolve, dirname } from "node:path";
 import {
   CotalEndpoint,
   agentFilePath,
+  assertKnownAgentCapabilities,
   assertLifecycleToken,
   credsClaims,
   identityFromCreds,
@@ -49,6 +50,8 @@ export async function mint(args: ParsedArgs): Promise<void> {
     identity?: string;
     "new-incarnation"?: boolean;
   };
+  const requestedProfile = values.profile ?? "agent";
+  const offAgent = values.signer ? "--signer" : requestedProfile !== "agent" ? `--profile ${requestedProfile}` : undefined;
   const cwdRoot = cotalRoot();
   const cwdStore = workspaceSecretStore(cwdRoot);
   const cwdAuthDir = authDir(cwdRoot);
@@ -59,11 +62,11 @@ export async function mint(args: ParsedArgs): Promise<void> {
   // ignored, so a typo does not read as done. Checked before the `--signer` branch: that branch
   // returns early, and a refusal that lives after it would let `--signer --provision` write
   // signing material where the operator asked for a provisioned identity.
-  const offAgent = values.signer ? "--signer" : (values.profile ?? "agent") !== "agent" ? `--profile ${values.profile}` : undefined;
-  if ((values.role !== undefined || values.provision) && offAgent) {
-    console.error(c.red(`--role and --provision apply to the agent profile only (got ${offAgent})`));
+  if (values["new-incarnation"] && offAgent) {
+    console.error(c.red(`--new-incarnation applies to the agent profile only (got ${offAgent})`));
     process.exit(1);
   }
+
   // AND SO DO THE TWO ACL FLAGS, WHICH USED TO BE IGNORED HERE RATHER THAN REFUSED. They are read
   // below only inside the `profile === "agent"` branch, while `permissionsFor`'s observer/admin arm
   // emits a FIXED read set over the whole chat plane. So `--profile observer --allow-subscribe
@@ -159,9 +162,9 @@ export async function mint(args: ParsedArgs): Promise<void> {
 
   const name = positionals[0];
   if (!name) {
-    console.error(c.red("usage: cotal mint <name> [--profile <agent|observer|admin>] [--out <path>] [--expires-in <s>|--expires-at <unix-s>] [--identity <creds>] [--new-incarnation]  (agent profile also: [--allow-subscribe a,b] [--allow-publish a,b] [--role <role>] [--provision])"));
+    console.error(c.red("usage: cotal mint <name> [--profile <agent|observer|admin>] [--out <path>] [--expires-in <s>|--expires-at <unix-s>] [--identity <creds>] [--new-incarnation (agent only)]  (agent profile also: [--allow-subscribe a,b] [--allow-publish a,b] [--role <role>] [--provision])"));
+    process.exit(1);
   }
-  // Only an absent flag is `undefined` and defers to the agent file; an empty value is the empty
   // list, so `--allow-publish ""` grants no channel.
   const splitList = (v?: string) => (v === undefined ? undefined : v.split(",").map((s) => s.trim()).filter(Boolean));
   const profile = (values.profile ?? "agent") as Profile;
@@ -228,6 +231,12 @@ export async function mint(args: ParsedArgs): Promise<void> {
     }
     allowPublish = splitList(values["allow-publish"]) ?? def?.allowPublish;
     role = values.role ?? def?.role;
+    try {
+      assertKnownAgentCapabilities(def?.capabilities ?? [], `agent file ${f}`);
+    } catch (error) {
+      console.error(c.red(`✗ ${error instanceof Error ? error.message : String(error)}`));
+      process.exit(1);
+    }
     capabilities = def?.capabilities;
     if (existingIdentity && existingCreds !== undefined && !values["new-incarnation"]) {
       const candidate = new Set<string>();

@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, lstatSync, renameSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
-import { assertDerivedOwnerToken, assertValidChannel, assertValidName, ensureDirNoSymlink, isConcreteChannel, realDirNoSymlink, type MeshLaunchAgent, type MeshLaunchSpec } from "@cotal-ai/core";
+import { assertDerivedOwnerToken, assertKnownAgentCapabilities, assertValidChannel, assertValidName, ensureDirNoSymlink, isConcreteChannel, realDirNoSymlink, type MeshLaunchAgent, type MeshLaunchSpec } from "@cotal-ai/core";
 
 /**
  * Load + materialize a resolved launch spec for `supervise --launch`.
@@ -120,13 +120,6 @@ export function launchSpecForRun(root: string, runId: string): MeshLaunchSpec {
   return spec;
 }
 
-// Capabilities that actually grant anything in v1: `spawn` (the privileged control tier), and — on
-// user-auth meshes — `role:<r>` delegation tokens the provision filter passes into the agent's
-// ledger scope (the envelope walk still attenuates them against the spawner chain). `admin` is
-// deliberately NOT accepted from a manifest: a hand-editable file must not be what mints an
-// authority-root agent. An unknown capability is inert downstream, so reject it at the boundary
-// rather than carry a no-op grant.
-const isKnownCapability = (c: string): boolean => c === "spawn" || c === "run" || /^role:[A-Za-z0-9_-]+$/.test(c);
 
 /** Re-enforce the v1 manifest's policy constraints at the manager boundary so a hand-edited/malicious
  *  launch spec can't smuggle in what the CLI schema would reject: concrete channels only (no wildcard
@@ -145,8 +138,7 @@ function validateLaunchPolicy(a: MeshLaunchAgent): void {
     }
   const missing = a.subscribe.filter((c) => !a.allowSubscribe.includes(c));
   if (missing.length) throw new Error(`${where}: subscribe [${missing.join(", ")}] not within allowSubscribe`);
-  for (const cap of a.capabilities ?? [])
-    if (!isKnownCapability(cap)) throw new Error(`${where}: unknown capability "${cap}" (known: spawn, run, role:<r>)`);
+  assertKnownAgentCapabilities(a.capabilities ?? [], where);
 }
 
 /** Materialize one resolved agent's persona to a transient file the connector reads, and return its

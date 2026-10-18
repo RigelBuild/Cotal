@@ -32,6 +32,15 @@ import type { EndpointKind } from "./types.js";
 import { assertValidName } from "./resolve.js";
 import { assertValidChannel, assertValidOwnerToken, channelInAllow, isConcreteChannel, resolveReadAcl } from "./subjects.js";
 
+/** Agent-file capabilities that grant authority in v1. Shared with boundaries that validate
+ *  hand-editable policies before they reach credential signing or provisioning. */
+export function assertKnownAgentCapabilities(capabilities: readonly string[], where = "agent"): void {
+  for (const capability of capabilities) {
+    if (capability !== "spawn" && capability !== "run" && !/^role:[A-Za-z0-9_-]+$/.test(capability))
+      throw new Error(`${where}: unknown capability "${capability}" (known: spawn, run, role:<r>)`);
+  }
+}
+
 export interface AgentDef {
   name: string;
   role?: string;
