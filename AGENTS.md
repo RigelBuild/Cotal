@@ -28,8 +28,8 @@ merge commit; this PR must not be squashed or rebased. Mutation reproof skips th
 numeric or process-group signals, retain or refuse an unproven reap). If an upstream test asserts
 the opposite, quarantine it unchanged.
 3. Quarantine every other upstream-red suite as above, then run `pnpm smoke:gate-inventory`.
-4. Add review fixes as new commits on the branch, never as a rebase. The PR needs an
-`Approved-at: <head sha>` paragraph naming its final head.
+4. Add review fixes as new commits on the branch, never as a rebase. The PR body needs its own
+paragraph `Approved-at: <full 40-character head sha>` naming the final pushed head.
 
 ## What this is
 
