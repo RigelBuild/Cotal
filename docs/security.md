@@ -84,6 +84,12 @@ The guarantees, at a glance, each enforced by the broker per
   provisioner-created bind-only consumers, so an agent cannot read someone else's inbox or
   steal another role's work; durable-channel backstop reads are re-authorized by a trusted
   reader ([delivery daemon](delivery-daemon.md)).
+- **Carried resume transcripts**: a transcript carried to another manager travels through a
+  bucket that only the target manager instance's transfer reader can read, and the operator's
+  writer is pinned to that one transcript. Seats and peers hold no grant on any transfer bucket,
+  and the carried seat runs in its own Claude home, so no other seat's Claude lists or finds the
+  transcript. Seats on one host still run as one OS user, so a process that opens another seat's
+  home by path can read it. See [connecting Claude](connect-claude.md).
 - **Transport secrecy (optional)**: `cotals://` enforces TLS for the hop to the broker.
   It protects that hop, not the broker itself.
 
@@ -146,6 +152,15 @@ The guarantees, at a glance, each enforced by the broker per
   agent-config keys). The boundary is *who* may spawn (the authenticated caller, gated by the
   capability), not *which* flags they pass. Grant `spawn` as host-launch authority, not a narrow
   "add a teammate" permission ([run a mesh](run-a-mesh.md#spawning-agents)).
+- **Seat reap proof:** `reapSeat` reports a seat gone only after a contained seat cgroup is empty.
+  Without that proof, it returns retained/unprovable and requests a custodian stop when it can read
+  the record. The custodian signals its child through a pidfd, never a numeric pid or process group.
+- **Same-uid rewrite of a seat custody record:** the custody record (`record.json`, `0600` in a
+  `0700` directory) carries no authentication. A process running as the same uid can rewrite it, so
+  its recorded process identities are untrusted. Reaping does not use them to signal or prove exit;
+  only a contained seat cgroup can prove the seat gone. This stays inside the same-uid boundary
+  under *Adversaries*: such a process can already reach the account signer in the default
+  compositions.
 
 ## Prompt-facing data
 

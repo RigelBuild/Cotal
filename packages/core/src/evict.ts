@@ -32,6 +32,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { connect, credsAuthenticator, type NatsConnection } from "@nats-io/transport-node";
+import { isAccountNkey, isUserNkey } from "./identity.js";
 import { connzRequestSubject, isPrincipalOwnerToken, parsePrincipalKey, principalFromConnz, serverKickSubject, MEMBERSHIP_INBOX_PREFIX } from "./subjects.js";
 
 const enc = (s: string) => new TextEncoder().encode(s);
@@ -133,7 +134,7 @@ async function scanLive(
       for (const c of cs) {
         // Attribute across BOTH cred shapes — a callout user surfaces its principal as the
         // `authorized_user` name-form (no tags), a static user surfaces the `principal:` tag.
-        const principal = principalFromConnz(c);
+        const principal = principalFromConnz(c, { allowPlatform: true });
         if (!principal) continue; // un-attributable (infra/open/nkey) — not a target, safe to ignore
         if (typeof c.cid !== "number") {
           // An ATTRIBUTABLE connection with no usable cid can't be KICK-routed — same fail-closed
@@ -238,52 +239,112 @@ export async function evictDeniedPrincipal(
   principal: string,
   options: EvictOptions = {},
 ): Promise<EvictionResult> {
+  return (await evictDeniedPrincipals(observerConn, evictorConn, accountId, [principal], options))[0]!;
+}
+
+/** The most principals one {@link evictDeniedPrincipals} sweep (and one `evictPrincipals`
+ *  delivery-admin request) carries. A caller with a larger set sends it in chunks. */
+export const EVICT_PRINCIPALS_MAX = 256;
+
+/** How many KICK requests one {@link evictDeniedPrincipals} sweep has in flight at a time. */
+export const KICK_CONCURRENCY = 16;
+
+/**
+ * {@link evictDeniedPrincipal} for a SET of denied principals in ONE shared sweep: one CONNZ scan
+ * for the whole set, a KICK for every matching cid ({@link KICK_CONCURRENCY} in flight at a time,
+ * all settled before the next scan), and one re-scan per verify round that checks
+ * every principal still pending. The broker work is a constant number of scans for the set rather
+ * than one scan → KICK → verify cycle per principal. Each principal gets its own result, in input
+ * order, with the same fail-closed reading: an under-reported scan leaves every principal it would
+ * have decided `verifiedGone:false, scanComplete:false`.
+ */
+export async function evictDeniedPrincipals(
+  observerConn: NatsConnection,
+  evictorConn: NatsConnection | (() => Promise<NatsConnection>),
+  accountId: string,
+  principals: readonly string[],
+  options: EvictOptions = {},
+): Promise<EvictionResult[]> {
   const opts = {
     maxVerifyRounds: options.maxVerifyRounds ?? 3,
     settleMs: options.settleMs ?? 250,
     maxWaitMs: options.maxWaitMs ?? 2000,
     pageLimit: options.pageLimit ?? 1024,
   };
+  const set = [...new Set(principals)];
+  if (set.length > EVICT_PRINCIPALS_MAX)
+    throw new Error(`evictDeniedPrincipals: ${set.length} principals exceed the ${EVICT_PRINCIPALS_MAX}-principal sweep bound; send them in chunks`);
+  const out = new Map<string, EvictionResult>();
+  const answer = () => principals.map((p) => out.get(p)!);
+  const byPrincipal = (conns: LiveConn[], among: Iterable<string>) => {
+    const m = new Map<string, LiveConn[]>([...among].map((p) => [p, []]));
+    for (const c of conns) m.get(c.principal)?.push(c);
+    return m;
+  };
+
   const first = await scanLive(observerConn, accountId, opts);
-  if (!first.complete)
-    return { principal, kicked: 0, remaining: 0, verifiedGone: false, scanComplete: false, note: "CONNZ scan under-reported (no responder or truncated) - eviction UNKNOWN, not attempted" };
-
-  const targets = first.conns.filter((c) => c.principal === principal);
-  // A complete scan that matches nothing is verified-gone on its own. The evictor supplier is not
-  // called: there is no connection to kick. A live match still needs it.
-  if (targets.length === 0)
-    return { principal, kicked: 0, remaining: 0, verifiedGone: true, scanComplete: true, note: "principal not currently live - nothing to evict" };
-  const kicker = typeof evictorConn === "function" ? await evictorConn() : evictorConn;
-
-  let kicked = 0;
-  let note: string | undefined;
-  for (const t of targets) {
-    try {
-      await kick(kicker, t);
-      kicked++;
-    } catch (e) {
-      note = e instanceof Error ? e.message : String(e);
-    }
+  if (!first.complete) {
+    for (const p of set)
+      out.set(p, { principal: p, kicked: 0, remaining: 0, verifiedGone: false, scanComplete: false, note: "CONNZ scan under-reported (no responder or truncated) - eviction UNKNOWN, not attempted" });
+    return answer();
   }
+
+  // A complete scan that matches nothing is verified-gone on its own. The evictor supplier is not
+  // called unless some principal has a live connection to kick.
+  const pending = new Map<string, { kicked: number; note?: string }>();
+  for (const [p, targets] of byPrincipal(first.conns, set)) {
+    if (targets.length === 0) out.set(p, { principal: p, kicked: 0, remaining: 0, verifiedGone: true, scanComplete: true, note: "principal not currently live - nothing to evict" });
+    else pending.set(p, { kicked: 0 });
+  }
+  if (pending.size === 0) return answer();
+  const kicker = typeof evictorConn === "function" ? await evictorConn() : evictorConn;
+  // KICKs are independent per connection, so they run KICK_CONCURRENCY at a time; every one of them
+  // settles before the verify re-scan reads the result.
+  const kickAll = async (live: Map<string, LiveConn[]>) => {
+    const queue = [...live].flatMap(([p, targets]) => targets.map((t) => ({ st: pending.get(p)!, t })));
+    const worker = async () => {
+      for (let next = queue.shift(); next; next = queue.shift()) {
+        try {
+          await kick(kicker, next.t);
+          next.st.kicked++;
+        } catch (e) {
+          next.st.note = e instanceof Error ? e.message : String(e);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(KICK_CONCURRENCY, queue.length) }, worker));
+  };
+  await kickAll(byPrincipal(first.conns, pending.keys()));
 
   // Verify by re-scan — a client kicked before deny-new fully propagates can reconnect with a fresh
-  // cid, so loop until the principal is gone or the rounds run out (never one snapshot).
-  for (let round = 0; round < opts.maxVerifyRounds; round++) {
+  // cid, so loop until every principal is gone or the rounds run out (never one snapshot).
+  for (let round = 0; round < opts.maxVerifyRounds && pending.size > 0; round++) {
     const rescan = await scanLive(observerConn, accountId, opts);
-    if (!rescan.complete)
-      return { principal, kicked, remaining: 0, verifiedGone: false, scanComplete: false, note: note ?? "verify re-scan under-reported - eviction UNKNOWN" };
-    const still = rescan.conns.filter((c) => c.principal === principal);
-    if (still.length === 0)
-      return { principal, kicked, remaining: 0, verifiedGone: true, scanComplete: true, note };
-    // Still live — kick the fresh cids and try again (bounded by maxVerifyRounds).
-    for (const t of still) {
-      try { await kick(kicker, t); kicked++; } catch (e) { note = e instanceof Error ? e.message : String(e); }
+    if (!rescan.complete) {
+      for (const [p, st] of pending)
+        out.set(p, { principal: p, kicked: st.kicked, remaining: 0, verifiedGone: false, scanComplete: false, note: st.note ?? "verify re-scan under-reported - eviction UNKNOWN" });
+      return answer();
     }
+    const live = byPrincipal(rescan.conns, pending.keys());
+    for (const [p, still] of live) {
+      if (still.length > 0) continue;
+      const st = pending.get(p)!;
+      out.set(p, { principal: p, kicked: st.kicked, remaining: 0, verifiedGone: true, scanComplete: true, note: st.note });
+      pending.delete(p);
+      live.delete(p);
+    }
+    // Still live — kick the fresh cids and try again (bounded by maxVerifyRounds).
+    await kickAll(live);
     if (round === opts.maxVerifyRounds - 1)
-      return { principal, kicked, remaining: still.length, verifiedGone: false, scanComplete: true, note: note ?? `${still.length} connection(s) still live after ${opts.maxVerifyRounds} verify rounds - is deny-new committed?` };
+      for (const [p, still] of live) {
+        const st = pending.get(p)!;
+        out.set(p, { principal: p, kicked: st.kicked, remaining: still.length, verifiedGone: false, scanComplete: true, note: st.note ?? `${still.length} connection(s) still live after ${opts.maxVerifyRounds} verify rounds - is deny-new committed?` });
+      }
   }
-  // Unreachable (the loop returns), but satisfies the type checker.
-  return { principal, kicked, remaining: 0, verifiedGone: false, scanComplete: true, note };
+  // maxVerifyRounds of 0 leaves kicked principals undecided: not verified.
+  for (const [p, st] of pending)
+    if (!out.has(p)) out.set(p, { principal: p, kicked: st.kicked, remaining: 0, verifiedGone: false, scanComplete: true, note: st.note });
+  return answer();
 }
 
 // ---- Plane-claim CONNZ liveness (#29 HIGH 3): the delivery-admin oracle's read half ----
@@ -333,7 +394,7 @@ export function isPlaneConnTuple(v: unknown): v is PlaneConnTuple {
   return (
     typeof t.serverId === "string" && t.serverId.length > 0 && t.serverId.length <= 128 &&
     typeof t.cid === "number" && Number.isSafeInteger(t.cid) && t.cid > 0 &&
-    typeof t.userNkey === "string" && /^U[A-Z2-7]{55}$/.test(t.userNkey)
+    isUserNkey(t.userNkey)
   );
 }
 
@@ -375,7 +436,9 @@ interface PlaneConnzConn {
  *  reclaim keys on `(serverId, cid)` and the connection's user nkey, the freeze-holder probe keys
  *  on the attributed `principal`. Captured in ONE pass so the two verdicts can never be drawn from
  *  differently-validated observations. */
-interface SweptConn {
+export interface SweptConn {
+  /** The broker-reported connection name, when present. */
+  label?: string;
   serverId: string;
   cid: number;
   userNkey?: string;
@@ -383,7 +446,11 @@ interface SweptConn {
   principal?: string;
 }
 
-interface LivenessSweep {
+export interface LivenessSweep {
+  /** At least one server answered, even when its page was malformed. */
+  gotAnyReply: boolean;
+  /** Pagination reached its safety ceiling. False alone does not prove completeness. */
+  truncated: boolean;
   conns: SweptConn[];
   /** CONNZ OBSERVATION completeness: every round replied, well-formed, no truncation. */
   sweepComplete: boolean;
@@ -458,9 +525,10 @@ async function livenessSweep(
           malformed = true; // an id-less row could BE the claimed connection — fail safe
           continue;
         }
-        const principal = principalFromConnz(c);
+        const principal = principalFromConnz(c, { allowPlatform: true });
         conns.push({
           serverId, cid: c.cid,
+          ...(typeof c.name === "string" ? { label: c.name } : {}),
           ...(typeof c.authorized_user === "string" ? { userNkey: c.authorized_user } : {}),
           ...(principal === null ? {} : { principal }),
         });
@@ -488,7 +556,7 @@ async function livenessSweep(
   }
   const sweepComplete = gotAnyReply && !truncated && !malformed && !lostPage;
   return {
-    conns, sweepComplete, clusterDeclared, repliers: repliers.size,
+    conns, gotAnyReply, truncated, sweepComplete, clusterDeclared, repliers: repliers.size,
     singleServerProven: sweepComplete && !clusterDeclared && repliers.size === 1,
   };
 }
@@ -561,6 +629,31 @@ export async function observePlaneLiveness(
     sweepComplete: s.sweepComplete,
     ...(note === undefined ? {} : { note }),
   };
+}
+
+/** Observe one account's connections through the same read-only observer credential as the
+ * tuple query. The broker enforces the credential's account scope. No wildcard account request,
+ * evictor, or credential mint occurs here. Empty results prove absence only when sweepComplete
+ * and singleServerProven are both true (SPEC 13.13). */
+export async function observeAccountLivenessWithCreds(opts: {
+  servers: string;
+  observerCreds: string;
+  accountId: string;
+  options?: EvictOptions;
+}): Promise<LivenessSweep> {
+  if (!isAccountNkey(opts.accountId))
+    throw new Error("account liveness requires one account public key");
+  const observer = await connect({
+    servers: opts.servers,
+    authenticator: credsAuthenticator(enc(opts.observerCreds)),
+    inboxPrefix: MEMBERSHIP_INBOX_PREFIX,
+    maxReconnectAttempts: 0,
+  });
+  try {
+    return await livenessSweep(observer, opts.accountId, opts.options ?? {});
+  } finally {
+    await observer.drain().catch(() => observer.close());
+  }
 }
 
 /** Creds-level wrapper for the delivery daemon's admin-rail plane-liveness verb: open the $SYS
@@ -652,8 +745,8 @@ export async function observePrincipalLiveness(
   options: EvictOptions = {},
 ): Promise<PrincipalLivenessResult> {
   const parsed = parsePrincipalKey(principal);
-  if (!parsed || !isPrincipalOwnerToken(parsed.owner))
-    throw new Error(`principalLiveness: "${principal}" is not a real owner.actor principal (owner must be \`local\` or a derived \`u_…\` token — the only shapes CONNZ attribution can surface); a clean sweep for it would be false confidence, not a verdict`);
+  if (!parsed || !isPrincipalOwnerToken(parsed.owner, { allowLocal: true, allowPlatform: true }))
+    throw new Error(`principalLiveness: "${principal}" is not a real owner.actor principal (owner must be \`local\`, a derived \`u_…\` or a platform \`p_…\` token — the shapes CONNZ attribution can surface); a clean sweep for it would be false confidence, not a verdict`);
   const s = await livenessSweep(observerConn, accountId, options);
   const live = s.conns.some((c) => c.principal === principal);
   const note = sweepShortfallNote(s, "a freeze-holder repair");
@@ -706,6 +799,22 @@ export async function evictDeniedPrincipalWithCreds(opts: {
   principal: string;
   options?: EvictOptions;
 }): Promise<EvictionResult> {
+  const { principal, ...rest } = opts;
+  return (await evictDeniedPrincipalsWithCreds({ ...rest, principals: [principal] }))[0]!;
+}
+
+/** {@link evictDeniedPrincipals} over per-call observer and evictor connections: one observer
+ *  connection and at most one evictor connection for the whole set. */
+export async function evictDeniedPrincipalsWithCreds(opts: {
+  servers: string;
+  observerCreds: string;
+  evictorCreds?: string;
+  /** Loaded only after a complete scan finds a live match. Wins over `evictorCreds` when both are set. */
+  openEvictor?: () => Promise<string>;
+  accountId: string;
+  principals: readonly string[];
+  options?: EvictOptions;
+}): Promise<EvictionResult[]> {
   const enc = (s: string) => new TextEncoder().encode(s);
   const observer = await connect({
     servers: opts.servers,
@@ -715,7 +824,7 @@ export async function evictDeniedPrincipalWithCreds(opts: {
   });
   let evictor: NatsConnection | undefined;
   try {
-    return await evictDeniedPrincipal(observer, async () => {
+    return await evictDeniedPrincipals(observer, async () => {
       const creds = opts.openEvictor ? await opts.openEvictor() : opts.evictorCreds;
       if (creds === undefined)
         throw new Error("evictDeniedPrincipal: a live match requires the kick-only evictor credential");
@@ -725,7 +834,7 @@ export async function evictDeniedPrincipalWithCreds(opts: {
         maxReconnectAttempts: 0,
       });
       return evictor;
-    }, opts.accountId, opts.principal, opts.options ?? {});
+    }, opts.accountId, opts.principals, opts.options ?? {});
   } finally {
     if (evictor) await evictor.drain().catch(() => {});
     await observer.drain().catch(() => {});

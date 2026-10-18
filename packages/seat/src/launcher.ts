@@ -1,7 +1,9 @@
 import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, chownSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { discardSeatArtifacts } from "./artifacts.js";
 import { assertSeatId, capabilityToken, fencePath, readSeatFileNoFollow, recordPath, seatId, socketPath, type SeatRecord, readRecord } from "./record.js";
 import { CONFIRM_TIMEOUT_MS, unattendedMs, assertSocketPathFits, unsupportedTransport } from "./protocol.js";
 import { tryLockFd } from "./peercred.js";
@@ -13,6 +15,9 @@ export interface SeatLaunchSpec {
   args: string[];
   env?: Record<string, string>;
   confirm?: string;
+  confirmBefore?: readonly import("./startup-confirm.js").StartupReply[];
+  /** The launch's private temporary directories, recorded on the seat record (see SeatRecord). */
+  artifacts?: string[];
 }
 
 export interface LaunchSeatOpts {
@@ -165,10 +170,17 @@ function holdLauncher(hold: { reached: string; release: string }): void {
 }
 
 export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
-  const created: { cgroup?: SeatCgroup } = {};
+  // The launch's artifacts were written under THIS process's temp dir. The custodian's environment
+  // is scrubbed, so it is told the root rather than reading its own.
+  const artifactRoot = resolve(tmpdir());
+  const created: { cgroup?: SeatCgroup; spawned?: boolean } = {};
   try {
-    return launchInto(opts, created);
+    return launchInto(opts, created, artifactRoot);
   } catch (e) {
+    // Every throw before the spawn comes before any process exists, so no child will read the files.
+    // A throw after it proves nothing about the child, which the custodian may have started; its
+    // files are then the custodian's to remove once it sees that child exit.
+    if (!created.spawned) discardSeatArtifacts(opts.spec.artifacts, artifactRoot);
     // rmdir only, never a kill: an empty cgroup goes, so a pending custodian finds it gone and exits.
     if (created.cgroup) {
       try {
@@ -182,7 +194,7 @@ export function launchSeat(opts: LaunchSeatOpts): SeatRecord {
   }
 }
 
-function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): SeatRecord {
+function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup; spawned?: boolean }, artifactRoot: string): SeatRecord {
   if (process.platform !== "linux") throw unsupportedTransport();
   const euid = process.geteuid?.() ?? -1;
   const agentUid = opts.agentUid ?? euid;
@@ -245,6 +257,8 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
       fence,
       logPath,
       confirm: opts.spec.confirm,
+      confirmBefore: opts.spec.confirmBefore,
+      ...(opts.spec.artifacts?.length ? { artifacts: opts.spec.artifacts, artifactRoot } : {}),
       run,
       // Resolved HERE, not in the custodian: the custodian's environment is scrubbed to `PATH` plus the
       // run marker, so it cannot read an override the caller set.
@@ -289,6 +303,7 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup }): Sea
     // and so `/proc/<pid>/environ` answers the same question argv does for a reader who can read it.
     env: { PATH: process.env.PATH ?? "", COTAL_RUN: run },
   });
+  created.spawned = true;
   closeSync(launchFd);
   child.unref();
   if (cgroup) {

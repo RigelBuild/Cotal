@@ -1,10 +1,12 @@
-import { appendFileSync, chmodSync, closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, existsSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { inSeatCgroup } from "./cgroup.js";
 import { createServer, type Socket } from "node:net";
-import { dropPidfdForTest, spawnPinned, type PinnedPty } from "./pty.js";
+import { argsAsStringForTest, dropPidfdForTest, NoChildStarted, spawnPinned, type PinnedPty } from "./pty.js";
 import Headless from "@xterm/headless";
 import { SerializeAddon } from "@xterm/addon-serialize";
+import { discardSeatArtifacts } from "./artifacts.js";
 import { peerCredentials, tryLockFd } from "./peercred.js";
+import { preferSeatForOomKill } from "./oom.js";
 import {
   CONFIRM_TIMEOUT_MS,
   DEFAULT_COLS,
@@ -17,10 +19,12 @@ import {
   UNATTENDED_MS as UNATTENDED_DEFAULT_MS,
   encodeFrame,
   type ClientRequest,
+  type SeatExit,
   type ServerMessage,
 } from "./protocol.js";
-import { RECORD_VERSION, bootToken, processStartToken, writeRecord, type SeatRecord } from "./record.js";
-import { StartupConfirmMatcher, unmatchedConfirmMessage } from "./startup-confirm.js";
+import { ConnectorDiagnosticReader } from "./diagnostic.js";
+import { RECORD_VERSION, bootToken, exitPath, processStartToken, writeRecord, type SeatRecord } from "./record.js";
+import { StartupConfirmGate } from "./startup-confirm.js";
 
 export interface CustodianLaunch {
   id: string;
@@ -36,6 +40,7 @@ export interface CustodianLaunch {
   fence: string;
   logPath?: string;
   confirm?: string;
+  confirmBefore?: readonly import("./startup-confirm.js").StartupReply[];
   /** Who started this custodian: the launcher's run marker, carried so a census can attribute an
    *  orphan to its run without walking `/proc/*\/cwd` (#1648). */
   run?: string;
@@ -43,6 +48,11 @@ export interface CustodianLaunch {
    *  Resolved by the LAUNCHER, because the launcher scrubs the environment it hands this process
    *  (the child must not inherit the caller's), so an env override read here would never see one. */
   unattendedMs?: number;
+  /** The launch's private temporary directories, copied onto the seat record. This custodian removes
+   *  them once it sees its child exit, the one exit it observes directly. */
+  artifacts?: string[];
+  /** The launcher's temp dir, which every entry of `artifacts` must sit directly under. */
+  artifactRoot?: string;
   /** The layer 3 seat cgroup the launcher moves this process into. No child is spawned outside it. */
   cgroup?: string;
   /** The only uid whose connections this custodian serves: the launcher's. With a distinct agent uid
@@ -57,6 +67,8 @@ type LaunchPayload = CustodianLaunch & { testSeam?: CustodianTestSeam };
 export interface CustodianTestSeam {
   /** Drop the fork's pidfd, as a kernel without `pidfd_open` would. */
   dropPidfd?: boolean;
+  /** Pass string args through to native node-pty to exercise its recognized pre-fork refusal. */
+  argsAsString?: boolean;
   /** Pause at each `at`: write `reached`, then wait until `release` exists, for up to `timeoutMs`
    *  (default CONFIRM_TIMEOUT_MS). `unpinned` pauses after a failed pin, so a test child can arm its
    *  handlers before this process exits and hangs it up. */
@@ -84,7 +96,6 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
     throw new Error(`custody transport unsupported on ${process.platform}`);
   }
   const startedAt = Date.now();
-  if (!Number.isInteger(launch.adopterUid) || launch.adopterUid < 0) throw new Error(`launch adopterUid ${String(launch.adopterUid)} is not a uid; starting no child`);
   const holdAt = async (at: "before-fs" | "after-pin" | "unpinned"): Promise<void> => {
     const hold = seam?.holds?.find((h) => h.at === at);
     if (!hold) return;
@@ -95,45 +106,80 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
       await sleep(25);
     }
   };
-  await holdAt("before-fs");
 
-  // Admission. Read-only and without O_CREAT: a fence that is gone admits nothing, and the read goes
-  // through this fd so a rename after the open cannot hide a seal.
-  const fenceFd = openSync(launch.fence, "r");
-  const admitBy = Date.now() + CONFIRM_TIMEOUT_MS;
-  while (!tryLockFd(fenceFd)) {
-    if (Date.now() >= admitBy) throw new Error(`launch fence ${launch.fence} stayed locked for ${CONFIRM_TIMEOUT_MS}ms; starting no child`);
-    await sleep(25);
-  }
-  if (readFileSync(fenceFd, "utf8").trim() === "sealed") throw new Error(`launch fence ${launch.fence} is sealed; the seat was released, starting no child`);
+  const note = (line: string): void => {
+    try {
+      if (launch.logPath) appendFileSync(launch.logPath, line, { mode: 0o600 });
+      else process.stderr.write(line);
+    } catch {
+      /* the seat directory may already be gone */
+    }
+  };
+  // Removes the launch's files, logging rather than throwing: a refused path must not take down the
+  // custodian of a live seat.
+  const discardArtifacts = (artifacts: readonly string[] | undefined): void => {
+    try {
+      discardSeatArtifacts(artifacts, launch.artifactRoot);
+    } catch (e) {
+      note(`${(e as Error).message}\n`);
+    }
+  };
 
-  // Membership is checked under the fence lock. A removed cgroup can never be joined, so it fails at once.
-  if (launch.cgroup !== undefined) {
-    const cgroup = { path: launch.cgroup };
-    while (!inSeatCgroup(cgroup)) {
-      if (!existsSync(cgroup.path)) throw new Error(`seat cgroup ${cgroup.path} was removed before this custodian joined it; starting no child`);
-      if (Date.now() >= startedAt + CONFIRM_TIMEOUT_MS) throw new Error(`custodian is not in seat cgroup ${cgroup.path} after ${CONFIRM_TIMEOUT_MS}ms; starting no child`);
+  // Every throw from here to the spawn starts no child, so none will read the files. The launcher
+  // handed them over once it spawned this process, and no record exists for a reap to remove them.
+  let confirmGate: StartupConfirmGate | undefined;
+  let fenceFd: number;
+  let custodianStart: string;
+  let bootId: string | undefined;
+  try {
+    if (!Number.isInteger(launch.adopterUid) || launch.adopterUid < 0) throw new Error(`launch adopterUid ${String(launch.adopterUid)} is not a uid; starting no child`);
+    await holdAt("before-fs");
+    // Admission. Read-only and without O_CREAT: a fence that is gone admits nothing, and the read goes
+    // through this fd so a rename after the open cannot hide a seal.
+    fenceFd = openSync(launch.fence, "r");
+    const admitBy = Date.now() + CONFIRM_TIMEOUT_MS;
+    while (!tryLockFd(fenceFd)) {
+      if (Date.now() >= admitBy) throw new Error(`launch fence ${launch.fence} stayed locked for ${CONFIRM_TIMEOUT_MS}ms; starting no child`);
       await sleep(25);
     }
-  }
+    if (readFileSync(fenceFd, "utf8").trim() === "sealed") throw new Error(`launch fence ${launch.fence} is sealed; the seat was released, starting no child`);
 
-  try {
-    unlinkSync(launch.socket);
+    // Membership is checked under the fence lock. A removed cgroup can never be joined, so it fails at once.
+    if (launch.cgroup !== undefined) {
+      const cgroup = { path: launch.cgroup };
+      while (!inSeatCgroup(cgroup)) {
+        if (!existsSync(cgroup.path)) throw new Error(`seat cgroup ${cgroup.path} was removed before this custodian joined it; starting no child`);
+        if (Date.now() >= startedAt + CONFIRM_TIMEOUT_MS) throw new Error(`custodian is not in seat cgroup ${cgroup.path} after ${CONFIRM_TIMEOUT_MS}ms; starting no child`);
+        await sleep(25);
+      }
+    }
+
+    try {
+      unlinkSync(launch.socket);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    }
+
+    // Built before the child exists, so a prompt that cannot match starts nothing.
+    if (launch.confirmBefore?.length && launch.confirm === undefined) throw new Error("startup choices require a final confirmation prompt");
+    confirmGate = launch.confirm === undefined ? undefined : new StartupConfirmGate(launch.confirm, launch.confirmBefore);
+    // Read before the spawn so a missing custodian identity fails with no child.
+    const start = processStartToken(process.pid);
+    if (start === undefined) throw new Error(`cannot read the process start identity of custodian ${process.pid} from /proc`);
+    custodianStart = start;
+    bootId = bootToken();
+
+    if (seam?.dropPidfd) dropPidfdForTest();
+    if (typeof launch.args === "string") throw new Error("args as a string is not supported on unix.");
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    discardArtifacts(launch.artifacts);
+    throw e;
   }
-
-  // Read before the spawn so a missing custodian identity fails with no child.
-  const custodianStart = processStartToken(process.pid);
-  if (custodianStart === undefined) throw new Error(`cannot read the process start identity of custodian ${process.pid} from /proc`);
-  const bootId = bootToken();
-
-  if (seam?.dropPidfd) dropPidfdForTest();
-  if (typeof launch.args === "string") throw new Error("args as a string is not supported on unix.");
   // A throw here sends nothing: without a pidfd this process cannot name the child, and its exit
   // hangs up the PTY instead.
   let proc: PinnedPty;
   try {
+    if (seam?.argsAsString) argsAsStringForTest();
     proc = spawnPinned(launch.command, launch.args, {
       name: "xterm-256color",
       cols: DEFAULT_COLS,
@@ -142,12 +188,15 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
       env: launch.env,
     });
   } catch (e) {
+    // Only a fork proved never to have run frees the files. Any other throw may come after the fork
+    // (an unpinned child), which can still be reading them, so they stay.
+    if (e instanceof NoChildStarted) discardArtifacts(launch.artifacts);
     await holdAt("unpinned");
     throw e;
   }
   // From here until ready every failure stops the child through its pidfd, before any log write.
   try {
-    await serveSeat(launch, proc, { custodianStart, bootId, fenceFd, holdAt, seam });
+    await serveSeat(launch, proc, { custodianStart, bootId, fenceFd, holdAt, seam, confirmGate, note, discardArtifacts });
   } catch (cause) {
     try {
       proc.handle.signal("SIGKILL");
@@ -161,10 +210,21 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
 async function serveSeat(
   launch: CustodianLaunch,
   proc: PinnedPty,
-  pinned: { custodianStart: string; bootId: string | undefined; fenceFd: number; holdAt: (at: "after-pin") => Promise<void>; seam: CustodianTestSeam | undefined },
+  pinned: {
+    custodianStart: string;
+    bootId: string | undefined;
+    fenceFd: number;
+    holdAt: (at: "after-pin") => Promise<void>;
+    seam: CustodianTestSeam | undefined;
+    confirmGate: StartupConfirmGate | undefined;
+    note: (line: string) => void;
+    discardArtifacts: (artifacts: readonly string[] | undefined) => void;
+  },
 ): Promise<void> {
-  const { custodianStart, bootId, seam } = pinned;
+  const { custodianStart, bootId, seam, confirmGate, note, discardArtifacts } = pinned;
   const child = proc.handle;
+  const oomPref = preferSeatForOomKill(proc.pid);
+  if (!oomPref.applied) note(`oom preference not applied to child ${proc.pid}: ${oomPref.reason}\n`);
   // Timer callbacks log through this: a throw there would end the custodian before the escalation.
   const logNote = (note: string): void => {
     if (!launch.logPath) return;
@@ -195,15 +255,14 @@ async function serveSeat(
   let seenClient = false;
   let cols = DEFAULT_COLS;
   let rows = DEFAULT_ROWS;
-  let exit: { code?: number; signal?: number } | undefined;
+  let exit: SeatExit | undefined;
+  const diagnostic = new ConnectorDiagnosticReader();
   const dataSubs = new Map<number, Set<Socket>>();
   const waiters = new Map<Socket, Set<number>>();
   const controllers = new Set<Socket>();
   const clients = new Set<Socket>();
   let nextSub = 1;
   let early = "";
-  const confirmMatcher = launch.confirm ? new StartupConfirmMatcher(launch.confirm) : undefined;
-  let confirmTimer: ReturnType<typeof setTimeout> | undefined;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
   let handoffTimer: ReturnType<typeof setTimeout> | undefined;
   let unattendedTimer: ReturnType<typeof setTimeout> | undefined;
@@ -211,22 +270,9 @@ async function serveSeat(
   let server: ReturnType<typeof createServer> | undefined;
   /** Wait for the first adopter when the child has already exited at listen. */
   const LAUNCH_HANDOFF_MS = 5_000;
+  /** How long a child already gone from /proc may wait for node-pty to report how it ended. */
+  const EXIT_STATUS_GRACE_MS = 1_000;
   const UNATTENDED_MS = launch.unattendedMs ?? UNATTENDED_DEFAULT_MS;
-
-  if (confirmMatcher) {
-    confirmTimer = setTimeout(() => {
-      if (!alive) return;
-      const message = unmatchedConfirmMessage(confirmMatcher.prompt, CONFIRM_TIMEOUT_MS);
-      term.write(`\r\n${message}\r\n`);
-      const encoded = Buffer.from(`\r\n${message}\r\n`, "utf8").toString("base64");
-      for (const [sub, socks] of dataSubs) {
-        for (const sock of socks) send(sock, { event: "output", sub, data: encoded });
-      }
-      // Send before the log write, so a failed write cannot skip the stop.
-      stopFromTimer("startup-confirm timeout");
-      logNote(`${message}\n`);
-    }, CONFIRM_TIMEOUT_MS);
-  }
 
   const snapshot = (): Promise<string> =>
     new Promise((resolve) => term.write("", () => resolve(serializer.serialize())));
@@ -241,6 +287,19 @@ async function serveSeat(
   // The pidfd, never `/proc/<pid>`: a reused pid must not read as this child still running.
   const childGone = (): boolean => child.exited();
 
+  /**
+   * Mark a child that its pidfd shows gone as exited WITHOUT a status, but only once node-pty has had
+   * time to report the status itself. node-pty reports an exit only when the pty closes, and when a
+   * descendant still holds the pty open it forces that close 200 ms after reaping the child. The
+   * exit event carries whatever is known when it is sent, so marking earlier sent no status.
+   */
+  let goneSince: number | undefined;
+  const markGone = (): void => {
+    if (!alive || !childGone()) return;
+    goneSince ??= Date.now();
+    if (Date.now() - goneSince >= EXIT_STATUS_GRACE_MS) markExited({});
+  };
+
   const settleTerminal = (): void => {
     if (alive || settling || !ready) return;
     // Only an AUTHENTICATED peer holds this custodian open. A connected socket that never said
@@ -252,10 +311,7 @@ async function serveSeat(
     if (controllers.size > 0) return;
     if (!seenClient) return;
     settling = true;
-    if (confirmTimer) {
-      clearTimeout(confirmTimer);
-      confirmTimer = undefined;
-    }
+    confirmGate?.disarm();
     if (killTimer) {
       clearTimeout(killTimer);
       killTimer = undefined;
@@ -362,12 +418,58 @@ async function serveSeat(
       return;
     }
     alive = false;
-    exit = info ?? exit ?? {};
-    if (confirmTimer) {
-      clearTimeout(confirmTimer);
-      confirmTimer = undefined;
+    const last = diagnostic.read();
+    exit = { ...(info ?? exit ?? {}), ...(last ? { diagnostic: last } : {}) };
+    // Kept beside the custody record so a reap that runs after every controller is gone, even in a
+    // successor manager, can still say how the child ended. Renamed into place, so a reader never
+    // sees half a record.
+    const exitFile = exitPath(launch.recordPath);
+    try {
+      writeFileSync(`${exitFile}.tmp`, `${JSON.stringify(exit)}\n`, { mode: 0o600 });
+      renameSync(`${exitFile}.tmp`, exitFile);
+    } catch (e) {
+      // A seat directory that is already gone has nobody left to read the record. Any other failure
+      // loses the only account a later reap has, so it is said where an operator can find it, and
+      // the reap reports the record missing or unreadable.
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+        const line = `exit record not written: ${(e as Error).message}\n`;
+        try {
+          unlinkSync(`${exitFile}.tmp`);
+        } catch {
+          /* never created */
+        }
+        try {
+          if (launch.logPath) appendFileSync(launch.logPath, line, { mode: 0o600 });
+          else process.stderr.write(line);
+        } catch {
+          /* the log can sit on the same failed storage */
+        }
+      }
     }
-    for (const sock of controllers) send(sock, { event: "exit" });
+    // The child is gone, so it has made every read it will make. Remove its files before anyone is
+    // told of the exit, and drop the removed ones from the record so a later reap does not remove the
+    // same names again. One that could not be removed stays listed, so the reap that proves this seat
+    // gone tries it again. Losing a controller's connection is not this: only the child's exit is.
+    if (record.artifacts) {
+      discardArtifacts(record.artifacts);
+      const left = record.artifacts.filter((dir) => existsSync(dir));
+      if (left.length) record.artifacts = left;
+      else {
+        delete record.artifacts;
+        delete record.artifactRoot;
+      }
+      if (ready) {
+        try {
+          const tmp = `${launch.recordPath}.tmp`;
+          writeRecord(tmp, record);
+          renameSync(tmp, launch.recordPath);
+        } catch (e) {
+          note(`${(e as Error).message}\n`);
+        }
+      }
+    }
+    confirmGate?.disarm();
+    for (const sock of controllers) send(sock, { event: "exit", exit });
     resolveWaiters();
     settleTerminal();
     armUnobservedHandoff();
@@ -375,6 +477,7 @@ async function serveSeat(
 
   proc.onData((d) => {
     term.write(d);
+    diagnostic.push(d);
     if (early.length < MAX_FRAME_SIZE) {
       early += early.length + d.length > MAX_FRAME_SIZE ? d.slice(0, MAX_FRAME_SIZE - early.length) : d;
     }
@@ -382,11 +485,7 @@ async function serveSeat(
     for (const [sub, socks] of dataSubs) {
       for (const sock of socks) send(sock, { event: "output", sub, data: encoded });
     }
-    if (confirmMatcher?.push(d)) {
-      proc.write("\r");
-      if (confirmTimer) clearTimeout(confirmTimer);
-      confirmTimer = undefined;
-    }
+    if (confirmGate?.push(d)) proc.write("\r");
   });
   proc.onExit(({ exitCode, signal }) => {
     markExited({ code: exitCode, ...(signal === undefined ? {} : { signal }) });
@@ -397,7 +496,7 @@ async function serveSeat(
       reap = undefined;
       return;
     }
-    if (childGone()) markExited({});
+    markGone();
   }, 50);
   reap.unref();
 
@@ -433,6 +532,23 @@ async function serveSeat(
     }
   };
 
+  confirmGate?.arm(diagnostic, {
+    report: (message) => {
+      const line = `\r\n${message}\r\n`;
+      term.write(line);
+      const encoded = Buffer.from(line, "utf8").toString("base64");
+      for (const [sub, socks] of dataSubs) {
+        for (const sock of socks) send(sock, { event: "output", sub, data: encoded });
+      }
+      note(`${message}\n`);
+    },
+    // A gate timer has no requester: stopFromTimer logs a failed pidfd send instead of throwing.
+    stop: () => stopFromTimer("startup-confirm timeout"),
+  }, {
+    read: () => alive ? Array.from({ length: term.rows }, (_, row) => term.buffer.active.getLine(term.buffer.active.baseY + row)?.translateToString(true) ?? "").join("\n") : undefined,
+    key: (key) => proc.write(key === "Down" ? "\x1b[B" : "\r"),
+  });
+
   const record: SeatRecord = {
     version: RECORD_VERSION,
     id: launch.id,
@@ -446,6 +562,7 @@ async function serveSeat(
     // Bind the pids to THIS boot: their start tokens are ticks since boot and the record outlives a
     // reboot on disk, so without this a survivor could match an innocent process on the next boot.
     ...(bootId === undefined ? {} : { bootId }),
+    ...(launch.artifacts?.length ? { artifacts: launch.artifacts, artifactRoot: launch.artifactRoot } : {}),
   };
 
   server = createServer((sock) => {
@@ -538,7 +655,7 @@ async function serveSeat(
           clearTimeout(handoffTimer);
           handoffTimer = undefined;
         }
-        if (alive && childGone()) markExited({});
+        markGone();
         send(sock, {
           id: req.id,
           ok: true,
@@ -550,7 +667,7 @@ async function serveSeat(
           status: alive ? "running" : "exited",
           ...(exit ? { exit } : {}),
         });
-        if (!alive) send(sock, { event: "exit" });
+        if (!alive) send(sock, { event: "exit", ...(exit ? { exit } : {}) });
         return;
       }
       case "snapshot": {
@@ -566,7 +683,7 @@ async function serveSeat(
         session.owned.add(sub);
         send(sock, { id: req.id, ok: true, op: "subscribe-output", sub });
         if (early) send(sock, { event: "output", sub, data: Buffer.from(early, "utf8").toString("base64") });
-        if (!alive) send(sock, { event: "exit", sub });
+        if (!alive) send(sock, { event: "exit", sub, ...(exit ? { exit } : {}) });
         return;
       }
       case "unsubscribe-output": {
@@ -606,7 +723,7 @@ async function serveSeat(
         return;
       }
       case "wait-exit": {
-        if (alive && childGone()) markExited({});
+        markGone();
         if (!alive) {
           send(sock, { id: req.id, ok: true, op: "wait-exit", exit });
           return;
@@ -617,7 +734,7 @@ async function serveSeat(
         return;
       }
       case "health": {
-        if (alive && childGone()) markExited({});
+        markGone();
         send(sock, {
           id: req.id,
           ok: true,

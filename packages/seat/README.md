@@ -12,6 +12,16 @@ named `custody transport unsupported on <platform>` error on darwin and win32. T
 in-process node-pty fallback here. The manager's `pty` runtime still spawns in-process off
 Linux and only `adopt` throws that named error.
 
+`peerCredentials(socket)` and its `PeerCredentials` type are exported from the package root.
+For a connected Linux Unix socket, the function returns the kernel's peer `pid`, `uid` and
+`gid` using the same `SO_PEERCRED` helper as custody. Callers must compare that identity
+against their own authorization policy; a PID is not a lifecycle or ownership fence. It
+throws for an unsupported transport or missing native helper, and for a socket without a
+file descriptor. No PTY or custodian is started by reading the peer identity.
+
+The custodian raises its child's `oom_score_adj` to 500 and writes one line to `custodian.log`
+when the kernel refuses.
+
 The Linux natives are compiled for the host arch by `pnpm build`: the `SO_PEERCRED` helper
 `peercred.node` and `pty.node`, built from the vendored `node-pty@1.2.0-beta.12` source in
 `native/node-pty/` plus `pidfd.patch`, which opens a pidfd for each forked child. That is a
@@ -41,14 +51,19 @@ silent degrade. First use of the helper is the right place for that refusal.
 
 The launcher owns no PTY and exits after writing a permissioned per-seat record. Each custodian
 owns exactly one pinned PTY child, its screen mirror, and exit observation; every signal it sends
-goes through the child's pidfd, never a bare pid. A manager worker connects to that custodian over a 0600 filesystem Unix socket
-authenticated by `SO_PEERCRED` uid match plus a per-seat capability token. Path possession is
-not enough. Child exit is pushed to every authenticated controller socket. After the child
-exits and the last authenticated client disconnects, the custodian closes the Unix server, unlinks the
-socket, keeps the record, and exits. An active child, or a still-connected observer of an exited
-child, keeps the process. A connected socket that never authenticated does not: it owns no
-session, no output subscription and no wait, so a settle owes it nothing. A seat whose child has
-already exited at listen stays up briefly so the launcher can adopt it.
+goes through the child's pidfd, never a bare pid. A manager worker connects to that custodian over
+a 0600 filesystem Unix socket authenticated by `SO_PEERCRED` uid match plus a per-seat capability
+token. Path possession is not enough. Child exit is pushed to every authenticated controller socket.
+After the child exits and the last authenticated client disconnects, the custodian closes the Unix
+server, unlinks the socket, keeps the record, and exits. An active child, or a still-connected
+observer of an exited child, keeps the process. A connected socket that never authenticated does
+not: it owns no session, no output subscription and no wait, so a settle owes it nothing. A seat
+whose child has already exited at listen stays up briefly so the launcher can adopt it.
+
+A reap never signals a numeric pid or process group. It proves a seat gone only through its
+contained cgroup. Without that proof it returns retained/unprovable, requesting a custodian stop
+when it can read the record. A reaped seat's record stays until explicit release with
+`removeSeatCustody`.
 
 A custodian with no authenticated controller stops its child and exits after `UNATTENDED_MS`
 (ten minutes, overridable at launch with `COTAL_SEAT_UNATTENDED_MS`). The window restarts at each
@@ -61,6 +76,14 @@ Every custodian carries `--cotal-run <marker>` on its argv and `COTAL_RUN` in it
 `COTAL_RUN` names the run when a caller sets one, otherwise the launching pid does.
 `censusCustodians(run?)` reads that marker back out of `/proc/<pid>/cmdline`, which is
 world-readable, so a reaper can find and attribute orphans without walking `/proc/*/cwd`.
+
+`drainSeats(root, { drain })` lists the custody records under a root. A record that cannot be
+read, or whose start and boot identity do not tie its pids to this boot, is reported as `refused`
+and left on disk, with or without `drain`. On a host that publishes no boot identity, no record
+can be tied to this boot, so every one is refused. A seat whose child still holds its recorded start
+identity is reported as `live-child` and never signalled. With `drain`, every other seat goes
+through `reapSeat`. One it cannot prove gone is reported as `refused` and left on disk.
+`cotal seats [--drain]` is the operator command over it.
 
 Generation CAS, the crash journal, N/N-1 protocol compatibility, and manager-worker activation
 are later milestones. This package currently speaks a single implicit controller.

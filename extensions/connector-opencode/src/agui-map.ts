@@ -43,6 +43,9 @@ export interface OpenCodeMapperOptions {
   threadId: string;
   /** Mints a `runId`. Connector-minted, so every `RUN_STARTED` carries `runIdSource: "connector"`. */
   mintRunId: () => string;
+  /** The run the write-ahead log has open when this mapper is built, so a mapper built for a
+   *  re-established plane attributes the next records to it instead of dropping them. */
+  resumeRunId?: string;
   /** Emit `REASONING_*` for reasoning parts. Off by default (§7 Q1). */
   reasoning?: boolean;
   /** Arrival clock, for the records carrying no usable source stamp. Injectable for determinism. */
@@ -52,21 +55,11 @@ export interface OpenCodeMapperOptions {
 export interface OpenCodeMapper {
   map: RecordMapper<OpenCodeRecord>;
   /**
-   * Close the open run at a boundary the record stream cannot see: `session.idle`, which §3.2 makes
-   * the flush boundary. Returns `null` when nothing is open, so calling it twice cannot manufacture
-   * a second `RUN_FINISHED` for the bracket machine to refuse.
-   */
-  closeOpenRun: (timestamp: number, stopReason?: string) => { runId: string; events: AguiEvent[] } | null;
-  /** The run currently open, or `null`. */
-  openRun: () => string | null;
-  /**
    * Forget a run the emitter closed out of band. KEYED ON THE ID: the report can arrive after this
    * mapper has already opened a newer run, and clearing unconditionally would orphan that one, whose
    * events would then emit under no run at all and halt a session that had done nothing wrong.
    */
   forgetOpenRun: (runId: string) => void;
-  /** Why this session opened no runs, or `null` once one has. A silent refusal is the defect. */
-  diagnose: () => string | null;
 }
 
 /**
@@ -81,19 +74,16 @@ export interface OpenCodeMapper {
  *   emitted by inventing a name and pairing positionally. `step-finish` carries `cost` and `tokens`:
  *   it is a usage record wearing a step's name, and emitting it as a step boundary would tell a
  *   consumer that a phase ended when what happened is that token counts arrived. §3.2 routes that
- *   usage to `cotal.usage` on `RUN_FINISHED`, and NO SUCH MEMBER EXISTS on `CotalMeta` today, so v1
- *   drops it and the carrier is filed against the frame contract rather than invented here.
+ *   usage to `cotal.usage` on `RUN_FINISHED`. `CotalMeta.usage` is that carrier, and filling it is
+ *   a change of its own, so v1 still drops the numbers.
  * - `file`, `patch`, `snapshot`, `subtask`, `agent`, `retry`, `compaction` -> nothing in v1 (§3.4).
  *
- * **THERE IS STILL NO `RUN_ERROR` ARM HERE, AND THAT IS NOW A STATEMENT ABOUT WHERE IT LIVES.**
+ * **THERE IS NO `RUN_ERROR` ARM HERE, AND THAT IS A STATEMENT ABOUT WHERE IT LIVES.**
  * §3.2 maps `session.error` to `RUN_ERROR`, and a failed turn IS published as one — but not from
  * this file, because `session.error` is a BUS event and never a record in the session store this
  * mapper reads. It is a turn boundary the record stream cannot see, exactly like the finish, so it
  * closes the run through the same out-of-band path: `plugin.ts` decides which errors are failed
- * turns and hands the reason to `AguiEmitterHolder.closeRun`. An earlier revision of this comment
- * said no emitter anywhere on this plane could publish one and that reaching it needed a new method
- * on the shared emitter; the first half was overtaken by the codex connector, which emits
- * `RUN_ERROR` straight from its mapper, and the second half is what this change did.
+ * turns and hands the reason to `AguiEmitterHolder.closeRun`.
  */
 const HANDLED = new Set(["text", "reasoning", "tool"]);
 
@@ -122,20 +112,14 @@ function toolResultContent(state: OpenCodeRecord["part"]["state"]): string {
 
 export function createOpenCodeMapper(opts: OpenCodeMapperOptions): OpenCodeMapper {
   const now = opts.now ?? (() => Date.now());
-  let open: string | null = null;
+  let open: string | null = opts.resumeRunId ?? null;
 
-  // What diagnose() reports on: a session that opened no runs must be able to say WHY, because
-  // "nobody prompted it" and "the mapper refused everything" are byte-identical otherwise.
-  let runsOpened = 0;
-  let assistantRecords = 0;
-  let handledParts = 0;
-
-  const close = (timestamp: number, stopReason?: string) => {
+  const close = (timestamp: number) => {
     if (open === null) return null;
     const runId = open;
     open = null;
-    // No `outcome`. OpenCode reports that a session went idle and nothing more, so manufacturing a
-    // `success` would assert something the source never said.
+    // No `outcome`. A user record says a new turn began and nothing about how the last one ended,
+    // so manufacturing a `success` would assert something the source never said.
     return {
       runId,
       events: [
@@ -143,7 +127,6 @@ export function createOpenCodeMapper(opts: OpenCodeMapperOptions): OpenCodeMappe
           threadId: opts.threadId,
           runId,
           timestamp,
-          ...(stopReason ? { cotal: { stopReason } } : {}),
         }),
       ] as AguiEvent[],
     };
@@ -159,12 +142,10 @@ export function createOpenCodeMapper(opts: OpenCodeMapperOptions): OpenCodeMappe
     // boundary, and the next `RUN_STARTED` would be refused by the bracket machine.
     if (message.role !== "assistant") return close(ts);
 
-    assistantRecords += 1;
     const events: AguiEvent[] = [];
 
     if (open === null) {
       open = opts.mintRunId();
-      runsOpened += 1;
       events.push(
         runStarted({
           threadId: opts.threadId,
@@ -183,21 +164,18 @@ export function createOpenCodeMapper(opts: OpenCodeMapperOptions): OpenCodeMappe
       const cotal = { providerMessageId: part.messageID, ...arrivalMeta };
 
       if (part.type === "text" && !part.synthetic && !part.ignored && part.text) {
-        handledParts += 1;
         events.push(
           textMessageStart({ messageId, timestamp: ts, role: "assistant", cotal }),
           textMessageContent({ messageId, delta: part.text, timestamp: ts }),
           textMessageEnd({ messageId, timestamp: ts }),
         );
       } else if (part.type === "reasoning" && opts.reasoning && part.text) {
-        handledParts += 1;
         events.push(
           reasoningMessageStart({ messageId, timestamp: ts, cotal }),
           reasoningMessageContent({ messageId, delta: part.text, timestamp: ts }),
           reasoningMessageEnd({ messageId, timestamp: ts }),
         );
       } else if (part.type === "tool" && part.callID) {
-        handledParts += 1;
         const isError = part.state?.status === "error";
         events.push(
           toolCallStart({
@@ -231,17 +209,8 @@ export function createOpenCodeMapper(opts: OpenCodeMapperOptions): OpenCodeMappe
 
   return {
     map,
-    closeOpenRun: close,
-    openRun: () => open,
     forgetOpenRun: (runId) => {
       if (open === runId) open = null;
-    },
-    diagnose: () => {
-      if (runsOpened > 0) return null;
-      if (assistantRecords === 0) {
-        return "no runs: this session produced no assistant records, so nothing ever began a turn";
-      }
-      return `no runs: ${assistantRecords} assistant records were seen and none opened a run, which should be impossible and means this mapper is broken`;
     },
   };
 }

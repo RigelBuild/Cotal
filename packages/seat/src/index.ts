@@ -3,8 +3,11 @@ export { launchSeat, loadSeat, RUN_MARKER_FLAG, runMarker, runMarkerOf, type Lau
 export { adoptSeat, adoptSeatSync, type SeatHandle, type SeatAttachSession } from "./handle.js";
 export { assertSeatId, bootToken, fencePath, processStartToken, readRecord, recordPath, seatId, socketPath, type SeatRecord } from "./record.js";
 export { ptyNativePath, spawnPinned, type ChildHandle, type PinnedPty } from "./pty.js";
-export { censusCustodians, checkSeatRelease, reapSeat, removeSeatCustody, sealSeatLaunch, type CustodianSighting, type SeatReapEvidence, type SeatReapOpts, type SeatReleaseCheck, type SeatRetainReason } from "./reap.js";
+export { censusCustodians, checkSeatRelease, drainSeats, identityVerdict, reapSeat, removeSeatCustody, sealSeatLaunch, type CustodianSighting, type SeatInventoryEntry, type SeatReapEvidence, type SeatReapOpts, type SeatReleaseCheck, type SeatRetainReason } from "./reap.js";
 export { agentCanReplace, agentPrimaryGid, CGROUP_DELEGATED_ENV, resolveCgroupBase, trustedSetpriv, seatCgroupContained, seatCgroupPath, seatCgroupPopulated, type SeatCgroup } from "./cgroup.js";
 export { SeatClient } from "./client.js";
+export { peerCredentials, type PeerCredentials } from "./peercred.js";
 export { runCustodian, type CustodianLaunch } from "./custodian.js";
-export { StartupConfirmMatcher, normalizeConfirmText, unmatchedConfirmMessage } from "./startup-confirm.js";
+export { SEAT_OOM_SCORE_ADJ, preferSeatForOomKill, type OomPreference } from "./oom.js";
+export { ConnectorDiagnosticReader } from "./diagnostic.js";
+export { StartupConfirmGate, StartupConfirmMatcher, StartupConfirmSequence, type StartupReply, normalizeConfirmText, unmatchedConfirmMessage } from "./startup-confirm.js";

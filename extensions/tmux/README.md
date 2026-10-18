@@ -12,13 +12,24 @@ import.
 
 - **`Runtime` (`tmux`)** — each agent gets its own window in a shared per-space tmux session
   (`cotal-<space>`). Spawned unfocused; switch to `session:name` to watch it. Env is isolated
-  (`env -i`) so the tmux server's environment doesn't reach agents. Graceful stop types `/exit`
-  then kills the window; hard stop kills immediately. Exit waits poll the stable pane id and honor
+  (`env -i`) so the tmux server's environment doesn't reach agents. That env is written to an
+  owner-only launch script, which keeps it off tmux's command line, and the script removes its
+  directory before it starts the agent. When it cannot remove the directory, the agent does not start.
+  Graceful stop types `/exit`
+  then kills the window; hard stop kills immediately. A close reads a window as already closed only
+  from tmux's own `can't find window` or `can't find session` report and throws on any other
+  failure, such as a missing socket. Exit waits poll the stable pane id and honor
   tmux's `pane_dead` state, including `remain-on-exit`; provider errors fail the wait closed.
+  Each handle carries a reference to its tmux server, window and pane, so a later manager can reap
+  the seat after the one that spawned it is gone. The reap closes the window while the session
+  still holds it, even when the agent's pane already exited. It refuses a pane that has moved out of
+  that window, whether it still runs or has exited, and a window that has moved out of the session,
+  including one that moves while the reap runs.
 
 - **`TerminalLayout` (`tmux`)** — opens/closes tmux windows for host-side orchestration
   (e.g. `cotal setup`). Detects the current session from `$TMUX`; must be called from inside
-  a tmux session. Supports multi-pane tabs via `split-window`.
+  a tmux session. Supports multi-pane tabs via `split-window`. Looking up tabs by label throws
+  when tmux cannot be queried.
 
 ## Usage
 

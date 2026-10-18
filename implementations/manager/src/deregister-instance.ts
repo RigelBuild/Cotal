@@ -42,7 +42,7 @@
  */
 import {
   deregisterServiceInstance, describeEndpoint, epProbeInstanceInterest, unansweredRequest,
-  epgateKey, parseEndpointGate,
+  readEndpointGateGeneration,
   type EpCaller, type EpInstanceLiveness, type ServiceDeregistration,
 } from "@cotal-ai/core";
 import type { KV } from "@nats-io/kv";
@@ -202,13 +202,7 @@ export async function deregisterEndpointInstance(opts: {
   const outcome: ServiceDeregistration = await deregisterServiceInstance(kv, {
     endpoint,
     instanceId,
-    observeGeneration: async () => {
-      const key = epgateKey(endpoint, instanceId);
-      const entry = await authKv.get(key);
-      if (!entry || entry.operation !== "PUT")
-        throw new Error(`no issuance gate at ${key}`);
-      return parseEndpointGate(entry.value, key).generation;
-    },
+    observeGeneration: () => readEndpointGateGeneration(authKv, { endpoint, instanceId }),
   });
   if (!outcome.removed && outcome.reason === "absent")
     throw new InstanceDeregisterRefused(
@@ -223,7 +217,7 @@ export async function deregisterEndpointInstance(opts: {
   if (!outcome.removed)
     throw new InstanceDeregisterRefused(
       "superseded",
-      `the registration for ${endpoint}/${instanceId} MOVED while this ran, so the record inspected is not the record now stored - something is writing to it. Nothing was removed. Re-observe before retrying.`,
+      `the registration for ${endpoint}/${instanceId} MOVED while this ran, so the record inspected is not the record now stored - something is writing to it. The registration was not removed; a status that was removed observed the inspected registration or an earlier one. Re-observe before retrying.`,
     );
 
   log(`✓ removed the ${endpoint} registration for ${instanceId} (spec revision ${outcome.specRevision}${outcome.statusRevision !== undefined ? `, status revision ${outcome.statusRevision}` : ", no status key"})`);

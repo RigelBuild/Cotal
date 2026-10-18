@@ -1,0 +1,252 @@
+{
+  "kind": "authored-public-error-fixtures.v1",
+  "offendingKeyBasis": "Authored fixture metadata only, never inferred from validator errors or used as engine output.",
+  "cases": [
+    {
+      "id": "root-additional",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": false
+      },
+      "valid": {
+        "ok": 1
+      },
+      "invalid": {
+        "ok": 1,
+        "extra": 2
+      },
+      "offendingKeys": [
+        {
+          "objectPointer": "",
+          "key": "extra"
+        }
+      ]
+    },
+    {
+      "id": "nested-additional",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "child": {
+            "type": "object",
+            "properties": {
+              "ok": {
+                "type": "number"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "valid": {
+        "child": {
+          "ok": 1
+        }
+      },
+      "invalid": {
+        "child": {
+          "ok": 1,
+          "extra": 2
+        }
+      },
+      "offendingKeys": [
+        {
+          "objectPointer": "/child",
+          "key": "extra"
+        }
+      ]
+    },
+    {
+      "id": "referenced-additional",
+      "schema": {
+        "$defs": {
+          "closed": {
+            "type": "object",
+            "properties": {
+              "ok": {
+                "type": "number"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "$ref": "#/$defs/closed"
+      },
+      "valid": {
+        "ok": 1
+      },
+      "invalid": {
+        "ok": 1,
+        "extra": 2
+      },
+      "offendingKeys": [
+        {
+          "objectPointer": "",
+          "key": "extra"
+        }
+      ]
+    },
+    {
+      "id": "escaped-key",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "a/b~c": {
+            "type": "object",
+            "properties": {
+              "ok": {
+                "type": "number"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "valid": {
+        "a/b~c": {
+          "ok": 1
+        }
+      },
+      "invalid": {
+        "a/b~c": {
+          "ok": 1,
+          "x/y~z": 2
+        }
+      },
+      "offendingKeys": [
+        {
+          "objectPointer": "/a~1b~0c",
+          "key": "x/y~z"
+        }
+      ]
+    },
+    {
+      "id": "multiple-extra",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": false
+      },
+      "valid": {
+        "ok": 1
+      },
+      "invalid": {
+        "ok": 1,
+        "first": 2,
+        "second": 3
+      },
+      "offendingKeys": [
+        {
+          "objectPointer": "",
+          "key": "first"
+        },
+        {
+          "objectPointer": "",
+          "key": "second"
+        }
+      ]
+    },
+    {
+      "id": "pattern-properties",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "number"
+          }
+        },
+        "patternProperties": {
+          "^x_": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": false
+      },
+      "valid": {
+        "ok": 1,
+        "x_allowed": 2
+      },
+      "invalid": {
+        "ok": 1,
+        "x_allowed": 2,
+        "other": 3
+      },
+      "offendingKeys": [
+        {
+          "objectPointer": "",
+          "key": "other"
+        }
+      ]
+    },
+    {
+      "id": "unevaluated-branch",
+      "schema": {
+        "type": "object",
+        "anyOf": [
+          {
+            "properties": {
+              "left": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "left"
+            ]
+          },
+          {
+            "properties": {
+              "right": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "right"
+            ]
+          }
+        ],
+        "unevaluatedProperties": false
+      },
+      "valid": {
+        "left": 1
+      },
+      "invalid": {
+        "left": 1,
+        "extra": 2
+      },
+      "offendingKeys": [
+        {
+          "objectPointer": "",
+          "key": "extra"
+        }
+      ]
+    },
+    {
+      "id": "ordinary-type",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "number"
+          }
+        }
+      },
+      "valid": {
+        "count": 1
+      },
+      "invalid": {
+        "count": "bad"
+      },
+      "offendingKeys": [],
+      "invalidValuePointer": "/count"
+    }
+  ]
+}

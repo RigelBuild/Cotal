@@ -42,7 +42,7 @@ import { headers as natsHeaders, type NatsConnection } from "@nats-io/transport-
 import { canonicalJson, contractDigest } from "./canonical.js";
 import { EpEnvelopeError } from "./endpoint-envelope.js";
 import { epfSubject, assertIdToken, endpointToken, type EpCaller, type ParsedEpRequest } from "./endpoint-subjects.js";
-import { RECORD_KINDS, recordSpecKey, recordStatusKey, recordAtomicKey, createRecordEntry, updateRecordEntry, assertStatusValue, openRecordsBucket, readRecordLeader } from "./endpoint-records.js";
+import { RECORD_KINDS, recordSpecKey, recordStatusKey, recordAtomicKey, createRecordEntry, updateRecordEntry, assertStatusValue, openRecordsBucket, readRecordLeader, decodeEntry } from "./endpoint-records.js";
 import { epfStreamName, epfGoalBindSubject, readLastFact, parseDecisionFact } from "./endpoint-journal.js";
 import { readCheckpointSpec, readCheckpointSettle } from "./endpoint-checkpoint.js";
 import {
@@ -417,7 +417,7 @@ export async function readGoalSpec(ctx: ActionContext, ref: GoalRef): Promise<{ 
   if (!entry) return undefined;
   if (entry.operation !== "PUT")
     throw new EpEnvelopeError("failed-precondition", `the goal spec ${key} carries a ${entry.operation} marker; a deletion never erases an accepted goal - reconcile the store (SPEC 13.4)`);
-  return { value: parseSpec(JSON.parse(new TextDecoder().decode(entry.value)), key, snap), revision: entry.revision };
+  return { value: parseSpec(decodeEntry(entry, key), key, snap), revision: entry.revision };
 }
 
 /** The goal STATUS value: the current state projection. State-dependent fields are CLOSED. */
@@ -771,16 +771,15 @@ export function goalTombstone(fact: GoalResultFact): GoalResultFact {
  *  here, exactly as the real executor would be. Create-only CAS conditions on subject ABSENCE and
  *  cannot express "only if my epoch is still current", so the write fence is the §13.1 barrier.
  *
- *  AND THE BARRIER'S WINDOW IS WIDER THAN "BYTES IN FLIGHT", which an earlier revision of this
- *  comment claimed. A gate FREEZE neither kills the predecessor's connection nor advances the
- *  epoch, and the currency belt compares `processEpoch` alone, so a deposed manager's belt STILL
- *  PASSES from barrier start through PHASE 1-2 until the reopen. Revoking an `epcred` row marks a
- *  ledger row; it does not re-check a live JWT mid-publish on an already-open connection. What
- *  durably kills that publisher is the CLUSTER-VERIFIED EVICTION in PHASE 2, not the revoke. So
- *  the window in which a deposed manager can still INITIATE a new terminal publish runs from
- *  barrier start until eviction is verified — not merely the bytes already on the wire. On an OPEN
- *  mesh no credential family exists, so that eviction is vacuous and there is no durable fence at
- *  all; the belt there is cooperative only. */
+ *  AND THE BARRIER'S WINDOW IS WIDER THAN "BYTES IN FLIGHT". A gate FREEZE neither kills the
+ *  predecessor's connection nor advances the epoch, and the currency belt compares `processEpoch`
+ *  alone, so a deposed manager's belt STILL PASSES from barrier start through PHASE 1-2 until the
+ *  reopen. Revoking an `epcred` row marks a ledger row; it does not re-check a live JWT
+ *  mid-publish on an already-open connection. What durably kills that publisher is the
+ *  CLUSTER-VERIFIED EVICTION in PHASE 2, not the revoke. So the window in which a deposed manager
+ *  can still INITIATE a new terminal publish runs from barrier start until eviction is verified —
+ *  not merely the bytes already on the wire. On an OPEN mesh no credential family exists, so that
+ *  eviction is vacuous and there is no durable fence at all; the belt there is cooperative only. */
 function assertTerminalAttribution(fact: GoalResultFact, spec: GoalSpecValue, goalId: string): void {
   const accepted = spec.acceptedEpoch;
   const committed = fact.committer?.epoch;
@@ -1178,7 +1177,9 @@ export async function commitGoalResult(
 /** The reverse-DNS detail kind carrying a goal's cached terminal fact on an error (§13.3). */
 export const GOAL_TERMINAL_DETAIL_KIND = "ai.cotal.goal.terminal";
 
-function alreadyTerminal(goalId: string, fact: GoalResultFact): EpEnvelopeError {
+/** The §13.6 item 4 refusal of a cancel addressed to a goal that already ended: `failed-precondition`
+ *  with the cached outcome attached. */
+export function goalAlreadyTerminal(goalId: string, fact: GoalResultFact): EpEnvelopeError {
   return new EpEnvelopeError("failed-precondition",
     `goal "${goalId}" is already terminal (${fact.state}); the cached outcome is attached (SPEC 13.6)`,
     [{ kind: GOAL_TERMINAL_DETAIL_KIND, fact }]);
@@ -1199,7 +1200,7 @@ export async function requestGoalCancel(
     throw new EpEnvelopeError("failed-precondition", `cancel mode must be "graceful" or "terminate"; got ${JSON.stringify(args.mode)} (SPEC 13.6)`);
   const ref = goalRefOf(args.request, args.goalId);
   const cached = await readGoalResult(ctx, ref);
-  if (cached !== undefined) throw alreadyTerminal(ref.goalId, cached);
+  if (cached !== undefined) throw goalAlreadyTerminal(ref.goalId, cached);
   let projected: GoalStatusValue | undefined;
   for (let pass = 0; pass < 2 && projected === undefined; pass++) {
     const status = await readGoalStatus(ctx, ref);
@@ -1210,7 +1211,7 @@ export async function requestGoalCancel(
       const fact = await readGoalResult(ctx, ref);
       if (fact === undefined)
         throw new EpEnvelopeError("internal", `goal "${ref.goalId}" status is terminal but no result fact is readable; a projection never leads the journal (SPEC 13.6)`);
-      throw alreadyTerminal(ref.goalId, fact);
+      throw goalAlreadyTerminal(ref.goalId, fact);
     }
     try { projected = await transitionGoal(ctx, ref, "cancelling", { fields: { cancelMode: args.mode } }); }
     catch (e) { if (!(e instanceof EpEnvelopeError && e.code === "conflict")) throw e; }
@@ -1220,7 +1221,7 @@ export async function requestGoalCancel(
   const raced = await readGoalResult(ctx, ref);
   if (raced !== undefined) {
     await projectGoalTerminal(ctx, ref);
-    throw alreadyTerminal(ref.goalId, raced);
+    throw goalAlreadyTerminal(ref.goalId, raced);
   }
   return projected;
 }
@@ -1260,8 +1261,9 @@ export interface GoalIndexEntry {
    *  the winner is still in flight, and the honest answers are only "here is what the winner
    *  allocated" or a refusal. OPTIONAL for read compatibility with entries written before this
    *  field existed; absent means the floor was never persisted and a reader must refuse rather
-   *  than invent one. */
-  allocated?: { name: string; actor: string; uid: string; readinessDeadlineMs?: number };
+   *  than invent one. `owner` is optional for the same reason, and because a turn's floor leaves
+   *  it to the note: a reader that has to name the owner refuses when the floor did not record it. */
+  allocated?: { name: string; owner?: string; actor: string; uid: string; readinessDeadlineMs?: number };
   /** An OPAQUE relay payload the accepting endpoint must be able to serve back after a restart —
    *  the durable half of a goal whose work is handed to another process (a seat's `turn` rides
    *  this: the run coordinates and rendered context the seat pulls). The substrate gives it no
@@ -1279,11 +1281,12 @@ function goalIndexKey(ref: GoalRef): string {
   return recordAtomicKey(RECORD_KINDS.goalidx, [ref.endpoint, ref.caller.owner, ref.caller.actor, ref.caller.uid, ref.goalId]);
 }
 
-function goalIndexEntryOf(ref: GoalRef, iid: string, allocated?: { name: string; actor: string; uid: string; readinessDeadlineMs?: number }, note?: string): GoalIndexEntry {
+function goalIndexEntryOf(ref: GoalRef, iid: string, allocated?: GoalIndexEntry["allocated"], note?: string): GoalIndexEntry {
   // Refuse a hollow floor AT THE WRITE, not only when someone reads it back: an entry naming an
   // empty identity is the exact defect this field exists to end, and letting it land would just
   // move the failure to whichever unlucky retry reads it.
-  if (allocated !== undefined && !(["name", "actor", "uid"] as const).every((k) => typeof allocated[k] === "string" && allocated[k].length > 0))
+  if (allocated !== undefined && (!(["name", "actor", "uid"] as const).every((k) => typeof allocated[k] === "string" && allocated[k].length > 0)
+    || (allocated.owner !== undefined && (typeof allocated.owner !== "string" || allocated.owner.length === 0))))
     throw new EpEnvelopeError("internal", `the acceptance floor for goal "${ref.goalId}" has an empty component; a hollow identity is never recorded (SPEC 13.6)`);
   if (allocated?.readinessDeadlineMs !== undefined && (!Number.isSafeInteger(allocated.readinessDeadlineMs) || allocated.readinessDeadlineMs <= 0))
     throw new EpEnvelopeError("internal", `the acceptance floor for goal "${ref.goalId}" has an invalid readiness deadline; an unbounded follower is never recorded (SPEC 13.6)`);
@@ -1293,7 +1296,7 @@ function goalIndexEntryOf(ref: GoalRef, iid: string, allocated?: { name: string;
     throw new EpEnvelopeError("internal", `the relay note for goal "${ref.goalId}" is ${note.length === 0 ? "empty" : `${note.length} bytes (max ${GOAL_INDEX_NOTE_MAX})`}; a hollow or oversized note is never recorded (SPEC 13.6)`);
   return {
     v: 1, endpoint: ref.endpoint, owner: ref.caller.owner, actor: ref.caller.actor, uid: ref.caller.uid, goalId: ref.goalId, iid,
-    ...(allocated !== undefined ? { allocated: { name: allocated.name, actor: allocated.actor, uid: allocated.uid, ...(allocated.readinessDeadlineMs !== undefined ? { readinessDeadlineMs: allocated.readinessDeadlineMs } : {}) } } : {}),
+    ...(allocated !== undefined ? { allocated: { name: allocated.name, ...(allocated.owner !== undefined ? { owner: allocated.owner } : {}), actor: allocated.actor, uid: allocated.uid, ...(allocated.readinessDeadlineMs !== undefined ? { readinessDeadlineMs: allocated.readinessDeadlineMs } : {}) } } : {}),
     ...(note !== undefined ? { note } : {}),
   };
 }
@@ -1310,10 +1313,11 @@ export function parseGoalIndexEntry(raw: unknown, key: string): GoalIndexEntry {
     const a = o.allocated as Record<string, unknown>;
     if (a === null || typeof a !== "object" || Array.isArray(a))
       throw new EpEnvelopeError("internal", `goal-index entry ${key} carries a malformed acceptance floor; garbled reconcile state never authorizes (SPEC 13.6)`);
-    assertClosedKeys(a, ["name", "actor", "uid", "readinessDeadlineMs"], `goal-index entry ${key} allocated`);
+    assertClosedKeys(a, ["name", "owner", "actor", "uid", "readinessDeadlineMs"], `goal-index entry ${key} allocated`);
     // A floor with an EMPTY component is the hollow acceptance this field exists to end: it would
     // read as a real identity and name nothing. Refuse it as garbled rather than serve it.
-    if (!["name", "actor", "uid"].every((k) => typeof a[k] === "string" && (a[k] as string).length > 0))
+    if (!["name", "actor", "uid"].every((k) => typeof a[k] === "string" && (a[k] as string).length > 0)
+      || (a.owner !== undefined && (typeof a.owner !== "string" || a.owner.length === 0)))
       throw new EpEnvelopeError("internal", `goal-index entry ${key} carries an acceptance floor with an empty component; a hollow identity never authorizes (SPEC 13.6)`);
     if (a.readinessDeadlineMs !== undefined && (!Number.isSafeInteger(a.readinessDeadlineMs) || (a.readinessDeadlineMs as number) <= 0))
       throw new EpEnvelopeError("internal", `goal-index entry ${key} carries an invalid readiness deadline; garbled acceptance state never authorizes (SPEC 13.6)`);
@@ -1323,14 +1327,14 @@ export function parseGoalIndexEntry(raw: unknown, key: string): GoalIndexEntry {
   return o as unknown as GoalIndexEntry;
 }
 
-/** Record an accepted goal in the endpoint's reconcile index, CREATE-ONLY and BEFORE the bind
- *  (must-5 Q-B): the atomicity is `index-CAS-before-bind`, so recoverability is clean either side
+/** Record an accepted goal in the endpoint's reconcile index, CREATE-ONLY and BEFORE the bind:
+ *  the atomicity is `index-CAS-before-bind`, so recoverability is clean either side
  *  of a crash — a crash AFTER this write and BEFORE the bind leaves an index entry whose goal
  *  status is absent (the sweep treats it as a no-goal and clears it); a crash BEFORE it leaves no
  *  entry, so the acceptance was never durable. `iid` is the accepting incarnation's instanceId.
  *  Idempotent for an adopted or concurrent same-goalId retry (a byte-identical pointer). */
 export async function recordGoalIndex(
-  ctx: ActionContext, ref: GoalRef, iid: string, allocated?: { name: string; actor: string; uid: string; readinessDeadlineMs?: number }, note?: string,
+  ctx: ActionContext, ref: GoalRef, iid: string, allocated?: GoalIndexEntry["allocated"], note?: string,
 ): Promise<{ recorded: true } | { recorded: false; existing: GoalIndexEntry }> {
   assertCtx(ctx);
   const snap = snapshotRef(ref);

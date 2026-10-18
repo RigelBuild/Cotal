@@ -5,10 +5,13 @@ built to be **agent-native** — the docs a protocol for agents ships should be
 readable by agents.
 
 The canonical Markdown stays in [`/docs`](../docs) and [`/SPEC.md`](../SPEC.md);
-this site renders it. `scripts/sync-docs.mjs` derives a frontmatter title from each
-file's first H1 and rewrites `*.md` cross-links to site routes, then writes the
-result into `src/content/docs/` (git-ignored). Edit the source files, not the
-generated copies.
+this site renders it. `scripts/sync-docs.mjs` derives a frontmatter title from the H1
+each file opens with and a description from its first paragraph of text after the banner
+and any headings, and rewrites `*.md` cross-links and image paths to site routes, whether
+a Markdown link or an HTML or JSX `href`, `src` or `srcset` names them, then writes the
+result into `src/content/docs/` (git-ignored). A page that does not open with an H1, a
+page with no such paragraph, or one whose long paragraph opens with a character too long
+to shorten, fails the sync. Edit the source files, not the generated copies.
 
 ## Develop
 
@@ -17,6 +20,10 @@ npm install --legacy-peer-deps   # plugin's Astro peer range lags; it works on 7
 npm run dev                      # syncs docs, then starts Astro
 npm run build                    # syncs docs, then builds to dist/
 ```
+
+`astro.config.mjs` loads the sidebar the sync generates and stops with an error when it
+cannot read or parse that file, so run `npm run sync` before calling `npm run astro`
+directly.
 
 ## Agent-native surface
 

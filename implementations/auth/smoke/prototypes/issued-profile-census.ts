@@ -7,7 +7,7 @@ import {
   epcStreamName, epeStreamName, epfStreamName, epjStreamName, eprStreamName,
   eptStreamName, eptReqStreamName, epwStreamName,
   channelBucket, presenceBucket, membershipBucket, deliveryBucket, managerBucket,
-  membersBucket, aclBucket, epAuthBucket, recordsBucket, sessionsBucket,
+  membersBucket, aclBucket, epAuthBucket, recordsBucket, sessionsBucket, transferBucket, objectStoreStream,
   type Profile, type MintOpts, type MintPrincipal, type EpCapability,
 } from "@cotal-ai/core";
 import { calloutPermissions } from "../../src/permissions.js";
@@ -20,14 +20,23 @@ export interface ProfileFixture {
   permissions: Record<string, unknown>;
   producer: "permissionsFor" | "epServeGrantRows" | "calloutPermissions";
 }
-export function profileFixtures(space: string): ProfileFixture[] {
-  const uid = "u".repeat(26), instance = "i".repeat(26), session = "s".repeat(26);
+/** The manager instance every instance-pinned fixture names, so {@link streamSubjects} can model its
+ *  transfer bucket. */
+const CENSUS_INSTANCE = "i".repeat(26);
+export async function profileFixtures(space: string): Promise<ProfileFixture[]> {
+  const uid = "u".repeat(26), instance = CENSUS_INSTANCE, session = "s".repeat(26);
   const principal: MintPrincipal = { owner: "local", actor: "census", connId: "census0123456789abcdef", lifecycleUid: uid };
   const rows: ProfileFixture[] = [];
   const one = (profile: Profile, opts: MintOpts = {}, variant = "default", pr = principal): void => {
     rows.push({ profile, variant, permissions: permissionsFor(profile, space, pr, opts), producer: "permissionsFor" });
   };
   const run = { endpoint: "manager", runId: "census-run", takeoverId: "take0001", instanceId: instance, epoch: 1 };
+  const environment = (profile: Profile, actor: string) => {
+    const owner = `u_${"a".repeat(26)}`;
+    one(profile, { environmentManager: { owner, instanceId: instance, lifecycleUid: uid,
+      authorityEndpoint: "test.example.environment", authorityInstanceId: instance,
+      expiresAt: Math.floor(Date.now() / 1000) + 300 } }, "manager-only", { ...principal, owner, actor });
+  };
   const producers: Record<Profile, () => void> = {
     agent() {
       one("agent");
@@ -35,6 +44,10 @@ export function profileFixtures(space: string): ProfileFixture[] {
       one("agent", { allowPublish: [], allowSubscribe: [] }, "empty-channel-scope");
     },
     observer: () => one("observer"), admin: () => one("admin"), supervisor: () => one("supervisor"),
+    "manager-caller"() {
+      one("manager-caller", { managerInstanceId: instance });
+      one("manager-caller", { managerInstanceId: instance, capabilities: ["spawn", "run", "admin"] }, "spawn-run-admin");
+    },
     provisioner: () => one("provisioner"),
     deprovisioner: () => one("deprovisioner", { deprovisionTarget: { principal: "local.worker", lifecycleUid: uid } }),
     "retirement-requester": () => one("retirement-requester", { retirementRequester: { owner: "local", actor: "census", uid, target: { owner: "local", actor: "worker", lifecycleUid: uid } } }),
@@ -71,25 +84,46 @@ export function profileFixtures(space: string): ProfileFixture[] {
     "endpoint-evictor": () => one("endpoint-evictor"),
     issuer: () => one("issuer"),
     "run-admitter": () => one("run-admitter", { runAdmitter: { endpoint: "manager", runId: "census-run" } }),
+    "transfer-writer": () => one("transfer-writer", { transferWriter: { instanceId: instance, hex: "0".repeat(64) } }),
+    "transfer-reader": () => one("transfer-reader", { transferReader: { instanceId: instance } }),
     "remote-manager"() {
       for (const actor of [`manager_${instance}`, `manager_exec_${instance}`]) {
         one("remote-manager", { remoteManager: { owner: "local", instanceId: instance, actor } }, actor.startsWith("manager_exec") ? "executor" : "server", { ...principal, actor });
       }
     },
+    "environment-bootstrap": () => environment("environment-bootstrap", `manager_bootstrap_${instance}`),
+    "environment-manager-supervisor": () => environment("environment-manager-supervisor", `manager_${instance}`),
+    "environment-manager-executor": () => environment("environment-manager-executor", `manager_exec_${instance}`),
+    "environment-manager-goal-writer": () => environment("environment-manager-goal-writer", `manager_goal_${instance}`),
   };
   const nonProfiles = ["membership-observer", "connection-evictor"];
   assert.deepEqual(Object.keys(producers).sort(), Object.keys(CREDENTIAL_LIFETIMES).filter((kind) => !nonProfiles.includes(kind)).sort(), "every Profile must have a producer");
   for (const produce of Object.values(producers)) produce();
   const owner = deriveOwnerToken("census-prototype-secret".repeat(2), "view-owner");
   for (const view of USER_TOKEN_VIEWS) {
-    const scope = [VIEW_REQUIRED_SCOPE[view]];
-    const token = { owner, space, scope, ver: USER_TOKEN_VER, exp: 2_000_000_000, act: { owner, actor: "census", scope, lifecycleUid: uid, view } };
-    const produce = calloutPermissions(() => ({ scope, lifecycleUid: uid, allowPublish: ["public"], allowSubscribe: ["public"] }));
+    const required = VIEW_REQUIRED_SCOPE[view];
+    const scope = required === undefined ? ["spawn", "run", "admin"] : [required];
+    const sessionClaim = { endpoint: "manager", sessionId: session, epoch: 1, exp: 2_000_000_000 };
+    const token = { owner, space, scope, ver: USER_TOKEN_VER, exp: 2_000_000_000, act: { owner, actor: "census", scope, lifecycleUid: uid, view, ...(view === "manager-caller" ? { managerInstanceId: instance } : {}), ...(view === "session-caller" ? { session: sessionClaim } : {}), ...(view === "transfer-writer" ? { transferWriter: { instanceId: instance, hex: "a".repeat(64) } } : {}) } };
+    // This fixture authorizes one coordinate to construct the shipped grant surface. Real gate
+    // ownership and registration validation are graded by the live exchange suites, not this census.
+    const produce = calloutPermissions(
+      () => ({ scope, lifecycleUid: uid, allowPublish: ["public"], allowSubscribe: ["public"] }),
+      async (selectedOwner, selectedInstance) => {
+        assert.equal(selectedOwner, owner);
+        assert.equal(selectedInstance, instance);
+      },
+      async (selectedPrincipal, claim) => {
+        assert.deepEqual(selectedPrincipal, { owner, actor: "census", lifecycleUid: uid });
+        assert.deepEqual(claim, { endpoint: sessionClaim.endpoint, sessionId: sessionClaim.sessionId, epoch: sessionClaim.epoch });
+        return sessionClaim;
+      },
+    );
     if (view === "manager-service") {
       assert.throws(() => produce(token, principal.connId), /typed material exchange/);
       continue; // Explicit refused view, represented separately from Profile in the report.
     }
-    rows.push({ profile: view, variant: `callout-view:${view}`, permissions: produce(token, principal.connId), producer: "calloutPermissions" });
+    rows.push({ profile: view, variant: `callout-view:${view}`, permissions: await produce(token, principal.connId), producer: "calloutPermissions" });
   }
   assert.deepEqual(rows.filter((row) => row.producer === "calloutPermissions").map((row) => row.variant).sort(),
     USER_TOKEN_VIEWS.filter((view) => view !== "manager-service").map((view) => `callout-view:${view}`).sort(),
@@ -154,6 +188,8 @@ export function streamSubjects(space: string): Record<string, string> {
     [`KV_cotal_accepted_${space}`]: kv(`cotal_accepted_${space}`),
     [`KV_cotal_admission_${space}`]: kv(`cotal_admission_${space}`),
     [`KV_${sessionsBucket(space)}`]: kv(sessionsBucket(space)),
+    // The census instance's transfer bucket (SPEC 8): its writer and reader read it raw.
+    [objectStoreStream(transferBucket(space, CENSUS_INSTANCE))]: `$O.${transferBucket(space, CENSUS_INSTANCE)}.>`,
   };
 }
 
@@ -201,7 +237,7 @@ function subjectCoveredBy(streamPattern: string, grantRow: string): boolean {
  * pairing is expected in the trusted infrastructure profiles (they ARE the trusted plane), and is the
  * condition the issued rail's origin assumption cannot survive in a peer-held credential.
  */
-export const PEER_HELD_PROFILES: readonly Profile[] = Object.freeze(["agent", "observer", "session-caller", "run-driver"]);
+export const PEER_HELD_PROFILES: readonly Profile[] = Object.freeze(["agent", "observer", "session-caller", "run-driver", "manager-caller"]);
 
 /**
  * The rest, classified as trusted infrastructure or operator credentials. Peer-heldness is a
@@ -215,7 +251,11 @@ export const TRUSTED_PROFILES: readonly Profile[] = Object.freeze([
   "session-ledger", "session-serving", "run-mediator", "run-operator", "remote-manager",
   "lifecycle-executor", "endpoint-serve-executor", "endpoint-serve", "control-caller-privileged",
   "control-caller-admin", "backup", "restore", "endpoint-evictor", "retirement-requester",
-  "issuer", "run-admitter",
+  "issuer", "run-admitter", "transfer-writer", "transfer-reader",
+  // Manager-only infrastructure duties, like remote-manager. This classification is not
+  // an isolation proof; host admission and the child UID boundary remain separate requirements.
+  "environment-bootstrap", "environment-manager-supervisor", "environment-manager-executor",
+  "environment-manager-goal-writer",
 ]);
 
 /** Every shipped `.ts` under the source trees a credential's grants can come from. */
@@ -414,6 +454,10 @@ export function peerOptionSweep(space: string, pr: MintPrincipal): { label: stri
   for (const allowSubscribe of subs) for (const allowPublish of pubs)
     out.push({ label: `observer sub=${JSON.stringify(allowSubscribe)} pub=${JSON.stringify(allowPublish)}`,
       permissions: permissionsFor("observer", space, pr, { allowSubscribe, allowPublish }) });
+  for (const capabilities of [[], ["spawn"], ["run"], ["admin"], ["spawn", "run", "admin"]])
+    for (const managerInstanceId of [instance, "j".repeat(26)])
+      out.push({ label: `manager-caller cap=${JSON.stringify(capabilities)} instance=${managerInstanceId}`,
+        permissions: permissionsFor("manager-caller", space, pr, { capabilities, managerInstanceId }) });
   out.push({ label: "session-caller", permissions: permissionsFor("session-caller", space, pr, { sessionCaller: { endpoint: "manager", sessionId: session, epoch: 1 } }) });
   out.push({ label: "run-driver", permissions: permissionsFor("run-driver", space, pr, { runDriver: { endpoint: "manager", runId: "sweep-run", takeoverId: "take0001", instanceId: instance, epoch: 1 } }) });
   return out;

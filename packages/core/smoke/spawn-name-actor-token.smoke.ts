@@ -19,6 +19,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import ts from "typescript";
 import { firstFreeName, spawnNameError } from "../src/agent-file.js";
 import { assertValidOwnerToken } from "../src/subjects.js";
 
@@ -136,6 +137,63 @@ check("…and carries no second copy of the token alphabet",
 check("a plain name is accepted in BOTH modes",
   spawnNameError("reviewer", { userMode: true }) === undefined &&
     spawnNameError("reviewer", { userMode: false }) === undefined);
+
+// THE CLIENT-SIDE PREFLIGHT (#867 residual). The detached CLI used to send `identity: values.name`
+// straight to the manager and the operator read the manager's refusal after the round trip. The fix
+// is the CLI calling the SAME predicate the manager calls, keyed on the target mesh's auth mode.
+// The suite cannot import the CLI's module (core's smoke may not depend on implementations), so
+// this pins the behaviour at the shared predicate with the exact argument shapes both call sites
+// pass, and the wiring itself is pinned structurally below by reading the CLI's shipped source.
+const CLI_REFUSAL_USER = spawnNameError("default_agent-3", { userMode: true });
+check("a hyphenated --name on a USER-mode target is refused by the same predicate the manager uses",
+  CLI_REFUSAL_USER !== undefined && /actor token/.test(CLI_REFUSAL_USER),
+  { msg: CLI_REFUSAL_USER });
+check("…the CLI's message is core's own, not a copy (names the separator reservation)",
+  typeof CLI_REFUSAL_USER === "string" && CLI_REFUSAL_USER.includes("reserved as the principal name-form separator"),
+  { msg: CLI_REFUSAL_USER });
+check("the same hyphenated --name on a STATIC-mode target is accepted",
+  spawnNameError("default_agent-3", { userMode: false }) === undefined);
+
+// The wiring, asserted structurally for the same reason as the delegation cells above: a call site
+// that is absent today is behaviourally indistinguishable from one that delegates faithfully, and
+// the only moment the difference shows is after the next grammar change. The source is parsed, so
+// the #867 comments, the door's declaration or a string that spells a call cannot pass for one, and
+// requoting an argument changes nothing.
+const CLI_RAW = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "implementations", "cli", "src", "commands", "spawn.ts"),
+  "utf8",
+);
+check("instrument control: the CLI's spawn source was located",
+  CLI_RAW.includes("async function spawnDetached") && CLI_RAW.includes("export async function spawn"),
+  { len: CLI_RAW.length });
+const CLI_AST = ts.createSourceFile("spawn.ts", CLI_RAW, ts.ScriptTarget.Latest);
+// Parsed, so only a real value import binding the export to its own name counts, wherever it sits in the list.
+const CORE_IMPORTS = CLI_AST.statements
+  .filter(ts.isImportDeclaration)
+  .filter((d) => ts.isStringLiteral(d.moduleSpecifier) && d.moduleSpecifier.text === "@cotal-ai/core" && !d.importClause?.isTypeOnly)
+  .flatMap((d) => {
+    const named = d.importClause?.namedBindings;
+    return named && ts.isNamedImports(named) ? named.elements : [];
+  })
+  .filter((e) => !e.isTypeOnly && (e.propertyName ?? e.name).text === e.name.text)
+  .map((e) => e.name.text);
+check("the CLI calls the shared name door (import present)",
+  CORE_IMPORTS.includes("spawnNameError"));
+const DOOR_CALLS: ts.CallExpression[] = [];
+const collectDoorCalls = (node: ts.Node): void => {
+  if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "refuseUnmintableNameOrExit")
+    DOOR_CALLS.push(node);
+  ts.forEachChild(node, collectDoorCalls);
+};
+collectDoorCalls(CLI_AST);
+check("the CLI calls the shared name door (call sites: detached + foreground)",
+  DOOR_CALLS.length === 2,
+  { sites: DOOR_CALLS.length });
+check("the CLI keys the door on the target mesh's auth mode, not on a restated grammar",
+  DOOR_CALLS.length > 0 && DOOR_CALLS.every(({ arguments: [, mode] }) =>
+    mode !== undefined && ts.isBinaryExpression(mode) && mode.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken &&
+    ts.isPropertyAccessExpression(mode.left) && mode.left.name.text === "mode" &&
+    ts.isStringLiteralLike(mode.right) && mode.right.text === "user"));
 
 console.log(
   failed === 0

@@ -9,7 +9,6 @@
  * queued peer messages, in that runtime's own hook-output shape.
  */
 import { createServer, type Server, type Socket } from "node:net";
-import { existsSync, unlinkSync } from "node:fs";
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { MeshAgent, InboxItem } from "./agent.js";
 import { fmtItem } from "./framing.js";
@@ -83,17 +82,17 @@ export interface ControlServerOpts {
 /** Hard cap on the first (only) frame: a control request is a token + one small lifecycle event —
  *  kilobytes at most. Generous headroom for a legit event, tiny next to the ~512MB string limit an
  *  unauthenticated spewer would otherwise drive `buf` toward to crash the process. */
-const MAX_FRAME_BYTES = 1 << 20; // 1 MiB
+export const MAX_FRAME_BYTES = 1 << 20; // 1 MiB
 /** ABSOLUTE deadline (not an idle timeout — a slow-loris dribbling one byte at a time would keep
  *  resetting an idle timer) for a connection to deliver its complete auth frame. Past it, an
  *  unauthenticated connection is dropped so a local process can't camp on a finite pipe instance.
  *  Cleared the instant a full frame is in hand (the token-bearing client then owns the connection). */
-const AUTH_DEADLINE_MS = 5_000;
+export const AUTH_DEADLINE_MS = 5_000;
 
 /** Constant-time match of a presented token against the endpoint's. Both sides are SHA-256'd first
  *  so the compare is fixed-length (and length-independent) regardless of the presented value — a
  *  non-string or wrong-length token can never throw `timingSafeEqual` or leak length via timing. */
-function tokenMatches(presented: unknown, digest: Buffer): boolean {
+export function tokenMatches(presented: unknown, digest: Buffer): boolean {
   if (typeof presented !== "string") return false;
   return timingSafeEqual(createHash("sha256").update(presented).digest(), digest);
 }
@@ -214,17 +213,8 @@ export function startControlServer(
 ): Server {
   const { path } = endpoint;
   const digest = createHash("sha256").update(endpoint.token).digest();
-  // Stale-socket cleanup is POSIX-only: a win32 named pipe is not a filesystem entry to unlink, and
-  // a live one there is a SQUATTER the fatal `EADDRINUSE` is meant to catch — never clear it. (With
-  // a token-random path a stale POSIX socket from a dead predecessor is itself near-impossible, but
-  // the unlink stays as cheap insurance against an exact-path leftover.)
-  if (process.platform !== "win32" && existsSync(path)) {
-    try {
-      unlinkSync(path);
-    } catch {
-      /* ignore */
-    }
-  }
+  // Never unlink an existing path: it may belong to a live listener. Random per-launch paths
+  // avoid stale reuse; an exact-path leftover is a loud refusal requiring explicit recovery.
   const server = createServer((sock) => {
     let buf = "";
     let handled = false; // one frame per connection — ignore anything after the first line

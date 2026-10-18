@@ -64,6 +64,16 @@ const rowsFor = (profile: Profile, actor: string, opts: Record<string, unknown> 
 const instRows = (rows: string[]) => rows.filter((r) => r.includes(`.ep.inst.`));
 const ordinaryRows = (rows: string[]) => rows.filter((r) => /\.ep\.(one|all)\./.test(r));
 
+const managerCallerRows = rowsFor("manager-caller", "bound", {
+  lifecycleUid: "b".repeat(26),
+  capabilities: ["spawn"],
+  managerInstanceId: "m".repeat(26),
+});
+check("manager-caller emits exact instance rows", instRows(managerCallerRows).length > 0);
+check("manager-caller emits no class or scatter rows", ordinaryRows(managerCallerRows).length === 0, managerCallerRows);
+check("manager-caller never wildcards the instance token",
+  !managerCallerRows.some((r) => /\.ep\.inst\.manager\.[*>]\./.test(r)), managerCallerRows);
+
 // The profiles the `--on` route matters for, and the ones it must never reach. Names come from the
 // shipped `Profile` union, so a renamed profile fails to compile rather than silently dropping an arm.
 // Each entry DECLARES whether it is an ep caller, and CELL 1 checks the declaration against the
@@ -145,12 +155,6 @@ console.log("\nCELL 4 - if a pinned capability is handed to an AGENT, where is t
     // payload gains this silently - no error, no refusal, a valid pinned row in an agent JWT.
     // The honest label is UNREACHABLE FROM TODAY'S CALLERS, UNENFORCED BY CONSTRUCTION. It is held
     // by callers choosing to enumerate their fields, not by the grammar.
-    //
-    // And the same door is bolted on one side only: the STATIC managed spawn REFUSES
-    // `endpointCapabilities` outright (manager.ts:2868-2870, Unit B F2, with a stated reason); the
-    // DYNAMIC path merely omits it. Somebody already judged this vector real enough to close one
-    // path. Why the two differ is a smaller and better-posed question than inverting the builder,
-    // which both security seats ruled NON-BLOCKING for this change.
     check("the boundary is the MINT AUTHORITY, not the row builder (recorded, not asserted away)",
       true, { agentPinnedRows: agentPinned.length, note: "operator-only is a policy at the mint site" });
     check("and the pin an agent would get is still the EXACT iid, never a wildcard",

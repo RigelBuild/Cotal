@@ -25,7 +25,7 @@ import {
   STEP_NAME_RE,
   primitiveDoc,
 } from "./primitives.js";
-import { KEY_RESERVED_RE } from "./keys.js";
+import { KEY_RESERVED_RE, scopeTraits } from "./keys.js";
 import { isDuration, parseDuration } from "./duration.js";
 import { ADMITTED_NODES, FORBIDDEN_NODES, STRUCTURAL_NODES } from "./syntax.js";
 import { MUTATING_METHODS } from "./library.js";
@@ -572,40 +572,40 @@ class Scope {
   }
 }
 
-/** Collect the identifiers a binding pattern introduces. */
-function patternNames(node: AnyNode, out: string[]): void {
+/**
+ * Collect the targets a pattern writes: identifiers, and in an assignment pattern also member
+ * expressions (`[o.a] = …`). A non-pattern node is its own single target.
+ */
+function patternTargets(node: AnyNode, out: AnyNode[]): void {
   switch (node.type) {
-    case "Identifier":
-      out.push(node.name as string);
-      break;
     case "ObjectPattern":
       for (const p of node.properties as AnyNode[]) {
-        if (p.type === "RestElement") patternNames(p.argument as AnyNode, out);
-        else patternNames(p.value as AnyNode, out);
+        if (p.type === "RestElement") patternTargets(p.argument as AnyNode, out);
+        else patternTargets(p.value as AnyNode, out);
       }
       break;
     case "ArrayPattern":
-      for (const el of node.elements as (AnyNode | null)[]) if (el !== null) patternNames(el, out);
+      for (const el of node.elements as (AnyNode | null)[]) if (el !== null) patternTargets(el, out);
       break;
     case "AssignmentPattern":
-      patternNames(node.left as AnyNode, out);
+      patternTargets(node.left as AnyNode, out);
       break;
     case "RestElement":
-      patternNames(node.argument as AnyNode, out);
+      patternTargets(node.argument as AnyNode, out);
       break;
     default:
+      out.push(node);
       break;
   }
 }
 
-/**
- * `notify`'s fact is a bounded decision record, not a message.
- *
- * This is the one place a program can push its own bytes toward another agent's context, so the
- * bound is what keeps "conversation is the data plane, the program is the control plane" true at
- * the one boundary where it is easiest to break. A literal fact is checked exactly; a computed
- * one is checked at the effect boundary by the same rules.
- */
+/** Collect the identifiers a binding pattern introduces. */
+function patternNames(node: AnyNode, out: string[]): void {
+  const targets: AnyNode[] = [];
+  patternTargets(node, targets);
+  for (const t of targets) if (t.type === "Identifier") out.push(t.name as string);
+}
+
 /**
  * `to` addresses the escalated mint and nothing else, so accepting it elsewhere records an input
  * that decides nothing, which the hash table then has to classify for no reason.
@@ -708,6 +708,14 @@ function checkWaitUntil(args: AnyNode[], given: Map<string, AnyNode>, v: Validat
   }
 }
 
+/**
+ * `notify`'s fact is a bounded decision record, not a message.
+ *
+ * This is the one place a program can push its own bytes toward another agent's context, so the
+ * bound is what keeps "conversation is the data plane, the program is the control plane" true at
+ * the one boundary where it is easiest to break. A literal fact is checked exactly; a computed
+ * one is checked at the effect boundary by the same rules.
+ */
 function checkNotifyFact(fact: AnyNode | undefined, v: Validator): void {
   if (fact === undefined || fact.type !== "ObjectExpression") return; // computed: checked at run time
 
@@ -829,7 +837,6 @@ function checkNotifyFact(fact: AnyNode | undefined, v: Validator): void {
   }
 }
 
-/** True when every element of an array literal is a record literal with a string `id`. */
 /** Every `spawn` lexically inside `root` whose options carry a LITERAL `worktree` string, as
  *  [worktree, the value node] pairs. Computed worktrees are invisible here by design: they are
  *  the runtime guard's (L4008) to decide, where the value exists. */
@@ -859,6 +866,7 @@ function literalSpawnWorktrees(root: AnyNode): Array<[string, AnyNode]> {
   return out;
 }
 
+/** True when every element of an array literal is a record literal with a string `id`. */
 function arrayItemsCarryId(items: AnyNode): boolean {
   const els = (items.elements as (AnyNode | null)[]) ?? [];
   if (els.length === 0) return false;
@@ -1164,13 +1172,16 @@ function checkCall(node: AnyNode, v: Validator, scope: Scope): void {
   // order, the binding ends up holding a different value, and the resumed run takes a path it never
   // recorded — with no divergence raised, because no effect's inputs changed.
   //
-  // `conclave` is deliberately not here. Its body is a single thunk with nothing to race, so a
-  // write from inside it is as ordered as a write anywhere else in the program.
-  if (name === "parallel" || name === "race" || name === "fanOut") {
+  // `once` and `conclave` have one body and nothing to race, and are here for another reason: a
+  // settled one is replayed without entering its body, so a write from it happens on the live run
+  // only.
+  if (spec.scope !== null) {
     // One `seen` set per combinator call: two branches calling the same helper is one defect in
     // that helper, not two, and reporting it twice tells an author to fix one line twice.
     const seen = new Set<AnyNode>();
-    const thunks = name === "fanOut" ? branchThunks(args[1], v, scope) : branchThunks(args[0], v, scope);
+    // The body is the argument just before the options bag. Reading it from the table keeps a new
+    // scope primitive from having its data walked in place of its body.
+    const thunks = branchThunks(args[spec.optionsAt - 1], v, scope);
     for (const thunk of thunks) checkCapturedWrites(thunk, name, v, seen);
   }
 }
@@ -1263,6 +1274,16 @@ function rootIdentifier(node: AnyNode | undefined): AnyNode | undefined {
 }
 
 function capturedWrite(at: AnyNode, name: string, combinator: string, v: Validator): void {
+  if (!scopeTraits(combinator)?.assembles) {
+    v.fail(
+      "L2032",
+      at,
+      `\`${name}\` is declared outside this \`${combinator}\` and written inside it. A settled \`${combinator}\` is replayed without entering its body, so the write happens on the live run and never on resume, and the resumed run reads the old value and takes a path it never recorded, with no divergence raised.`,
+      `Return the value from the body and read it out of \`${combinator}\`'s result.`,
+      combinator,
+    );
+    return;
+  }
   v.fail(
     "L2032",
     at,
@@ -1270,6 +1291,18 @@ function capturedWrite(at: AnyNode, name: string, combinator: string, v: Validat
     `Return the value from the branch and read it out of \`${combinator}\`'s result, or use \`race\`, which yields its winner.`,
     combinator,
   );
+}
+
+/** Report each binding declared outside the branch that any target of a write lands on. */
+function checkWriteTarget(target: AnyNode, scope: Scope, combinator: string, v: Validator): void {
+  const targets: AnyNode[] = [];
+  patternTargets(target, targets);
+  for (const t of targets) {
+    const root = rootIdentifier(t);
+    if (root !== undefined && scope.lookup(root.name as string) === undefined) {
+      capturedWrite(root, root.name as string, combinator, v);
+    }
+  }
 }
 
 /** Walk one branch thunk with its OWN scope chain: anything it did not declare, it captured. */
@@ -1306,10 +1339,7 @@ function walkCaptured(node: AnyNode, scope: Scope, combinator: string, v: Valida
       // itself; the runtime half (values carry the depth they were born at) covers what a value
       // reached through an alias hides from this walk.
       const target = (node.type === "AssignmentExpression" ? node.left : node.argument) as AnyNode;
-      const root = rootIdentifier(target);
-      if (root !== undefined && scope.lookup(root.name as string) === undefined) {
-        capturedWrite(root, root.name as string, combinator, v);
-      }
+      checkWriteTarget(target, scope, combinator, v);
       for (const c of children(node)) walkCaptured(c, scope, combinator, v, seen);
       return;
     }
@@ -1383,6 +1413,10 @@ function walkCaptured(node: AnyNode, scope: Scope, combinator: string, v: Valida
 
     case "ForStatement":
     case "ForOfStatement": {
+      // `for (x of xs)` with no declaration assigns `x` on every iteration.
+      if (node.type === "ForOfStatement" && (node.left as AnyNode).type !== "VariableDeclaration") {
+        checkWriteTarget(node.left as AnyNode, scope, combinator, v);
+      }
       const inner = new Scope(scope);
       for (const c of children(node)) walkCaptured(c, inner, combinator, v, seen);
       return;

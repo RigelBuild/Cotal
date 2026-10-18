@@ -16,7 +16,8 @@
  *      materialized persona has no access frontmatter) fell back to ["general"] and joined nothing.
  *   5. RESUME (issue #23) — claude buildLaunch emits `--resume <id> --fork-session` (never one
  *      without the other, hostile id stays one argv token, coexists with the persona append);
- *      opencode + hermes THROW; and `resume` threads StartAgentOpts → LaunchOpts verbatim.
+ *      hermes builds its fork launch; opencode THROWS; and `resume` threads StartAgentOpts →
+ *      LaunchOpts verbatim.
  *   6. RESUME CAPABILITY PREFLIGHT (issue #159 Part A) — a resume request for a connector that doesn't
  *      declare `supportsResume` is rejected BEFORE any provisioning side effect (no mint, no
  *      buildLaunch), mirroring the harness preflight; `supportsResume` matrix across the connectors.
@@ -89,21 +90,21 @@ let lastSpec: LaunchSpec | undefined;
   kind: "fake",
   spawn: (name, spec) => { lastSpec = spec; return fakeHandle(name); },
 };
-const agentsMap = () => (mgr as unknown as { agents: Map<string, { id: string; name: string; lifecycleUid: string }> }).agents;
+const agentsMap = (manager: Manager = mgr) => (manager as unknown as { agents: Map<string, { id: string; name: string; lifecycleUid: string }> }).agents;
 // Fake `ep` for the #159 B1 readiness race: getRoster() reports every currently-managed agent as LIVE, so
 // a just-spawned agent (already in `agents` when awaitReadiness runs) resolves "started" via the subscribe-
 // then-check — no timer wait. The "presence" event is only a wake, so on/off are no-ops. A custom `roster`
 // overrides the reported set (the UNCERTAIN test reports nobody). `extra` adds ep methods stop() needs.
-const fakeEp = (extra: Record<string, unknown> = {}, roster?: () => Array<{ card: { id: string; name: string }; status: string }>) => ({
+const fakeEp = (extra: Record<string, unknown> = {}, roster?: () => Array<{ card: { id: string; name: string }; status: string }>, manager: Manager = mgr) => ({
   ref: () => ({ id: "smoke-mgr" }),
   on: () => {},
   off: () => {},
   waitForPresenceSnapshot: async () => {},
-  getRoster: roster ?? (() => [...agentsMap().values()].map((a) => ({ card: { id: principalKey(DEV_OWNER, a.id).key, name: a.name }, status: "idle", lifecycleUid: a.lifecycleUid }))),
+  getRoster: roster ?? (() => [...agentsMap(manager).values()].map((a) => ({ card: { id: principalKey(DEV_OWNER, a.id).key, name: a.name }, status: "idle", lifecycleUid: a.lifecycleUid }))),
   ...extra,
 });
 (mgr as unknown as { ep: unknown }).ep = fakeEp();
-const agentCount = () => agentsMap().size;
+const agentCount = (manager: Manager = mgr) => agentsMap(manager).size;
 
 // A recording connector that requires `node` (present whenever this smoke runs) — captures the
 // LaunchOpts the manager hands it, so we can assert the model threads through verbatim. Declares
@@ -207,10 +208,10 @@ registry.register(recNoResumeCon);
   check("opencode: flag with no agent file", ocModel(opencodeConnector.buildLaunch({ ...base, model: "sonnet" })) === "sonnet");
   if (!onWin) check("hermes: flag with no agent file", hermesModel(hermesConnector.buildLaunch({ ...base, model: "sonnet" })) === "sonnet");
 
-  // no flag → agent-file model is the fallback (incl. Hermes, whose launcher previously ignored it)
-  check("claude: no flag → frontmatter opus", claudeModel(claudeConnector.buildLaunch({ ...base, configPath: af })) === "opus");
-  check("opencode: no flag → frontmatter opus", ocModel(opencodeConnector.buildLaunch({ ...base, configPath: af })) === "opus");
-  if (!onWin) check("hermes: no flag → frontmatter opus", hermesModel(hermesConnector.buildLaunch({ ...base, configPath: af })) === "opus");
+  // no flag → the launcher resolves the agent file's model; a connector never re-reads it
+  check("claude: agent file alone → no --model", claudeModel(claudeConnector.buildLaunch({ ...base, configPath: af })) === undefined);
+  check("opencode: agent file alone → no config.model", ocModel(opencodeConnector.buildLaunch({ ...base, configPath: af })) === undefined);
+  if (!onWin) check("hermes: agent file alone → no HERMES_MODEL", hermesModel(hermesConnector.buildLaunch({ ...base, configPath: af })) === undefined);
 
   // nothing set → no model applied
   check("claude: nothing → no --model", claudeModel(claudeConnector.buildLaunch({ ...base })) === undefined);
@@ -232,9 +233,10 @@ registry.register(recNoResumeCon);
 }
 
 // 5 — RESUME: fork an existing session into the mesh (issue #23). claude renders
-// `--resume <id> --fork-session`; opencode + hermes THROW (no silent fresh-spawn fallback); the id
-// threads through the manager verbatim and stays a single argv token (no shell). The manifest path
-// carries no resume by construction (see the cotal.yaml reject in cli manifest.smoke.ts).
+// `--resume <id> --fork-session`; hermes hands the id to its launcher, which forks the session;
+// opencode THROWS (no silent fresh-spawn fallback); the id threads through the manager verbatim and
+// stays a single argv token (no shell). The manifest path carries no resume by construction (see the
+// cotal.yaml reject in cli manifest.smoke.ts).
 {
   const base = { space: "smoke", name: "tester", events: false };
   const cArgs = (o: LaunchOpts) => claudeConnector.buildLaunch(o).args;
@@ -295,9 +297,17 @@ registry.register(recNoResumeCon);
   try { (await import("@cotal-ai/connector-codex")).codexConnector.buildLaunch({ ...base, continueSession: "current" }); } catch { codexContinueThrew = true; }
   check("codex: buildLaunch({continueSession}) throws", codexContinueThrew);
 
-  // opencode + hermes THROW on resume and produce NO command (fail loud, never spawn fresh silently).
-  // Hermes is excluded on win32 (its buildLaunch throws Unix-only regardless — asserted in §3).
-  const unsupportedResume = onWin ? [opencodeConnector] : [opencodeConnector, hermesConnector];
+  // hermes forks: the id rides to its launcher, and the fork's record path rides the spec and the env.
+  // Skipped on win32 (its buildLaunch throws Unix-only regardless — asserted in §3).
+  if (!onWin) {
+    let spec: LaunchSpec | undefined;
+    let err: unknown;
+    try { spec = hermesConnector.buildLaunch({ ...base, resume: "sess-1" }); } catch (e) { err = e; }
+    check("hermes: buildLaunch({resume}) builds the fork launch", spec?.env?.COTAL_HERMES_RESUME === "sess-1", err ?? spec?.env?.COTAL_HERMES_RESUME);
+    check("hermes: fork record path rides the spec and the env", !!spec?.resumeRecordPath && spec.env?.COTAL_HERMES_RESUME_RECORD === spec.resumeRecordPath, spec?.resumeRecordPath);
+  }
+  // opencode THROWS on resume and produces NO command (fail loud, never spawn fresh silently).
+  const unsupportedResume = [opencodeConnector];
   for (const con of unsupportedResume) {
     let threw = false;
     let spec: LaunchSpec | undefined;
@@ -325,7 +335,7 @@ registry.register(recNoResumeCon);
 {
   check("claude supportsResume === true", claudeConnector.supportsResume === true);
   check("opencode supportsResume falsy", !opencodeConnector.supportsResume, opencodeConnector.supportsResume);
-  check("hermes supportsResume falsy", !hermesConnector.supportsResume, hermesConnector.supportsResume);
+  check("hermes supportsResume === true", hermesConnector.supportsResume === true, hermesConnector.supportsResume);
 
   // REJECT: smoke-norsm passes the node PATH check but declares no resume support.
   resetNoResumeBuilt();
@@ -462,8 +472,9 @@ registry.register(recNoResumeCon);
   };
   (mgr as unknown as { ep: unknown }).ep = fakeEp({ releaseManagerLease: async () => {}, releaseDaemonRenewalLease: async () => {}, stop: async () => {} });
   (mgr as unknown as { attach: { stop: () => Promise<void> } }).attach = { stop: async () => {} };
-  await mgr.startAgent({ name: "shut1", agent: "smoke-rec", events: false });
-  await mgr.startAgent({ name: "shut2", agent: "smoke-rec", events: false });
+  const first = await mgr.startAgent({ name: "shut1", agent: "smoke-rec", events: false });
+  const second = await mgr.startAgent({ name: "shut2", agent: "smoke-rec", events: false });
+  check("shutdown: both launches succeed before stop", first.ok === true && second.ok === true, { first, second });
   check("shutdown: two managed agents present before stop", agentCount() >= 2, agentCount());
   await mgr.stop({ withAgents: true });
   check("shutdown: stop() hard-stops every managed child", stopped.includes("shut1") && stopped.includes("shut2"), stopped);
@@ -475,10 +486,13 @@ registry.register(recNoResumeCon);
 // reaps through. Assert it directly: it hard-stops every child + empties the map even when one stop
 // throws, touching no lease/endpoint.
 {
+  // stop() is terminal. This scenario needs its own manager and readiness inventory.
+  const mgr = new Manager({ space: "smoke", servers: undefined, runtime: "pty", workspaceRoot });
+  (mgr as unknown as { ep: unknown }).ep = fakeEp({}, undefined, mgr);
   // First child's hard-stop THROWS (the tmux `closeWindow` / cmux `closeWorkspace` failure the panel
   // named) — the teardown must be best-effort per agent: still stop + free + deprovision the rest and
   // empty the map, never abort on one throw.
-  agentsMap().clear();
+  agentsMap(mgr).clear();
   const stopped: string[] = [];
   const exited = new Set<string>();
   (mgr as unknown as { runtime: { kind: string; spawn: (n: string, s: LaunchSpec) => AgentHandle } }).runtime = {
@@ -490,14 +504,16 @@ registry.register(recNoResumeCon);
       interrupt: () => {}, attach: () => fakeSession,
     }),
   };
-  await mgr.startAgent({ name: "lease1", agent: "smoke-rec", events: false });
-  await mgr.startAgent({ name: "lease2", agent: "smoke-rec", events: false });
+  const first = await mgr.startAgent({ name: "lease1", agent: "smoke-rec", events: false });
+  const second = await mgr.startAgent({ name: "lease2", agent: "smoke-rec", events: false });
+  check("teardown: both launches succeed before teardown", first.ok === true && second.ok === true, { first, second });
+  check("teardown: both children are inventoried before teardown", agentsMap(mgr).has("lease1") && agentsMap(mgr).has("lease2"), agentCount(mgr));
   let teardownError = "";
   try { await (mgr as unknown as { teardownManagedAgents: () => Promise<void> }).teardownManagedAgents(); }
   catch (e) { teardownError = (e as Error).message; }
   check("teardown: a throwing hard-stop doesn't abort teardown (every child attempted)", stopped.includes("lease1") && stopped.includes("lease2"), stopped);
-  check("teardown: an unverified survivor makes shutdown fail loud (never releases into split brain)", /lease1.*still running/.test(teardownError), teardownError);
-  check("teardown: shared teardown empties the map despite a throwing stop", agentCount() === 0, agentCount());
+  check("teardown: a refused stop makes shutdown fail loud with its cause (never releases into split brain)", /lease1: stop failed: simulated runtime close failure/.test(teardownError), teardownError);
+  check("teardown: shared teardown empties the map despite a throwing stop", agentCount(mgr) === 0, agentCount(mgr));
 }
 
 // 11 — AUTHORITATIVE REAP: a throwing runtime hard-stop must not abort later siblings, but a recursive
@@ -525,7 +541,8 @@ registry.register(recNoResumeCon);
 // launch is UNCERTAIN — a non-success reply that KEEPS the agent (it may still be booting), never a
 // deprovision. Fake ep reports NOBODY joined; the handle stays running and never exits; short backstop.
 {
-  (mgr as unknown as { ep: unknown }).ep = fakeEp({}, () => []); // roster reports nobody → never "joins"
+  const mgr = new Manager({ space: "smoke", servers: undefined, runtime: "pty", workspaceRoot });
+  (mgr as unknown as { ep: unknown }).ep = fakeEp({}, () => [], mgr); // roster reports nobody → never "joins"
   (mgr as unknown as { readinessTimeoutMs: number }).readinessTimeoutMs = 40;
   (mgr as unknown as { runtime: { kind: string; spawn: (n: string, s: LaunchSpec) => AgentHandle } }).runtime = {
     kind: "fake",
@@ -534,7 +551,7 @@ registry.register(recNoResumeCon);
   const reply = await mgr.startAgent({ name: "unc1", agent: "smoke-rec", events: false });
   check("uncertain: neither presence nor exit → non-success reply", reply.ok === false, reply);
   check("uncertain: reply names it 'uncertain'", /uncertain/i.test(reply.error ?? ""), reply.error);
-  check("uncertain: the agent is KEPT (not deprovisioned — may still be booting)", agentsMap().has("unc1"), [...agentsMap().keys()]);
+  check("uncertain: the agent is KEPT (not deprovisioned — may still be booting)", agentsMap(mgr).has("unc1"), [...agentsMap(mgr).keys()]);
 }
 
 console.log(`\nSTART-MODEL/PREFLIGHT SMOKE ${failures === 0 ? "OK ✅" : "FAILED ❌"}`);

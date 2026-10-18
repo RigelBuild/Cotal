@@ -3,14 +3,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { CotalEndpoint, DEFAULT_SERVER, isReachable, mintLifecycleUid, type JsonValue, type ParsedArgs } from "@cotal-ai/core";
-
-/** Minimal ANSI helpers — local to the delivery daemon so it never imports the CLI. */
-const c = {
-  dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
-  bold: (s: string) => `\x1b[1m${s}\x1b[0m`,
-  cyan: (s: string) => `\x1b[36m${s}\x1b[0m`,
-  red: (s: string) => `\x1b[31m${s}\x1b[0m`,
-};
+import { c } from "@cotal-ai/workspace";
 
 type FeedbackType = "bug" | "idea" | "friction" | "praise" | "other";
 type FeedbackSeverity = "low" | "medium" | "high";
@@ -89,7 +82,7 @@ export async function runFeedbackIntake(args: ParsedArgs): Promise<void> {
   }
 
   const host = values.host ?? "127.0.0.1";
-  const port = numberOpt(values.port, 8787, "port");
+  const port = portOpt(values.port);
   const maxBytes = numberOpt(values["max-bytes"], 64 * 1024, "max-bytes");
   const rateLimit = numberOpt(values["rate-limit"], 30, "rate-limit");
   const store = resolve(values.store ?? ".cotal/feedback/feedback.jsonl");
@@ -188,6 +181,13 @@ export async function runFeedbackIntake(args: ParsedArgs): Promise<void> {
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
   await new Promise<void>(() => {});
+}
+
+function portOpt(raw: string | undefined): number {
+  if (raw === undefined) return 8787;
+  const port = Number(raw);
+  if (!/^[0-9]+$/.test(raw) || port < 1 || port > 65535) throw new Error("--port must be a decimal port from 1 to 65535");
+  return port;
 }
 
 function numberOpt(raw: string | undefined, fallback: number, name: string): number {

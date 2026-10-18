@@ -8,7 +8,11 @@
  * needs no claude/mesh; tmux/cmux are skipped (logged) when not present on the machine.
  */
 import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createRuntime, requireRuntimeAdopt } from "../src/index.js";
+import { isCustodialRuntime } from "../src/runtime/index.js";
 import type { AgentHandle, LaunchSpec, Runtime } from "@cotal-ai/core";
 import { detachKey } from "../../cli/src/lib/attach-client.js"; // the operator ws client moved into @cotal-ai/cli (stage 2a); dev-only smoke import
 import "@cotal-ai/cmux"; // registers the `cmux` runtime provider
@@ -41,15 +45,47 @@ const cwd = process.cwd();
 
 // pty (default) — the one streamable backend: attach() returns a live session, never throws.
 {
-  const h = createRuntime("pty", SESSION).spawn("smoke-pty", spec, cwd);
-  let sess: { onData?: unknown; cols?: unknown } | undefined;
-  const err = attachError(() => (sess = h.attach()));
-  check(
-    "pty: attach() returns a live session (streams, no throw)",
-    err === "" && typeof sess?.onData === "function" && typeof sess?.cols === "number",
-  );
-  h.stop({ graceful: false });
-  closeHandle(h);
+  const previousSeatRoot = process.env.COTAL_SEAT_ROOT;
+  const seatRoot = process.platform === "linux" ? mkdtempSync(join(tmpdir(), "cotal-attach-default-pty-")) : undefined;
+  if (seatRoot !== undefined) process.env.COTAL_SEAT_ROOT = seatRoot;
+  let runtime: Runtime | undefined;
+  let spawned: AgentHandle | undefined;
+  try {
+    const pty = createRuntime("pty", SESSION);
+    runtime = pty;
+    const h = pty.spawn("smoke-pty", spec, cwd);
+    spawned = h;
+    let sess: { onData?: unknown; cols?: unknown } | undefined;
+    const err = attachError(() => (sess = h.attach()));
+    check(
+      "pty: attach() returns a live session (streams, no throw)",
+      err === "" && typeof sess?.onData === "function" && typeof sess?.cols === "number",
+    );
+  } finally {
+    try {
+      if (spawned !== undefined) {
+        spawned.stop({ graceful: false });
+        if (process.platform === "linux") {
+          if (
+            typeof spawned.waitForExit !== "function" ||
+            spawned.reference === undefined ||
+            runtime === undefined ||
+            !isCustodialRuntime(runtime)
+          ) throw new Error("Linux pty handle cannot prove its child exited or its runtime cannot reap its seat");
+          await spawned.waitForExit();
+          await runtime.reap(spawned.reference);
+        }
+      }
+    } finally {
+      closeHandle(spawned);
+      try {
+        if (seatRoot !== undefined) rmSync(seatRoot, { recursive: true, force: true });
+      } finally {
+        if (previousSeatRoot === undefined) delete process.env.COTAL_SEAT_ROOT;
+        else process.env.COTAL_SEAT_ROOT = previousSeatRoot;
+      }
+    }
+  }
 }
 
 // Runtime-selection contract (no fallbacks): `auto` is deterministic pty — even inside $TMUX. tmux
@@ -152,25 +188,58 @@ const cwd = process.cwd();
   const handle: AgentHandle = { name: "ok", kind: "capable", status: () => "running", stop: () => {}, interrupt: () => {}, attach: () => { throw new Error("unused"); } };
   const capable: Runtime = { kind: "capable", spawn: () => handle, adopt: () => handle };
   check("present adopt returns the runtime handle", requireRuntimeAdopt(capable, { kind: "capable", id: "opaque" }) === handle);
+}
 
-  const pty = createRuntime("pty", SESSION);
-  const spawned = pty.spawn("smoke-pty-adopt", spec, cwd);
+{
+  const previousSeatRoot = process.env.COTAL_SEAT_ROOT;
+  const seatRoot = process.platform === "linux" ? mkdtempSync(join(tmpdir(), "cotal-attach-pty-")) : undefined;
+  if (seatRoot !== undefined) process.env.COTAL_SEAT_ROOT = seatRoot;
+  let pty: Runtime | undefined;
+  let spawned: AgentHandle | undefined;
   let adopted: AgentHandle | undefined;
-  const ptyErr = attachError(() => (adopted = requireRuntimeAdopt(pty, spawned.reference ?? { kind: "pty", id: "missing" })));
-  if (process.platform === "linux") {
-    check(
-      "pty adopt returns a live proxy",
-      ptyErr === "" && adopted !== undefined && typeof adopted.attach === "function" && adopted.pid !== undefined,
-    );
-  } else {
-    check(
-      `pty adopt throws custody transport unsupported on ${process.platform}`,
-      ptyErr === `custody transport unsupported on ${process.platform}`,
-    );
+  let ptyErr = "";
+  try {
+    // The fork keeps every Linux pty seat under a custodian, so a spawn carries a custody reference
+    // the same runtime adopts; elsewhere pty spawns in-process and adopt refuses the transport.
+    const runtime = createRuntime("pty", SESSION);
+    pty = runtime;
+    const handle = runtime.spawn("smoke-pty-adopt", spec, cwd);
+    spawned = handle;
+    ptyErr = attachError(() => (adopted = requireRuntimeAdopt(runtime, handle.reference ?? { kind: "pty", id: "missing" })));
+    if (process.platform === "linux") {
+      check(
+        "pty adopt returns a live proxy of the same seat",
+        ptyErr === "" && adopted !== undefined && typeof adopted.attach === "function" && adopted.pid === spawned.pid,
+      );
+    } else {
+      check("pty spawn records no custody reference", spawned.reference === undefined);
+      check(
+        `pty adopt throws custody transport unsupported on ${process.platform}`,
+        ptyErr === `custody transport unsupported on ${process.platform}`,
+      );
+    }
+  } finally {
+    try {
+      if (spawned !== undefined) {
+        spawned.stop({ graceful: false });
+        await spawned.waitForExit?.();
+        if (process.platform === "linux") {
+          if (spawned.reference === undefined || pty === undefined || !isCustodialRuntime(pty))
+            throw new Error("Linux pty seat has no reference or custodial runtime");
+          await pty.reap(spawned.reference);
+        }
+      }
+    } finally {
+      closeHandle(spawned);
+      closeHandle(adopted);
+      try {
+        if (seatRoot !== undefined) rmSync(seatRoot, { recursive: true, force: true });
+      } finally {
+        if (previousSeatRoot === undefined) delete process.env.COTAL_SEAT_ROOT;
+        else process.env.COTAL_SEAT_ROOT = previousSeatRoot;
+      }
+    }
   }
-  spawned.stop({ graceful: false });
-  closeHandle(spawned);
-  closeHandle(adopted);
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");

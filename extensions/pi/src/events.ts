@@ -15,12 +15,18 @@ export class PiEvents {
   private path?: string;
   private pending: Promise<void> = Promise.resolve();
   private closing = false;
-  private dead = false;
 
-  constructor(private readonly mesh: MeshAgent, private readonly space: string) {}
+  /** @param stopped Told of each failure that stopped this seat's event plane, with the delay before
+   *  the holder re-establishes it (`0` for at once), or `null` for a failure of this adapter's own
+   *  that no holder retries. */
+  constructor(
+    private readonly mesh: MeshAgent,
+    private readonly space: string,
+    private readonly stopped: (error: Error, retryInMs: number | null) => void,
+  ) {}
 
   async start(sessionId: string, path: string | undefined, freshSession = false): Promise<void> {
-    if (this.closing || this.dead) return;
+    if (this.closing) return;
     if (!path) {
       this.fail(new Error("Pi AG-UI: persistent native session file is required"));
       return;
@@ -43,7 +49,7 @@ export class PiEvents {
   }
 
   flush(sessionId: string, path: string | undefined): void {
-    if (this.closing || this.dead) return;
+    if (this.closing) return;
     if (!path) {
       this.fail(new Error("Pi AG-UI: persistent native session file is required"));
       return;
@@ -51,9 +57,10 @@ export class PiEvents {
     const step = this.pending.then(async () => {
       if (this.sessionId !== sessionId || this.path !== path) throw new Error("Pi AG-UI: turn belongs to an unadopted session");
       if (!this.holder) throw new Error("Pi AG-UI: no emitter was adopted before the turn");
+      // A failure inside the holder reaches `stopped` through the holder's own sink, and the holder
+      // re-establishes the plane itself; it is not rethrown here, which would report it twice.
       this.holder.flush(path);
       await this.holder.settled();
-      if (this.holder.failure) throw this.holder.failure;
     });
     this.pending = step.catch((error: Error) => this.fail(error));
   }
@@ -63,7 +70,6 @@ export class PiEvents {
     await this.pending;
     await this.release();
     this.closing = false;
-    this.dead = false;
   }
 
   private async release(): Promise<void> {
@@ -113,7 +119,10 @@ export class PiEvents {
       this.lock = lock;
       const subjectFrontier = await FileSubjectFrontier.open(subjectPath, { space: this.space, principal });
       const wal = await EventWal.open(walPath, { space: this.space, principal, threadId: sessionId, subjectMayExist: false });
-      if (freshFile && wal.frontier.sourceCursor !== undefined && wal.frontier.sourceCursor !== "pi:first-file")
+      // A re-establish starts this factory again with the cursor the first turns acknowledged, so
+      // an acknowledged cursor alone no longer says the file vanished; the file does (Sol, review
+      // of 2026-10-12: the first cut threw here on every re-establish of a new session).
+      if (freshFile && wal.frontier.sourceCursor !== undefined && wal.frontier.sourceCursor !== "pi:first-file" && !existsSync(path))
         throw new Error("Pi AG-UI: native session file vanished after an event cursor was acknowledged");
       // For an existing transcript, capture its boundary before subsequent turns. A restart keeps
       // its acknowledged cursor. A new file is read from its beginning to retain the first turn.
@@ -124,18 +133,21 @@ export class PiEvents {
           await wal.advanceCursorOnly(boundary.cursor);
         }
       }
-      const map = createPiMapper(sessionId, wal.brackets?.run, wal.brackets?.tools);
+      // Seeded from the pending frame when there is one: `start` settles that frame, and its
+      // brackets are the run and tool calls the wire will have open once it has.
+      const brackets = wal.pending === null ? wal.brackets : wal.pending.brackets;
+      const map = createPiMapper(sessionId, brackets?.run, brackets?.tools);
       return AguiEmitter.start({
         endpoint: this.mesh.ep, wal, subjectFrontier,
         source: new PiSessionSource(path),
         map,
+        onUnreadable: (gap) =>
+          console.error(`Pi AG-UI source: skipped an unreadable session record at offset ${gap.offset} (${gap.bytes} bytes): ${gap.reason}`),
       });
-    }, (error) => this.fail(error));
+    }, { onError: (error, retryInMs) => this.stopped(error, retryInMs), sourceEnd: (p) => new JsonlFileSource(p).end() });
   }
 
   private fail(error: Error): void {
-    if (this.dead) return;
-    this.dead = true;
-    console.error(`Pi AG-UI emitter stopped: ${error.message}`);
+    this.stopped(error, null);
   }
 }

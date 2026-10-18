@@ -5,26 +5,17 @@ import {
   hardenPrivate,
   registry,
   writeSecretFile,
+  SpawnRefused,
+  confirmWatch,
   type AgentHandle,
+  type ConfirmPane,
   type LaunchSpec,
   type Runtime,
   type RuntimeProvider,
 } from "@cotal-ai/core";
 import * as zellij from "./driver.js";
 import { readZellijPlacement, type AgentPlacement } from "./placement.js";
-
-const CONFIRM_INTERVAL_MS = 1_000;
-const MAX_CONFIRMS = 5;
-
-export function scheduleConfirmation(
-  confirm: string,
-  write: () => void,
-  schedule: (callback: () => void, delay: number) => unknown = (callback, delay) => setTimeout(callback, delay),
-): void {
-  if (!confirm) return;
-  for (let i = 1; i <= MAX_CONFIRMS; i++) schedule(write, i * CONFIRM_INTERVAL_MS);
-}
-
+const CONFIRM_BUDGET_MS = 1_000;
 
 export interface PrivateLauncher {
   /** Runs the launcher script from `cwd`, so zellij's fallback pane title reads `./<agent>`. */
@@ -105,8 +96,16 @@ export class ZellijRuntime implements Runtime {
 
   spawn(name: string, spec: LaunchSpec, cwd: string): AgentHandle {
     if (!/^[A-Za-z0-9_.-]+$/.test(name))
-      throw new Error(`zellij runtime: unsafe agent name ${JSON.stringify(name)} (allowed: letters, digits, _ . -)`);
-    if (!zellij.available()) throw new Error("zellij runtime: zellij is not available — is it installed and on PATH?");
+      throw new SpawnRefused(`zellij runtime: unsafe agent name ${JSON.stringify(name)} (allowed: letters, digits, _ . -)`);
+    if (!zellij.available()) throw new SpawnRefused("zellij runtime: zellij is not available — is it installed and on PATH?");
+    let watch: ((pane: ConfirmPane) => void) | undefined;
+    try {
+      if (spec.confirmBefore?.length && spec.confirm === undefined) throw new Error("startup choices require a final confirmation prompt");
+      watch = spec.confirm === undefined ? undefined : confirmWatch(spec.confirm, spec.confirmBefore);
+    } catch (error) {
+      throw new SpawnRefused(error instanceof Error ? error.message : String(error));
+    }
+
     const placement = readZellijPlacement(spec.env?.COTAL_AGENT_FILE);
     zellij.ensureSession(this.session);
     let paneId: string | undefined;
@@ -148,15 +147,20 @@ export class ZellijRuntime implements Runtime {
     }
 
     const startedPane = paneId;
-    if (spec.confirm) {
-      scheduleConfirmation(spec.confirm, () => {
+    watch?.({
+      read: () => zellij.dumpScreen(this.session, startedPane, Date.now() + CONFIRM_BUDGET_MS),
+      enter: () => zellij.writePane(this.session, startedPane, "13", Date.now() + CONFIRM_BUDGET_MS),
+      down: () => zellij.writeKeyDown(this.session, startedPane, Date.now() + CONFIRM_BUDGET_MS),
+      fail: (message) => {
+        console.error(`zellij runtime: "${name}": ${message}`);
         try {
-          zellij.writePane(this.session, startedPane, "13");
-        } catch {
-          /* pane may already be gone */
+          zellij.closePane(this.session, startedPane, Date.now() + CONFIRM_BUDGET_MS);
+        } catch (error) {
+          console.error(`zellij runtime: failed to close pane for "${name}":`, error);
         }
-      });
-    }
+        cleanupLauncher(launcher);
+      },
+    });
 
     return {
       name,

@@ -8,10 +8,13 @@
  *
  * stdio transport owns stdout for JSON-RPC — ALL diagnostics go to stderr.
  */
+import type { Readable, Writable } from "node:stream";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   configFromEnv,
+  envFlag,
+  eventPlaneArmed,
   hasIdentity,
   MeshAgent,
   startControlServer,
@@ -22,43 +25,161 @@ import {
   WORKFLOW_STEER,
   AguiEmitter,
   AguiEmitterHolder,
+  eventPlaneStopped,
   EventWal,
   FileSubjectFrontier,
   ensureEventWalDir,
   resolveEventsStateRoot,
   controlFromEnv,
+  NO_TOOL_ARGS,
+  JsonlFileSource,
+  type DurableSource,
 } from "@cotal-ai/connector-core";
 import { principalKey } from "@cotal-ai/core";
 import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import { createClaudeHandle, createWakePolicy, type WakePolicy } from "./hooks.js";
 import { createClaudeMapper, type ClaudeEntry, type ClaudeMapper } from "./agui-map.js";
-import { createClaudeTranscriptSource } from "./agui-source.js";
+import { createBoundClaudeTranscriptSource } from "./agui-source.js";
 
-/** Publishes this session's activity as AG-UI events on `events.<owner>.<actor>` — set in main()
- *  iff COTAL_EVENTS is on (buildLaunch sets it for managed sessions; a personal session never
- *  publishes). This replaces the `tr-<name>` transcript mirror, which is gone. */
-let events: AguiEmitterHolder<ClaudeEntry> | undefined;
+/** What a plain session's one tool says. Static: an unmanaged process knows nothing about any mesh. */
+const HOW_TO_JOIN =
+  "This Claude Code session is not on a Cotal mesh, so the cotal_* mesh tools are off. " +
+  "The Cotal plugin stays off the mesh unless the session was launched with a mesh identity " +
+  "(COTAL_NAME, COTAL_LINK or COTAL_AGENT_FILE in its environment). To work on a mesh, launch the " +
+  "session through Cotal: `cotal setup` once, `cotal up` to start a local mesh, then `cotal spawn` " +
+  "to start a Claude session that joins it (`cotal spawn <name> --detach` runs it under the manager). " +
+  "Docs: https://docs.cotal.ai/getting-started/";
 
-/** Claude Code lifecycle events → presence + (on inject-capable events) queued peer messages.
- *  Read `events` lazily: main() assigns it after this handler is built. `onReply` is the commit
- *  half — an injected batch is acked only once its reply is confirmed delivered. */
-const claude = createClaudeHandle({ events: () => events });
+/** A plain `claude`: answer MCP with one static tool instead of closing stdio. Builds no MeshAgent
+ *  and no control server, so nothing reaches a broker or binds a socket. */
+async function serveUnmanaged(): Promise<void> {
+  const server = new McpServer({ name: "cotal", version: "0.0.0" });
+  server.registerTool(
+    "cotal_how_to_join",
+    {
+      title: "How to join a Cotal mesh",
+      description: "Explains why this session has no Cotal mesh tools and how to launch one that does.",
+      inputSchema: NO_TOOL_ARGS,
+    },
+    async () => ({ content: [{ type: "text" as const, text: HOW_TO_JOIN }] }),
+  );
+  await server.connect(new StdioServerTransport());
+}
 
 async function main(): Promise<void> {
   // No identity → this is a plain `claude`, not a launcher-spawned agent. Stay
-  // inert: never connect to the mesh, so an installed plugin can't make the
-  // operator's own sessions join as stray peers.
+  // off the mesh, so an installed plugin can't make the operator's own sessions
+  // join as stray peers, but still answer MCP so the client sees a working server.
   if (!hasIdentity()) {
     process.stderr.write("[cotal-connector] no COTAL_NAME — not a managed session; staying off the mesh\n");
+    await serveUnmanaged();
     return;
   }
-  const config = configFromEnv();
-  config.connector = "claude"; // advertise the host harness on our AgentCard (meta.connector)
-  const agent = new MeshAgent(config);
-  agent.start(); // background connect with retry — never blocks tool serving
+  const session = await serveClaudeSession({
+    env: process.env,
+    input: process.stdin,
+    output: process.stdout,
+    fatalBind: true,
+    onShutdown: (code) => process.exit(code),
+  });
+  const stop = () => void session.close().finally(() => process.exit(0));
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+}
 
-  if (/^(1|true|yes|on)$/i.test(process.env.COTAL_EVENTS ?? "") || config.eventsRequired) {
+/** One managed session: its launch env (read only from here) and its MCP stream pair. */
+export interface ClaudeSessionOptions {
+  env: NodeJS.ProcessEnv;
+  input: Readable;
+  output: Writable;
+  /** Exit the process when the control socket cannot be bound. A host serving several sessions
+   *  leaves it off, and the call rejects instead. */
+  fatalBind?: boolean;
+  /** A shutdown frame or the end or closure of `input` ended the session. Called once after teardown;
+   *  `code` is 1 if teardown failed, or the requested exit code otherwise. */
+  onShutdown?: (code: number) => void;
+}
+
+export interface ClaudeSession {
+  name: string;
+  /** Leave the mesh and stop serving. Idempotent; may reject if teardown fails.
+   *  The streams stay open; the caller owns them. */
+  close(): Promise<void>;
+}
+
+/** Serve one managed Claude Code session over `input`/`output`. Every per-session object lives in
+ *  the call, so one process can serve several sessions. A startup failure closes what was started
+ *  before the call rejects. */
+export async function serveClaudeSession(opts: ClaudeSessionOptions): Promise<ClaudeSession> {
+  let close: (() => Promise<void>) | undefined;
+  try {
+    return await startSession(opts, (c) => (close = c));
+  } catch (e) {
+    await close?.();
+    throw e;
+  }
+}
+
+async function startSession(
+  opts: ClaudeSessionOptions,
+  setClose: (close: () => Promise<void>) => void,
+): Promise<ClaudeSession> {
+  const env = { ...opts.env };
+  if (opts.input.readableEnded || opts.input.destroyed)
+    throw new Error("hosted MCP input is already ended or destroyed");
+  /** Publishes this session's activity as AG-UI events on `events.<owner>.<actor>` — set below
+   *  iff COTAL_EVENTS is on (buildLaunch sets it for managed sessions; a personal session never
+   *  publishes). This replaces the `tr-<name>` transcript mirror, which is gone. */
+  let events: AguiEmitterHolder<ClaudeEntry> | undefined;
+
+  /** The `claude/channel` push side — set below once the MCP server exists. */
+  let wake: WakePolicy | undefined;
+
+  /** Claude Code lifecycle events → presence + (on inject-capable events) queued peer messages.
+   *  Read `events` and `wake` lazily: they are assigned after this handler is built. `onReply` is
+   *  the commit half — an injected batch is acked only once its reply is confirmed delivered. */
+  const claude = createClaudeHandle({ env, events: () => events, surfaced: (items) => wake?.surfaced(items) });
+
+  const config = configFromEnv(env);
+  config.connector = "claude"; // advertise the host harness on our AgentCard (meta.connector)
+  // Parsed here, not in the handshake handler that applies it: the SDK routes a throw from that
+  // handler to its error hook and the session would run on with the flag unread.
+  const channelFlag = envFlag(env, "COTAL_CHANNEL");
+  const agent = new MeshAgent(config, env);
+  const eventWaitStop = new AbortController();
+  // A Cotal bind can remain current while nats.js is reconnecting and has no server info.
+  // Wait for both edges before starting or pumping the recorder. Its transcript stays durable
+  // while the endpoint owns reconnection; shutdown cancels the wait instead of a timer killing MCP.
+  const waitForEventConnection = (): Promise<void> =>
+    new Promise<void>((resolve, reject) => {
+      const release = (): void => {
+        agent.off("connection", onConnection);
+        agent.off("transport", onTransport);
+        eventWaitStop.signal.removeEventListener("abort", onStop);
+      };
+      const finish = (): void => {
+        release();
+        resolve();
+      };
+      const onStop = (): void => {
+        release();
+        reject(new Error("seat stopping while the mesh connection is down; unpublished events stay in the transcript"));
+      };
+      const onConnection = (e: { connected: boolean }): void => {
+        if (e.connected && agent.transportConnected) finish();
+      };
+      const onTransport = (e: { connected: boolean }): void => {
+        if (e.connected && agent.connected) finish();
+      };
+      agent.on("connection", onConnection);
+      agent.on("transport", onTransport);
+      eventWaitStop.signal.addEventListener("abort", onStop);
+      if (eventWaitStop.signal.aborted) onStop();
+      else if (agent.connected && agent.transportConnected) finish();
+    });
+
+  if (eventPlaneArmed(config, env)) {
     // The mapper is built inside the emitter factory, because it is keyed on the thread the
     // transcript names and that is not known until a hook hands one over. It is HELD here because
     // `onRunClosed` below has to reach it, and the two are assigned at different times.
@@ -70,12 +191,23 @@ async function main(): Promise<void> {
     // The channel is derived inside the emitter from the endpoint's OWN principal, never from
     // `config.name`, so the subject the broker enforces a grant against and the subject this
     // publishes to are computed from the identity the connection authenticates as.
+    // ONE source for the holder's lifetime. The holder re-establishes a plane that stopped by
+    // calling this factory again, and the boundary a bound source captured on the first call is
+    // the position the thread adopted at; a second source would capture a second boundary, at the
+    // re-establish, and every record between the two would be lost without a word.
+    let source: DurableSource<ClaudeEntry> | undefined;
     events = new AguiEmitterHolder<ClaudeEntry, unknown>(
       async (transcriptPath: string, sessionSource: unknown) => {
+        // Captured as the FACTORY'S FIRST ACT, before the mesh wait below and before anything else
+        // this bind does: a lazily-built source otherwise positions itself on its own first read,
+        // which happens only after the mesh wait, and anything the session writes to the transcript
+        // in that window is silently dropped. `fork` runs its own file-appear wait inside this same
+        // call and still substitutes its boundary exactly once. `startup` needs no boundary.
+        const boundSource = (source ??= await createBoundClaudeTranscriptSource(transcriptPath, sessionSource));
         const startEmitter = async () => {
           // The events state root throws rather than defaulting to the working directory: a WAL
           // written somewhere no later start looks is a silent loss.
-          const workspaceRoot = resolveEventsStateRoot(process.env);
+          const workspaceRoot = resolveEventsStateRoot(env);
 
           // The native session IS the AG-UI thread, and Claude Code names the transcript after it.
           // Taken from the path rather than from any env: the hook's path is what the emitter
@@ -102,80 +234,117 @@ async function main(): Promise<void> {
           // subject that already has one, the broker refuses it, and the emitter halts.
           const wal = await EventWal.open(walPath, { space: config.space, threadId, principal, subjectMayExist: false });
 
-          mapper = createClaudeMapper({ threadId, mintRunId: () => randomUUID() });
+          // Seeded from the bracket state that will exist AFTER `start` settles a pending frame,
+          // not from the folded state before it: a pending terminal closes the log's run without
+          // passing through this mapper. A re-established plane starts here with the log's run
+          // open; a mapper that opened with none would drop every assistant record until the
+          // next prompt, whose `RUN_STARTED` the brackets then refuse.
+          const resumeRunId = wal.pending === null ? wal.brackets?.run : wal.pending.brackets.run;
+          mapper = createClaudeMapper({ threadId, mintRunId: () => randomUUID(), resumeRunId });
           return AguiEmitter.start<ClaudeEntry>({
             endpoint: agent.ep,
             wal,
             subjectFrontier,
-            source: createClaudeTranscriptSource(transcriptPath, sessionSource),
+            source: boundSource,
             map: mapper.map,
+            // Claude writes the transcript, and a write it cut short (a full disk) leaves part of
+            // one record glued to the next on a single line that never becomes readable. That line
+            // is stepped over and named here; halting on it ended the plane, and on a space that
+            // requires events the seat with it, for good at that byte, on every restart.
+            onUnreadable: (gap) =>
+              process.stderr.write(
+                `[cotal-connector] AG-UI source: skipped an unreadable transcript record at offset ${gap.offset} ` +
+                  `(${gap.bytes} bytes): ${gap.reason}\n`,
+              ),
           });
         };
 
-        // WAIT FOR THE MESH FIRST. This factory runs off the FIRST lifecycle hook, and with
-        // `--prompt` that hook lands within a second of launch — several seconds before the
-        // endpoint's first bind. Starting the emitter against the unbound endpoint answered
-        // "endpoint not started", and the holder is terminal on error BY DESIGN (a retry would
-        // re-run WAL recovery on a stream it already failed to establish) — so losing this race
-        // once silenced the event plane for the entire session, with one stderr line nothing
-        // surfaces as the only record. Measured live: the emitter died before the "connected to"
-        // log line every time. The wait is generous because it happens once, off the hot path,
-        // and a session that outlives it gets its whole plane; the timeout still fails into the
-        // holder's terminal error rather than hanging the hook.
-        await agent.whenConnected(20_000);
+        // Capture the source boundary above before waiting, so records written during a delayed
+        // initial connection remain eligible for publication when the endpoint becomes live.
+        await waitForEventConnection();
         return startEmitter();
       },
-      // Required, and not defaulted to a swallow: this runs behind a hook that must not throw, so
-      // a failure reaches a human only if it is written somewhere. The holder is terminal on
-      // error, it does not retry, so this line is the whole record of why events stopped.
-      (e: Error) => process.stderr.write(`[cotal-connector] AG-UI emitter stopped: ${e.message}\n`),
-      // The turn terminal closes a run the record stream never described, so the mapper still
-      // believes that run is open. Without this it would attribute the next records to a run the
-      // published stream has already finished and the emitter would refuse the batch. Keyed on the
-      // id, so a newer run opened in between is left alone.
-      (runId: string) => mapper?.forgetOpenRun(runId),
+      {
+        onError: eventPlaneStopped({ log: (line) => process.stderr.write(`[cotal-connector] ${line}\n`) }),
+        // The transcript's end when a Stop or StopFailure hook fires: what names the turn a terminal
+        // held through an outage ends.
+        sourceEnd: (transcriptPath: string) => new JsonlFileSource(transcriptPath).end(),
+        // The turn terminal closes a run the record stream never described, so the mapper still
+        // believes that run is open. Without this it would attribute the next records to a run the
+        // published stream has already finished and the emitter would refuse the batch. Keyed on
+        // the id, so a newer run opened in between is left alone.
+        onRunClosed: (runId: string) => mapper?.forgetOpenRun(runId),
+        waitLive: waitForEventConnection,
+      },
     );
   }
 
   // Local control plane for the lifecycle hooks (presence + message injection) and the manager's
   // cooperative shutdown. The SOCKET PATH comes from the launch env; the first-frame TOKEN comes
-  // from the launch-material file that env points at, which is also where the hooks read it. A
-  // managed session without both is misconfigured, so fail loud rather than serve an
+  // from the launch-material file that env points at, which is also where the hooks read it, or from
+  // COTAL_CONTROL_TOKEN in a session driven by hand. The hooks are what advance presence and inject
+  // peer messages, so a session without the pair is refused, naming it, rather than served with an
   // unauthenticated (or no) control plane.
-  const control = controlFromEnv();
+  const control = controlFromEnv(env);
   if (!control) {
-    process.stderr.write(
-      "[cotal-connector] managed session missing its control socket path or its control token - cannot serve the control plane\n",
+    throw new Error(
+      "no control endpoint for the lifecycle hooks: set COTAL_CONTROL_SOCKET to a socket path and COTAL_CONTROL_TOKEN to a random secret",
     );
-    process.exit(1);
   }
   const controlPath = control.path;
   const controlToken = control.token;
   // Defined before the server so it can be the cooperative-shutdown handler; only ever CALLED after
   // `controlServer` is assigned (on a signal or an authed `{op:"shutdown"}`), so the forward ref is safe.
-  // `wake` is likewise assigned later — declared with `let` (not `const` further down) so a shutdown
-  // frame arriving before the MCP server exists reads `undefined` instead of hitting the TDZ.
+  // `wake` is likewise assigned later, so a shutdown frame arriving before the MCP server exists
+  // reads `undefined`.
   let controlServer: ReturnType<typeof startControlServer> | undefined;
-  let wake: WakePolicy | undefined;
-  const shutdown = async () => {
-    try {
-      controlServer?.close();
-    } catch {
-      /* ignore */
-    }
-    wake?.stop();
-    try {
-      await agent.stop();
-    } finally {
-      process.exit(0);
-    }
+  let mcp: McpServer | undefined;
+  let stopping: Promise<void> | undefined;
+  let shuttingDown = false;
+  const onInputClose = () => shutdown();
+  const close = (): Promise<void> =>
+    (stopping ??= (async () => {
+      opts.input.off("end", onInputClose);
+      opts.input.off("close", onInputClose);
+      eventWaitStop.abort();
+      try {
+        controlServer?.close();
+      } catch {
+        /* ignore */
+      }
+      wake?.stop();
+      try {
+        await events?.close();
+        await agent.stop();
+      } finally {
+        await mcp?.close().catch(() => {});
+      }
+    })());
+  const shutdown = (code = 0): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    void close().then(
+      () => opts.onShutdown?.(code),
+      (e) => {
+        process.stderr.write(`[cotal-connector] session shutdown failed: ${String(e)}\n`);
+        opts.onShutdown?.(1);
+      },
+    );
   };
+  setClose(close);
   controlServer = startControlServer(
     agent,
     { path: controlPath, token: controlToken },
     claude.handle,
-    { fatalBind: true, onShutdown: () => void shutdown(), onReply: claude.onReply },
+    { fatalBind: opts.fatalBind ?? false, onShutdown: () => void shutdown(), onReply: claude.onReply },
   );
+  await new Promise<void>((resolve, reject) => {
+    controlServer!.once("listening", resolve);
+    controlServer!.once("error", reject);
+  });
+  if (opts.input.readableEnded || opts.input.destroyed)
+    throw new Error("hosted MCP input ended before startup completed");
+  agent.start(); // custody is claimed before background broker connect, after control bind
 
   const server = new McpServer(
     { name: "cotal", version: "0.0.0" },
@@ -209,7 +378,8 @@ async function main(): Promise<void> {
     },
   );
 
-  registerCotalTools(server, agent, config, "claude-code");
+  mcp = server;
+  registerCotalTools(server, agent, config, "claude-code", env);
 
   // The wake policy owns every `claude/channel` push (arriving messages + the Stop→idle flush).
   // It stays inert until the handshake below confirms the client speaks claude/channel.
@@ -219,31 +389,39 @@ async function main(): Promise<void> {
     (msg) => process.stderr.write(`[cotal-connector] ${msg}\n`),
   );
 
-  process.on("SIGINT", () => void shutdown());
-  process.on("SIGTERM", () => void shutdown());
+  // A client ends a stdio session by closing our stdin, and so does a harness that dies. The mesh
+  // connection would keep this process alive past it, heartbeating a presence no session backs,
+  // which every peer's roster reads as a live agent (#544).
+  opts.input.once("end", onInputClose);
+  opts.input.once("close", onInputClose);
 
-  const transport = new StdioServerTransport();
+  // Is this session consuming us as a channel? Decided once the client finishes the handshake,
+  // after its `initialize` has carried its capabilities: `connect()` resolves as soon as stdio is
+  // attached, before any client message has been read. The handlers registered above no-op until then.
+  server.server.oninitialized = () => {
+    const clientCaps = server.server.getClientCapabilities();
+    const channelActive =
+      channelFlag ?? Boolean((clientCaps?.experimental as Record<string, unknown> | undefined)?.["claude/channel"]);
+    wake?.setChannelActive(channelActive);
+    process.stderr.write(
+      `[cotal-connector] client capabilities: ${JSON.stringify(clientCaps ?? {})} → channel ${channelActive ? "ACTIVE" : "off"}\n`,
+    );
+  };
+
+  const transport = new StdioServerTransport(opts.input, opts.output);
   await server.connect(transport);
-
-  // Is this session consuming us as a channel? Only now (post-handshake) can we read the
-  // client's capabilities, so we flip the flag the nudge path is gated on. The handlers
-  // were registered above and simply no-op'd until this point.
-  const clientCaps = server.server.getClientCapabilities();
-  const envFlag = process.env.COTAL_CHANNEL;
-  const channelActive = envFlag
-    ? /^(1|true|yes|on)$/i.test(envFlag)
-    : Boolean((clientCaps?.experimental as Record<string, unknown> | undefined)?.["claude/channel"]);
-  wake?.setChannelActive(channelActive);
-  process.stderr.write(
-    `[cotal-connector] client capabilities: ${JSON.stringify(clientCaps ?? {})} → channel ${channelActive ? "ACTIVE" : "off"}\n`,
-  );
 
   process.stderr.write(
     `[cotal-connector] MCP ready (stdio) — space="${config.space}" name="${config.name}"${config.role ? ` role="${config.role}"` : ""}\n`,
   );
+  return { name: config.name, close };
 }
 
-main().catch((e) => {
-  process.stderr.write(`[cotal-connector] fatal: ${(e as Error).stack ?? String(e)}\n`);
-  process.exit(1);
-});
+// The bundle is CommonJS: required by a host it only exports. Run from source (`tsx src/mcp.ts`)
+// it is an ES module, where `require` is undefined, and serves as before.
+if (typeof require === "undefined" || require.main === module) {
+  main().catch((e) => {
+    process.stderr.write(`[cotal-connector] fatal: ${(e as Error).stack ?? String(e)}\n`);
+    process.exit(1);
+  });
+}

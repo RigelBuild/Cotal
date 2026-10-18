@@ -6,6 +6,11 @@ import { InboxTurn } from "./inbox-turn.js";
 const CUSTOM_TYPE = "cotal-inbox";
 const BATCH_LIMIT = 32;
 const DEFAULT_START_TIMEOUT_MS = 5_000;
+// A non-terminal agent_end with a batch pending is retried this many times, with this fixed
+// backoff, before the driver holds for operator intervention instead (issue #726: the hold's
+// only exit was a turn nothing in the process could start).
+const CONTINUATION_ATTEMPT_LIMIT = 2;
+const CONTINUATION_BACKOFF_MS = 50;
 
 export type DriverState = "idle" | "dispatching" | "streaming" | "held" | "shuttingDown";
 
@@ -39,9 +44,13 @@ interface Batch {
   started: boolean;
   confirmed: boolean;
   watchdog?: ReturnType<typeof setTimeout>;
-  /** Run-turn goal ids riding this batch; they commit as surfaced only when the batch confirms
-   *  (two-phase — a lost batch re-surfaces them instead of arming a `done` for unseen work). */
+  /** Run-turn goal ids riding this batch; they commit as surfaced only once the provider took the
+   *  request carrying it (two-phase — a lost batch re-surfaces them instead of arming a `done` for
+   *  unseen work). */
   turnIds?: string[];
+  /** Inbox items and run-turn text carried for the Pi renderer; re-sent unchanged on continuation. */
+  items?: InboxItem[];
+  suffix?: string;
 }
 
 function detailsOf(message: unknown): CotalBatchDetails | undefined {
@@ -79,6 +88,8 @@ export class PiDriver {
   private activeSignal?: AbortSignal;
   private pendingContinuation = false;
   private overflowRetry = false;
+  private continuationAttempts = 0;
+  private continuationTimer?: ReturnType<typeof setTimeout>;
   private _state: DriverState = "idle";
   private heldReason?: string;
   private retryableErrorHold = false;
@@ -152,6 +163,10 @@ export class PiDriver {
     if (this.pendingContinuation) {
       this.pendingContinuation = false;
       this.heldReason = undefined;
+      if (this.continuationTimer) {
+        clearTimeout(this.continuationTimer);
+        this.continuationTimer = undefined;
+      }
       this._state = this.batches.some((batch) => !batch.confirmed) ? "dispatching" : "streaming";
     } else if (this._state === "held" && this.batches.length === 0) {
       this.heldReason = undefined;
@@ -192,7 +207,7 @@ export class PiDriver {
     if (status >= 200 && status < 300) {
       for (const id of this.requestBatchIds) {
         const batch = this.batches.find((candidate) => candidate.id === id);
-        if (batch) batch.confirmed = true;
+        if (batch) this.confirm(batch);
       }
     } else {
       for (const id of this.requestBatchIds) this.terminalEvidenceBatchIds.delete(id);
@@ -207,6 +222,13 @@ export class PiDriver {
 
   onToolStart(name: string): void {
     if (this._state === "shuttingDown") return;
+    // A transport without after_provider_response confirms nothing before agent end, but Pi runs a
+    // tool only from a clean answer to the request that carried these batches. Their run turns are
+    // seen, and cotal_yield is itself a tool, so it must find them surfaced.
+    for (const id of this.requestBatchIds) {
+      const turnIds = this.batches.find((candidate) => candidate.id === id)?.turnIds;
+      if (turnIds) this.mesh.commitSurfacedTurns(turnIds);
+    }
     this.enqueuePresence("working", `running ${name || "tool"}`);
   }
 
@@ -236,18 +258,30 @@ export class PiDriver {
       this.terminalEvidenceBatchIds.clear();
       if (this.batches.length === 0) {
         this.inboundDuringTurn = undefined;
+        this.continuationAttempts = 0;
         this._state = "idle";
         this.publishIdleWhenSettled(context);
         return;
       }
       this.pendingContinuation = true;
-      this.hold(
-        aborted || lastAssistant?.stopReason === "aborted"
-          ? "Pi turn was aborted; Cotal delivery is retained until a proven clean continuation completes"
-          : `Pi turn ended with ${lastAssistant?.stopReason ?? "an unknown stop reason"}; ` +
-              "Cotal delivery is retained until a proven clean continuation completes",
-      );
-      this.retryableErrorHold = lastAssistant?.stopReason === "error" && !aborted;
+      if (aborted || lastAssistant?.stopReason === "aborted") {
+        // The person who aborted is the party who continues: a plain hold, never an automatic retry.
+        this.hold("Pi turn was aborted; Cotal delivery is retained until a proven clean continuation completes");
+        return;
+      }
+      const reasonLabel = `Pi turn ended with ${lastAssistant?.stopReason ?? "an unknown stop reason"}`;
+      if (this.continuationAttempts < CONTINUATION_ATTEMPT_LIMIT) {
+        this.continuationAttempts++;
+        this.hold(`${reasonLabel}; Cotal delivery is retained until a proven clean continuation completes`);
+        this.scheduleContinuation();
+      } else {
+        this.hold(
+          `${reasonLabel} after ${CONTINUATION_ATTEMPT_LIMIT} automatic continuation attempts; Cotal delivery ` +
+            "needs intervention: start a new turn in this session, or replace the seat.",
+        );
+      }
+      // `hold` clears eligibility, so arm the provider-error inbound retry after it (RIG-4249).
+      this.retryableErrorHold = lastAssistant?.stopReason === "error";
       this.knownAtErrorEnd = new Set(this.inbox.peek().map((item) => item.recvKey));
       const inbound = this.inboundDuringTurn;
       this.inboundDuringTurn = undefined;
@@ -258,7 +292,7 @@ export class PiDriver {
 
     for (const id of this.terminalEvidenceBatchIds) {
       const batch = this.batches.find((candidate) => candidate.id === id);
-      if (batch) batch.confirmed = true;
+      if (batch) this.confirm(batch);
     }
     this.terminalEvidenceBatchIds.clear();
     this.pendingContinuation = false;
@@ -320,16 +354,26 @@ export class PiDriver {
     if (turnPeek) content = content ? `${content}\n\n${turnPeek.text}` : turnPeek.text;
     if (!content) return;
 
-    const batch: Batch = { id: randomUUID(), ids, content, started: false, confirmed: false, ...(turnPeek ? { turnIds: turnPeek.goalIds } : {}) };
+    const batch: Batch = {
+      id: randomUUID(), ids, content, started: false, confirmed: false, items,
+      ...(turnPeek ? { turnIds: turnPeek.goalIds, suffix: turnPeek.text } : {}),
+    };
     this.batches.push(batch);
     this._state = "dispatching";
+    this.dispatch(batch);
+  }
+
+  /** The only call to `host.sendMessage`, the only thing that starts a Pi turn. Shared by `pump`
+   *  (new content) and `continueBatch` (re-dispatch of an already-batched, still-unconfirmed one). */
+  private dispatch(batch: Batch): void {
+    if (!this.host) return;
     try {
       this.host.sendMessage(
         {
           customType: CUSTOM_TYPE,
-          content,
+          content: batch.content,
           display: true,
-          details: { version: 1, batchId: batch.id, ids: [...ids], items, ...(turnPeek ? { suffix: turnPeek.text } : {}) },
+          details: { version: 1, batchId: batch.id, ids: [...batch.ids], items: batch.items ?? [], ...(batch.suffix !== undefined ? { suffix: batch.suffix } : {}) },
         },
         { triggerTurn: true, deliverAs: "steer" },
       );
@@ -357,9 +401,19 @@ export class PiDriver {
     this.retryableErrorHold = false;
     this.knownAtErrorEnd.clear();
     this.pendingContinuation = false;
+    clearTimeout(this.continuationTimer);
+    this.continuationTimer = undefined;
     this.heldReason = undefined;
     this._state = "idle";
     this.pump();
+  }
+
+  /** Surfacing at confirmation, not at agent end: a confirmation lets `pump` run mid-turn, which
+   *  would steer a still-unsurfaced turn in again, and the model's own cotal_yield inside this Pi
+   *  turn is refused for a turn that is not surfaced yet. */
+  private confirm(batch: Batch): void {
+    batch.confirmed = true;
+    if (batch.turnIds) this.mesh.commitSurfacedTurns(batch.turnIds);
   }
 
   private finalizeEnd(context: PiContextLike): void {
@@ -368,8 +422,6 @@ export class PiDriver {
     const confirmed = this.batches.filter((batch) => batch.confirmed);
     const ids = confirmed.flatMap((batch) => batch.ids);
     const committed = this.inbox.commitConfirmed(ids);
-    const confirmedTurnIds = confirmed.flatMap((batch) => batch.turnIds ?? []);
-    if (confirmedTurnIds.length) this.mesh.commitSurfacedTurns(confirmedTurnIds);
     this.batches = this.batches.filter((batch) => !batch.confirmed);
 
     if (this.batches.length > 0) {
@@ -377,10 +429,29 @@ export class PiDriver {
       return;
     }
 
+    this.continuationAttempts = 0;
     this._state = "idle";
     this.heldReason = undefined;
     this.pump();
     if (this._state === "idle") this.publishIdleWhenSettled(context);
+  }
+
+  /** Fires once after the fixed backoff to re-dispatch the still-unconfirmed batch through the same
+   *  host.sendMessage path `pump` uses, giving Pi a bounded number of real turns to clear the hold
+   *  itself before the driver gives up and holds for intervention. */
+  private scheduleContinuation(): void {
+    if (this.continuationTimer) clearTimeout(this.continuationTimer);
+    this.continuationTimer = setTimeout(() => this.continueBatch(), CONTINUATION_BACKOFF_MS);
+    this.continuationTimer.unref?.();
+  }
+
+  private continueBatch(): void {
+    this.continuationTimer = undefined;
+    if (this._state !== "held" || !this.pendingContinuation || !this.host) return;
+    const batch = this.batches.find((candidate) => !candidate.confirmed);
+    if (!batch) return;
+    batch.started = false;
+    this.dispatch(batch);
   }
 
   private hold(reason: string): void {
@@ -421,5 +492,7 @@ export class PiDriver {
 
   private clearTimers(): void {
     this.clearWatchdogs();
+    if (this.continuationTimer) clearTimeout(this.continuationTimer);
+    this.continuationTimer = undefined;
   }
 }

@@ -38,7 +38,8 @@ export interface AgentCard {
   tags?: string[];
   skills?: AgentSkill[];
   /** Free-form advisory display metadata. Reserved flat string keys are `connector`, `model`,
-   *  `host`, `cwd`, `repo`, `branch`, `head`, `sessionKind`, and `sessionId`. */
+   *  `provider` (the effective provider the connector reported), `host`, `cwd`, `repo`, `branch`,
+   *  `head`, `sessionKind`, and `sessionId`. */
   meta?: Record<string, unknown>;
   /** Wire-contract version this participant speaks (the SPEC.md version, `"0.2"` today). A change
    *  signal, not negotiation: v0 has none, but a peer can detect a mismatch instead of silently
@@ -110,6 +111,17 @@ export interface Presence {
   environment?: string;
   /** Freeform "what I'm doing right now". */
   activity?: string;
+  /** Epoch ms when the instance entered its current `status` and `activity`. A change to either moves
+   *  it; a heartbeat or a repeated report does not, so an activity that outlived what it described
+   *  reads as old even while `ts` stays fresh. Never carried by an offline record. */
+  statusSince?: number;
+  /** Epoch ms when the current `activity` was set. A status change does not move it, so an activity
+   *  left behind while hooks flip the status every turn still reads as old. */
+  activitySince?: number;
+  /** Epoch ms of the last work progress the harness reported (a turn event such as a token or a tool
+   *  call). `ts` is only the heartbeat: a seat whose turn stopped advancing keeps heartbeating while
+   *  this stays old. Missing means the connector reports none. */
+  activeAt?: number;
   /** This instance's current global attention mode. Advisory, within-space observability — a peer
    *  can see "they're in focus" and choose to DM. Published from the connector's authoritative state
    *  (presence is a mirror, never the source of truth for delivery). `open`/absent ⇒ receives all. */
@@ -440,6 +452,11 @@ export interface Delivery {
    *  cross-path duplicate must NOT downgrade a durable ack to a live no-op — else the durable copy
    *  is never committed, JetStream redelivers it, and it double-surfaces. See {@link DeliveryClass}. */
   durable: boolean;
+  /** A durable copy's redelivery state, read from the broker and never from the payload. Absent on
+   *  a live copy, which nothing redelivers. The broker hands an unacked copy to another reader of its
+   *  consumer once `ackWaitMs` passes without an ack or a `working()` call, which restarts that wait
+   *  (JetStream's in-progress ack). `deliveryCount` is 1 on the first delivery. */
+  redelivery?: { deliveryCount: number; ackWaitMs: number; working(): void };
 }
 
 /** Control-plane request/reply (e.g. CLI → manager). */
@@ -455,6 +472,9 @@ export interface ControlReply {
   ok: boolean;
   data?: unknown;
   error?: string;
+  /** The endpoint's error code when the reply carried one. A caller that decides on a refusal keys
+   *  on it, because the message is rendered prose and the code is the only stable half. */
+  code?: string;
   /** Structured §13.3 details when the manager named a cause the string cannot carry
    *  (lifecycle-blocked spawn refusals, #873). Optional so every existing `{ok,error}`
    *  producer stays valid. */

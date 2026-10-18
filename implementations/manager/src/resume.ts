@@ -1,3 +1,4 @@
+import { parseShareSelection } from "@cotal-ai/core";
 import { z } from "zod";
 import type { ManagerResumeInventory } from "./manager.js";
 
@@ -13,6 +14,7 @@ const SHA256 = /^[a-f0-9]{64}$/;
 
 const token = z.string().min(1).max(128).regex(TOKEN, "must be a safe identity token");
 const label = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/, "must be a safe token");
+const attemptId = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/, "must be a safe attempt token");
 const short = z.string().max(512);
 const path = z.string().min(1).max(4096);
 const digest = z.string().regex(SHA256, "must be a lowercase SHA-256 digest");
@@ -83,8 +85,13 @@ const agent = z.strictObject({
     // required field here would refuse every inventory the previous version wrote, so an upgrade
     // that restarts the manager would lose the agents it was supposed to preserve.
     events: z.boolean().default(false),
-    shareTools: z.string().max(4096).optional(),
+    // Start takes any declared server key as written, empty or long, so a bound per name here would
+    // refuse to preserve an agent that launched. The args byte cap bounds the list.
+    shareTools: z.array(z.string()).optional(),
     forkSource: z.string().min(1).max(4096).optional(),
+    // Optional: a seat that was not resumed, or has not recorded its fork yet, has none, and an
+    // inventory written before this field existed must still resume.
+    resumed: z.strictObject({ source: z.string().min(1).max(4096), title: z.string().min(1).max(1024).optional(), transcriptSha256: digest }).optional(),
     sessionId: z.string().min(1).max(4096).optional(),
     // The connector's session pointer file. Optional because a seat whose connector declares no
     // continuation has none, and because an inventory written before this field existed must still
@@ -96,24 +103,42 @@ const agent = z.strictObject({
   spawner: z.string().min(1).max(256),
   authorityParent: z.string().min(1).max(256).optional(),
   startedAt: z.string().min(1).max(64),
+  // The CHAT stream frontier at the preservation cut (issue #545). Optional because an inventory
+  // written before this field existed must still resume rather than be refused, exactly as
+  // sessionStatePath's absence means no pointer rather than a stricter refusal.
+  backfillFloor: z.number().int().nonnegative().optional(),
 });
 
-const inventory = z.strictObject({
-  version: z.literal("cotal-manager-resume/v1"),
-  space: label,
-  createdAt: z.string().min(1).max(64),
-  agents: z.array(agent).max(MAX_AGENTS),
-});
+const inventory = z.discriminatedUnion("version", [
+  z.strictObject({
+    version: z.literal("cotal-manager-resume/v2"),
+    space: label,
+    createdAt: z.string().min(1).max(64),
+    agents: z.array(agent).max(MAX_AGENTS),
+  }),
+  // v1 stored shareTools as the `--share-tools` flag string. A cut taken before the upgrade still
+  // resumes: its selection is parsed here, once, into the list v2 carries.
+  z.strictObject({
+    version: z.literal("cotal-manager-resume/v1"),
+    space: label,
+    createdAt: z.string().min(1).max(64),
+    agents: z.array(agent.extend({ launch: agent.shape.launch.extend({ shareTools: z.string().max(4096).optional() }) })).max(MAX_AGENTS),
+  }).transform(({ agents, ...rest }) => ({
+    ...rest,
+    version: "cotal-manager-resume/v2" as const,
+    agents: agents.map((a) => ({ ...a, launch: { ...a.launch, shareTools: parseShareSelection(a.launch.shareTools) } })),
+  })),
+]);
 
 const argsSchema = z.strictObject({
-  attemptId: z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/, "must be a safe attempt token"),
+  attemptId,
   inventory,
 });
 const commitArgsSchema = z.strictObject({
-  attemptId: z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/, "must be a safe attempt token"),
+  attemptId,
 });
 const finalizeArgsSchema = z.strictObject({
-  attemptId: z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/, "must be a safe attempt token"),
+  attemptId,
   durableCommitToken: z.string().regex(SHA256, "must be a lowercase 32-byte token"),
 });
 
@@ -122,51 +147,30 @@ export interface ResumeControlArgs {
   inventory: ManagerResumeInventory;
 }
 
-/** Strict, bounded wire parser. Unknown fields are rejected so secrets cannot hitchhike in inventory. */
-export function parseResumeControlArgs(value: unknown): ResumeControlArgs {
+function parseBounded<T>(op: string, capBytes: number, schema: z.ZodType<T>, value: unknown): T {
   let encoded: string;
   try {
     encoded = JSON.stringify(value);
   } catch {
-    throw new Error("resumePreserved args must be JSON-serializable");
+    throw new Error(`${op} args must be JSON-serializable`);
   }
-  if (encoded === undefined) throw new Error("resumePreserved args must be a JSON object");
-  if (Buffer.byteLength(encoded, "utf8") > MAX_RESUME_CONTROL_BYTES)
-    throw new Error(`resumePreserved args exceed ${MAX_RESUME_CONTROL_BYTES} bytes`);
-  const parsed = argsSchema.safeParse(value);
+  if (encoded === undefined) throw new Error(`${op} args must be a JSON object`);
+  if (Buffer.byteLength(encoded, "utf8") > capBytes) throw new Error(`${op} args exceed ${capBytes} bytes`);
+  const parsed = schema.safeParse(value);
   if (!parsed.success)
-    throw new Error(`resumePreserved: ${parsed.error.issues.map((issue) => `${issue.path.join(".") || "<root>"}: ${issue.message}`).join("; ")}`);
-  return parsed.data as ResumeControlArgs;
+    throw new Error(`${op}: ${parsed.error.issues.map((issue) => `${issue.path.join(".") || "<root>"}: ${issue.message}`).join("; ")}`);
+  return parsed.data;
+}
+
+/** Strict, bounded wire parser. Unknown fields are rejected so secrets cannot hitchhike in inventory. */
+export function parseResumeControlArgs(value: unknown): ResumeControlArgs {
+  return parseBounded("resumePreserved", MAX_RESUME_CONTROL_BYTES, argsSchema, value) as ResumeControlArgs;
 }
 
 export function parseResumeCommitArgs(value: unknown): { attemptId: string } {
-  let encoded: string;
-  try {
-    encoded = JSON.stringify(value);
-  } catch {
-    throw new Error("commitResume args must be JSON-serializable");
-  }
-  if (encoded === undefined) throw new Error("commitResume args must be a JSON object");
-  if (Buffer.byteLength(encoded, "utf8") > MAX_RESUME_COMMIT_BYTES)
-    throw new Error(`commitResume args exceed ${MAX_RESUME_COMMIT_BYTES} bytes`);
-  const parsed = commitArgsSchema.safeParse(value);
-  if (!parsed.success)
-    throw new Error(`commitResume: ${parsed.error.issues.map((issue) => `${issue.path.join(".") || "<root>"}: ${issue.message}`).join("; ")}`);
-  return parsed.data;
+  return parseBounded("commitResume", MAX_RESUME_COMMIT_BYTES, commitArgsSchema, value);
 }
 
 export function parseResumeFinalizeArgs(value: unknown): { attemptId: string; durableCommitToken: string } {
-  let encoded: string;
-  try {
-    encoded = JSON.stringify(value);
-  } catch {
-    throw new Error("finalizeResume args must be JSON-serializable");
-  }
-  if (encoded === undefined) throw new Error("finalizeResume args must be a JSON object");
-  if (Buffer.byteLength(encoded, "utf8") > MAX_RESUME_COMMIT_BYTES)
-    throw new Error(`finalizeResume args exceed ${MAX_RESUME_COMMIT_BYTES} bytes`);
-  const parsed = finalizeArgsSchema.safeParse(value);
-  if (!parsed.success)
-    throw new Error(`finalizeResume: ${parsed.error.issues.map((issue) => `${issue.path.join(".") || "<root>"}: ${issue.message}`).join("; ")}`);
-  return parsed.data;
+  return parseBounded("finalizeResume", MAX_RESUME_COMMIT_BYTES, finalizeArgsSchema, value);
 }

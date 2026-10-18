@@ -39,6 +39,8 @@ import { canonicalJson } from "./canonical.js";
 import { EpEnvelopeError } from "./endpoint-envelope.js";
 import { epcSubject } from "./endpoint-subjects.js";
 import { epcStreamName } from "./endpoint-binding.js";
+import { CONTRACT_CLOSURE_MAX_ARTIFACTS, contractRefToHex, parseClosureManifest, sha256Ref, type ContractClosureManifest } from "./contract-manifest.js";
+export { buildContractClosureManifest, CONTRACT_CLOSURE_MAX_ARTIFACTS, contractRefToHex, type ContractClosureManifest } from "./contract-manifest.js";
 
 /** The §13.7 artifact bound: a document above it cannot ride one message and is refused. */
 export const CONTRACT_ARTIFACT_MAX_BYTES = 256 * 1024;
@@ -46,10 +48,6 @@ export const CONTRACT_ARTIFACT_MAX_BYTES = 256 * 1024;
 export const CONTRACT_CLOSURE_MAX_BYTES = 1024 * 1024;
 /** The §13.7 reference-chain bound: the walk's depth from the root. */
 export const CONTRACT_CLOSURE_MAX_REF_DEPTH = 32;
-/** The artifact-count ceiling: a walk that would exceed it fails loud, never truncates. */
-export const CONTRACT_CLOSURE_MAX_ARTIFACTS = 64;
-
-const HEX64 = /^[0-9a-f]{64}$/;
 
 /** A trusted, space-bonded contract-store context: an OPAQUE token carrying only the space. Its
  *  JS + JSM resources DERIVE from one binding-layer connection by the constructor and live in a
@@ -104,15 +102,6 @@ function resources(ctx: ContractStoreContext): StoreResources {
  *  publication and verify-on-read enforce that ({@link assertCanonicalArtifactBytes}). */
 export function contractArtifactDigestHex(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
-}
-
-/** Normalize a digest reference (`<hex>` or `sha256:<hex>`) to the bare subject token; a
- *  malformed reference fails loud (a garbled ref never fetches an unintended subject). */
-export function contractRefToHex(ref: string): string {
-  const hex = ref.startsWith("sha256:") ? ref.slice("sha256:".length) : ref;
-  if (!HEX64.test(hex))
-    throw new EpEnvelopeError("contract-invalid", `contract reference ${JSON.stringify(ref)} is not a sha256 digest; a garbled reference never resolves (SPEC 13.7)`);
-  return hex;
 }
 
 /** A value's canonical artifact bytes (strict RFC 8785 over I-JSON): what publication stores
@@ -252,63 +241,6 @@ export async function fetchContractArtifact(
 
 // ---- the closure manifest (§13.7 "Two digests, never conflated") ------------------------------
 
-/** The §13.7 closure MANIFEST artifact: contract identity is THIS artifact's digest (the
- *  closure digest), never the root document digest alone. Digest fields carry the one scalar
- *  shape `sha256:<hex>`. */
-export interface ContractClosureManifest {
-  v: 1;
-  root: string;
-  /** Every artifact transitively reachable through by-digest references from `root` (the root
-   *  appears only if a reference re-reaches it), sorted lexicographically, deduplicated. */
-  members: string[];
-}
-
-const sha256Ref = (hex: string): string => `sha256:${hex}`;
-
-/** A manifest digest field is EXACTLY `sha256:<64-hex>` (frozen SPEC 13.7:1858-1861), never a
- *  bare `<hex>` or any other spelling (distsys 8dcad72 HIGH): two manifests differing only in
- *  digest spelling are both canonical JSON, receive DIFFERENT closure digests, yet verify the same
- *  walked graph - so one closure would have two identities. Normalization belongs in the BUILDER's
- *  input; the consuming parse requires the canonical prefixed form and refuses anything else. */
-const SHA256_REF = /^sha256:[0-9a-f]{64}$/;
-function assertManifestDigest(ref: unknown, what: string): void {
-  if (typeof ref !== "string" || !SHA256_REF.test(ref))
-    throw new EpEnvelopeError("contract-invalid", `${what} must be exactly "sha256:<64-hex>" (SPEC 13.7); a bare-hex or otherwise-spelled digest gives one closure two identities and never names it`);
-}
-
-/** Build the canonical manifest for a walked closure: refs normalize, members sort + dedup.
- *  The ROOT is named by its own field and belongs in `members` only when a reference
- *  re-reaches it (the §13.7 "reachable THROUGH references" rule, pinned here so two
- *  implementations always mint the identical manifest). */
-export function buildContractClosureManifest(rootRef: string, memberRefs: readonly string[]): ContractClosureManifest {
-  const root = sha256Ref(contractRefToHex(rootRef));
-  const members = [...new Set(memberRefs.map((r) => sha256Ref(contractRefToHex(r))))].sort();
-  return { v: 1, root, members };
-}
-
-function parseClosureManifest(value: unknown, what: string): ContractClosureManifest {
-  if (value === null || typeof value !== "object" || Array.isArray(value))
-    throw new EpEnvelopeError("contract-invalid", `${what} is not a manifest object (SPEC 13.7)`);
-  const o = value as Record<string, unknown>;
-  for (const k of Object.keys(o))
-    if (!["v", "root", "members"].includes(k))
-      throw new EpEnvelopeError("contract-invalid", `${what} carries the unknown field "${k}"; the manifest schema is closed (SPEC 13.7)`);
-  if (o.v !== 1 || typeof o.root !== "string" || !Array.isArray(o.members))
-    throw new EpEnvelopeError("contract-invalid", `${what} is not { v: 1, root, members } (SPEC 13.7)`);
-  assertManifestDigest(o.root, `${what} root`);
-  if (o.members.length > CONTRACT_CLOSURE_MAX_ARTIFACTS)
-    throw new EpEnvelopeError("contract-invalid", `${what} names ${o.members.length} members, above the ${CONTRACT_CLOSURE_MAX_ARTIFACTS}-artifact ceiling (SPEC 13.7)`);
-  for (let i = 0; i < o.members.length; i++) {
-    const m = o.members[i];
-    assertManifestDigest(m, `${what} member ${i}`);
-    // The canonical form IS sorted + deduplicated: an unsorted or duplicated members list is a
-    // DIFFERENT byte sequence claiming the same closure — refused, never silently normalized.
-    if (i > 0 && (o.members[i - 1] as string) >= m)
-      throw new EpEnvelopeError("contract-invalid", `${what} members are not strictly sorted/deduplicated at index ${i}; a noncanonical manifest never names a closure (SPEC 13.7)`);
-  }
-  return { v: 1, root: o.root, members: o.members as string[] };
-}
-
 /** Publish a closure's manifest as an ordinary canonical artifact; the returned digest IS the
  *  closure digest (§13.7). */
 export async function publishContractClosureManifest(
@@ -330,13 +262,14 @@ export async function publishContractClosureManifest(
  *  bound, the reference-chain depth, the artifact-count ceiling (non-raiseable; a caller may
  *  narrow), a per-artifact reference cap, and ONE total monotonic time budget. `extractRefs`
  *  receives a DETACHED copy of each artifact's bytes (a mutating seam cannot poison the
- *  returned map) and its answer is size-capped. Returns digest → bytes (manifest excluded;
- *  root first, then first-visit order) plus the parsed manifest. */
+ *  returned map) and its answer is size-capped. An aborted `signal` rejects the walk with its
+ *  reason, settling a read in flight. Returns digest → bytes (manifest excluded; root first,
+ *  then first-visit order) plus the parsed manifest. */
 export async function fetchContractClosure(
   ctx: ContractStoreContext,
   closureDigestRef: string,
   extractRefs: (bytes: Uint8Array, digestHex: string) => string[],
-  opts: { maxArtifacts?: number; walkBudgetMs?: number; artifactMemo?: ArtifactMemo } = {},
+  opts: { maxArtifacts?: number; walkBudgetMs?: number; artifactMemo?: ArtifactMemo; signal?: AbortSignal } = {},
 ): Promise<{ manifest: ContractClosureManifest; artifacts: Map<string, Uint8Array> }> {
   resources(ctx); // brand-check (resources unused here; the delegated publish/fetch use them)
   const max = opts.maxArtifacts ?? CONTRACT_CLOSURE_MAX_ARTIFACTS;
@@ -353,13 +286,23 @@ export async function fetchContractClosure(
   // extractor (distsys 8dcad72 M1): every Direct Get is raced against the REMAINING budget (a stuck
   // read is a bounded deadline, never a hang), and overBudget() is checked after each extractRefs
   // and before returning, so a slow synchronous seam cannot blow the budget and still return success.
+  // The read is raced against `signal` too, so a cancelled walk settles without waiting for it.
   const raceBudget = async <T>(p: Promise<T>, what: string): Promise<T> => {
+    opts.signal?.throwIfAborted();
     const rem = budgetMs - (performance.now() - startedAt);
     if (rem <= 0)
       throw new EpEnvelopeError("deadline-exceeded", `the closure walk exhausted its ${budgetMs}ms budget before ${what} (SPEC 13.7/13.8)`);
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new EpEnvelopeError("deadline-exceeded", `the closure walk exceeded its ${budgetMs}ms budget during ${what}; a closure fetch is bounded and fails loud, never hangs (SPEC 13.7/13.8)`)), rem); });
-    try { return await Promise.race([p, deadline]); } finally { clearTimeout(timer); }
+    let onAbort: (() => void) | undefined;
+    const bound = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new EpEnvelopeError("deadline-exceeded", `the closure walk exceeded its ${budgetMs}ms budget during ${what}; a closure fetch is bounded and fails loud, never hangs (SPEC 13.7/13.8)`)), rem);
+      onAbort = () => reject(opts.signal?.reason);
+      opts.signal?.addEventListener("abort", onAbort, { once: true });
+    });
+    try { return await Promise.race([p, bound]); } finally {
+      clearTimeout(timer);
+      if (onAbort) opts.signal?.removeEventListener("abort", onAbort);
+    }
   };
 
   // One RESOLVE reaches the same artifact from many closures (a shared void input, a common error

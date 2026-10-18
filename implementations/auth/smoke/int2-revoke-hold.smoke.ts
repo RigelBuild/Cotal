@@ -96,7 +96,7 @@ type PsRow = { name: string };
 const psList = (m: object, ownerFilter?: string): PsRow[] =>
   (m as unknown as { list: (o?: string) => PsRow[] }).list(ownerFilter);
 const { tmpdir } = await import("node:os");
-const { join, resolve } = await import("node:path");
+const { join } = await import("node:path");
 
 const home = mkdtempSync(join(tmpdir(), "cotal-fsb-home-"));
 process.env.COTAL_HOME = home;
@@ -344,8 +344,12 @@ try {
     evictPrincipal: (principal: string) => evictDeniedPrincipalWithCreds({
       servers: SERVER, observerCreds: dlvObserverCreds, evictorCreds: dlvEvictorCreds, accountId: auth.account.pub, principal,
     }),
-    reloadStoreIdentity: () => ({ kind: "fs", root: resolve(root) }),
+    reloadStoreIdentity: () => store.identity,
   });
+  // The manager's #1694 binding requires the answer to name a real holder of the delivery
+  // lease rather than assert it; acquire it the way manager-reconcile-startup.smoke.ts does so
+  // `holdsDeliveryLease` below is truthful.
+  await delivery.acquireDeliveryLease(0).catch(() => {});
   recordMesh({ space: SPACE, server: SERVER, root, mode: "user", userAuth: assertUserAuthInfo(prepared.publicAuth), ts: new Date().toISOString() });
   mkdirSync(join(root, ".cotal", "agents"), { recursive: true });
   writeFileSync(join(root, ".cotal", "agents", `${AGENT}.md`), `---\nname: ${AGENT}\nrole: worker\nsubscribe: [general]\nallowPublish: [general]\n---\n${AGENT} persona.\n`);
@@ -416,7 +420,7 @@ try {
     opStop: (a: Record<string, unknown>, c: string, admin: boolean) => Promise<ControlReply>;
     deprovision: (a: { id: string; name: string; lifecycleUid: string; userOwner?: string }) => Promise<void>;
     ep: { ref: () => { id: string } };
-    retiring: Map<string, { agentId: string; lifecycleUid: string; userOwner?: string; standingAuthorityLive?: boolean; lastError?: string }>;
+    retiring: Map<string, { target: { id: string; lifecycleUid: string; userOwner?: string }; standingAuthorityLive?: boolean; lastError?: string }>;
   };
   const listNames = (): string[] => psList(manager!).map((a) => a.name);
 
@@ -480,15 +484,15 @@ try {
   // hold must be UNCHANGED (same lifecycleUid) and NO successor managed record may appear under the
   // alias — a refusal that quietly kept a replacement, or an ABA hold swap, would both read as ok here
   // without these checks.
-  const heldUidBeforeRespawn = mAny.retiring.get(AGENT)?.lifecycleUid;
+  const heldUidBeforeRespawn = mAny.retiring.get(AGENT)?.target.lifecycleUid;
   const respawn = await manager.startAgent({ name: AGENT, agent: "e2e", owner: OWNER, events: false });
   check("GREEN: a same-name spawn is REFUSED while the mint authority stands (alias not reassigned)",
     respawn.ok === false, respawn);
   check("GREEN: no successor managed record took the alias (the manager lists no live agent under the held name)",
     !psList(manager).some((a) => a.name === AGENT), listNames());
   check("GREEN: the SAME hold is still in place after the refused respawn (unchanged lifecycleUid, no ABA swap)",
-    mAny.retiring.get(AGENT)?.lifecycleUid === heldUidBeforeRespawn && heldUidBeforeRespawn !== undefined,
-    { before: heldUidBeforeRespawn, after: mAny.retiring.get(AGENT)?.lifecycleUid });
+    mAny.retiring.get(AGENT)?.target.lifecycleUid === heldUidBeforeRespawn && heldUidBeforeRespawn !== undefined,
+    { before: heldUidBeforeRespawn, after: mAny.retiring.get(AGENT)?.target.lifecycleUid });
   check("GREEN: the refusal reads as the operator face (reserved pending retirement + standing-authority revoke + retry NEXT)",
     /reserved pending retirement/i.test(respawn.error ?? "") && /standing-authority revoke/i.test(respawn.error ?? "") && /retry/i.test(respawn.error ?? ""),
     respawn.error);
@@ -543,27 +547,43 @@ try {
   // nudge may already have spawned `worker` once the hold cleared; if not, do it here. Assert the EXACT
   // alias is live -- a suffixed sibling (worker-2) or an unrelated failure would BOTH leave the exact
   // alias absent from the roster, so this rejects both.
-  // Same two-stage release the freeslot suite measures: after the recovery nudge the reservation
-  // clears within ~1s, but the predecessor's advisory presence row keeps uniqueName numbering the
-  // successor until that record's TTL plus one sweep tick expires (endpoint.ts: ttlMs 6000, sweep
-  // every ttlMs/3), and the auth plane refuses the numbered name-form. A single shot lands inside
-  // that window, so retry to a deadline past its ceiling. The assertion below names the EXACT
-  // alias, so a numbered stand-in can never satisfy it, and it shows up in the failure payload.
-  const aliasDeadline = Date.now() + 30_000;
-  while (!psList(manager!).some((a) => a.name === AGENT) && Date.now() < aliasDeadline) {
-    const before = listNames();
-    await manager!.startAgent({ name: AGENT, agent: "e2e", owner: OWNER, events: false });
-    if (psList(manager!).some((a) => a.name === AGENT)) break;
-    // Stop anything the attempt DID create under another name, the way the freeslot suite does.
-    // On this tree the numbered attempt is refused outright and leaves nothing behind, so this
-    // never fires; it is here so that a future change admitting a live numbered sibling cannot
-    // leave one running for the cells below to trip over.
-    for (const stray of listNames().filter((x) => !before.includes(x) && x !== AGENT))
-      await mAny.opStop({ name: stray, graceful: false }, mAny.ep.ref().id, true);
-    await wait(250);
+  // The reservation stage is legitimate and retried: only while the reply is the "reserved
+  // pending retirement" refusal, bounded at 10s, with a 250ms wait between tries. The manager
+  // ignores the retired lifecycle's own presence row when allocating a name, so the presence
+  // window is no longer a stage here: the first reply that is not that refusal is graded once,
+  // with no further spawn. A recovery-loop nudge above may already have landed the exact alias
+  // once the hold cleared (the fixed manager gives it the exact alias, not a numbered stand-in);
+  // if so, this block does not spawn again. A numbered stand-in (a suffix, or a refusal) fails
+  // the checks below, and the added names plus the reply land in the payload so it shows up by
+  // name.
+  const aliasDeadline = Date.now() + 10_000;
+  let before = listNames();
+  let rSpawn: ControlReply | undefined;
+  if (!psList(manager!).some((a) => a.name === AGENT)) {
+    for (;;) {
+      before = listNames();
+      rSpawn = await manager!.startAgent({ name: AGENT, agent: "e2e", owner: OWNER, events: false });
+      if (rSpawn.ok === false && /reserved pending retirement/i.test(rSpawn.error ?? "") && Date.now() < aliasDeadline) {
+        await wait(250);
+        continue;
+      }
+      break;
+    }
   }
+  const added = listNames().filter((n) => !before.includes(n));
   check("GREEN: a same-name spawn takes the EXACT alias after recovery (no suffix, no lingering reservation)",
-    psList(manager!).some((a) => a.name === AGENT), { live: listNames() });
+    (rSpawn === undefined || rSpawn.ok === true) && added.every((n) => n === AGENT) && psList(manager!).some((a) => a.name === AGENT),
+    { added, reply: rSpawn, live: listNames() });
+
+  // Negative control: with AGENT now live, a second same-name spawn must number to a suffix and
+  // leave the live seat untouched.
+  const before2 = listNames();
+  const rSpawn2 = await manager!.startAgent({ name: AGENT, agent: "e2e", owner: OWNER, events: false });
+  const added2 = listNames().filter((n) => !before2.includes(n));
+  check("GREEN: a second same-name spawn while the alias is live numbers to a suffix and leaves the live seat alone",
+    psList(manager!).some((a) => a.name === AGENT) && !added2.includes(AGENT) && added2.every((n) => n === `${AGENT}_2`),
+    { added: added2, reply: rSpawn2 });
+  for (const stray of added2) await mAny.opStop({ name: stray, graceful: false }, mAny.ep.ref().id, true);
 
   console.error = origErr;
   console.log(`\nINT-2 SWALLOWED-REVOKE ${fail === 0 ? "GREEN ✅ (fix present: failed revoke holds the name; retry re-drives)" : "RED ❌"}  (${pass} passed, ${fail} failed)`);

@@ -11,6 +11,7 @@
 import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";
 import { canonicalJson, contractDigest, isContractDigest } from "./canonical.js";
 import { assertSafePattern } from "./safe-pattern.js";
+import { buildContractClosureManifest, type ContractClosureManifest } from "./contract-manifest.js";
 
 /** Registration-time bounds (SPEC §13.7/§13.8). Fixed by the profile, not caller-tunable, and
  *  RUNTIME-frozen (the afa715b class): a post-import `maxDepth = MAX_SAFE_INTEGER` would remove
@@ -41,11 +42,15 @@ export const SCHEMA_PROFILE = Object.freeze({
   //
   //   CRASH. A 2048-node patterned-properties document was observed to RangeError in Ajv's codegen
   //   at ~186KB — inside `maxDocumentBytes` — which looked like a hard edge worth standing in front
-  //   of. It is not an edge, and it failed to reproduce twice over. THE SAME SCHEMA IN THE SAME
-  //   PROCESS threw after 95.7ms cold and then COMPILED in 1035.5ms on the immediate warm retry;
-  //   and on the host these figures were taken from it does not throw at all, compiling in 679.8ms
-  //   cold and 544.8ms warm. A boundary that moves between two consecutive runs of one process, and
-  //   is absent on the next host, cannot be the basis of a frozen constant.
+  //   of. It is not an edge — not because it is unstable (re-measured for #1551: the SAME 2062-
+  //   property/187545-byte document RangeErrors 15/15 fresh processes at this profile's default
+  //   stack, and the reported cold-then-warm-compiles pattern did not reproduce once) — but because
+  //   the edge is a function of the STACK BUDGET, not the schema: it moves linearly with
+  //   `--stack-size` (measured 256KB→~460, 8MB default→~2050, on the pin this profile ships;
+  //   flattening ajv's codegen with `allErrors: true` moves the same edge to roughly 3.4x wider at
+  //   any given stack budget, never removes it) and by a fraction of a property per extra caller
+  //   frame burned before the compile call. A frozen node-count constant cannot express an edge that
+  //   moves with the CALLER's stack depth, which is outside this module's control.
   //
   //   AND THE VALUE WAS UNSAFE ON AN AXIS NOBODY MEASURED. Under `node --stack-size=256` a 512-node
   //   object RangeErrors, while 384 compiles — so the proposed `maxSchemaNodes: 512` did not hold
@@ -55,8 +60,10 @@ export const SCHEMA_PROFILE = Object.freeze({
   // WHAT STANDS IN ITS PLACE is what was doing the work the whole time: `maxDocumentBytes` and
   // `maxClosureBytes`, `maxDepth`, `maxRefChain`, `maxPatternChars`, the admitted-vocabulary
   // refusal, and — for exactly the codegen overflow above — the compile-error catch in
-  // `compileWithinBudget`, which has been normalising these to `contract-invalid` all along. That
-  // set refuses everything it refused before; removing an unfounded bound only LOOSENS, and
+  // `compileWithinBudget`, which normalises a stack overflow to `contract-invalid` naming the
+  // COMPILER's generated-code shape and the property count that triggered it, never the caller's
+  // schema (#1551). That set refuses everything it refused before; removing an unfounded bound only
+  // LOOSENS, and
   // loosening cannot break a contract that was already valid.
   //
   // BEFORE PROPOSING ONE AGAIN, run `implementations/manager/smoke/_probe-nodecount-rejected.ts`.
@@ -93,7 +100,33 @@ export const SCHEMA_PROFILE = Object.freeze({
  */
 const AJV_PROFILE_OPTIONS = Object.freeze({
   strict: false, // the wire accepts full 2020-12, not ajv's strict-mode dialect subset
-  allErrors: false,
+  // PINNED TRUE, not ajv's `false` default, for the flat code shape it produces (#1551).
+  // `allErrors: false` makes ajv nest one continuation `if` per property in the generated
+  // validator, so the compile of a wide object schema overflows the host call stack at a width
+  // set by the STACK BUDGET, not by any ceiling this profile enforces — every document this
+  // profile admits (bytes, depth, ref-chain, pattern length, vocabulary) can still fail to
+  // compile purely on shape. `allErrors: true` builds the same validations as a flat sequence
+  // instead, which does not remove the stack-bounded ceiling (ajv's codegen still recurses while
+  // it builds the code tree) but moves it about 3.4x wider at any given stack budget: measured on
+  // this pin, default 8MB stack SMALLEST_FAIL moved from 2055 properties to 6946, and
+  // `--stack-size=256` moved from 494 to 1769 (one host, Node 24; the ratio is the stable
+  // quantity, not the absolute counts — re-measure with a child process per candidate width, one
+  // `--stack-size` per row, per issue #1551's method).
+  //
+  // Safe to flip only because it changes NO VERDICT this profile's own checks depend on: ajv
+  // orders keyword/property evaluation identically regardless of `allErrors`, so `errors[0]` —
+  // the only field any caller-facing message reads (`endpoint-envelope.ts` firstErrorDetail,
+  // `endpoint-traits.ts` readSchema) — is byte-identical between the two settings for every
+  // schema/instance pair tried, and `packages/core/smoke/schema-profile.smoke.ts`'s full 67-check
+  // suite (every `refuses`/`ok` assertion, including the pattern safe-subset gate and the
+  // admitted-vocabulary walk) passes unchanged under either setting. Nothing on the wire ever
+  // reads ajv's full `errors` array, only its first entry, so `allErrors`'s extra collected
+  // errors are never observed by a caller. If a future change makes any of that no longer true —
+  // a caller starts reading `errors.length`, or a verdict diverges between the settings — this
+  // pin must be re-measured before it stays.
+  allErrors: true,
+  // JSON members are own properties. Host prototype names never satisfy required/properties.
+  ownProperties: true,
   validateFormats: false,
   loadSchema: undefined,
   // PINNED, never inherited from Ajv's default: the safe-pattern analyzer models `/u`
@@ -125,6 +158,17 @@ const AJV_PROFILE_OPTIONS = Object.freeze({
   inlineRefs: false,
 } as const);
 
+/** The §13.7 closure of one self-contained document: the manifest naming it with no members, and
+ *  that manifest's digest, the closure digest a registration or an `op` digest carries. It needs no
+ *  compile, and `compileContract` returns the same digest for a member-free schema. Producers build
+ *  it here so none drifts from {@link import("./endpoint-cluster.js").verifyClusterManifest}; it is
+ *  not beside that reader because `VOID_SCHEMA_DIGEST` is built from it at load and
+ *  `endpoint-cluster` already imports this module. */
+export function singleDocumentClosure(root: unknown): { manifest: ContractClosureManifest; closureDigest: string } {
+  const manifest = buildContractClosureManifest(contractDigest(root), []);
+  return { manifest, closureDigest: contractDigest(manifest) };
+}
+
 /** The canonical void schema (§13.7): the one artifact a side with no payload declares, so both
  *  `op` digests exist for every command. Validation against it means the payload is absent or
  *  `null`. */
@@ -133,7 +177,7 @@ export const VOID_SCHEMA = Object.freeze({ type: "null" } as const);
 export const VOID_SCHEMA_ARTIFACT_DIGEST = contractDigest(VOID_SCHEMA);
 /** The void schema's CLOSURE digest (the §13.7 manifest of a self-contained document) — the
  *  value `op.inputDigest`/`op.outputDigest` carry for a payload-free side. */
-export const VOID_SCHEMA_DIGEST = contractDigest({ v: 1, root: VOID_SCHEMA_ARTIFACT_DIGEST, members: [] });
+export const VOID_SCHEMA_DIGEST = singleDocumentClosure(VOID_SCHEMA).closureDigest;
 
 /** The digest-pinned contract-store reference scheme: `cotal:sha256:<hex>[#/json/pointer]`. */
 const STORE_REF = /^cotal:(sha256:[0-9a-f]{64})(#.*)?$/;
@@ -223,10 +267,11 @@ export interface SchemaBundle {
   members?: Record<string, unknown>;
 }
 
-/** Applicator keywords whose VALUE is a subschema, a map of them, or an array of them. Compile
- *  cost is driven by how many subschemas the compiler generates code for, so the walk follows
- *  exactly these and nothing else. */
 /**
+ * Applicator keywords whose VALUE is a subschema, a map of them, or an array of them. Compile
+ * cost is driven by how many subschemas the compiler generates code for, so the walk follows
+ * exactly these and nothing else.
+ *
  * THE ADMITTED VOCABULARY. Any keyword outside these three sets is REFUSED at registration.
  *
  * WHY AN ALLOWLIST RATHER THAN A LONGER WALK LIST, which is the whole lesson of this guard: the node
@@ -423,7 +468,37 @@ function assertClosureProfile(bundle: SchemaBundle): string {
   const extras = Object.keys(members).filter((d) => !seen.has(d));
   if (extras.length > 0)
     throw new ContractInvalidError(`bundle carries ${extras.length} member(s) unreachable from the root (${extras.slice(0, 3).join(", ")}${extras.length > 3 ? ", …" : ""})`);
-  return contractDigest({ v: 1, root: digestOrInvalid(bundle.root, "root schema"), members: [...seen].sort() });
+  return contractDigest(buildContractClosureManifest(digestOrInvalid(bundle.root, "root schema"), [...seen]));
+}
+
+/** The size of the widest map-valued keyword (`properties`, `patternProperties`, `$defs`,
+ *  `definitions`, `dependentSchemas`, `dependencies`) anywhere in one document — the shape that
+ *  drives ajv's per-property codegen (SPEC §13.7). Used only to NAME a codegen overflow after it
+ *  happens; every ceiling in {@link SCHEMA_PROFILE} has already admitted this document by the time
+ *  anything calls this, so it never gates anything itself. */
+function widestMapKeywordSize(doc: unknown, max = 0): number {
+  if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return max;
+  for (const [k, v] of Object.entries(doc as Record<string, unknown>)) {
+    if (SCHEMA_VALUED_MAP_KEYS.includes(k) && v && typeof v === "object" && !Array.isArray(v)) {
+      const size = Object.keys(v as Record<string, unknown>).length;
+      if (size > max) max = size;
+      for (const sub of Object.values(v as Record<string, unknown>)) max = widestMapKeywordSize(sub, max);
+    } else if (SCHEMA_VALUED_KEYS.includes(k)) {
+      max = widestMapKeywordSize(v, max);
+    } else if (SCHEMA_VALUED_LIST_KEYS.includes(k) && Array.isArray(v)) {
+      for (const sub of v) max = widestMapKeywordSize(sub, max);
+    }
+  }
+  return max;
+}
+
+/** The widest map-valued keyword across the whole closure (root plus every bundle member) — the
+ *  quantity {@link widestMapKeywordSize} measures, maximised over every document a compile call
+ *  actually sees. */
+function widestClosurePropertyCount(bundle: SchemaBundle): number {
+  let max = widestMapKeywordSize(bundle.root);
+  for (const member of Object.values(bundle.members ?? {})) max = widestMapKeywordSize(member, max);
+  return max;
 }
 
 function compileWithinBudget(bundle: SchemaBundle): ValidateFunction {
@@ -479,6 +554,22 @@ function compileWithinBudget(bundle: SchemaBundle): ValidateFunction {
     for (const [digest, member] of Object.entries(bundle.members ?? {})) ajv.addSchema(member as object, `cotal:${digest}`);
     validate = ajv.compile(bundle.root as object);
   } catch (e) {
+    // A `RangeError` here is the compiler's own generated code overflowing the host's call
+    // stack (SPEC §13.7) — every ceiling above already admitted this document, so the schema is
+    // not what failed. Naming the caller's schema in that case (as the generic branch below does
+    // for every other compile failure) sends the caller to rewrite something that was never
+    // wrong. Named instead: the shape that overflowed (ajv's per-property codegen), and the width
+    // that did it (the widest `properties`/`patternProperties`/`$defs`/… map anywhere in the
+    // closure) — the two facts a caller needs to know this is not their schema's fault.
+    if (e instanceof RangeError) {
+      const width = widestClosurePropertyCount(bundle);
+      throw new ContractInvalidError(
+        `schema does not compile under the 2020-12 profile: the generated validator's code shape overflowed `
+        + `the call stack (${(e as Error).message}) compiling a ${width}-property object, which every profile `
+        + `ceiling (document/closure bytes, depth, ref-chain, pattern length, admitted vocabulary) had already `
+        + `admitted; this is the compiler's generated-code shape running out of stack, not a defect in the schema`,
+      );
+    }
     throw new ContractInvalidError(`schema does not compile under the 2020-12 profile: ${(e as Error).message}`);
   }
   const cpu = process.cpuUsage(startedCpu);
@@ -532,5 +623,50 @@ export function createCompiledContractCache(capacity: number = SCHEMA_PROFILE.co
       return compiled;
     },
     size: () => lru.size,
+  };
+}
+
+type ContractPair = { input: CompiledContract; output: CompiledContract };
+
+/** A service's compiled command contracts and the §13.7 artifacts its registration publishes,
+ *  from its command rows. `contracts` compiles a command's pair on its first access and keeps it,
+ *  so a module can build its table at load while a process that only reads digests pays no Ajv
+ *  compile. `artifactValues()` returns each distinct schema root followed by its closure manifest. */
+export function serviceContractTable(rows: ReadonlyArray<{ name: string; input: unknown; output: unknown }>): {
+  contracts: Readonly<Record<string, ContractPair>>;
+  artifactValues: () => unknown[];
+} {
+  const compiled = new Map<string, ContractPair>();
+  const declared = (name: string | symbol) => rows.some((r) => r.name === name);
+  const pairFor = (name: string | symbol): ContractPair | undefined => {
+    const row = rows.find((r) => r.name === name);
+    if (!row) return undefined;
+    let pair = compiled.get(row.name);
+    if (!pair) {
+      pair = { input: compileContract({ root: row.input as Record<string, unknown> }), output: compileContract({ root: row.output as Record<string, unknown> }) };
+      compiled.set(row.name, pair);
+    }
+    return pair;
+  };
+  return {
+    contracts: new Proxy({} as Record<string, ContractPair>, {
+      has: (_, name) => declared(name),
+      ownKeys: () => rows.map((r) => r.name),
+      getOwnPropertyDescriptor: (_, name) => (declared(name) ? { configurable: true, enumerable: true, get: () => pairFor(name) } : undefined),
+      get: (_, name) => pairFor(name),
+    }),
+    artifactValues: () => {
+      const values: unknown[] = [];
+      const seen = new Set<string>();
+      for (const r of rows) {
+        for (const source of [r.input, r.output]) {
+          const { manifest } = singleDocumentClosure(source);
+          if (seen.has(manifest.root)) continue;
+          seen.add(manifest.root);
+          values.push(source, manifest);
+        }
+      }
+      return values;
+    },
   };
 }

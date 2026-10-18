@@ -1,0 +1,36 @@
+{
+  "grades": "tool",
+  "suite": [
+    "bin/smoke/shard-stability-workflow.test.mjs"
+  ],
+  "guard": "the shipped topology detector accepts only the fixed manual exclusion and refuses unsupported topology",
+  "command": "pnpm smoke:shard-stability",
+  "progressPattern": "^ok [0-9]+ - |  \u2713 ",
+  "completionMarker": "# tests 5",
+  "proveWith": "node scripts/mutation-proof.mjs --config bin/smoke/mutations/shard-stability-workflow.json",
+  "why": [
+    "Every child drives the actual shipped detector CLI with real committed workflow and registry blobs. No copied parser or replaced verdict. Existing six index controls still run first.",
+    "Two original-rule mutations discriminate the fixed exclusion and fail-closed unsupported conditions. Both require the same entire smoke command after restoration. No execution performed by source author.",
+    "The unsupported-condition mutant admits true only, leaving the built-in false-condition refusal control intact. A blanket condition bypass would abort on that older control and would not discriminate this regression."
+  ],
+  "mutations": [
+    {
+      "name": "topology reader again refuses the fixed manual exclusion",
+      "file": "bin/smoke/shard-stability.ts",
+      "find": "  const allowedJobKeys = new Set([\"if\", \"name\", \"timeout-minutes\", \"runs-on\", \"strategy\", \"steps\"]);",
+      "replace": "  const allowedJobKeys = new Set([\"name\", \"timeout-minutes\", \"runs-on\", \"strategy\", \"steps\"]);",
+      "expectRed": "the shipped detector accepts only the fixed manual exclusion on an unchanged ordinary topology",
+      "cell": "the shipped detector accepts only the fixed manual exclusion on an unchanged ordinary topology",
+      "afterRestore": "pnpm smoke:shard-stability"
+    },
+    {
+      "name": "topology reader accepts an unconditional true smoke job condition",
+      "file": "bin/smoke/shard-stability.ts",
+      "find": "  if (jobConditions.some((line) => line !== \"    if: ${{ github.event_name != 'workflow_dispatch' }}\")) return null;",
+      "replace": "  if (jobConditions.some((line) => line !== \"    if: ${{ github.event_name != 'workflow_dispatch' }}\" && line !== \"    if: ${{ true }}\")) return null;",
+      "expectRed": "the shipped detector refuses unsupported smoke job conditions instead of inventing topology",
+      "cell": "the shipped detector refuses unsupported smoke job conditions instead of inventing topology",
+      "afterRestore": "pnpm smoke:shard-stability"
+    }
+  ]
+}

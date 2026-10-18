@@ -1,3 +1,4 @@
+import { execFile, type ExecFileException } from "node:child_process";
 import { registry, type Extension } from "./registry.js";
 import type { SecretStore } from "./secret-store.js";
 import type {
@@ -9,8 +10,18 @@ import type {
   RemoteManagerGoalIndexScanResult,
   RemoteManagerMaintenanceRequest,
   RemoteManagerMaintenanceResult,
+  RemoteManagedAgentEnrollmentRequest,
+  RemoteManagedAgentEnrollmentResult,
+  RemoteManagedAgentPrepareRetirementRequest,
+  RemoteManagedAgentPrepareRetirementResult,
+  RemoteManagedAgentRuntimeRequest,
+  RemoteManagedAgentRuntimeResult,
   RemoteRetainedAgentValidationRequest,
   RemoteRetainedAgentValidationResult,
+  RemoteRunAdmissionRequest,
+  RemoteRunAdmissionResult,
+  RemoteRunAttemptRequest,
+  RemoteRunAttemptResult,
 } from "./remote-manager-authority.js";
 
 /**
@@ -65,7 +76,7 @@ export interface AuthProvider extends Extension {
    * deploy connections the operator surfaces (`web`, `console`, `history clear`, `channels`,
    * `spawn -f`) ride. An under-scoped or unknown view MUST fail loud with the exact re-grant.
    */
-  userCredentials(opts: { store: SecretStore; dir: string; space: string; actor: string; view?: string }): Promise<{ bearer: string; sentinelCreds: string }>;
+  userCredentials(opts: UserCredentialsRequest): Promise<{ bearer: string; sentinelCreds: string }>;
   /**
    * Prepare the signed-in account's optional space catalog without exposing its cached session
    * bearer. The provider owns advertisement discovery, conditional HTTP, freshness, locking, and
@@ -107,6 +118,24 @@ export interface AuthProvider extends Extension {
     dir: string;
     request: RemoteManagerAuthorityRequest;
   }): Promise<RemoteManagerAuthorityMaterial>;
+  /** The registered host resolves issued admission and native run state before returning a
+   * closed admission or fixed JWT set for a caller-held nkey. No signer reaches the manager. */
+  requestRemoteRunAdmission?(opts: {
+    store: SecretStore;
+    dir: string;
+    request: RemoteRunAdmissionRequest;
+  }): Promise<RemoteRunAdmissionResult>;
+  requestRemoteRunAttempt?(opts: {
+    store: SecretStore;
+    dir: string;
+    request: RemoteRunAttemptRequest;
+  }): Promise<RemoteRunAttemptResult>;
+  /** Revoke through the issuing host under the authenticated owner's fresh ledger grant. */
+  requestRemoteRunRevoke?(opts: {
+    store: SecretStore;
+    dir: string;
+    request: import("./remote-manager-authority.js").RemoteRunRevokeRequest;
+  }): Promise<import("./remote-manager-authority.js").RemoteRunRevokeResult>;
   /** Host-owned registration maintenance for a remote manager. The provider must scope eviction to
    * the caller instance's credential family and guard reconciliation with affirmative liveness. */
   maintainRemoteManager?(opts: {
@@ -138,6 +167,40 @@ export interface AuthProvider extends Extension {
     dir: string;
     request: RemoteRetainedAgentValidationRequest;
   }): Promise<RemoteRetainedAgentValidationResult>;
+  /**
+   * Ask the host to enroll one FRESH managed agent under the authenticated owner (#1972). The
+   * participant has already generated the standing `actorToken` and written it at 0600, so the
+   * request carries only its digest; the host picks the lifecycle UID, authors the ledger grant,
+   * pre-creates the durables, and returns the stable non-secret metadata plus the space sentinel.
+   * Optional so a provider with no hosted storage composition fails loud at the caller rather than
+   * letting a local grant masquerade as a host-owned one.
+   */
+  enrollRemoteManagedAgent?(opts: {
+    store: SecretStore;
+    dir: string;
+    request: RemoteManagedAgentEnrollmentRequest;
+  }): Promise<RemoteManagedAgentEnrollmentResult>;
+  /**
+   * Ask the host to PREPARE one managed agent's terminal retirement (#1972 phase P0/P1): revoke the
+   * managed grant UID-exactly and commit the resumable release while preserving the UID. Success
+   * means the terminal auth barrier may start. Never a retirement itself.
+   */
+  prepareRemoteManagedAgentRetirement?(opts: {
+    store: SecretStore;
+    dir: string;
+    request: RemoteManagedAgentPrepareRetirementRequest;
+  }): Promise<RemoteManagedAgentPrepareRetirementResult>;
+  /**
+   * Ask the host to create, or report, the hosted runtime of one already-enrolled managed agent.
+   * The request names only the enrollment's host-selected target; the host decides, owns the
+   * provider effect, and returns its intent state. Optional: a host with no hosted runtime leaves
+   * it absent, and the caller fails loud.
+   */
+  requestRemoteManagedAgentRuntime?(opts: {
+    store: SecretStore;
+    dir: string;
+    request: RemoteManagedAgentRuntimeRequest;
+  }): Promise<RemoteManagedAgentRuntimeResult>;
   /**
    * The derived owner token (`u_…`) of THIS machine's cached login for the given space — resolved
    * offline from the login session + the space's local user-auth material (no IdP round trip).
@@ -192,6 +255,8 @@ export interface AuthProvider extends Extension {
    * rotates its secret. MUST fail loud when the space has no user-auth material in `store`/`dir`.
    */
   grantAgent(opts: {
+    /** A genuinely new foreground launch refuses an existing row rather than rotating it. */
+    fresh?: boolean;
     store: SecretStore;
     dir: string;
     space: string;
@@ -212,7 +277,7 @@ export interface AuthProvider extends Extension {
   /** Revoke an agent grant. False when there was nothing to revoke. New exchanges and new
    *  connects die immediately (both boundaries read the ledger fresh); an already-live
    *  connection dies at its bearer-bound JWT expiry (live eviction is a separate lever). */
-  revokeAgent(opts: { dir: string; owner: string; actor: string }): Promise<boolean>;
+  revokeAgent(opts: { dir: string; owner: string; actor: string; lifecycleUid?: string; actorToken?: string }): Promise<boolean>;
   /**
    * Read-only FRESH capability-scope read for one granted principal — `undefined` when the
    * principal holds no grant (for an authorization read, unknowable is "no grant": fail-closed).
@@ -260,6 +325,40 @@ export interface AuthProvider extends Extension {
    * protocol, discovery, and secret handling stay entirely behind the provider; the agent-side
    * runtime only runs an argv and reads a line. */
   readonly agentBearerCommand: string;
+}
+
+/** The error for a failed run of an {@link AuthProvider.agentBearerCommand} argv. The command prints
+ *  an operator sentence on stderr for every failure it handles, and that sentence is the error.
+ *  Empty stderr means the child never reached its handler, and Node's `Command failed` message
+ *  would repeat the whole argv, with its exchange URL, principal and file paths, while hiding
+ *  whether the child timed out, was killed or exited. */
+export function bearerCommandFailure(err: ExecFileException, stderr: string, timeoutMs: number): Error {
+  const said = stderr.trim();
+  if (said) return new Error(said);
+  // execFile marks an exit error `killed` only when its own timeout killed the child.
+  if (err.killed) return new Error(`the bearer command timed out after ${timeoutMs}ms`);
+  if (err.signal) return new Error(`the bearer command was killed by ${err.signal}`);
+  if (typeof err.code === "number") return new Error(`the bearer command exited with code ${err.code} and printed nothing`);
+  // A spawn, abort or output-limit error has no exit, and Node's sentence for it repeats no arguments.
+  return new Error(err.message);
+}
+
+/** Run an {@link AuthProvider.agentBearerCommand} argv once and return the line it printed, trimmed
+ *  and possibly empty. A caller that needs a bearer refuses an empty line itself; a preflight that
+ *  only proves the command succeeds ignores it. */
+export function runAgentBearer(
+  argv: string[],
+  opts: { env?: NodeJS.ProcessEnv; signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<string> {
+  const timeoutMs = opts.timeoutMs ?? 30_000;
+  return new Promise((resolve, reject) => {
+    execFile(
+      argv[0],
+      argv.slice(1),
+      { timeout: timeoutMs, maxBuffer: 64 * 1024, env: opts.env, signal: opts.signal },
+      (err, stdout, stderr) => err ? reject(bearerCommandFailure(err, stderr, timeoutMs)) : resolve(stdout.trim()),
+    );
+  });
 }
 
 /** Non-secret proved account identity returned beside a catalog snapshot. */
@@ -330,6 +429,19 @@ export function resolveAuthProvider(): AuthProvider {
   if (providers.length > 1)
     throw new Error(`multiple auth providers registered (${providers.map((p) => p.name).join(", ")}) - cannot choose between them`);
   return providers[0];
+}
+
+/** What {@link AuthProvider.userCredentials} takes: `store` and `dir` locate this machine's state,
+ *  and the other fields are the coordinates of the credential requested. */
+export interface UserCredentialsRequest {
+  store: SecretStore;
+  dir: string;
+  space: string;
+  actor: string;
+  view?: string;
+  managerInstanceId?: string;
+  sessionGrant?: unknown;
+  transferWriter?: { instanceId: string; hex: string };
 }
 
 /** What {@link AuthProvider.userStatus} reports. Fields are absent when locally unknowable —

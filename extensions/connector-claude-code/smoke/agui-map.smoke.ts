@@ -153,13 +153,10 @@
  *   mutation that quietly breaks a second call site and a kill you then attribute to the first.
  *   Narrowed to a two-line anchor including the CONTENT call, and it killed.
  *
- * THE ABSENT-ORIGIN TABLE — graded on `[B]`, all four KILLED on the cell named, all four PREDICTED:
+ * THE ABSENT-ORIGIN TABLE — graded on `[B]`, both KILLED on the cell named, both PREDICTED:
  *   M16 `sdk: "sdk"` -> `sdk: null`     -> `mechanism:an-sdk-prompt-opens-a-run-REGARDLESS-of-entrypoint`
  *   M17 origin-less + no `promptSource` returns `"sdk"`
  *                                       -> `mechanism:an-origin-less-record-with-NO-promptSource-opens-no-run`
- *   M18 `diagnose()` always returns null -> `diagnose:a-session-whose-prompts-were-ALL-REFUSED-says-THAT-instead`
- *   M19 both `diagnose()` zeroes share one sentence
- *                                       -> `diagnose:the-two-zeroes-do-NOT-produce-the-same-sentence`
  *
  *   M20 delete the `system` row       -> `mechanism:an-origin-less-record-with-promptSource-system-is-refused-WITHOUT-throwing`
  *
@@ -172,12 +169,6 @@
  *   M16 is `sdk: null` and not a deletion ON PURPOSE. Deleting the key makes the value unmeasured,
  *   so the mapper THROWS and the suite dies before the cell — red, and the wrong red. `null` keeps
  *   the value known and flips only the answer, which is the thing under test.
- *
- *   **M19 was the one I expected to survive** and said so before running it: the two sentence cells
- *   above it discriminate on substrings, which is the defence-in-depth shape that makes an outcome
- *   cell prove neither mechanism. It killed. The prediction was wrong and the wrong prediction is
- *   worth more than the kill — it is the reason the cell exists at the mechanism rather than at the
- *   outcome, and the reason it is safe to trust now.
  *
  * BUILD PROVENANCE — graded by a CONTROL, not by a mutation, and the difference is stated rather
  * than filed under one heading. Staleness was PLANTED (`touch connector-core/src/agui.ts`) before
@@ -217,7 +208,9 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AguiBrackets, reasoningMessageContent, type AguiEvent } from "../../connector-core/src/agui.js";
 import { JsonlFileSource } from "../../connector-core/src/durable-source.js";
-import { createClaudeMapper, type ClaudeEntry } from "../src/agui-map.js";
+import { createClaudeMapper, type ClaudeEntry, type ClaudeMapper } from "../src/agui-map.js";
+/** The unit a record mapped to, or `null`: a turn the mapper opens no run for maps to none. */
+const unitOf = (r: ReturnType<ReturnType<typeof createClaudeMapper>["map"]>) => (r !== null && "runId" in r ? r : null);
 
 let pass = 0;
 let fail = 0;
@@ -464,6 +457,11 @@ const OPENER: ClaudeEntry = {
   message: { content: "open the run" },
 };
 
+// The mapper's open run, read through `map` alone. An assistant record neither opens nor closes a
+// run, so it maps under the open run, or to nothing when none is open.
+const openRunOf = (m: ClaudeMapper): string | null =>
+  unitOf(m.map({ type: "assistant", uuid: "open-run-probe", message: { content: [{ type: "text", text: "probe" }] } }))?.runId ?? null;
+
 const asSpecified = createClaudeMapper({ threadId: THREAD, mintRunId: mint, now: () => 0 });
 const asSpecifiedUnits = entries.map((e) => asSpecified.map(e)).filter((u) => u !== null);
 // Observed vocabularies, reported so a failure names what it actually met. KEY/ENUM names only.
@@ -570,14 +568,51 @@ if (OPENERS === 0) {
 c("split:a-tool-result-opens-NO-run", (() => {
   let n = 0;
   const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => `run-${(n += 1)}`, now: () => 0 });
-  const before = m.openRun();
-  const unit = m.map({
+  const before = openRunOf(m);
+  const unit = unitOf(m.map({
     type: "user",
     uuid: "tool-result-entry",
     timestamp: "2026-08-14T21:00:02.000Z",
     message: { content: [{ type: "tool_result", tool_use_id: "toolu_never_started", content: "x" }] },
-  } as ClaudeEntry);
-  return before === null && m.openRun() === null && unit === null;
+  } as ClaudeEntry));
+  return before === null && openRunOf(m) === null && unit === null;
+})());
+
+// A mapper built for a RE-ESTABLISHED plane starts with the log's open run, so the assistant
+// records after the outage are attributed to it rather than dropped, and the next prompt closes
+// it rather than opening a second run over it (Sol, review of 2026-10-12: a fresh mapper after a
+// mid-run halt dropped the rest of the turn and the next prompt's RUN_STARTED was refused).
+c("resume:a-mapper-seeded-with-the-log's-open-run-attributes-assistant-records-to-it", (() => {
+  const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => "run-new", resumeRunId: "run-from-log", now: () => 0 });
+  const unit = unitOf(m.map({
+    type: "assistant",
+    uuid: "after-outage",
+    timestamp: "2026-10-12T21:55:00.000Z",
+    message: { id: "m1", role: "assistant", content: [{ type: "text", text: "pong" }] },
+  } as ClaudeEntry));
+  return openRunOf(m) === "run-from-log" && unit?.runId === "run-from-log" && unit.events.length > 0;
+})());
+c("resume:the-next-prompt-CLOSES-the-log's-run-before-opening-its-own", (() => {
+  const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => "run-new", resumeRunId: "run-from-log", now: () => 0 });
+  const unit = unitOf(m.map({
+    type: "user",
+    uuid: "next-prompt",
+    timestamp: "2026-10-12T21:56:00.000Z",
+    origin: { kind: "human" },
+    message: { role: "user", content: "ping" },
+  } as ClaudeEntry));
+  const kinds = unit?.events.map((e) => e.type) ?? [];
+  return kinds[0] === "RUN_FINISHED" && (unit?.events[0] as { runId?: string }).runId === "run-from-log" && kinds[1] === "RUN_STARTED" && openRunOf(m) === "run-new";
+})());
+c("resume:CONTROL-an-unseeded-mapper-drops-the-same-assistant-record", (() => {
+  const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => "run-new", now: () => 0 });
+  const unit = unitOf(m.map({
+    type: "assistant",
+    uuid: "after-outage",
+    timestamp: "2026-10-12T21:55:00.000Z",
+    message: { id: "m1", role: "assistant", content: [{ type: "text", text: "pong" }] },
+  } as ClaudeEntry));
+  return unit === null && openRunOf(m) === null;
 })());
 
 // And the same claim over the REAL population rather than one hand-built record: every run opened
@@ -588,9 +623,9 @@ if (OPENERS > 0) c("split:every-run-opened-came-from-an-ATTRIBUTABLE-record", ((
   const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => `run-${(n += 1)}`, now: () => 0 });
   let opens = 0;
   for (const e of entries) {
-    const was = m.openRun();
-    m.map(e);
-    const now2 = m.openRun();
+    const was = openRunOf(m);
+    unitOf(m.map(e));
+    const now2 = openRunOf(m);
     if (now2 !== null && now2 !== was) {
       opens += 1;
       // The rule as it now stands, at both levels, via the single hand-written restatement above.
@@ -632,15 +667,15 @@ if (OPENERS > 0) c("split:every-run-opened-came-from-an-ATTRIBUTABLE-record", ((
 c("split:a-task-notification-opens-NO-run", (() => {
   let n = 0;
   const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => `run-${(n += 1)}`, now: () => 0 });
-  const unit = m.map({
+  const unit = unitOf(m.map({
     type: "user",
     uuid: "task-notification-entry",
     timestamp: "2026-08-14T21:00:05.000Z",
     origin: { kind: "task-notification" },
     promptSource: "system",
     message: { content: "harness plumbing" },
-  } as ClaudeEntry);
-  return unit === null && m.openRun() === null;
+  } as ClaudeEntry));
+  return unit === null && openRunOf(m) === null;
 })());
 
 c("mechanism:the-compaction-marker-ALONE-excludes-a-record-promptSource-does-not", (() => {
@@ -648,7 +683,7 @@ c("mechanism:the-compaction-marker-ALONE-excludes-a-record-promptSource-does-not
   const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => `run-${(n += 1)}`, now: () => 0 });
   // Carries `promptSource` AND an attributable origin, so the run-opening test would admit it. This
   // is the future the marker exists for: a harness that starts stamping compaction records.
-  const unit = m.map({
+  const unit = unitOf(m.map({
     type: "user",
     uuid: "stamped-compaction",
     timestamp: "2026-08-14T21:00:04.000Z",
@@ -656,15 +691,15 @@ c("mechanism:the-compaction-marker-ALONE-excludes-a-record-promptSource-does-not
     promptSource: "system",
     isCompactSummary: true,
     message: { content: "a compaction summary the harness stamped" },
-  } as ClaudeEntry);
-  return unit === null && m.openRun() === null;
+  } as ClaudeEntry));
+  return unit === null && openRunOf(m) === null;
 })());
 
 // ATTRIBUTION IS CARRIED, and it is the half that used to be a gate.
 if (OPENERS > 0) c("split:every-RUN_STARTED-carries-a-cotal.turnSource", (() => {
   let n = 0;
   const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => `run-${(n += 1)}`, now: () => 0 });
-  const starts = entries.flatMap((e) => m.map(e)?.events ?? []).filter((e) => e.type === "RUN_STARTED");
+  const starts = entries.flatMap((e) => unitOf(m.map(e))?.events ?? []).filter((e) => e.type === "RUN_STARTED");
   return starts.length > 0 && starts.every((s) => typeof (s as { cotal?: { turnSource?: string } }).cotal?.turnSource === "string");
 })());
 
@@ -675,7 +710,7 @@ c("split:an-unseen-origin.kind-REFUSES-rather-than-guessing", (() => {
   let n = 0;
   const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => `run-${(n += 1)}`, now: () => 0 });
   try {
-    m.map({ ...OPENER, uuid: "future-harness", origin: { kind: "telepathy" } } as ClaudeEntry);
+    unitOf(m.map({ ...OPENER, uuid: "future-harness", origin: { kind: "telepathy" } } as ClaudeEntry));
     return false;
   } catch (err) {
     return /unrecognised origin\.kind/.test((err as Error).message);
@@ -685,7 +720,7 @@ c("control:a-KNOWN-origin.kind-on-the-same-path-does-NOT-refuse", (() => {
   let n = 0;
   const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => `run-${(n += 1)}`, now: () => 0 });
   try {
-    return m.map({ ...OPENER, uuid: "known-origin", origin: { kind: "channel" } } as ClaudeEntry) !== null;
+    return unitOf(m.map({ ...OPENER, uuid: "known-origin", origin: { kind: "channel" } } as ClaudeEntry)) !== null;
   } catch {
     return false;
   }
@@ -698,7 +733,7 @@ c("control:a-KNOWN-origin.kind-on-the-same-path-does-NOT-refuse", (() => {
 c("UNMEASURED:a-spec-shaped-human-prompt-opens-a-run-attributed-human", (() => {
   let n = 0;
   const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => `run-${(n += 1)}`, now: () => 0 });
-  const unit = m.map(OPENER);
+  const unit = unitOf(m.map(OPENER));
   const start = unit?.events.find((e) => e.type === "RUN_STARTED");
   return (start as { cotal?: { turnSource?: string } } | undefined)?.cotal?.turnSource === "human";
 })());
@@ -721,7 +756,7 @@ const originLess = (promptSource: string | undefined, extra?: Partial<ClaudeEntr
 const mapOnce = (e: ClaudeEntry) => {
   let n = 0;
   const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => `run-${(n += 1)}`, now: () => 0 });
-  return { unit: m.map(e), mapper: m };
+  return { unit: unitOf(m.map(e)), mapper: m };
 };
 
 const turnSourceOf = (unit: { events: AguiEvent[] } | null): string | undefined =>
@@ -744,7 +779,7 @@ c("mechanism:an-sdk-prompt-opens-a-run-REGARDLESS-of-entrypoint", (() => {
 // that opens a run on every origin-less record, which is the caveat/heartbeat over-match exactly.
 c("mechanism:an-origin-less-record-with-NO-promptSource-opens-no-run", (() => {
   const { unit, mapper } = mapOnce(originLess(undefined));
-  return unit === null && mapper.openRun() === null;
+  return unit === null && openRunOf(mapper) === null;
 })());
 
 // §3.1's CLASS, and the cell exists because the ALTERNATIVE to it is a production throw. `"system"`
@@ -755,7 +790,7 @@ c("mechanism:an-origin-less-record-with-NO-promptSource-opens-no-run", (() => {
 c("mechanism:an-origin-less-record-with-promptSource-system-is-refused-WITHOUT-throwing", (() => {
   try {
     const { unit, mapper } = mapOnce(originLess("system"));
-    return unit === null && mapper.openRun() === null;
+    return unit === null && openRunOf(mapper) === null;
   } catch {
     // The throw IS the failure mode under test, so it is caught and reported as this cell failing.
     // Left uncaught it would kill the process before the cell name printed — red, and unattributable.
@@ -788,45 +823,6 @@ c("mechanism:an-UNMEASURED-origin.kind-throws-naming-the-OTHER-table", (() => {
 })());
 
 // ---------------------------------------------------------------------------------------------
-// `diagnose()` — THE LOUD REFUSAL. A zero-run session must say WHICH zero it is.
-//
-// This is the cell that makes the silence a defect rather than a shrug: an empty session and a
-// session whose every prompt was refused are byte-identical downstream, and the whole point is that
-// the mapper distinguishes them ITSELF, on the production path, not in this file's summary line.
-// ---------------------------------------------------------------------------------------------
-c("diagnose:a-session-that-opened-a-run-diagnoses-NOTHING", (() => {
-  const { mapper } = mapOnce(originLess("sdk"));
-  return mapper.diagnose() === null;
-})());
-
-c("diagnose:a-session-with-NO-prompt-shaped-record-says-so", (() => {
-  let n = 0;
-  const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => `run-${(n += 1)}`, now: () => 0 });
-  m.map({ type: "assistant", uuid: "a", message: { content: [] } } as ClaudeEntry);
-  const d = m.diagnose();
-  return d !== null && d.includes("no prompt-shaped record at all");
-})());
-
-c("diagnose:a-session-whose-prompts-were-ALL-REFUSED-says-THAT-instead", (() => {
-  let n = 0;
-  const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => `run-${(n += 1)}`, now: () => 0 });
-  m.map(originLess(undefined));
-  m.map(originLess(undefined));
-  const d = m.diagnose();
-  return d !== null && d.includes("NO RUN OPENED") && d.includes("refusal") && d.includes("2 of 2");
-})());
-
-// THE PAIR MUST BE DISTINGUISHABLE. Two sentences that both merely said "no runs" would leave the
-// defect exactly where it was, one indirection further along.
-c("diagnose:the-two-zeroes-do-NOT-produce-the-same-sentence", (() => {
-  let n = 0;
-  const empty = createClaudeMapper({ threadId: THREAD, mintRunId: () => `run-${(n += 1)}`, now: () => 0 });
-  const refused = createClaudeMapper({ threadId: THREAD, mintRunId: () => `run-${(n += 1)}`, now: () => 0 });
-  refused.map(originLess(undefined));
-  return empty.diagnose() !== refused.diagnose() && empty.diagnose() !== null && refused.diagnose() !== null;
-})());
-
-// ---------------------------------------------------------------------------------------------
 // PART 3 — the real records, read straight through. THE CRUTCH IS GONE.
 //
 // This block used to prepend one synthetic prompt because nothing in a real session could open a
@@ -843,7 +839,7 @@ const run = (opts?: { reasoning?: boolean }): { runId: string; events: AguiEvent
     now: () => 0,
     ...(opts?.reasoning ? { reasoning: true } : {}),
   });
-  return entries.map((e) => m.map(e)).filter((u): u is { runId: string; events: AguiEvent[] } => u !== null);
+  return entries.map((e) => unitOf(m.map(e))).filter((u): u is { runId: string; events: AguiEvent[] } => u !== null);
 };
 
 // ⚠️ A SESSION WITH NO RUN-OPENING RECORD STILL CANNOT ASSERT PART 3 — but this is no longer the
@@ -855,22 +851,12 @@ const run = (opts?: { reasoning?: boolean }): { runId: string; events: AguiEvent
 // `promptSource: "sdk"`, so a headless session now walks PART 3 like any other, on its own bytes.
 //
 // The branch stays because a session with genuinely nothing in it is still possible, and because
-// the arm must not silently skip thirteen cells. **What it prints now is `diagnose()`'s sentence,
-// from the mapper** — so the reason travels with the shipped code and not with this file.
+// the arm must not silently skip thirteen cells.
 if (OPENERS === 0) {
-  const why = (() => {
-    let n = 0;
-    const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => `run-${(n += 1)}`, now: () => 0 });
-    entries.forEach((e) => m.map(e));
-    return m.diagnose();
-  })();
   c("ARM:and-so-it-maps-to-nothing — PART 3 IS UNASSERTABLE ON THIS SESSION, not passing", run().length === 0);
-  // The mapper must be able to SAY why, or the zero is exactly the silent zero this work removed.
-  c("ARM:the-mapper-DIAGNOSES-its-own-zero-rather-than-returning-a-bare-empty", why !== null);
   console.log(
     `agui-map smoke: ${pass} passed, ${fail} failed  ` +
       `[session: ${SESSION.split("/").pop()}, ${entries.length} records — NO RUN-OPENING RECORD, PART 3 not run]\n` +
-      `  ${why ?? "(mapper diagnosed nothing — see the failing cell above)"}\n` +
       `  build provenance: ${provenance.join(", ")}`,
   );
   process.exit(fail === 0 ? 0 : 1);
@@ -977,8 +963,8 @@ if (HEAD.tool_use + HEAD.tool_result + HEAD.thinking > 0) {
     let n = 0;
     const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => `run-${(n += 1)}`, now: () => 0, reasoning: true });
     let emitted = 0;
-    for (let i = 0; i < FIRST_RUN_AT; i += 1) emitted += m.map(entries[i]!)?.events.length ?? 0;
-    return emitted === 0 && m.openRun() === null;
+    for (let i = 0; i < FIRST_RUN_AT; i += 1) emitted += unitOf(m.map(entries[i]!))?.events.length ?? 0;
+    return emitted === 0 && openRunOf(m) === null;
   })(), { firstRunAt: FIRST_RUN_AT, head: HEAD });
 } else {
   c("ARM:this-session-has-no-pre-run-head worth dropping — that cell is NOT assertable here", true, {
@@ -1084,8 +1070,8 @@ c("real:no-signature-KEY-is-emitted-by-any-event-of-a-real-session", (() => {
 c("real:a-signed-thinking-block-still-EMITS-its-reasoning-minus-the-signature", (() => {
   let n = 0;
   const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => `run-${(n += 1)}`, now: () => 0, reasoning: true });
-  m.map(OPENER);
-  const unit = m.map({
+  unitOf(m.map(OPENER));
+  const unit = unitOf(m.map({
     type: "assistant",
     uuid: "signed-thinking",
     timestamp: "2026-08-14T21:00:01.000Z",
@@ -1094,7 +1080,7 @@ c("real:a-signed-thinking-block-still-EMITS-its-reasoning-minus-the-signature", 
     // at all: §3.5 says the field is never read here, and the type says so too. The cast is what
     // lets this cell put on the wire the thing a real session puts there, and then assert it does
     // not come off. Narrowing the cast would delete the input the cell exists to test.
-  } as unknown as ClaudeEntry);
+  } as unknown as ClaudeEntry));
   const ev = unit?.events ?? [];
   return ev.some((e) => e.type === "REASONING_MESSAGE_CONTENT") && signatureKeys(ev) === 0;
 })());
@@ -1104,8 +1090,8 @@ c("real:a-signed-thinking-block-still-EMITS-its-reasoning-minus-the-signature", 
 c("real:the-non-conversational-record-types-map-to-nothing", (() => {
   const dropped = ["attachment", "queue-operation", "ai-title", "last-prompt", "mode"];
   const m = createClaudeMapper({ threadId: THREAD, mintRunId: mint, now: () => 0 });
-  m.map(OPENER);
-  return entries.filter((e) => dropped.includes(String(e.type))).every((e) => m.map(e) === null);
+  unitOf(m.map(OPENER));
+  return entries.filter((e) => dropped.includes(String(e.type))).every((e) => unitOf(m.map(e)) === null);
 })(), { types: [...typeHist] });
 
 // WHAT THIS CELL USED TO ASSERT AND WHY IT NO LONGER DOES. It required a MAJORITY of the session to
@@ -1120,10 +1106,10 @@ c("real:the-non-conversational-record-types-map-to-nothing", (() => {
 // invisible to a count of nulls because it is not a null.
 c("real:the-drop-path-runs-and-no-record-produces-an-EMPTY-unit", (() => {
   const m = createClaudeMapper({ threadId: THREAD, mintRunId: mint, now: () => 0 });
-  m.map(OPENER);
+  unitOf(m.map(OPENER));
   let nulls = 0;
   for (const e of entries) {
-    const unit = m.map(e);
+    const unit = unitOf(m.map(e));
     if (unit === null) { nulls += 1; continue; }
     if (unit.events.length === 0) return false;
     if (typeof unit.runId !== "string" || unit.runId.length === 0) return false;
@@ -1131,24 +1117,24 @@ c("real:the-drop-path-runs-and-no-record-produces-an-EMPTY-unit", (() => {
   return nulls > 0;
 })(), { records: entries.length });
 
-// BRACKET SEAM. `closeOpenRun` is the vehicle a ruling plugs the `Stop` hook into (defect A).
+// BRACKET SEAM. The `Stop` hook closes a run through the emitter holder, which reports it here. The
+// report can land after a newer run opened, so only the run it names is forgotten.
 {
   const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => "r-close", now: () => 0 });
-  m.map(OPENER);
-  c("seam:closeOpenRun-closes-the-open-run", (() => {
-    const closed = m.closeOpenRun(5);
-    return closed !== null && closed.runId === "r-close" && closed.events.length === 1 && closed.events[0]!.type === "RUN_FINISHED";
-  })());
-  c("seam:closeOpenRun-is-idempotent-and-cannot-manufacture-a-second-RUN_FINISHED", m.closeOpenRun(6) === null);
-  c("seam:and-the-run-really-is-closed-afterwards", m.openRun() === null);
+  unitOf(m.map(OPENER));
+  m.forgetOpenRun("some-other-run");
+  c("seam:forgetOpenRun-keyed-on-a-DIFFERENT-id-leaves-the-open-run-alone", openRunOf(m) === "r-close");
+  m.forgetOpenRun("r-close");
+  c("seam:forgetOpenRun-keyed-on-the-open-run-clears-it", openRunOf(m) === null);
 }
 
-// The last-run-never-closes consequence, pinned so it is not discovered by a consumer.
-c("real:the-LAST-run-of-the-session-is-still-open-at-EOF", (() => {
+// On records alone the session's last run stays open: no record follows it. The `Stop` hook closes
+// it through the emitter holder, which `smoke:claude-run-error` drives against a real broker.
+c("real:the-mapper-ALONE-leaves-the-LAST-run-open-at-EOF", (() => {
   let n = 0;
   const m = createClaudeMapper({ threadId: THREAD, mintRunId: () => `r-${(n += 1)}`, now: () => 0 });
-  for (const e of entries) m.map(e);
-  return m.openRun() !== null;
+  for (const e of entries) unitOf(m.map(e));
+  return openRunOf(m) !== null;
 })());
 
 // A COUNT, but only on the FIXTURE arm. Pointed at an operator's own session (`smoke:agui-map:real`)
@@ -1157,7 +1143,7 @@ c("real:the-LAST-run-of-the-session-is-still-open-at-EOF", (() => {
 // otherwise leaves the run green with a smaller number that nobody compares. The PR body leans on
 // this total, so the suite is what holds it.
 if (SESSION.endsWith("session-shape.jsonl")) {
-  const EXPECTED = 50;
+  const EXPECTED = 48;
   c(`fixture:every cell ran - ${EXPECTED} expected`, pass + fail === EXPECTED, `${pass + fail} cells reported`);
 }
 

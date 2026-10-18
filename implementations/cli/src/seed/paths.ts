@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { globalConfigDir } from "@cotal-ai/core";
 import { SEEDED_EXTENSIONS } from "@cotal-ai/workspace";
 
@@ -81,7 +81,13 @@ export function seedStoreDir(): string {
 
 /** A seeded connector's stable copy for one generation: `store/<generation>/<name>`. */
 export function seedStorePath(generation: string, name: string): string {
-  return join(seedStoreDir(), generation, name);
+  const root = resolve(seedStoreDir());
+  const destination = resolve(root, generation, name);
+  const pathFromRoot = relative(root, destination);
+  if (pathFromRoot === "" || pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`)) {
+    throw new Error(`refusing seed-store destination ${destination}: it is not strictly inside ${root}`);
+  }
+  return destination;
 }
 
 export type SeedWriterKind = "released" | "checkout" | "unknown";
@@ -141,7 +147,7 @@ export function assertReleasedSeedWriter(generation: string, action: string): vo
   }
   const origin = kind === "checkout" ? "a source checkout" : "an unproven CLI entry";
   throw new Error(
-    `refusing to ${action} the operator-global seed store at ${seedStoreDir()} for generation ${generation} from ${origin} (${entry}) - this would migrate the machine-wide store and can take an installed cotal down. Isolate with XDG_CONFIG_HOME. COTAL_HOME does not relocate this store.`,
+    `refusing to ${action} the operator-global seed store at ${seedStoreDir()} for generation ${generation} from ${origin} (${entry}) - this would migrate the machine-wide store and can take an installed cotal down. Set COTAL_SKIP_CONNECTOR_SEED=1 to run other commands without seeding; isolating XDG_CONFIG_HOME alone does not lift this refusal. COTAL_HOME does not relocate this store.`,
   );
 }
 
@@ -189,7 +195,44 @@ export function cliVersion(): string {
  * unreadable — a generation-less seed can't gate refresh.
  */
 export function seedGeneration(): string {
-  return cliVersion();
+  const generation = cliVersion();
+  const source = join(cliPackageRoot(), "package.json");
+  const invalid = (reason: string): never => {
+    throw new Error(`invalid seed generation ${JSON.stringify(generation)} read from ${source}: it must be a plausible semver and a single safe path segment with no path separator or ".." segment (${reason})`);
+  };
+  if (!isValidSemver(generation)) invalid("not plausible semver");
+  if (generation === "." || generation.includes("..")) invalid('".." segment');
+  if (/[\\/]/.test(generation)) invalid("path separator");
+  return generation;
+}
+
+/** True iff `v` parses as a numeric-core semver (the only thing the refresh comparison can order). */
+export function isValidSemver(v: string): boolean {
+  try {
+    parseSemver(v);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface Semver {
+  readonly rel: [number, number, number];
+  readonly pre: string[];
+}
+
+export function parseSemver(v: string): Semver {
+  const core = v.split("+")[0];
+  const dash = core.indexOf("-");
+  const pre = dash >= 0 ? core.slice(dash + 1).split(".") : [];
+  // Fail loud on a non-numeric release segment rather than coercing it to 0 (which would silently
+  // mis-order versions). The generation is a real package.json version and the stamp is one we wrote,
+  // so a non-semver core here means corrupt state → `cotal ext seed --repair`/`--reset`.
+  const release = (dash >= 0 ? core.slice(0, dash) : core).split(".").map((s) => {
+    if (!/^\d+$/.test(s)) throw new Error(`invalid version "${v}" (release segment "${s}" is not numeric) - repair with \`cotal ext seed --repair\` (or --reset)`);
+    return Number(s);
+  });
+  return { rel: [release[0] ?? 0, release[1] ?? 0, release[2] ?? 0], pre };
 }
 
 /** This module's repo root in a source checkout: `implementations/cli/{src,dist}/seed` → up 4. Only

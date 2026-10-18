@@ -12,6 +12,7 @@ import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { skipSuite } from "@cotal-ai/smoke-kit";
 import { hermesUvCommand, spawnHermesGateway } from "../src/binary.js";
 import { hermesConnector } from "../src/extension.js";
 import { ADOPT_HOME_ENV, LaunchRefused, adoptedHome, assertHermesVersion, setupAdoptedProfile, setupProfile } from "../src/launch.js";
@@ -26,7 +27,7 @@ import { ADOPT_HOME_ENV, LaunchRefused, adoptedHome, assertHermesVersion, setupA
  * line was edited. Counting the calls means the number cannot drift from the work again.
  */
 let cells = 0;
-const assert = new Proxy(nodeAssert, {
+const assert: typeof nodeAssert = new Proxy(nodeAssert, {
   get(target, prop, receiver) {
     const value = Reflect.get(target, prop, receiver);
     if (typeof value !== "function") return value;
@@ -46,15 +47,9 @@ const assert = new Proxy(nodeAssert, {
  * guarantee is the false-green shape this package keeps being bitten by. Pinning the floor turns a
  * smaller green into a red. Raise it deliberately when you add a cell; a drop means one vanished.
  */
-const EXPECTED_CELLS = 164;
+const EXPECTED_CELLS = 167;
 
-if (process.platform === "win32") {
-  console.log("✓ launch-env smoke skipped on Windows (the Hermes connector is Unix-only; buildLaunch throws)");
-  // A skip still has to name a cell count, or the shard reads the silence as a suite that ran
-  // nothing and refuses it.
-  console.log("COTAL_SMOKE_SENTINEL cells=1 passed=1 failed=0");
-  process.exit(0);
-}
+if (process.platform === "win32") skipSuite("the Hermes connector is Unix-only; buildLaunch throws");
 
 /** The provider keys this connector declares. They must still arrive. */
 const PROVIDER_KEYS = [
@@ -85,7 +80,7 @@ const PER_SESSION = [
   "COTAL_LIFECYCLE_UID", "COTAL_ID", "COTAL_ROLE", "COTAL_MODEL", "COTAL_VARIANT",
   "COTAL_AGENT_FILE", "COTAL_LINK", "COTAL_SUBSCRIBE", "COTAL_ALLOW_SUBSCRIBE",
   "COTAL_ALLOW_PUBLISH", "COTAL_CAPABILITIES", "COTAL_EVENTS", "COTAL_WORKSPACE_ROOT",
-  "COTAL_CHANNEL", "COTAL_CODEX_HOME", "COTAL_OPENCODE_PROMPT", "COTAL_TOKEN",
+  "COTAL_CHANNEL", "COTAL_CODEX_HOME", "COTAL_OPENCODE_PROMPT", "COTAL_TOKEN", "COTAL_BACKFILL_FLOOR",
 ] as const;
 
 /** Machine-wide operator knobs that DO cross: no connector assigns them per spawn. */
@@ -115,6 +110,10 @@ assert.ok(env.PATH !== undefined, "PATH is forwarded so the seat can still launc
 
 for (const k of OPERATOR_KNOBS)
   assert.equal(env[k], `parent-${k}`, `${k} is a machine-wide operator knob and must cross`);
+
+// A floor request DOES forward, distinct from the per-session ambient reset asserted above.
+const withFloor = hermesConnector.buildLaunch({ space: "smoke", name: "hermes-1", backfillFloor: 42 }).env ?? {};
+assert.equal(withFloor.COTAL_BACKFILL_FLOOR, "42", "a requested backfill floor is forwarded");
 
 // ── Allow-list extras (the operator declared `spawn.env`) ─────────────────────────────────────────
 const confined = hermesConnector.buildLaunch({ space: "smoke", name: "hermes-2", envAllow: ["NOUS_API_KEY"] }).env ?? {};

@@ -1,9 +1,11 @@
 import { closeSync, constants, existsSync, fsyncSync, ftruncateSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
-import { join } from "node:path";
-import { assertSeatId, fencePath, readRecord, recordPath, socketPath, type SeatRecord } from "./record.js";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { discardSeatArtifacts } from "./artifacts.js";
+import { assertSeatId, bootToken, exitPath, fencePath, isSeatId, processStartToken, readRecord, readSeatFileNoFollow, recordPath, socketPath, type SeatRecord } from "./record.js";
 import { RUN_MARKER_FLAG } from "./launcher.js";
-import { CONFIRM_TIMEOUT_MS, GRACE_MS, unsupportedTransport } from "./protocol.js";
+import { CONFIRM_TIMEOUT_MS, GRACE_MS, unsupportedTransport, type SeatExit } from "./protocol.js";
 import { SeatClient } from "./client.js";
 import { tryLockFd } from "./peercred.js";
 import { assertSeatCgroup, killSeatCgroup, removeSeatCgroup, seatCgroupContained, seatCgroupPopulated, type SeatCgroup } from "./cgroup.js";
@@ -14,8 +16,37 @@ export type SeatRetainReason = "unprovable" | "members-remain";
 
 export type SeatReapEvidence =
   | { outcome: "absent" }
-  | { outcome: "reaped"; detail: string }
+  | { outcome: "reaped"; exit?: SeatExit; detail: string }
   | { outcome: "retained"; reason: SeatRetainReason; stop: "requested" | "no-custodian" | "timeout"; detail: string };
+
+/** How the child ended, as its custodian recorded it; why a record that exists cannot be read; or
+ *  neither when no record exists (the child was still running, or its custodian never wrote one).
+ *  The seat directory may be agent-owned, so the read never follows a final symlink. */
+function recordedExit(file: string): { exit?: SeatExit; unreadable?: string } {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readSeatFileNoFollow(file));
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "ENOENT" ? {} : { unreadable: (e as Error).message };
+  }
+  if (typeof raw !== "object" || raw === null) return { unreadable: "not a JSON object" };
+  const { code, signal, diagnostic } = raw as Record<string, unknown>;
+  return {
+    exit: {
+      ...(Number.isInteger(code) ? { code: code as number } : {}),
+      ...(Number.isInteger(signal) ? { signal: signal as number } : {}),
+      ...(typeof diagnostic === "string" ? { diagnostic } : {}),
+    },
+  };
+}
+
+/** A pid's standing against a recorded start identity: a read of `/proc`, never a send. `live`
+ *  only when the process exists AND carries the recorded start token. Advisory: a record's pids and
+ *  tokens are agent-writable, so this can never prove an exit or aim a signal. */
+export function identityVerdict(pid: number, start: string): "live" | "gone" {
+  const now = processStartToken(pid);
+  return now !== undefined && now === start ? "live" : "gone";
+}
 
 export interface SeatReapOpts {
   graceMs?: number;
@@ -118,6 +149,10 @@ export async function reapSeat(root: string, id: string, opts: SeatReapOpts = {}
   const cg = opts.cgroup;
   if (cg !== undefined && existsSync(assertSeatCgroup(cg, id).path) && seatCgroupContained(cg)) {
     const evidence = await reapCgroup(id, cg, opts.graceMs ?? GRACE_MS);
+    if (evidence?.outcome === "reaped") {
+      const after = afterProvedGone(root, id);
+      return { outcome: "reaped", ...(after.exit ? { exit: after.exit } : {}), detail: after.notes.length ? `${evidence.detail}; ${after.notes.join("; ")}` : evidence.detail };
+    }
     if (evidence !== undefined) return evidence;
   }
   const path = recordPath(root, id);
@@ -141,6 +176,35 @@ export async function reapSeat(root: string, id: string, opts: SeatReapOpts = {}
     stop,
     detail: `seat ${id} has no contained cgroup proof; stop ${stop}${error ? ` (${error})` : ""}`,
   };
+}
+
+/** Once a contained cgroup proved the seat gone: how its child ended, and the launch artifacts the
+ *  record still lists. The record is agent-writable, so only artifacts under this process's own temp
+ *  dir are removed; a record naming any other root is left for the operator. */
+function afterProvedGone(root: string, id: string): { exit?: SeatExit; notes: string[] } {
+  const path = recordPath(root, id);
+  const recorded = recordedExit(exitPath(path));
+  const notes: string[] = [];
+  if (recorded.exit)
+    notes.push(`its custodian recorded exit code ${recorded.exit.code ?? "unknown"}${recorded.exit.signal === undefined ? "" : `, signal ${recorded.exit.signal}`}${recorded.exit.diagnostic ? `, diagnostic: ${recorded.exit.diagnostic}` : ""}`);
+  else if (recorded.unreadable !== undefined) notes.push(`its custodian's exit record is unreadable: ${recorded.unreadable}`);
+  let latest: SeatRecord | undefined;
+  try {
+    latest = readRecord(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") notes.push(`record unreadable, launch artifacts not removed: ${(e as Error).message}`);
+  }
+  if (latest?.artifacts?.length) {
+    const own = resolve(tmpdir());
+    try {
+      if (latest.artifactRoot === undefined || resolve(latest.artifactRoot) !== own)
+        throw new Error(`record names artifact root ${String(latest.artifactRoot)}, not ${own}`);
+      discardSeatArtifacts(latest.artifacts, own);
+    } catch (e) {
+      notes.push(`launch artifacts not removed: ${(e as Error).message}`);
+    }
+  }
+  return { ...(recorded.exit ? { exit: recorded.exit } : {}), notes };
 }
 
 export type SeatReleaseCheck = { ok: true; advisory: string } | { ok: false; reason: "populated" | "launch-in-progress"; detail: string };
@@ -258,4 +322,94 @@ export function removeSeatCustody(root: string, id: string): void {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
   }
   rmSync(tombstone, { recursive: true, force: true });
+}
+
+/** Why `rec`'s pids cannot be tied to the processes it recorded, or undefined when they can. A
+ *  start token counts ticks since ITS OWN boot, so it only tells two processes apart within one boot,
+ *  and a record may have outlived a reboot on disk. A record with no start identity or no boot
+ *  identity proves nothing about whatever holds those pid numbers now, and neither does any record
+ *  while this host's own `boot` is unknown, so such a record is never reported as running or gone. */
+function unprovedIdentity(id: string, rec: SeatRecord, boot: string | undefined): string | undefined {
+  if (rec.custodianStart === undefined)
+    return `seat ${id} record carries no process start identity; pid ${rec.custodianPid}/${rec.childPid} may belong to an unrelated process`;
+  if (rec.bootId === undefined)
+    return `seat ${id} record carries no boot identity; pid ${rec.custodianPid}/${rec.childPid} start tokens cannot be compared across a reboot`;
+  if (boot === undefined)
+    return `seat ${id}: this host publishes no boot identity; record boot ${rec.bootId} for pid ${rec.custodianPid}/${rec.childPid} cannot be tied to this boot`;
+  return undefined;
+}
+
+/** One custody record as {@link drainSeats} found it. `live-child`: the child still holds its
+ *  recorded start identity, so the seat is a running agent and is never stopped. `childless`: the
+ *  child is gone, so a drain would retire the seat. `drained`: a drain proved the seat gone.
+ *  `refused`: the record could not be read, carries no start or boot identity, this host publishes
+ *  no boot identity, or the reap did not prove the seat gone; the record stays on disk. */
+export interface SeatInventoryEntry {
+  id: string;
+  state: "live-child" | "childless" | "drained" | "refused";
+  name?: string;
+  custodianPid?: number;
+  childPid?: number;
+  detail: string;
+}
+
+/**
+ * List the custody records under `root`, and with `drain` retire every seat whose child is gone
+ * (#1391).
+ *
+ * The listing only reads `/proc`; it never sends a signal. A seat whose child still holds its
+ * recorded start identity is reported and left alone. Only a seat whose child reads gone reaches
+ * {@link reapSeat}, which proves nothing without a contained seat cgroup, so such a drain asks the
+ * custodian to stop through its socket and reports the retained seat as `refused` for the operator.
+ */
+export async function drainSeats(root: string, opts: { drain?: boolean; graceMs?: number } = {}): Promise<SeatInventoryEntry[]> {
+  if (process.platform !== "linux") throw unsupportedTransport();
+  let ids: string[];
+  try {
+    ids = readdirSync(root).filter(isSeatId).sort();
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw e;
+  }
+  const boot = bootToken();
+  const out: SeatInventoryEntry[] = [];
+  for (const id of ids) {
+    let rec: SeatRecord;
+    try {
+      rec = readRecord(recordPath(root, id));
+    } catch (e) {
+      out.push({ id, state: "refused", detail: `record unreadable: ${(e as Error).message}` });
+      continue;
+    }
+    const seen = { id, name: rec.name, custodianPid: rec.custodianPid, childPid: rec.childPid };
+    const unproved = unprovedIdentity(id, rec, boot);
+    if (unproved !== undefined) {
+      out.push({ ...seen, state: "refused", detail: unproved });
+      continue;
+    }
+    // No process outlives a reboot, so a record from an earlier boot names only gone processes.
+    const earlierBoot = rec.bootId !== boot;
+    if (!earlierBoot && rec.childStart !== undefined && identityVerdict(rec.childPid, rec.childStart) === "live") {
+      out.push({ ...seen, state: "live-child", detail: `child ${rec.childPid} is running; kept` });
+      continue;
+    }
+    if (!opts.drain) {
+      const custodian = !earlierBoot && rec.custodianStart !== undefined && identityVerdict(rec.custodianPid, rec.custodianStart) === "live" ? "running" : "gone";
+      out.push({ ...seen, state: "childless", detail: `child ${rec.childPid} is gone; custodian ${rec.custodianPid} ${custodian}${earlierBoot ? ` with boot ${rec.bootId}` : ""}` });
+      continue;
+    }
+    try {
+      const evidence = await reapSeat(root, id, opts.graceMs === undefined ? {} : { graceMs: opts.graceMs });
+      out.push(
+        evidence.outcome === "reaped"
+          ? { ...seen, state: "drained", detail: evidence.detail }
+          : evidence.outcome === "retained"
+            ? { ...seen, state: "refused", detail: `retained (${evidence.reason}): ${evidence.detail}` }
+            : { ...seen, state: "refused", detail: "record vanished before the reap; nothing was stopped" },
+      );
+    } catch (e) {
+      out.push({ ...seen, state: "refused", detail: (e as Error).message });
+    }
+  }
+  return out;
 }

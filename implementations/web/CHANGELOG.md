@@ -1,5 +1,152 @@
 # @cotal-ai/web
 
+## 0.82.0
+
+## 0.81.1
+
+## 0.81.0
+
+## 0.80.0
+
+## 0.79.0
+
+### Patch Changes
+
+- 4c2379d: `cotal console` and `cotal join` now print a seat's harness-reported condition and its ages the way `cotal endpoints` and `cotal status` do. The console roster, NEEDS YOU rail and detail pane, the `--plain` line stream, and the `cotal join` presence lines, `Present:` line and `/who` show `waiting (rate_limit for 40m) · unchanged for 5s · active 40m ago` and the activity's `(set <age> ago)` instead of a bare `waiting`. The roster and each NEEDS YOU card put the status and these facts on rows of their own under the seat's name, wrapped to the pane's width at any terminal size, so neither a long name nor a narrow terminal cuts them and they no longer push the activity out of view. A seat that needs more rows than a short terminal leaves its pane takes the title's row and is cut at the bottom, keeping its name row, and Enter opens its detail pane with every fact. The console's ages use the shared compact format, so a heartbeat nine hours old reads `9h` rather than `540m`, and an age floors rather than rounds.
+- 92590e8: The web dashboard's pidfile name is now one `WEB_PIDFILE` constant in `@cotal-ai/workspace`. The dashboard declares its record with it, and the `cotal status` `Web process` row, `cotal status --components`, the `cotal setup` card and the `cotal clean all` crash-residue sweep read it from there. They used to spell `web.pid` by hand, so renaming the dashboard's record would still typecheck while those readers reported a running dashboard as down or absent and `clean all` left its pidfile behind. The file is still `.cotal/web.pid`.
+
+## 0.78.1
+
+## 0.78.0
+
+### Patch Changes
+
+- 261e48c: When a detached web dashboard does not become HTTP-ready before the deadline, the timeout error now ends with the outcome of the last readiness probe: the probed `api/meta` URL and the fetch error, the HTTP status, or the space and pid the server answered with. Before, every probe failure was swallowed and the error said only that the dashboard timed out, so a refused connection, a rejected request and a different process on the port all looked the same. The retry cadence and the deadline are unchanged. A mismatched space or pid is summarized with bounded fields and the URL and outcome after `; last probe ` are capped at 300 bytes, counting the `...` that marks a cut, so whatever answers the port cannot inflate the error.
+
+## 0.77.1
+
+## 0.77.0
+
+## 0.76.0
+
+### Patch Changes
+
+- 42b28aa: `cotal status --components` now names a `web.session` that exists but cannot be read, for example after an ownership or mode change: the web row reads `refused · web.session unreadable: <error>`. The reader used to treat every read error as no record, so a live dashboard read `refused · probe refused (no bound address recorded)`, and the `Web process` row and the `cotal setup` card read `down`. Those two rows now name the unreadable record as well. Only a missing, empty or partial `web.session` still reads as no record. `cotal web --detach` prints the launch link from the record that proved the dashboard ready instead of reading `web.session` again, so a read error after that point cannot report a failed start over a running dashboard.
+
+## 0.75.0
+
+### Patch Changes
+
+- 92e7846: The comments on the dashboard's activity aggregation and its `/api/membership` route, which ship in `dist/web.js` and `dist/web.d.ts`, now state the aggregation deadline, the concurrency bound, the two named partial sources and the membership read's 503 as the current contract. They narrated earlier revisions ("used to", "no longer", "this change", "since #1210"), and the `/api/activity` comment drops corpus measurements that set no constant. No runtime change.
+- 343c1ea: `cotal web` now judges an existing `web.pid` with the workspace's `parsePid` and tri-state `probeLiveness`, as `cotal down web` does. It calls the record stale and points at `cotal down web` only when the file is empty or its pid is proven gone. Content that is not a pid (`abc`, `12.5`, `0`, `-1`, an out-of-range number), or a pid whose liveness the kernel will not report, is now refused as possibly fronting a running process. Before, the dashboard called it stale and advised a cleanup that `cotal down web` then refused. An extension-removal reservation in `web.pid` is judged by the same rule. A detached launch also no longer reads an unconfirmed liveness answer as its child having exited, so termination signals the child instead of skipping it.
+- 2a06543: The dashboard's console and graph pages now escape peer-supplied text through one HTML escaper shared from `parts.js` instead of a copy each, so the two can no longer drift. A missing value now renders as empty text on the console page as it already did on the graph, where the console used to show the words `null` or `undefined`.
+
+## 0.74.0
+
+## 0.73.0
+
+## 0.72.1
+
+## 0.72.0
+
+## 0.71.0
+
+## 0.70.2
+
+## 0.70.1
+
+### Patch Changes
+
+- 9788b5e: The doc comments on the dashboard's refusal reasons and on `makeAuthGate`, which ship in `dist/web.js` and `dist/web.d.ts`, now state the gate's current contract. They said the surface authenticated nobody and that a page in the operator's browser could reach the mesh reads and the channel delete, which described the dashboard before its authentication gate existed. No runtime change.
+
+## 0.70.0
+
+### Patch Changes
+
+- 60328b2: Source comments that sent readers to docs pages retired in the docs restructure now name the current pages. The `MeshView` header points at `docs/mesh-view.md`, and the console space picker and the web dashboard's Agent Detail frame point at `docs/watch-a-mesh.md`. These comments ship in the built packages, and `docs/protocol-view.md` and `docs/web.md` no longer exist.
+- a8f2f38: The dashboard escapes `"` in peer-supplied text. A peer whose activity contained a double quote could close the roster row's `title` attribute and add attributes of its choosing to that row in every dashboard watching the space. The same escaper fills the other double-quoted attributes on the page, such as agent ids, channel keys and the harness badge title, so they are covered too.
+- 020138b: The web dashboard now writes the `web.pid.identity` pin beside `web.pid` when it claims its pidfile, and removes both when it exits. `cotal down web` used to read every dashboard record as one that predates identity pinning: it warned that a relaunch would pin it, which no relaunch did, and signalled the recorded pid with no identity check, so after a SIGKILL left `web.pid` behind it would signal whatever process had reused that pid. A dashboard's record is now verified like the broker's and the daemons', and a reused pid is refused and preserved.
+- 906de06: `cotal web` now refuses a `--port` that is not a decimal number from 1 to 65535 before it connects to the broker or claims the dashboard pidfile, with an error that names `--port`. `--port 0` used to bind an ephemeral port while the printed link, the recorded launch link and the console's allowed Origin all named port 0, and a detached launch probed port 0 until it timed out. A hex or exponent spelling such as `0x1f90` was accepted, and `abc` or `70000` failed only after connecting, with `Invalid URL`. An empty `--port` no longer falls back to 7799.
+- 668f6b0: The web dashboard's `web.session` record and its `x-cotal-readiness` header now have one definition, in `@cotal-ai/workspace`: the file name, the record's fields, the one reader, and the header name. The dashboard writes and reads the record through it and `cotal status` reads it there. Renaming the file, a field or the header on the dashboard side used to typecheck cleanly while `cotal status --components` read the live dashboard as `refused` and the `Web process` row read `down`; now it is a compile error on both sides.
+
+## 0.69.0
+
+## 0.68.0
+
+### Patch Changes
+
+- e6b48bf: `cotal status --components` now presents the dashboard's readiness nonce from `web.session` when it probes `/api/meta`, so a live dashboard at its recorded address grades `web serving`. The probe used to ask anonymously, the dashboard's auth gate refused it with 401, and the row could only read `not-serving · http identity mismatch`.
+- f2af439: The dashboard's channel-delete route comment now names the cred it purges with: the `channel-purger` cred minted at startup, the connection creds on open and `--creds` meshes, or a per-delete `channel-purger` view in user mode. It used to name a `manager` cred that no longer exists. The observer's `tls` comment now states only why the client's own TLS requirement is the fence, without narrating the change that added it. No behavior changes.
+
+## 0.67.0
+
+### Patch Changes
+
+- cefb3c7: `cotal web` on the default host and port now prints its launch link a second time at
+  `http://127.0.0.1:7799/`, carrying the same single-use token, so a browser or system resolver with
+  no answer for `cotal.localhost` (Safari, WSL2) still has a printed way in.
+- 35504fe: The dashboard's ONLINE roster now groups live peers by the machine each one reports as its host (`card.meta.host`), with a count per machine, so an operator can see where seats run and how they are spread across machines without opening each agent. A peer that reports no host, such as a manager, is listed last under "host not reported". Seats do not report which manager runs them, so there is no manager grouping yet.
+
+## 0.66.1
+
+## 0.66.0
+
+### Patch Changes
+
+- 3808751: `cotal status --components` now probes the web dashboard at the address the dashboard bound. The dashboard records its socket's host and port in `web.session` once it is listening, and status reads that record. Before, status parsed `--host` and `--port` out of the dashboard's command line and fell back to `127.0.0.1:7799`, so a port spelled any way other than plain digits (`--port 0x1f90` binds 8080) was probed at 7799, and `--port 0` was refused as an invalid port while the dashboard listened on an ephemeral one. A live dashboard pid with no readable recorded address, including a dashboard still writing its record and one started by an earlier build, is now `refused` with `no bound address recorded`.
+
+## 0.65.0
+
+### Patch Changes
+
+- d5cf1eb: `cotal web --detach` on the default host and port now comes up on hosts whose system resolver has no answer for `cotal.localhost`, such as WSL2. The detached parent probed the branded `http://cotal.localhost:7799/` for readiness through Node's resolver, so every probe failed while the child was already serving on 127.0.0.1:7799; after 30 seconds it reported `web dashboard did not become HTTP-ready`, stopped the healthy child, and left only the banner in `web.log`. The readiness probe now asks the bound host and port. The printed address is unchanged.
+
+## 0.64.0
+
+## 0.63.0
+
+### Patch Changes
+
+- d8c557c: The web dashboard now binds the account seed only inside the step that connects and mints its channel-purger cred. Before, the full connection, seed included, stayed in scope of the request handlers beside the narrowed copy they were meant to use, so a one-word edit in a handler could reach the seed and still compile. A handler that reaches for the seed now fails to typecheck.
+
+## 0.62.0
+
+## 0.61.0
+
+## 0.60.0
+
+## 0.59.0
+
+### Patch Changes
+
+- f5cbc2d: `docs/watch-a-mesh.md` now quotes the all-activity deadline reason as the server builds it, `the read did not finish within <deadline>ms`, and states the 8000 ms default in its prose. The page quoted the concrete `8000ms`, which no shipped source string holds, so the docs literal gate failed on every branch.
+- 5d98406: The dashboard's all-activity page now says why each missing source is missing. A partial page carries `reasons`, keyed by source, and the server's partial line and the page's stale marker repeat it. A read the deadline cut says it did not finish within the deadline, and a read that was refused says so with its error, so a chat read refused for exceeding the broker's `max_payload` no longer looks the same as one that ran out of time.
+- d5e20e0: The dashboard's all-activity backfill now records its ordering rule where the page is sorted and in the dashboard docs. The chat half is the newest messages by broker arrival, the merged page with direct messages is ordered by the sender's `ts` because that is the only key the two streams share, and messages with equal `ts` keep stream order with chat before direct messages. Behaviour is unchanged.
+- 608f5f4: Re-attach doc comments that had drifted away from the declarations they document. A `/** */` block followed directly by another one documented nothing, so editor hovers and the published type declarations showed no doc for the intended declaration (for example `Manager`, the `plane3` field and `AclResolver`). Each such block now sits above its declaration, is merged into the block it duplicated, or is removed when its declaration no longer exists. A new `pnpm check:doc-comments` check, run as part of `check:docsbundle`, refuses a doc block followed directly by another in shipped source.
+
+## 0.58.0
+
+## 0.57.0
+
+## 0.56.1
+
+## 0.56.0
+
+### Patch Changes
+
+- 99cad7b: A membership watch that closes after setup now reaches its caller through a second callback on `watchMembership`, instead of leaving the caller holding a stale snapshot with no signal. The dashboard broadcasts the existing membership-read-failed event and the console marks the feed unreadable, instead of both keeping the last snapshot silently (#485).
+- 03912bb: Close the connection an auth-gate refusal rides on when the request announced a body, so an unauthenticated caller cannot hold the dashboard reading an upload it refused (#2024)
+- 4f288bd: Move the two header reads that compute the announced-body fact below the auth gate, so the pre-gate prefix stays a parse and nothing else; refusal bytes and the no-body guard are unchanged (#2178)
+
+## 0.55.0
+
+### Patch Changes
+
+- e1351c2: Take a DM sender's display name and role from the roster by authenticated id instead of the message payload, so one peer cannot spoof another's name or role in the CLI DM lens or the web feed.
+- 8c037f5: Refuse announced request bodies on dashboard routes that do not read one before the server accepts the upload.
+
+## 0.54.0
+
 ## 0.53.0
 
 ## 0.52.1

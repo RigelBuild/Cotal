@@ -73,6 +73,14 @@ const rowsOf = (perm: unknown): string[] => {
 };
 const via = (profile: Profile, opts: Record<string, unknown> = {}) => (): string[] =>
   rowsOf(permissionsFor(profile, SPACE, pr, opts as never));
+const viaEnvironment = (profile: Profile, actor: string) => (): string[] => {
+  const owner = `u_${"a".repeat(26)}`;
+  return rowsOf(permissionsFor(profile, SPACE, { ...pr, owner, actor }, {
+    environmentManager: { owner, instanceId: IID, lifecycleUid: UID,
+      authorityEndpoint: "test.example.environment", authorityInstanceId: IID,
+      expiresAt: Math.floor(Date.now() / 1000) + 240 },
+  }));
+};
 
 /**
  * How each profile's rows are produced. Keyed `Record<Profile, …>` so the profile union drives it.
@@ -84,9 +92,14 @@ const PRODUCERS: Record<Profile, () => string[]> = {
   observer: via("observer"),
   admin: via("admin"),
   supervisor: via("supervisor"),
+  "manager-caller": via("manager-caller", { managerInstanceId: IID, capabilities: ["spawn", "run", "admin"] }),
   "remote-manager": () => [`manager_${IID}`, `manager_exec_${IID}`].flatMap((actor) =>
     rowsOf(permissionsFor("remote-manager", SPACE,
       { ...pr, actor }, { remoteManager: { instanceId: IID, owner: DEV_OWNER, actor } }))),
+  "environment-bootstrap": viaEnvironment("environment-bootstrap", `manager_bootstrap_${IID}`),
+  "environment-manager-supervisor": viaEnvironment("environment-manager-supervisor", `manager_${IID}`),
+  "environment-manager-executor": viaEnvironment("environment-manager-executor", `manager_exec_${IID}`),
+  "environment-manager-goal-writer": viaEnvironment("environment-manager-goal-writer", `manager_goal_${IID}`),
   provisioner: via("provisioner"),
   deprovisioner: via("deprovisioner", { deprovisionTarget: { principal: `${DEV_OWNER}.worker`, lifecycleUid: UID } }),
   "retirement-requester": via("retirement-requester", { retirementRequester: { owner: DEV_OWNER, actor: "manager", uid: UID, target: { owner: DEV_OWNER, actor: "worker", lifecycleUid: UID } } }),
@@ -122,6 +135,8 @@ const PRODUCERS: Record<Profile, () => string[]> = {
   "endpoint-evictor": via("endpoint-evictor"),
   issuer: via("issuer"),
   "run-admitter": via("run-admitter", { runAdmitter: { endpoint: EP, runId: "run-sweep" } }),
+  "transfer-writer": via("transfer-writer", { transferWriter: { instanceId: IID, hex: "0".repeat(64) } }),
+  "transfer-reader": via("transfer-reader", { transferReader: { instanceId: IID } }),
 };
 
 // ── exhaustiveness: the table's key set IS the profile set, proven at runtime ──────────────────
@@ -167,7 +182,7 @@ console.log("B. no profile's credential can reach a session rail that is not its
     for (const row of rows) for (const rail of foreignRails) if (subjectMatches(row, rail)) leaks.push({ profile, row, reaches: rail });
   }
   c("every profile constructs (an unconstructible profile FAILS, never skips)", unconstructible.length === 0, unconstructible);
-  c("NO profile's rows match a foreign session's `in`/`out` rail — no standing EPS grant on either side (SPEC 13.9:2526)",
+  c("NO profile's rows match a foreign session's `in`/`out` rail — no standing EPS grant on either side (SPEC 13.9)",
     leaks.length === 0, leaks);
 }
 

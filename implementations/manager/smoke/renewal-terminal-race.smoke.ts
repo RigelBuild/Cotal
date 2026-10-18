@@ -17,7 +17,7 @@ import {
   standaloneConnectOpts, registry, DEV_OWNER, setupSpaceStreams, recordsBucket, epAuthBucket,
   parseLedgerRow, credRowKey, type AgentHandle, type AttachSession,
   type Connector, type LaunchSpec, type Presence, type CredentialLedgerRow,
-  type EvictionResult, type LifecycleStateTransport, type SecretStore,
+  type EvictionResult, type LifecycleStateTransport, type SecretStore, type ControlReply,
 } from "@cotal-ai/core";
 import { agentSecretKeyForFile, putSpaceAuth } from "@cotal-ai/workspace";
 import {
@@ -25,6 +25,7 @@ import {
 } from "../src/static-lifecycle.js";
 import { Manager } from "../src/manager.js";
 import { bootBroker } from "./_boot-broker.js";
+import { requestDeliveryAdminZeroMemberships } from "./_fake-delivery-admin.js";
 
 const SCENARIOS = [
   { name: "racer_despawn", renewal: "direct", terminal: "despawn" },
@@ -103,6 +104,13 @@ class PausingSecretStore implements SecretStore {
     }
     this.deleted.delete(key);
     this.values.set(key, value);
+  }
+
+  async create(key: string, value: string): Promise<boolean> {
+    if (this.values.has(key)) return false;
+    this.deleted.delete(key);
+    this.values.set(key, value);
+    return true;
   }
 
   delete(key: string): Promise<void> {
@@ -189,6 +197,7 @@ const handles = new Map<string, ControlledHandle>();
 (mgr as unknown as { ep: Record<string, unknown> }).ep = {
   ref: () => ({ id: "smoke-mgr" }), on: () => {}, off: () => {},
   waitForPresenceSnapshot: () => Promise.resolve(), getRoster: (): Presence[] => [],
+  requestDeliveryAdmin: requestDeliveryAdminZeroMemberships,
 };
 registry.register({ kind: "connector", name: "smoke-race", requires: ["node"], buildLaunch: () => ({ command: "true", args: [], env: {} }) } as Connector);
 
@@ -203,7 +212,7 @@ type Agent = {
   staticCredentialRenewal?: Promise<void>;
   secretPaths?: { creds?: string };
 };
-type RetirementHold = { lifecycleUid: string; lastError?: string };
+type RetirementHold = { target: { lifecycleUid: string }; lastError?: string };
 const M = mgr as unknown as {
   agents: Map<string, Agent>;
   retiring: Map<string, RetirementHold>;
@@ -254,6 +263,14 @@ async function stageExpiringCredential(agent: Agent, transport: LifecycleStateTr
 try {
   await setupSpaceStreams({ servers, space, creds: await mintCreds(auth, newIdentity(), "provisioner") });
   await mgr.start();
+  const mgrEp = (mgr as unknown as { ep: { requestDeliveryAdmin: (op: string, args?: unknown, t?: number) => Promise<ControlReply> } }).ep;
+  const origRequestDeliveryAdmin = mgrEp.requestDeliveryAdmin.bind(mgrEp);
+  mgrEp.requestDeliveryAdmin = async (op: string, args?: unknown, t?: number) => {
+    if (op === "lifecycleMemberships") {
+      return requestDeliveryAdminZeroMemberships(op, args);
+    }
+    return origRequestDeliveryAdmin(op, args, t);
+  };
   (mgr as unknown as { awaitReadiness(): Promise<{ ok: true }> }).awaitReadiness = async () => ({ ok: true });
 
   for (const scenario of SCENARIOS) {
@@ -308,7 +325,7 @@ try {
         terminalEntered = handles.get(name)?.exitNaturally() === true && !M.agents.has(name);
       check(`${name}: ${scenario.terminal} enters the terminal path`, terminalEntered);
       check(`${name}: the terminal latch closes synchronously`, agent.terminalizing === true);
-      check(`${name}: terminalization registers the lifecycle hold`, M.retiring.get(name)?.lifecycleUid === agent.lifecycleUid, M.retiring.get(name));
+      check(`${name}: terminalization registers the lifecycle hold`, M.retiring.get(name)?.target.lifecycleUid === agent.lifecycleUid, M.retiring.get(name));
 
       let lateOutcome: string | undefined;
       const late = M.renewManagedStaticCred(agent)

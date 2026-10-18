@@ -2,7 +2,8 @@
  * A source-checkout CLI must not mutate the operator-global seed store (#1215).
  *
  * Drives `stageSeedPayload` / `gcSeedStore` in-process against an isolated
- * `XDG_CONFIG_HOME`. Never runs `pnpm cotal`. The store path is derived from
+ * `XDG_CONFIG_HOME`, and a whole reconcile whose `ext add` re-exec is refused
+ * (#1629). Never runs `pnpm cotal`. The store path is derived from
  * `XDG_CONFIG_HOME` only; `COTAL_HOME` is not a relocator and this suite asserts
  * that rather than assuming it.
  *
@@ -12,7 +13,9 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { writeStamp } from "../src/seed/authority.js";
-import { seedStoreDir, seedWriterKind } from "../src/seed/paths.js";
+import { clearChildMarker, clearCursor, writeCursor, writePendingChildMarker } from "../src/seed/lock.js";
+import { reconcileChildPath, reconcileCursorPath, SEED_BUILTINS, seedStoreDir, seedWriterKind } from "../src/seed/paths.js";
+import { reconcileSeededConnectors } from "../src/seed/reconcile.js";
 import { gcSeedStore, stageSeedPayload } from "../src/seed/store.js";
 
 function writeJson(path: string, value: unknown): void {
@@ -168,6 +171,13 @@ try {
       result.ok && !result.message.includes("COTAL_ALLOW_CHECKOUT_SEED"),
       result.message,
     );
+    // The sandboxed XDG_CONFIG_HOME above did not lift the refusal, so a remedy that names only
+    // that variable cannot be followed. COTAL_SKIP_CONNECTOR_SEED=1 is what lets a checkout run.
+    check(
+      "checkout: the refusal names COTAL_SKIP_CONNECTOR_SEED=1 as the way to run without seeding",
+      result.ok && result.message.includes("COTAL_SKIP_CONNECTOR_SEED=1"),
+      result.message,
+    );
     check(
       "checkout: staging writes no payload under the sandboxed store",
       !existsSync(dest),
@@ -219,6 +229,12 @@ try {
       "unknown identity: staging is refused rather than treated as a released install",
       result.ok,
       result.message || "stageSeedPayload returned without throwing",
+    );
+    // The same line serves an entry that is not a checkout, so its remedy must not assume one.
+    check(
+      "unknown identity: the refusal names COTAL_SKIP_CONNECTOR_SEED=1 without calling the entry a checkout",
+      result.ok && result.message.includes("COTAL_SKIP_CONNECTOR_SEED=1") && !result.message.includes("from a checkout"),
+      result.message,
     );
     check("unknown identity: staging writes no payload", !existsSync(dest), dest);
   }
@@ -301,6 +317,42 @@ try {
     stageSeedPayload("0.42.0", "opencode");
     const gc = threw(() => gcSeedStore("0.42.0", []));
     check("gc removes a read-only prior generation", !gc.ok && !existsSync(dirname(old)), gc.message || old);
+  }
+
+  // #1629: a reconcile whose `ext add` re-exec is refused leaves the seed state as it found it. This
+  // suite is not the cotal entry, so `selfArgv` refuses. `seedOne` asked only after it had journaled
+  // its crash cursor, staged the payload and written a pending child marker, and nothing cleared
+  // them, so the next boot refused as an interrupted seed. The opt-in only gets this reconcile past
+  // the checkout writer check and on to the re-exec.
+  {
+    process.argv[1] = realArgv1;
+    sandboxXdg();
+    process.env.COTAL_ALLOW_CHECKOUT_SEED = "1";
+    const REFUSAL = /^refusing to re-exec this process as `cotal`/;
+    const reconcileOnce = async (): Promise<string> => {
+      try {
+        await reconcileSeededConnectors();
+        return "reconcileSeededConnectors returned";
+      } catch (e) {
+        return (e as Error).message;
+      }
+    };
+    const first = await reconcileOnce();
+    check("re-exec refused: a reconcile from an entry that is not cotal stops at the guard", REFUSAL.test(first), first);
+    check("re-exec refused: no crash cursor is left for the next boot", !existsSync(reconcileCursorPath()), reconcileCursorPath());
+    check("re-exec refused: no pending seed-child marker is left either", !existsSync(reconcileChildPath()), reconcileChildPath());
+    check("re-exec refused: no payload was staged", !existsSync(seedStoreDir()), seedStoreDir());
+    const retry = await reconcileOnce();
+    check("re-exec refused: the next reconcile meets the same refusal, not an interrupted seed", REFUSAL.test(retry), retry);
+    // CONTROL: the absences above are read where the journal writes, in this sandbox.
+    writeCursor({ nonce: "control", package: SEED_BUILTINS[0]!, phase: "add" });
+    writePendingChildMarker("control");
+    check(
+      "re-exec refused CONTROL: a cursor and a marker written in this sandbox are seen at those paths",
+      existsSync(reconcileCursorPath()) && existsSync(reconcileChildPath()),
+    );
+    clearCursor();
+    clearChildMarker();
   }
 } finally {
   restoreEnv();

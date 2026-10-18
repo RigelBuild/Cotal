@@ -8,6 +8,8 @@
  */
 
 import type { CalleeDoc } from "./errors.js";
+import type { ScopeKind } from "./keys.js";
+import { deepFreeze } from "./values.js";
 
 /** The journalled effect kinds. `channel` is pure and deliberately absent. */
 export const EFFECT_KINDS = [
@@ -23,6 +25,13 @@ export const EFFECT_KINDS = [
   "conclave",
 ] as const;
 export type EffectKind = (typeof EFFECT_KINDS)[number];
+
+/**
+ * The effect kinds a `once` scope admits. Closed, so a kind added later is refused under `once`
+ * (L4028) until it is listed: every other kind calls its handler more than once at one key, builds
+ * run state a settled answer cannot, or writes nothing a hold could bound.
+ */
+export const HOLDABLE_KINDS: ReadonlySet<EffectKind> = new Set(["ask"]);
 
 /** Which of a call's inputs decide whether a recorded result is still valid (design doc 5.12). */
 export interface PrimitiveSpec extends CalleeDoc {
@@ -60,13 +69,15 @@ export interface PrimitiveSpec extends CalleeDoc {
   readonly hashedValues?: Readonly<Record<string, readonly unknown[]>>;
   /** True when the positional subject is part of the input hash. */
   readonly hashesSubject: boolean;
-  /** This primitive opens a concurrency scope, so it pushes a scope frame. */
-  readonly opensScope: boolean;
+  /** The concurrency scope this primitive opens and journals, or null when it pushes no scope frame.
+   *  A kind rather than a flag, so a scope row the engines and the journal cannot classify does not
+   *  compile. */
+  readonly scope: ScopeKind | null;
   /**
    * This primitive takes a PROBE: a program function the runtime calls, repeatedly, to observe
    * something outside the run.
    *
-   * It is in the table rather than spelled as a name at each site for the reason `opensScope` is:
+   * It is in the table rather than spelled as a name at each site for the reason `scope` is:
    * the emitter has to hand that argument over unevaluated, the validator has to know the
    * position is a function rather than data, and a second primitive that takes one must not be
    * able to arrive with any of those silently wrong. The value is the argument INDEX, so nothing
@@ -83,21 +94,22 @@ export interface PrimitiveSpec extends CalleeDoc {
   readonly functionOptions?: readonly string[];
 }
 
-export const PRIMITIVES: Readonly<Record<string, PrimitiveSpec>> = Object.freeze({
+export const PRIMITIVES: Readonly<Record<string, PrimitiveSpec>> = deepFreeze({
   spawn: {
     kind: "spawn",
     nameRequired: false,
-    options: ["name", "cwd", "placement", "worktree", "join", "role", "permits", "supervise", "onFork"],
+    options: ["name", "cwd", "placement", "worktree", "join", "role", "permits", "supervise", "onFork", "events"],
     optionsAt: 1,
     // `placement` is HASHED, beside `cwd`: the target is half the answer to "where does this seat
     // live". A replay that edits the target must diverge as a migration, not silently reuse the
-    // resolution taken against the old instance (#1616 item 3).
+    // resolution taken against the old instance (#1616 item 3). `events` is launch policy, like
+    // `supervise`, so it is not hashed.
     hashedOptions: ["cwd", "placement", "worktree", "join", "role"],
     hashesSubject: true,
-    opensScope: false,
+    scope: null,
     signature:
-      "spawn(persona, { name?, cwd?, placement?, worktree?, join?, role?, permits?, supervise?, onFork? }) -> AgentHandle",
-    doc: "Bring an agent into the run. Permits are budgets whose violation is catchable; supervise is a declarative restart policy.",
+      "spawn(persona, { name?, cwd?, placement?, worktree?, join?, role?, permits?, supervise?, onFork?, events? }) -> AgentHandle",
+    doc: "Bring an agent into the run. Permits are budgets whose violation is catchable; supervise is a declarative restart policy; events: false starts the agent without an event plane.",
     example: 'const builder = await spawn("builder", { worktree: "wt-1", join: [team] })',
   },
   turn: {
@@ -107,7 +119,7 @@ export const PRIMITIVES: Readonly<Record<string, PrimitiveSpec>> = Object.freeze
     optionsAt: 1,
     hashedOptions: ["deadline"],
     hashesSubject: true,
-    opensScope: false,
+    scope: null,
     signature: "turn(agent, { name, deadline? }) -> { status, to?, note?, at }",
     doc: "Wake an agent for one turn. It reads its own channels and speaks for itself; the result is its yield status, one of done, blocked, or handoff.",
     example:
@@ -120,7 +132,7 @@ export const PRIMITIVES: Readonly<Record<string, PrimitiveSpec>> = Object.freeze
     optionsAt: 1,
     hashedOptions: ["schema", "deadline", "attempts"],
     hashesSubject: true,
-    opensScope: false,
+    scope: null,
     signature: "ask(agent, { name, schema, deadline?, attempts? }) -> record",
     doc: "The narrow case where the program itself needs a value. The agent publishes a record and the program awaits it. `schema` rides to the handler opaque; the reference simulator enforces the shorthand, refusing one it cannot read with L4022 and reporting L4006 once `attempts` non-conforming replies are exhausted.",
     example:
@@ -136,7 +148,7 @@ export const PRIMITIVES: Readonly<Record<string, PrimitiveSpec>> = Object.freeze
     hashedOptions: ["schema", "timeout", "to"],
     hashedValues: { onExpiry: ["escalate"] },
     hashesSubject: true,
-    opensScope: false,
+    scope: null,
     signature:
       'checkpoint(name, prompt, { schema?, timeout?, onExpiry?, to? }) -> { status, value?, by?, at, artifact? }',
     doc: "A durable pause a human or another agent resolves from anywhere, raced against a durable timer. onExpiry is fail, proceed, or escalate.",
@@ -153,7 +165,7 @@ export const PRIMITIVES: Readonly<Record<string, PrimitiveSpec>> = Object.freeze
     // the run clock, so editing 1h to 1m must diverge rather than silently keep the path the old
     // duration chose. This said `false` while the interpreter hashed it.
     hashesSubject: true,
-    opensScope: false,
+    scope: null,
     signature: "sleep(duration, { name? }) -> null",
     doc: "A durable timer. A resumed run does not re-sleep an elapsed sleep; use fork to re-run from this step.",
     example: 'await sleep("30m")',
@@ -166,7 +178,7 @@ export const PRIMITIVES: Readonly<Record<string, PrimitiveSpec>> = Object.freeze
     // A recorded null means "not within THIS timeout", never "never".
     hashedOptions: ["timeout"],
     hashesSubject: true,
-    opensScope: false,
+    scope: null,
     signature: "wait(event, { name?, timeout? }) -> value | null",
     doc: "Await one event. Resolves null on timeout rather than throwing, which is what makes ?? the recovery operator.",
     example:
@@ -190,7 +202,7 @@ export const PRIMITIVES: Readonly<Record<string, PrimitiveSpec>> = Object.freeze
     // re-observed on every resume by construction, so a probe whose body changed is answered by
     // observing again rather than by a divergence over something unhashable.
     hashesSubject: false,
-    opensScope: false,
+    scope: null,
     probeAt: 0,
     functionOptions: ["terminal"],
     signature:
@@ -208,7 +220,7 @@ export const PRIMITIVES: Readonly<Record<string, PrimitiveSpec>> = Object.freeze
     optionsAt: 2,
     hashedOptions: [],
     hashesSubject: true,
-    opensScope: false,
+    scope: null,
     signature: "notify(agents, fact, { name? }) -> null",
     doc: "Tell agents about a branch decision. It writes a notice onto the run, rendered ahead of each agent's next turn; it is never a channel message.",
     example:
@@ -221,7 +233,7 @@ export const PRIMITIVES: Readonly<Record<string, PrimitiveSpec>> = Object.freeze
     optionsAt: 1,
     hashedOptions: [],
     hashesSubject: true,
-    opensScope: false,
+    scope: null,
     signature: "monitor(agent, { name? }) -> null",
     doc: "Register interest in an agent's health, after which down(agent) is an ordinary awaitable event a concurrent branch can watch.",
     example: 'await monitor(builder)\nconst d = await wait(down(builder), { name: "gone", timeout: "1h" })',
@@ -233,7 +245,7 @@ export const PRIMITIVES: Readonly<Record<string, PrimitiveSpec>> = Object.freeze
     optionsAt: 1,
     hashedOptions: [],
     hashesSubject: false,
-    opensScope: true,
+    scope: "parallel",
     signature: "parallel(branches, { name? }) -> results",
     doc: "Run branches concurrently and settle all of them. The record form is the default; array branches are keyed by index and are linted. The first rejection cancels the rest.",
     example:
@@ -246,7 +258,7 @@ export const PRIMITIVES: Readonly<Record<string, PrimitiveSpec>> = Object.freeze
     optionsAt: 1,
     hashedOptions: [],
     hashesSubject: false,
-    opensScope: true,
+    scope: "race",
     signature: "race(branches, { name? }) -> { index, value }",
     doc: "Run branches concurrently and take the first to settle. Losers are cancelled by semantics: they perform no new effects, and an in-flight agent reply completes and is ignored.",
     example:
@@ -259,7 +271,7 @@ export const PRIMITIVES: Readonly<Record<string, PrimitiveSpec>> = Object.freeze
     optionsAt: 2,
     hashedOptions: [],
     hashesSubject: false,
-    opensScope: true,
+    scope: "fanOut",
     signature: "fanOut(items, fn, { name, key? }) -> results",
     doc: "Run fn(item, index) per item concurrently. key maps an item to the stable string that names its journal namespace, and defaults to a record item's string id.",
     example:
@@ -272,16 +284,28 @@ export const PRIMITIVES: Readonly<Record<string, PrimitiveSpec>> = Object.freeze
     optionsAt: 2,
     hashedOptions: [],
     hashesSubject: true,
-    opensScope: true,
+    scope: "conclave",
     signature: "conclave(members, fn, { name, channel? }) -> result",
-    doc: "Open a scoped sub-team: create a conclave channel, join the members, run fn with that channel, then have them leave. It scopes the derived flowchart the same way it scopes the journal.",
+    doc: "Open a scoped sub-team: create a conclave channel, join the members, run fn with that channel, then have them leave. fn returns what the program reads; a write from it to a binding outside it is refused (L2032). It scopes the derived flowchart the same way it scopes the journal.",
     example:
       'await conclave([a, b], (ch) => turn(a, { name: "huddle" }), { name: "triage" })',
+  },
+  once: {
+    kind: null,
+    nameRequired: true,
+    options: ["name"],
+    optionsAt: 1,
+    hashedOptions: [],
+    hashesSubject: false,
+    scope: "once",
+    signature: "once(fn, { name }) -> value",
+    doc: "Run fn so that each step inside it is dispatched at most once. A resume that finds a step begun and never settled does not dispatch it again: it opens a hold, a checkpoint under a token derived from the step's recorded request id, and the settler's answer becomes the step's result. fn returns what the program reads; a write from it to a binding outside it is refused (L2032). Only ask runs inside it; any other effect is refused before it begins (L4028).",
+    example: 'const r = await once(async () => await ask(builder, { name: "publish", schema: { commentId: "number" } }), { name: "publish-360" })',
   },
 });
 
 /** Event constructors. Pure: they build a descriptor and perform no effect. */
-export const EVENT_CONSTRUCTORS: Readonly<Record<string, CalleeDoc>> = Object.freeze({
+export const EVENT_CONSTRUCTORS: Readonly<Record<string, CalleeDoc>> = deepFreeze({
   replied: {
     signature: "replied(agent) -> Event",
     doc: "The agent finished a reply.",
@@ -305,7 +329,7 @@ export const EVENT_CONSTRUCTORS: Readonly<Record<string, CalleeDoc>> = Object.fr
 });
 
 /** Pure primitives that write no journal entry. */
-export const PURE_PRIMITIVES: Readonly<Record<string, CalleeDoc>> = Object.freeze({
+export const PURE_PRIMITIVES: Readonly<Record<string, CalleeDoc>> = deepFreeze({
   channel: {
     signature: "channel(name) -> ChannelHandle",
     doc: "Name a channel. Pure: a name is a name, and membership is what costs something.",

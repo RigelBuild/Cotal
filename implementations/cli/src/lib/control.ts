@@ -1,18 +1,22 @@
 import {
   BASELINE_LIFECYCLE_ENDPOINT,
   EpEnvelopeError,
+  assertLifecycleToken,
   GOAL_BEARING_COMMANDS,
   epProbeInstanceInterest,
   freezeExpectedSet,
   instancePinnedInstrumentCapabilities,
-  invokeCommand,
+  invokeRepairingSplit,
+  issuedUserCaller,
   mintCreds,
   parseEpSubject,
   respondedButUnbound,
   unansweredRequest,
   unansweredRail,
   registryReadFailed,
-  renderLifecycleBlocked,
+  undeclaredArg,
+  controlReplyFrom,
+  controlReplyFromThrown,
   submitAndFollowGoal,
   scatterCommand,
   mintLifecycleUid,
@@ -24,6 +28,7 @@ import {
   type EpCaller,
   type EpInstanceLiveness,
   type EpVerbTarget,
+  type FlagSpec,
   type Profile,
 } from "@cotal-ai/core";
 import { PermissionViolationError, type NatsConnection } from "@nats-io/transport-node";
@@ -31,6 +36,7 @@ import { jetstreamManager } from "@nats-io/jetstream";
 import { controlCaller, loadSpaceAuth, renderWorkspaceError, type ControlAuth } from "@cotal-ai/workspace";
 import { DEV_OWNER, type SpaceAuth } from "@cotal-ai/core";
 import { c, staleStoreHint } from "../ui.js";
+import { cliVersion } from "./version.js";
 
 /** The control auth shape and target resolver live in `@cotal-ai/workspace` (shared with every
  *  command surface that addresses the manager: this CLI, `cotal run`, the web dashboard). Re-exported
@@ -55,11 +61,13 @@ export const START_TIMEOUT_MS = 40_000;
 const EP_COMMANDS: Record<string, { command: string; targeted?: boolean }> = {
   managerStatus: { command: "status" },
   start: { command: "spawn" },
+  resolveAgent: { command: "resolve-agent" },
   stop: { command: "despawn", targeted: true },
   attach: { command: "attach", targeted: true },
   input: { command: "input", targeted: true },
   status: { command: "inspect" },
   ps: { command: "ps" },
+  slots: { command: "slots" },
   models: { command: "models" },
   launch: { command: "launch" },
   purge: { command: "purge" },
@@ -69,6 +77,7 @@ const EP_COMMANDS: Record<string, { command: string; targeted?: boolean }> = {
   preparePreservation: { command: "prepare-preservation" },
   commitPreservation: { command: "commit-preservation" },
   abortPreservation: { command: "abort-preservation" },
+  transcriptReceive: { command: "transcript-receive" },
 };
 
 /** Operator reach for one targeted control call: `owner` rides the caller's own-domain verb rows
@@ -96,16 +105,19 @@ async function askManagerEp(
   timeoutMs?: number,
   pin?: ManagerPin,
 ): Promise<ManagerReply> {
-  const instanceId = pin?.instanceId;
+  if (pin?.instanceId !== undefined && auth.managerInstanceId !== undefined && pin.instanceId !== auth.managerInstanceId)
+    return { ok: false, error: "the manager pin differs from this credential's instance authority", code: "permission-denied" };
+  const instanceId = pin?.instanceId ?? auth.managerInstanceId;
   const mapped = EP_COMMANDS[op];
   if (!mapped) return { ok: false, error: `unknown manager op "${op}" (no v0.4 command mapping)` };
-  const caller = auth.epCaller!;
-  const nc = await dialerFor(server)({
-    servers: server,
-    ...standaloneConnectOpts(auth.creds ? { creds: auth.creds, tls: auth.tls === true } : auth.bearer ? { bearer: auth.bearer, sentinelCreds: auth.sentinelCreds, tls: auth.tls === true } : { tls: auth.tls === true }),
-    maxReconnectAttempts: 0,
-  });
+  const connectOpts = standaloneConnectOpts(auth.creds ? { creds: auth.creds, tls: auth.tls === true } : auth.bearer ? { bearer: auth.bearer, sentinelCreds: auth.sentinelCreds, tls: auth.tls === true } : { tls: auth.tls === true });
+  const nc = await dialerFor(server)({ servers: server, ...connectOpts, maxReconnectAttempts: 0 });
   try {
+    // A logged-in user's manager view is issued at the callout (SPEC 13.15): read its generation
+    // back from this connection's accepted row; a missing row refuses, never a legacy-rail retry.
+    const caller = auth.bearer !== undefined && auth.managerInstanceId !== undefined
+      ? await issuedUserCaller(nc, space, String(connectOpts.name), auth.epCaller!)
+      : auth.epCaller!;
     // P2 item 3 `--on <instance>`: pin the resolve to the exact manager instance's `inst` route so a
     // multi-manager space addresses the intended manager, never whichever wins the class anycast.
     const service = await resolveService(nc, space, BASELINE_LIFECYCLE_ENDPOINT, caller, { deadlineMs: 10_000, ...(instanceId !== undefined ? { instanceId } : {}) });
@@ -119,14 +131,11 @@ async function askManagerEp(
       // rides the SPAWN capability arm as well as the instrument read set, so every caller class
       // that can despawn/attach can also resolve its target (a `ps` SCAN here broker-drops exactly
       // the spawn-scoped user bearers - the 1c.2b read narrowing - and hangs their stop/attach).
-      const info = await invokeCommand(nc, space, service, "inspect", { name }, { deadlineMs: 10_000 });
-      if (info.reply.ok !== true)
-        return {
-          ok: false,
-          error: `could not resolve "${name}": ${info.reply.error?.message ?? info.reply.error?.code ?? "inspect failed"}`,
-          ...(info.reply.error?.code ? { code: info.reply.error.code } : {}),
-          ...(info.reply.error?.details ? { details: info.reply.error.details } : {}),
-        };
+      const info = await invokeRepairingSplit(nc, space, service, "inspect", { name }, { deadlineMs: 10_000 });
+      if (info.reply.ok !== true) {
+        const refused = controlReplyFrom(info.reply);
+        return { ...refused, error: `could not resolve "${name}": ${refused.error}` };
+      }
       const row = info.reply.data as { id: string; lifecycleUid: string };
       // A STATIC row's `id` is the bare actor under the caller's own owner; a USER-mode row's `id`
       // is the composite `owner.actor` principal key - split it (an embedded dot would break the
@@ -152,25 +161,19 @@ async function askManagerEp(
       sendArgs = Object.keys(rest).length ? rest : undefined;
     }
     const invokeOpts = { ...(target ? { target } : {}), deadlineMs: timeoutMs ?? 10_000 };
-    const submit = () => invokeCommand(nc, space, service, mapped.command, sendArgs, invokeOpts);
+    const submit = () => invokeRepairingSplit(nc, space, service, mapped.command, sendArgs, invokeOpts);
     // P2 item 2 (2b): a goal-bearing command (spawn/launch) FOLLOWS its acceptance to the goal
     // terminal, so `spawn --detach` still returns on the real outcome (join / exit / ~30s uncertain)
     // exactly like the pre-action blocking reply — UX unchanged, no --no-wait.
     const r = (GOAL_BEARING_COMMANDS as readonly string[]).includes(mapped.command)
       ? await submitAndFollowGoal(nc, space, BASELINE_LIFECYCLE_ENDPOINT, caller, timeoutMs ?? START_TIMEOUT_MS, submit)
       : await submit();
-    if (r.reply.ok !== true)
-      return {
-        ok: false,
-        error: renderLifecycleBlocked(r.reply.error?.message ?? r.reply.error?.code ?? "error", r.reply.error),
-        ...(r.reply.error?.code ? { code: r.reply.error.code } : {}),
-        ...(r.reply.error?.details ? { details: r.reply.error.details } : {}),
-      };
+    if (r.reply.ok !== true) return controlReplyFrom(r.reply);
     // The ep `models` reply is normalized to `{catalogs}` — unwrap so call sites keep the ctl shape.
     const data = mapped.command === "models" ? (r.reply.data as { catalogs: unknown }).catalogs : r.reply.data;
     return { ok: true, ...(data !== undefined ? { data } : {}) };
   } catch (e) {
-    return epRailFailure(e, pin);
+    return epRailFailure(e, instanceId === undefined ? pin : { instanceId });
   } finally {
     // Drain waits for in-flight NATS work. A dead broker never finishes that, and
     // attach-auth-root hung here after spawn once nats-server exited.
@@ -191,11 +194,7 @@ async function askManagerEp(
  *  deadline elapsed with nothing attributed to the request). `up`'s resume readiness poll keys on it;
  *  it used to key on the message prefix, which turned an operator-facing string into a control-flow
  *  predicate in another file. */
-/** The manager's error CODE, when there was one. A caller that has to DECIDE on a refusal — the
- *  attach loop distinguishing "you may not" from "that seat is gone" from "try again" — was left
- *  matching English, because both renderings below collapse the envelope to
- *  `message ?? code` and the code is the only stable half. */
-export type ManagerReply = ControlReply & { unanswered?: boolean; code?: string };
+export type ManagerReply = ControlReply & { unanswered?: boolean };
 
 /** What the calling command declares about pinning. Passed ONLY by a command that offers `--on`
  *  (`ps`, `stop`, `attach`, `spawn --detach`), with `instanceId` set to what the operator typed, if
@@ -206,16 +205,32 @@ export interface ManagerPin {
   instanceId?: string;
 }
 
+/** `--on <instance>`: address ONE manager instance instead of the class queue. Shared by
+ *  ps/stop/attach/input/describe so they cannot drift. For stop and attach it is the seat-locality
+ *  escape hatch: the manager that can act on a seat is the one HOSTING it, which is not necessarily
+ *  the one that wins the class queue. */
+export const onFlag = { name: "on", type: "string", value: "<instance>", description: "target a specific manager instance id (multi-manager space); default = class anycast; `ps`'s instance id, not the roster's `local.…` principal id" } as const satisfies FlagSpec;
+
 /** Read `--on` at the site that declares it. Absent stays absent (class rails). An EMPTY value
  *  (`--on=`, `--on ""`, or `--on "$INSTANCE"` with the variable unset) is refused here, up front:
  *  it is falsy, so every `if (on)` branch would treat it as absent and drop the pin (a `stop` would
  *  fall through to seat locality, an open-mesh `ps` to the scatter), while the mint and core's
  *  route builder treat it as PRESENT and refuse it as an invalid token. Two answers for one input;
- *  a dropped pin is a silent fallback, so neither branch gets to see it. */
+ *  a dropped pin is a silent fallback, so neither branch gets to see it. A non-empty value is also
+ *  shape-checked here now, against core's own lifecycle-token grammar: the mint's bare grammar
+ *  error named neither the identifier `--on` wants nor where to read it, which cost operators
+ *  spawn attempts on a format mismatch (#423). */
 export function onInstanceOrExit(on: string | undefined, verb: string): string | undefined {
   if (on === undefined) return undefined;
   if (on === "") {
     console.error(c.red(`✗ --on requires a manager instance id (the whole id, as \`cotal ps\` prints it): \`${verb} --on <instance>\`. An empty value is refused, not dropped`));
+    process.exit(1);
+  }
+  try {
+    assertLifecycleToken(on, "instanceId");
+  } catch (e) {
+    const principalClause = on.startsWith("local.") ? `; "${on}" is a principal id` : "";
+    console.error(c.red(`✗ ${(e as Error).message}. --on wants the manager INSTANCE id as \`cotal ps\` prints it (the \`manager <id>\` header in a multi-manager space, the \`instance <id>\` fact under \`cotal ps --wide\`), not the roster's principal id (\`local.U…\`, as \`cotal endpoints\` shows it)${principalClause}: \`${verb} --on <instance>\``));
     process.exit(1);
   }
   return on;
@@ -242,8 +257,12 @@ export function onInstanceOrExit(on: string | undefined, verb: string): string |
  *  A failure that is not an {@link EpEnvelopeError} carries no answer provenance at all, so no verdict
  *  is stated for it either: its message stands alone. */
 export function epRailFailure(e: unknown, pin?: ManagerPin): ManagerReply {
-  const instanceId = pin?.instanceId;
   if (!(e instanceof EpEnvelopeError)) return { ok: false, unanswered: false, error: e instanceof Error ? e.message : String(e) };
+  return { ...controlReplyFromThrown(e, epRailMessage(e, pin)), unanswered: unansweredRequest(e) };
+}
+
+function epRailMessage(e: EpEnvelopeError, pin?: ManagerPin): string {
+  const instanceId = pin?.instanceId;
   const detail = `${e.code}: ${e.message}`;
   if (unansweredRequest(e)) {
     // The verdict is SCOPED TO THE RAIL the request rode (SPEC 13.15). The legacy and versioned rails are
@@ -260,17 +279,19 @@ export function epRailFailure(e: unknown, pin?: ManagerPin): ManagerReply {
     // was simply down to go and check a version.
     const skew = versioned === undefined ? "" :
       ` The ${versioned} and legacy ep rails are disjoint at the broker (SPEC 13.15) and an endpoint must serve both, so this does not tell no manager running apart from one older than ${versioned}, which serves ep only and cannot answer here. Check whether a manager is running, and if it is, its version.`;
-    return {
-      ok: false, unanswered: true,
-      error: instanceId !== undefined
-        ? `manager instance ${instanceId} did not answer${versioned === undefined ? "" : ` on the ${versioned} rail`} (${detail})${skew}`
-        : versioned === undefined
-          ? `no manager reachable on the ep rails (${detail})`
-          : `no manager answered on the ${versioned} rail (${detail})${skew}`,
-    };
+    return instanceId !== undefined
+      ? `manager instance ${instanceId} did not answer${versioned === undefined ? "" : ` on the ${versioned} rail`} (${detail})${skew}`
+      : versioned === undefined
+        ? `no manager reachable on the ep rails (${detail})`
+        : `no manager answered on the ${versioned} rail (${detail})${skew}`;
   }
   if (registryReadFailed(e))
-    return { ok: false, unanswered: false, error: `the manager registry could not be read: a broker read on this side, not the managers' silence, and they may all be up. Retry; if it persists, look at the broker's JetStream (${detail})` };
+    return `the manager registry could not be read: a broker read on this side, not the managers' silence, and they may all be up. Retry; if it persists, look at the broker's JetStream (${detail})`;
+  // This CLI built the args for a manager of its own release, and the two release in lockstep, so a
+  // key the manager's contract does not declare means the manager runs a different release.
+  const undeclared = undeclaredArg(e);
+  if (undeclared !== undefined)
+    return `${detail}. That is version skew: this CLI runs Cotal ${cliVersion()} and sends "${undeclared}", which the manager's contract does not declare. Run the manager at Cotal ${cliVersion()}, or use a CLI at the manager's version`;
   // The unpinned class-queue split. Core says a call that addresses one instance does not split
   // and stops there (a CLI flag name does not belong in a core error). The flag is named here only
   // when the CALLER declared it has one (`pin` present) and did not pass it: an absent `pin` is a
@@ -278,7 +299,7 @@ export function epRailFailure(e: unknown, pin?: ManagerPin): ManagerReply {
   // A marked `expired` is the other producer (a stale-epoch bind) and its remedy is re-resolving,
   // so the flag is offered only for the split.
   const unpinnedSplit = e.code === "failed-precondition" && respondedButUnbound(e) && pin !== undefined && instanceId === undefined;
-  return { ok: false, unanswered: false, error: `${detail}${unpinnedSplit ? " Pin one manager instance with --on <instance> (the whole id, as `ps` prints it) to avoid the split." : ""}` };
+  return `${detail}${unpinnedSplit ? " Pin one manager instance with --on <instance> (the whole id, as `ps` prints it) to avoid the split." : ""}`;
 }
 
 /** Send one control command to the manager over the v0.4 service-endpoint rails and disconnect —
@@ -341,7 +362,7 @@ export type ScatterReply = { ok: true; instances: ScatterInstanceReply[] } | { o
  *  the scatter's TWO connections cannot drift in their connect options: they differ in credential
  *  and in nothing else. The selected dialer matters because the raw node transport refuses a
  *  `wss://` mesh behind an HTTPS edge even when the other endpoint rails can reach it. */
-async function withControlConnection<T>(server: string, auth: ControlAuth, fn: (nc: NatsConnection) => Promise<T>): Promise<T> {
+export async function withControlConnection<T>(server: string, auth: ControlAuth, fn: (nc: NatsConnection) => Promise<T>): Promise<T> {
   const nc = await dialerFor(server)({
     servers: server,
     ...standaloneConnectOpts(auth.creds ? { creds: auth.creds, tls: auth.tls === true } : auth.bearer ? { bearer: auth.bearer, sentinelCreds: auth.sentinelCreds, tls: auth.tls === true } : { tls: auth.tls === true }),

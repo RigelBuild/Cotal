@@ -2,12 +2,24 @@
  * Private-by-owner file/dir helpers — the one place secret material (creds, signing keys, the
  * transient MCP config) is written so it is readable ONLY by the current user.
  *
- * On POSIX `writeFileSync(…, { mode: 0o600 })` does this. On Windows the Unix mode is a NO-OP — Node
- * honors only the write bit — so a secret written that way inherits its parent's ACL and can be
- * world-readable (e.g. a `.cotal/auth` under a project on a permissive path). The fix is to harden
- * the NTFS ACL explicitly with the built-in `icacls` (no new dependency). See {@link hardenPrivate}.
+ * On POSIX mode 0o600 does this, set on the open file before the bytes land. On Windows the Unix
+ * mode is a NO-OP — Node honors only the write bit — so a secret written that way inherits its
+ * parent's ACL and can be world-readable (e.g. a `.cotal/auth` under a project on a permissive
+ * path). The fix is to harden the NTFS ACL explicitly with the built-in `icacls` (no new
+ * dependency). See {@link hardenPrivate}.
  */
-import { chmodSync, linkSync, lstatSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  fchmodSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 
@@ -39,7 +51,7 @@ const BROAD_SIDS = ["S-1-1-0", "S-1-5-11", "S-1-5-32-545"] as const;
 /**
  * Lock a file or directory down to the current user (+ SYSTEM + Administrators) only.
  *
- * POSIX: `chmod` (0o600 file / 0o700 dir) — a belt-and-braces reassert of the create-time mode.
+ * POSIX: `chmod` (0o600 file / 0o700 dir), which also tightens a path that already existed.
  * win32: harden the NTFS ACL with `icacls`: `/inheritance:r` drops inherited ACEs; `/remove:g` drops
  * any pre-existing EXPLICIT broad grant (Everyone / Authenticated Users / Users) that `/grant:r`
  * alone would leave intact (e.g. on a pre-planted or pre-existing target); `/grant:r` then sets ONLY
@@ -79,14 +91,27 @@ export function hardenPrivate(path: string, kind: "file" | "dir"): void {
 }
 
 /**
- * Write a private secret file: the bytes (mode 0o600 at create on POSIX), then {@link hardenPrivate}
- * for the win32 ACL. FAIL-CLOSED — if hardening throws, the hardening error propagates (the caller
- * never proceeds as if the secret were safe) and the just-written file is best-effort deleted so it
- * isn't left readable.
+ * Write a private secret file: mode 0o600 on the descriptor before the bytes, whether or not the
+ * name already existed, then {@link hardenPrivate} for the win32 ACL. FAIL-CLOSED — if hardening
+ * throws, the hardening error propagates (the caller never proceeds as if the secret were safe) and
+ * the just-written file is best-effort deleted so it isn't left readable.
  */
 export function writeSecretFile(path: string, data: string | Buffer): void {
-  writeFileSync(path, data, { mode: 0o600 });
-  if (!isWin) return; // POSIX mode set at create, nothing more to do
+  writePrivate(path, data, "w");
+}
+
+/** The fail-closed write {@link writeSecretFile} documents, with the open flag as a parameter so
+ *  {@link writeSecretFileCreateOnlyRaw} can pass `wx`. */
+function writePrivate(path: string, data: string | Buffer, flag: "w" | "wx"): void {
+  const fd = openSync(path, flag, 0o600);
+  try {
+    // The open mode applies only when the open creates the file; an existing one keeps its own.
+    fchmodSync(fd, 0o600);
+    writeFileSync(fd, data);
+  } finally {
+    closeSync(fd);
+  }
+  if (!isWin) return;
   try {
     hardenPrivate(path, "file");
   } catch (e) {
@@ -143,16 +168,7 @@ export function writeSecretFileAtomic(path: string, data: string | Buffer): void
  * one syscall and is what picks the winner.
  */
 function writeSecretFileCreateOnlyRaw(path: string, data: string | Buffer): void {
-  // WIN32 ONLY, and deliberately so. Measured on POSIX: `O_EXCL` already refuses a plain file, a
-  // directory AND a dangling symlink with EEXIST, materialising nothing, so a pre-check there
-  // would add a check-then-act step that buys nothing and can only weaken the guarantee. Windows
-  // is the platform where `O_EXCL` RESOLVES a reparse point and creates its target, which would
-  // land bytes at a name the caller never asked for; `lstatSync` reports the link rather than its
-  // target, so the name is refused before anything is written.
-  //
-  // This never decides a concurrent create. Two creators that both see the name free still both
-  // reach `O_EXCL` below, and O_EXCL, one syscall, is what picks the winner. The check only ever
-  // converts a would-be write-through into the EEXIST the caller already handles.
+  // Deliberately win32 only, for the reason the doc comment gives.
   if (isWin) {
     let exists = true;
     try {
@@ -167,31 +183,18 @@ function writeSecretFileCreateOnlyRaw(path: string, data: string | Buffer): void
       throw taken;
     }
   }
-  writeFileSync(path, data, { flag: "wx", mode: 0o600 });
-  if (!isWin) return; // POSIX mode set at create, nothing more to do
-  try {
-    hardenPrivate(path, "file");
-  } catch (e) {
-    try {
-      unlinkSync(path); // best-effort cleanup; the hardening error below is what the caller sees
-    } catch {
-      /* ignore: surface the original hardening failure, not a secondary unlink error */
-    }
-    throw e;
-  }
+  writePrivate(path, data, "wx");
 }
 
 /**
  * Publish a completed temp inode at its final name. Separated from {@link writeSecretFileCreateOnly}
  * because the hard-link primitive is the one part of exclusive create whose AVAILABILITY is
- * platform-dependent: some Windows volumes and some network filesystems reject `link` outright, and
- * the caller must then fall back to `O_EXCL` on the destination. Naming that seam also makes the
- * fallback branch reachable from a suite, so the Windows-side primitive can carry a refusing case
- * instead of being the one accepting branch nothing grades.
+ * platform-dependent: some Windows volumes and some network filesystems reject `link` outright.
+ * Naming that seam makes the refusal reachable from a suite.
  */
 let publishLink: (from: string, to: string) => void = linkSync;
 
-/** Test-only: drive the `link`-unavailable fallback, which no POSIX CI host can reach naturally.
+/** Test-only: drive the `link`-unavailable refusal, which no POSIX CI host can reach naturally.
  *  Pass `undefined` to restore. Not exported from the package index. */
 export function __setPublishLinkForTest(fn: ((from: string, to: string) => void) | undefined): void {
   publishLink = fn ?? linkSync;
@@ -208,8 +211,9 @@ export function __setPublishLinkForTest(fn: ((from: string, to: string) => void)
  * the identity it minted in memory. Exclusive create is the mutual-exclusion primitive; atomic
  * replace is not.
  *
- * When the filesystem cannot hard-link (some Windows volumes), the fallback is `wx`
- * (`O_CREAT|O_EXCL`) on `path` itself, which is still exclusive create, not a replace.
+ * When the filesystem cannot hard-link (some Windows volumes or network filesystems), the function
+ * refuses rather than falling back to an in-place create, so a concurrent reader is never exposed
+ * to a partially written file.
  *
  * The TEMP write is exclusive for the same reason the publish is. A temp name is unique only by
  * probability (pid plus clock plus `Math.random`), and probability is not a concurrency argument:
@@ -229,10 +233,13 @@ export function writeSecretFileCreateOnly(path: string, data: string | Buffer): 
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
       if (code === "ENOTSUP" || code === "EPERM" || code === "ENOSYS") {
-        writeSecretFileCreateOnlyRaw(path, data);
-      } else {
-        throw e;
+        const err: NodeJS.ErrnoException = new Error(
+          `atomic-publish-unsupported: filesystem at '${path}' cannot publish a file atomically (${code})`,
+        );
+        err.code = code;
+        throw err;
       }
+      throw e;
     }
   } catch (e) {
     try {

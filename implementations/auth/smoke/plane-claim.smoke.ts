@@ -32,7 +32,7 @@ import { createSpaceAuth, epAuthBucket, isReachable, serverConfig, type Eviction
 import { openAuthorityClient, authorityBarrierGrants } from "../src/authority-client.js";
 import { openAuthLedgerScannerCandidate, makeLedgerScannerOverConnection } from "../src/ledger-scanner.js";
 import { openRecordsScannerCandidate } from "../src/records-scanner.js";
-import { acquirePlaneClaim, parsePlaneClaimRow, scannerDeathCopy, PLANE_CLAIM_KEY, type PlaneLivenessOracle } from "../src/plane-claim.js";
+import { acquirePlaneClaim, parsePlaneClaimRow, planeClaimRefusal, scannerDeathCopy, PLANE_CLAIM_KEY, type PlaneLivenessOracle } from "../src/plane-claim.js";
 import { openAuthAuthorityPlane } from "../src/service.js";
 import type { EvictPrincipal } from "../src/credential-ledger.js";
 import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
@@ -49,8 +49,8 @@ const space = `plcl-${randomUUID().slice(0, 8)}`;
 const auth = await createSpaceAuth(space);
 const tmp = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
 writeFileSync(join(tmp, "server.conf"), serverConfig(auth, [auth], { transport: { kind: "plaintext" }, port: PORT, storeDir: join(tmp, "js") }));
-const srv = spawn("nats-server", ["-c", join(tmp, "server.conf")], { stdio: "ignore" });
-const releaseBroker = teardownOnSignal(srv, tmp);
+let srv = spawn("nats-server", ["-c", join(tmp, "server.conf")], { stdio: "ignore" });
+let releaseBroker = teardownOnSignal(srv, tmp);
 const dataAccount = { pub: auth.account.pub, signingSeed: auth.account.signingSeed };
 const quiet = () => {};
 
@@ -91,9 +91,14 @@ if (!up) throw new Error(`nats-server did not come up on ${PORT}`);
 
 // A wide harness writer: store ensure + direct KV manipulation (claim steal / corruption).
 const wide = await openAuthorityClient({ server: SERVERS, space, dataAccount, label: `harness:${space}`, grants: (id) => (void id, { publish: [">"], subscribe: [`_INBOX_${id}.>`] }), log: quiet });
-const { ensureAuthorityStores } = await import("@cotal-ai/core");
+const { ensureAuthorityStores, createEndpointStreams } = await import("@cotal-ai/core");
 const { jetstreamManager } = await import("@nats-io/jetstream");
 await ensureAuthorityStores(await jetstreamManager(wide.nc), new Kvm(wide.nc), space);
+// The plane's own boot only ensures the AUTHORITY stores; the CONTRACT store (`EPC_<space>`,
+// created by `createEndpointStreams`) is created by production space setup (`up`'s `postStart`)
+// before the plane opens. Section H opens the real plane on this space, so this fixture stands
+// in for that setup step, once, before the first `openAuthAuthorityPlane(` call below.
+await createEndpointStreams(await jetstreamManager(wide.nc), new Kvm(wide.nc), space);
 const wideKv = await new Kvm(wide.nc).open(epAuthBucket(space));
 
 const openCands = async () => ({
@@ -182,9 +187,12 @@ try {
     const scan = makeLedgerScannerOverConnection(wide.nc, space, undefined, h.guard);
     const refusedTuple = await rejects(() => scan.scanStageFamily());
     check("a tuple-only mutation (same claimId + generation) REFUSES the scan", refusedTuple.includes("scanner tuples no longer match"));
-    await h.release();
+    const notReleased = await rejects(() => h.release());
     const after = await wideKv.get(PLANE_CLAIM_KEY);
-    check("release LEAVES a tuple-mutated row alone (a successor may own it)", parsePlaneClaimRow(after!.value)?.state === "held");
+    check("release REFUSES a tuple-mutated row and leaves it alone (a successor may own it)", notReleased.includes("NOT releasing") && parsePlaneClaimRow(after!.value)?.state === "held");
+    let lostReason: string | undefined;
+    try { await h.release(); } catch (e) { lostReason = planeClaimRefusal(e); }
+    check("a lost claim carries a nonretryable typed refusal", lostReason === "lost");
     await cands.ledger.close();
     await cands.records.close();
   }
@@ -209,6 +217,74 @@ try {
     await cands2.records.close();
     await h2.release();
     await b3.close();
+  }
+  // ---- F2. a failed release remains retryable after the broker comes back ----
+  console.log("F2. release after a broker disconnect");
+  {
+    const b = await openBarrier();
+    const cands = await openCands();
+    const h = await acquirePlaneClaim({ nc: b.nc, space, ledger: cands.ledger.tuple, records: cands.records.tuple, oracle: neverOracle, log: quiet });
+    await cands.ledger.close();
+    await cands.records.close();
+    srv.kill("SIGTERM");
+    await new Promise<void>((resolve) => srv.once("exit", () => resolve()));
+    let releaseError: unknown;
+    try { await h.release(); } catch (e) { releaseError = e; }
+    check("release refuses when the real KV broker is unreachable with a retryable reason",
+      releaseError instanceof Error && planeClaimRefusal(releaseError) === "release-unreachable");
+    releaseBroker();
+    srv = spawn("nats-server", ["-c", join(tmp, "server.conf")], { stdio: "ignore" });
+    releaseBroker = teardownOnSignal(srv, tmp);
+    let restored = false;
+    for (let i = 0; i < 100; i++) {
+      if (await isReachable(SERVERS)) { restored = true; break; }
+      await wait(100);
+    }
+    if (!restored) throw new Error("nats-server did not restart");
+    let clientsRestored = false;
+    for (let i = 0; i < 100; i++) {
+      try { await Promise.all([wide.nc.flush(), b.nc.flush()]); clientsRestored = true; break; }
+      catch { await wait(100); }
+    }
+    if (!clientsRestored) throw new Error("plane-claim KV clients did not reconnect");
+    const held = await wideKv.get(PLANE_CLAIM_KEY);
+    check("a failed release leaves the actual KV claim held", held !== null && parsePlaneClaimRow(held.value)?.state === "held");
+    let retryError: unknown;
+    try { await h.release(); } catch (e) { retryError = e; }
+    const released = await wideKv.get(PLANE_CLAIM_KEY);
+    check("the same hold retries release after reconnect and the KV row becomes released",
+      retryError === undefined && released !== null && parsePlaneClaimRow(released.value)?.state === "released", retryError);
+    await b.close();
+  }
+  {
+    const b = await openBarrier();
+    const cands = await openCands();
+    const h = await acquirePlaneClaim({ nc: b.nc, space, ledger: cands.ledger.tuple, records: cands.records.tuple, oracle: verdictOracle("gone", "gone", true), log: quiet });
+    await cands.ledger.close();
+    await cands.records.close();
+    const before = await wideKv.get(PLANE_CLAIM_KEY);
+    const first = h.release();
+    const second = h.release();
+    const settled = await Promise.allSettled([first, second]);
+    const after = await wideKv.get(PLANE_CLAIM_KEY);
+    check("concurrent release calls share one flight and write the KV row once",
+      first === second && settled.every((r) => r.status === "fulfilled") && before !== null && after !== null && after.revision === before.revision + 1);
+    await b.close();
+  }
+  {
+    const b = await openBarrier();
+    const cands = await openCands();
+    const h = await acquirePlaneClaim({ nc: b.nc, space, ledger: cands.ledger.tuple, records: cands.records.tuple, oracle: neverOracle, log: quiet });
+    await cands.ledger.close();
+    await cands.records.close();
+    const entry = (await wideKv.get(PLANE_CLAIM_KEY))!;
+    const owned = parsePlaneClaimRow(entry.value)!;
+    await wideKv.update(PLANE_CLAIM_KEY, enc.encode(JSON.stringify({ ...owned, state: "released" })), entry.revision);
+    const before = (await wideKv.get(PLANE_CLAIM_KEY))!.revision;
+    await h.release();
+    check("release accepts its own already-released row without another KV write",
+      (await wideKv.get(PLANE_CLAIM_KEY))!.revision === before);
+    await b.close();
   }
   // Corruption: garbage bytes refuse loudly and are NEVER overwritten.
   {
@@ -258,13 +334,13 @@ try {
     const logs: string[] = [];
     let kills: { ledger: () => Promise<void>; records: () => Promise<void> } | undefined;
     const plane1 = await openAuthAuthorityPlane({
-      server: SERVERS, space, dir, dataAccount, log: (l) => logs.push(l),
+      server: SERVERS, space, dir, identityRoot: dir, dataAccount, log: (l) => logs.push(l),
       probeEvictor: okEvictor, probePlaneOracle: neverOracle, probePlaneDeath: (k) => { kills = k; },
     });
     check("the real plane opens over the released row without an oracle round", logs.some((l) => l.includes("plane-claim: space")));
     // A second same-space plane: its adjudication sees plane1's LIVE scanners.
     const dual = await rejects(() => openAuthAuthorityPlane({
-      server: SERVERS, space, dir, dataAccount, log: quiet,
+      server: SERVERS, space, dir, identityRoot: dir, dataAccount, log: quiet,
       probeEvictor: okEvictor, probePlaneOracle: verdictOracle("live", "live", true),
     }));
     check("a second same-space plane REFUSES with the live-peer copy", dual.includes("another auth plane already owns"));
@@ -285,11 +361,31 @@ try {
     await plane1.close();
     // The successor takes over cleanly (the fenced plane released on close; no oracle needed).
     const plane2 = await openAuthAuthorityPlane({
-      server: SERVERS, space, dir, dataAccount, log: quiet,
+      server: SERVERS, space, dir, identityRoot: dir, dataAccount, log: quiet,
       probeEvictor: okEvictor, probePlaneOracle: neverOracle,
     });
     check("a successor plane opens cleanly after the fenced plane's close", true);
     await plane2.close();
+    const plane3 = await openAuthAuthorityPlane({
+      server: SERVERS, space, dir, identityRoot: dir, dataAccount, log: quiet,
+      probeEvictor: okEvictor, probePlaneOracle: neverOracle,
+    });
+    srv.kill("SIGTERM");
+    await new Promise<void>((resolve) => srv.once("exit", () => resolve()));
+    const failedClose = await rejects(() => plane3.close());
+    check("the hosted plane close refuses while its claim cannot be released", failedClose.includes("release for space"));
+    releaseBroker();
+    srv = spawn("nats-server", ["-c", join(tmp, "server.conf")], { stdio: "ignore" });
+    releaseBroker = teardownOnSignal(srv, tmp);
+    let restored = false;
+    for (let i = 0; i < 100; i++) {
+      try { await wide.nc.flush(); restored = true; break; }
+      catch { await wait(100); }
+    }
+    if (!restored) throw new Error("harness KV client did not reconnect");
+    check("hosted failed close still leaves its claim held", parsePlaneClaimRow((await wideKv.get(PLANE_CLAIM_KEY))!.value)?.state === "held");
+    const retryClose = await rejects(() => plane3.close());
+    check("hosted plane close retries its release after reconnect", retryClose === "" && parsePlaneClaimRow((await wideKv.get(PLANE_CLAIM_KEY))!.value)?.state === "released", retryClose);
   }
 } finally {
   await wide.close();

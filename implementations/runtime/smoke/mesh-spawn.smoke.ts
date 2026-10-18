@@ -264,7 +264,7 @@ const mappings = new Map<string, { lifecycleUid: string; mappingRevision: number
 const gone = new Set<string>();                          // despawned lifecycleUids → not-found on re-despawn
 /** Scripted per-persona outcome; default is a prompt `succeeded`. `readinessMs` narrows the
  *  accepted window (an uncertain settle is refused before the window elapses, SPEC 13.6). */
-const OUTCOME: Record<string, { state: "succeeded" | "failed" | "uncertain"; error?: string; reason?: string; delayMs?: number; readinessMs?: number }> = {};
+const OUTCOME: Record<string, { state: "succeeded" | "failed" | "uncertain"; error?: string; reason?: string; delayMs?: number; readinessMs?: number; floorUid?: string }> = {};
 const terminals: Promise<void>[] = [];
 let seat = 0;
 
@@ -316,12 +316,12 @@ const spawnHandler = async (ctx: EpServeContext): Promise<unknown> => {
   const uid = `s${String(seat).padStart(25, "0")}`;
   allocations.push({ goalId, name, owner: "local", actor, uid, persona });
   mappings.set(`local.${actor}`, { lifecycleUid: uid, mappingRevision: 1 });
+  const script = OUTCOME[persona] ?? { state: "succeeded" as const };
   const acceptance = {
-    name, owner: "local", actor, uid, goalId, fingerprint, readinessDeadlineMs: readinessMs,
+    name, owner: "local", actor, uid: script.floorUid ?? uid, goalId, fingerprint, readinessDeadlineMs: readinessMs,
     executor: { lifecycleUid: MGR_IID, epoch: EXEC_EPOCH },
   };
   acceptances.set(goalId, acceptance);
-  const script = OUTCOME[persona] ?? { state: "succeeded" as const };
   terminals.push((async () => {
     if (script.delayMs !== undefined) await wait(script.delayMs);
     if (script.state === "uncertain") {
@@ -559,6 +559,29 @@ const journalEntries = async (runId: string, kind: string): Promise<JournalEntry
     bound?.external?.goalId === bound?.requestId && bound?.external?.name === alloc?.name
       && bound?.external?.actor === alloc?.actor && bound?.external?.uid === alloc?.uid,
     JSON.stringify(bound?.external));
+}
+
+// Historical hosted enrollment could replace the provisional floor after acceptance. Drive the
+// stock interpreter and journal against both wire replies rather than construct a discharge entry.
+{
+  console.log("• U4-5 — successful terminal identity wins over a provisional acceptance floor");
+  const provisional = "p".repeat(26);
+  OUTCOME.enrolled = { state: "succeeded", floorUid: provisional };
+  const before = despawns.length;
+  const out = await withDeadline(driven({
+    space: SPACE, endpoint: EP, kv, runId: "sp-u4-terminal", lease: lease(),
+    source: 'await spawn("enrolled");', handler: mk("sp-u4-terminal"),
+  }), 30_000, "the terminal-lifecycle run");
+  const alloc = allocations.find((a) => a.persona === "enrolled");
+  const entries = await journalEntries("sp-u4-terminal", "spawn");
+  const floor = entries.filter((e) => e.state === "pending" && e.external?.uid !== undefined).at(-1);
+  c("U4-5 stock journal records a provisional floor distinct from the succeeded handle",
+    floor?.external?.uid === provisional && alloc !== undefined && alloc.uid !== provisional
+      && entries.some((e) => e.state === "settled" && (e.result as { agent?: string } | undefined)?.agent === `${alloc.name}#${alloc.uid}`));
+  c("U4-5 completion releases the succeeded terminal lifecycle, never the provisional floor",
+    out?.status === "completed" && alloc !== undefined
+      && despawns.slice(before).some((d) => d.lifecycleUid === alloc.uid && d.actor === alloc.actor)
+      && !despawns.slice(before).some((d) => d.lifecycleUid === provisional), despawns.slice(before));
 }
 
 // ── 3b) explicit placement launches in the prepared repository and resumes in place ───────────
@@ -1235,12 +1258,12 @@ log("winner", out.index);
     20_000, "the adopted spawn's resume");
   c("a resume of the adopted spawn after its bind re-reads the adopted goal and submits nothing",
     reentered?.agent === handle && spawnInvokes.length === invokesBeforeResume, { got: reentered?.agent, want: handle, invokes: spawnInvokes.length - invokesBeforeResume });
-  // AND ITS DISCHARGE RELEASES THE SEAT. A cancelled adopted spawn holds a seat whose goal was never
-  // minted under this step's request id; the discharge despawns by the goal the entry bound.
-  const despawnsBefore = despawns.length;
-  await withDeadline(mk("sp-10d").discharge([bound!]).then(() => "ok", (e: unknown) => `threw: ${String((e as Error)?.message).slice(0, 120)}`), 30_000, "the adopted spawn's discharge");
-  c("a cancelled adopted spawn's discharge despawns the seat it holds, by the bound goal",
-    despawns.slice(despawnsBefore).some((d) => d.lifecycleUid === alloc?.uid), { despawned: despawns.slice(despawnsBefore), want: alloc?.uid });
+  // AND THE SEAT IS RELEASED BY THE BOUND GOAL. An adopted spawn holds a seat whose goal was never
+  // minted under this step's request id. The completed run already released it by the goal the
+  // entry bound, so a later discharge of the same entry finds it gone and tolerates that.
+  const discharged = await withDeadline(mk("sp-10d").discharge([bound!]).then(() => "ok", (e: unknown) => `threw: ${String((e as Error)?.message).slice(0, 120)}`), 30_000, "the adopted spawn's discharge");
+  c("an adopted spawn's seat is despawned by the bound goal, and a second discharge tolerates it gone",
+    discharged === "ok" && despawns.filter((d) => d.lifecycleUid === alloc?.uid).length === 1, { discharged, despawned: despawns.filter((d) => d.lifecycleUid === alloc?.uid), want: alloc?.uid });
 
   // --release: the same edit, the seat torn down at commit through the run's own discharge.
   OUTCOME.leaver = { state: "succeeded" };
@@ -1311,7 +1334,7 @@ log("winner", out.index);
 await serve2.stop();
 await Promise.allSettled(terminals);
 await nc.drain().catch(() => undefined);
-const EXPECTED_CELLS = 70;
+const EXPECTED_CELLS = 72;
 const ran = ok + fail;
 console.log(`mesh-spawn.smoke: ${ok} passed, ${fail} failed`);
 if (ran !== EXPECTED_CELLS) {

@@ -25,11 +25,12 @@ import {
   UnwalkableScope,
   messageOf,
   InterpreterDefect,
+  isStackExhaustion,
 } from "./errors.js";
 export { RunDivergence, RuntimeFault, ScopeBranchMissing, UnwalkableScope } from "./errors.js";
 import { KeyScope, digest, programHashOf, requestId, scopePathString, stepKeyString, type PathKind, type ScopeKind, type StepKey } from "./keys.js";
 import { Journal, JournalAppendRejected, RunClock, type EntryError } from "./journal.js";
-import { NotCrossable, Prng, assertCrossable, birthDepth, born, deepFreeze, setOwn } from "./values.js";
+import { NotCrossable, Prng, assertCrossable, assertWritable, born, crossedWrite, deepFreeze, setOwn, type WritingFrame } from "./values.js";
 import { parseDuration } from "./duration.js";
 import { PRIMITIVES, VALUE_NAMES, type EffectKind } from "./primitives.js";
 import { arrayMethods, builtins, numberMethods, stringMethods, type Callable, type Method } from "./library.js";
@@ -38,6 +39,7 @@ import { bindPins, resolvePins, WALKER_LANGUAGE_VERSION, type RunPins } from "./
 import {
   dispatchPrimitive,
   freeConstructors,
+  onceBodyNotCallable,
   option,
   performEffect,
   performScope,
@@ -113,8 +115,9 @@ class Env {
    * branch the validator cannot resolve to a function node — one that arrives through a parameter
    * or a computed record — is not proven, and banning that shape outright would cost more than the
    * hazard. So the depth travels with the binding: a write from inside a concurrent branch to a
-   * binding declared OUTSIDE it is refused where it happens. `conclave` does not raise the depth,
-   * because its single body has nothing to race.
+   * binding declared OUTSIDE it is refused where it happens. `once` and `conclave` raise it too,
+   * though their single body has nothing to race, because a settled one is replayed without
+   * entering its body.
    */
   constructor(
     readonly parent: Env | null,
@@ -170,7 +173,7 @@ class Env {
     return this.find(name) !== undefined;
   }
 
-  set(name: string, value: unknown, atDepth: number): void {
+  set(name: string, value: unknown, frame: WritingFrame): void {
     const owner = this.owner(name);
     if (owner === undefined) throw new RuntimeFault("L2001", `${name} is not defined`);
     const b = owner.names.get(name) as Binding;
@@ -181,23 +184,11 @@ class Env {
       );
     }
     if (!b.mutable) throw new RuntimeFault("L2003", `${name} is declared const`);
-    if (owner.depth < atDepth) {
-      throw new RuntimeFault(
-        "L2032",
-        `${name} is declared outside this concurrent branch and written inside it. Live, the branches write in completion order; on resume the recorded effects return instantly and they write in launch order, so ${name} holds a different value and the run takes a path it never recorded, with no divergence raised. Return the value from the branch and read it out of the combinator's result, or use race, which yields its winner.`,
-      );
-    }
+    if (owner.depth < frame.depth) throw crossedWrite(frame, name);
     b.value = value;
   }
 }
 
-/**
- * The message of an arbitrary thrown value.
- *
- * Reading `.message` off `null` throws, and a thrown primitive is legal in a language with `throw`,
- * so every place that has to describe a failure it did not construct goes through here. A recorded
- * entry saying "Cannot read properties of null" describes the recorder, not the run.
- */
 /** An AST subtree with its source offsets removed: what the code IS, not where it sits. */
 export function stripPositions(node: unknown): unknown {
   if (Array.isArray(node)) return node.map(stripPositions);
@@ -284,9 +275,7 @@ class Frame {
       this.keys.branch(kind, name, occurrence, branchKey),
       this.clock.fork(),
       this.signal.child(),
-      // `conclave` opens a scope but not a RACE: one body, nothing running beside it, so a write
-      // from inside it is as ordered as a write anywhere else and the depth does not move.
-      kind === "conclave" ? this.depth : this.depth + 1,
+      this.depth + 1,
     );
   }
 }
@@ -447,34 +436,11 @@ class Interpreter {
       startedAt: this.pins.startedAt,
       prng: this.prng,
       ...(this.options.onLog !== undefined ? { onLog: this.options.onLog } : {}),
-      assertWritable: (target, frame) => this.assertWritable(target, frame),
+      assertWritable,
     };
   }
 
   // ---- values: reads and writes ---------------------------------------------------------------
-
-  /**
-   * May this frame write into this container? Two refusals, and they are the whole of the value
-   * half of freeze-on-share (design D4, §3.4 rule 4):
-   *
-   * - a FROZEN value crossed an effect boundary, and what crossed is what was recorded (L2031);
-   * - a value born OUTSIDE this concurrent branch and written inside it is L2032's defect reached
-   *   through a value instead of a binding, and just as silent on resume.
-   */
-  assertWritable(target: object, frame: { readonly depth: number }): void {
-    if (Object.isFrozen(target)) {
-      throw new RuntimeFault(
-        "L2031",
-        "this value crossed an effect boundary and is frozen: what crossed is what the journal recorded, so it cannot change afterwards. Build a new value instead: `{ ...record, field: value }` or `[...list, item]`.",
-      );
-    }
-    if (birthDepth(target) < frame.depth) {
-      throw new RuntimeFault(
-        "L2032",
-        "this value was built outside this concurrent branch and is written inside it. Two branches writing one value is nondeterministic, and it is silent: live they write in completion order, on resume the recorded effects return instantly and they write in launch order, so the value differs and the run takes a path it never recorded. Build the value inside the branch and return it, and read it out of the combinator's result.",
-      );
-    }
-  }
 
   /** The property key a member expression names, as JavaScript would spell it. A computed key is
    *  held to the same no-implicit-conversion law as every other coercion site (L4018): `String(k)`
@@ -556,7 +522,7 @@ class Interpreter {
     if (obj === null || obj === undefined || typeof obj !== "object") {
       throw new RuntimeFault("L4010", `cannot write \`${prop}\` of ${obj === null ? "null" : typeof obj === "undefined" ? "undefined" : `a ${typeof obj}`}`);
     }
-    this.assertWritable(obj, frame);
+    assertWritable(obj, frame);
     if (Array.isArray(obj)) {
       if (prop === "length") {
         // `xs.length = n` truncates, as in JavaScript. A LONGER length is refused: JavaScript would
@@ -753,14 +719,18 @@ class Interpreter {
         const arg = node.argument as AnyNode;
         if (arg.type === "Identifier") {
           const name = arg.name as string;
-          const old = Number(env.get(name));
+          const current = env.get(name);
+          refuseNonNumberUpdate(current);
+          const old = current as number;
           const next = old + delta;
-          env.set(name, next, frame.depth);
+          env.set(name, next, frame);
           return prefix ? next : old;
         }
         const obj = await this.evaluate(arg.object as AnyNode, env, frame);
         const key = await this.memberKey(arg, env, frame);
-        const old = Number(this.memberOf(obj, key));
+        const current = this.memberOf(obj, key);
+        refuseNonNumberUpdate(current);
+        const old = current as number;
         const next = old + delta;
         this.writeMember(obj, key, next, frame);
         return prefix ? next : old;
@@ -822,7 +792,7 @@ class Interpreter {
 
     const read =
       left.type === "Identifier"
-        ? { get: (): unknown => env.get(left.name as string), set: (v: unknown): void => env.set(left.name as string, v, frame.depth) }
+        ? { get: (): unknown => env.get(left.name as string), set: (v: unknown): void => env.set(left.name as string, v, frame) }
         : await (async () => {
             const obj = await this.evaluate(left.object as AnyNode, env, frame);
             const key = await this.memberKey(left, env, frame);
@@ -899,7 +869,7 @@ class Interpreter {
   ): Promise<void> {
     switch (pattern.type) {
       case "Identifier":
-        if (mode === "assign") env.set(pattern.name as string, value, frame.depth);
+        if (mode === "assign") env.set(pattern.name as string, value, frame);
         else env.declare(pattern.name as string, value, mode === "let");
         return;
       case "MemberExpression": {
@@ -1000,7 +970,7 @@ class Interpreter {
 
     // Concurrency combinators take their branches unevaluated: the thunks must run inside their
     // own frames, so evaluating them here would defeat the whole point.
-    if (spec.opensScope) return await this.callScope(name, argNodes, env, frame);
+    if (spec.scope !== null) return await this.callScope(name, spec.scope, argNodes, env, frame);
 
     const args: unknown[] = [];
     for (const a of argNodes) args.push(await this.evaluate(a, env, frame));
@@ -1038,6 +1008,11 @@ class Interpreter {
       );
   }
 
+  /** An options-bag field, read the way the shared scope machinery reads one. */
+  private option(bag: unknown, key: string): unknown {
+    return option(bag, key);
+  }
+
   /**
    * The concurrency combinators.
    *
@@ -1046,17 +1021,12 @@ class Interpreter {
    * the same named effect cannot race for a counter, and replay reproduces both regardless of
    * which one finished first.
    */
-  /** An options-bag field, read the way the shared scope machinery reads one. */
-  private option(bag: unknown, key: string): unknown {
-    return option(bag, key);
-  }
-
-  async callScope(name: string, argNodes: AnyNode[], env: Env, frame: Frame): Promise<unknown> {
+  async callScope(name: string, scopeKind: ScopeKind, argNodes: AnyNode[], env: Env, frame: Frame): Promise<unknown> {
     const spec = PRIMITIVES[name];
     if (spec === undefined) throw new RuntimeFault("L2001", `${name} is not a primitive`);
-    const scopeKind = name as ScopeKind;
 
     const first = await this.evaluate(argNodes[0] as AnyNode, env, frame);
+    if (name === "once" && typeof first !== "function") throw onceBodyNotCallable();
     const bagNode = argNodes[spec.optionsAt];
     const bag = bagNode === undefined ? undefined : await this.evaluate(bagNode, env, frame);
     const scopeName = (this.option(bag, "name") as string | undefined) ?? null;
@@ -1246,7 +1216,8 @@ class Interpreter {
           e instanceof RunHeld ||
           e instanceof RunDivergence ||
           e instanceof ScopeBranchMissing ||
-          e instanceof UnwalkableScope;
+          e instanceof UnwalkableScope ||
+          isStackExhaustion(e);
         // JavaScript's completion semantics, which the one-`try` shape this replaced could not
         // express (measured: `try { return 1; } finally { return 2; }` returned 1): the finalizer
         // always runs for ordinary completions, and an ABRUPT finalizer completion — a return, a
@@ -1354,17 +1325,6 @@ function declaredNames(pattern: AnyNode): string[] {
   return out;
 }
 
-/**
- * The binary operators, with JavaScript's meaning ON PRIMITIVES. `"a" + 1`, `true + 1` and
- * `null + 1` mean here exactly what they mean in JavaScript — primitive coercion is pure and
- * deterministic. A record, an array or a function operand is refused (L4018), a declared
- * difference: JavaScript would reach for the host's ToPrimitive machinery, which reads `valueOf`/
- * `toString` off the value — own fields a program can set to its OWN closures. Measured before the
- * refusal: `o + 1` invoked such a closure without an interpreter frame and crashed with a raw host
- * TypeError, and without one it silently produced `"[object Object]1"`. `==` and `!=` never reach
- * this function: the validator refuses them (L1025). `===`/`!==` compare identity and take any
- * operands.
- */
 /** Refuse a container or function where a primitive is needed: there is no implicit conversion. */
 function refuseCoercion(where: string, v: unknown): void {
   if (v !== null && (typeof v === "object" || typeof v === "function")) {
@@ -1376,6 +1336,31 @@ function refuseCoercion(where: string, v: unknown): void {
   }
 }
 
+/**
+ * Refuse an update's operand (`x++`, `--o.count`) that is not already a number: the same L4018
+ * sentence the compiled engine's `case "update"` throws (`engine/ctx.ts`), so `x++`, `x + 1` and
+ * `x += 1` refuse the same operand the same way rather than one of the three quietly coercing it.
+ */
+function refuseNonNumberUpdate(v: unknown): asserts v is number {
+  if (typeof v === "number") return;
+  const kind = v === null ? "null" : Array.isArray(v) ? "an array" : `a ${typeof v}`;
+  throw new RuntimeFault(
+    "L4018",
+    `\`++\` and \`--\` count, and ${kind} is not a number, so there is nothing to count. Nothing is converted for you here: parse it first (\`number(value)\`), or hold the counter in a number.`,
+  );
+}
+
+/**
+ * The binary operators, with JavaScript's meaning ON PRIMITIVES. `"a" + 1`, `true + 1` and
+ * `null + 1` mean here exactly what they mean in JavaScript — primitive coercion is pure and
+ * deterministic. A record, an array or a function operand is refused (L4018), a declared
+ * difference: JavaScript would reach for the host's ToPrimitive machinery, which reads `valueOf`/
+ * `toString` off the value — own fields a program can set to its OWN closures. Measured before the
+ * refusal: `o + 1` invoked such a closure without an interpreter frame and crashed with a raw host
+ * TypeError, and without one it silently produced `"[object Object]1"`. `==` and `!=` never reach
+ * this function: the validator refuses them (L1025). `===`/`!==` compare identity and take any
+ * operands.
+ */
 function applyBinary(op: string, l: unknown, r: unknown): unknown {
   const a = l as number;
   const b = r as number;

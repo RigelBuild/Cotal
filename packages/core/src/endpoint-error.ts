@@ -1,5 +1,5 @@
 /**
- * The §13.3 endpoint ERROR primitives, split out NODE-FREE (P2 item 6): the catalog codes + the
+ * The §13.3 endpoint ERROR primitives, split out NODE-FREE: the catalog codes + the
  * {@link EpEnvelopeError} a consuming boundary throws. The §13.6 session rail + terminal-frame codec
  * need ONLY these, and they run in the browser console bundle — so the error must not drag in the
  * envelope's schema/digest machinery (endpoint-envelope → schema-profile computes a digest at module
@@ -123,6 +123,27 @@ export function registryReadFailed(e: unknown): boolean {
 }
 
 /**
+ * `details[].kind` for a CALLER-side refusal raised before publish because the args carry a key the
+ * resolved input contract does not declare. That contract is the one the responder serves, so the
+ * key is one this caller sends and the responder does not know. Core cannot call that version skew,
+ * since args may be typed by hand; a surface that builds the args itself for a responder of its own
+ * release can.
+ */
+export const EP_UNDECLARED_ARG = "ai.cotal.ep.undeclared-arg";
+
+/** The {@link EP_UNDECLARED_ARG} payload: the key the contract does not declare. */
+export interface EpUndeclaredArgDetail extends EpErrorDetail {
+  kind: typeof EP_UNDECLARED_ARG;
+  property: string;
+}
+
+/** The key a caller-side refusal names through {@link EP_UNDECLARED_ARG}, or `undefined`. */
+export function undeclaredArg(e: unknown): string | undefined {
+  if (!(e instanceof EpEnvelopeError)) return undefined;
+  return (e.details?.find((d) => d.kind === EP_UNDECLARED_ARG) as EpUndeclaredArgDetail | undefined)?.property;
+}
+
+/**
  * `details[].kind` for a refusal raised by the RESPONDER because the request declared a bound
  * incarnation (`bind`, §13.3) that is not this instance: `failed-precondition` for a different
  * instance, `expired` for the same instance at another epoch. It marks what no caller-side check
@@ -202,6 +223,23 @@ export function replyRefusedBeforeEffect(e: EpError | undefined): boolean {
 }
 
 /**
+ * `details[].kind` for a targeted request refused because the instance that received it holds no
+ * mapping for the target (§13.3). A resolver that knows only the targets its own instance hosts, as
+ * a manager's does, cannot tell a target a sibling hosts from one retired everywhere, so it says the
+ * one thing it knows. The code is `expired`, as for any missing mapping, and the refusal carries
+ * `not-executed`: a caller that reached the instance through the class queue may re-resolve and
+ * re-issue, and one that addressed the instance has its answer. The marker carries no payload, because the target is the request's own
+ * and the refusing instance is the reply subject's.
+ */
+export const EP_TARGET_UNMAPPED = "ai.cotal.ep.target-unmapped";
+
+/** True iff an `EpError` is a {@link EP_TARGET_UNMAPPED} refusal that states `not-executed`. An
+ *  absent outcome reads as `unknown` (§13.3), so the marker alone licenses no re-issue. */
+export function replyTargetUnmapped(e: EpError | undefined): boolean {
+  return e?.outcome === "not-executed" && (e.details ?? []).some((d) => d.kind === EP_TARGET_UNMAPPED);
+}
+
+/**
  * `details[].kind` for a refusal raised because a lifecycle barrier already holds the actor
  * (or the manager instance) being spawned. The manager already knows the blocked op, the
  * head/gate state, the `opId`, and often the remedy; without this marker those facts die at
@@ -212,10 +250,14 @@ export const EP_LIFECYCLE_BLOCKED = "ai.cotal.ep.lifecycle-blocked";
 
 export type LifecycleBlockedOp = "registration" | "retirement" | "activation" | "takeover";
 export type LifecycleHeadState = "active" | "retiring" | "retired";
+export type LifecycleGateState = "frozen" | "retired";
 
+/** `headState` is set only by a site that read the lifecycle head and `gateState` only by one
+ *  that read the issuance gate: a gate frozen by a takeover says nothing about the head. */
 export interface LifecycleBlockedFacts {
   blockedOp: LifecycleBlockedOp;
-  headState: LifecycleHeadState;
+  headState?: LifecycleHeadState;
+  gateState?: LifecycleGateState;
   opId?: string;
   remedy?: string;
 }
@@ -225,7 +267,9 @@ export interface EpLifecycleBlockedDetail extends EpErrorDetail, LifecycleBlocke
 }
 
 export function lifecycleBlockedDetail(facts: LifecycleBlockedFacts): EpLifecycleBlockedDetail {
-  return { kind: EP_LIFECYCLE_BLOCKED, blockedOp: facts.blockedOp, headState: facts.headState,
+  return { kind: EP_LIFECYCLE_BLOCKED, blockedOp: facts.blockedOp,
+    ...(facts.headState !== undefined ? { headState: facts.headState } : {}),
+    ...(facts.gateState !== undefined ? { gateState: facts.gateState } : {}),
     ...(facts.opId !== undefined ? { opId: facts.opId } : {}),
     ...(facts.remedy !== undefined ? { remedy: facts.remedy } : {}) };
 }
@@ -256,9 +300,11 @@ export function lifecycleBlockedFrom(source: unknown): EpLifecycleBlockedDetail 
 export function renderLifecycleBlocked(message: string, source: unknown): string {
   const d = lifecycleBlockedFrom(source);
   if (!d) return message;
-  const parts = [`blockedOp=${d.blockedOp}`, `headState=${d.headState}`];
-  if (typeof d.opId === "string" && d.opId.length > 0) parts.push(`opId=${d.opId}`);
-  if (typeof d.remedy === "string" && d.remedy.length > 0) parts.push(`remedy=${d.remedy}`);
+  const parts = [`blockedOp=${d.blockedOp}`];
+  for (const k of ["headState", "gateState", "opId", "remedy"] as const) {
+    const v = d[k];
+    if (typeof v === "string" && v.length > 0) parts.push(`${k}=${v}`);
+  }
   const suffix = `[lifecycle ${parts.join(" ")}]`;
   return message.includes(suffix) ? message : `${message} ${suffix}`;
 }

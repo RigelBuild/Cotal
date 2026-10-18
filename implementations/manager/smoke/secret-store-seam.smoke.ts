@@ -21,7 +21,6 @@
  */
 import { spawn as spawnProc, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -32,15 +31,9 @@ import {
 import { authDir, saveSpaceAuth, workspaceSecretStore, agentSecretKeyForFile } from "@cotal-ai/workspace";
 import { Manager, type FreeSlotCause } from "../src/manager.js";
 import { bootDeliveryDaemon, type DeliveryDaemon } from "./_boot-delivery.js";
-import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const freePort = (): Promise<number> =>
-  new Promise((res, rej) => {
-    const s = createServer();
-    s.on("error", rej);
-    s.listen(0, "127.0.0.1", () => { const p = (s.address() as AddressInfo).port; s.close(() => res(p)); });
-  });
 let pass = 0, fail = 0;
 const check = (name: string, cond: boolean, extra?: unknown) => {
   if (cond) { pass++; console.log(`  ✓ ${name}`); }
@@ -48,7 +41,7 @@ const check = (name: string, cond: boolean, extra?: unknown) => {
 };
 
 /** The seam probe: a real store that records every access that reaches it. */
-interface Access { op: "get" | "put" | "delete"; key: string }
+interface Access { op: "get" | "put" | "create" | "delete"; key: string }
 function recordingStore(inner: SecretStore): SecretStore & { seen: Access[]; sawSince(from: number, op: Access["op"], key: string): boolean } {
   const seen: Access[] = [];
   return {
@@ -56,6 +49,7 @@ function recordingStore(inner: SecretStore): SecretStore & { seen: Access[]; saw
     sawSince: (from, op, key) => seen.slice(from).some((a) => a.op === op && a.key === key),
     async get(key) { seen.push({ op: "get", key }); return inner.get(key); },
     async put(key, value) { seen.push({ op: "put", key }); return inner.put(key, value); },
+    async create(key, value) { seen.push({ op: "create", key }); return inner.create(key, value); },
     async delete(key) { seen.push({ op: "delete", key }); return inner.delete(key); },
   };
 }
@@ -65,6 +59,9 @@ const SERVERS = `nats://127.0.0.1:${PORT}`;
 const space = `secseam-${mintLifecycleUid().slice(0, 8)}`;
 const auth = await createSpaceAuth(space);
 const dir = mkdtempSync(join(tmpdir(), `${SMOKE_BROKER_TOKEN}secseam-`));
+const prevHome = process.env.COTAL_HOME;
+process.env.COTAL_HOME = join(dir, "home");
+mkdirSync(process.env.COTAL_HOME, { recursive: true });
 const workspaceRoot = join(dir, "ws");
 mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
 saveSpaceAuth(authDir(workspaceRoot), auth);
@@ -206,6 +203,8 @@ try {
   await delivery?.stop();
   for (const k of kids) { k.kill("SIGKILL"); }
   await wait(200);
+  if (prevHome === undefined) delete process.env.COTAL_HOME;
+  else process.env.COTAL_HOME = prevHome;
 }
 
 process.exit(fail > 0 ? 1 : 0);

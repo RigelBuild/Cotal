@@ -7,8 +7,8 @@ import {
   isReachable,
   mintCreds,
   mintLifecycleUid,
-  invokeCommand,
   resolveService,
+  invokeRepairingSplit,
   standaloneConnectOpts,
   newIdentity,
   idFromCreds,
@@ -16,22 +16,24 @@ import {
   DEV_OWNER,
   unansweredRequest,
   resolveAuthProvider,
+  peerLabel,
+  personaDir,
   type FlagValues,
   type ParsedArgs,
   type SpaceAuth,
   type UserAuthStatus,
 } from "@cotal-ai/core";
-import { accountInventory, authDir, canonicalRoot, CLI_USER_ACTOR, deliveryCredsKey, DELIVERY_PIDFILE, extensionsDir, findCotalRoot, getCurrent, hasUserAuthState, isWorkspaceTargetError, loadExtensionsManifest, loadMeshes, loadSoleSpaceAuth, localProcessPath, localProcessVisible, MANAGER_PIDFILE, parsePid, preflightTarget, probeLiveness, readProcessCommand, readRenewalRecord, renderWorkspaceError, resolveMeshTarget, serverFlag, spaceFlag, userAuthStateDir, workspaceSecretStore, type LocalProcess, type LocalProcessContext, type MeshTarget } from "@cotal-ai/workspace";
+import { accountInventory, authDir, canonicalRoot, CLI_USER_ACTOR, deliveryCredsKey, DELIVERY_PIDFILE, extensionsDir, findCotalRoot, getCurrent, hasUserAuthState, isWorkspaceTargetError, loadMeshes, loadSoleSpaceAuth, localProcessPath, localProcessVisible, MANAGER_PIDFILE, oneLine, parsePid, preflightTarget, probeLiveness, readRenewalRecord, renderWorkspaceError, resolveMeshTarget, serverFlag, spaceFlag, userAuthStateDir, WEB_PIDFILE, WEB_READINESS_HEADER, WEB_SESSION_FILE, workspaceSecretStore, type LocalProcess, type LocalProcessContext, type MeshTarget } from "@cotal-ai/workspace";
 import { localProcessSurface } from "../ext-loader.js";
 import { cliVersion, cliProvenance, extensionVersions } from "../lib/version.js";
 import { agentSkillsSkew } from "../lib/agent-skills.js";
 import { managerHasDeliveryMarker } from "../lib/manager-proc.js";
-import { machineStatus, resolveRuntimeSpace, webUp, WEB_URL, type MachineStatus } from "../lib/status.js";
+import { connectorHarnesses, connectorStatusRows, machineStatus, recordedWebUrl, resolveRuntimeSpace, webBoundAddress, webInstalled, type HarnessStatus } from "../lib/status.js";
 import { deliveryResponderFromLease, deliveryResponderState, deliveryRowSuffix, RESPONDER_UNBOUND_CONSEQUENCE, type DeliveryResponderState } from "../lib/delivery-responder.js";
 import { pidfileState, type PidfileState } from "./down.js";
 import { displayCmd } from "../lib/self-exec.js";
 import { listPersonas } from "../lib/personas.js";
-import { c, statusBadge } from "../ui.js";
+import { activityAge, c, presenceDetail, statusBadge } from "../ui.js";
 import { preparedCatalogDiagnostics } from "./sync.js";
 
 /** `--components` is the fail-loud health pass with a machine-readable EXIT DISPOSITION. Bare
@@ -78,14 +80,14 @@ export async function status(args: ParsedArgs): Promise<void> {
   const cmd = displayCmd();
 
   console.log(c.bold("cotal status"));
-  await printMachine();
-  printExtensions();
   const selected = resolveSelected(cwd, values);
+  await printMachine(selected);
+  printExtensions();
   // THE RESPONDER AXIS (#1576), read ONCE and threaded into the rows that would otherwise claim
   // health they never checked. It is read before the folder section because that section renders
   // the delivery process row, and a live pid means nothing without it.
   const responder = await readResponderAxis(selected);
-  printProject(root, cmd, selected, values, responder);
+  await printProject(root, cmd, selected, values, responder);
   await printRegistry();
   await printTarget(selected, cmd, responder);
   if (values.components) await printComponentHealth(cwd, values);
@@ -131,38 +133,53 @@ function cliProvenanceLabel(): string {
   return `(${kind}: ${provenance.root})`;
 }
 
-/** The `cotal-skills` Claude Code plugin (user scope) vs this CLI release: stale means an update didn't
- *  take, missing means it isn't installed, broken means it is installed but failed to load; all point at
- *  `cotal setup --skills` so a read-path status user is not routed into unscoped setup writes. */
-function claudeSkillsLabel(skills: MachineStatus["claudeSkills"]): string {
-  switch (skills.state) {
-    case "current":
-      return c.green("current");
-    case "stale":
-      return c.yellow(`${skills.version ? `v${skills.version} ≠ v${cliVersion()} · ` : ""}stale · ${displayCmd()} setup --skills`);
-    case "broken":
-      return c.red(`load error · ${displayCmd()} setup --skills`);
-    case "missing":
-      return c.dim(`not installed · ${displayCmd()} setup --skills`);
-    default:
-      return c.dim("unknown");
-  }
-}
-
-async function printMachine(): Promise<void> {
+async function printMachine(selected: Selected): Promise<void> {
   const m = await machineStatus();
-  const web = await webUp();
-  const webExt = webInstalled();
   section("Machine");
   row("cotal-ai", `${c.green(`v${cliVersion()}`)} ${c.dim(cliProvenanceLabel())}`);
   row("NATS", m.nats === "missing" ? c.red("missing") : c.green(m.nats));
-  row("Claude plugin", m.claudePlugin ? c.green("installed") : c.dim("not installed"));
-  row("Claude skills", claudeSkillsLabel(m.claudeSkills));
-  row("Claude", m.agents.claude ? c.green("on PATH") : c.dim("not on PATH"));
-  row("OpenCode", m.agents.opencode ? c.green("on PATH") : c.dim("not on PATH"));
+  await printHarnesses();
   row("Skills (.agents)", skillsSkewRow());
-  row("Web extension", webExt ? c.green("installed") : c.dim("not installed"));
-  row("Web process", web ? c.green(WEB_URL) : c.dim(webExt ? "down" : "not installed"));
+  let webExt: boolean | undefined;
+  try {
+    webExt = webInstalled();
+    row("Web extension", webExt ? c.green("installed") : c.dim("not installed"));
+  } catch (e) {
+    row("Web extension", c.red((e as Error).message));
+  }
+  row("Web process", webProcessRow(selected, webExt));
+}
+
+/** The selected mesh's dashboard where its own records place it. An unreadable `web.pid` or
+ *  `web.session` is named on the row, like the folder's process rows, so the rest of status still
+ *  prints. An install state that could not be read is `undefined` and reads `down`, since only a known
+ *  absence is `not installed`. */
+function webProcessRow(selected: Selected, installed: boolean | undefined): string {
+  let url: string | undefined;
+  try {
+    url = selected.ok ? recordedWebUrl({ root: selected.target.root, space: selected.target.space }) : undefined;
+  } catch (e) {
+    return c.red((e as Error).message);
+  }
+  return url ? c.green(url) : c.dim(installed === false ? "not installed" : "down");
+}
+
+/** The rows each connector's setup provider reports, then one row per installed connector, named by
+ *  the connector and judged by the executables it declares. A manifest that cannot list them renders
+ *  as one red row, so the rest of status still prints. */
+async function printHarnesses(): Promise<void> {
+  let harnesses: HarnessStatus[];
+  try {
+    harnesses = connectorHarnesses();
+  } catch (e) {
+    row("Connectors", c.red((e as Error).message));
+    return;
+  }
+  const paint = { ok: c.green, warn: c.yellow, error: c.red, off: c.dim } as const;
+  for (const r of await connectorStatusRows(harnesses)) row(r.label, paint[r.state](r.text));
+  if (!harnesses.length) row("Connectors", c.dim(`none installed · ${displayCmd()} ext seed`));
+  for (const h of harnesses)
+    row(h.name, h.missing.length ? c.dim(`${h.missing.join(", ")} not on PATH`) : c.green(h.requires.length ? `${h.requires.join(", ")} on PATH` : "in-process"));
 }
 
 /** The lease `holder` the delivery daemon THIS WORKSPACE launched would write, or `undefined` when it
@@ -265,7 +282,7 @@ async function readResponderAxis(selected: Selected): Promise<DeliveryResponderS
   }
 }
 
-function printProject(root: string, cmd: string, selected: Selected, values: FlagValues<typeof statusFlags>, responder: DeliveryResponderState = "unknown"): void {
+async function printProject(root: string, cmd: string, selected: Selected, values: FlagValues<typeof statusFlags>, responder: DeliveryResponderState = "unknown"): Promise<void> {
   section("This Folder");
   row("root", root);
   // The inventory READ itself can throw (an EACCES/ELOOP on `.cotal/auth`, not just a bad record):
@@ -334,23 +351,35 @@ function printProject(root: string, cmd: string, selected: Selected, values: Fla
   printPersonas(root, cmd, selected, values);
   let nats: Proc | undefined;
   for (const component of localProcessSurface().filter((component) => localProcessVisible(component, context)).sort((a, b) => (a.order ?? 50) - (b.order ?? 50))) {
-    const state = proc(localProcessPath(component.pidFile, context));
+    let state: Proc;
+    try {
+      state = proc(localProcessPath(component.pidFile, context));
+    } catch (e) {
+      // `localProcessPath` throws on an ambiguous record and `pidfileState` on one it cannot read, so
+      // `clean` and `down` refuse to act on either. Status is the recovery command: name the failed
+      // read on this row and report the rest.
+      row(component.name, c.red(`pidfile unreadable · ${(e as Error).message}`));
+      continue;
+    }
     if (component.name === "nats") nats = state;
-    const detail = component.name === "manager" && state.live
-      ? c.dim(managerHasDeliveryMarker(context.space) ? " · delivery-aware" : " · old/unknown build")
-      // THE #1576 ROW. A live delivery PID is not the fact an operator needs; the responder is.
-      // `formatProc` greens any live pid, which is how `delivery running (pid N)` came to be printed
-      // identically over a bound responder and one that never bound. The suffix names which it is,
-      // and when unbound it names the CONSEQUENCE rather than a reconcile that has not happened yet.
-      : component.name === "delivery"
-        ? deliveryRowNote(state.live, responder)
-        : "";
+    if (component.name === "manager") {
+      // #2073: a live manager pid used to print green `running` on the pidfile alone, which is how
+      // a manager whose service rail had died read as healthy for hours. One probe of the service
+      // endpoint now decides the row; see `managerRowState`.
+      row(component.name, await managerRowState(selected.ok ? selected.target : undefined, state, context.space));
+      continue;
+    }
+    // THE #1576 ROW. A live delivery PID is not the fact an operator needs; the responder is.
+    // `formatProc` greens any live pid, which is how `delivery running (pid N)` came to be printed
+    // identically over a bound responder and one that never bound. The suffix names which it is,
+    // and when unbound it names the CONSEQUENCE rather than a reconcile that has not happened yet.
+    const detail = component.name === "delivery" ? deliveryRowNote(state.liveness === "alive", responder) : "";
     row(component.name, `${formatProc(state)}${detail}`);
   }
   // A stopped mesh with a persisted store: name the reset verb. Stale state (e.g. durables from
   // an older Cotal generation) is otherwise invisible until a spawn fails on it. The restart is
   // deliberately "your usual flags", never a bare `up` (mode/name/store-dir aren't recorded).
-  if (!nats?.live && existsSync(join(root, ".cotal", "nats")))
+  if (nats?.liveness !== "alive" && existsSync(join(root, ".cotal", "nats")))
     row("stored state", c.dim(`JetStream store persists across down/up - if stale: ${cmd} clean store --force, then \`up\` with your usual flags (\`clean all\` also resets identity)`));
 }
 
@@ -443,7 +472,7 @@ async function printTarget(selected: Selected, cmd: string, responder: DeliveryR
     if (st?.login) {
       row("login", c.green(st.login.sub) + c.dim(` · session until ${new Date(st.login.expiresAt * 1000).toISOString()}`));
       if (st.grant === "not-granted")
-        row("actor", c.yellow(`"${CLI_USER_ACTOR}" not granted - ${cmd} actor grant ${CLI_USER_ACTOR} --sub ${st.login.sub}`));
+        row("actor", c.yellow(`"${CLI_USER_ACTOR}" not granted - ${cmd} actor grant ${CLI_USER_ACTOR} --sub ${st.login.sub} --full`));
       else if (st.grant)
         row(
           "actor",
@@ -553,9 +582,9 @@ async function renderSnapshot(ep: CotalEndpoint, watchBrokerState: boolean): Pro
         : c.dim("skipped in open mode (read-only)"),
     );
     for (const p of roster.slice(0, 8)) {
-      const label = p.card.role ? `${p.card.name}/${p.card.role}` : p.card.name;
-      const condition = p.condition ? ` (${p.condition.code})` : "";
-      console.log(`    ${statusBadge(p.status)}${condition}  ${label}${p.activity ? c.dim(` - ${p.activity}`) : ""}`);
+      const label = peerLabel(p.card);
+      const condition = presenceDetail(p);
+      console.log(`    ${statusBadge(p.status)}${condition}  ${label}${p.activity ? c.dim(` - ${p.activity}${activityAge(p)}`) : ""}`);
     }
     if (roster.length > 8) console.log(c.dim(`    +${roster.length - 8} more`));
     row("channels", channels.length ? channels.map((ch) => `${ch.channel}(${ch.messages})`).join(", ") : "none");
@@ -566,14 +595,6 @@ async function renderSnapshot(ep: CotalEndpoint, watchBrokerState: boolean): Pro
       );
   } finally {
     await ep.stop();
-  }
-}
-
-function webInstalled(): boolean {
-  try {
-    return loadExtensionsManifest().extensions.some((e) => e.commands.some((cmd) => cmd.name === "web"));
-  } catch {
-    return false;
   }
 }
 
@@ -608,7 +629,7 @@ function personaSummary(root: string): string {
  *  as an unknown spawn root, matching the unreadable-auth / multi-space / corrupt-record paths
  *  above, which all describe the failure and continue. */
 function printPersonas(root: string, cmd: string, selected: Selected, values: FlagValues<typeof statusFlags>): void {
-  const folder = personasDirOf(root);
+  const folder = personaDir(root);
   if (!selected.ok) {
     // No single mesh resolves, so there is no root a bare spawn would use, and this catalog cannot
     // be claimed to be it. Report the folder as the folder, and refuse to imply launchability.
@@ -636,13 +657,6 @@ function printPersonas(root: string, cmd: string, selected: Selected, values: Fl
   row("hint", `a bare \`${cmd} spawn\` uses the mesh above, NOT this folder - personas in ${folder} will not launch until you run it from that mesh's root or select it (\`${cmd} use <space>\`${values.space ? "" : ", or pass `--space`"})`);
 }
 
-/** `<root>/.cotal/agents` — the persona catalog of a root. Spelled here to match the
- *  `personaRoot` the resolver puts on every target, so the two sides of the comparison below are
- *  the same construction and cannot drift apart. */
-function personasDirOf(root: string): string {
-  return join(root, ".cotal", "agents");
-}
-
 /** Do two catalog paths denote the SAME directory? `canonicalRoot` (realpath, `resolve` fallback
  *  for a path not on disk) is the repo's one spelling for this: a raw `===` reads a symlinked or
  *  8.3-short-name spelling of one directory as two, which here would fabricate a divergence and
@@ -664,8 +678,56 @@ function proc(path: string): Proc {
 }
 
 function formatProc(p: Proc): string {
-  if (p.live) return c.green(`running (pid ${p.pid})`);
+  if (p.liveness === "alive") return c.green(`running (pid ${p.pid})`);
   return c.dim(p.pid ? `${p.note} (${p.pid})` : (p.note ?? "down"));
+}
+
+/** Bare status's manager row, #2073: a live pid alone is not proof the manager serves — that was
+ *  exactly the incident (a lease holder whose service rail had died stayed `running` for hours).
+ *  So a live manager pid gets ONE probe of its own service endpoint before the row prints. This
+ *  adds one request to every bare `status` call for a live manager pid.
+ *
+ *  Three outcomes:
+ *  - answered: the row prints exactly as before (green `running (pid N)` plus the delivery-aware
+ *    suffix).
+ *  - a DEFINITIVE no-answer — the same predicate `managerHealth`'s not-serving branch uses
+ *    (`unansweredRequest`, or the service-registry-missing text): red `not serving (pid N)` with
+ *    ` · service endpoint not answering`, plus the marker error when the marker could not be read.
+ *  - any other failure (a refused probe, an `unavailable` user-mode credential): `running (pid N)`
+ *    as today with a dim ` · service unchecked`, so a failed probe never reads as a dead rail.
+ *
+ *  Bare status keeps exit 0 in every case; this only changes what the row says. A dead/stopped pid
+ *  never reaches the probe at all (the early return below), so a stopped manager still reads as the
+ *  dim stopped row, not `not serving` — a dead pid is not a live pid that will not answer. */
+async function managerRowState(target: MeshTarget | undefined, state: Proc, space: string): Promise<string> {
+  if (state.liveness !== "alive") return formatProc(state);
+  let deliveryAware = false;
+  let markerUnreadable = "";
+  try {
+    deliveryAware = managerHasDeliveryMarker(state.pid!, space);
+  } catch (e) {
+    // The marker reader throws so `up` and the delivery preflight refuse to act on a marker they
+    // cannot read. Status is the recovery command: name the failed read on this row and report the rest.
+    markerUnreadable = c.red(` · delivery-aware marker unreadable: ${(e as Error).message}`);
+  }
+  const unprobed = `${formatProc(state)}${markerUnreadable || c.dim(deliveryAware ? " · delivery-aware" : " · old/unknown build")}`;
+  if (!target) return unprobed;
+  try {
+    let auth: ({ creds?: string } | { bearer: string; sentinelCreds: string }) & { caller: { owner: string; actor: string; uid: string } };
+    if (target.mode === "user") {
+      const credential = await componentCredential(target);
+      if (credential.kind !== "user") return `${unprobed}${c.dim(" · service unchecked")}`;
+      auth = { bearer: credential.bearer, sentinelCreds: credential.sentinelCreds, caller: credential.caller };
+    } else {
+      auth = await staticServiceAuth(target.auth);
+    }
+    await managerServiceHealth(target, auth);
+    return unprobed;
+  } catch (e) {
+    const noService = e instanceof EpEnvelopeError && (unansweredRequest(e) || /service registry.*stream not found/i.test((e as Error).message));
+    if (noService) return `${c.red(`not serving (pid ${state.pid})`)}${c.dim(" · service endpoint not answering")}${markerUnreadable}`;
+    return `${unprobed}${c.dim(" · service unchecked")}`;
+  }
 }
 
 /** The delivery row's responder suffix, coloured for the bare-status renderer (#1576).
@@ -703,9 +765,10 @@ const COMPONENT_EXIT: Record<ComponentVerdict, number> = {
 };
 
 /** Machine-readable, uncoloured component records — one line per component.  Human text follows
- * after the state token, but the token/exit contract deliberately stays simple for cron. */
+ * after the state token, but the token/exit contract deliberately stays simple for cron.  A fact can
+ * quote a reason another process or a stored row wrote; a newline in it would split the record. */
 function printComponent(component: ComponentHealth): void {
-  console.log(`  ${component.name.padEnd(16)} ${component.verdict}${component.facts.length ? ` · ${component.facts.join(" · ")}` : ""}`);
+  console.log(`  ${component.name.padEnd(16)} ${component.verdict}${component.facts.length ? ` · ${component.facts.map(oneLine).join(" · ")}` : ""}`);
 }
 
 function componentExit(components: readonly ComponentHealth[]): number {
@@ -716,9 +779,17 @@ function componentExit(components: readonly ComponentHealth[]): number {
   return Math.max(...components.map((component) => COMPONENT_EXIT[component.verdict]));
 }
 
-function processRecord(path: string): { kind: "absent" } | { kind: "dead"; pid: number } | { kind: "unattributable"; raw: string } | { kind: "live"; pid: number } | { kind: "unknown"; pid: number } {
-  if (!existsSync(path)) return { kind: "absent" };
-  const raw = readFileSync(path, "utf8").trim();
+function processRecord(template: string, context: LocalProcessContext): { kind: "absent" } | { kind: "unreadable"; error: string } | { kind: "dead"; pid: number } | { kind: "unattributable"; raw: string } | { kind: "live"; pid: number } | { kind: "unknown"; pid: number } {
+  let raw: string;
+  try {
+    raw = readFileSync(localProcessPath(template, context), "utf8").trim();
+  } catch (e) {
+    // A component removes its own record on exit, so the file can be gone by the time it is read:
+    // that is absence. An ambiguous record or any other failed read refuses this component's row,
+    // never the whole pass.
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+    return { kind: "unreadable", error: (e as Error).message };
+  }
   if (!raw) return { kind: "absent" };
   const pid = parsePid(raw);
   if (pid === undefined) return { kind: "unattributable", raw };
@@ -728,12 +799,13 @@ function processRecord(path: string): { kind: "absent" } | { kind: "dead"; pid: 
 
 function pidFacts(record: ReturnType<typeof processRecord>): string[] {
   if (record.kind === "live" || record.kind === "dead" || record.kind === "unknown") return [`pid ${record.pid}`];
+  if (record.kind === "unreadable") return [`pidfile unreadable: ${record.error}`];
   return [];
 }
 
 function processVerdict(record: ReturnType<typeof processRecord>): ComponentVerdict | undefined {
   if (record.kind === "absent" || record.kind === "dead") return "absent";
-  if (record.kind === "unattributable" || record.kind === "unknown") return "refused";
+  if (record.kind === "unattributable" || record.kind === "unknown" || record.kind === "unreadable") return "refused";
   return undefined;
 }
 
@@ -796,17 +868,22 @@ async function componentEp(
 ): Promise<{ ep: CotalEndpoint; close(): Promise<void> }> {
   const id = newIdentity();
   const user = credential.kind === "user";
+  // Static/open: ONE lifecycleUid minted and used both in the credential and as the endpoint's own
+  // option, matching `staticServiceAuth`. Two different uids here (a fresh mint per site) is what
+  // `permissionsFor: ... mint with opts.lifecycleUid` refuses: the lease read is bound to the uid
+  // baked into the credential, not the one the endpoint separately declares (#2073).
+  const staticUid = !user && credential.auth ? mintLifecycleUid() : undefined;
   const ep = new CotalEndpoint({
     space: target.space,
     servers: target.server,
     tls: target.tlsRequired,
-    // Static/open: mint exactly as before. User: the signed-in login's bearer + sentinel; no
-    // lifecycleUid mint exists on this path (the bearer carries its own lifecycle claim).
+    // User: the signed-in login's bearer + sentinel; no lifecycleUid mint exists on this path (the
+    // bearer carries its own lifecycle claim).
     ...(user
       ? { bearer: credential.bearer, sentinelCreds: credential.sentinelCreds }
       : {
-          creds: credential.auth ? await mintCreds(credential.auth, id, "deployer") : undefined,
-          lifecycleUid: credential.auth ? mintLifecycleUid() : undefined,
+          creds: credential.auth && staticUid ? await mintCreds(credential.auth, id, "deployer", { lifecycleUid: staticUid }) : undefined,
+          lifecycleUid: staticUid,
         }),
     channels: [],
     consume: false,
@@ -824,9 +901,6 @@ async function componentEp(
   return { ep, close: () => ep.stop().catch(() => {}) };
 }
 
-/** A service registration is the health target itself.  Calling its `status` command through a
- * generic endpoint does not work on this base because a passive status endpoint has no v0.4 caller
- * rail; a one-shot standalone caller does. */
 /** The static arm's one-shot service instrument, unchanged from before the user-mode fix: a fresh
  *  identity, its minted deployer credential, and the caller triple on the SAME identity — a
  *  mismatched random actor would turn an authorized manager into a false no-answer. */
@@ -839,18 +913,25 @@ async function staticServiceAuth(auth: SpaceAuth | undefined): Promise<{ creds?:
   };
 }
 
-async function managerServiceHealth(
-  target: MeshTarget,
-  auth: ({ creds?: string } | { bearer: string; sentinelCreds: string }) & { caller: { owner: string; actor: string; uid: string } },
-): Promise<{
+/** The fields of a manager `status` answer that its component row reads. */
+type ManagerServiceStatus = {
   instanceId?: unknown;
   runtime?: unknown;
   staticReconciliation?: {
     state?: unknown;
+    lastSweep?: { error?: unknown };
     retainedCustody?: unknown;
     failures?: Array<{ alias?: unknown; phase?: unknown; disposition?: unknown; retainedReason?: unknown; nextRetryAt?: unknown; remedy?: unknown }>;
   };
-}> {
+};
+
+/** A service registration is the health target itself.  Calling its `status` command through a
+ * generic endpoint does not work on this base because a passive status endpoint has no v0.4 caller
+ * rail; a one-shot standalone caller does. */
+async function managerServiceHealth(
+  target: MeshTarget,
+  auth: ({ creds?: string } | { bearer: string; sentinelCreds: string }) & { caller: { owner: string; actor: string; uid: string } },
+): Promise<ManagerServiceStatus> {
   const nc = await dialerFor(target.server)({
     servers: target.server,
     ...standaloneConnectOpts(
@@ -864,30 +945,23 @@ async function managerServiceHealth(
   });
   try {
     const service = await resolveService(nc, target.space, "manager", auth.caller, { deadlineMs: 3_000 });
-    const response = await invokeCommand(nc, target.space, service, "status", undefined, { deadlineMs: 3_000 });
+    const response = await invokeRepairingSplit(nc, target.space, service, "status", undefined, { deadlineMs: 3_000 });
     if (response.reply.ok !== true)
       throw new EpEnvelopeError(response.reply.error?.code === "unavailable" ? "unavailable" : "failed-precondition", response.reply.error?.message ?? "manager status refused");
-    return response.reply.data as {
-      instanceId?: unknown;
-      runtime?: unknown;
-      staticReconciliation?: {
-        state?: unknown;
-        retainedCustody?: unknown;
-        failures?: Array<{ alias?: unknown; phase?: unknown; disposition?: unknown; retainedReason?: unknown; nextRetryAt?: unknown; remedy?: unknown }>;
-      };
-    };
+    return response.reply.data as ManagerServiceStatus;
   } finally {
     await nc.drain().catch(() => nc.close());
   }
 }
 
 async function managerHealth(target: MeshTarget, context: LocalProcessContext, credential: ComponentCredential): Promise<ComponentHealth> {
-  const record = processRecord(localProcessPath(MANAGER_PIDFILE, context));
+  const record = processRecord(MANAGER_PIDFILE, context);
   const facts = pidFacts(record);
   // A corrupt or kernel-unreadable LOCAL record is neither evidence that the manager is absent nor
   // permission to replace it with a network answer.  Name that failed local control surface first.
-  if (record.kind === "unattributable" || record.kind === "unknown") {
-    facts.push(record.kind === "unattributable" ? "unattributable pidfile" : "pid liveness unestablishable");
+  if (processVerdict(record) === "refused") {
+    if (record.kind === "unattributable") facts.push("unattributable pidfile");
+    if (record.kind === "unknown") facts.push("pid liveness unestablishable");
     facts.push("static reconciliation not reported by this manager build");
     return { name: "manager", verdict: "refused", facts };
   }
@@ -937,6 +1011,7 @@ async function managerHealth(target: MeshTarget, context: LocalProcessContext, c
       facts.push("static reconciliation not reported by this manager build");
     } else {
       facts.push(`static reconciliation ${String(reconcile.state ?? "unreported")}`);
+      if (typeof reconcile.lastSweep?.error === "string") facts.push(`static sweep error=${reconcile.lastSweep.error}`);
       // Both retained fields are optional: an older manager reports neither.
       if (typeof reconcile.retainedCustody === "number") facts.push(`static retained custody ${reconcile.retainedCustody}`);
       for (const failure of reconcile.failures ?? []) {
@@ -974,7 +1049,7 @@ async function managerHealth(target: MeshTarget, context: LocalProcessContext, c
  * adoption report is the renewal record it writes through the manager-owned renewal pass.  The
  * latter is intentionally not inferred from credential mtime or process output. */
 async function deliveryHealth(target: MeshTarget, context: LocalProcessContext, credential: ComponentCredential): Promise<ComponentHealth> {
-  const record = processRecord(localProcessPath(DELIVERY_PIDFILE, context));
+  const record = processRecord(DELIVERY_PIDFILE, context);
   const facts = pidFacts(record);
   const stopped = processVerdict(record);
   // The renewal record is PER-SPACE (#1850): read THIS space's record through the workspace seam
@@ -1046,40 +1121,8 @@ async function deliveryHealth(target: MeshTarget, context: LocalProcessContext, 
 
 /** The web dashboard owns the HTTP listener and identifies itself through `/api/meta`, including
  * the serving PID.  A raw TCP success is insufficient: another program could own its port. */
-export function webProbeTarget(command: string):
-  | { host: string; port: number; url: URL }
-  | { refused: string } {
-  const portMatch = /(?:^|\s)--port(?:=|\s+)(\d{1,5})(?:\s|$)/.exec(command);
-  const hostMatch = /(?:^|\s)--host(?:=|\s+)([^\s]+)(?:\s|$)/.exec(command);
-  // A direct web process uses the documented defaults. A detached process is re-execed with `web`
-  // in argv; an arbitrary live PID record whose command has neither form is not evidence that the
-  // default endpoint is its control face, so decline the probe rather than test a bystander.
-  const isWebCommand = /(?:^|\s)web(?:\s|$)/.test(command);
-  if (!portMatch && !isWebCommand)
-    return { refused: "port probe refused (recorded PID is not a web command)" };
-  const port = portMatch ? Number(portMatch[1]) : 7799;
-  if (!Number.isInteger(port) || port < 1 || port > 65535)
-    return { refused: "port probe refused (invalid process port)" };
-  const host = hostMatch?.[1] ?? "127.0.0.1";
-  try {
-    const unbracketed = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
-    if (unbracketed.includes("[") || unbracketed.includes("]") || /[\s/?#@]/.test(unbracketed)) throw new Error("invalid");
-    const ipv6 = unbracketed.includes(":");
-    const parsed = new URL(`http://${ipv6 ? `[${unbracketed}]` : unbracketed}:${port}/api/meta`);
-    const normalized = ipv6 ? parsed.hostname.slice(1, -1) : parsed.hostname;
-    if (normalized === "0.0.0.0" || normalized === "::" || normalized === "::ffff:0:0") throw new Error("invalid");
-    return {
-      host: normalized,
-      port,
-      url: parsed,
-    };
-  } catch {
-    return { refused: "host probe refused (invalid process host)" };
-  }
-}
-
 async function webHealth(context: LocalProcessContext): Promise<ComponentHealth> {
-  const record = processRecord(localProcessPath("web.pid", context));
+  const record = processRecord(WEB_PIDFILE, context);
   const facts = pidFacts(record);
   const stopped = processVerdict(record);
   if (stopped) {
@@ -1088,26 +1131,33 @@ async function webHealth(context: LocalProcessContext): Promise<ComponentHealth>
     if (record.kind === "unknown") facts.push("pid liveness unestablishable");
     return { name: "web", verdict: stopped, facts };
   }
-  // The dashboard exposes its own requested port in its process command.  We ask only the exact
-  // recorded PID — never scan ports — and then require that HTTP's `/api/meta` names the same PID.
-  // An unreadable command is a probe refusal rather than an assumption that the documented default
-  // was used.
+  // Probe only the address the dashboard recorded once it was listening, never one guessed from its
+  // command line or a default: no argv names the port `--port 0` bound. Without that record the
+  // control surface cannot be located, which is a probe refusal rather than a not-serving answer.
   if (record.kind !== "live") throw new Error("web component record lost its live pid after classification");
   const pid = record.pid;
-  const command = readProcessCommand(pid);
-  if (command.kind !== "command") return { name: "web", verdict: "refused", facts: [...facts, "port probe refused (process command unreadable)"] };
-  const target = webProbeTarget(command.command);
-  if ("refused" in target) return { name: "web", verdict: "refused", facts: [...facts, target.refused] };
+  let bound: ReturnType<typeof webBoundAddress>;
   try {
-    const response = await fetch(target.url, { signal: AbortSignal.timeout(500) });
-    const meta = await response.json() as { pid?: unknown };
-    if (response.ok && meta.pid === pid) return { name: "web", verdict: "serving", facts: [...facts, `host ${target.host}`, `port ${target.port}`, "http reachable"] };
-    return { name: "web", verdict: "not-serving", facts: [...facts, `host ${target.host}`, `port ${target.port}`, "http identity mismatch"] };
-  } catch {
-    // The registered web process has no persistent endpoint record beyond its own command. If that
-    // exact HTTP surface cannot identify the recorded PID, this component is present but not serving.
+    bound = webBoundAddress(localProcessPath(WEB_SESSION_FILE, context));
+  } catch (e) {
+    return { name: "web", verdict: "refused", facts: [...facts, `${WEB_SESSION_FILE} unreadable: ${(e as Error).message}`] };
   }
-  return { name: "web", verdict: "not-serving", facts: [...facts, `host ${target.host}`, `port ${target.port}`, "http not answered"] };
+  if (!bound) return { name: "web", verdict: "refused", facts: [...facts, "probe refused (no bound address recorded)"] };
+  try {
+    // The dashboard refuses an anonymous `/api/meta`; the readiness nonce is the one credential its
+    // gate accepts there, so without it a live dashboard could only ever read as a mismatch.
+    const response = await fetch(`${bound.url}api/meta`, {
+      signal: AbortSignal.timeout(500),
+      headers: { [WEB_READINESS_HEADER]: bound.readiness },
+    });
+    const meta = await response.json() as { pid?: unknown };
+    if (response.ok && meta.pid === pid) return { name: "web", verdict: "serving", facts: [...facts, `host ${bound.host}`, `port ${bound.port}`, "http reachable"] };
+    return { name: "web", verdict: "not-serving", facts: [...facts, `host ${bound.host}`, `port ${bound.port}`, "http identity mismatch"] };
+  } catch {
+    // If the recorded address cannot identify the recorded PID, this component is present but not
+    // serving.
+  }
+  return { name: "web", verdict: "not-serving", facts: [...facts, `host ${bound.host}`, `port ${bound.port}`, "http not answered"] };
 }
 
 async function brokerHealth(target: MeshTarget): Promise<ComponentHealth> {

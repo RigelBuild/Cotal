@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,12 +8,25 @@ import { appendedLogTail, detachedArgs, terminateDetachedWeb, waitForDetachedWeb
 
 const root = mkdtempSync(join(tmpdir(), "cotal-web-detach-"));
 const pidPath = join(root, "web.pid");
+const sessionPath = join(root, "web.session");
 const readyPath = join(root, "child.ready");
-const child = spawn(process.execPath, [
-  "-e",
-  `const fs=require("node:fs"); process.on("SIGTERM",()=>{}); fs.writeFileSync(${JSON.stringify(readyPath)}, "ready"); setInterval(()=>{}, 1000);`,
-], { detached: true, stdio: "ignore" });
-child.unref();
+
+/** A deliberately SIGTERM-resistant, detached, unref'd fixture child. It still ignores SIGTERM
+ *  (that resistance is what this suite tests), but it takes a deadline in milliseconds from its
+ *  own first argument and exits on its own once that deadline passes, so a copy that is never
+ *  collected by the suite's `finally` reaps itself instead of surviving forever. */
+const FIXTURE_DEADLINE_MS = 60_000;
+function spawnFixture(readyMarkerPath: string, deadlineMs: number) {
+  const child = spawn(process.execPath, [
+    "-e",
+    `const fs=require("node:fs"); process.on("SIGTERM",()=>{}); fs.writeFileSync(${JSON.stringify(readyMarkerPath)}, "ready"); const deadlineMs=Number(process.argv[1]); setTimeout(()=>process.exit(0), deadlineMs);`,
+    String(deadlineMs),
+  ], { detached: true, stdio: "ignore" });
+  child.unref();
+  return child;
+}
+
+const child = spawnFixture(readyPath, FIXTURE_DEADLINE_MS);
 
 const alive = (pid: number): boolean => {
   try { process.kill(pid, 0); return true; }
@@ -34,7 +48,7 @@ try {
 
   const missing = spawn(join(root, "missing-cotal-binary"), [], { stdio: "ignore" });
   await assert.rejects(
-    waitForDetachedWeb(missing, { pidPath, url: "http://127.0.0.1:1/", space: "fixture", timeoutMs: 100 }),
+    waitForDetachedWeb(missing, { pidPath, sessionPath, url: "http://127.0.0.1:1/", space: "fixture", timeoutMs: 100 }),
     /failed to start:.*(?:ENOENT|no such file)/i,
     "no-PID spawn failures retain the operating-system cause",
   );
@@ -54,15 +68,50 @@ try {
   assert.ok(existsSync(readyPath), "SIGTERM-resistant fixture child became ready");
   writeFileSync(pidPath, String(child.pid));
 
+  const selfReapReadyPath = join(root, "self-reap.ready");
+  const selfReapChild = spawnFixture(selfReapReadyPath, 500);
+  assert.ok(selfReapChild.pid, "self-reap fixture child has a pid");
+  let selfReaped = false;
+  for (let i = 0; i < 300 && !selfReaped; i++) {
+    await sleep(10);
+    selfReaped = !alive(selfReapChild.pid!);
+  }
+  assert.ok(selfReaped, "a leaked fixture child with a short deadline reaps itself, with no signal sent to it");
+
   await assert.rejects(
     waitForDetachedWeb(child, {
       pidPath,
+      sessionPath,
       url: "http://127.0.0.1:1/",
       space: "fixture",
       timeoutMs: 100,
     }),
-    /did not become HTTP-ready/,
+    /did not become HTTP-ready within 100ms \(pid \d+\); last probe http:\/\/127\.0\.0\.1:1\/api\/meta: .+/,
   );
+  // A different process on the bound port answers 200 with a huge space and pid whose JSON escaping
+  // turns each character into six bytes: the last-probe text still stays within its 300-byte cap.
+  const squatter = createServer((_req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ space: "\u0001".repeat(200_000), pid: "\u0001".repeat(200_000) }));
+  });
+  await new Promise<void>((resolve) => squatter.listen(0, "127.0.0.1", resolve));
+  try {
+    const port = (squatter.address() as { port: number }).port;
+    let message = "";
+    await waitForDetachedWeb(child, {
+      pidPath,
+      sessionPath,
+      url: `http://127.0.0.1:${port}/`,
+      space: "fixture",
+      timeoutMs: 600,
+    }).catch((e: unknown) => { message = e instanceof Error ? e.message : String(e); });
+    assert.match(message, /did not become HTTP-ready within 600ms \(pid \d+\); last probe http:\/\/127\.0\.0\.1:\d+\/api\/meta: answered space "(?:\\u0001){40}\.\.\."/);
+    const lastProbe = message.slice(message.indexOf("; last probe ") + "; last probe ".length);
+    assert.ok(Buffer.byteLength(lastProbe) <= 300, `last-probe text stays within its 300-byte cap (got ${Buffer.byteLength(lastProbe)} bytes)`);
+  } finally {
+    await new Promise<void>((resolve) => squatter.close(() => resolve()));
+  }
+
   await terminateDetachedWeb(child, pidPath);
   assert.equal(alive(child.pid!), false, "timeout cleanup escalates and confirms child death");
   assert.equal(existsSync(pidPath), false, "timeout cleanup removes the exact child-owned pidfile");

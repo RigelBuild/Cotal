@@ -75,13 +75,13 @@ try {
   const modeled = launch({ space: "s", name: "n", model: "gpt-5.6-sol", variant: "high" });
   check("model/variant ride env", modeled.env?.COTAL_MODEL === "gpt-5.6-sol" && modeled.env?.COTAL_VARIANT === "high");
 
-  // Agent file: model/variant defaults, flags win.
+  // Agent file: the launcher resolves its model/variant; the connector renders only what it is given.
   const agentFile = join(dir, "peer.md");
   writeFileSync(agentFile, `---\nname: peer\nmodel: gpt-5.5\nvariant: medium\n---\nYou are peer.\n`);
   const fromFile = launch({ space: "s", name: "peer", configPath: agentFile });
   check(
-    "agent file supplies model/variant defaults",
-    fromFile.env?.COTAL_MODEL === "gpt-5.5" && fromFile.env?.COTAL_VARIANT === "medium" && fromFile.env?.COTAL_AGENT_FILE === agentFile,
+    "agent file model/variant are not re-read by the connector",
+    fromFile.env?.COTAL_MODEL === undefined && fromFile.env?.COTAL_VARIANT === undefined && fromFile.env?.COTAL_AGENT_FILE === agentFile,
   );
   const flagWins = launch({ space: "s", name: "peer", configPath: agentFile, model: "gpt-5.6-sol" });
   check("the --model flag wins over the agent file", flagWins.env?.COTAL_MODEL === "gpt-5.6-sol");
@@ -137,6 +137,7 @@ try {
     role: "coder",
     id: "UAID",
     lifecycleUid: "lc-1",
+    backfillFloor: 42,
     servers: "nats://x:1",
     prompt: "greet the operator",
   });
@@ -147,6 +148,7 @@ try {
       full.env?.COTAL_LIFECYCLE_UID === "lc-1" &&
       full.env?.COTAL_CODEX_PROMPT === "greet the operator",
   );
+  check("backfill floor forwarded", full.env?.COTAL_BACKFILL_FLOOR === "42", full.env?.COTAL_BACKFILL_FLOOR);
   // The broker URL is NOT one of them: it rides the launch material, so a suite or a tool this seat
   // runs cannot resolve its "default" broker out of an inherited variable and silently dial ours.
   check(

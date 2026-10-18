@@ -2,7 +2,7 @@
   "suite": [
     "extensions/connector-opencode/smoke/agui-run-error.smoke.ts"
   ],
-  "guard": "a turn OpenCode killed is published as a run error carrying its reason, and a turn a person stopped is not",
+  "guard": "a turn OpenCode killed is published as a run error, and a turn a person stopped is not",
   "command": "pnpm smoke:opencode-run-error",
   "completionMarker": "opencode-run-error smoke:",
   "proveWith": "node scripts/mutation-proof.mjs --config extensions/connector-opencode/smoke/mutations/opencode-run-error.json",
@@ -19,8 +19,8 @@
     "publishes a user's own cancellation as an error. Without O2 the suite could not tell a mapping",
     "from a blanket.",
     "",
-    "O3 is the reason, and it matters separately from the type: a RUN_ERROR that names no code tells",
-    "a reader the turn failed and refuses to say how, which is most of the value of publishing it.",
+    "O3 was OpenCode's error name as the RUN_ERROR code. It is gone: since #1431 a published",
+    "RUN_ERROR carries no code, because upstream values can echo private text onto the events channel.",
     "",
     "NOT REGISTERED, and named rather than left as a hole: nothing mutates the ORDER of the flush and",
     "the close. Reversing them is a real defect and the reset suite already grades it; here it would",
@@ -31,10 +31,10 @@
     {
       "name": "O1 a failed turn closes exactly as a finished one does, which is the state this connector shipped in",
       "file": "extensions/connector-opencode/src/plugin.ts",
-      "find": "          eventHolder?.closeRun(Date.now(), interrupted ? undefined : runErrorOf(event.properties.error));",
-      "replace": "          eventHolder?.closeRun(Date.now());",
+      "find": "          await turnEnded(sessionID, eventHolder?.closeRun(Date.now(), interrupted ? undefined : runErrorOf(event.properties.error)));",
+      "replace": "          await turnEnded(sessionID, eventHolder?.closeRun(Date.now()));",
       "expectRed": "fail:and that close is RUN_ERROR, not RUN_FINISHED",
-      "cell": "fail:and that close is RUN_ERROR, not RUN_FINISHED — THE DEFECT",
+      "cell": "fail:and that close is RUN_ERROR, not RUN_FINISHED \u2014 THE DEFECT",
       "note": "The pre-fix line, restored verbatim. An APIError turn is published as a run that ended, carrying no outcome, and a reader cannot tell it from a turn that succeeded."
     },
     {
@@ -43,17 +43,55 @@
       "find": "interrupted ? undefined : runErrorOf(event.properties.error)",
       "replace": "runErrorOf(event.properties.error)",
       "expectRed": "abort:and THAT close is RUN_FINISHED",
-      "cell": "abort:and THAT close is RUN_FINISHED — a Stop is not a failed turn, and a blanket mapping would fail here",
+      "cell": "abort:and THAT close is RUN_FINISHED \u2014 a Stop is not a failed turn, and a blanket mapping would fail here",
       "note": "The plausible over-reach rather than a contrived one: the guard reads like a special case until you notice a user cancellation arrives on the same event."
     },
     {
-      "name": "O3 the failure loses OpenCode's own error name, so the wire says a turn failed and not how",
+      "name": "O3 the error arm returns before the terminal's position read answers",
       "file": "extensions/connector-opencode/src/plugin.ts",
-      "find": "    const code = typeof e.name === \"string\" && e.name ? e.name : undefined;",
-      "replace": "    const code = undefined;",
-      "expectRed": "fail:the RUN_ERROR carries the harness's own message and error name as the code",
-      "cell": "fail:the RUN_ERROR carries the harness's own message and error name as the code",
-      "note": "The union's tag is the only thing that separates a provider auth failure from an upstream outage for a consumer. Dropping it leaves a type with no content."
+      "find": "          await turnEnded(sessionID, eventHolder?.closeRun(Date.now(), interrupted ? undefined : runErrorOf(event.properties.error)));\n",
+      "replace": "          void turnEnded(sessionID, eventHolder?.closeRun(Date.now(), interrupted ? undefined : runErrorOf(event.properties.error)));\n",
+      "expectRed": "barrier:the error arm is still in flight while the terminal's position read is held",
+      "note": "The round-14 defect: the next turn was admitted before the position read answered, and the terminal named the next turn."
+    },
+    {
+      "name": "O4 the idle arm returns before the terminal's position read answers",
+      "file": "extensions/connector-opencode/src/plugin.ts",
+      "find": "          await turnEnded(idleSession, eventsFor(sessionID)?.closeRun(Date.now()));\n",
+      "replace": "          void turnEnded(idleSession, eventsFor(sessionID)?.closeRun(Date.now()));\n",
+      "expectRed": "barrier:the idle arm is still in flight while the terminal's position read is held"
+    },
+    {
+      "name": "O5 a native prompt passes the turn end still settling",
+      "file": "extensions/connector-opencode/src/plugin.ts",
+      "find": "      for (let barrier = turnEnds.get(input.sessionID); barrier !== undefined; barrier = turnEnds.get(input.sessionID))\n        await barrier;\n",
+      "replace": "      void turnEnds.get(input.sessionID);\n",
+      "expectRed": "barrier:a native prompt is held while the terminal's position read is held",
+      "note": "The driven path waited for the close's position read and the prompt typed into the TUI did not, so a failed turn closed as a finish and its successor as the error."
+    },
+    {
+      "name": "O6 a record at or before the reported turn end is settled only by its own marks",
+      "file": "extensions/connector-opencode/src/agui-source.ts",
+      "find": "      if (!this.settled(r)) break;\n",
+      "replace": "      if (!isSettled(r)) break;\n",
+      "expectRed": "unsettled:the turn after it is published, so the session is not wedged behind the unfinished part",
+      "note": "The round-16 defect: a part still filling when its turn died never gets its end mark and its message never reports completed, so every later read stopped at it and no later turn was published."
+    },
+    {
+      "name": "O7 the session's barrier is the latest turn end alone, not every one still settling",
+      "file": "extensions/connector-opencode/src/plugin.ts",
+      "find": "    const settled = Promise.all([turnEnds.get(session), close]).then(() => undefined);\n",
+      "replace": "    const settled = close;\n",
+      "expectRed": "twice:a native prompt is still held while the EARLIER turn end's read is held",
+      "note": "A turn that ended twice, by its error and the idle after it, had its barrier replaced by the later turn end, whose read answered first and deleted it while the error's read was still pending."
+    },
+    {
+      "name": "O8 a native prompt waits on the barrier it first found, not on each replacement",
+      "file": "extensions/connector-opencode/src/plugin.ts",
+      "find": "      for (let barrier = turnEnds.get(input.sessionID); barrier !== undefined; barrier = turnEnds.get(input.sessionID))\n        await barrier;\n",
+      "replace": "      await turnEnds.get(input.sessionID);\n",
+      "expectRed": "early:the prompt is STILL held behind the idle's read that replaced the barrier it first found",
+      "note": "A prompt already awaiting the error's barrier when the idle replaced it went through once the error's read answered, ahead of the idle's position, and the idle's close landed on the prompt's successor."
     }
   ]
 }

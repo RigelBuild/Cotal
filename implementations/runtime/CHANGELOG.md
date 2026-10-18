@@ -1,5 +1,649 @@
 # @cotal-ai/runtime
 
+## 0.82.0
+
+### Patch Changes
+
+- d06b27e: A cancelled `turn`, `ask` or escalation whose relay withdrawal is refused for a reason a retry cannot change now fails its step at once with that refusal's code. Before this, every refusal was retried silently every two seconds until the relay's deadline, so a cancelled step against a manager that serves no `cancel` (`not-found`), or an accepting manager with no such relay pending (`failed-precondition`), stayed in its scope for the step's whole timeout. Only `unavailable` and `deadline-exceeded` are still retried until the deadline. A withdrawal the accepting manager refuses is now thrown as an `EpEnvelopeError` carrying its code.
+- Updated dependencies [4f52881]
+- Updated dependencies [6afa12f]
+- Updated dependencies [7c6c109]
+- Updated dependencies [9a93a58]
+  - @cotal-ai/core@0.82.0
+  - @cotal-ai/workspace@0.82.0
+  - @cotal-ai/lang@0.82.0
+
+## 0.81.1
+
+### Patch Changes
+
+- @cotal-ai/core@0.81.1
+- @cotal-ai/workspace@0.81.1
+- @cotal-ai/lang@0.81.1
+
+## 0.81.0
+
+### Patch Changes
+
+- Updated dependencies [c166107]
+  - @cotal-ai/core@0.81.0
+  - @cotal-ai/workspace@0.81.0
+  - @cotal-ai/lang@0.81.0
+
+## 0.80.0
+
+### Patch Changes
+
+- 99c74fe: Complete an authorized relative sleep when its duration elapses before the first checkpoint mint. Preserve cancellation, existing-pause replay and checkpoint expiry rules.
+- Updated dependencies [5417401]
+- Updated dependencies [71e6311]
+- Updated dependencies [3614fdd]
+- Updated dependencies [e00402f]
+- Updated dependencies [80f66fd]
+- Updated dependencies [0835254]
+  - @cotal-ai/core@0.80.0
+  - @cotal-ai/workspace@0.80.0
+  - @cotal-ai/lang@0.80.0
+
+## 0.79.0
+
+### Patch Changes
+
+- fbc3e2d: Whether a consumer info or delete found no consumer is now decided by one predicate, `isConsumerNotFound` in `@cotal-ai/core`, which accepts only the broker's structured `ConsumerNotFound` error. It no longer accepts a bare `name` of `ConsumerNotFoundError` or a string `code`, so the run journal's replay cleanup no longer swallows those shapes. The stream, KV scan, run wait, delivery `pending` and auth scanner sites use it in place of their own copies, and `isJetStreamMissing`, the structured check it builds on, is exported beside it.
+- Updated dependencies [50747b1]
+- Updated dependencies [fbc3e2d]
+- Updated dependencies [c535d98]
+- Updated dependencies [36b03b0]
+- Updated dependencies [2bd492c]
+- Updated dependencies [5e9a618]
+- Updated dependencies [7cb89f9]
+- Updated dependencies [aaa6bc9]
+- Updated dependencies [db962ae]
+- Updated dependencies [4aafb0d]
+- Updated dependencies [92590e8]
+- Updated dependencies [c03f2af]
+- Updated dependencies [79ace0f]
+  - @cotal-ai/workspace@0.79.0
+  - @cotal-ai/core@0.79.0
+  - @cotal-ai/lang@0.79.0
+
+## 0.78.1
+
+### Patch Changes
+
+- @cotal-ai/core@0.78.1
+- @cotal-ai/workspace@0.78.1
+- @cotal-ai/lang@0.78.1
+
+## 0.78.0
+
+### Patch Changes
+
+- 6db45e5: The mesh-ask smoke's manager stand-in now serves the reserved `cancel`, committing the relay's goal `cancelled` as the manager does, so a cancelled ask and the discharge withdraw their relay instead of failing on a command the stand-in never described. Cell 7 passes again and the suite runs cells 8 to 11 and its summary. Cell 11's resumed escalation now records its attempt index on its binding, as every checkpoint binding has since each attempt began binding its own deadline.
+- 87fa2c3: A `wait`'s outer timeout token and a `waitUntil` observation's pause token are now each derived in one named function, which both the arm site and the pause-ownership table call. Before, the purpose strings were spelled by hand at every arm site and again in the ownership table, so renaming one side still typechecked and the run authority then refused the pause at run time with L4000. Behavior is unchanged.
+- c164c80: A manager-hosted or `--local` run's `wait(down(agent), { timeout })` and `wait(replied(agent), { timeout })` now wait, and resolve `null` when the timeout passes. They used to fail with L4000 before waiting: both armed their timeout without recording it on the step, and the run refuses to mint a wait timer the step did not record. `wait` now records the timers for every event before it branches to the agent-addressed waits.
+- Updated dependencies [a7f39aa]
+- Updated dependencies [981b567]
+- Updated dependencies [8b92413]
+- Updated dependencies [a74b832]
+- Updated dependencies [d04629a]
+- Updated dependencies [905a78b]
+- Updated dependencies [8344353]
+- Updated dependencies [f9a71ce]
+- Updated dependencies [b9499b3]
+- Updated dependencies [c2d8362]
+- Updated dependencies [70fb24e]
+- Updated dependencies [de3c0f7]
+- Updated dependencies [a32e955]
+- Updated dependencies [7d13389]
+  - @cotal-ai/workspace@0.78.0
+  - @cotal-ai/core@0.78.0
+  - @cotal-ai/lang@0.78.0
+
+## 0.77.1
+
+### Patch Changes
+
+- @cotal-ai/core@0.77.1
+- @cotal-ai/workspace@0.77.1
+- @cotal-ai/lang@0.77.1
+
+## 0.77.0
+
+### Patch Changes
+
+- Updated dependencies [6861390]
+- Updated dependencies [7d1b600]
+  - @cotal-ai/core@0.77.0
+  - @cotal-ai/workspace@0.77.0
+  - @cotal-ai/lang@0.77.0
+
+## 0.76.0
+
+### Patch Changes
+
+- 0cd1f60: An `ask` attempt and an escalated `checkpoint` now relay the instant their pause denies at, and the manager holds the relay to that instant. The relay used to send a duration the manager counted from its own acceptance, so the manager could still serve an attempt after its pause had expired, by the submit's round trip plus clock skew, or by up to a second from a one-second floor. The manager's `turn` command takes `deadlineAt` as an alternative to `deadlineMs` and refuses a relay whose deadline has already passed with `deadline-exceeded`. The run reads that refusal as nobody left to tell only when its own clock also shows the deadline passed. An `ask` whose deadline passes before its attempt's pause is minted now ends with its own `ask-deadline` L4006 instead of an L4000 from the refused mint.
+- 8e0876b: Comments in core, the manager and the runtime cite SPEC sections and code symbols instead of line numbers. Nine of those line numbers pointed at unrelated text, including the `EpGateState.space` doc in core's published types, which also named §13.9 for the per-space auth bucket that §13.12 defines. The comments now name the alias-reuse gate in the manager's spawn path, `resolveService`'s `instanceId` option and the `pinnedInstanceId` it returns, the spawn affinity gate, the auth session ledger's `reconcileSessionForTakeover`, and each SPEC section without a line. No behavior changes.
+- e65de9e: Fix a hosted `checkpoint` with `onExpiry: "escalate"` failing L4000 every time its first attempt expired. The escalated attempt read the first attempt's binding as its own, so it armed at the first attempt's already-passed deadline and never recorded its own. Each attempt now binds its index with its deadline: the escalation opens with a fresh `timeout`, records its addressee and deadline, and a resumed attempt keeps the deadline it recorded.
+- Updated dependencies [58a725f]
+- Updated dependencies [7829cbb]
+- Updated dependencies [8e0876b]
+- Updated dependencies [d85ca1a]
+- Updated dependencies [20c93a1]
+- Updated dependencies [715928c]
+- Updated dependencies [a4b0467]
+- Updated dependencies [08d92b7]
+- Updated dependencies [35fdda8]
+- Updated dependencies [7b34e9a]
+- Updated dependencies [d153172]
+- Updated dependencies [ea15e8d]
+- Updated dependencies [9adcf1c]
+- Updated dependencies [15d10c9]
+- Updated dependencies [0eb8eff]
+- Updated dependencies [ba76f78]
+- Updated dependencies [f2a4bde]
+- Updated dependencies [8be669e]
+- Updated dependencies [42b28aa]
+- Updated dependencies [720dbc3]
+  - @cotal-ai/core@0.76.0
+  - @cotal-ai/workspace@0.76.0
+  - @cotal-ai/lang@0.76.0
+
+## 0.75.0
+
+### Patch Changes
+
+- Updated dependencies [6286d29]
+- Updated dependencies [ed0785d]
+- Updated dependencies [625659e]
+- Updated dependencies [0c924f4]
+- Updated dependencies [b48a740]
+- Updated dependencies [597fa25]
+- Updated dependencies [cb3a177]
+- Updated dependencies [5f5196f]
+- Updated dependencies [d269d1d]
+  - @cotal-ai/core@0.75.0
+  - @cotal-ai/workspace@0.75.0
+  - @cotal-ai/lang@0.75.0
+
+## 0.74.0
+
+### Patch Changes
+
+- 5443012: The runtime's poll and retry loops now wait through one shared helper, whose timer never holds the process open. Each loop used to build its own wait inline, and the copies disagreed: the checkpoint answer's mint-window retry kept the process alive while every other wait did not. That retry now follows the same rule, which changes nothing a caller can see, because it reads over a broker connection that already keeps the process alive.
+- Updated dependencies [f3e6f95]
+- Updated dependencies [328d59b]
+- Updated dependencies [ac251fd]
+- Updated dependencies [e3498d9]
+  - @cotal-ai/core@0.74.0
+  - @cotal-ai/workspace@0.74.0
+  - @cotal-ai/lang@0.74.0
+
+## 0.73.0
+
+### Patch Changes
+
+- Updated dependencies [9873985]
+  - @cotal-ai/core@0.73.0
+  - @cotal-ai/workspace@0.73.0
+  - @cotal-ai/lang@0.73.0
+
+## 0.72.1
+
+### Patch Changes
+
+- Updated dependencies [07fe6b3]
+  - @cotal-ai/core@0.72.1
+  - @cotal-ai/workspace@0.72.1
+  - @cotal-ai/lang@0.72.1
+
+## 0.72.0
+
+### Patch Changes
+
+- Updated dependencies [c5a45ab]
+- Updated dependencies [18e7e91]
+  - @cotal-ai/core@0.72.0
+  - @cotal-ai/workspace@0.72.0
+  - @cotal-ai/lang@0.72.0
+
+## 0.71.0
+
+### Patch Changes
+
+- 518351a: A run's `turn` and `wait(down)` no longer read a seat as down while the manager still runs it. On a loaded host a live seat's presence heartbeats could stall for more than the 30-second lapse window while its process kept working, and the run failed the turn with L4002 (`lapsed`) although the seat went on to finish its step. Once a lapse is confirmed from presence, the run now asks the manager with `inspect`: if the manager still runs that incarnation, the 30 seconds start over; if the manager that spawned the seat no longer runs it, or that manager does not answer, the lapse stands and the turn fails with L4002 as before. In a space with several managers, another manager's miss does not count, since a manager knows only its own seats. The asking stops at a cancellation, the wait's timeout, or the turn's deadline or yield, so a late answer or refusal never replaces the timeout's `null` or the turn's own outcome. A run host's credential now carries the `inspect` request for this.
+- Updated dependencies [b9daf53]
+- Updated dependencies [3518435]
+- Updated dependencies [726a750]
+- Updated dependencies [3400d53]
+- Updated dependencies [518351a]
+  - @cotal-ai/core@0.71.0
+  - @cotal-ai/lang@0.71.0
+  - @cotal-ai/workspace@0.71.0
+
+## 0.70.2
+
+### Patch Changes
+
+- @cotal-ai/core@0.70.2
+- @cotal-ai/workspace@0.70.2
+- @cotal-ai/lang@0.70.2
+
+## 0.70.1
+
+### Patch Changes
+
+- b83ec25: `cotal run migrate` no longer says a pending orphaned `waitUntil`'s cadence timer "is released with the run's other timers". Nothing releases that pause, so the row now says only that the edit stops the wait and its recorded observations stay in the journal, as the §11.2 orphan table does. A single observation now reads "1 recorded observation stays".
+- 25237f0: A workflow run that cancels a branch now withdraws what that branch relayed to a seat. The manager serves the reserved `cancel` (SPEC 13.6 item 4) for a turn it relays: the caller's own goal moves to `cancelling`, leaves `turn-pending` and ends `cancelled`, and a later yield of it is answered with that terminal. A goal that already ended is refused with its cached outcome, and one the manager does not relay is refused unchanged. The run sends it as a cancelled `turn`, `ask` attempt or escalated `checkpoint` unwinds, before the branch's scope settles, and its cancellation sweep sends it again for a process that died first. In a space with more than one manager, a cancel refused by a manager other than the one that accepted the relay is sent again until the accepting manager answers. A cancel the accepting manager refuses is sent again until it lands or the relay's deadline passes, and a failed read of that deadline is retried as well (a goal record that is not JSON fails the step at once), so a transient failure no longer lets the branch's scope settle with the relay still on the seat. Before this, a race loser's turn stayed on the seat: the seat could still pull and answer it, and because a seat is shown one turn at a time, the run's next turn to that seat waited behind it until its deadline. The hosted run's credential carries the new `cancel` row, and the manager's cluster document moves to revision 23.
+- Updated dependencies [9c99ee5]
+- Updated dependencies [da6dba0]
+- Updated dependencies [032522a]
+- Updated dependencies [5c6c92d]
+- Updated dependencies [6d81d61]
+- Updated dependencies [fe54eb0]
+- Updated dependencies [1ef1396]
+- Updated dependencies [66a0f19]
+- Updated dependencies [2be1384]
+- Updated dependencies [25237f0]
+- Updated dependencies [6bd6099]
+- Updated dependencies [ed1e171]
+  - @cotal-ai/core@0.70.1
+  - @cotal-ai/lang@0.70.1
+  - @cotal-ai/workspace@0.70.1
+
+## 0.70.0
+
+### Minor Changes
+
+- 83a6352: A run on the compiled engine no longer reports a value the program threw as a host hold or release. The worker thread used to copy `code`, `reason`, `step` and `kind` off whatever was thrown, and the host rebuilt `RunHeld` or `RunReleased` from the code alone, so `throw { code: "L5025", reason: "..." }` came back as a held run with the placeholder step `(step not carried)`, and `throw { code: "L5012", ... }` as a release. Both now fail as the plain value they are, as they do on the walker. `WorkerRunFailed` is now a union discriminated by `class` (`released`, `held`, `effect`, `too-large`, `rejected` or `error`). The thread picks the variant with `instanceof`, each variant requires its class's fields, and the host rebuilds the class with no defaults. `tooLarge` is replaced by the `too-large` variant's `stepKey`, `bytes` and `bound`. This breaks code that calls `runInWorker` itself: `code` now crosses only on the `effect` and `error` variants, so a caller that branched on `L5012`, `L5025`, `L5006` or `L5010` branches on `class` instead.
+
+### Patch Changes
+
+- Updated dependencies [392bfeb]
+- Updated dependencies [66df6c0]
+- Updated dependencies [0ec35c2]
+- Updated dependencies [015f805]
+- Updated dependencies [2cbfe9c]
+- Updated dependencies [1b11c4e]
+- Updated dependencies [c088c5c]
+- Updated dependencies [b413e2a]
+- Updated dependencies [7986785]
+- Updated dependencies [12bfc34]
+- Updated dependencies [4dcfa0b]
+- Updated dependencies [fd07b1e]
+- Updated dependencies [8dc360c]
+- Updated dependencies [cce8dad]
+- Updated dependencies [c7e0c0a]
+- Updated dependencies [2639a13]
+- Updated dependencies [668f6b0]
+- Updated dependencies [83a6352]
+- Updated dependencies [15b7920]
+  - @cotal-ai/workspace@0.70.0
+  - @cotal-ai/core@0.70.0
+  - @cotal-ai/lang@0.70.0
+
+## 0.69.0
+
+### Patch Changes
+
+- 94996e5: The scope kinds' traits now come from one record keyed by `ScopeKind`, exported as `scopeTraits`, which returns a frozen row: whether a scope settles an assembly of branch outcomes, and whether a fork whose cut lies inside it re-enters it. The journal seed check, the scope value rule, the static captured-write check (L2032) and `planFork` read it instead of keeping their own kind lists, so a scope kind added to `ScopeKind` does not compile until it is classified. Before, a new kind compiled with a list missed and failed only at run time, for example a settled no-return scope of that kind refused at the journal seed with L5024. Shipped behaviour is unchanged.
+- 0c5b205: `cotal run start`, `resume`, `ps`, `journal` and `answer` now re-describe and re-issue an unpinned manager call that a sibling manager refused before running it, up to the same 16 attempts the CLI's manager commands use. Before, one such refusal ended the command, so in a space with two managers about half of these calls failed with a refusal saying the command was not run. A hosted run's own manager calls now use that bound too instead of 8. The repair is one core helper, `invokeRepairingSplit`, which the CLI and the runtime both call.
+- 848497f: A hosted run's presence reader now keeps only rows whose `card` carries a string `id` and `name`, and skips every other value the way it already skipped bytes that are not JSON. A participant that published `null` under its own presence key used to make every `wait(down(...))`, turn liveness poll, conclave join and worktree-reuse check in that space fail with `L4000` (`Cannot read properties of null (reading 'card')`). Those reads now ignore the row and answer about the agent they watch.
+- f409b46: A `waitUntil` whose first observation is not terminal now waits out its cadence on a host that checks journal authority (a manager-hosted run, or `cotal run start --local`) and fails `L4023` at its deadline. Before, its second observation failed `L4000`: the interpreter sent the observation index as the effect's attempt, which the run authority refused, and the authority listed no pause token for a `waitUntil` cadence. Which pause tokens a step owns is now one table that the run authority, the adoption re-arm and a cancelled branch's discharge all read, so a cancelled `waitUntil` on a hosted run also releases its open cadence pause.
+- Updated dependencies [f5cb8e1]
+- Updated dependencies [2d45766]
+- Updated dependencies [03a7405]
+- Updated dependencies [a256e2f]
+- Updated dependencies [3f3d04a]
+- Updated dependencies [4500563]
+- Updated dependencies [1bdc7f2]
+- Updated dependencies [94996e5]
+- Updated dependencies [5eb1e24]
+- Updated dependencies [69232cd]
+- Updated dependencies [02c0a2d]
+- Updated dependencies [93716c3]
+- Updated dependencies [3a1716d]
+- Updated dependencies [9772fd4]
+- Updated dependencies [06429be]
+- Updated dependencies [adab793]
+- Updated dependencies [d29d4d3]
+- Updated dependencies [539266a]
+- Updated dependencies [b584718]
+- Updated dependencies [0c5b205]
+- Updated dependencies [98d2b41]
+- Updated dependencies [f409b46]
+  - @cotal-ai/workspace@0.69.0
+  - @cotal-ai/core@0.69.0
+  - @cotal-ai/lang@0.69.0
+
+## 0.68.0
+
+### Minor Changes
+
+- 6141e7b: The issuing host no longer signs an answering run operator for a checkpoint token a participant manager names. The manager's request now names the run and step it answers (`operator.answers: { runId, stepKey, amend? }`), and the host requires that run admitted on the manager's instance, reads the pause's token off the run's journal under a read it mints for that run, and requires a served answer to name the same run and step as the request it observed. Before, a manager could be issued the answer and settle writes for another instance's waiting pause. The pause lookups `openCheckpointToken`, `settledPauseToken`, `stepPauseToken`, `CheckpointNotOpen` and `CheckpointNotAmendable` move to `@cotal-ai/lang`; `@cotal-ai/runtime` still exports the first four. A participant manager and its issuing host must upgrade together.
+
+### Patch Changes
+
+- Updated dependencies [6141e7b]
+- Updated dependencies [4120c97]
+- Updated dependencies [218006f]
+- Updated dependencies [681c5b0]
+- Updated dependencies [585fdb2]
+- Updated dependencies [a5256fd]
+- Updated dependencies [0d806ae]
+- Updated dependencies [b38a683]
+- Updated dependencies [d5ea4d2]
+- Updated dependencies [54e0199]
+- Updated dependencies [9b439e8]
+- Updated dependencies [41a7e66]
+- Updated dependencies [f018376]
+- Updated dependencies [6a1789b]
+- Updated dependencies [237c813]
+  - @cotal-ai/core@0.68.0
+  - @cotal-ai/lang@0.68.0
+  - @cotal-ai/workspace@0.68.0
+
+## 0.67.0
+
+### Patch Changes
+
+- c3601f9: A logged-in user's workflow run on a `cotal supervise` participant manager can spawn, turn and despawn agents that user owns and receive their typed answers. The run's spawn takes the admin reach of the user who started the run, read from that user's actor-ledger row when the spawn runs, so a space that requires the event plane no longer refuses it and a revoked login demotes it. The host pins each run mediator it signs for a participant manager to a placement on that manager's own instance, so a program may place a spawn there; a placement on any other instance is refused at `run start`. A completed run now releases a seat by the identity its spawn terminal records, so a seat the host enrolled at its own lifecycle UID is despawned instead of left running.
+- Updated dependencies [48f18d0]
+- Updated dependencies [e85e1fd]
+- Updated dependencies [55061ff]
+- Updated dependencies [5b0da88]
+- Updated dependencies [e65ec69]
+- Updated dependencies [79e5268]
+- Updated dependencies [bb0b14e]
+- Updated dependencies [3069425]
+- Updated dependencies [ae5b3cd]
+- Updated dependencies [954a78b]
+- Updated dependencies [f389576]
+- Updated dependencies [562a56b]
+  - @cotal-ai/core@0.67.0
+  - @cotal-ai/lang@0.67.0
+  - @cotal-ai/workspace@0.67.0
+
+## 0.66.1
+
+### Patch Changes
+
+- Updated dependencies [568f718]
+  - @cotal-ai/workspace@0.66.1
+  - @cotal-ai/core@0.66.1
+  - @cotal-ai/lang@0.66.1
+
+## 0.66.0
+
+### Patch Changes
+
+- a9be586: Apply the driver's result bound on the compiled engine. A hosted run on language version 2 never received the result bound that `cotal run` and the manager derive from the broker's `max_payload`, so an oversized effect result was recorded when it fit the store, or released as the store's own L5010 when it did not. The bound now reaches the journal the worker thread builds, an oversized `ok` result is refused ahead of the settling append (L5006) as it is on version 1, and the host rebuilds that refusal as `EffectResultTooLarge`, so the driver releases the run instead of recording it as failed. `WorkerRunRequest` gains `resultBytes`, refused outside the bridged route, and `WorkerRunFailed` gains `tooLarge`.
+- Updated dependencies [a9be586]
+- Updated dependencies [a07f732]
+- Updated dependencies [be53e2d]
+- Updated dependencies [658c1b8]
+- Updated dependencies [af779f9]
+  - @cotal-ai/lang@0.66.0
+  - @cotal-ai/core@0.66.0
+  - @cotal-ai/workspace@0.66.0
+
+## 0.65.0
+
+### Minor Changes
+
+- 8577576: Add `once`, an at-most-once scope for cotal-lang steps that write to a far side. A resume that finds a step inside `once` begun and never settled does not dispatch it again: it opens a hold, a checkpoint minted under `holdRequestId` of the step's recorded request id, and the answer becomes the step's result, while an expired hold fails the step with the catchable L4027. A hold the host refuses leaves the step pending rather than refused, so no later host writes again, and its L5025 says so. A hold whose checkpoint answers an outcome other than `resolved` or `expired` fails the step as a handler fault. Only `ask` runs inside `once`; every other effect is refused before it begins (L4028), and a write from the body to a binding outside it is refused (L2032). The journal entry gains a `hold` field for the hold's own binding. The hosted runtime ends the held `ask`'s open attempt pause before the hold binds, and `cotal run answer`, `cotal run amend` and `cotal run journal` read a held step at its hold. A fork may cut inside `once`, and a migration ignores an orphaned `once`. `once` becomes a reserved name, so a program that declares its own `once` binding is refused (L2002). The design record is `docs/design/at-most-once-external-effect.md`.
+
+### Patch Changes
+
+- Updated dependencies [ba5468d]
+- Updated dependencies [8577576]
+- Updated dependencies [451ffee]
+- Updated dependencies [f01aa7c]
+- Updated dependencies [2cef9e6]
+  - @cotal-ai/core@0.65.0
+  - @cotal-ai/lang@0.65.0
+  - @cotal-ai/workspace@0.65.0
+
+## 0.64.0
+
+### Patch Changes
+
+- Updated dependencies [eb2b2d5]
+- Updated dependencies [6c79419]
+- Updated dependencies [d121d21]
+  - @cotal-ai/lang@0.64.0
+  - @cotal-ai/core@0.64.0
+  - @cotal-ai/workspace@0.64.0
+
+## 0.63.0
+
+### Minor Changes
+
+- c975258: A logged-in user can now run hosted workflows on a user-auth space. The auth callout issues an interactive user's `manager-caller` view as an issuance (SPEC 13.15): it chooses the generation, records evidence whose one source is the user's actor-ledger row, and writes the accepted row under a token derived from the connection's inbox nonce, renewing that generation on a reconnect whose ceiling is unchanged. `cotal run` and the other manager calls read the generation back with the new `issuedUserCaller` and ride `ep.v1`, so `cotal run start` against a participant manager started with `cotal supervise` is admitted. The issuing host admits a run from a user caller only for the manager's registered owner, and a participant manager now forwards the served subject of every caller resume and answer, which the host checks against the run's owner and the caller's live issuance; a legacy-rail resume is refused. The issuing host subscribes to those resume and answer request subjects itself and issues for a forwarded one only when it observed that request, only once, and only for the run a resume's envelope names or the endpoint and amendment an answer's envelope names, and never for a request bound to another manager instance or epoch or declaring another class or pinning another contract than the manager registered for that command. Every answering operator issuance must carry that served subject, and an amendment's carries `answers.amend: true`, which the host accepts only for a pause settled with an accepted answer, so `cotal run amend` works on a participant manager. A user caller starts, resumes and answers runs only on the participant manager that user registered, and a static caller keeps its admission there. A managed seat's manager call keeps the legacy rail when the broker refuses its accepted-row read, which surfaces as a request error caused by the permission violation. Revoking or re-granting the actor makes its issuances dead at the next resolution. New exports: `connectionAcceptedToken`, `actorLedgerSource`, `actorLedgerSourceBucket`, `parseActorLedgerSource`, `issuedUserCaller` and `isDerivedOwner` in core, and `ledgerActorSourceIsLive` and `UserCallerIssuer` in auth. `manager-caller` joins the issuable profiles, and the `issuer` profile gains the per-key read of the accepted store. SPEC §13.15 gains a **User-auth issuance** paragraph and §14.8 a **User-auth runs** paragraph, both insertions; `docs/design/user-auth-run-start.md` records the path, and `docs/cli.md`, `docs/workflows.md` and `docs/run-a-mesh.md` describe it. `docs/run-a-mesh.md` also says the stock auth service refuses managed-agent enrollment and retirement preparation for a host platform to intercept.
+
+### Patch Changes
+
+- Updated dependencies [62ebc6b]
+- Updated dependencies [22e210a]
+- Updated dependencies [cb6a0bf]
+- Updated dependencies [5738154]
+- Updated dependencies [101c9b0]
+- Updated dependencies [9d5cc09]
+- Updated dependencies [c975258]
+  - @cotal-ai/core@0.63.0
+  - @cotal-ai/workspace@0.63.0
+  - @cotal-ai/lang@0.63.0
+
+## 0.62.0
+
+### Minor Changes
+
+- b36bebf: `cotal spawn --detach` run from a managed seat's own shell on a static or open mesh now launches as that seat, so the manager records the seat as the spawner and the seat can stop the child with `cotal_despawn`, as it can a `cotal_spawn` child. Before, the CLI minted a one-shot operator instrument that no session could present again, and the seat's despawn was refused. `--on <instance>` keeps its pin on that path: on a static mesh the CLI mints a one-shot `manager-caller` view for the seat, pinned to that instance and carrying the spawn subject only when the seat's own credential holds it. On an open mesh the seat's call keeps the TLS requirement the mesh records, and `--server` with an unregistered `--space` keeps the operator path. Without `--space` the seat's target is picked as the operator path picks it, skipping a recorded mesh that is not running. The child is now stopped when the seat exits, and on a static mesh a seat without `capabilities: [spawn]` is refused. The seat-scoped control target that `cotal run` already used on a static mesh moves to `@cotal-ai/workspace` as `resolveSeatControlTarget`; `cotal run` keeps using it on a static mesh only. On a static mesh the seat's credential also proves its space, so a seat launched without `COTAL_SPACE` still acts as itself, as `cotal run answer` did before; an open mesh acts as the seat only when `COTAL_SPACE` names its space. See docs/UPGRADING.md.
+
+### Patch Changes
+
+- Updated dependencies [bcf66d6]
+- Updated dependencies [1b3ba08]
+- Updated dependencies [97a2382]
+- Updated dependencies [877909b]
+- Updated dependencies [5ef9a67]
+- Updated dependencies [565036c]
+- Updated dependencies [9236a12]
+- Updated dependencies [b36bebf]
+  - @cotal-ai/core@0.62.0
+  - @cotal-ai/lang@0.62.0
+  - @cotal-ai/workspace@0.62.0
+
+## 0.61.0
+
+### Patch Changes
+
+- @cotal-ai/core@0.61.0
+- @cotal-ai/workspace@0.61.0
+- @cotal-ai/lang@0.61.0
+
+## 0.60.0
+
+### Patch Changes
+
+- Updated dependencies [3b616a2]
+- Updated dependencies [6ca4d8e]
+  - @cotal-ai/core@0.60.0
+  - @cotal-ai/workspace@0.60.0
+  - @cotal-ai/lang@0.60.0
+
+## 0.59.0
+
+### Patch Changes
+
+- 904f4b2: A hosted run that completes now despawns every seat it spawned, including a race winner's, a plain sequential spawn, and a spawn that failed catchably while its process stayed up. Before this, only seats on cancelled branches were released, so a long-lived orchestrator accumulated seats until the manager refused further spawns. A fork child never releases a seat copied from its parent, and a spawn marked `onFork: "adopt"` is never released at completion, because a fork may still be using it. A seat a migration handed to a later spawn follows that spawn's policy, and stays up if any spawn that held it was marked `onFork: "adopt"`. In a space with several managers a despawn treats a seat as already gone only when the manager that allocated it says so, and it retries a despawn another manager refused before running it.
+- 608f5f4: Re-attach doc comments that had drifted away from the declarations they document. A `/** */` block followed directly by another one documented nothing, so editor hovers and the published type declarations showed no doc for the intended declaration (for example `Manager`, the `plane3` field and `AclResolver`). Each such block now sits above its declaration, is merged into the block it duplicated, or is removed when its declaration no longer exists. A new `pnpm check:doc-comments` check, run as part of `check:docsbundle`, refuses a doc block followed directly by another in shipped source.
+- 4a12111: The hosted `cotal run ps` now reads each run's revocation marker, as `run ps --local` already did. A revoked run whose driver died is listed as `revoked` with the revoker and reason instead of `running`, and a marker the manager cannot read prints `unchecked` and exits 1. The `run-ps` rows gain optional `revoked` and `revocationUnreadable` fields; the record's own `state` is unchanged.
+- f485c49: A run driver now advances the run record's `journalHigh` after every journal append, before the program acts on the entry. A tail delete of records appended since the last activation used to leave a short journal that a successor resumed from, performing those effects again. The successor now refuses it with `RunJournalTailTruncated`.
+- 7b39a0b: `spawn` in a workflow program accepts `events`, the workflow form of `cotal spawn --no-events`. `events: false` starts the seat without its AG-UI event plane, so a hosted run can now start a connector that publishes none, such as Hermes. Before this the option was refused as an unknown key (L3011), and the same spawn without it was refused by the manager because an omitted `events` arms the plane. A value that is not a boolean is refused at the spawn. Like `supervise`, the option is launch policy and is not part of the step's input hash.
+- d0b1da3: Record a changed answer on a settled run step. `cotal run amend <runId> <stepKey>` files a new answer beside a settled checkpoint's or ask's accepted one, naming the answer it supersedes, and `cotal run journal` lists each amendment under the step in the order the store committed them, so the last one is the current position. Each filing is its own record, so returning to an earlier position is listed too. A settled `ask` now prints the answer it accepted, as a checkpoint does, read from its answer record even when the value is a record with fields named like a checkpoint's result. The pause stays settled and the run keeps the answer it acted on; a second `answer` is still refused. The hosted path is the `amend` form of the manager's `run-answer` command (cluster revision 19), and a spawned seat may amend only an answer recorded under its own name.
+- 37075a2: `cotal run ps` and `cotal run journal` take `--json`, hosted or `--local`: one JSON object per row per line on stdout, with the run header and errors on stderr, as `cotal ps --json` does for seats. A run row adds its pinned `startedAt` and the `programHash` of its recorded program. A step row adds its effect kind and name, the recorded status and error code, its start and end times, and for an open pause its deadline and the `onExpiry` a checkpoint was armed with, which a checkpoint now records on its pending entry. An unreadable revocation marker under `--json` prints its reason to stderr and exits 1. `run ps --local` now reads its rows through the same listing the manager answers `run-ps` with, so both paths print the same rows.
+- 63b8bb7: A run's `turn` and `wait(down)` no longer read a seat as down from one presence read that misses its row. A seat's presence row expires 6 seconds after its last heartbeat, and a seat whose connector stalls longer than that, under host load or across a reconnect, renews the same incarnation's row once it resumes. On a loaded host one such gap failed the turn with L4002 (`lapsed`) while the seat kept working, and the run threw away the sibling branches of a `parallel` with it. A lapsed row now counts as the death only after it has stayed absent for 30 seconds, observed by presence reads that follow each other within the row's 6-second TTL: a slow presence read or a run of failed reads could hide a renewal, so it starts the 30 seconds over instead of counting as absence. A row held by a different incarnation of the same name (`superseded`) still counts at once, and a seat that really died is still reported as L4002, about 30 seconds later than before.
+- Updated dependencies [70bcfe3]
+- Updated dependencies [1cf7f72]
+- Updated dependencies [5bec8b2]
+- Updated dependencies [6c01470]
+- Updated dependencies [acb713e]
+- Updated dependencies [77e2654]
+- Updated dependencies [cfc3b95]
+- Updated dependencies [b669a73]
+- Updated dependencies [350c87b]
+- Updated dependencies [608f5f4]
+- Updated dependencies [43c4179]
+- Updated dependencies [4a12111]
+- Updated dependencies [569cb6f]
+- Updated dependencies [b4c69bf]
+- Updated dependencies [f485c49]
+- Updated dependencies [7b39a0b]
+- Updated dependencies [5f13124]
+- Updated dependencies [fb1bc26]
+- Updated dependencies [c389563]
+- Updated dependencies [06f48f4]
+- Updated dependencies [eb2681e]
+- Updated dependencies [fb1bc26]
+- Updated dependencies [438e9ed]
+- Updated dependencies [446ed23]
+- Updated dependencies [15c16ff]
+- Updated dependencies [8ce6be3]
+- Updated dependencies [08194ec]
+- Updated dependencies [aa12a1a]
+- Updated dependencies [d90f9f2]
+- Updated dependencies [499bd8a]
+- Updated dependencies [569cb6f]
+- Updated dependencies [d0b1da3]
+- Updated dependencies [37075a2]
+- Updated dependencies [8d8d69a]
+- Updated dependencies [c7bfc2d]
+- Updated dependencies [6145abc]
+  - @cotal-ai/workspace@0.59.0
+  - @cotal-ai/core@0.59.0
+  - @cotal-ai/lang@0.59.0
+
+## 0.58.0
+
+### Patch Changes
+
+- 417b5f0: Replay a drive's own journal again when a read loses a round, instead of failing the step
+
+  A drive reads its journal through one replay durable named after its takeover, before every effect
+  and at every poll of a parked pause. When another reader held that durable, the read raised
+  `RunJournalReplayRaced` and the interpreter recorded it on the step as `L4000 handler-fault`, so one
+  branch of a `parallel` failed on a healthy run. `activateRun` already treats the same error as a
+  lost round and replays again.
+
+  The reads behind a drive's steps (`RunScopeAuthority`, hosted and under `cotal run --local`) and the driver's diagnostic for a
+  journal with no run record now do the same, with the takeover's bound: up to three replays, one
+  straight after another, and the race is raised unchanged when the third is lost too. An operator
+  read runs under a takeover id minted for that one read (the manager and `cotal run` mint a fresh one
+  per call), so `RunHost.status`, `RunHost.locate` and `cotal run journal` still report the race on
+  their first read.
+
+  Only the race is retried. A reader in another process can also tear a fetch or return an empty
+  replay; neither is retried here.
+
+  A new suite, `smoke:runtime-run-host-replay`, drives the manager's run host through a `parallel` of
+  three `ask` steps answered within the same second: once while `RunHost.status` reads the drive's
+  own takeover id, and once while another connection takes records off the drive's durable. No branch
+  fails in either.
+
+  The `connector-core` docs bundle is regenerated for the updated paragraph in `docs/workflows.md`.
+
+- 1721738: Support signerless manager run hosting through typed host admission, initial-attempt and renewal operations. Renew the complete standing credential family while preserving held identities, serve epochs and last-good credentials on refusal. Keep pooled managers off local PTY launch paths and enforce the execution host boundary. Update the native lifecycle and mutation checks for these paths.
+- Updated dependencies [0589316]
+- Updated dependencies [59a7e64]
+- Updated dependencies [95ae645]
+- Updated dependencies [fba1537]
+- Updated dependencies [576f622]
+- Updated dependencies [2457692]
+- Updated dependencies [ee6de5d]
+- Updated dependencies [4229e53]
+- Updated dependencies [e9ef5b3]
+- Updated dependencies [7c54825]
+- Updated dependencies [2c31f95]
+- Updated dependencies [397bc60]
+- Updated dependencies [7b3924c]
+- Updated dependencies [1721738]
+  - @cotal-ai/core@0.58.0
+  - @cotal-ai/workspace@0.58.0
+  - @cotal-ai/lang@0.58.0
+
+## 0.57.0
+
+### Patch Changes
+
+- Updated dependencies [e7c702a]
+- Updated dependencies [6f64bcc]
+- Updated dependencies [42448fa]
+- Updated dependencies [ae90f5d]
+- Updated dependencies [33357d9]
+  - @cotal-ai/core@0.57.0
+  - @cotal-ai/lang@0.57.0
+  - @cotal-ai/workspace@0.57.0
+
+## 0.56.1
+
+### Patch Changes
+
+- Updated dependencies [6b76946]
+  - @cotal-ai/core@0.56.1
+  - @cotal-ai/workspace@0.56.1
+  - @cotal-ai/lang@0.56.1
+
+## 0.56.0
+
+### Patch Changes
+
+- Updated dependencies [e506040]
+- Updated dependencies [8dc7c92]
+- Updated dependencies [493eef5]
+- Updated dependencies [99cad7b]
+- Updated dependencies [1218786]
+- Updated dependencies [ef8889d]
+  - @cotal-ai/core@0.56.0
+  - @cotal-ai/workspace@0.56.0
+  - @cotal-ai/lang@0.56.0
+
+## 0.55.0
+
+### Patch Changes
+
+- Updated dependencies [888e9bc]
+- Updated dependencies [810814b]
+- Updated dependencies [8472dc3]
+- Updated dependencies [f272f71]
+- Updated dependencies [a83dd80]
+- Updated dependencies [db9a969]
+- Updated dependencies [d284ee6]
+- Updated dependencies [4f48629]
+- Updated dependencies [2e13607]
+- Updated dependencies [d3d6742]
+- Updated dependencies [2b28653]
+- Updated dependencies [fd58782]
+- Updated dependencies [357af9f]
+  - @cotal-ai/core@0.55.0
+  - @cotal-ai/workspace@0.55.0
+  - @cotal-ai/lang@0.55.0
+
+## 0.54.0
+
+### Minor Changes
+
+- 34beea1: Route user-auth manager calls through a short-lived, instance-bound control credential. Discovery and invocation address the same authorized manager while the agent's standing connection, credentials and conversation remain unchanged. Managed launches retain their manager selection across launch and resume. Static and open mesh routing is unchanged. Confirm the standing goal-progress subscription at the broker before submitting on the separate control connection, so fast terminal events cannot outrun the subscription. Recover accepted goal results through the manager's caller-scoped `goal-result` command after connection replacement, without repeating the mutation or granting clients raw JetStream reads. Followed calls now require a compatible manager before submission; update the issuer, participant manager and client together. Stopping a caller cancels its observation without cancelling the accepted goal. Retain Linux custody records across clean child exit so retirement can prove process identity and finish cleanup even after the custodian removes its file; socket loss alone never frees the alias.
+
+### Patch Changes
+
+- Updated dependencies [e6badb8]
+- Updated dependencies [34beea1]
+- Updated dependencies [b4317fd]
+  - @cotal-ai/core@0.54.0
+  - @cotal-ai/workspace@0.54.0
+  - @cotal-ai/lang@0.54.0
+
 ## 0.53.0
 
 ### Patch Changes

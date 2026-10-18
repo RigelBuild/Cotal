@@ -1,5 +1,125 @@
 # @cotal-ai/seat
 
+## 0.82.0
+
+## 0.81.1
+
+## 0.81.0
+
+## 0.80.0
+
+### Minor Changes
+
+- 5417401: Authorized managed Claude launches now accept the selected workspace through the native trust dialog. Startup choices are matched against the current screen and answered once before the existing development-channel confirmation. Foreground trust prompts are unchanged. No tool-permission bypass flag is added; accepting trust enables the checkout's own hooks and settings. Upgrade the connector, core and runtime together; older runtimes do not implement the new startup choices.
+
+## 0.79.0
+
+## 0.78.1
+
+## 0.78.0
+
+### Patch Changes
+
+- fdb35c4: A pty seat whose declared startup confirmation never appears is now stopped the way a graceful stop ends it, so a child that ignores SIGTERM is killed 3 seconds later. The in-process pty runtime, which `createRuntime("pty")` uses for every launch, sent SIGTERM once and never escalated, so such a child kept running behind a failed gate and the launch resolved as uncertain instead of failing. Both pty runtimes now share one `StartupConfirmGate` from `@cotal-ai/seat`, which owns the prompt match, the 15-second window, the failure message and the exit diagnostic.
+
+## 0.77.1
+
+## 0.77.0
+
+## 0.76.0
+
+## 0.75.0
+
+### Patch Changes
+
+- 5f5196f: When a seat's declared startup confirmation never appears, the pty runtime now records its own reason, `Cotal startup confirmation failed: prompt "<prompt>" did not appear within 15000ms.`, as the exit's diagnostic. Before, it only painted that line into the seat's screen, so the reap line carried no diagnostic and the launch failure named whatever row the screen ended on, such as a dialog's footer. The launch failure now names the exit diagnostic beside the last output when the two differ, or says the runtime's exit detail was unreadable when its reader throws, and the reap lines label it `diagnostic` because it is no longer only a connector's line. A connector diagnostic over 240 characters is now cut on a code point, so it never carries half a surrogate pair into a launch terminal, and a lone surrogate in a runtime's exit diagnostic or reader error is replaced with U+FFFD, so the failed terminal still commits.
+
+## 0.74.0
+
+## 0.73.0
+
+## 0.72.1
+
+## 0.72.0
+
+## 0.71.0
+
+### Patch Changes
+
+- 726a750: The tmux, cmux, Orca and Herdr runtimes now honour `LaunchSpec.confirm` as the PTY runtime does. Each reads its pane, presses Enter once when the declared prompt is on screen, and ends the seat with `Cotal startup confirmation failed: prompt "<prompt>" did not appear within 15000ms.` in the manager's log when it never appears. They used to press Enter five times on a one-second timer whatever the screen showed, so a dialog shown before the declared prompt was answered with its default. Core exports the shared `confirmWatch` they use.
+
+  Each backend call the watch makes times out after one second: the screen read, the terminal lookup, the Enter, and the close that ends a failed seat. A call that times out is killed with SIGKILL, because Node waits for a timed-out child to exit and a CLI that handles SIGTERM would keep the manager blocked past the timeout. The status probes and other CLI calls that share those helpers are killed the same way when they time out. No read starts once the 15 seconds are up, so a backend CLI that hangs fails the seat instead of stalling the manager. The tmux watch ends a failed seat by closing the seat's pane in whichever window holds it now, so a pane swapped into the seat's first window survives. It reads, presses Enter and closes only on the tmux server that opened the seat's window, so after a tmux restart it never types into or closes a new pane that reuses the seat's pane id.
+
+  A `confirm` prompt that is empty once ANSI codes and whitespace are removed, `""` included, is now refused before anything starts, and its launch files are removed. The PTY runtime used to start the child first and then throw, which left the child running with no handle to stop it and its launch files on disk, and every runtime treated `""` as no prompt.
+
+## 0.70.2
+
+## 0.70.1
+
+## 0.70.0
+
+### Patch Changes
+
+- d949bc8: The seat reaper now refuses a custody record when this host's boot identity cannot be read, instead of comparing start tokens as if the record came from this boot. A start token is unique only within one boot, so with no boot to compare against, `cotal seats` reported a record stamped by another boot as `live-child`, and `cotal seats --drain` or a manager reap could signal an unrelated process that held the recorded pid and start tick. Such a record is now `refused` with "this host publishes no boot identity", nothing is signalled, and the record stays on disk.
+
+## 0.69.0
+
+## 0.68.0
+
+### Patch Changes
+
+- 2638235: A static retirement interrupted after its lifecycle audit was written now completes when a later manager process retries it. The retry compared the stored audit against its own manager process uid and broker eviction counts, so every process after the first, and any retry that found the connections already kicked, failed with `records different evidence` and left the slot `terminalizing`. The comparison now keys on the stable retirement identity: the principal, alias, lifecycle uid, manager instance and retirement op. The pty reaper also treats a custody record from an earlier boot as a seat that is gone. It used to refuse such a record, which held the name after a reboot on every attempt; it now removes the record without signalling anything, since no process outlives a reboot, and `cotal seats` reports it as `childless`.
+
+## 0.67.0
+
+## 0.66.1
+
+## 0.66.0
+
+## 0.65.0
+
+## 0.64.0
+
+## 0.63.0
+
+## 0.62.0
+
+## 0.61.0
+
+## 0.60.0
+
+## 0.59.0
+
+### Patch Changes
+
+- 5f13124: Private launch files now have an owner. The Claude persona file, the Claude shared-server MCP config file and the pi persona file are listed on the new `LaunchSpec.artifacts`, and the launcher removes them once it has proved the agent process gone. On the default pty runtime the manager removes them when it sees the agent exit; on tmux, cmux, orca and herdr the manager removes them by polling the seat's status and waiting for the runtime's exit proof; the foreground `cotal spawn` removes them when its child exits. Every one of those launches also starts its child through the new core `reclaimWithChild`: a watcher started beside the child removes the files once the child's process is gone, and tries a failed removal again every five seconds until it succeeds, so a killed manager or foreground `cotal spawn` no longer strands them (POSIX; Windows has no shell for the watcher). Each directory name carries a random per-launch identity, so a stale path can never name a later launch's directory. The tmux, cmux, orca and herdr runtimes now throw the new core `SpawnRefused` for an unsafe name, an unreachable backend, (herdr) a missing working directory or an unknown layout, (orca) a working directory that is missing or outside any Orca worktree, and a launcher script they cannot write or (tmux, herdr) a session or server that will not start, all before the agent's command is handed to the backend, and the manager removes the files at once. A removal that fails, after an exit or after a refusal, is tried again until it succeeds. A batch resume removes the files of specs it built and never launched. Both connectors now refuse a bad model, prompt or launch option before writing anything. Any other spawn that throws is not proof that nothing started, so its files stay for the child's watcher, or for the OS temp reaper when no child started, as do a killed launcher's on Windows. A seat started under a custodian with `launchSeat` from `@cotal-ai/seat`, which the manager no longer does for a new launch, hands them to that custodian: a launch it refuses before any process started removes them at once, the custodian removes them when it sees the agent exit, a removal that fails stays on the custody record, and a reap that proves the seat gone removes what the record still lists from the temp dir the launch wrote to, so a successor with a different `TMPDIR` still removes them. Losing a custodian's connection no longer counts as the agent's exit. The docs now say that owner-private means any process running as the same user can read the file while it exists.
+- 61d6365: Stop starting a detached seat custodian for every default `pty` spawn on Linux. The built-in `pty` runtime now spawns in-process on every platform, the same as macOS and Windows, and reports `legacy` custody. On Linux it still adopts and reaps seats that an earlier manager left under a custodian, so existing seats drain under the new manager. Because the pty runtime can no longer spare its seats, a bare `cotal down` on Linux now asks for `cotal down --with-agents` while pty agents are running, as it already did on other platforms. The in-process pty runtime gives no hot-update guarantee. `cotal seats` lists the custody records an earlier Linux manager left, and `cotal seats --drain` retires each seat whose agent has exited. A seat whose agent still runs is never signalled, and a record that cannot be proved safe is refused and kept. A record with no start or boot identity, or one from an earlier boot, is refused by the read-only listing too, rather than reported as running or exited. The seat package exports the same inventory as `drainSeats`.
+- 8d8d69a: A pty seat whose process exits on its own is logged as `seat reaped: ... exit code <n>[, signal <s>]` followed by the last line the child printed that starts with a connector's `[cotal-<name>]` or `[cotal-<name>/<part>]` prefix, cut to 240 characters, such as `[cotal-jcode] AG-UI emitter stopped: ...` or `[cotal-hermes/bridge] ...`. This holds for a seat the manager spawned in-process and for one a seat custodian holds. The custodian now sends the child's exit code, signal and that diagnostic with its exit event, and the seat handle reports them through `exitInfo()`, so a custodial seat no longer reads `exit detail unavailable from runtime "pty"`. `@cotal-ai/seat` exports the shared `ConnectorDiagnosticReader`. The custodian writes the same record beside the custody record, so a reap of the seat by reference reports how the child ended. When that record cannot be written, the custodian logs why, and the reap of a child that ended on its own says the record is missing or unreadable.
+- 62b004b: Record the two accepted residuals of the seat reap in the security model. The reap kills the seat child's process group by membership with no per-member start identity check, and it trusts the pids and start tokens its custody record names, so a same-uid process that rewrites `record.json` chooses what the next reap signals. The `reapSeat` doc comment and the design note on signer isolation no longer claim that the reap signals only identity-matched pids.
+
+## 0.58.0
+
+### Patch Changes
+
+- 5831ef8: Pty seats are marked more killable than the broker (`oom_score_adj` 500 on the seat's PTY child), with a logged reason when the kernel refuses and an explicit unavailable line off Linux.
+- 66ef843: Export the existing Linux socket peer-credentials reader and its type from the seat package root so embedders can apply their own UID policy without importing private native-helper paths. Verify the public API with real separate-process Unix sockets and explicit unsupported-platform refusal.
+- a726a3d: Register the hosted service and renewal checks with stable CI suite fragments, mark the restart fixture's broker for owned teardown, and verify unsupported seat reaping on other platforms without claiming Linux process-group coverage. Let the continuity fixture observe an already-started transport reconnect before preparing its recovery command.
+- fd0cf70: Retain custody records on disk across seat exit until verified reaping confirms kernel process identities and purges the directory, enabling manager process restart reconciliation. Refuse reaping when a dead leader leaves a nonempty group whose generation cannot be proved, retaining the custody record without signalling that group.
+
+## 0.57.0
+
+## 0.56.1
+
+## 0.56.0
+
+## 0.55.0
+
+## 0.54.0
+
+### Minor Changes
+
+- 34beea1: Route user-auth manager calls through a short-lived, instance-bound control credential. Discovery and invocation address the same authorized manager while the agent's standing connection, credentials and conversation remain unchanged. Managed launches retain their manager selection across launch and resume. Static and open mesh routing is unchanged. Confirm the standing goal-progress subscription at the broker before submitting on the separate control connection, so fast terminal events cannot outrun the subscription. Recover accepted goal results through the manager's caller-scoped `goal-result` command after connection replacement, without repeating the mutation or granting clients raw JetStream reads. Followed calls now require a compatible manager before submission; update the issuer, participant manager and client together. Stopping a caller cancels its observation without cancelling the accepted goal. Retain Linux custody records across clean child exit so retirement can prove process identity and finish cleanup even after the custodian removes its file; socket loss alone never frees the alias.
+
 ## 0.53.0
 
 ## 0.52.1

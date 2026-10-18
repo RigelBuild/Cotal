@@ -6,15 +6,16 @@
  * `@nats-io/jwt`, so there is no dependency on the external `nsc` CLI and the signing
  * key stays in one place (whoever holds {@link SpaceAuth.account.signingSeed}).
  *
- * Demo-1 stage: out-of-band mint. `cotal up` creates the space's trust material
+ * The static mint is out of band: `cotal up` creates the space's trust material
  * once and writes a `nats-server` config (operator + system account + MEMORY resolver);
- * `cotal mint` and the manager load that material and mint per-agent creds files. There
- * is no connect-time token exchange yet (that's the later auth-callout stage).
+ * `cotal mint` and the manager load that material and mint per-agent creds files. The auth
+ * callout mints at connect time through the same {@link permissionsFor}.
  *
- * D5 adds the first credential-death primitive: profile-classified user-JWT lifetimes. Full revocation,
- * live eviction, standing-host renewal, and issuance audit still land in later D5 slices.
+ * Every credential kind is classified in {@link CREDENTIAL_LIFETIMES}: its lifetime class, default
+ * expiry and renewal owner.
  */
 import { TTL_RECONCILE_CANARY_KEY, ttlBuckets } from "./streams.js";
+import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import {
   decode,
@@ -30,7 +31,7 @@ import {
   spacePrefix,
   chatSubject,
   assertValidChannel,
-  channelInAllow,
+  resolveReadAcl,
   principalKey,
   parsePrincipalKey,
   deprovisionTargetPrincipal,
@@ -58,6 +59,7 @@ import {
   membersBucket,
   aclBucket,
   aclKey,
+  memberKey,
   assertLifecycleToken,
   type DeprovisionTarget,
   membershipBucket,
@@ -71,10 +73,15 @@ import {
   MEMBERSHIP_INBOX_PREFIX,
   FANOUT_DURABLE,
   INBOX_READER_DURABLE,
+  livenessSubject,
+  livenessServeFilter,
+  livenessReplyGrant,
+  isTransferStream,
 } from "./subjects.js";
+import { LIVENESS_PLANES } from "./liveness.js";
 import {
-  epCallerGrantRows, epServeGrantRows, epBaselineGrantRows, spawnCallerCapabilities, runCallerCapabilities, epRequestGrantRows,
-  operatorInstrumentCapabilities, epDescribeAllGrantRow, BASELINE_LIFECYCLE_ENDPOINT,
+  epCallerGrantRows, epServeGrantRows, epBaselineGrantRows, baselineCallerCapabilities, spawnCallerCapabilities, runCallerCapabilities, epRequestGrantRows,
+  operatorInstrumentCapabilities, instanceOnlyManagerCapabilities, epDescribeAllGrantRow, BASELINE_LIFECYCLE_ENDPOINT,
   type EpCapability,
 } from "./endpoint-grants.js";
 import { assertServeGrantMintable, finalizeServeIssuance, type EpServeGrant, type EpIssuanceGate } from "./endpoint-service.js";
@@ -83,10 +90,12 @@ import { epsSubject, epCallerReplyFilter, assertGeneration, AUTH_ENDPOINT, EP_CM
 import { acceptedReadGrant, acceptedBucket, importNativeSubjectPermissions, issuedBucket, writeAcceptedRow, type IssuanceSeam, type IssuedAuthorityRef } from "./issued-authority.js";
 import { admissionBucket, admissionKey, revocationKey } from "./run-admission.js";
 import { runDriverGrants, runMediatorGrants, runOperatorGrants, type RunDriverGrantArgs, type RunOperatorGrantArgs } from "./run-driver-grants.js";
+import { transferReaderGrants, transferWriterGrants } from "./transfer.js";
 import { recordsBucket, recordSpecKey, recordStatusKey, recordAtomicKey, RECORD_KINDS, GOVERN_HEAD } from "./endpoint-records.js";
 import { lifecycleHeadKey, uidReservationKey, issuanceGateKey, staticSlotKey, STATIC_SLOT_PREFIX, epgateKey, epcredFamilyPrefix, eprepairKey } from "./lifecycle-state.js";
 import { rawDigest } from "./canonical.js";
-import { credsClaims, type Identity } from "./identity.js";
+import { environmentManagerPermissions, isEnvironmentManagerProfile, type EnvironmentManagerGrantPin } from "./environment-manager-grants.js";
+import { credsClaims, isUserNkey, type Identity } from "./identity.js";
 import {
   backupProfilePermissions,
   restoreProfilePermissions,
@@ -94,51 +103,52 @@ import {
   type RestorePermissionScope,
 } from "./backup.js";
 
-/** Cred profiles. Each profile has an explicit permission arm and a D5 lifetime classification. */
+/** Cred profiles. Each profile has an explicit permission arm and a lifetime classification. */
 export type Profile =
   | "agent"
+  | "manager-caller"
   | "observer"
   | "admin"
   | "supervisor"
   | "provisioner"
-  | "deprovisioner" // ephemeral, TARGET-PINNED teardown of ONE departed agent's id-keyed footprint (#159 B)
-  | "retirement-requester" // ephemeral request+reply on the auth-admin rail (#29 piece 3): asks the AUTH plane to retire a lifecycle; holds NO executing right
-  | "lifecycle-executor" // ephemeral, LIFECYCLE-PINNED §13.1 state writes for the STATIC manager (Unit B): exactly ONE incarnation's head/uid/gate/cred-row/slot keys
-  | "endpoint-serve-executor" // ephemeral, ENDPOINT-INSTANCE-PINNED §13.1 endpoint-serve writes (P2 item 1, 1a-serve): exactly ONE (endpoint, instanceId)'s epgate + epcred family + eprepair cursor
+  | "deprovisioner" // ephemeral, TARGET-PINNED teardown of ONE departed agent's id-keyed footprint
+  | "retirement-requester" // ephemeral request+reply on the auth-admin rail: asks the AUTH plane to retire a lifecycle; holds NO executing right
+  | "lifecycle-executor" // ephemeral, LIFECYCLE-PINNED §13.1 state writes for the STATIC manager: exactly ONE incarnation's head/uid/gate/cred-row/slot keys
+  | "endpoint-serve-executor" // ephemeral, ENDPOINT-INSTANCE-PINNED §13.1 endpoint-serve writes: exactly ONE (endpoint, instanceId)'s epgate + epcred family + eprepair cursor
   | "operator"
   | "purger"
   | "backup"
   | "restore"
   | "delivery"
   | "membership-rw"
-  // PR 1.5 — the CLI-surface profiles that finish scoping (and DELETE) the former allow-all `manager`.
+  // The scoped CLI-surface profiles.
   | "probe" // connect-only liveness/auth preflight
   | "channel-writer" // channel-registry value-writes (channels set/default, spawn -f seed)
   | "channel-purger" // channel-writer + STREAM.PURGE.CHAT (web channel-delete)
   | "teardown" // the SOLE STREAM.DELETE holder (down -f space teardown)
-  // Control callers — the manager's control tiers are SUBJECT-gated (holding the tier's pub grant IS
-  // the authority), so ps/start and stop/attach get SEPARATE, tier-scoped caller creds.
-  | "control-caller-privileged" // ps/start → ctl.<privileged>.<id> only (no cross-agent reach)
-  | "control-caller-admin" // stop/attach → ctl.<admin>.<id> only (cross-agent power)
+  // Control callers — each holds its tier's `operatorInstrumentCapabilities` ep rows, and an any-mode
+  // row IS cross-agent reach, so ps/start and stop/attach get SEPARATE, tier-scoped caller creds.
+  | "control-caller-privileged" // ps/start → the privileged instrument set, no any-mode row (no cross-agent reach)
+  | "control-caller-admin" // stop/attach → the admin instrument set, adding the any-mode rows + manager.admin (cross-agent power)
   | "deployer" // spawn -f deploy authority: reads + admin-control launch on one ephemeral cred
   // v0.4 control surface (SPEC §13.9): the per-instance endpoint serve credential — EXACTLY the
   // instance's registered rails + epoch-pinned egress, no agent baseline. Consumes only an
   // authorizeServeGrant-branded tuple; re-minted on takeover with the new epoch.
   | "endpoint-serve"
-  // v0.4 action surface (P2 item 2, spawn-as-action): the SELF-MEDIATED goal-writer for an endpoint
+  // v0.4 action surface (spawn-as-action): the SELF-MEDIATED goal-writer for an endpoint
   // that accepts action goals inline on its ephemeral handler — EXACTLY that endpoint's goal
   // bind/terminal facts + goal-record writes ({@link goalWriterGrants}), a dedicated connection
-  // disjoint from the serve credential (Q2). Standing, re-minted on renewal like the serve cred.
+  // disjoint from the serve credential. Standing, re-minted on renewal like the serve cred.
   | "goal-writer"
-  // The console/CLI per-session CALLER credential (P2 item 6): rails-only for ONE §13.6 session,
+  // The console/CLI per-session CALLER credential: rails-only for ONE §13.6 session,
   // TTL-bound to it, never standing. Static = face-minted from the seed; user mode = the callout.
   | "session-caller"
-  // The manager's SERVING per-session credential (P2 item 6): the mirror of `session-caller` with
+  // The manager's SERVING per-session credential: the mirror of `session-caller` with
   // the directions swapped — sub the ONE session's `in` rail, pub its `out` rail, nothing else.
   // Minted at redemption, TTL-bound to the session, never renewed (SPEC 13.6: both sides hold only
   // redemption-minted per-session credentials; no standing EPS grant exists on either side).
   | "session-serving"
-  // The manager's SESSION LEDGER (P2 item 6): the standing connection owning the DEDICATED
+  // The manager's SESSION LEDGER: the standing connection owning the DEDICATED
   // sessions-bucket `session.<id>` rows — §13.6's "durable named authority that survives the
   // serving endpoint". Holds NO session rail of any shape; the rails are `session-serving`'s and
   // `session-caller`'s. Standing + re-minted for the SAME nkey on renewal (the goal-writer precedent).
@@ -153,7 +163,7 @@ export type Profile =
   // never a standing connection, so the serve rails never hold a run's journal or records reach
   // ({@link runOperatorGrants}).
   | "run-operator"
-  // v0.4 endpoint-registration eviction (P2 item 3, slice 3a): the SCOPED delivery-admin caller a
+  // v0.4 endpoint-registration eviction: the SCOPED delivery-admin caller a
   // registration barrier mints PER re-registration to verify-evict the SUPERSEDED serve family
   // before the epoch advances (SPEC 13.1 "old authority dies before new authority is visible").
   // EXACTLY the delivery-admin request+reply rail + $JS.API.INFO — no lease, presence, store read,
@@ -169,16 +179,28 @@ export type Profile =
   // over. Creates that ONE run's admission record and, later, its revocation marker. The driver
   // holds nothing on this store; the mediator reads it.
   | "run-admitter"
+  // A carried resume's TRANSFER WRITER (docs/design/resume-transfer.md section 6): the operator's
+  // per-call instrument for ONE object in ONE manager instance's transfer bucket, minted after the
+  // CLI has hashed the transcript ({@link transferWriterGrants}).
+  | "transfer-writer"
+  // A manager instance's TRANSFER READER: one `transcript-receive` or sweep over its own transfer
+  // bucket and no other ({@link transferReaderGrants}).
+  | "transfer-reader"
   // Closed human-issued remote manager authority. Never exposed as a generic profile string: the
   // auth provider's typed manager-service protocol is the only mint door.
-  | "remote-manager";
+  | "remote-manager"
+  // Fixed host-issued environment profiles, never exchange views or raw caller-selected grants.
+  | "environment-bootstrap"
+  | "environment-manager-supervisor"
+  | "environment-manager-executor"
+  | "environment-manager-goal-writer";
 
 export type CredentialLifetimeClass =
   | "standing-renewable" // bounded exp + an ONLINE renewal owner (a seed-holder re-mints before expiry)
   // The $SYS class: bounded exp but NOT online-renewable — the $SYS signing seed is destroyed at end
   // of `up` (saveSpaceAuth strips it), so no running process can re-mint these. Their only renewal is
   // a coordinated system-account ROTATION (rotateSystemAccount) + broker restart. Named distinctly so
-  // the "renewable" verb can never leak "online renewal" into the doctor/operator copy (D5 slice 5).
+  // the "renewable" verb can never leak "online renewal" into the doctor/operator copy.
   | "rotation-renewed"
   | "one-shot"
   | "static-operator-managed"
@@ -187,7 +209,7 @@ export type CredentialKind = Profile | "membership-observer" | "connection-evict
 
 export interface CredentialLifetimePolicy {
   class: CredentialLifetimeClass;
-  /** Default max age for profiles safe to expire before the renewal slice. Undefined = no default exp yet. */
+  /** Default max age at mint. Undefined = the profile mints no default exp. */
   defaultTtlSeconds?: number;
   renewalOwner?: string;
   note: string;
@@ -195,7 +217,33 @@ export interface CredentialLifetimePolicy {
 
 const FIVE_MINUTES = 5 * 60;
 
-/** Bounded lifetime for `standing-renewable` credentials whose renewal owner is ONLINE (D5 slice 5):
+/** The broker's pre-auth control-line cap, in bytes (`max_control_line` in the generated config —
+ *  `openServerConfig` and `serverConfig` below both render this literal, so the cap and the
+ *  mint-time bound derived from it below can never drift). 64 KiB clears a many-channel agent
+ *  JWT (~4-8 KB) with wide margin while keeping the pre-auth allocation ~16x tighter than 1 MB
+ *  under connection flooding (the CONNECT line is parsed BEFORE auth). */
+export const MAX_CONTROL_LINE_BYTES = 65536;
+
+/** The fixed bytes a NATS client wraps around the `jwt` field on the CONNECT protocol line, over
+ *  and above the JWT itself: the JSON object's other keys (`nkey`, `sig`, `name`, `lang`,
+ *  `version`, `protocol`, `verbose`, `pedantic`, `no_responders`, `headers`), their values, and
+ *  the surrounding braces/quotes/commas. Measured live (nats-server `-DV`, the trace of the raw
+ *  protocol) on a real connect with the nats.js v3 client: a control-name credential produced a
+ *  5,104-byte JWT inside a 5,291-byte CONNECT line — 187 bytes of envelope, reproduced twice.
+ *  Rounded up generously (>2.5x) to absorb client/library variation this repo does not control. */
+export const CONNECT_ENVELOPE_OVERHEAD_BYTES = 512;
+
+/** The mint-time budget for a user JWT's byte size: every composition that inflates the JWT (a
+ *  long single channel, many channels, the per-agent event channel, any grant a later change
+ *  adds) is priced against the SAME number, because the credential is what the client sends on
+ *  the CONNECT line and the CONNECT line is what the broker caps — not any one contributor to it.
+ *  `assertValidName`/`assertValidChannel` bound one input each; this bounds the OUTPUT, closing
+ *  the gap between "every individual grant is legal" and "the composed credential still fits"
+ *  (issue #375's review finding: six distinct 4096-char channels, each individually accepted,
+ *  minted a JWT the broker would silently drop). */
+export const MAX_MINTED_JWT_BYTES = MAX_CONTROL_LINE_BYTES - CONNECT_ENVELOPE_OVERHEAD_BYTES;
+
+/** Bounded lifetime for `standing-renewable` credentials whose renewal owner is ONLINE:
  *  the holder (or its launcher) re-mints at 75% of the lifetime via the endpoint's creds-source seam,
  *  so a copied cred is broker-dead within a day while renewal never involves an operator. 24h keeps
  *  the remaining-25% loud-failure window at ~6h — wide enough to notice and repair before expiry. */
@@ -205,19 +253,20 @@ export const STANDING_RENEWABLE_TTL_SEC = 24 * 60 * 60;
  *  evictor). They are NOT online-renewable (the $SYS seed dies at end of `up`), so this exp is the
  *  credential-death horizon: a copied observer/evictor cred becomes broker-dead after it, and the
  *  operator is expected to have run a coordinated system-account rotation + broker restart within it
- *  (the doctor surface warns ahead — slice 6). 30 days balances "copied cred eventually dies" against
+ *  (the doctor surface warns ahead). 30 days balances "copied cred eventually dies" against
  *  a comfortable monthly rotation cadence; tune here as one named knob. */
 export const ROTATION_RENEWED_TTL_SEC = 30 * 24 * 60 * 60;
 
-/** D5 profile matrix. This is intentionally centralized so every new mint profile must classify its
+/** The credential lifetime matrix. This is intentionally centralized so every new mint profile must classify its
  * credential-death behavior instead of silently inheriting non-expiring static creds. */
 export const CREDENTIAL_LIFETIMES: Record<CredentialKind, CredentialLifetimePolicy> = {
   agent: { class: "mixed", note: "manager children, foreground spawn/join, and cotal mint static outputs all use this profile; split or repair flow required before default exp" },
+  "manager-caller": { class: "mixed", note: "short-lived user-auth view bound to the bearer expiry and one manager instance" },
   observer: { class: "static-operator-managed", note: "out-of-band dashboard/audit credential from cotal mint" },
   admin: { class: "static-operator-managed", note: "out-of-band elevated dashboard/audit credential from cotal mint" },
-  supervisor: { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "manager's always-on endpoint; the manager holds the DATA seed and self-remints via the endpoint creds source (D5 slice 5 class 1)" },
-  delivery: { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "server-side Plane-3 daemon; seed-less - the manager re-signs .cotal/delivery.creds for the SAME nkey, requests delivery-admin reloadCreds for explicit adoption, and the endpoint source re-read is only a backstop (D5 slice 5 class 2)" },
-  "membership-rw": { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "membership feed writer; seed-less - the manager re-signs the membership-rw.creds store key for the SAME nkey, the feed adopts it on a 75% preflight-proven renewal timer (its active self-heal), and delivery-admin reloadCreds is the explicit adoption on top (D5 slice 5 class 2)" },
+  supervisor: { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "manager's always-on endpoint; the manager holds the DATA seed and self-remints via the endpoint creds source" },
+  delivery: { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "server-side Plane-3 daemon; seed-less - the manager re-signs .cotal/delivery.creds for the SAME nkey, requests delivery-admin reloadCreds for explicit adoption, and the endpoint source re-read is only a backstop" },
+  "membership-rw": { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "membership feed writer; seed-less - the manager re-signs the membership-rw.creds store key for the SAME nkey, the feed adopts it on a 75% preflight-proven renewal timer (its active self-heal), and delivery-admin reloadCreds is the explicit adoption on top" },
   provisioner: { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "setup/spawn provisioning window only" },
   deprovisioner: { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "target-pinned teardown window only" },
   "retirement-requester": { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "one despawn's retirement request window; request+reply only" },
@@ -235,19 +284,25 @@ export const CREDENTIAL_LIFETIMES: Record<CredentialKind, CredentialLifetimePoli
   "control-caller-admin": { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "stop/attach admin control call" },
   deployer: { class: "one-shot", note: "manifest deploy spans planning/launch/ledger; needs near-expiry guard or remint before default exp" },
   "endpoint-serve": { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "per-instance endpoint serve credential (SPEC 13.9); the managing authority re-mints on renewal and on takeover (new epoch), and the 13.1 barrier revokes the superseded one" },
-  "goal-writer": { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "self-mediated goal-writer for spawn-as-action (P2 item 2); the manager re-mints for the SAME nkey on renewal, disjoint from the serve credential (Q2)" },
-  "session-caller": { class: "one-shot", defaultTtlSeconds: 24 * 60 * 60, note: "per-session console/CLI caller cred (P2 item 6): rails-only for ONE §13.6 session; TTL-BOUND to the session (the face mints with expiresAt = the session exp; the 24h default is the SESSION_GRANT_MAX_TTL ceiling, never a standing lifetime); NEVER renewed - a new session mints a new cred" },
-  "session-serving": { class: "one-shot", defaultTtlSeconds: 24 * 60 * 60, note: "per-session SERVING cred (P2 item 6): rails-only for ONE §13.6 session, the mirror of session-caller with the directions swapped; minted at redemption and TTL-BOUND to the session (the 24h default is the SESSION_GRANT_MAX_TTL ceiling, never a standing lifetime); NEVER renewed - a new session mints a new cred, and the session's terminal revokes this one by name" },
-  "session-ledger": { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "manager's session LEDGER (P2 item 6): the dedicated sessions-bucket `session.<id>` rows and NOTHING else - no session rail of any shape. Standing because SPEC 13.6 makes it the durable revocation authority that must survive the serving endpoint; the manager re-mints for the SAME nkey on the half-TTL loop (the goal-writer precedent)" },
+  "goal-writer": { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "self-mediated goal-writer for spawn-as-action; the manager re-mints for the SAME nkey on renewal, disjoint from the serve credential" },
+  "session-caller": { class: "one-shot", defaultTtlSeconds: 24 * 60 * 60, note: "per-session console/CLI caller cred: rails-only for ONE §13.6 session; TTL-BOUND to the session (the face mints with expiresAt = the session exp; the 24h default is the SESSION_GRANT_MAX_TTL ceiling, never a standing lifetime); NEVER renewed - a new session mints a new cred" },
+  "session-serving": { class: "one-shot", defaultTtlSeconds: 24 * 60 * 60, note: "per-session SERVING cred: rails-only for ONE §13.6 session, the mirror of session-caller with the directions swapped; minted at redemption and TTL-BOUND to the session (the 24h default is the SESSION_GRANT_MAX_TTL ceiling, never a standing lifetime); NEVER renewed - a new session mints a new cred, and the session's terminal revokes this one by name" },
+  "session-ledger": { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "manager's session LEDGER: the dedicated sessions-bucket `session.<id>` rows and NOTHING else - no session rail of any shape. Standing because SPEC 13.6 makes it the durable revocation authority that must survive the serving endpoint; the manager re-mints for the SAME nkey on the half-TTL loop (the goal-writer precedent)" },
   "run-driver": { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "one workflow run's driver, per takeover attempt (SPEC 14.6): the hosting manager mints it when it takes the run over and re-mints for the SAME nkey on renewal; a new takeover mints a new one" },
   "run-mediator": { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "trusted workflow host operations, bound to one run and attempt; kept on the hosting process's connection" },
   "run-operator": { class: "one-shot", defaultTtlSeconds: 60, note: "one served run-status / run-ps / run-answer call (SPEC 14.3): the hosting manager mints it per call on its own connection, never the serve rails; 60s bounds a copied cred to a minute" },
   issuer: { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "one issuance's evidence stage/release or one lifecycle terminal's issuance retirement (SPEC 13.15)" },
   "run-admitter": { class: "one-shot", defaultTtlSeconds: 60, note: "one hosted run's admission record create, or its revocation marker (SPEC 14.8); 60s bounds a copied cred to a minute" },
-  "endpoint-evictor": { class: "one-shot", defaultTtlSeconds: 60, note: "one re-registration's verify-evict window (P2 item 3): a scoped delivery-admin caller that kicks+verifies the SUPERSEDED serve family before the epoch advances; 60s bounds a copied cred to a minute" },
+  "transfer-writer": { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "one carried resume per CLI call: one object's chunk and meta subjects in one instance's transfer bucket" },
+  "transfer-reader": { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "one transcript-receive or sweep over the minting instance's own transfer bucket" },
+  "endpoint-evictor": { class: "one-shot", defaultTtlSeconds: 60, note: "one re-registration's verify-evict window: a scoped delivery-admin caller that kicks+verifies the SUPERSEDED serve family before the epoch advances; 60s bounds a copied cred to a minute" },
   "remote-manager": { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "auth-service", note: "the scoped remote manager lifecycle: own lease/presence plus same-owner agent provisioning; issued only by the typed supervise protocol, never by cotal mint or a raw view/profile string" },
+  "environment-bootstrap": { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "one admitted environment's bootstrap caller; explicit expiry capped by admission and five minutes" },
+  "environment-manager-supervisor": { class: "standing-renewable", renewalOwner: "environment-authority", note: "own lease/presence/liveness; explicit expiry capped by admission, no auth-store access" },
+  "environment-manager-executor": { class: "standing-renewable", renewalOwner: "environment-authority", note: "own admitted authority instance RPC; explicit expiry capped by admission, no direct store access" },
+  "environment-manager-goal-writer": { class: "standing-renewable", renewalOwner: "environment-authority", note: "manager goal rows without the auth-read belt; explicit expiry capped by admission" },
   "membership-observer": { class: "rotation-renewed", defaultTtlSeconds: ROTATION_RENEWED_TTL_SEC, renewalOwner: "system-account rotation", note: "$SYS-account CONNZ observer; NOT online-renewable ($SYS seed dies at `up`) - bounded exp, renewed only by rotateSystemAccount + broker restart; doctor warns near expiry" },
-  "connection-evictor": { class: "rotation-renewed", defaultTtlSeconds: ROTATION_RENEWED_TTL_SEC, renewalOwner: "system-account rotation", note: "$SYS-account KICK-only live-eviction cred (D5 slice 4); same rotation-renewed posture as the observer" },
+  "connection-evictor": { class: "rotation-renewed", defaultTtlSeconds: ROTATION_RENEWED_TTL_SEC, renewalOwner: "system-account rotation", note: "$SYS-account KICK-only live-eviction cred; same rotation-renewed posture as the observer" },
 };
 // RUNTIME integrity (the afa715b class): the matrix and every policy freeze at module load
 // (a post-import `defaultTtlSeconds = undefined` would otherwise mint a NON-EXPIRING credential
@@ -297,7 +352,7 @@ export function inspectCredHealth(creds: string, nowSec = Math.floor(Date.now() 
 
 /** BROKER-level trust: the operator root and the system account. A nats-server trusts exactly ONE
  *  operator and one system account, so this is the per-BROKER authority, not a per-space one. With
- *  many spaces on one broker (W4) every space's accounts are signed by this one operator.
+ *  many spaces on one broker every space's accounts are signed by this one operator.
  *
  *  `sys.signingSeed` is minting capability for system-account users (the membership observer and the
  *  connection evictor). It is in-memory only on a fresh {@link createBrokerAuth} and is NOT written
@@ -327,7 +382,7 @@ export interface SpaceAccountAuth {
 }
 
 /** The COMPOSED read view of one space's full trust chain: broker authority plus that space's
- *  account. Deliberately structurally identical to the pre-W4 single-space shape, so the many
+ *  account. Deliberately structurally identical to the single-space shape, so the many
  *  existing readers compose rather than churn.
  *
  *  This is a read adapter, never a persistence authority: it is produced by loading the two
@@ -396,8 +451,8 @@ export function stripSpaceAuth(auth: SpaceAuth): SpaceAuth {
 }
 
 /** Rotate the DATA-account signing key and re-issue the data-account JWT so the old data signer is no
- * longer trusted by the broker once it loads the returned auth. This does NOT rotate the system account:
- * persisted `membership-observer` creds remain valid until the system-account renewal/rotation slice. */
+ * longer trusted by the broker once it loads the returned auth. This does NOT rotate the system account
+ * (that is {@link rotateSystemAccount}): persisted `membership-observer` creds stay valid. */
 export async function rotateDataAccountSigningKey(auth: SpaceAuth): Promise<SpaceAuth> {
   if (!auth.operator.seed || !auth.account.seed)
     throw new Error("rotateDataAccountSigningKey: full operator/account seed material is required (a stripped signer cannot rotate trust)");
@@ -503,7 +558,7 @@ export async function createSpaceAccountAuth(broker: BrokerAuth, space: string):
 
 /** Generate a fresh operator → account(+signing key) → system-account chain for a space.
  *  The single-space composition of {@link createBrokerAuth} + {@link createSpaceAccountAuth}: one
- *  broker whose only tenant is this space, which is exactly the pre-W4 shape. */
+ *  broker whose only tenant is this space. */
 export async function createSpaceAuth(space: string): Promise<SpaceAuth> {
   const broker = await createBrokerAuth(space);
   const spaceAccount = await createSpaceAccountAuth(broker, space);
@@ -530,9 +585,9 @@ export interface MintOpts {
   allowPublish?: string[];
   /** The agent's role — scopes its TASK-queue consumer to svc_<role>. */
   role?: string;
-  /** Capabilities declared in the agent file (e.g. `"spawn"`). A capability gates the
-   *  privileged control-subject grant in {@link permissionsFor}: `spawn` → the agent may
-   *  publish to the privileged control subject (start/purge/definePersona/named stop).
+  /** Capabilities declared in the agent file (e.g. `"spawn"`). Each gates a set of manager ep
+   *  caller rows in {@link permissionsFor}: `spawn` → {@link spawnCallerCapabilities}, `run` →
+   *  {@link runCallerCapabilities}, `admin` → the admin {@link operatorInstrumentCapabilities} set.
    *  Default-deny when absent — nats-server rejects the publish, no handler involved. */
   capabilities?: string[];
   /** v0.4 endpoint request capabilities (SPEC §13.9 caller rows): each mints its exact
@@ -540,6 +595,8 @@ export interface MintOpts {
    *  caller's own reply-rail read row. Requires {@link MintOpts.lifecycleUid} — the rows pin
    *  the full caller triple. Default-deny when absent. */
   endpointCapabilities?: EpCapability[];
+  /** `manager-caller` profile only: the one manager instance every request row pins. */
+  managerInstanceId?: string;
   /** The caller's lifecycle UID (SPEC §13.1), minted by the managing authority BEFORE the
    *  entity is reachable. REQUIRED with `endpointCapabilities` — every endpoint-rail row
    *  forge-locks it as the third caller token. */
@@ -554,7 +611,7 @@ export interface MintOpts {
    *  registered owner). The freshness FENCE is the durable issuance gate ({@link serveIssuance}
    *  / SPEC §13.1), not this artifact. Every other profile refuses it (a serve credential is
    *  per-instance, never an agent-baseline cred). The `$JS.API` bind rows (effects/pool
-   *  durables) ride the D14 credential assembly, not this subject-space builder. */
+   *  durables) ride `effectsBindGrants`/`poolOwnerBindGrants`, not this subject-space builder. */
   endpointServe?: EpServeGrant;
   /** v0.4 SERVE mint fence (SPEC §13.1), `endpoint-serve` profile ONLY and REQUIRED there: the
    *  durable, single-key issuance gate whose revision-pinned CAS `mintCreds` must WIN to release
@@ -592,7 +649,7 @@ export interface MintOpts {
      *  `handle` target, so the grant pins it: a leaked requester cannot be re-aimed. */
     target: { owner: string; actor: string; lifecycleUid: string };
   };
-  /** `lifecycle-executor` profile only (Unit B, the static §13.1 executor): the ONE incarnation
+  /** `lifecycle-executor` profile only (the static §13.1 executor): the ONE incarnation
    *  whose lifecycle-state keys this credential may write — the head `lifecycle.<owner>.<actor>`,
    *  the reservation `uid.<lifecycleUid>`, the gate `gate.<lifecycleUid>`, the ledger family
    *  `cred.<lifecycleUid>.>`, and the manager's durable slot row `mgrslot.<owner>.<alias>`.
@@ -601,26 +658,25 @@ export interface MintOpts {
    *  coherent by construction and a leaked executor cred can move exactly one incarnation's state
    *  machine and nothing else. Ignored by every other profile. */
   lifecycleExecutor?: { owner: string; actor: string; lifecycleUid: string; alias: string };
-  /** `endpoint-serve-executor` profile only (P2 item 1, 1a-serve): the ONE endpoint instance whose
+  /** `endpoint-serve-executor` profile only: the ONE endpoint instance whose
    *  endpoint-serve state this credential may write — the endpoint gate `epgate.<endpoint>.
    *  <instanceId>` (the registration barrier's freeze/reopen CAS + the provisioner create) and the
    *  serving ledger family `epcred.<endpoint>.<instanceId>.>` (the mint fence's stage + the barrier's
    *  revoke). REQUIRED for that profile. Every key is DERIVED inside the profile from
    *  (endpoint, instanceId) — none is a caller literal — so the manager drives the gate CAS + serve
-   *  mint through THIS scoped executor and nothing else (critic #1: the manager-specific "no seed
-   *  shortcut"; the standing seed connection never writes the epgate or the epcred family). Ignored
-   *  by every other profile. */
+   *  mint through THIS scoped executor and nothing else (the standing seed connection never writes
+   *  the epgate or the epcred family). Ignored by every other profile. */
   endpointServeExecutor?: { endpoint: string; instanceId: string };
-  /** `goal-writer` profile only (P2 item 2, spawn-as-action): the endpoint whose action goals this
+  /** `goal-writer` profile only (spawn-as-action): the endpoint whose action goals this
    *  standing connection may bind + commit ({@link goalWriterGrants}). REQUIRED for that profile;
    *  ignored by every other. */
   goalWriter?: { endpoint: string };
-  /** `session-caller` profile only (P2 item 6): the ONE §13.6 session whose two eps rails this
+  /** `session-caller` profile only: the ONE §13.6 session whose two eps rails this
    *  credential may use — the serving endpoint, the fresh sessionId, and the serving epoch. REQUIRED
    *  for that profile; ignored by every other. The rows pin all three, so the cred authorizes
    *  exactly that session's `in`+`out` and nothing else. */
   sessionCaller?: { endpoint: string; sessionId: string; epoch: number };
-  /** `session-serving` profile only (P2 item 6): the ONE §13.6 session this SERVING credential may
+  /** `session-serving` profile only: the ONE §13.6 session this SERVING credential may
    *  serve — same three coordinates as {@link sessionCaller}, with the rail directions swapped.
    *  REQUIRED for that profile; ignored by every other. The `session-ledger` profile takes no pin
    *  at all: it holds no rail, so it has nothing to pin. */
@@ -642,6 +698,9 @@ export interface MintOpts {
    * manager lease/presence and same-owner provisioning resources; no caller-supplied subject rows
    * or profile fallback are accepted. */
   remoteManager?: { instanceId: string; owner: string; actor: string };
+  /** Fixed environment profiles only. Host-derived pins confer no admission authority.
+   * These profiles require explicit expiresAt, no later than this admission's expiry. */
+  environmentManager?: EnvironmentManagerGrantPin;
   /** `deployer` profile only: which v0.4 ep instrument set its `launch`/`ps` rows carry. Defaults
    *  to `"admin"` (the static operator's ephemeral deploy cred). The user-mode `deployer` VIEW
    *  mints `"privileged"` instead, so a spawn-scoped deploy reaches the manager where its
@@ -669,10 +728,28 @@ export interface MintOpts {
   /** `run-admitter` profile only: the ONE hosted run whose admission record and revocation marker
    *  this connection may create. */
   runAdmitter?: { endpoint: string; runId: string };
+  /** `transfer-writer` profile only: the ONE object (the transcript's hex digest) in the ONE manager
+   *  instance's transfer bucket this instrument may write. */
+  transferWriter?: { instanceId: string; hex: string };
+  /** `transfer-reader` profile only: the manager instance whose own transfer bucket this reads. */
+  transferReader?: { instanceId: string };
+  /** `teardown` profile only: the space's transfer streams, listed before the mint, that this
+   *  teardown may inspect and delete by name ({@link deleteSpace} lists and names them). */
+  transferStreams?: string[];
   /** `backup` profile only: one discriminated inspector or snapshot phase. */
   backup?: BackupPermissionScope;
   /** `restore` profile only: one discriminated initiate, upload, validate, or checkpoint phase. */
   restore?: RestorePermissionScope;
+}
+
+/** The principal tags every user JWT carries, plus one random issuance tag on a goal-writer or
+ *  session-ledger credential. Those two profiles carry no epoch-pinned grant, so two mints for one
+ *  nkey within one second would otherwise sign identical bytes, and their ledger row is keyed by the
+ *  JWT digest: a restart's re-mint would re-sign the credential its barrier just revoked under the
+ *  revoked row's id (SPEC 13.1). */
+function userTags(profile: Profile, pr: MintPrincipal): string[] {
+  const tags = principalTags(pr.owner, pr.actor);
+  return profile === "goal-writer" || profile === "session-ledger" ? [...tags, `issuance:${randomBytes(16).toString("hex")}`] : tags;
 }
 
 /** Compute a minted credential's `{ exp? }` from an explicit override or the centralized matrix
@@ -680,6 +757,16 @@ export interface MintOpts {
  *  — `membership-observer` / `connection-evictor`, which are kinds, not profiles — thread the same
  *  bounded-lifetime policy instead of minting non-expiring $SYS creds. */
 function userValidDates(kind: CredentialKind, opts: MintOpts): { exp?: number } {
+  if (isEnvironmentManagerProfile(kind)) {
+    const now = Math.floor(Date.now() / 1000);
+    const admissionExpiry = opts.environmentManager?.expiresAt;
+    const expiry = opts.expiresAt;
+    if (typeof admissionExpiry !== "number" || !Number.isSafeInteger(admissionExpiry) || admissionExpiry <= now ||
+        typeof expiry !== "number" || !Number.isSafeInteger(expiry) || expiry <= now || expiry > admissionExpiry)
+      throw new Error(`mintCreds: ${kind} requires a current explicit expiresAt no later than admission expiry`);
+    if (kind === "environment-bootstrap" && expiry > now + FIVE_MINUTES)
+      throw new Error("mintCreds: environment-bootstrap expiry exceeds its five-minute lifetime");
+  }
   if (opts.expiresAt !== undefined && opts.expiresInSeconds !== undefined)
     throw new Error("mintCreds: pass only one of expiresAt or expiresInSeconds");
   if (opts.expiresAt !== undefined) {
@@ -809,17 +896,12 @@ export async function provisionAgentDurables(
   // An omitted/empty read set means NO channels (it does not mean `general`): a caller that names
   // no channel gets a footprint with no channel membership and, below, a cred with no channel row.
   const subscribe = opts.subscribe ?? [];
-  const allowSubscribe = opts.allowSubscribe?.length ? opts.allowSubscribe : subscribe;
   // Reject channel names the wire layer would rewrite (the pre-created filter rides token() too).
-  for (const ch of [...subscribe, ...allowSubscribe]) assertValidChannel(ch);
+  for (const ch of [...subscribe, ...(opts.allowSubscribe ?? [])]) assertValidChannel(ch);
   // Re-assert the load-time invariant at the trust boundary (defense in depth): the pre-created
   // live filter (subscribe) must sit within the read ACL (allowSubscribe), or the provisioner
   // would hand the agent live delivery it isn't permitted to read.
-  for (const ch of subscribe)
-    if (!channelInAllow(allowSubscribe, ch))
-      throw new Error(
-        `provisionAgent: subscribe "${ch}" is not within allowSubscribe [${allowSubscribe.join(", ")}]`,
-      );
+  const allowSubscribe = resolveReadAcl(subscribe, opts.allowSubscribe);
   await provisioner.provisionDmInbox(pr.owner, pr.actor, uid);
   await provisioner.provisionDlvInbox(pr.owner, pr.actor, uid);
   // Record the agent's read ACL in the durable registry (the same act as baking it into the JWT) so the
@@ -832,7 +914,7 @@ export async function provisionAgentDurables(
   // reissueAcl — rides THIS mint: allowSubscribe was just baked into the user JWT above. Separate
   // from commitAcl so an ordinary registry writer cannot raise the ceiling by passing a flag
   // (SPEC §9.6). Not crypto-bound to the JWT bytes — process discipline that this call stays next
-  // to the mint (ACL-authority panel residual).
+  // to the mint.
   if (opts.durableMembership !== false) {
     await provisioner.reissueAcl(principalKey(pr.owner, pr.actor).key, uid, allowSubscribe);
   }
@@ -870,7 +952,7 @@ export async function mintCreds(
     // Stamp the principal `tags` so this connection's identity is CONNZ-recoverable by the membership
     // feed — the SAME tags the auth callout stamps (user mode), via core's single-source builder. The
     // JWT `name` stays the profile label (a debug breadcrumb; not a surfaced/queryable CONNZ field).
-    { ...perms, tags: principalTags(pr.owner, pr.actor) },
+    { ...perms, tags: userTags(profile, pr) },
     { signer, ...validDates },
   );
   // Build the credential string FULLY before the fence: nothing fallible may run AFTER a winning
@@ -878,6 +960,21 @@ export async function mintCreds(
   // orphan authority record). fmtCreds only wraps the already-signed JWT with the seed, so it is
   // done here and the fence is the mint's LAST step.
   const creds = new TextDecoder().decode(fmtCreds(userJwt, fromSeed(new TextEncoder().encode(identity.seed))));
+  // The composed-credential bound (SPEC 13.9, issue #375's review finding): every individual grant
+  // input can pass its own validator (assertValidName, assertValidChannel) and the COMPOSED JWT
+  // still exceed the CONNECT line the broker caps, because nothing bounded the COUNT of channels
+  // an agent's allowSubscribe/allowPublish may carry. Refuse here, BEFORE releaseIssuance (the
+  // file's own no-fallible-work-after-a-winning-CAS rule, stated above) — a refusal here has
+  // released no ledger row, unlike a refusal after.
+  const userJwtBytes = Buffer.byteLength(userJwt, "utf8");
+  if (userJwtBytes > MAX_MINTED_JWT_BYTES) {
+    const channelCount = (opts.allowSubscribe?.length ?? 0) + (opts.allowPublish?.length ?? 0);
+    throw new Error(
+      `mintCreds: minted JWT is ${userJwtBytes} bytes, exceeding the ${MAX_MINTED_JWT_BYTES}-byte ` +
+        `mint bound (${channelCount} allowSubscribe+allowPublish channel(s)) - the composed credential ` +
+        `would exceed the broker's CONNECT line and the connect would hang silently (issue #375)`,
+    );
+  }
   await releaseIssuance(auth.space, profile, pr, opts, perms, validDates.exp, rawDigest(creds).replace("sha256:", "sha256-"));
   // §13.1 mint fence for the serve credential: the credential is BUILT, but released only when its
   // NORMATIVE ledger row (holderPrincipal/lifecycleUid/sourceChain/state/exp + the currency
@@ -954,15 +1051,16 @@ async function releaseIssuance(
 /** Issue a host-signed NATS user JWT for a caller-generated nkey. The private seed stays with
  * the remote manager. This is deliberately narrower than {@link mintCreds}: only the typed remote
  * manager protocol may request it, and every profile still goes through the same permission and
- * lifetime builders. */
+ * lifetime builders. It signs with the space account's signing key alone, so a host that holds
+ * only that key passes no placeholder broker trust. */
 export async function mintPublicUserJwt(
-  auth: SpaceAuth,
+  auth: { space: string; account: Pick<SpaceAccountAuth["account"], "pub" | "signingSeed"> },
   publicId: string,
   profile: Profile,
   opts: MintOpts,
 ): Promise<{ jwt: string; exp: number }> {
-  if (!/^U[A-Z2-7]{55}$/.test(publicId)) throw new Error("mintPublicUserJwt: publicId must be a user nkey");
-  if (!["remote-manager", "endpoint-serve", "goal-writer", "session-ledger", "session-serving", "retirement-requester"].includes(profile))
+  if (!isUserNkey(publicId)) throw new Error("mintPublicUserJwt: publicId must be a user nkey");
+  if (!isEnvironmentManagerProfile(profile) && !["remote-manager", "endpoint-serve", "goal-writer", "session-ledger", "session-serving", "retirement-requester", "run-driver", "run-mediator", "run-operator", "transfer-reader"].includes(profile))
     throw new Error(`mintPublicUserJwt: profile "${profile}" is not part of the closed remote manager protocol`);
   const pr: MintPrincipal = {
     owner: opts.principal?.owner ?? DEV_OWNER,
@@ -976,8 +1074,22 @@ export async function mintPublicUserJwt(
   const validDates = userValidDates(profile, opts);
   if (validDates.exp === undefined) throw new Error(`mintPublicUserJwt: profile "${profile}" must be bounded`);
   const jwt = await encodeUser(profile, fromPublic(publicId), fromPublic(auth.account.pub),
-    { ...perms, tags: principalTags(pr.owner, pr.actor) },
+    { ...perms, tags: userTags(profile, pr) },
     { signer: fromSeed(new TextEncoder().encode(auth.account.signingSeed)), ...validDates });
+  // Same composed-credential bound as mintCreds (see MAX_MINTED_JWT_BYTES): this JWT is presented
+  // on a real CONNECT line by the remote manager, so it is priced against the same budget before
+  // any fallible finalize step below. None of this function's profiles read allowSubscribe/
+  // allowPublish today (each returns through its own dedicated permission builder), so the count
+  // is always 0 here - the check stays live in case a future profile addition changes that.
+  const jwtBytes = Buffer.byteLength(jwt, "utf8");
+  if (jwtBytes > MAX_MINTED_JWT_BYTES) {
+    const channelCount = (opts.allowSubscribe?.length ?? 0) + (opts.allowPublish?.length ?? 0);
+    throw new Error(
+      `mintPublicUserJwt: minted JWT is ${jwtBytes} bytes, exceeding the ${MAX_MINTED_JWT_BYTES}-byte ` +
+        `mint bound (${channelCount} allowSubscribe+allowPublish channel(s)) - the composed credential ` +
+        `would exceed the broker's CONNECT line and the connect would hang silently (issue #375)`,
+    );
+  }
   if (profile === "endpoint-serve") {
     if (!opts.serveIssuance) throw new Error("mintPublicUserJwt: endpoint-serve requires serveIssuance");
     await finalizeServeIssuance(opts.serveIssuance, opts.endpointServe!, {
@@ -991,10 +1103,14 @@ export async function mintPublicUserJwt(
   return { jwt, exp: validDates.exp };
 }
 
+/** The profiles whose credential carries caller rails, and can therefore be minted as an
+ *  issuance (SPEC 13.15). Everything else is infrastructure or a one-shot with no rail to bind. */
+const ISSUABLE_PROFILES: ReadonlySet<Profile> = new Set<Profile>(["agent", "control-caller-privileged", "control-caller-admin", "deployer", "manager-caller"]);
+
 /** Build the NATS user permission object for a profile: a default-deny allow-list scoped to
  *  exactly what each profile does. Every profile is now enumerated least-privilege — the former
  *  allow-all `manager` is gone (its roles split across supervisor/provisioner/operator/purger and the
- *  PR 1.5 CLI-surface profiles). Subject/stream/durable names come from the shared builders so the ACLs
+ *  CLI-surface profiles). Subject/stream/durable names come from the shared builders so the ACLs
  *  can't drift from the wire layout.
  *
  *  PRINCIPAL-PARAMETERIZED + MODE-AGNOSTIC (owner+actor grammar): `pr` carries the owner+actor wire
@@ -1004,10 +1120,6 @@ export async function mintPublicUserJwt(
  *  owner + ledger actor + the per-connection ephemeral nkey; the static/dev mint passes
  *  `{owner:"local", actor:<id>, connId:<id>}` via {@link principalOf}. EXPORTED so the callout's injected
  *  `permissionsFor` hook can feed a validated principal straight into the same builder. */
-/** The profiles whose credential carries caller rails, and can therefore be minted as an
- *  issuance (SPEC 13.15). Everything else is infrastructure or a one-shot with no rail to bind. */
-const ISSUABLE_PROFILES: ReadonlySet<Profile> = new Set<Profile>(["agent", "control-caller-privileged", "control-caller-admin", "deployer"]);
-
 export function permissionsFor(
   profile: Profile,
   space: string,
@@ -1028,12 +1140,15 @@ export function permissionsFor(
   // the generation to, so `issued` on it is a misconfiguration refused here, never dropped.
   if (opts.issued && !ISSUABLE_PROFILES.has(profile))
     throw new Error(`permissionsFor: opts.issued binds caller rails and "${profile}" holds none; only ${[...ISSUABLE_PROFILES].join(", ")} mint issued authority (SPEC 13.15)`);
+  if (isEnvironmentManagerProfile(profile)) return environmentManagerPermissions(profile, space, pr, opts.environmentManager);
+  if (opts.environmentManager) throw new Error(`permissionsFor: environmentManager pins cannot ride ${profile}`);
   if (profile === "delivery") return deliveryPermissions(space, pr); // scoped server-side Plane-3 infra
+  if (profile === "manager-caller") return managerCallerPermissions(space, pr, opts);
   if (profile === "membership-rw") return membershipRwPermissions(space, pr); // scoped graph-feed reader/writer
-  if (profile === "supervisor") return supervisorPermissions(space, pr); // always-on daemon (closure (ii) gate)
-  if (profile === "provisioner") return provisionerPermissions(space, pr); // ephemeral onboarding authority (closure (ii))
+  if (profile === "supervisor") return supervisorPermissions(space, pr); // always-on daemon
+  if (profile === "provisioner") return provisionerPermissions(space, pr); // ephemeral onboarding authority
   if (profile === "deprovisioner") {
-    // Ephemeral, TARGET-PINNED teardown (#159 B) — the counterpart to `provisioner`. The target is a
+    // Ephemeral, TARGET-PINNED teardown — the counterpart to `provisioner`. The target is a
     // full principal dot-form for user-mode agents, or a bare static/dev actor id (keyed under
     // DEV_OWNER) — see {@link deprovisionTargetPrincipal}.
     if (!opts.deprovisionTarget)
@@ -1041,7 +1156,7 @@ export function permissionsFor(
     return deprovisionerPermissions(space, pr, opts.deprovisionTarget);
   }
   if (profile === "retirement-requester") {
-    // Ephemeral request+reply on the AUTH ENDPOINT rail (#29 piece 3; moved off `ctl` by #350):
+    // Ephemeral request+reply on the AUTH ENDPOINT rail:
     // publish EXACTLY this caller triple's own request subject for the ONE target it names +
     // subscribe its own reply-plane filter and inbox. No store reads, no barrier/scanner/plane
     // authority - the requester only asks; the auth plane holds every executing right and
@@ -1061,33 +1176,28 @@ export function permissionsFor(
       throw new Error("permissionsFor: retirement-requester requires opts.retirementRequester.target ({owner, actor, lifecycleUid} of the ONE incarnation this credential may retire) - since #350 the handle target rides the SUBJECT and is grant-pinned, so it can no longer be supplied in the request body");
     const { owner, actor, uid, target } = rr;
     const caller = { owner, actor, uid };
-    // DEVIATION FROM `handle`'s NORMATIVE PROVENANCE, stated where the row is minted (SPEC
-    // 1314-1319, 1838-1863). `handle` is normatively REDEMPTION-MINTED: its triple is pinned at
-    // redemption from an ISSUER-SIGNED capability artifact, and the mode carries attenuation
-    // (`effective = presenter-cred INTERSECT handle.grants INTERSECT issuer-authority`), conferral
-    // through the trusted auth service, and ledgered `sourceChain` lineage.
-    // THIS PATH HAS NONE OF THAT: there is NO issuer-signed artifact, NO redemption step and NO
-    // sourceChain. The row is built directly from the manager's own coordinates under root
-    // authority. It is used because `handle` is the ONLY mode with arity 3 - every other mode
-    // resolves against the CURRENT mapping, which is the wrong semantics for retiring a NAMED
-    // incarnation - and because the reader-facing invariant ("the validator re-checks only
-    // currency") IS honoured: the auth handler fresh-checks the triple against the lifecycle
-    // mapping and refuses a stale incarnation.
-    // What is genuinely absent is delegation lineage and artifact revocation. There is no
-    // independent issuer/holder boundary on this one-shot path whose revocation would change this
-    // requester's authority, which is why the deviation is accepted rather than papered over with
-    // a manufactured artifact. NAMED RESIDUAL: Cotal #399 tracks making this genuinely
-    // redemption-shaped if real artifact semantics are ever intended.
-    // The `handle` target is grant-pinned, so this credential can ask to retire the ONE
-    // incarnation it was minted for and nothing else - the same confinement the pre-#350 grant got
-    // from naming an exact `ctl` subject, now covering the TARGET as well as the caller. The nonce
-    // is the only wildcard token (§13.9): a bounded per-request suffix, not an addressing widening.
+    // The row is minted in `exact` mode: a privileged, non-redemption mode where this profile
+    // pins the arity-3 target triple directly from the manager's own coordinates under root
+    // authority, rather than through `handle`'s issuer-signed redemption provenance. The target is
+    // still confinement-pinned, so this credential can ask to retire the ONE incarnation it was
+    // minted for and nothing else - the same confinement the pre-#350 grant got from naming an
+    // exact `ctl` subject, now covering the TARGET as well as the caller. The nonce is the only
+    // wildcard token (§13.9): a bounded per-request suffix, not an addressing widening.
     const rows = epRequestGrantRows(space, {
       endpoint: AUTH_ENDPOINT,
       command: EP_CMD_RETIRE_LIFECYCLE,
-      target: { mode: "handle", tOwner: target.owner, tActor: target.actor, tUid: target.lifecycleUid },
+      target: { mode: "exact", tOwner: target.owner, tActor: target.actor, tUid: target.lifecycleUid },
     }, caller);
-    return { pub: { allow: rows }, sub: { allow: [epCallerReplyFilter(space, caller), `_INBOX_${pr.connId}.>`] } };
+    return {
+      pub: {
+        allow: [
+          ...rows,
+          epDescribeAllGrantRow(space, caller),
+          `$JS.API.DIRECT.GET.${epcStreamName(space)}.${spacePrefix(space)}.epc.>`,
+        ],
+      },
+      sub: { allow: [epCallerReplyFilter(space, caller), `_INBOX_${pr.connId}.>`] },
+    };
   }
   if (profile === "manager-service" as Profile)
     throw new Error('permissionsFor: "manager-service" is not a generic profile; use the typed remote manager authority protocol');
@@ -1101,8 +1211,18 @@ export function permissionsFor(
     if (!opts.runAdmitter) throw new Error("permissionsFor: run-admitter requires opts.runAdmitter ({endpoint, runId} of the ONE run it admits)");
     return runAdmitterPermissions(space, pr, opts.runAdmitter);
   }
+  if (profile === "transfer-writer") {
+    if (!opts.transferWriter) throw new Error("permissionsFor: transfer-writer requires opts.transferWriter ({instanceId, hex} of the ONE object it writes)");
+    const g = transferWriterGrants(space, opts.transferWriter.instanceId, opts.transferWriter.hex, pr.connId);
+    return { pub: { allow: g.publish }, sub: { allow: g.subscribe } };
+  }
+  if (profile === "transfer-reader") {
+    if (!opts.transferReader) throw new Error("permissionsFor: transfer-reader requires opts.transferReader ({instanceId} whose own bucket it reads)");
+    const g = transferReaderGrants(space, opts.transferReader.instanceId, pr.connId);
+    return { pub: { allow: g.publish }, sub: { allow: g.subscribe } };
+  }
   if (profile === "endpoint-evictor") {
-    // P2 item 3 (slice 3a): a SCOPED delivery-admin caller for ONE re-registration's verify-evict.
+    // A SCOPED delivery-admin caller for ONE re-registration's verify-evict.
     // Publish EXACTLY this credential's OWN delivery-admin control subject + $JS.API.INFO; subscribe
     // its own reply subtree + inbox. NO lease, presence, store read, consumer, KV, or executing
     // right — the daemon does the $SYS scan/KICK (subject-gated authority, like the supervisor evictor
@@ -1126,7 +1246,7 @@ export function permissionsFor(
       throw new Error("permissionsFor: goal-writer requires opts.goalWriter ({endpoint} whose action goals this connection binds + commits)");
     return goalWriterPermissions(space, pr, opts.goalWriter);
   }
-  if (profile === "purger") return purgerPermissions(space, pr); // ephemeral history-purge (closure (ii))
+  if (profile === "purger") return purgerPermissions(space, pr); // ephemeral history-purge
   if (profile === "backup") {
     if (!opts.backup) throw new Error("permissionsFor: backup requires opts.backup");
     return backupProfilePermissions(space, pr.connId, opts.backup);
@@ -1135,17 +1255,17 @@ export function permissionsFor(
     if (!opts.restore) throw new Error("permissionsFor: restore requires opts.restore");
     return restoreProfilePermissions(space, pr.connId, opts.restore);
   }
-  if (profile === "operator") return operatorPermissions(space, pr); // human-CLI client (send/dm/ask) (closure (ii))
-  if (profile === "probe") return probePermissions(pr); // connect-only liveness/auth preflight (PR 1.5)
-  if (profile === "channel-writer") return channelWriterPermissions(space, pr); // channel-registry writes (PR 1.5)
-  if (profile === "channel-purger") return channelPurgerPermissions(space, pr); // channel-writer + CHAT purge (PR 1.5)
-  if (profile === "teardown") return teardownPermissions(space, pr); // sole STREAM.DELETE holder (PR 1.5)
-  if (profile === "control-caller-privileged") return controlCallerPermissions(space, pr, "privileged", opts); // ps/start reads (PR 1.5)
-  if (profile === "control-caller-admin") return controlCallerPermissions(space, pr, "admin", opts); // any-mode stop/attach (PR 1.5)
-  if (profile === "deployer") return deployerPermissions(space, pr, opts.controlTier ?? "admin", opts); // spawn -f deploy authority (PR 1.5; user-mode view rides privileged)
-  if (profile === "session-caller") return sessionCallerPermissions(space, pr, opts.sessionCaller); // one §13.6 session's caller rails (P2 item 6)
-  if (profile === "session-serving") return sessionServingPermissions(space, pr, opts.sessionServing); // one §13.6 session's SERVING rails (P2 item 6)
-  if (profile === "session-ledger") return sessionLedgerPermissions(space, pr); // the dedicated session ledger, no rails (P2 item 6)
+  if (profile === "operator") return operatorPermissions(space, pr); // human-CLI client (send/dm/ask)
+  if (profile === "probe") return probePermissions(pr); // connect-only liveness/auth preflight
+  if (profile === "channel-writer") return channelWriterPermissions(space, pr); // channel-registry writes
+  if (profile === "channel-purger") return channelPurgerPermissions(space, pr); // channel-writer + CHAT purge
+  if (profile === "teardown") return teardownPermissions(space, pr, opts.transferStreams ?? []); // sole STREAM.DELETE holder
+  if (profile === "control-caller-privileged") return controlCallerPermissions(space, pr, "privileged", opts); // ps/start reads
+  if (profile === "control-caller-admin") return controlCallerPermissions(space, pr, "admin", opts); // any-mode stop/attach
+  if (profile === "deployer") return deployerPermissions(space, pr, opts.controlTier ?? "admin", opts); // spawn -f deploy authority (user-mode view rides privileged)
+  if (profile === "session-caller") return sessionCallerPermissions(space, pr, opts.sessionCaller); // one §13.6 session's caller rails
+  if (profile === "session-serving") return sessionServingPermissions(space, pr, opts.sessionServing); // one §13.6 session's SERVING rails
+  if (profile === "session-ledger") return sessionLedgerPermissions(space, pr); // the dedicated session ledger, no rails
   if (profile === "run-driver") {
     if (!opts.runDriver)
       throw new Error("permissionsFor: run-driver requires opts.runDriver ({endpoint, runId, takeoverId, instanceId, epoch} of the ONE run and attempt it drives)");
@@ -1199,40 +1319,28 @@ export function permissionsFor(
       "$JS.API.INFO",
       `$JS.API.STREAM.INFO.${CHAT}`,
       `$JS.API.STREAM.INFO.${KV}`,
+      // NO CONSUMER.DELETE on any stream this profile reads (#691). Its consumers are client-named
+      // ordered consumers (`oc_<nuid>_<serial>`, the serial bumped on every rebuild), so the only
+      // expressible grant is stream-wide, and stream-wide let one observer delete another
+      // principal's live watch cursors and the delivery daemon's fan-out durable. The broker reaps
+      // these consumers at their inactive threshold instead, and the client treats a refused
+      // delete of its own ephemeral consumer as that designed outcome.
+      //
       // ephemeral backlog consumer (channelHistory): a multi-filter create can't encode its
       // filter in the subject → bare form; the .> form covers named consumers.
       `$JS.API.CONSUMER.CREATE.${CHAT}`,
       `$JS.API.CONSUMER.CREATE.${CHAT}.>`,
       `$JS.API.CONSUMER.INFO.${CHAT}.>`,
       `$JS.API.CONSUMER.MSG.NEXT.${CHAT}.>`,
-      `$JS.API.CONSUMER.DELETE.${CHAT}.>`,
       `$JS.ACK.${CHAT}.>`,
       `$JS.API.CONSUMER.CREATE.${KV}.>`, // kv.watch ordered consumer (roster is public)
       `$JS.API.CONSUMER.INFO.${KV}.>`,
-      // ...and DELETE, which this bucket was the only watched one missing. An ordered consumer
-      // REBUILDS ITSELF whenever it stops hearing from the server (idle_heartbeat 30s, two missed),
-      // and the rebuild DELETES its predecessor before creating the successor. Without this grant
-      // that delete is refused, so the predecessor lives on until its 5-minute inactivity threshold
-      // and the broker logs a Publish Violation for every rebuild. Reproduced against a stalled link
-      // (connection up, bytes not moving, which is what a saturated WAN link looks like): two stalls
-      // left NINE consumers on this one bucket and 21 violations in the broker log, on the cred
-      // `cotal web` mints. The three sibling buckets below and above already carry it; this was the
-      // gap, not a narrowing.
-      //
-      // WHY `.>` AND NOT A NAME. An ordered consumer's name is `oc_<nuid>_<serial>`, generated by the
-      // CLIENT at watch time and incremented on every rebuild, so there is no name to pin at mint
-      // time and NATS has no partial-token wildcard to pin a prefix with. Stream-scoped is the
-      // narrowest form this verb has. The capability it adds over the existing CREATE is the ability
-      // to delete a consumer on the world-readable presence bucket; this elevated profile already
-      // holds exactly that on CHAT, the channel registry, and the membership feed.
-      `$JS.API.CONSUMER.DELETE.${KV}.>`,
       // Channel registry read (watch + direct kv.get + enriched listChannels) — config is
       // world-readable. STREAM.MSG.GET is the verb kv.get() rides (the bucket has no allow_direct).
       `$JS.API.STREAM.INFO.${CHKV}`,
       `$JS.API.STREAM.MSG.GET.${CHKV}`,
       `$JS.API.CONSUMER.CREATE.${CHKV}.>`,
       `$JS.API.CONSUMER.INFO.${CHKV}.>`,
-      `$JS.API.CONSUMER.DELETE.${CHKV}.>`,  // ephemeral consumer cleanup
       // Derived graph-membership feed (broker-sourced who-is-subscribed) — watch + direct kv.get. The
       // silent-reader set is sensitive, so read is admin/observer-only (this elevated profile), never an
       // agent. Read-only: no `$KV.${membershipBucket}` publish — only the `membership-rw` cred writes it.
@@ -1240,7 +1348,6 @@ export function permissionsFor(
       `$JS.API.STREAM.MSG.GET.${MEMKV}`,
       `$JS.API.CONSUMER.CREATE.${MEMKV}.>`,
       `$JS.API.CONSUMER.INFO.${MEMKV}.>`,
-      `$JS.API.CONSUMER.DELETE.${MEMKV}.>`,
       // Delivery lease/readiness: READ-ONLY (STREAM.INFO + kv.get), the same pair the `agent` arm
       // below already carries for its non-gating `cotal_channels` health surface. A read-only
       // DIAGNOSTIC profile needs this axis for the same reason an agent does, and more: without it
@@ -1260,7 +1367,6 @@ export function permissionsFor(
         `$JS.API.CONSUMER.CREATE.${DM}.>`,
         `$JS.API.CONSUMER.INFO.${DM}.>`,
         `$JS.API.CONSUMER.MSG.NEXT.${DM}.>`,
-        `$JS.API.CONSUMER.DELETE.${DM}.>`,
         `$JS.ACK.${DM}.>`,
       );
     }
@@ -1295,11 +1401,25 @@ export function permissionsFor(
     unicastSubject(space, "*", "*", pr.owner, pr.actor), // inst.*.*.<o>.<a> — DM any instance, as me
     anycastSubject(space, "*", pr.owner, pr.actor), //  svc.*.<o>.<a>   — anycast any role, as me
     // Self stop/despawn rides the v0.4 ep baseline (`stop` self-mode) — the manager `ctl` rail is
-    // deleted (1d). The delivery-daemon rail below is a separate service (Plane-3), kept.
+    // deleted. The delivery-daemon rail below is a separate service (Plane-3), kept.
     // ctl.delivery.<o>.<a> — request a durable backstop join/leave/list from the SERVER-SIDE delivery
     // daemon (NOT the manager). The reply rides this same subtree (`ctl.delivery.<o>.<a>.reply.<n>`, in
     // sub.allow below) so the daemon can answer without broad inbox-publish — see CONTROL_DELIVERY.
     controlServiceSubject(space, CONTROL_DELIVERY, pr.owner, pr.actor),
+    // THE PEER-READABLE LIVENESS PROBE (#1577) — one publish row per plane, each pinned to THIS
+    // agent's own principal slots, so a peer asks as itself and can never forge a probe from
+    // another. This is the row that makes liveness askable by a NON-OWNER: without it, the only
+    // hypothesis a peer could form for any failure was "my credentials are wrong", because the
+    // subjects that answer "is the manager alive" were owner-only.
+    //
+    // WHAT THIS DOES NOT GRANT, which is the half that keeps it from being a back door. It is
+    // PUBLISH ON A REQUEST SUBJECT, not a read of anything. The agent gains NO grant on the manager
+    // bucket (still absent by deliberate omission, below) and NO new read of the delivery bucket.
+    // The answer it can obtain is one enum per plane, because the responder reduces the lease row
+    // before replying and the row never crosses the wire. It cannot subscribe the SERVE filter
+    // either: `live.<plane>.*.*` is not in `sub.allow`, so an agent cannot impersonate a responder
+    // and answer a peer's probe with a comforting lie.
+    ...LIVENESS_PLANES.map((plane) => livenessSubject(space, plane, pr.owner, pr.actor)),
     // JetStream control plane — scoped to this agent's own streams/durables.
     "$JS.API.INFO",
     // STREAM.INFO: CHAT (join watermark, recall drop-marker, channel-list counts — a documented
@@ -1339,12 +1459,9 @@ export function permissionsFor(
     // Presence: watch (read, public roster) + flow control + PUT OWN KEY ONLY.
     `$JS.API.CONSUMER.CREATE.${KV}.>`,
     `$JS.API.CONSUMER.INFO.${KV}.>`,
-    // `kv.watch()` is a client-managed ordered consumer. Reset and stop delete the current
-    // generated `oc_*` consumer before replacing/leaving it; CREATE+INFO without DELETE turns a
-    // stalled link into a refused-cleanup rebuild loop. The name is generated at runtime, so the
-    // public presence bucket is the narrowest broker-expressible delete scope. This cannot delete
-    // a presence RECORD or STREAM — those are different subjects and remain denied.
-    `$JS.API.CONSUMER.DELETE.${KV}.>`,
+    // No CONSUMER.DELETE here or on the registry below: the watch's `oc_<nuid>_<serial>` name
+    // cannot be pinned, and a stream-wide delete reaches every peer's watch cursor (#691). A
+    // rebuild's refused predecessor delete leaves that consumer to the broker's inactive threshold.
     "$JS.FC.>",
     `$KV.${presenceBucket(space)}.${pk.key}`, // own presence key (owner+actor) only — can't spoof peers
     // Channel registry: read-only (watch + direct kv.get for the join-time replay decision).
@@ -1352,10 +1469,6 @@ export function permissionsFor(
     `$JS.API.STREAM.MSG.GET.${CHKV}`,
     `$JS.API.CONSUMER.CREATE.${CHKV}.>`,
     `$JS.API.CONSUMER.INFO.${CHKV}.>`,
-    // Same ordered-consumer lifecycle as presence. Without this row the registry watcher is the
-    // second independent reset loop, which is why a broken connector alternates two `oc_*` denial
-    // families and floods its TUI even after one watch happens to settle.
-    `$JS.API.CONSUMER.DELETE.${CHKV}.>`,
     // Delivery lease/readiness: READ-ONLY (kv.get) for the non-gating `cotal_channels` delivery-health
     // surface (Component 6). The lease key is daemon-availability info, like the world-readable roster;
     // NO write grant — only the `delivery` cred writes it.
@@ -1381,7 +1494,7 @@ export function permissionsFor(
     );
   }
   // Spawn / admin capability control reach rides the v0.4 ep rows below (the manager `ctl` rail is
-  // deleted, 1d) — the spawn set (owner-mode manager lifecycle) and the admin instrument set
+  // deleted) — the spawn set (owner-mode manager lifecycle) and the admin instrument set
   // (any-mode + manager.admin family) are added to the ep caller rows, not a ctl subject.
   // v0.4 endpoint rails (SPEC §13.9 caller rows). EVERY agent gets the Appendix-B BASELINE set
   // (wildcard describe + delivery join/leave/list + self-mode lifecycle + the reply rail), keyed
@@ -1422,9 +1535,8 @@ export function permissionsFor(
     for (const s of rows.sub) if (!epSub.includes(s)) epSub.push(s);
   }
   if (opts.capabilities?.includes("admin"))
-    // The admin capability's ep mirror (the 1c grant-migration table): the v0.3 `ctl.<admin>`
-    // subject above grants the FULL admin-tier op reach, so its holder gets the admin instrument
-    // set on the ep rails — any-mode despawn/attach + the `manager.admin` family + the reads. In
+    // The admin capability grants the admin instrument set on the ep rails, the set a
+    // `control-caller-admin` holds — the any-mode rows + the `manager.admin` family + the reads. In
     // user mode this is the ledger `admin` scope arriving via the callout, the broker-enforced
     // half of the tier; the manager's ledger-derived per-op admin flag stays on top of it.
     {
@@ -1468,17 +1580,56 @@ export function permissionsFor(
   // Replies to this agent's durable join/leave/list requests ride `ctl.delivery.<o>.<a>.>` (NOT the
   // per-id _INBOX), so the scoped delivery daemon can answer without broad inbox-publish.
   const deliveryReplies = `${controlServiceSubject(space, CONTROL_DELIVERY, pr.owner, pr.actor)}.>`;
+  // Liveness answers (#1577) ride the probe's OWN request subtree, exactly like the delivery
+  // control replies above and for the same reason: the responder answers without needing broad
+  // inbox-publish. One row per plane, pinned to this agent's principal, so it can hear answers to
+  // ITS OWN probes and nothing else — it cannot subscribe a peer's reply lane and harvest answers
+  // addressed elsewhere.
+  const livenessReplies = LIVENESS_PLANES.map((plane) => `${livenessSubject(space, plane, pr.owner, pr.actor)}.>`);
   // Manager control replies ride the v0.4 ep reply rail (in `epSub`, keyed on the caller triple) —
-  // the `ctl.<tier>.<id>.reply.>` subtrees are gone with the ctl rail (1d).
-  return { pub: { allow: pubAllow, deny: pubDeny }, sub: { allow: [inbox, deliveryReplies, ...subChat, ...epSub] } };
+  // the `ctl.<tier>.<id>.reply.>` subtrees are gone with the ctl rail.
+  return { pub: { allow: pubAllow, deny: pubDeny }, sub: { allow: [inbox, deliveryReplies, ...livenessReplies, ...subChat, ...epSub] } };
 }
 
-/** The long-lived SUPERVISOR permission set (closure (ii), residual 2) — the always-on manager daemon
- *  (`manager.ts` `this.ep`), carved down from the former allow-all `manager`. THIS is the cred whose
- *  STANDING breadth was the residual-2 gate: tightening it removes the always-on DM/DLV body-read AND the
- *  stream-admin tamper from the one connection that never goes away. It does exactly three things — serve
- *  the three lifecycle control tiers (bounded replies), hold the singleton manager lease, and publish +
- *  watch presence (the roster) — and nothing else. Provisioning (DM/DLV/TASK consumer-create + ACL
+/** One seat's manager control view. It carries no agent messaging or delivery surface, and every
+ * manager request, including describe, is pinned to one exact registered instance. */
+function managerCallerPermissions(space: string, pr: MintPrincipal, opts: MintOpts): Record<string, unknown> {
+  if (!pr.lifecycleUid)
+    throw new Error("permissionsFor(manager-caller): a lifecycleUid is required");
+  const instanceId = opts.managerInstanceId === undefined
+    ? (() => { throw new Error("permissionsFor(manager-caller): managerInstanceId is required"); })()
+    : assertLifecycleToken(opts.managerInstanceId, "managerInstanceId");
+  const caps = opts.capabilities ?? [];
+  const ordinary = [
+    { endpoint: BASELINE_LIFECYCLE_ENDPOINT, command: "describe" },
+    ...baselineCallerCapabilities().filter((cap) => cap.endpoint === BASELINE_LIFECYCLE_ENDPOINT),
+    ...(caps.includes("spawn") ? spawnCallerCapabilities(pr.owner) : []),
+    ...(caps.includes("run") ? runCallerCapabilities(pr.owner) : []),
+    ...(caps.includes("admin") ? operatorInstrumentCapabilities("admin", pr.owner) : []),
+  ];
+  const caller = issuedCallerFor({ owner: pr.owner, actor: pr.actor, uid: assertLifecycleToken(pr.lifecycleUid) }, opts);
+  const rows = epCallerGrantRows(space, instanceOnlyManagerCapabilities(ordinary, instanceId), caller);
+  return {
+    pub: {
+      allow: [
+        `$JS.API.DIRECT.GET.${epcStreamName(space)}.${spacePrefix(space)}.epc.>`,
+        ...(opts.issued ? [acceptedReadGrant(space, opts.issued.acceptedToken)] : []),
+        ...rows.pub,
+      ],
+    },
+    sub: { allow: [`_INBOX_${pr.connId}.>`, ...rows.sub] },
+  };
+}
+
+/** The long-lived SUPERVISOR permission set — the always-on manager daemon
+ *  (`manager.ts` `this.ep`), carved down from the former allow-all `manager`. Its breadth is
+ *  STANDING, so tightening it removes the always-on DM/DLV body-read AND the stream-admin tamper
+ *  from the one connection that never goes away. It holds the manager bucket's `lease.*` instance keys
+ *  and the per-space renewal lease key, its own presence key + the roster watch, the ONE delivery-admin
+ *  call (request + bounded reply subtree), the manager-plane liveness serve + reply rows, and a
+ *  read-only point read of the delivery lease row — and nothing else. It serves no manager control:
+ *  that is the v0.4 `service` endpoint, served on a SEPARATE connection under its own
+ *  `endpoint-serve` credential. Provisioning (DM/DLV/TASK consumer-create + ACL
  *  writes) moves to the EPHEMERAL `provisioner` (opened per-spawn); destructive history-purge moves to the
  *  EPHEMERAL `purger`. So the supervisor holds NO chat/inst/svc publish (it never posts — only
  *  `setActivity`, a presence write), NO DM/DLV read of any kind (no consumer-create, no native sub), NO
@@ -1488,27 +1639,23 @@ export function permissionsFor(
  *  actor, provision, purge, or tamper with a stream. */
 function supervisorPermissions(space: string, pr: MintPrincipal): Record<string, unknown> {
   const PKV = `KV_${presenceBucket(space)}`, MKV = `KV_${managerBucket(space)}`;
-  // 1d: the supervisor no longer serves the manager control tiers — the manager's control surface
-  // is its v0.4 `service` endpoint, served on a SEPARATE connection under its own `endpoint-serve`
-  // credential (its rails are that credential's grant, not the supervisor's). The supervisor now
-  // holds only the lease, presence, and the ONE delivery-admin call.
+  const SUP_DLVKV = `KV_${deliveryBucket(space)}`;
   return {
     pub: {
       allow: [
         "$JS.API.INFO",
         // Per-instance manager liveness lease (managerBucket, pre-created at `cotal up`): OPEN-ONLY bind +
-        // CAS this instance's own `lease.<instanceId>` key (acquire/renew/release) + read the subtree. P2
-        // item 3 demoted the per-space singleton to per-instance keys, so the write grant spans `lease.*`
-        // (every instance of this space shares this one supervisor principal — the isolation between
-        // instances is the logical-id/CAS boundary, not a cred boundary). NO STREAM.CREATE (pre-created),
-        // DELETE, or PURGE.
+        // CAS this instance's own `lease.<instanceId>` key (acquire/renew/release) + read the subtree. The
+        // lease is per instance, so the write grant spans `lease.*` (every instance of this space
+        // shares this one supervisor principal — the isolation between instances is the logical-id/CAS
+        // boundary, not a cred boundary). NO STREAM.CREATE (pre-created), DELETE, or PURGE.
         `$JS.API.STREAM.INFO.${MKV}`,
         `$JS.API.STREAM.MSG.GET.${MKV}`, // readManagerLease (last_by_subj lease.*) + CAS-conflict kv.get
         `$KV.${managerBucket(space)}.${MANAGER_LEASE_KEY}.*`, // this instance's lease.<id> key (create/update/delete = $KV publishes)
         // #1634: the per-space daemon-credential renewal lease, the CAS that picks ONE renewal owner
         // when several managers share the daemon's store. Same bucket, its own key outside `lease.*`.
         `$KV.${managerBucket(space)}.${MANAGER_RENEWAL_LEASE_KEY}`,
-        // Presence: publish OWN key + watch the roster. Own key only (no peer-key forge — residual 3); no
+        // Presence: publish OWN key + watch the roster. Own key only (no peer-key forge); no
         // presence-stream purge/delete (no force-offline tamper). No presence kv.get (roster is the in-memory
         // watch cache + sweep), so no STREAM.MSG.GET on presence.
         `$KV.${presenceBucket(space)}.${principalKey(pr.owner, pr.actor).key}`,
@@ -1516,18 +1663,48 @@ function supervisorPermissions(space: string, pr: MintPrincipal): Record<string,
         `$JS.API.CONSUMER.CREATE.${PKV}.>`, // kv.watch ordered consumer (roster)
         `$JS.API.CONSUMER.INFO.${PKV}.>`,
         "$JS.FC.>", // ordered-consumer flow control
-        // The ONE control service the supervisor CALLS (D5 slice 5): the delivery daemon's privileged
-        // admin rail — the manager is the class-2 renewal owner, and after re-signing the daemon creds
+        // The ONE control service the supervisor CALLS: the delivery daemon's privileged
+        // admin rail — the manager is the daemon's renewal owner, and after re-signing the daemon creds
         // files it requests `reloadCreds` here so adoption is an explicit, auditable event. Self-scoped
         // request subject (its own owner+actor slots), bounded reply subtree in sub.allow below.
         controlServiceSubject(space, CONTROL_DELIVERY_ADMIN, pr.owner, pr.actor),
+        // LIVENESS REPLIES for the MANAGER plane (#1577), bounded to the `.reply.` leaf under a
+        // caller's own request subject. The supervisor is the natural responder for this plane: it
+        // is the process that HOLDS the manager lease, so it is the one that can answer the
+        // question honestly without anyone else being granted a read of the lease row.
+        //
+        // REPLIES ONLY, exactly like the delivery daemon's `ctl.delivery.*.*.reply.>`. The row stops
+        // at the leaf, so the supervisor cannot publish to the liveness REQUEST subjects themselves
+        // and therefore cannot forge a probe from a peer.
+        livenessReplyGrant(space, "manager"),
+        // #1694: a POINT READ of the delivery lease row, so the store-identity challenge can verify
+        // that the process which answered the queue-grouped admin rail is the holder that actually
+        // reloads the standing credentials. Without it the challenge can only report what some
+        // responder sent, and a non-holder's store stands in for the reloading process's.
+        //
+        // READ ONLY, and that is the half that matters: a credential able to WRITE this row could
+        // manufacture the very fact the challenge reads, which would put the determination back in
+        // the hands of a participant. No `$KV.${deliveryBucket(space)}` publish, no watch consumer,
+        // no STREAM.DELETE or PURGE.
+        `$JS.API.STREAM.INFO.${SUP_DLVKV}`,
+        `$JS.API.STREAM.MSG.GET.${SUP_DLVKV}`,
+        `$JS.API.DIRECT.GET.${SUP_DLVKV}.>`,
       ],
     },
     sub: {
       // Own reply inbox + the delivery-admin reply subtree for its OWN requests. NO chat/inst/dlv
-      // native sub (the supervisor reads no feed), NO manager control-tier serve (1d: that moved to
-      // the endpoint-serve credential), NO broad `$JS.>`/`$KV.>` (the residual-2 read/admin path is gone).
-      allow: [`_INBOX_${pr.connId}.>`, `${controlServiceSubject(space, CONTROL_DELIVERY_ADMIN, pr.owner, pr.actor)}.>`],
+      // native sub (the supervisor reads no feed), NO manager control-tier serve (that is
+      // the endpoint-serve credential's), NO broad `$JS.>`/`$KV.>`.
+      //
+      // PLUS the manager-plane liveness SERVE filter (#1577): `live.manager.*.*`, queue-grouped, so
+      // any credentialed peer's presence probe reaches the lease holder. This is a serve
+      // subscription on a presence-only rail, not a widening of what the supervisor may read: the
+      // request body is empty and the subject carries only the caller's own principal.
+      allow: [
+        `_INBOX_${pr.connId}.>`,
+        `${controlServiceSubject(space, CONTROL_DELIVERY_ADMIN, pr.owner, pr.actor)}.>`,
+        livenessServeFilter(space, "manager"),
+      ],
     },
   };
 }
@@ -1559,6 +1736,12 @@ function remoteManagerPermissions(
   const gateKey = epgateKey("manager", iid);
   const credPrefix = epcredFamilyPrefix("manager", iid);
   const repairKey = eprepairKey("manager", iid);
+  // The SUPERVISOR actor of the pair, which is the one that runs `Manager.start()` and therefore
+  // the only one that binds the manager plane's liveness responder (`service.ts` hands
+  // `credentials.supervisor` to the manager; the executor gets the instance-scoped registration
+  // surface). The liveness rows below are pinned to it so the executor does not carry authority to
+  // answer a probe it never serves.
+  const isSupervisorActor = pin.actor === `manager_${iid}`;
   const recordKeys = [
     recordSpecKey(RECORD_KINDS.svc, ["manager", iid]),
     recordStatusKey(RECORD_KINDS.svc, ["manager", iid]),
@@ -1593,13 +1776,39 @@ function remoteManagerPermissions(
         `$JS.API.CONSUMER.DELETE.KV_${AUTH}.>`,
         ...recordKeys.map((key) => `$JS.API.DIRECT.GET.KV_${REC}.$KV.${REC}.${key}`),
         `$JS.API.STREAM.MSG.GET.KV_${REC}`,
+        // LIVENESS REPLIES for the MANAGER plane (#1577), bounded to the `.reply.` leaf under a
+        // caller's own request subject — the same row and the same bound as the local supervisor
+        // profile holds.
+        //
+        // WHY THIS PROFILE NEEDS IT AT ALL. `Manager.start()` binds the manager plane's liveness
+        // responder unconditionally, and a remote manager runs the same `start()` under this
+        // credential. Without the serve subscription below the bind is denied, and a peer probing
+        // the manager plane then gets the broker's own no-responders answer, which this surface
+        // grades `unbound` — a definite verdict about the plane, produced by a gap in a credential,
+        // while the remote manager is bound and serving. A surface that exists to stop a failure to
+        // find out being rendered as a finding must not render its own missing grant as one.
+        //
+        // REPLIES ONLY. The row stops at the leaf, so a remote manager cannot publish to the
+        // liveness REQUEST subjects and therefore cannot forge a probe that appears to come from a
+        // peer, exactly as the supervisor row cannot.
+        ...(isSupervisorActor ? [livenessReplyGrant(space, "manager")] : []),
       ],
     },
-    sub: { allow: [`_INBOX_${pr.connId}.>`] },
+    sub: {
+      allow: [
+        `_INBOX_${pr.connId}.>`,
+        // The manager-plane liveness SERVE filter (#1577): `live.manager.*.*`, queue-grouped, so a
+        // credentialed peer's presence probe reaches this instance. A serve subscription on a
+        // presence-only rail and not a widening of what a remote manager may read: the request body
+        // is empty and the subject carries only the caller's own principal. The MANAGER plane only —
+        // this credential cannot serve `delivery`, so each plane still answers for itself.
+        ...(isSupervisorActor ? [livenessServeFilter(space, "manager")] : []),
+      ],
+    },
   };
 }
 
-/** The human-CLI OPERATOR permission set (closure (ii), residual 2) — the ephemeral key the headless
+/** The human-CLI OPERATOR permission set — the ephemeral key the headless
  *  client commands mint (`cotal send dm|msg|ask`, `cotal dm`, `personas list --running`, via
  *  `openTransient`). It does exactly what those do: POST as itself (chat/DM/anycast — self-scoped, can
  *  never forge another actor), and READ the public roster (presence) + the channel registry to resolve a
@@ -1643,7 +1852,7 @@ function operatorPermissions(space: string, pr: MintPrincipal): Record<string, u
   };
 }
 
-/** Connect-only PROBE (PR 1.5) — the liveness/auth preflight (`preflight.ts preflightTarget`, minted on
+/** Connect-only PROBE — the liveness/auth preflight (`preflight.ts preflightTarget`, minted on
  *  ~every CLI command that resolves a mesh). `probeConnect` opens a connection to prove the broker is up
  *  and the creds are accepted, then closes it — it performs NO pub/sub. So the tightest possible grant:
  *  deny ALL publish, subscribe only to the own reply inbox. A leaked probe cred can open a socket and do
@@ -1652,7 +1861,7 @@ function probePermissions(pr: MintPrincipal): Record<string, unknown> {
   return { pub: { deny: [">"] }, sub: { allow: [`_INBOX_${pr.connId}.>`] } };
 }
 
-/** CHANNEL-WRITER (PR 1.5) — edits the channel registry ONLY: `cotal channels set/default` and the
+/** CHANNEL-WRITER — edits the channel registry ONLY: `cotal channels set/default` and the
  *  `spawn -f` new-channel seed (`seedChannelRegistry`). It VALUE-writes `$KV.<channelBucket>` (a channel's
  *  config key) and read-before-writes it. NO stream data, NO other bucket, NO chat/DM — a leaked
  *  channel-writer can only rewrite channel config, never post, read a body, or tear a stream down. */
@@ -1674,7 +1883,7 @@ function channelWriterPermissions(space: string, pr: MintPrincipal): Record<stri
   };
 }
 
-/** CHANNEL-PURGER (PR 1.5) — the `cotal web` dashboard's ONLY write path: delete a channel
+/** CHANNEL-PURGER — the `cotal web` dashboard's ONLY write path: delete a channel
  *  (`clearChannel` = filtered `STREAM.PURGE.CHAT` to drop the channel's messages + a `$KV.<channelBucket>`
  *  key delete). Pre-minted once by `web` so the account signing seed falls out of scope; the dashboard's
  *  READ side runs on the separate read-only `admin` cred. = channel-writer + the scoped CHAT purge. */
@@ -1698,8 +1907,8 @@ function channelPurgerPermissions(space: string, pr: MintPrincipal): Record<stri
   };
 }
 
-/** TEARDOWN (PR 1.5) — `cotal down -f` space teardown. The SOLE cred that keeps `STREAM.DELETE` (the
- *  face-b tamper verb). `down -f` is multi-step: `connectProbe` (presence-watch + channel-registry read)
+/** TEARDOWN — `cotal down -f` space teardown. The SOLE cred that keeps `STREAM.DELETE` (the
+ *  tamper verb). `down -f` is multi-step: `connectProbe` (presence-watch + channel-registry read)
  *  → invoke the manager's `ps` + any-mode `despawn` over the ep rails to politely stop the managed
  *  agents → `deleteChannels`
  *  (channel-registry key delete + CHAT purge) → `deleteSpace` (STREAM.DELETE every owned stream/bucket).
@@ -1707,8 +1916,8 @@ function channelPurgerPermissions(space: string, pr: MintPrincipal): Record<stri
  *  DM/DLV body, posts chat, or forges. Isolated here so no standing operator/provisioner/supervisor cred
  *  can delete a stream; a leaked teardown can wipe a space you own + stop its agents (that IS its job),
  *  nothing else. Minted ephemerally per teardown from the local trust material (same-checkout `down -f`). */
-function teardownPermissions(space: string, pr: MintPrincipal): Record<string, unknown> {
-  // The ep-rail mirror of the admin deploy tier (1c.2c): teardown reads `ps` and stops owned agents
+function teardownPermissions(space: string, pr: MintPrincipal, transferStreams: string[]): Record<string, unknown> {
+  // The ep-rail mirror of the admin deploy tier: teardown reads `ps` and stops owned agents
   // it did not spawn (any-mode despawn) - the admin instrument set. Lifecycle-keyed, so a uid is
   // required at mint (fail-loud).
   const ep = instrumentEpRows(space, pr, "admin");
@@ -1716,7 +1925,7 @@ function teardownPermissions(space: string, pr: MintPrincipal): Record<string, u
   const PKV = `KV_${presenceBucket(space)}`, CHKV = `KV_${channelBucket(space)}`;
   // deleteSpace() deletes EVERY stream + KV bucket setup creates; each needs INFO (jsm existence)
   // + DELETE. This is the ONLY cred that
-  // holds STREAM.DELETE (face-b isolated here). This list and deleteSpace()'s own array must agree:
+  // holds STREAM.DELETE. This list and deleteSpace()'s own array must agree:
   // a stream in one and not the other is either an undeletable leak or a grant for nothing.
   const del = [
     CHAT, dmStream(space), taskStream(space), inboxStream(space), dlvStream(space),
@@ -1724,11 +1933,18 @@ function teardownPermissions(space: string, pr: MintPrincipal): Record<string, u
     `KV_${membershipBucket(space)}`, `KV_${deliveryBucket(space)}`, `KV_${managerBucket(space)}`,
     ...endpointPlaneStreamNames(space),
     objectStoreStream(artifactBucket(space)),
+    ...transferStreams.map((name) => {
+      if (!isTransferStream(space, name)) throw new Error(`permissionsFor: teardown transferStreams names ${JSON.stringify(name)}, not one of ${space}'s transfer streams`);
+      return name;
+    }),
   ].flatMap((s) => [`$JS.API.STREAM.INFO.${s}`, `$JS.API.STREAM.DELETE.${s}`]);
   return {
     pub: {
       allow: [
         "$JS.API.INFO",
+        // deleteSpace() enumerates the transfer streams (one per manager instance that received a
+        // carried resume) by name shape; their names are not derivable from the space alone.
+        "$JS.API.STREAM.NAMES",
         // connectProbe read: presence watch (name→id + roster) + channel registry read.
         `$JS.API.CONSUMER.CREATE.${PKV}.>`,
         `$JS.API.CONSUMER.INFO.${PKV}.>`,
@@ -1738,7 +1954,7 @@ function teardownPermissions(space: string, pr: MintPrincipal): Record<string, u
         `$JS.API.CONSUMER.INFO.${CHKV}.>`,
         "$JS.FC.>", // ordered-consumer flow control
         // Stop the managed agents over the v0.4 ep rails only (ps + any-mode despawn) — the admin
-        // instrument set. The manager `ctl` rail is deleted (1d).
+        // instrument set. The manager `ctl` rail is deleted.
         ...ep.pub,
         ...del,
         // deleteChannels/clearChannel: purge the channel's chat messages + delete its registry key.
@@ -1747,17 +1963,17 @@ function teardownPermissions(space: string, pr: MintPrincipal): Record<string, u
       ],
     },
     // Own inbox (connectProbe presence-watch delivery + JS API responses) + the ep reply rail (the
-    // ps + any-mode despawn calls reply there). The `ctl.admin.<id>.reply.>` subtree is gone (1d).
+    // ps + any-mode despawn calls reply there). The `ctl.admin.<id>.reply.>` subtree is gone.
     sub: { allow: [`_INBOX_${pr.connId}.>`, ...ep.sub] },
   };
 }
 
-/** CONTROL-CALLER (PR 1.5; ep-only since 1d) — the operator's lifecycle commands
+/** CONTROL-CALLER (ep rails only) — the operator's lifecycle commands
  *  (`cotal ps/start/stop/attach`, `manager/commands.ts`). It invokes the manager's v0.4 service
  *  endpoint and reads the bounded reply on the ep reply rail. That is ALL — no `$JS`, no `$KV`,
  *  no chat/DM: it forges nothing, reads no body.
  *
- *  The tiers stay SPLIT because the BROKER grant is load-bearing (the 1c decision): an any-mode
+ *  The tiers stay SPLIT because the BROKER grant is load-bearing: an any-mode
  *  despawn/attach row *is* cross-agent reach — the manager maps mode `any` to its admin
  *  authorization path, so which ROWS an instrument holds is the tier boundary. Therefore:
  *   • `control-caller-privileged` (ps/start) holds the manager reads + untargeted `spawn` +
@@ -1769,11 +1985,11 @@ function teardownPermissions(space: string, pr: MintPrincipal): Record<string, u
  *     disconnect, from the local signing seed); on a user mesh the manager's serve-time ledger
  *     re-check sits on top. */
 function controlCallerPermissions(space: string, pr: MintPrincipal, epTier: "privileged" | "admin", opts: MintOpts = {}): Record<string, unknown> {
-  // 1d: the manager `ctl` rail is gone — an operator instrument holds ONLY its v0.4 ep rows (the
+  // The manager `ctl` rail is gone — an operator instrument holds ONLY its v0.4 ep rows (the
   // tier-matched request set, the reply rail, describe, the one epc fetch). The `epTier` selects
   // privileged (ps/start reads) vs admin (any-mode stop/attach) exactly as the ctl tier did.
   //
-  // B6 / `--on <instanceId>`: these instruments are ONE-SHOT, minted per control call, and the
+  // `--on <instanceId>`: these instruments are ONE-SHOT, minted per control call, and the
   // resolve that pins the instance happens BEFORE the mint. So the caller can hand the exact
   // instance id down and get the exact `ep.inst.<endpoint>.<iid>.<command>` row for THIS invocation
   // and nothing else — the least-privilege issuance, with no standing wildcard anywhere. The
@@ -1783,7 +1999,7 @@ function controlCallerPermissions(space: string, pr: MintPrincipal, epTier: "pri
   const ep = instrumentEpRows(space, pr, epTier, opts.endpointCapabilities ?? [], opts);
   return {
     // The PRIVILEGED tier (the `cotal ps` instrument) also carries the SCOPED §13.9 records read the
-    // class scatter's freeze rides (P2 item 3): `freezeExpectedSet` enumerates `svc.<endpoint>.*.spec`
+    // class scatter's freeze rides: `freezeExpectedSet` enumerates `svc.<endpoint>.*.spec`
     // and LEADER-reads each frozen slot's svc spec/status before it scatters `ps` on the `all` rail.
     // The admin tier (stop/attach) never scatters, so it gets no records read.
     pub: { allow: epTier === "privileged" ? [...ep.pub, ...scatterFreezeReadRows(space)] : ep.pub },
@@ -1791,10 +2007,10 @@ function controlCallerPermissions(space: string, pr: MintPrincipal, epTier: "pri
   };
 }
 
-/** The SCOPED §13.9 records-read rows the class-scatter freeze rides (P2 item 3, `cotal ps`): the
+/** The SCOPED §13.9 records-read rows the class-scatter freeze rides (`cotal ps`): the
  *  `svc.*` enumeration consumer + the leader-served per-slot spec/status read of the endpoint's
- *  `svc` registry — a READ of exactly the service-registration keys, no write, no other bucket. A
- *  new D32 matrix row. The keyed Direct Get is subject-PINNED to `svc.>`; the enumeration consumer
+ *  `svc` registry — a READ of exactly the service-registration keys, no write, no other bucket.
+ *  The keyed Direct Get is subject-PINNED to `svc.>`; the enumeration consumer
  *  and the leader `STREAM.MSG.GET` are STREAM-scoped because the requested key rides the PAYLOAD
  *  (which a subject grant cannot narrow) — the SAME NAMED RESIDUAL every records reader already
  *  accepts (the provisioner, the lifecycle/serve executors): for this EPHEMERAL one-shot instrument's
@@ -1819,12 +2035,10 @@ function scatterFreezeReadRows(space: string): string[] {
   ];
 }
 
-/** The v0.4 ep-rail rows of an operator INSTRUMENT credential (the 1c grant-migration table's
- *  admin row): the tier-matched {@link operatorInstrumentCapabilities} request rows + the caller's
- *  reply rail, the wildcard `describe` form, and the ONE subject-scoped §13.7 contract-store fetch
- *  row (the same shape the agent baseline holds; the D32 audit's single exemption). These mirror
- *  the instrument's ctl tier onto the ep rails during dual-serve; at 1d the ctl row disappears and
- *  these ARE the instrument. The caller triple pins the instrument's own mint-time lifecycle uid
+/** The v0.4 ep-rail rows of an operator INSTRUMENT credential: the tier-matched
+ *  {@link operatorInstrumentCapabilities} request rows + the caller's reply rail, the wildcard
+ *  `describe` form, and the ONE subject-scoped §13.7 contract-store fetch row (the same shape the
+ *  agent baseline holds). No ctl row exists, so these ARE the instrument. The caller triple pins the instrument's own mint-time lifecycle uid
  *  ({@link MintPrincipal.lifecycleUid}) — REQUIRED here: without it the reply rail cannot be pinned
  *  and the mint fails loud rather than emit a triple-less (unfenced) caller surface. `extra` lets a
  *  profile append its tier-refined additions (the user-mode deployer's owner-equality `launch`). */
@@ -1889,7 +2103,7 @@ function endpointServePermissions(space: string, pr: MintPrincipal, opts: MintOp
   const rows = epServeGrantRows(space, {
     endpoint: snap.endpoint, instanceId: snap.instanceId, epoch: snap.epoch, ephemeralCommands,
   });
-  // §13.9:2473 bind rows, from the BRANDED snapshot only (journal class is registered truth,
+  // §13.9 bind rows, from the BRANDED snapshot only (journal class is registered truth,
   // pools are the authorizing provisioner's pre-created durables): a journal-class instance
   // binds the shared `eff_<e>` effects durable, a pool-owning one binds each owned
   // `pool_<e>_<pool>` — all bind-only (INFO/MSG.NEXT/ACK, never create/delete), plus the one
@@ -1905,7 +2119,7 @@ function endpointServePermissions(space: string, pr: MintPrincipal, opts: MintOp
   };
 }
 
-/** DEPLOYER (PR 1.5) — the `cotal spawn -f` manifest-deploy authority. `spawn -f` drives ONE
+/** DEPLOYER — the `cotal spawn -f` manifest-deploy authority. `spawn -f` drives ONE
  *  `connectProbe` endpoint that both READS live state (roster/presence watch, channel registry,
  *  membership feed, manager-singleton lease) AND invokes the running manager's `launch` + `ps`
  *  readiness over the v0.4 ep rails. Those interleave on one connection, so a strict 3-connection
@@ -1928,7 +2142,7 @@ function deployerPermissions(space: string, pr: MintPrincipal, epTier: "privileg
   // set; the user-mode deployer VIEW (privileged) carries the privileged set PLUS an untargeted
   // `launch` row — its launch stays owner-equality-authorized (the manager's ledger-derived admin
   // flag is false for a spawn-scoped deployer), exactly the v0.3 user-mode privileged-tier launch.
-  // B6 / `--on`: the per-invocation pin APPENDS to this profile's standing set, never replaces it -
+  // `--on`: the per-invocation pin APPENDS to this profile's standing set, never replaces it -
   // the privileged deployer view keeps its owner-equality `launch` row and additionally gets the one
   // exact `ep.inst.<endpoint>.<iid>.<command>` row for the instance this deploy resolved.
   const pinned = opts.endpointCapabilities ?? [];
@@ -1965,7 +2179,7 @@ function deployerPermissions(space: string, pr: MintPrincipal, epTier: "privileg
         ...kvPointRead(MGRKV), // manager-singleton lease keyed read (waitManagerReady) — point-get, NO write, NO watch
         ...kvPointRead(DLVKV), // delivery-lease keyed read (preserve-state quiescence proof) — point-get, NO write, NO watch
         "$JS.FC.>", // ordered-consumer flow control
-        // 1d: launch + ps readiness ride the v0.4 ep rows only (the manager `ctl` rail is gone).
+        // Launch + ps readiness ride the v0.4 ep rows only (the manager `ctl` rail is gone).
         // Static deploys carry the admin instrument set; the user-mode deployer VIEW carries the
         // privileged set + an owner-equality `launch` row (the manager's ledger-derived admin flag
         // is false for a spawn-scoped deployer, so its launch stays owner-equality-authorized).
@@ -1977,7 +2191,7 @@ function deployerPermissions(space: string, pr: MintPrincipal, epTier: "privileg
   };
 }
 
-/** The ephemeral PURGER permission set (closure (ii), residual 2) — minted per-purge inside the daemon's
+/** The ephemeral PURGER permission set — minted per-purge inside the daemon's
  *  `opPurge` and `cotal history clear`. Isolates the DESTRUCTIVE history-purge grant
  *  (`STREAM.PURGE.CHAT` + `STREAM.PURGE.DM`) off the always-on supervisor: `--dms` purges the DM stream,
  *  exactly the grant the supervisor must not hold. It PURGES but never READS — no DM/chat consumer, no
@@ -1992,13 +2206,13 @@ function purgerPermissions(space: string, pr: MintPrincipal): Record<string, unk
         `$JS.API.STREAM.PURGE.${DM}`, // clearSpaceHistory includeDms — the isolated DM-purge grant
       ],
       // NOTE: this profile does NOT cover `clearChannel` (web/`down -f` channel-delete) — that also does a
-      // `$KV.<channelBucket>.<ch>` registry delete this cred lacks; it stays on the broad operator/CLI cred.
+      // `$KV.<channelBucket>.<ch>` registry delete this cred lacks, which `channel-purger` and `teardown` hold.
     },
     sub: { allow: [`_INBOX_${pr.connId}.>`] },
   };
 }
 
-/** The ephemeral PROVISIONER permission set (closure (ii), residual 2) — the onboarding authority,
+/** The ephemeral PROVISIONER permission set — the onboarding authority,
  *  carved off the long-lived manager. Minted short-lived for per-spawn provisioning (pre-create each
  *  agent's bind-only DM/DLV/TASK durables + record its read ACL via `commitAcl`) — the daemon opens it per
  *  spawn (`manager.ts withProvisioner`). It is ALSO the cred that creates the space's streams + KV buckets
@@ -2012,16 +2226,18 @@ function purgerPermissions(space: string, pr: MintPrincipal): Record<string, unk
  *  create a DM/DLV consumer can stream the bodies). That is exactly why it is split OFF the always-on
  *  supervisor and made EPHEMERAL: the daemon opens a provisioner connection per spawn and drains it
  *  immediately, so the surface exists only for the provisioning window, not as a standing target. The
- *  cred is MEMORY-ONLY (never written to `.cotal`) and now carries a short profile-default `exp`; signer
- *  rotation, live eviction, and full revocation are later D5 slices.
+ *  cred is MEMORY-ONLY (never written to `.cotal`) and carries a short profile-default `exp`.
  *
  *  `$JS` is an ENUMERATED allow-list, never `$JS.>`: STREAM.CREATE + INFO for the space streams/buckets,
  *  DM/DLV/TASK consumer CREATE/DURABLE.CREATE/INFO — and deliberately NO `MSG.NEXT`/`MSG.GET`/`ACK` on
  *  DM/DLV (it creates the bind-only mailbox but never reads it), and NO STREAM.DELETE/PURGE/MSG.DELETE
- *  (it provisions, it does not tear down). STREAM.UPDATE is held on EXACTLY seven streams and no others:
+ *  (it provisions, it does not tear down). STREAM.UPDATE is held on EXACTLY eight streams and no others:
  *  the three TTL'd KV buckets (presence + the two leases, #286: an existing bucket's `max_age` cannot be
- *  fixed by `kvm.create`, so reconciling a pre-TTL deployment requires updating it) and the four hardened
- *  authority stores (records, issued, accepted, admission), each updated once at creation.
+ *  fixed by `kvm.create`, so reconciling a pre-TTL deployment requires updating it), the four hardened
+ *  authority stores (records, issued, accepted, admission), each updated once at creation, and the
+ *  artifact Object Store, whose legacy 4 GiB `max_bytes` `ensureArtifactStore` reconciles to -1 (the
+ *  reservation a positive cap holds against the broker's `max_file_store` is what stopped a tenth space
+ *  from being provisioned; `Objm.create` cannot fix an existing bucket's cap either).
  *  Stated positively on purpose: this docblock previously read "NO …/UPDATE", which was already untrue of
  *  the records stream and became untrue of the buckets, and a comment that denies a credential's real
  *  power is worse than none — it is the document a reader trusts instead of checking. KV value-writes are
@@ -2040,9 +2256,9 @@ function provisionerPermissions(space: string, pr: MintPrincipal): Record<string
   // STREAM.CREATE + INFO for each (idempotent setup at `cotal up`; CREATE is create-if-matching, INFO covers
   // the client's existence checks). NO DELETE/PURGE — provisioning never tears a stream down.
   // The §13.7 CONTRACT store (EPC) joins the list for the static manager's start-time
-  // `ensureContractStore` (P2 item 1, 1c): create-or-verify only — the provisioner holds no
+  // `ensureContractStore`: create-or-verify only — the provisioner holds no
   // artifact-publish grant on it (publication rides the scoped endpoint-serve executor).
-  // The seven §13.12 ENDPOINT streams join the list (P2 item 2): spawn-as-action makes the manager
+  // The seven §13.12 ENDPOINT streams join the list: spawn-as-action makes the manager
   // the first EPF (goal facts) + EPE (progress) writer, and nothing provisioned the endpoint streams
   // before (no manager code wrote to them), so `createEndpointStreams` now runs at the manager's
   // start-time ensure over this provisioner. Create-or-verify only (idempotent, fail-loud on drift);
@@ -2053,8 +2269,9 @@ function provisionerPermissions(space: string, pr: MintPrincipal): Record<string
   // The artifact Object Store joins the list: `setupSpaceStreams` creates it, and under auth mode the
   // provisioner is the cred doing that creating. Its backing stream is `OBJ_<bucket>` - named
   // explicitly, because `$O.<bucket>.>` is outside the `cotal.<space>.>` grammar and no space-prefix
-  // grant reaches it. CREATE + INFO only: the provisioner never publishes an object, never creates a
-  // consumer on it, and never deletes it. That confinement is load-bearing rather than tidy - the
+  // grant reaches it. CREATE + INFO here, plus the ONE STREAM.UPDATE below (the legacy-cap reconcile):
+  // the provisioner never publishes an object, never creates a consumer on it, and never deletes it.
+  // That confinement is load-bearing rather than tidy - the
   // object-store client reads by creating an ephemeral PUSH consumer with a caller-chosen
   // `deliver_subject`, so a CONSUMER.CREATE here would be an exporter of every artifact in the space.
   const OBJ = objectStoreStream(artifactBucket(space));
@@ -2075,7 +2292,15 @@ function provisionerPermissions(space: string, pr: MintPrincipal): Record<string
   // the grant never learned about it. Same defect one seam out — a bucket the code knows to maintain
   // and the credential is not allowed to.
   const ttlStreams = ttlBuckets(space).map(([bucket]) => `KV_${bucket}`);
-  const streamReconcile = ttlStreams.map((s) => `$JS.API.STREAM.UPDATE.${s}`);
+  // ...plus the artifact Object Store. `ensureArtifactStore` creates it at `max_bytes: -1` so it
+  // reserves nothing against the broker's `max_file_store`, and reconciles a store left at the legacy
+  // stock 4 GiB to -1 so an EXISTING mesh releases that reservation too. `Objm.create` never updates
+  // an existing bucket's config (measured: create at 1024 then create at 4096 leaves 1024), so the
+  // reconcile is a STREAM.UPDATE and needs this grant — without it the provisioner dies on a
+  // permissions violation on the first `cotal up` after the upgrade. Still CREATE/INFO/UPDATE only:
+  // no publish, no CONSUMER.CREATE (a push consumer's caller-chosen `deliver_subject` would export
+  // every artifact in the space), no DELETE/PURGE.
+  const streamReconcile = [...ttlStreams, OBJ].map((s) => `$JS.API.STREAM.UPDATE.${s}`);
   // #404: one EXACT reserved key on each TTL bucket is the post-update enforcement canary. The
   // provisioner still cannot write presence identities or lease keys; it can only write this fixed
   // maintenance key, which expires through the policy the reconcile is proving.
@@ -2110,7 +2335,7 @@ function provisionerPermissions(space: string, pr: MintPrincipal): Record<string
         `$JS.API.DIRECT.GET.KV_${aclBucket(space)}.>`, // keyed get: `.>` (the key rides the subject)
         `$JS.API.STREAM.MSG.GET.KV_${channelBucket(space)}`,
         `$JS.API.DIRECT.GET.KV_${channelBucket(space)}.>`, // keyed get: `.>` (the key rides the subject)
-        // The Unit B static-manager start path: `ensureAuthorityStores` UPDATEs the records store's
+        // The static-manager start path: `ensureAuthorityStores` UPDATEs the records store's
         // deny-flags exactly once at fresh creation (create → update → verify), and the boot
         // reconciliation sweep enumerates the manager's slot rows (`keys()` → an ordered consumer)
         // then reads each slot BODY (phase/uid/actor) to plan resume — the reads ride the
@@ -2138,17 +2363,6 @@ function provisionerPermissions(space: string, pr: MintPrincipal): Record<string
   };
 }
 
-/** The ephemeral, LIFECYCLE-PINNED §13.1 state-write permission set for the STATIC manager's
- *  lifecycle executor (Unit B). One credential per lifecycle OPERATION (activation, terminal,
- *  renewal ledger append): every grant names exactly ONE incarnation's keys — the alias head,
- *  the uid reservation, the manager slot row, the issuance gate, and the `cred.<uid>.>` ledger
- *  family — so a leaked executor cred can move one incarnation's state machine and nothing else.
- *
- *  Reads: records reads ride the keyed Direct Get form (the key is ON the subject, so the read
- *  grant stays key-pinned); the auth store is leader-served (`allow_direct=false`), so its reads
- *  are body-selected `STREAM.MSG.GET` — stream-scoped, NOT key-scoped (the requested key rides
- *  the PAYLOAD, which a subject grant cannot see). NAMED RESIDUAL: for its one-shot lifetime the
- *  executor can READ (never write) other rows in the auth store. */
 /** The ISSUER permission set (SPEC 13.15): value-writes on the evidence store (evidence, attempt,
  *  source index: create-only and CAS rows, keyed by generation) and on the accepted-row store
  *  (create-only, keyed by the client's token); the leader-served point read on the evidence
@@ -2163,6 +2377,8 @@ function issuerPermissions(space: string, pr: MintPrincipal): Record<string, unk
         "$JS.API.INFO",
         `$KV.${issuedBucket(space)}.>`,
         `$KV.${acceptedBucket(space)}.>`,
+        // A user-auth connection's renewal finds the accepted row its nonce names (SPEC 13.15).
+        `$JS.API.DIRECT.GET.KV_${acceptedBucket(space)}.$KV.${acceptedBucket(space)}.>`,
         `$JS.API.STREAM.INFO.${ISSUED}`,
         `$JS.API.STREAM.MSG.GET.${ISSUED}`,
         // Source liveness: the leader-served point read of a static incarnation's issuance gate on
@@ -2197,6 +2413,17 @@ function runAdmitterPermissions(space: string, pr: MintPrincipal, pin: { endpoin
   };
 }
 
+/** The ephemeral, LIFECYCLE-PINNED §13.1 state-write permission set for the STATIC manager's
+ *  lifecycle executor. One credential per lifecycle OPERATION (activation, terminal,
+ *  renewal ledger append): every grant names exactly ONE incarnation's keys — the alias head,
+ *  the uid reservation, the manager slot row, the issuance gate, and the `cred.<uid>.>` ledger
+ *  family — so a leaked executor cred can move one incarnation's state machine and nothing else.
+ *
+ *  Reads: records reads ride the keyed Direct Get form (the key is ON the subject, so the read
+ *  grant stays key-pinned); the auth store is leader-served (`allow_direct=false`), so its reads
+ *  are body-selected `STREAM.MSG.GET` — stream-scoped, NOT key-scoped (the requested key rides
+ *  the PAYLOAD, which a subject grant cannot see). NAMED RESIDUAL: for its one-shot lifetime the
+ *  executor can READ (never write) other rows in the auth store. */
 function lifecycleExecutorPermissions(
   space: string,
   pr: MintPrincipal,
@@ -2221,7 +2448,7 @@ function lifecycleExecutorPermissions(
         // grant names exactly one of this incarnation's keys.
         ...recordKeys.map((k) => `$KV.${REC}.${k}`),
         // Auth-store CAS writes — this incarnation's gate + its cred-ledger family (renewals
-        // append rows here; the terminal's B1 revoke CASes them).
+        // append rows here; the terminal's revoke CASes them).
         `$KV.${AUTH}.${issuanceGateKey(pin.lifecycleUid)}`,
         `$KV.${AUTH}.cred.${pin.lifecycleUid}.>`,
         // Keyed Direct Get reads of the same records keys (key-pinned) for direct-aware read
@@ -2239,30 +2466,17 @@ function lifecycleExecutorPermissions(
   };
 }
 
-/** The ephemeral, ENDPOINT-INSTANCE-PINNED endpoint-serve executor permission set (P2 item 1,
- *  1a-serve): the manager mints this per registration/serve-mint op and drives the endpoint
- *  registration barrier's `epgate` CAS + the mint fence's `epcred` stage/revoke THROUGH it — never
- *  its standing seed/supervisor connection (critic #1's manager-specific "no seed shortcut"). Every
- *  WRITE is key-pinned to exactly ONE (endpoint, instanceId): the gate `epgate.<ep>.<iid>`, its
- *  serving ledger family `epcred.<ep>.<iid>.>`, and the registration's two records keys (the
- *  instance's `svc` spec + the endpoint's governance head — `registerServiceInstance` drives the
- *  slot-take/promote over this same connection). A leaked/mis-constructed executor can move exactly
- *  one endpoint instance's serve state and nothing else. The auth store is `allow_direct=false`, so
- *  reads are leader-served `STREAM.MSG.GET` (stream-scoped, NOT key-scoped — the key rides the
- *  payload); enumeration of the epcred family rides an ordered `keys()` consumer. NAMED RESIDUAL:
- *  for its one-shot lifetime the executor can READ (never write) other auth rows — endpoint/
- *  credential metadata, no bearer bytes; every WRITE stays key-pinned. */
-/** The SELF-MEDIATED goal-writer profile (P2 item 2, spawn-as-action): exactly
+/** The SELF-MEDIATED goal-writer profile (spawn-as-action): exactly
  *  {@link goalWriterGrants} for ITS endpoint — the goal bind + terminal facts, the goal-record KV
  *  writes, and the leader-served fencing reads — plus the connection-scoped reply inbox. Disjoint
- *  from the endpoint's serve credential (Q2): a serve connection carries none of these rows, so it
+ *  from the endpoint's serve credential: a serve connection carries none of these rows, so it
  *  is broker-denied every goal write. */
 function goalWriterPermissions(space: string, pr: MintPrincipal, pin: { endpoint: string }): Record<string, unknown> {
   const g = goalWriterGrants(space, pin.endpoint, pr.connId);
   return { pub: { allow: g.publish }, sub: { allow: g.subscribe } };
 }
 
-/** The console/CLI per-session CALLER rows (P2 item 6): RAILS-ONLY for ONE §13.6 session — pub the
+/** The console/CLI per-session CALLER rows: RAILS-ONLY for ONE §13.6 session — pub the
  *  session's epoch-pinned `in` rail, sub its `out` rail plus the caller's own reply inbox, and
  *  NOTHING else. Deliberately NO KV, NO JetStream API, NO store: the caller drives the terminal over
  *  the two core-only eps subjects and never reads the session ledger, so there is no subject-blind
@@ -2277,7 +2491,7 @@ function sessionCallerPermissions(space: string, pr: MintPrincipal, pin: { endpo
   };
 }
 
-/** The manager's per-session SERVING rows (P2 item 6): the EXACT mirror of
+/** The manager's per-session SERVING rows: the EXACT mirror of
  *  {@link sessionCallerPermissions} with the directions swapped — sub the ONE session's epoch-pinned
  *  `in` rail (caller→serving), pub its `out` rail (serving→caller), plus the connection-scoped reply
  *  inbox, and NOTHING else. Same asymmetry §13.6 states: "the caller publishes `in` and subscribes
@@ -2300,7 +2514,7 @@ function sessionServingPermissions(space: string, pr: MintPrincipal, pin: { endp
   };
 }
 
-/** The manager's SESSION-LEDGER rows (P2 item 6): the DEDICATED sessions-bucket rows and nothing
+/** The manager's SESSION-LEDGER rows: the DEDICATED sessions-bucket rows and nothing
  *  else — no session rail of any shape. Needs no pin: the grant carries no endpoint, epoch, or
  *  session component, because §13.6's durable revocation authority is per-space, not per-session
  *  (it must still be able to resolve and revoke a row after the endpoint that served it is gone).
@@ -2311,6 +2525,19 @@ function sessionLedgerPermissions(space: string, pr: MintPrincipal): Record<stri
   return { pub: { allow: g.publish }, sub: { allow: g.subscribe } };
 }
 
+/** The ephemeral, ENDPOINT-INSTANCE-PINNED endpoint-serve executor permission set:
+ *  the manager mints this per registration/serve-mint op and drives the endpoint
+ *  registration barrier's `epgate` CAS + the mint fence's `epcred` stage/revoke THROUGH it — never
+ *  its standing seed/supervisor connection. Every
+ *  WRITE is key-pinned to exactly ONE (endpoint, instanceId): the gate `epgate.<ep>.<iid>`, its
+ *  serving ledger family `epcred.<ep>.<iid>.>`, and the registration's two records keys (the
+ *  instance's `svc` spec + the endpoint's governance head — `registerServiceInstance` drives the
+ *  slot-take/promote over this same connection). A leaked/mis-constructed executor can move exactly
+ *  one endpoint instance's serve state and nothing else. The auth store is `allow_direct=false`, so
+ *  reads are leader-served `STREAM.MSG.GET` (stream-scoped, NOT key-scoped — the key rides the
+ *  payload); enumeration of the epcred family rides an ordered `keys()` consumer. NAMED RESIDUAL:
+ *  for its one-shot lifetime the executor can READ (never write) other auth rows — endpoint/
+ *  credential metadata, no bearer bytes; every WRITE stays key-pinned. */
 function endpointServeExecutorPermissions(
   space: string,
   pr: MintPrincipal,
@@ -2323,7 +2550,7 @@ function endpointServeExecutorPermissions(
   const repairKey = eprepairKey(pin.endpoint, pin.instanceId);
   // The registration writes this ONE instance's spec key plus the endpoint's governance head
   // (`registerServiceInstance` PHASE 1/3b: the slot-take + promote ride the SAME executor), and this
-  // instance's own svc STATUS key (P2 item 3: the manager writes its CONVERGED `ready` status so it
+  // instance's own svc STATUS key (the manager writes its CONVERGED `ready` status so it
   // is a §13.5 scatter member — `freezeExpectedSet` requires a status caught up to the current
   // registration; the write is epoch-fenced by `writeServiceStatus`).
   const recordKeys = [
@@ -2343,7 +2570,7 @@ function endpointServeExecutorPermissions(
         `$KV.${AUTH}.${repairKey}`,
         `$KV.${AUTH}.${credPrefix}.>`,
         ...recordKeys.map((k) => `$KV.${REC}.${k}`),
-        // §13.7 contract-artifact publication (P2 item 1, 1c): the registration publishes the
+        // §13.7 contract-artifact publication: the registration publishes the
         // endpoint's cluster document, closure manifests, and schema roots to the EPC store so
         // callers can fetch-verify-compile the registered digests. A digest subject is a SINGLE
         // hex token (`epc.<64hex>`), so the grant is the single-token `epc.*` form (matching
@@ -2384,7 +2611,7 @@ function endpointServeExecutorPermissions(
   };
 }
 
-/** The ephemeral, TARGET-PINNED DEPROVISIONER permission set (#159 Part B) — the teardown counterpart
+/** The ephemeral, TARGET-PINNED DEPROVISIONER permission set — the teardown counterpart
  *  to {@link provisionerPermissions}, minted per departed agent inside the manager's `deprovision` tail
  *  (`withProvisioner`-style: a fresh scoped cred per teardown is cheap). It deletes exactly the
  *  dev/static principal footprint the provisioner created for ONE agent: that agent's two bind-only
@@ -2418,11 +2645,19 @@ function deprovisionerPermissions(space: string, pr: MintPrincipal, deprovisionT
         // replayed teardown is broker-DENIED there (SPEC 13.1 / Appendix "deprovisioner").
         `$JS.API.CONSUMER.DELETE.${DM}.${dmDurable(t.owner, t.actor, t.lifecycleUid)}`,
         `$JS.API.CONSUMER.DELETE.${DLV}.${dlvDurable(t.owner, t.actor, t.lifecycleUid)}`,
+        `$JS.API.CONSUMER.INFO.${DM}.${dmDurable(t.owner, t.actor, t.lifecycleUid)}`,
+        `$JS.API.CONSUMER.INFO.${DLV}.${dlvDurable(t.owner, t.actor, t.lifecycleUid)}`,
         // Purge the target lifecycle's read-ACL row (own-target exact key only — the reader then treats
         // it as an unknown owner). `kvm.open` binds the pre-created bucket; the purge rides
         // `$KV.<aclBucket>.<key>`.
         `$JS.API.STREAM.INFO.KV_${aclBucket(space)}`,
+        `$JS.API.DIRECT.GET.KV_${aclBucket(space)}.$KV.${aclBucket(space)}.${aclKey(target.key, t.lifecycleUid)}`,
         `$KV.${aclBucket(space)}.${aclKey(target.key, t.lifecycleUid)}`,
+        // Purge the target lifecycle's durable membership rows, one exact key per named concrete
+        // channel. The key embeds the uid, so a successor's row is unreachable by name.
+        ...(t.memberChannels.length > 0 ? [`$JS.API.STREAM.INFO.KV_${membersBucket(space)}`] : []),
+        ...t.memberChannels.map((ch) => `$JS.API.DIRECT.GET.KV_${membersBucket(space)}.$KV.${membersBucket(space)}.${memberKey(ch, target.key, t.lifecycleUid)}`),
+        ...t.memberChannels.map((ch) => `$KV.${membersBucket(space)}.${memberKey(ch, target.key, t.lifecycleUid)}`),
       ],
     },
     // Replies only: the CONSUMER.DELETE PubAcks + KV purge ack land on the per-connection inbox. NO chat/DM/ctl
@@ -2482,6 +2717,10 @@ function deliveryPermissions(space: string, pr: MintPrincipal): Record<string, u
     `$JS.API.CONSUMER.MSG.NEXT.${INBOX}.${INBOX_READER_DURABLE}`,
     `$JS.API.CONSUMER.DELETE.${INBOX}.${INBOX_READER_DURABLE}`,
     `$JS.ACK.${INBOX}.${INBOX_READER_DURABLE}.>`,
+    // The reader removes an entry addressed to a retired lifecycle (its ACL row is tombstoned), so the
+    // store does not keep what no reader can ever deliver. Nothing new in substance: the reader can
+    // already ack any INBOX entry away.
+    `$JS.API.STREAM.MSG.DELETE.${INBOX}`,
     "$JS.FC.>", // ordered-consumer flow control
     // Reads: presence (@mention resolve) + channel registry (delivery class) + members + ACL (re-auth).
     ...kvRead(PKV), ...kvRead(CHKV), ...kvRead(MKV), ...kvRead(AKV),
@@ -2524,14 +2763,24 @@ function deliveryPermissions(space: string, pr: MintPrincipal): Record<string, u
     // the `.reply.>` leaf so the daemon can't publish to the request subjects themselves — tighter than a
     // blanket `ctl.delivery.>` (fact-check precision, review panel). The caller slots widened to `.*.*`.
     `${p}.ctl.delivery.*.*.reply.>`,
-    // The privileged delivery-admin rail (D5 slice 5/6): same replies-only shape. Requests reach the
+    // The privileged delivery-admin rail: same replies-only shape. Requests reach the
     // daemon on the sub below; only the supervisor cred can PUBLISH them (nats-server is the boundary).
     `${p}.ctl.delivery-admin.*.*.reply.>`,
+    // LIVENESS REPLIES for the DELIVERY plane (#1577) — same replies-only shape as the two control
+    // rails above. The daemon is the only process that can grade its own responder honestly: it
+    // knows its own incarnation, so a predecessor's `ready:true` corpse in the lease classifies as
+    // stale rather than as its own health. Bounded to the `.reply.` leaf, so it cannot publish to
+    // the request subjects and forge a probe from a peer.
+    livenessReplyGrant(space, "delivery"),
   ];
   const sub = [
     `_INBOX_${pr.connId}.>`,
     `${p}.ctl.delivery.*.*`, // serve the delivery control service (queue-grouped; owner+actor caller slots)
     `${p}.ctl.delivery-admin.*.*`, // serve the privileged admin rail (reloadCreds; eviction executor next)
+    // Serve the delivery plane's liveness probe (#1577), queue-grouped. Presence-only: the handler
+    // reduces the lease row to one enum before replying, so this subscription lets the daemon ANSWER
+    // a peer without any peer gaining a read of the lease.
+    livenessServeFilter(space, "delivery"),
   ];
   return { pub: { allow: pub }, sub: { allow: sub } };
 }
@@ -2600,7 +2849,7 @@ export async function mintMembershipObserverCreds(auth: SpaceAuth, identity: Ide
     );
   const signer = fromSeed(new TextEncoder().encode(auth.sys.signingSeed));
   const perms = membershipObserverPermissions(auth.account.pub);
-  // Bounded exp (D5 slice 5): the observer is `rotation-renewed` — it carries the matrix's default
+  // Bounded exp: the observer is `rotation-renewed` — it carries the matrix's default
   // lifetime so a copied cred becomes broker-dead, but there is NO online renewal (the $SYS seed is
   // gone after `up`); renewal is a coordinated system-account rotation + restart.
   const validDates = userValidDates("membership-observer", opts);
@@ -2615,7 +2864,7 @@ export async function mintMembershipObserverCreds(auth: SpaceAuth, identity: Ide
   return new TextDecoder().decode(creds);
 }
 
-/** The KICK-ONLY connection-evictor permission set (D5 slice 4) — a SYSTEM-account user that can do
+/** The KICK-ONLY connection-evictor permission set — a SYSTEM-account user that can do
  *  exactly ONE thing: `$SYS.REQ.SERVER.*.KICK` (disconnect a live client by cid). It CANNOT read
  *  CONNZ (discovery stays on the separate observer cred — never one broad sys user that both
  *  enumerates and kills), touch any other `$SYS` verb, or reach another account's data. A leaked
@@ -2633,8 +2882,8 @@ function connectionEvictorPermissions(): Record<string, unknown> {
   };
 }
 
-/** Mint the scoped `connection-evictor` creds — the kick-only SYSTEM-account user D5 slice 4's live
- *  eviction holds. Same mint-only-at-provision property as the observer (the $SYS seed is in-memory
+/** Mint the scoped `connection-evictor` creds — the kick-only SYSTEM-account user for live
+ *  eviction. Same mint-only-at-provision property as the observer (the $SYS seed is in-memory
  *  only), same fail-loud when it's absent. Paired with the observer at `up`. */
 export async function mintConnectionEvictorCreds(auth: SpaceAuth, identity: Identity, opts: MintOpts = {}): Promise<string> {
   if (!auth.sys.signingSeed)
@@ -2642,7 +2891,7 @@ export async function mintConnectionEvictorCreds(auth: SpaceAuth, identity: Iden
       "mintConnectionEvictorCreds: no in-memory system-account signing seed - the evictor can only be minted from a system account that is being (re)provisioned, because the $SYS seed is never persisted. Rotate the system account to mint a fresh one (`cotal down` then `cotal up --rotate-sys`); a plain re-`up` reuses the existing account and its existing creds.",
     );
   const signer = fromSeed(new TextEncoder().encode(auth.sys.signingSeed));
-  // Bounded exp (D5 slice 5): `rotation-renewed`, same posture as the observer above.
+  // Bounded exp: `rotation-renewed`, same posture as the observer above.
   const validDates = userValidDates("connection-evictor", opts);
   const userJwt = await encodeUser(
     "connection-evictor",
@@ -2655,17 +2904,6 @@ export async function mintConnectionEvictorCreds(auth: SpaceAuth, identity: Iden
   return new TextDecoder().decode(creds);
 }
 
-/** Render the `nats-server` config that trusts ONE broker operator and serves N spaces' accounts via
- *  the in-config MEMORY resolver.
- *
- *  Broker trust (operator + system account) comes from `broker` and has exactly one owner; the
- *  per-space data accounts are listed in `spaces`. Every space account is asserted to be signed by
- *  THIS broker's operator before it is preloaded: rendering a foreign-signed account would either
- *  refuse broker boot or, worse, advertise a tenant the broker cannot actually authenticate.
- *
- *  NOTE (W4): the MEMORY resolver is one static whole-broker map, so every mutation rewrites all of
- *  it. Concurrent add/remove of spaces needs a broker-authoritative inventory with generation/CAS
- *  and atomic promotion above this function; this renderer is deliberately pure. */
 /**
  * Render the config for an OPEN (no-auth) broker.
  *
@@ -2701,7 +2939,7 @@ export function openServerConfig(opts: {
   return `# Generated by \`cotal up\` - do not edit by hand.
 host: ${host}
 port: ${port}
-max_control_line: 65536
+max_control_line: ${MAX_CONTROL_LINE_BYTES}
 ${renderTlsBlock(opts.transport)}${renderJetStreamBlock("openServerConfig", opts.storeDir, opts.maxFileStore)}
 `;
 }
@@ -2731,6 +2969,17 @@ function renderTlsBlock(transport: BrokerTransport): string {
 `;
 }
 
+/** Render the `nats-server` config that trusts ONE broker operator and serves N spaces' accounts via
+ *  the in-config MEMORY resolver.
+ *
+ *  Broker trust (operator + system account) comes from `broker` and has exactly one owner; the
+ *  per-space data accounts are listed in `spaces`. Every space account is asserted to be signed by
+ *  THIS broker's operator before it is preloaded: rendering a foreign-signed account would either
+ *  refuse broker boot or, worse, advertise a tenant the broker cannot actually authenticate.
+ *
+ *  NOTE: the MEMORY resolver is one static whole-broker map, so every mutation rewrites all of
+ *  it. Concurrent add/remove of spaces needs a broker-authoritative inventory with generation/CAS
+ *  and atomic promotion above this function; this renderer is deliberately pure. */
 export function serverConfig(
   broker: BrokerAuth,
   spaces: readonly SpaceAccountAuth[],
@@ -2750,7 +2999,7 @@ export function serverConfig(
      *  TLS is listener-wide, so it lives here in the broker options rather than per space —
      *  no space can enable, disable or rotate it independently. */
     transport: BrokerTransport;
-    /** OPT-IN NATS websocket listener port (P2 item 6): browsers cannot speak raw NATS TCP, so the
+    /** OPT-IN NATS websocket listener port: browsers cannot speak raw NATS TCP, so the
      *  console session client (a real mesh caller) needs one. This is a NEW ATTACK SURFACE the broker
      *  did not have — emitted only when set, DEFAULT-BOUND TO LOCALHOST ({@link wsHost}), no TLS
      *  (dev loopback; a remote/TLS dashboard is a later explicit opt-in). Omit it and no listener
@@ -2771,7 +3020,7 @@ export function serverConfig(
   }
   const port = opts.port ?? 4222;
   const host = opts.host ?? "127.0.0.1";
-  // The websocket listener (item 6): LOCALHOST by default, no_tls for the dev loopback. Emitted only
+  // The websocket listener: LOCALHOST by default, no_tls for the dev loopback. Emitted only
   // when wsPort is set — a broker with no console session client opens no ws surface.
   const websocket = opts.wsPort === undefined ? "" : `websocket {
   host: ${opts.wsHost ?? "127.0.0.1"}
@@ -2784,13 +3033,14 @@ export function serverConfig(
   // exceeds the 4 KB default max_control_line at ~2 channels, and the server then silently drops
   // the connection (the client retries forever — a connect that "hangs"). Raise it to fit a rich
   // agent JWT — but right-sized, not generous: the CONNECT line is parsed BEFORE auth, so the cap
-  // is a per-connection pre-auth allocation under connection flooding. 64 KB clears a many-channel
-  // agent JWT (~4–8 KB) with wide margin while keeping the pre-auth surface ~16× tighter than 1 MB.
+  // is a per-connection pre-auth allocation under connection flooding. See MAX_CONTROL_LINE_BYTES
+  // for the derivation; mintCreds/mintPublicUserJwt refuse a JWT that would not fit it BEFORE this
+  // config is ever reached, so a legal credential never depends on this margin alone.
   const tlsBlock = renderTlsBlock(opts.transport);
   return `# Generated by \`cotal up\` - do not edit by hand.
 host: ${host}
 port: ${port}
-max_control_line: 65536
+max_control_line: ${MAX_CONTROL_LINE_BYTES}
 ${tlsBlock}${renderJetStreamBlock("serverConfig", opts.storeDir, opts.maxFileStore)}
 ${websocket}operator: ${broker.operator.jwt}
 system_account: ${broker.sys.pub}

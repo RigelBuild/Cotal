@@ -6,8 +6,7 @@
  * logged in as YOU across every repo on this box.
  */
 import { readFileSync, writeFileSync } from "node:fs";
-import { isIPv4, isIPv6 } from "node:net";
-import { CotalEndpoint, mintCreds, newIdentity, registry, resolveAuthProvider, resolveSpaceCatalogConsumer, type Command, type ParsedArgs, type SecretStore } from "@cotal-ai/core";
+import { assertLifecycleToken, isLoopbackLiteral, registry, resolveAuthProvider, resolveSpaceCatalogConsumer, type Command, type ParsedArgs, type SecretStore } from "@cotal-ai/core";
 import { CLI_USER_ACTOR, findCotalRoot, getSpaceAuth, homeCotalDir, loadMeshes, probeLiveness, removeCatalogMeshes, resolveSpace, userAuthStateDir, workspaceSecretStore, type AgentAuthHealth } from "@cotal-ai/workspace";
 import {
   deleteIdpSession,
@@ -17,23 +16,14 @@ import {
   normalizeIdpUrl,
   revokeIdpSession,
 } from "./login.js";
+import { checkedEviction } from "./barrier-evict.js";
 import { deriveOwnerForIdpSubject } from "./derive.js";
+import { withDeliveryAdminEndpoint } from "./delivery-admin.js";
 import { findInteractiveActor, findManagedActor, grantActor, loadActorLedger, revokeActor, type ActorRow } from "./ledger.js";
 import { INTERACTIVE_RETIRE_PATH, runAuthService } from "./service.js";
 import { loadAuthServiceInfo, loadOwnerSecret, loadPinnedIdp } from "./store.js";
 
 const DEFAULT_CLIENT_ID = "cotal-cli";
-
-function isLoopbackLiteral(hostname: string): boolean {
-  const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  if (isIPv4(host)) return host.startsWith("127.");
-  const mappedHex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
-  if (mappedHex) return parseInt(mappedHex[1], 16) >> 8 === 127;
-  if (!isIPv6(host)) return false;
-  if (host === "::1") return true;
-  const mapped = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  return mapped !== null && mapped[1].startsWith("127.");
-}
 
 /** Every operational failure in these commands is a deliberately-legible thrown sentence
  *  (a refused client id, a revoked session, a malformed IdP response …) — the CLI's generic
@@ -115,7 +105,7 @@ async function runLogin(args: ParsedArgs): Promise<void> {
     // Signing in proves WHO you are; each mesh separately lets you in. Hand the human the exact
     // next step — their sub is the one thing the operator needs from them.
     console.log(
-      `Not yet on a mesh? Its operator lets you in with: cotal actor grant ${CLI_USER_ACTOR} --sub ${sub}   (that's the full grant - all channels, may spawn; narrow with --allow-subscribe/--allow-publish/--scope)`,
+      `Not yet on a mesh? Its operator lets you in with: cotal actor grant ${CLI_USER_ACTOR} --sub ${sub} --full   (all channels, scope spawn,role:default; or name --scope, --allow-subscribe and --allow-publish instead of --full)`,
     );
   });
 }
@@ -185,6 +175,10 @@ async function resolveGrantOwner(
   return deriveOwnerForIdpSubject(secret, idp.issuer, values.sub!);
 }
 
+/** The two explicit shapes of `actor grant`, printed by its usage and its refusal. */
+const GRANT_FORMS =
+  "cotal actor grant <actor> --sub <IdP subject> --full   (all channels, scope spawn,role:default; a named flag still overrides its field), or cotal actor grant <actor> --sub <IdP subject> --scope a,b --allow-subscribe a,b --allow-publish a,b   ('' = none, e.g. --scope '' --allow-subscribe general --allow-publish ''). [--role r] [--label l]";
+
 const csv = (s: string | undefined, dflt: string[]): string[] =>
   s === undefined ? dflt : s.split(",").map((x) => x.trim()).filter(Boolean);
 
@@ -197,36 +191,22 @@ const csv = (s: string | undefined, dflt: string[]): string[] =>
 async function evictRevokedPrincipal(space: string, principal: string): Promise<string> {
   const fallback = (why: string) =>
     `live-connection eviction skipped (${why}) - deny-new is committed and the revoke cannot be re-run; the already-open connection ends at its current bearer's expiry. To evict live connections at revoke time, run \`cotal actor revoke\` from the mesh root (local signer + registry).`;
+  const incomplete = (why: string) => `live-connection eviction INCOMPLETE (${why}) - run \`cotal doctor auth\``;
   const root = findCotalRoot();
   const auth = await getSpaceAuth(workspaceSecretStore(root), space);
   if (!auth) return fallback("no local signer here");
   const mesh = loadMeshes().find((m) => m.space === space);
   if (!mesh) return fallback("mesh not in the local registry");
-  const id = newIdentity();
-  const ep = new CotalEndpoint({
-    space,
-    servers: mesh.server,
-    creds: await mintCreds(auth, id, "supervisor"),
-    card: { id: id.id, name: "revoke-evict", kind: "endpoint" },
-    channels: [],
-    consume: false,
-    watchChannels: false,
-    watchPresence: false,
-    registerPresence: false,
-  });
-  ep.on("error", () => {});
   try {
-    await ep.start();
-    const r = await ep.requestDeliveryAdmin("evictPrincipal", { principal }, 15_000);
-    if (!r.ok) return `live-connection eviction refused: ${r.error}`;
-    const d = (r.data ?? {}) as { kicked?: number; remaining?: number; verifiedGone?: boolean };
-    return d.verifiedGone
-      ? `live connections closed now (${d.kicked ?? 0} kicked, verified gone)`
-      : `live-connection eviction INCOMPLETE (${d.kicked ?? 0} kicked, ${d.remaining ?? "?"} still live) - run \`cotal doctor auth\``;
+    return await withDeliveryAdminEndpoint({ space, server: mesh.server, dataAccount: auth.account }, "supervisor", "revoke-evict", async (ep) => {
+      const r = await ep.requestDeliveryAdmin("evictPrincipal", { principal }, 15_000);
+      if (!r.ok) return `live-connection eviction refused: ${r.error}`;
+      const d = checkedEviction(principal, r.data, (_principal, note) => note);
+      if (typeof d === "string") return incomplete(d);
+      return d.verifiedGone ? `live connections closed now (${d.kicked} kicked, verified gone)` : incomplete(`${d.kicked} kicked, ${d.remaining} still live`);
+    });
   } catch (e) {
     return fallback(e instanceof Error ? e.message : String(e));
-  } finally {
-    await ep.stop().catch(() => {});
   }
 }
 
@@ -234,7 +214,7 @@ async function runActor(args: ParsedArgs): Promise<void> {
   const [sub, actor] = args.positionals;
   const values = args.values as {
     space?: string; sub?: string; owner?: string; scope?: string; "allow-subscribe"?: string;
-    "allow-publish"?: string; role?: string; label?: string; parent?: string;
+    "allow-publish"?: string; role?: string; label?: string; parent?: string; full?: boolean;
   };
   const st = actorState(values.space);
   const { dir, space } = st;
@@ -242,7 +222,7 @@ async function runActor(args: ParsedArgs): Promise<void> {
     if (sub === "list") {
       const rows = loadActorLedger(dir);
       if (!rows.length) {
-        console.log("no actors granted - grant one with: cotal actor grant <actor> --sub <IdP subject>   (that's the full grant - all channels, may spawn; narrow with --allow-subscribe/--allow-publish/--scope)");
+        console.log("no actors granted - grant one with: cotal actor grant <actor> --sub <IdP subject> --full   (all channels, scope spawn,role:default; or name --scope, --allow-subscribe and --allow-publish instead of --full)");
         return;
       }
       for (const r of rows.sort((a, b) => (a.owner + a.actor).localeCompare(b.owner + b.actor)))
@@ -252,12 +232,16 @@ async function runActor(args: ParsedArgs): Promise<void> {
       return;
     }
     if (sub === "grant") {
-      if (!actor) throw new Error("usage: cotal actor grant <actor> --sub <IdP subject> [--scope a,b] [--allow-subscribe a,b] [--allow-publish a,b] [--role r] [--label l]   (an upsert of the WHOLE row: an omitted flag is the WIDE default - scope spawn,role:default, read '>', post '>' - so narrowing means naming every field, e.g. --scope '' --allow-subscribe general --allow-publish '')");
+      if (!actor) throw new Error(`usage: ${GRANT_FORMS}`);
+      // The row is an upsert of the WHOLE row, so every field must be chosen: either all three ACL
+      // flags are named, or `--full` opts in to the wide default for the ones left off. Omission
+      // alone never means "everything": a dropped flag on a narrow reader grant would otherwise
+      // mint a space-wide row with a success line. The user's agents are still attenuated from
+      // whatever this row says (the envelope rule).
+      const omitted = (["scope", "allow-subscribe", "allow-publish"] as const).filter((f) => values[f] === undefined);
+      if (omitted.length && !values.full)
+        throw new Error(`refusing to grant "${actor}" with ${omitted.map((f) => `--${f}`).join(", ")} left off: an omitted flag would be the WIDE default (scope spawn,role:default, read '>', post '>'). Say which grant you mean: ${GRANT_FORMS}`);
       const owner = await resolveGrantOwner(st, values);
-      // Default = the FULL grant (all channels, spawn + the stock role): `actor grant` is an
-      // operator act of letting a user in, so omitting flags means "fully", and narrowing is the
-      // explicit choice (`--allow-subscribe general --scope ''`). The user's agents are still
-      // attenuated from whatever this row says (the envelope rule).
       //
       // A re-grant rotates the lifecycle so a copied bearer cannot cross the authorization update.
       // Retire the predecessor through the auth plane first; issuance is not allowed to perform a
@@ -319,6 +303,7 @@ async function runAgentBearer(args: ParsedArgs): Promise<void> {
   const v = args.values as {
     dir?: string; space?: string; owner?: string; actor?: string;
     "token-file"?: string; "health-file"?: string; "exchange-url"?: string;
+    "manager-call"?: boolean; "manager-instance"?: string;
   };
   const { dir, space, owner, actor } = v;
   const tokenFile = v["token-file"];
@@ -327,7 +312,14 @@ async function runAgentBearer(args: ParsedArgs): Promise<void> {
   // Every attempt's outcome lands in the manager-composed health file (core's AgentAuthHealth) —
   // the `ps` window into a detached agent's bearer life. Best-effort: health reporting must never
   // turn a successful exchange into a failure.
+  const managerCall = v["manager-call"] === true;
+  if (v["manager-instance"] !== undefined && !managerCall)
+    throw new Error("agent-bearer: --manager-instance requires --manager-call");
+  const managerInstance = v["manager-instance"] === undefined
+    ? undefined
+    : assertLifecycleToken(v["manager-instance"], "manager instance");
   const health = (state: "ok" | "failed", reason?: string) => {
+    if (managerCall) return;
     const path = v["health-file"];
     if (!path) return;
     try {
@@ -380,7 +372,12 @@ async function runAgentBearer(args: ParsedArgs): Promise<void> {
         method: "POST",
         headers,
         redirect: "manual",
-        body: JSON.stringify({ owner, actor, actorToken }),
+        body: JSON.stringify({
+          owner,
+          actor,
+          actorToken,
+          ...(managerCall ? { view: "manager-caller", ...(managerInstance !== undefined ? { managerInstanceId: managerInstance } : {}) } : {}),
+        }),
         signal: AbortSignal.timeout(15_000),
       });
     } catch (e) {
@@ -431,15 +428,16 @@ const authCommands: Command[] = [
     name: "actor",
     group: "Identity",
     summary: "manage the space's actor ledger - grant/revoke which (user, actor) pairs may run agents",
-    usage: "actor <grant <actor> | revoke <actor> | list> [--sub <IdP subject>|--owner <u_…>] [--space <s>] [--scope a,b] [--allow-subscribe a,b] [--allow-publish a,b] [--role r] [--label l]",
+    usage: "actor <grant <actor> | revoke <actor> | list> [--sub <IdP subject>|--owner <u_…>] [--space <s>] [--full | --scope a,b --allow-subscribe a,b --allow-publish a,b] [--role r] [--label l]",
     positionals: "<grant <actor> | revoke <actor> | list>",
     flags: [
       { name: "space", type: "string", value: "<s>", description: "space whose ledger to manage (default: the folder's)" },
       { name: "sub", type: "string", value: "<subject>", description: "the IdP subject (shown by `cotal login`) the actor belongs to" },
       { name: "owner", type: "string", value: "<u_…>", description: "the derived owner token (alternative to --sub)" },
-      { name: "scope", type: "string", value: "<a,b>", description: "capability scope for the bearer (default: spawn,role:default; '' = none; spawn = may run agents, role:<r> = may delegate role r)" },
-      { name: "allow-subscribe", type: "string", value: "<a,b>", description: "channel read ACL (default: > = all channels) - the user's envelope: their agents can never read beyond it" },
-      { name: "allow-publish", type: "string", value: "<a,b>", description: "channel post ACL (default: > = all channels) - also the envelope for their agents' posting" },
+      { name: "full", type: "boolean", description: "grant: the full row - every ACL flag left off takes its wide default (all channels; scope spawn,role:default). Without it, grant needs --scope, --allow-subscribe and --allow-publish" },
+      { name: "scope", type: "string", value: "<a,b>", description: "capability scope for the bearer (with --full: default spawn,role:default; '' = none; spawn = may run agents, role:<r> = may delegate role r)" },
+      { name: "allow-subscribe", type: "string", value: "<a,b>", description: "channel read ACL (with --full: default > = all channels) - the user's envelope: their agents can never read beyond it" },
+      { name: "allow-publish", type: "string", value: "<a,b>", description: "channel post ACL (with --full: default > = all channels) - also the envelope for their agents' posting" },
       { name: "role", type: "string", value: "<r>", description: "role (scopes the task-queue consumer)" },
       { name: "label", type: "string", value: "<l>", description: "display label for `actor list` (never the IdP subject)" },
       { name: "parent", type: "string", value: "<owner.actor>", description: "spawning principal audit link (operator grants are authority - this does not attenuate)" },
@@ -460,6 +458,8 @@ const authCommands: Command[] = [
       { name: "actor", type: "string", value: "<a>", description: "the agent's actor token" },
       { name: "token-file", type: "string", value: "<path>", description: "0600 file holding the spawn-time agent secret" },
       { name: "health-file", type: "string", value: "<path>", description: "write each attempt's outcome here (read by the manager's ps)" },
+      { name: "manager-call", type: "boolean", description: "mint a token bound to one manager instance" },
+      { name: "manager-instance", type: "string", value: "<id>", description: "select the manager instance for --manager-call" },
     ],
     run: (args) => legibly(() => runAgentBearer(args)),
   },

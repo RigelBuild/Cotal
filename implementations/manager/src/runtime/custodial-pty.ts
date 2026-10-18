@@ -1,12 +1,13 @@
 import { lstatSync, mkdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
-import type { AgentHandle, AttachSession, LaunchSpec, RuntimeReference } from "@cotal-ai/core";
+import { discardLaunchArtifacts, type AgentHandle, type AttachSession, type LaunchSpec, type RuntimeReference } from "@cotal-ai/core";
 import type { ReleasableRuntime, RuntimeReapEvidence, RuntimeReleaseCheck } from "./index.js";
 import { adoptSeatSync, agentCanReplace, agentPrimaryGid, CGROUP_DELEGATED_ENV, checkSeatRelease, launchSeat, loadSeat, reapSeat, removeSeatCustody, resolveCgroupBase, sealSeatLaunch, seatCgroupPath, seatId, unsupportedTransport, type SeatCgroup } from "@cotal-ai/seat";
 
-function defaultCustodyRoot(): string {
-  return join(homedir(), ".cotal", "seats");
+/** Where custodial pty seats keep their records: `COTAL_SEAT_ROOT`, else `~/.cotal/seats`. */
+export function custodyRoot(): string {
+  return process.env.COTAL_SEAT_ROOT ?? join(homedir(), ".cotal", "seats");
 }
 
 export interface CustodialPtyRuntimeOpts {
@@ -26,10 +27,8 @@ function envAgentUid(): number | undefined {
 }
 
 /**
- * Production pty runtime on Linux: a one-shot launcher starts a detached
- * per-seat custodian, then this process holds only a proxy AgentHandle.
- * `createRuntime("pty")` does not construct this class off Linux. Spawn and
- * adopt still throw the named transport error if it is instantiated there.
+ * Linux pty runtime. Each seat runs under a detached custodian.
+ * Linux `createRuntime("pty")` selects this class. Off Linux, spawn and adopt throw.
  */
 export class CustodialPtyRuntime implements ReleasableRuntime {
   readonly kind = "pty" as const;
@@ -40,7 +39,7 @@ export class CustodialPtyRuntime implements ReleasableRuntime {
   readonly agentUid: number;
 
   constructor(opts: CustodialPtyRuntimeOpts = {}) {
-    this.root = opts.root ?? process.env.COTAL_SEAT_ROOT ?? defaultCustodyRoot();
+    this.root = opts.root ?? custodyRoot();
     const euid = process.geteuid?.() ?? -1;
     this.agentUid = opts.agentUid ?? envAgentUid() ?? euid;
     // Fail at construction, not at the first spawn: launchSeat would refuse every seat anyway.
@@ -81,13 +80,20 @@ export class CustodialPtyRuntime implements ReleasableRuntime {
   }
 
   spawn(name: string, spec: LaunchSpec, cwd: string, reference?: RuntimeReference): AgentHandle {
-    if (process.platform !== "linux") throw unsupportedTransport();
-    if (reference !== undefined && reference.kind !== "pty")
-      throw new Error(`cannot spawn under runtime kind "${reference.kind}" with pty`);
+    try {
+      if (process.platform !== "linux") throw unsupportedTransport();
+      if (reference !== undefined && reference.kind !== "pty")
+        throw new Error(`cannot spawn under runtime kind "${reference.kind}" with pty`);
+    } catch (e) {
+      // Refused before any process exists, so no child will read the launch's files (core
+      // launch-artifacts). Every later refusal is launchSeat's, which removes them the same way.
+      discardLaunchArtifacts(spec.artifacts);
+      throw e;
+    }
     const rec = launchSeat({
       root: this.root,
       name,
-      spec: { command: spec.command, args: spec.args, env: spec.env ?? {}, confirm: spec.confirm },
+      spec: { command: spec.command, args: spec.args, env: spec.env ?? {}, confirm: spec.confirm, confirmBefore: spec.confirmBefore, artifacts: spec.artifacts },
       cwd,
       ...(reference ? { id: reference.id } : {}),
       ...(this.cgroupBase === undefined ? {} : { cgroupBase: this.cgroupBase }),

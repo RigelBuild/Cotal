@@ -48,6 +48,11 @@ export interface DeliveryLeaseInfo {
    *  Optional because rows written by daemons from before this field exist in live buckets; a row
    *  without one cannot be proven ours (some other process wrote it), which is the safe reading. */
   incarnation?: string;
+  /** Epoch ms when this incarnation acquired the shard. Unlike `since`, which every ready flip and
+   *  renewal re-stamps, it is written once at acquisition and carried on every later write. Optional
+   *  because rows written before this field exist; their acquisition time is unknown. */
+  acquiredAt?: number;
+  /** Epoch ms of this row's latest write: the acquisition, a ready flip, or a renewal. */
   since: number;
   ready: boolean;
 }
@@ -55,9 +60,9 @@ export interface DeliveryLeaseInfo {
 /** A manager per-instance LIVENESS-lease record: which logical instance is live + how it was launched.
  *  `runtime`/`root` let `spawn -f` fail LOUD on a mismatch instead of silently reusing a wrong-runtime /
  *  foreign-checkout manager (no fallbacks); `pid` is a diagnostics + targeted-stop hint. Keyed per
- *  {@link ManagerLeaseInfo.instanceId} ({@link import("./subjects.js").managerLeaseKey}) — P2 item 3
- *  demoted the per-space singleton to per-instance liveness, so a second manager's create no longer
- *  THROWS (distinct instance id ⇒ distinct key ⇒ both acquire). Losing the key stops THAT instance only. */
+ *  {@link ManagerLeaseInfo.instanceId} ({@link import("./subjects.js").managerLeaseKey}) — per-instance
+ *  liveness, so a second manager's create does not THROW (distinct instance id ⇒ distinct key ⇒ both
+ *  acquire). Losing the key stops THAT instance only. */
 export interface ManagerLeaseInfo {
   /** The manager endpoint id — `principalKey(owner, actor).key` dot-form (the endpoint card's
    *  id), so it is DIRECTLY comparable to a control subject's `<owner>.<actor>` attribution:

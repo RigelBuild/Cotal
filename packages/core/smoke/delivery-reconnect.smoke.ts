@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect } from "@nats-io/transport-node";
 import { Kvm } from "@nats-io/kv";
-import { CotalEndpoint, isReachable, createSpaceAuth, mintCreds, provisionAgent, mintLifecycleUid, serverConfig, newIdentity, setupSpaceStreams, principalKey, DEV_OWNER, membershipBucket, standaloneConnectOpts } from "../src/index.js";
+import { CotalEndpoint, isReachable, createSpaceAuth, mintCreds, provisionAgent, mintLifecycleUid, serverConfig, newIdentity, setupSpaceStreams, principalKey, DEV_OWNER, membershipBucket, standaloneConnectOpts, dlvDurable, isPublishPermissionDenied } from "../src/index.js";
 import { pickFreePort } from "./_free-port.js";
 import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
 
@@ -26,6 +26,10 @@ const SERVERS = `nats://127.0.0.1:${PORT}`;
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const awaitExit = (proc: ReturnType<typeof spawn>, t = 3000): Promise<void> =>
   new Promise((resolve) => { if (proc.exitCode !== null || proc.signalCode !== null) return resolve(); proc.once("exit", () => resolve()); setTimeout(resolve, t); });
+const reconnected = (ep: CotalEndpoint): Promise<void> => new Promise((resolve) => {
+  const onConnection = (state: { connected: boolean }) => { if (state.connected) { ep.off("connection", onConnection); resolve(); } };
+  ep.on("connection", onConnection);
+});
 let pass = 0, fail = 0;
 const check = (name: string, cond: boolean, extra?: unknown) => { if (cond) { pass++; console.log(`  ✓ ${name}`); } else { fail++; console.log(`  ✗ FAIL: ${name}`, extra ?? ""); } };
 
@@ -55,7 +59,7 @@ try {
 
   // The dashboard/observer is the membership-feed reader in production. Use its real admin grant:
   // the delivery cred writes the feed but deliberately cannot create the ordered consumer a KV watch needs.
-  observer = new CotalEndpoint({ space, servers: SERVERS, creds: await mintCreds(auth, newIdentity(), "admin"), channels: [], consume: false, watchPresence: false, registerPresence: false, card: { name: "observer", role: "observer", kind: "observer" } });
+  observer = new CotalEndpoint({ space, servers: SERVERS, creds: await mintCreds(auth, newIdentity(), "admin"), channels: [], consume: false, watchPresence: false, registerPresence: false, card: { name: "observer", role: "observer", kind: "endpoint" } });
   observer.on("error", () => {}); await observer.start();
 
   const aId = newIdentity();
@@ -67,18 +71,20 @@ try {
   // Pre-reconnect: the responder works + the daemon holds a (ready) lease (so the deliveryKv reopen is
   // exercised post-reconnect).
   const leaseRev = await daemon.acquireDeliveryLease(0);
-  await daemon.markDeliveryLeaseReady(0, leaseRev);
+  const readyLeaseRev = await daemon.markDeliveryLeaseReady(0, leaseRev);
   const pre = await agent.durableJoinChannel("review");
   check("durableJoin works before reconnect", pre.durable === true);
   const reviewGen = pre.generation ?? 0;
   await observer.readMembership(); // open the membership-feed KV on the old connection before rebuilding
   const membershipStream = `KV_${membershipBucket(space)}`;
+  // PUSH-BOUND consumers only. The admin cred holds no consumer delete on this bucket (#691), so a
+  // stopped or superseded watch leaves its unbound consumer to the broker's inactive threshold.
   const membershipConsumers = async (): Promise<string[]> => {
     const j = await (await fetch(`http://127.0.0.1:${MON}/jsz?consumers=true&streams=true&accounts=true`)).json() as
-      { account_details?: { stream_detail?: { name: string; consumer_detail?: { name: string }[] }[] }[] };
+      { account_details?: { stream_detail?: { name: string; consumer_detail?: { name: string; push_bound?: boolean }[] }[] }[] };
     const out: string[] = [];
     for (const acc of j.account_details ?? []) for (const st of acc.stream_detail ?? [])
-      if (st.name === membershipStream) for (const c of st.consumer_detail ?? []) out.push(c.name);
+      if (st.name === membershipStream) for (const c of st.consumer_detail ?? []) if (c.push_bound) out.push(c.name);
     return out.sort();
   };
   let membershipChanges = 0;
@@ -143,10 +149,10 @@ try {
   const afterMembershipConsumers = await membershipConsumers();
   const successorMembershipConsumerName = afterMembershipConsumers.find((n) => n !== predecessorMembershipConsumerName);
   check("reconnect creates exactly one successor membership consumer", afterMembershipConsumers.length === 1 && successorMembershipConsumerName !== undefined, { predecessorMembershipConsumerName, afterMembershipConsumers });
-  check("reconnect deletes the predecessor membership consumer instead of accumulating one", !afterMembershipConsumers.includes(predecessorMembershipConsumerName), { predecessorMembershipConsumerName, afterMembershipConsumers });
+  check("reconnect leaves no bound predecessor membership consumer", !afterMembershipConsumers.includes(predecessorMembershipConsumerName), { predecessorMembershipConsumerName, afterMembershipConsumers });
   await membershipWatch.stop();
   for (let i = 0; i < 20 && (await membershipConsumers()).length !== 0; i++) await wait(50);
-  check("stopping the membership watch deletes its broker consumer", (await membershipConsumers()).length === 0, await membershipConsumers());
+  check("stopping the membership watch unbinds its broker consumer", (await membershipConsumers()).length === 0, await membershipConsumers());
 
   // Invoke the REAL public stop while its broker consumer is live, then terminal-close that epoch.
   // The stop promise must remain endpoint-owned and pending until fresh-epoch retained-identity deletion.
@@ -161,6 +167,8 @@ try {
   };
   (observer as unknown as { membershipFeedKv: unknown }).membershipFeedKv = raceFeed;
   const raceHandle = await observer.watchMembership(() => {});
+  // The broker marks the consumer push-bound only once it sees the subscribe, which can trail the watch.
+  for (let i = 0; i < 20 && (await membershipConsumers()).length !== 1; i++) await wait(50);
   const raceConsumers = await membershipConsumers();
   check("the public stop/close race starts with one membership consumer", raceConsumers.length === 1 && raceConsumer !== undefined, raceConsumers);
   if (!raceConsumer) throw new Error("public stop/close race did not capture broker consumer creation");
@@ -168,14 +176,31 @@ try {
   let releaseDelete!: () => void;
   const deleteGate = new Promise<void>((resolve) => { releaseDelete = resolve; });
   raceConsumer.delete = async () => { await deleteGate; return raceDelete(); };
-  const raceStop = raceHandle.stop();
+  // The admin cred's delete is refused, so the census reads the same whether the stop sent its fresh-epoch
+  // delete or skipped it. The refused request tells them apart. The endpoint binds each connection's
+  // request when it dials, so only the fresh connection sends through this prototype.
+  const raceDeleteSubject = `$JS.API.CONSUMER.DELETE.${membershipStream}.${(await raceConsumer.info(true)).name}`;
+  const ncPrototype = Object.getPrototypeOf(raceNc) as typeof raceNc;
+  const ncRequest = ncPrototype.request;
+  let raceFreshDeleteRefused = false;
+  ncPrototype.request = function (this: typeof raceNc, ...args: Parameters<typeof ncRequest>) {
+    const reply = ncRequest.apply(this, args);
+    if (args[0] === raceDeleteSubject) reply.catch((e) => { raceFreshDeleteRefused = isPublishPermissionDenied(e); });
+    return reply;
+  };
+  let raceStopAfterFreshDelete = false;
+  const raceStop = raceHandle.stop().then(() => { raceStopAfterFreshDelete = raceFreshDeleteRefused; });
   void raceStop.catch(() => {});
+  const raceHealed = reconnected(observer);
   void raceNc.close();
-  await wait(50);
+  await raceNc.closed();
   releaseDelete();
   const raceStopSettled = await Promise.race([raceStop.then(() => true, () => false), wait(5000).then(() => false)]);
+  ncPrototype.request = ncRequest;
   for (let i = 0; i < 40 && (await membershipConsumers()).length !== 0; i++) await wait(50);
-  check("public stop concurrent with terminal close resolves after fresh cleanup", raceStopSettled && (await membershipConsumers()).length === 0, { raceStopSettled, consumers: await membershipConsumers() });
+  check("public stop concurrent with terminal close resolves after fresh cleanup", raceStopSettled && raceStopAfterFreshDelete && (await membershipConsumers()).length === 0, { raceStopSettled, raceStopAfterFreshDelete, consumers: await membershipConsumers() });
+  // A stop that settles before the self-heal must not leave the next cell watching mid-rebuild.
+  await Promise.race([raceHealed, wait(5000)]);
 
   const shutdownWatch = await observer.watchMembership(() => {});
   await wait(200);
@@ -184,13 +209,13 @@ try {
   await shutdownWatch.stop();
   await observer.stop();
   for (let i = 0; i < 20 && (await membershipConsumers()).length !== 0; i++) await wait(50);
-  check("awaited watch stop before endpoint stop deletes the broker consumer", (await membershipConsumers()).length === 0, await membershipConsumers());
+  check("awaited watch stop before endpoint stop unbinds the broker consumer", (await membershipConsumers()).length === 0, await membershipConsumers());
 
   await observer.stop();
 
   // Permanent endpoint shutdown has no future cleanup epoch. If the broker connection is already
   // terminal, an outstanding public stop must not hang the process waiting for an impossible rebuild.
-  observer = new CotalEndpoint({ space, servers: SERVERS, creds: await mintCreds(auth, newIdentity(), "admin"), channels: [], consume: false, watchPresence: false, registerPresence: false, card: { name: "observer-broker-down", role: "observer", kind: "observer" } });
+  observer = new CotalEndpoint({ space, servers: SERVERS, creds: await mintCreds(auth, newIdentity(), "admin"), channels: [], consume: false, watchPresence: false, registerPresence: false, card: { name: "observer-broker-down", role: "observer", kind: "endpoint" } });
   observer.on("error", () => {}); await observer.start();
   const brokerDownWatch = await observer.watchMembership(() => {});
   await (observer as unknown as { nc: import("@nats-io/transport-node").NatsConnection }).nc.close();
@@ -199,38 +224,29 @@ try {
   const endpointStopped = await Promise.race([observer.stop().then(() => true), wait(2000).then(() => false)]);
   const brokerDownWatchStopped = await Promise.race([brokerDownStop.then(() => true, () => false), wait(1000).then(() => false)]);
   check("endpoint shutdown while broker is down settles the public membership stop", endpointStopped && brokerDownWatchStopped, { endpointStopped, brokerDownWatchStopped });
-  // This terminal boundary explicitly leaves broker expiry to retire the unreachable consumer; remove it
-  // from the cardinality census so subsequent cells grade their own ownership rather than this exception.
-  const expiredByShutdown = await membershipConsumers();
-  const cleanupNc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds: await mintCreds(auth, newIdentity(), "admin"), tls: false }) });
-  try {
-    const jsm = await import("@nats-io/jetstream").then(({ jetstreamManager }) => jetstreamManager(cleanupNc));
-    for (const name of expiredByShutdown) await jsm.consumers.delete(membershipStream, name);
-  } finally { await cleanupNc.drain(); }
+  // This terminal boundary leaves broker expiry to retire the unreachable consumer, which the bound-only
+  // census no longer counts, so later cells grade their own ownership rather than this exception.
   for (let i = 0; i < 20 && (await membershipConsumers()).length !== 0; i++) await wait(50);
   check("the broker-down shutdown exception is isolated before later lifecycle cells", (await membershipConsumers()).length === 0, await membershipConsumers());
 
   // Restart a fresh observer for the terminal-close arm: endpoint stop is permanent by contract.
-  observer = new CotalEndpoint({ space, servers: SERVERS, creds: await mintCreds(auth, newIdentity(), "admin"), channels: [], consume: false, watchPresence: false, registerPresence: false, card: { name: "observer-2", role: "observer", kind: "observer" } });
+  observer = new CotalEndpoint({ space, servers: SERVERS, creds: await mintCreds(auth, newIdentity(), "admin"), channels: [], consume: false, watchPresence: false, registerPresence: false, card: { name: "observer-2", role: "observer", kind: "endpoint" } });
   observer.on("error", () => {}); await observer.start();
 
   // Terminal self-heal starts only AFTER the old connection is closed. Its cleanup request cannot ride
-  // that epoch, so the fresh connection must delete the predecessor by recorded stream+consumer name.
+  // that epoch, so the fresh connection must release the predecessor by recorded stream+consumer name.
   let terminalChanges = 0;
   const terminalWatch = await observer.watchMembership(() => { terminalChanges++; });
   await wait(200);
   terminalChanges = 0;
   const terminalBefore = await membershipConsumers();
   check("the terminal-close control starts with one membership consumer", terminalBefore.length === 1, terminalBefore);
-  const healed = new Promise<void>((resolve) => {
-    const onConnection = (state: { connected: boolean }) => { if (state.connected) { observer!.off("connection", onConnection); resolve(); } };
-    observer!.on("connection", onConnection);
-  });
+  const healed = reconnected(observer);
   await (observer as unknown as { nc: import("@nats-io/transport-node").NatsConnection }).nc.close();
   await Promise.race([healed, wait(5000)]);
   await wait(200);
   const terminalAfter = await membershipConsumers();
-  check("terminal self-heal creates one successor and deletes the closed-epoch predecessor", terminalAfter.length === 1 && !terminalAfter.some((n) => terminalBefore.includes(n)), { terminalBefore, terminalAfter });
+  check("terminal self-heal creates one successor and leaves no bound closed-epoch predecessor", terminalAfter.length === 1 && !terminalAfter.some((n) => terminalBefore.includes(n)), { terminalBefore, terminalAfter });
   const terminalNc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds: membershipRwCreds, tls: false }) });
   try {
     const feed = await new Kvm(terminalNc).open(membershipBucket(space));
@@ -247,7 +263,56 @@ try {
   let recoveredFromRejectedArm = false;
   try { await observer.reconnect(); recoveredFromRejectedArm = true; } catch { /* cell below names it */ }
   check("a later rebuild recovers a membership watch after a transient arm rejection", recoveredFromRejectedArm);
+
+  // A watch iterator closed under a live connection must reach the caller through onClosed,
+  // not just the generic endpoint error event.
+  const closedReasons: string[] = [];
+  const watchesBeforeClosedCell = new Set([...(observer as unknown as { membershipFeedWatches: Set<{ iter?: { stop(): void } }> }).membershipFeedWatches]);
+  const closedWatch = await observer.watchMembership(() => {}, (err) => { closedReasons.push(err.message); });
+  await wait(200);
+  const closedWatchIntent = [...(observer as unknown as { membershipFeedWatches: Set<{ iter?: { stop(): void } }> }).membershipFeedWatches]
+    .find((w) => !watchesBeforeClosedCell.has(w));
+  closedWatchIntent?.iter?.stop();
+  for (let i = 0; i < 40 && closedReasons.length === 0; i++) await wait(50);
+  check("a watch iterator closed under a live connection reaches the caller's closed callback", JSON.stringify(closedReasons) === JSON.stringify(["membership watch closed"]), closedReasons);
+  await closedWatch.stop();
+
   await terminalWatch.stop();
+
+  const durable = dlvDurable(DEV_OWNER, aId.id, uidA);
+  const probeDlvBind = async () => {
+    const errors: Error[] = [];
+    const warnings: Error[] = [];
+    let messages = 0;
+    const probe = new CotalEndpoint({ space, servers: SERVERS, creds: aCreds, channels: [], lifecycleUid: uidA, watchPresence: false, registerPresence: false, card: { id: aId.id, name: "alice-bind-probe", kind: "agent" } });
+    probe.on("error", (e) => errors.push(e));
+    probe.on("warning", (e) => warnings.push(e));
+    probe.on("message", () => { messages++; });
+    let startError: Error | undefined;
+    try { await probe.start(); await wait(100); }
+    catch (e) { startError = e as Error; }
+    finally { try { await probe.stop(); } catch { /* isolate probe cleanup from the named bind cells */ } }
+    return { errors, warnings, messages, startError };
+  };
+
+  const quiet = await probeDlvBind();
+  check("a quiet delivery durable binds while the plane holds a ready lease without raising a warning", quiet.startError === undefined && quiet.errors.length === 0 && quiet.warnings.length === 0, quiet);
+  check("the ready-lease control delivers no message on a genuinely quiet plane", quiet.messages === 0, quiet);
+
+  await daemon.releaseDeliveryLease(0, readyLeaseRev);
+  const missingLease = await probeDlvBind();
+  const missingLeaseWarning = missingLease.warnings[0];
+  check("a delivery durable binds and warns when the plane has no ready delivery lease", missingLease.startError === undefined && missingLease.errors.length === 0 && missingLease.warnings.length === 1, missingLease);
+  check("the missing-lease warning names the durable, space, condition, and reconnect repair", missingLeaseWarning?.message.includes(durable) === true && missingLeaseWarning.message.includes(space) && missingLeaseWarning.message.includes("no ready delivery lease") && missingLeaseWarning.message.includes("reconnect against it"), missingLeaseWarning?.message);
+  check("the warned missing-lease bind delivers no message", missingLease.messages === 0, missingLease);
+
+  const notReadyRev = await daemon.acquireDeliveryLease(0);
+  const notReadyLease = await probeDlvBind();
+  const notReadyWarning = notReadyLease.warnings[0];
+  check("a delivery durable binds and warns when the delivery lease is not ready", notReadyLease.startError === undefined && notReadyLease.errors.length === 0 && notReadyLease.warnings.length === 1, notReadyLease);
+  check("the not-ready warning names the durable, space, condition, and reconnect repair", notReadyWarning?.message.includes(durable) === true && notReadyWarning.message.includes(space) && notReadyWarning.message.includes("no ready delivery lease") && notReadyWarning.message.includes("reconnect against it"), notReadyWarning?.message);
+  check("the warned not-ready bind delivers no message", notReadyLease.messages === 0, notReadyLease);
+  await daemon.releaseDeliveryLease(0, notReadyRev);
 
   console.log(`\nDELIVERY-RECONNECT SMOKE ${fail === 0 ? "OK ✅" : "FAILED ❌"}  (${pass} passed, ${fail} failed)`);
   if (fail) process.exitCode = 1;

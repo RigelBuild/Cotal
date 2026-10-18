@@ -41,6 +41,7 @@ import type { ManagerStatus, ManagerStaticReconciliationFailure } from "../src/m
 import type { ReleasableRuntime, RuntimeReapEvidence, RuntimeReleaseCheck } from "../src/runtime/index.js";
 import { staticLifecycleTransport, readStaticSlot, casStaticSlot, readStaticRelease, writeStaticRelease, type StaticLifecycleReleaseSpec } from "../src/static-lifecycle.js";
 import { bootBroker } from "./_boot-broker.js";
+import { requestDeliveryAdminZeroMemberships } from "./_fake-delivery-admin.js";
 
 let failures = 0;
 let ran = 0;
@@ -168,6 +169,7 @@ function wire(mgr: Manager): Seams {
     on: () => {},
     off: () => {},
     waitForPresenceSnapshot: () => Promise.resolve(),
+    requestDeliveryAdmin: requestDeliveryAdminZeroMemberships,
     getRoster: (): Presence[] =>
       [...M.agents.values()].map((a): Presence => ({ card: { id: principalKey(DEV_OWNER, a.id).key, name: a.name, role: "worker", kind: "agent", description: "", tags: [] }, status: "idle", lifecycleUid: a.lifecycleUid, ts: 0 })),
   };

@@ -46,11 +46,12 @@
  *   drain makes an OUT-OF-FILTER delivery from a foreign re-resolution loud, while a foreign
  *   same-or-narrower filter stays covered by that composition assumption, not by the check.
  */
-import { AckPolicy, DeliverPolicy, JetStreamApiCodes, JetStreamApiError, jetstream, jetstreamManager, type JetStreamClient, type JetStreamManager } from "@nats-io/jetstream";
+import { AckPolicy, DeliverPolicy, jetstream, jetstreamManager, type JetStreamClient, type JetStreamManager } from "@nats-io/jetstream";
 import type { NatsConnection } from "@nats-io/transport-node";
-import { EpEnvelopeError, RECORD_KINDS, assertDerivedOwnerToken, assertInboxConnId, parseGoalIndexEntry, parseRecordKey, recordsBucket, recordsKvStreamName, type GoalIndexEntry, type PlaneConnTuple } from "@cotal-ai/core";
+import { EpEnvelopeError, RECORD_KINDS, assertInboxConnId, assertPrincipalOwnerToken, isConsumerNotFound, parseGoalIndexEntry, parseRecordKey, recordsBucket, recordsKvStreamName, type GoalIndexEntry, type PlaneConnTuple } from "@cotal-ai/core";
 import { openAuthorityClient, type AuthorityClient } from "./authority-client.js";
-import type { ScanGuard } from "./plane-claim.js";
+import { guardedScan, type ScanGuard } from "./plane-claim.js";
+import { serializedFor } from "./serialized.js";
 
 /** The ONE literal consumer name every obligation scan over the records stream reuses (the grant
  *  pins exactly this token; separate from the auth-ledger scanner's — fact-5, one name per stream).
@@ -63,12 +64,6 @@ const MANAGER_GOAL_INDEX_SCANNER_CONSUMER_NAME = "cotal-manager-goalidx-scan";
  *  and can never interleave pre-clean/create/fetch/delete on that name (a per-instance lock cannot
  *  see a sibling instance). */
 const SPACE_SCAN_CHAINS = new Map<string, Promise<unknown>>();
-const serializedForSpace = <T>(space: string, fn: () => Promise<T>): Promise<T> => {
-  const tail = SPACE_SCAN_CHAINS.get(space) ?? Promise.resolve();
-  const run = tail.then(fn, fn);
-  SPACE_SCAN_CHAINS.set(space, run.then(() => undefined, () => undefined));
-  return run;
-};
 
 /** Does a concrete delivered subject match the requested consumer filter (`*` one token, trailing
  *  `>` a non-empty remainder)? Revalidated PER MESSAGE in the drain: bind-verify proves the config
@@ -134,12 +129,6 @@ export interface RecordsScanner {
   close(): Promise<void>;
 }
 
-/** STRUCTURAL not-found classification (not a message regex): @nats-io/jetstream throws a
- *  JetStreamApiError whose `.code` is the JS API err_code (`JetStreamApiCodes.ConsumerNotFound` =
- *  10014); `.status` is the HTTP 404. The pre-clean proceeds ONLY on this exact structured shape. */
-const isConsumerNotFound = (e: unknown): boolean =>
-  e instanceof JetStreamApiError && e.code === JetStreamApiCodes.ConsumerNotFound;
-
 /** The records scanner's BRAND (site-3, mirroring the auth scanner): the ONLY way to be a
  *  RecordsScanner a registry/mediator accepts is to be built by {@link buildScanner} in THIS module,
  *  which pins the scanner's exact space. A hand-assembled structural object (e.g. one whose op
@@ -176,12 +165,14 @@ export async function openRecordsScannerCandidate(opts: {
   server: string;
   space: string;
   dataAccount: { pub: string; signingSeed: string };
+  onConnection?: import("./authority-client.js").AuthorityClientOpts["onConnection"];
   log: (line: string) => void;
   /** SMOKE-ONLY scanner observation hooks. Production leaves this absent. */
   probe?: RecordsScannerProbe;
 }): Promise<RecordsScannerCandidate> {
   const client: AuthorityClient = await openAuthorityClient({
     server: opts.server, space: opts.space, dataAccount: opts.dataAccount, label: `cotal:records-scan:${opts.space}`,
+    onConnection: opts.onConnection,
     grants: (id) => recordsScannerGrants(opts.space, id), log: opts.log, planeCandidate: true,
   });
   if (client.tuple === undefined || client.gone === undefined)
@@ -340,7 +331,8 @@ function buildScanner(nc: NatsConnection, space: string, onClose: () => Promise<
   };
 
   const scanManagerGoalIndexOnce = async (owner: string): Promise<GoalIndexEntry[]> => {
-    const expectedOwner = assertDerivedOwnerToken(owner);
+    // A human manager's derived `u_…` owner, or the platform control manager's `p_…` owner (SPEC 13.1).
+    const expectedOwner = assertPrincipalOwnerToken(owner, { allowPlatform: true });
     const jsm = await jsmOf();
     const js = jsOf();
     const rawFilter = `goalidx.manager.${expectedOwner}.>`;
@@ -441,22 +433,8 @@ function buildScanner(nc: NatsConnection, space: string, onClose: () => Promise<
   // freeze guarantees its ops are still the module's when an install seam asserts the brand — a
   // post-brand method swap throws (strict mode) instead of surviving as a silent-empty scanner.
   const scanner: RecordsScanner = Object.freeze({
-    // The PLANE guard (#29 HIGH 3, SPEC 13.13) wraps the scan INSIDE the serialized critical
-    // section: claim re-validated before (refuse to enumerate) and after (discard the result).
-    scanObligations: (filter: string) => serializedForSpace(space, async () => {
-      if (guard === undefined) return scanOnce(filter);
-      await guard.assertHeld("before");
-      const out = await scanOnce(filter);
-      await guard.assertHeld("after");
-      return out;
-    }),
-    scanManagerGoalIndex: (owner: string) => serializedForSpace(space, async () => {
-      if (guard === undefined) return scanManagerGoalIndexOnce(owner);
-      await guard.assertHeld("before");
-      const out = await scanManagerGoalIndexOnce(owner);
-      await guard.assertHeld("after");
-      return out;
-    }),
+    scanObligations: (filter: string) => serializedFor(SPACE_SCAN_CHAINS, space, () => guardedScan(guard, () => scanOnce(filter))),
+    scanManagerGoalIndex: (owner: string) => serializedFor(SPACE_SCAN_CHAINS, space, () => guardedScan(guard, () => scanManagerGoalIndexOnce(owner))),
     close: onClose,
   });
   RECORDS_SCANNER_BRAND.set(scanner, space);

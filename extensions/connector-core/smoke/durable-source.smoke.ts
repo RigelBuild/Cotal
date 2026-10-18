@@ -58,7 +58,7 @@
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync, statSync, openSync, readSync, writeSync, closeSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { JsonlFileSource, type SourceRecord } from "../src/durable-source.js";
+import { JsonlFileSource, type SourceRead } from "../src/durable-source.js";
 
 let ok = 0, fail = 0;
 const c = (n: string, v: boolean, extra?: unknown) => {
@@ -68,9 +68,9 @@ const c = (n: string, v: boolean, extra?: unknown) => {
 /** Read, converting an UNEXPECTED throw into a cell failure instead of crashing the suite.
  *  A run that aborts on the first surprise cannot report which cells a mutation killed, and an
  *  illegible kill set is the same as no mutation testing at all. */
-const readOr = async <T>(src: JsonlFileSource<T>, cursor: string | undefined, what: string) => {
+const readOr = async <T>(src: JsonlFileSource<T>, cursor: string | undefined, what: string): Promise<SourceRead<T>> => {
   try { return await src.read(cursor); }
-  catch (e) { c(`${what} (unexpected throw)`, false, String(e)); return { records: [] as SourceRecord<T>[], cursor: cursor ?? "0" }; }
+  catch (e) { c(`${what} (unexpected throw)`, false, String(e)); return { records: [], cursor: cursor ?? "0" }; }
 };
 
 const dir = mkdtempSync(join(tmpdir(), "durable-source-"));
@@ -80,6 +80,9 @@ try {
   // ── a fresh adopt starts at the END: an existing session is not rebroadcast ──
   writeFileSync(path, '{"i":1}\n{"i":2}\n');
   const src = new JsonlFileSource<{ i: number }>(path);
+  const beginning = await src.cursorAtBeginning();
+  const fromBeginning = await readOr(src, beginning, "beginning cursor read");
+  c("a beginning cursor reads retained complete records", fromBeginning.records.length === 2 && fromBeginning.records[0]?.value.i === 1 && fromBeginning.records[1]?.value.i === 2, fromBeginning.records);
   const adopt = await readOr(src, undefined, "fresh adopt");
   // ONE cell asserting both halves: the separate cursor row did not discriminate M4 (reading from 0
   // still lands the cursor on the same value), so it read as coverage without being any
@@ -113,11 +116,51 @@ try {
   const r4 = await readOr(src, r3.cursor, "completed-fragment read");
   c("the fragment is delivered once the writer completes it", r4.records.length === 1 && r4.records[0]?.value.i === 6, r4.records);
 
-  // ── a complete but unparseable line is LOUD, never silently skipped ──
-  appendFileSync(path, 'not json at all\n');
-  let threw = false;
-  try { await src.read(r4.cursor); } catch { threw = true; }
-  c("an unparseable COMPLETE line fails loud", threw);
+  // ── a complete line that is not a record is a GAP: stepped over, reported with its bytes, never a halt ──
+  //
+  // The shape is the one a full disk leaves behind: the writer's short write puts part of one record
+  // on the line, and the next append lands a whole record behind it with no newline between. That
+  // line never becomes readable, so a reader that halted on it halted for good at that byte and every
+  // later start died at the same place (measured on two live sessions). The record AFTER the gap must
+  // still arrive, and the cursor must land past both, in bytes.
+  c("an ordinary read reports no gaps at all", r4.unreadable === undefined, r4.unreadable);
+  const torn = '{"i":7,"text":"cut sho{"i":8}';
+  const beforeTorn = off(r4.cursor);
+  appendFileSync(path, torn + '\n{"i":9}\n');
+  const r5 = await readOr(src, r4.cursor, "torn-line read");
+  c("a torn line is stepped over and reported with its exact offset and length",
+    r5.unreadable?.length === 1 && r5.unreadable[0]?.offset === beforeTorn && r5.unreadable[0]?.bytes === Buffer.byteLength(torn) && /JSON/.test(r5.unreadable[0]?.reason ?? ""),
+    r5.unreadable);
+  c("the record after a torn line is still delivered", r5.records.length === 1 && r5.records[0]?.value.i === 9, r5.records);
+  // The parser's message can quote the bytes it choked on, and those are the record's own text:
+  // "cut sho" is private to the session and must not travel into a log on the reason line.
+  c("the gap reason carries no text from the record itself", !/cut sho|i":7/.test(r5.unreadable?.[0]?.reason ?? ""), r5.unreadable?.[0]?.reason);
+  c("the gap reason is the fixed category and nothing else", r5.unreadable?.[0]?.reason === "not a JSON record", r5.unreadable?.[0]?.reason);
+  c("the cursor lands past the torn line and the record after it", off(r5.cursor) === beforeTorn + Buffer.byteLength(torn + '\n{"i":9}\n'), { got: r5.cursor });
+  const r5b = await readOr(src, r5.cursor, "post-gap re-read");
+  c("a re-read from the returned cursor neither replays the gap nor reports it again", r5b.records.length === 0 && r5b.unreadable === undefined, r5b);
+  // ── invalid UTF-8 is the same answer, confined to ITS line: the line after it is still a record ──
+  const badBytes = Buffer.concat([Buffer.from('{"i":10,"s":"'), Buffer.from([0xff, 0xfe]), Buffer.from('"}\n{"i":11}\n')]);
+  appendFileSync(path, badBytes);
+  const r6 = await readOr(src, r5.cursor, "invalid-utf8 read");
+  c("a line with invalid UTF-8 is a gap and the line after it is a record",
+    r6.unreadable?.length === 1 && r6.unreadable[0]?.offset === off(r5.cursor) && r6.records.length === 1 && r6.records[0]?.value.i === 11,
+    { gaps: r6.unreadable, records: r6.records });
+  c("an invalid UTF-8 gap says so and nothing else", r6.unreadable?.[0]?.reason === "not valid UTF-8", r6.unreadable?.[0]?.reason);
+  // ── QUOTE ADVERSARIES: the parser's "Unexpected token" form quotes a span of the line, and a span
+  // can itself contain quotes, so a reason built by rewriting the message leaked `CANARY` through a
+  // quote the rewrite took for a delimiter (found by an independent probe at head ad6ebeb8d). ──
+  // (A BOM-prefixed line is not in this list: the decoder strips the mark and the line is a record.)
+  // The last one carries parser-message wording with a number, which a position read out of the
+  // message by pattern would have reported as the parser's own position.
+  const adversaries = ['X"CANARY-A"', '{"x":X"CANARY-B"}', '"CANARY-C', 'CANARY-D', '{"s":"\\"CANARY-E"}x', 'at position 864209 CANARY-F'];
+  appendFileSync(path, adversaries.join("\n") + '\n{"i":12}\n');
+  const r7 = await readOr(src, r6.cursor, "quote-adversary read");
+  const leaked = (r7.unreadable ?? []).filter((g) => /CANARY/.test(g.reason)).map((g) => g.reason);
+  c("every quote adversary is a gap, none of them a record", r7.unreadable?.length === adversaries.length && r7.records.length === 1 && r7.records[0]?.value.i === 12, { gaps: r7.unreadable?.length, records: r7.records });
+  c("no quote adversary's text reaches any gap reason", leaked.length === 0, leaked);
+  c("every adversary's reason is the fixed category, digits included", (r7.unreadable ?? []).every((g) => g.reason === "not a JSON record"), r7.unreadable?.map((g) => g.reason));
+  c("CONTROL: the adversary text WOULD show if the reason were the raw message", (() => { try { JSON.parse(adversaries[0]!); return false; } catch (e) { return /CANARY-A/.test((e as Error).message); } })());
 
   // ── truncation/replacement is loud too: neither re-adopting nor re-sending is safe to guess ──
   //
@@ -167,16 +210,16 @@ try {
   }
 
   // B2 — malformed UTF-8 was substituted with U+FFFD, so corrupted data PARSED and would publish.
+  // It is a GAP now, and the cell keeps the half that matters: no record is delivered for that line.
   {
     const d = mkdtempSync(join(tmpdir(), "ds-b2-"));
     const f = join(d, "s.jsonl");
     writeFileSync(f, '{"a":1}\n');
-    const s2 = new JsonlFileSource(f);
+    const s2 = new JsonlFileSource<{ s?: string }>(f);
     const a = await readOr(s2, undefined, "B2 adopt");
     appendFileSync(f, Buffer.concat([Buffer.from('{"s":"'), Buffer.from([0xff]), Buffer.from('"}\n')]));
-    let rejected = false;
-    try { await s2.read(a.cursor); } catch { rejected = true; }
-    c("B2: invalid UTF-8 is REJECTED, never silently rewritten to U+FFFD", rejected);
+    const r = await readOr(s2, a.cursor, "B2 read");
+    c("B2: invalid UTF-8 is a GAP, never a record rewritten to U+FFFD", r.records.length === 0 && r.unreadable?.length === 1 && r.unreadable[0]?.bytes === 9, r);
     rmSync(d, { recursive: true, force: true });
   }
 
@@ -404,6 +447,29 @@ try {
     } finally {
       rmSync(pd, { recursive: true, force: true });
     }
+  }
+  // ── end(): the cursor after the last complete record, consuming nothing, AS OF THE CALL ──
+  // The holder takes it at a turn's terminal hook to name the terminal's turn; a position read later
+  // than the call would be past whatever the session wrote in between.
+  {
+    const p = join(dir, "end.jsonl");
+    writeFileSync(p, "");
+    const s = new JsonlFileSource<{ i: number }>(p);
+    const empty = await s.end();
+    const adoptEmpty = await readOr(s, undefined, "adopt empty");
+    c("end:an-empty-file-ends-where-a-fresh-adopt-starts", empty === adoptEmpty.cursor, { empty, adopt: adoptEmpty.cursor });
+    appendFileSync(p, '{"i":1}\n{"i":2}\n');
+    const all = await readOr(s, adoptEmpty.cursor, "read all");
+    const end = await s.end();
+    c("end:is-the-cursor-a-read-that-consumed-everything-returns", end === all.cursor && all.records.length === 2, { end, read: all.cursor });
+    appendFileSync(p, '{"i":3}\n{"i":4');
+    const torn = await s.end();
+    const after = await readOr(s, all.cursor, "read to the torn line");
+    c("end:stops-at-the-last-complete-line-and-a-read-resumes-from-it", torn === after.cursor && after.records.length === 1 && off(torn) === off(all.cursor) + Buffer.byteLength('{"i":3}\n'), { torn, read: after.cursor });
+    const atCall = s.end();
+    appendFileSync(p, '}\n{"i":5}\n');
+    c("end:is-the-position-AT-THE-CALL-not-when-awaited", (await atCall) === torn, { atCall: await atCall, torn });
+    c("end:consumes-nothing", (await readOr(s, all.cursor, "re-read after end")).records.length === 3);
   }
 } finally {
   rmSync(dir, { recursive: true, force: true });
