@@ -1,7 +1,7 @@
 import { appendFileSync, chmodSync, closeSync, existsSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { inSeatCgroup } from "./cgroup.js";
 import { createServer, type Socket } from "node:net";
-import { dropPidfdForTest, NoChildStarted, spawnPinned, type PinnedPty } from "./pty.js";
+import { argsAsStringForTest, dropPidfdForTest, NoChildStarted, spawnPinned, type PinnedPty } from "./pty.js";
 import Headless from "@xterm/headless";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { discardSeatArtifacts } from "./artifacts.js";
@@ -67,6 +67,8 @@ type LaunchPayload = CustodianLaunch & { testSeam?: CustodianTestSeam };
 export interface CustodianTestSeam {
   /** Drop the fork's pidfd, as a kernel without `pidfd_open` would. */
   dropPidfd?: boolean;
+  /** Pass string args through to native node-pty to exercise its recognized pre-fork refusal. */
+  argsAsString?: boolean;
   /** Pause at each `at`: write `reached`, then wait until `release` exists, for up to `timeoutMs`
    *  (default CONFIRM_TIMEOUT_MS). `unpinned` pauses after a failed pin, so a test child can arm its
    *  handlers before this process exits and hangs it up. */
@@ -94,7 +96,6 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
     throw new Error(`custody transport unsupported on ${process.platform}`);
   }
   const startedAt = Date.now();
-  if (!Number.isInteger(launch.adopterUid) || launch.adopterUid < 0) throw new Error(`launch adopterUid ${String(launch.adopterUid)} is not a uid; starting no child`);
   const holdAt = async (at: "before-fs" | "after-pin" | "unpinned"): Promise<void> => {
     const hold = seam?.holds?.find((h) => h.at === at);
     if (!hold) return;
@@ -105,7 +106,6 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
       await sleep(25);
     }
   };
-  await holdAt("before-fs");
 
   const note = (line: string): void => {
     try {
@@ -132,6 +132,8 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
   let custodianStart: string;
   let bootId: string | undefined;
   try {
+    if (!Number.isInteger(launch.adopterUid) || launch.adopterUid < 0) throw new Error(`launch adopterUid ${String(launch.adopterUid)} is not a uid; starting no child`);
+    await holdAt("before-fs");
     // Admission. Read-only and without O_CREAT: a fence that is gone admits nothing, and the read goes
     // through this fd so a rename after the open cannot hide a seal.
     fenceFd = openSync(launch.fence, "r");
@@ -177,6 +179,7 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
   // hangs up the PTY instead.
   let proc: PinnedPty;
   try {
+    if (seam?.argsAsString) argsAsStringForTest();
     proc = spawnPinned(launch.command, launch.args, {
       name: "xterm-256color",
       cols: DEFAULT_COLS,

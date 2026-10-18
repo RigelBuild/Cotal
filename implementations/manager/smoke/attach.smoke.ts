@@ -45,15 +45,47 @@ const cwd = process.cwd();
 
 // pty (default) — the one streamable backend: attach() returns a live session, never throws.
 {
-  const h = createRuntime("pty", SESSION).spawn("smoke-pty", spec, cwd);
-  let sess: { onData?: unknown; cols?: unknown } | undefined;
-  const err = attachError(() => (sess = h.attach()));
-  check(
-    "pty: attach() returns a live session (streams, no throw)",
-    err === "" && typeof sess?.onData === "function" && typeof sess?.cols === "number",
-  );
-  h.stop({ graceful: false });
-  closeHandle(h);
+  const previousSeatRoot = process.env.COTAL_SEAT_ROOT;
+  const seatRoot = process.platform === "linux" ? mkdtempSync(join(tmpdir(), "cotal-attach-default-pty-")) : undefined;
+  if (seatRoot !== undefined) process.env.COTAL_SEAT_ROOT = seatRoot;
+  let runtime: Runtime | undefined;
+  let spawned: AgentHandle | undefined;
+  try {
+    const pty = createRuntime("pty", SESSION);
+    runtime = pty;
+    const h = pty.spawn("smoke-pty", spec, cwd);
+    spawned = h;
+    let sess: { onData?: unknown; cols?: unknown } | undefined;
+    const err = attachError(() => (sess = h.attach()));
+    check(
+      "pty: attach() returns a live session (streams, no throw)",
+      err === "" && typeof sess?.onData === "function" && typeof sess?.cols === "number",
+    );
+  } finally {
+    try {
+      if (spawned !== undefined) {
+        spawned.stop({ graceful: false });
+        if (process.platform === "linux") {
+          if (
+            typeof spawned.waitForExit !== "function" ||
+            spawned.reference === undefined ||
+            runtime === undefined ||
+            !isCustodialRuntime(runtime)
+          ) throw new Error("Linux pty handle cannot prove its child exited or its runtime cannot reap its seat");
+          await spawned.waitForExit();
+          await runtime.reap(spawned.reference);
+        }
+      }
+    } finally {
+      closeHandle(spawned);
+      try {
+        if (seatRoot !== undefined) rmSync(seatRoot, { recursive: true, force: true });
+      } finally {
+        if (previousSeatRoot === undefined) delete process.env.COTAL_SEAT_ROOT;
+        else process.env.COTAL_SEAT_ROOT = previousSeatRoot;
+      }
+    }
+  }
 }
 
 // Runtime-selection contract (no fallbacks): `auto` is deterministic pty — even inside $TMUX. tmux

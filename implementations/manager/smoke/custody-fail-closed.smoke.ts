@@ -57,7 +57,7 @@ import { requestDeliveryAdminZeroMemberships } from "./_fake-delivery-admin.js";
 let failures = 0;
 let ran = 0;
 /** Intent, not a measurement: one per cell assertion below. A shortfall means a cell stopped running. */
-const EXPECTED_CHECKS = 24;
+const EXPECTED_CHECKS = 30;
 function check(label: string, cond: boolean, extra?: unknown): void {
   console.log(`${cond ? "✓" : "✗"} ${label}${cond ? "" : ` — ${JSON.stringify(extra) ?? ""}`}`);
   ran++;
@@ -79,7 +79,7 @@ const space = `custody-${randomUUID().slice(0, 8)}`;
 const auth = await createSpaceAuth(space);
 const { servers: SERVERS, stop: stopBroker } = await bootBroker(auth);
 const workspaceRoot = mkdtempSync(join(tmpdir(), "cotal-custody-ws-"));
-const ALIASES = ["retainer", "membersok", "membersmax", "predkept", "fatalres", "failrestart", "othref", "lateref", "membersweep", "clearme", "laterfail", "retryret", "retrymove", "escalate", "rekick", "unres", "unresfail"];
+const ALIASES = ["retainer", "membersok", "membersmax", "predkept", "fatalres", "failrestart", "othref", "lateref", "membersweep", "clearme", "laterfail", "retryret", "retrymove", "escalate", "rekick", "unres", "unresfail", "unresheld", "resunproved", "resfail"];
 mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
 for (const alias of ALIASES)
   writeFileSync(join(workspaceRoot, ".cotal", "agents", `${alias}.md`), `---\nname: ${alias}\nrole: worker\nsubscribe: [general]\nallowSubscribe: [general]\nallowPublish: [general]\n---\nbody\n`);
@@ -99,6 +99,42 @@ const fakeHandle = (name: string, reference: RuntimeReference | undefined): Agen
   let running = true;
   return { name, kind: "pty", reference, status: () => running ? "running" : "exited", stop: () => { running = false; }, waitForExit: async () => { running = false; }, interrupt: () => {}, attach: () => fakeSession };
 };
+/** A seat whose stop is only a request: its exit is proved when the smoke calls `exit()`, and never
+ *  once `refuse()` makes every exit wait reject. */
+function gatedHandle(name: string): { handle: AgentHandle; stopped: () => boolean; waits: () => number; exit: () => void; refuse: () => void } {
+  let running = true;
+  let stopped = false;
+  let refused = false;
+  let waits = 0;
+  const listeners = new Set<() => void>();
+  let release: () => void = () => {};
+  const exited = new Promise<void>((resolve) => { release = resolve; });
+  const session = { ...fakeSession, onExit: (fn: () => void) => { listeners.add(fn); return () => listeners.delete(fn); } };
+  const handle: AgentHandle = {
+    name,
+    kind: "pty",
+    reference: { kind: "pty", id: randomUUID().replaceAll("-", "") },
+    status: () => running ? "running" : "exited",
+    stop: () => { stopped = true; },
+    waitForExit: () => {
+      waits++;
+      return refused && running ? Promise.reject(new Error("smoke: exit cannot be proved")) : exited;
+    },
+    interrupt: () => {},
+    attach: () => session,
+  };
+  return {
+    handle,
+    stopped: () => stopped,
+    waits: () => waits,
+    exit: () => {
+      running = false;
+      release();
+      for (const fn of listeners) fn();
+    },
+    refuse: () => { refused = true; },
+  };
+}
 const fakeRuntime: CustodialRuntime = {
   kind: "pty",
   reserve: () => ({ kind: "pty", id: randomUUID().replaceAll("-", "") }),
@@ -121,7 +157,7 @@ const fakeRuntime: CustodialRuntime = {
 };
 
 const mgr = new Manager({ space, servers: SERVERS, runtime: "pty", workspaceRoot });
-type Managed = { id: string; name: string; lifecycleUid: string; handle: AgentHandle; secretPaths?: { creds?: string } };
+type Managed = { id: string; name: string; lifecycleUid: string; handle: AgentHandle; secretPaths?: { creds?: string }; restart?: { recovering: boolean } };
 type Executor = <T>(pin: { owner: string; actor: string; lifecycleUid: string; alias: string }, fn: (t: LifecycleStateTransport) => Promise<T>) => Promise<T>;
 // The smoke drives private manager seams, as static-lifecycle.smoke.ts does.
 const M = mgr as unknown as {
@@ -149,6 +185,7 @@ const M = mgr as unknown as {
   reconcileStaticLifecycles: () => Promise<void>;
   managerStatusData: () => ManagerStatus;
   freeSlot: (a: unknown, floor: boolean, cause: FreeSlotCause) => void;
+  launchPreparedResume: (entry: unknown, prepared: unknown, batchReserved: boolean) => Promise<{ ok: boolean; error?: string }>;
 };
 M.auth = auth;
 M.runtime = fakeRuntime;
@@ -517,42 +554,119 @@ try {
       it !== undefined && it.retainedReason === undefined && (label === "moved" || it.remedy === undefined) && after === counted - 1, { it, counted, after });
   }
 
-  // ── An unreserved runtime's restart records the replacement's reference, or stops it ──────
+  // ── An unreserved runtime's restart and resume record the replacement's reference, or stop it ──
   {
-    // A runtime that names its seats but reserves nothing (as tmux does): the row learns the
-    // replacement's reference only after the spawn.
+    // A runtime that names its seats and can reap them but reserves nothing (as tmux does): the row
+    // learns the replacement's reference only after the spawn.
     const spawned: AgentHandle[] = [];
+    let nextHandle: ((name: string) => AgentHandle) | undefined;
     M.runtime = {
       kind: "pty",
       spawn: (name: string) => {
-        const h = fakeHandle(name, { kind: "pty", id: randomUUID().replaceAll("-", "") });
+        const h = nextHandle?.(name) ?? fakeHandle(name, { kind: "pty", id: randomUUID().replaceAll("-", "") });
+        nextHandle = undefined;
         spawned.push(h);
         return h;
       },
+      reap: fakeRuntime.reap,
     };
-    // A restart waits for a heartbeat newer than the exited seat's, so the roster must move.
+    // A restart waits for a heartbeat newer than the exited seat's, so the roster must move; while
+    // `holdReady` is set it does not, and the replacement's readiness stays pending.
+    let holdReady = false;
     const getRoster = M.ep.getRoster as () => Presence[];
-    M.ep.getRoster = (): Presence[] => getRoster().map((p) => ({ ...p, ts: Date.now() }));
+    M.ep.getRoster = (): Presence[] => getRoster().map((p) => ({ ...p, ts: holdReady ? 0 : Date.now() }));
     try {
       const a = await spawnLive("unres", true);
       const prior = refOf(a);
+      holdReady = true;
       M.onAgentExit(a);
-      await until(() => spawned.length === 2 && M.agents.get("unres")?.handle === spawned[1], 30_000);
+      await until(() => spawned.length === 2, 10_000);
       const next = spawned[1]?.reference;
-      await until(async () => (await readSlot("unres"))?.runtime?.id === next?.id, 10_000);
+      await until(async () => (await readSlot("unres"))?.runtime?.id === next?.id, 5_000);
+      const early = await readSlot("unres");
+      check("unreserved restart: the row names the replacement's reference before its readiness settles",
+        next !== undefined && early?.runtime?.id === next.id && M.agents.get("unres")?.restart?.recovering === true,
+        { row: early?.runtime, next, recovering: M.agents.get("unres")?.restart?.recovering });
+      holdReady = false;
+      await until(() => M.agents.get("unres")?.handle === spawned[1], 30_000);
       const row = await readSlot("unres");
       check("unreserved restart: the slot row names the replacement's reference, not the exited seat's",
-        next !== undefined && row?.runtime?.id === next.id && next.id !== prior.id, { row: row?.runtime, prior, next });
+        next !== undefined && row?.runtime?.id === next.id && next.id !== prior.id && M.agents.get("unres")?.handle === spawned[1], { row: row?.runtime, prior, next });
 
+      // Recording refused: the replacement is stopped, and the slot frees only once its exit is proved.
       const b = await spawnLive("unresfail", true);
-      const before = spawned.length;
+      const gate = gatedHandle("unresfail");
+      nextHandle = () => gate.handle;
       failSlotCasFor = "unresfail";
       M.onAgentExit(b);
-      await until(() => spawned.length > before && !M.agents.has("unresfail"), 30_000);
-      const replacement = spawned[before];
-      check("unreserved restart, recording refused: the replacement is stopped through its handle and the seat is retired",
-        failSlotCasFor === undefined && replacement !== undefined && replacement.status() === "exited" && !M.agents.has("unresfail"),
-        { cas: failSlotCasFor, spawned: spawned.length - before, status: replacement?.status(), managed: M.agents.has("unresfail") });
+      await until(() => gate.waits() > 0, 10_000);
+      check("unreserved restart, recording refused: the replacement is stopped and the seat stays managed until its exit is proved",
+        failSlotCasFor === undefined && gate.stopped() && M.agents.get("unresfail") === b,
+        { cas: failSlotCasFor, stopped: gate.stopped(), managed: M.agents.has("unresfail") });
+      gate.exit();
+      await until(() => !M.agents.has("unresfail"), 10_000);
+      check("unreserved restart, recording refused: once the replacement's exit is proved, the seat is retired",
+        gate.handle.status() === "exited" && !M.agents.has("unresfail"), { status: gate.handle.status(), managed: M.agents.has("unresfail") });
+
+      // Recording refused and the replacement's exit unprovable: the lifecycle stays held and the
+      // replacement stays managed under its own handle.
+      const c = await spawnLive("unresheld", true);
+      const held = gatedHandle("unresheld");
+      held.refuse();
+      nextHandle = () => held.handle;
+      failSlotCasFor = "unresheld";
+      M.onAgentExit(c);
+      await until(() => held.stopped() && M.agents.get("unresheld")?.handle === held.handle, 10_000);
+      check("unreserved restart, recording refused and exit unproven: the replacement stays managed and the slot is not freed",
+        held.stopped() && M.agents.get("unresheld") === c && c.handle === held.handle && !M.retiring.has("unresheld") && (await readSlot("unresheld"))?.phase === "active",
+        { stopped: held.stopped(), managed: M.agents.has("unresheld"), handle: c.handle === held.handle, retiring: M.retiring.has("unresheld") });
+      held.exit(); // the watched handle's exit retires the seat through the ordinary exit path
+      await until(async () => !M.agents.has("unresheld") && (await readSlot("unresheld"))?.phase === "retired", 10_000);
+
+      // Resume: the reference a resume replaces is proved gone first; an unproven one refuses it.
+      for (const [alias, label] of [["resunproved", "unproven"], ["resfail", "refused"]] as const) {
+        const p = await spawnLive(alias);
+        const predecessor = refOf(p);
+        M.agents.delete(alias); // the preserved seat this manager no longer holds
+        const creds = p.secretPaths?.creds;
+        if (creds === undefined) throw new Error(`${alias} has no creds path`);
+        const gr = gatedHandle(alias);
+        if (label === "unproven") {
+          plans.set(predecessor.id, [UNPROVABLE]);
+          gr.exit();
+        } else {
+          failSlotCasFor = alias;
+        }
+        nextHandle = () => gr.handle;
+        const entry = {
+          space, name: alias, role: "worker",
+          identity: { mode: "static" as const, id: p.id, lifecycleUid: p.lifecycleUid, credential: { kind: "file" as const, path: creds, sha256: "" } },
+          launch: {
+            connector: "smoke-custody", runtime: "pty", cwd: workspaceRoot, events: false,
+            source: { kind: "persona" as const, ref: alias, configPath: join(workspaceRoot, ".cotal", "agents", `${alias}.md`), configSha256: "" },
+            allowSubscribe: ["general"],
+          },
+          dependencies: [], spawner: "smoke", startedAt: new Date().toISOString(),
+        };
+        const pending = M.launchPreparedResume(entry, { spec: { command: "true", args: [], env: {} }, launchOpts: {} }, false);
+        if (label === "unproven") {
+          const reply = await pending;
+          const row = await readSlot(alias);
+          check("unreserved resume, predecessor unproven: the resume is refused, its seat stopped, and the row still names the predecessor",
+            reply.ok === false && /NOT proved gone/.test(reply.error ?? "") && gr.stopped() && !M.agents.has(alias) && row?.runtime?.id === predecessor.id,
+            { reply, stopped: gr.stopped(), managed: M.agents.has(alias), row: row?.runtime, predecessor });
+          continue;
+        }
+        await until(() => gr.waits() > 0, 10_000);
+        const whileHeld = M.agents.get(alias)?.handle === gr.handle;
+        check("unreserved resume, recording refused: the resumed seat is stopped and stays managed until its exit is proved",
+          failSlotCasFor === undefined && gr.stopped() && whileHeld, { cas: failSlotCasFor, stopped: gr.stopped(), whileHeld });
+        gr.exit();
+        const reply = await pending;
+        check("unreserved resume, recording refused: once its exit is proved the seat leaves management and the resume is refused",
+          reply.ok === false && /forced slot CAS/.test(reply.error ?? "") && !M.agents.has(alias) && (await readSlot(alias))?.runtime?.id === predecessor.id,
+          { reply, managed: M.agents.has(alias) });
+      }
     } finally {
       M.ep.getRoster = getRoster;
       failSlotCasFor = undefined;

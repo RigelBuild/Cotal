@@ -107,10 +107,10 @@ const ARMED_CHILD =
   "process.on('SIGHUP',()=>{});process.on('SIGTERM',()=>fs.writeFileSync(mark,'term'));" +
   "fs.writeFileSync(pidf,String(process.pid));if(rel)fs.writeFileSync(rel,'');setInterval(()=>{},1000);";
 /** Launch under a test seam; a launch that should have failed but did not leaves its pids to `strays`. */
-const launchUnderSeam = (seam: CustodianTestSeam, id: string, args: string[]): string => {
+const launchUnderSeam = (seam: CustodianTestSeam, id: string, args: string[], artifacts?: string[]): string => {
   setCustodianTestSeam(seam);
   try {
-    const rec: SeatRecord = launchSeat({ root, name: "t1-seam", id, spec: { command: process.execPath, args, env: { PATH: process.env.PATH ?? "" } }, cwd: process.cwd() });
+    const rec: SeatRecord = launchSeat({ root, name: "t1-seam", id, spec: { command: process.execPath, args, env: { PATH: process.env.PATH ?? "" }, ...(artifacts === undefined ? {} : { artifacts }) }, cwd: process.cwd() });
     strays.push({ pid: rec.custodianPid, start: rec.custodianStart }, { pid: rec.childPid, start: rec.childStart });
     return "";
   } catch (e) {
@@ -692,10 +692,60 @@ await h.waitForExit();
       process.kill = realKill;
     }
     check("dead-leader group reap returns retained/unprovable evidence", retainedUnprovable, reapError);
+    check("dead-leader retained reap keeps record.json", existsSync(join(root, rec.id, "record.json")), rec.id);
     check("surviving dead-leader group members keep identity and receive no signal",
       attempted.length === 0 && owned.every((p) => p.start !== undefined && processStartToken(p.pid) === p.start),
       { attempted, owned });
     for (const p of owned) killOwned(p.pid, p.start);
+  }
+
+  {
+    const dir = mkdtempSync(join(root, "setsid-escapee-"));
+    const childPidPath = join(dir, "child.pid");
+    const grandchildPidPath = join(dir, "grandchild.pid");
+    const child = spawn(process.execPath, [
+      "-e",
+      "const {spawn}=require('node:child_process'); const fs=require('node:fs'); const [childFile,grandFile]=process.argv.slice(1); fs.writeFileSync(childFile,String(process.pid)); const g=spawn(process.execPath,['-e',\"require('node:fs').writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)\",grandFile],{detached:true,stdio:'ignore'}); g.unref(); setTimeout(()=>process.exit(0),300);",
+      childPidPath,
+      grandchildPidPath,
+    ], { stdio: "ignore" });
+    child.unref();
+    const childPid = child.pid;
+    if (childPid === undefined) throw new Error("setsid fixture child did not expose its pid");
+    try {
+      const childReady = await until(() => existsSync(childPidPath), 2_000);
+      const grandchildReady = await until(() => existsSync(grandchildPidPath), 2_000);
+      const grandchildPid = Number(readFileSync(grandchildPidPath, "utf8"));
+      const grandchildStart = processStartToken(grandchildPid);
+      check("setsid escapee fixture: grandchild starts in a new session", childReady && grandchildReady && state(grandchildPid) !== "gone", { childPid, grandchildPid });
+      const id = seatId();
+      const boot = bootToken();
+      const childStart = processStartToken(childPid);
+      const record: SeatRecord = {
+        version: 1,
+        id,
+        name: "setsid-escapee",
+        socket: join(root, id, "missing-seat.sock"),
+        token: "missing-token",
+        custodianPid: childPid,
+        childPid,
+        ...(childStart === undefined ? {} : { custodianStart: childStart, childStart }),
+        ...(boot === undefined ? {} : { bootId: boot }),
+      };
+      mkdirSync(join(root, id), { recursive: true, mode: 0o700 });
+      writeFileSync(join(root, id, "record.json"), `${JSON.stringify(record)}\n`);
+      await until(() => isGone(childPid), 2_000);
+      const evidence = await reapSeat(root, id, { graceMs: 100 }).catch((e: Error) => e);
+      check(
+        "a setsid escapee keeps the reap retained and is never signalled",
+        !(evidence instanceof Error) && evidence.outcome === "retained" && evidence.reason === "unprovable" && evidence.stop === "no-custodian" && state(grandchildPid) !== "gone" && state(grandchildPid) !== "Z",
+        { evidence: evidence instanceof Error ? evidence.message : evidence, grandchild: state(grandchildPid) },
+      );
+      killOwned(grandchildPid, grandchildStart);
+      await until(() => isGone(grandchildPid), 2_000);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 
 
@@ -769,22 +819,64 @@ await h.waitForExit();
   }
 
   {
+    // A recognized node-pty refusal occurs before fork and must release launch artifacts.
+    const artifact = mkdtempSync(join(tmpdir(), "cotal-prefork-artifact-"));
+    writeFileSync(join(artifact, "persona.md"), "private\n");
+    const id = seatId();
+    const err = launchUnderSeam({ argsAsString: true }, id, [], [artifact]);
+    check(
+      "node-pty recognized pre-fork refusal removes launch artifacts",
+      /custodian exited before ready/.test(err) && /args as a string is not supported on unix\./.test(err) && !existsSync(artifact),
+      { err, artifact: existsSync(artifact) },
+    );
+    rmSync(artifact, { recursive: true, force: true });
+  }
+
+  {
+    const artifact = mkdtempSync(join(tmpdir(), "cotal-before-fs-artifact-"));
+    writeFileSync(join(artifact, "persona.md"), "private\n");
+    const invalidUid = Number.NaN;
+    let err = "";
+    try {
+      launchSeat({
+        root,
+        name: "invalid-adopter-uid-artifact-cleanup",
+        id: seatId(),
+        agentUid: invalidUid,
+        spec: { command: process.execPath, args: ["-e", "setInterval(()=>{},1000)"], env: { PATH: process.env.PATH ?? "" }, artifacts: [artifact] },
+        cwd: process.cwd(),
+      });
+    } catch (e) {
+      err = (e as Error).message;
+    }
+    check("invalid adopter uid removes launch artifacts before spawn", /agent uid NaN is not a uid/.test(err) && !existsSync(artifact), { err, artifact: existsSync(artifact) });
+    rmSync(artifact, { recursive: true, force: true });
+  }
+
+  {
     // A failed pin sends nothing: the child is named by no pidfd, so only the PTY hangup reaches it.
     const dir = mkdtempSync(join(root, "t1-unpinned-"));
     const pidf = join(dir, "pid");
     const mark = join(dir, "term");
     const release = join(dir, "release");
+    const artifact = mkdtempSync(join(tmpdir(), "cotal-unpinned-artifact-"));
+    writeFileSync(join(artifact, "persona.md"), "private\n");
     const id = seatId();
-    const err = launchUnderSeam({ dropPidfd: true, holds: [{ at: "unpinned", reached: join(dir, "reached"), release }] }, id, ["-e", ARMED_CHILD, pidf, mark, release]);
+    const err = launchUnderSeam({ dropPidfd: true, holds: [{ at: "unpinned", reached: join(dir, "reached"), release }] }, id, ["-e", ARMED_CHILD, pidf, mark, release], [artifact]);
     const owned = readPid(pidf);
     if (owned !== undefined) strays.push(owned);
     const pid = owned?.pid;
     await wait(300);
     check(
-      "an unpinned child is never signalled: launch fails, no socket or record, the child lives unmarked",
-      /returned no pidfd/.test(err) && !existsSync(join(root, id, "seat.sock")) && !existsSync(join(root, id, "record.json")) && pid !== undefined && !isGone(pid) && !existsSync(mark),
-      { err, pid, child: pid === undefined ? "none" : state(pid), sigterm: existsSync(mark) },
+      "an unpinned child is never signalled: launch fails, no socket or record, artifact kept and child lives unmarked",
+      /returned no pidfd/.test(err) && !existsSync(join(root, id, "seat.sock")) && !existsSync(join(root, id, "record.json")) && existsSync(artifact) && pid !== undefined && !isGone(pid) && !existsSync(mark),
+      { err, pid, child: pid === undefined ? "none" : state(pid), artifact: existsSync(artifact), sigterm: existsSync(mark) },
     );
+    if (owned !== undefined) {
+      killOwned(owned.pid, owned.start);
+      await until(() => isGone(owned.pid), 2_000);
+    }
+    rmSync(artifact, { recursive: true, force: true });
   }
 
   for (const fail of ["listen-error", "after-bind"] as const) {

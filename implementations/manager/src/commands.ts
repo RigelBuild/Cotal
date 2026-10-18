@@ -747,9 +747,9 @@ async function runDeregisterInstance(args: ParsedArgs): Promise<void> {
 }
 
 /**
- * `cotal seats` lists Linux seat custody records. With `--drain`, it tries to reap seats whose
- * child has exited. Without contained cgroup proof they stay retained; reaped records need an
- * explicit release.
+ * `cotal seats` lists Linux seat custody records. `--drain` asks the custodian to stop exited seats,
+ * but this CLI supplies no contained cgroup proof, so it cannot prove a seat gone and reports the
+ * retained seat as `refused`.
  */
 async function runSeats(args: ParsedArgs): Promise<void> {
   const root = custodyRoot();
@@ -761,7 +761,7 @@ async function runSeats(args: ParsedArgs): Promise<void> {
   for (const e of entries) console.log(`${e.id}  ${e.state.padEnd(10)}  ${e.name ?? "-"}  ${e.detail}`);
   const count = (state: string): number => entries.filter((e) => e.state === state).length;
   console.error(
-    c.dim(`• ${entries.length} record(s) under ${root}: ${count("live-child")} live-child, ${count("childless")} childless, ${count("drained")} drained, ${count("refused")} refused`),
+    c.dim(`• ${entries.length} record(s) under ${root}: ${count("live-child")} live-child, ${count("childless")} childless, ${count("refused")} refused`),
   );
   if (count("refused") > 0) process.exitCode = 1;
 }
@@ -828,8 +828,8 @@ const managerCommands: Command[] = [
     name: "seats",
     group: "Manager",
     summary:
-      "list Linux pty seat custody records - [--drain] tries to reap exited seats; without contained cgroup proof they stay retained",
-    flags: [{ name: "drain", type: "boolean", description: "try to reap exited seats; without contained cgroup proof they stay retained" }],
+      "list Linux pty seat custody records - [--drain] asks custodians to stop exited seats but cannot prove them gone without a contained cgroup; retained seats are reported refused",
+    flags: [{ name: "drain", type: "boolean", description: "ask custodians to stop exited seats; this command has no contained cgroup proof and reports childless seats as refused (retained)" }],
     run: runSeats,
   },
 ];

@@ -100,6 +100,16 @@
       "note": "An empty process-group census cannot establish that a detached descendant is gone."
     },
     {
+      "name": "a pre-fork PTY error is not classified as childless",
+      "file": "packages/seat/src/pty.ts",
+      "find": "if (e instanceof Error && Object.hasOwn(PRE_FORK_ERRORS, e.message)) throw new NoChildStarted(e.message, { cause: e });",
+      "replace": "if (e instanceof Error && Object.hasOwn(PRE_FORK_ERRORS, e.message)) throw e;",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "node-pty recognized pre-fork refusal removes launch artifacts",
+      "cell": "node-pty recognized pre-fork refusal removes launch artifacts",
+      "note": "The artifact cell reaches native node-pty's recognized string-args refusal; without NoChildStarted, the custodian retains the artifacts."
+    },
+    {
       "name": "a foreign-boot record cannot throw",
       "file": "packages/seat/src/reap.ts",
       "find": "  const { stop, error } = await requestStop(root, id, rec, opts.graceMs ?? 10_000);",
@@ -154,9 +164,9 @@
       "find": "  const pidfd = dropPidfd ? undefined : term._pidfd;\n",
       "replace": "  const pidfd = dropPidfd ? undefined : term._pidfd;\n  if (typeof pidfd !== \"number\") process.kill(term.pid, \"SIGKILL\");\n",
       "afterRestore": "pnpm --filter @cotal-ai/seat build",
-      "expectRed": "an unpinned child is never signalled: launch fails, no socket or record, the child lives unmarked",
-      "cell": "an unpinned child is never signalled: launch fails, no socket or record, the child lives unmarked",
-      "note": "The proc.kill fallback: a send by pid to a child this process cannot name."
+      "expectRed": "an unpinned child is never signalled: launch fails, no socket or record, artifact kept and child lives unmarked",
+      "cell": "an unpinned child is never signalled: launch fails, no socket or record, artifact kept and child lives unmarked",
+      "note": "The proc.kill fallback: a send by pid to a child this process cannot name. The same cell checks the post-fork launch artifacts remain on disk."
     },
     {
       "name": "T1 a listen error escapes the startup SIGKILL",

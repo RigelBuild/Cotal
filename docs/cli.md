@@ -1939,7 +1939,7 @@ cotal seats [--drain]
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--drain` | off | Try to reap exited seats. Without contained cgroup proof, the seat stays retained |
+| `--drain` | off | Ask the custodian to stop exited seats. This CLI has no contained cgroup proof, so it cannot prove a seat gone and reports it `refused` (retained) |
 
 The Linux pty runtime starts each seat under a detached custodian and reports custody as
 `custodied`. Off Linux, it spawns in-process with no custodian and reports `legacy`. Custodians
@@ -1950,14 +1950,15 @@ manager still holds its connection. This command lists custody records under `CO
 | State | Meaning |
 |---|---|
 | `live-child` | The agent process still runs. The seat is never signalled, and a manager can still adopt it |
-| `childless` | The agent exited, or the record is from an earlier boot. Without proof, it stays retained |
-| `drained` | A contained cgroup proved the seat gone. The record stays until explicit release |
-| `refused` | Unreadable or incomplete identity, no host boot identity, or unproved reap; the record stays on disk |
+| `childless` | A valid record has no live child, or belongs to an earlier boot. Without `--drain`, it stays retained |
+| `refused` | Unreadable or incomplete identity, no host boot identity, or an unproved reap. The record stays on disk; `--drain` reports childless seats this way |
+| `drained` | A contained seat cgroup proved its processes gone. `cotal seats` does not supply that proof, so it cannot report this state |
 
 A reap never signals a numeric pid or process group. The custodian signals its child through a
-pinned pidfd. Only a contained seat cgroup proves the seat gone; without one, the reap returns
-retained/unprovable, even if it requested a stop. A reaped seat's record stays until explicit
-release. A record from an earlier boot is reported childless and stays on disk after `--drain`. A
+pinned pidfd. Only a contained seat cgroup proves the seat gone; `cotal seats` does not supply that
+proof, so `--drain` cannot report `drained` and returns childless seats as `refused` (retained),
+even if it requested a stop. The record stays on disk. A record from an earlier boot is reported
+childless without `--drain` and refused after `--drain`. A
 record with no start or boot identity is refused and is never reported as running or exited. A host
 with no boot identity (`/proc/sys/kernel/random/boot_id`) refuses every record. These refusals and
 unreadable records signal nothing. The command exits non-zero when any record is refused. It is

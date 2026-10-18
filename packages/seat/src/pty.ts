@@ -42,6 +42,11 @@ let dropPidfd = false;
 export function dropPidfdForTest(): void {
   dropPidfd = true;
 }
+// Same seam: hand node-pty string args so it refuses before forking.
+let argsAsString = false;
+export function argsAsStringForTest(): void {
+  argsAsString = true;
+}
 
 /** Thrown by {@link spawnPinned} only when the fork is proved not to have started a child: the
  *  vendored node-pty refused before forking, or forkpty(3) itself failed. Any other throw may leave a
@@ -69,11 +74,11 @@ export function spawnPinned(
   if (process.platform !== "linux") throw unsupportedTransport();
   const require = createRequire(import.meta.url);
   const { UnixTerminal } = require(join(packageRoot, "native", "node-pty", "lib", "unixTerminal.js")) as {
-    UnixTerminal: new (file: string, args: string[], opts: object) => UnixTerminal;
+    UnixTerminal: new (file: string, args: string[] | string, opts: object) => UnixTerminal;
   };
   let term: UnixTerminal;
   try {
-    term = new UnixTerminal(file, args, opts);
+    term = new UnixTerminal(file, argsAsString ? "" : args, opts);
   } catch (e) {
     if (e instanceof Error && Object.hasOwn(PRE_FORK_ERRORS, e.message)) throw new NoChildStarted(e.message, { cause: e });
     throw e;
