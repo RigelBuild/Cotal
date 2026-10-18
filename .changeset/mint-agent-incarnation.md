@@ -1,5 +1,6 @@
 ---
 "@cotal-ai/cli": patch
+"@cotal-ai/core": patch
 ---
 
-`cotal mint` now validates agent-file capabilities against the manager's shared allowlist before signing. It refuses unknown capabilities and rejects `--new-incarnation` outside the agent profile. Missing mint names and agent re-mints without exactly one lifecycle UID are refused before writing credentials.
+`cotal mint` now forwards the agent file's capabilities, so a minted credential can carry `spawn`. A re-mint with `--identity` keeps the lifecycle UID by default, so existing DM, delivery and history durables stay bound; `--new-incarnation` (agent profile only) mints a fresh UID instead. Capabilities are checked against the allowlist the manager uses, `admin` and unknown values are refused before signing, and `@cotal-ai/core` exports that check as `assertKnownAgentCapabilities`.
