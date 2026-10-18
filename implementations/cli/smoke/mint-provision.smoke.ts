@@ -38,8 +38,11 @@
 import { strict as assert } from "node:assert";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { connect, type NatsConnection } from "@nats-io/transport-node";
+import { Manager } from "../../manager/src/manager.js";
+import type { CotalMessage, Connector, EpCaller, LaunchOpts, LaunchSpec } from "@cotal-ai/core";
 const home = mkdtempSync(join(tmpdir(), "cotal-mint-prov-home-"));
 process.env.COTAL_HOME = home;
 process.env.COTAL_NO_PROMPT = "1";
@@ -49,8 +52,8 @@ await import("../src/index.js");
 const {
   CotalEndpoint, createSpaceAuth, jwtFromCreds, mintCreds, newIdentity, setupSpaceStreams,
   seedChannelRegistry, provisionAgent, mintLifecycleUid, principalKey, DEV_OWNER, registry,
+  spawnCallerCapabilities, epRequestGrantRows, resolveService, invokeCommand, standaloneConnectOpts,
 } = await import("@cotal-ai/core");
-type CotalMessage = import("@cotal-ai/core").CotalMessage;
 const { authDir, canonicalRoot, saveSpaceAuth, recordMesh } = await import("@cotal-ai/workspace");
 const { credsClaims } = await import("@cotal-ai/core");
 const { runCli } = await import("../src/command.js");
@@ -94,7 +97,7 @@ async function runMint(argv: string[]): Promise<{ out: string; code: number }> {
 
 /** What a client recovers from the credential without connecting: the principal tag and the
  *  lifecycle uid its dm/dlv/chathist grants are named for (SPEC 13.1). */
-function facts(creds: string): { principal?: string; uids: string[]; subAllow: string[] } {
+function facts(creds: string): { principal?: string; uids: string[]; subAllow: string[]; pubAllow: string[] } {
   const jwt = jwtFromCreds(creds)!;
   const payload = JSON.parse(Buffer.from(jwt.split(".")[1]!, "base64url").toString("utf8")) as {
     nats?: { tags?: string[]; pub?: { allow?: string[] }; sub?: { allow?: string[] } };
@@ -105,9 +108,24 @@ function facts(creds: string): { principal?: string; uids: string[]; subAllow: s
     const m = /(?:^|\.)(?:dm|dlv|chathist)_([^.]+)/.exec(s);
     if (m) uids.add(m[1]!.split("-").pop()!);
   }
-  return { principal, uids: [...uids], subAllow: payload.nats?.sub?.allow ?? [] };
+  return {
+    principal,
+    uids: [...uids],
+    subAllow: payload.nats?.sub?.allow ?? [],
+    pubAllow: payload.nats?.pub?.allow ?? [],
+  };
 }
 
+function lifecycleUidFromCreds(creds: string): string {
+  const rows = credsClaims(creds).nats?.pub?.allow ?? [];
+  const uids = new Set<string>();
+  for (const row of rows) {
+    const match = /\.(?:dm|dlv|chathist)_[A-Za-z0-9_]+-[A-Za-z0-9_]+-([a-z0-9]{26,32})$/.exec(row);
+    if (match) uids.add(match[1]!);
+  }
+  if (uids.size !== 1) throw new Error(`--identity credential carries ${uids.size} lifecycle UIDs; expected one agent lifecycle`);
+  return [...uids][0]!;
+}
 /** Broker-side truth: the client names of every OPEN connection, off the monitoring endpoint. The
  *  endpoint connects as `cotal:<card.name>`, so a provisioner the command forgot to drop is an open
  *  connection named `cotal:mint-provisioner` — counted by the BROKER, not by this process's own
@@ -136,6 +154,21 @@ try {
   await seedChannelRegistry({ servers: broker.servers, space: SPACE, creds: provisioner, file: { channels: { general: {}, "fix.x": {} } } });
   recordMesh({ space: SPACE, server: broker.servers, root, mode: "auth", ts: new Date().toISOString(), origin: "manual" });
   process.chdir(root); // `mint` finds the root's `.cotal/` by walking up from cwd, like the binary
+  // ── 0. capabilities from the agent file reach the credential -------------------------------
+  {
+    const agents = join(root, ".cotal", "agents");
+    mkdirSync(agents, { recursive: true });
+    writeFileSync(join(agents, "mint-caller.md"), "---\nname: mint-caller\ncapabilities: [spawn]\n---\n");
+    const out = join(root, "mint-caller.creds");
+    const r = await runMint(["mint-caller", "--out", out]);
+    const minted = facts(readFileSync(out, "utf8"));
+    const caller: EpCaller = { owner: DEV_OWNER, actor: minted.principal!.split(".")[1]!, uid: minted.uids[0]! };
+    const required = spawnCallerCapabilities(DEV_OWNER).flatMap((cap) => epRequestGrantRows(SPACE, cap, caller));
+    check("mint forwards every agent-file spawn caller row into the JWT", r.code === 0 && required.every((row) => minted.pubAllow.includes(row)), {
+      missing: required.filter((row) => !minted.pubAllow.includes(row)),
+    });
+    check("mint prints the agent-file capabilities", /capabilities:\s+spawn/.test(r.out), r.out);
+  }
   cleanup.push(() => process.chdir(cwd0));
 
   // A second, ordinary peer that will DM and anycast the minted identity. Provisioned the launcher

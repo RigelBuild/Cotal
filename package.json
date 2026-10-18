@@ -624,6 +624,8 @@
     "smoke:join-denial-guidance": "tsx implementations/cli/smoke/join-denial-guidance.smoke.ts",
     "smoke:join-external:live": "tsx implementations/cli/smoke/join-external-broker-live.smoke.ts",
     "smoke:mint-provision:auth": "tsx implementations/cli/smoke/mint-provision.smoke.ts",
+    "smoke:mint-capabilities:unit": "tsx implementations/cli/smoke/mint-capabilities.unit.smoke.ts",
+    "smoke:mint-capabilities:manager": "tsx implementations/manager/smoke/mint-capabilities.smoke.ts",
     "smoke:down-lease-tombstone": "tsx implementations/cli/smoke/down-lease-tombstone.smoke.ts",
     "smoke:down-target": "tsx implementations/cli/smoke/down-target.smoke.ts",
     "smoke:flag-inventory": "tsx bin/smoke/flag-inventory.smoke.ts",

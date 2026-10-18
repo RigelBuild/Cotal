@@ -3,6 +3,8 @@ import { resolve, dirname } from "node:path";
 import {
   CotalEndpoint,
   agentFilePath,
+  assertLifecycleToken,
+  credsClaims,
   identityFromCreds,
   loadAgentFile,
   mintCreds,
@@ -45,6 +47,7 @@ export async function mint(args: ParsedArgs): Promise<void> {
     "expires-in"?: string;
     "expires-at"?: string;
     identity?: string;
+    "new-incarnation"?: boolean;
   };
   const cwdRoot = cotalRoot();
   const cwdStore = workspaceSecretStore(cwdRoot);
@@ -119,6 +122,7 @@ export async function mint(args: ParsedArgs): Promise<void> {
   // (`identityFromCreds`: the USER NKEY SEED block, cross-checked against the JWT subject), never
   // by a second parser; a file that carries no seed is refused BY NAME.
   let existingIdentity: Identity | undefined;
+  let existingCreds: string | undefined;
   if (values.identity !== undefined) {
     const path = resolve(values.identity);
     if (!existsSync(path)) {
@@ -126,7 +130,8 @@ export async function mint(args: ParsedArgs): Promise<void> {
       process.exit(1);
     }
     try {
-      existingIdentity = identityFromCreds(readFileSync(path, "utf8"));
+      existingCreds = readFileSync(path, "utf8");
+      existingIdentity = identityFromCreds(existingCreds);
     } catch {
       console.error(c.red(`--identity file carries no user nkey seed: ${path} - pass a creds file (JWT + USER NKEY SEED) minted by cotal`));
       process.exit(1);
@@ -154,8 +159,7 @@ export async function mint(args: ParsedArgs): Promise<void> {
 
   const name = positionals[0];
   if (!name) {
-    console.error(c.red("usage: cotal mint <name> [--profile <agent|observer|admin>] [--out <path>] [--expires-in <s>|--expires-at <unix-s>] [--identity <creds>]  (agent profile also: [--allow-subscribe a,b] [--allow-publish a,b] [--role <role>] [--provision])"));
-    process.exit(1);
+    console.error(c.red("usage: cotal mint <name> [--profile <agent|observer|admin>] [--out <path>] [--expires-in <s>|--expires-at <unix-s>] [--identity <creds>] [--new-incarnation]  (agent profile also: [--allow-subscribe a,b] [--allow-publish a,b] [--role <role>] [--provision])"));
   }
   // Only an absent flag is `undefined` and defers to the agent file; an empty value is the empty
   // list, so `--allow-publish ""` grants no channel.
@@ -206,24 +210,12 @@ export async function mint(args: ParsedArgs): Promise<void> {
     );
     process.exit(1);
   }
-  // For agents, derive the read/post ACLs AND role from the agent file if one exists (flags
-  // override): allowSubscribe (read; defaults to subscribe) and allowPublish (post; default-deny);
-  // role scopes the TASK-queue consumer to svc_<role>. Only the agent profile takes the
-  // `profile === "agent"` branch below: the three flags are REFUSED above off that profile, so
-  // there is no arm here that reads them and discards them.
   // NOTE: this mints CREDS only — the bind-only chat/DM/TASK durables are pre-created separately by
   // a privileged provisioner (`cotal up` / manager / `cotal spawn`), as for DM/TASK already.
   let allowSubscribe: string[] | undefined;
   let allowPublish: string[] | undefined;
   let role: string | undefined;
-  // The agent profile's dm/dlv/chathist grants are lifecycle-keyed exact names (SPEC 13.1), so
-  // `permissionsFor("agent")` REQUIRES a lifecycleUid and throws without one. This command never
-  // supplied it, which made `cotal mint <name> --profile agent` — the default profile, and the one
-  // its own usage line advertises first — fail on every space with:
-  //   permissionsFor(agent): a lifecycleUid is required
-  // Minting one HERE is the correct owner: a lifecycle uid identifies an incarnation, and an
-  // out-of-band mint IS the first incarnation of that identity. The alternative (accept one as a
-  // flag) would let a caller collide with a live agent's broker footprint by passing its uid.
+  let capabilities: string[] | undefined;
   let lifecycleUid: string | undefined;
   if (profile === "agent") {
     const f = agentFilePath(root, name);
@@ -236,13 +228,32 @@ export async function mint(args: ParsedArgs): Promise<void> {
     }
     allowPublish = splitList(values["allow-publish"]) ?? def?.allowPublish;
     role = values.role ?? def?.role;
-    lifecycleUid = mintLifecycleUid();
+    capabilities = def?.capabilities;
+    if (existingIdentity && existingCreds !== undefined && !values["new-incarnation"]) {
+      const candidate = new Set<string>();
+      try {
+        const sourceClaims = credsClaims(existingCreds);
+        for (const subject of sourceClaims.nats?.pub?.allow ?? []) {
+          const match = /\.(?:dm|dlv|chathist)_[A-Za-z0-9_]+-[A-Za-z0-9_]+-([a-z0-9]{26,32})$/.exec(subject);
+          if (match) candidate.add(assertLifecycleToken(match[1]!));
+        }
+        if (sourceClaims.sub !== existingIdentity.id || candidate.size !== 1)
+          throw new Error("credential does not carry one lifecycle UID for its user nkey");
+        lifecycleUid = [...candidate][0]!;
+      } catch (error) {
+        console.error(c.red(`--identity credential has no single agent lifecycle UID: ${error instanceof Error ? error.message : String(error)}`));
+        process.exit(1);
+      }
+    } else {
+      lifecycleUid = mintLifecycleUid();
+    }
   }
   const identity = existingIdentity ?? newIdentity();
   const lifetime = { expiresInSeconds, expiresAt };
+  const mintOptions = { allowSubscribe, allowPublish, role, capabilities, lifecycleUid, ...lifetime };
   const creds = target
-    ? await provisionForMint(auth, identity, { allowSubscribe, allowPublish, role, lifecycleUid: lifecycleUid!, ...lifetime }, target)
-    : await mintCreds(auth, identity, profile, { allowSubscribe, allowPublish, role, lifecycleUid, ...lifetime });
+    ? await provisionForMint(auth, identity, { ...mintOptions, lifecycleUid: lifecycleUid! }, target)
+    : await mintCreds(auth, identity, profile, mintOptions);
   let out: string;
   if (values.out) {
     // An operator-directed EXPORT to an explicit path — outside the canonical kind location,
@@ -269,6 +280,7 @@ export async function mint(args: ParsedArgs): Promise<void> {
     // should have to parse a JWT to learn what this command chose a moment ago.
     console.log(c.dim(`  principal: ${principalKey(DEV_OWNER, identity.id).key}`));
     console.log(c.dim(`  lifecycle uid: ${lifecycleUid}`));
+    if (capabilities?.length) console.log(c.dim(`  capabilities: ${capabilities.join(", ")}`));
     if (!values.provision)
       console.log(c.dim("  (creds only: it can publish within its post ACL now; to CONSUME its DMs on this mesh, mint with --provision)"));
   }
@@ -371,7 +383,7 @@ async function provisionTarget(auth: SpaceAuth | undefined, flags: { space?: str
 async function provisionForMint(
   auth: SpaceAuth,
   identity: Identity,
-  opts: { allowSubscribe?: string[]; allowPublish?: string[]; role?: string; lifecycleUid: string; expiresInSeconds?: number; expiresAt?: number },
+  opts: { allowSubscribe?: string[]; allowPublish?: string[]; role?: string; capabilities?: string[]; lifecycleUid: string; expiresInSeconds?: number; expiresAt?: number },
   target: MeshTarget,
 ): Promise<string> {
   await preflightOrExit(target); // one sentence if the mesh is down or refuses, never a raw NATS trace
