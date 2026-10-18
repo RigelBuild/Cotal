@@ -26,6 +26,12 @@ provide (`uv` + `hermes-agent` on a supported version range), is **not** offered
   inside the range. Below 0.18 the gateway does not send the reconnect signal the adapter needs,
   so those versions are refused.
 
+To run a Hermes you installed yourself instead of the connector's pinned one, set
+`COTAL_HERMES_BIN` to that `hermes` executable. The gateway then runs `<bin> gateway run`, and
+the version check reads `<bin> --version`, so the same `0.18` to `0.21` range applies. The setting
+is read on the launching host and reaches the session's launcher unchanged. `uv` is still required:
+`--resume` forks the session under the pinned project.
+
 ## Spawn it
 
 ```bash

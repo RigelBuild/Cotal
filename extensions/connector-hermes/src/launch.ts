@@ -22,7 +22,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { LAUNCH_MATERIAL_ENV, discardLaunchMaterial, loadAgentFile, peerLabel, readLaunchMaterial, writeLaunchMaterial } from "@cotal-ai/core";
 import { hasIdentity, configFromEnv, controlEndpoint, SUN_PATH_MAX_BYTES, ORIENTATION_BOOTSTRAP, MESH_FIRST_STEER, WORKFLOW_STEER } from "@cotal-ai/connector-core";
-import { hermesUvCommand, spawnHermesGateway } from "./binary.js";
+import { HERMES_BIN_ENV, hermesCommand, hermesUvCommand, spawnHermesGateway } from "./binary.js";
 import { startSidecar } from "./sidecar.js";
 import { HERMES_FORK_RECORD, hermesSeatHome, moveLegacyHermesFork } from "./seat-home.js";
 
@@ -246,16 +246,31 @@ export function assertHermesVersion(opts: {
   execFileImpl?: (file: string, args: readonly string[], options: { encoding: "utf8" }) => string;
   logImpl?: (message: string) => void;
 } = {}): void {
+  const env = opts.env ?? process.env;
+  const execFileImpl = opts.execFileImpl ?? ((file, args, options) => execFileSync(file, args, options));
   let raw: string;
-  try {
-    const execFileImpl = opts.execFileImpl ?? ((file, args, options) => execFileSync(file, args, options));
-    raw = execFileImpl(
-      hermesUvCommand(opts.env),
-      ["run", "--project", opts.pkgDir ?? PKG_DIR, "--quiet", "python", "-c", "from importlib.metadata import version; print(version('hermes-agent'))"],
-      { encoding: "utf8" },
-    ).trim();
-  } catch (e) {
-    throw new Error(`could not resolve the hermes-agent version via uv — is uv installed and hermes-agent available? (${(e as Error).message})`);
+  if (env[HERMES_BIN_ENV]?.trim()) {
+    // The operator's own Hermes is checked through the same command the gateway runs: its
+    // `--version` first line is `Hermes Agent v<version> (<release>)`.
+    const version = hermesCommand(env, opts.pkgDir ?? PKG_DIR, ["--version"]);
+    let out: string;
+    try {
+      out = execFileImpl(version.command, version.args, { encoding: "utf8" });
+    } catch (e) {
+      throw new Error(`could not resolve the hermes-agent version via ${HERMES_BIN_ENV}=${version.command} (${(e as Error).message})`);
+    }
+    const first = out.trim().split("\n")[0] ?? "";
+    raw = /^Hermes Agent v(\S+)/.exec(first)?.[1] ?? first;
+  } else {
+    try {
+      raw = execFileImpl(
+        hermesUvCommand(opts.env),
+        ["run", "--project", opts.pkgDir ?? PKG_DIR, "--quiet", "python", "-c", "from importlib.metadata import version; print(version('hermes-agent'))"],
+        { encoding: "utf8" },
+      ).trim();
+    } catch (e) {
+      throw new Error(`could not resolve the hermes-agent version via uv — is uv installed and hermes-agent available? (${(e as Error).message})`);
+    }
   }
   const supported = `>=${HERMES_MIN},<${HERMES_MAX_EXCLUSIVE}`;
   const line = parseLine(raw);
