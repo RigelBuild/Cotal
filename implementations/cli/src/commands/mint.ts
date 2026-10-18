@@ -62,6 +62,10 @@ export async function mint(args: ParsedArgs): Promise<void> {
   // ignored, so a typo does not read as done. Checked before the `--signer` branch: that branch
   // returns early, and a refusal that lives after it would let `--signer --provision` write
   // signing material where the operator asked for a provisioned identity.
+  if ((values.role !== undefined || values.provision) && offAgent) {
+    console.error(c.red(`--role and --provision apply to the agent profile only (got ${offAgent})`));
+    process.exit(1);
+  }
   if (values["new-incarnation"] && offAgent) {
     console.error(c.red(`--new-incarnation applies to the agent profile only (got ${offAgent})`));
     process.exit(1);
@@ -165,6 +169,7 @@ export async function mint(args: ParsedArgs): Promise<void> {
     console.error(c.red("usage: cotal mint <name> [--profile <agent|observer|admin>] [--out <path>] [--expires-in <s>|--expires-at <unix-s>] [--identity <creds>] [--new-incarnation (agent only)]  (agent profile also: [--allow-subscribe a,b] [--allow-publish a,b] [--role <role>] [--provision])"));
     process.exit(1);
   }
+  // Only an absent flag is `undefined` and defers to the agent file; an empty value is the empty
   // list, so `--allow-publish ""` grants no channel.
   const splitList = (v?: string) => (v === undefined ? undefined : v.split(",").map((s) => s.trim()).filter(Boolean));
   const profile = (values.profile ?? "agent") as Profile;
