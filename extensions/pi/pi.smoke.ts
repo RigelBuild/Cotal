@@ -547,8 +547,9 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const driver = new PiDriver(mesh as unknown as MeshAgent);
   driver.bind(host);
   driver.onSessionStart(ctx);
-  startBatch(driver, host);
+  const refusedBatch = startBatch(driver, host);
   driver.onAgentStart(ctx);
+  confirm(driver, refusedBatch);
   driver.onAgentEnd([{
     role: "assistant",
     stopReason: "error",
@@ -565,6 +566,25 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   mesh.items.push(inbound);
   driver.onIncoming(inbound);
   ok(host.sent.length === 1 && mesh.items.includes(inbound), "inbound queues without retrying a refused history");
+  ok(
+    mesh.drained.length === 0 && mesh.items.some((value) => value.id === "refused"),
+    "a provider-accepted refused batch stays in the inbox, unacknowledged",
+  );
+  driver.onSessionShutdown();
+  const fresh = new PiDriver(mesh as unknown as MeshAgent);
+  const freshHost = new FakeHost();
+  const freshCtx = context();
+  fresh.bind(freshHost);
+  fresh.onSessionStart(freshCtx);
+  ok(
+    freshHost.sent[0]?.details.ids.join() === "refused,after-refusal" && mesh.drained.length === 0,
+    "a fresh seat re-surfaces the retained items without acknowledging them",
+  );
+  const freshBatch = startBatch(fresh, freshHost);
+  fresh.onAgentStart(freshCtx);
+  confirm(fresh, freshBatch);
+  fresh.onAgentEnd([{ role: "assistant", stopReason: "stop" }], freshCtx);
+  ok(mesh.drained.join() === "refused,after-refusal", "only the fresh seat's clean turn drains them");
   const ordinaryMesh = new FakeMesh();
   ordinaryMesh.items = [item("ordinary-error")];
   const ordinaryHost = new FakeHost();
