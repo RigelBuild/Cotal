@@ -557,7 +557,8 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   await driver.flushPresence();
   ok(
     driver.state === "held" && mesh.statuses.at(-1)?.status === "waiting" &&
-      mesh.statuses.at(-1)?.activity === "provider refused this session's history; relaunch with FRESH=1",
+      mesh.statuses.at(-1)?.activity ===
+        "provider refused this session's history; retries stopped — restart this seat with a fresh session (no --resume)",
     "a history refusal holds with fresh-session recovery guidance",
   );
   const inbound = item("after-refusal");
