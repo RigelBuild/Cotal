@@ -16,14 +16,13 @@ import {
 } from "@cotal-ai/core";
 import { authDir, recordMesh, saveSpaceAuth } from "@cotal-ai/workspace";
 import { SMOKE_BROKER_TOKEN } from "@cotal-ai/smoke-kit";
+import { runCli } from "@cotal-ai/cli";
 import { Manager } from "../src/manager.js";
 import { bootBroker } from "./_boot-broker.js";
 
 const home = mkdtempSync(join(tmpdir(), "cotal-mint-cap-home-"));
 process.env.COTAL_HOME = home;
 process.env.COTAL_NO_PROMPT = "1";
-await import("../../cli/src/index.js");
-const { runCli } = await import("../../cli/src/command.js");
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../..");
