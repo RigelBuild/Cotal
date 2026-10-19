@@ -104,6 +104,7 @@ export class PiDriver {
   private inboundDuringTurn?: InboxItem;
   private knownAtTurnStart = new Set<string>();
   private knownAtErrorEnd = new Set<string>();
+  private sessionId?: string;
 
   constructor(
     private readonly mesh: MeshAgent,
@@ -124,12 +125,15 @@ export class PiDriver {
     this.host = host;
   }
 
-  onSessionStart(context: PiContextLike): void {
+  onSessionStart(context: PiContextLike, sessionId: string): void {
     this.context = context;
     if (this._state === "shuttingDown") {
       context.shutdown();
       return;
     }
+    const switched = this.sessionId !== undefined && this.sessionId !== sessionId;
+    this.sessionId = sessionId;
+    if (switched) this.resetForNewSession();
     this.pump();
   }
 
@@ -421,6 +425,26 @@ export class PiDriver {
     this.heldReason = undefined;
     this._state = "idle";
     this.pump();
+  }
+
+  /** A different Pi session never saw the retained batches, so none may commit there. The inbox
+   *  still owns their keys; drop them uncommitted and clear every hold and turn bound to them. */
+  private resetForNewSession(): void {
+    this.clearTimers();
+    this.batches = [];
+    this.contextBatchIds.clear();
+    this.requestBatchIds.clear();
+    this.terminalEvidenceBatchIds.clear();
+    this.activeSignal = undefined;
+    this.pendingContinuation = false;
+    this.overflowRetry = false;
+    this.continuationAttempts = 0;
+    this.retryableErrorHold = false;
+    this.inboundDuringTurn = undefined;
+    this.knownAtTurnStart = new Set();
+    this.knownAtErrorEnd.clear();
+    this.heldReason = undefined;
+    this._state = "idle";
   }
 
   /** Surfacing at confirmation, not at agent end: a confirmation lets `pump` run mid-turn, which

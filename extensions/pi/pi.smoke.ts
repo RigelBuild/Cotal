@@ -326,7 +326,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context();
   const driver = new PiDriver(mesh as unknown as MeshAgent, 20);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   const details = startBatch(driver, host);
   ok(details.items?.[0]?.text === "m1" && renderCotalInbox({ content: host.sent[0]?.content, details }).render(40).some((line) => line.includes("Cotal · DM · [sender]")),
     "driver dispatch carries item metadata into the Pi renderer");
@@ -344,7 +344,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const host = new FakeHost();
   const driver = new PiDriver(mesh as unknown as MeshAgent);
   driver.bind(host);
-  driver.onSessionStart(context());
+  driver.onSessionStart(context(), "session");
   const sent = host.sent[0];
   ok(sent?.details.items?.[0]?.text === "turn-dm" && sent.details.suffix?.includes("Run turn deadline: 14:00") &&
     renderCotalInbox(sent).render(80).join("\n").includes("Run turn deadline: 14:00"),
@@ -359,7 +359,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context();
   const driver = new PiDriver(mesh as unknown as MeshAgent, 20);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   const details = host.sent.at(-1)?.details;
   assert.ok(details);
   driver.onAgentStart(ctx);
@@ -382,7 +382,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const host = new FakeHost();
   const driver = new PiDriver(mesh as unknown as MeshAgent);
   driver.bind(host);
-  driver.onSessionStart(context());
+  driver.onSessionStart(context(), "session");
   ok(mesh.drained[0] === "echo", "only an own channel multicast is treated as an echo");
   ok(host.sent[0]?.details.ids.join() === "self-anycast", "self-selected anycast is surfaced");
 }
@@ -399,7 +399,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const host = new FakeHost();
   const driver = new PiDriver(mesh as unknown as MeshAgent);
   driver.bind(host);
-  driver.onSessionStart(context());
+  driver.onSessionStart(context(), "session");
   ok(mesh.drained.includes("echo"), "a buried own echo is discarded by exact id");
   ok(host.sent[0]?.details.ids.join() === "dm", "the DM passes older pull-only traffic and the buried echo");
   ok(mesh.items.some((value) => value.id === "quiet"), "quiet ambient remains buffered for explicit pull");
@@ -413,7 +413,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const automaticHost = new FakeHost();
   const automaticDriver = new PiDriver(automatic as unknown as MeshAgent);
   automaticDriver.bind(automaticHost);
-  automaticDriver.onSessionStart(context());
+  automaticDriver.onSessionStart(context(), "session");
   ok(automaticHost.sent[0]?.details.ids.join() === "auto", "normal→quiet does not strand receive-time automatic Pi traffic");
 
   const pulled = new FakeMesh();
@@ -422,7 +422,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const pullHost = new FakeHost();
   const pullDriver = new PiDriver(pulled as unknown as MeshAgent);
   pullDriver.bind(pullHost);
-  pullDriver.onSessionStart(context());
+  pullDriver.onSessionStart(context(), "session");
   ok(pullHost.sent.length === 0, "quiet→normal does not release receive-time pull-only Pi traffic");
 }
 
@@ -433,7 +433,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const host = new FakeHost();
   const driver = new PiDriver(mesh as unknown as MeshAgent);
   driver.bind(host);
-  driver.onSessionStart(context());
+  driver.onSessionStart(context(), "session");
   mesh.items.push(item("m2"));
   driver.onIncoming(mesh.items.at(-1)!);
   driver.onMentionWake(item("mention", { kind: "channel", channel: "general", mentionsMe: true }));
@@ -449,7 +449,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context(controller.signal);
   const driver = new PiDriver(mesh as unknown as MeshAgent);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   const details = startBatch(driver, host);
   driver.onAgentStart(ctx);
   confirm(driver, details);
@@ -477,7 +477,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context(controller.signal);
   const driver = new PiDriver(mesh as unknown as MeshAgent);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   const details = startBatch(driver, host);
   driver.onAgentStart(ctx);
   controller.abort();
@@ -499,7 +499,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context(controller.signal);
   const driver = new PiDriver(mesh as unknown as MeshAgent);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   const details = startBatch(driver, host);
   driver.onAgentStart(ctx);
   confirm(driver, details);
@@ -524,7 +524,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context();
   const driver = new PiDriver(mesh as unknown as MeshAgent, 20);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   const details = startBatch(driver, host);
   driver.onAgentStart(ctx);
   driver.onContext([{ role: "custom", customType: "cotal-inbox", details }]);
@@ -546,7 +546,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context();
   const driver = new PiDriver(mesh as unknown as MeshAgent);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   const refusedBatch = startBatch(driver, host);
   driver.onAgentStart(ctx);
   confirm(driver, refusedBatch);
@@ -575,7 +575,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const freshHost = new FakeHost();
   const freshCtx = context();
   fresh.bind(freshHost);
-  fresh.onSessionStart(freshCtx);
+  fresh.onSessionStart(freshCtx, "session");
   ok(
     freshHost.sent[0]?.details.ids.join() === "refused,after-refusal" && mesh.drained.length === 0,
     "a fresh seat re-surfaces the retained items without acknowledging them",
@@ -591,7 +591,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ordinaryContext = context();
   const ordinaryDriver = new PiDriver(ordinaryMesh as unknown as MeshAgent);
   ordinaryDriver.bind(ordinaryHost);
-  ordinaryDriver.onSessionStart(ordinaryContext);
+  ordinaryDriver.onSessionStart(ordinaryContext, "session");
   startBatch(ordinaryDriver, ordinaryHost);
   ordinaryDriver.onAgentStart(ordinaryContext);
   ordinaryDriver.onAgentEnd([{
@@ -608,6 +608,61 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   );
 }
 
+// A session switch drops a held batch uncommitted; only the new session's clean turn commits it.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("refused")];
+  const host = new FakeHost();
+  const sessionA = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(sessionA, "session-a");
+  const refusedBatch = startBatch(driver, host);
+  driver.onAgentStart(sessionA);
+  confirm(driver, refusedBatch);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error", errorMessage: "Refusal (reasoning_extraction)" }], sessionA);
+  ok(driver.state === "held" && mesh.drained.length === 0, "a confirmed batch is held uncommitted after a history refusal");
+  driver.onSessionShutdown();
+  const sessionB = context();
+  driver.onSessionStart(sessionB, "session-b");
+  ok(
+    driver.state === "dispatching" && host.sent.length === 2 && host.sent[1]?.details.ids.join() === "refused" &&
+      host.sent[1]?.details.batchId !== refusedBatch.batchId && mesh.drained.length === 0,
+    "a new session re-dispatches the held batch's keys without committing them",
+  );
+  const redelivered = startBatch(driver, host);
+  driver.onAgentStart(sessionB);
+  ok(mesh.drained.length === 0, "nothing commits before the new session's turn ends");
+  confirm(driver, redelivered);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], sessionB);
+  ok(
+    mesh.drained.join() === "refused" && host.sent.length === 2 && driver.state === "idle",
+    "the keys commit once, only after the session that was shown them ends cleanly",
+  );
+}
+
+// A session start with the same id (a reload) keeps the history-refusal hold.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("refused")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(ctx, "session-a");
+  const refusedBatch = startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  confirm(driver, refusedBatch);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error", errorMessage: "Refusal (reasoning_extraction)" }], ctx);
+  const reason = driver.reason;
+  driver.onSessionShutdown();
+  driver.onSessionStart(context(), "session-a");
+  ok(
+    driver.state === "held" && driver.reason === reason && host.sent.length === 1 && mesh.drained.length === 0,
+    "a same-session start keeps the hold and its retained batch",
+  );
+}
+
 // A provider error retains the old batch, but a later DM starts a new turn with both items.
 {
   const mesh = new FakeMesh();
@@ -616,7 +671,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context();
   const driver = new PiDriver(mesh as unknown as MeshAgent);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   const first = startBatch(driver, host);
   driver.onAgentStart(ctx);
   driver.onContext([{ role: "custom", customType: "cotal-inbox", details: first }]);
@@ -638,7 +693,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const acceptedContext = context();
   const acceptedDriver = new PiDriver(accepted as unknown as MeshAgent);
   acceptedDriver.bind(acceptedHost);
-  acceptedDriver.onSessionStart(acceptedContext);
+  acceptedDriver.onSessionStart(acceptedContext, "session");
   const acceptedBatch = startBatch(acceptedDriver, acceptedHost);
   acceptedDriver.onAgentStart(acceptedContext);
   confirm(acceptedDriver, acceptedBatch);
@@ -654,7 +709,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const waitingContext = context();
   const waitingDriver = new PiDriver(waiting as unknown as MeshAgent);
   waitingDriver.bind(waitingHost);
-  waitingDriver.onSessionStart(waitingContext);
+  waitingDriver.onSessionStart(waitingContext, "session");
   startBatch(waitingDriver, waitingHost);
   waitingDriver.onAgentStart(waitingContext);
   waitingDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], waitingContext);
@@ -677,7 +732,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const crowdedContext = context();
   const crowdedDriver = new PiDriver(crowded as unknown as MeshAgent);
   crowdedDriver.bind(crowdedHost);
-  crowdedDriver.onSessionStart(crowdedContext);
+  crowdedDriver.onSessionStart(crowdedContext, "session");
   startBatch(crowdedDriver, crowdedHost);
   crowdedDriver.onAgentStart(crowdedContext);
   crowdedDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], crowdedContext);
@@ -697,7 +752,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const staleContext = context();
   const staleDriver = new PiDriver(staleMesh as unknown as MeshAgent);
   staleDriver.bind(staleHost);
-  staleDriver.onSessionStart(staleContext);
+  staleDriver.onSessionStart(staleContext, "session");
   startBatch(staleDriver, staleHost);
   staleDriver.onAgentStart(staleContext);
   staleDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], staleContext);
@@ -714,7 +769,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const channelDriver = new PiDriver(channelMesh as unknown as MeshAgent);
   channelDriver.bind(channelHost);
   const channelContext = context();
-  channelDriver.onSessionStart(channelContext);
+  channelDriver.onSessionStart(channelContext, "session");
   startBatch(channelDriver, channelHost);
   channelDriver.onAgentStart(channelContext);
   channelDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], channelContext);
@@ -729,7 +784,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const pullDriver = new PiDriver(pullOnly as unknown as MeshAgent);
   pullDriver.bind(pullHost);
   const pullContext = context();
-  pullDriver.onSessionStart(pullContext);
+  pullDriver.onSessionStart(pullContext, "session");
   startBatch(pullDriver, pullHost);
   pullDriver.onAgentStart(pullContext);
   pullDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], pullContext);
@@ -746,7 +801,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const overflowContext = context();
   const overflowDriver = new PiDriver(overflowMesh as unknown as MeshAgent);
   overflowDriver.bind(overflowHost);
-  overflowDriver.onSessionStart(overflowContext);
+  overflowDriver.onSessionStart(overflowContext, "session");
   startBatch(overflowDriver, overflowHost);
   overflowDriver.onAgentStart(overflowContext);
   overflowDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], overflowContext);
@@ -762,7 +817,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const raceDriver = new PiDriver(racing as unknown as MeshAgent);
   raceDriver.bind(raceHost);
   const raceContext = context();
-  raceDriver.onSessionStart(raceContext);
+  raceDriver.onSessionStart(raceContext, "session");
   startBatch(raceDriver, raceHost);
   raceDriver.onAgentStart(raceContext);
   raceDriver.onProviderResponse(429);
@@ -787,7 +842,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context();
   const driver = new PiDriver(mesh as unknown as MeshAgent, 20);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   startBatch(driver, host);
   driver.onAgentStart(ctx);
   driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
@@ -808,7 +863,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context();
   const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   startBatch(driver, host);
   driver.onAgentStart(ctx);
   driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
@@ -831,7 +886,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context();
   const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   startBatch(driver, host);
   driver.onAgentStart(ctx);
   driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
@@ -857,7 +912,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context();
   const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   startBatch(driver, host);
   driver.onAgentStart(ctx);
   driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
@@ -895,7 +950,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context();
   const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   driver.onAgentStart(ctx);
   driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
   ok(driver.state === "idle", "an error with zero batches still returns to idle, never a retry");
@@ -911,7 +966,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context(controller.signal);
   const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   startBatch(driver, host);
   driver.onAgentStart(ctx);
   controller.abort();
@@ -930,7 +985,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context();
   const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   startBatch(driver, host);
   driver.onAgentStart(ctx);
   driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
@@ -954,7 +1009,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context();
   const driver = new PiDriver(mesh as unknown as MeshAgent);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   const details = startBatch(driver, host);
   driver.onAgentStart(ctx);
   confirm(driver, details);
@@ -976,7 +1031,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const between = new PiDriver(new FakeMesh() as unknown as MeshAgent);
   between.requestShutdown();
   const replacement = context();
-  between.onSessionStart(replacement);
+  between.onSessionStart(replacement, "session");
   ok(replacement.shutdowns === 1 && between.state === "shuttingDown", "shutdown between sessions closes the replacement context");
 }
 
@@ -988,7 +1043,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const ctx = context();
   const driver = new PiDriver(mesh as unknown as MeshAgent);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   const details = startBatch(driver, host);
   driver.onAgentStart(ctx);
   confirm(driver, details);
@@ -1011,7 +1066,7 @@ for (const assistant of [
   const ctx = context();
   const driver = new PiDriver(mesh as unknown as MeshAgent);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   const details = startBatch(driver, host);
   driver.onAgentStart(ctx);
   confirm(driver, details);
@@ -1029,7 +1084,7 @@ for (const assistant of [
   const ctx = context();
   const driver = new PiDriver(mesh as unknown as MeshAgent);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   const details = startBatch(driver, host);
   driver.onAgentStart(ctx);
   confirm(driver, details);
@@ -1050,7 +1105,7 @@ for (const assistant of [
   const ctx = context();
   const driver = new PiDriver(mesh as unknown as MeshAgent, 5);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   const details = host.sent[0]!.details;
   // Wait well past the 5ms watchdog so it has reliably FIRED before the assertion — a 10ms wait races
   // the 5ms timer on Windows' coarse (~15ms) granularity, where both round to the same tick.
@@ -1071,7 +1126,7 @@ for (const assistant of [
   const driver = new PiDriver(mesh as unknown as MeshAgent);
   const ctx = context();
   driver.bind(new FakeHost());
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(ctx, "session");
   driver.onAgentStart(ctx);
   driver.onToolStart("bash");
   driver.onToolEnd();

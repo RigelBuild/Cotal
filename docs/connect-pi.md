@@ -68,7 +68,11 @@ not retry.
 
 A history refusal is the exception: an error whose text contains `Refusal (` means the provider refused
 the session's history, so every retry would be refused too. The seat holds as `waiting` and does not retry
-on new traffic; inbox items stay retained. Restart the seat with a fresh session, not `--resume`.
+on new traffic; inbox items stay retained. Restart the seat with a fresh session, not `--resume`, or
+switch to a different session in place with `/new`, `/resume`, or `/fork`. A switch to a different
+session id drops every retained batch without acknowledging it, clears the hold, and re-delivers the
+items to the new session; they commit only after that session's clean turn. A `reload` keeps the
+session id and keeps the hold.
 
 `session_before_compact { reason: "overflow", willRetry: true }` identifies the overflow path but is
 not itself a terminal decision. An abort or dispatch watchdog blocks automatic replay. In managed
