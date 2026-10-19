@@ -1084,7 +1084,8 @@ there it runs the enrollment consumer above without redeeming anything. See
 |---|---|---|
 | `--space <s>` | resolved mesh | Target space |
 | `--server <url>` | registry entry | Broker URL override. With `-f`, overrides the manifest's `broker.servers` under the same rules: a valid URL with no embedded credentials |
-| `--creds <path>` | none | Control-caller creds for an off-registry manager (`--detach` only) |
+| `--creds <path>` | none | With `--detach`: control-caller creds for an off-registry manager. In the foreground: the agent's own pre-minted credential, paired with `--lifecycle-uid` (see [Spawn from a pre-minted credential](#spawn-from-a-pre-minted-credential)) |
+| `--lifecycle-uid <uid>` | `COTAL_LIFECYCLE_UID` | With a foreground `--creds` only, and required there: the lifecycle uid minted alongside that credential. Refused with `--detach`, `-f`, or without `--creds` |
 | `--name <n>` | persona's `name:` | Presence-name override (does not choose the persona) |
 | `--config <persona-or-path>` | none | Persona catalog name or file path; wins over the positional |
 | `--agent <a>` | persona's `agent:`, else `COTAL_DEFAULT_AGENT`, else `claude` | Connector type (`claude`, `opencode`, `jcode`, `hermes`, and so on) |
@@ -1194,6 +1195,23 @@ an existing grant before rotating it. Departure cleanup is conditional on the la
 and lifecycle generation, so an earlier launch cannot revoke a successor's grant. Remote
 provisioning remains the mesh operator's authority and can reissue material before the
 client observes an existing same-host consumer.
+
+### Spawn from a pre-minted credential
+
+```bash
+cotal mint worker --provision            # where the space's trust material lives; prints the lifecycle uid
+cotal spawn worker --creds worker.creds --lifecycle-uid <uid>   # on any host that can reach the broker
+```
+
+A foreground spawn with `--creds` launches the agent as the credential's identity. The launching
+host needs no trust material: it mints nothing, provisions nothing and writes no credential, so the
+operator's file is never removed. The capabilities the session gets are the ones the credential
+grants. The credential's durable grants name exact lifecycle-keyed resources, so it is paired with
+the uid minted with it, by `--lifecycle-uid` or `COTAL_LIFECYCLE_UID`. A missing uid, or one the
+credential's DM grant does not name, is refused before anything launches. The event plane needs
+publish on the agent's event channel: mint with that channel in `--allow-publish`, or pass
+`--no-events`. `--live-only`, enrollment variables and a user-auth mesh are refused. The connector
+receives the credential's path through its launch material file, never through its environment.
 
 ## models
 

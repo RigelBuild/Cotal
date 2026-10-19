@@ -327,7 +327,7 @@ try {
   ok("tombstone exits non-zero", tomb.status === 1, tomb.status);
   ok("tombstone names spawn --detach", /spawn --detach/.test(tomb.stderr), tomb.stderr.slice(0, 200));
 
-  // F — foreground --creds fails loud. A foreground spawn REQUIRES its connector materialized
+  // F — foreground --creds without its lifecycle uid fails loud. A foreground spawn REQUIRES its connector materialized
   // pre-dispatch (spawnRequiredExtensions), so first `ext add` THIS WORKTREE's claude connector
   // into the sandbox prefix (the real local-path install + core peer-link path) — never the
   // operator's global store.
@@ -337,10 +337,11 @@ try {
   ok("sandbox ext add of the worktree claude connector succeeds", extAdd.status === 0, (extAdd.stderr + extAdd.stdout).slice(0, 300));
   const fg = spawnSync(TSX, [join(import.meta.dirname, "..", "cotal.ts"), "spawn", "poet", "--creds", "/tmp/x.creds"], {
     encoding: "utf8",
-    env: subEnv,
+    // An inherited COTAL_LIFECYCLE_UID would pair the credential; this case is the unpaired one.
+    env: { ...subEnv, COTAL_LIFECYCLE_UID: undefined },
   });
-  ok("foreground --creds exits non-zero", fg.status === 1, fg.status);
-  ok("foreground --creds names --detach", /only valid with --detach/.test(fg.stderr), fg.stderr.slice(0, 200));
+  ok("unpaired foreground --creds exits non-zero", fg.status === 1, fg.status);
+  ok("unpaired foreground --creds names --lifecycle-uid", /lifecycle-paired.*--lifecycle-uid/.test(fg.stderr), fg.stderr.slice(0, 200));
 
   console.log(`\nspawn-detach live e2e: ${pass} checks passed`);
 } finally {

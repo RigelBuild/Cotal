@@ -345,7 +345,8 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): AgentConfig
     description: def?.description,
     tags: def?.tags,
     meta: def?.meta,
-    capabilities: splitList(env.COTAL_CAPABILITIES).length ? splitList(env.COTAL_CAPABILITIES) : def?.capabilities,
+    // Defined-but-empty is the launcher's "none" and must not fall back to the persona's list.
+    capabilities: env.COTAL_CAPABILITIES !== undefined ? splitList(env.COTAL_CAPABILITIES) : def?.capabilities,
     model: env.COTAL_MODEL?.trim() || undefined,
     variant: env.COTAL_VARIANT?.trim() || undefined,
     servers: material?.servers || env.COTAL_SERVERS?.trim() || link?.servers || DEFAULT_SERVER,

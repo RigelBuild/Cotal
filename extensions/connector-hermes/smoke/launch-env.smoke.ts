@@ -8,12 +8,12 @@
  * Run: pnpm --filter @cotal-ai/connector-hermes test
  */
 import { strict as nodeAssert } from "node:assert";
-import type { ChildProcess } from "node:child_process";
+import type { ChildProcess, spawn as SpawnFn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { skipSuite } from "@cotal-ai/smoke-kit";
-import { hermesUvCommand, spawnHermesGateway } from "../src/binary.js";
+import { HERMES_BIN_ENV, hermesUvCommand, spawnHermesGateway } from "../src/binary.js";
 import { hermesConnector } from "../src/extension.js";
 import { ADOPT_HOME_ENV, LaunchRefused, adoptedHome, assertHermesVersion, setupAdoptedProfile, setupProfile } from "../src/launch.js";
 
@@ -47,7 +47,7 @@ const assert: typeof nodeAssert = new Proxy(nodeAssert, {
  * guarantee is the false-green shape this package keeps being bitten by. Pinning the floor turns a
  * smaller green into a red. Raise it deliberately when you add a cell; a drop means one vanished.
  */
-const EXPECTED_CELLS = 167;
+const EXPECTED_CELLS = 176;
 
 if (process.platform === "win32") skipSuite("the Hermes connector is Unix-only; buildLaunch throws");
 
@@ -189,6 +189,61 @@ assert.deepEqual(
     args: ["run", "--project", "/connector/hermes", "--quiet", "python", "-c", "from importlib.metadata import version; print(version('hermes-agent'))"],
   },
   "version inspection executes the exact manager-boot uv path",
+);
+
+// ── The operator's own Hermes command (COTAL_HERMES_BIN) ──────────────────────────────────────────
+// An adopted profile can run a pinned Hermes the operator installed. The gateway and the version
+// check must both run that executable, or the range guard would judge a Hermes that never runs.
+process.env[HERMES_BIN_ENV] = "/operator/bin/hermes";
+const operatorPinned = hermesConnector.buildLaunch({ space: "smoke", name: "hermes-operator" }).env ?? {};
+delete process.env[HERMES_BIN_ENV];
+assert.equal(operatorPinned[HERMES_BIN_ENV], "/operator/bin/hermes", "the operator Hermes command reaches the launcher");
+const unpinned = hermesConnector.buildLaunch({ space: "smoke", name: "hermes-unpinned" }).env ?? {};
+assert.ok(!(HERMES_BIN_ENV in unpinned), "without the setting the launcher keeps the project-pinned Hermes");
+let operatorSpawned: { command: string; args: readonly string[] } | undefined;
+spawnHermesGateway({
+  pkgDir: "/connector/hermes",
+  env: { ...bootResolved, [HERMES_BIN_ENV]: "/operator/bin/hermes" },
+  spawnImpl: ((command: string, args: readonly string[]) => {
+    operatorSpawned = { command, args };
+    return {} as ChildProcess;
+  }) as typeof SpawnFn,
+});
+assert.deepEqual(
+  operatorSpawned,
+  { command: "/operator/bin/hermes", args: ["gateway", "run"] },
+  "the gateway spawn executes the operator Hermes command instead of uv",
+);
+let operatorInspected: { command: string; args: readonly string[] } | undefined;
+assertHermesVersion({
+  env: { ...bootResolved, [HERMES_BIN_ENV]: "/operator/bin/hermes" },
+  pkgDir: "/connector/hermes",
+  execFileImpl: (command, args) => {
+    operatorInspected = { command, args };
+    return "Hermes Agent v0.18.0 (2026.7.1)\nProject: /nix/store/x\n";
+  },
+  logImpl: () => {},
+});
+assert.deepEqual(
+  operatorInspected,
+  { command: "/operator/bin/hermes", args: ["--version"] },
+  "version inspection executes the operator Hermes command",
+);
+const checkOperatorVersion = (out: string): void =>
+  assertHermesVersion({
+    env: { [HERMES_BIN_ENV]: "/operator/bin/hermes" },
+    pkgDir: "/connector/hermes",
+    execFileImpl: () => out,
+    logImpl: () => {},
+  });
+assert.doesNotThrow(() => checkOperatorVersion("Hermes Agent v0.21.2 (2026.9.1)\n"), "an operator Hermes inside the range launches");
+assert.throws(() => checkOperatorVersion("Hermes Agent v0.17.0 (2026.5.1)\n"), /below the 0\.18 floor/, "an operator Hermes under the floor is refused");
+assert.throws(() => checkOperatorVersion("Hermes Agent v0.22.0 (2026.11.1)\n"), /at or above the 0\.22 ceiling/, "an operator Hermes at the ceiling is refused");
+assert.throws(() => checkOperatorVersion("not hermes\n"), /could not read a major\.minor/, "an operator command that prints no version is refused");
+assert.throws(
+  () => assertHermesVersion({ env: { [HERMES_BIN_ENV]: "/missing/hermes" }, execFileImpl: () => { throw new Error("ENOENT"); }, logImpl: () => {} }),
+  /COTAL_HERMES_BIN=\/missing\/hermes/,
+  "an operator command that cannot run is refused by name",
 );
 
 // ── The supported hermes-agent range (#1531) ─────────────────────────────────────────────────────

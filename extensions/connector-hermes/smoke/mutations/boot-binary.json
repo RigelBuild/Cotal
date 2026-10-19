@@ -18,8 +18,8 @@
     {
       "name": "Hermes gateway spawn ignores the manager-boot uv path",
       "file": "extensions/connector-hermes/src/binary.ts",
-      "find": "  return spawnImpl(hermesUvCommand(opts.env), [\"run\", \"--project\", opts.pkgDir, \"hermes\", \"gateway\", \"run\"], spawnOptions);",
-      "replace": "  return spawnImpl(\"uv\", [\"run\", \"--project\", opts.pkgDir, \"hermes\", \"gateway\", \"run\"], spawnOptions);",
+      "find": "  return { command: hermesUvCommand(env), args: [\"run\", \"--project\", pkgDir, \"hermes\", ...args] };",
+      "replace": "  return { command: \"uv\", args: [\"run\", \"--project\", pkgDir, \"hermes\", ...args] };",
       "expectRed": "the gateway spawn executes the exact manager-boot uv path",
       "cell": "the gateway spawn executes the exact manager-boot uv path"
     },

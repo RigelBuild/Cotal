@@ -5,6 +5,10 @@ import { hostname } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import {
   agentFilePath,
+  assertLifecycleToken,
+  chatSubject,
+  channelInAllow,
+  credsClaims,
   connectorServers,
   spawnEnvAllow,
   deprovisionAgent,
@@ -92,7 +96,8 @@ import {
 } from "@cotal-ai/workspace";
 import { c } from "../ui.js";
 import { completedFlagValue, completingFlagValue, hasCompletedFlagValue, positionalsForCompletion } from "../lib/completion.js";
-import { preflightOrExit, resolveTargetOrExit } from "../lib/connect.js";
+import { preflightOrExit, reachableOrExit, refuseStaticCredsForKnownUserAuthOrExit, resolveTargetOrExit } from "../lib/connect.js";
+import { readCredentialGrant, type CredentialGrant } from "./spawn-creds.js";
 import { askManager, failIfNotOk, onInstanceOrExit, resolveControlTarget, START_TIMEOUT_MS, withControlConnection } from "../lib/control.js";
 import { listDeclaredChannels, listDeclaredRoles, listPersonas } from "../lib/personas.js";
 import { spawnManifest } from "./spawn-manifest.js";
@@ -390,7 +395,8 @@ async function uniqueMeshName(
 export const spawnFlags = [
   spaceFlag,
   serverFlag,
-  { ...credsFlag, description: "control-caller creds for an off-registry manager (--detach only)" },
+  { ...credsFlag, description: "with --detach: control-caller creds for an off-registry manager; foreground: a pre-minted agent credential to launch as (needs --lifecycle-uid)" },
+  { name: "lifecycle-uid", type: "string", value: "<uid>", description: "lifecycle uid paired with a foreground --creds (minted with the credential at provision time)" },
   ...launchFlags,
   { name: "detach", type: "boolean", short: "d", description: "launch via the manager into a detached PTY (reattach with `cotal attach`)" },
   { name: "live-only", type: "boolean", description: "foreground only: skip the durable backstop (no read-ACL row; messages missed while disconnected are not replayed)" },
@@ -716,6 +722,15 @@ export async function spawn(args: ParsedArgs): Promise<void> {
     console.error(c.red("✗ --on only applies to a detached imperative spawn (`cotal spawn <persona> --detach --on <instance>`); a foreground spawn has no manager to pin and a manifest deploy (-f) launches through the manager class queue"));
     process.exit(1);
   }
+  // The pairing belongs to a foreground --creds launch only; anywhere else the flag would be ignored.
+  if (values["lifecycle-uid"] !== undefined && (!values.creds || values.detach || values.file)) {
+    console.error(
+      c.red(`✗ --lifecycle-uid applies only to a foreground `) +
+        c.bold("--creds") +
+        c.red(` spawn - every other spawn mints its own lifecycle. Drop the flag, or launch in the foreground with --creds.`),
+    );
+    process.exit(1);
+  }
   if (values.file) {
     await spawnManifest(values.file, {
       dryRun: Boolean(values["dry-run"]),
@@ -781,11 +796,37 @@ export async function spawn(args: ParsedArgs): Promise<void> {
   if (values.detach) {
     return spawnDetached(values, positionals, events, cliLaunchOptions);
   }
-  // `--creds` names a CONTROL-CALLER credential (reach an off-registry manager) — meaningless for
-  // a foreground launch, which provisions the agent's own creds. Fail loud, never ignore.
-  if (values.creds) {
-    console.error(c.red("✗ --creds is only valid with --detach (it authenticates the manager control call)"));
-    process.exit(1);
+  // Foreground `--creds` launches AS a pre-minted agent credential: no seed, no mint, no provisioning.
+  // Its durable grants name one lifecycle, so the uid minted with it is required, never invented.
+  const credsFile = values.creds;
+  let pairedUid: string | undefined;
+  if (credsFile !== undefined) {
+    if (enrollmentUrl) {
+      console.error(c.red(`✗ --creds cannot be combined with ${ENROLLMENT_URL_ENV}/${ENROLLMENT_FILE_ENV} - one launch carries one identity`));
+      process.exit(1);
+    }
+    if (values["live-only"]) {
+      console.error(c.red("✗ --live-only does not apply to --creds - the credential's durables were provisioned when it was minted"));
+      process.exit(1);
+    }
+    pairedUid = values["lifecycle-uid"] ?? (process.env.COTAL_LIFECYCLE_UID?.trim() || undefined);
+    if (pairedUid !== undefined) {
+      try {
+        assertLifecycleToken(pairedUid);
+      } catch (e) {
+        console.error(c.red(`✗ ${(e as Error).message}`));
+        process.exit(1);
+      }
+    }
+    if (pairedUid === undefined) {
+      console.error(
+        c.red(`✗ --creds is lifecycle-paired (SPEC 13.1): pass `) +
+          c.bold("--lifecycle-uid <uid>") +
+          c.red(` (or set COTAL_LIFECYCLE_UID) with the uid minted alongside this credential at provision time. `) +
+          c.red(`The credential's durable grants name exact lifecycle-keyed resources; a made-up uid would name durables it cannot bind.`),
+      );
+      process.exit(1);
+    }
   }
 
   // An enrollment may bootstrap the stock remote user-mesh record before normal target resolution.
@@ -816,12 +857,25 @@ export async function spawn(args: ParsedArgs): Promise<void> {
   // selected `current` mesh, a local project, or the registry's only running mesh. A handoff's
   // resolution diagnostics quote its space, and only a remote user-auth record can host the
   // lifecycle it carries, so any other record is refused before a later step reads it.
-  const target = handoffText === undefined
+  const resolved = handoffText === undefined
     ? await resolveTargetOrExit({ server: values.server, space: values.space })
     : await resolveTargetOrThrow({ server: values.server, space: values.space }).catch(() => {
       console.error(c.red(`✗ ${HANDOFF_REFUSALS.target}`));
       process.exit(1);
     });
+  // A creds launch never reads the root's trust material, so nothing below can mint or provision.
+  const target: MeshTarget = credsFile === undefined ? resolved : { ...resolved, auth: undefined };
+  let presented: { text: string; grant: CredentialGrant } | undefined;
+  if (credsFile !== undefined) {
+    refuseStaticCredsForKnownUserAuthOrExit(target.space, values.server, "foreground spawn");
+    try {
+      const text = readFileSync(credsFile, "utf8");
+      presented = { text, grant: readCredentialGrant(text, target.space, pairedUid!) };
+    } catch (e) {
+      console.error(c.red(`✗ --creds ${credsFile}: ${(e as Error).message}`));
+      process.exit(1);
+    }
+  }
   if (handoffText !== undefined && !(target.mode === "user" && target.userAuth?.remote)) {
     console.error(c.red("✗ the managed handoff's space is registered here as a local mesh, so it cannot host a managed handoff"));
     process.exit(1);
@@ -930,7 +984,10 @@ export async function spawn(args: ParsedArgs): Promise<void> {
 
   // Preflight: fail with one sentence if the mesh is down or won't take our creds, instead of
   // crashing mid-connect with a raw NATS Authorization Violation.
-  if (handoffText === undefined) await preflightOrExit(target);
+  // A presented credential takes the raw probe: its rejection is about that credential, never a
+  // stale-registry signal, so it must not prune the recorded mesh.
+  if (presented) await reachableOrExit(target.server, { creds: presented.text, ...(target.tlsRequired ? { tls: true } : {}) });
+  else if (handoffText === undefined) await preflightOrExit(target);
   else
     await preflightOrThrow(target).catch(() => {
       console.error(c.red(`✗ ${HANDOFF_REFUSALS.preflight}`));
@@ -944,7 +1001,8 @@ export async function spawn(args: ParsedArgs): Promise<void> {
   // requested name stands; a same-name respawn ROTATES that actor's grant (upsert), which kills the
   // previous holder's next bearer refresh with the "secret is stale — respawn" health state rather
   // than aliasing it silently.
-  const name = target.mode === "user" ? requested : await uniqueMeshName(requested, { space, server, auth });
+  // A creds launch holds no seed to mint the roster probe's credential, so its name stands.
+  const name = target.mode === "user" || presented ? requested : await uniqueMeshName(requested, { space, server, auth });
   if (name !== requested)
     console.error(`"${requested}" is already on the mesh - spawning as ${name} instead`);
 
@@ -1079,7 +1137,21 @@ export async function spawn(args: ParsedArgs): Promise<void> {
     if (failed.length) console.error(c.red(`✗ cleaning up after ${name}: ${describeCleanupFailures(failed)}`));
     else console.error(`  ↩ retired creds for ${name} (${why})`);
   };
-  if (target.mode === "user" && target.userAuth?.remote && (enrollmentUrl || redeemedEnrollment)) {
+  if (presented) {
+    // The credential is the operator's file: launched as-is, never retired on exit.
+    id = presented.grant.id;
+    credsPath = resolvePath(credsFile!);
+    lifecycleUid = pairedUid!;
+    if (launchEvents) {
+      const channel = connector.eventChannel!({ owner: DEV_OWNER, actor: id });
+      // NATS grants may be wildcards (`…events.>`), so coverage is pattern matching, not membership.
+      if (!channelInAllow(credsClaims(presented.text).nats?.pub?.allow ?? [], chatSubject(space, DEV_OWNER, id, channel))) {
+        console.error(c.red(`✗ the credential does not grant publish on its event channel "${channel}" - pass --no-events, or mint it with that channel in --allow-publish`));
+        process.exit(1);
+      }
+      allowPublish = [...(allowPublish ?? []), channel];
+    }
+  } else if (target.mode === "user" && target.userAuth?.remote && (enrollmentUrl || redeemedEnrollment)) {
     if (!redeemedEnrollment) {
       // The record alone decides this refusal, and the redemption below spends the enrollment.
       if (!target.userAuth.endpoints?.url) {
@@ -1231,6 +1303,7 @@ export async function spawn(args: ParsedArgs): Promise<void> {
       creds: credsPath,
       userAuth,
       lifecycleUid,
+      ...(presented ? { capabilities: presented.grant.capabilities } : {}),
       servers: server,
       configPath: path,
       model,
