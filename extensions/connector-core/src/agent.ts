@@ -2395,6 +2395,14 @@ export class MeshAgent extends EventEmitter {
     }
   }
 
+  /** Undo {@link commitSurfacedTurns} for turns whose host session was replaced unseen, so they re-surface. */
+  releaseSurfacedTurns(goalIds: readonly string[]): void {
+    for (const id of goalIds) {
+      const t = this.activeTurns.get(id);
+      if (t) t.surfaced = false;
+    }
+  }
+
   /** Yield one active turn back to the run (`turn-yield`, self-mode). Without `turn` it targets
    *  the OLDEST surfaced turn — the one the current session turn is working on. The entry is
    *  dropped locally only when the manager's answer settles it, by this yield or by a terminal

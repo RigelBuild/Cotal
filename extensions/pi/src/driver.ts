@@ -125,6 +125,11 @@ export class PiDriver {
     this.host = host;
   }
 
+  /** Seed the tracked session id from a start the extension saw before the driver had a context. */
+  noteSession(sessionId: string): void {
+    this.sessionId = sessionId;
+  }
+
   onSessionStart(context: PiContextLike, sessionId: string): void {
     this.context = context;
     if (this._state === "shuttingDown") {
@@ -431,6 +436,9 @@ export class PiDriver {
    *  still owns their keys; drop them uncommitted and clear every hold and turn bound to them. */
   private resetForNewSession(): void {
     this.clearTimers();
+    // Their run turns were surfaced to the old session only; release them so the next batch carries them.
+    const turnIds = this.batches.flatMap((batch) => batch.turnIds ?? []);
+    if (turnIds.length > 0) this.mesh.releaseSurfacedTurns(turnIds);
     this.batches = [];
     this.contextBatchIds.clear();
     this.requestBatchIds.clear();

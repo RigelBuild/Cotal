@@ -109,6 +109,9 @@ const row = (goalId: string, context: string, acceptedAt = Date.now()): PendingT
   check("peeking commits nothing: a second peek still returns the turn", a.peekPendingTurns() !== undefined);
   a.commitSurfacedTurns(["g1"]);
   check("committing the surface consumes the peek and the wake count", a.peekPendingTurns() === undefined && a.pendingWake() === 0);
+  a.releaseSurfacedTurns(["g1"]);
+  check("releasing the surface re-offers the turn to the next peek", a.peekPendingTurns()?.goalIds.join() === "g1");
+  a.commitSurfacedTurns(["g1"]);
   await poll();
   check("a surfaced-but-unyielded turn stays active across polls (it is still pending on the plane)",
     (await a.yieldTurn("done")).ok === true);
@@ -348,7 +351,7 @@ const row = (goalId: string, context: string, acceptedAt = Date.now()): PendingT
   check("the same reason after a good pull is a new outage and is said", lines.length === 3, lines);
 }
 
-const EXPECTED_CELLS = 39;
+const EXPECTED_CELLS = 40;
 const ran = pass + fail;
 console.log(`\nturn-intake.smoke: ${pass} passed, ${fail} failed`);
 if (ran !== EXPECTED_CELLS) {

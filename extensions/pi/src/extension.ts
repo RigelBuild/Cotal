@@ -163,6 +163,7 @@ export default async function cotalMesh(pi: ExtensionAPI): Promise<void> {
     if (expectedSessionId && startupSessionId !== expectedSessionId)
       throw new Error(`pi connector: expected startup session ${expectedSessionId}, host opened ${startupSessionId}`);
     runtime.sessionId = startupSessionId;
+    runtime.driver.noteSession(startupSessionId);
     runtime.expectedSessionId = undefined;
     persistSessionId(startupSessionId);
   }

@@ -180,6 +180,45 @@ class FakeMesh {
   }
 }
 
+/** A FakeMesh with the real agent's two-phase run-turn surface and its working→idle `done` yield. */
+class TurnMesh extends FakeMesh {
+  turns = new Map<string, { text: string; surfaced: boolean }>();
+  released: string[] = [];
+  doneYields: string[] = [];
+
+  override peekPendingTurns(): { text: string; goalIds: string[] } | undefined {
+    const waiting = [...this.turns].filter(([, turn]) => !turn.surfaced);
+    if (waiting.length === 0) return undefined;
+    return { text: waiting.map(([, turn]) => turn.text).join("\n"), goalIds: waiting.map(([id]) => id) };
+  }
+
+  override commitSurfacedTurns(goalIds: readonly string[]): void {
+    for (const id of goalIds) {
+      const turn = this.turns.get(id);
+      if (turn) turn.surfaced = true;
+    }
+  }
+
+  releaseSurfacedTurns(goalIds: readonly string[]): void {
+    this.released.push(...goalIds);
+    for (const id of goalIds) {
+      const turn = this.turns.get(id);
+      if (turn) turn.surfaced = false;
+    }
+  }
+
+  override async setStatus(status: string, activity?: string): Promise<void> {
+    const previous = this.statuses.at(-1)?.status;
+    await super.setStatus(status, activity);
+    if (previous !== "working" || status !== "idle") return;
+    for (const [id, turn] of this.turns) {
+      if (!turn.surfaced) continue;
+      this.doneYields.push(id);
+      this.turns.delete(id);
+    }
+  }
+}
+
 class FakeHost implements PiHost {
   sent: Array<{ content: string; details: CotalBatchDetails }> = [];
 
@@ -661,6 +700,71 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
     driver.state === "held" && driver.reason === reason && host.sent.length === 1 && mesh.drained.length === 0,
     "a same-session start keeps the hold and its retained batch",
   );
+}
+
+// The startup session id seeds the driver, so a first session_start for another id still resets.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("refused")];
+  const host = new FakeHost();
+  const sessionA = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.noteSession("session-a");
+  driver.onAgentStart(sessionA);
+  const refusedBatch = startBatch(driver, host);
+  confirm(driver, refusedBatch);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error", errorMessage: "Refusal (reasoning_extraction)" }], sessionA);
+  ok(driver.state === "held" && mesh.drained.length === 0, "a startup session holds its refused batch uncommitted");
+  const sessionB = context();
+  driver.onSessionStart(sessionB, "session-b");
+  ok(
+    host.sent.length === 2 && host.sent[1]?.details.ids.join() === "refused" && mesh.drained.length === 0,
+    "the first observed start of a different session re-dispatches the startup session's batch uncommitted",
+  );
+  const redelivered = startBatch(driver, host);
+  driver.onAgentStart(sessionB);
+  confirm(driver, redelivered);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], sessionB);
+  ok(mesh.drained.join() === "refused", "only the new session's clean turn commits the startup session's batch");
+}
+
+// A session switch releases a dropped batch's run turn, so the new session is shown it before `done`.
+{
+  const mesh = new TurnMesh();
+  mesh.items = [item("turn-dm")];
+  mesh.turns.set("goal-1", { text: "Run turn deadline: 14:00; yield when done", surfaced: false });
+  const host = new FakeHost();
+  const sessionA = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(sessionA, "session-a");
+  const refusedBatch = startBatch(driver, host);
+  driver.onAgentStart(sessionA);
+  confirm(driver, refusedBatch);
+  ok(mesh.turns.get("goal-1")?.surfaced === true, "provider acceptance in session A surfaces the run turn");
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error", errorMessage: "Refusal (reasoning_extraction)" }], sessionA);
+  driver.onSessionShutdown();
+  const sessionB = context();
+  driver.onSessionStart(sessionB, "session-b");
+  const resent = host.sent[1];
+  ok(
+    mesh.released.join() === "goal-1" && resent?.details.ids.join() === "turn-dm" &&
+      resent.details.suffix?.includes("Run turn deadline: 14:00") === true && resent.content.includes("Run turn deadline: 14:00"),
+    "the switch releases the run turn and session B's batch carries its text again",
+  );
+  await driver.flushPresence();
+  ok(mesh.doneYields.length === 0 && mesh.turns.get("goal-1")?.surfaced === false,
+    "no done yield happens before session B is shown the turn");
+  const redelivered = startBatch(driver, host);
+  driver.onAgentStart(sessionB);
+  confirm(driver, redelivered);
+  ok(mesh.turns.get("goal-1")?.surfaced === true, "session B's batch carries the goal id and surfaces it on acceptance");
+  sessionB.idle = true;
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], sessionB);
+  await driver.flushPresence();
+  ok(mesh.drained.join() === "turn-dm" && mesh.doneYields.join() === "goal-1",
+    "the turn yields done only at session B's clean boundary");
 }
 
 // A provider error retains the old batch, but a later DM starts a new turn with both items.
