@@ -1,9 +1,10 @@
 {
   "suite": [
     "implementations/cli/smoke/persona-templates.smoke.ts",
-    "implementations/cli/smoke/mint-provision.smoke.ts"
+    "implementations/cli/smoke/mint-provision.smoke.ts",
+    "implementations/cli/smoke/mint-capabilities.unit.smoke.ts"
   ],
-  "guard": "new defaults can create channels, byte-exact legacy defaults upgrade, user-edited personas remain untouched, and a minted credential's lifetime and identity are the operator's flags, not the command's defaults",
+  "guard": "new defaults can create channels, byte-exact legacy defaults upgrade, user-edited personas remain untouched, and the minted credential's lifetime is set by the operator's flag",
   "command": "pnpm --filter @cotal-ai/core build && pnpm --filter @cotal-ai/workspace build && pnpm --filter @cotal-ai/cli typecheck && pnpm smoke:persona-templates && pnpm smoke:mint-provision:auth",
   "completionMarker": "persona templates:",
   "proveWith": "node scripts/mutation-proof.mjs --config implementations/cli/smoke/mutations/default-agent-publish.json",
@@ -61,11 +62,13 @@
     {
       "name": "M6 drop the mint lifetime before it reaches the seam",
       "file": "implementations/cli/src/commands/mint.ts",
-      "find": "  const identity = existingIdentity ?? newIdentity();\n  const lifetime = { expiresInSeconds, expiresAt };\n  const creds = target\n    ? await provisionForMint(auth, identity, { allowSubscribe, allowPublish, role, lifecycleUid: lifecycleUid!, ...lifetime }, target)\n    : await mintCreds(auth, identity, profile, { allowSubscribe, allowPublish, role, lifecycleUid, ...lifetime });",
-      "replace": "  const identity = existingIdentity ?? newIdentity();\n  const creds = target\n    ? await provisionForMint(auth, identity, { allowSubscribe, allowPublish, role, lifecycleUid: lifecycleUid! }, target)\n    : await mintCreds(auth, identity, profile, { allowSubscribe, allowPublish, role, lifecycleUid });",
+      "command": "corepack pnpm --filter @cotal-ai/core build && corepack pnpm --filter @cotal-ai/workspace build && corepack pnpm --filter @cotal-ai/cli typecheck && corepack pnpm smoke:mint-capabilities:unit",
+      "completionMarker": "MINT CAPABILITIES UNIT SMOKE COMPLETE",
+      "find": "  const identity = existingIdentity ?? newIdentity();\n  const lifetime = { expiresInSeconds, expiresAt };\n  const mintOptions = { allowSubscribe, allowPublish, role, capabilities, lifecycleUid, ...lifetime };\n  const creds = target\n    ? await provisionForMint(auth, identity, { ...mintOptions, lifecycleUid: lifecycleUid! }, target)\n    : await mintCreds(auth, identity, profile, mintOptions);",
+      "replace": "  const identity = existingIdentity ?? newIdentity();\n  const mintOptions = { allowSubscribe, allowPublish, role, capabilities, lifecycleUid };\n  const creds = target\n    ? await provisionForMint(auth, identity, { ...mintOptions, lifecycleUid: lifecycleUid! }, target)\n    : await mintCreds(auth, identity, profile, mintOptions);",
       "expectRed": "the JWT's exp is iat + the flag, computed within the command's own second",
       "cell": "the JWT's exp is iat + the flag, computed within the command's own second",
-      "note": "Restores the shipped half 1: the flag parses and validates but never reaches mintCreds, so the mint itself still succeeds while the credential stays unbounded (exp undefined). The success cell stays green by design; the exp-arithmetic cell is the one that catches the dropped lifetime."
+      "note": "The fixture selects the unit smoke source, which invokes runCli in-process and checks the minted JWT lifetime without a broker."
     },
     {
       "name": "M7 churn the identity on every re-mint",

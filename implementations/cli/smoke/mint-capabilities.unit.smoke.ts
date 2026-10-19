@@ -108,6 +108,22 @@ try {
   const nextUid = nextClaims.nats?.pub?.allow?.find((subject) => /\.dm_/.test(subject))?.match(/\.dm_[A-Za-z0-9_]+-[A-Za-z0-9_]+-([a-z0-9]{26,32})$/)?.[1];
   assert.ok(nextUid);
   assert.notEqual(nextUid, firstUid);
+  const ttlPath = join(root, "bounded.creds");
+  const before = Math.floor(Date.now() / 1000);
+  const ttlResult = await runMint(["bounded-agent", "--expires-in", "3600", "--out", ttlPath]);
+  const after = Math.floor(Date.now() / 1000);
+  assert.equal(ttlResult.code, 0, ttlResult.output);
+  const ttlJwt = jwtFromCreds(readFileSync(ttlPath, "utf8"));
+  assert.ok(ttlJwt);
+  const ttlClaims = JSON.parse(Buffer.from(ttlJwt.split(".")[1]!, "base64url").toString("utf8")) as { iat?: number; exp?: number };
+  assert.equal(
+    typeof ttlClaims.iat === "number" && typeof ttlClaims.exp === "number"
+      && ttlClaims.exp - ttlClaims.iat <= 3600 && ttlClaims.exp - ttlClaims.iat >= 3599
+      && ttlClaims.exp >= before + 3600 && ttlClaims.exp <= after + 3600,
+    true,
+    `the JWT's exp is iat + the flag, computed within the command's own second: ${JSON.stringify({ exp: ttlClaims.exp, iat: ttlClaims.iat, before, after })}`,
+  );
+
 
   for (const [name, capability] of [["admin-caller", "admin"], ["unknown-caller", "unknown"]] as const) {
     writeFileSync(join(agents, `${name}.md`), `---\nname: ${name}\ncapabilities: [${capability}]\n---\n`);
@@ -150,7 +166,6 @@ try {
   assert.equal(multipleUids.code, 1, multipleUids.output);
   assert.match(multipleUids.output, /no single agent lifecycle UID/);
   assert.equal(existsSync(multipleUidOut), false);
-  console.log("MINT CAPABILITIES UNIT SMOKE OK");
 } finally {
   process.chdir(cwd);
   if (previousHome === undefined) delete process.env.COTAL_HOME;
@@ -158,4 +173,5 @@ try {
   if (previousNoPrompt === undefined) delete process.env.COTAL_NO_PROMPT;
   else process.env.COTAL_NO_PROMPT = previousNoPrompt;
   rmSync(root, { recursive: true, force: true });
+  console.log(`MINT CAPABILITIES UNIT SMOKE COMPLETE`);
 }
