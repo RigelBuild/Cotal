@@ -65,7 +65,7 @@ const CHILD = [
   "Promise.all([import(pathToFileURL(process.env.CORE_DIST).href),import(pathToFileURL(process.env.CC_DIST).href)]).then(async([{CotalEndpoint,readLaunchMaterial},{configFromEnv}])=>{",
   "const m=readLaunchMaterial(process.env.COTAL_LAUNCH_MATERIAL);",
   "const out={pid:process.pid,env:process.env,material:m};const save=()=>fs.writeFileSync(process.env.REPORT,JSON.stringify(out));",
-  "try{out.capabilities=configFromEnv({...process.env}).capabilities??[];}catch(e){out.error='config: '+String(e&&e.message);}save();",
+  "try{out.capabilities=configFromEnv(process.env).capabilities??[];}catch(e){out.error='config: '+String(e&&e.message);}save();",
   "const ep=new CotalEndpoint({space:process.env.COTAL_SPACE,servers:m.servers,creds:fs.readFileSync(m.creds,'utf8'),lifecycleUid:process.env.COTAL_LIFECYCLE_UID,channels:[],card:{id:process.env.COTAL_ID,name:process.env.COTAL_NAME,kind:'agent'}});",
   "ep.on('error',(e)=>{out.error=String(e.message);save();});",
   "try{await ep.start();out.started=out.error===undefined;}catch(e){out.error=String(e&&e.message);}save();setInterval(()=>{},1000);});",
