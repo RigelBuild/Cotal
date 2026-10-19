@@ -134,9 +134,17 @@ const networkSetupEnv = (): NodeJS.ProcessEnv => {
   return env;
 };
 
-const scan = (root: string, base: string, head: string, env = childEnv(), shard?: string): { status: number | null; out: string } => {
+const scan = (
+  root: string,
+  base: string,
+  head: string,
+  env = childEnv(),
+  shard?: string,
+  listShards?: string,
+): { status: number | null; out: string } => {
   const args = [SCAN, "--root", root, "--base", base, "--head", head];
   if (shard !== undefined) args.push("--shard", shard);
+  if (listShards !== undefined) args.push("--list-shards", listShards);
   const run = spawnSync(process.execPath, args, { encoding: "utf8", env });
   return { status: run.status, out: `${run.stdout ?? ""}${run.stderr ?? ""}` };
 };
@@ -1998,6 +2006,32 @@ try {
           }],
         }, null, 2));
       },
+      (r) => rmSync(join(r, "quarantined.mjs")),
+    );
+    const { status, out } = scan(root, base, head);
+    check(
+      "diff mode refuses a deleted guarded source even when its fixture suite is quarantined",
+      status === 1
+        && eq(danglingPaths(out), ["smoke/mutations/quarantined.mutations.json"])
+        && out.includes("mutation reproof: UNMEASURED — 1 dangling fixture(s)")
+        && out.includes("smoke/mutations/quarantined.mutations.json -> missing: quarantined.mjs"),
+      `status=${status}\n${out}`,
+    );
+  }
+  {
+    const { root, base, head } = makeSingle(
+      (r) => {
+        writeFileSync(join(r, "package.json"), JSON.stringify({ scripts: { "smoke:quarantined": "node suites/quarantined.suite.mjs" } }, null, 2));
+        writeFileSync(join(r, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = { 'smoke:quarantined': {} };\nexport const LIVE_QUARANTINED = {};\n");
+        writeFileSync(join(r, "quarantined.mjs"), "export const quarantined = () => 1;\n");
+        writeFileSync(join(r, "suites", "quarantined.suite.mjs"), "import { quarantined } from '../quarantined.mjs';\nif (quarantined() !== 1) { console.error('✗ FAIL: quarantined cap holds'); process.exit(1); }\nconsole.log('✓ quarantined cap holds');\n");
+        writeFileSync(join(r, "smoke", "mutations", "quarantined.mutations.json"), JSON.stringify({
+          suite: ["suites/quarantined.suite.mjs"], command: "node suites/quarantined.suite.mjs", mutations: [{
+            name: "quarantined changes", file: "quarantined.mjs", find: "export const quarantined = () => 1;",
+            replace: "export const quarantined = () => 2;", expectRed: "quarantined cap holds",
+          }],
+        }, null, 2));
+      },
       (r) => writeFileSync(join(r, "quarantined.mjs"), "// source-only diff\nexport const quarantined = () => 1;\n"),
     );
     const { status, out } = scan(root, base, head);
@@ -2007,6 +2041,37 @@ try {
         && selectedPaths(out).length === 0
         && out.includes("skipped 1 fixture(s) of quarantined suites:\n  smoke/mutations/quarantined.mutations.json (smoke:quarantined)")
         && out.includes("No mutation fixtures to re-prove: selected fixtures belong only to quarantined suites."),
+    );
+  }
+  {
+    const { root, base, head } = makeSingle(
+      (r) => {
+        writeFileSync(join(r, "package.json"), JSON.stringify({ scripts: { "smoke:quarantined": "node suites/quarantined.suite.mjs" } }, null, 2));
+        writeFileSync(join(r, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = { 'smoke:quarantined': {} };\nexport const LIVE_QUARANTINED = {};\n");
+        writeFileSync(join(r, "quarantined.mjs"), "export const quarantined = () => 1;\n");
+        writeFileSync(join(r, "suites", "quarantined.suite.mjs"), "import { quarantined } from '../quarantined.mjs';\nif (quarantined() !== 1) { console.error('✗ FAIL: quarantined cap holds'); process.exit(1); }\nconsole.log('✓ quarantined cap holds');\n");
+        writeFileSync(join(r, "smoke", "mutations", "quarantined.mutations.json"), JSON.stringify({
+          suite: ["suites/quarantined.suite.mjs"], command: "node suites/quarantined.suite.mjs", mutations: [{
+            name: "quarantined changes", file: "quarantined.mjs", find: "export const quarantined = () => 1;",
+            replace: "export const quarantined = () => 2;", expectRed: "quarantined cap holds",
+          }],
+        }, null, 2));
+      },
+      (r) => writeFileSync(join(r, "quarantined.mjs"), "// source-only diff\nexport const quarantined = () => 1;\n"),
+    );
+    const plan = scan(root, base, head, childEnv(), undefined, "2");
+    const shard = scan(root, base, head, childEnv(), "1/2");
+    const shardPlanLine = plan.out.match(/^\{"shards":\[[^\]]*\]\}$/m)?.[0];
+    const shardPlan: unknown = shardPlanLine ? JSON.parse(shardPlanLine) : undefined;
+    const shardIndexes = typeof shardPlan === "object" && shardPlan !== null
+      && "shards" in shardPlan && Array.isArray(shardPlan.shards) ? shardPlan.shards : [];
+    check(
+      "diff-mode shard plan includes a quarantined mutation-only fixture and its shard reports zero work",
+      plan.status === 0
+        && JSON.stringify(shardIndexes) === "[1]"
+        && shard.out.includes("skipped 1 fixture(s) of quarantined suites:\n  smoke/mutations/quarantined.mutations.json (smoke:quarantined)")
+        && shard.out.includes("No mutation fixtures to re-prove: selected fixtures belong only to quarantined suites."),
+      `plan=${plan.status}\n${plan.out}\nshard=${shard.status}\n${shard.out}`,
     );
   }
   {

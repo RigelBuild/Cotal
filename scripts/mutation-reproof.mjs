@@ -380,9 +380,10 @@ if (liveRefused.length) {
 
 // UNMEASURED, exit 1: a selected fixture's guarded file does not exist at head — a dangling fixture.
 // Its guarded source was deleted or renamed away, so its anchor cannot resolve and its proof is
-// unrunnable. This is the failure the gate exists to refuse, so it is loud, not a skip.
+// unrunnable. This is the failure the gate exists to refuse, so it is loud, not a skip. It reads the
+// pre-quarantine selection, so a quarantine skip can never hide a deleted guard.
 const dangling = [];
-for (const { path, suites, mutations } of selected) {
+for (const { path, suites, mutations } of selectedBeforeQuarantine) {
   const missing = [...new Set([
     ...suites.filter((suite) => !existsSync(resolve(root, suite))),
     ...mutations
@@ -413,12 +414,12 @@ if (listShards !== undefined) {
 // A zero after filtering means either no diff match or no assignment to this shard.
 // Keep the diff, corpus and selected counts visible in both cases.
 if (prove.length === 0) {
-  console.log(shard
-    ? `No selected mutation fixtures are assigned to shard ${a.shard}.`
-    : liveRefused.length > 0
-      ? "No mutation fixtures to re-prove: every selected fixture was a named live-shaped refusal."
-      : !a.all && quarantinedSkipped.length > 0
-        ? "No mutation fixtures to re-prove: selected fixtures belong only to quarantined suites."
+  console.log(!a.all && quarantinedSkipped.length > 0
+    ? "No mutation fixtures to re-prove: selected fixtures belong only to quarantined suites."
+    : shard
+      ? `No selected mutation fixtures are assigned to shard ${a.shard}.`
+      : liveRefused.length > 0
+        ? "No mutation fixtures to re-prove: every selected fixture was a named live-shaped refusal."
         : metadataOnlyExclusions.size > 0
           ? "No mutation fixtures to re-prove: the only intersections were metadata-only config-path exclusions."
           : "No mutation fixtures to re-prove: no fixture config, suite, or guarded source intersects the diff.");
