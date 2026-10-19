@@ -234,6 +234,9 @@ class CotalAdapter(BasePlatformAdapter):
                 user_name=sender,
             )
         event = MessageEvent(
+            # Peers are agents: `/approve`, bare `yes`, and `/restart` must reach the model as text.
+            # Never let a peer run gateway commands or approve a tool call.
+            allow_gateway_control=False,
             # A PEER NAMES ITSELF AND WRITES ITS OWN BODY, so neither is framing. This text is
             # auto-injected into a turn rather than returned when the model asks, so the model never
             # had the chance to distrust it, and the attribution plus the body go through one
