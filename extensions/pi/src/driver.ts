@@ -12,6 +12,14 @@ const DEFAULT_START_TIMEOUT_MS = 5_000;
 const CONTINUATION_ATTEMPT_LIMIT = 2;
 const CONTINUATION_BACKOFF_MS = 50;
 
+const HISTORY_REFUSAL_MARKER = "Refusal (";
+const HISTORY_REFUSAL_ACTIVITY =
+  "provider refused this session's history; retries stopped — restart this seat with a fresh session (no --resume)";
+
+function isHistoryRefusal(errorText: string | undefined): boolean {
+  return errorText?.includes(HISTORY_REFUSAL_MARKER) ?? false;
+}
+
 export type DriverState = "idle" | "dispatching" | "streaming" | "held" | "shuttingDown";
 
 export interface CotalBatchDetails {
@@ -242,12 +250,19 @@ export class PiDriver {
     const lastAssistant = [...messages]
       .reverse()
       .find((message) => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant") as
-      | { stopReason?: string; usage?: { output?: number } }
+      | { stopReason?: string; usage?: { output?: number }; errorMessage?: string }
       | undefined;
     const aborted = this.activeSignal?.aborted === true;
     this.activeSignal = undefined;
     this.contextBatchIds.clear();
     this.requestBatchIds.clear();
+    if (!aborted && lastAssistant?.stopReason === "error" && isHistoryRefusal(lastAssistant.errorMessage)) {
+      this.terminalEvidenceBatchIds.clear();
+      this.pendingContinuation = false;
+      this.inboundDuringTurn = undefined;
+      this.hold(HISTORY_REFUSAL_ACTIVITY);
+      return;
+    }
     const terminal =
       !aborted &&
       (lastAssistant?.stopReason === "stop" ||

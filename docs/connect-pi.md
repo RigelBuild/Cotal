@@ -66,6 +66,10 @@ retained inbox items and the new traffic, before or after the attempts are spent
 acknowledged until that turn reaches a clean boundary; a bare wake or redelivered old traffic does
 not retry.
 
+A history refusal is the exception: an error whose text contains `Refusal (` means the provider refused
+the session's history, so every retry would be refused too. The seat holds as `waiting` and does not retry
+on new traffic; inbox items stay retained. Restart the seat with a fresh session, not `--resume`.
+
 `session_before_compact { reason: "overflow", willRetry: true }` identifies the overflow path but is
 not itself a terminal decision. An abort or dispatch watchdog blocks automatic replay. In managed
 headless use, restart is the safe recovery because it terminates any possibly-live provider call

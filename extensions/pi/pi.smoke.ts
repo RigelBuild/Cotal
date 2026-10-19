@@ -538,6 +538,76 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   ok(mesh.drained.join() === "m1" && driver.state === "idle", "the automatic retry commits only at its later clean boundary");
 }
 
+// A history refusal is terminal; ordinary provider errors still recover on new inbound.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("refused")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const refusedBatch = startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  confirm(driver, refusedBatch);
+  driver.onAgentEnd([{
+    role: "assistant",
+    stopReason: "error",
+    errorMessage: "Refusal (reasoning_extraction)",
+  }], ctx);
+  await driver.flushPresence();
+  ok(
+    driver.state === "held" && mesh.statuses.at(-1)?.status === "waiting" &&
+      mesh.statuses.at(-1)?.activity ===
+        "provider refused this session's history; retries stopped — restart this seat with a fresh session (no --resume)",
+    "a history refusal holds with fresh-session recovery guidance",
+  );
+  const inbound = item("after-refusal");
+  mesh.items.push(inbound);
+  driver.onIncoming(inbound);
+  ok(host.sent.length === 1 && mesh.items.includes(inbound), "inbound queues without retrying a refused history");
+  ok(
+    mesh.drained.length === 0 && mesh.items.some((value) => value.id === "refused"),
+    "a provider-accepted refused batch stays in the inbox, unacknowledged",
+  );
+  driver.onSessionShutdown();
+  const fresh = new PiDriver(mesh as unknown as MeshAgent);
+  const freshHost = new FakeHost();
+  const freshCtx = context();
+  fresh.bind(freshHost);
+  fresh.onSessionStart(freshCtx);
+  ok(
+    freshHost.sent[0]?.details.ids.join() === "refused,after-refusal" && mesh.drained.length === 0,
+    "a fresh seat re-surfaces the retained items without acknowledging them",
+  );
+  const freshBatch = startBatch(fresh, freshHost);
+  fresh.onAgentStart(freshCtx);
+  confirm(fresh, freshBatch);
+  fresh.onAgentEnd([{ role: "assistant", stopReason: "stop" }], freshCtx);
+  ok(mesh.drained.join() === "refused,after-refusal", "only the fresh seat's clean turn drains them");
+  const ordinaryMesh = new FakeMesh();
+  ordinaryMesh.items = [item("ordinary-error")];
+  const ordinaryHost = new FakeHost();
+  const ordinaryContext = context();
+  const ordinaryDriver = new PiDriver(ordinaryMesh as unknown as MeshAgent);
+  ordinaryDriver.bind(ordinaryHost);
+  ordinaryDriver.onSessionStart(ordinaryContext);
+  startBatch(ordinaryDriver, ordinaryHost);
+  ordinaryDriver.onAgentStart(ordinaryContext);
+  ordinaryDriver.onAgentEnd([{
+    role: "assistant",
+    stopReason: "error",
+    errorMessage: "ordinary provider error",
+  }], ordinaryContext);
+  const ordinaryInbound = item("after-ordinary-error");
+  ordinaryMesh.items.push(ordinaryInbound);
+  ordinaryDriver.onIncoming(ordinaryInbound);
+  ok(
+    ordinaryHost.sent.length === 2 && ordinaryHost.sent[1]?.details.ids.join() === "ordinary-error,after-ordinary-error",
+    "a non-refusal provider error still retries with new inbound",
+  );
+}
+
 // A provider error retains the old batch, but a later DM starts a new turn with both items.
 {
   const mesh = new FakeMesh();
