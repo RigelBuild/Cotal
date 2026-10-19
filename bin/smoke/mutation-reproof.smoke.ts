@@ -134,18 +134,30 @@ const networkSetupEnv = (): NodeJS.ProcessEnv => {
   return env;
 };
 
-const scan = (root: string, base: string, head: string, env = childEnv(), shard?: string): { status: number | null; out: string } => {
+const scan = (
+  root: string,
+  base: string,
+  head: string,
+  env = childEnv(),
+  shard?: string,
+  listShards?: string,
+): { status: number | null; out: string } => {
   const args = [SCAN, "--root", root, "--base", base, "--head", head];
   if (shard !== undefined) args.push("--shard", shard);
+  if (listShards !== undefined) args.push("--list-shards", listShards);
   const run = spawnSync(process.execPath, args, { encoding: "utf8", env });
   return { status: run.status, out: `${run.stdout ?? ""}${run.stderr ?? ""}` };
 };
-const scanAll = (root: string, shard?: string): { status: number | null; out: string } => {
+
+const scanAll = (root: string, shard?: string, listShards?: string): { status: number | null; out: string } => {
   const args = [SCAN, "--root", root, "--all"];
   if (shard !== undefined) args.push("--shard", shard);
+  if (listShards !== undefined) args.push("--list-shards", listShards);
   const run = spawnSync(process.execPath, args, { encoding: "utf8", env: childEnv() });
   return { status: run.status, out: `${run.stdout ?? ""}${run.stderr ?? ""}` };
 };
+
+
 
 /**
  * A synthetic repo with TWO fixtures over TWO guarded sources. `mutate` decides what the head commit
@@ -159,6 +171,8 @@ function makeRepo(mutate: (root: string) => void, names = ["a", "b"]): { root: s
   git(root, ["config", "user.name", "Smoke"]);
   mkdirSync(join(root, "smoke", "mutations"), { recursive: true });
   mkdirSync(join(root, "suites"), { recursive: true });
+  mkdirSync(join(root, "bin", "smoke"), { recursive: true });
+  writeFileSync(join(root, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = {};\nexport const LIVE_QUARANTINED = {};\n");
   for (const name of names) {
     writeFileSync(join(root, `${name}.mjs`), [
       `export function capped_${name}(input) {`,
@@ -216,6 +230,8 @@ function makeSingle(
   git(root, ["config", "user.name", "Smoke"]);
   mkdirSync(join(root, "smoke", "mutations"), { recursive: true });
   mkdirSync(join(root, "suites"), { recursive: true });
+  mkdirSync(join(root, "bin", "smoke"), { recursive: true });
+  writeFileSync(join(root, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = {};\nexport const LIVE_QUARANTINED = {};\n");
   seed(root);
   git(root, ["add", "."]);
   git(root, ["commit", "--quiet", "-m", "base"]);
@@ -226,6 +242,7 @@ function makeSingle(
   const head = git(root, ["rev-parse", "HEAD"]);
   return { root, base, head };
 }
+
 
 const previousSentinel = process.env.COTAL_REPROOF_SENTINEL;
 try {
@@ -1916,6 +1933,211 @@ try {
         && unmeasuredPreRedPaths(out).length === 0
         && floorCouldNot(out, ["smoke/mutations/all.mutations.json"]),
       `status=${status} preRed=${JSON.stringify(preRedPaths(out))}\n${out}`,
+    );
+  }
+  {
+    const { root } = makeSingle(
+      (r) => {
+        writeFileSync(join(r, "package.json"), JSON.stringify({ scripts: { "smoke:quarantined": "node suites/quarantined.suite.mjs" } }, null, 2));
+        mkdirSync(join(r, "bin", "smoke"), { recursive: true });
+        writeFileSync(join(r, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = { 'smoke:quarantined': {} };\nexport const LIVE_QUARANTINED = {};\n");
+        for (const name of ["quarantined", "live"]) {
+          writeFileSync(join(r, `${name}.mjs`), `export const ${name} = () => 1;\n`);
+          writeFileSync(join(r, "suites", `${name}.suite.mjs`), `import { ${name} } from '../${name}.mjs';\nif (${name}() !== 1) { console.error('✗ FAIL: ${name} cap holds'); process.exit(1); }\nconsole.log('✓ ${name} cap holds');\n`);
+          writeFileSync(join(r, "smoke", "mutations", `${name}.mutations.json`), JSON.stringify({
+            suite: [`suites/${name}.suite.mjs`], command: `node suites/${name}.suite.mjs`, mutations: [{
+              name: `${name} changes`, file: `${name}.mjs`, find: `export const ${name} = () => 1;`,
+              replace: `export const ${name} = () => 2;`, expectRed: `${name} cap holds`,
+            }],
+          }, null, 2));
+        }
+      },
+      (r) => writeFileSync(join(r, "head-note"), "head\n"),
+    );
+    const { status, out } = scanAll(root);
+    check(
+      "--all skips quarantined suites, lists their script, and proves remaining fixtures",
+      status === 0
+        && eq(selectedPaths(out), ["smoke/mutations/live.mutations.json"])
+        && /skipped 1 fixture\(s\) of quarantined suites:\n  smoke\/mutations\/quarantined\.mutations\.json \(smoke:quarantined\)/.test(out)
+        && /MUTATION REPROOF OK \(1 fixture\(s\) selected; 1 discriminated; 1 quarantined skipped;/.test(out),
+      `status=${status}\n${out}`,
+    );
+  }
+  {
+    const { root } = makeSingle(
+      (r) => {
+        writeFileSync(join(r, "package.json"), JSON.stringify({ scripts: { "smoke:quarantined-chain": "node suites/quarantined.suite.mjs && node suites/independent.suite.mjs" } }, null, 2));
+        writeFileSync(join(r, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = { 'smoke:quarantined-chain': {} };\nexport const LIVE_QUARANTINED = {};\n");
+        for (const name of ["quarantined", "independent"]) {
+          writeFileSync(join(r, `${name}.mjs`), `export const ${name} = () => 1;\n`);
+          writeFileSync(join(r, "suites", `${name}.suite.mjs`), `import { ${name} } from '../${name}.mjs';\nif (${name}() !== 1) { console.error('✗ FAIL: ${name} cap holds'); process.exit(1); }\nconsole.log('✓ ${name} cap holds');\n`);
+          writeFileSync(join(r, "smoke", "mutations", `${name}.mutations.json`), JSON.stringify({
+            suite: [`suites/${name}.suite.mjs`], command: `node suites/${name}.suite.mjs`, mutations: [{
+              name: `${name} changes`, file: `${name}.mjs`, find: `export const ${name} = () => 1;`,
+              replace: `export const ${name} = () => 2;`, expectRed: `${name} cap holds`,
+            }],
+          }, null, 2));
+        }
+      },
+      (r) => writeFileSync(join(r, "head-note"), "head\n"),
+    );
+    const { status, out } = scanAll(root);
+    check(
+      "--all does not skip either fixture from a quarantined script chaining two suites",
+      status === 0
+        && eq(selectedPaths(out), ["smoke/mutations/independent.mutations.json", "smoke/mutations/quarantined.mutations.json"])
+        && out.includes("skipped 0 fixture(s) of quarantined suites:")
+        && /MUTATION REPROOF OK \(2 fixture\(s\) selected; 2 discriminated; 0 quarantined skipped;/.test(out),
+      `status=${status}\n${out}`,
+    );
+  }
+  {
+    const { root, base, head } = makeSingle(
+      (r) => {
+        writeFileSync(join(r, "package.json"), JSON.stringify({ scripts: { "smoke:quarantined": "node suites/quarantined.suite.mjs" } }, null, 2));
+        writeFileSync(join(r, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = { 'smoke:quarantined': {} };\nexport const LIVE_QUARANTINED = {};\n");
+        writeFileSync(join(r, "quarantined.mjs"), "export const quarantined = () => 1;\n");
+        writeFileSync(join(r, "suites", "quarantined.suite.mjs"), "import { quarantined } from '../quarantined.mjs';\nif (quarantined() !== 1) { console.error('✗ FAIL: quarantined cap holds'); process.exit(1); }\nconsole.log('✓ quarantined cap holds');\n");
+        writeFileSync(join(r, "smoke", "mutations", "quarantined.mutations.json"), JSON.stringify({
+          suite: ["suites/quarantined.suite.mjs"], command: "node suites/quarantined.suite.mjs", mutations: [{
+            name: "quarantined changes", file: "quarantined.mjs", find: "export const quarantined = () => 1;",
+            replace: "export const quarantined = () => 2;", expectRed: "quarantined cap holds",
+          }],
+        }, null, 2));
+      },
+      (r) => rmSync(join(r, "quarantined.mjs")),
+    );
+    const { status, out } = scan(root, base, head);
+    check(
+      "diff mode refuses a deleted guarded source even when its fixture suite is quarantined",
+      status === 1
+        && eq(danglingPaths(out), ["smoke/mutations/quarantined.mutations.json"])
+        && out.includes("mutation reproof: UNMEASURED — 1 dangling fixture(s)")
+        && out.includes("smoke/mutations/quarantined.mutations.json -> missing: quarantined.mjs"),
+      `status=${status}\n${out}`,
+    );
+  }
+  {
+    const { root, base, head } = makeSingle(
+      (r) => {
+        writeFileSync(join(r, "package.json"), JSON.stringify({ scripts: { "smoke:quarantined": "node suites/quarantined.suite.mjs" } }, null, 2));
+        writeFileSync(join(r, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = { 'smoke:quarantined': {} };\nexport const LIVE_QUARANTINED = {};\n");
+        writeFileSync(join(r, "quarantined.mjs"), "export const quarantined = () => 1;\n");
+        writeFileSync(join(r, "suites", "quarantined.suite.mjs"), "import { quarantined } from '../quarantined.mjs';\nif (quarantined() !== 1) { console.error('✗ FAIL: quarantined cap holds'); process.exit(1); }\nconsole.log('✓ quarantined cap holds');\n");
+        writeFileSync(join(r, "smoke", "mutations", "quarantined.mutations.json"), JSON.stringify({
+          suite: ["suites/quarantined.suite.mjs"], command: "node suites/quarantined.suite.mjs", mutations: [{
+            name: "quarantined changes", file: "quarantined.mjs", find: "export const quarantined = () => 1;",
+            replace: "export const quarantined = () => 2;", expectRed: "quarantined cap holds",
+          }],
+        }, null, 2));
+      },
+      (r) => writeFileSync(join(r, "quarantined.mjs"), "// source-only diff\nexport const quarantined = () => 1;\n"),
+    );
+    const { status, out } = scan(root, base, head);
+    check(
+      "diff mode skips and lists quarantined fixtures selected only by a mutation source",
+      status === 0
+        && selectedPaths(out).length === 0
+        && out.includes("skipped 1 fixture(s) of quarantined suites:\n  smoke/mutations/quarantined.mutations.json (smoke:quarantined)")
+        && out.includes("No mutation fixtures to re-prove: selected fixtures belong only to quarantined suites."),
+    );
+  }
+  {
+    const { root, base, head } = makeSingle(
+      (r) => {
+        writeFileSync(join(r, "package.json"), JSON.stringify({ scripts: { "smoke:quarantined": "node suites/quarantined.suite.mjs" } }, null, 2));
+        writeFileSync(join(r, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = { 'smoke:quarantined': {} };\nexport const LIVE_QUARANTINED = {};\n");
+        writeFileSync(join(r, "quarantined.mjs"), "export const quarantined = () => 1;\n");
+        writeFileSync(join(r, "suites", "quarantined.suite.mjs"), "import { quarantined } from '../quarantined.mjs';\nif (quarantined() !== 1) { console.error('✗ FAIL: quarantined cap holds'); process.exit(1); }\nconsole.log('✓ quarantined cap holds');\n");
+        writeFileSync(join(r, "smoke", "mutations", "quarantined.mutations.json"), JSON.stringify({
+          suite: ["suites/quarantined.suite.mjs"], command: "node suites/quarantined.suite.mjs", mutations: [{
+            name: "quarantined changes", file: "quarantined.mjs", find: "export const quarantined = () => 1;",
+            replace: "export const quarantined = () => 2;", expectRed: "quarantined cap holds",
+          }],
+        }, null, 2));
+      },
+      (r) => writeFileSync(join(r, "quarantined.mjs"), "// source-only diff\nexport const quarantined = () => 1;\n"),
+    );
+    const plan = scan(root, base, head, childEnv(), undefined, "2");
+    const shard = scan(root, base, head, childEnv(), "1/2");
+    const shardPlanLine = plan.out.match(/^\{"shards":\[[^\]]*\]\}$/m)?.[0];
+    const shardPlan: unknown = shardPlanLine ? JSON.parse(shardPlanLine) : undefined;
+    const shardIndexes = typeof shardPlan === "object" && shardPlan !== null
+      && "shards" in shardPlan && Array.isArray(shardPlan.shards) ? shardPlan.shards : [];
+    check(
+      "diff-mode shard plan includes a quarantined mutation-only fixture and its shard reports zero work",
+      plan.status === 0
+        && JSON.stringify(shardIndexes) === "[1]"
+        && shard.out.includes("skipped 1 fixture(s) of quarantined suites:\n  smoke/mutations/quarantined.mutations.json (smoke:quarantined)")
+        && shard.out.includes("No mutation fixtures to re-prove: selected fixtures belong only to quarantined suites."),
+      `plan=${plan.status}\n${plan.out}\nshard=${shard.status}\n${shard.out}`,
+    );
+  }
+  {
+    const { root, base, head } = makeSingle(
+      (r) => {
+        writeFileSync(join(r, "package.json"), JSON.stringify({ scripts: { "smoke:quarantined": "node suites/quarantined.suite.mjs" } }, null, 2));
+        mkdirSync(join(r, "bin", "smoke"), { recursive: true });
+        writeFileSync(join(r, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = { 'smoke:quarantined': {} };\nexport const LIVE_QUARANTINED = {};\n");
+        writeFileSync(join(r, "quarantined.mjs"), "export const quarantined = () => 1;\n");
+        writeFileSync(join(r, "suites", "quarantined.suite.mjs"), "import { quarantined } from '../quarantined.mjs';\nif (quarantined() !== 1) { console.error('✗ FAIL: quarantined cap holds'); process.exit(1); }\nconsole.log('✓ quarantined cap holds');\n");
+        writeFileSync(join(r, "smoke", "mutations", "quarantined.mutations.json"), JSON.stringify({
+          suite: ["suites/quarantined.suite.mjs"], command: "node suites/quarantined.suite.mjs", mutations: [{
+            name: "quarantined changes", file: "quarantined.mjs", find: "export const quarantined = () => 1;",
+            replace: "export const quarantined = () => 2;", expectRed: "quarantined cap holds",
+          }],
+        }, null, 2));
+      },
+      (r) => writeFileSync(join(r, "suites", "quarantined.suite.mjs"), readFileSync(join(r, "suites", "quarantined.suite.mjs"), "utf8") + "// suite changed\n"),
+    );
+    const { status, out } = scan(root, base, head);
+    check(
+      "diff mode still proves a quarantined fixture when its suite changed",
+      status === 0
+        && eq(selectedPaths(out), ["smoke/mutations/quarantined.mutations.json"])
+        && !out.includes("skipped ")
+        && /MUTATION REPROOF OK \(1 fixture\(s\) selected; 1 discriminated/.test(out),
+      `status=${status}\n${out}`,
+    );
+  }
+  {
+    const { root } = makeSingle(
+      (r) => {
+        writeFileSync(join(r, "package.json"), JSON.stringify({ scripts: { "smoke:quarantined": "node suites/b.suite.mjs" } }, null, 2));
+        writeFileSync(join(r, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = { 'smoke:quarantined': {} };\nexport const LIVE_QUARANTINED = {};\n");
+        for (const name of ["a", "b"]) {
+          writeFileSync(join(r, `${name}.mjs`), `export const ${name} = () => 1;\n`);
+          writeFileSync(join(r, "suites", `${name}.suite.mjs`), `import { ${name} } from '../${name}.mjs';\nif (${name}() !== 1) { console.error('✗ FAIL: ${name} cap holds'); process.exit(1); }\nconsole.log('✓ ${name} cap holds');\n`);
+          writeFileSync(join(r, "smoke", "mutations", `${name}.mutations.json`), JSON.stringify({
+            suite: [`suites/${name}.suite.mjs`], command: `node suites/${name}.suite.mjs`, mutations: [{
+              name: `${name} changes`, file: `${name}.mjs`, find: `export const ${name} = () => 1;`,
+              replace: `export const ${name} = () => 2;`, expectRed: `${name} cap holds`,
+            }],
+          }, null, 2));
+        }
+      },
+      (r) => writeFileSync(join(r, "head-note"), "head\n"),
+    );
+    const plan = scanAll(root, undefined, "2");
+    const shard0 = scanAll(root, "0/2");
+    const shard1 = scanAll(root, "1/2");
+    const shardPlanLine = plan.out.match(/^\{"shards":\[[^\]]*\]\}$/m)?.[0];
+    const shardPlan: unknown = shardPlanLine ? JSON.parse(shardPlanLine) : undefined;
+    const shardIndexes = typeof shardPlan === "object" && shardPlan !== null
+      && "shards" in shardPlan && Array.isArray(shardPlan.shards) ? shardPlan.shards : [];
+    check(
+      "--all shard plan preserves membership and a quarantined-only shard exits OK without work",
+      plan.status === 0
+        && JSON.stringify(shardIndexes) === "[0,1]"
+        && eq(selectedPaths(plan.out), ["smoke/mutations/a.mutations.json"])
+        && shard0.status === 0
+        && eq(selectedPaths(shard0.out), ["smoke/mutations/a.mutations.json"])
+        && shard1.status === 0
+        && selectedPaths(shard1.out).length === 0
+        && shard1.out.includes("No selected mutation fixtures are assigned to shard 1/2.")
+        && shard1.out.includes("smoke/mutations/b.mutations.json (smoke:quarantined)"),
+      `plan=${plan.status}\n${plan.out}\nshard0=${shard0.status}\n${shard0.out}\nshard1=${shard1.status}\n${shard1.out}`,
     );
   }
   {
