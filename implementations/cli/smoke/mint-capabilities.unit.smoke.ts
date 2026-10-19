@@ -1,10 +1,15 @@
-import { strict as assert } from "node:assert";
+import { strict as nodeAssert } from "node:assert";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSpaceAuth, DEV_OWNER, epRequestGrantRows, jwtFromCreds, mintCreds, mintLifecycleUid, newIdentity, registry, spawnCallerCapabilities, type EpCaller } from "@cotal-ai/core";
 import { authDir, recordMesh, saveSpaceAuth } from "@cotal-ai/workspace";
 import { runCli } from "../src/command.js";
+import { countedAssert, emitSentinel } from "@cotal-ai/smoke-kit";
+
+const counted = countedAssert(nodeAssert);
+const assert: typeof nodeAssert = counted.assert;
+const cells = counted.cells;
 
 class ExitSignal extends Error {}
 async function runMint(argv: string[]): Promise<{ output: string; code: number }> {
@@ -173,5 +178,7 @@ try {
   if (previousNoPrompt === undefined) delete process.env.COTAL_NO_PROMPT;
   else process.env.COTAL_NO_PROMPT = previousNoPrompt;
   rmSync(root, { recursive: true, force: true });
-  console.log(`MINT CAPABILITIES UNIT SMOKE COMPLETE`);
 }
+// Success-only: a thrown assertion skips both, so the runner and the mutation marker see the failure.
+console.log(`MINT CAPABILITIES UNIT SMOKE COMPLETE`);
+emitSentinel({ passed: cells(), failed: 0 });

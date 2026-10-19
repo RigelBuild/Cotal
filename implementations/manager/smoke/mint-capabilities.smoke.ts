@@ -15,7 +15,7 @@ import {
   type Connector, type CotalMessage, type EpCaller, type LaunchOpts, type LaunchSpec,
 } from "@cotal-ai/core";
 import { authDir, recordMesh, saveSpaceAuth } from "@cotal-ai/workspace";
-import { SMOKE_BROKER_TOKEN } from "@cotal-ai/smoke-kit";
+import { SMOKE_BROKER_TOKEN, emitSentinel } from "@cotal-ai/smoke-kit";
 import { runCli } from "@cotal-ai/cli";
 import { Manager } from "../src/manager.js";
 import { bootBroker } from "./_boot-broker.js";
@@ -178,3 +178,4 @@ try {
 }
 
 console.log(`\nMINT CAPABILITIES SMOKE OK  (${passed} passed)`);
+emitSentinel({ passed, failed: 0 });
