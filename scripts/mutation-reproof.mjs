@@ -227,7 +227,10 @@ function isExecutesOnlyConfigChange(root, base, fixture) {
 }
 
 async function quarantinedSuitePaths(root) {
-  const { QUARANTINED, LIVE_QUARANTINED } = await import(pathToFileURL(resolve(root, "bin/smoke/ci-quarantine.mjs")).href);
+  // A root without the registry (a fixture-only test tree) quarantines nothing.
+  const registry = resolve(root, "bin/smoke/ci-quarantine.mjs");
+  if (!existsSync(registry)) return new Map();
+  const { QUARANTINED, LIVE_QUARANTINED } = await import(pathToFileURL(registry).href);
   const { scripts = {} } = existsSync(resolve(root, "package.json"))
     ? JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"))
     : {};
@@ -414,15 +417,17 @@ if (listShards !== undefined) {
 // A zero after filtering means either no diff match or no assignment to this shard.
 // Keep the diff, corpus and selected counts visible in both cases.
 if (prove.length === 0) {
-  console.log(!a.all && quarantinedSkipped.length > 0
-    ? "No mutation fixtures to re-prove: selected fixtures belong only to quarantined suites."
-    : shard
-      ? `No selected mutation fixtures are assigned to shard ${a.shard}.`
-      : liveRefused.length > 0
-        ? "No mutation fixtures to re-prove: every selected fixture was a named live-shaped refusal."
-        : metadataOnlyExclusions.size > 0
-          ? "No mutation fixtures to re-prove: the only intersections were metadata-only config-path exclusions."
-          : "No mutation fixtures to re-prove: no fixture config, suite, or guarded source intersects the diff.");
+  if (!a.all && quarantinedSkipped.length > 0) {
+    console.log("No mutation fixtures to re-prove: selected fixtures belong only to quarantined suites.");
+    process.exit(0);
+  }
+  console.log(shard
+    ? `No selected mutation fixtures are assigned to shard ${a.shard}.`
+    : liveRefused.length > 0
+      ? "No mutation fixtures to re-prove: every selected fixture was a named live-shaped refusal."
+      : metadataOnlyExclusions.size > 0
+        ? "No mutation fixtures to re-prove: the only intersections were metadata-only config-path exclusions."
+        : "No mutation fixtures to re-prove: no fixture config, suite, or guarded source intersects the diff.");
   process.exit(0);
 }
 
