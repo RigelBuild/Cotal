@@ -186,7 +186,8 @@ export function aclEnv(opts: {
   // Control-plane capabilities (e.g. `spawn`) gate cotal_spawn/cotal_persona in the connector's tool
   // list. Forward them on the same rail as the read/post ACL, or a manifest-spawned agent (no persona
   // file) gets `config.capabilities = []` and the tools stay hidden even though its creds authorize them.
-  if (opts.capabilities?.length) env.COTAL_CAPABILITIES = opts.capabilities.join(",");
+  // An empty list is forwarded as an empty value, like the ACL lists: the launcher decided "none".
+  if (opts.capabilities) env.COTAL_CAPABILITIES = opts.capabilities.join(",");
   return env;
 }
 

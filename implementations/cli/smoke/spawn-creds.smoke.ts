@@ -6,11 +6,15 @@
  * minted and provisioned out of band (as `cotal mint --provision` would), then handed to the spawn.
  * Cells:
  *   - refusals: no uid, a malformed uid, a uid the credential does not name, `--lifecycle-uid`
- *     outside a foreground creds launch, and a credential without its event-channel grant;
+ *     outside a foreground creds launch, a credential without its event-channel grant, and a
+ *     wildcard grant that does not cover that channel;
+ *   - a credential the broker rejects is refused without pruning the `up`-origin mesh record;
  *   - `--creds --detach` still takes the detached control path (unchanged semantics);
  *   - the valid launch reaches presence as the credential's identity under the persona's name;
  *   - the material file carries the creds path and servers, the child environment carries neither;
- *   - the credential's own grants set COTAL_CAPABILITIES, and the operator's file survives exit.
+ *   - the credential's own grants set COTAL_CAPABILITIES, and the operator's file survives exit;
+ *   - a credential with no capabilities and a wildcard event grant launches, and its session sees
+ *     no capabilities even though the persona declares spawn.
  *
  * The connector env is the real Hermes `buildLaunch`; only its command is replaced by a node child
  * that joins the mesh from the material file alone.
@@ -40,11 +44,11 @@ process.env.COTAL_SKIP_CONNECTOR_SEED = "1";
 await import("../src/index.js");
 const { runCli } = await import("../src/command.js");
 const { CotalEndpoint, createSpaceAuth, eventChannel, mintCreds, mintLifecycleUid, newIdentity, principalKey, probeConnect, provisionAgent, registry, serverConfig, setupSpaceStreams, DEV_OWNER, LAUNCH_MATERIAL_ENV } = await import("@cotal-ai/core");
-const { recordMesh } = await import("@cotal-ai/workspace");
+const { findMesh, recordMesh } = await import("@cotal-ai/workspace");
 const { hermesConnector } = await import("../../../extensions/connector-hermes/src/extension.js");
 
 /** What the child wrote: its pid, its whole env, the material it read, and how its join went. */
-interface ChildReport { pid: number; env: Record<string, string>; material: Record<string, unknown>; started?: boolean; error?: string }
+interface ChildReport { pid: number; env: Record<string, string>; material: Record<string, unknown>; capabilities?: string[]; started?: boolean; error?: string }
 
 let pass = 0, fail = 0;
 const check = (name: string, cond: boolean, extra?: unknown) => {
@@ -53,15 +57,18 @@ const check = (name: string, cond: boolean, extra?: unknown) => {
 };
 const report = join(temp, "child.json");
 const coreDist = resolve(import.meta.dirname, "..", "..", "..", "packages", "core", "dist", "index.js");
+const connectorCoreDist = resolve(import.meta.dirname, "..", "..", "..", "extensions", "connector-core", "dist", "index.js");
 // The child holds only what the launch handed it: env from Hermes' buildLaunch plus the material file.
+// It reports the capabilities a real connector session would resolve from that env and the persona.
 const CHILD = [
   "const fs=require('node:fs');const{pathToFileURL}=require('node:url');",
-  "import(pathToFileURL(process.env.CORE_DIST).href).then(async({CotalEndpoint,readLaunchMaterial})=>{",
+  "Promise.all([import(pathToFileURL(process.env.CORE_DIST).href),import(pathToFileURL(process.env.CC_DIST).href)]).then(async([{CotalEndpoint,readLaunchMaterial},{configFromEnv}])=>{",
   "const m=readLaunchMaterial(process.env.COTAL_LAUNCH_MATERIAL);",
-  "const out={pid:process.pid,env:process.env,material:m};const save=()=>fs.writeFileSync(process.env.REPORT,JSON.stringify(out));save();",
+  "const out={pid:process.pid,env:process.env,material:m};const save=()=>fs.writeFileSync(process.env.REPORT,JSON.stringify(out));",
+  "try{out.capabilities=configFromEnv({...process.env}).capabilities??[];}catch(e){out.error='config: '+String(e&&e.message);}save();",
   "const ep=new CotalEndpoint({space:process.env.COTAL_SPACE,servers:m.servers,creds:fs.readFileSync(m.creds,'utf8'),lifecycleUid:process.env.COTAL_LIFECYCLE_UID,channels:[],card:{id:process.env.COTAL_ID,name:process.env.COTAL_NAME,kind:'agent'}});",
   "ep.on('error',(e)=>{out.error=String(e.message);save();});",
-  "try{await ep.start();out.started=true;}catch(e){out.error=String(e&&e.message);}save();setInterval(()=>{},1000);});",
+  "try{await ep.start();out.started=out.error===undefined;}catch(e){out.error=String(e&&e.message);}save();setInterval(()=>{},1000);});",
 ].join("");
 let lastSpec: LaunchSpec | undefined;
 const probe: Connector = {
@@ -71,7 +78,7 @@ const probe: Connector = {
   eventChannel,
   buildLaunch: (o: LaunchOpts): LaunchSpec => {
     const real = hermesConnector.buildLaunch(o);
-    lastSpec = { command: process.execPath, args: ["-e", CHILD], env: { ...real.env, CORE_DIST: coreDist, REPORT: report } };
+    lastSpec = { command: process.execPath, args: ["-e", CHILD], env: { ...real.env, CORE_DIST: coreDist, CC_DIST: connectorCoreDist, REPORT: report } };
     return lastSpec;
   },
 };
@@ -130,16 +137,37 @@ try {
   const bare = newIdentity();
   const bareUid = mintLifecycleUid();
   const bareCreds = await provisionAgent(provisioner, auth, bare, { lifecycleUid: bareUid, subscribe: [], allowSubscribe: [] });
+  // No capabilities, and an event grant that only a wildcard covers.
+  const wild = newIdentity();
+  const wildUid = mintLifecycleUid();
+  const wildCreds = await provisionAgent(provisioner, auth, wild, { lifecycleUid: wildUid, subscribe: [], allowSubscribe: [], allowPublish: ["events.>"] });
+  // A wildcard grant over someone else's event channels only.
+  const narrow = newIdentity();
+  const narrowUid = mintLifecycleUid();
+  const narrowCreds = await provisionAgent(provisioner, auth, narrow, { lifecycleUid: narrowUid, subscribe: [], allowSubscribe: [], allowPublish: ["events.someone.>"] });
   await provisioner.stop();
-  const credsPath = join(temp, "agent.creds");
-  const bareCredsPath = join(temp, "bare.creds");
-  writeFileSync(credsPath, creds, { mode: 0o600 });
-  writeFileSync(bareCredsPath, bareCreds, { mode: 0o600 });
+  // Well formed for this space and uid, but signed by an account this broker does not trust.
+  const foreign = newIdentity();
+  const foreignUid = mintLifecycleUid();
+  const foreignCreds = await mintCreds(await createSpaceAuth(SPACE), foreign, "agent", {
+    lifecycleUid: foreignUid, allowPublish: [eventChannel({ owner: DEV_OWNER, actor: foreign.id })],
+  });
+  const write = (file: string, text: string): string => {
+    const path = join(temp, file);
+    writeFileSync(path, text, { mode: 0o600 });
+    return path;
+  };
+  const credsPath = write("agent.creds", creds);
+  const bareCredsPath = write("bare.creds", bareCreds);
+  const wildCredsPath = write("wild.creds", wildCreds);
+  const narrowCredsPath = write("narrow.creds", narrowCreds);
+  const foreignCredsPath = write("foreign.creds", foreignCreds);
 
-  // The launch host: a mesh record whose root holds nothing, and a persona outside any catalog.
-  recordMesh({ space: SPACE, server, root: launchDir, mode: "auth", origin: "manual", ts: new Date().toISOString() });
+  // The launch host: an `up` record (the prunable kind) whose root holds nothing, and a persona
+  // outside any catalog that declares more than some credentials grant.
+  recordMesh({ space: SPACE, server, root: launchDir, mode: "auth", origin: "up", ts: new Date().toISOString() });
   const persona = join(temp, "seedless.md");
-  writeFileSync(persona, "---\nname: seedless\nrole: worker\nsubscribe: []\nallowSubscribe: []\n---\nseedless spawn acceptance\n");
+  writeFileSync(persona, "---\nname: seedless\nrole: worker\nsubscribe: []\nallowSubscribe: []\ncapabilities: [spawn]\n---\nseedless spawn acceptance\n");
   process.chdir(launchDir);
   const base = ["spawn", "--config", persona, "--space", SPACE, "--agent", "creds-probe"];
 
@@ -176,40 +204,74 @@ try {
     check("a credential without its event-channel grant is refused unless --no-events", r.exited === 1 && /event channel/.test(r.stderr), r);
     check("event-grant refusal happens before any launch", lastSpec === undefined, lastSpec);
   }
+  {
+    const r = await run([...base, "--creds", narrowCredsPath, "--lifecycle-uid", narrowUid]);
+    check("a wildcard grant that does not cover the event channel is refused", r.exited === 1 && /event channel/.test(r.stderr), r);
+  }
+  {
+    const r = await run([...base, "--creds", foreignCredsPath, "--lifecycle-uid", foreignUid]);
+    check("a credential the broker rejects exits 1 as a rejected credential", r.exited === 1 && /rejected|requires auth|authoriz/i.test(r.stderr), r);
+    check("the rejection does not prune the up-origin mesh record", findMesh(SPACE)?.server === server, findMesh(SPACE));
+    check("the rejection does not blame the registry entry", !/no longer matches its registry entry|removed/.test(r.stderr), r.stderr);
+    check("a rejected credential is refused before any launch", lastSpec === undefined, lastSpec);
+  }
 
-  console.log("seedless foreground launch");
   observer = new CotalEndpoint({ space: SPACE, servers: server, creds: await mintCreds(auth, newIdentity(), "observer"), card: { name: "observer", kind: "endpoint" }, channels: [], consume: false, registerPresence: false });
   await observer.start();
-  const launched = run([...base, "--creds", credsPath, "--lifecycle-uid", lifecycleUid]);
-  let presence: Presence | undefined;
-  // Presence is keyed by principal: the dev owner qualifies the credential's actor id.
-  const presenceId = principalKey(DEV_OWNER, actor.id).key;
-  for (let i = 0; i < 150 && !presence; i++) {
-    await sleep(100);
-    presence = observer.getRoster().find((p) => p.card.id === presenceId && p.status !== "offline");
+  const roster = observer;
+  /** Launch one credential, wait for its presence, read the child's report, then stop it. */
+  const launch = async (path: string, uid: string, actorId: string) => {
+    rmSync(report, { force: true });
+    const launched = run([...base, "--creds", path, "--lifecycle-uid", uid]);
+    // Presence is keyed by principal: the dev owner qualifies the credential's actor id.
+    const presenceId = principalKey(DEV_OWNER, actorId).key;
+    let presence: Presence | undefined;
+    for (let i = 0; i < 150 && !presence; i++) {
+      await sleep(100);
+      presence = roster.getRoster().find((p) => p.card.id === presenceId && p.status !== "offline");
+    }
+    // SAFETY: the child above writes exactly this shape; it is this suite's own fixture.
+    const child: ChildReport | undefined = existsSync(report) ? (JSON.parse(readFileSync(report, "utf8")) as ChildReport) : undefined;
+    childPid = child?.pid;
+    return { presence, child, stop: async () => {
+      if (childPid) process.kill(childPid, "SIGTERM");
+      const done = await launched;
+      childPid = undefined;
+      return done;
+    } };
+  };
+
+  console.log("seedless foreground launch");
+  {
+    const { presence, child, stop } = await launch(credsPath, lifecycleUid, actor.id);
+    check("the pre-minted identity reaches presence", presence !== undefined, roster.getRoster().map((p) => p.card.id));
+    check("under the persona's name", presence?.card.name === "seedless", presence?.card);
+    check("the child's endpoint joined without error", child?.started === true && child.error === undefined, child?.error);
+    check("the material file carries the creds path", child?.material.creds === resolve(credsPath), child?.material);
+    check("the material file carries the servers", child?.material.servers === server, child?.material);
+    const envValues = Object.values(child?.env ?? {});
+    check("the child env names the material file", typeof child?.env[LAUNCH_MATERIAL_ENV] === "string");
+    check("the child env carries no creds path", child !== undefined && !envValues.some((v) => v.includes(credsPath)), child?.env);
+    check("the child env carries no server URL", child !== undefined && !envValues.some((v) => v.includes(server)));
+    check("the child env carries no COTAL_CREDS / COTAL_SERVERS", child !== undefined && !("COTAL_CREDS" in child.env) && !("COTAL_SERVERS" in child.env));
+    check("COTAL_CAPABILITIES comes from the credential's grants", child?.env.COTAL_CAPABILITIES === "spawn", child?.env.COTAL_CAPABILITIES);
+    check("COTAL_ID / COTAL_LIFECYCLE_UID are the credential's", child?.env.COTAL_ID === actor.id && child?.env.COTAL_LIFECYCLE_UID === lifecycleUid);
+    const done = await stop();
+    check("the spawn returns once the child exits", done.exited === undefined, done);
+    check("the launch root still has no .cotal", !existsSync(join(launchDir, ".cotal")));
+    check("the operator's credential file is not retired", existsSync(credsPath));
+    check("no secret material was written", !/retired creds|wrote creds/.test(done.stderr), done.stderr);
   }
-  check("the pre-minted identity reaches presence", presence !== undefined, observer.getRoster().map((p) => p.card.id));
-  check("under the persona's name", presence?.card.name === "seedless", presence?.card);
-  // SAFETY: the child above writes exactly this shape; it is this suite's own fixture.
-  const child: ChildReport | undefined = existsSync(report) ? (JSON.parse(readFileSync(report, "utf8")) as ChildReport) : undefined;
-  childPid = child?.pid;
-  check("the child's endpoint joined without error", child?.started === true && child.error === undefined, child?.error);
-  check("the material file carries the creds path", child?.material.creds === resolve(credsPath), child?.material);
-  check("the material file carries the servers", child?.material.servers === server, child?.material);
-  const envValues = Object.values(child?.env ?? {});
-  check("the child env names the material file", typeof child?.env[LAUNCH_MATERIAL_ENV] === "string");
-  check("the child env carries no creds path", child !== undefined && !envValues.some((v) => v.includes(credsPath)), child?.env);
-  check("the child env carries no server URL", child !== undefined && !envValues.some((v) => v.includes(server)));
-  check("the child env carries no COTAL_CREDS / COTAL_SERVERS", child !== undefined && !("COTAL_CREDS" in child.env) && !("COTAL_SERVERS" in child.env));
-  check("COTAL_CAPABILITIES comes from the credential's grants", child?.env.COTAL_CAPABILITIES === "spawn", child?.env.COTAL_CAPABILITIES);
-  check("COTAL_ID / COTAL_LIFECYCLE_UID are the credential's", child?.env.COTAL_ID === actor.id && child?.env.COTAL_LIFECYCLE_UID === lifecycleUid);
-  if (childPid) process.kill(childPid, "SIGTERM");
-  const done = await launched;
-  childPid = undefined;
-  check("the spawn returns once the child exits", done.exited === undefined, done);
-  check("the launch root still has no .cotal", !existsSync(join(launchDir, ".cotal")));
-  check("the operator's credential file is not retired", existsSync(credsPath));
-  check("no secret material was written", !/retired creds|wrote creds/.test(done.stderr), done.stderr);
+
+  console.log("no-capability credential, wildcard event grant, spawn-declaring persona");
+  {
+    const { presence, child, stop } = await launch(wildCredsPath, wildUid, wild.id);
+    check("a wildcard grant covering the event channel is accepted and reaches presence", presence !== undefined, child?.error);
+    check("COTAL_CAPABILITIES is defined and empty", child?.env.COTAL_CAPABILITIES === "", child?.env.COTAL_CAPABILITIES);
+    check("the session resolves no capabilities despite the persona's spawn", Array.isArray(child?.capabilities) && child.capabilities.length === 0, child?.capabilities);
+    const done = await stop();
+    check("the wildcard launch returns once the child exits", done.exited === undefined, done);
+  }
 } finally {
   process.chdir(cwd);
   process.exitCode = fail === 0 ? 0 : 1;
@@ -220,7 +282,7 @@ try {
   rmSync(temp, { recursive: true, force: true });
 }
 
-const EXPECTED = 24;
+const EXPECTED = 33;
 check(`every cell ran - ${EXPECTED} expected`, pass + fail === EXPECTED, `${pass + fail} cells reported`);
 console.log(`\nSPAWN-CREDS ${fail === 0 ? "OK" : "FAILED"}  (${pass} passed, ${fail} failed)`);
 process.exit(fail === 0 ? 0 : 1);

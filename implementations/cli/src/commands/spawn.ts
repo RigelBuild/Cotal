@@ -7,6 +7,7 @@ import {
   agentFilePath,
   assertLifecycleToken,
   chatSubject,
+  channelInAllow,
   credsClaims,
   connectorServers,
   spawnEnvAllow,
@@ -95,7 +96,7 @@ import {
 } from "@cotal-ai/workspace";
 import { c } from "../ui.js";
 import { completedFlagValue, completingFlagValue, hasCompletedFlagValue, positionalsForCompletion } from "../lib/completion.js";
-import { preflightOrExit, refuseStaticCredsForKnownUserAuthOrExit, resolveTargetOrExit } from "../lib/connect.js";
+import { preflightOrExit, reachableOrExit, refuseStaticCredsForKnownUserAuthOrExit, resolveTargetOrExit } from "../lib/connect.js";
 import { readCredentialGrant, type CredentialGrant } from "./spawn-creds.js";
 import { askManager, failIfNotOk, onInstanceOrExit, resolveControlTarget, START_TIMEOUT_MS, withControlConnection } from "../lib/control.js";
 import { listDeclaredChannels, listDeclaredRoles, listPersonas } from "../lib/personas.js";
@@ -983,7 +984,10 @@ export async function spawn(args: ParsedArgs): Promise<void> {
 
   // Preflight: fail with one sentence if the mesh is down or won't take our creds, instead of
   // crashing mid-connect with a raw NATS Authorization Violation.
-  if (handoffText === undefined) await preflightOrExit(target, presented?.text);
+  // A presented credential takes the raw probe: its rejection is about that credential, never a
+  // stale-registry signal, so it must not prune the recorded mesh.
+  if (presented) await reachableOrExit(target.server, { creds: presented.text, ...(target.tlsRequired ? { tls: true } : {}) });
+  else if (handoffText === undefined) await preflightOrExit(target);
   else
     await preflightOrThrow(target).catch(() => {
       console.error(c.red(`✗ ${HANDOFF_REFUSALS.preflight}`));
@@ -1140,7 +1144,8 @@ export async function spawn(args: ParsedArgs): Promise<void> {
     lifecycleUid = pairedUid!;
     if (launchEvents) {
       const channel = connector.eventChannel!({ owner: DEV_OWNER, actor: id });
-      if (!(credsClaims(presented.text).nats?.pub?.allow ?? []).includes(chatSubject(space, DEV_OWNER, id, channel))) {
+      // NATS grants may be wildcards (`…events.>`), so coverage is pattern matching, not membership.
+      if (!channelInAllow(credsClaims(presented.text).nats?.pub?.allow ?? [], chatSubject(space, DEV_OWNER, id, channel))) {
         console.error(c.red(`✗ the credential does not grant publish on its event channel "${channel}" - pass --no-events, or mint it with that channel in --allow-publish`));
         process.exit(1);
       }
