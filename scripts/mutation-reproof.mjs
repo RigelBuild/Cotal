@@ -37,7 +37,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { comparableFailure, failureSignatureHash, unmeasurableFailure } from "./mutation-failure-signature.mjs";
 import { liveShapedCommandReason, liveShapedFixtureReason } from "./mutation-command-safety.mjs";
@@ -226,6 +226,22 @@ function isExecutesOnlyConfigChange(root, base, fixture) {
   return isDeepStrictEqual(baseRest, headRest);
 }
 
+async function quarantinedSuitePaths(root) {
+  const { QUARANTINED, LIVE_QUARANTINED } = await import(pathToFileURL(resolve(root, "bin/smoke/ci-quarantine.mjs")).href);
+  const { scripts = {} } = existsSync(resolve(root, "package.json"))
+    ? JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"))
+    : {};
+  const suites = new Map();
+  for (const scriptName of [...Object.keys(QUARANTINED), ...Object.keys(LIVE_QUARANTINED)]) {
+    const command = scripts[scriptName];
+    if (typeof command !== "string") continue;
+    for (const token of command.split(/\s+/)) {
+      if (token.includes("/") && /\.(?:ts|mts|mjs|js)$/.test(token)) suites.set(token, scriptName);
+    }
+  }
+  return suites;
+}
+
 const a = args(process.argv.slice(2));
 const root = resolve(a.root ?? process.cwd());
 const head = a.head ?? "HEAD";
@@ -314,6 +330,18 @@ let selected = fixtures.map((fixture) => ({
   },
 })).filter(({ selectedBy }) => Object.values(selectedBy).some(Boolean));
 if (shard) selected = selected.filter(({ path }) => mutationShard(path, Number(shard[2])) === Number(shard[1]));
+let quarantinedSkipped = [];
+if (a.all) {
+  const quarantinedSuites = await quarantinedSuitePaths(root);
+  quarantinedSkipped = selected.flatMap((fixture) => {
+    const scriptName = fixture.suites.map((suite) => quarantinedSuites.get(suite)).find(Boolean);
+    return scriptName ? [{ path: fixture.path, scriptName }] : [];
+  });
+  const skippedPaths = new Set(quarantinedSkipped.map(({ path }) => path));
+  selected = selected.filter(({ path }) => !skippedPaths.has(path));
+  console.log(`mutation reproof: skipped ${quarantinedSkipped.length} fixture(s) of quarantined suites:`);
+  for (const { path, scriptName } of quarantinedSkipped) console.log(`  ${path} (${scriptName})`);
+}
 
 const liveRefused = selected.flatMap((fixture) => {
   const reason = liveShapedFixtureReason(fixture, { cwd: root });
@@ -914,5 +942,5 @@ if (!floor.pass) {
   process.exit(1);
 }
 console.log(a.all
-  ? `\nMUTATION REPROOF OK (${selected.length} fixture(s) selected; ${discriminated.length} discriminated, ${preRed.length} pre-red, ${inconclusive.length} inconclusive; base not compared under --all)`
+  ? `\nMUTATION REPROOF OK (${selected.length} fixture(s) selected; ${discriminated.length} discriminated; ${quarantinedSkipped.length} quarantined skipped; ${preRed.length} pre-red, ${inconclusive.length} inconclusive; base not compared under --all)`
   : `\nMUTATION REPROOF OK (${selected.length} fixture(s) selected; ${discriminated.length} discriminated, ${fixtureCount(preRed)} inherited pre-red, 0 attributable pre-red, 0 unmeasured pre-red, ${inconclusive.length} inconclusive)`);

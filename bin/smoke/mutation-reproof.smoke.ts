@@ -140,12 +140,15 @@ const scan = (root: string, base: string, head: string, env = childEnv(), shard?
   const run = spawnSync(process.execPath, args, { encoding: "utf8", env });
   return { status: run.status, out: `${run.stdout ?? ""}${run.stderr ?? ""}` };
 };
+
 const scanAll = (root: string, shard?: string): { status: number | null; out: string } => {
   const args = [SCAN, "--root", root, "--all"];
   if (shard !== undefined) args.push("--shard", shard);
   const run = spawnSync(process.execPath, args, { encoding: "utf8", env: childEnv() });
   return { status: run.status, out: `${run.stdout ?? ""}${run.stderr ?? ""}` };
 };
+
+
 
 /**
  * A synthetic repo with TWO fixtures over TWO guarded sources. `mutate` decides what the head commit
@@ -159,6 +162,8 @@ function makeRepo(mutate: (root: string) => void, names = ["a", "b"]): { root: s
   git(root, ["config", "user.name", "Smoke"]);
   mkdirSync(join(root, "smoke", "mutations"), { recursive: true });
   mkdirSync(join(root, "suites"), { recursive: true });
+  mkdirSync(join(root, "bin", "smoke"), { recursive: true });
+  writeFileSync(join(root, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = {};\nexport const LIVE_QUARANTINED = {};\n");
   for (const name of names) {
     writeFileSync(join(root, `${name}.mjs`), [
       `export function capped_${name}(input) {`,
@@ -216,6 +221,8 @@ function makeSingle(
   git(root, ["config", "user.name", "Smoke"]);
   mkdirSync(join(root, "smoke", "mutations"), { recursive: true });
   mkdirSync(join(root, "suites"), { recursive: true });
+  mkdirSync(join(root, "bin", "smoke"), { recursive: true });
+  writeFileSync(join(root, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = {};\nexport const LIVE_QUARANTINED = {};\n");
   seed(root);
   git(root, ["add", "."]);
   git(root, ["commit", "--quiet", "-m", "base"]);
@@ -226,6 +233,7 @@ function makeSingle(
   const head = git(root, ["rev-parse", "HEAD"]);
   return { root, base, head };
 }
+
 
 const previousSentinel = process.env.COTAL_REPROOF_SENTINEL;
 try {
@@ -1916,6 +1924,62 @@ try {
         && unmeasuredPreRedPaths(out).length === 0
         && floorCouldNot(out, ["smoke/mutations/all.mutations.json"]),
       `status=${status} preRed=${JSON.stringify(preRedPaths(out))}\n${out}`,
+    );
+  }
+  {
+    const { root } = makeSingle(
+      (r) => {
+        writeFileSync(join(r, "package.json"), JSON.stringify({ scripts: { "smoke:quarantined": "node suites/quarantined.suite.mjs" } }, null, 2));
+        mkdirSync(join(r, "bin", "smoke"), { recursive: true });
+        writeFileSync(join(r, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = { 'smoke:quarantined': {} };\nexport const LIVE_QUARANTINED = {};\n");
+        for (const name of ["quarantined", "live"]) {
+          writeFileSync(join(r, `${name}.mjs`), `export const ${name} = () => 1;\n`);
+          writeFileSync(join(r, "suites", `${name}.suite.mjs`), `import { ${name} } from '../${name}.mjs';\nif (${name}() !== 1) { console.error('✗ FAIL: ${name} cap holds'); process.exit(1); }\nconsole.log('✓ ${name} cap holds');\n`);
+          writeFileSync(join(r, "smoke", "mutations", `${name}.mutations.json`), JSON.stringify({
+            suite: [`suites/${name}.suite.mjs`], command: `node suites/${name}.suite.mjs`, mutations: [{
+              name: `${name} changes`, file: `${name}.mjs`, find: `export const ${name} = () => 1;`,
+              replace: `export const ${name} = () => 2;`, expectRed: `${name} cap holds`,
+            }],
+          }, null, 2));
+        }
+      },
+      (r) => writeFileSync(join(r, "head-note"), "head\n"),
+    );
+    const { status, out } = scanAll(root);
+    check(
+      "--all skips quarantined suites, lists their script, and proves remaining fixtures",
+      status === 0
+        && eq(selectedPaths(out), ["smoke/mutations/live.mutations.json"])
+        && /skipped 1 fixture\(s\) of quarantined suites:\n  smoke\/mutations\/quarantined\.mutations\.json \(smoke:quarantined\)/.test(out)
+        && /MUTATION REPROOF OK \(1 fixture\(s\) selected; 1 discriminated; 1 quarantined skipped;/.test(out),
+      `status=${status}\n${out}`,
+    );
+  }
+  {
+    const { root, base, head } = makeSingle(
+      (r) => {
+        writeFileSync(join(r, "package.json"), JSON.stringify({ scripts: { "smoke:quarantined": "node suites/quarantined.suite.mjs" } }, null, 2));
+        mkdirSync(join(r, "bin", "smoke"), { recursive: true });
+        writeFileSync(join(r, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = { 'smoke:quarantined': {} };\nexport const LIVE_QUARANTINED = {};\n");
+        writeFileSync(join(r, "quarantined.mjs"), "export const quarantined = () => 1;\n");
+        writeFileSync(join(r, "suites", "quarantined.suite.mjs"), "import { quarantined } from '../quarantined.mjs';\nif (quarantined() !== 1) { console.error('✗ FAIL: quarantined cap holds'); process.exit(1); }\nconsole.log('✓ quarantined cap holds');\n");
+        writeFileSync(join(r, "smoke", "mutations", "quarantined.mutations.json"), JSON.stringify({
+          suite: ["suites/quarantined.suite.mjs"], command: "node suites/quarantined.suite.mjs", mutations: [{
+            name: "quarantined changes", file: "quarantined.mjs", find: "export const quarantined = () => 1;",
+            replace: "export const quarantined = () => 2;", expectRed: "quarantined cap holds",
+          }],
+        }, null, 2));
+      },
+      (r) => writeFileSync(join(r, "suites", "quarantined.suite.mjs"), readFileSync(join(r, "suites", "quarantined.suite.mjs"), "utf8") + "// suite changed\n"),
+    );
+    const { status, out } = scan(root, base, head);
+    check(
+      "diff mode still proves a quarantined fixture when its suite changed",
+      status === 0
+        && eq(selectedPaths(out), ["smoke/mutations/quarantined.mutations.json"])
+        && !out.includes("skipped ")
+        && /MUTATION REPROOF OK \(1 fixture\(s\) selected; 1 discriminated/.test(out),
+      `status=${status}\n${out}`,
     );
   }
   {
