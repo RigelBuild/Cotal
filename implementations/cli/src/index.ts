@@ -259,6 +259,7 @@ const baseCommands: Command[] = [
       { name: "expires-in", type: "string", value: "<seconds>", description: "bound the credential's lifetime (TTL in seconds, e.g. 3600); mutually exclusive with --expires-at" },
       { name: "expires-at", type: "string", value: "<unix-seconds>", description: "bound the credential's lifetime (absolute exp, unix seconds); mutually exclusive with --expires-in" },
       { name: "identity", type: "string", value: "<creds>", description: "re-mint for the existing nkey carried by this creds file (JWT + USER NKEY SEED), keeping the principal and its durables; default: a fresh identity" },
+      { name: "new-incarnation", type: "boolean", description: "agent profile only: with --identity, create a fresh lifecycle incarnation for the same nkey" },
       spaceFlag,
       serverFlag,
     ],

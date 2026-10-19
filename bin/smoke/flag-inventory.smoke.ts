@@ -138,11 +138,12 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
     // second half); the target flags name the mesh that provisioning connects to.
     // `--expires-in` / `--expires-at` / `--identity` (2026-09, #1992): bound the credential's lifetime
     // (TTL seconds or absolute exp, mutually exclusive), and re-mint for the nkey an existing creds
-    // file already carries. All three are refused together with `--signer`.
+    // file already carries. All three are refused together with `--signer`. `--new-incarnation`: an
+    // agent re-mint takes a fresh lifecycle UID instead of keeping the one the old creds name.
     flags: [
       "allow-publish:string", "allow-subscribe:string", "expires-at:string", "expires-in:string",
-      "force:boolean", "identity:string", "out:string", "profile:string", "provision:boolean",
-      "role:string", "server:string", "signer:boolean", "space:string",
+      "force:boolean", "identity:string", "new-incarnation:boolean", "out:string", "profile:string",
+      "provision:boolean", "role:string", "server:string", "signer:boolean", "space:string",
     ],
     positionals: true,
   },

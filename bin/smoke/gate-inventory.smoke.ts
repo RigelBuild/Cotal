@@ -25,6 +25,7 @@ import ts from "typescript";
 import { parse as parseYaml } from "yaml";
 import { readCiSuites, ciChainBody } from "./ci-suites.mjs";
 import { LIVE_QUARANTINED, QUARANTINED } from "./ci-quarantine.mjs";
+import { duplicateObjectKeys } from "./json-duplicate-keys.js";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -141,32 +142,8 @@ const packagePath = join(ROOT, "package.json");
 const packageText = readFileSync(packagePath, "utf8");
 const packageSource = ts.parseJsonText(packagePath, packageText);
 
-/** JSON.parse silently keeps the final value of a duplicate object key. Walk TypeScript's JSON AST,
- *  which preserves every property, so a duplicate script cannot hide behind the same parsed map the
- *  inventory is auditing. Recurse through every object: the invariant belongs to the manifest, not
- *  only today's `scripts` shape. */
-function duplicateObjectKeys(node: ts.Node, path = "$"): string[] {
-  if (ts.isArrayLiteralExpression(node))
-    return node.elements.flatMap((element, index) => duplicateObjectKeys(element, `${path}[${index}]`));
-  if (!ts.isObjectLiteralExpression(node)) return [];
-  const seen = new Set<string>();
-  const duplicates: string[] = [];
-  for (const property of node.properties) {
-    if (!ts.isPropertyAssignment(property)) continue;
-    const name =
-      ts.isStringLiteral(property.name) || ts.isNumericLiteral(property.name)
-        ? property.name.text
-        : property.name.getText(packageSource);
-    const next = `${path}.${name}`;
-    if (seen.has(name)) duplicates.push(next);
-    else seen.add(name);
-    duplicates.push(...duplicateObjectKeys(property.initializer, next));
-  }
-  return duplicates;
-}
-
 const rootExpression = (packageSource.statements[0] as ts.ExpressionStatement | undefined)?.expression;
-const duplicatePackageKeys = rootExpression ? duplicateObjectKeys(rootExpression) : [];
+const duplicatePackageKeys = rootExpression ? duplicateObjectKeys(rootExpression, packageSource) : [];
 const pkg = JSON.parse(packageText) as { scripts: Record<string, string> };
 // THE AUDITED SET INCLUDES THE BARE `smoke` SCRIPT. An earlier version filtered on `smoke:` and so
 // could not see `"smoke": "tsx packages/core/smoke.ts"` — a real suite that nothing runs, invisible

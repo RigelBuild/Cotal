@@ -1,17 +1,14 @@
 {
   "grades": "tool",
   "suite": [
-    "bin/smoke/gate-inventory.smoke.ts"
+    "bin/smoke/ci-suites.smoke.ts"
   ],
   "guard": "the root package manifest contains no duplicate object keys, because JSON.parse silently hides every copy except the last",
-  "command": "pnpm smoke:gate-inventory && echo '1 checks passed'",
-  "completionMarker": "GATE INVENTORY",
+  "command": "corepack pnpm smoke:ci-suites && echo '1 checks passed'",
+  "completionMarker": "SUITE COMPLETE:",
   "proveWith": "node scripts/mutation-proof.mjs --config bin/smoke/mutations/package-json-duplicate-keys.json",
   "why": [
-    "Every esbuild invocation warned that smoke:jcode-retry-policy appeared twice in package.json,",
-    "but the gate inventory parsed the manifest with JSON.parse and therefore saw a unique map: the",
-    "same instrument erased the defect before auditing it. TypeScript's JSON AST preserves every",
-    "property, so the gated inventory can now fail on the source manifest rather than its lossy map."
+    "TypeScript's JSON AST preserves every property in the manifest. The configured runner is the deterministic ci-suites smoke: it checks both mint-capabilities registrations, verifies that the real root manifest has no duplicate object keys, and exercises duplicate-key detection with a synthetic manifest. D1 and D2 therefore have explicit failing cells in this runner."
   ],
   "mutations": [
     {
@@ -19,7 +16,14 @@
       "file": "package.json",
       "find": "    \"smoke:jcode-recovery-classifier\": \"tsx extensions/connector-jcode/smoke/jcode-recovery-classifier.smoke.ts\",\n    \"smoke:jcode-mid-turn-delivery\": \"tsx extensions/connector-jcode/smoke/jcode-mid-turn-delivery.smoke.ts\",\n    \"smoke:jcode-inbound-wedge\": \"pnpm --filter @cotal-ai/connector-core build && tsx extensions/connector-jcode/smoke/jcode-inbound-wedge.smoke.ts\",\n    \"smoke:jcode-queue-fallback-policy\": \"tsx extensions/connector-jcode/smoke/jcode-queue-fallback-policy.smoke.ts\",\n    \"smoke:jcode-queue-fallback\": \"tsx extensions/connector-jcode/smoke/jcode-queue-fallback.smoke.ts\",\n    \"smoke:jcode-live\": \"tsx extensions/connector-jcode/smoke/jcode-live.smoke.ts\",",
       "replace": "    \"smoke:jcode-recovery-classifier\": \"tsx extensions/connector-jcode/smoke/jcode-recovery-classifier.smoke.ts\",\n    \"smoke:jcode-mid-turn-delivery\": \"tsx extensions/connector-jcode/smoke/jcode-mid-turn-delivery.smoke.ts\",\n    \"smoke:jcode-inbound-wedge\": \"pnpm --filter @cotal-ai/connector-core build && tsx extensions/connector-jcode/smoke/jcode-inbound-wedge.smoke.ts\",\n    \"smoke:jcode-queue-fallback-policy\": \"tsx extensions/connector-jcode/smoke/jcode-queue-fallback-policy.smoke.ts\",\n    \"smoke:jcode-queue-fallback\": \"tsx extensions/connector-jcode/smoke/jcode-queue-fallback.smoke.ts\",\n    \"smoke:jcode-retry-policy\": \"tsx extensions/connector-jcode/smoke/retry-policy.smoke.ts\",\n    \"smoke:jcode-live\": \"tsx extensions/connector-jcode/smoke/jcode-live.smoke.ts\",",
-      "expectRed": "root package JSON has 1 duplicate object key(s)"
+      "expectRed": "root package JSON has no duplicate object keys"
+    },
+    {
+      "name": "D2 remove the mint-capabilities scripts from the root manifest",
+      "file": "package.json",
+      "find": "    \"smoke:mint-provision:auth\": \"tsx implementations/cli/smoke/mint-provision.smoke.ts\",\n    \"smoke:mint-capabilities:unit\": \"tsx implementations/cli/smoke/mint-capabilities.unit.smoke.ts\",\n    \"smoke:mint-capabilities:manager\": \"tsx implementations/manager/smoke/mint-capabilities.smoke.ts\",\n    \"smoke:down-lease-tombstone\": \"tsx implementations/cli/smoke/down-lease-tombstone.smoke.ts\",",
+      "replace": "    \"smoke:mint-provision:auth\": \"tsx implementations/cli/smoke/mint-provision.smoke.ts\",\n    \"smoke:down-lease-tombstone\": \"tsx implementations/cli/smoke/down-lease-tombstone.smoke.ts\",",
+      "expectRed": "smoke:mint-capabilities:"
     }
   ]
 }

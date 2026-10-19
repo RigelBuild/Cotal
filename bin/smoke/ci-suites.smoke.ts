@@ -23,7 +23,9 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import ts from "typescript";
 import { parseCiSuites, readCiSuites, CI_SUITES_PATH } from "./ci-suites.mjs";
+import { duplicateObjectKeys } from "./json-duplicate-keys.js";
 
 let pass = 0;
 let fail = 0;
@@ -174,7 +176,26 @@ check(
   simultaneousAppendsConflict,
 );
 
-const EXPECTED = 24;
+const mintCapabilitySuites = ["smoke:mint-capabilities:unit", "smoke:mint-capabilities:manager"];
+for (const suite of mintCapabilitySuites) {
+  const fragment = real?.includes(suite) === true;
+  check(`${suite} is registered in the real CI suite list`, fragment, real);
+  check(`${suite} resolves to a root smoke script`, typeof packageScripts[suite] === "string", packageScripts[suite]);
+}
+
+const packagePath = join(process.cwd(), "package.json");
+const packageSource = ts.parseJsonText(packagePath, readFileSync(packagePath, "utf8"));
+const packageRoot = (packageSource.statements[0] as ts.ExpressionStatement | undefined)?.expression;
+const packageDuplicates = packageRoot ? duplicateObjectKeys(packageRoot, packageSource) : [];
+check("root package JSON has no duplicate object keys", packageDuplicates.length === 0, packageDuplicates);
+
+const duplicateEntry = '\n  "smoke:ci": "pnpm build && node bin/smoke/shard.mjs 0 1",\n  "smoke:ci": "pnpm build && node bin/smoke/shard.mjs 0 1"';
+const duplicateSource = ts.parseJsonText("package.json fixture", `{${duplicateEntry}\n}`);
+const duplicateRoot = (duplicateSource.statements[0] as ts.ExpressionStatement | undefined)?.expression;
+const duplicateKeys = duplicateRoot ? duplicateObjectKeys(duplicateRoot, duplicateSource) : [];
+check("duplicate manifest keys remain visible to the source-level inventory", duplicateKeys.length === 1 && duplicateKeys[0] === "$.smoke:ci", duplicateKeys);
+
+const EXPECTED = 30;
 check(
   `every cell ran - ${EXPECTED} expected, so a cell that stops existing is not mistaken for one that passed`,
   pass + fail === EXPECTED,

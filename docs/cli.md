@@ -2236,7 +2236,8 @@ presence watch on `<name>` entirely, so `<name>` is required but only echoed in 
 cotal mint <name> [--profile <agent|observer|admin>] [--out <path>] [--signer]
 cotal mint <name> --provision [--role <role>] [--space <s>] [--server <url>]
 cotal mint <name> --expires-in <seconds> | --expires-at <unix-seconds>
-cotal mint <name> --identity <creds> [--expires-in <seconds>]
+cotal mint <name> --identity <creds> [--expires-in <seconds>] [--new-incarnation]  # agent profile only
+
 ```
 
 | Flag | Default | Meaning |
@@ -2252,6 +2253,7 @@ cotal mint <name> --identity <creds> [--expires-in <seconds>]
 | `--expires-in <seconds>` | unbounded | Bound the credential's lifetime: the JWT `exp` is `iat + <seconds>`. A positive integer; refused together with `--expires-at` |
 | `--expires-at <unix-seconds>` | unbounded | Bound the credential to an absolute `exp` (unix seconds). Refused together with `--expires-in` |
 | `--identity <creds>` | a fresh identity | Re-mint for the nkey carried by this creds file, keeping the principal and every durable keyed to it. The file is read by the same loader the endpoint uses; a file with no seed is refused by name |
+| `--new-incarnation` | off | **Agent profile only.** With `--identity`, keep the nkey but mint a fresh lifecycle UID. Without `--identity`, the flag has no effect because mint already creates a fresh identity and lifecycle UID |
 | `--space <s>`, `--server <url>` | the resolved mesh | Which root supplies the agent file, static trust and default credential storage; with `--provision`, also which live mesh receives the durables |
 
 Mints a NATS creds file for a space in **static** auth mode, scoped to a profile and (optionally)
@@ -2278,10 +2280,10 @@ footprint cannot be created under a different root's trust material.
 
 The CLI-mintable profiles carry no default TTL: without a lifetime flag the credential is
 unbounded, and a standing-renewal consumer refuses it. `--expires-in <seconds>` (or
-`--expires-at`) is the door the renewal seam's own error names. `--identity <creds>` re-mints for
-the nkey the file already carries, so the new credential presents the SAME principal and every
-durable keyed to it survives; combine it with a lifetime flag to rotate an expiring credential
-without churning the identity.
+`--expires-at`) is the door the renewal seam's own error names. `--identity <creds>` re-mints for the
+same nkey and, by default, reuses the lifecycle UID from its agent grants so existing DM, delivery,
+and history durables remain bound. Add `--new-incarnation` on the agent profile to mint a fresh lifecycle UID for that
+nkey; use `--provision` to create its new durables. The flag has no effect without `--identity` and is refused for observer or admin profiles.
 
 ## Login
 
