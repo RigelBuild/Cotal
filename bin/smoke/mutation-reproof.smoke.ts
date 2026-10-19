@@ -1988,6 +1988,31 @@ try {
     const { root, base, head } = makeSingle(
       (r) => {
         writeFileSync(join(r, "package.json"), JSON.stringify({ scripts: { "smoke:quarantined": "node suites/quarantined.suite.mjs" } }, null, 2));
+        writeFileSync(join(r, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = { 'smoke:quarantined': {} };\nexport const LIVE_QUARANTINED = {};\n");
+        writeFileSync(join(r, "quarantined.mjs"), "export const quarantined = () => 1;\n");
+        writeFileSync(join(r, "suites", "quarantined.suite.mjs"), "import { quarantined } from '../quarantined.mjs';\nif (quarantined() !== 1) { console.error('✗ FAIL: quarantined cap holds'); process.exit(1); }\nconsole.log('✓ quarantined cap holds');\n");
+        writeFileSync(join(r, "smoke", "mutations", "quarantined.mutations.json"), JSON.stringify({
+          suite: ["suites/quarantined.suite.mjs"], command: "node suites/quarantined.suite.mjs", mutations: [{
+            name: "quarantined changes", file: "quarantined.mjs", find: "export const quarantined = () => 1;",
+            replace: "export const quarantined = () => 2;", expectRed: "quarantined cap holds",
+          }],
+        }, null, 2));
+      },
+      (r) => writeFileSync(join(r, "quarantined.mjs"), "// source-only diff\nexport const quarantined = () => 1;\n"),
+    );
+    const { status, out } = scan(root, base, head);
+    check(
+      "diff mode skips and lists quarantined fixtures selected only by a mutation source",
+      status === 0
+        && selectedPaths(out).length === 0
+        && out.includes("skipped 1 fixture(s) of quarantined suites:\n  smoke/mutations/quarantined.mutations.json (smoke:quarantined)")
+        && out.includes("No mutation fixtures to re-prove: selected fixtures belong only to quarantined suites."),
+    );
+  }
+  {
+    const { root, base, head } = makeSingle(
+      (r) => {
+        writeFileSync(join(r, "package.json"), JSON.stringify({ scripts: { "smoke:quarantined": "node suites/quarantined.suite.mjs" } }, null, 2));
         mkdirSync(join(r, "bin", "smoke"), { recursive: true });
         writeFileSync(join(r, "bin", "smoke", "ci-quarantine.mjs"), "export const QUARANTINED = { 'smoke:quarantined': {} };\nexport const LIVE_QUARANTINED = {};\n");
         writeFileSync(join(r, "quarantined.mjs"), "export const quarantined = () => 1;\n");

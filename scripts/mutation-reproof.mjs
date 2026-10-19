@@ -332,9 +332,15 @@ let selected = fixtures.map((fixture) => ({
 if (shard) selected = selected.filter(({ path }) => mutationShard(path, Number(shard[2])) === Number(shard[1]));
 const selectedBeforeQuarantine = selected;
 let quarantinedSkipped = [];
-if (a.all) {
+// Diff-mode quarantine applies only to mutation-only selection; changed configs and suites still run.
+if (a.all || selected.some(({ selectedBy }) => selectedBy.mutation && !selectedBy.config && !selectedBy.suite)) {
   const quarantinedSuites = await quarantinedSuitePaths(root);
   quarantinedSkipped = selected.flatMap((fixture) => {
+    const onlyMutationChanged = !a.all
+      && fixture.selectedBy.mutation
+      && !fixture.selectedBy.config
+      && !fixture.selectedBy.suite;
+    if (!a.all && !onlyMutationChanged) return [];
     const scriptName = fixture.suites.map((suite) => quarantinedSuites.get(suite)).find(Boolean);
     return scriptName ? [{ path: fixture.path, scriptName }] : [];
   });
@@ -397,9 +403,7 @@ if (dangling.length) {
 // line is the JSON a workflow reads; an empty list is printed, not turned into exit 0 with no output,
 // so a caller that fans out on it can tell "nothing to prove" from "nothing was said".
 if (listShards !== undefined) {
-  const shardCandidates = a.all
-    ? selectedBeforeQuarantine.filter(({ path }) => !liveRefusedPaths.has(path))
-    : prove;
+  const shardCandidates = selectedBeforeQuarantine.filter(({ path }) => !liveRefusedPaths.has(path));
   const shards = [...new Set(shardCandidates.map(({ path }) => mutationShard(path, listShards)))].sort((x, y) => x - y);
   console.log(`shard plan: ${shards.length} of ${listShards} shard(s) hold a selected fixture${shards.length ? `: ${shards.join(", ")}` : ""}`);
   console.log(JSON.stringify({ shards }));
@@ -413,9 +417,11 @@ if (prove.length === 0) {
     ? `No selected mutation fixtures are assigned to shard ${a.shard}.`
     : liveRefused.length > 0
       ? "No mutation fixtures to re-prove: every selected fixture was a named live-shaped refusal."
-      : metadataOnlyExclusions.size > 0
-        ? "No mutation fixtures to re-prove: the only intersections were metadata-only config-path exclusions."
-        : "No mutation fixtures to re-prove: no fixture config, suite, or guarded source intersects the diff.");
+      : !a.all && quarantinedSkipped.length > 0
+        ? "No mutation fixtures to re-prove: selected fixtures belong only to quarantined suites."
+        : metadataOnlyExclusions.size > 0
+          ? "No mutation fixtures to re-prove: the only intersections were metadata-only config-path exclusions."
+          : "No mutation fixtures to re-prove: no fixture config, suite, or guarded source intersects the diff.");
   process.exit(0);
 }
 
@@ -947,4 +953,4 @@ if (!floor.pass) {
 }
 console.log(a.all
   ? `\nMUTATION REPROOF OK (${selected.length} fixture(s) selected; ${discriminated.length} discriminated; ${quarantinedSkipped.length} quarantined skipped; ${preRed.length} pre-red, ${inconclusive.length} inconclusive; base not compared under --all)`
-  : `\nMUTATION REPROOF OK (${selected.length} fixture(s) selected; ${discriminated.length} discriminated, ${fixtureCount(preRed)} inherited pre-red, 0 attributable pre-red, 0 unmeasured pre-red, ${inconclusive.length} inconclusive)`);
+  : `\nMUTATION REPROOF OK (${selected.length} fixture(s) selected; ${discriminated.length} discriminated, ${fixtureCount(preRed)} inherited pre-red, 0 attributable pre-red, 0 unmeasured pre-red, ${inconclusive.length} inconclusive${quarantinedSkipped.length ? `, ${quarantinedSkipped.length} quarantined skipped` : ""})`);
