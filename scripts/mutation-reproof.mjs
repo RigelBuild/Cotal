@@ -235,9 +235,9 @@ async function quarantinedSuitePaths(root) {
   for (const scriptName of [...Object.keys(QUARANTINED), ...Object.keys(LIVE_QUARANTINED)]) {
     const command = scripts[scriptName];
     if (typeof command !== "string") continue;
-    for (const token of command.split(/\s+/)) {
-      if (token.includes("/") && /\.(?:ts|mts|mjs|js)$/.test(token)) suites.set(token, scriptName);
-    }
+    const suiteFiles = command.split(/\s+/).filter((token) => /(?:\.smoke\.ts|\.suite\.mjs)$/.test(token));
+    // Chained suite commands do not identify which suite is quarantined.
+    if (suiteFiles.length === 1) suites.set(suiteFiles[0], scriptName);
   }
   return suites;
 }
@@ -330,6 +330,7 @@ let selected = fixtures.map((fixture) => ({
   },
 })).filter(({ selectedBy }) => Object.values(selectedBy).some(Boolean));
 if (shard) selected = selected.filter(({ path }) => mutationShard(path, Number(shard[2])) === Number(shard[1]));
+const selectedBeforeQuarantine = selected;
 let quarantinedSkipped = [];
 if (a.all) {
   const quarantinedSuites = await quarantinedSuitePaths(root);
@@ -396,7 +397,10 @@ if (dangling.length) {
 // line is the JSON a workflow reads; an empty list is printed, not turned into exit 0 with no output,
 // so a caller that fans out on it can tell "nothing to prove" from "nothing was said".
 if (listShards !== undefined) {
-  const shards = [...new Set(prove.map(({ path }) => mutationShard(path, listShards)))].sort((x, y) => x - y);
+  const shardCandidates = a.all
+    ? selectedBeforeQuarantine.filter(({ path }) => !liveRefusedPaths.has(path))
+    : prove;
+  const shards = [...new Set(shardCandidates.map(({ path }) => mutationShard(path, listShards)))].sort((x, y) => x - y);
   console.log(`shard plan: ${shards.length} of ${listShards} shard(s) hold a selected fixture${shards.length ? `: ${shards.join(", ")}` : ""}`);
   console.log(JSON.stringify({ shards }));
   process.exit(0);
