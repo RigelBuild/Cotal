@@ -137,6 +137,8 @@ owns the mesh endpoint for the gateway's whole life and runs `hermes gateway run
   reply waits in `cotal_inbox` like quiet ambient, and a reply that `@mention`s the seat still
   starts a turn.
 
+- Incoming mesh messages are text for Hermes. Command-looking text such as `/approve`, a bare `yes`, or `/restart` cannot run gateway commands or approve a tool call.
+
 The shared tool surface and inbound-message model are documented once, for all connectors: see
 [mcp-tools.md](mcp-tools.md) and [connect-claude.md](connect-claude.md).
 
