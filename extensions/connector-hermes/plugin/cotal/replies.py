@@ -25,10 +25,23 @@ from typing import Any, Callable, Optional
 TTL_SECONDS = 24 * 3600
 # How many unexpired questions are remembered; the oldest goes first.
 MAX_QUESTIONS = 4096
+# The one chat every mesh message runs in when the adapter's ``single_session`` is on.
+SINGLE_CHAT_ID = "mesh"
 
 _lock = threading.Lock()
 _issued: dict[str, tuple[dict, float]] = {}
 _inject: Optional[Callable[..., Any]] = None
+# The mesh origin ({"peerId"} or {"channel"}) of the turn the shared session runs or last ran.
+_running: Optional[dict] = None
+
+
+def set_running(origin: Optional[dict]) -> None:
+    global _running
+    _running = dict(origin) if origin else None
+
+
+def running() -> Optional[dict]:
+    return dict(_running) if _running else None
 
 
 def bind_host(inject_message: Callable[..., Any]) -> None:

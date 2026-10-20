@@ -50,6 +50,12 @@ class FakeAgent extends EventEmitter {
     return fn();
   }
 
+  holdInFlight(_ids: readonly string[]): boolean {
+    return true;
+  }
+
+  releaseInFlight(_ids: readonly string[]): void {}
+
   private remove(keys: readonly string[]): ExactDrainResult {
     // Keys are receive keys now (the bridge addresses deliveries by InboxItem.recvKey, #624).
     const wanted = new Set(keys);

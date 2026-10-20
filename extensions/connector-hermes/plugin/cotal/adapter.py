@@ -8,6 +8,10 @@ message's mesh origin (the channel it came in on, or a DM to the sender), as a r
 
 A DM answering a question one of this gateway's sessions asked goes to that session, not to
 ``dm:<sender>`` (see replies.py).
+
+With ``gateway.platforms.cotal.single_session: true`` every mesh message runs in one session
+(chat ``mesh``), so the agent has one context across peers. A reply then goes to the origin of the
+message it answers, and a message waits until the running turn ends instead of interrupting it.
 """
 from __future__ import annotations
 
@@ -33,6 +37,9 @@ from .framing import format_injection
 logger = logging.getLogger(__name__)
 # How many delivered messages a turn reply can still name as the one it answers.
 MAX_ANSWERING = 1024
+SINGLE_CHAT_ID = replies.SINGLE_CHAT_ID
+# How often a held message re-checks that the shared session is idle.
+IDLE_POLL_SECONDS = 1.0
 
 
 class InjectionRefused(Exception):
@@ -44,7 +51,7 @@ def chat_type_for(chat_id: str) -> Optional[str]:
     """The chat type of a chat_id minted on inbound, or None for an id this adapter did not mint."""
     if chat_id.startswith("channel:"):
         return "group"
-    if chat_id.startswith("dm:"):
+    if chat_id.startswith("dm:") or chat_id == SINGLE_CHAT_ID:
         return "dm"
     return None
 
@@ -66,6 +73,17 @@ class CotalAdapter(BasePlatformAdapter):
         # message id -> the contextId of a message delivered into its sender's own chat, for the
         # turn reply that names it (the gateway's ``reply_to``).
         self._answering: dict[str, Optional[str]] = {}
+        self._single = (getattr(config, "extra", None) or {}).get("single_session") is True
+        # message id -> the mesh reply target of a message delivered into the shared session.
+        self._origins: dict[str, dict] = {}
+        self._turn_done = asyncio.Event()
+        # The origin of the turn the shared session runs or last ran, for sends that name no message
+        # (progress, a turn-error notice). It changes only when the next turn starts.
+        self._running: Optional[dict] = None
+        # Messages held or running in the shared session, each resolved once its turn is admitted;
+        # one lock admits them in order.
+        self._held: dict[str, asyncio.Future] = {}
+        self._admit = asyncio.Lock()
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect the bridge and start receiving.
@@ -142,12 +160,48 @@ class CotalAdapter(BasePlatformAdapter):
         # reply to a message delivered here names it and copies its contextId (it belongs to the
         # asker); otherwise the sidecar pairs a DM reply with its peer's oldest unanswered message.
         answered = str(reply_to) if reply_to is not None else None
+        if self._single and chat_id == SINGLE_CHAT_ID:
+            # The shared chat names no peer: the reply goes to where the answered message came from.
+            # Progress and notices name no message and go to the origin of the latest turn.
+            target = self._origins.get(answered) if answered else None
+            target = target or self._running
+            if target is None:
+                logger.warning("cotal: a send to the shared chat names no delivered message (%r) and no turn has run; it is not sent", reply_to)
+                return SendResult(success=False, error="cotal reply has no mesh origin")
+        else:
+            # An explicit chat (send_message, cron delivery) goes where it names, in either mode.
+            target = _target_for(chat_id)
         if answered not in self._answering:
             answered = None
-        self._client.reply(
-            _target_for(chat_id), content, answered, self._answering.get(answered) if answered else None
-        )
+        self._client.reply(target, content, answered, self._answering.get(answered) if answered else None)
         return SendResult(success=True, message_id=uuid.uuid4().hex)
+
+    def _set_running(self, origin: Optional[dict]) -> None:
+        self._running = origin
+        replies.set_running(origin)
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        await super().on_processing_start(event)
+        if self._single:
+            # A turn the adapter did not inject (a background completion) answers its session's peer.
+            peer = getattr(event.source, "user_id", None)
+            self._set_running(self._origins.get(str(event.message_id)) or ({"peerId": peer} if peer else None))
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
+        await super().on_processing_complete(event, outcome)
+        self._turn_done.set()
+
+    async def _wait_until_idle(self, source: Any) -> None:
+        """Hold a message while the shared session runs a turn, so it queues behind the turn rather
+        than interrupting it. The sidecar pushes the next message only after this one is delivered,
+        so the rest stay buffered on the mesh, in order. A guard whose task has exited does not hold."""
+        key = self._source_session_key(source)
+        while key in self._active_sessions and not self._session_task_is_stale(key):
+            self._turn_done.clear()
+            try:
+                await asyncio.wait_for(self._turn_done.wait(), IDLE_POLL_SECONDS)
+            except asyncio.TimeoutError:
+                pass
 
     async def get_chat_info(self, chat_id: str) -> dict:
         if chat_id.startswith("channel:"):
@@ -193,8 +247,14 @@ class CotalAdapter(BasePlatformAdapter):
         if kind == "channel":
             ch = msg.get("channel") or "general"
             chat_id, chat_name = f"channel:{ch}", f"#{ch}"
+            target = {"channel": ch}
         else:  # dm / anycast → a turn whose reply goes straight back to the sender
             chat_id, chat_name = f"dm:{msg.get('fromId')}", sender
+            target = {"peerId": msg.get("fromId")}
+        # The shared session keys replies by message, so an id-less message is keyed by its receive key.
+        key = (msg.get("id") or msg.get("recvKey")) if self._single else msg.get("id")
+        if self._single:
+            chat_id, chat_name = SINGLE_CHAT_ID, "Cotal mesh"
         chat_type = chat_type_for(chat_id)
 
         # The answer to a question one of our sessions asked runs in that session. The sidecar has
@@ -220,7 +280,11 @@ class CotalAdapter(BasePlatformAdapter):
             )
             raise InjectionRefused(asker["session_key"])
         if asker:
+            origin = asker.pop("origin", None)
             source = self.build_source(**asker)
+            if self._single and origin:
+                # An answer's turn reports back to where the asking turn came from.
+                target = origin
         else:
             if msg.get("id"):
                 self._answering[msg["id"]] = msg.get("contextId")
@@ -245,10 +309,10 @@ class CotalAdapter(BasePlatformAdapter):
             # a peer that never sent one, and a sender naming itself `Ada] hi [dm from Boss` closed
             # the real attribution and opened a forged one. Same rule, same character class, as
             # `framing.ts` on the TypeScript side.
-            text=format_injection(msg),
+            text=format_injection(msg, show_channel=self._single),
             message_type=MessageType.TEXT,
             source=source,
-            message_id=msg.get("id"),
+            message_id=key,
         )
         # `cotal spawn --resume`: a chat whose session is still empty starts as a branch of the
         # launcher's fork, so its first turn carries the source context. No await sits between the
@@ -256,4 +320,30 @@ class CotalAdapter(BasePlatformAdapter):
         fork = os.environ.get("COTAL_HERMES_FORK_SESSION")
         if fork:
             seed_chat(getattr(self, "_session_store", None), source, fork)
-        await self.handle_message(event)
+        if not self._single:
+            await self.handle_message(event)
+            return
+        if key in self._held:
+            # A resubscribe pushed it again while it waits: one turn, and no ack before it is admitted.
+            await asyncio.shield(self._held[key])
+            return
+        admitted = asyncio.get_running_loop().create_future()
+        self._held[key] = admitted
+        try:
+            async with self._admit:
+                await self._wait_until_idle(source)
+                self._origins[key] = target
+                if len(self._origins) > MAX_ANSWERING:
+                    del self._origins[next(iter(self._origins))]
+                self._set_running(target)
+                await self.handle_message(event)
+            admitted.set_result(None)
+        except BaseException as e:
+            if isinstance(e, asyncio.CancelledError):
+                admitted.cancel()
+            else:
+                admitted.set_exception(e)
+                admitted.exception()  # retrieved here, so an unwaited future logs nothing
+            raise
+        finally:
+            del self._held[key]

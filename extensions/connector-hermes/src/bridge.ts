@@ -144,8 +144,15 @@ export function startBridgeServer(agent: MeshAgent, config: AgentConfig, socketP
     if (!adapter || awaitingId) return;
     const next = agent.peekInbox("automatic").find((i) => !deferred.has(i.recvKey));
     if (!next) return;
+    // Held while the host has it: the broker's ack wait is renewed, so a delivery the adapter holds
+    // behind a long turn is not redelivered or handed to another reader of its role.
+    if (!agent.holdInFlight([next.recvKey])) return;
     awaitingId = next.recvKey;
     sendFrame(adapter, { t: "incoming", msg: wireItem(agent, next) });
+  };
+  const release = (): void => {
+    if (awaitingId) agent.releaseInFlight([awaitingId]);
+    awaitingId = undefined;
   };
 
   agent.on("incoming", () => pump());
@@ -193,7 +200,7 @@ export function startBridgeServer(agent: MeshAgent, config: AgentConfig, socketP
     switch (frame.t) {
       case "subscribe":
         adapter = sock;
-        awaitingId = undefined;
+        release();
         log("adapter subscribed");
         pump();
         return;
@@ -207,7 +214,7 @@ export function startBridgeServer(agent: MeshAgent, config: AgentConfig, socketP
           // mis-ack a newer, unsurfaced message (losing it). If the front is no longer ours, the
           // overflow already acked it — just resync and let pump() surface the new front.
           agent.drainInboxDeliveries([awaitingId]);
-          awaitingId = undefined;
+          release();
           pump();
         }
         return;
@@ -216,7 +223,7 @@ export function startBridgeServer(agent: MeshAgent, config: AgentConfig, socketP
         if (typeof frame.recvKey === "string" && frame.recvKey !== "" && frame.recvKey === awaitingId) {
           const key = awaitingId;
           deferred.add(key);
-          awaitingId = undefined;
+          release();
           setTimeout(() => {
             deferred.delete(key);
             pump();
@@ -310,7 +317,7 @@ export function startBridgeServer(agent: MeshAgent, config: AgentConfig, socketP
       clearTimeout(deadline);
       if (sock === adapter) {
         adapter = undefined;
-        awaitingId = undefined;
+        release();
         log("adapter disconnected");
       }
     });

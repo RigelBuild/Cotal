@@ -40,7 +40,7 @@ def body_safe(text: object) -> str:
     return _LINE_BREAK.sub("\n  ", "" if text is None else str(text))
 
 
-def format_injection(msg: dict) -> str:
+def format_injection(msg: dict, show_channel: bool = False) -> str:
     """One mesh message as one injected line: neutralized attribution, then an indented body.
 
     ``kind`` goes through the same neutralization as the rest, and it is worth saying why, because
@@ -50,8 +50,12 @@ def format_injection(msg: dict) -> str:
     absolutely: what is rendered outside the body cannot write the frame. A renderer whose guarantee
     holds only while every upstream path keeps deriving one field correctly is a renderer whose
     guarantee belongs to somebody else's code.
+
+    ``show_channel`` names a channel message's channel, for a session that mixes channels and DMs.
     """
     kind = attribution_safe(msg.get("kind"))
+    if show_channel and msg.get("kind") == "channel":
+        kind = f"{kind} #{attribution_safe(msg.get('channel') or 'general')}"
     sender = attribution_safe(msg.get("fromName") or "peer")
     role = msg.get("fromRole")
     who = f"{sender} / {attribution_safe(role)}" if role else sender

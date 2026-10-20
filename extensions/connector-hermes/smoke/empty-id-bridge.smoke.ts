@@ -58,6 +58,9 @@ class FakeAgent {
     return Promise.resolve({ items: [], droppedChannels: [] });
   }
   answersQuestion(): boolean { return false; }
+  held = new Set<string>();
+  holdInFlight(ids: readonly string[]): boolean { for (const id of ids) this.held.add(id); return true; }
+  releaseInFlight(ids: readonly string[]): void { for (const id of ids) this.held.delete(id); }
   private listeners: Array<() => void> = [];
   on(_ev: string, fn: () => void) { if (_ev === "incoming" || _ev === "wake") this.listeners.push(fn); }
   emitIncoming() { for (const fn of this.listeners) fn(); }
@@ -150,11 +153,13 @@ try {
   assert.equal(firstMsg.id, "", "the empty wire id rides the wire item");
   assert.strictEqual(firstMsg.historical, false, "the wire item carries the historical flag, so the sidecar can frame a backfill (#2205)");
   assert.ok(typeof firstMsg.recvKey === "string" && firstMsg.recvKey !== "", "the wire item carries a minted receive key");
+  assert.deepEqual([...agent.held], [firstMsg.recvKey], "the pushed delivery is held in flight, so its ack wait renews while the host holds it");
 
   // ---- 2) the ack the sidecar sends (by receive key, wire id empty) clears the hold ----
   client.write(JSON.stringify({ t: "delivered", id: "", recvKey: firstMsg.recvKey }) + "\n");
   await new Promise((r) => setTimeout(r, 150));
   assert.deepEqual(agent.drained, [firstMsg.recvKey], "the empty-id delivery is retired by its receive key (no wedge)");
+  assert.equal(agent.held.size, 0, "the ack releases the in-flight hold");
   assert.equal(agent.items.length, 0, "the inbox is empty: the hold cleared and the drain ran");
 
   // ---- 3) a SECOND empty-id message is pumped and retired in turn ----

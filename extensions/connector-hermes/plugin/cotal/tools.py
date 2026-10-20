@@ -47,8 +47,14 @@ def _handler(name: str) -> Callable[..., str]:
             session = _calling_session() if name in _QUESTIONS else None
             context_id = replies.issue(session) if session else None
             # A cotal session dm:<peer id> is that peer's conversation: a DM to it there answers it.
+            # In the shared chat the peer is the origin of the turn, when that origin is a peer.
             chat_id = (session or {}).get("chat_id", "")
-            peer_id = chat_id[len("dm:"):] if chat_id.startswith("dm:") else None
+            if chat_id.startswith("dm:"):
+                peer_id = chat_id[len("dm:"):]
+            elif chat_id == replies.SINGLE_CHAT_ID:
+                peer_id = ((session or {}).get("origin") or {}).get("peerId")
+            else:
+                peer_id = None
             return get_client().call_tool(name, args or {}, context_id=context_id, peer_id=peer_id)
         except Exception as e:  # surfaced back to the model as the tool result
             return f"cotal error: {e}"
@@ -73,13 +79,17 @@ def _calling_session() -> Optional[dict]:
     chat_type = chat_type_for(chat_id)
     if not chat_type:
         return None
-    return {
+    session = {
         "chat_id": chat_id,
         "chat_type": chat_type,
         "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME", ""),
         "user_id": get_session_env("HERMES_SESSION_USER_ID", ""),
         "user_name": get_session_env("HERMES_SESSION_USER_NAME", ""),
     }
+    # The shared chat names no peer: keep the asking turn's origin, so the answer reports back there.
+    if chat_id == replies.SINGLE_CHAT_ID and replies.running():
+        session["origin"] = replies.running()
+    return session
 
 
 def _load_descriptors() -> list[dict]:
