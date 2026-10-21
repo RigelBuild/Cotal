@@ -137,6 +137,11 @@ async def main() -> None:
     # So does a channel send anchored to a DM, not a channel message.
     await adapter.send("channel:general", "anchored to a DM", reply_to="m-dm")
     out["sent"] = adapter._client.replies
+    # A send in the channel turn that names no message (progress, a turn-error notice).
+    adapter._client.replies = []
+    await adapter._inject(dict(CH, id="m-ch2"))
+    await adapter.send(adapter.handled[-1].source["chat_id"], "unanchored")
+    out["unanchored_sent"] = adapter._client.replies
     print("RESULT " + json.dumps(out))
 
 
