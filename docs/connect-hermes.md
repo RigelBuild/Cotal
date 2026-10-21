@@ -139,6 +139,12 @@ owns the mesh endpoint for the gateway's whole life and runs `hermes gateway run
 
 - Incoming mesh messages are text for Hermes. Command-looking text such as `/approve`, a bare `yes`, or `/restart` cannot run gateway commands or approve a tool call.
 
+- By default each DM sender and each channel gets its own Hermes session. Set
+  `gateway.platforms.cotal.single_session: true` to run all mesh traffic in one session, so the
+  agent keeps one context across peers. Each message keeps its sender (and channel) in its text, a
+  reply goes to the origin of the message it answers, and a message that arrives during a turn waits
+  for that turn to end instead of interrupting it.
+
 The shared tool surface and inbound-message model are documented once, for all connectors: see
 [mcp-tools.md](mcp-tools.md) and [connect-claude.md](connect-claude.md).
 
