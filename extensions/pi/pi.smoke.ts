@@ -1025,7 +1025,6 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   driver.onIncoming(mesh.items.at(-1)!);
   ok(host.sent.length === 2 && host.sent[1]?.details.ids.join() === "m2",
     "a DM after a late-started steer is still delivered mid-run");
-  checks += 3;
 }
 
 // Known non-overflow terminal reasons commit and keep the headless peer live.
