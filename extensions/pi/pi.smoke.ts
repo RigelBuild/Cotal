@@ -1000,6 +1000,34 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   ok(mesh.drained.join() === "m1", "an exact later stop resolves an unknown retained boundary");
 }
 
+// A steer sent mid-run is only consumed at Pi's next turn boundary, which a long tool call can
+// push past the start watchdog. That late start must not leave later DMs undelivered for the rest
+// of the run.
+{
+  const mesh = new FakeMesh();
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 20);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  driver.onAgentStart(ctx);
+  driver.onToolStart("bash");
+  mesh.items.push(item("m1"));
+  driver.onIncoming(mesh.items.at(-1)!);
+  ok(host.sent.length === 1, "a mid-run DM is steered");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  driver.onToolEnd();
+  const late = startBatch(driver, host);
+  confirm(driver, late);
+  ok(driver.state !== "held", "a steer Pi starts late at the next turn boundary releases the start watchdog hold");
+  driver.onToolStart("bash");
+  mesh.items.push(item("m2"));
+  driver.onIncoming(mesh.items.at(-1)!);
+  ok(host.sent.length === 2 && host.sent[1]?.details.ids.join() === "m2",
+    "a DM after a late-started steer is still delivered mid-run");
+  checks += 3;
+}
+
 // Known non-overflow terminal reasons commit and keep the headless peer live.
 for (const assistant of [
   { role: "assistant", stopReason: "length", usage: { output: 12 } },
