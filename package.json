@@ -767,6 +767,7 @@
     "smoke:hermes-injection-framing": "tsx extensions/connector-hermes/smoke/injection-framing.smoke.ts",
     "smoke:hermes-peer-command-control": "tsx extensions/connector-hermes/smoke/peer-command-control.smoke.ts",
     "smoke:hermes-single-session": "tsx extensions/connector-hermes/smoke/single-session.smoke.ts",
+    "smoke:hermes-channel-replies": "tsx extensions/connector-hermes/smoke/channel-replies.smoke.ts",
     "smoke:codex-tool-closed": "tsx extensions/connector-codex/smoke/tool-input-closed.smoke.ts",
     "smoke:cli-on-instance": "tsx implementations/manager/smoke/cli-on-instance-live.smoke.ts",
     "smoke:seat-input": "tsx implementations/manager/smoke/seat-input-live.smoke.ts",
