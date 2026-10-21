@@ -132,7 +132,10 @@ async def main() -> None:
     channel_reply = await adapter.send(ch_event.source["chat_id"], "not for me", reply_to="m-ch")
     out["channel_reply_ok"] = channel_reply.success is True
     await adapter.send(dm_event.source["chat_id"], "hello Ada", reply_to="m-dm")
+    # An explicit send naming no delivered message (send_message, cron delivery) still posts.
     await adapter.send("channel:general", "explicit channel send")
+    # So does a channel send anchored to a DM, not a channel message.
+    await adapter.send("channel:general", "anchored to a DM", reply_to="m-dm")
     out["sent"] = adapter._client.replies
     print("RESULT " + json.dumps(out))
 

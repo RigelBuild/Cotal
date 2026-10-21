@@ -13,8 +13,9 @@ With ``gateway.platforms.cotal.single_session: true`` every mesh message runs in
 (chat ``mesh``), so the agent has one context across peers. A reply then goes to the origin of the
 message it answers, and a message waits until the running turn ends instead of interrupting it.
 
-With ``gateway.platforms.cotal.channel_replies: false`` a turn's reply is never posted to a channel:
-the agent posts there only by calling ``cotal_send``. DM replies are unchanged.
+With ``gateway.platforms.cotal.channel_replies: false`` a turn's reply to a channel message is not
+posted: the agent posts there only by calling ``cotal_send``. DM replies and explicit sends that name
+no delivered message (``send_message``, cron delivery) are unchanged.
 """
 from __future__ import annotations
 
@@ -86,6 +87,8 @@ class CotalAdapter(BasePlatformAdapter):
         # Only an explicit false turns channel replies off, so an absent or malformed value keeps
         # the default behavior.
         self._channel_replies = extra.get("channel_replies") is not False
+        # Keys of channel messages delivered here, so a turn reply anchored to one can be dropped.
+        self._channel_keys: dict[str, None] = {}
         # message id -> the mesh reply target of a message delivered into the shared session.
         self._origins: dict[str, dict] = {}
         self._turn_done = asyncio.Event()
@@ -183,7 +186,7 @@ class CotalAdapter(BasePlatformAdapter):
         else:
             # An explicit chat (send_message, cron delivery) goes where it names, in either mode.
             target = _target_for(chat_id)
-        if "channel" in target and not self._channel_replies:
+        if answered in self._channel_keys and "channel" in target:
             # Channel posts are tool-only: a turn's text reply would cost every subscriber a turn.
             logger.debug("cotal: channel_replies is off; a reply to #%s is not posted", target["channel"])
             return SendResult(success=True, message_id=uuid.uuid4().hex)
@@ -278,6 +281,10 @@ class CotalAdapter(BasePlatformAdapter):
         key = (msg.get("id") or msg.get("recvKey")) if self._single else msg.get("id")
         if self._single:
             chat_id, chat_name = SINGLE_CHAT_ID, "Cotal mesh"
+        if kind == "channel" and key and not self._channel_replies:
+            self._channel_keys[key] = None
+            if len(self._channel_keys) > MAX_ANSWERING:
+                del self._channel_keys[next(iter(self._channel_keys))]
         chat_type = chat_type_for(chat_id)
 
         # The answer to a question one of our sessions asked runs in that session. The sidecar has

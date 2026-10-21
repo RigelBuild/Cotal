@@ -147,8 +147,8 @@ owns the mesh endpoint for the gateway's whole life and runs `hermes gateway run
 
 - Set `gateway.platforms.cotal.channel_replies: false` to stop posting a turn's reply to a
   channel. The agent then posts in a channel only by calling `cotal_send`, so a channel message
-  it has nothing to add to gets no reply. DM replies are unchanged. Other gateway sends to a
-  channel chat, such as a cron delivery, are dropped too.
+  it has nothing to add to gets no reply. DM replies and explicit sends to a channel, such as a
+  cron delivery, are unchanged.
 
 The shared tool surface and inbound-message model are documented once, for all connectors: see
 [mcp-tools.md](mcp-tools.md) and [connect-claude.md](connect-claude.md).

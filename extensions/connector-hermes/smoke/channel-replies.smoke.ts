@@ -66,10 +66,14 @@ function run(mode: "subject" | "control" | "shared"): ProbeResult {
 }
 
 const dmReply: Sent = { target: { peerId: "ada-id" }, text: "hello Ada" };
+const explicit: Sent[] = [
+  { target: { channel: "general" }, text: "explicit channel send" },
+  { target: { channel: "general" }, text: "anchored to a DM" },
+];
 
 for (const mode of ["subject", "shared"] as const) {
   const r = run(mode);
-  assert.deepEqual(r.sent, [dmReply], `${mode}: only the DM reply reaches the mesh; channel sends are dropped`);
+  assert.deepEqual(r.sent, [dmReply, ...explicit], `${mode}: the reply to a channel message is dropped; DM replies and explicit sends post`);
   assert.equal(r.channel_reply_ok, true, `${mode}: a dropped channel reply reports success, so the gateway does not retry`);
   assert.equal(r.channel_note, true, `${mode}: a channel message tells the model its reply is not posted`);
   assert.equal(r.dm_note, false, `${mode}: a DM carries no channel note`);
@@ -81,7 +85,7 @@ assert.deepEqual(
   [
     { target: { channel: "ops" }, text: "not for me" },
     dmReply,
-    { target: { channel: "general" }, text: "explicit channel send" },
+    ...explicit,
   ],
   "control: by default a channel reply is posted",
 );
