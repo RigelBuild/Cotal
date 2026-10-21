@@ -104,6 +104,7 @@ export class PiDriver {
   private inboundDuringTurn?: InboxItem;
   private knownAtTurnStart = new Set<string>();
   private knownAtErrorEnd = new Set<string>();
+  private startHoldBatchId?: string;
 
   constructor(
     private readonly mesh: MeshAgent,
@@ -197,8 +198,15 @@ export class PiDriver {
       this.requestBatchIds.add(batch.id);
       this.terminalEvidenceBatchIds.add(batch.id);
     }
-    if (batch.watchdog) clearTimeout(batch.watchdog);
+    clearTimeout(batch.watchdog);
     batch.watchdog = undefined;
+    // Pi consumes a mid-run steer at its next turn boundary, which can land after the watchdog.
+    if (this._state === "held" && this.startHoldBatchId === batch.id) {
+      this.startHoldBatchId = undefined;
+      this.heldReason = undefined;
+      this._state = "dispatching";
+      this.enqueuePresence("working", "thinking");
+    }
   }
 
   onContext(messages: readonly unknown[]): void {
@@ -394,7 +402,9 @@ export class PiDriver {
       );
       if (!batch.started) {
         batch.watchdog = setTimeout(() => {
-          if (!batch.started) this.hold(`Pi did not start dispatched Cotal batch ${batch.id}`);
+          if (batch.started) return;
+          this.hold(`Pi did not start dispatched Cotal batch ${batch.id}`);
+          this.startHoldBatchId = batch.id;
         }, this.startTimeoutMs);
         batch.watchdog.unref?.();
       }
@@ -472,6 +482,7 @@ export class PiDriver {
   private hold(reason: string): void {
     if (this._state === "shuttingDown") return;
     this.retryableErrorHold = false;
+    this.startHoldBatchId = undefined;
     this._state = "held";
     this.heldReason = reason;
     this.clearWatchdogs();
