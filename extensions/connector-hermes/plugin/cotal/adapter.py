@@ -179,6 +179,9 @@ class CotalAdapter(BasePlatformAdapter):
             # The shared chat names no peer: the reply goes to where the answered message came from.
             # Progress and notices name no message and go to the origin of the latest turn.
             target = self._origins.get(answered) if answered else None
+            if target is None and self._running and "channel" in self._running and not self._channel_replies:
+                # An unanchored send in a channel turn (progress, a notice) falls back to the channel.
+                return SendResult(success=True, message_id=uuid.uuid4().hex)
             target = target or self._running
             if target is None:
                 logger.warning("cotal: a send to the shared chat names no delivered message (%r) and no turn has run; it is not sent", reply_to)

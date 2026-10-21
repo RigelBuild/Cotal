@@ -44,7 +44,7 @@ function hard(condition: unknown, name: string): asserts condition {
   throw new Error(name);
 }
 
-const EXPECTED_CELLS = 17;
+const EXPECTED_CELLS = 20;
 if (process.platform === "win32") skipSuite("the Hermes connector is Unix-only");
 
 const pkgDir = fileURLToPath(new URL("..", import.meta.url));
@@ -54,7 +54,13 @@ if (!python) skipSuite("Python is unavailable for the Hermes adapter probe");
 const pythonBin = python;
 
 type Sent = { target: { peerId?: string; channel?: string }; text: string };
-type ProbeResult = { channel_note: boolean; dm_note: boolean; channel_reply_ok: boolean; sent: Sent[] };
+type ProbeResult = {
+  channel_note: boolean;
+  dm_note: boolean;
+  channel_reply_ok: boolean;
+  sent: Sent[];
+  unanchored_sent: Sent[];
+};
 
 function run(mode: "subject" | "control" | "shared"): ProbeResult {
   const res = spawnSync(pythonBin, [probe, `${pkgDir}plugin`, mode], { encoding: "utf8", timeout: 60_000 });
@@ -77,6 +83,9 @@ for (const mode of ["subject", "shared"] as const) {
   assert.equal(r.channel_reply_ok, true, `${mode}: a dropped channel reply reports success, so the gateway does not retry`);
   assert.equal(r.channel_note, true, `${mode}: a channel message tells the model its reply is not posted`);
   assert.equal(r.dm_note, false, `${mode}: a DM carries no channel note`);
+  // Per-peer, an unanchored send names its chat like an explicit send (cron), so it still posts.
+  const unanchored = mode === "shared" ? [] : [{ target: { channel: "ops" }, text: "unanchored" }];
+  assert.deepEqual(r.unanchored_sent, unanchored, `${mode}: an unanchored send follows the chat it names`);
 }
 
 const control = run("control");
@@ -91,6 +100,11 @@ assert.deepEqual(
 );
 assert.equal(control.channel_note, false, "control: by default a channel message carries no note");
 assert.equal(control.dm_note, false, "control: a DM carries no note");
+assert.deepEqual(
+  control.unanchored_sent,
+  [{ target: { channel: "ops" }, text: "unanchored" }],
+  "control: by default an unanchored send in a channel turn is posted",
+);
 
 console.log("hermes channel replies: channel posts are tool-only when channel_replies is false");
 if (cells !== EXPECTED_CELLS) {
