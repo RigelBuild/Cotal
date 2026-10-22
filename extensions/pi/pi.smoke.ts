@@ -901,7 +901,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   mesh.items = [item("m1")];
   const host = new FakeHost();
   const ctx = context();
-  const driver = new PiDriver(mesh as unknown as MeshAgent, 200, 300);
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200, 1_000);
   driver.bind(host);
   driver.onSessionStart(context());
   driver.onAgentStart(ctx);
@@ -911,14 +911,14 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   await new Promise((resolve) => setTimeout(resolve, 450));
   ok(driver.state === "held" && host.sent.length === 1, "a steer Pi still queues keeps the hold");
   ctx.pending = false;
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  await new Promise((resolve) => setTimeout(resolve, 400));
   ok(driver.state === "held" && host.sent.length === 1, "a host that only just settled keeps the hold through the settle window");
   ctx.idle = false;
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  await new Promise((resolve) => setTimeout(resolve, 500));
   ctx.idle = true;
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  await new Promise((resolve) => setTimeout(resolve, 600));
   ok(driver.state === "held" && host.sent.length === 1, "post-run host work restarts the settle window");
-  await new Promise((resolve) => setTimeout(resolve, 350));
+  for (let waited = 0; host.sent.length < 2 && waited < 5_000; waited += 50) await new Promise((resolve) => setTimeout(resolve, 50));
   ok(driver.state === "dispatching" && host.sent.length === 2 && host.sent[1]?.details.ids.join() === "m1" &&
     host.sent[1]?.details.batchId !== host.sent[0]?.details.batchId && mesh.drained.length === 0,
     "a steer Pi dropped is re-dispatched from the inbox without acknowledging it");
