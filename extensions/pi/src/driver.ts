@@ -11,6 +11,7 @@ const DEFAULT_START_TIMEOUT_MS = 5_000;
 // only exit was a turn nothing in the process could start).
 const CONTINUATION_ATTEMPT_LIMIT = 2;
 const CONTINUATION_BACKOFF_MS = 50;
+const LOST_STEER_POLL_MS = 10;
 
 const HISTORY_REFUSAL_MARKER = "Refusal (";
 const HISTORY_REFUSAL_ACTIVITY =
@@ -33,6 +34,7 @@ export interface CotalBatchDetails {
 export interface PiContextLike {
   signal?: AbortSignal;
   isIdle(): boolean;
+  hasPendingMessages(): boolean;
   hasUI: boolean;
   ui: { notify(message: string, level?: "info" | "warning" | "error"): void };
   shutdown(): void;
@@ -105,6 +107,7 @@ export class PiDriver {
   private knownAtTurnStart = new Set<string>();
   private knownAtErrorEnd = new Set<string>();
   private startHoldBatchId?: string;
+  private runSeq = 0;
 
   constructor(
     private readonly mesh: MeshAgent,
@@ -169,6 +172,7 @@ export class PiDriver {
     this.activeSignal = context.signal;
     this.knownAtTurnStart = new Set(this.inbox.peek().map((item) => item.recvKey));
     this.overflowRetry = false;
+    this.runSeq++;
     if (this.pendingContinuation) {
       this.pendingContinuation = false;
       this.heldReason = undefined;
@@ -183,7 +187,7 @@ export class PiDriver {
     } else if (this._state !== "held") {
       this._state = this.batches.some((batch) => !batch.confirmed) ? "dispatching" : "streaming";
     }
-    this.enqueuePresence("working", "thinking");
+    this.enqueuePresence("working", this.activity("thinking"));
     if (this._state !== "held") this.pump(true);
   }
 
@@ -245,12 +249,12 @@ export class PiDriver {
       const turnIds = this.batches.find((candidate) => candidate.id === id)?.turnIds;
       if (turnIds) this.mesh.commitSurfacedTurns(turnIds);
     }
-    this.enqueuePresence("working", `running ${name || "tool"}`);
+    this.enqueuePresence("working", this.activity(`running ${name || "tool"}`));
   }
 
   onToolEnd(): void {
     if (this._state === "shuttingDown") return;
-    this.enqueuePresence("working", "thinking");
+    this.enqueuePresence("working", this.activity("thinking"));
   }
 
   onAgentEnd(messages: readonly unknown[], context: PiContextLike): void {
@@ -451,6 +455,7 @@ export class PiDriver {
 
     if (this.batches.length > 0) {
       this.hold("Pi ended before confirming a queued Cotal steer");
+      this.watchLostSteer(context);
       return;
     }
 
@@ -488,6 +493,31 @@ export class PiDriver {
     this.clearWatchdogs();
     this.enqueuePresence("waiting", reason);
     if (this.context?.hasUI) this.context.ui.notify(`Cotal delivery held: ${reason}`, "warning");
+  }
+
+  /** A steer queued past the ended run's last poll stays in Pi's queue, and Pi's idle drain starts
+   *  the turn that confirms it. Once Pi is idle with nothing queued, no turn can carry the batch:
+   *  drop it and dispatch again from the inbox, which still owns every receive key. */
+  private watchLostSteer(context: PiContextLike): void {
+    const seq = this.runSeq;
+    const check = (): void => {
+      if (this._state !== "held" || this.runSeq !== seq || this.context !== context) return;
+      if (!context.isIdle() || context.hasPendingMessages()) {
+        setTimeout(check, LOST_STEER_POLL_MS).unref?.();
+        return;
+      }
+      this.batches = [];
+      this.heldReason = undefined;
+      this._state = "idle";
+      this.pump(true);
+      if (this._state === "idle") this.publishIdleWhenSettled(context);
+    };
+    setTimeout(check, LOST_STEER_POLL_MS).unref?.();
+  }
+
+  /** While held, every presence update keeps the hold visible instead of reading as normal work. */
+  private activity(text: string): string {
+    return this._state === "held" && this.heldReason ? `${text} · Cotal delivery held: ${this.heldReason}` : text;
   }
 
   private publishIdleWhenSettled(context: PiContextLike): void {

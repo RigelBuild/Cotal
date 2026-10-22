@@ -188,10 +188,11 @@ class FakeHost implements PiHost {
   }
 }
 
-function context(signal?: AbortSignal): PiContextLike & { idle: boolean; notifications: string[]; shutdowns: number } {
+function context(signal?: AbortSignal): PiContextLike & { idle: boolean; pending: boolean; notifications: string[]; shutdowns: number } {
   const value = {
     signal,
     idle: false,
+    pending: true,
     notifications: [] as string[],
     shutdowns: 0,
     hasUI: true,
@@ -202,6 +203,9 @@ function context(signal?: AbortSignal): PiContextLike & { idle: boolean; notific
     },
     isIdle(): boolean {
       return value.idle;
+    },
+    hasPendingMessages(): boolean {
+      return value.pending;
     },
     shutdown(): void {
       value.shutdowns++;
@@ -886,6 +890,76 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   driver.onIncoming(mesh.items.at(-1)!);
   ok(host.sent.length === sentBeforeFreshInput + 1 && host.sent.at(-1)?.details.ids.join() === "m1,m2",
     "a new DM after a spent provider-error budget retries the retained batch with the new traffic");
+}
+
+// A steer queued past the last poll of a cleanly ended turn: while Pi still holds it, the hold
+// stays (its idle drain starts the turn that confirms it). Once Pi settles with nothing queued,
+// the steer is lost; the driver re-dispatches from the inbox instead of holding forever.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
+  ok(driver.state === "held" && host.sent.length === 1, "an unconfirmed steer at a clean end holds");
+  ctx.idle = true;
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  ok(driver.state === "held" && host.sent.length === 1, "a steer Pi still queues keeps the hold");
+  ctx.pending = false;
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  ok(driver.state === "dispatching" && host.sent.length === 2 && host.sent[1]?.details.ids.join() === "m1" &&
+    host.sent[1]?.details.batchId !== host.sent[0]?.details.batchId && mesh.drained.length === 0,
+    "a steer Pi dropped is re-dispatched from the inbox without acknowledging it");
+  mesh.items.push(item("m2"));
+  driver.onIncoming(mesh.items.at(-1)!);
+  ok(host.sent.length === 2, "the re-dispatched batch still serializes new traffic behind it");
+  const retry = context();
+  driver.onAgentStart(retry);
+  confirm(driver, startBatch(driver, host));
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], retry);
+  ok(mesh.drained.join() === "m1" && host.sent.at(-1)?.details.ids.join() === "m2",
+    "the recovered batch commits once and the backlog flows");
+}
+
+// A turn that starts while the lost-steer check waits owns the hold again; a stale check never fires.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
+  const next = context();
+  driver.onAgentStart(next);
+  ctx.idle = true;
+  ctx.pending = false;
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  ok(driver.state === "held" && host.sent.length === 1, "a check from an earlier end does not drop a batch a newer turn may carry");
+}
+
+// The hold stays visible while the session keeps running tools.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
+  const next = context();
+  driver.onAgentStart(next);
+  driver.onToolStart("wait");
+  await driver.flushPresence();
+  ok(/Cotal delivery held/.test(mesh.statuses.at(-1)?.activity ?? ""), "a tool run while held still names the hold in presence");
 }
 
 // Controls that must not weaken: zero batches still returns to idle on the same error boundary.
