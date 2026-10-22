@@ -893,24 +893,32 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
 }
 
 // A steer queued past the last poll of a cleanly ended turn: while Pi still holds it, the hold
-// stays (its idle drain starts the turn that confirms it). Once Pi settles with nothing queued,
-// the steer is lost; the driver re-dispatches from the inbox instead of holding forever.
+// stays (its idle drain starts the turn that confirms it). Once Pi stays settled with nothing
+// queued, the steer is lost; the driver re-dispatches from the inbox instead of holding forever.
+// Hosts build a fresh context per event, so agent_end gets a different object than agent_start.
 {
   const mesh = new FakeMesh();
   mesh.items = [item("m1")];
   const host = new FakeHost();
   const ctx = context();
-  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200, 300);
   driver.bind(host);
-  driver.onSessionStart(ctx);
+  driver.onSessionStart(context());
   driver.onAgentStart(ctx);
-  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], context());
   ok(driver.state === "held" && host.sent.length === 1, "an unconfirmed steer at a clean end holds");
   ctx.idle = true;
-  await new Promise((resolve) => setTimeout(resolve, 40));
+  await new Promise((resolve) => setTimeout(resolve, 450));
   ok(driver.state === "held" && host.sent.length === 1, "a steer Pi still queues keeps the hold");
   ctx.pending = false;
-  await new Promise((resolve) => setTimeout(resolve, 40));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  ok(driver.state === "held" && host.sent.length === 1, "a host that only just settled keeps the hold through the settle window");
+  ctx.idle = false;
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  ctx.idle = true;
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  ok(driver.state === "held" && host.sent.length === 1, "post-run host work restarts the settle window");
+  await new Promise((resolve) => setTimeout(resolve, 350));
   ok(driver.state === "dispatching" && host.sent.length === 2 && host.sent[1]?.details.ids.join() === "m1" &&
     host.sent[1]?.details.batchId !== host.sent[0]?.details.batchId && mesh.drained.length === 0,
     "a steer Pi dropped is re-dispatched from the inbox without acknowledging it");
@@ -920,7 +928,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const retry = context();
   driver.onAgentStart(retry);
   confirm(driver, startBatch(driver, host));
-  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], retry);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], context());
   ok(mesh.drained.join() === "m1" && host.sent.at(-1)?.details.ids.join() === "m2",
     "the recovered batch commits once and the backlog flows");
 }
@@ -931,16 +939,16 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   mesh.items = [item("m1")];
   const host = new FakeHost();
   const ctx = context();
-  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200, 50);
   driver.bind(host);
   driver.onSessionStart(ctx);
   driver.onAgentStart(ctx);
-  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], context());
   const next = context();
+  next.idle = true;
+  next.pending = false;
   driver.onAgentStart(next);
-  ctx.idle = true;
-  ctx.pending = false;
-  await new Promise((resolve) => setTimeout(resolve, 40));
+  await new Promise((resolve) => setTimeout(resolve, 300));
   ok(driver.state === "held" && host.sent.length === 1, "a check from an earlier end does not drop a batch a newer turn may carry");
 }
 

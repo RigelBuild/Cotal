@@ -11,7 +11,9 @@ const DEFAULT_START_TIMEOUT_MS = 5_000;
 // only exit was a turn nothing in the process could start).
 const CONTINUATION_ATTEMPT_LIMIT = 2;
 const CONTINUATION_BACKOFF_MS = 50;
-const LOST_STEER_POLL_MS = 10;
+const LOST_STEER_POLL_MS = 100;
+// Longer than a host's post-run auto-compaction, after which it drains a queued steer.
+const DEFAULT_LOST_STEER_SETTLE_MS = 120_000;
 
 const HISTORY_REFUSAL_MARKER = "Refusal (";
 const HISTORY_REFUSAL_ACTIVITY =
@@ -112,6 +114,7 @@ export class PiDriver {
   constructor(
     private readonly mesh: MeshAgent,
     private readonly startTimeoutMs = DEFAULT_START_TIMEOUT_MS,
+    private readonly lostSteerSettleMs = DEFAULT_LOST_STEER_SETTLE_MS,
   ) {
     this.inbox = new InboxTurn(mesh);
   }
@@ -455,7 +458,7 @@ export class PiDriver {
 
     if (this.batches.length > 0) {
       this.hold("Pi ended before confirming a queued Cotal steer");
-      this.watchLostSteer(context);
+      this.watchLostSteer();
       return;
     }
 
@@ -496,13 +499,20 @@ export class PiDriver {
   }
 
   /** A steer queued past the ended run's last poll stays in Pi's queue, and Pi's idle drain starts
-   *  the turn that confirms it. Once Pi is idle with nothing queued, no turn can carry the batch:
-   *  drop it and dispatch again from the inbox, which still owns every receive key. */
-  private watchLostSteer(context: PiContextLike): void {
+   *  the turn that confirms it. Once Pi stays idle with nothing queued for the settle window, no turn
+   *  can carry the batch: drop it and dispatch again from the inbox, which owns every receive key. */
+  private watchLostSteer(): void {
+    // Hosts build a fresh context per event, so watch the session-bound one, not agent_end's.
+    const bound = this.context;
+    if (!bound) return;
     const seq = this.runSeq;
+    let settledSince: number | undefined;
     const check = (): void => {
-      if (this._state !== "held" || this.runSeq !== seq || this.context !== context) return;
-      if (!context.isIdle() || context.hasPendingMessages()) {
+      if (this._state !== "held" || this.runSeq !== seq || this.context !== bound) return;
+      // The window covers post-run work (auto-compaction) before a host drains a steer it does not count.
+      if (!bound.isIdle() || bound.hasPendingMessages()) settledSince = undefined;
+      else settledSince ??= Date.now();
+      if (settledSince === undefined || Date.now() - settledSince < this.lostSteerSettleMs) {
         setTimeout(check, LOST_STEER_POLL_MS).unref?.();
         return;
       }
@@ -510,7 +520,7 @@ export class PiDriver {
       this.heldReason = undefined;
       this._state = "idle";
       this.pump(true);
-      if (this._state === "idle") this.publishIdleWhenSettled(context);
+      if (this._state === "idle") this.publishIdleWhenSettled(bound);
     };
     setTimeout(check, LOST_STEER_POLL_MS).unref?.();
   }
