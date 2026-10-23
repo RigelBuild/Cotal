@@ -102,14 +102,6 @@ sys.path.insert(0, PLUGIN_PARENT)
 from cotal import adapter as adapter_mod  # noqa: E402
 
 
-class Client:
-    def __init__(self):
-        self.replies = []
-
-    def reply(self, target, text, reply_to=None, context_id=None):
-        self.replies.append({"target": target, "text": text})
-
-
 EXTRA = {
     "subject": {"peer_silence": True},
     "control": {},
@@ -122,7 +114,6 @@ CH = {"kind": "channel", "id": "m-ch", "fromId": "cy-id", "fromName": "Cy", "cha
 
 async def main() -> None:
     adapter = adapter_mod.CotalAdapter(PlatformConfig(EXTRA))
-    adapter._client = Client()
     await adapter._inject(CH)
     await adapter._inject(DM)
     out = {"reply_expected": [getattr(e, "reply_expected", "unset") for e in adapter.handled]}
