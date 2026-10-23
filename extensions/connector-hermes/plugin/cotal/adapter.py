@@ -87,6 +87,9 @@ class CotalAdapter(BasePlatformAdapter):
         # Only an explicit false turns channel replies off, so an absent or malformed value keeps
         # the default behavior.
         self._channel_replies = extra.get("channel_replies") is not False
+        # A peer is an agent, so a bare silence marker is a valid answer to it; Hermes otherwise
+        # replaces the marker with an error notice and sends that.
+        self._silence_ok = extra.get("peer_silence") is True
         # Keys of channel messages delivered here, so a turn reply anchored to one can be dropped.
         self._channel_keys: dict[str, None] = {}
         # message id -> the mesh reply target of a message delivered into the shared session.
@@ -347,6 +350,8 @@ class CotalAdapter(BasePlatformAdapter):
             source=source,
             message_id=key,
         )
+        if self._silence_ok:
+            event.reply_expected = False
         # `cotal spawn --resume`: a chat whose session is still empty starts as a branch of the
         # launcher's fork, so its first turn carries the source context. No await sits between the
         # check and the switch inside seed_chat, so a second message for the same chat sees it done.
