@@ -92,44 +92,74 @@ export function clearCursor(): void {
 /**
  * A seed child's liveness marker. The PARENT records `pending` BEFORE it spawns (so the window never
  * opens ownerless); the CHILD upgrades it to `live` with its own PID + start token as its first act;
- * the parent clears it after the child exits. A `pending` marker whose parent has died is the ambiguous
- * window — the child may or may not have started — and is resolved fail-loud, never by guessing.
+ * the parent clears it after the child exits. A `pending` marker whose parent has died is `orphaned`:
+ * a child authenticates only against its live parent's lock, so none can still start under it.
  */
 export type ChildMarker =
-  | { readonly state: "pending"; readonly parentPid: number; readonly nonce: string; readonly ts: number }
+  | { readonly state: "pending"; readonly parentPid: number; readonly parentStart?: string; readonly nonce: string; readonly ts: number }
   | { readonly state: "live"; readonly childPid: number; readonly childStart?: string; readonly parentPid: number; readonly nonce: string; readonly ts: number };
+
+/** Run one read-compare-write of the shared marker under its own short lock, so a delayed child and
+ *  a repair's newer reconcile can never interleave between the read and the write. */
+function withChildMarker<T>(transition: (marker: ChildMarker | undefined) => T): T {
+  const path = reconcileChildPath();
+  const held = acquireLock(`${path}.lock`, { label: `the seed child marker lock for ${path}`, waitMs: 30_000, pollMs: 20 });
+  try {
+    let marker: ChildMarker | undefined;
+    try {
+      marker = readJsonFile<ChildMarker>(path);
+    } catch {
+      marker = undefined; // corrupt: no transition below matches it, so it stays for the fail-loud check
+    }
+    return transition(marker);
+  } finally {
+    held.release();
+  }
+}
 
 /** Parent: record intent to spawn a seed child before `spawnSync`, so a crash never leaves a gap a
  *  concurrent repair could race through unaware. */
 export function writePendingChildMarker(nonce: string): void {
-  writeJsonAtomic(reconcileChildPath(), { state: "pending", parentPid: process.pid, nonce, ts: Date.now() });
+  withChildMarker(() =>
+    writeJsonAtomic(reconcileChildPath(), { state: "pending", parentPid: process.pid, parentStart: processStartToken(process.pid), nonce, ts: Date.now() }),
+  );
 }
 
-/** Child: upgrade the parent's pending marker to a live one carrying this child's identity. */
-export function markSeedChildLive(nonce: string, parentPid: number): void {
-  writeJsonAtomic(reconcileChildPath(), {
-    state: "live",
-    childPid: process.pid,
-    childStart: processStartToken(process.pid),
-    parentPid,
-    nonce,
-    ts: Date.now(),
+/** Child: upgrade its parent's pending marker to a live one carrying this child's identity. Returns
+ *  false, writing nothing, when the marker is no longer that pending one: a newer reconcile owns it. */
+export function markSeedChildLive(nonce: string, parentPid: number): boolean {
+  return withChildMarker((marker) => {
+    if (marker?.state !== "pending" || marker.nonce !== nonce || marker.parentPid !== parentPid) return false;
+    writeJsonAtomic(reconcileChildPath(), {
+      state: "live",
+      childPid: process.pid,
+      childStart: processStartToken(process.pid),
+      parentPid,
+      nonce,
+      ts: Date.now(),
+    });
+    return true;
   });
 }
 
-export function clearChildMarker(): void {
-  rmSync(reconcileChildPath(), { force: true });
+/** Clear the marker only while it still belongs to `nonce`'s reconcile, so neither a parent nor a
+ *  refused child of an older reconcile removes a newer one's marker. */
+export function clearChildMarker(nonce: string): void {
+  withChildMarker((marker) => {
+    if (marker?.nonce === nonce) rmSync(reconcileChildPath(), { force: true });
+  });
 }
 
 export type SeedChildStatus =
   | { readonly kind: "none" }
   | { readonly kind: "live"; readonly pid: number }
+  | { readonly kind: "orphaned"; readonly nonce: string; readonly path: string }
   | { readonly kind: "ambiguous"; readonly path: string };
 
 /** The state of any recorded seed child, for the orphan-vs-repair decision. A `live` child (its parent
- *  SIGKILL'd mid-install → orphan) must not be raced. A `pending` marker whose parent is gone, or a
- *  corrupt marker, is `ambiguous` (cannot tell "never spawned" from "child delayed") and is resolved
- *  fail-loud. A dead/recycled child is `none` (safe to proceed). */
+ *  SIGKILL'd mid-install → orphan) must not be raced. A `pending` marker whose parent is gone is
+ *  `orphaned`: recoverable under the reconcile lock. A corrupt marker is `ambiguous` and fails loud.
+ *  A dead/recycled child is `none` (safe to proceed). */
 export function seedChildStatus(): SeedChildStatus {
   const path = reconcileChildPath();
   let marker: ChildMarker | undefined;
@@ -143,10 +173,9 @@ export function seedChildStatus(): SeedChildStatus {
     if (typeof marker.childPid !== "number") return { kind: "ambiguous", path };
     return pidAliveMatching(marker.childPid, marker.childStart) ? { kind: "live", pid: marker.childPid } : { kind: "none" };
   }
-  if (marker.state === "pending" && typeof marker.parentPid === "number") {
-    // Parent still alive ⇒ a reconcile is starting (the caller waits on the lock); parent gone ⇒ the
-    // ambiguous SIGKILL/delayed-start window.
-    return pidAliveMatching(marker.parentPid, undefined) ? { kind: "live", pid: marker.parentPid } : { kind: "ambiguous", path };
+  if (marker.state === "pending" && typeof marker.parentPid === "number" && typeof marker.nonce === "string") {
+    // Parent still alive ⇒ a reconcile is starting (the caller waits on the lock).
+    return pidAliveMatching(marker.parentPid, marker.parentStart) ? { kind: "live", pid: marker.parentPid } : { kind: "orphaned", nonce: marker.nonce, path };
   }
   return { kind: "ambiguous", path };
 }

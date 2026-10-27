@@ -13,8 +13,8 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { writeStamp } from "../src/seed/authority.js";
-import { clearChildMarker, clearCursor, writeCursor, writePendingChildMarker } from "../src/seed/lock.js";
-import { reconcileChildPath, reconcileCursorPath, SEED_BUILTINS, seedStoreDir, seedWriterKind } from "../src/seed/paths.js";
+import { clearChildMarker, clearCursor, markSeedChildLive, writeCursor, writePendingChildMarker } from "../src/seed/lock.js";
+import { readJsonFile, reconcileChildPath, reconcileCursorPath, SEED_BUILTINS, seedStoreDir, seedWriterKind } from "../src/seed/paths.js";
 import { reconcileSeededConnectors } from "../src/seed/reconcile.js";
 import { gcSeedStore, stageSeedPayload } from "../src/seed/store.js";
 
@@ -352,7 +352,22 @@ try {
       existsSync(reconcileCursorPath()) && existsSync(reconcileChildPath()),
     );
     clearCursor();
-    clearChildMarker();
+    clearChildMarker("control");
+  }
+  {
+    // A seed child of a reconcile a repair replaced must not take over or remove the repair's marker.
+    sandboxXdg();
+    const repairNonce = "repair";
+    writePendingChildMarker(repairNonce);
+    const repairParent = process.pid;
+    check("stale child: its live upgrade against a newer reconcile's marker is refused", markSeedChildLive("old", 2147483646) === false);
+    check("stale child: the newer pending marker is untouched", readJsonFile<{ nonce: string; state: string }>(reconcileChildPath())?.nonce === repairNonce);
+    check("CONTROL: the newer reconcile's own child upgrades it to live", markSeedChildLive(repairNonce, repairParent) === true &&
+      readJsonFile<{ state: string }>(reconcileChildPath())?.state === "live");
+    clearChildMarker("old");
+    check("stale child: its clear leaves the newer live marker in place", readJsonFile<{ nonce: string }>(reconcileChildPath())?.nonce === repairNonce);
+    clearChildMarker(repairNonce);
+    check("CONTROL: the owner's clear removes it", !existsSync(reconcileChildPath()));
   }
 } finally {
   restoreEnv();

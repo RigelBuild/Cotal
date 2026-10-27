@@ -122,6 +122,13 @@ async function reconcile(mode: Mode): Promise<ReconcileResult> {
           throw new Error(`a connector seed child (pid ${child.pid}) is still installing - retry once it finishes`);
         if (child.kind === "ambiguous")
           throw new Error(`a connector seed may be mid-flight (marker ${child.path}) - if no cotal process is running, remove it, then run \`cotal ext seed --repair\``);
+        if (child.kind === "orphaned" && cursor) {
+          // The reconcile was killed while it spawned a seed child. Repair takes the lock, under which
+          // no child of the dead parent can authenticate, so the same verified repair runs unattended.
+          console.error(c.dim(`resuming a connector seed whose reconcile was killed (package "${cursor.package}", phase ${cursor.phase}) …`));
+          await reconcile("repair");
+          return NOOP;
+        }
         const migration = cursor ? interruptedUpgrade(cursor, generation) : undefined;
         if (migration && cursor) {
           console.error(
@@ -224,13 +231,15 @@ function builtinsMetadataCurrent(): boolean {
 
 async function runUnderLocks(mode: Mode, generation: string, nonce: string): Promise<ReconcileResult> {
   // Refuse to touch the prefix while an orphaned seed child (a crashed parent's still-running
-  // installer) is mutating it — reclaiming the lock does not stop that process. An ambiguous marker
-  // (pending with a dead parent, or corrupt) is fail-loud: we cannot prove no installer is running.
+  // installer) is mutating it — reclaiming the lock does not stop that process. A pending marker whose
+  // parent died is cleared: this lock is now live, so that parent's children refuse before installing.
+  // A corrupt marker is fail-loud: we cannot prove no installer is running.
   const child = seedChildStatus();
   if (child.kind === "live")
     throw new Error(`a connector seed child (pid ${child.pid}) is still installing - retry once it finishes`);
   if (child.kind === "ambiguous")
     throw new Error(`a connector seed may be mid-flight (marker ${child.path}) - if no cotal process is running, remove it and retry`);
+  if (child.kind === "orphaned") clearChildMarker(child.nonce);
 
   // REFUSE TO WRITE A GENERATION OLDER THAN THE STORE'S. An older binary run against a store stamped
   // newer misses the fast path (its generation is not the stamp), refreshes NOTHING (the refresh below
@@ -538,7 +547,7 @@ function seedOne(name: string, generation: string, nonce: string, force: boolean
     encoding: "utf8",
     env: { ...process.env, COTAL_EXT_SEEDING: nonce, COTAL_EXT_SEEDING_PARENT: String(process.pid) },
   });
-  clearChildMarker(); // parent survived the child: the marker's job is done (child also clears its own)
+  clearChildMarker(nonce); // parent survived the child: the marker's job is done (child also clears its own)
   // The child's `✓ added …` line is seeding progress, not the invoking command's output: the boot gate
   // runs this ahead of whatever command was typed, so on stdout it would land in front of that
   // command's result (a first-boot `cotal meshes --json` printed seven non-JSON lines).
