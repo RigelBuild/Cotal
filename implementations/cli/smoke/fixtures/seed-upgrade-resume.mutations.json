@@ -16,8 +16,8 @@
     {
       "name": "the manager recognizes an interrupted generation upgrade but skips the verified repair",
       "file": "implementations/cli/src/seed/reconcile.ts",
-      "find": "          await reconcile(\"repair\");\n          return NOOP;",
-      "replace": "          return NOOP;",
+      "find": "          );\n          await reconcile(\"repair\");\n          return NOOP;",
+      "replace": "          );\n          return NOOP;",
       "afterRestore": "pnpm --filter @cotal-ai/cli build && pnpm --filter cotal-ai build",
       "expectRed": "upgrade interruption: manager repairs the newer-generation cursor before reaching ready",
       "cell": "upgrade interruption: manager repairs the newer-generation cursor before reaching ready"

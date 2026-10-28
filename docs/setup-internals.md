@@ -263,5 +263,7 @@ A crash **cursor** is journaled before each connector mutation and cleared only 
 a SIGKILL mid-run is detected on the next boot (fail loud → `ext seed --repair` re-installs the
 interrupted connector before it clears the evidence). Seed children are authenticated (they carry the
 live lock's nonce + parent PID, not a bare env flag) and record a liveness marker so a post-crash repair
-refuses to race an orphaned installer. `ext seed --reset` quarantines corrupt manifest/authority state
+refuses to race an orphaned installer. A reconcile killed while it spawns a seed child leaves a pending
+marker naming a dead parent; the next command repairs it unattended, because no child can authenticate
+against the new reconcile's lock. A corrupt marker still fails loud. `ext seed --reset` quarantines corrupt manifest/authority state
 aside and rebuilds. See [cli.md `ext`](cli.md#ext) for the operator-facing flags.

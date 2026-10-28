@@ -144,7 +144,16 @@ export async function addExtension(spec: string, expectedPkg?: string, borrowMut
     : claimExtensionMutation(borrowMutation ? { borrowUpdateParent: process.ppid } : {});
   // Upgrade the parent's pending marker to a live one carrying this child's PID, as the first act — so
   // a repair after a parent SIGKILL sees the exact orphan identity and refuses to race it.
-  if (seeding) markSeedChildLive(process.env.COTAL_EXT_SEEDING as string, Number(process.env.COTAL_EXT_SEEDING_PARENT));
+  const nonce = process.env.COTAL_EXT_SEEDING as string;
+  if (seeding) {
+    // A repair may have taken the lock from a dead parent since the check above. Then the marker is
+    // no longer this parent's, or the lock is no longer its: refuse without touching a newer marker.
+    const marked = markSeedChildLive(nonce, Number(process.env.COTAL_EXT_SEEDING_PARENT));
+    if (!marked || !isAuthenticSeedChild()) {
+      clearChildMarker(nonce);
+      throw new Error("the connector reconcile that started this seed child is gone - nothing was installed");
+    }
+  }
   try {
     mkdirSync(dir, { recursive: true });
     if (!existsSync(join(dir, "package.json"))) {
@@ -153,7 +162,7 @@ export async function addExtension(spec: string, expectedPkg?: string, borrowMut
     }
     await addTransaction();
   } finally {
-    if (seeding) clearChildMarker();
+    if (seeding) clearChildMarker(nonce);
     releaseMutation();
   }
 
@@ -204,7 +213,7 @@ export async function addExtension(spec: string, expectedPkg?: string, borrowMut
   } catch (e) {
     await restore();
     if (wasInterrupted) {
-      if (seeding) clearChildMarker();
+      if (seeding) clearChildMarker(nonce);
       releaseMutation();
       process.exit(130);
     }
