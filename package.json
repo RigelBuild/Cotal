@@ -765,6 +765,7 @@
     "smoke:hermes-empty-id": "tsx extensions/connector-hermes/smoke/empty-id-bridge.smoke.ts",
     "smoke:hermes-lifecycle-idle": "tsx extensions/connector-hermes/smoke/lifecycle-idle.smoke.ts",
     "smoke:hermes-injection-framing": "tsx extensions/connector-hermes/smoke/injection-framing.smoke.ts",
+    "smoke:hermes-peer-silence": "tsx extensions/connector-hermes/smoke/peer-silence.smoke.ts",
     "smoke:hermes-peer-command-control": "tsx extensions/connector-hermes/smoke/peer-command-control.smoke.ts",
     "smoke:hermes-single-session": "tsx extensions/connector-hermes/smoke/single-session.smoke.ts",
     "smoke:hermes-channel-replies": "tsx extensions/connector-hermes/smoke/channel-replies.smoke.ts",

@@ -150,6 +150,9 @@ owns the mesh endpoint for the gateway's whole life and runs `hermes gateway run
   it has nothing to add to gets no reply. DM replies and explicit sends to a channel, such as a
   cron delivery, are unchanged.
 
+- Set `gateway.platforms.cotal.peer_silence: true` to let the agent answer a peer with a bare
+  silence marker. Without it, Hermes replaces the marker with an error notice and sends that.
+
 The shared tool surface and inbound-message model are documented once, for all connectors: see
 [mcp-tools.md](mcp-tools.md) and [connect-claude.md](connect-claude.md).
 
