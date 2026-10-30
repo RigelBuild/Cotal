@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -34,7 +34,7 @@ function readCalls(logPath: string): string[][] {
 }
 
 async function withFakeZellij(
-  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable" | "slow-probe" | "no-client" | "slow-client" | "clients-error" | "handoff",
+  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable" | "slow-probe" | "no-client" | "slow-client" | "clients-error" | "clients-flaky" | "handoff",
   run: (logPath: string, session: string) => void | Promise<void>,
 ): Promise<void> {
   // The fake is a shebang script Windows cannot exec, and zellij ships no Windows build.
@@ -55,7 +55,7 @@ async function withFakeZellij(
     screenCount: process.env.COTAL_ZELLIJ_TEST_SCREEN_COUNT,
   };
   writeFileSync(executable, `#!/usr/bin/env node
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
 appendFileSync(process.env.COTAL_ZELLIJ_TEST_LOG, JSON.stringify(args) + "\\n");
 if (process.env.COTAL_ZELLIJ_TEST_MODE === "unavailable") process.exit(1);
@@ -72,12 +72,24 @@ if (action === "list-clients") {
   const mode = process.env.COTAL_ZELLIJ_TEST_MODE;
   if (mode === "slow-client") Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600);
   if (mode === "clients-error") { console.error("Error occurred: timed out"); process.exit(1); }
+  if (mode === "clients-flaky") {
+    const flag = process.env.COTAL_ZELLIJ_TEST_LOG + ".flaked";
+    try { readFileSync(flag); } catch { writeFileSync(flag, "1"); console.error("Error occurred: timed out"); process.exit(1); }
+  }
   if (mode === "handoff") {
-    // Our headless client counts once its stand-in starts; the test file adds real clients.
-    const log = process.env.COTAL_ZELLIJ_TEST_LOG;
-    const ours = readFileSync(log, "utf8").split("\\n").filter((line) => line === "script").length;
+    // Live headless clients count as zellij clients; the test file sets how many real clients exist.
+    const command = "exec zellij attach " + process.env.COTAL_ZELLIJ_TEST_SESSION;
+    // PIDs in ".unattached" model a headless client that has not connected yet.
+    let unattached = [];
+    try { unattached = readFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".unattached", "utf8").split("\\n"); } catch {}
+    const ours = readdirSync("/proc").filter((entry) => {
+      try { return /^\\d+$/.test(entry) && !unattached.includes(entry) && readFileSync("/proc/" + entry + "/cmdline", "utf8").includes(command); } catch { return false; }
+    }).length;
+    const realPath = process.env.COTAL_ZELLIJ_TEST_LOG + ".clients";
     let real = 0;
-    try { real = Number(readFileSync(log + ".clients", "utf8")); } catch {}
+    try { real = Number(readFileSync(realPath, "utf8")); } catch {}
+    // "leave" models a real client that is gone by the next listing.
+    try { readFileSync(realPath + ".leave"); writeFileSync(realPath, "0"); } catch {}
     console.log("CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND");
     for (let id = 1; id <= ours + real; id++) console.log(id + " terminal_1 node");
     process.exit(0);
@@ -437,28 +449,141 @@ await withFakeZellij("clients-error", (logPath, session) => {
   check("a failed client listing starts no headless client",
     failed && !readFileSync(logPath, "utf8").includes("script"));
 });
-await withFakeZellij("handoff", (logPath, session) => {
-  const stand = fakeScript(dirname(logPath));
-  process.env.COTAL_ZELLIJ_SCRIPT = stand;
-  const scriptPids = (): number[] => readdirSync("/proc").filter((entry) => /^\d+$/.test(entry)).flatMap((entry) => {
-    try {
-      return readFileSync(`/proc/${entry}/cmdline`, "utf8").split("\0").includes(stand) ? [Number(entry)] : [];
-    } catch {
-      return [];
-    }
-  });
+await withFakeZellij("clients-flaky", (logPath, session) => {
+  let ok = true;
+  try {
+    zellij.ensureClient(session);
+  } catch {
+    ok = false;
+  }
+  check("an unbounded caller recovers from one failed client listing",
+    ok && readCalls(logPath).filter((args) => args[3] === "list-clients").length >= 2);
+});
+// The stand-in forks a descendant like script(1) forks zellij, so group cleanup is observable.
+const fakeGroupScript = (bin: string): string => {
+  const path = join(bin, "script");
+  writeFileSync(path, `#!/bin/sh\necho script >> "$COTAL_ZELLIJ_TEST_LOG"\nsleep 30 &\necho $! >> "$COTAL_ZELLIJ_TEST_LOG.children"\nwait\n`);
+  chmodSync(path, 0o755);
+  return path;
+};
+const alive = (pid: number): boolean => {
+  try {
+    return !readFileSync(`/proc/${pid}/stat`, "utf8").includes(") Z ");
+  } catch {
+    return false;
+  }
+};
+const children = (logPath: string): number[] => {
+  try {
+    return readFileSync(`${logPath}.children`, "utf8").split("\n").filter(Boolean).map(Number);
+  } catch {
+    return [];
+  }
+};
+const waitGone = (pids: number[]): number[] => {
+  const until = Date.now() + 2_000;
+  while (pids.some(alive) && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  return pids.filter(alive);
+};
+const headlessCount = (logPath: string): number => readFileSync(logPath, "utf8").split("\n").filter((line) => line === "script").length;
+// These cells model clients through /proc; on a host without it the driver falls back to its own groups.
+const procfs = existsSync("/proc/self/cmdline");
+if (!procfs) console.log("  ✓ skipped /proc headless-client scenarios (no /proc on this platform)");
+if (procfs) await withFakeZellij("handoff", (logPath, session) => {
+  process.env.COTAL_ZELLIJ_SCRIPT = fakeGroupScript(dirname(logPath));
   zellij.ensureClient(session, Date.now() + 2_000);
-  const started = scriptPids().length;
+  const first = children(logPath);
   writeFileSync(`${logPath}.clients`, "1");
   zellij.ensureClient(session, Date.now() + 2_000);
-  const deadline = Date.now() + 2_000;
-  while (scriptPids().length > 0 && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
-  const left = scriptPids();
-  for (const pid of left) process.kill(pid, "SIGKILL");
+  const left = waitGone(first);
   delete process.env.COTAL_ZELLIJ_SCRIPT;
-  const scripts = readFileSync(logPath, "utf8").split("\n").filter((line) => line === "script").length;
-  check("the headless client detaches once a real client attaches",
-    started > 0 && left.length === 0 && scripts === 1, { started, left, scripts });
+  for (const pid of left) process.kill(pid, "SIGKILL");
+  check("the headless client and its descendants exit once a real client attaches",
+    first.length === 1 && left.length === 0 && headlessCount(logPath) === 1, { first, left });
+});
+if (procfs) await withFakeZellij("handoff", (logPath, session) => {
+  process.env.COTAL_ZELLIJ_SCRIPT = fakeGroupScript(dirname(logPath));
+  zellij.ensureClient(session, Date.now() + 2_000);
+  const first = children(logPath);
+  // The real client leaves between the listing that saw it and the re-check after handoff.
+  writeFileSync(`${logPath}.clients`, "1");
+  writeFileSync(`${logPath}.clients.leave`, "");
+  let ok = true;
+  try {
+    zellij.ensureClient(session, Date.now() + 2_000);
+  } catch {
+    ok = false;
+  }
+  const all = children(logPath);
+  waitGone(first);
+  const live = all.filter(alive);
+  delete process.env.COTAL_ZELLIJ_SCRIPT;
+  for (const pid of live) process.kill(pid, "SIGKILL");
+  check("a real client leaving during handoff leaves the session with a headless client",
+    ok && headlessCount(logPath) === 2 && live.length === 1, { all, live });
+});
+if (procfs) await withFakeZellij("handoff", (logPath, session) => {
+  const stand = fakeGroupScript(dirname(logPath));
+  // Two survivors of earlier manager processes, unknown to this one.
+  const survivors = [0, 1].map(() => {
+    const child = spawn(stand, zellij.scriptAttachArgs(session), { detached: true, stdio: "ignore", env: process.env });
+    child.unref();
+    return child.pid as number;
+  });
+  const until = Date.now() + 2_000;
+  while (children(logPath).length < 2 && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  process.env.COTAL_ZELLIJ_SCRIPT = stand;
+  zellij.ensureClient(session, Date.now() + 2_000);
+  const all = [...survivors, ...children(logPath)];
+  // One survivor group (wrapper plus its descendant) stays; the other is stopped.
+  const kept = waitGone(all);
+  writeFileSync(`${logPath}.clients`, "1");
+  zellij.ensureClient(session, Date.now() + 2_000);
+  const left = waitGone(all);
+  delete process.env.COTAL_ZELLIJ_SCRIPT;
+  for (const pid of left) process.kill(pid, "SIGKILL");
+  check("extra headless clients from earlier managers are stopped, and the last one leaves after a real client attaches",
+    kept.length === 2 && left.length === 0 && headlessCount(logPath) === 2, { kept, left });
+});
+if (procfs) await withFakeZellij("handoff", (logPath, session) => {
+  const stand = fakeGroupScript(dirname(logPath));
+  // A headless client from an earlier manager that never connected: replace it, never add a second.
+  const stale = spawn(stand, zellij.scriptAttachArgs(session), { detached: true, stdio: "ignore", env: process.env });
+  stale.unref();
+  writeFileSync(`${logPath}.unattached`, String(stale.pid));
+  const until = Date.now() + 2_000;
+  while (children(logPath).length < 1 && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  process.env.COTAL_ZELLIJ_SCRIPT = stand;
+  zellij.ensureClient(session, Date.now() + 2_000);
+  const staleGroup = [stale.pid as number, ...children(logPath).slice(0, 1)];
+  const staleLeft = waitGone(staleGroup);
+  const live = children(logPath).filter(alive);
+  delete process.env.COTAL_ZELLIJ_SCRIPT;
+  for (const pid of [...staleLeft, ...live]) process.kill(pid, "SIGKILL");
+  check("an unattached headless client is replaced, not joined by a second one",
+    staleLeft.length === 0 && live.length === 1 && headlessCount(logPath) === 2, { staleLeft, live });
+});
+if (procfs) await withFakeZellij("handoff", (logPath, session) => {
+  const stand = fakeGroupScript(dirname(logPath));
+  // One real client plus a survivor that has not connected: the listing cannot tell which client
+  // is which, so it stays until it attaches, and the next call then stops it.
+  const stale = spawn(stand, zellij.scriptAttachArgs(session), { detached: true, stdio: "ignore", env: process.env });
+  stale.unref();
+  writeFileSync(`${logPath}.unattached`, String(stale.pid));
+  writeFileSync(`${logPath}.clients`, "1");
+  const until = Date.now() + 2_000;
+  while (children(logPath).length < 1 && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  process.env.COTAL_ZELLIJ_SCRIPT = stand;
+  const group = [stale.pid as number, ...children(logPath)];
+  zellij.ensureClient(session, Date.now() + 2_000);
+  const keptWhileUnattached = group.filter(alive).length;
+  writeFileSync(`${logPath}.unattached`, "");
+  zellij.ensureClient(session, Date.now() + 2_000);
+  const left = waitGone(group);
+  delete process.env.COTAL_ZELLIJ_SCRIPT;
+  for (const pid of left) process.kill(pid, "SIGKILL");
+  check("a survivor beside a real client is stopped once it attaches, and none is started",
+    keptWhileUnattached === 2 && left.length === 0 && headlessCount(logPath) === 1, { keptWhileUnattached, left });
 });
 await withFakeZellij("confirm", (logPath, session) => {
   let refused = false;
