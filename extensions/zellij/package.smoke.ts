@@ -34,7 +34,7 @@ function readCalls(logPath: string): string[][] {
 }
 
 async function withFakeZellij(
-  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable" | "slow-probe" | "no-client" | "slow-client",
+  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable" | "slow-probe" | "no-client" | "slow-client" | "clients-error" | "handoff",
   run: (logPath: string, session: string) => void | Promise<void>,
 ): Promise<void> {
   // The fake is a shebang script Windows cannot exec, and zellij ships no Windows build.
@@ -71,6 +71,17 @@ const action = args[3];
 if (action === "list-clients") {
   const mode = process.env.COTAL_ZELLIJ_TEST_MODE;
   if (mode === "slow-client") Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600);
+  if (mode === "clients-error") { console.error("Error occurred: timed out"); process.exit(1); }
+  if (mode === "handoff") {
+    // Our headless client counts once its stand-in starts; the test file adds real clients.
+    const log = process.env.COTAL_ZELLIJ_TEST_LOG;
+    const ours = readFileSync(log, "utf8").split("\\n").filter((line) => line === "script").length;
+    let real = 0;
+    try { real = Number(readFileSync(log + ".clients", "utf8")); } catch {}
+    console.log("CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND");
+    for (let id = 1; id <= ours + real; id++) console.log(id + " terminal_1 node");
+    process.exit(0);
+  }
   console.log(mode === "missing-session" || mode === "no-client" || mode === "slow-client" ? "not found" : "1");
   process.exit(0);
 }
@@ -413,6 +424,41 @@ await withFakeZellij("no-client", (logPath, session) => {
   delete process.env.COTAL_ZELLIJ_SCRIPT;
   check("a bounded attach that never sees a client kills the script client it started",
     failed && readFileSync(logPath, "utf8").includes("script") && scriptPids().length === 0, scriptPids());
+});
+await withFakeZellij("clients-error", (logPath, session) => {
+  process.env.COTAL_ZELLIJ_SCRIPT = fakeScript(dirname(logPath));
+  let failed = false;
+  try {
+    zellij.ensureClient(session, Date.now() + 400);
+  } catch {
+    failed = true;
+  }
+  delete process.env.COTAL_ZELLIJ_SCRIPT;
+  check("a failed client listing starts no headless client",
+    failed && !readFileSync(logPath, "utf8").includes("script"));
+});
+await withFakeZellij("handoff", (logPath, session) => {
+  const stand = fakeScript(dirname(logPath));
+  process.env.COTAL_ZELLIJ_SCRIPT = stand;
+  const scriptPids = (): number[] => readdirSync("/proc").filter((entry) => /^\d+$/.test(entry)).flatMap((entry) => {
+    try {
+      return readFileSync(`/proc/${entry}/cmdline`, "utf8").split("\0").includes(stand) ? [Number(entry)] : [];
+    } catch {
+      return [];
+    }
+  });
+  zellij.ensureClient(session, Date.now() + 2_000);
+  const started = scriptPids().length;
+  writeFileSync(`${logPath}.clients`, "1");
+  zellij.ensureClient(session, Date.now() + 2_000);
+  const deadline = Date.now() + 2_000;
+  while (scriptPids().length > 0 && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  const left = scriptPids();
+  for (const pid of left) process.kill(pid, "SIGKILL");
+  delete process.env.COTAL_ZELLIJ_SCRIPT;
+  const scripts = readFileSync(logPath, "utf8").split("\n").filter((line) => line === "script").length;
+  check("the headless client detaches once a real client attaches",
+    started > 0 && left.length === 0 && scripts === 1, { started, left, scripts });
 });
 await withFakeZellij("confirm", (logPath, session) => {
   let refused = false;

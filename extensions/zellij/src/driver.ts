@@ -105,14 +105,28 @@ export function ensureSession(session: string): void {
   run(["attach", "--create-background", session], { stdio: "ignore" });
 }
 
-function clientAttached(session: string, deadline?: number): boolean {
+// Client count, or undefined when the probe fails: a failed probe is not "no client".
+function clientCount(session: string, deadline?: number): number | undefined {
   try {
     return run(actionArgs(session, ["list-clients"]), { encoding: "utf8", deadline })
       .split("\n")
-      .some((line) => /^\d/.test(line.trim()));
+      .filter((line) => /^\d/.test(line.trim())).length;
   } catch {
-    return false;
+    return undefined;
   }
+}
+
+// The headless client this process started, per session; it detaches once another client is present.
+const headless = new Map<string, { pid: number; exited: boolean }>();
+
+function stopHeadless(session: string): void {
+  const client = headless.get(session);
+  headless.delete(session);
+  if (!client || client.exited) return;
+  try {
+    // Detached spawn leads its own group, so this stops script(1) and the zellij client together.
+    process.kill(-client.pid, "SIGKILL");
+  } catch {}
 }
 
 export function scriptAttachArgs(session: string): string[] {
@@ -124,7 +138,16 @@ export function scriptAttachArgs(session: string): string[] {
 export function ensureClient(session: string, deadline?: number): void {
   if (!sessionExists(session, deadline))
     throw new Error(`zellij runtime: session ${JSON.stringify(session)} does not exist`);
-  if (clientAttached(session, deadline)) return;
+  const count = clientCount(session, deadline);
+  if (count === undefined) {
+    if (deadline !== undefined && Date.now() >= deadline)
+      throw new Error("zellij runtime: the operation deadline passed before a client could start");
+    throw new Error(`zellij runtime: could not list clients of session ${JSON.stringify(session)}`);
+  }
+  const own = headless.get(session);
+  if (own?.exited) headless.delete(session);
+  else if (own && count >= 2) stopHeadless(session);
+  if (count > 0) return;
   const attachBy = deadline ?? Date.now() + 3_000;
   if (Date.now() >= attachBy) throw new Error("zellij runtime: the operation deadline passed before a client could start");
   const env = { ...process.env };
@@ -134,13 +157,16 @@ export function ensureClient(session: string, deadline?: number): void {
   const client = spawn(process.env.COTAL_ZELLIJ_SCRIPT ?? "script", scriptAttachArgs(session), { detached: true, stdio: "ignore", env });
   client.on("error", () => {});
   if (!client.pid) throw new Error("zellij runtime: could not start a headless script client");
+  const record = { pid: client.pid, exited: false };
+  client.on("exit", () => { record.exited = true; });
+  headless.set(session, record);
   client.unref();
   while (Date.now() < attachBy) {
-    if (clientAttached(session, attachBy)) return;
+    if ((clientCount(session, attachBy) ?? 0) > 0) return;
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(1, Math.min(100, attachBy - Date.now())));
   }
   // Only a bounded call leaves its own client behind on failure; an unbounded caller keeps today's behaviour.
-  if (deadline !== undefined) client.kill("SIGKILL");
+  if (deadline !== undefined) stopHeadless(session);
   throw new Error(`zellij runtime: no client could attach to session ${JSON.stringify(session)}`);
 }
 
