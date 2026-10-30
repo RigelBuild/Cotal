@@ -79,8 +79,11 @@ if (action === "list-clients") {
   if (mode === "handoff") {
     // Live headless clients count as zellij clients; the test file sets how many real clients exist.
     const command = "exec zellij attach " + process.env.COTAL_ZELLIJ_TEST_SESSION;
+    // PIDs in ".unattached" model a headless client that has not connected yet.
+    let unattached = [];
+    try { unattached = readFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".unattached", "utf8").split("\\n"); } catch {}
     const ours = readdirSync("/proc").filter((entry) => {
-      try { return /^\\d+$/.test(entry) && readFileSync("/proc/" + entry + "/cmdline", "utf8").includes(command); } catch { return false; }
+      try { return /^\\d+$/.test(entry) && !unattached.includes(entry) && readFileSync("/proc/" + entry + "/cmdline", "utf8").includes(command); } catch { return false; }
     }).length;
     const realPath = process.env.COTAL_ZELLIJ_TEST_LOG + ".clients";
     let real = 0;
@@ -483,7 +486,10 @@ const waitGone = (pids: number[]): number[] => {
   return pids.filter(alive);
 };
 const headlessCount = (logPath: string): number => readFileSync(logPath, "utf8").split("\n").filter((line) => line === "script").length;
-await withFakeZellij("handoff", (logPath, session) => {
+// These cells model clients through /proc; on a host without it the driver falls back to its own groups.
+const procfs = existsSync("/proc/self/cmdline");
+if (!procfs) console.log("  ✓ skipped /proc headless-client scenarios (no /proc on this platform)");
+if (procfs) await withFakeZellij("handoff", (logPath, session) => {
   process.env.COTAL_ZELLIJ_SCRIPT = fakeGroupScript(dirname(logPath));
   zellij.ensureClient(session, Date.now() + 2_000);
   const first = children(logPath);
@@ -495,7 +501,7 @@ await withFakeZellij("handoff", (logPath, session) => {
   check("the headless client and its descendants exit once a real client attaches",
     first.length === 1 && left.length === 0 && headlessCount(logPath) === 1, { first, left });
 });
-await withFakeZellij("handoff", (logPath, session) => {
+if (procfs) await withFakeZellij("handoff", (logPath, session) => {
   process.env.COTAL_ZELLIJ_SCRIPT = fakeGroupScript(dirname(logPath));
   zellij.ensureClient(session, Date.now() + 2_000);
   const first = children(logPath);
@@ -516,7 +522,7 @@ await withFakeZellij("handoff", (logPath, session) => {
   check("a real client leaving during handoff leaves the session with a headless client",
     ok && headlessCount(logPath) === 2 && live.length === 1, { all, live });
 });
-await withFakeZellij("handoff", (logPath, session) => {
+if (procfs) await withFakeZellij("handoff", (logPath, session) => {
   const stand = fakeGroupScript(dirname(logPath));
   // Two survivors of earlier manager processes, unknown to this one.
   const survivors = [0, 1].map(() => {
@@ -538,6 +544,24 @@ await withFakeZellij("handoff", (logPath, session) => {
   for (const pid of left) process.kill(pid, "SIGKILL");
   check("extra headless clients from earlier managers are stopped, and the last one leaves after a real client attaches",
     kept.length === 2 && left.length === 0 && headlessCount(logPath) === 2, { kept, left });
+});
+if (procfs) await withFakeZellij("handoff", (logPath, session) => {
+  const stand = fakeGroupScript(dirname(logPath));
+  // A headless client from an earlier manager that never connected: replace it, never add a second.
+  const stale = spawn(stand, zellij.scriptAttachArgs(session), { detached: true, stdio: "ignore", env: process.env });
+  stale.unref();
+  writeFileSync(`${logPath}.unattached`, String(stale.pid));
+  const until = Date.now() + 2_000;
+  while (children(logPath).length < 1 && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  process.env.COTAL_ZELLIJ_SCRIPT = stand;
+  zellij.ensureClient(session, Date.now() + 2_000);
+  const staleGroup = [stale.pid as number, ...children(logPath).slice(0, 1)];
+  const staleLeft = waitGone(staleGroup);
+  const live = children(logPath).filter(alive);
+  delete process.env.COTAL_ZELLIJ_SCRIPT;
+  for (const pid of [...staleLeft, ...live]) process.kill(pid, "SIGKILL");
+  check("an unattached headless client is replaced, not joined by a second one",
+    staleLeft.length === 0 && live.length === 1 && headlessCount(logPath) === 2, { staleLeft, live });
 });
 await withFakeZellij("confirm", (logPath, session) => {
   let refused = false;
