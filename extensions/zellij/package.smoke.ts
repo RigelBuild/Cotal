@@ -563,6 +563,28 @@ if (procfs) await withFakeZellij("handoff", (logPath, session) => {
   check("an unattached headless client is replaced, not joined by a second one",
     staleLeft.length === 0 && live.length === 1 && headlessCount(logPath) === 2, { staleLeft, live });
 });
+if (procfs) await withFakeZellij("handoff", (logPath, session) => {
+  const stand = fakeGroupScript(dirname(logPath));
+  // One real client plus a survivor that has not connected: the listing cannot tell which client
+  // is which, so it stays until it attaches, and the next call then stops it.
+  const stale = spawn(stand, zellij.scriptAttachArgs(session), { detached: true, stdio: "ignore", env: process.env });
+  stale.unref();
+  writeFileSync(`${logPath}.unattached`, String(stale.pid));
+  writeFileSync(`${logPath}.clients`, "1");
+  const until = Date.now() + 2_000;
+  while (children(logPath).length < 1 && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  process.env.COTAL_ZELLIJ_SCRIPT = stand;
+  const group = [stale.pid as number, ...children(logPath)];
+  zellij.ensureClient(session, Date.now() + 2_000);
+  const keptWhileUnattached = group.filter(alive).length;
+  writeFileSync(`${logPath}.unattached`, "");
+  zellij.ensureClient(session, Date.now() + 2_000);
+  const left = waitGone(group);
+  delete process.env.COTAL_ZELLIJ_SCRIPT;
+  for (const pid of left) process.kill(pid, "SIGKILL");
+  check("a survivor beside a real client is stopped once it attaches, and none is started",
+    keptWhileUnattached === 2 && left.length === 0 && headlessCount(logPath) === 1, { keptWhileUnattached, left });
+});
 await withFakeZellij("confirm", (logPath, session) => {
   let refused = false;
   try {
