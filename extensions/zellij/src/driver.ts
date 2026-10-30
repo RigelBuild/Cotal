@@ -199,6 +199,7 @@ export function ensureClient(session: string, deadline?: number): void {
   let count = knownClientCount(session, attachBy);
   if (count === undefined) throw unknown();
   // One attached client is the steady state, headless or real; only other counts need the scan.
+  // list-clients has no process identity, so an unattached survivor beside a real client stays until it attaches.
   if (count !== 1) {
     const procfs = (() => { try { readdirSync("/proc"); return true; } catch { return false; } })();
     const groups = headlessGroups(session);
