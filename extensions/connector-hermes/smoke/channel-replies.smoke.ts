@@ -44,7 +44,7 @@ function hard(condition: unknown, name: string): asserts condition {
   throw new Error(name);
 }
 
-const EXPECTED_CELLS = 20;
+const EXPECTED_CELLS = 23;
 if (process.platform === "win32") skipSuite("the Hermes connector is Unix-only");
 
 const pkgDir = fileURLToPath(new URL("..", import.meta.url));
@@ -60,6 +60,7 @@ type ProbeResult = {
   channel_reply_ok: boolean;
   sent: Sent[];
   unanchored_sent: Sent[];
+  answer_sent: Sent[];
 };
 
 function run(mode: "subject" | "control" | "shared"): ProbeResult {
@@ -86,6 +87,9 @@ for (const mode of ["subject", "shared"] as const) {
   // Per-peer, an unanchored send names its chat like an explicit send (cron), so it still posts.
   const unanchored = mode === "shared" ? [] : [{ target: { channel: "ops" }, text: "unanchored" }];
   assert.deepEqual(r.unanchored_sent, unanchored, `${mode}: an unanchored send follows the chat it names`);
+  // Shared: the answer to a question asked in a channel turn reports back to that channel, so it is dropped.
+  const answer = mode === "shared" ? [] : [{ target: { channel: "ops" }, text: "answer turn reply" }];
+  assert.deepEqual(r.answer_sent, answer, `${mode}: an answer turn whose origin is a channel follows channel_replies`);
 }
 
 const control = run("control");
@@ -104,6 +108,11 @@ assert.deepEqual(
   control.unanchored_sent,
   [{ target: { channel: "ops" }, text: "unanchored" }],
   "control: by default an unanchored send in a channel turn is posted",
+);
+assert.deepEqual(
+  control.answer_sent,
+  [{ target: { channel: "ops" }, text: "answer turn reply" }],
+  "control: by default an answer turn whose origin is a channel is posted",
 );
 
 console.log("hermes channel replies: channel posts are tool-only when channel_replies is false");

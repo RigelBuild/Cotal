@@ -189,6 +189,11 @@ class CotalAdapter(BasePlatformAdapter):
             if target is None:
                 logger.warning("cotal: a send to the shared chat names no delivered message (%r) and no turn has run; it is not sent", reply_to)
                 return SendResult(success=False, error="cotal reply has no mesh origin")
+            if "channel" in target and not self._channel_replies:
+                # A shared-chat send is a turn's own output, never an explicit send. An answer to a
+                # question asked in a channel turn reports back to that channel, so drop it here.
+                logger.info("cotal: channel_replies is off; a shared-chat send to #%s is not posted", target["channel"])
+                return SendResult(success=True, message_id=uuid.uuid4().hex)
         else:
             # An explicit chat (send_message, cron delivery) goes where it names, in either mode.
             target = _target_for(chat_id)

@@ -148,7 +148,8 @@ owns the mesh endpoint for the gateway's whole life and runs `hermes gateway run
 - Set `gateway.platforms.cotal.channel_replies: false` to stop posting a turn's reply to a
   channel. The agent then posts in a channel only by calling `cotal_send`, so a channel message
   it has nothing to add to gets no reply. DM replies and explicit sends to a channel, such as a
-  cron delivery, are unchanged.
+  cron delivery, are unchanged. In a single session, a reply never goes to a channel, even
+  when the turn answers a question the agent asked from a channel turn.
 
 - Set `gateway.platforms.cotal.peer_silence: true` to let the agent answer a peer with a bare
   silence marker. Without it, Hermes replaces the marker with an error notice and sends that.

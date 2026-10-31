@@ -142,6 +142,17 @@ async def main() -> None:
     await adapter._inject(dict(CH, id="m-ch2"))
     await adapter.send(adapter.handled[-1].source["chat_id"], "unanchored")
     out["unanchored_sent"] = adapter._client.replies
+    # A question asked in a channel turn: the peer's answer runs a turn whose origin is the channel.
+    from cotal import replies
+    adapter._client.replies = []
+    await adapter._inject(dict(CH, id="m-ch3"))
+    await adapter.on_processing_start(adapter.handled[-1])
+    ctx = replies.issue({"chat_id": adapter.handled[-1].source["chat_id"], "origin": replies.running()})
+    await adapter._inject({"kind": "dm", "id": "m-ans", "fromId": "ada-id", "fromName": "Ada", "text": "answer", "contextId": ctx, "answersQuestion": True})
+    answer = adapter.handled[-1]
+    await adapter.on_processing_start(answer)
+    await adapter.send(answer.source["chat_id"], "answer turn reply", reply_to=answer.message_id)
+    out["answer_sent"] = adapter._client.replies
     print("RESULT " + json.dumps(out))
 
 
