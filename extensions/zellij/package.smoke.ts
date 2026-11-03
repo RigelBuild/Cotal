@@ -3,6 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { LaunchSpec } from "@cotal-ai/core";
 import { buildNewPaneArgs, buildNewTabArgs } from "./src/driver.js";
 import { parseZellijPlacement } from "./src/placement.js";
@@ -35,7 +36,7 @@ function readCalls(logPath: string): string[][] {
 
 let fakeCells = 0;
 async function withFakeZellij(
-  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable" | "slow-probe" | "no-client" | "slow-client" | "clients-error" | "clients-flaky" | "handoff",
+  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable" | "slow-probe" | "no-client" | "slow-client" | "clients-error" | "clients-flaky" | "handoff" | "subscribe-drop",
   run: (logPath: string, session: string) => void | Promise<void>,
 ): Promise<void> {
   // The fake is a shebang script Windows cannot exec, and zellij ships no Windows build.
@@ -46,7 +47,7 @@ async function withFakeZellij(
   const bin = mkdtempSync(join(tmpdir(), "cotal-zellij-fake-"));
   const executable = join(bin, "zellij");
   const logPath = join(bin, "calls.jsonl");
-  // One session per cell: the driver caches pane listings per session name.
+  // Unique per cell: a handle's exit watch from an earlier cell must not list this cell's session.
   const session = `ztest-fake-${process.pid}-${++fakeCells}`;
   const saved = {
     PATH: process.env.PATH,
@@ -57,7 +58,7 @@ async function withFakeZellij(
     screenCount: process.env.COTAL_ZELLIJ_TEST_SCREEN_COUNT,
   };
   writeFileSync(executable, `#!/usr/bin/env node
-import { appendFileSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
 appendFileSync(process.env.COTAL_ZELLIJ_TEST_LOG, JSON.stringify(args) + "\\n");
 if (process.env.COTAL_ZELLIJ_TEST_MODE === "unavailable") process.exit(1);
@@ -114,9 +115,19 @@ if (action === "dump-screen") {
   console.log(process.env.COTAL_ZELLIJ_TEST_SCREEN ?? (reads >= 3 ? "Continue?" : "booting"));
   process.exit(0);
 }
-if (action === "list-panes") {
+if (args[2] === "subscribe") {
+  // A held stream: ends when the pane file reads "closed", and at once when the server cannot be
+  // reached (no-server, probe-error) or the stream drops (subscribe-drop).
+  const panePath = process.env.COTAL_ZELLIJ_TEST_LOG + ".pane";
+  const closed = () => { try { return readFileSync(panePath, "utf8") === "closed"; } catch { return false; } };
+  if (["subscribe-drop", "no-server", "probe-error"].includes(process.env.COTAL_ZELLIJ_TEST_MODE)) process.exit(0);
+  // Ends once the cell tears down its fake, the way a real stream ends with its server.
+  setInterval(() => { if (closed() || !existsSync(process.env.COTAL_ZELLIJ_TEST_LOG)) process.exit(0); }, 20);
+} else if (action === "list-panes") {
   const mode = process.env.COTAL_ZELLIJ_TEST_MODE;
-  console.log(JSON.stringify(mode === "partial-tab" ? [] : [{
+  let closed = false;
+  try { closed = readFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".pane", "utf8") === "closed"; } catch {}
+  console.log(JSON.stringify(mode === "partial-tab" || closed ? [] : [{
     id: 77, tab_id: 77, title: "confirm-agent", is_plugin: false, exited: false, exit_status: null
   }, ...(mode === "dropped-pane" ? [{ id: 78, tab_id: 77, title: "", is_plugin: false, exited: false, exit_status: null }] : [])]));
   process.exit(0);
@@ -186,7 +197,7 @@ assert.deepEqual(
 );
 assert.deepEqual(
   buildNewTabArgs("agent", "/work", ["node", "/tmp/launch.mjs"]),
-  ["new-tab", "--name", "agent", "--no-focus", "--cwd", "/work", "--", "node", "/tmp/launch.mjs"],
+  ["new-tab", "--name", "agent", "--no-focus", "--close-on-exit", "--cwd", "/work", "--", "node", "/tmp/launch.mjs"],
 );
 checks += 4;
 console.log("  ✓ pane and tab argv use focus-free CLI forms");
@@ -617,39 +628,49 @@ await withFakeZellij("dropped-pane", (logPath, session) => {
   );
 });
 
+const settles = async (promise: Promise<void>, ms: number): Promise<boolean> =>
+  Promise.race([promise.then(() => true), sleep(ms).then(() => false)]);
+const listings = (logPath: string): number => readCalls(logPath).filter((args) => args[3] === "list-panes").length;
+
 // Each list-panes connects a client whose disconnect sends every PaneUpdate plugin the full pane
-// manifest; per-seat exit polls must share one listing instead of one each.
-await withFakeZellij("confirm", (logPath, session) => {
-  const states = Array.from({ length: 40 }, (_, i) => zellij.paneState(session, i % 2 ? "terminal_77" : "terminal_5"));
-  const listings = readCalls(logPath).filter((args) => args[3] === "list-panes").length;
+// manifest, so a running seat is watched through one held subscriber and listed only to prove exit.
+await withFakeZellij("confirm", async (logPath, session) => {
+  const watch = new zellij.PaneWatch(session, "terminal_77");
+  await sleep(500);
+  const quiet = listings(logPath);
+  const subscribes = readCalls(logPath).filter((args) => args[2] === "subscribe").length;
+  writeFileSync(`${logPath}.pane`, "closed");
+  const exited = await settles(watch.waitForExit(), 2_000);
   check(
-    `many seats polling one session within a second share one list-panes call (got ${listings})`,
-    listings === 1 && states.every((state, i) => state === (i % 2 ? "running" : "exited")),
+    `a running pane costs one subscriber and no listing; its close is proved by one listing (listings ${quiet} then ${listings(logPath)}, subscribers ${subscribes})`,
+    quiet === 0 && subscribes === 1 && exited && watch.status() === "exited" && listings(logPath) === 1,
   );
 });
 
-await withFakeZellij("confirm", (logPath, session) => {
-  zellij.paneState(session, "terminal_77");
-  zellij.closePane(session, "terminal_77");
-  zellij.paneState(session, "terminal_77");
-  const listings = readCalls(logPath).filter((args) => args[3] === "list-panes").length;
-  check(`closing a pane drops the cached listing (got ${listings} listings)`, listings === 2);
+// A stream that ends while the pane still runs (server restart, broken pipe) is not an exit.
+await withFakeZellij("subscribe-drop", async (logPath, session) => {
+  const watch = new zellij.PaneWatch(session, "terminal_77");
+  const exited = await settles(watch.waitForExit(), 2_500);
+  const subscribes = readCalls(logPath).filter((args) => args[2] === "subscribe").length;
+  watch.stop();
+  check(
+    `a dropped stream over a live pane stays running and subscribes again (subscribers ${subscribes})`,
+    !exited && watch.status() === "running" && subscribes >= 2,
+  );
 });
 
-await withFakeZellij("confirm", (logPath, session) => {
-  check("terminal_78 reads exited before it is created", zellij.paneState(session, "terminal_78") === "exited");
-  zellij.createPane(session, "77", "/work", "exec agent", { stacked: false, floating: false });
-  const before = readCalls(logPath).filter((args) => args[3] === "list-panes").length;
-  zellij.paneState(session, "terminal_78");
-  const after = readCalls(logPath).filter((args) => args[3] === "list-panes").length;
-  check(`creating a pane drops the cached listing, so the new pane is not read as exited`, after === before + 1);
+// A failed listing after the stream ends is unknown, never an exit.
+await withFakeZellij("probe-error", async (_logPath, session) => {
+  const watch = new zellij.PaneWatch(session, "terminal_77");
+  const exited = await settles(watch.waitForExit(), 1_500);
+  watch.stop();
+  check("a stream end with a failed listing does not read as an exit", !exited && watch.status() === "running");
 });
 
-await withFakeZellij("confirm", (logPath, session) => {
-  zellij.paneState(session, "terminal_77");
-  zellij.dumpScreen(session, "terminal_77", Date.now() + 5_000);
-  const listings = readCalls(logPath).filter((args) => args[3] === "list-panes").length;
-  check(`dumpScreen re-reads pane state instead of trusting the shared listing (got ${listings})`, listings === 3);
+// A watch whose session is gone proves the exit through the session listing.
+await withFakeZellij("no-server", async (_logPath, session) => {
+  const watch = new zellij.PaneWatch(session, "terminal_77");
+  check("a watch on a session zellij no longer has resolves as exited", await settles(watch.waitForExit(), 2_000) && watch.status() === "exited");
 });
 
 console.log(`ZELLIJ PACKAGE TESTS: ${checks} tests executed`);

@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 
 export interface ZellijPlacement {
@@ -51,14 +51,14 @@ function run(args: string[], options: RunOptions = { encoding: "utf8" }): string
 
 /** Read the active viewport of a terminal pane; every call shares one deadline so a watch cannot stall the manager. */
 export function dumpScreen(session: string, paneId: string, deadline: number): string | undefined {
-  if (paneState(session, paneId, deadline, 0) === "exited") return undefined;
+  if (paneState(session, paneId, deadline) === "exited") return undefined;
   let screen: string | undefined;
   try {
     screen = run(actionArgs(session, ["dump-screen", "--pane-id", paneId]), { encoding: "utf8", deadline });
   } catch (error) {
     if (Date.now() >= deadline) throw error;
   }
-  if (paneState(session, paneId, deadline, 0) === "exited") return undefined;
+  if (paneState(session, paneId, deadline) === "exited") return undefined;
   if (screen === undefined) throw new Error(`zellij runtime: could not read pane ${paneId}`);
   return screen;
 }
@@ -292,13 +292,14 @@ export function buildNewPaneArgs(tabId: string, cwd: string, placement: ZellijPl
   return args;
 }
 
+// --close-on-exit: zellij holds an exited command pane open, and a held pane sends its subscribers
+// no close event.
 export function buildNewTabArgs(name: string, cwd: string, argv: readonly string[]): string[] {
-  return ["new-tab", "--name", name, "--no-focus", "--cwd", cwd, "--", ...argv];
+  return ["new-tab", "--name", name, "--no-focus", "--close-on-exit", "--cwd", cwd, "--", ...argv];
 }
 
 export function createTab(session: string, name: string, cwd: string, argv: readonly string[]): string {
   ensureClient(session);
-  snapshots.delete(session);
   const output = run(actionArgs(session, buildNewTabArgs(name, cwd, argv)));
   const id = output.trim();
   if (!/^\d+$/.test(id)) throw new Error(`zellij runtime: could not read tab ID from ${JSON.stringify(output)}`);
@@ -307,7 +308,6 @@ export function createTab(session: string, name: string, cwd: string, argv: read
 
 export function createEmptyTab(session: string, name: string, cwd: string): string {
   ensureClient(session);
-  snapshots.delete(session);
   const output = run(actionArgs(session, ["new-tab", "--name", name, "--no-focus", "--cwd", cwd]));
   const id = output.trim();
   if (!/^\d+$/.test(id)) throw new Error(`zellij runtime: could not read tab ID from ${JSON.stringify(output)}`);
@@ -332,8 +332,6 @@ export function createPane(
 }
 
 function newPane(session: string, args: string[]): string {
-  // A snapshot from before this pane existed would read it as exited.
-  snapshots.delete(session);
   const output = run(actionArgs(session, args));
   const id = output.trim();
   if (!/^terminal_\d+$/.test(id)) throw new Error(`zellij runtime: could not read pane ID from ${JSON.stringify(output)}`);
@@ -343,14 +341,12 @@ function newPane(session: string, args: string[]): string {
 export function closePane(session: string, paneId: string, deadline?: number): void {
   if (!sessionExists(session, deadline)) return;
   ensureClient(session, deadline);
-  snapshots.delete(session);
   run(actionArgs(session, ["close-pane", "-p", paneId]), { stdio: "ignore", deadline });
 }
 
 export function closeTab(session: string, tabId: string): void {
   if (!sessionExists(session)) return;
   ensureClient(session);
-  snapshots.delete(session);
   run(actionArgs(session, ["close-tab", "--tab-id", tabId]), { stdio: "ignore" });
 }
 export function buildWriteArgs(paneId: string, input: string): string[] {
@@ -371,34 +367,102 @@ export function interruptPane(session: string, paneId: string): void {
   writePane(session, paneId, "3");
 }
 
-// Every list-panes call connects a zellij client, and its disconnect sends a full pane manifest
-// to each PaneUpdate plugin (status-bar, link). Per-seat exit polls share one read per second.
-const SNAPSHOT_MAX_AGE_MS = 1_000;
-const snapshots = new Map<string, { at: number; panes: ZellijPane[] }>();
-
-export function paneState(
-  session: string,
-  paneId: string,
-  deadline?: number,
-  maxAgeMs = SNAPSHOT_MAX_AGE_MS,
-): "running" | "exited" {
-  let snapshot = snapshots.get(session);
-  if (!snapshot || Date.now() - snapshot.at >= maxAgeMs) {
-    // A failed probe throws before the store, so it is never reused as an answer.
-    snapshot = { at: Date.now(), panes: listPanes(session, deadline) };
-    snapshots.set(session, snapshot);
-  }
-  const pane = snapshot.panes.find((candidate) => candidate.id === paneId && !candidate.is_plugin);
+export function paneState(session: string, paneId: string, deadline?: number): "running" | "exited" {
+  if (!sessionExists(session, deadline)) return "exited";
+  const pane = listPanes(session, deadline).find((candidate) => candidate.id === paneId && !candidate.is_plugin);
   return !pane || pane.exited || pane.exit_status !== null ? "exited" : "running";
 }
 
-export async function waitForPaneExit(session: string, paneId: string): Promise<void> {
-  for (;;) {
+const RESUBSCRIBE_MS = 1_000;
+
+/** Tracks one pane's exit through a held `zellij subscribe`. Each list-panes call connects a client
+ *  whose disconnect queues the full pane manifest on every PaneUpdate plugin (status-bar, link); a
+ *  held subscriber does not. The stream only says when to look: one listing proves the exit, and a
+ *  stream that ends while the pane still runs is opened again. */
+export class PaneWatch {
+  #exited = false;
+  #stopped = false;
+  #child: ChildProcess | undefined;
+  #retry: NodeJS.Timeout | undefined;
+  #resolveExit!: () => void;
+  // Executor form: the repo's lib is ES2023, which has no Promise.withResolvers.
+  readonly #exit = new Promise<void>((resolve) => {
+    this.#resolveExit = resolve;
+  });
+
+  constructor(
+    private readonly session: string,
+    private readonly paneId: string,
+  ) {
+    this.#open();
+  }
+
+  /** "running" until a listing has proved the pane gone. */
+  status(): "running" | "exited" {
+    return this.#exited ? "exited" : "running";
+  }
+
+  waitForExit(): Promise<void> {
+    return this.#exit;
+  }
+
+  /** Stops watching; a pending waitForExit stays pending. */
+  stop(): void {
+    this.#stopped = true;
+    clearTimeout(this.#retry);
+    this.#retry = undefined;
+    this.#child?.kill("SIGKILL");
+    this.#child = undefined;
+  }
+
+  #check(): void {
+    if (this.#exited || this.#stopped) return;
+    let state: "running" | "exited";
     try {
-      if (paneState(session, paneId) === "exited") return;
+      state = paneState(this.session, this.paneId);
     } catch {
-      // A failed probe is not an exit; poll again.
+      // A failed listing is not an exit: subscribe again and look again when that stream ends.
+      this.#reopen();
+      return;
     }
-    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    if (state === "running") {
+      this.#reopen();
+      return;
+    }
+    this.#exited = true;
+    this.stop();
+    this.#resolveExit();
+  }
+
+  #reopen(): void {
+    if (this.#stopped || this.#retry) return;
+    this.#retry = setTimeout(() => {
+      this.#retry = undefined;
+      this.#open();
+    }, RESUBSCRIBE_MS);
+    this.#retry.unref();
+  }
+
+  #open(): void {
+    if (this.#stopped) return;
+    const env = { ...process.env };
+    delete env.ZELLIJ;
+    delete env.ZELLIJ_PANE_ID;
+    delete env.ZELLIJ_SESSION_NAME;
+    const child = spawn("zellij", ["--session", this.session, "subscribe", "--pane-id", this.paneId, "--format", "json"], {
+      stdio: "ignore",
+      env,
+    });
+    this.#child = child;
+    // pane_closed, a dead server, an unknown pane and a broken stream all end the process; a spawn
+    // failure may report only "error". Either way one listing decides.
+    const ended = (): void => {
+      if (this.#child !== child) return;
+      this.#child = undefined;
+      this.#check();
+    };
+    child.on("error", ended);
+    child.on("exit", ended);
+    child.unref();
   }
 }

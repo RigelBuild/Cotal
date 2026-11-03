@@ -162,16 +162,12 @@ export class ZellijRuntime implements Runtime {
       },
     });
 
+    // One held subscriber per seat replaces per-call list-panes polling for status and exit.
+    const exitWatch = new zellij.PaneWatch(this.session, startedPane);
     return {
       name,
       kind: "zellij",
-      status: () => {
-        try {
-          return zellij.paneState(this.session, startedPane);
-        } catch {
-          return "running";
-        }
-      },
+      status: () => exitWatch.status(),
       stop: () => {
         try {
           zellij.closePane(this.session, startedPane);
@@ -180,7 +176,7 @@ export class ZellijRuntime implements Runtime {
         }
       },
       interrupt: () => zellij.interruptPane(this.session, startedPane),
-      waitForExit: () => zellij.waitForPaneExit(this.session, startedPane),
+      waitForExit: () => exitWatch.waitForExit(),
       attach: () => {
         throw new Error(`zellij runtime: attach natively with zellij attach ${this.session}`);
       },
