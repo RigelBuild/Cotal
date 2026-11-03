@@ -51,14 +51,14 @@ function run(args: string[], options: RunOptions = { encoding: "utf8" }): string
 
 /** Read the active viewport of a terminal pane; every call shares one deadline so a watch cannot stall the manager. */
 export function dumpScreen(session: string, paneId: string, deadline: number): string | undefined {
-  if (paneState(session, paneId, deadline) === "exited") return undefined;
+  if (paneState(session, paneId, deadline, 0) === "exited") return undefined;
   let screen: string | undefined;
   try {
     screen = run(actionArgs(session, ["dump-screen", "--pane-id", paneId]), { encoding: "utf8", deadline });
   } catch (error) {
     if (Date.now() >= deadline) throw error;
   }
-  if (paneState(session, paneId, deadline) === "exited") return undefined;
+  if (paneState(session, paneId, deadline, 0) === "exited") return undefined;
   if (screen === undefined) throw new Error(`zellij runtime: could not read pane ${paneId}`);
   return screen;
 }
@@ -298,6 +298,7 @@ export function buildNewTabArgs(name: string, cwd: string, argv: readonly string
 
 export function createTab(session: string, name: string, cwd: string, argv: readonly string[]): string {
   ensureClient(session);
+  snapshots.delete(session);
   const output = run(actionArgs(session, buildNewTabArgs(name, cwd, argv)));
   const id = output.trim();
   if (!/^\d+$/.test(id)) throw new Error(`zellij runtime: could not read tab ID from ${JSON.stringify(output)}`);
@@ -306,6 +307,7 @@ export function createTab(session: string, name: string, cwd: string, argv: read
 
 export function createEmptyTab(session: string, name: string, cwd: string): string {
   ensureClient(session);
+  snapshots.delete(session);
   const output = run(actionArgs(session, ["new-tab", "--name", name, "--no-focus", "--cwd", cwd]));
   const id = output.trim();
   if (!/^\d+$/.test(id)) throw new Error(`zellij runtime: could not read tab ID from ${JSON.stringify(output)}`);
@@ -330,6 +332,8 @@ export function createPane(
 }
 
 function newPane(session: string, args: string[]): string {
+  // A snapshot from before this pane existed would read it as exited.
+  snapshots.delete(session);
   const output = run(actionArgs(session, args));
   const id = output.trim();
   if (!/^terminal_\d+$/.test(id)) throw new Error(`zellij runtime: could not read pane ID from ${JSON.stringify(output)}`);
@@ -339,12 +343,14 @@ function newPane(session: string, args: string[]): string {
 export function closePane(session: string, paneId: string, deadline?: number): void {
   if (!sessionExists(session, deadline)) return;
   ensureClient(session, deadline);
+  snapshots.delete(session);
   run(actionArgs(session, ["close-pane", "-p", paneId]), { stdio: "ignore", deadline });
 }
 
 export function closeTab(session: string, tabId: string): void {
   if (!sessionExists(session)) return;
   ensureClient(session);
+  snapshots.delete(session);
   run(actionArgs(session, ["close-tab", "--tab-id", tabId]), { stdio: "ignore" });
 }
 export function buildWriteArgs(paneId: string, input: string): string[] {
@@ -365,9 +371,24 @@ export function interruptPane(session: string, paneId: string): void {
   writePane(session, paneId, "3");
 }
 
-export function paneState(session: string, paneId: string, deadline?: number): "running" | "exited" {
-  if (!sessionExists(session, deadline)) return "exited";
-  const pane = listPanes(session, deadline).find((candidate) => candidate.id === paneId && !candidate.is_plugin);
+// Every list-panes call connects a zellij client, and its disconnect sends a full pane manifest
+// to each PaneUpdate plugin (status-bar, link). Per-seat exit polls share one read per second.
+const SNAPSHOT_MAX_AGE_MS = 1_000;
+const snapshots = new Map<string, { at: number; panes: ZellijPane[] }>();
+
+export function paneState(
+  session: string,
+  paneId: string,
+  deadline?: number,
+  maxAgeMs = SNAPSHOT_MAX_AGE_MS,
+): "running" | "exited" {
+  let snapshot = snapshots.get(session);
+  if (!snapshot || Date.now() - snapshot.at >= maxAgeMs) {
+    // A failed probe throws before the store, so it is never reused as an answer.
+    snapshot = { at: Date.now(), panes: listPanes(session, deadline) };
+    snapshots.set(session, snapshot);
+  }
+  const pane = snapshot.panes.find((candidate) => candidate.id === paneId && !candidate.is_plugin);
   return !pane || pane.exited || pane.exit_status !== null ? "exited" : "running";
 }
 

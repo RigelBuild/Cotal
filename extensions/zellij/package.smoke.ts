@@ -33,6 +33,7 @@ function readCalls(logPath: string): string[][] {
     .map((line) => JSON.parse(line) as string[]);
 }
 
+let fakeCells = 0;
 async function withFakeZellij(
   mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable" | "slow-probe" | "no-client" | "slow-client" | "clients-error" | "clients-flaky" | "handoff",
   run: (logPath: string, session: string) => void | Promise<void>,
@@ -45,7 +46,8 @@ async function withFakeZellij(
   const bin = mkdtempSync(join(tmpdir(), "cotal-zellij-fake-"));
   const executable = join(bin, "zellij");
   const logPath = join(bin, "calls.jsonl");
-  const session = `ztest-fake-${process.pid}`;
+  // One session per cell: the driver caches pane listings per session name.
+  const session = `ztest-fake-${process.pid}-${++fakeCells}`;
   const saved = {
     PATH: process.env.PATH,
     mode: process.env.COTAL_ZELLIJ_TEST_MODE,
@@ -613,6 +615,41 @@ await withFakeZellij("dropped-pane", (logPath, session) => {
     "a placed pane zellij never adds is replaced by an unplaced pane that gets the launch line",
     id === "terminal_78" && typed.length === 1 && typed[0].includes("terminal_78"),
   );
+});
+
+// Each list-panes connects a client whose disconnect sends every PaneUpdate plugin the full pane
+// manifest; per-seat exit polls must share one listing instead of one each.
+await withFakeZellij("confirm", (logPath, session) => {
+  const states = Array.from({ length: 40 }, (_, i) => zellij.paneState(session, i % 2 ? "terminal_77" : "terminal_5"));
+  const listings = readCalls(logPath).filter((args) => args[3] === "list-panes").length;
+  check(
+    `many seats polling one session within a second share one list-panes call (got ${listings})`,
+    listings === 1 && states.every((state, i) => state === (i % 2 ? "running" : "exited")),
+  );
+});
+
+await withFakeZellij("confirm", (logPath, session) => {
+  zellij.paneState(session, "terminal_77");
+  zellij.closePane(session, "terminal_77");
+  zellij.paneState(session, "terminal_77");
+  const listings = readCalls(logPath).filter((args) => args[3] === "list-panes").length;
+  check(`closing a pane drops the cached listing (got ${listings} listings)`, listings === 2);
+});
+
+await withFakeZellij("confirm", (logPath, session) => {
+  check("terminal_78 reads exited before it is created", zellij.paneState(session, "terminal_78") === "exited");
+  zellij.createPane(session, "77", "/work", "exec agent", { stacked: false, floating: false });
+  const before = readCalls(logPath).filter((args) => args[3] === "list-panes").length;
+  zellij.paneState(session, "terminal_78");
+  const after = readCalls(logPath).filter((args) => args[3] === "list-panes").length;
+  check(`creating a pane drops the cached listing, so the new pane is not read as exited`, after === before + 1);
+});
+
+await withFakeZellij("confirm", (logPath, session) => {
+  zellij.paneState(session, "terminal_77");
+  zellij.dumpScreen(session, "terminal_77", Date.now() + 5_000);
+  const listings = readCalls(logPath).filter((args) => args[3] === "list-panes").length;
+  check(`dumpScreen re-reads pane state instead of trusting the shared listing (got ${listings})`, listings === 3);
 });
 
 console.log(`ZELLIJ PACKAGE TESTS: ${checks} tests executed`);
