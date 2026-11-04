@@ -889,6 +889,7 @@ export async function provisionAgent(
 ): Promise<string> {
   if (!opts.lifecycleUid)
     throw new Error("provisionAgent: a lifecycleUid is required - the agent's broker footprint is lifecycle-keyed (SPEC 13.1); mint one with mintLifecycleUid() and persist it with the agent");
+  if (opts.name !== undefined) assertValidName(opts.name);
   const pr = principalOf(identity, opts.principal, opts.lifecycleUid);
   const allowSubscribe = await provisionAgentDurables(
     provisioner,

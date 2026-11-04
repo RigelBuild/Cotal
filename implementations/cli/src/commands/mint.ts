@@ -4,6 +4,7 @@ import {
   CotalEndpoint,
   agentFilePath,
   assertKnownAgentCapabilities,
+  assertValidName,
   assertLifecycleToken,
   credsClaims,
   identityFromCreds,
@@ -167,6 +168,12 @@ export async function mint(args: ParsedArgs): Promise<void> {
   const name = positionals[0];
   if (!name) {
     console.error(c.red("usage: cotal mint <name> [--profile <agent|observer|admin>] [--out <path>] [--expires-in <s>|--expires-at <unix-s>] [--identity <creds>] [--new-incarnation (agent only)]  (agent profile also: [--allow-subscribe a,b] [--allow-publish a,b] [--role <role>] [--provision])"));
+    process.exit(1);
+  }
+  try {
+    assertValidName(name);
+  } catch (err) {
+    console.error(c.red(`✗ ${(err as Error).message}`));
     process.exit(1);
   }
   // Only an absent flag is `undefined` and defers to the agent file; an empty value is the empty

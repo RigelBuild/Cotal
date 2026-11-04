@@ -466,6 +466,10 @@ try {
     const rp = await runMint(["bounded-agent", "--profile", "agent", "--provision", "--expires-in", "3600", "--out", pout]);
     check("mint --provision --expires-in succeeds and stamps the positional name",
       rp.code === 0 && existsSync(pout) && credsClaims(readFileSync(pout, "utf8")).exp !== undefined && credsClaims(readFileSync(pout, "utf8")).name === "bounded-agent", rp.out);
+    // An invalid name must refuse before --provision connects and creates durables.
+    const badOut = join(root, "bad.creds");
+    const rBad = await runMint([" padded ", "--profile", "agent", "--provision", "--out", badOut]);
+    check("mint --provision refuses an invalid name before connecting", rBad.code === 1 && !existsSync(badOut) && /invalid name/.test(rBad.out) && !/nats:\/\//.test(rBad.out), rBad.out);
   }
 
   // ── 8. --identity re-mints for the SAME nkey ──────────────────────────────────────────────
