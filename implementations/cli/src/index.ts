@@ -245,8 +245,8 @@ const baseCommands: Command[] = [
     kind: "command",
     name: "mint",
     group: "Mesh",
-    summary: "mint a creds file for a space (auth mode); --signer emits a stripped account-signing file",
-    positionals: "<name>",
+    summary: "mint a creds file with a named display identity; --signer emits a stripped account-signing file",
+    positionals: "<name: display name>",
     flags: [
       { name: "profile", type: "string", value: "<agent|observer|admin>", description: "cred profile (default agent)" },
       { name: "out", type: "string", value: "<path>", description: "output path (default .cotal/auth/creds/space.<key>/<name>.creds)" },

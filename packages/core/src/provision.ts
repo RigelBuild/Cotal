@@ -194,6 +194,18 @@ export type Profile =
   | "environment-manager-supervisor"
   | "environment-manager-executor"
   | "environment-manager-goal-writer";
+/** Runtime list of credential profile labels for claim classification. */
+export const PROFILES = [
+  "agent", "manager-caller", "observer", "admin", "supervisor", "provisioner", "deprovisioner",
+  "retirement-requester", "lifecycle-executor", "endpoint-serve-executor", "operator", "purger",
+  "backup", "restore", "delivery", "membership-rw", "probe", "channel-writer", "channel-purger",
+  "teardown", "control-caller-privileged", "control-caller-admin", "deployer", "endpoint-serve",
+  "goal-writer", "session-caller", "session-serving", "session-ledger", "run-driver", "run-mediator",
+  "run-operator", "endpoint-evictor", "issuer", "run-admitter", "transfer-writer", "transfer-reader",
+  "remote-manager", "environment-bootstrap", "environment-manager-supervisor",
+  "environment-manager-executor", "environment-manager-goal-writer",
+] as const satisfies readonly Profile[];
+
 
 export type CredentialLifetimeClass =
   | "standing-renewable" // bounded exp + an ONLINE renewal owner (a seed-holder re-mints before expiry)
@@ -567,6 +579,8 @@ export async function createSpaceAuth(space: string): Promise<SpaceAuth> {
 
 /** Options shaping a minted user's permissions. */
 export interface MintOpts {
+  /** Display name placed in the JWT `name` claim. Defaults to the profile label. */
+  name?: string;
   /** The owner+actor principal to mint for. Omitted ⇒ the no-login dev default (owner `"local"`, actor
    *  = the connection id) via {@link principalOf}. User mode supplies the derived owner + ledger actor. */
   principal?: { owner: string; actor: string };
@@ -946,13 +960,11 @@ export async function mintCreds(
     : permissionsFor(profile, auth.space, pr, opts);
   const validDates = userValidDates(profile, opts);
   const userJwt = await encodeUser(
-    profile,
+    opts.name ?? profile,
     fromPublic(identity.id),
     fromPublic(auth.account.pub),
-    // Stamp the principal `tags` so this connection's identity is CONNZ-recoverable by the membership
-    // feed — the SAME tags the auth callout stamps (user mode), via core's single-source builder. The
-    // JWT `name` stays the profile label (a debug breadcrumb; not a surfaced/queryable CONNZ field).
     { ...perms, tags: userTags(profile, pr) },
+    // The JWT name is the requested display name or the profile label.
     { signer, ...validDates },
   );
   // Build the credential string FULLY before the fence: nothing fallible may run AFTER a winning

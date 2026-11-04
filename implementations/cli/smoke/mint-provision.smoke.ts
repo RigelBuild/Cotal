@@ -470,7 +470,10 @@ try {
 
   // ── 8. --identity re-mints for the SAME nkey ──────────────────────────────────────────────
   {
-    // The durable half of the issue: two plain mints churn the principal; --identity must not.
+    const namedOut = join(root, "named.creds");
+    const namedMint = await runMint(["minted-label", "--profile", "observer", "--out", namedOut]);
+    check("plain mint stamps its requested display name", namedMint.code === 0 && credsClaims(readFileSync(namedOut, "utf8")).name === "minted-label", namedMint.out);
+
     const first = join(root, "id-first.creds");
     const r1 = await runMint(["idfirst", "--profile", "observer", "--out", first]);
     check("the first plain mint succeeds", r1.code === 0 && existsSync(first), r1.out);
@@ -486,6 +489,7 @@ try {
     const r3 = await runMint(["idremint", "--profile", "observer", "--identity", first, "--expires-in", "3600", "--out", remint]);
     check("re-mint --identity <creds> succeeds", r3.code === 0 && existsSync(remint), r3.out);
     const claims3 = credsClaims(readFileSync(remint, "utf8"));
+    check("--identity re-mint uses the new requested display name", claims3.name === "idremint", claims3.name);
     check("  the re-minted credential's principal IS the original's (same nkey, so every durable keyed to it survives)",
       claims3.sub === sub1, { sub1, sub3: claims3.sub });
     check("  and it is bounded, so the renewal seam's own remedy now has a CLI form",

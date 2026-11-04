@@ -1,8 +1,12 @@
+import { existsSync, readFileSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
+import { resolve } from "node:path";
 import {
   resolvePeer,
   readsDirectMessages,
   AmbiguousPeerError,
+  credsClaims,
+  PROFILES,
   type Presence,
   type CompletionResult,
   type ParsedArgs,
@@ -12,8 +16,8 @@ import { c } from "../ui.js";
 import { completedFlagValue, completingFlagValue, positionalsForCompletion } from "../lib/completion.js";
 import { openTransient } from "../lib/transient.js";
 import { listDeclaredChannels, listDeclaredRoles } from "../lib/personas.js";
-import { mentionsIn } from "../lib/mentions.js";
 import { dmEndpointRefusal } from "../lib/dm-refusal.js";
+import { mentionsIn } from "../lib/mentions.js";
 
 /**
  * One-shot send command — `cotal send <dm|msg|ask>` — the headless equivalent of the console's
@@ -21,28 +25,40 @@ import { dmEndpointRefusal } from "../lib/dm-refusal.js";
  * `anycast`); each connects, sends one message, and exits. Fire-and-forget: no reply waiting.
  */
 
-type SendValues = { space?: string; server?: string; creds?: string };
-
 /** Split `<target> <text…>` positionals, stripping a leading `@`/`#` from the target. */
 function targetAndText(positionals: string[], strip: RegExp): { target?: string; text: string } {
   return { target: positionals[0]?.replace(strip, ""), text: positionals.slice(1).join(" ").trim() };
 }
 
-/** Derive the one-shot send's display name from the OS login and host, `<login>@<host>` — never
- *  from `COTAL_NAME` (#680). `userInfo()` throws on a system with no passwd entry for the uid;
- *  let it propagate. No fallback to a fixed literal (per AGENTS.md). */
-function senderName(): string {
+/** Prefer a non-profile name from explicit creds; invalid COTAL_NAME is omitted. */
+function senderName(credsPath?: string): string {
+  const path = credsPath ? resolve(credsPath) : undefined;
+  const base = path && existsSync(path)
+    ? displayNameFromCreds(readFileSync(path, "utf8")) ?? osSenderName()
+    : osSenderName();
+  const agent = process.env.COTAL_NAME;
+  if (agent === undefined || agent.length === 0 || agent.length > 128 || /[\/\\\r\n]/.test(agent) || base.length + agent.length + 3 > 128) return base;
+  return `${base} (${agent})`;
+}
+
+function displayNameFromCreds(creds: string): string | undefined {
+  const name = credsClaims(creds).name;
+  return typeof name === "string" && name.length > 0 && name.length <= 128 && !/[\/\\\r\n]/.test(name) && !PROFILES.some((profile) => profile === name)
+    ? name
+    : undefined;
+}
+
+function osSenderName(): string {
   const login = userInfo().username.trim();
   const host = hostname().trim();
   if (!login || !host)
     throw new Error("cotal send cannot derive a sender name: empty login or host from the OS");
   const name = `${login}@${host}`;
-  if (name.length > 128)
-    throw new Error(`cotal send cannot derive a sender name: "${name}" exceeds 128 characters`);
-  if (/[/\\\r\n]/.test(name))
-    throw new Error(`cotal send cannot derive a sender name: "${name}" contains a reserved character`);
+  if (name.length > 128 || /[\/\\\r\n]/.test(name))
+    throw new Error("cotal send cannot derive a valid sender name from OS login and host");
   return name;
 }
+
 
 /** `cotal send <dm|msg|ask> …` — dispatch one-shot send by delivery mode, then exit. */
 export async function send(args: ParsedArgs): Promise<void> {
@@ -54,9 +70,8 @@ export async function send(args: ParsedArgs): Promise<void> {
     );
     process.exit(1);
   }
-  // Display text beside the credential-derived principal: the login and host are what a reader
-  // needs to find the shell that sent it, taken from the OS, never from `COTAL_NAME` (#680).
-  const opened = await openTransient(values, senderName());
+  // The wire principal remains credential-derived; only this card name is descriptive.
+  const opened = await openTransient(values, senderName(typeof values.creds === "string" ? values.creds : undefined));
   if (mode === "dm") return dm(opened, rest);
   if (mode === "msg") return msg(opened, rest);
   return ask(opened, rest);

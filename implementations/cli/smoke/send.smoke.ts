@@ -38,7 +38,7 @@ import { authDir, recordMesh, saveSpaceAuth, setCurrent } from "@cotal-ai/worksp
 import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-const EXPECTED = 38;
+const EXPECTED = 43;
 let pass = 0;
 let fail = 0;
 const check = (name: string, cond: boolean, extra?: unknown) => {
@@ -245,6 +245,15 @@ try {
     got,
   );
 
+  const agentText = `agent-name-${randomUUID().slice(0, 6)}`;
+  const agentSend = await run(["send", "dm", "bob", agentText], { COTAL_NAME: "nemo-intake" });
+  await wait(400);
+  check(
+    "COTAL_NAME appends the sending agent to the OS display name",
+    agentSend.code === 0 && got.some((m) => m.route === "DM" && m.text === agentText && m.fromName === `${expectedSender} (nemo-intake)`),
+    { agentSend, got },
+  );
+
   const spoofText = `spoof-${randomUUID().slice(0, 6)}`;
   const spoof = await run(["send", "dm", "bob", spoofText], {
     COTAL_NAME: "forged-seat",
@@ -256,16 +265,16 @@ try {
   check("seat-shaped environment does not block an operator-credential send", spoof.code === 0, spoof.stderr);
   check(
     "seat-shaped environment cannot replace the credential-derived principal",
-    got.some((m) => m.route === "DM" && m.text === spoofText && m.fromId.startsWith(`${DEV_OWNER}.`) && m.fromId !== "forged-owner.forged-actor" && m.fromName === expectedSender),
+    got.some((m) => m.route === "DM" && m.text === spoofText && m.fromId.startsWith(`${DEV_OWNER}.`) && m.fromId !== "forged-owner.forged-actor" && m.fromName === `${expectedSender} (forged-seat)`),
     got,
   );
   check(
-    "the one-shot sender name is derived from the login and host, never from the environment",
+    "the one-shot sender name keeps the OS base and labels COTAL_NAME as the agent part",
     got.some(
       (m) =>
         m.route === "DM" &&
         m.text === spoofText &&
-        m.fromName === expectedSender &&
+        m.fromName === `${expectedSender} (forged-seat)` &&
         m.fromName !== "forged-seat" &&
         m.fromName !== "cotal-send",
     ),
@@ -285,8 +294,43 @@ try {
   check("explicit operator creds remain a supported outside-seat boundary", explicit.code === 0, explicit.stderr);
   check(
     "the explicit credential supplies the exact received principal",
-    got.some((m) => m.route === "DM" && m.text === explicitText && m.fromId === explicitPrincipal && m.fromName === expectedSender),
+    got.some((m) => m.route === "DM" && m.text === explicitText && m.fromId === explicitPrincipal),
     got,
+  );
+  check(
+    "legacy profile name in explicit creds falls back to login@host",
+    got.some((m) => m.route === "DM" && m.text === explicitText && m.fromName === expectedSender),
+    got,
+  );
+
+  const namedIdentity = newIdentity();
+  const namedCreds = join(tmp, "named-operator.creds");
+  writeFileSync(namedCreds, await mintCreds(auth, namedIdentity, "operator", { name: "named-sender" }), { mode: 0o600 });
+  const namedText = `named-${randomUUID().slice(0, 6)}`;
+  const namedSend = await run(["send", "dm", "bob", namedText, "--space", space, "--server", servers, "--creds", namedCreds]);
+  await wait(400);
+  check(
+    "--creds display name comes from a non-profile JWT name",
+    namedSend.code === 0 && got.some((m) => m.route === "DM" && m.text === namedText && m.fromName === "named-sender"),
+    { namedSend, got },
+  );
+  const credsAgentText = `creds-agent-${randomUUID().slice(0, 6)}`;
+  const credsAgentSend = await run([
+    "send", "dm", "bob", credsAgentText, "--space", space, "--server", servers, "--creds", namedCreds,
+  ], { COTAL_NAME: "nemo-intake" });
+  await wait(400);
+  check(
+    "COTAL_NAME appends to a non-profile credential display name",
+    credsAgentSend.code === 0 && got.some((m) => m.route === "DM" && m.text === credsAgentText && m.fromName === "named-sender (nemo-intake)"),
+    { credsAgentSend, got },
+  );
+  const invalidAgentText = `invalid-agent-${randomUUID().slice(0, 6)}`;
+  const invalidAgentSend = await run(["send", "dm", "bob", invalidAgentText], { COTAL_NAME: "forged/seat" });
+  await wait(400);
+  check(
+    "invalid COTAL_NAME is omitted",
+    invalidAgentSend.code === 0 && got.some((m) => m.route === "DM" && m.text === invalidAgentText && m.fromName === expectedSender),
+    { invalidAgentSend, got },
   );
 
   const missing = await run(["send", "dm", "nobody-here", "x"]);

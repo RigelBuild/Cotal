@@ -264,7 +264,7 @@ export async function mint(args: ParsedArgs): Promise<void> {
   }
   const identity = existingIdentity ?? newIdentity();
   const lifetime = { expiresInSeconds, expiresAt };
-  const mintOptions = { allowSubscribe, allowPublish, role, capabilities, lifecycleUid, ...lifetime };
+  const mintOptions = { name, allowSubscribe, allowPublish, role, capabilities, lifecycleUid, ...lifetime };
   const creds = target
     ? await provisionForMint(auth, identity, { ...mintOptions, lifecycleUid: lifecycleUid! }, target)
     : await mintCreds(auth, identity, profile, mintOptions);
@@ -397,7 +397,7 @@ async function provisionTarget(auth: SpaceAuth | undefined, flags: { space?: str
 async function provisionForMint(
   auth: SpaceAuth,
   identity: Identity,
-  opts: { allowSubscribe?: string[]; allowPublish?: string[]; role?: string; capabilities?: string[]; lifecycleUid: string; expiresInSeconds?: number; expiresAt?: number },
+  opts: { name: string; allowSubscribe?: string[]; allowPublish?: string[]; role?: string; capabilities?: string[]; lifecycleUid: string; expiresInSeconds?: number; expiresAt?: number },
   target: MeshTarget,
 ): Promise<string> {
   await preflightOrExit(target); // one sentence if the mesh is down or refuses, never a raw NATS trace

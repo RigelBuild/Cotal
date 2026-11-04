@@ -2008,11 +2008,11 @@ ask/anycast (`ask`), then exit. For a running conversation, agents use the mesh 
 
 Direct messages go to peers that read them. Endpoints with the manager, delivery, provisioner, or feedback role do not read direct messages, and targeting them by name or instance id is refused. Use `cotal endpoints` to find a DM-capable peer.
 
-`cotal send` works from an operator shell or from a seat. Its display name is `<login>@<host>` of
-the shell that ran it, so the recipient can tell one operator's send from another's; it is taken
-from the operating system, never from `COTAL_NAME`. The wire principal comes from the resolved
-operator credential or user bearer, not from `COTAL_NAME`, `COTAL_ID`, `COTAL_OWNER`, or
-`COTAL_ACTOR`. On an open mesh the transient endpoint self-mints its principal.
+`cotal send` uses a non-profile JWT name from `--creds` when present; legacy profile labels fall back to
+the shell's `<login>@<host>`. A valid `COTAL_NAME` appends as `<base> (<agent>)`; an empty or invalid
+value, or one that would make the combined name exceed 128 characters, is omitted. It never replaces the base.
+The wire principal comes from the resolved operator credential or user bearer, not from `COTAL_NAME`,
+`COTAL_ID`, `COTAL_OWNER`, or `COTAL_ACTOR`. On an open mesh the transient endpoint self-mints its principal.
 
 The transient endpoint never joins the roster and binds no inbox. A recipient can still answer a
 `send dm` or `send ask` with `cotal_dm`, by the sender's name or by the id on the message it
@@ -2243,6 +2243,7 @@ cotal mint <name> --identity <creds> [--expires-in <seconds>] [--new-incarnation
 | Flag | Default | Meaning |
 |---|---|---|
 | `--profile <agent\|observer\|admin>` | `agent` | Credential profile |
+| `<name>` | required | Display name stamped in the credential's JWT `name` claim; `cotal send --creds` uses it unless it is a legacy profile label |
 | `--out <path>` | `.cotal/auth/creds/space.<key>/<name>.creds` | Output path - the default sits under the resolved space's segment (`<key>` is that space's hex encoding, as in [Project files](config.md#project-files)) |
 | `--signer` | off | Emit a stripped account-signing file instead |
 | `--force` | off | With `--signer`: overwrite an existing file |
