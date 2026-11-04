@@ -205,20 +205,42 @@ async def main() -> None:
 
     # A question asked from a turn reports its answer back to that turn's origin: Ada by DM, and
     # the #ops channel for a channel post, through the real tool-side session record.
-    answers = []
+    answers, answer_senders = [], []
     for msg in (A, C):
         adapter = make()
         await adapter._inject(msg)
         SESSION_ENV.clear()
         SESSION_ENV.update({"HERMES_SESSION_PLATFORM": "cotal", "HERMES_SESSION_CHAT_ID": adapter_mod.SINGLE_CHAT_ID,
-                            "HERMES_SESSION_USER_ID": msg["fromId"]})
+                            "HERMES_SESSION_USER_ID": msg["fromId"], "HERMES_SESSION_USER_NAME": msg["fromName"]})
         ctx = replies.issue(tools._calling_session())
         await adapter.on_processing_complete(adapter.handled[0], None)
         await adapter._inject({"kind": "dm", "id": "m-ans", "fromId": "eve-id", "fromName": "Eve", "text": "42",
                                "contextId": ctx, "answersQuestion": True})
         await adapter.send(adapter.handled[1].source["chat_id"], "noted", reply_to="m-ans")
         answers.append(adapter._client.replies[-1]["target"] if adapter._client.replies else None)
+        answer_senders.append([adapter.handled[1].source.get("user_id"), adapter.handled[1].source.get("user_name")])
     out["answer_targets"] = answers
+    # The answer turn is attributed to the peer that answered, not to whoever started the asking turn.
+    out["answer_senders"] = answer_senders
+
+    # Per-peer sessions: a DM answer keeps the asker's chat (its session key) and names the answerer.
+    # A group session is keyed per participant, so a channel answer keeps the asker's user.
+    kept = []
+    for msg in (A, C):
+        adapter = adapter_mod.CotalAdapter(PlatformConfig({"single_session": False}))
+        adapter._client = Client()
+        await adapter._inject(msg)
+        asked = adapter.handled[0].source
+        SESSION_ENV.clear()
+        SESSION_ENV.update({"HERMES_SESSION_PLATFORM": "cotal", "HERMES_SESSION_CHAT_ID": asked["chat_id"],
+                            "HERMES_SESSION_CHAT_NAME": asked["chat_name"],
+                            "HERMES_SESSION_USER_ID": msg["fromId"], "HERMES_SESSION_USER_NAME": msg["fromName"]})
+        ctx = replies.issue(tools._calling_session())
+        await adapter._inject({"kind": "dm", "id": "m-ans2", "fromId": "eve-id", "fromName": "Eve", "text": "42",
+                               "contextId": ctx, "answersQuestion": True})
+        got = adapter.handled[1].source
+        kept.append([got.get("chat_id"), got.get("chat_type"), got.get("user_id")])
+    out["per_peer_answers"] = kept
 
     print("RESULT " + json.dumps(out))
 

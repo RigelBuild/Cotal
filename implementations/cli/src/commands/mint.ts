@@ -4,6 +4,7 @@ import {
   CotalEndpoint,
   agentFilePath,
   assertKnownAgentCapabilities,
+  assertValidName,
   assertLifecycleToken,
   credsClaims,
   identityFromCreds,
@@ -169,6 +170,12 @@ export async function mint(args: ParsedArgs): Promise<void> {
     console.error(c.red("usage: cotal mint <name> [--profile <agent|observer|admin>] [--out <path>] [--expires-in <s>|--expires-at <unix-s>] [--identity <creds>] [--new-incarnation (agent only)]  (agent profile also: [--allow-subscribe a,b] [--allow-publish a,b] [--role <role>] [--provision])"));
     process.exit(1);
   }
+  try {
+    assertValidName(name);
+  } catch (err) {
+    console.error(c.red(`✗ ${(err as Error).message}`));
+    process.exit(1);
+  }
   // Only an absent flag is `undefined` and defers to the agent file; an empty value is the empty
   // list, so `--allow-publish ""` grants no channel.
   const splitList = (v?: string) => (v === undefined ? undefined : v.split(",").map((s) => s.trim()).filter(Boolean));
@@ -264,7 +271,7 @@ export async function mint(args: ParsedArgs): Promise<void> {
   }
   const identity = existingIdentity ?? newIdentity();
   const lifetime = { expiresInSeconds, expiresAt };
-  const mintOptions = { allowSubscribe, allowPublish, role, capabilities, lifecycleUid, ...lifetime };
+  const mintOptions = { name, allowSubscribe, allowPublish, role, capabilities, lifecycleUid, ...lifetime };
   const creds = target
     ? await provisionForMint(auth, identity, { ...mintOptions, lifecycleUid: lifecycleUid! }, target)
     : await mintCreds(auth, identity, profile, mintOptions);
@@ -397,7 +404,7 @@ async function provisionTarget(auth: SpaceAuth | undefined, flags: { space?: str
 async function provisionForMint(
   auth: SpaceAuth,
   identity: Identity,
-  opts: { allowSubscribe?: string[]; allowPublish?: string[]; role?: string; capabilities?: string[]; lifecycleUid: string; expiresInSeconds?: number; expiresAt?: number },
+  opts: { name: string; allowSubscribe?: string[]; allowPublish?: string[]; role?: string; capabilities?: string[]; lifecycleUid: string; expiresInSeconds?: number; expiresAt?: number },
   target: MeshTarget,
 ): Promise<string> {
   await preflightOrExit(target); // one sentence if the mesh is down or refuses, never a raw NATS trace

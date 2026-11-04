@@ -322,6 +322,9 @@ class CotalAdapter(BasePlatformAdapter):
             raise InjectionRefused(asker["session_key"])
         if asker:
             origin = asker.pop("origin", None)
+            if asker.get("chat_type") == "dm" and asker.get("chat_id"):
+                # A DM session is keyed by chat id, so the turn can name the peer that answered.
+                asker.update(user_id=msg.get("fromId"), user_name=sender)
             source = self.build_source(**asker)
             if self._single and origin:
                 # An answer's turn reports back to where the asking turn came from.
