@@ -65,6 +65,8 @@ type ProbeResult = {
   error_notice_target: Target | null;
   explicit_target: Target | null;
   orphan_send_refused: boolean;
+  background_reply_sent_to: Target[];
+  background_send_ok: boolean;
   idless_target: Target | null;
   dup_waits: boolean;
   held_once: boolean;
@@ -100,6 +102,8 @@ assert.deepEqual(subject.unanchored_target, { peerId: "bob-id" }, "an unanchored
 assert.deepEqual(subject.error_notice_target, { peerId: "bob-id" }, "a turn-error notice after the turn ends still reaches that turn's origin");
 assert.deepEqual(subject.explicit_target, { channel: "general" }, "a send naming its own chat goes there, not to the last peer");
 assert.equal(subject.orphan_send_refused, true, "before any turn, an unanchored send is refused, not sent to a guess");
+assert.deepEqual(subject.background_reply_sent_to, [], "a background-completion turn's reply goes to no peer, not the session's last sender");
+assert.equal(subject.background_send_ok, true, "a background-completion reply is dropped, not reported as a failed send");
 assert.deepEqual(subject.idless_target, { peerId: "dee-id" }, "an id-less message's reply reaches its sender by receive key");
 assert.equal(subject.dup_waits, true, "a held message pushed again is not acked before its turn is admitted");
 assert.equal(subject.held_once, true, "a held message pushed again runs one turn, not two");

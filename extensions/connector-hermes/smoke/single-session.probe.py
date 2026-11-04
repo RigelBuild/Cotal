@@ -176,6 +176,17 @@ async def main() -> None:
     adapter = make()
     result = await adapter.send(adapter_mod.SINGLE_CHAT_ID, "orphan")
     out["orphan_send_refused"] = result.success is False and not adapter._client.replies
+    # A turn no peer message started (a background completion) carries the session's stale source:
+    # its reply goes to no peer.
+    adapter = make()
+    await adapter._inject(A)
+    await adapter.on_processing_complete(adapter.handled[0], None)
+    background = MessageEvent(text="done", source=types.SimpleNamespace(chat_id=adapter_mod.SINGLE_CHAT_ID, user_id="bob-id"),
+                              message_id=None, internal=True)
+    await adapter.on_processing_start(background)
+    result = await adapter.send(adapter_mod.SINGLE_CHAT_ID, "background reply")
+    out["background_reply_sent_to"] = [r["target"] for r in adapter._client.replies if r["text"] == "background reply"]
+    out["background_send_ok"] = result.success
 
     # An id-less message is keyed by its receive key, so its reply still finds its sender after
     # another peer's turn has started.
