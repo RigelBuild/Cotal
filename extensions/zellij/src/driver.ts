@@ -1,4 +1,5 @@
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { promisify } from "node:util";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 
 export interface ZellijPlacement {
@@ -263,8 +264,11 @@ export function listTabs(session: string): ZellijTab[] {
 
 export function listPanes(session: string, deadline?: number): ZellijPane[] {
   if (!sessionExists(session, deadline)) return [];
-  const rows = parseArray(run(actionArgs(session, ["list-panes", "--json", "--all"]), { encoding: "utf8", deadline }), "pane list");
-  return rows.flatMap((row): ZellijPane[] => {
+  return parsePanes(run(actionArgs(session, ["list-panes", "--json", "--all"]), { encoding: "utf8", deadline }));
+}
+
+function parsePanes(raw: string): ZellijPane[] {
+  return parseArray(raw, "pane list").flatMap((row): ZellijPane[] => {
     if (typeof row !== "object" || row === null || Array.isArray(row)) return [];
     const id = Reflect.get(row, "id");
     const tabId = Reflect.get(row, "tab_id");
@@ -367,16 +371,39 @@ export function interruptPane(session: string, paneId: string): void {
   writePane(session, paneId, "3");
 }
 
+function stateOf(panes: readonly ZellijPane[], paneId: string): "running" | "exited" {
+  const pane = panes.find((candidate) => candidate.id === paneId && !candidate.is_plugin);
+  return !pane || pane.exited || pane.exit_status !== null ? "exited" : "running";
+}
+
 export function paneState(session: string, paneId: string, deadline?: number): "running" | "exited" {
   if (!sessionExists(session, deadline)) return "exited";
-  const pane = listPanes(session, deadline).find((candidate) => candidate.id === paneId && !candidate.is_plugin);
-  return !pane || pane.exited || pane.exit_status !== null ? "exited" : "running";
+  return stateOf(listPanes(session, deadline), paneId);
+}
+
+const execFileAsync = promisify(execFile);
+
+/** paneState without blocking the event loop: many seats can end their streams at once. Like
+ *  paneState, only zellij's own "no sessions" answer reads as gone; any other failure rejects. */
+async function probePaneState(session: string, paneId: string, timeout: number): Promise<"running" | "exited"> {
+  const options = { encoding: "utf8", timeout, killSignal: "SIGKILL" } as const;
+  let listing: string;
+  try {
+    listing = (await execFileAsync("zellij", ["list-sessions", "--no-formatting"], options)).stdout;
+  } catch (error) {
+    if (isNoSessionsError(error)) return "exited";
+    throw error;
+  }
+  if (!hasLiveSession(listing, session)) return "exited";
+  const { stdout } = await execFileAsync("zellij", actionArgs(session, ["list-panes", "--json", "--all"]), options);
+  return stateOf(parsePanes(stdout), paneId);
 }
 
 const RESUBSCRIBE_MS = 1_000;
 const RESUBSCRIBE_MAX_MS = 30_000;
 // A stream that lasted this long was healthy, so the next drop retries at the base delay again.
 const STREAM_HEALTHY_MS = 10_000;
+// Each call of the exit check gets this long; a hung call fails into the resubscribe path.
 const CHECK_MS = 10_000;
 
 // The manager exits through process.exit under KillMode=process, and a subscriber outlives its
@@ -395,6 +422,8 @@ export class PaneWatch {
   #retry: NodeJS.Timeout | undefined;
   #awaited = false;
   #openedAt = 0;
+  // How long the last stream lived, taken when it ended so a slow check does not count as uptime.
+  #lived = 0;
   #delay = RESUBSCRIBE_MS;
   #resolveExit!: () => void;
   // Executor form: the repo's lib is ES2023, which has no Promise.withResolvers.
@@ -434,17 +463,17 @@ export class PaneWatch {
     this.#child = undefined;
   }
 
-  #check(): void {
+  async #check(): Promise<void> {
     if (this.#exited || this.#stopped) return;
     let state: "running" | "exited";
     try {
-      // Bounded: a hung zellij call fails into the retry path instead of blocking the event loop.
-      state = paneState(this.session, this.paneId, Date.now() + CHECK_MS);
+      state = await probePaneState(this.session, this.paneId, CHECK_MS);
     } catch {
       // A failed listing is not an exit: subscribe again and look again when that stream ends.
       this.#reopen();
       return;
     }
+    if (this.#exited || this.#stopped) return;
     if (state === "running") {
       this.#reopen();
       return;
@@ -457,7 +486,7 @@ export class PaneWatch {
 
   #reopen(): void {
     if (this.#stopped || this.#retry) return;
-    if (Date.now() - this.#openedAt >= STREAM_HEALTHY_MS) this.#delay = RESUBSCRIBE_MS;
+    if (this.#lived >= STREAM_HEALTHY_MS) this.#delay = RESUBSCRIBE_MS;
     const delay = this.#delay;
     this.#delay = Math.min(delay * 2, RESUBSCRIBE_MAX_MS);
     this.#retry = setTimeout(() => {
@@ -492,7 +521,8 @@ export class PaneWatch {
       subscribers.delete(child);
       if (this.#child !== child) return;
       this.#child = undefined;
-      this.#check();
+      this.#lived = Date.now() - this.#openedAt;
+      void this.#check();
     };
     child.on("error", ended);
     child.on("exit", ended);

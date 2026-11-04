@@ -36,7 +36,7 @@ function readCalls(logPath: string): string[][] {
 
 let fakeCells = 0;
 async function withFakeZellij(
-  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable" | "slow-probe" | "no-client" | "slow-client" | "clients-error" | "clients-flaky" | "handoff" | "subscribe-drop" | "panes-error" | "early-exit" | "healthy-drop",
+  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable" | "slow-probe" | "no-client" | "slow-client" | "clients-error" | "clients-flaky" | "handoff" | "subscribe-drop" | "panes-error" | "early-exit" | "healthy-drop" | "slow-panes",
   run: (logPath: string, session: string) => void | Promise<void>,
 ): Promise<void> {
   // The fake is a shebang script Windows cannot exec, and zellij ships no Windows build.
@@ -110,6 +110,8 @@ if (action === "new-tab") {
   console.log("77");
   process.exit(0);
 }
+// close-pane closes the watched pane, so its held stream ends the way zellij's does.
+if (action === "close-pane") { writeFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".pane", "closed"); process.exit(0); }
 // Placed panes get an ID zellij never adds; the unplaced retry lands as terminal_78.
 if (action === "new-pane") { console.log(args.includes("--stacked") ? "terminal_99" : "terminal_78"); process.exit(0); }
 if (action === "list-tabs") {
@@ -132,7 +134,7 @@ if (args[2] === "subscribe") {
   const closed = () => { try { return readFileSync(panePath, "utf8") === "closed"; } catch { return false; } };
   appendFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".subscribed", Date.now() + "\\n");
   const opened = readFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".subscribed", "utf8").split("\\n").filter(Boolean).length;
-  if (["subscribe-drop", "no-server", "probe-error", "panes-error"].includes(process.env.COTAL_ZELLIJ_TEST_MODE)) process.exit(0);
+  if (["subscribe-drop", "no-server", "probe-error", "panes-error", "slow-panes"].includes(process.env.COTAL_ZELLIJ_TEST_MODE)) process.exit(0);
   // healthy-drop: two quick drops, then a stream that outlives the healthy threshold, then drops.
   if (process.env.COTAL_ZELLIJ_TEST_MODE === "healthy-drop") {
     if (opened !== 3) process.exit(0);
@@ -143,6 +145,8 @@ if (args[2] === "subscribe") {
 } else if (action === "list-panes") {
   const mode = process.env.COTAL_ZELLIJ_TEST_MODE;
   if (mode === "panes-error") { console.error("Error occurred: timed out"); process.exit(1); }
+  // slow-panes: a listing that hangs past the check's 10 s limit.
+  if (mode === "slow-panes") Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10_500);
   let closed = false;
   try { closed = readFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".pane", "utf8") === "closed"; } catch {}
   console.log(JSON.stringify(mode === "partial-tab" || closed ? [] : [{
@@ -247,6 +251,14 @@ try {
   const escapedRun = spawnSync(process.execPath, [join(escaped.dir, "evil_0_owned___2Jname")], { encoding: "utf8" });
   check("launcher strips C0 and C1 controls from the pane title", escapedRun.stdout.startsWith("\x1b]0;evil0;owned[2Jname\x07"));
   rmSync(escaped.dir, { recursive: true, force: true });
+  const failing = privateLauncher({ command: process.execPath, args: ["-e", "process.exit(3)"], env: {} }, temp, "failing-agent");
+  const failingRun = spawnSync(process.execPath, [join(failing.dir, "failing-agent")], { encoding: "utf8" });
+  const failingReason = readFileSync(join(failing.dir, "exit reason"), "utf8");
+  check(
+    `a child's non-zero exit is the launcher's status and its recorded reason (${failingRun.status}, ${JSON.stringify(failingReason)})`,
+    failingRun.status === 3 && failingReason === `${process.execPath} exited with code 3\n`,
+  );
+  rmSync(failing.dir, { recursive: true, force: true });
   // Setup errors before the child starts still leave a reason, since the pane closes with the launcher.
   const goneCwd = privateLauncher({ command: "true", args: [], env: {} }, join(temp, "removed-cwd"), "gone-cwd");
   spawnSync(process.execPath, [join(goneCwd.dir, "gone-cwd")], { encoding: "utf8" });
@@ -671,8 +683,9 @@ await withFakeZellij("dropped-pane", (logPath, session) => {
   );
 });
 
+// Unref'd: a race's losing timer must not hold the test process open.
 const settles = async (promise: Promise<void>, ms: number): Promise<boolean> =>
-  Promise.race([promise.then(() => true), sleep(ms).then(() => false)]);
+  Promise.race([promise.then(() => true), sleep(ms, undefined, { ref: false }).then(() => false)]);
 const listings = (logPath: string): number => readCalls(logPath).filter((args) => args[3] === "list-panes").length;
 
 // Each list-panes connects a client whose disconnect sends every PaneUpdate plugin the full pane
@@ -704,6 +717,16 @@ await withFakeZellij("confirm", async (logPath, session) => {
     `a spawned handle's status() lists no panes while running and its exit is proved (listings during ${during})`,
     during === 0 && exited && handle.status() === "exited",
   );
+});
+
+// stop() closes the pane; the held stream ends and one listing proves the exit.
+await withFakeZellij("confirm", async (logPath, session) => {
+  const handle = new ZellijRuntime(session).spawn("stop-agent", { command: "sleep", args: ["600"] }, process.cwd());
+  await sleep(300);
+  handle.stop();
+  const exited = await settles(handle.waitForExit!(), 2_000);
+  const closes = readCalls(logPath).filter((args) => args[3] === "close-pane").length;
+  check(`stop() closes the pane and settles waitForExit (close-pane calls ${closes})`, closes === 1 && exited && handle.status() === "exited");
 });
 
 // A pane that exits after spawn logs the launcher's reason once the watch proves the exit, and its
@@ -785,6 +808,25 @@ await withFakeZellij("healthy-drop", async (logPath, session) => {
   );
 });
 
+// Time spent in a hung exit check is not stream uptime: the delay keeps doubling, and the check
+// does not block the event loop while it waits.
+await withFakeZellij("slow-panes", async (logPath, session) => {
+  let ticked = Date.now();
+  let stall = 0;
+  const ticker = setInterval(() => {
+    stall = Math.max(stall, Date.now() - ticked);
+    ticked = Date.now();
+  }, 100);
+  const watch = new zellij.PaneWatch(session, "terminal_77");
+  const gaps = await subscribeGaps(logPath, 3, 30_000);
+  watch.stop();
+  clearInterval(ticker);
+  check(
+    `a hung exit check neither resets the backoff nor stalls the event loop (gaps ${gaps.join(", ")} ms, stall ${stall} ms)`,
+    gaps.length === 2 && gaps[1] - gaps[0] >= 700 && stall < 1_000,
+  );
+});
+
 // A failed pane listing after the stream ends is unknown, never an exit.
 await withFakeZellij("panes-error", async (logPath, session) => {
   const watch = new zellij.PaneWatch(session, "terminal_77");
@@ -821,11 +863,12 @@ const driverProcess = (body: string) =>
 const exitCode = (child: ChildProcess, ms: number): Promise<number | null | "alive"> =>
   Promise.race([
     new Promise<number | null>((resolve) => child.once("exit", (code) => resolve(code))),
-    sleep(ms).then(() => "alive" as const),
+    sleep(ms, undefined, { ref: false }).then(() => "alive" as const),
   ]);
 
 // A subscriber outlives its parent, so the watching process kills all its subscribers when it exits.
-await withFakeZellij("confirm", async (logPath, session) => {
+if (!procfs) console.log("  ✓ skipped /proc subscriber-count scenarios (no /proc on this platform)");
+if (procfs) await withFakeZellij("confirm", async (logPath, session) => {
   const child = driverProcess(
     `for (const id of ["terminal_77", "terminal_78", "terminal_79"]) new z.PaneWatch(${JSON.stringify(session)}, id); setTimeout(() => process.exit(0), 600);`,
   );
@@ -850,7 +893,7 @@ for (const [mode, label] of [["confirm", "held subscriber"], ["subscribe-drop", 
     check(`a late waitForExit on a ${label} keeps the process alive until the exit (early ${early}, then ${settled})`, early === "alive" && settled === 7);
   });
 }
-await withFakeZellij("confirm", async (_logPath, session) => {
+if (procfs) await withFakeZellij("confirm", async (_logPath, session) => {
   const child = driverProcess(`new z.PaneWatch(${JSON.stringify(session)}, "terminal_77");`);
   const code = await exitCode(child, 5_000);
   if (code === "alive") child.kill("SIGKILL");
