@@ -383,20 +383,31 @@ export function paneState(session: string, paneId: string, deadline?: number): "
 
 const execFileAsync = promisify(execFile);
 
+/** One zellij call off the event loop; the child joins the exit reaper's set while it runs. */
+async function zellijAsync(args: string[], signal: AbortSignal): Promise<string> {
+  const call = execFileAsync("zellij", args, { encoding: "utf8", signal, killSignal: "SIGKILL" });
+  subscribers.add(call.child);
+  try {
+    return (await call).stdout;
+  } finally {
+    subscribers.delete(call.child);
+  }
+}
+
 /** The session's panes, or undefined once the session is gone, without blocking the event loop.
  *  Like paneState, only zellij's own "no sessions" answer reads as gone; any other failure, or
  *  both calls together passing CHECK_MS, rejects. */
 async function probePanes(session: string): Promise<ZellijPane[] | undefined> {
-  const options = { encoding: "utf8", signal: AbortSignal.timeout(CHECK_MS), killSignal: "SIGKILL" } as const;
+  const signal = AbortSignal.timeout(CHECK_MS);
   let listing: string;
   try {
-    listing = (await execFileAsync("zellij", ["list-sessions", "--no-formatting"], options)).stdout;
+    listing = await zellijAsync(["list-sessions", "--no-formatting"], signal);
   } catch (error) {
     if (isNoSessionsError(error)) return undefined;
     throw error;
   }
   if (!hasLiveSession(listing, session)) return undefined;
-  return parsePanes((await execFileAsync("zellij", actionArgs(session, ["list-panes", "--json", "--all"]), options)).stdout);
+  return parsePanes(await zellijAsync(actionArgs(session, ["list-panes", "--json", "--all"]), signal));
 }
 
 // Streams that end together (a server restart) share one listing per session instead of a burst.
@@ -423,8 +434,8 @@ const STREAM_HEALTHY_MS = 10_000;
 // Each call of the exit check gets this long; a hung call fails into the resubscribe path.
 const CHECK_MS = 10_000;
 
-// The manager exits through process.exit under KillMode=process, and a subscriber outlives its
-// parent; kill every held subscriber when this process exits.
+// The manager exits through process.exit under KillMode=process, and a subscriber or an exit
+// listing outlives its parent; kill every one still running when this process exits.
 const subscribers = new Set<ChildProcess>();
 let reapOnExit = false;
 

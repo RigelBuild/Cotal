@@ -906,6 +906,32 @@ await withFakeZellij("confirm", async (logPath, session) => {
   );
 });
 
+// Freshness does not trust the clock: with Date.now() frozen, so a stream opening after a listing
+// started reads the same time, the new pane's watch still lists afresh instead of joining.
+await withFakeZellij("confirm", async (logPath, session) => {
+  writeFileSync(`${logPath}.slow-list`, "");
+  const realNow = Date.now;
+  const frozen = realNow();
+  Date.now = () => frozen;
+  try {
+    const older = new zellij.PaneWatch(session, "terminal_77");
+    await sleep(300);
+    writeFileSync(`${logPath}.drop-terminal_77`, "");
+    for (let i = 0; i < 100 && !existsSync(`${logPath}.snapshots`); i++) await sleep(20);
+    writeFileSync(`${logPath}.extra-pane`, "");
+    const fresh = new zellij.PaneWatch(session, "terminal_90");
+    await sleep(200);
+    writeFileSync(`${logPath}.drop-terminal_90`, "");
+    await sleep(3_500);
+    const state = fresh.status();
+    older.stop();
+    fresh.stop();
+    check(`a listing whose start time ties a later stream's open never proves that pane's exit (state ${state}, listings ${listings(logPath)})`, state === "running" && listings(logPath) >= 2);
+  } finally {
+    Date.now = realNow;
+  }
+});
+
 // A failed pane listing after the stream ends is unknown, never an exit.
 await withFakeZellij("panes-error", async (logPath, session) => {
   const watch = new zellij.PaneWatch(session, "terminal_77");
@@ -956,6 +982,20 @@ if (procfs) await withFakeZellij("confirm", async (logPath, session) => {
   const subscribed = readCalls(logPath).filter((args) => args[2] === "subscribe").length;
   const live = liveSubscribers(session);
   check(`every subscriber is killed when the watching process exits (subscribed ${subscribed}, left ${live})`, subscribed === 3 && live === 0);
+});
+// An exit listing still running when the watching process exits is killed with the subscribers.
+if (procfs) await withFakeZellij("slow-panes", async (_logPath, session) => {
+  const child = driverProcess(`new z.PaneWatch(${JSON.stringify(session)}, "terminal_77"); setTimeout(() => process.exit(0), 1_500);`);
+  await exitCode(child, 10_000);
+  await sleep(100);
+  const hung = readdirSync("/proc").filter((entry) => {
+    try {
+      return /^\d+$/.test(entry) && readFileSync(`/proc/${entry}/cmdline`, "utf8").includes(`${session}\0action\0list-panes`);
+    } catch {
+      return false;
+    }
+  }).length;
+  check(`an exit listing in flight is killed when the watching process exits (left ${hung})`, hung === 0);
 });
 
 // A wait started after the subscriber or the retry timer already exists still holds the process
