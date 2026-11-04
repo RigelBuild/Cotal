@@ -464,8 +464,8 @@ try {
     // --provision rides the same lifetime through the seam (the durable mint is bounded too).
     const pout = join(root, "bounded-agent.creds");
     const rp = await runMint(["bounded-agent", "--profile", "agent", "--provision", "--expires-in", "3600", "--out", pout]);
-    check("mint --provision --expires-in succeeds and bounds the provisioned credential too",
-      rp.code === 0 && existsSync(pout) && credsClaims(readFileSync(pout, "utf8")).exp !== undefined, rp.out);
+    check("mint --provision --expires-in succeeds and stamps the positional name",
+      rp.code === 0 && existsSync(pout) && credsClaims(readFileSync(pout, "utf8")).exp !== undefined && credsClaims(readFileSync(pout, "utf8")).name === "bounded-agent", rp.out);
   }
 
   // ── 8. --identity re-mints for the SAME nkey ──────────────────────────────────────────────

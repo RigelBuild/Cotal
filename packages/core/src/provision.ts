@@ -15,6 +15,7 @@
  * expiry and renewal owner.
  */
 import { TTL_RECONCILE_CANARY_KEY, ttlBuckets } from "./streams.js";
+import { assertValidName } from "./resolve.js";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import {
@@ -206,7 +207,8 @@ export const PROFILES = [
   "environment-manager-executor", "environment-manager-goal-writer",
 ] as const satisfies readonly Profile[];
 
-
+type _AllProfiles = Exclude<Profile, (typeof PROFILES)[number]> extends never ? true : never;
+const _allProfiles: _AllProfiles = true;
 export type CredentialLifetimeClass =
   | "standing-renewable" // bounded exp + an ONLINE renewal owner (a seed-holder re-mints before expiry)
   // The $SYS class: bounded exp but NOT online-renewable — the $SYS signing seed is destroyed at end
@@ -950,6 +952,7 @@ export async function mintCreds(
   profile: Profile,
   opts: MintOpts = {},
 ): Promise<string> {
+  if (opts.name !== undefined) assertValidName(opts.name);
   const signer = fromSeed(new TextEncoder().encode(auth.account.signingSeed));
   const pr = principalOf(identity, opts.principal, opts.lifecycleUid);
   // Serve rows are INTERNAL to mintCreds behind the §13.1 fence: the exported permissionsFor

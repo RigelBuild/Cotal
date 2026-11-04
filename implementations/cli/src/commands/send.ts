@@ -6,6 +6,7 @@ import {
   readsDirectMessages,
   AmbiguousPeerError,
   credsClaims,
+  assertValidName,
   PROFILES,
   type Presence,
   type CompletionResult,
@@ -37,15 +38,25 @@ function senderName(credsPath?: string): string {
     ? displayNameFromCreds(readFileSync(path, "utf8")) ?? osSenderName()
     : osSenderName();
   const agent = process.env.COTAL_NAME;
-  if (agent === undefined || agent.length === 0 || agent.length > 128 || /[\/\\\r\n]/.test(agent) || base.length + agent.length + 3 > 128) return base;
-  return `${base} (${agent})`;
+  if (agent === undefined || agent.length === 0) return base;
+  const name = `${base} (${agent})`;
+  try {
+    assertValidName(name);
+    return name;
+  } catch {
+    return base;
+  }
 }
 
 function displayNameFromCreds(creds: string): string | undefined {
   const name = credsClaims(creds).name;
-  return typeof name === "string" && name.length > 0 && name.length <= 128 && !/[\/\\\r\n]/.test(name) && !PROFILES.some((profile) => profile === name)
-    ? name
-    : undefined;
+  if (typeof name !== "string" || PROFILES.some((profile) => profile === name)) return undefined;
+  try {
+    assertValidName(name);
+    return name;
+  } catch {
+    return undefined;
+  }
 }
 
 function osSenderName(): string {
@@ -54,11 +65,13 @@ function osSenderName(): string {
   if (!login || !host)
     throw new Error("cotal send cannot derive a sender name: empty login or host from the OS");
   const name = `${login}@${host}`;
-  if (name.length > 128 || /[\/\\\r\n]/.test(name))
+  try {
+    assertValidName(name);
+  } catch {
     throw new Error("cotal send cannot derive a valid sender name from OS login and host");
+  }
   return name;
 }
-
 
 /** `cotal send <dm|msg|ask> …` — dispatch one-shot send by delivery mode, then exit. */
 export async function send(args: ParsedArgs): Promise<void> {

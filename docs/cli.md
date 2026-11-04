@@ -2013,6 +2013,7 @@ the shell's `<login>@<host>`. A valid `COTAL_NAME` appends as `<base> (<agent>)`
 value, or one that would make the combined name exceed 128 characters, is omitted. It never replaces the base.
 The wire principal comes from the resolved operator credential or user bearer, not from `COTAL_NAME`,
 `COTAL_ID`, `COTAL_OWNER`, or `COTAL_ACTOR`. On an open mesh the transient endpoint self-mints its principal.
+The card name is display-only; the principal ID is authoritative. A credential name can match another agent's visible name.
 
 The transient endpoint never joins the roster and binds no inbox. A recipient can still answer a
 `send dm` or `send ask` with `cotal_dm`, by the sender's name or by the id on the message it
@@ -2233,17 +2234,19 @@ presence watch on `<name>` entirely, so `<name>` is required but only echoed in 
 ## mint
 
 ```bash
-cotal mint <name> [--profile <agent|observer|admin>] [--out <path>] [--signer]
+cotal mint <name> [--profile <agent|observer|admin>] [--out <path>]
+cotal mint --signer [--out <path>] [--force]
 cotal mint <name> --provision [--role <role>] [--space <s>] [--server <url>]
 cotal mint <name> --expires-in <seconds> | --expires-at <unix-seconds>
 cotal mint <name> --identity <creds> [--expires-in <seconds>] [--new-incarnation]  # agent profile only
 
 ```
+For credential minting, `<name>` is a required positional argument. It becomes the JWT `name` claim.
+The signer form omits `<name>` because it writes account-signing material, not user credentials.
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--profile <agent\|observer\|admin>` | `agent` | Credential profile |
-| `<name>` | required | Display name stamped in the credential's JWT `name` claim; `cotal send --creds` uses it unless it is a legacy profile label |
 | `--out <path>` | `.cotal/auth/creds/space.<key>/<name>.creds` | Output path - the default sits under the resolved space's segment (`<key>` is that space's hex encoding, as in [Project files](config.md#project-files)) |
 | `--signer` | off | Emit a stripped account-signing file instead |
 | `--force` | off | With `--signer`: overwrite an existing file |
