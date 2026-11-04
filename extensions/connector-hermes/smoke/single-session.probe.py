@@ -187,6 +187,28 @@ async def main() -> None:
     result = await adapter.send(adapter_mod.SINGLE_CHAT_ID, "background reply")
     out["background_reply_sent_to"] = [r["target"] for r in adapter._client.replies if r["text"] == "background reply"]
     out["background_send_ok"] = result.success
+    # Every injected turn (plain, id-less, answer) runs the start hook the gateway runs: its
+    # unanchored sends, and an error notice after it completes, still reach its own origin.
+    started = []
+    for inbound, want_ctx in ((B, False), ({"kind": "dm", "id": "", "recvKey": "rx9", "fromId": "dee-id", "fromName": "Dee", "text": "x"}, False),
+                              ({"kind": "dm", "id": "m-ans3", "fromId": "eve-id", "fromName": "Eve", "text": "42"}, True)):
+        adapter = make()
+        await adapter._inject(A)
+        await adapter.on_processing_start(adapter.handled[0])
+        if want_ctx:
+            SESSION_ENV.clear()
+            SESSION_ENV.update({"HERMES_SESSION_PLATFORM": "cotal", "HERMES_SESSION_CHAT_ID": adapter_mod.SINGLE_CHAT_ID,
+                                "HERMES_SESSION_USER_ID": "ada-id", "HERMES_SESSION_USER_NAME": "Ada"})
+            inbound = dict(inbound, contextId=replies.issue(tools._calling_session()), answersQuestion=True)
+        await adapter.on_processing_complete(adapter.handled[0], None)
+        await adapter._inject(inbound)
+        turn = adapter.handled[-1]
+        await adapter.on_processing_start(turn)
+        await adapter.send(adapter_mod.SINGLE_CHAT_ID, "progress")
+        await adapter.on_processing_complete(turn, None)
+        await adapter.send(adapter_mod.SINGLE_CHAT_ID, "notice")
+        started.append([r["target"] for r in adapter._client.replies])
+    out["started_targets"] = started
 
     # An id-less message is keyed by its receive key, so its reply still finds its sender after
     # another peer's turn has started.
