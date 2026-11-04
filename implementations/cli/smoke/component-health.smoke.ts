@@ -149,10 +149,10 @@ async function writeDeliveryHolder(): Promise<ChildProcess> {
 const SERVED_INSTANCE = "s".repeat(26);
 const FOREIGN_INSTANCE = "f".repeat(26);
 const FOREIGN_REMEDY = "the owning manager must reconcile or an operator must perform an explicit CAS takeover";
-const FOREIGN_FAILURE_FACT = `static alias=foreign-owned phase=active disposition=refused remedy=${FOREIGN_REMEDY}`;
+const FOREIGN_FAILURE_FACT = `static alias=foreign-owned phase=active disposition=refused lastError=the durable slot belongs to manager instance ${FOREIGN_INSTANCE}, not ${SERVED_INSTANCE} remedy=${FOREIGN_REMEDY}`;
 // The retained-terminal shape the manager serves when a reap could not prove a seat gone.
 const RETAINED_REMEDY = "the seat is not proved gone; confirm its processes are gone, then call release-seat with this alias and lifecycleUid";
-const RETAINED_FAILURE_FACT = `static alias=retained-seat phase=terminalizing disposition=refused retainedReason=unprovable remedy=${RETAINED_REMEDY}`;
+const RETAINED_FAILURE_FACT = `static alias=retained-seat phase=terminalizing disposition=refused retainedReason=unprovable lastError=runtime "pty" retained pty:${"c".repeat(32)} (unprovable), so the seat it addresses is NOT proved gone remedy=${RETAINED_REMEDY}`;
 const RETAINED_COUNT_FACT = "static retained custody 1";
 
 async function serveManagerWithForeignRefusal(): Promise<{ close(): Promise<void> }> {
@@ -250,6 +250,7 @@ async function serveManagerWithForeignRefusal(): Promise<{ close(): Promise<void
       staticReconciliation: {
         state: "failed",
         retainedCustody: 1,
+        deferredSeats: 0,
         failures: [{
           alias: "foreign-owned",
           actor: "a".repeat(26),

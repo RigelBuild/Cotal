@@ -22,7 +22,7 @@
  *
  * Run: pnpm smoke:seat-locality-honesty   (no broker)
  */
-import { locateSeatIn, seatMissRefusal, type SeatLocation } from "../src/commands/agents.js";
+import { deferredSeatIn, deferredSeatLookupFailureMessage, deferredSeatLookupIn, deferredSeatMessage, locateSeatIn, seatMissRefusal, type SeatLocation } from "../src/commands/agents.js";
 import type { ScatterInstanceReply } from "../src/lib/control.js";
 
 let pass = 0, fail = 0;
@@ -99,9 +99,32 @@ console.log("\n3. what the operator is TOLD, which is where the damage landed");
   check("and the remedy names the verb it was called for", refusedMsg.includes("cotal input --on <instance>"), refusedMsg);
 }
 
+console.log("4. a plain stop on a deferred seat names the seat's remedy, not absence");
+{
+  const status = (instanceId: string, failures: unknown[]): ScatterInstanceReply =>
+    ({ instanceId, reachable: true, data: { staticReconciliation: { failures } } });
+  const remedy = "the seat is unreachable and its credential has not expired; it terminalizes after deferUntil, or confirm its processes are gone and run cotal stop <alias> --attest-gone <reason>";
+  const holder = deferredSeatIn([status(A, [{ alias: "other", disposition: "deferred", lifecycleUid: "u0", remedy }]), status(B, [{ alias: "seat", disposition: "deferred", lifecycleUid: "u1", deferUntil: "2026-11-05T00:00:00.000Z", remedy }])], "seat");
+  check("two instances: attest-gone without --on pins to the instance that holds the alias deferred, not the first",
+    holder?.instanceId === B && holder.lifecycleUid === "u1" && holder.deferUntil === "2026-11-05T00:00:00.000Z", holder);
+  const msg = holder === undefined ? "" : deferredSeatMessage("seat", holder);
+  check("the plain-stop refusal names the instance, uid, deferUntil and the pinned --on attest-gone command",
+    msg.includes(B) && msg.includes("u1") && msg.includes("2026-11-05T00:00:00.000Z") && msg.includes(`--on ${B} --attest-gone`), msg);
+  check("a non-deferred item for the same alias yields nothing, so attest-gone fails with the no-holder message",
+    deferredSeatIn([status(A, [{ alias: "seat", disposition: "refused", lifecycleUid: "u1", remedy }])], "seat") === undefined);
+  const failedLookup = deferredSeatLookupIn({ ok: false, error: "no manager replies" }, "seat");
+  const failedScatterMessage = failedLookup.kind === "found"
+    ? "unexpected found deferred seat"
+    : deferredSeatLookupFailureMessage("seat", failedLookup);
+  check("a failed status scatter stays unreachable and says managers could not be asked, never that none reports the deferred seat",
+    failedLookup.kind === "unreachable"
+    && failedScatterMessage === "✗ could not ask the managers in this space (no manager replies); pass --on <instance>"
+    && !failedScatterMessage.includes("no manager instance in this space reports"), failedScatterMessage);
+}
+
 // DECLARED, not implied: a suite that ends early reddens no line, and `fail === 0` with a zero exit
 // reads as a pass in every one of those ways out. The count is checked however the process leaves.
-const EXPECTED_CELLS = 18;
+const EXPECTED_CELLS = 22;
 process.on("exit", () => {
   const ran = pass + fail;
   if (ran !== EXPECTED_CELLS) {

@@ -29,7 +29,7 @@
  *   manager.lifecycle despawn / attach / input             (owner-mode terminal/interactive)
  *   manager.self     stop                                  (self-mode halt; baseline)
  *   manager.persona  definePersona                         (privileged-grade; ownership-checked)
- *   manager.admin    purge / launch / resume family / transcript-receive / release-seat (operator instruments only)
+ *   manager.admin    purge / launch / resume family / transcript-receive / release-seat / attest-gone (operator instruments only)
  *   manager.run      run-start / run-resume / run-answer   (the `run` capability + privileged instrument)
  *                    run-status / run-ps ride manager.read
  */
@@ -97,11 +97,13 @@ const STATUS_OUTPUT_SCHEMA = {
     staticReconciliation: {
       type: "object",
       additionalProperties: false,
-      required: ["state", "failures", "retainedCustody"],
+      required: ["state", "failures", "retainedCustody", "deferredSeats"],
       properties: {
         state: { enum: ["idle", "running", "retry-wait", "retrying", "recovered", "failed"] },
         /** Items whose seat is not proved gone (`retainedReason` set) and not yet recovered. */
         retainedCustody: { type: "integer", minimum: 0 },
+        /** Items held `deferred`: an unreachable seat whose credential has not expired. */
+        deferredSeats: { type: "integer", minimum: 0 },
         lastSweep: {
           type: "object",
           additionalProperties: false,
@@ -130,12 +132,16 @@ const STATUS_OUTPUT_SCHEMA = {
               phase: { enum: ["provisioning", "active", "terminalizing", "retired"] },
               attempts: { type: "integer", minimum: 0 },
               maxAttempts: { type: "integer", minimum: 1 },
-              disposition: { enum: ["retry-scheduled", "retrying", "recovered", "refused", "refused-foreign", "retry-exhausted"] },
+              disposition: { enum: ["retry-scheduled", "retrying", "recovered", "refused", "refused-foreign", "retry-exhausted", "deferred"] },
               lastError: { type: "string" },
               nextRetryAt: { type: "string" },
               recoveredAt: { type: "string" },
               remedy: { type: "string" },
               retainedReason: { enum: ["absent", "no-reference", "unprovable", "members-remain"] },
+              /** When a deferred item's credential proof holds: the latest ledger exp plus 60 s. */
+              deferUntil: { type: "string" },
+              /** The operator's attest-gone reason, once an admin attested the seat gone. */
+              attestedGone: { type: "string" },
             },
           },
         },
@@ -176,19 +182,25 @@ export interface ManagerStaticReconciliationFailure {
   phase: "provisioning" | "active" | "terminalizing" | "retired";
   attempts: number;
   maxAttempts: number;
-  disposition: "retry-scheduled" | "retrying" | "recovered" | "refused" | "refused-foreign" | "retry-exhausted";
+  disposition: "retry-scheduled" | "retrying" | "recovered" | "refused" | "refused-foreign" | "retry-exhausted" | "deferred";
   lastError?: string;
   nextRetryAt?: string;
   recoveredAt?: string;
   remedy?: string;
   /** Set while the terminal holds the lifecycle because its seat is not proved gone. */
   retainedReason?: "absent" | "no-reference" | "unprovable" | "members-remain";
+  /** ISO time after which a deferred item's credential has expired. */
+  deferUntil?: string;
+  /** The reason an admin gave when attesting the seat gone. */
+  attestedGone?: string;
 }
 
 export interface ManagerStaticReconciliationStatus {
   state: "idle" | "running" | "retry-wait" | "retrying" | "recovered" | "failed";
   /** Items with `retainedReason` set and a disposition other than `recovered`. */
   retainedCustody: number;
+  /** Items with disposition `deferred`. */
+  deferredSeats: number;
   lastSweep?: ManagerStaticReconciliationSweep;
   failures: ManagerStaticReconciliationFailure[];
 }
@@ -612,6 +624,15 @@ const RELEASE_SEAT_OUTPUT_SCHEMA = {
   type: "object", additionalProperties: false, required: ["alias", "lifecycleUid", "phase", "advisory"],
   properties: { alias: { type: "string" }, lifecycleUid: { type: "string" }, phase: { type: "string" }, advisory: { type: "string" } },
 } as const;
+const ATTEST_GONE_INPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["name", "attestGone"],
+  // One line with a non-space character, as two patterns: the profile refuses the one-regex form.
+  properties: { name: { type: "string", minLength: 1 }, attestGone: { type: "string", maxLength: 500, allOf: [{ pattern: "^\\s*\\S" }, { pattern: "^[^\\r\\n]+$" }] } },
+} as const;
+const ATTEST_GONE_OUTPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["name", "lifecycleUid", "phase", "attestedGone"],
+  properties: { name: { type: "string" }, lifecycleUid: { type: "string" }, phase: { type: "string" }, attestedGone: { type: "string" } },
+} as const;
 
 const CHANNEL_LIST = { type: "array", items: { type: "string" } } as const;
 const PERSONA_INPUT_SCHEMA = {
@@ -951,6 +972,7 @@ const ROWS: CommandRow[] = [
   { name: "abort-preservation", capability: "manager.admin", input: ATTEMPT_INPUT_SCHEMA, output: ATTEMPT_STATE_OUTPUT_SCHEMA, targeted: false, handler: "abortPreservation" },
   { name: "transcript-receive", capability: "manager.admin", input: TRANSCRIPT_RECEIVE_INPUT_SCHEMA, output: TRANSCRIPT_RECEIVE_OUTPUT_SCHEMA, targeted: false, handler: "transcriptReceive" },
   { name: "release-seat", capability: "manager.admin", input: RELEASE_SEAT_INPUT_SCHEMA, output: RELEASE_SEAT_OUTPUT_SCHEMA, targeted: false, handler: "releaseSeat" },
+  { name: "attest-gone", capability: "manager.admin", input: ATTEST_GONE_INPUT_SCHEMA, output: ATTEST_GONE_OUTPUT_SCHEMA, targeted: false, handler: "attestGone" },
 ];
 
 // WHEN THE COMPILE HAPPENS (#1323): every CLI invocation loads this module before its verb is
@@ -1085,7 +1107,10 @@ export const MANAGER_STATUS_CONTRACT: { input: CompiledContract; output: Compile
  *  `retainedReason`: a terminal whose seat is not proved gone.
  *
  *  30 = `release-seat` lets an operator release a retained seat's custody. A new served command
- *  cannot fold into 29. */
+ *  cannot fold into 29.
+ *
+ *  31 = `attest-gone` lets an operator drive the terminal of a deferred seat, and manager `status`
+ *  adds `deferredSeats`, the `deferred` disposition, `deferUntil` and `attestedGone`. */
 export function managerClusterDocument(): {
   urn: string;
   revision: number;
@@ -1103,7 +1128,7 @@ export function managerClusterDocument(): {
 } {
   return {
     urn: MANAGER_CLUSTER_URN,
-    revision: 30,
+    revision: 31,
     attributes: [],
     events: [],
     commands: ROWS.map((r) => ({
@@ -1192,6 +1217,7 @@ export interface ManagerServiceHandlers {
   abortPreservation(ctx: EpServeContext): unknown | Promise<unknown>;
   transcriptReceive(ctx: EpServeContext): unknown | Promise<unknown>;
   releaseSeat(ctx: EpServeContext): unknown | Promise<unknown>;
+  attestGone(ctx: EpServeContext): unknown | Promise<unknown>;
 }
 
 /** Build the `EpCommandDef[]` `serveEndpoint` consumes: each command's provenance-branded compiled

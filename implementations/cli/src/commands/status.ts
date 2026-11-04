@@ -921,7 +921,8 @@ type ManagerServiceStatus = {
     state?: unknown;
     lastSweep?: { error?: unknown };
     retainedCustody?: unknown;
-    failures?: Array<{ alias?: unknown; phase?: unknown; disposition?: unknown; retainedReason?: unknown; nextRetryAt?: unknown; remedy?: unknown }>;
+    deferredSeats?: unknown;
+    failures?: Array<{ alias?: unknown; phase?: unknown; disposition?: unknown; retainedReason?: unknown; nextRetryAt?: unknown; deferUntil?: unknown; lastError?: unknown; remedy?: unknown }>;
   };
 };
 
@@ -1014,11 +1015,14 @@ async function managerHealth(target: MeshTarget, context: LocalProcessContext, c
       if (typeof reconcile.lastSweep?.error === "string") facts.push(`static sweep error=${reconcile.lastSweep.error}`);
       // Both retained fields are optional: an older manager reports neither.
       if (typeof reconcile.retainedCustody === "number") facts.push(`static retained custody ${reconcile.retainedCustody}`);
+      if (typeof reconcile.deferredSeats === "number") facts.push(`static deferred seats ${reconcile.deferredSeats}`);
       for (const failure of reconcile.failures ?? []) {
         const retained = typeof failure.retainedReason === "string" ? ` retainedReason=${failure.retainedReason}` : "";
         const next = typeof failure.nextRetryAt === "string" ? ` nextRetryAt=${failure.nextRetryAt}` : "";
+        const deferUntil = typeof failure.deferUntil === "string" ? ` deferUntil=${failure.deferUntil}` : "";
         const remedy = typeof failure.remedy === "string" ? ` remedy=${failure.remedy}` : "";
-        facts.push(`static alias=${String(failure.alias ?? "unreported")} phase=${String(failure.phase ?? "unreported")} disposition=${String(failure.disposition ?? "unreported")}${retained}${next}${remedy}`);
+        const lastError = typeof failure.lastError === "string" ? ` lastError=${failure.lastError}` : "";
+        facts.push(`static alias=${String(failure.alias ?? "unreported")} phase=${String(failure.phase ?? "unreported")} disposition=${String(failure.disposition ?? "unreported")}${retained}${next}${deferUntil}${lastError}${remedy}`);
       }
     }
     facts.push("serve reachable");

@@ -1276,7 +1276,7 @@ reach needs the `admin` scope). An open mesh has no service registry.
 
 ```bash
 cotal ps [--on <instance>] [--wide | --json] [--slots] [--space <s>]
-cotal stop --name <n> [--on <instance>] [--space <s>]
+cotal stop --name <n> [--on <instance>] [--attest-gone <reason>] [--space <s>]
 cotal attach --name <n> [--on <instance>] [--no-reconnect] [--space <s>]
 ```
 
@@ -1289,10 +1289,26 @@ cotal attach --name <n> [--on <instance>] [--no-reconnect] [--space <s>]
 | `--json` (`ps`) | off | Machine-readable: one JSON object per seat per line, copied unchanged from the manager row. Instance headers and errors go to stderr, so stdout contains only rows. Mutually exclusive with `--wide` |
 | `--slots` (`ps`) | off | List the durable static slot rows this manager owns instead of live seats, through the `slots` command. Mutually exclusive with `--wide`. A row that is not in the live roster still prints, with `live=false`; a retired row never prints |
 | `--no-reconnect` (`attach`) | off | End the attach when its session ends, instead of re-establishing it. For scripts that want one run and one exit code |
+| `--attest-gone <reason>` (`stop`) | none | Terminalize a deferred seat now. The reason is your statement that the seat's processes are gone, and the manager log records it with your principal |
 
 A raw `--creds` file is refused by `ps`, `stop`, `attach` and the other control commands, because
 that route mints no endpoint-caller triple; the project folder, or `--space` against the registry
 entry, is the route that does.
+
+A seat can be deferred after a manager restart. This happens when its slot is still `active` or
+`provisioning`, no managed agent adopted it, and the runtime cannot reap it by reference. While the
+seat's credential has not expired, the manager cannot prove the seat is gone, so it does not
+terminalize the slot. It waits until 60 seconds after the latest credential expiry. It checks the
+deferral again on each credential-renewal tick and at the next boot. `status` counts these seats as
+`staticReconciliation.deferredSeats`, and each deferred item carries `deferUntil`. If the
+credential expiry cannot be read, the item has no `deferUntil`, `cotal status` shows the read error
+as `lastError`, and the seat does not terminalize on its own. A plain
+`cotal stop --name <n>` on a deferred seat prints this remedy and changes nothing. If you have
+confirmed that the seat's processes are gone, `cotal stop --name <n> --attest-gone <reason>`
+terminalizes the slot now. The reason must be one line. This needs operator (admin) reach. It rides the untargeted `attest-gone`
+admin command because a deferred seat is not live and cannot be addressed by a target. Without
+`--on`, the CLI finds the instance whose `cotal status` reports the seat deferred and sends the
+command there. It fails if no instance reports it. A spawn of a deferred alias is refused with the same remedy.
 
 The human `ps` row is presentation text and is not a stable parsing target. Scripts use `--json`,
 which is the machine-readable row contract.

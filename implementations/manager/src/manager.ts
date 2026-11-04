@@ -131,6 +131,9 @@ import {
   type LifecycleStateTransport,
   type StaticManagedSlotRow,
   type SignerAnchor,
+  credRowKey,
+  parseLedgerRow,
+  type CredentialLedgerRow,
 } from "@cotal-ai/core";
 // The manager's ONE §13.6 session plane — offer mint + one-use redeem + PTY-bridge
 // standup for `attach`, over a dedicated standing session-LEDGER connection (the byte rails ride
@@ -302,6 +305,12 @@ const STATIC_RECONCILE_MAX_ATTEMPTS = STATIC_RECONCILE_RETRY_DELAYS_MS.length + 
 const RETAINED_CUSTODY_REMEDY =
   "the seat is not proved gone; confirm its processes are gone, then call release-seat with this alias and lifecycleUid";
 const RESTART_RETRY_REMEDY = "restart this manager for a fresh per-process retry budget";
+/** The remedy a deferred seat carries: an unreachable seat waits out its credential, or an operator attests it gone. */
+const DEFERRED_SEAT_REMEDY =
+  "the seat is unreachable and its credential has not expired; it terminalizes after deferUntil, or confirm its processes are gone and run cotal stop <alias> --attest-gone <reason>";
+/** The remedy when the expiry cannot be read: the seat never terminalizes on its own. */
+const UNREADABLE_EXPIRY_REMEDY =
+  "the seat is unreachable and its credential expiry is unreadable (see lastError); it will not terminalize on its own, so confirm its processes are gone and run cotal stop <alias> --attest-gone <reason>";
 
 type StaticReconcileItem = ManagerStaticReconciliationFailure & {
   owner: string;
@@ -1403,6 +1412,8 @@ export class Manager {
   /** Current failed/recovered static reconciliation coordinates. This is an operator snapshot, not
    *  lifecycle authority: every re-drive re-reads broker KV and re-runs planStaticSlotResume. */
   private readonly staticReconcileItems = new Map<string, StaticReconcileItem>();
+  /** The renewal tick's single in-flight re-check of deferred seats. */
+  private deferredRecheck?: Promise<void>;
   private staticReconcileLastSweep?: ManagerStaticReconciliationSweep;
   public staticReconcileLastSweepResources?: {
     slots: {
@@ -1978,7 +1989,7 @@ export class Manager {
       this.daemonRenewalLeaseTimer = setInterval(() => { void this.keepDaemonRenewalLease(); }, MANAGER_LEASE_RENEW_MS);
       this.daemonRenewalLeaseTimer.unref?.();
       await this.renewDaemonCreds();
-      this.credRenewTimer = setInterval(() => { void this.renewDaemonCreds(); }, credRenewIntervalMs(STANDING_RENEWABLE_TTL_SEC));
+      this.credRenewTimer = setInterval(() => this.onCredRenewTick(), credRenewIntervalMs(STANDING_RENEWABLE_TTL_SEC));
       this.credRenewTimer.unref?.();
     } else if (this.remoteAuthority) {
       if (this.remoteAuthority.renewStandingBundle) await this.renewRemoteStandingBundle();
@@ -2778,7 +2789,7 @@ export class Manager {
     this.preservationInventory = undefined;
     this.preservationFailures = [];
     if (this.auth && !this.credRenewTimer) {
-      this.credRenewTimer = setInterval(() => { void this.renewDaemonCreds(); }, credRenewIntervalMs(STANDING_RENEWABLE_TTL_SEC));
+      this.credRenewTimer = setInterval(() => this.onCredRenewTick(), credRenewIntervalMs(STANDING_RENEWABLE_TTL_SEC));
       this.credRenewTimer.unref?.();
     }
     // Exit watchers were suppressed while the fence stood: reconcile every child that died during
@@ -3734,8 +3745,13 @@ export class Manager {
             // exists nowhere and a caller had no way to tell the two apart (#443).
             if (observed?.ownerInstanceId !== undefined)
               throw new EpEnvelopeError("failed-precondition", `the durable slot for "${name}" belongs to manager instance ${observed.ownerInstanceId}, not ${this.managerInstanceId} which answered; only that instance can act on it ${renderStaticSlotObservation(observed)}`, [observed]);
-            if (observed !== undefined && observed.slotPhase !== "retired")
+            if (observed !== undefined && observed.slotPhase !== "retired") {
+              // A deferred seat is a known state: name it and its remedy, so a plain stop says what to do.
+              const deferred = [...this.staticReconcileItems.values()].find((item) => item.alias === name && item.disposition === "deferred");
+              if (deferred !== undefined)
+                throw new EpEnvelopeError("failed-precondition", this.deferredSeatRefusal(deferred), [observed]);
               throw new EpEnvelopeError("failed-precondition", `no live agent "${name}"; durable state contradicts absence ${renderStaticSlotObservation(observed)}`, [observed]);
+            }
           }
           throw new EpEnvelopeError("not-found", `no agent "${name}"`);
         }
@@ -3843,6 +3859,7 @@ export class Manager {
       }),
       purge: (ctx) => this.serveGated(ctx, () => adminGated(ctx, async () => unwrap(await this.opPurge(args(ctx), callerOf(ctx))))),
       releaseSeat: (ctx) => this.serveGated(ctx, () => adminGated(ctx, async () => unwrap(await this.opReleaseSeat(args(ctx), ctx.subject.caller)))),
+      attestGone: (ctx) => this.serveGated(ctx, () => adminGated(ctx, async () => unwrap(await this.opStop(args(ctx), callerOf(ctx), true)))),
       // launch is OWNER-EQUALITY on the ep door for every caller: the deploy
       // path is the only launch consumer and its spec stamps the CALLER's own owner, so
       // owner-equality always holds for a legitimate deploy; cross-owner launch was a ctl
@@ -6018,6 +6035,9 @@ export class Manager {
     // outstanding. All the teardown ops are idempotent, and the rail request is single-flighted.
     if (this.reconcilingAliases.has(identityName))
       return { ok: false, error: `the name "${identityName}" is still reconciling at manager startup; its prior lifecycle terminal owns this alias until it completes. Retry shortly.` };
+    // A deferred seat still owns its alias until its credential lapses or an operator attests it gone.
+    const deferredHolder = [...this.staticReconcileItems.values()].find((item) => item.alias === identityName && item.disposition === "deferred");
+    if (deferredHolder !== undefined) return { ok: false, error: this.deferredSeatRefusal(deferredHolder) };
     const held = this.retiring.get(identityName);
     if (held !== undefined) {
       void this.deprovision(held.target).catch(() => {});
@@ -7452,8 +7472,39 @@ export class Manager {
   private async opStop(args: Record<string, unknown>, caller: string, admin: boolean): Promise<ControlReply> {
     const name = String(args.name ?? "").trim();
     const a = this.agents.get(name);
-    if (!a) return { ok: false, error: `no agent "${name}"` };
-    return this.despawnCore(a, caller, admin, args.graceful !== false);
+    if (a) {
+      if (args.attestGone !== undefined) return { ok: false, error: `"${name}" is a live managed agent; attest-gone applies only to a deferred seat, so use cotal stop ${name}` };
+      return this.despawnCore(a, caller, admin, args.graceful !== false);
+    }
+    const deferred = [...this.staticReconcileItems].find(([, item]) => item.alias === name && item.disposition === "deferred");
+    if (!deferred) return { ok: false, error: `no agent "${name}"` };
+    const [key, item] = deferred;
+    const reason = typeof args.attestGone === "string" ? args.attestGone.trim() : "";
+    if (!reason) return { ok: false, error: this.deferredSeatRefusal(item) };
+    // The reason is logged verbatim, so a line break could forge a second log line.
+    if (/[\r\n]/.test(reason)) return { ok: false, error: `the attest-gone reason for "${name}" must be one line` };
+    const row = await this.readStaticReconcileSlot(name);
+    if (row === undefined || row.lifecycleUid !== item.lifecycleUid || row.actor !== item.actor)
+      return { ok: false, error: `the durable slot for "${name}" is no longer at uid ${item.lifecycleUid}; nothing was attested` };
+    if (ownedBySibling(row, this.managerInstanceId))
+      return { ok: false, error: `the slot for "${name}" belongs to manager instance ${row.ownerInstanceId}, not ${this.managerInstanceId}` };
+    const before = item.flight;
+    const attempt = this.attemptStaticReconcile(key, item, row);
+    // Record the attestation only when this call started the terminal, never on a refused or joined one.
+    if (item.flight === undefined || item.flight === before)
+      return { ok: false, error: `the terminal for "${name}" at uid ${item.lifecycleUid} did not start (${item.timer ? "a retry is scheduled" : item.disposition}); nothing was attested` };
+    item.attestedGone = reason;
+    console.error(`static reconcile attested-gone alias=${name} uid=${item.lifecycleUid} by=${caller}: ${reason}`);
+    if (!(await attempt)) return { ok: false, error: `the terminal for "${name}" at uid ${item.lifecycleUid} did not complete: ${item.lastError ?? item.disposition}` };
+    return { ok: true, data: { name, lifecycleUid: item.lifecycleUid, phase: "retired", attestedGone: reason } };
+  }
+
+  /** The one refusal a deferred seat answers with: its uid, when it lapses, and the remedy it carries. */
+  private deferredSeatRefusal(item: StaticReconcileItem): string {
+    const until = item.deferUntil !== undefined ? `until ${item.deferUntil}` : `with an unreadable credential expiry (${item.lastError ?? "no error recorded"})`;
+    // Name this instance in the command: an unpinned attest-gone may reach a sibling that holds no such seat.
+    const remedy = (item.remedy ?? DEFERRED_SEAT_REMEDY).replace("cotal stop <alias> --attest-gone", `cotal stop --name ${item.alias} --on ${this.managerInstanceId} --attest-gone`);
+    return `"${item.alias}" is a deferred unreachable seat on manager instance ${this.managerInstanceId} at uid ${item.lifecycleUid} ${until}; NEXT: ${remedy}`;
   }
 
   /** The ONE named-terminal core both doors share: the ctl named `stop`
@@ -7690,6 +7741,7 @@ export class Manager {
       ...(this.staticReconcileLastSweep ? { lastSweep: { ...this.staticReconcileLastSweep } } : {}),
       failures,
       retainedCustody: failures.filter((item) => item.retainedReason !== undefined && item.disposition !== "recovered").length,
+      deferredSeats: failures.filter((item) => item.disposition === "deferred").length,
     };
   }
 
@@ -9821,6 +9873,111 @@ export class Manager {
     }
   }
 
+  /** An unadopted live-phase row with credentials and no custody reference, on a runtime that cannot
+   *  prove its seat gone, terminalizes only once its credentials have expired. */
+  private credentialGateApplies(row: StaticManagedSlotRow, adopted: boolean): boolean {
+    if (adopted || (row.phase !== "active" && row.phase !== "provisioning")) return false;
+    if (row.credentialIds.length === 0 || row.runtime !== undefined) return false;
+    return this.executionState.kind === "none" || !isCustodialRuntime(this.runtime);
+  }
+
+  /** Read exp for the row's own credentialIds only. Undefined once `max(exp) + 60` has passed; a
+   *  failed read defers with its error, so an unreadable ledger never terminalizes a live seat. */
+  private async credentialDeferral(row: StaticManagedSlotRow): Promise<{ deferUntil?: string; error?: string } | undefined> {
+    let maxExp: number | undefined;
+    try {
+      maxExp = await this.withLifecycleExecutor({ owner: row.owner, actor: row.actor, lifecycleUid: row.lifecycleUid, alias: row.alias }, async (t) => {
+        let max: number | undefined;
+        for (const id of row.credentialIds) {
+          const key = credRowKey(row.lifecycleUid, id);
+          const entry = await t.getAuth(key);
+          // An id with no row was recorded before a mint that never completed: no credential exists.
+          if (entry === undefined) continue;
+          if (entry.operation !== "PUT") throw new Error(`the ledger row ${key} carries a ${entry.operation} marker`);
+          const ledger: CredentialLedgerRow = parseLedgerRow(entry.value, key);
+          max = max === undefined ? ledger.exp : Math.max(max, ledger.exp);
+        }
+        return max;
+      });
+    } catch (error) {
+      return { error: `credential expiry read failed: ${rejectionText(error)}` };
+    }
+    if (maxExp === undefined || maxExp + 60 < Math.floor(Date.now() / 1000)) return undefined;
+    return { deferUntil: new Date((maxExp + 60) * 1000).toISOString() };
+  }
+
+  /** Record a row held until its credential expires. It keeps its retry budget for the terminal. */
+  private deferStaticReconcileItem(key: string, row: StaticManagedSlotRow, deferral: { deferUntil?: string; error?: string }): void {
+    let item = this.staticReconcileItems.get(key);
+    if (!item) {
+      item = {
+        owner: row.owner,
+        alias: row.alias,
+        actor: row.actor,
+        lifecycleUid: row.lifecycleUid,
+        phase: row.phase,
+        attempts: 0,
+        maxAttempts: STATIC_RECONCILE_MAX_ATTEMPTS,
+        disposition: "deferred",
+      };
+      this.staticReconcileItems.set(key, item);
+    }
+    item.phase = row.phase;
+    item.disposition = "deferred";
+    item.deferUntil = deferral.deferUntil;
+    item.lastError = deferral.error;
+    item.remedy = deferral.error === undefined ? DEFERRED_SEAT_REMEDY : UNREADABLE_EXPIRY_REMEDY;
+    console.error(`! static reconcile deferred alias=${row.alias} phase=${row.phase} uid=${row.lifecycleUid} deferUntil=${deferral.deferUntil ?? "unknown"}${deferral.error ? `: ${deferral.error}` : ""}; NEXT: ${item.remedy}`);
+  }
+
+  /** The daemon renewal tick. Both timer sites use it, so a re-armed timer keeps the deferred re-check. */
+  private onCredRenewTick(): void {
+    void this.renewDaemonCreds();
+    void this.recheckDeferredSeats();
+  }
+
+  /** The renewal tick's re-check: a deferred seat whose credential has expired takes the terminal. */
+  private recheckDeferredSeats(): Promise<void> {
+    if (this.deferredRecheck) return this.deferredRecheck;
+    const flight = this.driveDeferredRecheck().finally(() => { this.deferredRecheck = undefined; });
+    this.deferredRecheck = flight;
+    return flight;
+  }
+
+  private async driveDeferredRecheck(): Promise<void> {
+    if (!this.auth || this.staticReconcileStopping) return;
+    const due = [...this.staticReconcileItems].filter(([, item]) =>
+      // Same whole-second test as credentialDeferral, so a due seat is never deferred again.
+      item.disposition === "deferred" && (item.deferUntil === undefined || Math.floor(Date.parse(item.deferUntil) / 1000) < Math.floor(Date.now() / 1000)));
+    if (due.length === 0) return;
+    this.staticReconcileSweepsInFlight++;
+    try {
+      for (const [key, item] of due) {
+        if (this.staticReconcileStopping) break;
+        try {
+          const row = await this.readStaticReconcileSlot(item.alias);
+          const live = row === undefined ? undefined : this.agents.get(row.alias);
+          if (row === undefined || row.lifecycleUid !== item.lifecycleUid || row.actor !== item.actor || (row.phase !== "active" && row.phase !== "provisioning") || live?.lifecycleUid === row.lifecycleUid) {
+            this.staticReconcileItems.delete(key);
+            console.error(`static reconcile deferred alias=${item.alias} uid=${item.lifecycleUid} left the deferred set: the durable slot is ${row === undefined ? "absent" : `${row.phase} at uid ${row.lifecycleUid}`}`);
+            continue;
+          }
+          const deferral = await this.credentialDeferral(row);
+          if (deferral !== undefined) {
+            this.deferStaticReconcileItem(key, row, deferral);
+            continue;
+          }
+          await this.attemptStaticReconcile(key, item, row);
+        } catch (error) {
+          item.lastError = `deferred re-check failed: ${rejectionText(error)}`;
+          console.error(`! static reconcile deferred alias=${item.alias} uid=${item.lifecycleUid}: ${item.lastError}`);
+        }
+      }
+    } finally {
+      this.releaseStaticReconcileSweep();
+    }
+  }
+
   /** Settle a failed item. A retained item stays `refused` with the release remedy, whatever failed
    *  later: a manager restart never proves its seat gone. */
   private failStaticReconcileItem(item: StaticReconcileItem, disposition: "refused-foreign" | "retry-exhausted", remedy: string, lastError: string): void {
@@ -9954,11 +10111,13 @@ export class Manager {
       item.phase = row.phase;
       item.disposition = "retrying";
       item.nextRetryAt = undefined;
+      item.deferUntil = undefined;
+      if (item.remedy === DEFERRED_SEAT_REMEDY || item.remedy === UNREADABLE_EXPIRY_REMEDY) item.remedy = undefined;
       this.reconcilingAliases.add(row.alias);
       console.error(`static reconcile terminal alias=${row.alias} phase=${row.phase} uid=${row.lifecycleUid} attempt=${item.attempts}/${item.maxAttempts}`);
       try {
         await this.driveStaticRetirement({ id: row.actor, name: row.alias, lifecycleUid: row.lifecycleUid, runtime: row.runtime }, true);
-        if (item.attempts === 1) {
+        if (item.attempts === 1 && item.attestedGone === undefined) {
           this.staticReconcileItems.delete(key);
         } else {
           item.phase = "retired";
@@ -10078,6 +10237,8 @@ export class Manager {
       let preservedAdopted = 0;
       let deferredSlots = 0;
       const terminalRows: StaticManagedSlotRow[] = [];
+      const plannedRows: Array<{ row: StaticManagedSlotRow; adopted: boolean }> = [];
+      const joinedFlights: Array<Promise<boolean>> = [];
       for (const row of slotRows) {
         if (row.phase === "retired") {
           // A retirement is a GLOBAL refusal fact — seed the F5 index for EVERY retired incarnation
@@ -10113,7 +10274,39 @@ export class Manager {
           deferredSlots++;
           continue;
         }
-        if (planStaticSlotResume(row, adopted) !== "none") terminalRows.push(row);
+        if (planStaticSlotResume(row, adopted) === "none") continue;
+        // A terminal already in flight (attest-gone or a tick) owns this item and its fence: join it.
+        const flight = this.staticReconcileItems.get(this.staticReconcileKey(row))?.flight;
+        if (flight !== undefined) joinedFlights.push(flight);
+        else plannedRows.push({ row, adopted });
+      }
+      // Fence every plannable alias before the first expiry read awaits, so no same-alias spawn
+      // slips into the read window. A deferred alias leaves the fence once it is classified.
+      for (const { row } of plannedRows) this.reconcilingAliases.add(row.alias);
+      try {
+        for (const { row, adopted } of plannedRows) {
+          // A seat this manager cannot reap may still hold a live credential: wait out its expiry.
+          if (this.credentialGateApplies(row, adopted)) {
+            const deferral = await this.credentialDeferral(row);
+            // A flight that started during the read owns the item and its fence (its finally unfences).
+            const started = this.staticReconcileItems.get(this.staticReconcileKey(row))?.flight;
+            if (started !== undefined) {
+              joinedFlights.push(started);
+              continue;
+            }
+            if (deferral !== undefined) {
+              this.deferStaticReconcileItem(this.staticReconcileKey(row), row, deferral);
+              this.reconcilingAliases.delete(row.alias);
+              deferredSlots++;
+              continue;
+            }
+          }
+          terminalRows.push(row);
+        }
+        await Promise.allSettled(joinedFlights);
+      } catch (error) {
+        for (const { row } of plannedRows) this.reconcilingAliases.delete(row.alias);
+        throw error;
       }
       try {
         // Mark the complete planned set before the first terminal awaits. A timer owns only its own

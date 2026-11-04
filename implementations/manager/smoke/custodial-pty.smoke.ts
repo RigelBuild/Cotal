@@ -58,7 +58,7 @@ const file = (path: string): string => {
     uptimeMs: 0,
     connectors: [],
     classSpawn: true,
-    staticReconciliation: { state: "idle", failures: [], retainedCustody: 0 },
+    staticReconciliation: { state: "idle", failures: [], retainedCustody: 0, deferredSeats: 0 },
   };
   check("status output accepts custodied", MANAGER_STATUS_CONTRACT.output.validate(sample) === true);
   check("status output still accepts legacy", MANAGER_STATUS_CONTRACT.output.validate({ ...sample, custody: "legacy" }) === true);
@@ -84,7 +84,7 @@ const file = (path: string): string => {
   );
   check(
     "status output refuses a staticReconciliation missing retainedCustody",
-    MANAGER_STATUS_CONTRACT.output.validate({ ...sample, staticReconciliation: { state: "idle", failures: [] } }) === false,
+    MANAGER_STATUS_CONTRACT.output.validate({ ...sample, staticReconciliation: { state: "idle", failures: [], deferredSeats: 0 } }) === false,
   );
 }
 

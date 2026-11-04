@@ -78,6 +78,7 @@ const EP_COMMANDS: Record<string, { command: string; targeted?: boolean }> = {
   commitPreservation: { command: "commit-preservation" },
   abortPreservation: { command: "abort-preservation" },
   transcriptReceive: { command: "transcript-receive" },
+  attestGone: { command: "attest-gone" },
 };
 
 /** Operator reach for one targeted control call: `owner` rides the caller's own-domain verb rows
