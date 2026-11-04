@@ -94,6 +94,8 @@ class CotalAdapter(BasePlatformAdapter):
         # The origin of the turn the shared session runs or last ran, for sends that name no message
         # (progress, a turn-error notice). It changes only when the next turn starts.
         self._running: Optional[dict] = None
+        # True while the shared session runs a turn no delivered message started; its sends go nowhere.
+        self._internal_turn = False
         # Messages held or running in the shared session, each resolved once its turn is admitted;
         # one lock admits them in order.
         self._held: dict[str, asyncio.Future] = {}
@@ -182,6 +184,9 @@ class CotalAdapter(BasePlatformAdapter):
                 # An unanchored send in a channel turn (progress, a notice) falls back to the channel.
                 return SendResult(success=True, message_id=uuid.uuid4().hex)
             target = target or self._running
+            if target is None and self._internal_turn:
+                logger.info("cotal: a turn no peer message started has no mesh origin; its reply is not sent")
+                return SendResult(success=True, message_id=uuid.uuid4().hex)
             if target is None:
                 logger.warning("cotal: a send to the shared chat names no delivered message (%r) and no turn has run; it is not sent", reply_to)
                 return SendResult(success=False, error="cotal reply has no mesh origin")
@@ -209,9 +214,11 @@ class CotalAdapter(BasePlatformAdapter):
     async def on_processing_start(self, event: MessageEvent) -> None:
         await super().on_processing_start(event)
         if self._single:
-            # A turn the adapter did not inject (a background completion) answers its session's peer.
-            peer = getattr(event.source, "user_id", None)
-            self._set_running(self._origins.get(str(event.message_id)) or ({"peerId": peer} if peer else None))
+            # A turn the adapter did not inject (a background completion) has no peer to answer: its
+            # source is the shared chat's last sender, so it is never a reply target.
+            origin = self._origins.get(str(event.message_id)) if event.message_id is not None else None
+            self._internal_turn = origin is None
+            self._set_running(origin)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
         await super().on_processing_complete(event, outcome)

@@ -145,7 +145,8 @@ owns the mesh endpoint for the gateway's whole life and runs `hermes gateway run
   reply goes to the origin of the message it answers, and a message that arrives during a turn waits
   for that turn to end instead of interrupting it. A peer's answer to a question the agent asked
   runs its own turn, and that turn's reply goes to the peer that answered. To tell the asker, the
-  agent calls `cotal_dm`.
+  agent calls `cotal_dm`. A turn no peer message started, such as a background-process
+  completion, has no mesh origin: its reply is not sent, so the agent calls `cotal_dm` to report it.
 
 - Set `gateway.platforms.cotal.channel_replies: false` to stop posting a turn's reply to a
   channel. The agent then posts in a channel only by calling `cotal_send`, so a channel message
