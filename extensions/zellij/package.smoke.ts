@@ -195,7 +195,8 @@ if (args[2] === "subscribe") {
     else process.env.COTAL_ZELLIJ_TEST_SCREEN = saved.screen;
     if (saved.screenCount === undefined) delete process.env.COTAL_ZELLIJ_TEST_SCREEN_COUNT;
     else process.env.COTAL_ZELLIJ_TEST_SCREEN_COUNT = saved.screenCount;
-    rmSync(bin, { recursive: true, force: true });
+    // A just-killed fake can still append to its log while the directory is removed.
+    rmSync(bin, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 }
 
@@ -848,11 +849,13 @@ await withFakeZellij("slow-panes", async (logPath, session) => {
 // Streams that end together share one listing per session rather than one each.
 await withFakeZellij("confirm", async (logPath, session) => {
   const watches = ["terminal_77", "terminal_78", "terminal_79", "terminal_80", "terminal_81"].map((id) => new zellij.PaneWatch(session, id));
-  await sleep(500);
+  // All five streams must be up, or a late one ends after the shared listing settles.
+  await subscribeGaps(logPath, 5, 5_000);
   writeFileSync(`${logPath}.slow-list`, "");
   writeFileSync(`${logPath}.pane`, "closed");
   const exited = await settles(Promise.all(watches.map((watch) => watch.waitForExit())).then(() => undefined), 5_000);
-  check(`five streams ending together cost one listing (listings ${listings(logPath)})`, exited && listings(logPath) === 1);
+  const listed = readCalls(logPath).filter((args) => args[3] === "list-panes").map((args) => args[1]);
+  check(`five streams ending together cost one listing (listings ${listed.length}: ${listed.join(",")}, subscribes ${readCalls(logPath).filter((args) => args[2] === "subscribe").length})`, exited && listed.length === 1);
 });
 
 // The 10 s limit covers both calls of a check, not each: two 6 s calls fail the check by ~10 s.
@@ -906,10 +909,17 @@ await withFakeZellij("confirm", async (logPath, session) => {
   );
 });
 
-// Freshness does not trust the clock: with Date.now() frozen, so a stream opening after a listing
-// started reads the same time, the new pane's watch still lists afresh instead of joining.
+// With Date.now() frozen, a stream opened after a listing starts has the same timestamp; the new
+// pane's watch must still start a fresh listing rather than join the older one.
 await withFakeZellij("confirm", async (logPath, session) => {
   writeFileSync(`${logPath}.slow-list`, "");
+  const snapshots = (): string[] => {
+    try {
+      return readFileSync(`${logPath}.snapshots`, "utf8").split("\n").filter(Boolean);
+    } catch {
+      return [];
+    }
+  };
   const realNow = Date.now;
   const frozen = realNow();
   Date.now = () => frozen;
@@ -917,7 +927,9 @@ await withFakeZellij("confirm", async (logPath, session) => {
     const older = new zellij.PaneWatch(session, "terminal_77");
     await sleep(300);
     writeFileSync(`${logPath}.drop-terminal_77`, "");
-    for (let i = 0; i < 100 && !existsSync(`${logPath}.snapshots`); i++) await sleep(20);
+    for (let i = 0; i < 250 && snapshots().length === 0; i++) await sleep(20);
+    // The older listing has taken its snapshot, without terminal_90, and has not returned.
+    const inFlight = snapshots().length === 1 && snapshots()[0].startsWith("start");
     writeFileSync(`${logPath}.extra-pane`, "");
     const fresh = new zellij.PaneWatch(session, "terminal_90");
     await sleep(200);
@@ -926,7 +938,10 @@ await withFakeZellij("confirm", async (logPath, session) => {
     const state = fresh.status();
     older.stop();
     fresh.stop();
-    check(`a listing whose start time ties a later stream's open never proves that pane's exit (state ${state}, listings ${listings(logPath)})`, state === "running" && listings(logPath) >= 2);
+    check(
+      `a listing whose start time ties a later stream's open never proves that pane's exit (in flight ${inFlight}, state ${state}, listings ${listings(logPath)})`,
+      inFlight && state === "running" && listings(logPath) >= 2,
+    );
   } finally {
     Date.now = realNow;
   }
@@ -984,18 +999,27 @@ if (procfs) await withFakeZellij("confirm", async (logPath, session) => {
   check(`every subscriber is killed when the watching process exits (subscribed ${subscribed}, left ${live})`, subscribed === 3 && live === 0);
 });
 // An exit listing still running when the watching process exits is killed with the subscribers.
-if (procfs) await withFakeZellij("slow-panes", async (_logPath, session) => {
-  const child = driverProcess(`new z.PaneWatch(${JSON.stringify(session)}, "terminal_77"); setTimeout(() => process.exit(0), 1_500);`);
-  await exitCode(child, 10_000);
-  await sleep(100);
-  const hung = readdirSync("/proc").filter((entry) => {
+if (procfs) await withFakeZellij("slow-panes", async (logPath, session) => {
+  // The child exits through process.exit, as the manager does, once its listing has started.
+  const child = driverProcess(
+    `const fs = await import("node:fs"); new z.PaneWatch(${JSON.stringify(session)}, "terminal_77"); ` +
+    `setInterval(() => { const log = process.env.COTAL_ZELLIJ_TEST_LOG; if (fs.existsSync(log) && fs.readFileSync(log, "utf8").includes('"list-panes"')) setTimeout(() => process.exit(0), 200); }, 20);`,
+  );
+  const hung = (): number => readdirSync("/proc").filter((entry) => {
     try {
       return /^\d+$/.test(entry) && readFileSync(`/proc/${entry}/cmdline`, "utf8").includes(`${session}\0action\0list-panes`);
     } catch {
       return false;
     }
   }).length;
-  check(`an exit listing in flight is killed when the watching process exits (left ${hung})`, hung === 0);
+  const exited = exitCode(child, 10_000);
+  for (let i = 0; i < 250 && (hung() === 0 || listings(logPath) === 0); i++) await sleep(20);
+  const seen = hung();
+  const listed = listings(logPath);
+  const started = seen === 1 && listed === 1;
+  await exited;
+  await sleep(100);
+  check(`an exit listing in flight is killed when the watching process exits (running ${seen}, listed ${listed}, left ${hung()})`, started && hung() === 0);
 });
 
 // A wait started after the subscriber or the retry timer already exists still holds the process
