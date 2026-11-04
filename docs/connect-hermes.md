@@ -261,7 +261,7 @@ session keyed by its sender. With `gateway.platforms.cotal.single_session: true`
 mesh session. In the session `dm:<peer>`, a `cotal_dm` to that peer answers it. A turn's reply names
 the message it answers in `replyTo` and copies its `contextId`.
 
-An id stops routing 24 hours after it was asked, or sooner once the seat has asked 1024 newer
+An id stops routing 24 hours after it was asked, or sooner once the seat has asked 4096 newer
 questions.
 
 ## Limits
