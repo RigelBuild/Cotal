@@ -44,7 +44,7 @@ function hard(condition: unknown, name: string): asserts condition {
   throw new Error(name);
 }
 
-const EXPECTED_CELLS = 30;
+const EXPECTED_CELLS = 32;
 if (process.platform === "win32") skipSuite("the Hermes connector is Unix-only");
 
 const pkgDir = fileURLToPath(new URL("..", import.meta.url));
