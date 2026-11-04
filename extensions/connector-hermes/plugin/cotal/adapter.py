@@ -190,8 +190,8 @@ class CotalAdapter(BasePlatformAdapter):
                 logger.warning("cotal: a send to the shared chat names no delivered message (%r) and no turn has run; it is not sent", reply_to)
                 return SendResult(success=False, error="cotal reply has no mesh origin")
             if "channel" in target and not self._channel_replies:
-                # A shared-chat send is a turn's own output, never an explicit send. An answer to a
-                # question asked in a channel turn reports back to that channel, so drop it here.
+                # A shared-chat send is a turn's own output, never an explicit send, so a channel
+                # turn's reply is dropped here.
                 logger.info("cotal: channel_replies is off; a shared-chat send to #%s is not posted", target["channel"])
                 return SendResult(success=True, message_id=uuid.uuid4().hex)
         else:
@@ -321,14 +321,12 @@ class CotalAdapter(BasePlatformAdapter):
             )
             raise InjectionRefused(asker["session_key"])
         if asker:
-            origin = asker.pop("origin", None)
+            # The asking turn's origin is not needed: an answer's turn replies to the answerer.
+            asker.pop("origin", None)
             if asker.get("chat_type") == "dm" and asker.get("chat_id"):
                 # A DM session is keyed by chat id, so the turn can name the peer that answered.
                 asker.update(user_id=msg.get("fromId"), user_name=sender)
             source = self.build_source(**asker)
-            if self._single and origin:
-                # An answer's turn reports back to where the asking turn came from.
-                target = origin
         else:
             if msg.get("id"):
                 self._answering[msg["id"]] = msg.get("contextId")

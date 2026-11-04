@@ -101,7 +101,7 @@ assert.equal(subject.orphan_send_refused, true, "before any turn, an unanchored 
 assert.deepEqual(subject.idless_target, { peerId: "dee-id" }, "an id-less message's reply reaches its sender by receive key");
 assert.equal(subject.dup_waits, true, "a held message pushed again is not acked before its turn is admitted");
 assert.equal(subject.held_once, true, "a held message pushed again runs one turn, not two");
-assert.deepEqual(subject.answer_targets, [{ peerId: "ada-id" }, { channel: "ops" }], "an answer reports to the asking turn's origin: the DM peer, or the channel");
+assert.deepEqual(subject.answer_targets, [{ peerId: "eve-id" }, { peerId: "eve-id" }], "an answer's reply goes to the peer that answered, not the asking turn's origin");
 assert.deepEqual(subject.answer_senders, [["eve-id", "Eve"], ["eve-id", "Eve"]], "an answer turn names the peer that answered, not the asking turn's sender");
 assert.deepEqual(
   subject.per_peer_answers,

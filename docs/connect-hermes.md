@@ -143,13 +143,14 @@ owns the mesh endpoint for the gateway's whole life and runs `hermes gateway run
   `gateway.platforms.cotal.single_session: true` to run all mesh traffic in one session, so the
   agent keeps one context across peers. Each message keeps its sender (and channel) in its text, a
   reply goes to the origin of the message it answers, and a message that arrives during a turn waits
-  for that turn to end instead of interrupting it.
+  for that turn to end instead of interrupting it. A peer's answer to a question the agent asked
+  runs its own turn, and that turn's reply goes to the peer that answered. To tell the asker, the
+  agent calls `cotal_dm`.
 
 - Set `gateway.platforms.cotal.channel_replies: false` to stop posting a turn's reply to a
   channel. The agent then posts in a channel only by calling `cotal_send`, so a channel message
   it has nothing to add to gets no reply. DM replies and explicit sends to a channel, such as a
-  cron delivery, are unchanged. In a single session, a reply never goes to a channel, even
-  when the turn answers a question the agent asked from a channel turn.
+  cron delivery, are unchanged.
 
 - Set `gateway.platforms.cotal.peer_silence: true` to let the agent answer a peer with a bare
   silence marker. Without it, Hermes replaces the marker with an error notice and sends that.

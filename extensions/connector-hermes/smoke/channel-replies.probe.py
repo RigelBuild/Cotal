@@ -142,7 +142,7 @@ async def main() -> None:
     await adapter._inject(dict(CH, id="m-ch2"))
     await adapter.send(adapter.handled[-1].source["chat_id"], "unanchored")
     out["unanchored_sent"] = adapter._client.replies
-    # A question asked in a channel turn: the peer's answer runs a turn whose origin is the channel.
+    # A question asked in a channel turn: the peer's answer runs a turn of its own.
     from cotal import replies
     adapter._client.replies = []
     await adapter._inject(dict(CH, id="m-ch3"))
