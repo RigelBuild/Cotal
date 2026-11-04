@@ -87,9 +87,9 @@ for (const mode of ["subject", "shared"] as const) {
   // Per-peer, an unanchored send names its chat like an explicit send (cron), so it still posts.
   const unanchored = mode === "shared" ? [] : [{ target: { channel: "ops" }, text: "unanchored" }];
   assert.deepEqual(r.unanchored_sent, unanchored, `${mode}: an unanchored send follows the chat it names`);
-  // Shared: the answer to a question asked in a channel turn reports back to that channel, so it is dropped.
-  const answer = mode === "shared" ? [] : [{ target: { channel: "ops" }, text: "answer turn reply" }];
-  assert.deepEqual(r.answer_sent, answer, `${mode}: an answer turn whose origin is a channel follows channel_replies`);
+  // Shared: the answer to a question asked in a channel turn replies to the answerer by DM, never the channel.
+  const answer = mode === "shared" ? [{ target: { peerId: "ada-id" }, text: "answer turn reply" }] : [{ target: { channel: "ops" }, text: "answer turn reply" }];
+  assert.deepEqual(r.answer_sent, answer, `${mode}: an answer to a channel turn's question replies to the answerer (shared) or follows the session's chat`);
 }
 
 const control = run("control");

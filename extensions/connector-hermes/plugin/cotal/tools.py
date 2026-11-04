@@ -86,7 +86,7 @@ def _calling_session() -> Optional[dict]:
         "user_id": get_session_env("HERMES_SESSION_USER_ID", ""),
         "user_name": get_session_env("HERMES_SESSION_USER_NAME", ""),
     }
-    # The shared chat names no peer: keep the asking turn's origin, so the answer reports back there.
+    # The shared chat names no peer: keep the asking turn's origin, so a DM to it answers that peer.
     if chat_id == replies.SINGLE_CHAT_ID and replies.running():
         session["origin"] = replies.running()
     return session

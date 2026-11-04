@@ -203,8 +203,8 @@ async def main() -> None:
     await asyncio.wait_for(asyncio.gather(first, again), 2)
     out["held_once"] = [e.message_id for e in adapter.handled] == ["m-ada", "m-bob"]
 
-    # A question asked from a turn reports its answer back to that turn's origin: Ada by DM, and
-    # the #ops channel for a channel post, through the real tool-side session record.
+    # The answer to a question asked from a turn (Ada by DM, or the #ops channel) replies to the
+    # peer that answered, through the real tool-side session record.
     answers, answer_senders = [], []
     for msg in (A, C):
         adapter = make()
