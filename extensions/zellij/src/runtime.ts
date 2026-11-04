@@ -1,4 +1,4 @@
-import { chmodSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdtempSync, openSync, readSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -28,7 +28,7 @@ export interface PrivateLauncher {
 function launcherSource(dir: string, payload: string, name: string): string {
   return `#!${process.execPath}\n` +
     `const { spawn } = require("node:child_process");\n` +
-    `const { appendFileSync, lstatSync, readFileSync, rmSync } = require("node:fs");\n` +
+    `const { closeSync, constants, lstatSync, openSync, readFileSync, rmSync, writeSync } = require("node:fs");\n` +
     `const dir = ${JSON.stringify(dir)};\n` +
     `const payload = ${JSON.stringify(payload)};\n` +
     `const alreadyRun = () => { console.error("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal"); process.exit(1); };\n` +
@@ -43,14 +43,16 @@ function launcherSource(dir: string, payload: string, name: string): string {
     `}\n` +
     `rmSync(payload, { force: true });\n` +
     `process.stdout.write("\\x1b]0;" + ${JSON.stringify(name.replace(/[\x00-\x1f\x7f-\x9f]/g, ""))} + "\\x07");\n` +
+    // The pane closes with the launcher, so its last words also go to a file the runtime reports.
+    // O_EXCL|O_NOFOLLOW: one reason per launch, never written through a planted file or link.
+    `const report = (line) => { line = String(line).replace(/[\\x00-\\x1f\\x7f-\\x9f]/g, " ").slice(0, 500); console.error("[cotal-zellij-launch] " + line); try { const fd = openSync(dir + "/exit reason", constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600); writeSync(fd, line + "\\n"); closeSync(fd); } catch {} };\n` +
+    `process.on("uncaughtException", (err) => { report("launcher: " + (err && err.message ? err.message : String(err))); process.exit(1); });\n` +
     `process.chdir(launch.cwd);\n` +
     `const child = spawn(launch.command, launch.args, { env: launch.env, stdio: "inherit" });\n` +
     `let exiting = false;\n` +
     `const forward = (signal) => { if (!exiting && child.pid) child.kill(signal); };\n` +
     `process.on("SIGINT", () => forward("SIGINT"));\n` +
     `process.on("SIGTERM", () => forward("SIGTERM"));\n` +
-    // The pane closes with the launcher, so its last words also go to a file the runtime reports.
-    `const report = (line) => { console.error("[cotal-zellij-launch] " + line); try { appendFileSync(dir + "/exit reason", line + "\\n", { mode: 0o600 }); } catch {} };\n` +
     `child.on("error", (err) => { report(launch.command + ": " + err.message); process.exit(127); });\n` +
     `child.on("exit", (code, signal) => { exiting = true; if (signal || code) report(launch.command + " exited with " + (signal ?? "code " + code)); if (signal) process.exit(128); process.exit(code ?? 0); });\n`;
 }
@@ -71,11 +73,19 @@ export function privateLauncher(spec: LaunchSpec, cwd: string, name: string): Pr
 }
 
 // What the launcher recorded before its pane closed, or "" when it exited cleanly or never ran.
+// The launched agent shares our uid, so only a regular file opened without following links counts.
 function exitReason(launcher: PrivateLauncher): string {
+  let fd: number | undefined;
   try {
-    return readFileSync(join(launcher.dir, "exit reason"), "utf8").trim();
+    fd = openSync(join(launcher.dir, "exit reason"), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    if (!fstatSync(fd).isFile()) return "";
+    const buffer = Buffer.alloc(512);
+    const read = readSync(fd, buffer, 0, buffer.length, 0);
+    return buffer.toString("utf8", 0, read).replace(/[\x00-\x1f\x7f-\x9f]/g, " ").trim();
   } catch {
     return "";
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }
 

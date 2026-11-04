@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -681,33 +681,82 @@ await withFakeZellij("confirm", async (logPath, session) => {
   );
 });
 
-const subscribeTimes = (logPath: string): number[] =>
-  readFileSync(`${logPath}.subscribed`, "utf8").split("\n").filter(Boolean).map(Number);
+// A pane that exits after spawn logs the launcher's reason once the watch proves the exit, and its
+// private launcher directory is removed; a planted symlink in place of the reason is never followed.
+for (const planted of [false, true]) {
+  await withFakeZellij("confirm", async (logPath, session) => {
+    const tmp = mkdtempSync(join(tmpdir(), "cotal-zellij-tmp-"));
+    const savedTmp = process.env.TMPDIR;
+    process.env.TMPDIR = tmp;
+    const secretFile = join(tmp, "readable-secret");
+    writeFileSync(secretFile, "planted-secret-contents");
+    const logged: string[] = [];
+    const savedError = console.error;
+    console.error = (...parts: unknown[]) => void logged.push(parts.join(" "));
+    try {
+      const handle = new ZellijRuntime(session).spawn("exit-agent", { command: "sleep", args: ["600"] }, process.cwd());
+      const [dir] = readdirSync(tmp).filter((entry) => entry.startsWith("cotal-zellij-launch-"));
+      if (planted) symlinkSync(secretFile, join(tmp, dir, "exit reason"));
+      else writeFileSync(join(tmp, dir, "exit reason"), "sleep exited with code 5\n");
+      writeFileSync(`${logPath}.pane`, "closed");
+      const exited = await settles(handle.waitForExit!(), 2_000);
+      const left = readdirSync(tmp).filter((entry) => entry.startsWith("cotal-zellij-launch-")).length;
+      check(
+        planted
+          ? `a planted exit-reason symlink is not followed into the log (logged ${JSON.stringify(logged)})`
+          : `a pane exit after spawn logs the launcher's reason and removes its launcher dir (logged ${JSON.stringify(logged)}, left ${left})`,
+        exited && left === 0 && (planted
+          ? !logged.some((line) => line.includes("planted-secret-contents"))
+          : logged.some((line) => line.includes('"exit-agent": sleep exited with code 5'))),
+      );
+    } finally {
+      console.error = savedError;
+      if (savedTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = savedTmp;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+}
+
+// Waits until the fake has logged `count` subscriber starts, so slow process starts cannot cut a
+// timed cell short; returns the gaps between starts.
+async function subscribeGaps(logPath: string, count: number, ms: number): Promise<number[]> {
+  const deadline = Date.now() + ms;
+  let times: number[] = [];
+  while (Date.now() < deadline) {
+    try {
+      times = readFileSync(`${logPath}.subscribed`, "utf8").split("\n").filter(Boolean).map(Number);
+    } catch {
+      times = [];
+    }
+    if (times.length >= count) break;
+    await sleep(50);
+  }
+  return times.slice(0, count).slice(1).map((time, i) => time - times[i]);
+}
 
 // A stream that ends while the pane still runs (server restart, broken pipe) is not an exit, and
 // repeated drops back off instead of listing every second.
-await withFakeZellij("subscribe-drop", async (_logPath, session) => {
+await withFakeZellij("subscribe-drop", async (logPath, session) => {
   const watch = new zellij.PaneWatch(session, "terminal_77");
-  const exited = await settles(watch.waitForExit(), 3_800);
+  const gaps = await subscribeGaps(logPath, 3, 15_000);
+  const running = watch.status() === "running";
   watch.stop();
-  const times = subscribeTimes(_logPath);
-  const gaps = times.slice(1).map((time, i) => time - times[i]);
   check(
     `a dropped stream over a live pane stays running and resubscribes after doubling delays (gaps ${gaps.join(", ")} ms)`,
-    !exited && watch.status() === "running" && gaps.length === 2 && gaps[0] >= 950 && gaps[1] >= 1_950,
+    running && gaps.length === 2 && gaps[0] >= 950 && gaps[1] >= 1_950,
   );
 });
 
-// A stream that stayed up past the healthy threshold resets the delay to its base.
+// A stream that stayed up past the healthy threshold resets the delay to its base: the gap after
+// it is the stream's 10.5 s life plus 1 s, not plus the 4 s the doubling had reached.
 await withFakeZellij("healthy-drop", async (logPath, session) => {
   const watch = new zellij.PaneWatch(session, "terminal_77");
-  await settles(watch.waitForExit(), 15_500);
+  const gaps = await subscribeGaps(logPath, 4, 30_000);
   watch.stop();
-  const times = subscribeTimes(logPath);
-  const gaps = times.slice(1).map((time, i) => time - times[i]);
   check(
     `a drop after a healthy stream retries at the base delay (gaps ${gaps.join(", ")} ms)`,
-    gaps.length === 3 && gaps[1] >= 1_950 && gaps[2] >= 10_400 && gaps[2] - 10_500 < 1_900,
+    gaps.length === 3 && gaps[1] >= 1_950 && gaps[2] >= 11_400 && gaps[2] < 14_400,
   );
 });
 
