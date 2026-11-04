@@ -402,11 +402,13 @@ async function probePanes(session: string): Promise<ZellijPane[] | undefined> {
 // Streams that end together (a server restart) share one listing per session instead of a burst.
 // A watch joins only a listing started after its stream opened: the pane existed by then, so its
 // absence is an exit, while an older listing may predate the pane. A stale "running" resubscribes.
-const probes = new Map<string, { readonly started: number; readonly panes: Promise<ZellijPane[] | undefined> }>();
+// One counter orders stream opens and listing starts; clock time can tie or step backwards.
+let sequence = 0;
+const probes = new Map<string, { readonly seq: number; readonly panes: Promise<ZellijPane[] | undefined> }>();
 function sharedProbe(session: string, since: number): Promise<ZellijPane[] | undefined> {
   const current = probes.get(session);
-  if (current && current.started >= since) return current.panes;
-  const probe = { started: Date.now(), panes: probePanes(session) };
+  if (current && current.seq > since) return current.panes;
+  const probe = { seq: ++sequence, panes: probePanes(session) };
   probes.set(session, probe);
   void probe.panes.finally(() => {
     if (probes.get(session) === probe) probes.delete(session);
@@ -437,6 +439,7 @@ export class PaneWatch {
   #retry: NodeJS.Timeout | undefined;
   #awaited = false;
   #openedAt = 0;
+  #openedSeq = 0;
   // How long the last stream lived, taken when it ended so a slow check does not count as uptime.
   #lived = 0;
   #delay = RESUBSCRIBE_MS;
@@ -524,6 +527,7 @@ export class PaneWatch {
     });
     this.#child = child;
     this.#openedAt = Date.now();
+    this.#openedSeq = ++sequence;
     subscribers.add(child);
     if (!reapOnExit) {
       reapOnExit = true;
@@ -538,7 +542,7 @@ export class PaneWatch {
       if (this.#child !== child) return;
       this.#child = undefined;
       this.#lived = Date.now() - this.#openedAt;
-      void this.#check(this.#openedAt);
+      void this.#check(this.#openedSeq);
     };
     child.on("error", ended);
     child.on("exit", ended);

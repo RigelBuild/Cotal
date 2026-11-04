@@ -139,16 +139,16 @@ if (args[2] === "subscribe") {
   appendFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".subscribed", Date.now() + "\\n");
   const opened = readFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".subscribed", "utf8").split("\\n").filter(Boolean).length;
   if (["subscribe-drop", "no-server", "probe-error", "panes-error", "slow-panes", "slow-both"].includes(process.env.COTAL_ZELLIJ_TEST_MODE)) process.exit(0);
-  // ".drop-<pane>": that pane's next stream drops once.
+  // ".drop-<pane>": that pane's stream drops once, whenever the file appears.
   const drop = process.env.COTAL_ZELLIJ_TEST_LOG + ".drop-" + args[args.indexOf("--pane-id") + 1];
-  if (existsSync(drop)) { rmSync(drop); process.exit(0); }
+  const dropped = () => { try { rmSync(drop); return true; } catch { return false; } };
   // healthy-drop: two quick drops, then a stream that outlives the healthy threshold, then drops.
   if (process.env.COTAL_ZELLIJ_TEST_MODE === "healthy-drop") {
     if (opened !== 3) process.exit(0);
     setTimeout(() => process.exit(0), 10_500);
   }
   // Ends once the cell tears down its fake, the way a real stream ends with its server.
-  setInterval(() => { if (closed() || !existsSync(process.env.COTAL_ZELLIJ_TEST_LOG)) process.exit(0); }, 20);
+  setInterval(() => { if (closed() || dropped() || !existsSync(process.env.COTAL_ZELLIJ_TEST_LOG)) process.exit(0); }, 20);
 } else if (action === "list-panes") {
   const mode = process.env.COTAL_ZELLIJ_TEST_MODE;
   if (mode === "panes-error") { console.error("Error occurred: timed out"); process.exit(1); }
@@ -158,16 +158,18 @@ if (args[2] === "subscribe") {
   slowBoth();
   let closed = false;
   try { closed = readFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".pane", "utf8") === "closed"; } catch {}
-  // ".extra-pane": terminal_90 exists from this snapshot on.
+  // ".extra-pane": terminal_90 and terminal_91 exist from this snapshot on.
   const extra = existsSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".extra-pane");
-  if (existsSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".slow-list")) {
-    appendFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".snapshots", "1\\n");
+  const slowList = existsSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".slow-list");
+  if (slowList) {
+    appendFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".snapshots", "start " + Date.now() + "\\n");
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_500);
+    appendFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".snapshots", "end " + Date.now() + "\\n");
   }
   console.log(JSON.stringify(mode === "partial-tab" || closed ? [] : [{
     id: 77, tab_id: 77, title: "confirm-agent", is_plugin: false, exited: false, exit_status: null
   }, ...(mode === "dropped-pane" ? [{ id: 78, tab_id: 77, title: "", is_plugin: false, exited: false, exit_status: null }] : []),
-    ...(extra && !closed ? [{ id: 90, tab_id: 77, title: "new-agent", is_plugin: false, exited: false, exit_status: null }] : [])]));
+    ...(extra && !closed ? [90, 91].map((id) => ({ id, tab_id: 77, title: "new-agent", is_plugin: false, exited: false, exit_status: null })) : [])]));
   process.exit(0);
 }
 `);
@@ -862,24 +864,46 @@ await withFakeZellij("slow-both", async (logPath, session) => {
 });
 
 // A listing that began before a pane existed never proves that pane's exit: a new pane's watch
-// starts its own listing instead of joining the older one.
+// starts its own listing instead of joining the older one. When the older listing settles, the
+// newer one stays shared: a third stream ending meanwhile joins it rather than listing again.
 await withFakeZellij("confirm", async (logPath, session) => {
   writeFileSync(`${logPath}.slow-list`, "");
-  writeFileSync(`${logPath}.drop-terminal_77`, "");
-  const older = new zellij.PaneWatch(session, "terminal_77");
-  const snapshotted = async (): Promise<boolean> => {
-    for (let i = 0; i < 100 && !existsSync(`${logPath}.snapshots`); i++) await sleep(20);
-    return existsSync(`${logPath}.snapshots`);
+  const snapshots = (): string[] => {
+    try {
+      return readFileSync(`${logPath}.snapshots`, "utf8").split("\n").filter(Boolean);
+    } catch {
+      return [];
+    }
   };
-  const inFlight = await snapshotted();
+  const until = async (ready: () => boolean): Promise<boolean> => {
+    for (let i = 0; i < 250 && !ready(); i++) await sleep(20);
+    return ready();
+  };
+  const third = new zellij.PaneWatch(session, "terminal_91");
+  const older = new zellij.PaneWatch(session, "terminal_77");
+  await sleep(300);
+  writeFileSync(`${logPath}.drop-terminal_77`, "");
+  await until(() => snapshots().length >= 1);
+  await sleep(600);
   writeFileSync(`${logPath}.extra-pane`, "");
-  writeFileSync(`${logPath}.drop-terminal_90`, "");
   const fresh = new zellij.PaneWatch(session, "terminal_90");
-  await sleep(4_000);
-  const state = fresh.status();
-  older.stop();
-  fresh.stop();
-  check(`a new pane's watch never reads an older in-flight listing as its exit (in flight ${inFlight}, state ${state})`, inFlight && state === "running");
+  await sleep(200);
+  writeFileSync(`${logPath}.drop-terminal_90`, "");
+  await until(() => snapshots().some((line) => line.startsWith("end")));
+  // Let the older listing settle in this process; the newer one runs ~800 ms longer.
+  await sleep(300);
+  writeFileSync(`${logPath}.drop-terminal_91`, "");
+  await until(() => snapshots().filter((line) => line.startsWith("end")).length >= 2);
+  await sleep(300);
+  const log = snapshots();
+  const times = (kind: string): number[] => log.filter((line) => line.startsWith(kind)).map((line) => Number(line.split(" ")[1]));
+  const overlapped = times("start").length >= 2 && times("start")[1] < times("end")[0];
+  const states = [older, fresh, third].map((watch) => watch.status());
+  for (const watch of [older, fresh, third]) watch.stop();
+  check(
+    `a new pane's watch lists afresh and a later stream joins the listing still in flight (overlap ${overlapped}, listings ${listings(logPath)}, states ${states.join(",")})`,
+    overlapped && listings(logPath) === 2 && states.every((state) => state === "running"),
+  );
 });
 
 // A failed pane listing after the stream ends is unknown, never an exit.
