@@ -377,6 +377,7 @@ const RESUBSCRIBE_MS = 1_000;
 const RESUBSCRIBE_MAX_MS = 30_000;
 // A stream that lasted this long was healthy, so the next drop retries at the base delay again.
 const STREAM_HEALTHY_MS = 10_000;
+const CHECK_MS = 10_000;
 
 // The manager exits through process.exit under KillMode=process, and a subscriber outlives its
 // parent; kill every held subscriber when this process exits.
@@ -437,7 +438,8 @@ export class PaneWatch {
     if (this.#exited || this.#stopped) return;
     let state: "running" | "exited";
     try {
-      state = paneState(this.session, this.paneId);
+      // Bounded: a hung zellij call fails into the retry path instead of blocking the event loop.
+      state = paneState(this.session, this.paneId, Date.now() + CHECK_MS);
     } catch {
       // A failed listing is not an exit: subscribe again and look again when that stream ends.
       this.#reopen();

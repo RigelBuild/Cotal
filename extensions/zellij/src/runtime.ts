@@ -32,9 +32,14 @@ function launcherSource(dir: string, payload: string, name: string): string {
     `const dir = ${JSON.stringify(dir)};\n` +
     `const payload = ${JSON.stringify(payload)};\n` +
     `const alreadyRun = () => { console.error("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal"); process.exit(1); };\n` +
+    // The pane closes with the launcher, so its last words also go to a file the runtime reports.
+    // O_EXCL|O_NOFOLLOW: one reason per launch, never written through a planted file or link.
+    `const report = (line) => { line = String(line).replace(/[\\x00-\\x1f\\x7f-\\x9f]/g, " ").slice(0, 500); console.error("[cotal-zellij-launch] " + line); try { const fd = openSync(dir + "/exit reason", constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600); writeSync(fd, line + "\\n"); closeSync(fd); } catch {} };\n` +
     `let dirInfo;\n` +
     `try { dirInfo = lstatSync(dir); } catch { alreadyRun(); }\n` +
     `if (!dirInfo.isDirectory() || (typeof process.getuid === "function" && (dirInfo.uid !== process.getuid() || (dirInfo.mode & 0o077) !== 0))) alreadyRun();\n` +
+    // Installed only once the directory is ours, so a report never lands in a directory we did not make.
+    `process.on("uncaughtException", (err) => { report("launcher: " + (err && err.message ? err.message : String(err))); process.exit(1); });\n` +
     `let launch;\n` +
     `try { launch = JSON.parse(readFileSync(payload, "utf8")); } catch (error) {\n` +
     `  try { rmSync(payload, { force: true }); } catch {}\n` +
@@ -43,10 +48,6 @@ function launcherSource(dir: string, payload: string, name: string): string {
     `}\n` +
     `rmSync(payload, { force: true });\n` +
     `process.stdout.write("\\x1b]0;" + ${JSON.stringify(name.replace(/[\x00-\x1f\x7f-\x9f]/g, ""))} + "\\x07");\n` +
-    // The pane closes with the launcher, so its last words also go to a file the runtime reports.
-    // O_EXCL|O_NOFOLLOW: one reason per launch, never written through a planted file or link.
-    `const report = (line) => { line = String(line).replace(/[\\x00-\\x1f\\x7f-\\x9f]/g, " ").slice(0, 500); console.error("[cotal-zellij-launch] " + line); try { const fd = openSync(dir + "/exit reason", constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600); writeSync(fd, line + "\\n"); closeSync(fd); } catch {} };\n` +
-    `process.on("uncaughtException", (err) => { report("launcher: " + (err && err.message ? err.message : String(err))); process.exit(1); });\n` +
     `process.chdir(launch.cwd);\n` +
     `const child = spawn(launch.command, launch.args, { env: launch.env, stdio: "inherit" });\n` +
     `let exiting = false;\n` +
@@ -79,7 +80,8 @@ function exitReason(launcher: PrivateLauncher): string {
   try {
     fd = openSync(join(launcher.dir, "exit reason"), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     if (!fstatSync(fd).isFile()) return "";
-    const buffer = Buffer.alloc(512);
+    // The launcher keeps 500 UTF-16 units, which is at most 1,500 UTF-8 bytes plus the newline.
+    const buffer = Buffer.alloc(1_501);
     const read = readSync(fd, buffer, 0, buffer.length, 0);
     return buffer.toString("utf8", 0, read).replace(/[\x00-\x1f\x7f-\x9f]/g, " ").trim();
   } catch {
@@ -107,12 +109,13 @@ export function launchLine(launcher: PrivateLauncher): string {
 function paneForTab(session: string, tabId: number, launcher: PrivateLauncher): string {
   const pane = zellij.listPanes(session).find((candidate) => candidate.tab_id === tabId && !candidate.is_plugin);
   if (pane) return pane.id;
+  const reason = exitReason(launcher);
+  const detail = reason ? `: ${reason}` : "";
   // Tab seats close on exit, so a launch that dies at once takes its tab with it.
   if (!zellij.listTabs(session).some((tab) => tab.tab_id === tabId)) {
-    const reason = exitReason(launcher);
-    throw new Error(`zellij runtime: the agent in tab ${tabId} exited before its pane could be read${reason ? `: ${reason}` : ""}`);
+    throw new Error(`zellij runtime: the agent in tab ${tabId} exited before its pane could be read${detail}`);
   }
-  throw new Error(`zellij runtime: no terminal pane found in tab ${tabId}`);
+  throw new Error(`zellij runtime: no terminal pane found in tab ${tabId}${detail}`);
 }
 
 export class ZellijRuntime implements Runtime {

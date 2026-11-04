@@ -246,6 +246,31 @@ try {
   const escaped = privateLauncher(spec, temp, "evil\x9d0;owned\x9c\x1b[2Jname");
   const escapedRun = spawnSync(process.execPath, [join(escaped.dir, "evil_0_owned___2Jname")], { encoding: "utf8" });
   check("launcher strips C0 and C1 controls from the pane title", escapedRun.stdout.startsWith("\x1b]0;evil0;owned[2Jname\x07"));
+  rmSync(escaped.dir, { recursive: true, force: true });
+  // Setup errors before the child starts still leave a reason, since the pane closes with the launcher.
+  const goneCwd = privateLauncher({ command: "true", args: [], env: {} }, join(temp, "removed-cwd"), "gone-cwd");
+  spawnSync(process.execPath, [join(goneCwd.dir, "gone-cwd")], { encoding: "utf8" });
+  const goneReason = readFileSync(join(goneCwd.dir, "exit reason"), "utf8");
+  check(`a launcher whose cwd is gone records why (${JSON.stringify(goneReason)})`, goneReason.startsWith("launcher: ENOENT") && goneReason.includes("chdir"));
+  rmSync(goneCwd.dir, { recursive: true, force: true });
+  const corrupt = privateLauncher(spec, temp, "corrupt-payload");
+  writeFileSync(corrupt.payload, "{not json", { mode: 0o600 });
+  spawnSync(process.execPath, [join(corrupt.dir, "corrupt-payload")], { encoding: "utf8" });
+  const corruptReason = readFileSync(join(corrupt.dir, "exit reason"), "utf8");
+  check(`a launcher with an unreadable payload records why (${JSON.stringify(corruptReason)})`, corruptReason.startsWith("launcher: ") && corruptReason.includes("JSON"));
+  rmSync(corrupt.dir, { recursive: true, force: true });
+  if (process.platform !== "win32") {
+    const victim = join(temp, "link-victim");
+    writeFileSync(victim, "untouched");
+    const linked = privateLauncher({ command: "cotal-no-such-command", args: [], env: {} }, temp, "linked-reason");
+    symlinkSync(victim, join(linked.dir, "exit reason"));
+    const linkedRun = spawnSync(process.execPath, [join(linked.dir, "linked-reason")], { encoding: "utf8" });
+    check(
+      "a launcher error never writes through a planted exit-reason link",
+      linkedRun.status !== 0 && linkedRun.stderr.includes("cotal-no-such-command") && readFileSync(victim, "utf8") === "untouched",
+    );
+    rmSync(linked.dir, { recursive: true, force: true });
+  }
   if (process.platform !== "win32") {
     chmodSync(launcher.dir, 0o755);
     const marker = join(temp, "planted-command-ran");
