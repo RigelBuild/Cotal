@@ -1,4 +1,4 @@
-import { chmodSync, lstatSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -28,7 +28,7 @@ export interface PrivateLauncher {
 function launcherSource(dir: string, payload: string, name: string): string {
   return `#!${process.execPath}\n` +
     `const { spawn } = require("node:child_process");\n` +
-    `const { lstatSync, readFileSync, rmSync } = require("node:fs");\n` +
+    `const { lstatSync, readFileSync, rmSync, writeFileSync } = require("node:fs");\n` +
     `const dir = ${JSON.stringify(dir)};\n` +
     `const payload = ${JSON.stringify(payload)};\n` +
     `const alreadyRun = () => { console.error("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal"); process.exit(1); };\n` +
@@ -42,6 +42,7 @@ function launcherSource(dir: string, payload: string, name: string): string {
     `  throw error;\n` +
     `}\n` +
     `rmSync(payload, { force: true });\n` +
+    `writeFileSync(dir + "/pid", String(process.pid));\n` +
     `process.stdout.write("\\x1b]0;" + ${JSON.stringify(name.replace(/[\x00-\x1f\x7f-\x9f]/g, ""))} + "\\x07");\n` +
     `process.chdir(launch.cwd);\n` +
     `const child = spawn(launch.command, launch.args, { env: launch.env, stdio: "inherit" });\n` +
@@ -50,7 +51,7 @@ function launcherSource(dir: string, payload: string, name: string): string {
     `process.on("SIGINT", () => forward("SIGINT"));\n` +
     `process.on("SIGTERM", () => forward("SIGTERM"));\n` +
     `child.on("error", (err) => { console.error("[cotal-zellij-launch] " + launch.command + ": " + err.message); process.exit(127); });\n` +
-    `child.on("exit", (code, signal) => { exiting = true; if (signal) process.exit(128); process.exit(code ?? 0); });\n`;
+    `child.on("exit", (code, signal) => { exiting = true; try { writeFileSync(dir + "/exit", signal ?? String(code ?? 0)); } catch {} if (signal) process.exit(128); process.exit(code ?? 0); });\n`;
 }
 
 export function privateLauncher(spec: LaunchSpec, cwd: string, name: string): PrivateLauncher {
@@ -66,6 +67,28 @@ export function privateLauncher(spec: LaunchSpec, cwd: string, name: string): Pr
   chmodSync(script, 0o700);
   const argv = process.platform === "win32" ? [process.execPath, script] : [`./${file}`];
   return { argv, cwd: dir, dir, payload };
+}
+
+/** Seat liveness from the launcher's own files, with no zellij call: polling list-panes per seat loads the server. */
+export function launcherState(dir: string): "running" | "exited" {
+  if (existsSync(join(dir, "exit"))) return "exited";
+  let pid: number;
+  try {
+    pid = Number(readFileSync(join(dir, "pid"), "utf8"));
+  } catch {
+    // No pid yet means the pane has not started the launcher; a missing dir means the seat was stopped.
+    return existsSync(dir) ? "running" : "exited";
+  }
+  try {
+    process.kill(pid, 0);
+    return "running";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM" ? "running" : "exited";
+  }
+}
+
+export async function waitForLauncherExit(dir: string, pollMs = 1_000): Promise<void> {
+  while (launcherState(dir) === "running") await new Promise<void>((resolve) => setTimeout(resolve, pollMs));
 }
 
 function cleanupLauncher(launcher: PrivateLauncher): void {
@@ -165,13 +188,7 @@ export class ZellijRuntime implements Runtime {
     return {
       name,
       kind: "zellij",
-      status: () => {
-        try {
-          return zellij.paneState(this.session, startedPane);
-        } catch {
-          return "running";
-        }
-      },
+      status: () => launcherState(launcher.dir),
       stop: () => {
         try {
           zellij.closePane(this.session, startedPane);
@@ -180,7 +197,7 @@ export class ZellijRuntime implements Runtime {
         }
       },
       interrupt: () => zellij.interruptPane(this.session, startedPane),
-      waitForExit: () => zellij.waitForPaneExit(this.session, startedPane),
+      waitForExit: () => waitForLauncherExit(launcher.dir),
       attach: () => {
         throw new Error(`zellij runtime: attach natively with zellij attach ${this.session}`);
       },

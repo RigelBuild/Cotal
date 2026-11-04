@@ -370,14 +370,3 @@ export function paneState(session: string, paneId: string, deadline?: number): "
   const pane = listPanes(session, deadline).find((candidate) => candidate.id === paneId && !candidate.is_plugin);
   return !pane || pane.exited || pane.exit_status !== null ? "exited" : "running";
 }
-
-export async function waitForPaneExit(session: string, paneId: string): Promise<void> {
-  for (;;) {
-    try {
-      if (paneState(session, paneId) === "exited") return;
-    } catch {
-      // A failed probe is not an exit; poll again.
-    }
-    await new Promise<void>((resolve) => setTimeout(resolve, 100));
-  }
-}

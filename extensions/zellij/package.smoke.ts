@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import type { LaunchSpec } from "@cotal-ai/core";
 import { buildNewPaneArgs, buildNewTabArgs } from "./src/driver.js";
 import { parseZellijPlacement } from "./src/placement.js";
-import { privateLauncher, ZellijRuntime } from "./src/runtime.js";
+import { launcherState, privateLauncher, waitForLauncherExit, ZellijRuntime } from "./src/runtime.js";
 import * as zellij from "./src/driver.js";
 
 let checks = 0;
@@ -212,6 +212,26 @@ try {
     "rerunning a consumed launcher prints the clear message and exits non-zero",
     rerun.status !== 0 && rerunOutput.includes("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal") && !rerunOutput.includes("MODULE_NOT_FOUND"),
   );
+  {
+    const live = privateLauncher({ command: process.execPath, args: ["-e", "setTimeout(() => process.exit(3), 1500)"] }, temp, "exit-watch");
+    check("a launcher not yet started reads as running", launcherState(live.dir) === "running");
+    const child = spawn(process.execPath, [join(live.dir, "exit-watch")], { cwd: live.cwd, stdio: "ignore" });
+    const started = Date.now();
+    while (!existsSync(join(live.dir, "pid")) && Date.now() - started < 5_000) await new Promise((r) => setTimeout(r, 20));
+    check("a running launcher reads as running, with no zellij call", launcherState(live.dir) === "running");
+    await waitForLauncherExit(live.dir, 50);
+    check("a seat exit is detected from the launcher's exit file", readFileSync(join(live.dir, "exit"), "utf8") === "3" && launcherState(live.dir) === "exited");
+    child.kill();
+    const killed = privateLauncher({ command: process.execPath, args: ["-e", "setTimeout(() => {}, 60_000)"] }, temp, "exit-kill");
+    const victim = spawn(process.execPath, [join(killed.dir, "exit-kill")], { cwd: killed.cwd, stdio: "ignore" });
+    const t0 = Date.now();
+    while (!existsSync(join(killed.dir, "pid")) && Date.now() - t0 < 5_000) await new Promise((r) => setTimeout(r, 20));
+    victim.kill("SIGKILL");
+    await new Promise((r) => victim.once("exit", r));
+    check("a SIGKILLed launcher reads as exited from its dead pid", launcherState(killed.dir) === "exited");
+    rmSync(killed.dir, { recursive: true, force: true });
+    check("a removed launcher dir reads as exited", launcherState(killed.dir) === "exited");
+  }
   const escaped = privateLauncher(spec, temp, "evil\x9d0;owned\x9c\x1b[2Jname");
   const escapedRun = spawnSync(process.execPath, [join(escaped.dir, "evil_0_owned___2Jname")], { encoding: "utf8" });
   check("launcher strips C0 and C1 controls from the pane title", escapedRun.stdout.startsWith("\x1b]0;evil0;owned[2Jname\x07"));
