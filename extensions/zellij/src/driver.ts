@@ -400,16 +400,18 @@ async function probePanes(session: string): Promise<ZellijPane[] | undefined> {
 }
 
 // Streams that end together (a server restart) share one listing per session instead of a burst.
-// A watch that joins a listing begun before its stream ended may read "running"; it resubscribes,
-// and a gone pane's new stream ends at once and checks again.
-const probes = new Map<string, Promise<ZellijPane[] | undefined>>();
-function sharedProbe(session: string): Promise<ZellijPane[] | undefined> {
-  let probe = probes.get(session);
-  if (!probe) {
-    probe = probePanes(session).finally(() => probes.delete(session));
-    probes.set(session, probe);
-  }
-  return probe;
+// A watch joins only a listing started after its stream opened: the pane existed by then, so its
+// absence is an exit, while an older listing may predate the pane. A stale "running" resubscribes.
+const probes = new Map<string, { readonly started: number; readonly panes: Promise<ZellijPane[] | undefined> }>();
+function sharedProbe(session: string, since: number): Promise<ZellijPane[] | undefined> {
+  const current = probes.get(session);
+  if (current && current.started >= since) return current.panes;
+  const probe = { started: Date.now(), panes: probePanes(session) };
+  probes.set(session, probe);
+  void probe.panes.finally(() => {
+    if (probes.get(session) === probe) probes.delete(session);
+  }).catch(() => undefined);
+  return probe.panes;
 }
 
 const RESUBSCRIBE_MS = 1_000;
@@ -476,11 +478,11 @@ export class PaneWatch {
     this.#child = undefined;
   }
 
-  async #check(): Promise<void> {
+  async #check(since: number): Promise<void> {
     if (this.#exited || this.#stopped) return;
     let state: "running" | "exited";
     try {
-      const panes = await sharedProbe(this.session);
+      const panes = await sharedProbe(this.session, since);
       state = panes ? stateOf(panes, this.paneId) : "exited";
     } catch {
       // A failed listing is not an exit: subscribe again and look again when that stream ends.
@@ -536,7 +538,7 @@ export class PaneWatch {
       if (this.#child !== child) return;
       this.#child = undefined;
       this.#lived = Date.now() - this.#openedAt;
-      void this.#check();
+      void this.#check(this.#openedAt);
     };
     child.on("error", ended);
     child.on("exit", ended);

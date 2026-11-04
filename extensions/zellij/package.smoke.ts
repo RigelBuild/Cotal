@@ -36,7 +36,7 @@ function readCalls(logPath: string): string[][] {
 
 let fakeCells = 0;
 async function withFakeZellij(
-  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable" | "slow-probe" | "no-client" | "slow-client" | "clients-error" | "clients-flaky" | "handoff" | "subscribe-drop" | "panes-error" | "early-exit" | "healthy-drop" | "slow-panes",
+  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable" | "slow-probe" | "no-client" | "slow-client" | "clients-error" | "clients-flaky" | "handoff" | "subscribe-drop" | "panes-error" | "early-exit" | "healthy-drop" | "slow-panes" | "slow-both",
   run: (logPath: string, session: string) => void | Promise<void>,
 ): Promise<void> {
   // The fake is a shebang script Windows cannot exec, and zellij ships no Windows build.
@@ -59,12 +59,16 @@ async function withFakeZellij(
   };
   writeFileSync(executable, `#!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
 appendFileSync(process.env.COTAL_ZELLIJ_TEST_LOG, JSON.stringify(args) + "\\n");
 if (process.env.COTAL_ZELLIJ_TEST_MODE === "unavailable") process.exit(1);
 if (process.env.COTAL_ZELLIJ_TEST_MODE === "slow-probe") Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600);
+// slow-both: the session and pane listings each take 6 s, so only a deadline shared by both ends
+// the check before 12 s.
+const slowBoth = () => { if (process.env.COTAL_ZELLIJ_TEST_MODE === "slow-both") Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 6_000); };
 if (args[0] === "list-sessions") {
+  slowBoth();
   const mode = process.env.COTAL_ZELLIJ_TEST_MODE;
   if (mode === "no-server") { console.error("No active zellij sessions found."); process.exit(1); }
   if (mode === "probe-error") { console.error("Error occurred: timed out"); process.exit(1); }
@@ -134,7 +138,10 @@ if (args[2] === "subscribe") {
   const closed = () => { try { return readFileSync(panePath, "utf8") === "closed"; } catch { return false; } };
   appendFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".subscribed", Date.now() + "\\n");
   const opened = readFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".subscribed", "utf8").split("\\n").filter(Boolean).length;
-  if (["subscribe-drop", "no-server", "probe-error", "panes-error", "slow-panes"].includes(process.env.COTAL_ZELLIJ_TEST_MODE)) process.exit(0);
+  if (["subscribe-drop", "no-server", "probe-error", "panes-error", "slow-panes", "slow-both"].includes(process.env.COTAL_ZELLIJ_TEST_MODE)) process.exit(0);
+  // ".drop-<pane>": that pane's next stream drops once.
+  const drop = process.env.COTAL_ZELLIJ_TEST_LOG + ".drop-" + args[args.indexOf("--pane-id") + 1];
+  if (existsSync(drop)) { rmSync(drop); process.exit(0); }
   // healthy-drop: two quick drops, then a stream that outlives the healthy threshold, then drops.
   if (process.env.COTAL_ZELLIJ_TEST_MODE === "healthy-drop") {
     if (opened !== 3) process.exit(0);
@@ -145,15 +152,22 @@ if (args[2] === "subscribe") {
 } else if (action === "list-panes") {
   const mode = process.env.COTAL_ZELLIJ_TEST_MODE;
   if (mode === "panes-error") { console.error("Error occurred: timed out"); process.exit(1); }
-  // slow-panes: a listing that hangs far past the check's 10 s limit; ".slow-list": a short delay
-  // that lets streams ending together overlap one listing.
+  // slow-panes: a listing that hangs far past the check's 10 s limit; ".slow-list": a delay after
+  // the snapshot, so later events overlap an in-flight listing.
   if (mode === "slow-panes") Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30_000);
-  if (existsSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".slow-list")) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
+  slowBoth();
   let closed = false;
   try { closed = readFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".pane", "utf8") === "closed"; } catch {}
+  // ".extra-pane": terminal_90 exists from this snapshot on.
+  const extra = existsSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".extra-pane");
+  if (existsSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".slow-list")) {
+    appendFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".snapshots", "1\\n");
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_500);
+  }
   console.log(JSON.stringify(mode === "partial-tab" || closed ? [] : [{
     id: 77, tab_id: 77, title: "confirm-agent", is_plugin: false, exited: false, exit_status: null
-  }, ...(mode === "dropped-pane" ? [{ id: 78, tab_id: 77, title: "", is_plugin: false, exited: false, exit_status: null }] : [])]));
+  }, ...(mode === "dropped-pane" ? [{ id: 78, tab_id: 77, title: "", is_plugin: false, exited: false, exit_status: null }] : []),
+    ...(extra && !closed ? [{ id: 90, tab_id: 77, title: "new-agent", is_plugin: false, exited: false, exit_status: null }] : [])]));
   process.exit(0);
 }
 `);
@@ -810,8 +824,8 @@ await withFakeZellij("healthy-drop", async (logPath, session) => {
   );
 });
 
-// A hung exit check gives up at its 10 s limit, its time is not stream uptime (the delay keeps
-// doubling), and it does not block the event loop while it waits.
+// A hung exit check gives up at its 10 s limit. Time spent in the check does not count as stream
+// uptime, so the delay keeps doubling; the wait is async, so the event loop stays responsive.
 await withFakeZellij("slow-panes", async (logPath, session) => {
   let ticked = Date.now();
   let stall = 0;
@@ -837,6 +851,35 @@ await withFakeZellij("confirm", async (logPath, session) => {
   writeFileSync(`${logPath}.pane`, "closed");
   const exited = await settles(Promise.all(watches.map((watch) => watch.waitForExit())).then(() => undefined), 5_000);
   check(`five streams ending together cost one listing (listings ${listings(logPath)})`, exited && listings(logPath) === 1);
+});
+
+// The 10 s limit covers both calls of a check, not each: two 6 s calls fail the check by ~10 s.
+await withFakeZellij("slow-both", async (logPath, session) => {
+  const watch = new zellij.PaneWatch(session, "terminal_77");
+  const gaps = await subscribeGaps(logPath, 2, 25_000);
+  watch.stop();
+  check(`one deadline covers the session and pane listings of a check (first gap ${gaps.join(", ")} ms)`, gaps.length === 1 && gaps[0] >= 10_900 && gaps[0] < 12_500);
+});
+
+// A listing that began before a pane existed never proves that pane's exit: a new pane's watch
+// starts its own listing instead of joining the older one.
+await withFakeZellij("confirm", async (logPath, session) => {
+  writeFileSync(`${logPath}.slow-list`, "");
+  writeFileSync(`${logPath}.drop-terminal_77`, "");
+  const older = new zellij.PaneWatch(session, "terminal_77");
+  const snapshotted = async (): Promise<boolean> => {
+    for (let i = 0; i < 100 && !existsSync(`${logPath}.snapshots`); i++) await sleep(20);
+    return existsSync(`${logPath}.snapshots`);
+  };
+  const inFlight = await snapshotted();
+  writeFileSync(`${logPath}.extra-pane`, "");
+  writeFileSync(`${logPath}.drop-terminal_90`, "");
+  const fresh = new zellij.PaneWatch(session, "terminal_90");
+  await sleep(4_000);
+  const state = fresh.status();
+  older.stop();
+  fresh.stop();
+  check(`a new pane's watch never reads an older in-flight listing as its exit (in flight ${inFlight}, state ${state})`, inFlight && state === "running");
 });
 
 // A failed pane listing after the stream ends is unknown, never an exit.
