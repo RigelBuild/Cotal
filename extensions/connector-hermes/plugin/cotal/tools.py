@@ -63,14 +63,12 @@ def _handler(name: str) -> Callable[..., str]:
 
 
 def _calling_session() -> Optional[dict]:
-    """The gateway session this tool call runs in: a cotal session's gateway source, or the session
-    key of a session on another platform when the host can inject into it; None otherwise. The
-    gateway binds these per task (``gateway.session_context``)."""
+    """The cotal gateway session this tool call runs in, or None for another platform. The gateway
+    binds these per task (``gateway.session_context``)."""
     from gateway.session_context import get_session_env
 
     if get_session_env("HERMES_SESSION_PLATFORM", "") != "cotal":
-        key = get_session_env("HERMES_SESSION_KEY", "")
-        return {"session_key": key} if key and replies.can_inject() else None
+        return None
     from .adapter import chat_type_for
 
     # Not every supported gateway binds a chat type, so it is read off the chat_id the adapter

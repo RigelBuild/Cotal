@@ -44,7 +44,7 @@ function hard(condition: unknown, name: string): asserts condition {
   throw new Error(name);
 }
 
-const EXPECTED_CELLS = 27;
+const EXPECTED_CELLS = 29;
 if (process.platform === "win32") skipSuite("the Hermes connector is Unix-only");
 
 const pkgDir = fileURLToPath(new URL("..", import.meta.url));
@@ -71,6 +71,8 @@ type ProbeResult = {
   answer_targets: (Target | null)[];
   answer_senders: [string | null, string | null][];
   per_peer_answers: [string | null, string | null, string | null][];
+  other_platform_session: null;
+  unknown_context_answer_session: string;
 };
 
 function run(mode: "subject" | "control"): ProbeResult {
@@ -109,6 +111,8 @@ assert.deepEqual(
   "a per-peer DM answer stays in the asker's chat and names the answerer; a group answer keeps the asker's participant key",
 );
 
+assert.equal(subject.other_platform_session, null, "another platform session with a key does not get a context id");
+assert.equal(subject.unknown_context_answer_session, "mesh", "an answer with an unknown context id runs in the shared mesh session");
 assert.equal(control.one_session, false, "the default keeps one session per peer and channel");
 assert.notDeepEqual(control.reply_targets, expected, "routing by chat id in one session would misroute replies");
 assert.equal(control.held_mid_turn, false, "the default does not hold a message for another session's turn");
