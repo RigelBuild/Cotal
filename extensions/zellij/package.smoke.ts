@@ -36,7 +36,7 @@ function readCalls(logPath: string): string[][] {
 
 let fakeCells = 0;
 async function withFakeZellij(
-  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable" | "slow-probe" | "no-client" | "slow-client" | "clients-error" | "clients-flaky" | "handoff" | "subscribe-drop",
+  mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable" | "slow-probe" | "no-client" | "slow-client" | "clients-error" | "clients-flaky" | "handoff" | "subscribe-drop" | "panes-error",
   run: (logPath: string, session: string) => void | Promise<void>,
 ): Promise<void> {
   // The fake is a shebang script Windows cannot exec, and zellij ships no Windows build.
@@ -120,11 +120,12 @@ if (args[2] === "subscribe") {
   // reached (no-server, probe-error) or the stream drops (subscribe-drop).
   const panePath = process.env.COTAL_ZELLIJ_TEST_LOG + ".pane";
   const closed = () => { try { return readFileSync(panePath, "utf8") === "closed"; } catch { return false; } };
-  if (["subscribe-drop", "no-server", "probe-error"].includes(process.env.COTAL_ZELLIJ_TEST_MODE)) process.exit(0);
+  if (["subscribe-drop", "no-server", "probe-error", "panes-error"].includes(process.env.COTAL_ZELLIJ_TEST_MODE)) process.exit(0);
   // Ends once the cell tears down its fake, the way a real stream ends with its server.
   setInterval(() => { if (closed() || !existsSync(process.env.COTAL_ZELLIJ_TEST_LOG)) process.exit(0); }, 20);
 } else if (action === "list-panes") {
   const mode = process.env.COTAL_ZELLIJ_TEST_MODE;
+  if (mode === "panes-error") { console.error("Error occurred: timed out"); process.exit(1); }
   let closed = false;
   try { closed = readFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".pane", "utf8") === "closed"; } catch {}
   console.log(JSON.stringify(mode === "partial-tab" || closed ? [] : [{
@@ -647,30 +648,74 @@ await withFakeZellij("confirm", async (logPath, session) => {
   );
 });
 
-// A stream that ends while the pane still runs (server restart, broken pipe) is not an exit.
-await withFakeZellij("subscribe-drop", async (logPath, session) => {
-  const watch = new zellij.PaneWatch(session, "terminal_77");
-  const exited = await settles(watch.waitForExit(), 2_500);
-  const subscribes = readCalls(logPath).filter((args) => args[2] === "subscribe").length;
-  watch.stop();
+// The spawned handle reads the held watch: repeated status() calls list nothing until the pane closes.
+await withFakeZellij("confirm", async (logPath, session) => {
+  const handle = new ZellijRuntime(session).spawn("confirm-agent", { command: "sleep", args: ["600"] }, process.cwd());
+  await sleep(300);
+  const before = listings(logPath);
+  for (let i = 0; i < 20; i++) handle.status();
+  await sleep(300);
+  const during = listings(logPath) - before;
+  writeFileSync(`${logPath}.pane`, "closed");
+  const exited = await settles(handle.waitForExit!(), 2_000);
   check(
-    `a dropped stream over a live pane stays running and subscribes again (subscribers ${subscribes})`,
-    !exited && watch.status() === "running" && subscribes >= 2,
+    `a spawned handle's status() lists no panes while running and its exit is proved (listings during ${during})`,
+    during === 0 && exited && handle.status() === "exited",
   );
 });
 
-// A failed listing after the stream ends is unknown, never an exit.
-await withFakeZellij("probe-error", async (_logPath, session) => {
+// A stream that ends while the pane still runs (server restart, broken pipe) is not an exit, and
+// repeated drops back off instead of listing every second.
+await withFakeZellij("subscribe-drop", async (logPath, session) => {
+  const watch = new zellij.PaneWatch(session, "terminal_77");
+  const exited = await settles(watch.waitForExit(), 3_500);
+  const subscribes = readCalls(logPath).filter((args) => args[2] === "subscribe").length;
+  watch.stop();
+  check(
+    `a dropped stream over a live pane stays running and subscribes again with backoff (subscribers ${subscribes} in 3.5 s)`,
+    !exited && watch.status() === "running" && subscribes >= 2 && subscribes <= 3,
+  );
+});
+
+// A failed pane listing after the stream ends is unknown, never an exit.
+await withFakeZellij("panes-error", async (logPath, session) => {
   const watch = new zellij.PaneWatch(session, "terminal_77");
   const exited = await settles(watch.waitForExit(), 1_500);
+  const attempted = listings(logPath);
   watch.stop();
-  check("a stream end with a failed listing does not read as an exit", !exited && watch.status() === "running");
+  check(
+    `a stream end whose pane listing fails does not read as an exit (listings ${attempted})`,
+    attempted >= 1 && !exited && watch.status() === "running",
+  );
 });
 
 // A watch whose session is gone proves the exit through the session listing.
 await withFakeZellij("no-server", async (_logPath, session) => {
   const watch = new zellij.PaneWatch(session, "terminal_77");
-  check("a watch on a session zellij no longer has resolves as exited", await settles(watch.waitForExit(), 2_000) && watch.status() === "exited");
+  check("a watch resolves as exited when its zellij session is gone", await settles(watch.waitForExit(), 2_000) && watch.status() === "exited");
+});
+
+// A subscriber outlives its parent, so the watching process kills its subscribers when it exits.
+await withFakeZellij("confirm", async (logPath, session) => {
+  const driver = new URL("./src/driver.ts", import.meta.url).href;
+  const child = spawn(
+    process.execPath,
+    ["--import", "tsx", "--input-type=module", "-e", `const z = await import(${JSON.stringify(driver)}); new z.PaneWatch(${JSON.stringify(session)}, "terminal_77"); setTimeout(() => process.exit(0), 400);`],
+    { stdio: "ignore", env: process.env },
+  );
+  await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  await sleep(100);
+  const live = readdirSync("/proc").filter((entry) => {
+    try {
+      return /^\d+$/.test(entry) && readFileSync(`/proc/${entry}/cmdline`, "utf8").includes(`${session}\0subscribe`);
+    } catch {
+      return false;
+    }
+  }).length;
+  check(
+    `subscribers are killed when the watching process exits (subscribed ${readCalls(logPath).filter((args) => args[2] === "subscribe").length}, left ${live})`,
+    readCalls(logPath).some((args) => args[2] === "subscribe") && live === 0,
+  );
 });
 
 console.log(`ZELLIJ PACKAGE TESTS: ${checks} tests executed`);

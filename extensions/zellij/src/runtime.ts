@@ -85,8 +85,11 @@ export function launchLine(launcher: PrivateLauncher): string {
 
 function paneForTab(session: string, tabId: number): string {
   const pane = zellij.listPanes(session).find((candidate) => candidate.tab_id === tabId && !candidate.is_plugin);
-  if (!pane) throw new Error(`zellij runtime: no terminal pane found in tab ${tabId}`);
-  return pane.id;
+  if (pane) return pane.id;
+  // Tab seats close on exit, so a launch that dies at once takes its tab with it.
+  if (!zellij.listTabs(session).some((tab) => tab.tab_id === tabId))
+    throw new Error(`zellij runtime: the agent in tab ${tabId} exited before its pane could be read`);
+  throw new Error(`zellij runtime: no terminal pane found in tab ${tabId}`);
 }
 
 export class ZellijRuntime implements Runtime {

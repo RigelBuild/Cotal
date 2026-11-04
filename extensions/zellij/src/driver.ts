@@ -374,6 +374,14 @@ export function paneState(session: string, paneId: string, deadline?: number): "
 }
 
 const RESUBSCRIBE_MS = 1_000;
+const RESUBSCRIBE_MAX_MS = 30_000;
+// A stream that lasted this long was healthy, so the next drop retries at the base delay again.
+const STREAM_HEALTHY_MS = 10_000;
+
+// The manager exits through process.exit under KillMode=process, and a subscriber outlives its
+// parent; kill every held subscriber when this process exits.
+const subscribers = new Set<ChildProcess>();
+let reapOnExit = false;
 
 /** Tracks one pane's exit through a held `zellij subscribe`. Each list-panes call connects a client
  *  whose disconnect queues the full pane manifest on every PaneUpdate plugin (status-bar, link); a
@@ -384,6 +392,9 @@ export class PaneWatch {
   #stopped = false;
   #child: ChildProcess | undefined;
   #retry: NodeJS.Timeout | undefined;
+  #awaited = false;
+  #openedAt = 0;
+  #delay = RESUBSCRIBE_MS;
   #resolveExit!: () => void;
   // Executor form: the repo's lib is ES2023, which has no Promise.withResolvers.
   readonly #exit = new Promise<void>((resolve) => {
@@ -402,7 +413,11 @@ export class PaneWatch {
     return this.#exited ? "exited" : "running";
   }
 
+  /** Pending waits keep the event loop alive, as the polling wait did; status() alone does not. */
   waitForExit(): Promise<void> {
+    this.#awaited = true;
+    this.#child?.ref();
+    this.#retry?.ref();
     return this.#exit;
   }
 
@@ -411,6 +426,7 @@ export class PaneWatch {
     this.#stopped = true;
     clearTimeout(this.#retry);
     this.#retry = undefined;
+    if (this.#child) subscribers.delete(this.#child);
     this.#child?.kill("SIGKILL");
     this.#child = undefined;
   }
@@ -436,11 +452,14 @@ export class PaneWatch {
 
   #reopen(): void {
     if (this.#stopped || this.#retry) return;
+    if (Date.now() - this.#openedAt >= STREAM_HEALTHY_MS) this.#delay = RESUBSCRIBE_MS;
+    const delay = this.#delay;
+    this.#delay = Math.min(delay * 2, RESUBSCRIBE_MAX_MS);
     this.#retry = setTimeout(() => {
       this.#retry = undefined;
       this.#open();
-    }, RESUBSCRIBE_MS);
-    this.#retry.unref();
+    }, delay);
+    if (!this.#awaited) this.#retry.unref();
   }
 
   #open(): void {
@@ -454,15 +473,28 @@ export class PaneWatch {
       env,
     });
     this.#child = child;
+    this.#openedAt = Date.now();
+    subscribers.add(child);
+    if (!reapOnExit) {
+      reapOnExit = true;
+      process.once("exit", () => {
+        for (const subscriber of subscribers) subscriber.kill("SIGKILL");
+      });
+    }
     // pane_closed, a dead server, an unknown pane and a broken stream all end the process; a spawn
     // failure may report only "error". Either way one listing decides.
     const ended = (): void => {
+      subscribers.delete(child);
       if (this.#child !== child) return;
       this.#child = undefined;
       this.#check();
     };
     child.on("error", ended);
     child.on("exit", ended);
-    child.unref();
+    if (!this.#awaited) child.unref();
   }
+}
+
+export function waitForPaneExit(session: string, paneId: string): Promise<void> {
+  return new PaneWatch(session, paneId).waitForExit();
 }
