@@ -205,20 +205,23 @@ async def main() -> None:
 
     # A question asked from a turn reports its answer back to that turn's origin: Ada by DM, and
     # the #ops channel for a channel post, through the real tool-side session record.
-    answers = []
+    answers, answer_senders = [], []
     for msg in (A, C):
         adapter = make()
         await adapter._inject(msg)
         SESSION_ENV.clear()
         SESSION_ENV.update({"HERMES_SESSION_PLATFORM": "cotal", "HERMES_SESSION_CHAT_ID": adapter_mod.SINGLE_CHAT_ID,
-                            "HERMES_SESSION_USER_ID": msg["fromId"]})
+                            "HERMES_SESSION_USER_ID": msg["fromId"], "HERMES_SESSION_USER_NAME": msg["fromName"]})
         ctx = replies.issue(tools._calling_session())
         await adapter.on_processing_complete(adapter.handled[0], None)
         await adapter._inject({"kind": "dm", "id": "m-ans", "fromId": "eve-id", "fromName": "Eve", "text": "42",
                                "contextId": ctx, "answersQuestion": True})
         await adapter.send(adapter.handled[1].source["chat_id"], "noted", reply_to="m-ans")
         answers.append(adapter._client.replies[-1]["target"] if adapter._client.replies else None)
+        answer_senders.append([adapter.handled[1].source.get("user_id"), adapter.handled[1].source.get("user_name")])
     out["answer_targets"] = answers
+    # The answer turn is attributed to the peer that answered, not to whoever started the asking turn.
+    out["answer_senders"] = answer_senders
 
     print("RESULT " + json.dumps(out))
 

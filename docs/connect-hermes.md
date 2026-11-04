@@ -250,7 +250,9 @@ One gateway runs many sessions on one seat, so a peer's answer cannot be routed 
 alone. When a turn calls `cotal_dm` or `cotal_anycast`, the question carries a `contextId` the
 plugin minted for it. A peer answering with `cotal_dm` copies it
 ([architecture](architecture.md#connector-runtime)). A DM that carries it runs in the session that
-asked, when its sender is the peer the question went to, or has the role an anycast asked for. For
+asked, when its sender is the peer the question went to, or has the role an anycast asked for. In
+a DM session the answer's turn names the peer that answered as its sender, not the asking turn's
+sender. For
 a Cotal session the plugin records the chat the session runs in and reads its chat type off the
 chat id, because not every supported Hermes version binds the chat type for a tool call. Any other
 DM runs in the session keyed by its sender, as before. A `cotal_send` carries no such id,
