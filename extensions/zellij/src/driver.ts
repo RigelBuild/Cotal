@@ -401,9 +401,11 @@ export class PaneWatch {
     this.#resolveExit = resolve;
   });
 
+  /** `onExit` runs once the exit is proved, without holding the event loop the way a wait does. */
   constructor(
     private readonly session: string,
     private readonly paneId: string,
+    private readonly onExit?: () => void,
   ) {
     this.#open();
   }
@@ -448,6 +450,7 @@ export class PaneWatch {
     this.#exited = true;
     this.stop();
     this.#resolveExit();
+    this.onExit?.();
   }
 
   #reopen(): void {

@@ -1,4 +1,4 @@
-import { chmodSync, lstatSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -28,7 +28,7 @@ export interface PrivateLauncher {
 function launcherSource(dir: string, payload: string, name: string): string {
   return `#!${process.execPath}\n` +
     `const { spawn } = require("node:child_process");\n` +
-    `const { lstatSync, readFileSync, rmSync } = require("node:fs");\n` +
+    `const { appendFileSync, lstatSync, readFileSync, rmSync } = require("node:fs");\n` +
     `const dir = ${JSON.stringify(dir)};\n` +
     `const payload = ${JSON.stringify(payload)};\n` +
     `const alreadyRun = () => { console.error("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal"); process.exit(1); };\n` +
@@ -49,8 +49,10 @@ function launcherSource(dir: string, payload: string, name: string): string {
     `const forward = (signal) => { if (!exiting && child.pid) child.kill(signal); };\n` +
     `process.on("SIGINT", () => forward("SIGINT"));\n` +
     `process.on("SIGTERM", () => forward("SIGTERM"));\n` +
-    `child.on("error", (err) => { console.error("[cotal-zellij-launch] " + launch.command + ": " + err.message); process.exit(127); });\n` +
-    `child.on("exit", (code, signal) => { exiting = true; if (signal) process.exit(128); process.exit(code ?? 0); });\n`;
+    // The pane closes with the launcher, so its last words also go to a file the runtime reports.
+    `const report = (line) => { console.error("[cotal-zellij-launch] " + line); try { appendFileSync(dir + "/exit reason", line + "\\n", { mode: 0o600 }); } catch {} };\n` +
+    `child.on("error", (err) => { report(launch.command + ": " + err.message); process.exit(127); });\n` +
+    `child.on("exit", (code, signal) => { exiting = true; if (signal || code) report(launch.command + " exited with " + (signal ?? "code " + code)); if (signal) process.exit(128); process.exit(code ?? 0); });\n`;
 }
 
 export function privateLauncher(spec: LaunchSpec, cwd: string, name: string): PrivateLauncher {
@@ -68,6 +70,15 @@ export function privateLauncher(spec: LaunchSpec, cwd: string, name: string): Pr
   return { argv, cwd: dir, dir, payload };
 }
 
+// What the launcher recorded before its pane closed, or "" when it exited cleanly or never ran.
+function exitReason(launcher: PrivateLauncher): string {
+  try {
+    return readFileSync(join(launcher.dir, "exit reason"), "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
 function cleanupLauncher(launcher: PrivateLauncher): void {
   try {
     rmSync(launcher.dir, { recursive: true, force: true });
@@ -83,12 +94,14 @@ export function launchLine(launcher: PrivateLauncher): string {
   return `cd ${shellQuote(launcher.cwd)} && exec ${launcher.argv.map(shellQuote).join(" ")}`;
 }
 
-function paneForTab(session: string, tabId: number): string {
+function paneForTab(session: string, tabId: number, launcher: PrivateLauncher): string {
   const pane = zellij.listPanes(session).find((candidate) => candidate.tab_id === tabId && !candidate.is_plugin);
   if (pane) return pane.id;
   // Tab seats close on exit, so a launch that dies at once takes its tab with it.
-  if (!zellij.listTabs(session).some((tab) => tab.tab_id === tabId))
-    throw new Error(`zellij runtime: the agent in tab ${tabId} exited before its pane could be read`);
+  if (!zellij.listTabs(session).some((tab) => tab.tab_id === tabId)) {
+    const reason = exitReason(launcher);
+    throw new Error(`zellij runtime: the agent in tab ${tabId} exited before its pane could be read${reason ? `: ${reason}` : ""}`);
+  }
   throw new Error(`zellij runtime: no terminal pane found in tab ${tabId}`);
 }
 
@@ -123,7 +136,7 @@ export class ZellijRuntime implements Runtime {
     try {
       if (!placement?.tab || !existingTab) {
         createdTabId = zellij.createTab(this.session, targetTabName, launcher.cwd, launcher.argv);
-        paneId = paneForTab(this.session, Number(createdTabId));
+        paneId = paneForTab(this.session, Number(createdTabId), launcher);
       } else {
         paneId = zellij.createPane(
           this.session,
@@ -166,7 +179,11 @@ export class ZellijRuntime implements Runtime {
     });
 
     // One held subscriber per seat replaces per-call list-panes polling for status and exit.
-    const exitWatch = new zellij.PaneWatch(this.session, startedPane);
+    const exitWatch = new zellij.PaneWatch(this.session, startedPane, () => {
+      const reason = exitReason(launcher);
+      if (reason) console.error(`zellij runtime: "${name}": ${reason}`);
+      cleanupLauncher(launcher);
+    });
     return {
       name,
       kind: "zellij",
