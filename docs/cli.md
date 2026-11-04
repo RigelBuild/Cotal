@@ -1566,6 +1566,29 @@ Only the `pty` runtime can be typed into. The external terminal runtimes (`tmux`
 `herdr`) attach to a process they do not own, so they have no input stream for it and the command
 refuses by name rather than dropping the keystroke.
 
+## Spawn allowlist
+
+```bash
+cotal supervise --spawn-allowlist <path> ...
+cotal allowlist set <name>... [--on <instance>] [--space <s>]
+```
+
+A manager started with `--spawn-allowlist <path>` reads that file at start. The file is a JSON
+array of agent names. A file that cannot be read or parsed is an empty list, so the manager then
+refuses every launch. Without the flag, every name is allowed.
+
+The check uses the final name, after auto-numbering. If `reviewer` is listed and already running,
+a second spawn would become `reviewer_2`, and `reviewer_2` is refused unless it is listed too. The
+refusal is `spawn refused: "<name>" is not in the spawn allowlist <path>`. The manager checks every
+new launch: each spawn door, a crash-recovery restart and a resume. A recovery whose name is no
+longer listed retires the seat. The check never stops a process that is already running.
+
+`cotal allowlist set` replaces the list and rewrites the file through a temporary file and a
+rename. It needs admin on the manager. A manager started without `--spawn-allowlist` refuses it.
+The command returns only after every launch already in flight for a removed name has settled.
+Such a launch either left no process or is in the managed list, so a `cotal stop` run after
+`allowlist set` returns finds it.
+
 ## personas
 
 ```bash
@@ -1609,6 +1632,7 @@ cotal supervise [--runtime <name>] [--space <s>] [--server <url>] [--spawn <name
 | `--roster <file>` | none | Declarative roster to boot at startup. See [Roster files](define-a-team.md#roster-files) |
 | `--launch <spec>` | none | Resolved manifest launch spec (from `up -f` / `spawn -f`) |
 | `--spawn <names>` | none | Comma-separated personas to pre-spawn at startup |
+| `--spawn-allowlist <path>` | none | JSON array of the exact names this manager may launch. See [Spawn allowlist](#spawn-allowlist) |
 
 The manager is the agent supervisor and control plane: it answers `spawn --detach`, `stop`, `ps`,
 `attach`, and the `cotal_*` manager tools. `cotal up --detach` starts one for you; run `supervise`

@@ -821,6 +821,8 @@ try {
         "abort-preservation": attempt,
         "release-seat": { alias: `no-such-agent-${randomUUID().slice(0, 6)}`, lifecycleUid: "no-such-lifecycle", reason: "pin probe" },
         "attest-gone": { name: `no-such-agent-${randomUUID().slice(0, 6)}`, attestGone: "pin probe" },
+        // This manager runs with no allowlist, so the handler refuses without touching any file.
+        "allowlist-set": { names: [`no-such-agent-${randomUUID().slice(0, 6)}`] },
       };
       const notReached: string[] = [];
       const ranTwice: string[] = [];

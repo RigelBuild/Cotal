@@ -10,8 +10,8 @@
     "Reached suites used to pin 18 while the shipped document served 20. Restating the count is the",
     "defect class: correct the day it is written, wrong after the next served command.",
     "",
-    "M2 restores revision 30 after attest-gone is the next shipped surface change. A new admin",
-    "command changed the document, so 30 would name the preceding surface.",
+    "M2 restores revision 31 after allowlist-set advances the document to revision 32.",
+    "Revision 31 adds deferred-seat support and attest-gone; the new command needs revision 32.",
     "The named revision cell runs after the service has published and a generic client has",
     "resolved the actual shipped document.",
     "",
@@ -31,12 +31,12 @@
       "cell": "the resolved surface matches the shipped cluster document"
     },
     {
-      "name": "M2 keep revision 30 after attest-gone is added",
+      "name": "M2 keep revision 31 after allowlist-set is added",
       "file": "implementations/manager/src/manager-service-contract.ts",
-      "find": "    revision: 31,",
-      "replace": "    revision: 30,",
-      "expectRed": "the attest-gone command advances the manager cluster revision and retains release-seat, cancel, transcript-receive, goal-result and resolve-cwd",
-      "cell": "the attest-gone command advances the manager cluster revision and retains release-seat, cancel, transcript-receive, goal-result and resolve-cwd"
+      "find": "    revision: 32,",
+      "replace": "    revision: 31,",
+      "expectRed": "revision 31 adds deferred seats/attest-gone; revision 32 adds allowlist-set",
+      "cell": "revision 31 adds deferred seats/attest-gone; revision 32 adds allowlist-set"
     },
     {
       "name": "M3 compile every contract pair at module scope again",

@@ -29,7 +29,7 @@
  *   manager.lifecycle despawn / attach / input             (owner-mode terminal/interactive)
  *   manager.self     stop                                  (self-mode halt; baseline)
  *   manager.persona  definePersona                         (privileged-grade; ownership-checked)
- *   manager.admin    purge / launch / resume family / transcript-receive / release-seat / attest-gone (operator instruments only)
+ *   manager.admin    purge / launch / resume family / transcript-receive / release-seat / attest-gone / allowlist-set (operator instruments only)
  *   manager.run      run-start / run-resume / run-answer   (the `run` capability + privileged instrument)
  *                    run-status / run-ps ride manager.read
  */
@@ -51,6 +51,14 @@ export const MANAGER_ENDPOINT = "manager";
 /** The manager cluster document's URN (§13.7 content-addressed authority). */
 export const MANAGER_CLUSTER_URN = "ai.cotal.manager";
 
+const ALLOWLIST_SET_INPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["names"],
+  properties: { names: { type: "array", items: { type: "string", minLength: 1 }, uniqueItems: true } },
+} as const;
+const ALLOWLIST_SET_OUTPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["names"],
+  properties: { names: { type: "array", items: { type: "string" } } },
+} as const;
 // ---- output/input schemas (closed unless the payload is genuinely open) ------------------------
 
 /** The read-only manager-health output. Manager-LEVEL — per-agent rows are `ps`/`inspect`. */
@@ -973,6 +981,7 @@ const ROWS: CommandRow[] = [
   { name: "transcript-receive", capability: "manager.admin", input: TRANSCRIPT_RECEIVE_INPUT_SCHEMA, output: TRANSCRIPT_RECEIVE_OUTPUT_SCHEMA, targeted: false, handler: "transcriptReceive" },
   { name: "release-seat", capability: "manager.admin", input: RELEASE_SEAT_INPUT_SCHEMA, output: RELEASE_SEAT_OUTPUT_SCHEMA, targeted: false, handler: "releaseSeat" },
   { name: "attest-gone", capability: "manager.admin", input: ATTEST_GONE_INPUT_SCHEMA, output: ATTEST_GONE_OUTPUT_SCHEMA, targeted: false, handler: "attestGone" },
+  { name: "allowlist-set", capability: "manager.admin", input: ALLOWLIST_SET_INPUT_SCHEMA, output: ALLOWLIST_SET_OUTPUT_SCHEMA, targeted: false, handler: "allowlistSet" },
 ];
 
 // WHEN THE COMPILE HAPPENS (#1323): every CLI invocation loads this module before its verb is
@@ -1109,8 +1118,10 @@ export const MANAGER_STATUS_CONTRACT: { input: CompiledContract; output: Compile
  *  30 = `release-seat` lets an operator release a retained seat's custody. A new served command
  *  cannot fold into 29.
  *
- *  31 = `attest-gone` lets an operator drive the terminal of a deferred seat, and manager `status`
- *  adds `deferredSeats`, the `deferred` disposition, `deferUntil` and `attestedGone`. */
+ *  31 adds deferred seats and the `attest-gone` command.
+ *
+ *  32 adds the `allowlist-set` command.
+ */
 export function managerClusterDocument(): {
   urn: string;
   revision: number;
@@ -1128,7 +1139,7 @@ export function managerClusterDocument(): {
 } {
   return {
     urn: MANAGER_CLUSTER_URN,
-    revision: 31,
+    revision: 32,
     attributes: [],
     events: [],
     commands: ROWS.map((r) => ({
@@ -1218,6 +1229,7 @@ export interface ManagerServiceHandlers {
   transcriptReceive(ctx: EpServeContext): unknown | Promise<unknown>;
   releaseSeat(ctx: EpServeContext): unknown | Promise<unknown>;
   attestGone(ctx: EpServeContext): unknown | Promise<unknown>;
+  allowlistSet(ctx: EpServeContext): unknown | Promise<unknown>;
 }
 
 /** Build the `EpCommandDef[]` `serveEndpoint` consumes: each command's provenance-branded compiled

@@ -1,7 +1,7 @@
 import { createHash, randomUUID, randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 import { credsAuthenticator } from "@nats-io/transport-node";
-import { closeSync, constants, existsSync, fchmodSync, fchownSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { closeSync, constants, existsSync, fchmodSync, fchownSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, dirname, resolve } from "node:path";
 import Headless from "@xterm/headless";
 import {
@@ -410,6 +410,16 @@ function ownLists<T extends { subscribe?: readonly string[]; allowSubscribe?: re
   };
 }
 
+/** One runtime launch attempt admitted under the spawn allowlist. `settled` resolves once the
+ *  attempt's handle is installed in its ManagedAgent row or no process from it can be alive. */
+interface LaunchToken {
+  name: string;
+  attemptId: string;
+  settled: Promise<void>;
+  finish: () => void;
+  /** Set when the runtime spawned a process the attempt then refused; settling waits for its exit. */
+  exited?: Promise<unknown>;
+}
 export interface ManagerOptions {
   space: string;
   /** Hosted pooled control requires signerless authority and either an explicit non-custodial
@@ -471,6 +481,8 @@ export interface ManagerOptions {
    *  `cotal up --max-sessions` (recorded on the mesh so a repair does not silently drop to 64).
    *  {@link ManagerSessionPlaneDeps.maxSessions} carries the per-caller-scoping residual. */
   maxSessions?: number;
+  /** Optional JSON file containing the exact admitted spawn names. */
+  spawnAllowlist?: string;
   /** Remote manager-service prepare material. The participant owns every private seed; the host
    * returned only scoped JWTs. When present, local signer/static trust is forbidden and the
    * manager follows the remote authority path. */
@@ -610,7 +622,8 @@ export type FreeSlotCause =
   | "session-bind-failed"
   | "resume-session-rebind-failed"
   | "carried-fork-refused"
-  | "resume-custody-unrecorded";
+  | "resume-custody-unrecorded"
+  | "spawn-allowlist-refused";
 
 /** Operator-facing phrasing per cause. Kept beside the union so adding a member without a sentence
  *  is a type error rather than a blank in the log. The stop family's sentences carry the principal
@@ -626,6 +639,7 @@ const FREE_SLOT_CAUSE_TEXT: Record<Exclude<FreeSlotCause, FreeSlotStopCause>, st
   "resume-session-rebind-failed": "this manager stopped it: its host session could not be rebound on resume",
   "carried-fork-refused": "this manager stopped it: it recorded no fork of the carried transcript",
   "resume-custody-unrecorded": "this manager stopped it: its custody reference could not be recorded on resume",
+  "spawn-allowlist-refused": "this manager retired it after a crash: its name is no longer in the spawn allowlist",
 };
 
 /** The stop family's sentences — the same job {@link FREE_SLOT_CAUSE_TEXT} does for the string
@@ -1242,6 +1256,71 @@ export class Manager {
   private staticLifecycleEvict?: (principal: string) => Promise<import("@cotal-ai/core").EvictionResult>;
   private readonly preserveStopTimeoutMs: number;
   private readonly endpointServeExecutorExpiresInSeconds?: number;
+  private readonly spawnAllowlistPath?: string;
+  /** Absent when no allowlist is configured: every name is admitted and no launch holds a token. */
+  private spawnAllowlist?: Set<string>;
+  /** Every runtime launch attempt admitted under the allowlist that has not yet settled. */
+  private readonly launchTokens = new Map<string, LaunchToken>();
+
+  /** The refusal for a name the allowlist does not hold; undefined when admitted. */
+  private admitName(name: string): string | undefined {
+    if (this.spawnAllowlist === undefined || this.spawnAllowlist.has(name)) return undefined;
+    return `spawn refused: "${name}" is not in the spawn allowlist ${this.spawnAllowlistPath}`;
+  }
+
+  /** Admit one runtime launch attempt. Synchronous, so the check and the token are one critical
+   *  section against {@link opAllowlistSet}'s swap. */
+  private admitLaunch(name: string): { ok: false; error: string } | { ok: true; token: LaunchToken | undefined } {
+    const refused = this.admitName(name);
+    if (refused !== undefined) return { ok: false, error: refused };
+    if (this.spawnAllowlist === undefined) return { ok: true, token: undefined };
+    let finish = (): void => {};
+    const settled = new Promise<void>((resolve) => { finish = resolve; });
+    const token: LaunchToken = { name, attemptId: randomUUID(), settled, finish };
+    this.launchTokens.set(token.attemptId, token);
+    return { ok: true, token };
+  }
+
+  /** Settle a launch attempt. Idempotent, so every exit of a launch path may call it. */
+  private finishLaunch(token: LaunchToken | undefined): void {
+    if (!token || !this.launchTokens.has(token.attemptId)) return;
+    const settle = (): void => {
+      if (this.launchTokens.delete(token.attemptId)) token.finish();
+    };
+    if (token.exited === undefined) settle();
+    else void token.exited.then(settle, settle);
+  }
+
+  /** Re-check an admitted attempt right before the runtime call; throws when its name was removed. */
+  private recheckLaunch(token: LaunchToken | undefined): void {
+    if (!token) return;
+    const refused = this.admitName(token.name);
+    if (refused !== undefined) throw new Error(refused);
+  }
+
+  /** Swap the set and rewrite the file in one synchronous section, then wait for every attempt
+   *  admitted for a removed name to settle. */
+  private async opAllowlistSet(args: Record<string, unknown>): Promise<ControlReply> {
+    const path = this.spawnAllowlistPath;
+    if (path === undefined) return { ok: false, error: "allowlist-set: this manager runs with no spawn allowlist (start it with `cotal supervise --spawn-allowlist <path>`)" };
+    const input = args.names;
+    if (!Array.isArray(input)) return { ok: false, error: "allowlist-set: names must be an array of names" };
+    const names = [...new Set(input.filter((name): name is string => typeof name === "string" && name !== ""))];
+    if (names.length !== input.length) return { ok: false, error: "allowlist-set: names must be distinct non-empty strings" };
+    const next = new Set(names);
+    const temp = `${path}.${process.pid}.tmp`;
+    try {
+      writeFileSync(temp, `${JSON.stringify([...next].sort(), null, 2)}\n`, { mode: 0o600 });
+      renameSync(temp, path);
+    } catch (e) {
+      rmSync(temp, { force: true });
+      return { ok: false, error: `allowlist-set: could not rewrite ${path}: ${rejectionText(e)}; the allowlist is unchanged` };
+    }
+    this.spawnAllowlist = next;
+    const pending = [...this.launchTokens.values()].filter((token) => !next.has(token.name));
+    await Promise.all(pending.map((token) => token.settled));
+    return { ok: true, data: { names: [...next].sort() } };
+  }
   private readonly agents = new Map<string, ManagedAgent>();
   /** Names whose spawn is in flight (reserved synchronously before the provision await) — counted
    *  toward the ceiling (once per name, see {@link Manager.occupancy}) so two concurrent same-name
@@ -1563,6 +1642,15 @@ export class Manager {
     this.name = opts.name ?? "manager";
     this.workspaceRoot = opts.workspaceRoot ?? findCotalRoot();
     this.eventsRequired = opts.eventsRequired === true;
+    this.spawnAllowlistPath = opts.spawnAllowlist;
+    if (opts.spawnAllowlist !== undefined) {
+      try {
+        const parsed: unknown = JSON.parse(readFileSync(opts.spawnAllowlist, "utf8"));
+        this.spawnAllowlist = new Set(Array.isArray(parsed) ? parsed.filter((name): name is string => typeof name === "string") : []);
+      } catch {
+        this.spawnAllowlist = new Set();
+      }
+    }
     this.maxSessions = opts.maxSessions;
     this.remoteAuthority = opts.remoteAuthority;
     this.remoteExecutorCreds = opts.remoteAuthority?.executorCreds;
@@ -2633,11 +2721,11 @@ export class Manager {
 
   /** A cleanup spawned by accepted active-mode work is part of that work for maintenance draining,
    * even where the ordinary control reply remains fire-and-forget. */
-  private trackDeprovision(a: TeardownTarget, context = ""): void {
+  private trackDeprovision(a: TeardownTarget, context = "", launchToken?: LaunchToken): void {
     this.lifecycleInFlight++;
     void this.deprovision(a)
       .catch((e) => console.error(`deprovision${context ? ` ${context}` : ""} ${a.name} (${a.id}): ${rejectionText(e)}`))
-      .finally(() => this.releaseLifecycle());
+      .finally(() => { this.finishLaunch(launchToken); this.releaseLifecycle(); });
   }
 
   private async awaitLifecycleDrain(): Promise<void> {
@@ -3887,6 +3975,7 @@ export class Manager {
         return this.runHost().answer(input, this.runAnswerer(ctx), (open) => this.authorizeRunAnswer(ctx, input, open), ctx);
       }),
       runStatus: (ctx) => this.serveGated(ctx, () => this.runHost().status(args(ctx) as { runId: string; endpoint?: string })),
+      allowlistSet: (ctx) => this.serveGated(ctx, () => adminGated(ctx, async () => unwrap(await this.opAllowlistSet(args(ctx))))),
       runPs: (ctx) => this.serveGated(ctx, () => this.runHost().list(args(ctx) as { endpoint?: string })),
       preparePreservation: (ctx) => adminGated(ctx, async () => unwrap(await this.opPreservationCtl("preparePreservation", args(ctx)))),
       commitPreservation: (ctx) => adminGated(ctx, async () => unwrap(await this.opPreservationCtl("commitPreservation", args(ctx)))),
@@ -5093,10 +5182,23 @@ export class Manager {
       release();
       return;
     }
+    const admission = this.admitLaunch(a.name);
+    if (!admission.ok) {
+      console.error(`! ${a.name}: ${admission.error} - retiring the managed seat`);
+      restart.armed = false;
+      this.freeSlot(a, true, "spawn-allowlist-refused");
+      this.reapChildrenOf(this.managedPrincipal(a));
+      exited.release?.();
+      release();
+      return;
+    }
+    const launchToken = admission.token;
     restart.recovering = true;
     void (async () => {
       let replacement: AgentHandle | undefined;
       let replacementControl: ManagedAgent["control"];
+      // The attempt's token settles in the finally, after this when it is set.
+      let settle: Promise<unknown> | undefined;
       try {
         const connector = await this.resolveConnector(a.agent);
         const continueSession = connector.supportsSessionContinuation ? this.readManagedSession(a) : undefined;
@@ -5118,7 +5220,7 @@ export class Manager {
           await this.recordSlotCustody(a, custody);
         }
         if (a.secretPaths?.creds) this.grantSeatCreds(a.secretPaths.creds);
-        const handle = await this.spawnCustodied(a.name, spec, a.launch.cwd, custody, a);
+        const handle = await this.spawnCustodied(a.name, spec, a.launch.cwd, custody, a, launchToken);
         replacement = handle;
         replacementControl = spec.control;
         // A runtime that names its seats without reserving the name (no custody reservation above)
@@ -5149,7 +5251,8 @@ export class Manager {
         }
         if (this.agents.get(a.name) !== a || a.terminalizing) {
           try { handle.stop({ graceful: false }); } catch { /* terminal path owns cleanup */ }
-          void handle.waitForExit?.().catch(() => undefined);
+          // No row takes this replacement, so its attempt settles only once its exit does.
+          settle = handle.waitForExit?.().catch(() => undefined);
           return;
         }
         a.handle = handle;
@@ -5185,14 +5288,19 @@ export class Manager {
               a.control = replacementControl;
               this.watchExit(a);
             }
+            // Still alive, but the row now holds its handle, so `cotal stop` finds it.
             return;
           }
         }
         exited.release?.();
         this.freeSlot(a, true, supervised ? "supervise-recovery-failed" : "pi-recovery-failed");
         this.reapChildrenOf(this.managedPrincipal(a));
+        // A replacement whose reference was recorded on the slot is reaped by the terminal; wait for it.
+        settle = this.deprovisioningFlight.get(JSON.stringify([a.name, a.lifecycleUid]));
       } finally {
         release();
+        if (settle === undefined) this.finishLaunch(launchToken);
+        else void settle.catch(() => undefined).finally(() => this.finishLaunch(launchToken));
       }
     })();
   }
@@ -6113,10 +6221,13 @@ export class Manager {
     // and retires over a live process. The slot row holds the same reference; this is the copy the
     // in-process rollback can actually read.
     let provisioned: TeardownTarget | undefined;
-    // A carried resume's seat-private home, removed by the finally unless a live seat took it.
     let seatHome: string | undefined;
-    // Taken right before the try so its finally is the only release; a refusal belongs above the
-    // allocation, where there is no name to give back.
+    // The final name, after uniqueName/pinning, so a listed base cannot launch as an unlisted `_2`.
+    const admission = this.admitLaunch(name);
+    if (!admission.ok) return { ok: false, error: admission.error };
+    const launchToken = admission.token;
+    // The launched handle until a row takes it; with no rollback to wait on, the token waits on its exit.
+    let uninstalled: AgentHandle | undefined;
     this.reserved.add(name);
     try {
       // A stable nkey identity assigned at spawn: the public key is the agent's card.id (threaded via
@@ -6360,6 +6471,8 @@ export class Manager {
       let handle: AgentHandle;
       if (this.requiredRuntime.spawnDelegated) {
         const handoff = this.composeManagedHandoff(enrolled!.material, enrolled!.actorToken);
+        // No await between this re-check and the runtime call below.
+        this.recheckLaunch(launchToken);
         if (this.delegatedLaunched.has(lifecycleUid))
           throw new Error(`lifecycle ${lifecycleUid} was already handed to runtime "${this.requiredRuntime.kind}"; a lifecycle is handed off at most once`);
         this.delegatedLaunched.add(lifecycleUid);
@@ -6376,8 +6489,9 @@ export class Manager {
         spec = connector.buildLaunch(launchOpts);
         if (carried) this.transcripts!.consume(opts.resumeClaim!, opts.resume!);
         spec.env = { ...spec.env, COTAL_MANAGER_INSTANCE: this.managerInstanceId };
-        handle = await this.spawnCustodied(name, spec, cwd, custody, { id: identity.id, lifecycleUid });
+        handle = await this.spawnCustodied(name, spec, cwd, custody, { id: identity.id, lifecycleUid }, launchToken);
       }
+      uninstalled = handle;
       hooks?.onLaunched?.(); // The "launched" progress edge (process spawned, pre-presence)
       const managed: ManagedAgent = {
         name,
@@ -6462,6 +6576,8 @@ export class Manager {
         });
       }
       this.agents.set(name, managed);
+      uninstalled = undefined;
+      this.finishLaunch(launchToken);
       this.reservedLive.add(name);
       // The live slot now owns teardown — freeSlot deprovisions this identity on exit — so the
       // orphan-rollback in `finally` no longer applies to it.
@@ -6568,7 +6684,13 @@ export class Manager {
         // retires it, and its name stays held for retireDelegatedAgent.
         const p = orphan.delegated ? parsePrincipalKey(orphan.id) : null;
         if (p) this.retiring.set(orphan.name, { opId: retireOpId(orphan.lifecycleUid), owner: p.owner, actor: p.actor, target: orphan, startedAt: Date.now() });
-        this.trackDeprovision(orphan, "(orphaned spawn)");
+        this.trackDeprovision(orphan, "(orphaned spawn)", launchToken);
+      } else {
+        if (uninstalled && launchToken && !launchToken.exited) {
+          try { uninstalled.stop({ graceful: false }); } catch { /* the exit wait below still bounds the token */ }
+          launchToken.exited = uninstalled.waitForExit?.() ?? Promise.resolve();
+        }
+        this.finishLaunch(launchToken);
       }
     }
   }
@@ -6925,6 +7047,14 @@ export class Manager {
         return { ok: false, error: `retained agent ${entry.name} requires runtime "${entry.launch.runtime}", current manager uses "${this.requiredRuntime.kind}"` };
       const nameErr = this.nameError(entry.name);
       if (nameErr) return { ok: false, error: nameErr };
+      const listed = this.admitName(entry.name);
+      if (listed !== undefined) return { ok: false, error: listed };
+      // The token is taken synchronously before the launch; launchPreparedResume owns it from here.
+      const launch = (value: PreparedResume): Promise<ControlReply> => {
+        const admission = this.admitLaunch(entry.name);
+        if (!admission.ok) return Promise.resolve({ ok: false, error: admission.error });
+        return this.launchPreparedResume(entry, value, batchReserved, admission.token);
+      };
       if (this.agents.has(entry.name) || (!batchReserved && this.reserved.has(entry.name)))
         return { ok: false, error: `retained agent "${entry.name}" is already managed or reserved; same-principal resume never auto-numbers` };
       const occupancy = batchReserved ? undefined : this.occupancy();
@@ -6938,7 +7068,7 @@ export class Manager {
         } catch (e) {
           return { ok: false, error: rejectionText(e) };
         }
-        return this.launchPreparedResume(entry, cached, batchReserved);
+        return launch(cached);
       }
       try {
         const cwd = lstatSync(entry.launch.cwd);
@@ -7049,7 +7179,7 @@ export class Manager {
         const value = { spec, launchOpts, ...authority, exact } satisfies PreparedResume;
         prepared?.set(entry.name, value);
         if (preflightOnly) return { ok: true, data: { name: entry.name, preflight: true } };
-        return this.launchPreparedResume(entry, value, batchReserved);
+        return launch(value);
       } catch (e) {
         return { ok: false, error: rejectionText(e) };
       }
@@ -7062,6 +7192,7 @@ export class Manager {
     entry: ManagerResumeAgent,
     prepared: PreparedResume,
     batchReserved: boolean,
+    launchToken?: LaunchToken,
   ): Promise<ControlReply> {
     if (!batchReserved) this.reserved.add(entry.name);
     try {
@@ -7087,8 +7218,10 @@ export class Manager {
         await this.recordSlotCustody(resumeSlot, custody);
       }
       if (entry.identity.mode === "static") this.grantSeatCreds(resolve(entry.identity.credential.path));
+      // Same tick as spawnCustodied's own re-check, so a refused launch leaves its artifacts to the discard.
+      this.recheckLaunch(launchToken);
       prepared.spawned = true;
-      const handle = await this.spawnCustodied(entry.name, prepared.spec, entry.launch.cwd, custody, resumeSlot);
+      const handle = await this.spawnCustodied(entry.name, prepared.spec, entry.launch.cwd, custody, resumeSlot, launchToken);
       const managed: ManagedAgent = {
         name: entry.name,
         role: entry.role,
@@ -7134,6 +7267,7 @@ export class Manager {
         suppressCleanup: true,
       };
       this.agents.set(entry.name, managed);
+      this.finishLaunch(launchToken);
       this.reservedLive.add(entry.name);
       if (this.resumeAttemptId) this.resumedAgentNames.add(entry.name);
       // As on restart: an unreserved runtime's reference is recorded once the seat exists. A row
@@ -7190,6 +7324,8 @@ export class Manager {
     } catch (e) {
       return { ok: false, error: rejectionText(e) };
     } finally {
+      // Every exit before agents.set either never reached the runtime or left the spawn throwing.
+      this.finishLaunch(launchToken);
       if (!batchReserved) {
         this.reserved.delete(entry.name);
         this.reservedLive.delete(entry.name);
@@ -9569,11 +9705,21 @@ export class Manager {
 
   /** Spawn under a reserved reference. On a mismatch with a slot row, record `got` on the row and
    *  throw, so the terminal reaps `got`; without a row, reap `got` inline. */
-  private async spawnCustodied(name: string, spec: LaunchSpec, cwd: string, reserved: RuntimeReference | undefined, slot: { id: string; lifecycleUid: string }): Promise<AgentHandle> {
+  private async spawnCustodied(
+    name: string,
+    spec: LaunchSpec,
+    cwd: string,
+    reserved: RuntimeReference | undefined,
+    slot: { id: string; lifecycleUid: string },
+    launchToken?: LaunchToken,
+  ): Promise<AgentHandle> {
+    this.recheckLaunch(launchToken);
     const handle = this.requiredRuntime.spawn(name, spec, cwd, reserved);
     if (reserved === undefined) return handle;
     const got = handle.reference;
     if (got?.kind === reserved.kind && got.id === reserved.id) return handle;
+    // The attempt will not install this process, so its token settles only once the process exits.
+    if (launchToken) launchToken.exited = handle.waitForExit?.() ?? Promise.resolve();
     let disposal: string;
     if (got === undefined) {
       try { handle.stop({ graceful: false }); } catch { /* reported below */ }
