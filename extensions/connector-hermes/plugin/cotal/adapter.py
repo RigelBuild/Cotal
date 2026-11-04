@@ -51,10 +51,6 @@ CHANNEL_QUIET_NOTE = (
 )
 
 
-class InjectionRefused(Exception):
-    """The host would not run an answer in the session that asked. The answer is not acked, and the
-    sidecar offers it again later (``deferred``)."""
-
 
 def chat_type_for(chat_id: str) -> Optional[str]:
     """The chat type of a chat_id minted on inbound, or None for an id this adapter did not mint."""
@@ -273,9 +269,6 @@ class CotalAdapter(BasePlatformAdapter):
             # message is "", which the truthiness check below would silently never deliver-ack, and
             # the bridge's own guard would then never clear its in-flight slot.
             self._client.delivered(recv_key)
-        elif isinstance(exc, InjectionRefused):
-            # Not taken: free the bridge's in-flight slot without an ack, so the answer is kept.
-            self._client.deferred(recv_key)
 
     async def _inject(self, msg: dict) -> None:
         kind = msg.get("kind")
@@ -298,28 +291,9 @@ class CotalAdapter(BasePlatformAdapter):
                 del self._channel_keys[next(iter(self._channel_keys))]
         chat_type = chat_type_for(chat_id)
 
-        # The answer to a question one of our sessions asked runs in that session. The sidecar has
-        # checked that its sender is the peer the question went to.
+        # A known context id routes a DM to the cotal session that asked. An answer with no matching
+        # context id uses the ordinary session keyed by its sender.
         asker = replies.asking_session(msg.get("contextId")) if msg.get("answersQuestion") is True else None
-        if asker and "session_key" in asker:  # a session on another platform
-            try:
-                taken = replies.inject(format_injection(msg), asker["session_key"])
-            except Exception:
-                # A host that raised has not taken it: keep the answer for the asker, as for a refusal.
-                logger.exception(
-                    "cotal: the host failed to run an answer in session %s; it is kept and offered again",
-                    asker["session_key"],
-                )
-                raise InjectionRefused(asker["session_key"]) from None
-            if taken:
-                return
-            # Running it in another session would consume the answer where nobody asked for it.
-            logger.warning(
-                "cotal: the host refused to run an answer in session %s; it is kept and offered "
-                "again. Allow it with plugins.entries.cotal.allow_gateway_injection: true",
-                asker["session_key"],
-            )
-            raise InjectionRefused(asker["session_key"])
         if asker:
             # The asking turn's origin is not needed: an answer's turn replies to the answerer.
             asker.pop("origin", None)

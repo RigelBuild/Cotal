@@ -10,8 +10,6 @@
  *   Python → sidecar
  *     {t:"subscribe"}                          adapter: start receiving inbound pushes
  *     {t:"delivered", recvKey}                 adapter: turn accepted delivery <recvKey> → ack it on the stream
- *     {t:"deferred", recvKey}                  adapter: the host would not take delivery <recvKey> →
- *                                              leave it unacked, offer it again after DEFER_MS
  *     {t:"reply", target, text, replyTo?, contextId?}
  *                                              adapter: route a turn's reply back to its origin,
  *                                              answering message <replyTo> in conversation <contextId>
@@ -33,10 +31,8 @@
  * Tool calls are dispatched generically over {@link cotalToolSpecs} (looked up by name), so this
  * bridge never has to enumerate the surface — full parity by construction.
  *
- * One gateway runs many sessions over this one seat, so correlation is per frame, never the seat's
- * single context id: the plugin stamps each question with its own `contextId`, and an incoming DM
- * carries `answersQuestion` when it copies one from the peer the question went to, so the adapter
- * can run it in the session that asked (see replies.py).
+ * One gateway runs many sessions over this one seat. A known `contextId` routes a DM to the cotal
+ * session that asked; without one, the answer runs in its sender's session (see replies.py).
  */
 import { createServer, type Server, type Socket } from "node:net";
 import { existsSync, unlinkSync } from "node:fs";
@@ -61,9 +57,6 @@ interface ReplyTarget {
   /** Peer instance id (or name) for a DM/anycast reply. */
   peerId?: string;
 }
-
-/** How long a delivery the host would not take waits before it is offered again. */
-const DEFER_MS = 30_000;
 
 /** An optional string field of a frame; anything else is absent. */
 const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
@@ -126,8 +119,6 @@ export function startBridgeServer(agent: MeshAgent, config: AgentConfig, socketP
   /** The single subscribed adapter connection, and the id we're currently awaiting an ack for. */
   let adapter: Socket | undefined;
   let awaitingId: string | undefined;
-  /** Receive keys of deliveries the host would not take, each held back until its timer frees it. */
-  const deferred = new Set<string>();
 
   const sendFrame = (sock: Socket, frame: Record<string, unknown>): void => {
     try {
@@ -138,11 +129,10 @@ export function startBridgeServer(agent: MeshAgent, config: AgentConfig, socketP
   };
 
   /** Push the oldest buffered message to the adapter, one at a time. Acks happen only on the
-   *  adapter's `delivered` (see below), so a turn that never surfaces a message redelivers it. A
-   *  deferred one waits out its delay while the messages behind it go first. */
+   *  adapter's `delivered`; a crash before it redelivers the message. */
   const pump = (): void => {
     if (!adapter || awaitingId) return;
-    const next = agent.peekInbox("automatic").find((i) => !deferred.has(i.recvKey));
+    const next = agent.peekInbox("automatic")[0];
     if (!next) return;
     // Held while the host has it: the broker's ack wait is renewed, so a delivery the adapter holds
     // behind a long turn is not redelivered or handed to another reader of its role.
@@ -215,19 +205,6 @@ export function startBridgeServer(agent: MeshAgent, config: AgentConfig, socketP
           // overflow already acked it — just resync and let pump() surface the new front.
           agent.drainInboxDeliveries([awaitingId]);
           release();
-          pump();
-        }
-        return;
-      case "deferred":
-        // The host would not run it where it belongs (see adapter.py). It stays buffered and unacked.
-        if (typeof frame.recvKey === "string" && frame.recvKey !== "" && frame.recvKey === awaitingId) {
-          const key = awaitingId;
-          deferred.add(key);
-          release();
-          setTimeout(() => {
-            deferred.delete(key);
-            pump();
-          }, DEFER_MS).unref();
           pump();
         }
         return;

@@ -241,6 +241,17 @@ async def main() -> None:
         got = adapter.handled[1].source
         kept.append([got.get("chat_id"), got.get("chat_type"), got.get("user_id")])
     out["per_peer_answers"] = kept
+    # Other platforms do not get a context id, even when Hermes provides a session key.
+    SESSION_ENV.clear()
+    SESSION_ENV.update({"HERMES_SESSION_PLATFORM": "discord", "HERMES_SESSION_KEY": "discord:topic:42"})
+    out["other_platform_session"] = tools._calling_session()
+
+    # answersQuestion with an unknown context id follows the sender into the shared mesh session.
+    adapter = make()
+    await adapter._inject({"kind": "dm", "id": "m-unknown-answer", "recvKey": "rx-unknown-answer",
+                           "fromId": "eve-id", "fromName": "Eve", "text": "42",
+                           "contextId": "unknown-context", "answersQuestion": True})
+    out["unknown_context_answer_session"] = adapter.handled[0].source.get("chat_id")
 
     print("RESULT " + json.dumps(out))
 
