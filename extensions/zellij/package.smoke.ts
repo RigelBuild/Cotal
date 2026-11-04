@@ -145,8 +145,10 @@ if (args[2] === "subscribe") {
 } else if (action === "list-panes") {
   const mode = process.env.COTAL_ZELLIJ_TEST_MODE;
   if (mode === "panes-error") { console.error("Error occurred: timed out"); process.exit(1); }
-  // slow-panes: a listing that hangs past the check's 10 s limit.
-  if (mode === "slow-panes") Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10_500);
+  // slow-panes: a listing that hangs far past the check's 10 s limit; ".slow-list": a short delay
+  // that lets streams ending together overlap one listing.
+  if (mode === "slow-panes") Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30_000);
+  if (existsSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".slow-list")) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
   let closed = false;
   try { closed = readFileSync(process.env.COTAL_ZELLIJ_TEST_LOG + ".pane", "utf8") === "closed"; } catch {}
   console.log(JSON.stringify(mode === "partial-tab" || closed ? [] : [{
@@ -808,8 +810,8 @@ await withFakeZellij("healthy-drop", async (logPath, session) => {
   );
 });
 
-// Time spent in a hung exit check is not stream uptime: the delay keeps doubling, and the check
-// does not block the event loop while it waits.
+// A hung exit check gives up at its 10 s limit, its time is not stream uptime (the delay keeps
+// doubling), and it does not block the event loop while it waits.
 await withFakeZellij("slow-panes", async (logPath, session) => {
   let ticked = Date.now();
   let stall = 0;
@@ -818,13 +820,23 @@ await withFakeZellij("slow-panes", async (logPath, session) => {
     ticked = Date.now();
   }, 100);
   const watch = new zellij.PaneWatch(session, "terminal_77");
-  const gaps = await subscribeGaps(logPath, 3, 30_000);
+  const gaps = await subscribeGaps(logPath, 3, 40_000);
   watch.stop();
   clearInterval(ticker);
   check(
-    `a hung exit check neither resets the backoff nor stalls the event loop (gaps ${gaps.join(", ")} ms, stall ${stall} ms)`,
-    gaps.length === 2 && gaps[1] - gaps[0] >= 700 && stall < 1_000,
+    `a hung exit check times out, keeps the backoff doubling and leaves the loop live (gaps ${gaps.join(", ")} ms, stall ${stall} ms)`,
+    gaps.length === 2 && gaps[0] >= 10_900 && gaps[0] < 13_000 && gaps[1] - gaps[0] >= 700 && stall < 1_000,
   );
+});
+
+// Streams that end together share one listing per session rather than one each.
+await withFakeZellij("confirm", async (logPath, session) => {
+  const watches = ["terminal_77", "terminal_78", "terminal_79", "terminal_80", "terminal_81"].map((id) => new zellij.PaneWatch(session, id));
+  await sleep(500);
+  writeFileSync(`${logPath}.slow-list`, "");
+  writeFileSync(`${logPath}.pane`, "closed");
+  const exited = await settles(Promise.all(watches.map((watch) => watch.waitForExit())).then(() => undefined), 5_000);
+  check(`five streams ending together cost one listing (listings ${listings(logPath)})`, exited && listings(logPath) === 1);
 });
 
 // A failed pane listing after the stream ends is unknown, never an exit.

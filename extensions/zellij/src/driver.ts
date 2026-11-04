@@ -383,20 +383,33 @@ export function paneState(session: string, paneId: string, deadline?: number): "
 
 const execFileAsync = promisify(execFile);
 
-/** paneState without blocking the event loop: many seats can end their streams at once. Like
- *  paneState, only zellij's own "no sessions" answer reads as gone; any other failure rejects. */
-async function probePaneState(session: string, paneId: string, timeout: number): Promise<"running" | "exited"> {
-  const options = { encoding: "utf8", timeout, killSignal: "SIGKILL" } as const;
+/** The session's panes, or undefined once the session is gone, without blocking the event loop.
+ *  Like paneState, only zellij's own "no sessions" answer reads as gone; any other failure, or
+ *  both calls together passing CHECK_MS, rejects. */
+async function probePanes(session: string): Promise<ZellijPane[] | undefined> {
+  const options = { encoding: "utf8", signal: AbortSignal.timeout(CHECK_MS), killSignal: "SIGKILL" } as const;
   let listing: string;
   try {
     listing = (await execFileAsync("zellij", ["list-sessions", "--no-formatting"], options)).stdout;
   } catch (error) {
-    if (isNoSessionsError(error)) return "exited";
+    if (isNoSessionsError(error)) return undefined;
     throw error;
   }
-  if (!hasLiveSession(listing, session)) return "exited";
-  const { stdout } = await execFileAsync("zellij", actionArgs(session, ["list-panes", "--json", "--all"]), options);
-  return stateOf(parsePanes(stdout), paneId);
+  if (!hasLiveSession(listing, session)) return undefined;
+  return parsePanes((await execFileAsync("zellij", actionArgs(session, ["list-panes", "--json", "--all"]), options)).stdout);
+}
+
+// Streams that end together (a server restart) share one listing per session instead of a burst.
+// A watch that joins a listing begun before its stream ended may read "running"; it resubscribes,
+// and a gone pane's new stream ends at once and checks again.
+const probes = new Map<string, Promise<ZellijPane[] | undefined>>();
+function sharedProbe(session: string): Promise<ZellijPane[] | undefined> {
+  let probe = probes.get(session);
+  if (!probe) {
+    probe = probePanes(session).finally(() => probes.delete(session));
+    probes.set(session, probe);
+  }
+  return probe;
 }
 
 const RESUBSCRIBE_MS = 1_000;
@@ -467,7 +480,8 @@ export class PaneWatch {
     if (this.#exited || this.#stopped) return;
     let state: "running" | "exited";
     try {
-      state = await probePaneState(this.session, this.paneId, CHECK_MS);
+      const panes = await sharedProbe(this.session);
+      state = panes ? stateOf(panes, this.paneId) : "exited";
     } catch {
       // A failed listing is not an exit: subscribe again and look again when that stream ends.
       this.#reopen();
