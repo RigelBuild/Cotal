@@ -44,7 +44,7 @@ function hard(condition: unknown, name: string): asserts condition {
   throw new Error(name);
 }
 
-const EXPECTED_CELLS = 32;
+const EXPECTED_CELLS = 33;
 if (process.platform === "win32") skipSuite("the Hermes connector is Unix-only");
 
 const pkgDir = fileURLToPath(new URL("..", import.meta.url));
@@ -68,6 +68,7 @@ type ProbeResult = {
   background_reply_sent_to: Target[];
   background_send_ok: boolean;
   started_targets: Target[][];
+  held_started_targets: Target[];
   idless_target: Target | null;
   dup_waits: boolean;
   held_once: boolean;
@@ -110,6 +111,7 @@ assert.deepEqual(
   [[{ peerId: "bob-id" }, { peerId: "bob-id" }], [{ peerId: "dee-id" }, { peerId: "dee-id" }], [{ peerId: "eve-id" }, { peerId: "eve-id" }]],
   "an injected turn (plain, id-less, answer) keeps its origin through the start hook, for progress and a later notice",
 );
+assert.deepEqual(subject.held_started_targets, [{ peerId: "bob-id" }, { peerId: "bob-id" }], "a held turn keeps its origin through the start hook, for progress and a later notice");
 assert.deepEqual(subject.idless_target, { peerId: "dee-id" }, "an id-less message's reply reaches its sender by receive key");
 assert.equal(subject.dup_waits, true, "a held message pushed again is not acked before its turn is admitted");
 assert.equal(subject.held_once, true, "a held message pushed again runs one turn, not two");

@@ -235,6 +235,13 @@ async def main() -> None:
     await adapter.on_processing_complete(adapter.handled[0], None)
     await asyncio.wait_for(asyncio.gather(first, again), 2)
     out["held_once"] = [e.message_id for e in adapter.handled] == ["m-ada", "m-bob"]
+    # The held turn, admitted after the idle wait, keeps its origin through the start hook too.
+    held = adapter.handled[-1]
+    await adapter.on_processing_start(held)
+    await adapter.send(adapter_mod.SINGLE_CHAT_ID, "held progress")
+    await adapter.on_processing_complete(held, None)
+    await adapter.send(adapter_mod.SINGLE_CHAT_ID, "held notice")
+    out["held_started_targets"] = [r["target"] for r in adapter._client.replies if r["text"].startswith("held ")]
 
     # The answer to a question asked from a turn (Ada by DM, or the #ops channel) replies to the
     # peer that answered, through the real tool-side session record.
