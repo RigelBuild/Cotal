@@ -223,6 +223,25 @@ async def main() -> None:
     # The answer turn is attributed to the peer that answered, not to whoever started the asking turn.
     out["answer_senders"] = answer_senders
 
+    # Per-peer sessions: a DM answer keeps the asker's chat (its session key) and names the answerer.
+    # A group session is keyed per participant, so a channel answer keeps the asker's user.
+    kept = []
+    for msg in (A, C):
+        adapter = adapter_mod.CotalAdapter(PlatformConfig({"single_session": False}))
+        adapter._client = Client()
+        await adapter._inject(msg)
+        asked = adapter.handled[0].source
+        SESSION_ENV.clear()
+        SESSION_ENV.update({"HERMES_SESSION_PLATFORM": "cotal", "HERMES_SESSION_CHAT_ID": asked["chat_id"],
+                            "HERMES_SESSION_CHAT_NAME": asked["chat_name"],
+                            "HERMES_SESSION_USER_ID": msg["fromId"], "HERMES_SESSION_USER_NAME": msg["fromName"]})
+        ctx = replies.issue(tools._calling_session())
+        await adapter._inject({"kind": "dm", "id": "m-ans2", "fromId": "eve-id", "fromName": "Eve", "text": "42",
+                               "contextId": ctx, "answersQuestion": True})
+        got = adapter.handled[1].source
+        kept.append([got.get("chat_id"), got.get("chat_type"), got.get("user_id")])
+    out["per_peer_answers"] = kept
+
     print("RESULT " + json.dumps(out))
 
 

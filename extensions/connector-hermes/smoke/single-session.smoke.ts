@@ -44,7 +44,7 @@ function hard(condition: unknown, name: string): asserts condition {
   throw new Error(name);
 }
 
-const EXPECTED_CELLS = 26;
+const EXPECTED_CELLS = 27;
 if (process.platform === "win32") skipSuite("the Hermes connector is Unix-only");
 
 const pkgDir = fileURLToPath(new URL("..", import.meta.url));
@@ -70,6 +70,7 @@ type ProbeResult = {
   held_once: boolean;
   answer_targets: (Target | null)[];
   answer_senders: [string | null, string | null][];
+  per_peer_answers: [string | null, string | null, string | null][];
 };
 
 function run(mode: "subject" | "control"): ProbeResult {
@@ -102,6 +103,11 @@ assert.equal(subject.dup_waits, true, "a held message pushed again is not acked 
 assert.equal(subject.held_once, true, "a held message pushed again runs one turn, not two");
 assert.deepEqual(subject.answer_targets, [{ peerId: "ada-id" }, { channel: "ops" }], "an answer reports to the asking turn's origin: the DM peer, or the channel");
 assert.deepEqual(subject.answer_senders, [["eve-id", "Eve"], ["eve-id", "Eve"]], "an answer turn names the peer that answered, not the asking turn's sender");
+assert.deepEqual(
+  subject.per_peer_answers,
+  [["dm:ada-id", "dm", "eve-id"], ["channel:ops", "group", "cy-id"]],
+  "a per-peer DM answer stays in the asker's chat and names the answerer; a group answer keeps the asker's participant key",
+);
 
 assert.equal(control.one_session, false, "the default keeps one session per peer and channel");
 assert.notDeepEqual(control.reply_targets, expected, "routing by chat id in one session would misroute replies");
