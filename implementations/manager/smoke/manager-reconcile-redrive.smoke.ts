@@ -144,7 +144,8 @@ async function writeOrphan(
     await activateStaticLifecycle(transport, { owner: DEV_OWNER, alias, actor: identity.id, lifecycleUid: uid, managerInstance: "orphaned-process", ownerInstanceId });
     const credentialId = `cred-${alias}`;
     await recordSlotCredential(transport, DEV_OWNER, alias, uid, credentialId);
-    await appendStaticCredentialRow(transport, { lifecycleUid: uid, credentialId, holderPrincipal: principal, exp: Math.floor(Date.now() / 1000) + 3600 });
+    // Expired, so the boot sweep terminalizes the unreachable orphan instead of deferring it.
+    await appendStaticCredentialRow(transport, { lifecycleUid: uid, credentialId, holderPrincipal: principal, exp: Math.floor(Date.now() / 1000) - 120 });
     const slot = await readStaticSlot(transport, DEV_OWNER, alias);
     await casStaticSlot(transport, { ...slot!.row, phase: "active" }, slot!.revision);
     if (foreignRetirementOp) {

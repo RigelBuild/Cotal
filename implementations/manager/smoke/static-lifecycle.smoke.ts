@@ -250,7 +250,8 @@ async function plantActiveOrphan(alias: string, actor: string, uid: string, ledg
         lifecycleUid: uid,
         credentialId,
         holderPrincipal: principalKey(DEV_OWNER, actor).key,
-        exp: Math.floor(Date.now() / 1000) + 3600,
+        // Expired, so the sweep terminalizes the unreachable orphan instead of deferring it.
+        exp: Math.floor(Date.now() / 1000) - 120,
       });
     }
     const slot = await readStaticSlot(t, DEV_OWNER, alias);

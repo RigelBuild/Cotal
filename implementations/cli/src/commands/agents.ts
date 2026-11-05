@@ -2,7 +2,7 @@ import { dialerFor, mintCreds, newIdentity, openSessionRail, peerLabel, standalo
 import { ConnectRefusal, divergentCwdAnchor, isWorkspaceTargetError, loadMeshes, renderWorkspaceError, targetFlags, userSessionAuth } from "@cotal-ai/workspace";
 import { type NatsConnection } from "@nats-io/transport-node";
 import { c, presenceDetail } from "../ui.js";
-import { askManager, scatterManager, failIfNotOk, resolveControlTarget, onInstanceOrExit, onFlag, type ScatterInstanceLiveness, type ScatterInstanceReply } from "../lib/control.js";
+import { askManager, scatterManager, failIfNotOk, resolveControlTarget, onInstanceOrExit, onFlag, type ScatterInstanceLiveness, type ScatterInstanceReply, type ScatterReply } from "../lib/control.js";
 import { attachClient, detachKey, holdTerminal, isDetachPress, isTransportEnd, meshSessionTransport, type TerminalHold } from "../lib/attach-client.js";
 import { completingFlagValue } from "../lib/completion.js";
 
@@ -22,7 +22,9 @@ const nameFlag = (what: string) =>
 const wideFlag = { name: "wide", type: "boolean", description: "also print the per-seat facts the manager already records: cwd, pid, spawner, lifecycle uid, host/instance" } as const;
 const jsonFlag = { name: "json", type: "boolean", description: "machine-readable: one JSON object per seat per line (instance headers go to stderr)" } as const;
 const slotsFlag = { name: "slots", type: "boolean", description: "list durable static slot rows instead of live seats (#1274); mutually exclusive with --wide" } as const;
-export const stopFlags = [...targetFlags, nameFlag("managed agent to stop (required)"), onFlag] as const satisfies readonly FlagSpec[];
+/** `--attest-gone`: the operator's statement that a deferred seat's processes are gone. */
+const attestGoneFlag = { name: "attest-gone", type: "string", value: "<reason>", description: "terminalize a deferred unreachable seat now; the reason is your statement that its processes are gone" } as const;
+export const stopFlags = [...targetFlags, nameFlag("managed agent to stop (required)"), onFlag, attestGoneFlag] as const satisfies readonly FlagSpec[];
 export const psFlags = [...targetFlags, onFlag, wideFlag, jsonFlag, slotsFlag] as const satisfies readonly FlagSpec[];
 /** `--no-reconnect`: one session, exit when it ends, whatever ended it. The default reconnects,
  *  which is right for a person at a terminal and wrong for a script that wants a single run with a
@@ -58,6 +60,28 @@ export async function stop(args: ParsedArgs): Promise<void> {
   if (!v.name) {
     console.error(c.red("--name is required"));
     process.exit(1);
+  }
+  if (v["attest-gone"] !== undefined) {
+    // A deferred seat is not live, so no seat lookup can locate it: ask the manager directly.
+    if (!/\S/.test(v["attest-gone"])) {
+      console.error(c.red("--attest-gone needs a reason"));
+      process.exit(1);
+    }
+    // Without --on the call is class-anycast and a sibling would answer "no agent": pin to the holder.
+    let on = onInstanceOrExit(v.on, "cotal stop");
+    if (on === undefined) {
+      const lookup = await findDeferredSeat(v, v.name);
+      if (lookup.kind !== "found") {
+        console.error(c.red(deferredSeatLookupFailureMessage(v.name, lookup)));
+        process.exit(1);
+      }
+      on = lookup.instanceId;
+    }
+    const t = await resolveControlTarget(v, "control-caller-admin", on);
+    const reply = await askManager(t.space, t.server, "attestGone", { name: v.name, attestGone: v["attest-gone"] }, t.auth, "any", undefined, { instanceId: on });
+    failIfNotOk(reply);
+    console.log(c.dim(`✓ attested ${v.name} gone; its deferred lifecycle is terminalized`));
+    return;
   }
   // STATIC mesh: operator stop is a cross-agent op — the `control-caller-admin` instrument holds
   // the any-mode despawn row, so `reach: "any"` names any target (the broker grant IS the
@@ -213,9 +237,65 @@ async function pinForTarget(v: FlagValues<typeof stopFlags>, verb: string): Prom
   const loc = await locateSeat(v, String(v.name));
   if (loc.kind === "pin") return loc.instanceId;
   if (loc.kind === "unpinned") return undefined;
-  console.error(c.red(`✗ ${seatMissRefusal(String(v.name), verb, loc)}`));
+  // A deferred seat is not live, so the roster misses it; its manager's status still names it.
+  const deferred = verb === "cotal stop" ? await deferredSeatRemedy(v, String(v.name)) : undefined;
+  console.error(c.red(`✗ ${deferred ?? seatMissRefusal(String(v.name), verb, loc)}`));
   process.exit(1);
 }
+
+/** Scatter manager status and distinguish a found deferred seat from no match or a failed search. */
+async function findDeferredSeat(v: FlagValues<typeof stopFlags>, name: string): Promise<DeferredSeatLookup> {
+  try {
+    const probe = await resolveControlTarget(v, "control-caller-privileged", undefined, { onRefusal: "throw" });
+    return deferredSeatLookupIn(await scatterManager(probe.space, probe.server, "managerStatus", probe.auth, probe.spaceAuth), name);
+  } catch (e) {
+    return { kind: "unreachable", error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+async function deferredSeatRemedy(v: FlagValues<typeof stopFlags>, name: string): Promise<string | undefined> {
+  const lookup = await findDeferredSeat(v, name);
+  return lookup.kind === "found" ? deferredSeatMessage(name, lookup) : undefined;
+}
+
+/** Map a status scatter to the deferred-seat verdict without treating a failed scatter as absence. */
+export function deferredSeatLookupIn(scatter: ScatterReply, name: string): DeferredSeatLookup {
+  if (!scatter.ok) return { kind: "unreachable", error: scatter.error };
+  const seat = deferredSeatIn(scatter.instances, name);
+  return seat === undefined ? { kind: "none" } : { kind: "found", ...seat };
+}
+
+export function deferredSeatLookupFailureMessage(name: string, result: Exclude<DeferredSeatLookup, { kind: "found" }>): string {
+  if (result.kind === "unreachable")
+    return `✗ could not ask the managers in this space (${result.error}); pass --on <instance>`;
+  return `✗ no manager instance in this space reports "${name}" as a deferred seat; check \`cotal status\`, or pass --on <instance>`;
+}
+
+type DeferredFailure = { alias?: unknown; disposition?: unknown; lifecycleUid?: unknown; deferUntil?: unknown };
+/** The instance that holds a deferred seat, with the fields its status item reported. */
+export type DeferredSeat = { instanceId: string; lifecycleUid: string; deferUntil?: string };
+export type DeferredSeatLookup =
+  | ({ kind: "found" } & DeferredSeat)
+  | { kind: "none" }
+  | { kind: "unreachable"; error: string };
+
+/** The instance whose status reports `name` deferred, or undefined. Pure, so gradable without a broker. */
+export function deferredSeatIn(instances: readonly ScatterInstanceReply[], name: string): DeferredSeat | undefined {
+  for (const instance of instances) {
+    const failures = (instance.data as { staticReconciliation?: { failures?: DeferredFailure[] } } | undefined)?.staticReconciliation?.failures ?? [];
+    const hit = failures.find((f) => f.alias === name && f.disposition === "deferred");
+    if (hit !== undefined)
+      return { instanceId: instance.instanceId, lifecycleUid: String(hit.lifecycleUid), ...(typeof hit.deferUntil === "string" ? { deferUntil: hit.deferUntil } : {}) };
+  }
+  return undefined;
+}
+
+/** The plain-stop refusal for a deferred seat, with the pinned attest-gone command to run. */
+export function deferredSeatMessage(name: string, seat: DeferredSeat): string {
+  const until = seat.deferUntil !== undefined ? ` until ${seat.deferUntil}` : " with an unreadable credential expiry";
+  return `"${name}" is a deferred unreachable seat on manager instance ${seat.instanceId} at uid ${seat.lifecycleUid}${until}; it terminalizes after its credential expires, or confirm its processes are gone and run cotal stop --name ${name} --on ${seat.instanceId} --attest-gone <reason>`;
+}
+
 
 /** The console's wording for a seat the whole space proved absent. Main's richer `seatMissRefusal`
  *  needs the `unknown` variant too; the console (and `attachSeat`'s returned verdict) only ever

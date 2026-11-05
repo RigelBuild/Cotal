@@ -1,0 +1,145 @@
+{
+  "suite": ["implementations/manager/smoke/spawn-allowlist.smoke.ts"],
+  "guard": "spawn allowlist admission refuses every new runtime launch of an unlisted name, and allowlist-set returns only after every in-flight launch of a removed name settled",
+  "command": "pnpm smoke:spawn-allowlist",
+  "completionMarker": "SPAWN-ALLOWLIST SMOKE COMPLETE",
+  "proveWith": "node scripts/mutation-proof.mjs --config implementations/manager/smoke/mutations/spawn-allowlist.json",
+  "mutations": [
+    {
+      "name": "admission admits every name",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "if (this.spawnAllowlist === undefined || this.spawnAllowlist.has(name)) return undefined;",
+      "replace": "return undefined;",
+      "expectRed": "an unlisted name is refused before mint",
+      "cell": "an unlisted name is refused before mint"
+    },
+    {
+      "name": "spawn admits the base name, not the suffixed final name",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "const admission = this.admitLaunch(name);\n    if (!admission.ok) return { ok: false, error: admission.error };\n    const launchToken = admission.token;\n    // The launched handle",
+      "replace": "const admission = this.admitLaunch(identityName);\n    if (!admission.ok) return { ok: false, error: admission.error };\n    const launchToken = admission.token;\n    // The launched handle",
+      "expectRed": "a suffixed name from a listed base is refused",
+      "cell": "a suffixed name from a listed base is refused"
+    },
+    {
+      "name": "an unreadable allowlist admits every name",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "      } catch {\n        this.spawnAllowlist = new Set();\n      }",
+      "replace": "      } catch {\n        this.spawnAllowlist = undefined;\n      }",
+      "expectRed": "an unreadable allowlist refuses every name",
+      "cell": "an unreadable allowlist refuses every name"
+    },
+    {
+      "name": "no option refuses every name",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "if (this.spawnAllowlist === undefined || this.spawnAllowlist.has(name)) return undefined;",
+      "replace": "if (this.spawnAllowlist?.has(name)) return undefined;",
+      "expectRed": "no option admits every name",
+      "cell": "no option admits every name"
+    },
+    {
+      "name": "allowlist-set does not rewrite the file",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "      renameSync(temp, path);\n",
+      "replace": "      rmSync(temp, { force: true });\n",
+      "expectRed": "allowlist-set rewrites the allowlist file",
+      "cell": "allowlist-set rewrites the allowlist file"
+    },
+    {
+      "name": "custodied launch skips the re-check",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    this.recheckLaunch(launchToken);\n    const handle = this.requiredRuntime.spawn(name, spec, cwd, reserved);",
+      "replace": "    const handle = this.requiredRuntime.spawn(name, spec, cwd, reserved);",
+      "expectRed": "fails before the runtime call (custodied)",
+      "cell": "a launch whose name is removed during enrollment fails before the runtime call (custodied)"
+    },
+    {
+      "name": "delegated launch skips the re-check",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "        // No await between this re-check and the runtime call below.\n        this.recheckLaunch(launchToken);\n",
+      "replace": "",
+      "expectRed": "fails before the runtime call (delegated)",
+      "cell": "a launch whose name is removed during enrollment fails before the runtime call (delegated)"
+    },
+    {
+      "name": "allowlist-set does not wait for in-flight launches",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    await Promise.all(pending.map((token) => token.settled));\n",
+      "replace": "    void pending;\n",
+      "expectRed": "allowlist-set waits for a launch paused between Runtime.spawn and agents.set",
+      "cell": "allowlist-set waits for a launch paused between Runtime.spawn and agents.set, and stop then finds it"
+    },
+    {
+      "name": "a failed launch releases its token before its process exits",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "          launchToken.exited = uninstalled.waitForExit?.() ?? Promise.resolve();\n",
+      "replace": "",
+      "expectRed": "allowlist-set waits for a failed launch's rollback to settle (uninstalled process exits)",
+      "cell": "allowlist-set waits for a failed launch's rollback to settle (uninstalled process exits)"
+    },
+    {
+      "name": "trackDeprovision does not settle the token",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    this.lifecycleInFlight++;\n    void this.deprovision(a)",
+      "replace": "    this.lifecycleInFlight++;\n    this.finishLaunch(launchToken);\n    void this.deprovision(a)",
+      "expectRed": "allowlist-set waits for a failed launch's rollback to settle (trackDeprovision)",
+      "cell": "allowlist-set waits for a failed launch's rollback to settle (trackDeprovision)"
+    },
+    {
+      "name": "crash recovery takes no token",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    const launchToken = admission.token;\n    restart.recovering = true;",
+      "replace": "    const launchToken = undefined;\n    this.finishLaunch(admission.token);\n    restart.recovering = true;",
+      "expectRed": "allowlist-set waits for a crash-recovery replacement to be installed",
+      "cell": "allowlist-set waits for a crash-recovery replacement to be installed"
+    },
+    {
+      "name": "crash recovery skips admission",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    const admission = this.admitLaunch(a.name);\n    if (!admission.ok) {",
+      "replace": "    const admission = this.admitLaunch(a.name);\n    if (!admission.ok && false) {",
+      "expectRed": "crash recovery of a delisted name retires it",
+      "cell": "crash recovery of a delisted name retires it"
+    },
+    {
+      "name": "resume skips admission",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "      const listed = this.admitName(entry.name);\n      if (listed !== undefined) return { ok: false, error: listed };",
+      "replace": "      const listed = this.admitName(entry.name);\n      void listed;",
+      "expectRed": "resume preflight of a delisted name is refused",
+      "cell": "resume preflight of a delisted name is refused"
+    },
+    {
+      "name": "resume launches a delisted name",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "      if (listed !== undefined) return { ok: false, error: listed };\n      // The token is taken synchronously before the launch; launchPreparedResume owns it from here.\n      const launch = (value: PreparedResume): Promise<ControlReply> => {\n        const admission = this.admitLaunch(entry.name);\n        if (!admission.ok) return Promise.resolve({ ok: false, error: admission.error });\n        return this.launchPreparedResume(entry, value, batchReserved, admission.token);",
+      "replace": "      void listed;\n      const launch = (value: PreparedResume): Promise<ControlReply> => {\n        return this.launchPreparedResume(entry, value, batchReserved, undefined);",
+      "expectRed": "resume of a delisted name is refused",
+      "cell": "resume of a delisted name is refused"
+    },
+    {
+      "name": "resume releases in resumePreservedAgent's finally",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "        return this.launchPreparedResume(entry, value, batchReserved, admission.token);",
+      "replace": "        return this.launchPreparedResume(entry, value, batchReserved, undefined).finally(() => this.finishLaunch(admission.token));",
+      "expectRed": "allowlist-set waits for launchPreparedResume, not resumePreservedAgent's finally",
+      "cell": "allowlist-set waits for launchPreparedResume, not resumePreservedAgent's finally"
+    },
+    {
+      "name": "a refused resume spawn releases its token at once",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "    if (launchToken) launchToken.exited = handle.waitForExit?.() ?? Promise.resolve();\n",
+      "replace": "",
+      "expectRed": "a refused resume spawn holds its token until the spawned process exits",
+      "cell": "a refused resume spawn holds its token until the spawned process exits"
+    },
+    {
+      "name": "a listed name is refused",
+      "file": "implementations/manager/src/manager.ts",
+      "find": "if (this.spawnAllowlist === undefined || this.spawnAllowlist.has(name)) return undefined;",
+      "replace": "if (this.spawnAllowlist === undefined) return undefined;",
+      "expectRed": "a listed name spawns",
+      "cell": "a listed name spawns"
+    }
+  ]
+}

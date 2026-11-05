@@ -34,6 +34,7 @@ import { backup, backupComplete, backupFlags } from "./commands/backup.js";
 import { update, updateFlags } from "./commands/update.js";
 import { service, serviceComplete } from "./commands/service.js";
 import { sync, syncFlags } from "./commands/sync.js";
+import { allowlist, allowlistComplete, allowlistFlags } from "./commands/allowlist.js";
 import { DELIVERY_PROCESS } from "./lib/delivery-proc.js";
 import { AUTH_PROCESS } from "./lib/auth-proc.js";
 
@@ -433,6 +434,17 @@ const baseCommands: Command[] = [
     ],
     run: personas,
     complete: personasComplete,
+  },
+  {
+    kind: "command",
+    name: "allowlist",
+    group: "Manager",
+    summary: "replace the manager's spawn allowlist - allowlist set <name>...",
+    usage: "allowlist set <name>... [--space <s>] [--server <url>] [--creds <path>] [--on <instance>]",
+    positionals: "<set> <name>...",
+    flags: allowlistFlags,
+    run: allowlist,
+    complete: allowlistComplete,
   },
   // ---- Observe ------------------------------------------------------------------------------
   {

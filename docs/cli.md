@@ -1276,7 +1276,7 @@ reach needs the `admin` scope). An open mesh has no service registry.
 
 ```bash
 cotal ps [--on <instance>] [--wide | --json] [--slots] [--space <s>]
-cotal stop --name <n> [--on <instance>] [--space <s>]
+cotal stop --name <n> [--on <instance>] [--attest-gone <reason>] [--space <s>]
 cotal attach --name <n> [--on <instance>] [--no-reconnect] [--space <s>]
 ```
 
@@ -1289,10 +1289,26 @@ cotal attach --name <n> [--on <instance>] [--no-reconnect] [--space <s>]
 | `--json` (`ps`) | off | Machine-readable: one JSON object per seat per line, copied unchanged from the manager row. Instance headers and errors go to stderr, so stdout contains only rows. Mutually exclusive with `--wide` |
 | `--slots` (`ps`) | off | List the durable static slot rows this manager owns instead of live seats, through the `slots` command. Mutually exclusive with `--wide`. A row that is not in the live roster still prints, with `live=false`; a retired row never prints |
 | `--no-reconnect` (`attach`) | off | End the attach when its session ends, instead of re-establishing it. For scripts that want one run and one exit code |
+| `--attest-gone <reason>` (`stop`) | none | Terminalize a deferred seat now. The reason is your statement that the seat's processes are gone, and the manager log records it with your principal |
 
 A raw `--creds` file is refused by `ps`, `stop`, `attach` and the other control commands, because
 that route mints no endpoint-caller triple; the project folder, or `--space` against the registry
 entry, is the route that does.
+
+A seat can be deferred after a manager restart. This happens when its slot is still `active` or
+`provisioning`, no managed agent adopted it, and the runtime cannot reap it by reference. While the
+seat's credential has not expired, the manager cannot prove the seat is gone, so it does not
+terminalize the slot. It waits until 60 seconds after the latest credential expiry. It checks the
+deferral again on each credential-renewal tick and at the next boot. `status` counts these seats as
+`staticReconciliation.deferredSeats`, and each deferred item carries `deferUntil`. If the
+credential expiry cannot be read, the item has no `deferUntil`, `cotal status` shows the read error
+as `lastError`, and the seat does not terminalize on its own. A plain
+`cotal stop --name <n>` on a deferred seat prints this remedy and changes nothing. If you have
+confirmed that the seat's processes are gone, `cotal stop --name <n> --attest-gone <reason>`
+terminalizes the slot now. The reason must be one line. This needs operator (admin) reach. It rides the untargeted `attest-gone`
+admin command because a deferred seat is not live and cannot be addressed by a target. Without
+`--on`, the CLI finds the instance whose `cotal status` reports the seat deferred and sends the
+command there. It fails if no instance reports it. A spawn of a deferred alias is refused with the same remedy.
 
 The human `ps` row is presentation text and is not a stable parsing target. Scripts use `--json`,
 which is the machine-readable row contract.
@@ -1550,6 +1566,29 @@ Only the `pty` runtime can be typed into. The external terminal runtimes (`tmux`
 `herdr`) attach to a process they do not own, so they have no input stream for it and the command
 refuses by name rather than dropping the keystroke.
 
+## Spawn allowlist
+
+```bash
+cotal supervise --spawn-allowlist <path> ...
+cotal allowlist set <name>... [--on <instance>] [--space <s>]
+```
+
+A manager started with `--spawn-allowlist <path>` reads that file at start. The file is a JSON
+array of agent names. A file that cannot be read or parsed is an empty list, so the manager then
+refuses every launch. Without the flag, every name is allowed.
+
+The check uses the final name, after auto-numbering. If `reviewer` is listed and already running,
+a second spawn would become `reviewer_2`, and `reviewer_2` is refused unless it is listed too. The
+refusal is `spawn refused: "<name>" is not in the spawn allowlist <path>`. The manager checks every
+new launch: each spawn door, a crash-recovery restart and a resume. A recovery whose name is no
+longer listed retires the seat. The check never stops a process that is already running.
+
+`cotal allowlist set` replaces the list and rewrites the file through a temporary file and a
+rename. It needs admin on the manager. A manager started without `--spawn-allowlist` refuses it.
+The command returns only after every launch already in flight for a removed name has settled.
+Such a launch either left no process or is in the managed list, so a `cotal stop` run after
+`allowlist set` returns finds it.
+
 ## personas
 
 ```bash
@@ -1593,6 +1632,7 @@ cotal supervise [--runtime <name>] [--space <s>] [--server <url>] [--spawn <name
 | `--roster <file>` | none | Declarative roster to boot at startup. See [Roster files](define-a-team.md#roster-files) |
 | `--launch <spec>` | none | Resolved manifest launch spec (from `up -f` / `spawn -f`) |
 | `--spawn <names>` | none | Comma-separated personas to pre-spawn at startup |
+| `--spawn-allowlist <path>` | none | JSON array of the exact names this manager may launch. See [Spawn allowlist](#spawn-allowlist) |
 
 The manager is the agent supervisor and control plane: it answers `spawn --detach`, `stop`, `ps`,
 `attach`, and the `cotal_*` manager tools. `cotal up --detach` starts one for you; run `supervise`
