@@ -23,6 +23,7 @@
  * Run: pnpm smoke:seat-locality-honesty   (no broker)
  */
 import { deferredSeatIn, deferredSeatLookupFailureMessage, deferredSeatLookupIn, deferredSeatMessage, locateSeatIn, seatMissRefusal, type SeatLocation } from "../src/commands/agents.js";
+import { allowlistSetOptions, allowlistStatusAmbiguity } from "../src/commands/allowlist.js";
 import type { ScatterInstanceReply } from "../src/lib/control.js";
 
 let pass = 0, fail = 0;
@@ -52,6 +53,23 @@ console.log("1. the positive control: a complete search still finds, and still r
     both.kind === "absent" && (both as { checked: number }).checked === 2, both);
   check("a single answering manager stays unpinned (no ambiguity to resolve)",
     locateSeatIn([answered(A)], "seat").kind === "unpinned");
+}
+
+
+console.log("\n5. allowlist-set's multi-manager target and settle deadline");
+{
+  const status = [answered(A), answered(B)];
+  const singleManager = allowlistStatusAmbiguity([answered(A)]);
+  const multipleManagers = allowlistStatusAmbiguity(status);
+  const noManagers = allowlistStatusAmbiguity([]);
+  check("one answering manager keeps the unpinned allowlist path", singleManager === undefined);
+  check("two answering managers require an explicit allowlist target", /2 reachable manager instances/.test(multipleManagers ?? ""));
+  check("a refused sibling blocks unpinned allowlist-set", /2 reachable manager instances, 1 without a status reply/.test(allowlistStatusAmbiguity([answered(A), refused(B)]) ?? ""));
+  check("an empty status result preserves the prior anycast path", noManagers === undefined);
+  const pinned = allowlistSetOptions(A);
+  const unpinned = allowlistSetOptions(undefined);
+  check("allowlist-set waits 120 seconds and retains an explicit instance pin", pinned.timeoutMs === 120_000 && pinned.pin?.instanceId === A);
+  check("the single-manager path stays unpinned with the same settle window", unpinned.timeoutMs === 120_000 && unpinned.pin === undefined);
 }
 
 console.log("\n2. THE DEFECT: an instance that did not answer FOR ITSELF cannot license absence");
@@ -124,7 +142,7 @@ console.log("4. a plain stop on a deferred seat names the seat's remedy, not abs
 
 // DECLARED, not implied: a suite that ends early reddens no line, and `fail === 0` with a zero exit
 // reads as a pass in every one of those ways out. The count is checked however the process leaves.
-const EXPECTED_CELLS = 22;
+const EXPECTED_CELLS = 28;
 process.on("exit", () => {
   const ran = pass + fail;
   if (ran !== EXPECTED_CELLS) {

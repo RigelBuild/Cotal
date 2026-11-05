@@ -1,6 +1,7 @@
 ---
 "@cotal-ai/manager": patch
 "@cotal-ai/core": patch
+"@cotal-ai/cli": patch
 "cotal-ai": patch
 ---
 

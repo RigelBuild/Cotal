@@ -172,7 +172,7 @@ export class HolderRuntime implements Runtime {
             if (!this.areGone(identities)) throw error;
           }
         },
-        interrupt: () => this.exec(holder, ["interrupt", "--name", name], { encoding: "utf8" }),
+        interrupt: () => this.exec(holder, ["interrupt", "--name", name], { encoding: "utf8", timeout: START_TIMEOUT_MS }),
         waitForExit: async () => {
           while (status() !== "exited") await this.sleep(POLL_MS);
         },
@@ -180,6 +180,12 @@ export class HolderRuntime implements Runtime {
           throw new Error("holder runtime: attach with wave-seat-holder attach");
         },
       };
+    } catch (error) {
+      if (holderAcceptedStart) {
+        try { this.exec("systemctl", ["--user", "stop", "--no-block", `${this.prefix()}${name}`], { encoding: "utf8" }); } catch { /* the original start failure is primary */ }
+        try { cleanupLauncher(); } catch { /* best effort after stopping the unit */ }
+      }
+      throw error;
     } finally {
       if (!holderAcceptedStart) cleanupLauncher();
     }
@@ -251,7 +257,7 @@ export class HolderRuntime implements Runtime {
   private stopUnit(name: string, identities: { holder: ProcessIdentity; agent: ProcessIdentity }): void {
     if (this.areGone(identities)) return;
     try {
-      this.exec("systemctl", ["--user", "stop", `${this.prefix()}${name}`], { encoding: "utf8" });
+      this.exec("systemctl", ["--user", "stop", "--no-block", `${this.prefix()}${name}`], { encoding: "utf8" });
     } catch (error) {
       if (!this.areGone(identities)) throw error;
     }
