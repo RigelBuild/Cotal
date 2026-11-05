@@ -109,7 +109,7 @@ M.ep = {
   off: () => {},
   waitForPresenceSnapshot: () => Promise.resolve(),
   requestDeliveryAdmin: requestDeliveryAdminZeroMemberships,
-  getRoster: (): Presence[] => [...M.agents.values()].map((agent) => ({ card: { id: principalKey(DEV_OWNER, agent.id).key, name: agent.name }, status: "idle", lifecycleUid: agent.lifecycleUid })),
+  getRoster: (): Presence[] => [...M.agents.values()].map((agent): Presence => ({ card: { id: principalKey(DEV_OWNER, agent.id).key, name: agent.name, role: "worker", kind: "agent", description: "", tags: [] }, status: "idle", lifecycleUid: agent.lifecycleUid, ts: 0 })),
 };
 M.staticLifecycleEvict = async (principal) => ({ principal, kicked: 0, remaining: 0, scanComplete: true, verifiedGone: true });
 const quiet: Connector = { kind: "connector", name: "smoke-deferred", requires: ["node"], buildLaunch: () => ({ command: "true", args: [], env: {} }) };
@@ -291,7 +291,7 @@ try {
   const worker = await mgr.startAgent({ name: "worker", agent: "smoke-deferred", events: false });
   const autoNumber = await mgr.startAgent({ name: "worker", agent: "smoke-deferred", events: false });
   check("spawn: auto-numbered deferred alias returns its deferred-seat refusal before slot admission",
-    worker.ok && worker.data.name === "worker" && !autoNumber.ok && autoNumber.error?.startsWith(`\"worker_2\" is a deferred unreachable seat on manager instance ${M.managerInstanceId}`) === true && (await readSlot("worker_2"))?.phase === "active" && item("worker_2")?.disposition === "deferred", 
+    worker.ok && (worker.data as { name?: string }).name === "worker" && !autoNumber.ok && autoNumber.error?.startsWith(`\"worker_2\" is a deferred unreachable seat on manager instance ${M.managerInstanceId}`) === true && (await readSlot("worker_2"))?.phase === "active" && item("worker_2")?.disposition === "deferred",
     { autoNumber, slot: await readSlot("worker_2"), item: item("worker_2") });
   check("plain stop: a blank attest-gone reason fails the input schema", (() => {
     const def = M.managerServiceDefs().find((d) => d.command === "attest-gone");
