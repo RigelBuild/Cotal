@@ -10,6 +10,12 @@ workspace packages under `packages/*`, `extensions/*`, and `implementations/*` t
 > Here the workflow is renamed `.github/workflows/changesets.yml.disabled`, so GitHub never runs
 > it. The smoke suites still read it. Restore the `.yml` name only with a Rigel npm scope repoint.
 
+## Rigel runtime release assets
+
+The `Rigel release` workflow runs on each push to `rigel-release`. It builds the runtime on `ubuntu-latest` and `macos-15`, then publishes `cotal-runtime-linux-x64.tar.gz`, `cotal-runtime-darwin-arm64.tar.gz`, and `SHA256SUMS` to a GitHub Release tagged `rigel-v<bin/package.json version>-<10-character commit sha>`.
+Each archive contains the install tree under `cotal/`, including the `cotal-ai` launcher copy. The tag names the commit used for both builds.
+Runs are grouped by ref and queued without canceling an active release. Re-running the same commit is a no-op if its tag already points to that commit; a tag pointing elsewhere fails.
+
 ## 0.11 runtime migration
 
 The published binary no longer bundles the optional tmux and cmux runtimes. Existing operators
