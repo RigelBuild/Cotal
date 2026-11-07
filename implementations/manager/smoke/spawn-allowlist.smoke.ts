@@ -55,23 +55,35 @@ function makeSeat(name: string, opts: { holdExit?: boolean; reference?: RuntimeR
 }
 
 /** The private members this smoke drives. */
+interface LaunchTokenView {
+  name: string;
+  attemptId: string;
+  settled: Promise<void>;
+  finish: () => void;
+  exited?: Promise<unknown>;
+}
 interface ManagerView {
   runtime: object;
   ep: object;
   userMode: boolean;
   remoteAuthority: object | undefined;
+  managerInstanceId: string;
+  managerLifecycleUid: string;
   readinessTimeoutMs: number;
   agents: Map<string, { name: string; id: string; lifecycleUid: string; userOwner?: string; handle: AgentHandle; restart?: { armed: boolean } }>;
-  spawnCustodied: (...args: unknown[]) => Promise<AgentHandle>;
-  opAllowlistSet(args: Record<string, unknown>): Promise<ControlReply>;
-  opStop(args: Record<string, unknown>, caller: string, admin: boolean): Promise<ControlReply>;
-  admitLaunch(name: string): { ok: false; error: string } | { ok: true; token: unknown };
-  trackDeprovision(a: object, context: string, token: unknown): void;
+  launchTokens: Map<string, LaunchTokenView>;
+  auth: unknown;
+  spawnCustodied: (name: string, spec: LaunchSpec, cwd: string, reserved: RuntimeReference | undefined, slot: { id: string; lifecycleUid: string }, launchToken?: LaunchTokenView) => Promise<AgentHandle>;
+  opAllowlistSet: (args: Record<string, unknown>) => Promise<ControlReply>;
+  opStop: (args: Record<string, unknown>, caller: string, admin: boolean) => Promise<ControlReply>;
+  admitLaunch: (name: string) => { ok: false; error: string } | { ok: true; token: LaunchTokenView | undefined };
+  resumePreservedAgent: (entry: ManagerResumeAgent, preflightOnly?: boolean) => Promise<ControlReply>;
+  trackDeprovision: (a: object, context: string, token?: LaunchTokenView) => void;
+  provisionUserAgent: (name: unknown, ...args: unknown[]) => Promise<unknown>;
   deprovision: (a: object) => Promise<void>;
-  resumePreservedAgent(entry: ManagerResumeAgent, preflightOnly?: boolean): Promise<ControlReply>;
-  provisionUserAgent: (...args: unknown[]) => Promise<unknown>;
-  composeManagedHandoff: (...args: unknown[]) => unknown;
+  withLifecycleExecutor: <T>(pin: object, fn: (t: unknown) => Promise<T>) => Promise<T>;
   delegatedMeshRecord: () => unknown;
+  composeManagedHandoff: (...args: unknown[]) => unknown;
 }
 const view = (m: Manager): ManagerView => m as unknown as ManagerView;
 
@@ -90,7 +102,7 @@ function watch(p: Promise<unknown>): () => boolean {
 const workspaceRoot = mkdtempSync(join(tmpdir(), "cotal-spawn-allowlist-"));
 const agentsDir = join(workspaceRoot, ".cotal", "agents");
 mkdirSync(agentsDir, { recursive: true });
-for (const n of ["listed", "stranger", "reviewer", "early", "paused", "failing", "rollback1", "medic", "medic2", "rescue", "refused", "mismatch", "deleg1", "deleg2"])
+for (const n of ["listed", "stranger", "reviewer", "reviewer_2", "early", "paused", "failing", "rollback1", "rollback2", "medic", "medic2", "rescue", "refused", "mismatch", "deleg1", "deleg2"])
   writeFileSync(join(agentsDir, `${n}.md`), `---\nname: ${n}\nsubscribe: []\n---\n`);
 
 const smokeConnector: Connector = {
@@ -175,6 +187,22 @@ const without = (name: string) => setList(allowed.filter((n) => n !== name));
   await view(open.mgr).opStop({ name: "stranger", graceful: false }, "smoke", true);
 }
 
+{
+  const freshPath = join(workspaceRoot, "numbered-allowlist.json");
+  writeFileSync(freshPath, JSON.stringify(["reviewer"]));
+  const numbered = makeManager(freshPath);
+  const privateNames = numbered.M as ManagerView & { issuedNumberedNames: Set<string> };
+  const occupied = await numbered.mgr.startAgent({ name: "reviewer", agent: "smoke-allow", events: false });
+  const refusal = await numbered.mgr.startAgent({ name: "reviewer", agent: "smoke-allow", events: false });
+  await numbered.M.opAllowlistSet({ names: ["reviewer", "reviewer_2"] });
+  const retried = await numbered.mgr.startAgent({ name: "reviewer", agent: "smoke-allow", events: false });
+  check("a refused numbered candidate is not committed, so a later-listed suffix stays available",
+    occupied.ok && refusal.ok === false && retried.ok === true && privateNames.issuedNumberedNames.has("reviewer_2"),
+    { occupied, refusal, retried, issued: [...privateNames.issuedNumberedNames] });
+  await numbered.M.opStop({ name: "reviewer", graceful: false }, "smoke", true);
+  await numbered.M.opStop({ name: "reviewer_2", graceful: false }, "smoke", true);
+}
+
 // ── allowlist-set ─────────────────────────────────────────────────────────────────
 {
   const reply = await setList([...allowed, "extra"]);
@@ -237,7 +265,7 @@ const realSpawnCustodied = M.spawnCustodied;
   seat?.exit();
   await swap;
   M.spawnCustodied = realSpawnCustodied;
-  check("allowlist-set waits for a failed launch's rollback to settle (uninstalled process exits)",
+  check("allowlist-set waits for an unprovisioned failed launch until its process exits",
     reply.ok === false && heldUntilExit, { reply, heldUntilExit });
 }
 {
@@ -290,6 +318,52 @@ const realSpawnCustodied = M.spawnCustodied;
     spawn.ok === true && stillRunning && !M.agents.has("medic2") && spawned.filter((n) => n === "medic2").length === 1,
     { spawn, stillRunning, managed: M.agents.has("medic2"), spawned });
 }
+{
+  writeFileSync(join(workspaceRoot, "allow-rollback.json"), JSON.stringify(["rollback2"]));
+  const noCustody = makeManager(join(workspaceRoot, "allow-rollback.json"));
+  noCustody.M.userMode = true;
+  noCustody.M.provisionUserAgent = async (name: unknown) => ({
+    owner: DEV_OWNER,
+    lifecycleUid: mintLifecycleUid(),
+    files: {
+      actorToken: join(workspaceRoot, `${String(name)}.token`),
+      sentinelCreds: join(workspaceRoot, `${String(name)}.creds`),
+      health: join(workspaceRoot, `${String(name)}.health`),
+    },
+    launch: { owner: DEV_OWNER, actor: String(name), sentinelCredsPath: "", bearerCmd: [] },
+    enrolled: { material: {}, actorToken: "" },
+  });
+  noCustody.M.deprovision = async () => {};
+  let seat: Seat | undefined;
+  noCustody.M.runtime = {
+    kind: "fake-no-custody",
+    spawn: (name: string) => {
+      seat = makeSeat(name, { holdExit: true });
+      return seat.handle;
+    },
+  };
+  const pending = noCustody.mgr.startAgent(
+    { name: "rollback2", agent: "smoke-allow", events: false },
+    undefined,
+    { onLaunched: () => { throw new Error("smoke: activation refused"); } },
+  );
+  await tick();
+  const swap = noCustody.M.opAllowlistSet({ names: [] });
+  const swapDone = watch(swap);
+  const reply = await pending;
+  await tick();
+  const noCustodyTokens = [...noCustody.M.launchTokens.values()];
+  const launchToken = noCustodyTokens.find((token) => token.name === "rollback2");
+  const exited = launchToken?.exited;
+  const exitedDone = exited === undefined ? () => true : watch(exited);
+  const heldUntilExit = exited !== undefined && !exitedDone() && !swapDone() && seat?.stopped() === true;
+  seat?.exit();
+  if (exited !== undefined) await exited;
+  await swap;
+  check("no-custody rollback stops its uninstalled process and holds the token until exit",
+    reply.ok === false && heldUntilExit, { reply, heldUntilExit, stopped: seat?.stopped() });
+}
+
 
 // ── Resume ──────────────────────────────────────────────────────────────────────────
 const resumeEntry = (name: string): ManagerResumeAgent => {

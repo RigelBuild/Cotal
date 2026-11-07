@@ -1585,9 +1585,18 @@ longer listed retires the seat. The check never stops a process that is already 
 
 `cotal allowlist set` replaces the list and rewrites the file through a temporary file and a
 rename. It needs admin on the manager. A manager started without `--spawn-allowlist` refuses it.
-The command returns only after every launch already in flight for a removed name has settled.
+Without `--on`, the CLI scatters manager status first. It refuses if more than one manager is not
+confirmed gone, if any reachable manager refuses its status read, or if a silent manager is not
+confirmed gone. A single reachable manager that refuses is ambiguous too; it has not reported its
+allowlist. Pass `--on <instance>` to choose the manager when status is ambiguous. Issuer-pinned
+callers use their selected manager, and bearer callers skip the class scatter.
+The command waits up to 120 seconds for every launch already in flight for a removed name to settle.
 Such a launch either left no process or is in the managed list, so a `cotal stop` run after
 `allowlist set` returns finds it.
+
+The holder runtime's synchronous `wave-seat-holder start` call is bounded to 15 seconds. It can
+exceed the manager's 10-second lease TTL; the manager renews its lease on a separate timer after
+the call returns.
 
 ## personas
 

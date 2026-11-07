@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import type { RuntimeReapEvidence as ManagerRuntimeReapEvidence } from "../../implementations/manager/src/runtime/index.js";
 import { isCustodialRuntime } from "../../implementations/manager/src/runtime/index.js";
 import { HolderRuntime, holderRuntimeProvider } from "./src/holder.js";
@@ -14,6 +14,7 @@ type ExecOptions = { cwd?: string; encoding: "utf8"; timeout?: number };
 type ExecCall = { file: string; args: string[]; cwd?: string; timeout?: number };
 type FixtureOptions = {
   readonly startError?: Error;
+  readonly startOutput?: string;
   readonly systemctlError?: Error;
   readonly onExec?: (file: string, args: string[], proc: Map<number, string>) => void;
 };
@@ -50,7 +51,7 @@ function fixture(options: FixtureOptions = {}) {
       options.onExec?.(file, args, proc);
       if (file === holder && args[0] === "start") {
         if (options.startError !== undefined) throw options.startError;
-        return "101 202\n";
+        return options.startOutput ?? "101 202\n";
       }
       if (file === "systemctl" && options.systemctlError !== undefined) throw options.systemctlError;
       return "";
@@ -204,6 +205,20 @@ await check("holder runtime is not custodial", () => {
   }
 });
 
+await check("graceful stop does not wait for the unit to exit", () => {
+  const f = fixture();
+  try {
+    const handle = f.spawn();
+    handle.stop({ graceful: true });
+    assert.deepEqual(f.calls.at(-1), {
+      file: "systemctl",
+      args: ["--user", "stop", "--no-block", `wave-seat-${seatName}`],
+    });
+  } finally {
+    f.cleanup();
+  }
+});
+
 await check("graceful and forced stop use the seat unit and verified agent pid", () => {
   const f = fixture();
   try {
@@ -211,7 +226,7 @@ await check("graceful and forced stop use the seat unit and verified agent pid",
     handle.stop({ graceful: true });
     assert.deepEqual(f.calls.at(-1), {
       file: "systemctl",
-      args: ["--user", "stop", `wave-seat-${seatName}`],
+      args: ["--user", "stop", "--no-block", `wave-seat-${seatName}`],
     });
     handle.stop({ graceful: false });
     assert.deepEqual(f.kills, [{ pid: 202, signal: "SIGKILL" }]);
@@ -219,6 +234,42 @@ await check("graceful and forced stop use the seat unit and verified agent pid",
       file: "systemctl",
       args: ["--user", "kill", "-s", "SIGKILL", `wave-seat-${seatName}`],
     });
+  } finally {
+    f.cleanup();
+  }
+});
+
+await check("a post-start parse failure stops the unit and removes the launcher", () => {
+  const f = fixture({ startOutput: "not a pid pair" });
+  try {
+    assert.throws(() => f.spawn(), /invalid start output/);
+    assert.deepEqual(f.calls.at(-1), {
+      file: "systemctl",
+      args: ["--user", "stop", "--no-block", `wave-seat-${seatName}`],
+    });
+    const launcherDir = f.calls[0]?.cwd;
+    assert.ok(launcherDir);
+    assert.equal(existsSync(launcherDir), false);
+  } finally {
+    f.cleanup();
+  }
+});
+
+await check("a post-start /proc identity failure also stops the accepted unit", () => {
+  const f = fixture({
+    onExec: (file, args, proc) => {
+      if (file === holder && args[0] === "start") proc.delete(202);
+    },
+  });
+  try {
+    assert.throws(() => f.spawn(), /could not read live process identities/);
+    assert.deepEqual(f.calls.at(-1), {
+      file: "systemctl",
+      args: ["--user", "stop", "--no-block", `wave-seat-${seatName}`],
+    });
+    const launcherDir = f.calls[0]?.cwd;
+    assert.ok(launcherDir);
+    assert.equal(existsSync(launcherDir), false);
   } finally {
     f.cleanup();
   }
@@ -263,12 +314,12 @@ await check("systemctl failure is rethrown while a process identity survives", (
   }
 });
 
-await check("interrupt and attach use the native holder command", () => {
+await check("interrupt is bounded and attach uses the native holder command", () => {
   const f = fixture();
   try {
     const handle = f.spawn();
     handle.interrupt();
-    assert.deepEqual(f.calls.at(-1), { file: holder, args: ["interrupt", "--name", seatName] });
+    assert.deepEqual(f.calls.at(-1), { file: holder, args: ["interrupt", "--name", seatName], timeout: 15_000 });
     assert.throws(() => handle.attach(), /holder runtime: attach with wave-seat-holder attach/);
   } finally {
     f.cleanup();
@@ -298,7 +349,7 @@ await check("reap escalates after 30 seconds and reports a forced teardown", asy
     assert.equal(evidence.outcome, "reaped");
     assert.deepEqual(f.sleeps, Array.from({ length: 30 }, () => 1_000));
     assert.deepEqual(f.calls.slice(-2).map(({ args }) => args), [
-      ["--user", "stop", `wave-seat-${seatName}`],
+      ["--user", "stop", "--no-block", `wave-seat-${seatName}`],
       ["--user", "kill", "-s", "SIGKILL", `wave-seat-${seatName}`],
     ]);
   } finally {

@@ -51,7 +51,7 @@ import { requestDeliveryAdminZeroMemberships } from "./_fake-delivery-admin.js";
 let passed = 0;
 let failed = 0;
 /** Intent, not a measurement: one per check below. A shortfall means a cell stopped running. */
-const EXPECTED_CHECKS = 20;
+const EXPECTED_CHECKS = 23;
 function check(label: string, cond: boolean, extra?: unknown): void {
   console.log(`${cond ? "✓" : "✗"} ${label}${cond ? "" : ` — ${JSON.stringify(extra) ?? ""}`}`);
   if (cond) passed++;
@@ -79,6 +79,10 @@ type Seams = {
   renewDaemonCreds: () => Promise<void>;
   opStop: (args: Record<string, unknown>, caller: string, admin: boolean) => Promise<{ ok: boolean; error?: string }>;
   managerStatusData: () => ManagerStatus;
+  driveDeferredRecheck: () => Promise<void>;
+  readStaticReconcileSlot: (alias: string) => Promise<StaticManagedSlotRow | undefined>;
+  credentialDeferral: (row: StaticManagedSlotRow) => Promise<{ deferUntil?: string; remedy?: string; lastError?: string } | undefined>;
+  deferStaticReconcileItem: (key: string, row: StaticManagedSlotRow, deferral: { deferUntil?: string; remedy?: string; lastError?: string }) => void;
   managerServiceDefs: () => EpCommandDef[];
   withLifecycleExecutor: Executor;
   reconcilingAliases: Set<string>;
@@ -105,7 +109,7 @@ M.ep = {
   off: () => {},
   waitForPresenceSnapshot: () => Promise.resolve(),
   requestDeliveryAdmin: requestDeliveryAdminZeroMemberships,
-  getRoster: (): Presence[] => [],
+  getRoster: (): Presence[] => [...M.agents.values()].map((agent): Presence => ({ card: { id: principalKey(DEV_OWNER, agent.id).key, name: agent.name, role: "worker", kind: "agent", description: "", tags: [] }, status: "idle", lifecycleUid: agent.lifecycleUid, ts: 0 })),
 };
 M.staticLifecycleEvict = async (principal) => ({ principal, kicked: 0, remaining: 0, scanComplete: true, verifiedGone: true });
 const quiet: Connector = { kind: "connector", name: "smoke-deferred", requires: ["node"], buildLaunch: () => ({ command: "true", args: [], env: {} }) };
@@ -162,15 +166,20 @@ async function serve(command: string, args: Record<string, unknown>): Promise<Se
   }
 }
 const attestGone = (args: Record<string, unknown>): Promise<ServeReply> => serve("attest-gone", args);
-
-/** Run fn and return every console.error line it wrote. */
+/** Capture manager log lines for an assertion about an operator attestation. */
 async function captureErrors(fn: () => Promise<unknown>): Promise<string[]> {
   const lines: string[] = [];
   const original = console.error;
-  console.error = (...a: unknown[]) => { lines.push(a.map(String).join(" ")); original(...a); };
-  try { await fn(); } finally { console.error = original; }
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); original(...args); };
+  try {
+    await fn();
+  } finally {
+    console.error = original;
+  }
   return lines;
 }
+
+
 
 let inspectNc: NatsConnection | undefined;
 try {
@@ -185,6 +194,7 @@ try {
   // deferUntil = exp + 60, so this one lapses a few seconds into the run.
   const tickExp = nowSec() - 54;
   await plant("tick", tickExp);
+  await plant("worker_2", nowSec() + 3600);
   await plant("attest", nowSec() + 3600);
   await plant("plain", nowSec() + 3600);
   await plant("busy", nowSec() + 3600);
@@ -209,15 +219,15 @@ try {
     deferred?.disposition === "deferred" && typeof deferred.deferUntil === "string" && (await readSlot("unexpired"))?.phase === "active",
     { deferred, slot: await readSlot("unexpired") });
   check("unexpired: status counts it in staticReconciliation.deferredSeats",
-    M.managerStatusData().staticReconciliation.deferredSeats === 6, M.managerStatusData().staticReconciliation);
+    M.managerStatusData().staticReconciliation.deferredSeats === 7, M.managerStatusData().staticReconciliation);
   check("fence: every plannable alias is fenced before the first expiry read, and a deferred alias leaves it",
-    ["unexpired", "expired", "tick", "attest", "plain", "busy", "unreadable"].every((a) => fencedDuringRead.has(a)) && !M.reconcilingAliases.has("unexpired"),
+    ["unexpired", "expired", "tick", "attest", "plain", "busy", "unreadable", "worker_2"].every((a) => fencedDuringRead.has(a)) && !M.reconcilingAliases.has("unexpired"),
     { fenced: [...fencedDuringRead], after: [...M.reconcilingAliases] });
 
   // ── Unreadable ledger: deferred, with a remedy that says it never lapses ──
   const bad = item("unreadable");
-  check("unreadable: deferred with no deferUntil, the read error, and the unreadable remedy",
-    bad?.disposition === "deferred" && bad.deferUntil === undefined && /unreadable/.test(bad.lastError ?? "") && /will not terminalize on its own/.test(bad.remedy ?? ""), bad);
+  check("unreadable: deferred with no deferUntil, the read error, and an executable --name remedy",
+    bad?.disposition === "deferred" && bad.deferUntil === undefined && /unreadable/.test(bad.lastError ?? "") && /will not terminalize on its own/.test(bad.remedy ?? "") && /cotal stop --name <alias> --attest-gone/.test(bad.remedy ?? ""), bad);
 
   // ── Expired credential terminalizes ──
   check("expired: the boot sweep terminalizes the slot through the existing path",
@@ -267,8 +277,8 @@ try {
 
   // ── A plain stop on a deferred seat returns the remedy, through the served door ──
   const plain = await serve("inspect", { name: "plain" });
-  check("plain stop: target resolution through served inspect refuses with the attest-gone remedy pinned --on this instance, the slot unchanged",
-    !plain.ok && /deferred unreachable seat/.test(plain.message) && plain.message.includes(`--on ${M.managerInstanceId} --attest-gone`) && (await readSlot("plain"))?.phase === "active" && item("plain")?.disposition === "deferred",
+  check("plain stop: target resolution returns the --name and pinned --on remedy, slot unchanged",
+    !plain.ok && /deferred unreachable seat/.test(plain.message) && plain.message.includes(`cotal stop --name plain --on ${M.managerInstanceId} --attest-gone`) && (await readSlot("plain"))?.phase === "active" && item("plain")?.disposition === "deferred",
     { plain, slot: await readSlot("plain") });
 
   // ── A spawn of a deferred alias is refused at the alias check ──
@@ -277,6 +287,12 @@ try {
   check("spawn: a deferred alias is refused at the alias check with the deferred-seat refusal, the slot unchanged",
     !respawn.ok && /deferred unreachable seat/.test(respawn.error ?? "") && (await readSlot("plain"))?.phase === "active" && item("plain")?.disposition === "deferred",
     { respawn, slot: await readSlot("plain") });
+  writeFileSync(join(workspaceRoot, ".cotal", "agents", "worker.md"), "---\nname: worker\nrole: worker\nsubscribe: [general]\nallowSubscribe: [general]\nallowPublish: [general]\n---\nbody\n");
+  const worker = await mgr.startAgent({ name: "worker", agent: "smoke-deferred", events: false });
+  const autoNumber = await mgr.startAgent({ name: "worker", agent: "smoke-deferred", events: false });
+  check("spawn: auto-numbered deferred alias returns its deferred-seat refusal before slot admission",
+    worker.ok && (worker.data as { name?: string }).name === "worker" && !autoNumber.ok && autoNumber.error?.startsWith(`\"worker_2\" is a deferred unreachable seat on manager instance ${M.managerInstanceId}`) === true && (await readSlot("worker_2"))?.phase === "active" && item("worker_2")?.disposition === "deferred",
+    { autoNumber, slot: await readSlot("worker_2"), item: item("worker_2") });
   check("plain stop: a blank attest-gone reason fails the input schema", (() => {
     const def = M.managerServiceDefs().find((d) => d.command === "attest-gone");
     return def !== undefined && def.contract.input.validate({ name: "plain", attestGone: "   " }) === false;
@@ -329,6 +345,71 @@ try {
   check("attest-gone: the log names alias, uid, caller and reason",
     lines.some((l) => /static reconcile attested-gone alias=attest uid=\S+ by=\S+operator_a\S*: host rebooted, processes confirmed gone/.test(l)), lines.filter((l) => l.includes("attest")));
   check("attest-gone: status records the attestation on the item", item("attest")?.attestedGone === "host rebooted, processes confirmed gone" && item("attest")?.disposition === "recovered", item("attest"));
+  // A terminal that starts during either deferred tick await must keep ownership of the item.
+  const raceItem = [...M.staticReconcileItems.values()].find((candidate) => candidate.alias === "unexpired");
+  if (raceItem !== undefined) {
+    raceItem.deferUntil = undefined;
+    const originalSlotReader = M.readStaticReconcileSlot;
+    const slotReader = originalSlotReader.bind(M);
+    const originalCredentialReaderForRead = M.credentialDeferral;
+    const credentialReaderForRead = originalCredentialReaderForRead.bind(M);
+    let credentialReadsForReadRace = 0;
+    M.credentialDeferral = async (row) => {
+      if (row.alias === "unexpired") credentialReadsForReadRace++;
+      return await credentialReaderForRead(row);
+    };
+    let releaseRead: () => void = () => {};
+    const heldRead = new Promise<void>((resolve) => { releaseRead = resolve; });
+    let reachedRead: () => void = () => {};
+    const readReached = new Promise<void>((resolve) => { reachedRead = resolve; });
+    const priorReadError = raceItem.lastError;
+    M.readStaticReconcileSlot = async (alias) => {
+      if (alias === "unexpired") reachedRead();
+      const row = await slotReader(alias);
+      if (alias === "unexpired") await heldRead;
+      return row;
+    };
+    try {
+      const readRace = M.driveDeferredRecheck();
+      await readReached;
+      raceItem.disposition = "retrying";
+      releaseRead();
+      await readRace;
+    } finally {
+      releaseRead();
+      M.readStaticReconcileSlot = originalSlotReader;
+      M.credentialDeferral = originalCredentialReaderForRead;
+    }
+    const readRed = raceItem.disposition === "retrying" && raceItem.lastError === priorReadError && credentialReadsForReadRace === 0;
+    check("deferred tick does not overwrite a terminal started during the durable read", readRed, { raceItem, priorReadError, credentialReadsForReadRace });
+
+    raceItem.disposition = "deferred";
+    const originalCredentialReader = M.credentialDeferral;
+    const credentialReader = originalCredentialReader.bind(M);
+    let releaseCredential: () => void = () => {};
+    const heldCredential = new Promise<void>((resolve) => { releaseCredential = resolve; });
+    let reachedCredential: () => void = () => {};
+    const credentialReached = new Promise<void>((resolve) => { reachedCredential = resolve; });
+    const priorCredentialError = raceItem.lastError;
+    M.credentialDeferral = async (row) => {
+      if (row.alias === "unexpired") reachedCredential();
+      const result = await credentialReader(row);
+      if (row.alias === "unexpired") await heldCredential;
+      return result;
+    };
+    try {
+      const credentialRace = M.driveDeferredRecheck();
+      await credentialReached;
+      raceItem.disposition = "retrying";
+      releaseCredential();
+      await credentialRace;
+    } finally {
+      releaseCredential();
+      M.credentialDeferral = originalCredentialReader;
+    }
+    check("deferred tick does not overwrite a terminal started during credential proof",
+      raceItem.disposition === "retrying" && raceItem.lastError === priorCredentialError, { raceItem, priorCredentialError });
+  }
 
   // ── A custodial runtime never defers a credentialed no-reference row ──
   M.runtime = {

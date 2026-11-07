@@ -54,7 +54,6 @@ import {
   type IssuedStore,
   mintLifecycleUid,
   managedRetirementOpId,
-  mkSecretDir,
   newIdentity,
   actionContext,
   parsePrincipalKey,
@@ -307,10 +306,10 @@ const RETAINED_CUSTODY_REMEDY =
 const RESTART_RETRY_REMEDY = "restart this manager for a fresh per-process retry budget";
 /** The remedy a deferred seat carries: an unreachable seat waits out its credential, or an operator attests it gone. */
 const DEFERRED_SEAT_REMEDY =
-  "the seat is unreachable and its credential has not expired; it terminalizes after deferUntil, or confirm its processes are gone and run cotal stop <alias> --attest-gone <reason>";
+  "the seat is unreachable and its credential has not expired; it terminalizes after deferUntil, or confirm its processes are gone and run cotal stop --name <alias> --attest-gone <reason>";
 /** The remedy when the expiry cannot be read: the seat never terminalizes on its own. */
 const UNREADABLE_EXPIRY_REMEDY =
-  "the seat is unreachable and its credential expiry is unreadable (see lastError); it will not terminalize on its own, so confirm its processes are gone and run cotal stop <alias> --attest-gone <reason>";
+  "the seat is unreachable and its credential expiry is unreadable (see lastError); it will not terminalize on its own, so confirm its processes are gone and run cotal stop --name <alias> --attest-gone <reason>";
 
 type StaticReconcileItem = ManagerStaticReconciliationFailure & {
   owner: string;
@@ -5382,11 +5381,9 @@ export class Manager {
    *  ({@link issuedNumberedNames}), even after its holder retired. The requested base is exempt
    *  from that history: it is the persona's own name, which stays reusable even when it once came
    *  out of another persona's numbering. */
-  private uniqueName(base: string): string {
+  private uniqueNameCandidate(base: string): string {
     const live = this.liveRosterNames();
-    const name = firstFreeName(base, (n) => this.nameInUse(n, live) || (n !== base && this.issuedNumberedNames.has(n)));
-    if (name !== base) this.issuedNumberedNames.add(name);
-    return name;
+    return firstFreeName(base, (n) => this.nameInUse(n, live) || (n !== base && this.issuedNumberedNames.has(n)));
   }
 
   /** Spawn a teammate by persona ref (`name` loads `.cotal/agents/<name>.md`; the peer presents
@@ -6143,7 +6140,7 @@ export class Manager {
     // outstanding. All the teardown ops are idempotent, and the rail request is single-flighted.
     if (this.reconcilingAliases.has(identityName))
       return { ok: false, error: `the name "${identityName}" is still reconciling at manager startup; its prior lifecycle terminal owns this alias until it completes. Retry shortly.` };
-    // A deferred seat still owns its alias until its credential lapses or an operator attests it gone.
+    // An explicitly requested deferred alias refuses before any allocation or provisioning.
     const deferredHolder = [...this.staticReconcileItems.values()].find((item) => item.alias === identityName && item.disposition === "deferred");
     if (deferredHolder !== undefined) return { ok: false, error: this.deferredSeatRefusal(deferredHolder) };
     const held = this.retiring.get(identityName);
@@ -6208,8 +6205,14 @@ export class Manager {
         return { ok: false, error: `the name "${identityName}" is hard-pinned (${opts.resolved ? "manifest-declared" : "--name/identity override"}) but is already held by a live incarnation (managed here, an unmanaged foreground/connector session, or another manager's agent); a pinned same-name collision refuses at accept - pick another name or despawn the existing one` };
       name = identityName;
     } else {
-      name = this.uniqueName(identityName);
+      name = this.uniqueNameCandidate(identityName);
+      const admissionError = this.admitName(name);
+      if (admissionError !== undefined) return { ok: false, error: admissionError };
+      if (name !== identityName) this.issuedNumberedNames.add(name);
     }
+    // Persona allocation can land on a deferred numbered alias even when identityName itself is free.
+    const deferredFinal = [...this.staticReconcileItems.values()].find((item) => item.alias === name && item.disposition === "deferred");
+    if (deferredFinal !== undefined) return { ok: false, error: this.deferredSeatRefusal(deferredFinal) };
     // Set once the agent's footprint (durables + creds, or the user-mode grant + secret files)
     // exists; cleared when a live slot takes ownership. If it survives to `finally`, the spawn threw
     // AFTER provisioning (buildLaunch / runtime.spawn) — the orphan-rollback tears it down. Carries
@@ -6676,20 +6679,17 @@ export class Manager {
       this.reserved.delete(name);
       this.reservedLive.delete(name);
       if (seatHome) rmSync(seatHome, { recursive: true, force: true });
-      // Minted but never handed to a live slot (buildLaunch / runtime.spawn threw after mint) → tear the
-      // orphan down (detached, fail-loud) so a failed spawn leaves no creds/durables behind (#159 B).
+      // A process the attempt launched but did not install must exit before its token settles.
+      if (uninstalled && launchToken && !launchToken.exited) {
+        try { uninstalled.stop({ graceful: false }); } catch { /* the exit wait below still bounds the token */ }
+        launchToken.exited = uninstalled.waitForExit?.() ?? Promise.resolve();
+      }
       if (provisioned) {
         const orphan = provisioned;
-        // The host enrolled this UID for the intent's user, so only that user's retirement intent
-        // retires it, and its name stays held for retireDelegatedAgent.
         const p = orphan.delegated ? parsePrincipalKey(orphan.id) : null;
         if (p) this.retiring.set(orphan.name, { opId: retireOpId(orphan.lifecycleUid), owner: p.owner, actor: p.actor, target: orphan, startedAt: Date.now() });
         this.trackDeprovision(orphan, "(orphaned spawn)", launchToken);
       } else {
-        if (uninstalled && launchToken && !launchToken.exited) {
-          try { uninstalled.stop({ graceful: false }); } catch { /* the exit wait below still bounds the token */ }
-          launchToken.exited = uninstalled.waitForExit?.() ?? Promise.resolve();
-        }
         this.finishLaunch(launchToken);
       }
     }
@@ -7639,7 +7639,7 @@ export class Manager {
   private deferredSeatRefusal(item: StaticReconcileItem): string {
     const until = item.deferUntil !== undefined ? `until ${item.deferUntil}` : `with an unreadable credential expiry (${item.lastError ?? "no error recorded"})`;
     // Name this instance in the command: an unpinned attest-gone may reach a sibling that holds no such seat.
-    const remedy = (item.remedy ?? DEFERRED_SEAT_REMEDY).replace("cotal stop <alias> --attest-gone", `cotal stop --name ${item.alias} --on ${this.managerInstanceId} --attest-gone`);
+    const remedy = (item.remedy ?? DEFERRED_SEAT_REMEDY).replace("cotal stop --name <alias> --attest-gone", `cotal stop --name ${item.alias} --on ${this.managerInstanceId} --attest-gone`);
     return `"${item.alias}" is a deferred unreachable seat on manager instance ${this.managerInstanceId} at uid ${item.lifecycleUid} ${until}; NEXT: ${remedy}`;
   }
 
@@ -10102,6 +10102,7 @@ export class Manager {
         if (this.staticReconcileStopping) break;
         try {
           const row = await this.readStaticReconcileSlot(item.alias);
+          if (this.staticReconcileItems.get(key) !== item || item.disposition !== "deferred" || item.flight !== undefined) continue;
           const live = row === undefined ? undefined : this.agents.get(row.alias);
           if (row === undefined || row.lifecycleUid !== item.lifecycleUid || row.actor !== item.actor || (row.phase !== "active" && row.phase !== "provisioning") || live?.lifecycleUid === row.lifecycleUid) {
             this.staticReconcileItems.delete(key);
@@ -10109,6 +10110,7 @@ export class Manager {
             continue;
           }
           const deferral = await this.credentialDeferral(row);
+          if (this.staticReconcileItems.get(key) !== item || item.disposition !== "deferred" || item.flight !== undefined) continue;
           if (deferral !== undefined) {
             this.deferStaticReconcileItem(key, row, deferral);
             continue;
