@@ -45,6 +45,7 @@
  * rule, verbatim. And ordinary private ranges are refused in BOTH modes — no public CA issues for
  * them, so required TLS cannot make them verifiable, and a cafe LAN is private too.
  */
+import { isIP } from "node:net";
 import { isLoopbackLiteral } from "@cotal-ai/core";
 
 /** The address class a permitted target belongs to. This is a REACHABILITY allowlist: it says the
@@ -168,10 +169,13 @@ export type JoinRefusalCode = (typeof JOIN_REFUSAL_CODES)[number];
  */
 export class JoinRefusal extends Error {
   readonly code: JoinRefusalCode;
-  constructor(code: JoinRefusalCode, message: string) {
+  /** The next step, when the refusal has one. */
+  readonly remedy?: string;
+  constructor(code: JoinRefusalCode, message: string, remedy?: string) {
     super(message);
     this.name = "JoinRefusal";
     this.code = code;
+    if (remedy !== undefined) this.remedy = remedy;
   }
 }
 
@@ -350,6 +354,12 @@ export function classifyJoinTarget(raw: string, policy: DialPolicy): JoinTarget 
   const port = url.port || String(ws ? (url.protocol === "wss:" ? 443 : 80) : DEFAULT_PORT);
   const path = ws && url.pathname !== "/" ? url.pathname : "";
   const server = `${url.protocol}//${url.hostname}:${port}${path}`;
+  if (policy.tlsRequired && url.protocol === "ws:")
+    throw new JoinRefusal(
+      "unprotected-target",
+      "TLS is required but ws:// is plaintext",
+      `use wss://${url.hostname}${url.port ? `:${url.port}` : ""}${path}`,
+    );
 
   // Loopback is the one class that needs no transport guarantee: nothing leaves the machine, so
   // there is nothing on a wire for anyone to sit on.
@@ -391,11 +401,22 @@ export function classifyJoinTarget(raw: string, policy: DialPolicy): JoinTarget 
     );
   }
 
+  // A public address or a host name is registrable over required TLS, so the refusal names that form
+  // of the same address. A private range is refused with TLS too, so it keeps the general sentence.
+  if (!isPrivateLiteral(host)) {
+    const literal = isIP(host) !== 0;
+    const secure = url.protocol === "nats:" ? "tls:" : url.protocol === "ws:" ? "wss:" : undefined;
+    throw new JoinRefusal(
+      "unprotected-target",
+      `${JSON.stringify(raw)} refused: ${host} is ${literal ? "a public address" : "a host name"}, and a machine that registers a mesh sends its agent credentials to that broker, so the connection must require TLS.\n` +
+        `  TLS checks the broker's certificate and host name, so whoever answers the ${literal ? "dial" : "lookup or the dial"} cannot pose as the broker. Without TLS, only a loopback literal (127.0.0.0/8, ::1), or a private-overlay literal (100.64.0.0/10, fd7a:115c:a1e0::/48) with --allow-unencrypted-overlay, may be registered.`,
+      secure ? `use ${secure}//${url.hostname}${url.port ? `:${url.port}` : ""}${path}${url.protocol === "nats:" ? ", or pass --tls" : ""}` : "pass --tls to require TLS on the connection",
+    );
+  }
   throw new JoinRefusal(
     "unprotected-target",
     `${JSON.stringify(raw)} refused: this build cannot protect a connection to ${host}, and a machine that registers a mesh sends its agent credentials to that broker.\n` +
       `  Only a loopback literal (127.0.0.0/8, ::1) or a private-overlay literal (100.64.0.0/10, fd7a:115c:a1e0::/48) may be registered. An overlay literal additionally needs --allow-unencrypted-overlay, which records that you accepted its tunnel dependency.\n` +
-      `  Ordinary private ranges are refused too: a cafe network is private, and private is not the same as yours.\n` +
-      `  A hostname is refused even when it resolves somewhere permitted - otherwise whoever answers the lookup chooses which machine receives the credentials. Pass the address itself.`,
+      `  Ordinary private ranges are refused too: a cafe network is private, and private is not the same as yours.`,
   );
 }

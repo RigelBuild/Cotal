@@ -800,127 +800,6 @@ await h.waitForExit();
   }
 
   {
-    // Graceful escalation: a child that ignores SIGTERM still goes, by the pidfd SIGKILL after GRACE_MS.
-    const dir = mkdtempSync(join(root, "t1-grace-"));
-    const pidf = join(dir, "pid");
-    const mark = join(dir, "term");
-    const rec = launchSeat({ root, name: "grace-escalate", spec: { command: process.execPath, args: ["-e", ARMED_CHILD, pidf, mark, ""], env: { PATH: process.env.PATH ?? "" } }, cwd: process.cwd() });
-    const h = adoptSeatSync(rec);
-    handles.push(h);
-    await until(() => readPid(pidf) !== undefined, 5_000);
-    h.stop({ graceful: true });
-    const exited = await Promise.race([h.waitForExit().then(() => true), wait(GRACE_MS + 5_000).then(() => false)]);
-    check(
-      "graceful stop escalates: a child ignoring SIGTERM is gone after waitForExit",
-      exited && existsSync(mark) && (await until(() => isGone(rec.childPid), 2_000)),
-      { exited, sigterm: existsSync(mark), child: state(rec.childPid) },
-    );
-    h.close();
-  }
-
-  {
-    // A recognized node-pty refusal occurs before fork and must release launch artifacts.
-    const artifact = mkdtempSync(join(tmpdir(), "cotal-prefork-artifact-"));
-    writeFileSync(join(artifact, "persona.md"), "private\n");
-    const id = seatId();
-    const err = launchUnderSeam({ argsAsString: true }, id, [], [artifact]);
-    check(
-      "node-pty recognized pre-fork refusal removes launch artifacts",
-      /custodian exited before ready/.test(err) && /args as a string is not supported on unix\./.test(err) && !existsSync(artifact),
-      { err, artifact: existsSync(artifact) },
-    );
-    rmSync(artifact, { recursive: true, force: true });
-  }
-
-  {
-    const artifact = mkdtempSync(join(tmpdir(), "cotal-before-fs-artifact-"));
-    writeFileSync(join(artifact, "persona.md"), "private\n");
-    const invalidUid = Number.NaN;
-    let err = "";
-    try {
-      launchSeat({
-        root,
-        name: "invalid-adopter-uid-artifact-cleanup",
-        id: seatId(),
-        agentUid: invalidUid,
-        spec: { command: process.execPath, args: ["-e", "setInterval(()=>{},1000)"], env: { PATH: process.env.PATH ?? "" }, artifacts: [artifact] },
-        cwd: process.cwd(),
-      });
-    } catch (e) {
-      err = (e as Error).message;
-    }
-    check("invalid adopter uid removes launch artifacts before spawn", /agent uid NaN is not a uid/.test(err) && !existsSync(artifact), { err, artifact: existsSync(artifact) });
-    rmSync(artifact, { recursive: true, force: true });
-  }
-
-  {
-    // A failed pin sends nothing: the child is named by no pidfd, so only the PTY hangup reaches it.
-    const dir = mkdtempSync(join(root, "t1-unpinned-"));
-    const pidf = join(dir, "pid");
-    const mark = join(dir, "term");
-    const release = join(dir, "release");
-    const artifact = mkdtempSync(join(tmpdir(), "cotal-unpinned-artifact-"));
-    writeFileSync(join(artifact, "persona.md"), "private\n");
-    const id = seatId();
-    const err = launchUnderSeam({ dropPidfd: true, holds: [{ at: "unpinned", reached: join(dir, "reached"), release }] }, id, ["-e", ARMED_CHILD, pidf, mark, release], [artifact]);
-    const owned = readPid(pidf);
-    if (owned !== undefined) strays.push(owned);
-    const pid = owned?.pid;
-    await wait(300);
-    check(
-      "an unpinned child is never signalled: launch fails, no socket or record, artifact kept and child lives unmarked",
-      /returned no pidfd/.test(err) && !existsSync(join(root, id, "seat.sock")) && !existsSync(join(root, id, "record.json")) && existsSync(artifact) && pid !== undefined && !isGone(pid) && !existsSync(mark),
-      { err, pid, child: pid === undefined ? "none" : state(pid), artifact: existsSync(artifact), sigterm: existsSync(mark) },
-    );
-    if (owned !== undefined) {
-      killOwned(owned.pid, owned.start);
-      await until(() => isGone(owned.pid), 2_000);
-    }
-    rmSync(artifact, { recursive: true, force: true });
-  }
-
-  for (const fail of ["listen-error", "after-bind"] as const) {
-    // Every startup failure after pinning SIGKILLs the child through the pidfd before the custodian exits.
-    const dir = mkdtempSync(join(root, `t1-${fail}-`));
-    const pidf = join(dir, "pid");
-    const release = join(dir, "release");
-    const id = seatId();
-    const err = launchUnderSeam({ fail, holds: [{ at: "after-pin", reached: join(dir, "reached"), release }] }, id, ["-e", ARMED_CHILD, pidf, join(dir, "term"), release]);
-    const owned = readPid(pidf);
-    if (owned !== undefined) strays.push(owned);
-    const pid = owned?.pid;
-    check(
-      `startup failure (${fail}) after pinning stops the child`,
-      /custodian exited before ready/.test(err) && !existsSync(join(root, id, "record.json")) && pid !== undefined && (await until(() => isGone(pid), 5_000)),
-      { err, pid, child: pid === undefined ? "none" : state(pid) },
-    );
-  }
-
-  {
-    // The custodian creates no directory: a seat dir removed under a late custodian stays removed.
-    const dir = mkdtempSync(join(root, "t1-rmdir-"));
-    const pidf = join(dir, "pid");
-    const reached = join(dir, "reached");
-    const release = join(dir, "release");
-    const childRelease = join(dir, "child-release");
-    const id = seatId();
-    onReached(reached, 'rm -rf "$2"; : > "$3"', join(root, id), release);
-    const err = launchUnderSeam(
-      { holds: [{ at: "before-fs", reached, release }, { at: "after-pin", reached: join(dir, "pinned"), release: childRelease }] },
-      id,
-      ["-e", ARMED_CHILD, pidf, join(dir, "term"), childRelease],
-    );
-    const owned = readPid(pidf);
-    if (owned !== undefined) strays.push(owned);
-    const pid = owned?.pid;
-    check(
-      "a removed seat directory stops a late custodian: no record, no directory, the child is gone",
-      err !== "" && !existsSync(join(root, id)) && pid !== undefined && (await until(() => isGone(pid), 5_000)),
-      { err, dir: existsSync(join(root, id)), pid, child: pid === undefined ? "none" : state(pid) },
-    );
-  }
-
-  {
     // A seal written after the launcher's check still stops the custodian before it spawns.
     const dir = mkdtempSync(join(root, "t1-seal-"));
     const pidf = join(dir, "pid");
@@ -940,152 +819,6 @@ await h.waitForExit();
     let refused = "";
     try { launchSeat({ root, name: "sealed", id: again, spec: { command: process.execPath, args: ["-e", ""], env: { PATH: process.env.PATH ?? "" } }, cwd: process.cwd() }); } catch (e) { refused = (e as Error).message; }
     check("a launch over an existing fence creates no seat directory", refused !== "" && !existsSync(join(root, again)), refused);
-  }
-
-  {
-    // A custodian that refuses before it spawns frees the launch files: no child will ever read them,
-    // and the launcher handed them over once the custodian process existed.
-    const dir = mkdtempSync(join(root, "t1-seal-artifacts-"));
-    const reached = join(dir, "reached");
-    const release = join(dir, "release");
-    const artifact = mkdtempSync(join(tmpdir(), "cotal-seal-artifact-"));
-    writeFileSync(join(artifact, "persona.md"), "private\n");
-    const id = seatId();
-    onReached(reached, 'printf sealed > "$2"; : > "$3"', join(root, `.launch-${id}`), release);
-    setCustodianTestSeam({ holds: [{ at: "before-fs", reached, release }] });
-    let err = "";
-    try {
-      const rec = launchSeat({ root, name: "t1-seal-artifacts", id, spec: { command: process.execPath, args: ["-e", ""], env: { PATH: process.env.PATH ?? "" }, artifacts: [artifact] }, cwd: process.cwd() });
-      strays.push({ pid: rec.custodianPid, start: rec.custodianStart }, { pid: rec.childPid, start: rec.childStart });
-    } catch (e) {
-      err = (e as Error).message;
-    } finally {
-      setCustodianTestSeam(undefined);
-    }
-    const gone = await until(() => !existsSync(artifact), 5_000);
-    check("a custodian refused at its fence removes the launch artifacts it was handed", /is sealed/.test(err) && gone, { err, artifact: existsSync(artifact) });
-    rmSync(artifact, { recursive: true, force: true });
-  }
-
-  // ── T4 operator release ────────────────────────────────────────────────────
-  // launchSeat blocks this event loop, so a release that must land mid-launch runs in a runner process.
-  const releaseRunner = join(mkdtempSync(join(root, "t4-runner-")), "release.mjs");
-  writeFileSync(
-    releaseRunner,
-    `import { writeFileSync } from "node:fs";
-import { sealSeatLaunch, removeSeatCustody } from ${JSON.stringify(join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "index.js"))};
-const [root, id, out] = process.argv.slice(2);
-const sealed = await sealSeatLaunch(root, id);
-if (sealed.ok) removeSeatCustody(root, id);
-writeFileSync(out, JSON.stringify(sealed));
-`,
-  );
-  const releaseThen = 'NODE="$2"; shift 2; "$NODE" "$@"; : > "$5"';
-
-  {
-    const dir = mkdtempSync(join(root, "t4-late-custodian-"));
-    const pidf = join(dir, "pid");
-    const reached = join(dir, "reached");
-    const release = join(dir, "release");
-    const out = join(dir, "out.json");
-    const id = seatId();
-    onReached(reached, releaseThen, process.execPath, releaseRunner, root, id, out, release);
-    // The after-pin hold waits on the child's own marker, so a child that does spawn is always seen.
-    const childRelease = join(dir, "child-release");
-    const err = launchUnderSeam(
-      { holds: [{ at: "before-fs", reached, release }, { at: "after-pin", reached: join(dir, "pinned"), release: childRelease }] },
-      id,
-      ["-e", ARMED_CHILD, pidf, join(dir, "term"), childRelease],
-    );
-    await wait(300);
-    const child = readPid(pidf);
-    if (child !== undefined) strays.push(child);
-    check(
-      "late custodian: a release during its before-fs hold leaves no child, socket, record, seat directory or tombstone",
-      err !== "" && child === undefined && !existsSync(join(root, id, "seat.sock")) && !existsSync(join(root, id, "record.json")) && !existsSync(join(root, id)) && !existsSync(join(root, `.released-${id}`)),
-      { err, child, out: existsSync(out) ? readFileSync(out, "utf8") : "none" },
-    );
-  }
-
-  {
-    const dir = mkdtempSync(join(root, "t4-late-launcher-"));
-    const reached = join(dir, "reached");
-    const release = join(dir, "release");
-    const out = join(dir, "out.json");
-    const pidf = join(dir, "pid");
-    const id = seatId();
-    onReached(reached, releaseThen, process.execPath, releaseRunner, root, id, out, release);
-    setLauncherTestSeam({ afterFence: { reached, release } });
-    let err = "";
-    try {
-      const rec = launchSeat({ root, name: "t4-launcher", id, spec: { command: process.execPath, args: ["-e", ARMED_CHILD, pidf, join(dir, "term"), ""], env: { PATH: process.env.PATH ?? "" } }, cwd: process.cwd() });
-      strays.push({ pid: rec.custodianPid, start: rec.custodianStart }, { pid: rec.childPid, start: rec.childStart });
-    } catch (e) {
-      err = (e as Error).message;
-    } finally {
-      setLauncherTestSeam(undefined);
-    }
-    check("late launcher: a release between fence and lock refuses the launch and no seat directory appears",
-      /is sealed/.test(err) && !existsSync(join(root, id)), { err, dir: existsSync(join(root, id)), out: existsSync(out) ? readFileSync(out, "utf8") : "none" });
-  }
-
-  {
-    const id = seatId();
-    setLauncherTestSeam({ failMkdir: true });
-    let err = "";
-    try {
-      launchSeat({ root, name: "t4-mkdir", id, spec: { command: process.execPath, args: ["-e", ""], env: { PATH: process.env.PATH ?? "" } }, cwd: process.cwd() });
-    } catch (e) {
-      err = (e as Error).message;
-    } finally {
-      setLauncherTestSeam(undefined);
-    }
-    const sealed = await sealSeatLaunch(root, id);
-    check("failed launcher setup: the launch fails and a release in the same process takes the lock and seals",
-      /seat mkdir failed/.test(err) && sealed.ok && readFileSync(join(root, `.launch-${id}`), "utf8") === "sealed", { err, sealed });
-  }
-
-  {
-    // The custodian holds the fence lock from admission until ready; the release must wait it out.
-    const dir = mkdtempSync(join(root, "t4-in-progress-"));
-    const pidf = join(dir, "pid");
-    const reached = join(dir, "reached");
-    const release = join(dir, "release");
-    const id = seatId();
-    const seam: CustodianTestSeam = { holds: [{ at: "after-pin", reached, release, timeoutMs: 40_000 }] };
-    const runner = join(dir, "launch.mjs");
-    writeFileSync(
-      runner,
-      `import { setCustodianTestSeam, launchSeat } from ${JSON.stringify(join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "launcher.js"))};
-setCustodianTestSeam(${JSON.stringify(seam)});
-try { launchSeat({ root: ${JSON.stringify(root)}, name: "t4-progress", id: ${JSON.stringify(id)}, spec: { command: process.execPath, args: ${JSON.stringify(["-e", ARMED_CHILD, pidf, join(dir, "term"), ""])}, env: { PATH: process.env.PATH ?? "" } }, cwd: process.cwd() }); } catch {}
-`,
-    );
-    const launcher: ChildProcess = spawn(process.execPath, [runner], { stdio: "ignore" });
-    const held = await until(() => existsSync(reached), 10_000);
-    const sealed = held ? await sealSeatLaunch(root, id) : undefined;
-    writeFileSync(release, "");
-    await until(() => existsSync(join(root, id, "record.json")), 10_000);
-    const child = readPid(pidf);
-    if (child !== undefined) strays.push(child);
-    try {
-      const rec = JSON.parse(readFileSync(join(root, id, "record.json"), "utf8")) as SeatRecord;
-      strays.push({ pid: rec.custodianPid, start: rec.custodianStart });
-    } catch { /* no record: the custodian never got past the hold */ }
-    launcher.kill("SIGKILL");
-    check("launch in progress: a release refuses with launch-in-progress and leaves the fence unsealed",
-      held && sealed !== undefined && !sealed.ok && sealed.reason === "launch-in-progress" && readFileSync(join(root, `.launch-${id}`), "utf8") !== "sealed", { held, sealed });
-  }
-
-  {
-    const id = seatId();
-    mkdirSync(join(root, id));
-    writeFileSync(join(root, id, "record.json"), "{}");
-    writeFileSync(join(root, `.launch-${id}`), "sealed");
-    removeSeatCustody(root, id);
-    removeSeatCustody(root, id);
-    check("release removal: the seat directory and tombstone are gone, a repeat is success, and the sealed fence stays",
-      !existsSync(join(root, id)) && !existsSync(join(root, `.released-${id}`)) && readFileSync(join(root, `.launch-${id}`), "utf8") === "sealed");
   }
 
   {
@@ -1127,6 +860,193 @@ console.log("PID_REUSE " + JSON.stringify({ error, child, reused, reusedAlive })
       "a reused pid is never signalled: the process that retook the child's pid outlives the startup failure",
       got !== undefined && /test seam: startup failure after pinning/.test(got.error) && got.child !== undefined && got.child === got.reused && got.reusedAlive,
       { cc: cc.status === 0 ? "ok" : cc.stderr || cc.error?.message, status: ns?.status, stderr: ns?.stderr, got },
+    );
+  }
+
+  {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const dist = join(here, "..", "dist");
+    const distFiles = ["record.js", "reap.js", "launcher.js", "custodian.js", "index.js"] as const;
+    const statReads = Object.fromEntries(
+      distFiles.map((f) => [f, (readFileSync(join(dist, f), "utf8").match(/\/proc\/\$\{[^}]+\}\/stat/g) ?? []).length]),
+    );
+    const terminators = Object.fromEntries(
+      distFiles.map((f) => [f, (readFileSync(join(dist, f), "utf8").match(/lastIndexOf\("\) "\)/g) ?? []).length]),
+    );
+    check(
+      "stat parser: only record.js reads /proc/<pid>/stat and locates the comm terminator",
+      JSON.stringify(statReads) === JSON.stringify({ "record.js": 1, "reap.js": 0, "launcher.js": 0, "custodian.js": 0, "index.js": 0 }) &&
+        JSON.stringify(terminators) === JSON.stringify({ "record.js": 1, "reap.js": 0, "launcher.js": 0, "custodian.js": 0, "index.js": 0 }),
+      { statReads, terminators },
+    );
+
+    const probeDir = mkdtempSync(join(root, "stat-probe-"));
+    const probeScript = join(probeDir, "probe.mjs");
+    writeFileSync(
+      probeScript,
+      `import assert from "node:assert/strict";
+import cp from "node:child_process";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import path from "node:path";
+import * as seat from ${JSON.stringify(join(dist, "index.js"))};
+
+assert.equal(typeof seat.processStatFields, "function");
+assert.equal(process.env.COTAL_RUN, "probe-3152-real");
+delete process.env.COTAL_RUN;
+
+const sleepBin = cp.execFileSync("sh", ["-c", "command -v sleep"], { encoding: "utf8" }).trim();
+const commBin = path.join(${JSON.stringify(probeDir)}, "x) y (z");
+fs.copyFileSync(sleepBin, commBin);
+fs.chmodSync(commBin, 0o755);
+
+const decoy = cp.spawn(sleepBin, ["300"], { stdio: "ignore", env: { PATH: process.env.PATH ?? "", COTAL_RUN: "probe-3152-decoy" } });
+const real = cp.spawn(commBin, ["300"], { stdio: "ignore", env: { PATH: process.env.PATH ?? "" } });
+const P = real.pid;
+const Q = decoy.pid;
+assert.ok(P && Q);
+
+try {
+  await new Promise((r) => setTimeout(r, 200));
+  const rawStat = fs.readFileSync(\`/proc/\${P}/stat\`, "utf8");
+  assert.ok(rawStat.includes("(x) y (z)"), rawStat);
+  const expectedToken = rawStat.slice(rawStat.lastIndexOf(") ") + 2).trim().split(/\\s+/)[19];
+
+  const observe = () => ({
+    fields: seat.processStatFields(P),
+    token: seat.processStartToken(P),
+    verdict: seat.identityVerdict(P, expectedToken),
+    runMarker: seat.runMarker(process.env, P),
+  });
+
+  const before = observe();
+  assert.ok(Array.isArray(before.fields) && before.fields.length >= 20);
+  assert.equal(before.fields[1], String(process.pid));
+  assert.equal(before.token, expectedToken);
+  assert.equal(before.verdict, "live");
+  assert.equal(before.runMarker, "probe-3152-real");
+
+  const origRead = fs.readFileSync;
+  const malformedLines = [
+    \`\${P} \${Q} S\`,
+    \`\${P} ) \${Q} S 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 99\`,
+    \`\${Q} (x) y (z) S \${Q} \${Q} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 99\`,
+    \`\${P} (x) y (z) S \${Q} \${Q}\`,
+    \`\${P} (x) y (z) \`,
+    \`\${P} (x) y (z) S \${Q} \${Q} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 99\\ninjected\`,
+  ];
+  const reapRoot = fs.mkdtempSync(path.join(${JSON.stringify(probeDir)}, "reap-"));
+  try {
+    for (const line of malformedLines) {
+      fs.readFileSync = function (file, ...args) {
+        if (String(file) === \`/proc/\${P}/stat\`) return line;
+        return origRead.call(this, file, ...args);
+      };
+      syncBuiltinESMExports();
+      const got = observe();
+      assert.deepEqual(got, {
+        fields: undefined,
+        token: undefined,
+        verdict: "gone",
+        runMarker: \`pid-\${P}\`,
+      }, \`malformed stat line failed: \${JSON.stringify(line)}\`);
+    }
+
+    const absentLeader = 999999;
+    const reapId = "b".repeat(32);
+    const reapRecPath = seat.recordPath(reapRoot, reapId);
+    fs.mkdirSync(path.dirname(reapRecPath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(reapRecPath, JSON.stringify({
+      version: 1,
+      id: reapId,
+      name: "malformed-group-probe",
+      socket: seat.socketPath(reapRoot, reapId),
+      token: "fixture",
+      custodianPid: absentLeader,
+      custodianStart: "1",
+      childPid: absentLeader,
+      childStart: "1",
+      bootId: seat.bootToken(),
+    }) + "\\n", { mode: 0o600 });
+    fs.readFileSync = function (file, ...args) {
+      if (String(file) === \`/proc/\${P}/stat\`) return \`\${P} (x) y (z) S 1 \${absentLeader}\`;
+      return origRead.call(this, file, ...args);
+    };
+    syncBuiltinESMExports();
+    const reaped = await seat.reapSeat(reapRoot, reapId, { graceMs: 200 });
+    assert.equal(reaped.outcome, "reaped");
+
+    const launchRoot = ${JSON.stringify(root)};
+    const launchId = "c".repeat(32);
+    const launchRecFile = seat.recordPath(launchRoot, launchId);
+    let launchStatPolls = 0;
+    let launchedCustodianPid = 0;
+    process.env.COTAL_RUN = "probe-3152-real";
+    fs.readFileSync = function (file, ...args) {
+      const s = String(file);
+      if (s === launchRecFile) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      const m = /^\\/proc\\/(\\d+)\\/stat$/.exec(s);
+      if (m && Number(m[1]) !== P && Number(m[1]) !== Q && Number(m[1]) !== process.pid) {
+        launchedCustodianPid = Number(m[1]);
+        launchStatPolls++;
+        return \`\${launchedCustodianPid} \${Q} S\`;
+      }
+      return origRead.call(this, file, ...args);
+    };
+    syncBuiltinESMExports();
+    let launchErr = "";
+    try {
+      seat.launchSeat({
+        root: launchRoot,
+        id: launchId,
+        name: "malformed-pidlive",
+        spec: { command: process.execPath, args: ["-e", "process.exit(0)"], env: { PATH: process.env.PATH ?? "" } },
+        cwd: process.cwd(),
+      });
+    } catch (e) {
+      launchErr = e.message;
+    } finally {
+      delete process.env.COTAL_RUN;
+      fs.readFileSync = origRead;
+      syncBuiltinESMExports();
+      if (launchedCustodianPid > 0) {
+        try { process.kill(-launchedCustodianPid, "SIGKILL"); } catch {}
+        try { process.kill(launchedCustodianPid, "SIGKILL"); } catch {}
+        try {
+          const rec = JSON.parse(fs.readFileSync(launchRecFile, "utf8"));
+          if (rec.childPid > 0) try { process.kill(-rec.childPid, "SIGKILL"); } catch {}
+        } catch {}
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      fs.rmSync(path.dirname(launchRecFile), { recursive: true, force: true });
+    }
+    assert.equal(launchStatPolls, 1);
+    assert.match(launchErr, /custodian exited before ready/);
+  } finally {
+    fs.readFileSync = origRead;
+    syncBuiltinESMExports();
+    fs.rmSync(reapRoot, { recursive: true, force: true });
+  }
+
+  const after = observe();
+  assert.equal(after.token, expectedToken);
+  assert.equal(after.verdict, "live");
+  assert.equal(after.runMarker, "probe-3152-real");
+} finally {
+  try { real.kill("SIGKILL"); } catch {}
+  try { decoy.kill("SIGKILL"); } catch {}
+}
+`,
+    );
+    const probeRun = spawnSync(process.execPath, [probeScript], {
+      encoding: "utf8",
+      timeout: 15_000,
+      env: { PATH: process.env.PATH ?? "", COTAL_RUN: "probe-3152-real" },
+    });
+    check(
+      "stat parser: comm with ') ' parses cleanly and malformed stat lines never shift into a decoy pid",
+      probeRun.status === 0 && probeRun.signal === null,
+      { status: probeRun.status, signal: probeRun.signal, stderr: probeRun.stderr },
     );
   }
 } finally {

@@ -39,7 +39,8 @@
  *     the disk says several tenants (or an unreadable one) exist.
  */
 import { strict as assert } from "node:assert";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 
@@ -52,8 +53,8 @@ const { createBrokerAuth, createSpaceAccountAuth, createSpaceAuth, composeSpaceA
 const {
   accountInventory, assertSingleSpaceBroker, authDir, agentCredsRoot, brokerAuthPath, hasUserAuthState,
   isWorkspaceTargetError, listSpaceAccounts, loadMeshes, loadSpaceAccountAuth, loadSpaceAuth, localProcessPath,
-  recordMesh, removeMesh, resolveMeshTarget, saveBrokerAuth, saveSpaceAccountAuth, soleSpaceOf, spaceAccountPath,
-  spaceKey, userAuthSpacesOnDisk, userAuthStateDir,
+  reclaimDeadPreUpgradeRecord, recordMesh, removeMesh, resolveMeshTarget, saveBrokerAuth, saveSpaceAccountAuth, soleSpaceOf, spaceAccountPath,
+  spaceKey, userAuthSpacesOnDisk, userAuthStateDir, workspaceErrorParts,
 } = await import("@cotal-ai/workspace");
 const { down } = await import("../src/commands/down.js");
 const { clean } = await import("../src/commands/clean.js");
@@ -123,6 +124,53 @@ try {
   mkdirSync(userAuthStateDir(solo, "halfspace"), { recursive: true });
   check("an empty state dir (crashed enable) is NOT user-auth", hasUserAuthState(solo, "halfspace") === false);
   for (const space of ["alpha", "beta"]) check(`…and neither is "${space}" on the multi-space root`, hasUserAuthState(multi, space) === false);
+
+  console.log("\n3a) user-auth markers describe entries, not symlink targets");
+  const markerChecksStart = pass;
+  for (const pin of ["idp.json", "callout.json"]) {
+    const markerRoot = mkdtempSync(join(tmpdir(), "cotal-marker-"));
+    roots.push(markerRoot);
+    const state = userAuthStateDir(markerRoot, "marker");
+    mkdirSync(state, { recursive: true });
+    const marker = join(state, pin);
+    const markerState = (label: string, expected: boolean) => {
+      check(`${pin}: ${label} has the expected user-auth marker`, hasUserAuthState(markerRoot, "marker") === expected);
+      check(`${pin}: ${label} has the expected user-auth inventory`,
+        userAuthSpacesOnDisk(authDir(markerRoot)).join(",") === (expected ? "marker" : ""));
+    };
+    markerState("absent pin", false);
+    writeFileSync(marker, "{}");
+    markerState("regular pin", true);
+    rmSync(marker);
+    mkdirSync(marker);
+    markerState("directory at pin name", false);
+    rmSync(marker, { recursive: true });
+    const outside = join(markerRoot, "outside.json");
+    writeFileSync(outside, "{}");
+    symlinkSync(outside, marker);
+    markerState("symlink to a file outside the state dir", false);
+    const otherPin = join(state, pin === "idp.json" ? "callout.json" : "idp.json");
+    writeFileSync(otherPin, "{}");
+    markerState("symlink beside a regular provider pin", true);
+    rmSync(otherPin);
+    rmSync(marker);
+    symlinkSync(markerRoot, marker, "dir");
+    markerState("symlink to a directory", false);
+    rmSync(marker);
+    symlinkSync(join(markerRoot, "missing.json"), marker);
+    markerState("dangling symlink", false);
+    rmSync(marker);
+    symlinkSync(marker, marker);
+    markerState("self-referential symlink", false);
+    rmSync(marker);
+    writeFileSync(marker, "{}");
+    const outsideState = join(markerRoot, "outside-state");
+    renameSync(state, outsideState);
+    symlinkSync(outsideState, state, "dir");
+    markerState("symlinked state directory holding a regular pin", false);
+  }
+
+  check("all 36 provider-marker matrix assertions ran", pass - markerChecksStart === 36);
 
   console.log("\n4) an unreadable account record makes the guard refuse (fail-closed), never undercount");
   const corrupt = await makeRoot("corrupt", ["one"]);
@@ -227,6 +275,35 @@ try {
   writeFileSync(join(home, "meshes", "legacyname.json"), JSON.stringify(meshEntry("legacyname")));
   removeMesh("legacyname");
   check("removeMesh removes canonical AND pre-hex forms (no resurrection)", !loadMeshes().some((m) => m.space === "legacyname"));
+  if (process.platform !== "win32" && process.getuid?.() !== 0) {
+    writeFileSync(join(home, "meshes", "legacyname.json"), JSON.stringify(meshEntry("legacyname")));
+    chmodSync(join(home, "meshes"), 0o311); // traversable for the unlink, not listable for the sweep
+    const sweepMsg = await refusal(() => removeMesh("legacyname"));
+    chmodSync(join(home, "meshes"), 0o700);
+    check("removeMesh THROWS when the pre-hex sweep cannot list the registry", sweepMsg.includes("EACCES"), sweepMsg);
+    removeMesh("legacyname");
+  }
+  // A pre-hex record the sweep parsed but cannot unlink: the removal must fail rather than return
+  // with the record left to list the mesh again. The refusal is injected on that one path only.
+  const pinned = join(home, "meshes", "legacyname.json");
+  writeFileSync(pinned, JSON.stringify(meshEntry("legacyname")));
+  const realRm = fs.rmSync;
+  fs.rmSync = ((target: Parameters<typeof fs.rmSync>[0], options?: Parameters<typeof fs.rmSync>[1]) => {
+    if (String(target) === pinned) throw Object.assign(new Error(`EBUSY: resource busy or locked, unlink '${pinned}'`), { code: "EBUSY" });
+    return realRm(target, options);
+  }) as typeof fs.rmSync;
+  syncBuiltinESMExports();
+  let unlinkMsg: string;
+  try {
+    unlinkMsg = await refusal(() => removeMesh("legacyname"));
+  } finally {
+    fs.rmSync = realRm;
+    syncBuiltinESMExports();
+  }
+  check("removeMesh THROWS when a parsed pre-hex record cannot be unlinked, naming it (the mesh is still listed)",
+    unlinkMsg.includes(pinned) && unlinkMsg.includes("EBUSY") && loadMeshes().some((m) => m.space === "legacyname"), unlinkMsg);
+  removeMesh("legacyname");
+  check("with the unlink allowed again, the same removal completes", !loadMeshes().some((m) => m.space === "legacyname") && !existsSync(pinned));
   for (const s of ["gamma", "Gamma"]) removeMesh(s);
 
   if (process.platform !== "win32" && process.getuid?.() !== 0) {
@@ -238,8 +315,10 @@ try {
     writeFileSync(join(eaDir, "idp.json"), "{}");
     chmodSync(eaDir, 0o000);
     const eaMsg = await refusal(() => hasUserAuthState(ea, "solo3"));
+    const inventoryMsg = await refusal(() => userAuthSpacesOnDisk(authDir(ea)));
     chmodSync(eaDir, 0o700);
     check("an EACCES on the pin THROWS (never reads as static mode)", eaMsg.includes("EACCES"), eaMsg);
+    check("an EACCES on the pin THROWS during inventory", inventoryMsg.includes("EACCES"), inventoryMsg);
     check("…and reads user-auth again once readable", hasUserAuthState(ea, "solo3") === true);
   } else {
     console.log("\n11) (skipped: chmod-000 semantics need a non-root POSIX runner)");
@@ -534,20 +613,82 @@ try {
     chmodSync(authDir(unreadable), 0o700);
     check("an unreadable .cotal/auth resolves to a typed unreadable-auth, not a raw EACCES",
       isWorkspaceTargetError(unreadErr) && (unreadErr as { code: string }).code === "unreadable-auth", (unreadErr as Error)?.message);
+    const authRemedy = isWorkspaceTargetError(unreadErr) ? workspaceErrorParts({ kind: "target", error: unreadErr }).remedy ?? "" : "";
+    check("…whose next step names .cotal/auth itself, the folder this account cannot read or enter",
+      authRemedy.includes(`make ${authDir(unreadable)} a folder this account can read and enter, `) && authRemedy.includes("--space <name>"), authRemedy);
+
+    // A `.cotal` this account cannot enter hides `.cotal/auth` from `existsSync`. Read as absent, the
+    // inventory found no tenants, the legacy record's EACCES became a corrupt `auth.json`, and every
+    // read here refused as an ambiguity with no candidates: "multiple meshes running: ".
+    const cotal = join(unreadable, ".cotal");
+    chmodSync(cotal, 0o000);
+    let invErr: unknown, localErr: unknown, serverErr: unknown;
+    try { accountInventory(authDir(unreadable)); } catch (e) { invErr = e; }
+    try { resolveMeshTarget(unreadable, {}); } catch (e) { localErr = e; }
+    try { resolveMeshTarget(unreadable, { server: "nats://127.0.0.1:4999" }); } catch (e) { serverErr = e; }
+    chmodSync(cotal, 0o700);
+    check("the inventory of an auth dir behind a .cotal it cannot enter throws EACCES, never reads as absent",
+      (invErr as NodeJS.ErrnoException | undefined)?.code === "EACCES", (invErr as Error)?.message);
+    for (const [how, err] of [["local", localErr], ["--server", serverErr]] as const) {
+      const rendered = isWorkspaceTargetError(err) ? workspaceErrorParts({ kind: "target", error: err }) : undefined;
+      check(`a ${how} target behind a .cotal it cannot enter is unreadable-auth naming the root, not an empty ambiguity`,
+        isWorkspaceTargetError(err) && err.code === "unreadable-auth" && rendered !== undefined &&
+          rendered.message.includes(unreadable) && rendered.message.includes("EACCES") && !rendered.message.includes("multiple meshes") &&
+          !rendered.message.includes("undefined") && (rendered.remedy ?? "").includes("--space <name>"), rendered ?? (err as Error)?.message);
+      // The account cannot enter `.cotal`, so making `.cotal/auth` readable is not a step it can take.
+      check(`…and its next step names the ${how} .cotal it cannot enter, not .cotal/auth`,
+        (rendered?.remedy ?? "").includes(`this account cannot enter ${cotal}, `) && !(rendered?.remedy ?? "").includes(authDir(unreadable)), rendered?.remedy);
+    }
+
+    // A `.cotal/auth` at 0600 lists its names but opens no record, so the missing `auth.json` fails
+    // its stat on permission. That is the folder's mode, not a record that will not load.
+    const listable = await makeRoot("listable", []);
+    roots.push(listable);
+    chmodSync(authDir(listable), 0o600);
+    const listErrs: [string, unknown][] = [];
+    for (const [how, flags] of [["local", {}], ["--server", { server: "nats://127.0.0.1:4999" }]] as const) {
+      try { resolveMeshTarget(listable, flags); } catch (e) { listErrs.push([how, e]); }
+    }
+    chmodSync(authDir(listable), 0o700);
+    for (const [how, err] of listErrs) {
+      const rendered = isWorkspaceTargetError(err) ? workspaceErrorParts({ kind: "target", error: err }) : undefined;
+      check(`a ${how} target whose .cotal/auth lists but cannot be searched is refused as unreadable, naming no record`,
+        isWorkspaceTargetError(err) && err.code === "unreadable-auth" && err.details.records === undefined && rendered !== undefined &&
+          !rendered.message.includes("will not load") && (rendered.remedy ?? "").includes(`make ${authDir(listable)} a folder this account can read and enter, `), rendered ?? (err as Error)?.message);
+    }
+    check("…and both the local and the --server target refused", listErrs.length === 2, listErrs.length);
   } else {
     check("unreadable-auth-dir resolver check skipped (needs a non-root POSIX runner)", true);
   }
 
-  console.log("\n24) the REAL reclaimDeadLegacyPid: dead/empty reclaimed, but garbled or LIVE legacy fails loud (never orphan an unattributable signer)");
-  // A pre-upgrade crash leaves `auth-service.<encoded>.pid`. readPidPath admits it, so a fresh start
-  // that claimed canonical WITHOUT reclaiming a dead legacy would leave BOTH files → every later
-  // authServiceUp/down throws ambiguous. reclaimDeadLegacyPid runs at the top of the start; it must
-  // reclaim only what the canonical claim would (empty, or a positive PID proven dead) and NEVER
-  // steal an unattributable record (garbled content, or a still-live legacy) - that is the live
-  // pre-hex signer this path exists not to orphan. Exercises the PRODUCTION helper directly.
-  const { authServiceUp: authUp, claimAuthPidSlot, reclaimDeadLegacyPid } = await import("../src/lib/auth-proc.js");
+  console.log("\n23b) an account record that will not load is refused by path, not as several running meshes");
+  // A readable `auth.json` or account record that is not JSON used to count as a corrupt tenant, and
+  // the resolver refused as an ambiguity with no candidates: "multiple meshes running: ".
+  for (const [label, file] of [["corrupt-legacy", "auth.json"], ["corrupt-account", `account.${spaceKey("cc")}.json`]] as const) {
+    const root = await makeRoot(label, []);
+    roots.push(root);
+    const record = join(authDir(root), file);
+    writeFileSync(record, "not json");
+    for (const [how, flags] of [["local", {}], ["--server", { server: "nats://127.0.0.1:4999" }]] as const) {
+      let err: unknown;
+      try { resolveMeshTarget(root, flags); } catch (e) { err = e; }
+      const rendered = isWorkspaceTargetError(err) ? workspaceErrorParts({ kind: "target", error: err }) : undefined;
+      check(`a ${how} target whose ${file} will not load is unreadable-auth naming that record, not an empty ambiguity`,
+        isWorkspaceTargetError(err) && err.code === "unreadable-auth" && rendered !== undefined &&
+          rendered.message.includes(`(${record})`) && !rendered.message.includes("multiple meshes") &&
+          (rendered.remedy ?? "").includes("repair or remove that record") && (rendered.remedy ?? "").includes("--space <name>"), rendered ?? (err as Error)?.message);
+    }
+    check(`…and the refused ${file} is left as it was`, readFileSync(record, "utf8") === "not json");
+  }
+
+  console.log("\n24) the shared auth-record reclaim: dead/empty reclaimed, but garbled or LIVE legacy fails loud");
+  // A pre-upgrade crash leaves `auth-service.<encoded>.pid`. The start uses the shared reclaim on
+  // the registered auth template before claiming the canonical slot. Only an empty or proven-dead
+  // record may be removed; an unattributable or live holder must survive the refusal.
+  const { AUTH_PROCESS, authServiceUp: authUp, claimAuthPidSlot } = await import("../src/lib/auth-proc.js");
   const wedge = await makeRoot("wedge", []);
   roots.push(wedge);
+  const reclaim = (space: string) => reclaimDeadPreUpgradeRecord(AUTH_PROCESS.pidFile, { root: wedge, space });
   const prevCwd = process.cwd();
   process.chdir(wedge); // cotalPath resolves under findCotalRoot(cwd)
   try {
@@ -564,21 +705,21 @@ try {
     check("authServiceUp reads an EMPTY pre-hex pidfile as DOWN (0 is not a positive pid), so it reaches the reclaimer",
       authUp("emptyup") === false);
     rmSync(legacyPidPath("emptyup"), { force: true });
-    reclaimDeadLegacyPid("dead"); // the real production call
-    check("reclaimDeadLegacyPid removed the DEAD legacy pidfile", !existsSync(legacyPidPath("dead")));
+    reclaim("dead"); // the real production call
+    check("reclaim removed the DEAD legacy pidfile", !existsSync(legacyPidPath("dead")));
     const slot = claimAuthPidSlot("dead");
     check("…so the canonical claim yields exactly ONE record, no wedge", slot !== undefined && "fd" in slot && authPids().length === 1 && authPids()[0] === `auth-service.${spaceKey("dead")}.pid`, authPids());
     rmSync(join(dot, `auth-service.${spaceKey("dead")}.pid`), { force: true });
 
     // (b) EMPTY legacy (pre-protocol husk) → reclaimed.
     writeFileSync(legacyPidPath("empty"), "");
-    reclaimDeadLegacyPid("empty");
+    reclaim("empty");
     check("an EMPTY legacy pidfile is reclaimed (pre-protocol husk)", !existsSync(legacyPidPath("empty")));
 
     // (c) GARBLED legacy → NEVER stolen; reclaim throws, the file survives (start aborts loud).
     writeFileSync(legacyPidPath("garbled"), "not-a-pid");
     check("a GARBLED legacy pidfile makes reclaim THROW (unattributable, never stolen)",
-      (await refusal(() => reclaimDeadLegacyPid("garbled"))).includes("unattributable"));
+      (await refusal(() => reclaim("garbled"))).includes("unattributable"));
     check("…and the garbled record is LEFT in place (no delete, no competing start)", existsSync(legacyPidPath("garbled")));
     // Every value the kernel cannot map to a signalable process must REFUSE, never be misread as
     // "proven dead" and reclaimed: non-positive, fractional, and syntactic garbage are caught by the
@@ -587,7 +728,7 @@ try {
     // UNKNOWN and reclaim refuses ("cannot determine"). Only a clean ESRCH is dead.
     for (const bad of ["0", "-5", "1.5", "9007199254740992", " 12 x", "abc", "2147483648"]) {
       writeFileSync(legacyPidPath("garbled"), bad);
-      const msg = await refusal(() => reclaimDeadLegacyPid("garbled"));
+      const msg = await refusal(() => reclaim("garbled"));
       check(`a kernel-unsignalable legacy pid ${JSON.stringify(bad)} → reclaim REFUSES, file kept (never misread as dead)`,
         msg !== "" && (msg.includes("unattributable") || msg.includes("cannot determine")) && existsSync(legacyPidPath("garbled")), msg);
     }
@@ -596,7 +737,7 @@ try {
     // (d) LIVE legacy (our own pid) → reclaim refuses to start a second, and does NOT delete it.
     writeFileSync(legacyPidPath("live"), String(process.pid));
     check("a LIVE pre-hex legacy makes reclaim THROW (refuse to start a second signer)",
-      (await refusal(() => reclaimDeadLegacyPid("live"))).includes("already running"));
+      (await refusal(() => reclaim("live"))).includes("already running"));
     check("…and the live record is LEFT untouched (never orphan the running signer)", existsSync(legacyPidPath("live")));
     rmSync(legacyPidPath("live"), { force: true });
 
@@ -608,7 +749,7 @@ try {
     if (initIsEperm) {
       writeFileSync(legacyPidPath("eperm"), "1");
       check("an EPERM (live-but-unsignalable) legacy pid reads ALIVE → reclaim THROWS, record kept (no orphan)",
-        (await refusal(() => reclaimDeadLegacyPid("eperm"))).includes("already running") && existsSync(legacyPidPath("eperm")));
+        (await refusal(() => reclaim("eperm"))).includes("already running") && existsSync(legacyPidPath("eperm")));
       rmSync(legacyPidPath("eperm"), { force: true });
     } else {
       check("EPERM-live-pid reclaim check skipped (pid 1 is not EPERM on this runner)", true);
@@ -620,11 +761,11 @@ try {
     const hexStop = join(dot, `auth-service.${spaceKey("stopg")}.pid`);
     writeFileSync(hexStop, "not-a-pid");
     check("stopAuthService THROWS on a garbled record (never silently drops an unattributable signer)",
-      (await refusal(() => stopAuthService("stopg"))).includes("unattributable"));
+      (await refusal(() => stopAuthService("stopg"))).includes("names no process"));
     check("…and leaves the garbled record in place for manual inspection", existsSync(hexStop));
     writeFileSync(hexStop, "0");
     check("stopAuthService also refuses pid 0 (would signal the whole process group)",
-      (await refusal(() => stopAuthService("stopg"))).includes("unattributable") && existsSync(hexStop));
+      (await refusal(() => stopAuthService("stopg"))).includes("names no process") && existsSync(hexStop));
     rmSync(hexStop, { force: true });
     writeFileSync(hexStop, ""); // empty husk is safe to clear (nothing to signal)
     await stopAuthService("stopg");
@@ -638,16 +779,15 @@ try {
   // also runs, so the same attribution contract must hold there or a real `down` orphans a live
   // signer behind a torn pidfile at exit 0. Drive stopLocalProcess directly on the auth descriptor.
   const { stopLocalProcess } = await import("../src/lib/local-process-stop.js");
-  const authComponent = { kind: "local-process" as const, name: "auth", label: "user-auth service", pidFile: "auth-service.{space}.pid" };
   const dpRoot = await makeRoot("downpath", []);
   roots.push(dpRoot);
   const dpCtx = { root: dpRoot, space: "dp25", userAuth: true };
   const dpPid = join(authDir(dpRoot), "..", `auth-service.${spaceKey("dp25")}.pid`);
   for (const bad of ["not-a-pid", "1.5", "2147483648", "0", "-5"]) {
     writeFileSync(dpPid, bad);
-    const msg = await refusal(() => stopLocalProcess(authComponent as never, dpCtx as never));
+    const msg = await refusal(() => stopLocalProcess(AUTH_PROCESS, dpCtx));
     check(`down/stopLocalProcess REFUSES an unattributable auth pidfile ${JSON.stringify(bad)} and PRESERVES it (no clean-report orphan)`,
-      msg.includes("unattributable") && existsSync(dpPid), { msg, kept: existsSync(dpPid) });
+      msg.includes("names no process") && existsSync(dpPid), { msg, kept: existsSync(dpPid) });
   }
   // An UNKNOWN probe result (a valid pid whose kill throws a non-ESRCH/non-EPERM error, e.g. EIO)
   // is NOT dead: stop must fail loud + preserve, never report the process gone and delete its
@@ -662,7 +802,7 @@ try {
       if (p === UNKNOWN_PID) { const err = new Error("EIO") as NodeJS.ErrnoException; err.code = "EIO"; throw err; }
       return realKill(p, sig as never);
     }) as typeof process.kill;
-    unkMsg = await refusal(() => stopLocalProcess(authComponent as never, dpCtx as never));
+    unkMsg = await refusal(() => stopLocalProcess(AUTH_PROCESS, dpCtx));
   } finally {
     (process as unknown as { kill: typeof process.kill }).kill = realKill;
   }
@@ -676,13 +816,13 @@ try {
   rmSync(dpPid, { force: true });
 
   writeFileSync(dpPid, ""); // empty husk: safe to clear
-  await stopLocalProcess(authComponent as never, dpCtx as never);
+  await stopLocalProcess(AUTH_PROCESS, dpCtx);
   check("down/stopLocalProcess CLEARS an empty husk (no process behind it)", !existsSync(dpPid));
   // Over-refusal negative: a valid pid PROVEN dead (ESRCH) still clears normally - the contract
   // refuses UNATTRIBUTABLE/UNKNOWN records, it does not break the ordinary stop of a gone process.
   writeFileSync(dpPid, "999999");
   check("down/stopLocalProcess still CLEARS a valid ESRCH-dead pid (normal stop, no over-refusal)",
-    (await stopLocalProcess(authComponent as never, dpCtx as never)) === true && !existsSync(dpPid));
+    (await stopLocalProcess(AUTH_PROCESS, dpCtx)) === true && !existsSync(dpPid));
 
   // The stop-MARKER (`.stopping`) mutual-exclusion reservation. The ATOMIC publish (temp+link) means
   // a LIVE `down` holding the marker always wrote its own POSITIVE pid - a live holder is never
@@ -694,7 +834,7 @@ try {
   const marker = `${dpPid}.stopping`;
   writeFileSync(dpPid, "999999");
   writeFileSync(marker, String(process.pid)); // a LIVE holder's reservation
-  const liveMarkerMsg = await refusal(() => stopLocalProcess(authComponent as never, dpCtx as never));
+  const liveMarkerMsg = await refusal(() => stopLocalProcess(AUTH_PROCESS, dpCtx));
   check("stop-marker with a LIVE owner is NOT reclaimed (mutual exclusion holds)",
     liveMarkerMsg.includes("already being stopped") && existsSync(marker) && existsSync(dpPid), { liveMarkerMsg });
   rmSync(marker, { force: true });
@@ -702,82 +842,132 @@ try {
     writeFileSync(dpPid, "999999");
     writeFileSync(marker, stale); // stale/unattributable reservation, cannot be a live holder
     check(`a stale ${stale === "999999" ? "ESRCH-dead" : stale === "" ? "EMPTY" : JSON.stringify(stale)} marker is reclaimed and the stop proceeds (crashed `+"`down`"+` never wedges the next)`,
-      (await stopLocalProcess(authComponent as never, dpCtx as never)) === true && !existsSync(marker) && !existsSync(dpPid));
+      (await stopLocalProcess(AUTH_PROCESS, dpCtx)) === true && !existsSync(marker) && !existsSync(dpPid));
   }
 
-  console.log("\n26) the PRE-STOP `stopLast` dependant guard fails CLOSED on an unattributable dependant (mayBeRunning)");
-  // `cotal down nats` (nats = stopLast) must NOT stop the broker while an unselected dependant (the
-  // auth signer) may be running - including behind a torn/unattributable pidfile. `processAlive`
-  // collapsed unparsable/unknown to "not running" and let `down nats` orphan a live signer; the
-  // guard now uses `mayBeRunning`, which fails closed on uncertainty.
+  // An extension-removal reservation (`removing:<pid>`): `ext remove` always records its own
+  // positive pid, so a live owner reports removal in progress, a dead or non-pid owner is stale,
+  // and an owner whose liveness the kernel will not confirm (`unknown`) refuses without calling the
+  // reservation stale or advising deletion (#3352).
+  writeFileSync(dpPid, `removing:${process.pid}`);
+  const liveRemovalMsg = await refusal(() => stopLocalProcess(AUTH_PROCESS, dpCtx));
+  check("removing:<live pid> refuses as an extension removal in progress and preserves the reservation",
+    liveRemovalMsg === `auth extension removal is in progress (pid ${process.pid})` && readFileSync(dpPid, "utf8") === `removing:${process.pid}`,
+    { liveRemovalMsg });
+  writeFileSync(dpPid, `removing:${UNKNOWN_PID}`);
+  let unkRemovalMsg: string;
+  try {
+    (process as unknown as { kill: typeof process.kill }).kill = ((p: number, sig?: string | number) => {
+      if (p === UNKNOWN_PID) { const err = new Error("EACCES") as NodeJS.ErrnoException; err.code = "EACCES"; throw err; }
+      return realKill(p, sig as never);
+    }) as typeof process.kill;
+    unkRemovalMsg = await refusal(() => stopLocalProcess(AUTH_PROCESS, dpCtx));
+  } finally {
+    (process as unknown as { kill: typeof process.kill }).kill = realKill;
+  }
+  check("removing:<unknown-liveness pid> refuses naming the pid and unconfirmed liveness without calling it stale or advising removal",
+    unkRemovalMsg.includes(`(pid ${UNKNOWN_PID})`)
+      && unkRemovalMsg.includes("whose liveness could not be confirmed")
+      && !/stale|remove/i.test(unkRemovalMsg)
+      && readFileSync(dpPid, "utf8") === `removing:${UNKNOWN_PID}`,
+    { unkRemovalMsg });
+  for (const staleRemoval of ["removing:999999", "removing:", "removing:not-a-pid", "removing:0", "removing:-5"]) {
+    writeFileSync(dpPid, staleRemoval);
+    const staleRemovalMsg = await refusal(() => stopLocalProcess(AUTH_PROCESS, dpCtx));
+    check(`${JSON.stringify(staleRemoval)} is reported as a stale extension-removal reservation and preserved`,
+      staleRemovalMsg.includes("has a stale extension-removal reservation") && readFileSync(dpPid, "utf8") === staleRemoval,
+      { staleRemoval, staleRemovalMsg });
+  }
+  rmSync(dpPid, { force: true });
+
+  console.log("\n26) mayBeRunning fails CLOSED on an unattributable record, and a named `down nats` leaves it alone");
+  // `mayBeRunning` is the liveness question `down --preserve-state` asks before it fences a daemon or
+  // calls a cut complete, so it must fail closed on a torn/unattributable pidfile. `processAlive`
+  // collapses unparsable/unknown to "not running", which would count a live auth signer as stopped.
   const { mayBeRunning, down: downCmd } = await import("../src/commands/down.js");
   const { resolveSpace: resolveDpSpace } = await import("../src/lib/status.js");
   const guardRoot = await makeRoot("stoplast", ["downtenant"]);
   roots.push(guardRoot);
   const guardSpace = resolveDpSpace(guardRoot);
-  const authComp = { kind: "local-process" as const, name: "auth", label: "user-auth service", pidFile: "auth-service.{space}.pid" };
   const guardCtx = { root: guardRoot, space: guardSpace, userAuth: true };
   const authPidAt = join(guardRoot, ".cotal", `auth-service.${spaceKey(guardSpace)}.pid`);
   // mayBeRunning contract, directly:
-  check("mayBeRunning: absent pidfile ⇒ false", mayBeRunning(authComp as never, guardCtx as never) === false);
+  check("mayBeRunning: absent pidfile ⇒ false", mayBeRunning(AUTH_PROCESS, guardCtx) === false);
   for (const bad of ["not-a-pid", "1.5", "2147483648"]) {
     writeFileSync(authPidAt, bad);
-    check(`mayBeRunning: unattributable ${JSON.stringify(bad)} ⇒ TRUE (fail-closed, may be running)`, mayBeRunning(authComp as never, guardCtx as never) === true);
+    check(`mayBeRunning: unattributable ${JSON.stringify(bad)} ⇒ TRUE (fail-closed, may be running)`, mayBeRunning(AUTH_PROCESS, guardCtx) === true);
   }
   writeFileSync(authPidAt, "999999");
-  check("mayBeRunning: ESRCH-dead pid ⇒ false (provably gone)", mayBeRunning(authComp as never, guardCtx as never) === false);
+  check("mayBeRunning: ESRCH-dead pid ⇒ false (provably gone)", mayBeRunning(AUTH_PROCESS, guardCtx) === false);
   writeFileSync(authPidAt, "");
-  check("mayBeRunning: empty husk ⇒ false", mayBeRunning(authComp as never, guardCtx as never) === false);
+  check("mayBeRunning: empty husk ⇒ false", mayBeRunning(AUTH_PROCESS, guardCtx) === false);
   writeFileSync(authPidAt, String(process.pid));
-  check("mayBeRunning: a LIVE pid ⇒ true", mayBeRunning(authComp as never, guardCtx as never) === true);
-  // The REAL command path: `cotal down nats` with an unattributable live-ish auth dependant must
-  // REFUSE (stop-last guard) and stop nothing.
-  // The REAL command path: `cotal down nats` with an unattributable auth dependant must throw the
-  // stop-last guard (before any teardown) and stop nothing. (The over-refusal negative - a dead/empty
-  // dependant does NOT block - is covered by the mayBeRunning-direct checks above, which is the exact
-  // predicate the guard filters on; driving the full `down` past the guard would hit its unrelated
-  // "nothing running" teardown path.)
+  check("mayBeRunning: a LIVE pid ⇒ true", mayBeRunning(AUTH_PROCESS, guardCtx) === true);
+  // The REAL command path: `cotal down nats` is a named down, so a service stop. It resolves a saved
+  // service definition and never a component's pidfile (docs/cli.mdx, `down`), so with none saved it
+  // refuses before any teardown and leaves the unattributable auth record as it was.
   const prevCwd26 = process.cwd();
   const prevExit = process.exitCode;
   process.chdir(guardRoot);
   try {
     for (const bad of ["not-a-pid", "1.5", "2147483648"]) {
       writeFileSync(authPidAt, bad);
-      const msg = await refusal(() => downCmd({ positionals: ["nats"], values: {} } as never));
-      check(`real \`cotal down nats\` REFUSES while the auth dependant is unattributable ${JSON.stringify(bad)} (guard throws before any teardown; record preserved)`,
-        msg.includes("still running") && existsSync(authPidAt), { msg, kept: existsSync(authPidAt) });
+      let refused: { code?: string; message?: string } | undefined;
+      try { await downCmd({ positionals: ["nats"], values: {} } as never); } catch (e) { refused = e as { code?: string; message?: string }; }
+      check(`real \`cotal down nats\` is a service stop: TARGET_NOT_FOUND, and the unattributable auth record ${JSON.stringify(bad)} is kept`,
+        refused?.code === "TARGET_NOT_FOUND" && existsSync(authPidAt) && readFileSync(authPidAt, "utf8") === bad, { msg: refused?.message, kept: existsSync(authPidAt) });
     }
   } finally {
     process.chdir(prevCwd26);
-    process.exitCode = prevExit; // the guard throw never sets exitCode, but stay defensive
+    process.exitCode = prevExit; // the refusal never sets exitCode, but stay defensive
   }
 
   console.log("\n27) `doctor auth` on a multi-space root: loud refusal bare, actionable with --space, no false-healthy on a typo");
   const { doctor: doctorCmd } = await import("../src/commands/doctor.js");
+  const { exitCode: outcomeExit, isCommandFailure } = await import("@cotal-ai/workspace");
   const docRoot = await makeRoot("doctor", ["doca", "docb"]);
   roots.push(docRoot);
-  const runDoc = async (values: Record<string, unknown>): Promise<{ out: string; code: number | undefined }> => {
+  type DoctorEnvelope = { target: { space?: string | null }; result: { space?: string; mode?: string } };
+  type DoctorRefusal = { outcome: string; code: string; message: string; remedy?: string; target: unknown };
+  // doctor writes one envelope with --json, and refuses by throwing the failure the command kernel
+  // exits with, so a run records the envelope or the refusal, and the exit code either way.
+  const runDoc = async (values: Record<string, unknown>): Promise<{ out: string; envelope?: DoctorEnvelope; failure?: DoctorRefusal; code: number | undefined }> => {
+    const written: string[] = [];
     const lines: string[] = [];
-    const oL = console.log, oE = console.error;
+    const oW = process.stdout.write, oL = console.log, oE = console.error;
+    process.stdout.write = ((chunk: string | Uint8Array) => (written.push(String(chunk)), true)) as typeof process.stdout.write;
     console.log = (...a: unknown[]) => { lines.push(a.join(" ")); };
     console.error = (...a: unknown[]) => { lines.push(a.join(" ")); };
     const oX = process.exitCode;
     process.exitCode = undefined;
     try {
       await doctorCmd({ positionals: ["auth"], values, raw: [] } as never);
-      return { out: lines.join("\n"), code: process.exitCode as number | undefined };
-    } finally { console.log = oL; console.error = oE; process.exitCode = oX; }
+      return { out: [...written, ...lines].join("\n"), ...(values.json ? { envelope: JSON.parse(written.join("")) as DoctorEnvelope } : {}), code: process.exitCode as number | undefined };
+    } catch (e) {
+      if (!isCommandFailure(e)) throw e;
+      return { out: [...written, ...lines].join("\n"), failure: e, code: outcomeExit(e.outcome, e.code) };
+    } finally { process.stdout.write = oW; console.log = oL; console.error = oE; process.exitCode = oX; }
   };
   const prevCwd27 = process.cwd();
   process.chdir(docRoot);
   try {
-    const bare = await refusal(() => doctorCmd({ positionals: ["auth"], values: {}, raw: [] } as never));
-    check("bare doctor on 2 tenants refuses naming both (and --space makes the advice actionable)", bare.includes("2 spaces"), bare);
-    const explicit = await runDoc({ space: "doca" });
-    check("doctor --space <tenant> diagnoses that tenant", explicit.out.includes("space doca"), explicit);
-    check("…and the signer line names the tenant's split account file", explicit.out.includes(spaceAccountPath(authDir(docRoot), "doca")), explicit.out);
+    const bare = await runDoc({});
+    const bareRefusal = bare.failure;
+    check("bare doctor on 2 tenants refuses naming both (and --space makes the advice actionable)",
+      bareRefusal?.outcome === "refused" && bareRefusal.code === "TARGET_AMBIGUOUS" && bare.code === 2 && bareRefusal.message.includes("2 spaces") &&
+        ["doca", "docb"].every((space) => bareRefusal.message.includes(space)) && bareRefusal.remedy?.includes("--space") === true,
+      { failure: bareRefusal && { code: bareRefusal.code, message: bareRefusal.message, remedy: bareRefusal.remedy }, out: bare.out });
+    const explicit = await runDoc({ space: "doca", json: true });
+    check("doctor --space <tenant> diagnoses that tenant", explicit.failure === undefined && explicit.envelope?.target.space === "doca" && explicit.envelope.result.space === "doca", { failure: explicit.failure?.message, out: explicit.out });
+    // The report no longer prints a signer path; the split record is the only trust doca has here,
+    // so a static diagnosis of doca read it.
+    check("…and its signing trust is the tenant's split account file",
+      explicit.envelope?.result.mode === "static" && existsSync(spaceAccountPath(authDir(docRoot), "doca")) && !existsSync(join(authDir(docRoot), "auth.json")), { out: explicit.out });
     const typo = await runDoc({ space: "nope" });
-    check("doctor --space <unknown> fails loud, never a false-healthy", typo.code === 1 && !typo.out.includes("healthy") && typo.out.includes("no account record"), typo);
+    check("doctor --space <unknown> fails loud, never a false-healthy",
+      typo.failure?.outcome === "refused" && typo.failure.code === "AUTH_REQUIRED" && typo.code === 2 && (typo.failure.target as { space?: unknown } | null)?.space === "nope" &&
+        !/healthy|No local credential findings/.test(typo.out),
+      { failure: typo.failure && { code: typo.failure.code, message: typo.failure.message, target: typo.failure.target }, out: typo.out });
   } finally {
     process.chdir(prevCwd27);
   }

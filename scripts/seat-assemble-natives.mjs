@@ -1,7 +1,5 @@
 #!/usr/bin/env node
 /**
- * Copy the native linux-x64 and linux-arm64 builder directories (peercred.node and pty.node) into
- * @cotal-ai/seat and refuse anything that is not ELF e_machine 62 plus 183.
  *
  * The PR pack proof, Changesets publish, and snapshot publish all run this
  * script. It does not compile. It does not run `pnpm build`.
@@ -56,6 +54,14 @@ for (const [arch, src] of [
     }
     copyFileSync(from, join(dir, file));
   }
+}
+
+for (const platform of ["darwin", "win32"]) for (const arch of ["x64", "arm64"]) {
+  const src = arg(`--${platform}-${arch}`, `SEAT_NATIVE_${platform.toUpperCase()}_${arch.toUpperCase()}`);
+  if (!src || !existsSync(src)) throw new Error(`@cotal-ai/seat: missing ${platform}-${arch} native builder artifact`);
+  const dir = join(destRoot, `${platform}-${arch}`);
+  mkdirSync(dir, { recursive: true });
+  copyFileSync(src, join(dir, "peercred.node"));
 }
 
 const assert = spawnSync(process.execPath, [join(repo, "packages", "seat", "scripts", "assert-shipped-natives.mjs")], {

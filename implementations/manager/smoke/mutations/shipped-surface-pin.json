@@ -10,11 +10,8 @@
     "Reached suites used to pin 18 while the shipped document served 20. Restating the count is the",
     "defect class: correct the day it is written, wrong after the next served command.",
     "",
-    "M2 restores revision 31 after allowlist-set advances the document to revision 32.",
-    "Revision 31 adds deferred-seat support and attest-gone; the new command needs revision 32.",
-    "The named revision cell runs after the service has published and a generic client has",
-    "resolved the actual shipped document.",
-    "",
+    "M2 keeps revision 51 after the fork's retained-seat, deferred-seat, allowlist and spawn-input validation changes advance the upstream revision 46 surface.",
+    "The named revision cell runs after resolving the actual shipped document over the wire.",
     "M3 re-introduces the module-scope compile (#1323): every CLI invocation paid ~1.8 CPU-seconds",
     "of Ajv work before its verb was read. The mutant reads every pair from the shared lazy table",
     "at import, which compiles them all as the removed eager map did. The contract-vocabulary",
@@ -31,12 +28,11 @@
       "cell": "the resolved surface matches the shipped cluster document"
     },
     {
-      "name": "M2 keep revision 31 after allowlist-set is added",
+      "name": "M2 keep revision 50 after manager-specific fork commands advance the upstream surface",
       "file": "implementations/manager/src/manager-service-contract.ts",
-      "find": "    revision: 32,",
-      "replace": "    revision: 31,",
-      "expectRed": "revision 31 adds deferred seats/attest-gone; revision 32 adds allowlist-set",
-      "cell": "revision 31 adds deferred seats/attest-gone; revision 32 adds allowlist-set"
+      "find": "  return buildClusterDocument(MANAGER_CLUSTER_URN, 51, ROWS);",
+      "replace": "  return buildClusterDocument(MANAGER_CLUSTER_URN, 50, ROWS);",
+      "cell": "persona input validation advances the manager cluster revision and retains upstream and fork commands"
     },
     {
       "name": "M3 compile every contract pair at module scope again",

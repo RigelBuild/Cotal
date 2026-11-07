@@ -16,7 +16,7 @@ process.env.COTAL_HOME = home;
 process.env.COTAL_NO_PROMPT = "1";
 const port = await pickFreePort();
 const store = mkdtempSync(join(tmpdir(), `${SMOKE_BROKER_TOKEN}continue-js-`));
-const { bin } = await resolveNatsServer();
+const { path: bin } = await resolveNatsServer();
 const broker = spawnProcess(bin, ["-a", "127.0.0.1", "-p", String(port), "-js", "-sd", store], { stdio: "ignore" });
 teardownOnSignal(broker, store);
 const server = `nats://127.0.0.1:${port}`;

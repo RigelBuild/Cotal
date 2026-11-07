@@ -120,6 +120,43 @@ if (process.platform !== "linux") {
   }
 
   if (process.platform === "linux") {
+  const HOST_TARGETS = [
+    { platform: "darwin", arch: "x64", machine: 0x01000007 },
+    { platform: "darwin", arch: "arm64", machine: 0x0100000c },
+    { platform: "win32", arch: "x64", machine: 0x8664 },
+    { platform: "win32", arch: "arm64", machine: 0xaa64 },
+  ] as const;
+  const writeHostBinary = (
+    path: string,
+    target: (typeof HOST_TARGETS)[number],
+    machine = target.machine,
+  ): void => {
+    mkdirSync(dirname(path), { recursive: true });
+    if (target.platform === "darwin") {
+      const buf = Buffer.alloc(32);
+      buf.writeUInt32LE(0xfeedfacf, 0);
+      buf.writeUInt32LE(machine, 4);
+      buf.writeUInt32LE(8, 12);
+      writeFileSync(path, buf);
+      return;
+    }
+    const buf = Buffer.alloc(88);
+    const offset = 64;
+    buf.write("MZ", 0, "ascii");
+    buf.writeUInt32LE(offset, 60);
+    buf.write("PE\0\0", offset, "ascii");
+    buf.writeUInt16LE(machine, offset + 4);
+    buf.writeUInt16LE(0x2000, offset + 22);
+    writeFileSync(path, buf);
+  };
+  const hostNativePath = (root: string, target: (typeof HOST_TARGETS)[number]): string =>
+    join(root, "build", "Release", `${target.platform}-${target.arch}`, "peercred.node");
+  const writeHostArtifacts = (under: string): string[] =>
+    HOST_TARGETS.flatMap((target) => {
+      const path = join(under, `${target.platform}-${target.arch}-peercred.node`);
+      writeHostBinary(path, target);
+      return [`--${target.platform}-${target.arch}`, path];
+    });
   {
     const blocked = mkdtempSync(join(tmpdir(), "cotal-seat-ncc-"));
     try {
@@ -273,6 +310,63 @@ if (process.platform !== "linux") {
         noPty.status === 1 && /native helper missing at .*linux-arm64\/pty\.node/.test(`${noPty.stdout}\n${noPty.stderr}`),
         { status: noPty.status, stdout: noPty.stdout, stderr: noPty.stderr },
       );
+    } finally {
+      rmSync(tree, { recursive: true, force: true });
+    }
+  }
+  {
+    const tree = mkdtempSync(join(tmpdir(), "cotal-seat-host-assert-"));
+    const assertNatives = (root: string) => spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `import { assertShippedNatives } from ${JSON.stringify(join(pkgRoot, "scripts", "assert-shipped-natives.mjs"))}; assertShippedNatives(process.argv[1]);`,
+        root,
+      ],
+      { encoding: "utf8" },
+    );
+    try {
+      for (const arch of ["x64", "arm64"] as const) {
+        const machine = arch === "x64" ? 62 : 183;
+        for (const file of ["peercred.node", "pty.node"]) {
+          const path = join(tree, "build", "Release", `linux-${arch}`, file);
+          mkdirSync(dirname(path), { recursive: true });
+          const buf = Buffer.alloc(20);
+          buf[0] = 0x7f;
+          buf.write("ELF", 1);
+          buf.writeUInt16LE(machine, 18);
+          writeFileSync(path, buf);
+        }
+      }
+      for (const target of HOST_TARGETS) writeHostBinary(hostNativePath(tree, target), target);
+      const complete = assertNatives(tree);
+      check("Linux and darwin/win32 x64/arm64 natives are packable", complete.status === 0, {
+        status: complete.status,
+        stdout: complete.stdout,
+        stderr: complete.stderr,
+      });
+
+      const missingHost = HOST_TARGETS[0];
+      rmSync(hostNativePath(tree, missingHost));
+      const missing = assertNatives(tree);
+      check(
+        "a tree missing a darwin host native is refused before pack",
+        missing.status === 1 && new RegExp(`native helper missing at .*darwin-x64/peercred\\.node`).test(`${missing.stdout}\n${missing.stderr}`),
+        { status: missing.status, stdout: missing.stdout, stderr: missing.stderr },
+      );
+      writeHostBinary(hostNativePath(tree, missingHost), missingHost);
+
+      const wrongHost = HOST_TARGETS.find((target) => target.platform === "win32" && target.arch === "arm64");
+      if (wrongHost) {
+        writeHostBinary(hostNativePath(tree, wrongHost), wrongHost, 0x8664);
+        const wrong = assertNatives(tree);
+        check(
+          "a host native with the wrong architecture is refused before pack",
+          wrong.status === 1 && /native architecture does not match win32-arm64/.test(`${wrong.stdout}\n${wrong.stderr}`),
+          { status: wrong.status, stdout: wrong.stdout, stderr: wrong.stderr },
+        );
+      }
     } finally {
       rmSync(tree, { recursive: true, force: true });
     }

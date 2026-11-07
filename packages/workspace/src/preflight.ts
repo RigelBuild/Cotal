@@ -1,7 +1,8 @@
 import { createConnection } from "node:net";
 import { mintCreds, newIdentity, probeConnect, isReachable } from "@cotal-ai/core";
-import { loadMeshes, pruneMesh } from "./mesh-registry.js";
+import { brokerAddressKey, loadMeshes } from "./mesh-registry.js";
 import type { MeshTarget } from "./mesh-target.js";
+import { stoppedLoopbackListener } from "./pid.js";
 
 /**
  * Liveness verification for a resolved mesh target — the companion to {@link resolveMeshTarget}
@@ -25,6 +26,9 @@ export type PreflightFailure =
   | "creds-rejected"
   | "open-wants-auth"
   | "stale-auth"
+  /** The listener answered but does not offer the required TLS. Its unauthenticated greeting
+   *  cannot establish mesh identity or justify deleting a registration. */
+  | "tls-unsupported"
   /** A TLS-required NATS listener still greets (INFO.tls_required) but the TLS probe could not
    *  complete the handshake — typically a private CA without `NODE_EXTRA_CA_CERTS`. NEVER a prune
    *  signal: INFO is unauthenticated shape evidence, not peer identity; conservatively keep the
@@ -35,7 +39,16 @@ export type PreflightFailure =
    *  NEVER a prune signal: a slow or jittery link is not a dead broker (#851). Distinct from
    *  `tls-trust`, whose evidence is an actual plaintext INFO greeting; a bare timeout has none, so
    *  it must not borrow that verdict's CA guidance. */
-  | "slow-link";
+  | "slow-link"
+  /** The first dial timed out and the process holding the loopback listener is stopped, so the
+   *  confirm budget is not spent on it. NEVER a prune signal: the broker is there, only paused. */
+  | "broker-stopped"
+  /** A broker answered at this record's address and refused the credentials, and another registered
+   *  space names that same address, so the broker answering is that space's. NEVER a prune signal:
+   *  the entry is not stale, its address is held, and deleting it is the destructive reading of a
+   *  recoverable conflict. It also leaves the folder with no record of its own space, after which
+   *  nothing there names the space its commands meant. Free the address or move this space. */
+  | "address-held";
 
 /** Pure decision tree — separated from I/O so the whole branch tree is unit-testable (it's the
  *  riskiest logic: a wrong branch prunes a LIVE registry entry). Only a registry-OWNED source
@@ -45,12 +58,15 @@ export type PreflightFailure =
  *  operator-supplied, so a failure there is the user's to diagnose, not a stale-registry signal. */
 export function classifyPreflightFailure(
   source: MeshTarget["source"],
-  reason: "auth-required" | "stale-auth" | "unreachable" | "timeout",
+  reason: "auth-required" | "stale-auth" | "unreachable" | "timeout" | "tls-unsupported",
   hasAuth: boolean,
+  inferred = false,
+  heldBy?: string,
 ): { prune: boolean; kind: PreflightFailure } {
   // A timeout is never a stale-entry signal, whatever the source: the dial ran out of its own
   // budget, which says nothing about whether the broker is actually gone (#851).
   if (reason === "timeout") return { prune: false, kind: "slow-link" };
+  if (reason === "tls-unsupported") return { prune: false, kind: "tls-unsupported" };
   // `flag-space-override` and `flag-server` are deliberately absent: the probe hit an operator-named
   // endpoint, not the registry-recorded broker, so its failure must not delete the recorded entry.
   const fromRegistry =
@@ -64,10 +80,26 @@ export function classifyPreflightFailure(
   // live mesh's registry entry because a cred expired would misdirect the repair (the fix is
   // `doctor auth`, not re-registration) — the same misdiagnosis class as the gate-1 prune bug.
   if (reason === "stale-auth") return { prune: false, kind: "stale-auth" };
-  if (fromRegistry && hasAuth) return { prune: true, kind: "registry-creds-rejected" };
-  if (fromRegistry) return { prune: true, kind: "registry-open-now-auth" };
+  // An `inferred` auth-required read no rejection, only an auth greeting and a reset handshake. Like
+  // the tls-trust read in `preflightTarget`, that unauthenticated evidence names the failure but
+  // never deletes a record.
+  // A broker IS answering here, and another registered space names this exact address, so the one
+  // that answered is that space's. The rejection then says whose broker holds the address, not that
+  // this record is stale, and the prune below would delete a sound record of a running space.
+  if (fromRegistry && heldBy !== undefined) return { prune: false, kind: "address-held" };
+  if (fromRegistry && hasAuth) return { prune: !inferred, kind: "registry-creds-rejected" };
+  if (fromRegistry) return { prune: !inferred, kind: "registry-open-now-auth" };
   if (hasAuth) return { prune: false, kind: "creds-rejected" };
   return { prune: false, kind: "open-wants-auth" };
+}
+
+/** The other registered space whose broker address is this target's, if one is recorded. Compared
+ *  by {@link brokerAddressKey}, so the two records name one listener however each spelled it. A row
+ *  with an address this cannot take apart is skipped: an unreadable address proves no conflict. */
+function addressHolder(target: MeshTarget): string | undefined {
+  const key = brokerAddressKey(target.server);
+  if (key === undefined) return undefined;
+  return loadMeshes().find((m) => m.space !== target.space && brokerAddressKey(m.server) === key)?.space;
 }
 
 /** Probe a resolved target and, on failure, classify it — WITHOUT touching the registry. Returns the
@@ -77,7 +109,7 @@ export function classifyPreflightFailure(
 export async function preflightTarget(
   target: MeshTarget,
   probeCreds?: string,
-): Promise<{ ok: true } | { ok: false; kind: PreflightFailure; prune: boolean }> {
+): Promise<{ ok: true } | { ok: false; kind: PreflightFailure; prune: boolean; pid?: number; heldBy?: string }> {
   // A user-mode target has no probe credential by design (its auth is a per-connect bearer) — a
   // credless probe would be DENIED by the callout and misclassified as a stale registry entry
   // (prune:true). Callers own the user connect; reaching here with one is a caller bug, fail loud.
@@ -99,6 +131,9 @@ export async function preflightTarget(
   const auth = { ...(creds ? { creds } : {}), ...(target.tlsRequired ? { tls: true as const } : {}) };
   let probe = await probeConnect(target.server, auth);
   if (probe.ok) return { ok: true };
+  // A stopped broker never answers, so its pid is named now instead of after the confirm budget.
+  const stopped = probe.reason === "timeout" ? stoppedLoopbackListener(target.server) : undefined;
+  if (stopped !== undefined) return { ok: false, kind: "broker-stopped", prune: false, pid: stopped };
   // CONFIRM BEFORE CONDEMNING. `probeConnect`'s default budget is 1s, and this is a CREDENTIALED
   // connect: TCP, INFO, then the JWT exchange — several round trips. A perfectly healthy broker
   // across a slow or jittery link (a relayed overlay VPN, a loaded host) misses that routinely.
@@ -110,8 +145,8 @@ export async function preflightTarget(
   probe = await probeConnect(target.server, { ...auth, timeoutMs: PREFLIGHT_CONFIRM_TIMEOUT_MS });
   if (probe.ok) return { ok: true };
 
-  // TLS-REQUIRED + "unreachable" is often NOT a dead broker. `probeConnect` maps every non-auth,
-  // non-timeout failure (including certificate verification) to `unreachable`. Against a
+  // TLS-REQUIRED + "unreachable" is often NOT a dead broker. Other transport failures,
+  // including certificate verification, can still be `unreachable`. Against a
   // private-CA mesh without `NODE_EXTRA_CA_CERTS`, the TLS handshake fails while the broker is
   // live and still greets with plaintext INFO advertising `tls_required`. Classifying that as
   // unreachable + prune DELETES a healthy tlsRequired registry entry — durable state destroyed on
@@ -138,14 +173,16 @@ export async function preflightTarget(
       return { ok: false, kind: "tls-trust", prune: false };
   }
 
-  const { prune, kind } = classifyPreflightFailure(target.source, probe.reason, Boolean(target.auth));
-  return { ok: false, kind, prune };
+  const inferred = probe.reason === "auth-required" && probe.inferred === true;
+  const heldBy = probe.reason === "auth-required" ? addressHolder(target) : undefined;
+  const { prune, kind } = classifyPreflightFailure(target.source, probe.reason, Boolean(target.auth), inferred, heldBy);
+  return { ok: false, kind, prune, ...(kind === "address-held" && heldBy !== undefined ? { heldBy } : {}) };
 }
 
 /** Read the pre-auth NATS INFO greeting (plaintext, before any STARTTLS). Returns null if nothing
  *  usable answered. Used to distinguish a TLS-required NATS listener from a plaintext substitute
  *  without a TLS handshake. It does NOT establish mesh identity — INFO is unauthenticated. */
-async function readNatsInfoGreeting(
+export async function readNatsInfoGreeting(
   server: string,
   timeoutMs = 1_000,
 ): Promise<{ tls_required?: boolean } | null> {
@@ -192,29 +229,8 @@ async function readNatsInfoGreeting(
   });
 }
 
-/**
- * Drop registry entries whose broker is gone — a `cotal up` that crashed or was `kill -9`'d without
- * `cotal down` leaves a record behind. This is liveness-only and we hold NO creds for these meshes,
- * so it uses the silent TCP+INFO {@link isReachable} probe — NOT a credless `probeConnect`, whose
- * auth-rejection-as-liveness would log a broker auth error on every live AUTH mesh it sweeps.
- * `isReachable` is true for any live broker (open or auth, since INFO precedes auth); only a truly
- * dead one (refused/timeout) prunes. An EXPLICIT call (never wired into resolution itself), so
- * registry mutation stays opt-in: callers that act on the registry (`spawn`/`use`/`meshes`, the
- * manager control commands) invoke it; `<TAB>` completion must not.
- *
- * A dead broker is never enough to delete a record: {@link pruneMesh} keeps both an
- * operator-registered (`cotal meshes add`) mesh and an `up` / pre-origin one on a liveness miss,
- * and this reports them as `offline` instead. Mismatch deletion is a different path.
- *
- * **Deletion needs CONFIRMATION, not one timeout.** Pruning is destructive: a wrongly pruned mesh
- * costs the operator a re-`up` (or, for a remote one, the exact registration line again) and every
- * command in between fails on a mesh that was live all along. `isReachable`'s default budget is 1s, which a
- * perfectly healthy broker across a slow or jittery link (a relayed overlay VPN, a loaded host)
- * misses routinely — one such blip silently unregistered a live remote mesh. So a first failure
- * only makes it a CANDIDATE: confirm with a second, longer probe and prune only if that also
- * fails. A live-but-slow broker keeps its entry; a genuinely dead one still prunes on the next
- * sweep, one extra probe later.
- */
+/** Confirm a missed TCP+INFO liveness probe with a longer budget before reporting offline.
+ *  This probe holds no credentials and cannot establish a mismatch or authorize deletion. */
 const PRUNE_CONFIRM_TIMEOUT_MS = 5_000;
 
 /** The confirming budget for a single target's preflight. Larger than {@link PRUNE_CONFIRM_TIMEOUT_MS}
@@ -226,25 +242,33 @@ export const PREFLIGHT_CONFIRM_TIMEOUT_MS = 8_000;
  *  every origin, because a liveness miss is not a deletion. A surface that lists meshes renders
  *  that as a state instead of probing every broker a second time. */
 export interface MeshSweep {
-  /** Spaces whose dead record was dropped. Empty after a liveness-only sweep. */
-  pruned: string[];
   /** Spaces kept despite a dead broker. */
   offline: string[];
 }
 
-export async function pruneStaleMeshes(): Promise<MeshSweep> {
-  const sweep: MeshSweep = { pruned: [], offline: [] };
+/** Whether `server` answers a liveness probe. A first miss is confirmed with a second, longer probe
+ *  before it counts, so a slow link reads as live. A miss whose loopback listener is a stopped
+ *  process counts at once. */
+export async function brokerAnswers(server: string): Promise<boolean> {
+  if (await isReachable(server)) return true;
+  // A stopped broker never answers, so the longer confirm is not spent on it.
+  return stoppedLoopbackListener(server) === undefined && await isReachable(server, { timeoutMs: PRUNE_CONFIRM_TIMEOUT_MS });
+}
+
+/** Sweep liveness without deleting records. Catalog entries are not probed. Given the `--server` a
+ *  command resolves with, only the records at that address are probed: that resolve reads no other
+ *  record's liveness. Other explicitly requested checks, such as status --all, have their own scope. */
+export async function pruneStaleMeshes(server?: string): Promise<MeshSweep> {
+  const sweep: MeshSweep = { offline: [] };
   await Promise.all(
-    loadMeshes().map(async (m) => {
+    loadMeshes().filter((m) => server === undefined || m.server === server).map(async (m) => {
       // A catalog snapshot is registry preparation, not broker discovery. Catalog-owned entries are
       // never pruned from liveness and must not be probed here either: `meshes`, `use`, and a
       // space-less control command may prepare hundreds of registrations, while only the command's
       // selected target is allowed to connect.
       if (m.origin === "catalog") return;
-      if (await isReachable(m.server)) return;
-      if (await isReachable(m.server, { timeoutMs: PRUNE_CONFIRM_TIMEOUT_MS })) return;
-      // pruneMesh, not removeMesh: a liveness miss keeps the record (manual and up alike).
-      (pruneMesh(m.space) ? sweep.pruned : sweep.offline).push(m.space);
+      if (await brokerAnswers(m.server)) return;
+      sweep.offline.push(m.space);
     }),
   );
   return sweep;

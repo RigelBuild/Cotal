@@ -29,16 +29,16 @@ function check(name: string, condition: unknown, detail?: unknown): void {
   else { failed++; console.log(`  ✗ FAIL: ${name}`, detail ?? ""); }
 }
 
-// "Mutation reproof" is expected on every PR: mutation-reproof.yml (#1272, closing #1217) declares a
-// pull_request trigger with no paths filter, so the declaration-derived set includes it for any
-// changed-path set. Added in sorted position. The matching run row lives in the #1087 fixture below.
-// "Attribution" likewise: attribution.yml declares pull_request with no paths filter and a types
-// list that keeps opened and synchronize, so it is minted at every head of every PR.
-const expectedNames = ["Attribution", "CI", "Docs", "Mutation reproof"];
+const positive = fixture.cases.find((c: { pr: number }) => c.pr === 1087);
+if (!positive) throw new Error("positive PR-head fixture case is missing");
+// Windows and Changesets are retired on this fork. Docs, Installer, and Remotion remain path-filtered.
+const expectedNames = positive.expectedNames;
+const packageExpectedNames = ["CI", "Mutation reproof", "Remotion typecheck"];
 check(
-  "path-filtered workflows are included only when a changed path matches their declaration",
-  JSON.stringify(expectedPullRequestWorkflows(workflows, ["package.json"])) === JSON.stringify(["Attribution", "CI", "Mutation reproof"]) &&
-    JSON.stringify(expectedPullRequestWorkflows(workflows, ["install.sh"])) === JSON.stringify(["Attribution", "CI", "Installer", "Mutation reproof"]),
+  "path-filtered workflows are included only when changed paths match declarations",
+  JSON.stringify(expectedPullRequestWorkflows(workflows, ["package.json"])) === JSON.stringify(packageExpectedNames) &&
+    JSON.stringify(expectedPullRequestWorkflows(workflows, ["package.json", "docs/cli.md"])) === JSON.stringify(["CI", "Docs", "Mutation reproof", "Remotion typecheck"]) &&
+    JSON.stringify(expectedPullRequestWorkflows(workflows, ["install.sh"])) === JSON.stringify(["CI", "Installer", "Mutation reproof"]),
 );
 let repositoryWorkflowsParsed = false;
 try {
@@ -50,10 +50,10 @@ check(
   "paths-ignore skips a workflow only when every changed path is ignored",
   JSON.stringify(expectedPullRequestWorkflows({
     "ignore.yml": "name: Ignore\non:\n  pull_request:\n    paths-ignore: ['docs/**']\n",
-  }, ["docs/cli.md"])) === "[]" &&
+  }, ["docs/cli.mdx"])) === "[]" &&
     JSON.stringify(expectedPullRequestWorkflows({
       "ignore.yml": "name: Ignore\non:\n  pull_request:\n    paths-ignore: ['docs/**']\n",
-    }, ["docs/cli.md", "package.json"])) === '["Ignore"]',
+    }, ["docs/cli.mdx", "package.json"])) === '["Ignore"]',
 );
 check(
   "ordinary YAML comments after a flow event list preserve pull_request",
@@ -170,7 +170,7 @@ let unsupportedPatternRefused = false;
 try {
   expectedPullRequestWorkflows({
     "unknown.yml": "name: Unknown\non:\n  pull_request:\n    paths:\n      - 'docs/{api,cli}.md'\n",
-  }, ["docs/cli.md"]);
+  }, ["docs/cli.mdx"]);
 } catch (error) {
   unsupportedPatternRefused = /unsupported workflow path pattern/.test(String(error));
 }
@@ -179,7 +179,7 @@ for (const c of fixture.cases) {
   const expected = expectedPullRequestWorkflows(workflows, c.changedPaths);
   check(
     `${c.label}: expected workflows come from the declarations and path filters`,
-    JSON.stringify(expected) === JSON.stringify(expectedNames),
+    JSON.stringify(expected) === JSON.stringify(c.expectedNames),
     expected,
   );
   const result = classifyPullRequestHead({
@@ -190,15 +190,14 @@ for (const c of fixture.cases) {
   });
   if (c.pr === 1087) {
     check(`${c.label}: no expected workflow is missing`, result.missing.length === 0, result);
-    check(`${c.label}: minted but unfinished workflows are pending`, JSON.stringify(result.pending) === JSON.stringify(expectedNames), result);
+    check(`${c.label}: minted but unfinished workflows are pending`, JSON.stringify(result.pending) === JSON.stringify(c.expectedNames), result);
     check(`${c.label}: a pending head is not green`, !result.green, result);
   } else {
-    check(`${c.label}: Code Quality or another PR's run does not satisfy this PR`, JSON.stringify(result.missing) === JSON.stringify(expectedNames), result);
+    check(`${c.label}: Code Quality or another PR's run does not satisfy this PR`, JSON.stringify(result.missing) === JSON.stringify(expected), result);
     check(`${c.label}: zero ordinary pending and zero ordinary failures is still not green`, result.pending.length === 0 && result.failing.length === 0 && !result.green, result);
   }
 }
 
-const positive = fixture.cases.find((c: { pr: number }) => c.pr === 1087);
 const succeeded = positive.runs.map((run: Record<string, unknown>) =>
   run.event === "pull_request" ? { ...run, status: "completed", conclusion: "success" } : run,
 );
@@ -263,16 +262,15 @@ for (const conclusion of ["neutral", "skipped"]) {
 }
 
 function shippedCommand(mode: "success" | "missing" | "merge-key") {
-  // The shipped gate reads GitHub credentials (GH_TOKEN/GITHUB_TOKEN/GITHUB_REPOSITORY) and no
-  // COTAL_ name at all, so an ambient copy would hand a live credential and broker URL to a child
-  // that has no use for either. Strip the prefix.
+  // The offline fixture needs neither ambient mesh credentials nor a real GitHub token.
   const env: NodeJS.ProcessEnv = { ...process.env };
-  for (const key of Object.keys(env)) if (key.startsWith("COTAL_")) delete env[key];
+  for (const key of Object.keys(env)) if (key.startsWith("COTAL_") || key.startsWith("GH_") || key.startsWith("GITHUB_")) delete env[key];
   return spawnSync("pnpm", ["--silent", "pr-head-gate", "1098"], {
     cwd: ROOT,
     encoding: "utf8",
     env: {
       ...env,
+      GH_TOKEN: "fixture-pr-head-gate-token",
       GITHUB_REPOSITORY: "Cotal-AI/Cotal",
       NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${fixtureFetch}`.trim(),
       PR_HEAD_GATE_FIXTURE: mode,

@@ -1,7 +1,9 @@
 import type { CompletionResult, FlagSpec, FlagValues, ParsedArgs } from "@cotal-ai/core";
-import { loadMeshes, targetFlags } from "@cotal-ai/workspace";
+import { loadMeshes, resolveControlTarget, targetFlags } from "@cotal-ai/workspace";
 import { c } from "../ui.js";
-import { askManager, failIfNotOk, onFlag, onInstanceOrExit, resolveControlTarget, scatterManager, type ControlAuth, type ScatterInstanceReply, type ScatterReply } from "../lib/control.js";
+import { askManager, scatterManager, type ScatterInstanceReply, type ScatterReply } from "@cotal-ai/workspace/control";
+import type { ControlAuth } from "@cotal-ai/workspace";
+import { cliControl, failIfNotOk, onFlag, onInstanceId } from "../lib/control.js";
 import { completingFlagValue } from "../lib/completion.js";
 
 export const allowlistFlags = [...targetFlags, onFlag] as const satisfies readonly FlagSpec[];
@@ -59,11 +61,11 @@ export async function allowlist(args: ParsedArgs): Promise<void> {
     console.error(c.red("usage: cotal allowlist set <name>... [--space <s>] [--server <url>] [--creds <path>] [--on <instance>]"));
     process.exit(1);
   }
-  let target = onInstanceOrExit(v.on, "cotal allowlist");
+  let target = onInstanceId(v.on, "cotal allowlist");
   if (target === undefined) {
     const probe = await resolveControlTarget(v, "control-caller-privileged");
     const preflight = await allowlistSetPreflight(probe.auth, () =>
-      scatterManager(probe.space, probe.server, "managerStatus", probe.auth, probe.spaceAuth),
+      scatterManager(cliControl, probe.space, probe.server, "managerStatus", probe.auth, probe.spaceAuth),
     );
     if (preflight.kind === "pin") {
       target = preflight.instanceId;
@@ -83,7 +85,7 @@ export async function allowlist(args: ParsedArgs): Promise<void> {
   const t = await resolveControlTarget(v, "control-caller-admin", target);
   const reach = t.auth.bearer ? "owner" : "any";
   const request = allowlistSetOptions(target);
-  const reply = await askManager(t.space, t.server, "allowlistSet", { names }, t.auth, reach, request.timeoutMs, request.pin);
+  const reply = await askManager(cliControl, t.space, t.server, "allowlistSet", { names }, t.auth, reach, request.timeoutMs, request.pin);
   failIfNotOk(reply);
   console.log(c.dim(`✓ spawn allowlist set to ${names.length} name${names.length === 1 ? "" : "s"}`));
 }

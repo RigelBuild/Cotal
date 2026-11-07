@@ -114,6 +114,7 @@ function paneForTab(session: string, tabId: number): string {
 
 export class ZellijRuntime implements Runtime {
   readonly kind = "zellij" as const;
+  readonly streamsTerminal = false;
 
   constructor(private readonly session: string) {}
 

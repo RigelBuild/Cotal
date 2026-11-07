@@ -137,6 +137,7 @@ function gatedHandle(name: string): { handle: AgentHandle; stopped: () => boolea
 }
 const fakeRuntime: CustodialRuntime = {
   kind: "pty",
+  streamsTerminal: false,
   reserve: () => ({ kind: "pty", id: randomUUID().replaceAll("-", "") }),
   spawn: (name, _spec, _cwd, reference) => {
     spawnCalls++;

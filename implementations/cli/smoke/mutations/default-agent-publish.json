@@ -1,92 +1,116 @@
 {
   "suite": [
     "implementations/cli/smoke/persona-templates.smoke.ts",
-    "implementations/cli/smoke/mint-provision.smoke.ts",
-    "implementations/cli/smoke/mint-capabilities.unit.smoke.ts"
+    "implementations/cli/smoke/mint-provision.smoke.ts"
   ],
-  "guard": "new defaults can create channels, byte-exact legacy defaults upgrade, user-edited personas remain untouched, and the minted credential's lifetime is set by the operator's flag",
+  "guard": "new defaults can create channels, byte-exact legacy defaults upgrade, user-edited personas remain untouched, minted credential lifetimes honor their flags, and an identity re-mint preserves its principal",
   "command": "pnpm --filter @cotal-ai/core build && pnpm --filter @cotal-ai/workspace build && pnpm --filter @cotal-ai/cli typecheck && pnpm smoke:persona-templates && pnpm smoke:mint-provision:auth",
   "completionMarker": "persona templates:",
   "proveWith": "node scripts/mutation-proof.mjs --config implementations/cli/smoke/mutations/default-agent-publish.json",
   "why": [
-    "Setup writes the default persona from a literal template rather than through the guarded agent-file writer.",
-    "The mutation is compile-clean and restores the shipped regression: an empty default post ACL under the protocol's default-deny policy.",
-    "The cells check the new-install grant and both sides of the byte-exact migration decision without touching real setup state."
+    "Setup, space create and a local up write the default persona from a literal template rather than through the guarded agent-file writer.",
+    "The cells check the new-install grant and both sides of the byte-exact migration decision without touching real setup state.",
+    "The auth-mint smoke also covers mint lifecycle preservation, provisioning, and rejected lifetime inputs."
   ],
   "mutations": [
     {
       "name": "M1 remove the default wildcard post grant",
-      "file": "implementations/cli/src/commands/setup.ts",
-      "find": "subscribe: []\nallowSubscribe: [\">\"]\nallowPublish: [\">\"]\ncapabilities: [spawn, run]",
-      "replace": "subscribe: []\nallowSubscribe: [\">\"]\nallowPublish: []\ncapabilities: [spawn, run]",
+      "file": "implementations/cli/src/lib/default-persona.ts",
+      "command": "corepack pnpm --filter @cotal-ai/core build && corepack pnpm --filter @cotal-ai/workspace build && corepack pnpm --filter @cotal-ai/cli typecheck && pnpm smoke:persona-templates",
+      "completionMarker": "persona templates:",
+      "find": "subscribe: []\nallowSubscribe: [\u0022>\u0022]\nallowPublish: [\u0022>\u0022]\ncapabilities: [spawn, run]",
+      "replace": "subscribe: []\nallowSubscribe: [\u0022>\u0022]\nallowPublish: []\ncapabilities: [spawn, run]",
       "expectRed": "default-channel-creation: default stays unsubscribed with wildcard read and post ACLs",
       "cell": "default-channel-creation: default stays unsubscribed with wildcard read and post ACLs",
-      "note": "This is the exact shipped regression. Typecheck remains green, then the static template assertion observes that a fresh default can no longer create or post to a concrete channel."
+      "note": "The static template assertion observes that a fresh default can no longer create or post to a concrete channel."
     },
     {
       "name": "M2 stop recognizing the byte-exact legacy default",
-      "file": "implementations/cli/src/commands/setup.ts",
+      "file": "implementations/cli/src/lib/default-persona.ts",
+      "command": "corepack pnpm --filter @cotal-ai/core build && corepack pnpm --filter @cotal-ai/workspace build && corepack pnpm --filter @cotal-ai/cli typecheck && pnpm smoke:persona-templates",
+      "completionMarker": "persona templates:",
       "find": "  return current === LEGACY_DEFAULT_AGENT ? DEFAULT_AGENT : undefined;",
       "replace": "  return undefined;",
       "expectRed": "legacy-default-upgrade: the byte-exact legacy template gains wildcard post permission",
       "cell": "legacy-default-upgrade: the byte-exact legacy template gains wildcard post permission",
-      "note": "This restores the upgrade-path defect while compiling cleanly: an untouched legacy default remains post-denied after setup reruns."
+      "note": "This restores the upgrade-path defect: an untouched legacy default remains post-denied after setup reruns."
     },
     {
       "name": "M3 migrate every existing default regardless of user edits",
-      "file": "implementations/cli/src/commands/setup.ts",
+      "file": "implementations/cli/src/lib/default-persona.ts",
+      "command": "corepack pnpm --filter @cotal-ai/core build && corepack pnpm --filter @cotal-ai/workspace build && corepack pnpm --filter @cotal-ai/cli typecheck && pnpm smoke:persona-templates",
+      "completionMarker": "persona templates:",
       "find": "  return current === LEGACY_DEFAULT_AGENT ? DEFAULT_AGENT : undefined;",
       "replace": "  return DEFAULT_AGENT;",
       "expectRed": "edited-default-preservation: a user-edited legacy persona stays byte-identical",
       "cell": "edited-default-preservation: a user-edited legacy persona stays byte-identical",
-      "note": "This broadens the repair decision past byte equality. The preservation cell detects that an edited persona would be overwritten."
+      "note": "The preservation cell detects that an edited persona would be overwritten."
     },
     {
       "name": "M4 drift the frozen legacy fixture to the current wildcard post grant",
-      "file": "implementations/cli/src/commands/setup.ts",
+      "file": "implementations/cli/src/lib/default-persona.ts",
+      "command": "corepack pnpm --filter @cotal-ai/core build && corepack pnpm --filter @cotal-ai/workspace build && corepack pnpm --filter @cotal-ai/cli typecheck && pnpm smoke:persona-templates",
+      "completionMarker": "persona templates:",
       "find": "  \"allowPublish: []\",",
-      "replace": "  'allowPublish: [\">\"]',",
+      "replace": "  'allowPublish: [\u0022>\u0022]',",
       "expectRed": "legacy-migration-fixture: the frozen legacy template carries the empty post ACL",
       "cell": "legacy-migration-fixture: the frozen legacy template carries the empty post ACL",
-      "note": "A future current-template edit must not redefine which prior-release bytes are eligible. This compile-clean mutation makes the frozen fixture cease representing the shipped empty-post default."
+      "note": "This compile-clean mutation makes the frozen fixture cease representing the shipped empty-post default."
     },
     {
       "name": "M5 remove workflow capability from the setup default",
-      "file": "implementations/cli/src/commands/setup.ts",
-      "find": "allowPublish: [\">\"]\ncapabilities: [spawn, run]\n---",
-      "replace": "allowPublish: [\">\"]\ncapabilities: [spawn]\n---",
+      "file": "implementations/cli/src/lib/default-persona.ts",
+      "command": "corepack pnpm --filter @cotal-ai/core build && corepack pnpm --filter @cotal-ai/workspace build && corepack pnpm --filter @cotal-ai/cli typecheck && pnpm smoke:persona-templates",
+      "completionMarker": "persona templates:",
+      "find": "allowPublish: [\u0022>\u0022]\ncapabilities: [spawn, run]\n---",
+      "replace": "allowPublish: [\u0022>\u0022]\ncapabilities: [spawn]\n---",
       "expectRed": "default-workflow-capability: the default declares spawn and run",
       "cell": "default-workflow-capability: the default declares spawn and run",
-      "note": "Restores the spawn-only default; the real setup subprocess also checks the parsed on-disk capabilities."
+      "note": "Restores the spawn-only default; the smoke checks the parsed on-disk capabilities."
     },
     {
-      "name": "M6 drop the mint lifetime before it reaches the seam",
+      "name": "M6 drop the mint lifetime options before they reach the signing seam",
       "file": "implementations/cli/src/commands/mint.ts",
-      "command": "corepack pnpm --filter @cotal-ai/core build && corepack pnpm --filter @cotal-ai/workspace build && corepack pnpm --filter @cotal-ai/cli typecheck && corepack pnpm smoke:mint-capabilities:unit",
-      "completionMarker": "MINT CAPABILITIES UNIT SMOKE COMPLETE",
-      "find": "  const identity = existingIdentity ?? newIdentity();\n  const lifetime = { expiresInSeconds, expiresAt };\n  const mintOptions = { allowSubscribe, allowPublish, role, capabilities, lifecycleUid, ...lifetime };\n  const creds = target\n    ? await provisionForMint(auth, identity, { ...mintOptions, lifecycleUid: lifecycleUid! }, target)\n    : await mintCreds(auth, identity, profile, mintOptions);",
-      "replace": "  const identity = existingIdentity ?? newIdentity();\n  const mintOptions = { allowSubscribe, allowPublish, role, capabilities, lifecycleUid };\n  const creds = target\n    ? await provisionForMint(auth, identity, { ...mintOptions, lifecycleUid: lifecycleUid! }, target)\n    : await mintCreds(auth, identity, profile, mintOptions);",
+      "command": "corepack pnpm --filter @cotal-ai/core build && corepack pnpm --filter @cotal-ai/workspace build && corepack pnpm --filter @cotal-ai/cli typecheck && pnpm smoke:mint-provision:auth",
+      "completionMarker": "MINT-PROVISION SMOKE OK",
+      "find": "    const options = { name, allowSubscribe, allowPublish, role, capabilities, lifecycleUid, expiresInSeconds: values[\"expires-in\"] !== undefined ? Number(values[\"expires-in\"]) : defaultLifetime ? DEFAULT_LIFETIME_SECONDS : undefined, expiresAt: values[\"expires-at\"] === undefined ? undefined : Number(values[\"expires-at\"]) };",
+      "replace": "    const options = { name, allowSubscribe, allowPublish, role, capabilities, lifecycleUid };",
       "expectRed": "the JWT's exp is iat + the flag, computed within the command's own second",
       "cell": "the JWT's exp is iat + the flag, computed within the command's own second",
-      "note": "The fixture selects the unit smoke source, which invokes runCli in-process and checks the minted JWT lifetime without a broker."
+      "note": "The auth-mint smoke dispatches through runCli and checks the JWT lifetime, including its one-second issuance window."
     },
     {
-      "name": "M7 churn the identity on every re-mint",
+      "name": "M7 churn the re-minted identity",
       "file": "implementations/cli/src/commands/mint.ts",
-      "find": "  const identity = existingIdentity ?? newIdentity();",
-      "replace": "  const identity = newIdentity();",
+      "command": "corepack pnpm --filter @cotal-ai/core build && corepack pnpm --filter @cotal-ai/workspace build && corepack pnpm --filter @cotal-ai/cli typecheck && pnpm smoke:mint-provision:auth",
+      "completionMarker": "MINT-PROVISION SMOKE OK",
+      "find": "    identity ??= newIdentity();",
+      "replace": "    identity = newIdentity();",
       "expectRed": "the re-minted credential's principal IS the original's (same nkey, so every durable keyed to it survives)",
       "cell": "the re-minted credential's principal IS the original's (same nkey, so every durable keyed to it survives)",
-      "note": "Restores the shipped half 2: --identity is read and validated, then ignored, so the re-minted credential is a new principal and every durable keyed to the old one is orphaned."
+      "note": "The auth-mint smoke checks that an identity re-sign keeps its principal and lifecycle UID, while --new-incarnation changes only the lifecycle UID."
     },
     {
       "name": "M8 stop refusing a TTL the seam would refuse",
-      "file": "implementations/cli/src/commands/mint.ts",
-      "find": "    const n = Number(values[\"expires-in\"]);\n    if (!Number.isInteger(n) || n <= 0) {\n      console.error(c.red(`--expires-in must be a positive integer number of seconds (got \"${values[\"expires-in\"]}\")`));\n      process.exit(1);\n    }",
-      "replace": "    const n = Number(values[\"expires-in\"]);",
-      "expectRed": "--expires-in 0 exits 1 naming the value (a TTL the seam would refuse)",
-      "cell": "--expires-in 0 exits 1 naming the value (a TTL the seam would refuse)",
-      "note": "Drops the CLI-side validation so a zero TTL falls through to the seam's throw after the operator believed the mint was underway. The cell requires the refusal at the command surface, naming the value."
+      "file": "packages/workspace/src/credential-actions.ts",
+      "command": "corepack pnpm --filter @cotal-ai/workspace build && corepack pnpm --filter @cotal-ai/core build && corepack pnpm --filter @cotal-ai/cli typecheck && pnpm smoke:mint-provision:auth",
+      "completionMarker": "MINT-PROVISION SMOKE OK",
+      "find": "Number(values[key]) < (key === \"expires-in\" ? 1 : 0))) throw",
+      "replace": "Number(values[key]) < (key === \"expires-in\" ? 0 : 0))) throw",
+      "expectRed": "--expires-in 0 exits 1 with USAGE_INVALID",
+      "cell": "--expires-in 0 exits 1 with USAGE_INVALID",
+      "note": "The auth-mint smoke requires zero lifetime to be refused by the CLI before a credential is written.",
+      "afterRestore": "corepack pnpm --filter @cotal-ai/workspace build && corepack pnpm --filter @cotal-ai/core build"
+    },
+    {
+      "name": "M9 a space this machine started is sent to persona create instead of up",
+      "file": "implementations/cli/src/lib/default-persona.ts",
+      "completionMarker": "persona templates:",
+      "find": "  return space.origin === \"up\"\n",
+      "replace": "  return space.origin === \"never\"\n",
+      "expectRed": "default-persona-fix: a space this machine started is fixed by up in its root",
+      "cell": "default-persona-fix: a space this machine started is fixed by up in its root",
+      "note": "The status, spawn and app-identity remedies all take this decision. The cell grades it directly, without a broker."
     }
   ]
 }

@@ -33,13 +33,18 @@
  * there is no later reader, so that session calls {@link discardLaunchMaterial} at startup and the
  * file and its private directory cease to exist. Where readers start LATER (the Claude connector's
  * MCP server and its one-process-per-hook relays, the Hermes launcher's gateway child) the file has
- * to outlive startup, so it lives as long as the seat and the OS temp reaper is what removes it. A
- * launch that dies before its session starts leaves its file to that same reaper.
+ * to outlive startup. For every connector the launch also lists the private directory on
+ * `LaunchSpec.artifacts` (see `materialEnv` in the connector runtime), so the launcher that spawns
+ * the spec removes it once the child has exited, as it does a persona carrier (core
+ * launch-artifacts). The second file the Hermes launcher writes for its gateway child is not on that
+ * list. A file whose launcher and watcher were both killed, or whose spawn failed before any child
+ * started, is left to the OS temp reaper.
  */
 import { mkdtempSync, readFileSync, realpathSync, rmSync, rmdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { hardenPrivate, writeSecretFile } from "./secret-fs.js";
+import type { UserAuthLaunch } from "./connector.js";
 
 /** The prefix {@link writeLaunchMaterial} gives its private directory, and the single filename it
  *  puts inside. Named constants because {@link discardLaunchMaterial} has to recognise this module's
@@ -67,7 +72,7 @@ export type LaunchMaterial = {
   /** The selected registration requires this session's structured event plane. */
   eventsRequired?: boolean;
   /** User-mode launch identity: principal, sentinel creds path, and the exec-able bearer command. */
-  userAuth?: { owner: string; actor: string; sentinelCredsPath: string; bearerCmd: string[] };
+  userAuth?: UserAuthLaunch;
 };
 
 /**
@@ -179,7 +184,7 @@ function validate(raw: Record<string, unknown>, path: string): LaunchMaterial {
       actor: actor as string,
       sentinelCredsPath: sentinelCredsPath as string,
       bearerCmd: bearerCmd as string[],
-    };
+    } satisfies Required<UserAuthLaunch>;
   }
   if (Object.keys(material).length === 0)
     throw new Error(
