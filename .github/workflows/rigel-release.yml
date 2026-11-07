@@ -1,0 +1,132 @@
+name: Rigel release
+
+on:
+  push:
+    branches:
+      - rigel-release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rigel-release-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-latest
+          - platform: darwin-arm64
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - uses: pnpm/action-setup@v6.0.8
+      - uses: actions/setup-node@v6
+        with:
+          # Native .node helpers are ABI-bound; match the nodejs_24 that orion runs them under.
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Prepare release metadata
+        id: metadata
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short=10 HEAD)"
+          version="$(node -p "require('./bin/package.json').version")"
+          commit_time="$(git show -s --format=%ct HEAD)"
+          {
+            echo "sha=$sha"
+            echo "short_sha=$short_sha"
+            echo "tag=rigel-v${version}-${short_sha}"
+            echo "commit_time=$commit_time"
+          } >> "$GITHUB_OUTPUT"
+      - name: Install GNU tar
+        if: runner.os == 'macOS'
+        run: brew install gnu-tar
+      - name: Assemble runtime archive
+        env:
+          COMMIT_TIME: ${{ steps.metadata.outputs.commit_time }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          asset_root="$RUNNER_TEMP/cotal-runtime-asset"
+          mkdir -p "$asset_root/cotal"
+          cp -R bin extensions implementations packages examples node_modules package.json pnpm-workspace.yaml "$asset_root/cotal/"
+          cp -R bin "$asset_root/cotal/cotal-ai"
+          ln -sfn ../../../cotal-ai "$asset_root/cotal/node_modules/.pnpm/node_modules/cotal-ai"
+          tar_bin=tar
+          if [ "$PLATFORM" = darwin-arm64 ]; then tar_bin=gtar; fi
+          "$tar_bin" --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$COMMIT_TIME" -czf "$RUNNER_TEMP/cotal-runtime-${PLATFORM}.tar.gz" -C "$asset_root" cotal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cotal-runtime-${{ matrix.platform }}
+          path: ${{ runner.temp }}/cotal-runtime-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - name: Prepare release metadata
+        id: metadata
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short=10 HEAD)"
+          version="$(node -p "require('./bin/package.json').version")"
+          {
+            echo "sha=$sha"
+            echo "tag=rigel-v${version}-${short_sha}"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: cotal-runtime-linux-x64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: cotal-runtime-darwin-arm64
+          path: dist
+      - name: Create checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum cotal-runtime-linux-x64.tar.gz cotal-runtime-darwin-arm64.tar.gz > SHA256SUMS
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.metadata.outputs.sha }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag_ref="refs/tags/$TAG"
+          refs="$(git ls-remote --tags origin "$tag_ref" "$tag_ref^{}")"
+          if [ -n "$refs" ]; then
+            existing_sha="$(printf '%s\n' "$refs" | awk -v ref="$tag_ref^{}" '$2 == ref { print $1; exit }')"
+            if [ -z "$existing_sha" ]; then
+              existing_sha="$(printf '%s\n' "$refs" | awk -v ref="$tag_ref" '$2 == ref { print $1; exit }')"
+            fi
+            if [ "$existing_sha" = "$SHA" ]; then
+              echo "Release tag $TAG already points to $SHA; nothing to do."
+              exit 0
+            fi
+            echo "::error::Release tag $TAG already exists at $existing_sha, not $SHA."
+            exit 1
+          fi
+          gh release create "$TAG" --target "$SHA" --title "$TAG" --notes "Prebuilt Cotal runtime for $SHA." dist/cotal-runtime-linux-x64.tar.gz dist/cotal-runtime-darwin-arm64.tar.gz dist/SHA256SUMS

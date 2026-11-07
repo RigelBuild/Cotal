@@ -1,0 +1,5 @@
+# actionlint 1.7.12 does not yet recognize GitHub Actions concurrency queue.
+paths:
+  .github/workflows/rigel-release.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'
