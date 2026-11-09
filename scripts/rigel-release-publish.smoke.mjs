@@ -21,7 +21,7 @@ function scenario(steps, expectedError) {
     return response;
   };
   const execute = () => publish({ repository: 'example/cotal', tag, sha, run });
-  if (expectedError) assert.throws(execute, expectedError);
+  if (expectedError) assert.throws(execute, (error) => error.message === expectedError.message);
   else execute();
   assert.equal(remaining.length, 0, 'Expected commands were not called');
 }
@@ -35,8 +35,8 @@ scenario([[lookup, ref({ type: 'commit', sha: 'b'.repeat(40) })]],
   { message: `Release tag ${tag} points to ${'b'.repeat(40)} (commit), not ${sha}.` });
 scenario([
   [lookup, ref({ type: 'tag', sha: 'tag-sha' })],
-  [['api', 'repos/example/cotal/git/tags/tag-sha'], ok(JSON.stringify({ object: { type: 'tree', sha } }))],
-], { message: `Release tag ${tag} points to ${sha} (tree), not ${sha}.` });
+  [['api', 'repos/example/cotal/git/tags/tag-sha'], ok(JSON.stringify({ object: { type: 'tree', sha: 'c'.repeat(40) } }))],
+], { message: `Release tag ${tag} points to ${'c'.repeat(40)} (tree), not ${sha}.` });
 const logs = [];
 const originalLog = console.log;
 try {
@@ -57,10 +57,10 @@ scenario([
 scenario([
   [lookup, ref({ type: 'commit', sha })],
   [view, { status: 1, stdout: '', stderr: 'release not found' }],
-], /Restore the Release or remove the tag/);
+], { message: `Tag ${tag} exists but its Release cannot be read. Restore the Release or remove the tag before retrying.` });
 scenario([
   [lookup, ref({ type: 'commit', sha })],
   [view, { status: 1, stdout: '', stderr: 'HTTP 403 forbidden' }],
 ], { message: `gh release view ${tag} failed: HTTP 403 forbidden` });
-scenario([[lookup, { status: 1, stdout: 'HTTP/2 403 Forbidden\r\n\r\n{}', stderr: 'forbidden' }]], /Could not look up/);
+scenario([[lookup, { status: 1, stdout: 'HTTP/2 403 Forbidden\r\n\r\n{}', stderr: 'forbidden' }]], { message: `Could not look up ${tag}: forbidden` });
 console.log('RIGEL RELEASE PUBLISH SMOKE OK');

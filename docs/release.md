@@ -12,8 +12,8 @@ workspace packages under `packages/*`, `extensions/*`, and `implementations/*` t
 
 ## Rigel runtime release assets
 
-Each push to `rigel-release` builds Linux x64 and macOS arm64 archives and publishes them with `SHA256SUMS` under `rigel-v<version>-<first 10 chars of SHA>`. Version comes from `bin/package.json`.
-Runs queue without cancellation. A tag pointing elsewhere fails. A complete published Release is a no-op; otherwise a rerun uploads all three assets and clears the draft flag. If the Release cannot be found, restore it or remove the tag before retrying.
+Each push to `rigel-release` builds Linux x64 and macOS arm64 archives and publishes them with `SHA256SUMS` under `rigel-v<version>-<first 10 chars of SHA>`. Version comes from `bin/package.json`. The darwin-arm64 build uses GNU tar (`gtar`) from the macos-15 runner image.
+Runs queue without cancellation. A tag pointing elsewhere fails. A complete published Release is a no-op; otherwise a rerun uploads all three assets, clearing the draft flag only if the Release is a draft. If the Release cannot be found, restore it or remove the tag before retrying.
 
 ## 0.11 runtime migration
 

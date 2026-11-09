@@ -72,7 +72,13 @@ const PROBES = [
   },
   { script: "live-job-conclusion.mjs", argv: [], status: 1, stderr: "--result is required" },
   { script: "pr-head-gate.mjs", argv: [], status: 2, stderr: "usage: pnpm pr-head-gate <pull-request-number>" },
-  { script: "rigel-release-publish.mjs", argv: [], status: 1, stderr: "GITHUB_REPOSITORY, TAG and SHA are required" },
+  {
+    script: "rigel-release-publish.mjs",
+    argv: [],
+    env: { GITHUB_REPOSITORY: undefined, TAG: undefined, SHA: undefined },
+    status: 1,
+    stderr: "GITHUB_REPOSITORY, TAG and SHA are required",
+  },
   {
     script: "verify-publish-closure.mjs",
     argv: [],
@@ -107,9 +113,14 @@ function cell(name, ok, detail) {
   console.log(`${ok ? "ok  " : "FAIL"} ${name}${suffix}`);
 }
 
-/** @param {string} path @param {string[]} argv */
-function run(path, argv) {
-  const r = spawnSync(process.execPath, [path, ...argv], { cwd: ROOT, encoding: "utf8" });
+function run(path, argv, env) {
+  const childEnv = { ...process.env, ...env };
+  if (env) {
+    for (const [key, value] of Object.entries(env)) {
+      if (value === undefined) delete childEnv[key];
+    }
+  }
+  const r = spawnSync(process.execPath, [path, ...argv], { cwd: ROOT, encoding: "utf8", env: childEnv });
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
@@ -135,8 +146,8 @@ try {
     // to be one before its result is read.
     const linked = lstatSync(link).isSymbolicLink() && realpathSync(link) === real;
 
-    const direct = run(real, argv);
-    const through = run(link, argv);
+    const direct = run(real, argv, probe.env);
+    const through = run(link, argv, probe.env);
     const ranByRealPath = reachedMain(direct, probe);
     const ranThroughLink = reachedMain(through, probe);
     const same =

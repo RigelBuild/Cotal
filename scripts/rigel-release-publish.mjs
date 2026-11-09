@@ -41,9 +41,9 @@ export function publish({ repository, tag, sha, run = runGh }) {
   }
   const release = JSON.parse(view.stdout);
   const present = new Set(release.assets.map((asset) => asset.name));
-  const missing = assets.some(name => !present.has(name));
+  const missing = assets.some((name) => !present.has(name));
   if (missing || release.isDraft) {
-    invoke(['release', 'upload', tag, ...assets.map(name => `dist/${name}`), '--clobber']);
+    invoke(['release', 'upload', tag, ...assets.map((name) => `dist/${name}`), '--clobber']);
   }
   if (release.isDraft) invoke(['release', 'edit', tag, '--draft=false']);
   if (!missing && !release.isDraft) console.log(`Release ${tag} already has all assets.`);
