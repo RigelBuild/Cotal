@@ -20,7 +20,6 @@ import { fileURLToPath } from "node:url";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const CI = join(ROOT, ".github", "workflows", "ci.yml");
 const CHANGESETS = join(ROOT, ".github", "workflows", "changesets.yml.disabled");
-const PKG = join(ROOT, "package.json");
 
 const BUILDERS = ["seat-native-linux-x64", "seat-native-linux-arm64"] as const;
 
@@ -152,11 +151,8 @@ const csText = readFileSync(CHANGESETS, "utf8");
 const ciJobs = jobs(ciText);
 const csJobs = jobs(csText);
 const pack = ciJobs.get("seat-pack") ?? "";
-const releasePack = csJobs.get("pack") ?? "";
-const publish = csJobs.get("publish") ?? "";
-const releaseNative = csJobs.get("native") ?? "";
-const rootPkg = JSON.parse(readFileSync(PKG, "utf8")) as { scripts?: Record<string, string> };
-const ciPublish = rootPkg.scripts?.["ci:publish"] ?? "";
+const version = csJobs.get("version") ?? "";
+const snapshot = csJobs.get("snapshot") ?? "";
 
 console.log("A. PR pack path in ci.yml");
 check("ci.yml declares job seat-pack", pack.length > 0);
@@ -192,22 +188,17 @@ check("cold candidate requests, downloads and assembles both macOS native artifa
   && ["workspace-native-darwin-x64", "workspace-native-darwin-arm64"].every((name) => downloaded(candidate).includes(name))
   && ["WORKSPACE_NATIVE_DARWIN_X64", "WORKSPACE_NATIVE_DARWIN_ARM64"].every((name) => candidate.includes(name)));
 
-console.log("\nC. Standard packed publication");
-check("release packing needs both native build jobs", ["native", "workspace-native"].every((name) => needsList(releasePack).includes(name)));
-check("release native matrix builds x64 and arm64 on native Linux", /arch: x64\s+runner: ubuntu-latest/.test(releaseNative) && /arch: arm64\s+runner: ubuntu-24.04-arm/.test(releaseNative));
-check("release packing assembles both native families before packing", ["seat-assemble-natives.mjs", "workspace-assemble-natives.mjs"].every((name) => releasePack.indexOf(name) >= 0 && releasePack.indexOf(name) < releasePack.indexOf("changesets/action/pack@")));
-check("release packing downloads the same run's native artifacts", /pattern: '\*-native-\*'/.test(releasePack) && !/run-id:/.test(releasePack));
-check("release packing builds and assembles both macOS bindings", /^\s+darwin: true\s*$/m.test(csJobs.get("workspace-native") ?? "")
-  && ["WORKSPACE_NATIVE_DARWIN_X64", "WORKSPACE_NATIVE_DARWIN_ARM64"].every((name) => releasePack.includes(name)));
-check("publication uses the maintained Changesets publisher", /uses: changesets\/action\/publish@/.test(publish) && ciPublish === "pnpm changeset publish");
-const release = csJobs.get("release") ?? "";
-check("publication consumes the pack this workflow's push run on main made from the same tree",
-  /gh run list --workflow changesets\.yml --event push --branch main --commit "\$parent"/.test(release)
-    && /git rev-parse 'HEAD\^\{tree\}'/.test(releasePack) && /jq -r \.tree "\$candidate"\)" = "\$tree"/.test(release)
-    && /^\s+needs: release\s*$/m.test(publish) && /run-id: \$\{\{ needs\.release\.outputs\.run \}\}/.test(publish)
-    && /pack-dir-artifact-id:.*steps\.packed\.outputs\.artifact-id/.test(publish));
-check("only publication receives npm identity", /^\s+environment:\s*npm-publish\s*$/m.test(publish) && /id-token: write/.test(publish) && !/id-token:/.test(releasePack));
-check("publication does not invoke custom qualification or publication wrappers", !/release-qualification|publish-cold-candidate|direct-release|select-release-natives/.test(csText));
+console.log("\nC. Disabled Changesets version and snapshot paths");
+check("changesets.yml declares job version", version.length > 0);
+hasBoth(needsList(version), "changesets.yml version needs both native linux builders");
+hasBoth(downloaded(version), "changesets.yml version downloads both native linux artifacts");
+check("changesets.yml version job is bound to the npm-publish Environment", /^\s+environment:\s*npm-publish\s*$/m.test(version));
+check("changesets.yml declares job snapshot", snapshot.length > 0);
+hasBoth(needsList(snapshot), "changesets.yml snapshot needs both native linux builders");
+hasBoth(downloaded(snapshot), "changesets.yml snapshot downloads both native linux artifacts");
+check("changesets.yml snapshot runs the shared assembler", /scripts\/seat-assemble-natives\.mjs/.test(snapshot));
+check("Changesets snapshot job reaches the release preflight before its recursive publish", snapshot.indexOf("preflight-npm-publish.mjs") >= 0 && snapshot.indexOf("preflight-npm-publish.mjs") < snapshot.indexOf("pnpm publish -r"));
+check("changesets.yml snapshot job is bound to the npm-publish Environment", /^\s+environment:\s*npm-publish\s*$/m.test(snapshot));
 
 console.log("\nD. Desktop host artifacts");
 const hostTargets = ["darwin-x64", "darwin-arm64", "win32-x64", "win32-arm64"];
@@ -216,7 +207,7 @@ check("PR pack requests the macOS host builds", /^\s+darwin: true\s*$/m.test(ciJ
 for (const [name, body] of [["PR", pack], ["cold", candidate]]) {
   check(`${name} pack downloads all four desktop host artifacts`, hostTargets.every((target) => downloaded(body).some((spec) => spec === `seat-native-${target}` || (spec.endsWith("*") && `seat-native-${target}`.startsWith(spec.slice(0, -1))))));
 }
-for (const [name, body] of [["PR", pack], ["cold", candidate], ["release", releasePack]]) {
+for (const [name, body] of [["PR", pack], ["cold", candidate]]) {
   check(`${name} pack supplies all four host artifacts to assembly`, hostTargets.every((target) => body.includes(`SEAT_NATIVE_${target.toUpperCase().replaceAll("-", "_")}`)));
 }
 check("shared host builders compile and upload seat helpers", (windowsRecipe.match(/node packages\/seat\/scripts\/build-native.mjs --host/g) ?? []).length === 2
@@ -269,7 +260,7 @@ try {
 console.log("\nD. Native builders ship pty.node, and ARM loads it");
 shipsBothNatives("ci.yml", ciJobs);
 shipsBothNatives("changesets.yml", csJobs);
-const nativeEnv = [...`${ciText}\n${csText}`.matchAll(/SEAT_NATIVE_(?:X64|ARM64):[ \t]*(.+?)[ \t]*$/gm)].map((m) => m[1]);
+const nativeEnv = [...`${pack}\n${version}\n${snapshot}`.matchAll(/SEAT_NATIVE_(?:X64|ARM64):[ \t]*(.+?)[ \t]*$/gm)].map((m) => m[1]);
 check(
   "SEAT_NATIVE_X64 and SEAT_NATIVE_ARM64 name the builder directory, not one file",
   nativeEnv.length === 6 && nativeEnv.every((v) => /\/seat-native-linux-(x64|arm64)$/.test(v)),
