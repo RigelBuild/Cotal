@@ -1,0 +1,37 @@
+{
+  "suite": [
+    "extensions/connector-core/smoke/history-flood.smoke.ts"
+  ],
+  "guard": "historical channel traffic including mentions stays pull-only, while direct mail and live channel traffic keep their existing delivery",
+  "command": "pnpm smoke:history-flood",
+  "completionMarker": "history-flood smoke:",
+  "proveWith": "node scripts/mutation-proof.mjs --config extensions/connector-core/smoke/mutations/history-flood.json",
+  "why": [
+    "A replayed channel mention is catch-up context, not a new request.",
+    "The original ambient-only exclusion left old mentions able to wake a session.",
+    "These existing fixture definitions track the current classifier and its live-traffic control."
+  ],
+  "mutations": [
+    {
+      "name": "M1 historical traffic no longer forces pull-only",
+      "file": "extensions/connector-core/src/agent.ts",
+      "find": "item.historical || (!item.mentionsMe && (remembered?.pullOnly ?? cm === \"quiet\"))",
+      "replace": "!item.mentionsMe && (remembered?.pullOnly ?? cm === \"quiet\")",
+      "expectRed": "automatic delivery after a 119-message backfill is EXACTLY the live work order"
+    },
+    {
+      "name": "M2 historical mentions become automatic again",
+      "file": "extensions/connector-core/src/agent.ts",
+      "find": "item.historical || (!item.mentionsMe && (remembered?.pullOnly ?? cm === \"quiet\"))",
+      "replace": "!item.mentionsMe && (item.historical || (remembered?.pullOnly ?? cm === \"quiet\"))",
+      "expectRed": "historical mentions and ambient both stay pull-only"
+    },
+    {
+      "name": "M3 all channel ambient becomes pull-only",
+      "file": "extensions/connector-core/src/agent.ts",
+      "find": "item.historical || (!item.mentionsMe && (remembered?.pullOnly ?? cm === \"quiet\"))",
+      "replace": "item.historical || !item.mentionsMe",
+      "expectRed": "live channel ambient remains automatic under open attention"
+    }
+  ]
+}

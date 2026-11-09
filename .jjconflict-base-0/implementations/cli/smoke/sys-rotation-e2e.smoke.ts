@@ -1,0 +1,414 @@
+/**
+ * `$SYS` ROTATION E2E (issue #338): the operator's whole recovery cycle, through the packaged
+ * binary, against a real broker + a real delivery daemon + a real manager. Nothing here is staged in
+ * process: every state transition is a `cotal` subprocess, and every assertion reads what that
+ * subprocess left behind.
+ *
+ * `sys-rotation.smoke.ts` proves the mechanism (`rotateSystemCreds`, the refusal guards, the boot
+ * split-check) and drives `up` in process. It cannot see any of the following, because all of it
+ * lives in other processes:
+ *
+ *  - the reported SYMPTOM: with the $SYS pair past its 30-day horizon the real daemon's membership
+ *    feed does not come up, and what it logs is now the credential and the repair rather than a bare
+ *    "Authorization Violation";
+ *  - the NO-OP that shipped as the fix: `cotal down` + a plain `cotal up` rewrites neither $SYS file
+ *    leaves it byte-identical, still expired, doctor still red. This is the regression the branch exists to
+ *    kill, so it is a check, not a comment;
+ *  - the REPAIR: `cotal up --rotate-sys` clears the symptom in the daemon that reported it;
+ *  - the SURVIVAL claim the repair copy makes to the operator. An agent credential minted before the
+ *    rotation still connects afterwards, and a message published before it is still readable at its
+ *    JetStream sequence after it. "Your agents and your data are untouched" is otherwise a promise
+ *    with no test behind it;
+ *  - the CONTROLLER route: a stack from `space create` plus `up` refuses the rotation while a member
+ *    runs, and after `down --yes` its `up --rotate-sys` rotates and reports the generation.
+ *
+ * Elapsed time is the one thing simulated: the $SYS pair is minted with a past `exp`, which is the
+ * state a 30-day-old mesh reaches on its own. It is signed by the space's CURRENT system account, so
+ * what the daemon and the doctor react to is expiry, not the torn-pair case, which is
+ * `sys-rotation.smoke.ts` stage 6.
+ *
+ * NOTE: runs the BUILT dist, so `pnpm build` first.
+ * Run: pnpm smoke:sys-rotation-e2e   (needs `nats-server` on PATH; local-only; ~60s)
+ */
+import { randomUUID } from "node:crypto";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { connect, credsAuthenticator } from "@nats-io/transport-node";
+import { jetstreamManager } from "@nats-io/jetstream";
+import {
+  chatStream,
+  createSpaceAuth,
+  credsClaims,
+  inspectCredHealth,
+  mintConnectionEvictorCreds,
+  mintCreds,
+  mintLifecycleUid,
+  mintMembershipObserverCreds,
+  newIdentity,
+  standaloneConnectOpts,
+} from "@cotal-ai/core";
+import { canonicalLocalProcessPath, DELIVERY_LOGFILE, getSpaceAuth, MANAGER_LOGFILE, MEMBERSHIP_RW_CREDS_KIND, putSpaceAuth, renewalRecordPath, spaceMaterialDir, SYSTEM_CREDS_FILES, workspaceSecretStore } from "@cotal-ai/workspace";
+import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
+import { assertSmokeSandboxDown, recordSmokeSandbox, type SmokeSandboxAnchor } from "@cotal-ai/smoke-kit";
+
+let pass = 0,
+  fail = 0;
+const check = (name: string, cond: boolean, extra?: unknown) => {
+  if (cond) {
+    pass++;
+    console.log(`  ✓ ${name}`);
+  } else {
+    fail++;
+    console.log(`  ✗ FAIL: ${name}`, extra ?? "");
+  }
+};
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const enc = (s: string) => new TextEncoder().encode(s);
+const survivors = (label: string): void => {
+  if (process.env.SYSROT_DEBUG !== "1") return;
+  const ps = execFileSync("ps", ["-eo", "pid,command"], { encoding: "utf8" })
+    .split("\n")
+    .filter((l) => (l.includes(SPACE) || l.includes(`-e2e-${RUN}-`)) && !l.includes("ps -eo"));
+  console.log(`  [debug] after ${label}: ${ps.length} live:\n${ps.map((l) => "      " + l.trim().slice(0, 150)).join("\n")}`);
+};
+
+const repoRoot = join(import.meta.dirname, "..", "..", "..");
+const cotalJs = join(repoRoot, "bin", "dist", "cotal.js");
+if (!existsSync(cotalJs)) {
+  console.error(`no built CLI at ${cotalJs}; run \`pnpm build\` first`);
+  process.exit(1);
+}
+
+// Unique per run: both the temp root and the space name appear in the child processes' command
+// lines, and the teardown sweep keys on them, so they must not collide with another lane's mesh.
+const RUN = randomUUID().slice(0, 8);
+const SPACE = `sysrote2e-${RUN}`;
+const HOME = mkdtempSync(join(tmpdir(), `cotal-sysrot-e2e-home-${RUN}-`));
+const root = mkdtempSync(join(tmpdir(), `cotal-sysrot-e2e-${RUN}-`));
+// Stage 6's controller stack. `-e2e-${RUN}-` in its path keeps its broker inside the teardown sweep.
+const stackRoot = mkdtempSync(join(tmpdir(), `cotal-sysrot-e2e-${RUN}-stack-`));
+const CONFIG = join(HOME, "xdg");
+const sandbox = recordSmokeSandbox({ root, cotalHome: HOME, xdgConfigHome: CONFIG });
+const cotalPath = (f: string) => join(root, ".cotal", f);
+// The mesh this suite stages is PRE-P7: a 30-day-old root whose material is still flat. That is the
+// honest input, and it makes the first boot's migration part of what this e2e covers — so the
+// STAGING paths are the legacy flat ones and every path read after a boot is the canonical
+// segmented one. Nothing here writes flat after a boot: a flat file beside a segmented one is the
+// §2 rule 3 ambiguity, and it refuses loudly.
+const legacyPath = cotalPath;
+const obsPath = join(spaceMaterialDir(root, SPACE), SYSTEM_CREDS_FILES[0]);
+const evPath = join(spaceMaterialDir(root, SPACE), SYSTEM_CREDS_FILES[1]);
+const runtimeLog = (template: string) => canonicalLocalProcessPath(template, { root, space: SPACE });
+const deliveryLog = runtimeLog(DELIVERY_LOGFILE);
+mkdirSync(join(root, ".cotal", "auth"), { recursive: true });
+
+const PORT = await pickFreePort();
+const SERVERS = `nats://127.0.0.1:${PORT}`;
+
+/** One `cotal` subprocess, on the sandboxed home. From the provisioned root it runs as the `sysrot`
+ *  sender. Stage 6's controller stack runs as the operator, because its `up` and `down` read a named
+ *  caller as a managed seat. */
+function cotal(args: string[], timeout = 120_000, at: { cwd: string; sandbox: SmokeSandboxAnchor; sender: boolean } = { cwd: root, sandbox, sender: true }): { code: number | null; out: string; stdout: string } {
+  const options = {
+    cwd: at.cwd,
+    encoding: "utf8" as const,
+    timeout,
+    env: {
+      ...process.env,
+      NO_COLOR: "1",
+      COTAL_HOME: HOME,
+      XDG_CONFIG_HOME: CONFIG,
+      COTAL_SKIP_CONNECTOR_SEED: "1",
+      ...(at.sender ? { COTAL_NAME: "sysrot", COTAL_ID: "sysrot_send" } : {}),
+    },
+  };
+  assertSmokeSandboxDown(at.sandbox, args, options);
+  const r = spawnSync(process.execPath, [cotalJs, ...args], options);
+  return { code: r.status, out: (r.stdout ?? "") + (r.stderr ?? ""), stdout: r.stdout ?? "" };
+}
+
+/** The delivery daemon appends across boots, so every read is of ONE boot's tail. Marked in DECODED
+ *  characters, not bytes: the log is full of multibyte glyphs (`✓`, `•`), so a `statSync().size` mark would slice a
+ *  UTF-8 string at the wrong place and silently eat the head of the tail. */
+const logSize = (): number => (existsSync(deliveryLog) ? readFileSync(deliveryLog, "utf8").length : 0);
+const logTail = (from: number): string => (existsSync(deliveryLog) ? readFileSync(deliveryLog, "utf8").slice(from) : "");
+/** The daemon starts a beat behind the CLI's exit. Wait for its membership VERDICT (up, degraded,
+ *  or unprovisioned), which is the last thing it writes before installing its signal handlers. */
+async function daemonTail(from: number, ms = 25_000): Promise<string> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    const t = logTail(from);
+    if (/membership feed up|[!•] membership:/.test(t)) {
+      await wait(700);
+      return logTail(from);
+    }
+    await wait(250);
+  }
+  return logTail(from);
+}
+
+/**
+ * `cotal down`, but never within the delivery daemon's first few seconds.
+ *
+ * A daemon SIGTERMed that young never completes the KV delete that releases its single-flight
+ * delivery lease: the request does not settle, its own 2s hard-exit fallback fires first, and the
+ * lease is left holding a live value for the rest of its 30s TTL, so the NEXT daemon refuses to
+ * bind ("a live lease already exists for shard 0") and the mesh comes back without Plane-3 delivery.
+ *
+ * This is a property of the daemon's shutdown path, not of anything here: it reproduces on an
+ * ordinary mesh with no expired credential and no rotation anywhere, purely by stopping a
+ * seconds-old daemon (three `up`/`down` cycles back to back, ~2.5s of daemon life apiece → the third
+ * boot cannot bind; give each daemon 2.5s more and every cycle is clean). A real operator's daemon
+ * has been up for weeks, so this suite waits rather than encoding the bug as an expectation.
+ */
+async function settleThenDown(opts: { awaitManagerLease?: boolean } = {}): Promise<{ code: number | null; out: string }> {
+  await wait(3000);
+  const r = cotal(["down", "--with-agents"]);
+  // The MANAGER has the same shape of problem on its own lease, and it bites the boot AFTER the one
+  // that was stopped. Its instance id is persisted, so a restart re-acquires the SAME per-instance
+  // key; a manager whose predecessor did not release it refuses to start ("already serves space … -
+  // stop it first"), `up` still exits 0, and the mesh comes back with no manager at all: no renewal
+  // pass runs, so `doctor auth` goes on grading a record from before the repair. Waiting out
+  // MANAGER_LEASE_TTL_MS (10s) is what makes it deterministic. Also reproducible with no rotation
+  // anywhere: three ordinary `up`/`down` cycles refuse on the third, and the same three with 12s
+  // after each `down` do not.
+  if (opts.awaitManagerLease) await wait(12_000);
+  return r;
+}
+
+async function accepts(creds: string, servers = SERVERS): Promise<boolean> {
+  try {
+    const nc = await connect({ servers, timeout: 3000, reconnect: false, maxReconnectAttempts: 0, authenticator: credsAuthenticator(enc(creds)) });
+    await nc.close();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** A privileged standalone JS connection: a scoped cred subscribes only `_INBOX_<id>.>`, so the
+ *  JS-API replies need the pinned inbox prefix or every request hangs on a permissions violation. */
+async function withJsm<T>(creds: string, fn: (jsm: Awaited<ReturnType<typeof jetstreamManager>>) => Promise<T>): Promise<T> {
+  const nc = await connect({ servers: SERVERS, timeout: 5000, reconnect: false, maxReconnectAttempts: 0, ...standaloneConnectOpts({ creds, tls: false }) });
+  try {
+    return await fn(await jetstreamManager(nc));
+  } finally {
+    await nc.close();
+  }
+}
+/** The CHAT stream's identity as the operator's data: how many messages, and where the log is. A
+ *  stream that was recreated by the rotation would come back at sequence 0. (No role may
+ *  `STREAM.MSG.GET` on CHAT, since reads there are consumer-scoped by design, so the bytes are proven
+ *  through the registry instead, below.) */
+const chatState = (creds: string): Promise<{ messages: number; last_seq: number; first_ts: string }> =>
+  withJsm(creds, async (jsm) => {
+    const s = (await jsm.streams.info(chatStream(SPACE))).state;
+    return { messages: s.messages, last_seq: s.last_seq, first_ts: String(s.first_ts) };
+  });
+
+try {
+  // ── the state a 30-day-old mesh reaches on its own ──────────────────────────────────────────────
+  const store = workspaceSecretStore(root);
+  const auth = await createSpaceAuth(SPACE);
+  await putSpaceAuth(store, auth);
+  const deadAt = Math.floor(Date.now() / 1000) - 3600;
+  writeFileSync(legacyPath(SYSTEM_CREDS_FILES[0]), await mintMembershipObserverCreds(auth, newIdentity(), { expiresAt: deadAt }), { mode: 0o600 });
+  writeFileSync(legacyPath(SYSTEM_CREDS_FILES[1]), await mintConnectionEvictorCreds(auth, newIdentity(), { expiresAt: deadAt }), { mode: 0o600 });
+  // The rest of the membership bundle, exactly as a `cotal up` that CREATED this space left it: the
+  // reported mesh had a feed that ran for weeks, so the file set must be complete or the daemon stops
+  // at "not provisioned here" and never reaches the expiry it is supposed to report.
+  writeFileSync(legacyPath("membership.json"), JSON.stringify({ accountId: auth.account.pub }), { mode: 0o600 });
+  // The bare KIND is the pre-P7 flat key, which is exactly the legacy shape being staged.
+  await store.put(MEMBERSHIP_RW_CREDS_KIND, await mintCreds(auth, newIdentity(), "membership-rw"));
+  // Two DATA-account creds minted before any rotation. The whole safety claim of the repair is that
+  // these keep working, so they are minted here, once, and never re-minted.
+  const preAgent = await mintCreds(auth, newIdentity(), "agent", { lifecycleUid: mintLifecycleUid() });
+  const preReader = await mintCreds(auth, newIdentity(), "provisioner");
+  const expiredObs = readFileSync(legacyPath(SYSTEM_CREDS_FILES[0]), "utf8");
+  const expiredEv = readFileSync(legacyPath(SYSTEM_CREDS_FILES[1]), "utf8");
+
+  // ── 1) the mesh as the reporter found it ───────────────────────────────────────────────────────
+  console.log("\n1) an auth mesh whose $SYS pair is past its horizon");
+  let mark = logSize();
+  const boot1 = cotal(["up", "--detach", "--space", SPACE, "--server", SERVERS]);
+  check("`cotal up --detach` boots the mesh (the expiry does not stop the space)", boot1.code === 0, boot1.out.slice(-500));
+  const tail1 = await daemonTail(mark);
+  check("the real delivery daemon came up", /delivery daemon up/.test(tail1), tail1.slice(-400));
+  // The reported symptom, in the process that reports it.
+  check("its membership feed did NOT start (#338's symptom, reproduced live)", !/membership feed up/.test(tail1), tail1.slice(-400));
+  // ...and the diagnosis, which used to be a bare "Authorization Violation" naming nothing.
+  check("the daemon names the EXPIRED $SYS cred, not just a dead feed", /! membership:.*EXPIRED/s.test(tail1), tail1.slice(-400));
+  check("the daemon names the repair that works", /--rotate-sys/.test(tail1), tail1.slice(-400));
+  // P7, through the real binary on a real pre-P7 root: the first boot MOVED the flat pair into this
+  // space's segment. Both halves matter — a copy that left the flat file behind is the §2 rule 3
+  // ambiguity the next reader refuses on, and it is invisible if only the new location is asserted.
+  check("the boot migrated the legacy $SYS pair into `.cotal/space.<hex>/`", existsSync(obsPath) && existsSync(evPath));
+  check("...and left no flat copy behind", !existsSync(legacyPath(SYSTEM_CREDS_FILES[0])) && !existsSync(legacyPath(SYSTEM_CREDS_FILES[1])));
+  check("the migration is byte-preserving (a move, not a re-mint)", readFileSync(obsPath, "utf8") === expiredObs && readFileSync(evPath, "utf8") === expiredEv);
+  const doc1 = cotal(["doctor", "auth"]);
+  check("`cotal doctor auth` exits 5 on the expired pair", doc1.code === 5, `code=${doc1.code} ${doc1.out.slice(-300)}`);
+  check("`cotal doctor auth` names both $SYS files as EXPIRED", doc1.out.includes(SYSTEM_CREDS_FILES[0]) && doc1.out.includes(SYSTEM_CREDS_FILES[1]) && /EXPIRED/.test(doc1.out), doc1.out.slice(-400));
+  check("`cotal doctor auth` prints `--rotate-sys` as the repair", /--rotate-sys/.test(doc1.out), doc1.out.slice(-400));
+
+  // ── 2) data written BEFORE the rotation, through the product surface ────────────────────────────
+  console.log("\n2) traffic and durable state before any rotation");
+  const NONCE = `sysrot-${randomUUID()}`;
+  const CH = `survive-${RUN}`;
+  const sent = cotal(["send", "-c", "general", NONCE, "--space", SPACE, "--server", SERVERS]);
+  check("`cotal send -c` exits 0 on the expiring mesh", sent.code === 0, sent.out.slice(-400));
+  const set = cotal(["channel", "set", CH, "--desc", NONCE, "--space", SPACE, "--server", SERVERS]);
+  check("`cotal channel set` writes durable registry state", set.code === 0, set.out.slice(-400));
+  const list1 = cotal(["channel", "--space", SPACE, "--server", SERVERS]);
+  check("`cotal channel` reads it back before the rotation", list1.out.includes(CH) && list1.out.includes(NONCE), list1.out.slice(-400));
+  const chatBefore = await chatState(preReader);
+  check("the message landed on the CHAT stream", chatBefore.messages > 0 && chatBefore.last_seq > 0, chatBefore);
+
+  // ── 3) the repair the tooling used to advertise ────────────────────────────────────────────────
+  console.log("\n3) `down` + a plain `up`: the repair that shipped, and did nothing");
+  const down1 = await settleThenDown();
+  check("`cotal down` exits 0", down1.code === 0, down1.out.slice(-400));
+  survivors("down 1");
+  mark = logSize();
+  const boot2 = cotal(["up", "--detach", "--space", SPACE, "--server", SERVERS]);
+  // The expired evictor cannot verify-evict the previous manager's serve family, so its restart
+  // fails closed. A degraded first boot exits 1 (#3893), even though broker and delivery start.
+  check("a plain `cotal up` reports the degraded control plane", boot2.code === 1 && /control plane degraded:/.test(boot2.out), boot2.out.slice(-500));
+  // Wait for THIS boot's daemon before the next `down`; see `settleThenDown` for why a
+  // seconds-old daemon must not be stopped here.
+  const tail2 = await daemonTail(mark);
+  check("the plain re-up's daemon came up", /delivery daemon up/.test(tail2), tail2.slice(-400));
+  check("...and still reports the same expired $SYS cred (the re-up healed nothing)", /! membership:.*EXPIRED/s.test(tail2), tail2.slice(-400));
+  // The bug, pinned: `up` mints the $SYS pair only on the branch that CREATES the trust record.
+  check("it left the observer cred BYTE-IDENTICAL (still expired)", readFileSync(obsPath, "utf8") === expiredObs);
+  check("it left the evictor cred BYTE-IDENTICAL (still expired)", readFileSync(evPath, "utf8") === expiredEv);
+  const doc2 = cotal(["doctor", "auth"]);
+  check("`cotal doctor auth` is still red after the advertised repair", doc2.code === 5, `code=${doc2.code} ${doc2.out.slice(-300)}`);
+
+  // ── 4) the repair that works ───────────────────────────────────────────────────────────────────
+  console.log("\n4) `down` + `up --rotate-sys`");
+  // The manager must be able to start on the boot that follows, because the doctor check below
+  // grades the renewal record its first pass writes.
+  const down2 = await settleThenDown({ awaitManagerLease: true });
+  check("`cotal down` exits 0 before the rotation", down2.code === 0, down2.out.slice(-400));
+  survivors("down 2");
+  const mgrMark = (() => { try { return readFileSync(runtimeLog(MANAGER_LOGFILE), "utf8").length; } catch { return 0; } })();
+  mark = logSize();
+  const boot3 = cotal(["up", "--rotate-sys", "--detach", "--space", SPACE, "--server", SERVERS]);
+  check("`cotal up --rotate-sys --detach` exits 0", boot3.code === 0, boot3.out.slice(-800));
+  check("the rotation tells the operator its backups are now unrestorable", /backup/i.test(boot3.out), boot3.out.slice(-800));
+
+  survivors("boot 3");
+  const rotated = await getSpaceAuth(store, SPACE);
+  const newObs = readFileSync(obsPath, "utf8");
+  const newEv = readFileSync(evPath, "utf8");
+  check("the system-account generation advanced", (rotated?.gen ?? 0) > (auth.gen ?? 0), `${auth.gen} → ${rotated?.gen}`);
+  check("both $SYS creds were rewritten", newObs !== expiredObs && newEv !== expiredEv);
+  check("both are issued by the record's CURRENT system account", credsClaims(newObs).iss === rotated?.sys.pub && credsClaims(newEv).iss === rotated?.sys.pub, `${credsClaims(newObs).iss} / ${credsClaims(newEv).iss} vs ${rotated?.sys.pub}`);
+  check("neither is expired any more", inspectCredHealth(newObs).state !== "expired" && inspectCredHealth(newEv).state !== "expired", `${inspectCredHealth(newObs).state} / ${inspectCredHealth(newEv).state}`);
+
+  // The symptom, cleared in the process that reported it: the same reader that said "did NOT start"
+  // above, so its silence there was a real reading rather than a broken probe.
+  const tail3 = await daemonTail(mark);
+  check("the daemon's membership feed IS up after the rotation", /membership feed up/.test(tail3), tail3.slice(-500));
+  // A degraded feed says so. The first sweep after boot can miss the daemon's own connection and
+  // keep its last membership for one interval; that warning is not a degraded feed.
+  check("the daemon no longer reports a degraded membership feed", !/! membership:.*graph membership degraded/.test(tail3), tail3.split("\n").filter((line) => /! membership:/.test(line)));
+  // Bounded, and only on the POSITIVE assertion. `doctor auth` also grades the last renewal record,
+  // which still holds the pre-rotation adoption failure until the manager's first post-boot pass
+  // rewrites it, so this waits for that pass rather than for the rotation, which has already
+  // happened. A red here at the deadline is a real finding: it would mean an operator sees a failed
+  // doctor for as long as the record stays stale after a successful repair.
+  const started = Date.now();
+  let doc3 = cotal(["doctor", "auth"]);
+  while (doc3.code !== 0 && Date.now() - started < 60_000) {
+    await wait(2000);
+    doc3 = cotal(["doctor", "auth"]);
+  }
+  check(`\`cotal doctor auth\` exits 0 after the rotation (${Math.round((Date.now() - started) / 1000)}s)`, doc3.code === 0, `code=${doc3.code} ${doc3.out.slice(-400)}`);
+
+  // ── 5) what the repair promised to leave alone ─────────────────────────────────────────────────
+  console.log("\n5) the survival claim the repair copy makes");
+  check("the ROTATED observer is accepted by the broker `up` started", await accepts(newObs));
+  check("the ROTATED evictor is accepted too (live eviction rides this pair)", await accepts(newEv));
+  check("the pre-rotation observer is REJECTED (the old system account is retired)", !(await accepts(expiredObs)));
+  check("an AGENT cred minted before the rotation still connects", await accepts(preAgent));
+  const chatAfter = await chatState(preReader);
+  check("the CHAT stream came back at the same sequence, count and start (not recreated)", JSON.stringify(chatAfter) === JSON.stringify(chatBefore), `${JSON.stringify(chatBefore)} vs ${JSON.stringify(chatAfter)}`);
+  const list2 = cotal(["channel", "--space", SPACE, "--server", SERVERS]);
+  check("durable registry state written before the rotation reads back byte-for-byte after it", list2.out.includes(CH) && list2.out.includes(NONCE), list2.out.slice(-400));
+
+  const down3 = await settleThenDown();
+  check("`cotal down` tears the rotated mesh down cleanly", down3.code === 0, down3.out.slice(-400));
+
+  // ── 6) the controller stack's route ────────────────────────────────────────────────────────────
+  console.log("\n6) a controller stack rotates through its own stopped `up`");
+  // SPACE in the space name keeps this stack's daemons inside the teardown sweep.
+  const stackSpace = `${SPACE}-stack`;
+  const stackServers = `nats://127.0.0.1:${await pickFreePort()}`;
+  const json = (r: { stdout: string }) => { try { return JSON.parse(r.stdout) as { outcome?: string; result?: { rotatedSystemAccount?: { generation: number; expiresAt: string | null } | null }; error?: { code: string; remedy?: string } }; } catch { return undefined; } };
+  const created = cotal(["space", "create", stackSpace, "--root", stackRoot, "--json"]);
+  check("`space create` prepares the stack's root", created.code === 0, created.out.slice(-400));
+  const stack = { cwd: stackRoot, sandbox: recordSmokeSandbox({ root: stackRoot, cotalHome: HOME, xdgConfigHome: CONFIG }), sender: false };
+  const stackCli = (args: string[]) => cotal(args, 120_000, stack);
+  const stackObs = () => readFileSync(join(spaceMaterialDir(stackRoot, stackSpace), SYSTEM_CREDS_FILES[0]), "utf8");
+  const first = stackCli(["up", "--server", stackServers, "--json"]);
+  check("the first `up` starts a controller stack", first.code === 0 && /"kind":"controller-stack-up"/.test(first.stdout), first.out.slice(-600));
+  const stackStore = workspaceSecretStore(stackRoot);
+  const stackAuth = await getSpaceAuth(stackStore, stackSpace);
+  const obsBefore = stackObs();
+  const live = json(stackCli(["up", "--rotate-sys", "--json"]));
+  check("`up --rotate-sys` on the running stack refuses LIFECYCLE_BLOCKED and names `cotal down --yes`", live?.outcome === "refused" && live.error?.code === "LIFECYCLE_BLOCKED" && Boolean(live.error.remedy?.includes("cotal down --yes")), live);
+  check("the refused rotation left the $SYS creds and the trust record as they were", stackObs() === obsBefore && (await getSpaceAuth(stackStore, stackSpace))?.sys.pub === stackAuth?.sys.pub);
+  await wait(3000);
+  const stackDown = stackCli(["down", "--yes", "--json"]);
+  check("`cotal down --yes` stops the stack", stackDown.code === 0, stackDown.out.slice(-400));
+  const rotatedUp = stackCli(["up", "--rotate-sys", "--json"]);
+  const receipt = json(rotatedUp)?.result?.rotatedSystemAccount;
+  const stackRotated = await getSpaceAuth(stackStore, stackSpace);
+  const obsAfter = stackObs();
+  check("the stopped stack's `up --rotate-sys` exits 0 and reports the new generation", rotatedUp.code === 0 && receipt?.generation === stackRotated?.gen && (stackRotated?.gen ?? 0) > (stackAuth?.gen ?? 0), { receipt, before: stackAuth?.gen, after: stackRotated?.gen, out: rotatedUp.out.slice(-600) });
+  check("its observer is issued by the record's new system account", credsClaims(obsAfter).iss === stackRotated?.sys.pub && stackRotated?.sys.pub !== stackAuth?.sys.pub, `${credsClaims(obsAfter).iss} vs ${stackRotated?.sys.pub}`);
+  check("the stack's broker accepts the rotated observer and refuses the retired one", (await accepts(obsAfter, stackServers)) && !(await accepts(obsBefore, stackServers)));
+  await wait(3000);
+  const stackDown2 = stackCli(["down", "--yes", "--json"]);
+  check("`cotal down --yes` stops the rotated stack", stackDown2.code === 0, stackDown2.out.slice(-400));
+
+  if (process.env.SYSROT_DEBUG === "1") {
+    console.log("\n---- FULL DELIVERY LOG ----\n" + readFileSync(deliveryLog, "utf8"));
+    console.log("\n---- DOWN OUTPUTS ----\n1:", down1.out, "\n2:", down2.out, "\n3:", down3.out);
+    console.log("\n---- BOOT3 OUT ----\n", boot3.out);
+    try { console.log("\n---- MANAGER LOG (boot 3 only) ----\n" + readFileSync(runtimeLog(MANAGER_LOGFILE), "utf8").slice(mgrMark)); } catch (e) { console.log("mgr tail unreadable:", (e as Error).message); }
+    try { console.log("\n---- MANAGER LOG (full tail) ----\n" + readFileSync(runtimeLog(MANAGER_LOGFILE), "utf8").slice(-3000)); } catch (e) { console.log("manager.log unreadable:", (e as Error).message); }
+    try { console.log("\n---- RENEWAL RECORD ----\n" + readFileSync(renewalRecordPath(root, SPACE), "utf8")); } catch (e) { console.log("renewal record unreadable:", (e as Error).message); }
+  }
+
+  console.log(`\n${fail ? "✗" : "✓"} $SYS ROTATION E2E: ${pass} passed, ${fail} failed`);
+} finally {
+  // `up --detach` starts THREE processes that outlive this suite (broker, delivery, manager) and a
+  // failed check skips the `down` above. Sweep by command line: the broker carries this run's temp
+  // root, the daemons carry its unique space name. Both tokens are unique to this run, so no other
+  // lane's broker is in range. POSIX-only (no `ps` on Windows, where this lane is advisory); the
+  // pass path has already torn everything down through `cotal down` before reaching here.
+  try {
+    const ps = execFileSync("ps", ["-eo", "pid,command"], { encoding: "utf8" });
+    for (const line of ps.split("\n")) {
+      const pid = Number(line.trim().split(/\s+/)[0]);
+      if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
+      if (!line.includes(`-e2e-${RUN}-`) && !line.includes(SPACE)) continue;
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }
+  } catch {
+    /* best effort */
+  }
+  await wait(400);
+  rmSync(root, { recursive: true, force: true });
+  rmSync(stackRoot, { recursive: true, force: true });
+  rmSync(HOME, { recursive: true, force: true });
+}
+process.exit(fail ? 1 : 0);

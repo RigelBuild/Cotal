@@ -1,0 +1,898 @@
+/**
+ * Claude Code wake-path regression test (no test runner) — spins up its OWN nats-server on an
+ * ephemeral port and drives the SHIPPED handler (`createClaudeHandle`) behind the SHIPPED control
+ * server, with a real mesh peer sending real DMs. No `claude` binary, no model.
+ *
+ * It guards the three ways an unattended peer used to go permanently silent — a DM arrives, and
+ * nothing ever delivers it, so the peer simply never replies and only a human at the keyboard
+ * notices:
+ *
+ *   1. ACK-BEFORE-DELIVERY. The hook reply travels connector → unix socket → hook relay → stdout →
+ *      Claude Code, and the relay abandons it after 2s (`runHookRelay`'s TIMEOUT_MS). The handler
+ *      used to `drainInbox()` — which ACKS the JetStream message and marks it handled — while
+ *      merely *formatting* that reply. When the reply then failed to land, the message was gone:
+ *      `handledIds` turns the durable redelivery into a silent ack, so the DM could never come back.
+ *   2. PRESENCE BLOCKING THE WAKE. Every hook branch did `await agent.setStatus(...)` (a broker
+ *      round-trip that throws mid-reconnect) inside the same try/catch as the delivery work, so one
+ *      failed presence write skipped the `Stop` → `requestWake()` flush of held messages entirely.
+ *   3. A DROPPED NUDGE WITH NO RETRY. The `claude/channel` push is an idle session's ONLY wake
+ *      source; a rejected notification was logged and forgotten, and no later hook fires to recover.
+ *
+ * Ack semantics under test: a peer message is COMMITTED only once the reply carrying it is
+ * confirmed flushed to the hook client. Anything less must leave it un-acked so JetStream
+ * redelivers it.
+ *
+ * It also pins the same property one layer down, in code this fix depends on and does not own: when
+ * the ack itself throws (a JetStream ack publishes, so a closed connection fails), the message must
+ * come back. That holds only because `commitPending` acks BEFORE marking handled; reverse those two
+ * lines and a failed ack is marked handled without being acked, which is this branch's original bug
+ * with a new cause. Nothing else in the repo covers that ordering.
+ *
+ * Run: pnpm smoke:claude-wake
+ */
+import { strict as assert } from "node:assert";
+import { spawn } from "node:child_process";
+import { connect } from "node:net";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { once } from "node:events";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { CotalEndpoint, seedChannelRegistry, isReachable, unicastSubject, parsePrincipalKey } from "@cotal-ai/core";
+import { connect as rawConnect } from "@nats-io/transport-node";
+import { MeshAgent, startControlServer, cotalToolSpecs, type InboxItem } from "@cotal-ai/connector-core";
+import { createClaudeHandle, createWakePolicy } from "../src/hooks.js";
+import { SMOKE_BROKER_TOKEN, awaitBrokerReady, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
+
+const here = fileURLToPath(new URL(".", import.meta.url));
+/** The real per-event hook entry Claude Code runs, and the loader that can execute its TS. */
+const hookEntry = join(here, "..", "src", "hook.ts");
+const tsxCli = createRequire(import.meta.url).resolve("tsx/cli");
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const PORT = await freePort();
+const servers = `nats://127.0.0.1:${PORT}`;
+const space = "ccwake";
+/**
+ * Short so redelivery (the recovery path this test asserts) is observable in seconds, not a minute —
+ * but LONG relative to the nudge retry's 1s first attempt. Both mechanisms produce an identical
+ * nudge, so the retry check below can only be about the retry if redelivery cannot have happened
+ * yet: keep `RETRY_DEADLINE_MS` comfortably under this. At 2.5s they were indistinguishable and the
+ * retry check passed with the retry deleted.
+ */
+const ACK_WAIT_MS = 10_000;
+/** The retry's first attempt is at 1s; anything inside this window predates any possible redelivery. */
+const RETRY_DEADLINE_MS = 5_000;
+/** `NUDGE_RETRY_INITIAL_MS` in `../src/hooks.ts` — the earliest the retry timer can possibly fire. */
+const NUDGE_RETRY_FIRST_MS = 1_000;
+const TOKEN = "wake-path-test-token";
+
+const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+const socketPath = join(dir, "control.sock");
+const srv = spawn("nats-server", ["-js", "-p", String(PORT), "-sd", join(dir, "js")], { stdio: "ignore" });
+const releaseBroker = teardownOnSignal(srv, dir);
+
+let pass = 0;
+const check = (name: string, cond: boolean, extra?: unknown) => {
+  assert.ok(cond, `${name}${extra !== undefined ? ` — ${JSON.stringify(extra)}` : ""}`);
+  pass++;
+  console.log(`  ✓ ${name}`);
+};
+
+// ---- the peer side of the mesh -------------------------------------------------------------
+const agent = new MeshAgent({
+  space,
+  name: "Otto",
+  id: "otto",
+  kind: "agent",
+  role: "generalist",
+  servers,
+  subscribe: ["team"],
+  allowSubscribe: ["team"],
+  allowPublish: ["team"],
+  tls: false,
+  ackWaitMs: ACK_WAIT_MS,
+});
+agent.on("error", () => {});
+
+const pub = new CotalEndpoint({ space, servers, card: { name: "Pubby", kind: "agent", id: "pubby" }, channels: ["team"] });
+pub.on("error", () => {});
+
+// ---- the push side: record every claude/channel nudge, and fail it on demand ------------------
+const nudges: string[] = [];
+let failNudges = 0;
+const wake = createWakePolicy(
+  agent,
+  async (params) => {
+    if (failNudges > 0) {
+      failNudges--;
+      throw new Error("stdio pipe closed");
+    }
+    nudges.push(params.content);
+  },
+  () => {},
+);
+
+// ---- the hook side: the SHIPPED handler behind the SHIPPED control server ---------------------
+// Wired to the wake policy as `mcp.ts` wires it: a frame that surfaces an item spends its nudge.
+const claude = createClaudeHandle({ surfaced: (items) => wake.surfaced(items) });
+const inboxSpec = cotalToolSpecs(agent.config, "claude-code", undefined, undefined, claude.inboxDeliveryNote).find((s) => s.name === "cotal_inbox")!;
+const controlServer = startControlServer(agent, { path: socketPath, token: TOKEN }, claude.handle, {
+  onReply: claude.onReply,
+});
+
+/**
+ * Speak the real control-frame protocol the hook relay speaks.
+ * `dropReply` reproduces a relay that gave up (its 2s timeout, or a killed hook process): the frame
+ * IS delivered — we destroy only after the write flushes — but nothing ever reads the answer.
+ */
+function fireHook(event: Record<string, unknown>, opts: { dropReply?: boolean } = {}): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    const sock = connect(socketPath);
+    let buf = "";
+    const finish = (out?: string) => {
+      sock.destroy();
+      resolve(out);
+    };
+    sock.setEncoding("utf8");
+    sock.on("connect", () => {
+      sock.write(JSON.stringify({ token: TOKEN, event }) + "\n", () => {
+        if (opts.dropReply) finish(undefined); // frame delivered; answer abandoned
+      });
+    });
+    sock.on("data", (d) => {
+      buf += d;
+      const nl = buf.indexOf("\n");
+      if (nl >= 0) finish(buf.slice(0, nl));
+    });
+    sock.on("error", () => resolve(undefined));
+    setTimeout(() => finish(undefined), 5_000).unref?.();
+  });
+}
+
+/**
+ * Run the REAL hook entry point — `src/hook.ts`, the same one-liner over `runHookRelay` that
+ * Claude Code executes per lifecycle event — as its own process, event JSON on stdin, and return
+ * what it prints on stdout.
+ *
+ * `fireHook` above hand-builds the control frame, which is fine for driving exact interleavings but
+ * proves nothing about the production path. This is the positive control for the whole chain:
+ * relay process → control socket → handler → reply → relay stdout → runtime, including the relay's
+ * own 2s abandon timer and its stdout-flush backstop. Without it, `delivered === true` might be
+ * unreachable in production and every message would redeliver forever behind a green suite.
+ */
+function fireHookViaRealRelay(
+  event: Record<string, unknown>,
+  opts: { starveStdout?: boolean; breakStdout?: boolean } = {},
+): Promise<{ stdout: string; code: number | null }> {
+  return new Promise((resolve) => {
+    // Ambient COTAL_ vars are stripped before this suite sets its own. Whatever runs this suite may
+    // itself be a managed agent session, and inheriting ITS identity here would give the relay a
+    // second answer to "which control endpoint": a launch-material pointer from the outer session
+    // alongside the token this suite is testing with. The config layer refuses that pair rather than
+    // picking one, and the relay fails open on a refusal, so the failure mode would be a hook that
+    // silently does nothing while every assertion here still reads as a relay bug.
+    const clean = { ...process.env };
+    for (const key of Object.keys(clean)) if (key.startsWith("COTAL_")) delete clean[key];
+    const child = spawn(process.execPath, [tsxCli, hookEntry], {
+      env: {
+        ...clean,
+        COTAL_NAME: "Otto", // hasIdentity() gate — the relay no-ops for an unmanaged session
+        COTAL_CONTROL_SOCKET: socketPath,
+        COTAL_CONTROL_TOKEN: TOKEN,
+      },
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    let out = "";
+    // starveStdout models a runtime that is not draining the hook's output: we never read the pipe,
+    // so a reply larger than the OS pipe buffer can never flush and the relay's 1s backstop kills it
+    // mid-write. Reading it (the normal case) is what lets a large reply through at all.
+    // breakStdout models a runtime that has gone away: we tear the read end down, so the relay's
+    // write FAILS (EPIPE) rather than merely not flushing. The write callback fires either way, which
+    // is exactly why it has to inspect its error argument before confirming the handoff.
+    if (opts.breakStdout) child.stdout.destroy();
+    else if (!opts.starveStdout) {
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (d) => (out += d));
+    }
+    child.on("close", (code) => resolve({ stdout: out.trim(), code }));
+    child.stdin.end(JSON.stringify(event));
+  });
+}
+
+const injected = (reply: string | undefined): string => {
+  if (!reply) return "";
+  const parsed = JSON.parse(reply) as { hookSpecificOutput?: { additionalContext?: string } };
+  return parsed.hookSpecificOutput?.additionalContext ?? "";
+};
+
+const waitFor = async (what: string, cond: () => boolean, ms = 8_000): Promise<void> => {
+  for (let i = 0; i < ms / 100 && !cond(); i++) await sleep(100);
+  if (!cond()) throw new Error(`timed out waiting for ${what}`);
+};
+
+let ottoId = "";
+const dmOtto = async (text: string): Promise<void> => {
+  await pub.unicast(ottoId, text);
+};
+/** Pending count for a specific message body — the honest "is it still recoverable" question. */
+const stillPending = (text: string): boolean => agent.peekInbox("all").some((i: InboxItem) => i.text.includes(text));
+
+try {
+  await awaitBrokerReady(() => isReachable(servers), { servers, attempts: 50, delayMs: 200 });
+  await seedChannelRegistry({ servers, space, file: { defaults: { replay: false }, channels: { team: { replay: false } } } });
+  await pub.start();
+  agent.start();
+  await waitFor("Otto to join the roster", () => pub.getRoster().some((p) => p.card.name === "Otto"));
+  ottoId = pub.getRoster().find((p) => p.card.name === "Otto")!.card.id;
+
+  // A session that has not completed the MCP handshake must not push: the message still buffers.
+  await dmOtto("pre-handshake dm");
+  await waitFor("the pre-handshake DM to buffer", () => stillPending("pre-handshake dm"));
+  check("no claude/channel push before the handshake confirms the capability", nudges.length === 0, nudges);
+  wake.setChannelActive(true);
+  await waitFor("activation to reconcile the buffered pre-handshake DM", () => nudges.length === 1);
+  check("activation emits one batch wake for the buffered pre-handshake DM", nudges[0].includes("Cotal message"), nudges);
+
+  // Boot: SessionStart surfaces whatever was waiting.
+  const boot = await fireHook({ hook_event_name: "SessionStart", model: "claude-opus-5" });
+  check("SessionStart injects the messages that arrived before the session was up", injected(boot).includes("pre-handshake dm"), injected(boot));
+  check("a delivered SessionStart batch is committed", !stillPending("pre-handshake dm"));
+
+  // Real relay presence: permission waits name the tool, never its command or other input.
+  const presence = () => pub.getRoster().find((p) => p.card.id === ottoId);
+  await fireHookViaRealRelay({ hook_event_name: "UserPromptSubmit" });
+  const privateCommand = "printf '%s\\n' private-command-marker";
+  await fireHookViaRealRelay({
+    hook_event_name: "PreToolUse", tool_name: "Bash",
+    tool_input: { command: privateCommand, description: "private-description-marker" },
+  });
+  const permission = await fireHookViaRealRelay({
+    hook_event_name: "Notification", notification_type: "permission_prompt", message: "Claude needs permission to use Bash",
+  });
+  check("the real permission hook exits cleanly", permission.code === 0);
+  await waitFor("the permission wait in the observer roster", () => presence()?.status === "waiting");
+  check("permission activity names only Bash and carries no command or description", presence()?.activity === "Bash");
+  const permissionRow = presence();
+  check("permission waiting retains the native approval condition",
+    permissionRow?.condition?.code === "approval" && permissionRow.condition.source === "permission_prompt" &&
+    permissionRow.condition.message === "Claude needs permission to use Bash");
+  await fireHookViaRealRelay({ hook_event_name: "PreToolUse", tool_name: "Read", tool_input: { file_path: "private-path-marker" } });
+  check("another tool in the open turn does not clear an unresolved permission wait", agent.status === "waiting");
+  await fireHook({ hook_event_name: "PostToolBatch" });
+  await fireHook({ hook_event_name: "Stop" });
+
+  // Channel work need not supply UserPromptSubmit. A real main-agent tool proves work began;
+  // neither a subagent nor a notification merely written to stdio proves that about the main turn.
+  const subagent = await fireHookViaRealRelay({
+    hook_event_name: "PreToolUse", agent_id: "child", tool_name: "Bash", tool_input: { command: "true" },
+  });
+  check("the subagent hook exits cleanly", subagent.code === 0);
+  check("a subagent tool does not open the main agent turn", agent.status === "idle");
+  const noPrompt = await fireHookViaRealRelay({ hook_event_name: "PreToolUse", tool_name: "mcp__cotal__cotal_inbox", tool_input: {} });
+  check("the main tool hook without UserPromptSubmit exits cleanly", noPrompt.code === 0);
+  await waitFor("working after the first main tool without a prompt", () => presence()?.status === "working");
+  check("the first main tool without UserPromptSubmit publishes working", presence()?.status === "working");
+  await fireHook({ hook_event_name: "SessionStart", source: "compact" });
+  check("compaction preserves a tool-started open turn", agent.status === "working");
+  await fireHookViaRealRelay({ hook_event_name: "Stop" });
+  await waitFor("idle after the tool-started turn stops", () => presence()?.status === "idle");
+  check("Stop closes the tool-started turn as idle", presence()?.status === "idle");
+  await fireHookViaRealRelay({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "true" } });
+  await fireHookViaRealRelay({ hook_event_name: "StopFailure", error: "rate_limit" });
+  await waitFor("the failed tool-started turn to stop", () => presence()?.status === "idle" && presence()?.condition?.code === "rate_limit");
+  check("StopFailure closes a tool-started turn and keeps its native failure condition", presence()?.status === "idle" && presence()?.condition?.code === "rate_limit");
+
+  // ---- 1. a DM wakes an idle session -----------------------------------------------------------
+  const nudgesBeforeFirstDm = nudges.length;
+  await dmOtto("dm-one: wake me");
+  await waitFor("a nudge for the first DM", () => nudges.length > nudgesBeforeFirstDm);
+  check("a DM pushes a claude/channel nudge at an idle session", nudges.slice(nudgesBeforeFirstDm).some((n) => n.includes("New dm")), nudges);
+
+  const turnOne = await fireHook({ hook_event_name: "UserPromptSubmit" });
+  check("the woken turn is injected with the DM body", injected(turnOne).includes("dm-one: wake me"), injected(turnOne));
+  await fireHook({ hook_event_name: "Stop" });
+  check("a delivered batch is committed at the end of its turn", !stillPending("dm-one: wake me"));
+
+  const beforeRepeat = await fireHook({ hook_event_name: "UserPromptSubmit" });
+  check("a committed batch is not surfaced twice", !injected(beforeRepeat).includes("dm-one: wake me"), injected(beforeRepeat));
+
+  // A queued channel notice can accompany context the prompt hook already carried. An empty
+  // inbox must explain that confirmed handoff without replaying the peer's body as new mail.
+  const afterHook = await inboxSpec.run(agent, agent.config, {});
+  check("an empty inbox identifies the latest confirmed hook delivery without duplicating it",
+    afterHook.text.includes("most recent confirmed Claude Code hook handoff carried 1 message") &&
+    afterHook.text.includes("additionalContext (UserPromptSubmit)") &&
+    !afterHook.text.includes("dm-one: wake me"));
+  const freshHooks = createClaudeHandle();
+  check("a fresh hook handler invents no delivery receipt", freshHooks.inboxDeliveryNote() === undefined);
+  const plainInbox = cotalToolSpecs(agent.config).find((s) => s.name === "cotal_inbox")!;
+  check("a connector without hook receipts retains the ordinary empty answer",
+    (await plainInbox.run(agent, agent.config, {})).text === "Inbox empty, no new messages.");
+  await fireHook({ hook_event_name: "Stop" });
+
+  // ---- 2. THE BUG: a reply the runtime never receives must not consume the message --------------
+  // This is the relay's 2s timeout (or a killed hook): the connector answers into a socket nobody
+  // is reading. Pre-fix the handler had already acked at format time, so the DM was gone for good.
+  await dmOtto("dm-two: reply is lost");
+  await waitFor("the second DM to buffer", () => stillPending("dm-two: reply is lost"));
+  await fireHook({ hook_event_name: "UserPromptSubmit" }, { dropReply: true });
+  await waitFor("the handler to finish the abandoned frame", () => agent.status === "working");
+  await sleep(500); // let any commit land before we judge it
+  check(
+    "a DM whose hook reply never reached the runtime is NOT consumed",
+    stillPending("dm-two: reply is lost"),
+    { inbox: agent.peekInbox("all").map((i) => i.text) },
+  );
+  check("an unconfirmed hook reply does not update the delivery receipt",
+    claude.inboxDeliveryNote() === afterHook.text);
+  // Un-acked means JetStream is still on the hook for it: the message comes back on its own.
+  const nudgesBeforeRedelivery = nudges.length;
+  await waitFor("JetStream to redeliver the abandoned DM", () => nudges.length > nudgesBeforeRedelivery, ACK_WAIT_MS * 3);
+  check("the abandoned DM is redelivered and re-nudged, so the peer still hears about it", nudges.length > nudgesBeforeRedelivery);
+  const recovery = await fireHook({ hook_event_name: "UserPromptSubmit" });
+  check("the recovered DM reaches the model on the next turn", injected(recovery).includes("dm-two: reply is lost"), injected(recovery));
+  await fireHook({ hook_event_name: "Stop" });
+  check("the recovered DM is committed once it is actually delivered", !stillPending("dm-two: reply is lost"));
+
+  // ---- 3. a failed presence write must never swallow the Stop wake -----------------------------
+  // A DM lands mid-turn (held), then presence fails exactly as it does when the endpoint is
+  // mid-reconnect (setStatus calls assertConnected). The turn-end flush must still fire.
+  await fireHook({ hook_event_name: "UserPromptSubmit" }); // open a turn
+  await dmOtto("dm-three: held behind a turn");
+  await waitFor("the third DM to buffer", () => stillPending("dm-three: held behind a turn"));
+  const realSetStatus = agent.setStatus.bind(agent);
+  agent.setStatus = async () => {
+    throw new Error("not connected to the mesh");
+  };
+  const nudgesBeforeStop = nudges.length;
+  await fireHook({ hook_event_name: "Stop" });
+  await sleep(300);
+  agent.setStatus = realSetStatus;
+  check(
+    "Stop still flushes held messages when the presence write fails",
+    nudges.length > nudgesBeforeStop,
+    { before: nudgesBeforeStop, after: nudges.length },
+  );
+  const afterPresenceFailure = await fireHook({ hook_event_name: "UserPromptSubmit" });
+  check("the held DM survives the presence failure and is injected", injected(afterPresenceFailure).includes("dm-three: held behind a turn"), injected(afterPresenceFailure));
+  await fireHook({ hook_event_name: "Stop" });
+
+  // ---- 3b. one frame's delivery verdict must never commit another frame's batch ------------------
+  // Hook frames are separate socket connections and can overlap (a PreToolUse from a parallel tool
+  // batch while a UserPromptSubmit reply is still being written). Driven directly, not over the
+  // socket, so the interleaving is exact rather than timing-dependent.
+  await dmOtto("dm-cross: belongs to frame A");
+  await waitFor("the cross-frame DM to buffer", () => stillPending("dm-cross: belongs to frame A"));
+  const frameA = { hook_event_name: "UserPromptSubmit" };
+  const frameB = { hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" } };
+  const replyA = await claude.handle(agent, frameA);
+  check(
+    "frame A carries the batch",
+    JSON.stringify(replyA).includes("dm-cross: belongs to frame A"),
+    replyA,
+  );
+  await claude.handle(agent, frameB);
+  claude.onReply(frameB, true); // B delivered — it carried nothing, so it must commit nothing
+  check(
+    "another frame's delivered reply does not commit frame A's batch",
+    stillPending("dm-cross: belongs to frame A"),
+    { inbox: agent.peekInbox("all").map((i) => i.text) },
+  );
+  claude.onReply(frameA, true); // A delivered — now, and only now, it commits
+  check("frame A's own verdict commits frame A's batch", !stillPending("dm-cross: belongs to frame A"));
+
+  // ---- 3c. POSITIVE CONTROL: the same thing through the REAL hook process -----------------------
+  // Every check above drives a frame this file wrote. This one runs the actual entry point Claude
+  // Code invokes, so the whole production chain — relay process, its 2s abandon timer, its stdout
+  // flush, the control socket, the handler, the delivery verdict — is what delivers and commits.
+  await dmOtto("dm-relay: through the real hook");
+  await waitFor("the relay DM to buffer", () => stillPending("dm-relay: through the real hook"));
+  const viaRelay = await fireHookViaRealRelay({ hook_event_name: "UserPromptSubmit" });
+  check("the real hook process exits cleanly", viaRelay.code === 0, viaRelay);
+  check(
+    "the real hook process prints the injected DM for the runtime to apply",
+    injected(viaRelay.stdout).includes("dm-relay: through the real hook"),
+    viaRelay.stdout,
+  );
+  await sleep(300); // the verdict lands just after the child's stdout closes
+  check(
+    "a batch delivered through the real relay IS committed",
+    !stillPending("dm-relay: through the real hook"),
+    { inbox: agent.peekInbox("all").map((i) => i.text) },
+  );
+  await fireHook({ hook_event_name: "Stop" });
+
+  // ---- 4. a rejected nudge is retried — an idle session has no other wake source ----------------
+  // The retry and a JetStream redelivery emit the SAME nudge, so this must be timed to exclude the
+  // latter: the deadline is well under ack_wait, so a nudge inside it can only have come from the
+  // retry timer. (Measured, not assumed — with the two windows overlapping, this check passed with
+  // the retry deleted, proving the redelivery and not the fix.)
+  failNudges = 1;
+  const nudgesBeforeRetry = nudges.length;
+  const retryClock = Date.now();
+  await dmOtto("dm-four: first push fails");
+  await waitFor(
+    "the retried nudge after the first push was rejected",
+    () => nudges.length > nudgesBeforeRetry,
+    RETRY_DEADLINE_MS,
+  );
+  const retryElapsed = Date.now() - retryClock;
+  console.log(`    (retry nudge observed after ${retryElapsed}ms; timer fires at ${NUDGE_RETRY_FIRST_MS}ms, redelivery at ${ACK_WAIT_MS}ms)`);
+  check(
+    "a rejected claude/channel push is retried, before any redelivery could explain it",
+    nudges.length > nudgesBeforeRetry && retryElapsed < ACK_WAIT_MS,
+    { retryElapsed, ackWaitMs: ACK_WAIT_MS },
+  );
+  // Upper bound alone only rules out the redelivery. A nudge arriving IMMEDIATELY would mean some
+  // other producer satisfied the check — a live/durable duplicate re-announcing the same item, say —
+  // and the assertion would be green for the wrong reason. The retry timer cannot fire before its
+  // first delay, so a lower bound pins the observation to the mechanism being claimed.
+  check(
+    "and it was the retry timer that produced it, not a same-instant duplicate",
+    retryElapsed >= NUDGE_RETRY_FIRST_MS,
+    { retryElapsed, timerFiresAtMs: NUDGE_RETRY_FIRST_MS },
+  );
+  const retried = await fireHook({ hook_event_name: "UserPromptSubmit" });
+  check("the DM behind the rejected push is delivered", injected(retried).includes("dm-four: first push fails"), injected(retried));
+  await fireHook({ hook_event_name: "Stop" });
+
+  // ---- 5. the ack ITSELF fails — the branch that runs when the commit does not ------------------
+  // A JetStream ack publishes, so a closed connection throws. `drainInboxDeliveries` removes the batch from
+  // the in-memory buffer BEFORE acking, so a throw part-way through leaves the remainder neither
+  // acked nor marked handled. That is the safe direction — JetStream still owns it — but it is the
+  // branch nobody exercises, and it is safe ONLY because `commitPending` acks before it marks
+  // handled. Swap those two lines in connector-core and a failed ack becomes permanent loss: marked
+  // handled, so `ingest` silently acks the redelivery. That is this branch's original bug, one layer
+  // down, in code this fix depends on and does not own. This is the check that would catch it.
+  await dmOtto("dm-five-a: acks cleanly");
+  await dmOtto("dm-five-b: ack throws");
+  await waitFor("both DMs buffered", () => stillPending("dm-five-a") && stillPending("dm-five-b"));
+  const pendings = (agent as unknown as { inbox: { item: InboxItem; ack: () => void }[] }).inbox;
+  const doomed = pendings.find((p) => p.item.text.includes("dm-five-b"));
+  check("the fault target is buffered and reachable, so the fault is really wired", !!doomed, {
+    buffered: pendings.map((p) => p.item.text),
+  });
+  let ackAttempted = false;
+  doomed!.ack = () => {
+    ackAttempted = true;
+    throw new Error("simulated: connection closed before the ack could publish");
+  };
+  const bothSurfaced = await fireHook({ hook_event_name: "UserPromptSubmit" });
+  check(
+    "both DMs reach the model in one batch",
+    injected(bothSurfaced).includes("dm-five-a") && injected(bothSurfaced).includes("dm-five-b"),
+    injected(bothSurfaced),
+  );
+  await sleep(300); // the verdict lands just after the reply is written
+  check("the failing ack was attempted, so the batch really did try to commit", ackAttempted);
+  check("a throwing ack does not take the session down: the clean sibling still commits", !stillPending("dm-five-a"));
+  check("the un-acked message left the local buffer, because the drain removes before it acks", !stillPending("dm-five-b"));
+  // ...and comes BACK. Un-acked AND un-handled is the only state from which JetStream can recover it.
+  await waitFor("the un-acked DM to be redelivered", () => stillPending("dm-five-b"), ACK_WAIT_MS + 8_000);
+  check("a message whose ack threw is redelivered, not lost", stillPending("dm-five-b"));
+  check("and its cleanly-acked sibling is NOT redelivered with it", !stillPending("dm-five-a"));
+  const afterAckFailure = await fireHook({ hook_event_name: "UserPromptSubmit" });
+  check(
+    "the recovered message reaches the model",
+    injected(afterAckFailure).includes("dm-five-b: ack throws"),
+    injected(afterAckFailure),
+  );
+  check(
+    "and it is labelled a possible repeat, because this one HAD already been shown",
+    injected(afterAckFailure).includes("may be a repeat"),
+    injected(afterAckFailure),
+  );
+  await fireHook({ hook_event_name: "Stop" });
+
+  // ---- 5b. #674: two raw DMs with EMPTY wire ids surface on ONE frame and commit with it ------
+  // The first-party APIs mint an id per message, so an empty id can only come off the wire from a
+  // raw client — the foreign shape `empty-id-ingest` drives at the MeshAgent layer; here it meets
+  // the ADAPTER seam. `surfaceAutomatic` peeks the whole automatic inbox, holds BOTH id-less
+  // deliveries in flight by their RECEIVE keys (a minted one each — the raw ids are ""), and the
+  // frame's `true` verdict drains by those same keys. Under the ledger-keyed-by-id mutation the
+  // hold and the drain address "" instead, the verdict commits nothing, and both texts re-surface
+  // on the very next frame — caught by the no-resurface check below.
+  const enc = new TextEncoder();
+  const rawNc = await rawConnect({ servers, maxReconnectAttempts: 0 });
+  try {
+    const parsedClaude = parsePrincipalKey(ottoId) as { owner: string; actor: string };
+    const emptyIdDm = (text: string): void =>
+      rawNc.publish(
+        unicastSubject(space, parsedClaude.owner, parsedClaude.actor, "local", "rawpub"),
+        enc.encode(
+          JSON.stringify({
+            id: "",
+            ts: Date.now(),
+            space,
+            from: { id: "local.rawpub", name: "RawPub", kind: "agent" },
+            to: ottoId,
+            parts: [{ kind: "text", text }],
+          }),
+        ),
+      );
+    emptyIdDm("cc-empty-a");
+    emptyIdDm("cc-empty-b");
+    await rawNc.flush();
+    await waitFor("both empty-id DMs buffered", () => stillPending("cc-empty-a") && stillPending("cc-empty-b"));
+    const emptyEvent = { hook_event_name: "UserPromptSubmit" };
+    const emptyFrame = await fireHook(emptyEvent);
+    check(
+      "two empty-id DMs in one frame both commit (#674)",
+      injected(emptyFrame).includes("cc-empty-a") && injected(emptyFrame).includes("cc-empty-b"),
+      injected(emptyFrame),
+    );
+    claude.onReply(emptyEvent, true); // the runtime applied the context — the verdict commits
+    await sleep(300); // the commit lands just after the verdict
+    check(
+      "the empty-id pair was committed by the frame's verdict (neither text resurfaces)",
+      !stillPending("cc-empty-a") && !stillPending("cc-empty-b"),
+      { inbox: agent.peekInbox("all").map((i: InboxItem) => i.text) },
+    );
+    const nextFrame = await fireHook({ hook_event_name: "UserPromptSubmit" });
+    check(
+      "the next frame carries neither empty-id text",
+      !injected(nextFrame).includes("cc-empty-a") && !injected(nextFrame).includes("cc-empty-b"),
+      injected(nextFrame),
+    );
+    await fireHook({ hook_event_name: "Stop" });
+  } finally {
+    await rawNc.close();
+  }
+
+  // ---- 6. oversized bodies stay for explicit inbox parts --------------------------------------
+  // Hook replies now fit below the host's inline cap, so large peer bodies cannot manufacture
+  // a huge stdout write. Neither an unread notice nor its successful write may ACK those bodies.
+  const BIG = 64 * 1024; // > the 64 KiB pipe buffer once a few are batched; < the 1 MiB NATS payload cap
+  const BIG_N = 20;
+  for (let i = 0; i < BIG_N; i++) await dmOtto(`dm-six-${i}: ${"x".repeat(BIG)}`);
+  await waitFor("the large batch to buffer", () => agent.inboxCount("automatic") >= BIG_N, 15_000);
+  const bigPending = agent.inboxCount("automatic");
+  check("the oversized batch is buffered and ready to surface", bigPending >= BIG_N, { bigPending });
+  const starved = await fireHookViaRealRelay({ hook_event_name: "UserPromptSubmit" }, { starveStdout: true });
+  console.log(`    (starved relay exited ${starved.code} with ${starved.stdout.length} bytes read by the runtime)`);
+  check("the starved relay still exits without blocking the session", starved.code === 0, starved.code);
+  check("the runtime received none of it, so the batch was NOT handed off", starved.stdout.length === 0, {
+    stdoutBytes: starved.stdout.length,
+  });
+  await sleep(500); // the connector's verdict lands just after the child dies
+  check(
+    "a reply the runtime never received does NOT consume the batch",
+    agent.inboxCount("automatic") >= BIG_N,
+    { stillBuffered: agent.inboxCount("automatic"), expected: BIG_N },
+  );
+  // A reader gets a bounded notice and any small complete body. Oversized bodies remain
+  // unacknowledged until explicit inbox reads have returned every part.
+  await dmOtto("small-behind-oversized: still fits inline");
+  await waitFor("the small body behind oversized messages", () => stillPending("small-behind-oversized"));
+  const bigOk = await fireHookViaRealRelay({ hook_event_name: "UserPromptSubmit" });
+  await sleep(500);
+  check("oversized individual messages stay out of the bounded hook reply",
+    injected(bigOk.stdout).length <= 9_000 && !injected(bigOk.stdout).includes("dm-six-0"));
+  check("an oversized message does not prevent a complete smaller body from being handed off",
+    injected(bigOk.stdout).includes("small-behind-oversized") && !stillPending("small-behind-oversized"));
+  check("the hook names every message still waiting for an explicit read",
+    injected(bigOk.stdout).includes(`${BIG_N} Cotal messages are still waiting`) && agent.inboxCount("automatic") === BIG_N);
+  const oversizedReads: string[] = [];
+  while (agent.inboxCount("automatic")) oversizedReads.push((await inboxSpec.run(agent, agent.config, {})).text);
+  check("explicit inbox parts recover every oversized body before committing it",
+    Array.from({ length: BIG_N }, (_, n) => `dm-six-${n}:`).every((marker) => oversizedReads.some((text) => text.includes(marker))));
+  await fireHook({ hook_event_name: "Stop" });
+
+  // Real relay, same >10KB batch as the host reproduction. Each reply is bounded, and its
+  // own verdict clears only the complete bodies it carried. A late mention remains readable.
+  for (let n = 0; n < 12; n++) await dmOtto(`bounded-${String(n).padStart(2, "0")}: ${"z".repeat(1_000)}`);
+  await waitFor("the bounded batch to buffer", () => agent.inboxCount("automatic") === 12);
+  const firstBounded = injected((await fireHookViaRealRelay({ hook_event_name: "SessionStart", source: "compact" })).stdout);
+  await sleep(150);
+  const carried = Array.from({ length: 12 }, (_, n) => `bounded-${String(n).padStart(2, "0")}:`).filter((mark) => firstBounded.includes(mark));
+  check("one hook frame stays under the host limit and leaves exactly its omitted bodies pending",
+    firstBounded.length <= 9_000 && carried.length > 0 && carried.length < 12 &&
+    agent.inboxCount("automatic") === 12 - carried.length && firstBounded.includes("still waiting"));
+  const remainder = (await inboxSpec.run(agent, agent.config, {})).text;
+  check("the late body is readable by inbox and no inline body is duplicated there",
+    remainder.includes("bounded-11:") && carried.every((mark) => !remainder.includes(mark)) && agent.inboxCount("automatic") === 0);
+  await fireHook({ hook_event_name: "Stop" });
+
+  await dmOtto("briefing-overflow: must remain unread");
+  await waitFor("the briefing overflow body", () => stillPending("briefing-overflow"));
+  const realBriefing = agent.channelBriefing.bind(agent);
+  agent.channelBriefing = () => "large briefing ".repeat(800);
+  try {
+    const oversizedBriefing = injected((await fireHookViaRealRelay({ hook_event_name: "SessionStart", source: "compact" })).stdout);
+    await sleep(100);
+    check("an oversized combined session context falls back to a bounded notice without committing mail",
+      oversizedBriefing.length <= 9_000 && oversizedBriefing.includes("still waiting") && stillPending("briefing-overflow"));
+  } finally {
+    agent.channelBriefing = realBriefing;
+  }
+  const afterBriefing = injected((await fireHookViaRealRelay({ hook_event_name: "UserPromptSubmit" })).stdout);
+  check("mail deferred by the session briefing is delivered once space is available", afterBriefing.includes("briefing-overflow"));
+  await fireHook({ hook_event_name: "Stop" });
+
+  // ---- 7. the capacity valve must not consume an in-flight batch --------------------------------
+  // Found by review, not by this suite. Committing on the handoff means a surfaced batch stays in
+  // the inbox (peekInbox does not remove) for the whole handoff window. `buffer`'s overflow evicts
+  // the OLDEST pending and ACKS it without marking it handled — deliberate bounded loss for a
+  // backlog nobody has looked at, but the oldest pending is exactly what a surfaced batch is made
+  // of. So a message arriving while a batch is in flight can ack an id that is mid-delivery, and if
+  // that delivery then fails there is nothing left to recover it from: gone from the inbox, never
+  // marked handled, and already acked in JetStream. That is this branch's own loss class, re-entered
+  // through the capacity valve.
+  const FILL = 200; // MAX_INBOX
+  const BODY = 1024; // enough for only a subset of the full backlog to fit in one hook
+  for (let i = 0; i < FILL; i++) await dmOtto(`dm-seven-${String(i).padStart(3, "0")}: ${"y".repeat(BODY)}`);
+  await waitFor("the inbox to reach capacity", () => agent.inboxCount("automatic") >= FILL, 60_000);
+  const oldest = "dm-seven-000";
+  check("the inbox is at capacity with the oldest message pending", stillPending(oldest), {
+    automatic: agent.inboxCount("automatic"),
+  });
+  // Hold a bounded frame open, then abandon it after the overflow arrives.
+  const oldestId = agent.peekInbox("all").find((i) => i.text.includes(oldest))!.id;
+  const heldFrame = { hook_event_name: "UserPromptSubmit" };
+  const heldReply = await claude.handle(agent, heldFrame);
+  check("the bounded frame carries the oldest body before the handoff verdict", injected(JSON.stringify(heldReply)).includes(oldest));
+  // ...and push one more message through the capacity valve WHILE IT IS IN FLIGHT — which this must
+  // WAIT for, not guess at. A fixed sleep here made the cell a race: the handoff runs through a real
+  // relay process, and on a slower machine the hold was not yet taken when the overflow landed, so
+  // the valve acked an id no batch had claimed. That is the bounded-loss design working correctly on
+  // an unlooked-at backlog, and the cell then failed for a condition it had never established.
+  // Measured on Linux: eviction 133ms BEFORE the hold. Wait for the property this cell is named for.
+  await waitFor("the oldest message to be held in flight", () => agent.isInFlight(oldestId), 15_000);
+  await dmOtto("dm-seven-overflow: arrives mid-handoff and evicts the oldest");
+  claude.onReply(heldFrame, false);
+  check("the abandoned bounded frame releases its hold without committing the body", !agent.isInFlight(oldestId) && stillPending(oldest));
+  await sleep(500);
+  // The overflow landed while the oldest id was held mid-delivery, so the valve passed over it, and
+  // nothing showed it to the model. The failed handoff must leave it pending, buffered or redelivered.
+  const backAfterOverflow = async (): Promise<boolean> => {
+    for (let i = 0; i < (ACK_WAIT_MS + 8_000) / 250 && !stillPending(oldest); i++) await sleep(250);
+    return stillPending(oldest);
+  };
+  const recovered = await backAfterOverflow();
+  console.log(`    (after a failed handoff + overflow, ${oldest} recoverable: ${recovered})`);
+  check(
+    "a message held in flight through an overflow is not consumed by a failed handoff",
+    recovered,
+    { oldest, stillBuffered: agent.inboxCount("automatic") },
+  );
+
+  // ---- 7b. TWO frames hold the same ids; one verdict must not unprotect the other ---------------
+  // Found by review, after §7's guard shipped. Frames overlap by design — that is why the batch map
+  // is keyed on event identity — so the same ids sit in two open batches at once. A boolean hold
+  // meant the FIRST verdict unpinned ids the SECOND was still delivering, and an arrival in between
+  // acked one. Same permanent loss as §7, reached through the concurrency the keying deliberately
+  // allows, so the hold has to be counted rather than flagged.
+  //
+  // Grade that refcount state machine directly with a synthetic id. The product property is entirely
+  // inside MeshAgent: two frames acquire the same id, the first verdict releases only its ownership,
+  // and the second releases the last ownership. Routing this cell through the live inbox or hook
+  // handler made the selected batch depend on unrelated redelivery timing — the flake this fix is
+  // removing. The public boolean observer is enough to distinguish a real refcount from a set.
+  const overlapId = "synthetic-overlap-hold";
+  check("the first overlapping frame acquires the id", agent.holdInFlight([overlapId]));
+  check("the second overlapping frame acquires the same id", agent.holdInFlight([overlapId]));
+  check("the overlapping id is protected while both frames are open", agent.isInFlight(overlapId));
+  agent.releaseInFlight([overlapId]); // frame A's verdict lands first — B is still in flight
+  check("one frame's verdict does not unprotect the overlapping id", agent.isInFlight(overlapId));
+  agent.releaseInFlight([overlapId]); // ...and only now does B report
+  check("the final frame's verdict releases the overlapping id", !agent.isInFlight(overlapId));
+
+  // ---- 7c. at the hold ceiling, DECLINE to surface rather than surface unprotected --------------
+  // Found by review, after §7b's refcount shipped. The cap protected existing holds but let a NEW
+  // batch through unprotected and told the caller nothing, so at the ceiling the handler surfaced a
+  // batch the overflow valve was still free to ack mid-handoff — F-1 again, reached through the
+  // guard's own limit. The hold is all-or-nothing now and reports it; a batch that cannot be
+  // protected is not surfaced at all, and simply waits for a later frame.
+  const saturate = Array.from({ length: 400 }, (_, i) => `synthetic-hold-${i}`); // MAX_INBOX * 2
+  check("the agent accepts holds up to its ceiling", agent.holdInFlight(saturate));
+  check("and refuses a further batch rather than half-protecting it", !agent.holdInFlight(["one-too-many"]));
+  const ceilFrame = { hook_event_name: "UserPromptSubmit" };
+  const atCeiling = await claude.handle(agent, ceilFrame); // declined → no hold, no inFlight entry
+  check(
+    "a batch that cannot be protected is NOT surfaced",
+    !injected(JSON.stringify(atCeiling)).includes("dm-seven"),
+    { injected: injected(JSON.stringify(atCeiling)).slice(0, 60) },
+  );
+  check("and nothing was consumed by the refusal", agent.inboxCount("automatic") >= FILL, {
+    automatic: agent.inboxCount("automatic"),
+  });
+  agent.releaseInFlight(saturate);
+  const freeFrame = { hook_event_name: "UserPromptSubmit" };
+  const afterCeiling = await claude.handle(agent, freeFrame);
+  check(
+    "once capacity frees, the same batch surfaces normally",
+    injected(JSON.stringify(afterCeiling)).includes("dm-seven"),
+  );
+  // Release on the SAME object the handler saw — a fresh literal is a different WeakMap key and
+  // would leak the hold into the groups below.
+  claude.onReply(freeFrame, false);
+
+  // The new hook window deliberately leaves the rest for inbox instead of a huge stdout reply.
+  while (agent.inboxCount("automatic")) await inboxSpec.run(agent, agent.config, {});
+  check("explicit reads finish the overflow backlog before the next delivery cell", agent.inboxCount("automatic") === 0);
+
+  // ---- 8. the stdout write FAILS — the receipt must not be sent -------------------------------
+  // Found by review, reproduced independently by two seats. A failed write and a successful one both
+  // invoke the same callback; the difference is only the error argument. Ignoring it meant the relay
+  // confirmed a handoff for a reply that got EPIPE: `delivered=true`, zero bytes at the runtime,
+  // batch committed. Group 6 starves the pipe (no error, just no flush); this is the other half.
+  await dmOtto("dm-eight: the runtime's pipe is gone");
+  await waitFor("the DM to buffer", () => stillPending("dm-eight"));
+  const broken = await fireHookViaRealRelay({ hook_event_name: "UserPromptSubmit" }, { breakStdout: true });
+  check("the relay survives a destroyed stdout without blocking the session", broken.code === 0, broken.code);
+  await sleep(500);
+  check("a reply whose stdout write FAILED does not consume the batch", stillPending("dm-eight"), {
+    inbox: agent.peekInbox("all").map((i) => i.text.slice(0, 24)),
+  });
+  const afterBroken = await fireHookViaRealRelay({ hook_event_name: "UserPromptSubmit" });
+  await sleep(400);
+  check("and it reaches a runtime whose pipe is intact", injected(afterBroken.stdout).includes("dm-eight"), {
+    bytes: afterBroken.stdout.length,
+  });
+  check("only then is it committed", !stillPending("dm-eight"));
+
+  // ---- 9. the one wake with no second chance ----------------------------------------------------
+  // Found by review. A focus-mode @mention is ack-dropped at ingest, not buffered — so it is in no
+  // inbox and no stream, and the `claude/channel` push is its ONLY notice. The retry was gated on
+  // `pendingWake() > 0`, which is 0 precisely for this case, so the single wake that nothing else can
+  // recover was the single wake never retried.
+  await fireHook({ hook_event_name: "Stop" });
+  await agent.setAttention("focus");
+  failNudges = 1; // reject the mention push, exactly as the host would mid-restart
+  const nudgesBeforeMention = nudges.length;
+  const mentionClock = Date.now();
+  await pub.multicast("@Otto focus mention: the push will be rejected", { channel: "team", mentions: ["Otto"] });
+  await waitFor(
+    "the retried mention-wake after the first push was rejected",
+    () => nudges.length > nudgesBeforeMention,
+    RETRY_DEADLINE_MS,
+  );
+  const mentionElapsed = Date.now() - mentionClock;
+  console.log(`    (mention-wake retry observed after ${mentionElapsed}ms; nothing else can recover it)`);
+  check(
+    "a rejected focus mention-wake IS retried, though nothing buffered it",
+    nudges.some((n) => n.includes("pull it with cotal_inbox")),
+    nudges.slice(-2),
+  );
+  check("and it was the retry timer, not an instant duplicate", mentionElapsed >= NUDGE_RETRY_FIRST_MS, {
+    mentionElapsed,
+  });
+  // ---- 9b. an UNRELATED nudge succeeding is not this mention's delivery -------------------------
+  // Found by review, after §9's retry shipped. Clearing the pending mention on ANY successful push
+  // read "the session is awake, it will pull" — but the notice that woke it is about a DM, carries no
+  // pull hint, and the ack-dropped mention is in no inbox to be stumbled upon. So an ordinary DM
+  // landing between the rejected mention push and its retry cancelled the only recovery that mention
+  // had. Only the mention's own notice may discharge it.
+  failNudges = 1;
+  const mentionOnly = nudges.filter((n) => n.includes("pull it with cotal_inbox")).length;
+  await pub.multicast("@Otto second focus mention: rejected, then a DM lands", {
+    channel: "team",
+    mentions: ["Otto"],
+  });
+  await sleep(120); // the mention push has been rejected; its retry is pending
+  // Count DM nudges rather than testing for any — earlier groups already produced them, so
+  // `some(...)` was true before this group started and would have graded an ordering that never
+  // occurred. The unrelated success has to land FIRST, and the mention must still be undelivered at
+  // that instant, or this proves nothing about G-2 at all.
+  const dmNudgesBefore = nudges.filter((n) => n.includes("New dm")).length;
+  await dmOtto("dm-nine-b: an unrelated DM whose nudge succeeds");
+  await waitFor(
+    "the unrelated DM nudge to succeed",
+    () => nudges.filter((n) => n.includes("New dm")).length > dmNudgesBefore,
+    3_000,
+  );
+  check(
+    "the unrelated success landed while the mention was still outstanding",
+    nudges.filter((n) => n.includes("pull it with cotal_inbox")).length === mentionOnly,
+    { mentionNoticesAtThatInstant: nudges.filter((n) => n.includes("pull it with cotal_inbox")).length, mentionOnly },
+  );
+  await waitFor(
+    "the mention retry to survive the unrelated success",
+    () => nudges.filter((n) => n.includes("pull it with cotal_inbox")).length > mentionOnly,
+    RETRY_DEADLINE_MS + 2_000,
+  );
+  check(
+    "an unrelated nudge succeeding does not cancel the focus mention's only recovery",
+    nudges.filter((n) => n.includes("pull it with cotal_inbox")).length > mentionOnly,
+    { mentionNoticesBefore: mentionOnly, now: nudges.filter((n) => n.includes("pull it with cotal_inbox")).length },
+  );
+  await agent.setAttention("open");
+
+
+// ---- R1/R2/R3: fail open, but never fail silent ---------------------------------------------
+//
+// The relay resolves its control endpoint inside a try/catch and returns an empty reply on any
+// failure. Fail open is correct and stays: a lifecycle hook that throws is a hook that blocked a
+// human's session. Silent fail open is not, and it was what shipped. A material file that is
+// missing, permissive, malformed or contradicted by a direct carrier produced a hook that did
+// nothing and said nothing, so the seat ran with dead presence and no injected messages and there
+// was no line anywhere to read. The same defect, in Python, is what smoke:hermes-hooks-control
+// exists for; this is the TypeScript half of it.
+//
+// R3 is the discrimination and is the reason this is three legs rather than one. Warning whenever
+// there is no control endpoint would fire on every hook of a legitimate hand-driven session, which
+// is how a warning channel gets trained into background noise.
+{
+  const relayDir = mkdtempSync(join(tmpdir(), "cotal-relay-warn-"));
+  const runRelay = (env: NodeJS.ProcessEnv): Promise<{ code: number | null; stdout: string; stderr: string }> =>
+    new Promise((resolve) => {
+      const clean = { ...process.env };
+      for (const key of Object.keys(clean)) if (key.startsWith("COTAL_")) delete clean[key];
+      const child = spawn(process.execPath, [tsxCli, hookEntry], {
+        env: { ...clean, ...env },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (c) => (stdout += String(c)));
+      child.stderr.on("data", (c) => (stderr += String(c)));
+      child.on("close", (code) => resolve({ code, stdout, stderr }));
+      child.stdin.end(JSON.stringify({ hook_event_name: "UserPromptSubmit" }));
+    });
+
+  // A material file readable by every local user: the reader refuses it, which is a configuration
+  // fault the operator has to be able to see.
+  const looseMaterial = join(relayDir, "loose.json");
+  writeFileSync(looseMaterial, JSON.stringify({ controlToken: "warn-leg-token" }), { mode: 0o644 });
+  chmodSync(looseMaterial, 0o644);
+  const broken = await runRelay({
+    COTAL_NAME: "Otto",
+    COTAL_CONTROL_SOCKET: join(relayDir, "absent.sock"),
+    COTAL_LAUNCH_MATERIAL: looseMaterial,
+  });
+  const warnings = broken.stderr.split("\n").filter((l) => l.includes("[cotal-connector]"));
+  check(
+    "R1: a hook whose control endpoint cannot be resolved says so on stderr",
+    warnings.length === 1,
+    { warnings: warnings.length },
+  );
+  check(
+    "R1: and still fails open, exit 0 with no reply, so the session is never blocked",
+    broken.code === 0 && broken.stdout.trim() === "",
+    { code: broken.code },
+  );
+  check(
+    "R1: the warning names variables and carries no values",
+    !broken.stderr.includes(looseMaterial) && !broken.stderr.includes("warn-leg-token"),
+  );
+
+  // Positive control: a resolvable endpoint warns about nothing, even though the socket is dead and
+  // the relay still returns empty. Without this leg, a warn-on-every-run mutant would pass R1.
+  const goodMaterial = join(relayDir, "good.json");
+  writeFileSync(goodMaterial, JSON.stringify({ controlToken: "warn-leg-token" }), { mode: 0o600 });
+  chmodSync(goodMaterial, 0o600);
+  const resolvable = await runRelay({
+    COTAL_NAME: "Otto",
+    COTAL_CONTROL_SOCKET: join(relayDir, "absent.sock"),
+    COTAL_LAUNCH_MATERIAL: goodMaterial,
+  });
+  check(
+    "R2: a resolvable control endpoint warns about nothing",
+    !resolvable.stderr.includes("[cotal-connector]") && resolvable.code === 0,
+    { stderr: resolvable.stderr.slice(0, 200) },
+  );
+
+  // R3: a managed-looking session that simply has no control plane is a normal launch, not a fault.
+  const noControl = await runRelay({ COTAL_NAME: "Otto" });
+  check(
+    "R3: a session with no control endpoint at all is not warned about",
+    !noControl.stderr.includes("[cotal-connector]") && noControl.code === 0,
+    { stderr: noControl.stderr.slice(0, 200) },
+  );
+  rmSync(relayDir, { recursive: true, force: true });
+}
+
+  console.log(`\nCLAUDE WAKE-PATH TEST PASSED ✅  (${pass} checks)`);
+} finally {
+  wake.stop();
+  controlServer.close();
+  await agent.stop().catch(() => {});
+  await pub.stop().catch(() => {});
+  srv.kill("SIGKILL");
+  await sleep(200);
+  rmSync(dir, { recursive: true, force: true });
+  releaseBroker(); // last: ownership is held until this teardown has actually finished
+}
+process.exit(0);

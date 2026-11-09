@@ -1,0 +1,233 @@
+import * as pty from "@lydell/node-pty";
+import Headless from "@xterm/headless";
+import { SerializeAddon } from "@xterm/addon-serialize";
+import { SpawnRefused, type AgentHandle, type AttachSession, type LaunchSpec, type Runtime, type RuntimeReference } from "@cotal-ai/core";
+import {
+  ConnectorDiagnosticReader,
+  DEFAULT_COLS,
+  DEFAULT_ROWS,
+  GRACE_MS,
+  SCROLLBACK_ROWS,
+  StartupConfirmGate,
+  unsupportedTransport,
+  preferSeatForOomKill,
+} from "@cotal-ai/seat";
+import { preparePtyLaunch } from "./windows-launch.js";
+
+/**
+ * In-process node-pty runtime used off Linux, with no custodian.
+ * Linux `createRuntime("pty")` uses `CustodialPtyRuntime`; `adopt` throws here.
+ */
+export class LegacyPtyRuntime implements Runtime {
+  readonly kind = "pty" as const;
+  readonly streamsTerminal = true;
+  readonly reportsStartupOutcome = true;
+
+  spawn(name: string, spec: LaunchSpec, cwd: string): AgentHandle {
+    // POSIX: passthrough (node-pty's exec resolves the bare name). win32: resolve the EXACT file and
+    // adapt — a `.cmd`/`.bat` shim runs through cmd.exe with a pre-escaped command line. Resolve
+    // against `spec.env` (the env we actually launch with), not the manager's, so executable
+    // selection stays inside the launch env's isolation.
+    const { command, args } = preparePtyLaunch(spec.command, spec.args, spec.env ?? {});
+    // Honor LaunchSpec.confirm literally: match the connector-owned text in normalized early output,
+    // press Enter exactly once when it appears, and fail loud if the declared gate never materializes.
+    // Built before the child exists, so a prompt that cannot match is a refusal.
+    let confirmGate: StartupConfirmGate | undefined;
+    try {
+      if ((spec.confirmBefore?.length || spec.confirmReady?.length || spec.confirmBlockers?.length) && spec.confirm === undefined) throw new Error("startup choices require a final confirmation prompt");
+      confirmGate = spec.confirm === undefined ? undefined : new StartupConfirmGate(spec.confirm, spec.confirmBefore, spec.confirmReady, spec.confirmBlockers, spec.confirmNotice);
+    } catch (err) {
+      throw new SpawnRefused((err as Error).message);
+    }
+    const proc = pty.spawn(command, args, {
+      name: "xterm-256color",
+      cols: DEFAULT_COLS,
+      rows: DEFAULT_ROWS,
+      cwd,
+      // Pass ONLY the connector-declared env (OS allow-list + identity + named model key) —
+      // never `...process.env`. The operator's unrelated secrets (AWS/GH/other service keys) don't
+      // bleed into the child. `spec.env ?? {}` so a connector that forgets env fails loud (no
+      // PATH) instead of silently inheriting the manager's env.
+      env: spec.env ?? {},
+    });
+    const oomPref = preferSeatForOomKill(proc.pid);
+    if (!oomPref.applied) {
+      console.error(`oom preference not applied to child ${proc.pid}: ${oomPref.reason}`);
+    }
+
+    const dataSubs = new Set<(c: Buffer) => void>();
+    const exitSubs = new Set<() => void>();
+    // Mirror the child's PTY into a headless terminal, so on attach we hand the new client a
+    // reconstructed screen image — the alternate-screen buffer of a full-screen TUI, or the
+    // scrollback of an inline one — instead of a raw byte replay. A raw replay can't rebuild an
+    // alt-screen, which left a late or concurrent attach staring at a partial screen (see `backlog`).
+    const term = new Headless.Terminal({
+      cols: DEFAULT_COLS,
+      rows: DEFAULT_ROWS,
+      scrollback: SCROLLBACK_ROWS,
+      allowProposedApi: true, // the serialize addon reads buffer internals via proposed API
+    });
+    const serializer = new SerializeAddon();
+    term.loadAddon(serializer);
+    let alive = true;
+    let cols = DEFAULT_COLS;
+    let rows = DEFAULT_ROWS;
+    // node-pty hands us the child's exit code and killing signal exactly once, and this runtime
+    // used to drop them on the floor — leaving the manager unable to say why any seat had died.
+    // Retained here so `exitInfo` can answer after the fact; stays undefined while the child lives,
+    // because "not exited yet" and "exited cleanly" must never read the same.
+    let exit: { code?: number; signal?: number; diagnostic?: string } | undefined;
+    // Why the child ended, as far as its output and this runtime can say, carried on `exit` so the
+    // reap line and a launch failure can name it.
+    const diagnostic = new ConnectorDiagnosticReader();
+
+    proc.onData((d) => {
+      term.write(d); // mirror into the screen model for attach-time reconstruction
+      diagnostic.push(d);
+      const b = Buffer.from(d, "utf8");
+      for (const fn of dataSubs) fn(b);
+      if (confirmGate?.push(d)) proc.write("\r");
+    });
+    proc.onExit(({ exitCode, signal }) => {
+      alive = false;
+      // `signal` is absent on an ordinary exit and 0 is a real exit code, so both are recorded as
+      // present-or-absent rather than coalesced into one number.
+      const last = diagnostic.read();
+      exit = { code: exitCode, ...(signal === undefined ? {} : { signal }), ...(last ? { diagnostic: last } : {}) };
+      confirmGate?.disarm();
+      for (const fn of exitSubs) fn();
+    });
+
+    const handle: AgentHandle = {
+      name,
+      kind: "pty",
+      // Read when asked: node-pty's ConPTY backend creates the child after `spawn` returns and
+      // reports pid 0 until then, so a copy taken here named no process. Absent until it exists.
+      get pid() {
+        return proc.pid > 0 ? proc.pid : undefined;
+      },
+      status: () => (alive ? "running" : "exited"),
+      exitInfo: () => exit,
+      startupOutcome: () => confirmGate?.outcome ?? "pending",
+      stop: (opts) => {
+        if (!alive) return;
+        // node-pty's ConPTY backend has no signals: kill(<signal>) throws on Windows, and a
+        // pseudoconsole can't deliver SIGTERM for a graceful mesh-leave. The manager instead sends a
+        // cooperative `{op:"shutdown"}` over the agent's control endpoint BEFORE a graceful stop, so
+        // here we just give the agent a window to run its exit handlers (leave the mesh, publish
+        // offline) and exit on its own, then hard-kill (ConPTY close) as a fallback. A hard stop
+        // (graceful:false — emergency reap) skips the window and kills immediately.
+        if (process.platform === "win32") {
+          if (opts?.graceful === false) {
+            proc.kill();
+            return;
+          }
+          // `alive` guards the already-exited case; the try/catch covers the narrow race where the
+          // ConPTY tears down between the check and the kill (node-pty throws on a dead handle).
+          setTimeout(() => {
+            if (!alive) return;
+            try {
+              proc.kill();
+            } catch {
+              /* already gone */
+            }
+          }, GRACE_MS);
+          return;
+        }
+        if (opts?.graceful === false) {
+          proc.kill("SIGKILL");
+          return;
+        }
+        // Graceful: SIGTERM lets the session run its exit handlers (incl. leaving the
+        // mesh); escalate to SIGKILL if it's still up after a grace window.
+        proc.kill("SIGTERM");
+        setTimeout(() => alive && proc.kill("SIGKILL"), GRACE_MS);
+      },
+      waitForExit: () => alive
+        ? new Promise<void>((resolve) => {
+            const done = (): void => {
+              exitSubs.delete(done);
+              resolve();
+            };
+            exitSubs.add(done);
+            if (!alive) done();
+          })
+        : Promise.resolve(),
+      interrupt: () => {
+        if (alive) proc.write("\x03");
+      },
+      // Type into the child without standing up an attach session. Guarded on `alive` exactly as
+      // `interrupt` and the session's own `write` are: node-pty throws on a dead handle, and the
+      // manager has already refused a non-running agent before it gets here, so this guard covers
+      // only the narrow race where the child exits between that check and this call.
+      write: async (data) => {
+        if (!alive) throw new Error(`seat ${name} is not running; the PTY rejected the write`);
+        proc.write(data);
+        return Buffer.byteLength(data, "utf8");
+      },
+      attach: (): AttachSession => ({
+        get cols() {
+          return cols;
+        },
+        get rows() {
+          return rows;
+        },
+        backlog: () =>
+          // Serialize the mirrored screen into bytes that repaint it exactly — the alt-screen buffer
+          // (and modes) of a full-screen TUI, or the scrollback of an inline one. The empty write
+          // drains the parser first (xterm writes are FIFO), so the snapshot reflects every byte the
+          // child has emitted so far, not a state that lags behind in-flight output.
+          new Promise<Buffer>((resolve) =>
+            term.write("", () => resolve(Buffer.from(serializer.serialize(), "utf8"))),
+          ),
+        onData: (fn) => {
+          dataSubs.add(fn);
+          return () => dataSubs.delete(fn);
+        },
+        onExit: (fn) => {
+          // Already exited (a session attaching over a just-dead pty): fire on the next tick so the
+          // bridge surfaces a `process-exit` end frame instead of a silent zombie. proc.onExit fired
+          // ONCE before this listener existed, so a late subscriber would otherwise never hear it
+          // (waitForExit carries the same already-dead guard).
+          if (!alive) { queueMicrotask(fn); return () => {}; }
+          exitSubs.add(fn);
+          return () => exitSubs.delete(fn);
+        },
+        write: (data) => {
+          if (alive) proc.write(data);
+        },
+        resize: (c, r) => {
+          // node-pty REJECTS a non-positive dimension (throws), and a console fitting BEFORE its pane
+          // is laid out can send a 0. Guard BOTH the mirror and the pty resize so a degenerate geometry
+          // is a safe no-op — never a throw that would propagate into and wedge the serving frame
+          // handler (the live-e2e "zombie session" class).
+          if (c <= 0 || r <= 0) return;
+          cols = c;
+          rows = r;
+          term.resize(c, r); // keep the mirror in step so snapshots reconstruct at size
+          if (alive) proc.resize(c, r);
+        },
+      }),
+    };
+    confirmGate?.arm(diagnostic, {
+      report: (message) => {
+        const line = `\r\n${message}\r\n`;
+        term.write(line);
+        const b = Buffer.from(line, "utf8");
+        for (const fn of dataSubs) fn(b);
+      },
+      stop: () => handle.stop(),
+    }, {
+      read: () => alive ? Array.from({ length: term.rows }, (_, row) => term.buffer.active.getLine(term.buffer.active.baseY + row)?.translateToString(true) ?? "").join("\n") : undefined,
+      key: (key) => proc.write(key === "Down" ? "\x1b[B" : "\r"),
+    });
+    return handle;
+  }
+
+  adopt(_reference: RuntimeReference): AgentHandle {
+    throw unsupportedTransport();
+  }
+}
+
+/** @deprecated Use LegacyPtyRuntime. Kept so existing isolated fixtures keep compiling. */
+export { LegacyPtyRuntime as PtyRuntime };

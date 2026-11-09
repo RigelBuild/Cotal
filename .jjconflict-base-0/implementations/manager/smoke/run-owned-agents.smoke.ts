@@ -1,0 +1,903 @@
+/** Native participant-run acceptance. All policy decisions use the stock auth service and ledger.
+ * The two signed-up users and their grants are disposable fixture identities, not operator state.
+ * The lightweight child is a real PTY process and uses only its own minted bearer for commands.
+ */
+const subcommand = process.argv[2];
+if (subcommand === "agent-bearer" || subcommand === "auth-service") {
+  await import("@cotal-ai/auth");
+  const { registry } = await import("@cotal-ai/core");
+  const values: Record<string, string | boolean> = {};
+  const positionals: string[] = [];
+  const rest = process.argv.slice(3);
+  for (let i = 0; i < rest.length; i++) {
+    const value = rest[i]!;
+    if (!value.startsWith("--")) positionals.push(value);
+    else if (rest[i + 1] && !rest[i + 1]!.startsWith("--")) values[value.slice(2)] = rest[++i]!;
+    else values[value.slice(2)] = true;
+  }
+  await registry.resolve<import("@cotal-ai/core").Command>("command", subcommand).run({ values, positionals, raw: rest });
+  process.exit(0);
+}
+if (subcommand === "seat") {
+  const { CotalEndpoint } = await import("@cotal-ai/core");
+  const { execFile } = await import("node:child_process");
+  const { readFileSync, appendFileSync } = await import("node:fs");
+  const e = process.env;
+  const argv = JSON.parse(e.COTAL_BEARER_CMD!) as string[];
+  const bearer = () => new Promise<string>((resolve, reject) => execFile(argv[0]!, argv.slice(1), { timeout: 15_000 }, (error, stdout) => {
+    if (error) reject(new Error("seat bearer exchange refused")); else resolve(stdout.trim());
+  }));
+  const endpoint = new CotalEndpoint({
+    space: e.COTAL_SPACE!, servers: e.COTAL_SERVERS!, bearer,
+    sentinelCreds: readFileSync(e.COTAL_SENTINEL_CREDS!, "utf8"), lifecycleUid: e.COTAL_LIFECYCLE_UID!,
+    channels: [], consume: false, watchChannels: false,
+    card: { owner: e.COTAL_OWNER!, actor: e.COTAL_ACTOR!, name: e.COTAL_NAME!, kind: "agent" },
+  });
+  endpoint.on("error", () => {});
+  await endpoint.start();
+  const seen = new Set<string>();
+  const trace = (event: Record<string, unknown>) => appendFileSync(e.U4_TRACE!, JSON.stringify({ owner: e.COTAL_OWNER, actor: e.COTAL_ACTOR, uid: e.COTAL_LIFECYCLE_UID, ...event }) + "\n");
+  trace({ kind: "joined" });
+  const timer = setInterval(async () => {
+    try {
+      const pulled = await endpoint.invokeService("manager", "turn-pending", undefined, { target: { mode: "self" }, deadlineMs: 5000 });
+      if (!pulled.reply.ok) return;
+      for (const turn of (pulled.reply.data as { turns: Array<{ goalId: string; payload: string }> }).turns) {
+        if (seen.has(turn.goalId)) continue;
+        seen.add(turn.goalId);
+        const payload = JSON.parse(turn.payload) as { run: string; step: string; ask?: { schema: unknown } };
+        trace({ kind: "turn", goalId: turn.goalId, run: payload.run, step: payload.step });
+        if (payload.ask) {
+          const answered = await endpoint.invokeService("manager", "run-answer", { runId: payload.run, stepKey: payload.step, value: { estimate: 7, ready: true } }, { target: { mode: "self" }, deadlineMs: 10_000 });
+          trace({ kind: "answer", ok: answered.reply.ok, run: payload.run, step: payload.step });
+        } else {
+          const persona = await endpoint.invokeService("manager", "define-persona", { name: `${e.COTAL_NAME}_content`, persona: "Owned content from the run's seat.", agent: "u4-seat" }, { deadlineMs: 5000 });
+          trace({ kind: "persona", ok: persona.reply.ok, error: persona.reply.error?.message });
+          const yielded = await endpoint.invokeService("manager", "turn-yield", { goalId: turn.goalId, status: "done", note: "native owned seat turn" }, { target: { mode: "self" }, deadlineMs: 5000 });
+          trace({ kind: "yield", ok: yielded.reply.ok });
+        }
+      }
+    } catch (error) { trace({ kind: "seat-call-refused", reason: (error instanceof Error ? error.message : String(error)).replace(/\beyJ[\w-]+\.[\w-]+\.[\w-]+\b/g, "[redacted]").slice(0, 300) }); }
+  }, 200);
+  const stop = () => { clearInterval(timer); void endpoint.stop().finally(() => process.exit(0)); };
+  process.on("SIGTERM", stop);
+  process.on("SIGINT", stop);
+  await new Promise(() => {});
+}
+
+if (subcommand === "tool-seat") {
+  const { MeshAgent, configFromEnv, cotalToolSpecs, parseToolArgs } = await import("@cotal-ai/connector-core");
+  const { appendFileSync, existsSync, readFileSync } = await import("node:fs");
+  const { mintLifecycleUid } = await import("@cotal-ai/core");
+  const config = configFromEnv();
+  const mesh = new MeshAgent(config);
+  const trace = (event: Record<string, unknown>) => appendFileSync(process.env.U4_TRACE!, JSON.stringify({ actor: config.userAuth!.actor, uid: config.lifecycleUid, ...event,
+    ...(typeof event.text === "string" ? { text: event.text.replace(/"token"\s*:\s*"[^"]+"/g, '"token":"[redacted]"') } : {}),
+  }) + "\n");
+  mesh.on("error", () => {});
+  const tool = cotalToolSpecs(config).find((s) => s.name === "cotal_run")!;
+  const waitFor = async (condition: () => boolean | Promise<boolean>) => {
+    const deadline = Date.now() + 30_000;
+    while (!await condition()) {
+      if (Date.now() >= deadline) throw new Error("managed connector native condition timed out");
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  };
+  try {
+    await mesh.start();
+    trace({ kind: "tool-joined", runCapability: config.capabilities?.includes("run"), managerPinned: !!config.managerInstanceId });
+    if (tool) trace({ kind: "tool-guidance", truthful: tool.description.includes("managed agent on a user-auth mesh") && !tool.description.includes("static authentication with issued caller authority") });
+    if (config.name === "toolbaseline") {
+      const refused = await mesh.run("start", { source: 'log("missing-run must refuse");' });
+      trace({ kind: "tool-missing-run", hidden: !tool, ok: refused.ok, error: refused.error });
+    } else if (config.name === "toolpin") {
+      // #3959: this seat's spawner is one of two live managers for its owner. Tool arguments pass
+      // the closed input an MCP host enforces before `run` is reached.
+      const { execFile } = await import("node:child_process");
+      const other = process.env.MC_OTHER_INSTANCE!;
+      const personas = cotalToolSpecs(config).find((s) => s.name === "cotal_personas")!;
+      const persona = cotalToolSpecs(config).find((s) => s.name === "cotal_persona")!;
+      const call = async (spec: typeof tool, args: Record<string, unknown>) => {
+        try { return await spec.run(mesh, config, parseToolArgs(spec, args)); }
+        catch (error) { return { isError: true, text: error instanceof Error ? error.message : String(error) }; }
+      };
+      // The seat's own shell, as when it runs a rendered `cotal run …` command: the environment it was launched with.
+      const env: NodeJS.ProcessEnv = { ...process.env };
+      for (const key of Object.keys(env)) if (key.startsWith("COTAL_")) delete env[key];
+      Object.assign(env, { COTAL_HOME: process.env.MC_CLI_HOME!, COTAL_SPACE: config.space, COTAL_MANAGER_INSTANCE: config.managerInstanceId, COTAL_SKIP_CONNECTOR_SEED: "1" });
+      const shell = (args: string[]) => new Promise<Record<string, unknown>>((done) => execFile(process.execPath, [...process.execArgv, join(import.meta.dirname, "..", "..", "..", "bin", "cotal.ts"), ...args],
+        { env, timeout: 60_000 },
+        (error, stdout, stderr) => done({ code: error ? (typeof error.code === "number" ? error.code : -1) : 0, stdout: stdout.slice(0, 1500), stderr: stderr.slice(0, 1500) })));
+      trace({ kind: "pin-run-ps", ...await call(tool, { verb: "ps" }) });
+      trace({ kind: "pin-cli-run-ps", ...await shell(["run", "ps", "--space", config.space]) });
+      trace({ kind: "pin-cli-models-on", ...await shell(["models", "--space", config.space, "--harness", "u4-seat", "--on", other]) });
+      // What a user-mode seat launched without COTAL_MANAGER_INSTANCE (a foreground spawn) holds.
+      const spawner = config.managerInstanceId;
+      config.managerInstanceId = undefined;
+      trace({ kind: "unbound-run-ps", ...await call(tool, { verb: "ps" }) });
+      // #4037: the same seat's own `cotal agent-bearer --manager-call`, with its launch flags and no instance.
+      const bearerCmd = config.userAuth!.bearerCmd!;
+      if (!bearerCmd.includes("agent-bearer")) throw new Error("the seat's bearer command does not run agent-bearer");
+      const { code, stderr } = await shell(["agent-bearer", ...bearerCmd.slice(bearerCmd.indexOf("agent-bearer") + 1), "--manager-call"]);
+      trace({ kind: "unbound-cli-bearer", code, stderr });
+      trace({ kind: "unbound-run-ps-on", ...await call(tool, { verb: "ps", instance: other }) });
+      trace({ kind: "unbound-personas-on", ...await call(personas, { instance: other }) });
+      trace({ kind: "unbound-persona-on", ...await call(persona, {
+        name: "pinned_definition", prompt: "A persona on the selected manager.", instance: other,
+        subscribe: [], allowSubscribe: [], allowPublish: [],
+      }) });
+      // A peer the other manager runs: unpinned, the exchange cannot pick a manager.
+      const despawn = cotalToolSpecs(config).find((s) => s.name === "cotal_despawn")!;
+      trace({ kind: "unbound-despawn", ...await call(despawn, { name: "despawnee" }) });
+      config.managerInstanceId = spawner;
+      trace({ kind: "bound-persona-other", ...await call(persona, {
+        name: "wrong_manager_definition", prompt: "Must not be written.", instance: other,
+      }) });
+      trace({ kind: "bound-despawn-other", ...await call(despawn, { name: "despawnee", instance: other }) });
+      trace({ kind: "despawn-instance-no-name", ...await call(despawn, { instance: other }) });
+      // Each refusal above left the peer running, so naming its manager stops it.
+      config.managerInstanceId = undefined;
+      trace({ kind: "unbound-despawn-on", ...await call(despawn, { name: "despawnee", instance: other }) });
+      config.managerInstanceId = spawner;
+      trace({ kind: "pin-done" });
+    } else if (config.name === "toolpage") {
+      trace({ kind: "tool-page", ...await tool.run(mesh, config, parseToolArgs(tool, { verb: "ps", page: { limit: 1 } })) });
+    } else {
+      const started = await tool.run(mesh, config, { verb: "start", source: 'await checkpoint("child-owned", "Native child decision", { timeout: "1m" }); await checkpoint("child-finish", "Finish resumed child run", { timeout: "1m" });' });
+      trace({ kind: "tool-start", ...started });
+      const runId = started.text.match(/Started run (run-[a-f0-9]+)/)?.[1];
+      if (!runId || started.isError) throw new Error("native child cotal_run start refused");
+      await waitFor(async () => {
+        const status = await tool.run(mesh, config, { verb: "status", runId });
+        if (!status.isError && status.text.includes("/checkpoint:child-owned#0")) { trace({ kind: "tool-status", runId, ...status }); return true; }
+        return false;
+      });
+      // The parent observes the real drive at a native pause, requests public release, then signals.
+      await waitFor(() => existsSync(process.env.MC_RELEASE!));
+      const answer = await tool.run(mesh, config, { verb: "answer", runId, stepKey: "/checkpoint:child-owned#0", value: "native child approval" });
+      trace({ kind: "tool-answer", runId, ...answer });
+      if (answer.isError) throw new Error("native child answer refused");
+      await waitFor(async () => {
+        const status = await tool.run(mesh, config, { verb: "status", runId });
+        if (!status.isError && status.text.includes(": released,")) { trace({ kind: "tool-released", runId }); return true; }
+        return false;
+      });
+      const resumed = await tool.run(mesh, config, { verb: "resume", runId });
+      trace({ kind: "tool-resume", runId, ...resumed });
+      if (resumed.isError) throw new Error("native child resume refused");
+      await waitFor(async () => {
+        const status = await tool.run(mesh, config, { verb: "status", runId });
+        return !status.isError && status.text.includes("/checkpoint:child-finish#0");
+      });
+      const finished = await tool.run(mesh, config, { verb: "answer", runId, stepKey: "/checkpoint:child-finish#0", value: "finish" });
+      trace({ kind: "tool-answer-finish", runId, ...finished });
+      if (finished.isError) throw new Error("native child resumed checkpoint answer refused");
+      await waitFor(async () => {
+        const status = await tool.run(mesh, config, { verb: "status", runId });
+        if (!status.isError && status.text.includes(": completed,")) { trace({ kind: "tool-completed", runId }); return true; }
+        return false;
+      });
+      for (const scenario of ["parent-denied", "parent-restored", "stale-uid", "wrong-instance"]) {
+        await waitFor(() => existsSync(process.env.MC_CONTROL!) && readFileSync(process.env.MC_CONTROL!, "utf8") === scenario);
+        const originalUid = config.lifecycleUid, originalInstance = config.managerInstanceId;
+        if (scenario === "stale-uid") config.lifecycleUid = mintLifecycleUid();
+        if (scenario === "wrong-instance") config.managerInstanceId = mintLifecycleUid();
+        const result = await tool.run(mesh, config, { verb: "start", source: 'log("current caller check");' });
+        config.lifecycleUid = originalUid; config.managerInstanceId = originalInstance;
+        trace({ kind: `tool-${scenario}`, ...result });
+      }
+    }
+  } catch (error) {
+    trace({ kind: "tool-failure", reason: (error instanceof Error ? error.message : String(error)).replace(/\beyJ[\w-]+\.[\w-]+\.[\w-]+\b/g, "[redacted]").slice(0, 500) });
+  }
+  const stop = () => { void mesh.stop().finally(() => process.exit(0)); };
+  process.on("SIGTERM", stop);
+  process.on("SIGINT", stop);
+  await new Promise(() => {});
+}
+
+import assert from "node:assert/strict";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { createServer } from "node:http";
+import { createServer as createTcpServer, connect as tcpConnect, type Server as TcpServer, type Socket } from "node:net";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { connect } from "@nats-io/transport-node";
+import { jetstreamManager } from "@nats-io/jetstream";
+import {
+  CotalEndpoint, createSpaceAuth, mintCreds, newIdentity, mintLifecycleUid, serverConfig, setupSpaceStreams,
+  standaloneConnectOpts, isReachable, remoteManagerActors, remoteManagerRegistrationProof,
+  eventChannel, loadAgentFile, readRunAdmission, runDriverCaller, readGoalResult,
+  openRecordsBucket, createRunSpec, writeRunStatus, newTakeoverId, type RunListPage,
+  RUN_HOST_KIND, COTAL_LANG_RUN_HOST, type RunHost, type RunHostDrive,
+  epCall, issuedUserCaller, resolveService, invokeCommand, type EpCaller, type Connector, type EpAttributedReply, registry,
+} from "@cotal-ai/core";
+import { authDir, userAuthStateDir, workspaceSecretStore, saveSpaceAuth, recordMesh, assertUserAuthInfo } from "@cotal-ai/workspace";
+import {
+  cotalAuthProvider, saveIdpSession, grantActor, loadAuthServiceInfo, saveAuthServiceInfo, loadOwnerSecret, loadPinnedIdp,
+  deriveOwnerForIdpSubject, findActorUnified, revokeActor,
+} from "@cotal-ai/auth";
+import { Manager, type ManagerOptions } from "../src/manager.js";
+import { managerClusterArtifacts, MANAGER_CONTRACTS } from "../src/manager-service-contract.js";
+import { registerRemoteManagerAuthority } from "../src/remote-register.js";
+import * as remote from "../src/remote-authority.js";
+import { RunHosting } from "../src/run-hosting.js";
+import "@cotal-ai/runtime";
+import { bootDeliveryDaemon } from "./_boot-delivery.js";
+import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal, killAndAwaitExit } from "@cotal-ai/smoke-kit";
+
+const here = import.meta.dirname;
+const self = resolve(here, "run-owned-agents.smoke.ts");
+const cotalBin = join(here, "..", "..", "..", "bin", "cotal.ts");
+const scratch = mkdtempSync(join(tmpdir(), `${SMOKE_BROKER_TOKEN}u4-`));
+const home = join(scratch, "home");
+const hostRoot = join(scratch, "host");
+const root = join(scratch, "participant");
+for (const dir of [home, hostRoot, root]) mkdirSync(join(dir, ".cotal"), { recursive: true });
+const previousHome = process.env.COTAL_HOME;
+process.env.COTAL_HOME = home;
+const space = `u4${mintLifecycleUid().slice(0, 8)}`;
+const port = await freePort();
+const servers = `nats://127.0.0.1:${port}`;
+const hostDir = userAuthStateDir(hostRoot, space);
+const hostStore = workspaceSecretStore(hostRoot);
+const tracePath = join(scratch, "seat.jsonl");
+const releasePath = join(scratch, "release"), controlPath = join(scratch, "tool-control");
+// #3959: the owner's own CLI home (registry entry plus sign-in), and the second manager's instance.
+const cliHome = join(scratch, "cli-home");
+let otherInstance: string | undefined;
+writeFileSync(tracePath, "");
+let passed = 0, failed = 0;
+const check = (name: string, condition: unknown): void => {
+  if (condition) { passed++; console.log(`  ✓ ${name}`); }
+  else { failed++; console.error(`  ✗ FAIL: ${name}`); }
+};
+const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+async function until(fn: () => boolean | Promise<boolean>, label: string, ms = 25_000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!await fn()) { if (Date.now() > end) throw new Error(label); await wait(100); }
+}
+function successful(r: EpAttributedReply): Record<string, unknown> {
+  if (!r.reply.ok) throw new Error(`endpoint refused ${r.reply.error?.code}: ${r.reply.error?.message}; ${JSON.stringify(r.reply.error?.details)}`);
+  return r.reply.data as Record<string, unknown>;
+}
+const trace = (): Array<Record<string, unknown>> => readFileSync(tracePath, "utf8").split("\n").slice(0, -1).filter(Boolean).map((line) => JSON.parse(line));
+let broker: ChildProcess | undefined;
+let authChild: ChildProcess | undefined;
+let manager: Manager | undefined;
+let managerB: Manager | undefined;
+let delivery: Awaited<ReturnType<typeof bootDeliveryDaemon>> | undefined;
+let idpServer: ReturnType<typeof createServer> | undefined;
+const endpoints: CotalEndpoint[] = [];
+const connections: Awaited<ReturnType<typeof connect>>[] = [];
+let adminRequests: Array<{ owner: string; actor: string; lifecycleUid: string; authorized: boolean }> = [];
+let mainRun: string | undefined;
+let fatal: string | undefined;
+let connectorResolutions = 0, enrollments = 0;
+const drives = new Map<string, RunHostDrive>();
+const admissions = new Map<string, ReturnType<typeof readRunAdmission>>();
+const nativeRunHost = registry.resolve<RunHost>(RUN_HOST_KIND, COTAL_LANG_RUN_HOST);
+registry.unregister(RUN_HOST_KIND, COTAL_LANG_RUN_HOST);
+const observingRunHost: RunHost = { ...nativeRunHost, drive: (planes, request, mediator) => {
+  const drive = nativeRunHost.drive(planes, request, mediator);
+  drives.set(request.runId, drive); admissions.set(request.runId, readRunAdmission(mediator!.jsm, space, "manager", request.runId));
+  return drive;
+} };
+registry.register(observingRunHost);
+
+try {
+  // Native Better Auth users and sessions. No guessed JWT, callout rule copy or artificial issuance.
+  const betterRoot = new URL("../../auth/node_modules/better-auth/", import.meta.url);
+  const { betterAuth } = await import(new URL("dist/index.mjs", betterRoot).href);
+  const { memoryAdapter } = await import(new URL("dist/adapters/memory-adapter/index.mjs", betterRoot).href);
+  const { jwt } = await import(new URL("dist/plugins/jwt/index.mjs", betterRoot).href);
+  const { bearer } = await import(new URL("dist/plugins/bearer/index.mjs", betterRoot).href);
+  const { toNodeHandler } = await import(new URL("dist/integrations/node.mjs", betterRoot).href);
+  let handler: ReturnType<typeof toNodeHandler>;
+  idpServer = createServer((req, res) => handler(req, res));
+  await new Promise<void>((r) => idpServer!.listen(0, "127.0.0.1", r));
+  const address = idpServer.address();
+  assert(address && typeof address === "object");
+  const origin = `http://127.0.0.1:${address.port}`;
+  const idpUrl = `${origin}/api/auth`;
+  const idp = betterAuth({ baseURL: origin, secret: "native-u4-disposable-fixture-secret-123456", database: memoryAdapter({ user: [], session: [], account: [], verification: [], jwks: [] }), emailAndPassword: { enabled: true }, plugins: [jwt({ jwt: { issuer: origin, audience: origin } }), bearer()] });
+  handler = toNodeHandler(idp);
+  const signup = await idp.api.signUpEmail({ body: { email: "owner-a@example.test", password: "native-fixture-password", name: "Fixture owner A" } });
+  assert(signup.token && signup.user.id);
+  saveIdpSession(home, idpUrl, { token: signup.token, sub: signup.user.id, expiresAt: Math.floor(Date.now() / 1000) + 3600 });
+  const auth = await createSpaceAuth(space);
+  saveSpaceAuth(authDir(hostRoot), auth);
+  const prepared = await cotalAuthProvider.prepareServer({ space, operatorSeed: auth.operator.seed, account: { pub: auth.account.pub, signingSeed: auth.account.signingSeed }, store: hostStore, dir: hostDir, idpUrl });
+  writeFileSync(join(scratch, "server.conf"), serverConfig(auth, [auth], { transport: { kind: "plaintext" }, port, storeDir: join(scratch, "js"), extraAccounts: prepared.extraAccounts }));
+  broker = spawn("nats-server", ["-c", join(scratch, "server.conf")], { stdio: "ignore" });
+  teardownOnSignal(broker, scratch);
+  await until(() => isReachable(servers), "broker readiness");
+  await setupSpaceStreams({ servers, space, creds: await mintCreds(auth, newIdentity(), "provisioner") });
+  delivery = await bootDeliveryDaemon({ space, servers, auth, reloadStoreIdentity: hostStore.identity! });
+  let authOutput = "";
+  authChild = spawn(process.execPath, [...process.execArgv, self, "auth-service", "--space", space, "--server", servers, "--exchange-public-port", "0"], { cwd: hostRoot, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+  for (const stream of [authChild.stdout, authChild.stderr]) stream!.on("data", (d) => { authOutput += d.toString(); });
+  await until(async () => {
+    if (authChild!.exitCode !== null) throw new Error("stock auth service exited during boot");
+    const info = loadAuthServiceInfo(hostDir);
+    return !!info?.publicUrl && (await fetch(`${info.url}/health`).catch(() => undefined))?.ok === true;
+  }, "stock auth service readiness");
+  const info = loadAuthServiceInfo(hostDir)!;
+  const pin = loadPinnedIdp(hostDir)!;
+  const secret = (await loadOwnerSecret(hostStore, space))!;
+  const owner = deriveOwnerForIdpSubject(secret, pin.issuer, signup.user.id);
+  const signupB = await idp.api.signUpEmail({ body: { email: "owner-b@example.test", password: "native-fixture-password", name: "Fixture owner B" } });
+  const otherOwner = deriveOwnerForIdpSubject(secret, pin.issuer, signupB.user.id);
+  const row = grantActor(hostDir, { owner, actor: "cli", scope: ["spawn", "run", "supervise", "admin"], allowSubscribe: [">"], allowPublish: [">"], label: "disposable native U4 operator" });
+  grantActor(hostDir, { owner: otherOwner, actor: "cli", scope: ["spawn", "run", "admin"], allowSubscribe: [], allowPublish: [], label: "disposable native U4 other owner" });
+  recordMesh({ space, server: servers, root, mode: "user", policy: { events: "required" }, userAuth: assertUserAuthInfo(prepared.publicAuth), ts: new Date().toISOString() });
+  const state = remote.loadOrCreateRemoteManagerIdentity(root, space);
+  const connector: Connector = { kind: "connector", name: "u4-seat", requires: ["node"], eventChannel,
+    buildLaunch: (o) => {
+      assert(o.userAuth && o.lifecycleUid);
+      const env: Record<string, string> = {};
+      for (const key of ["PATH", "HOME", "TMPDIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "COTAL_SKIP_CONNECTOR_SEED"]) if (process.env[key]) env[key] = process.env[key]!;
+      return { command: process.execPath, args: [...process.execArgv, self, o.name.startsWith("tool") ? "tool-seat" : "seat"], env: { ...env, COTAL_SPACE: o.space, COTAL_SERVERS: servers, COTAL_OWNER: o.userAuth.owner, COTAL_ACTOR: o.userAuth.actor, COTAL_NAME: o.name, COTAL_LIFECYCLE_UID: o.lifecycleUid, COTAL_SENTINEL_CREDS: o.userAuth.sentinelCredsPath, COTAL_BEARER_CMD: JSON.stringify(o.userAuth.bearerCmd), COTAL_MANAGER_INSTANCE: state.instanceId, COTAL_CAPABILITIES: (o.capabilities ?? []).join(","), U4_TRACE: tracePath, MC_RELEASE: releasePath, MC_CONTROL: controlPath,
+        ...(o.name === "toolpin" ? { COTAL_HOME: cliHome, MC_CLI_HOME: cliHome, MC_OTHER_INSTANCE: otherInstance! } : {}) } };
+    },
+  };
+  registry.register(connector);
+  mkdirSync(join(root, ".cotal", "agents"), { recursive: true });
+  writeFileSync(join(root, ".cotal", "agents", "owned.md"), "---\nname: owned\nagent: u4-seat\ncapabilities: [spawn]\nsubscribe: []\nallowSubscribe: []\nallowPublish: []\n---\nNative owned seat.\n");
+  const callArgs = { store: hostStore, dir: hostDir };
+  const callAuthority = (request: Parameters<NonNullable<typeof cotalAuthProvider.managerServiceAuthority>>[0]["request"]) => cotalAuthProvider.managerServiceAuthority!({ ...callArgs, request });
+  // One participant manager for `owner`, registered through the stock authority. #3959 boots a
+  // second one from another root, as an owner running a manager per host does.
+  const remoteManager = async (workspaceRoot: string, state: ReturnType<typeof remote.loadOrCreateRemoteManagerIdentity>): Promise<Manager> => {
+    const prep = await callAuthority(remote.remoteManagerAuthorityRequest(state, "cli", "prepare"));
+    const supervisorCreds = remote.materialCredential(prep, "supervisor", state.identities.supervisor);
+    const executorCreds = remote.materialCredential(prep, "executor", state.identities.executor);
+    const registered = await registerRemoteManagerAuthority({ space, server: servers, owner, instanceId: state.instanceId, serveActor: remoteManagerActors(state.instanceId).serve, prepareCreds: executorCreds, tlsRequired: false,
+      evict: async (principals) => {
+        const request = remote.remoteManagerMaintenanceRequest(state, "cli", "evict-family-principal", state.instanceId, [...principals]);
+        const result = await cotalAuthProvider.maintainRemoteManager!({ ...callArgs, request });
+        return remote.remoteManagerMaintenanceResult(result, request, owner).evictions!.map((e) => e.verifiedGone);
+      },
+    });
+    const artifacts = managerClusterArtifacts();
+    const contractArtifacts = [artifacts.document, artifacts.manifest];
+    const activate = await callAuthority(remote.remoteManagerAuthorityRequest(state, "cli", "activate", { registrationProof: remoteManagerRegistrationProof(owner, state, contractArtifacts), contractArtifacts }));
+    const proof = remote.currentRegistrationProof(activate);
+    const standing = remote.remoteStandingBundleRenewal({ state, owner, registrationProof: proof, supervisorCreds, call: callAuthority });
+    const remoteAuthority: NonNullable<ManagerOptions["remoteAuthority"]> = {
+      ...standing, owner, actors: remoteManagerActors(state.instanceId), instanceId: state.instanceId, lifecycleUid: state.lifecycleUid, identities: state.identities,
+      supervisorCreds, executorCreds, serveCreds: remote.materialCredential(activate, "serve", state.identities.serve), goalWriterCreds: remote.materialCredential(activate, "goalWriter", state.identities.goalWriter), sessionLedgerCreds: remote.materialCredential(activate, "sessionLedger", state.identities.sessionLedger), serveGrant: registered.serveGrant,
+      agentBearerExchangeUrl: info.publicUrl!,
+      renewExecutor: async () => remote.materialCredential(await callAuthority(remote.remoteManagerAuthorityRequest(state, "cli", "renew", { registrationProof: proof })), "executor", state.identities.executor),
+      runHosting: remote.remoteRunHosting({ state, owner, registrationProof: proof, accountPublicKey: standing.accountPublicKey, processEpoch: registered.processEpoch,
+        requestRunAdmission: (request) => cotalAuthProvider.requestRemoteRunAdmission!({ ...callArgs, request }),
+        requestRunAttempt: (request) => cotalAuthProvider.requestRemoteRunAttempt!({ ...callArgs, request }), call: callAuthority,
+      }),
+      authorizeAdmin: async (caller) => {
+        const request = remote.remoteManagerAdminAuthorizationRequest(state, "cli", proof, registered.processEpoch, caller);
+        const response = await cotalAuthProvider.authorizeRemoteManagerAdmin!({ ...callArgs, request });
+        const authorized = remote.remoteManagerAdminAuthorized(response, request, owner);
+        adminRequests.push({ ...caller, authorized });
+        return authorized;
+      },
+      enrollManagedAgent: async ({ target }) => {
+        enrollments++;
+        const request = remote.remoteManagedAgentEnrollmentRequest(state, "cli", proof, registered.processEpoch, target);
+        return remote.remoteManagedAgentEnrollmentMaterial(await cotalAuthProvider.enrollRemoteManagedAgent!({ ...callArgs, request }), request);
+      },
+      prepareAgentRetirement: async ({ target, opId }) => {
+        const request = remote.remoteManagedAgentPrepareRetirementRequest(state, "cli", proof, registered.processEpoch, target, opId);
+        remote.remoteManagedAgentRetirementPrepared(await cotalAuthProvider.prepareRemoteManagedAgentRetirement!({ ...callArgs, request }), request);
+      },
+      mintRetirementRequester: async ({ identity, target, opId, serveEpoch }) => remote.materialCredential(await callAuthority(remote.remoteManagerAuthorityRequest(state, "cli", "retire", { registrationProof: remoteManagerRegistrationProof(owner, state), retirement: { id: identity.id, target, opId, serveEpoch } })), "retirementRequester", identity),
+      mintSessionServing: async (session) => remote.materialCredential(await callAuthority(remote.remoteManagerAuthorityRequest(state, "cli", "session", {
+        registrationProof: remoteManagerRegistrationProof(owner, state),
+        session: { id: session.identity.id, endpoint: session.endpoint, sessionId: session.sessionId, epoch: session.epoch, exp: session.exp },
+      })), "sessionServing", session.identity),
+      validateRetainedAgent: async () => { throw new Error("fixture starts no retained seat"); },
+      scanGoalIndex: async () => {
+        const request = remote.remoteManagerGoalIndexScanRequest(state, "cli", proof, registered.processEpoch);
+        return remote.remoteManagerGoalIndexEntries(await cotalAuthProvider.scanRemoteManagerGoalIndex!({ ...callArgs, request }), request, owner);
+      },
+  };
+  const started = new Manager({ space, servers, workspaceRoot, runtime: "pty", remoteAuthority, eventsRequired: true });
+  await started.start();
+  return started;
+  };
+  manager = await remoteManager(root, state);
+  const connectorBoundary = manager as unknown as { resolveConnector: (agent: string) => Promise<Connector> };
+  const resolveConnector = connectorBoundary.resolveConnector.bind(manager);
+  connectorBoundary.resolveConnector = async (agent) => { connectorResolutions++; return resolveConnector(agent); };
+  const view = { ...callArgs, space, actor: "cli", view: "manager-caller", managerInstanceId: state.instanceId };
+  const material = await cotalAuthProvider.userCredentials(view);
+  const controlOpts = standaloneConnectOpts({ ...material, tls: false });
+  const controlNc = await connect({ servers, ...controlOpts, maxReconnectAttempts: 0 });
+  connections.push(controlNc);
+  const caller = await issuedUserCaller(controlNc, space, controlOpts.name as string, { owner, actor: "cli", uid: row.lifecycleUid! });
+  const controlService = await resolveService(controlNc, space, "manager", caller, { instanceId: state.instanceId });
+  const endpoint = { invokeService: (_endpoint: string, command: string, args?: Record<string, unknown>, opts: { deadlineMs?: number } = {}) => invokeCommand(controlNc, space, controlService, command, args, { deadlineMs: opts.deadlineMs ?? 10_000, ...(command === "run-answer" ? { target: { mode: "self" as const } } : {}) }) };
+  const observer = new CotalEndpoint({ space, servers, creds: await mintCreds(auth, newIdentity(), "observer"), channels: [], consume: false, registerPresence: false, watchPresence: true, watchChannels: false, card: { name: "native-roster-observer", kind: "endpoint" } });
+  observer.on("error", () => {}); endpoints.push(observer); await observer.start();
+  const hosting = (manager as unknown as { runHosting: RunHosting }).runHosting;
+  const start = async (source: string) => String(successful(await endpoint.invokeService("manager", "run-start", { source, file: "native-u4.cotal.js" }, { deadlineMs: 20_000 })).runId);
+  const status = async (runId: string) => successful(await endpoint.invokeService("manager", "run-status", { runId }, { deadlineMs: 10_000 }));
+  const runCount = async () => (successful(await endpoint.invokeService("manager", "run-ps")) as unknown as Array<{ runId: string }>).length;
+  // #3959: a second live remote manager for the same owner makes every unpinned manager-caller
+  // exchange ambiguous. The owner's CLI runs from the root `cotal up --user-auth` records, signed in
+  // as that owner; each manager counts the reads it serves, so a cell can name the one that answered.
+  const servedBy = (m: Manager) => {
+    const counts = { models: 0, runs: 0 };
+    const seams = m as unknown as { resolveConnector(agent: string): Promise<Connector>; runHost(): RunHosting };
+    const resolveConnector = seams.resolveConnector.bind(m), runHost = seams.runHost.bind(m);
+    seams.resolveConnector = async (agent) => { counts.models++; return resolveConnector(agent); };
+    seams.runHost = () => { counts.runs++; return runHost(); };
+    return counts;
+  };
+  const rootB = join(scratch, "participant-b");
+  mkdirSync(join(rootB, ".cotal"), { recursive: true });
+  const stateB = remote.loadOrCreateRemoteManagerIdentity(rootB, space);
+  otherInstance = stateB.instanceId;
+  managerB = await remoteManager(rootB, stateB);
+  const onA = servedBy(manager!), onB = servedBy(managerB);
+  mkdirSync(cliHome, { recursive: true });
+  process.env.COTAL_HOME = cliHome;
+  try {
+    recordMesh({ space, server: servers, root: hostRoot, mode: "user", policy: { events: "required" }, userAuth: assertUserAuthInfo(prepared.publicAuth), ts: new Date().toISOString() });
+  } finally {
+    process.env.COTAL_HOME = home;
+  }
+  saveIdpSession(cliHome, idpUrl, { token: signup.token, sub: signup.user.id, expiresAt: Math.floor(Date.now() / 1000) + 3600 });
+  const cliEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("COTAL_")));
+  const cli = (args: string[]) => {
+    const argv = [...process.execArgv, cotalBin, ...args];
+    return new Promise<{ code: number; stdout: string; stderr: string }>((done) => execFile(process.execPath, argv,
+      { cwd: hostRoot, env: { ...cliEnv, COTAL_HOME: cliHome, COTAL_SKIP_CONNECTOR_SEED: "1" }, timeout: 60_000 },
+      (error, stdout, stderr) => done({ code: error ? (typeof error.code === "number" ? error.code : -1) : 0, stdout, stderr })));
+  };
+  const cell = (name: string, condition: boolean, detail: unknown): void => {
+    check(name, condition);
+    if (!condition) console.error(`    ${JSON.stringify(detail).replace(/\beyJ[\w-]+\.[\w-]+\.[\w-]+\b/g, "[redacted]").slice(0, 1500)}`);
+  };
+  const namesBoth = (text: unknown, remedy: string) => typeof text === "string" && text.includes(state.instanceId) && text.includes(stateB.instanceId) && text.includes(remedy);
+  // The CLI lists both managers, and its Next gives the command again with `--on` for each. The two
+  // share a host and a runtime, so each is picked by its instance id.
+  const rerunsBoth = (text: unknown) => typeof text === "string" && [state.instanceId, stateB.instanceId].every((id) => text.includes(`--on ${id}`));
+  const unpinnedModels = await cli(["models", "--space", space, "--harness", "u4-seat"]);
+  cell("#3959 unpinned `cotal models` refuses two live managers, lists both and names --on", unpinnedModels.code === 2 && /^Request refused$/m.test(unpinnedModels.stderr) && rerunsBoth(unpinnedModels.stderr), unpinnedModels);
+  const unpinnedRuns = await cli(["run", "ps", "--space", space]);
+  cell("#3959 unpinned `cotal run ps` refuses two live managers, lists both and names --on", unpinnedRuns.code === 2 && /^Request refused$/m.test(unpinnedRuns.stderr) && rerunsBoth(unpinnedRuns.stderr), unpinnedRuns);
+  let before = { a: { ...onA }, b: { ...onB } };
+  const pinnedModels = await cli(["models", "--space", space, "--harness", "u4-seat", "--on", stateB.instanceId]);
+  cell("#3959 `cotal models --on <instance>` succeeds against the named instance", pinnedModels.code === 0 && onB.models === before.b.models + 1 && onA.models === before.a.models, { pinnedModels, before, onA, onB });
+  before = { a: { ...onA }, b: { ...onB } };
+  const pinnedRuns = await cli(["run", "ps", "--space", space, "--on", state.instanceId]);
+  cell("#3959 `cotal run ps --on <instance>` succeeds against the named instance", pinnedRuns.code === 0 && onA.runs > before.a.runs && onB.runs === before.b.runs, { pinnedRuns, before, onA, onB });
+  // A seat the second manager runs, for the seat below to stop by naming that manager.
+  mkdirSync(join(rootB, ".cotal", "agents"), { recursive: true });
+  writeFileSync(join(rootB, ".cotal", "agents", "despawnee.md"), "---\nname: despawnee\nagent: u4-seat\nsubscribe: []\nallowSubscribe: []\nallowPublish: []\n---\nSeat the second manager runs.\n");
+  assert.equal((await managerB.startAgent({ name: "despawnee" }, `${owner}.cli`)).ok, true);
+  // Its persona leaves the catalog, which a cell below reads as empty; the running seat stays.
+  rmSync(join(rootB, ".cotal", "agents", "despawnee.md"));
+  const runsOnB = (name: string) => (managerB as unknown as { agents: Map<string, unknown> }).agents.has(name);
+  // A seat the first manager spawns, beside both managers.
+  writeFileSync(join(root, ".cotal", "agents", "toolpin.md"), "---\nname: toolpin\nagent: u4-seat\ncapabilities: [spawn, run]\nsubscribe: []\nallowSubscribe: []\nallowPublish: []\n---\nManaged seat beside two live managers.\n");
+  assert.equal((await manager.startAgent({ name: "toolpin" }, `${owner}.cli`)).ok, true);
+  before = { a: { ...onA }, b: { ...onB } };
+  await until(() => trace().some((e) => e.actor === "toolpin" && (e.kind === "pin-done" || e.kind === "tool-failure")), "two-manager seat calls", 120_000);
+  const seat = (kind: string): Record<string, unknown> => trace().find((e) => e.actor === "toolpin" && e.kind === kind) ?? { kind, missing: true };
+  const answered = (kind: string) => seat(kind).missing !== true && seat(kind).isError !== true;
+  cell("#3959 a managed seat's MCP cotal_run ps succeeds with two live managers", answered("pin-run-ps"), seat("pin-run-ps"));
+  cell("#3959 a managed seat's own `cotal run ps` defaults to its spawner", seat("pin-cli-run-ps").code === 0, seat("pin-cli-run-ps"));
+  cell("#3959 an explicit --on from a managed seat wins over its spawner", seat("pin-cli-models-on").code === 0 && onB.models === before.b.models + 1, { call: seat("pin-cli-models-on"), before, onB });
+  cell("#3959 an unbound seat's cotal_run ps refuses, lists both and names the instance argument", seat("unbound-run-ps").isError === true && namesBoth(seat("unbound-run-ps").text, "instance argument"), seat("unbound-run-ps"));
+  cell("#4037 an unbound seat's `cotal agent-bearer --manager-call` refuses, lists both and names --manager-instance", seat("unbound-cli-bearer").code === 1 && namesBoth(seat("unbound-cli-bearer").stderr, "--manager-instance <instanceId>"), seat("unbound-cli-bearer"));
+  cell("#3959 MCP cotal_run ps with instance succeeds against the named instance", answered("unbound-run-ps-on"), seat("unbound-run-ps-on"));
+  cell("#3959 MCP cotal_personas with instance reads the named instance's catalog", answered("unbound-personas-on") && seat("unbound-personas-on").text === "No personas in the manager catalog.", seat("unbound-personas-on"));
+  cell("MCP cotal_persona with instance defines on the named manager", answered("unbound-persona-on") &&
+    existsSync(join(rootB, ".cotal", "agents", "pinned_definition.md")) &&
+    !existsSync(join(root, ".cotal", "agents", "pinned_definition.md")), seat("unbound-persona-on"));
+  cell("MCP cotal_persona keeps a bound seat on its own manager", seat("bound-persona-other").isError === true &&
+    String(seat("bound-persona-other").text).includes("differs from this credential's instance authority") &&
+    !existsSync(join(rootB, ".cotal", "agents", "wrong_manager_definition.md")) &&
+    !existsSync(join(root, ".cotal", "agents", "wrong_manager_definition.md")), seat("bound-persona-other"));
+  cell("an unbound seat's cotal_despawn refuses, lists both managers and names the instance argument", seat("unbound-despawn").isError === true && namesBoth(seat("unbound-despawn").text, "instance argument"), seat("unbound-despawn"));
+  cell("cotal_despawn keeps a bound seat on its own manager", seat("bound-despawn-other").isError === true &&
+    String(seat("bound-despawn-other").text).includes("differs from this credential's instance authority"), seat("bound-despawn-other"));
+  cell("cotal_despawn with instance and no name is refused, and the seat is not stopped", seat("despawn-instance-no-name").isError === true &&
+    String(seat("despawn-instance-no-name").text).includes("instance selects the manager of a named peer") && seat("pin-done").missing !== true, seat("despawn-instance-no-name"));
+  const despawnedOnB = await (async () => { for (const end = Date.now() + 30_000; Date.now() < end; await new Promise((r) => setTimeout(r, 200))) if (!runsOnB("despawnee")) return true; return false; })();
+  cell("MCP cotal_despawn with instance stops the peer on the named manager", answered("unbound-despawn-on") &&
+    String(seat("unbound-despawn-on").text).startsWith("Stopping despawnee") && despawnedOnB, { call: seat("unbound-despawn-on"), despawnedOnB });
+  cell("#3959 each seat call reached the manager it named (runs: spawner 2, other 1)", onA.runs === before.a.runs + 2 && onB.runs === before.b.runs + 1, { before, onA, onB });
+  // The cells above leave one manager live and an empty trace, as the cells below expect.
+  await managerB.stop({ withAgents: true });
+  managerB = undefined;
+  writeFileSync(tracePath, "");
+  writeFileSync(join(root, ".cotal", "agents", "toolowned.md"), "---\nname: toolowned\nagent: u4-seat\ncapabilities: [run]\nsubscribe: []\nallowSubscribe: []\nallowPublish: []\n---\nNative connector workflow caller.\n");
+  // The hold stays open through MC-1 to MC-6, which take over a minute on a loaded host.
+  const toolParent = await start('await spawn("toolowned"); await checkpoint("tool-parent", "Keep managed tool child alive", { timeout: "5m" });');
+  await until(() => trace().some((e) => e.actor === "toolowned" && (e.kind === "tool-status" || e.kind === "tool-failure")), "native tool child checkpoint status");
+  const firstToolStatus = trace().find((e) => e.kind === "tool-status");
+  if (firstToolStatus) {
+    drives.get(firstToolStatus.runId as string)!.release("native child connector resume acceptance");
+    writeFileSync(releasePath, "released requested at genuine pause");
+  }
+  await until(() => trace().some((e) => e.actor === "toolowned" && (e.kind === "tool-completed" || e.kind === "tool-failure")), "genuine child connector run outcome", 40_000);
+  const toolStarted = trace().find((e) => e.kind === "tool-start" && e.actor === "toolowned");
+  check("MC-1 genuine managed PTY cotal_run start uses its own issued manager-call path", !!toolStarted && toolStarted.isError !== true && trace().some((e) => e.kind === "tool-joined" && e.runCapability === true && e.managerPinned === true) && trace().some((e) => e.kind === "tool-completed" && e.actor === "toolowned"));
+  console.log(`MANAGED_CONNECTOR_OUTCOME ${JSON.stringify(trace().filter((e) => e.actor === "toolowned"))}`);
+  if (toolStarted?.isError === true || !trace().some((e) => e.kind === "tool-completed" && e.actor === "toolowned")) throw new Error("MC-1 genuine managed connector workflow refused");
+  check("MC-2 genuine managed child inspects answers and resumes its released recorded run", trace().some((e) => e.kind === "tool-resume" && e.isError !== true) && trace().some((e) => e.kind === "tool-answer-finish" && e.isError !== true));
+  const childRunId = firstToolStatus!.runId as string;
+  const childAdmission = (await admissions.get(childRunId)!).admission;
+  const joinedTool = trace().find((e) => e.kind === "tool-joined")!;
+  check("MC-3 real child run admission records own issued owner actor and UID", childAdmission.provenance.kind === "issued" && childAdmission.caller.owner === owner && childAdmission.caller.actor === "toolowned" && childAdmission.caller.uid === joinedTool.uid);
+  check("MC-7 shipped tool help describes managed user-auth issuance without static-only claim", trace().find((e) => e.kind === "tool-guidance")?.truthful === true);
+  grantActor(hostDir, { ...row, owner, actor: "cli", scope: ["spawn", "supervise", "admin"], lifecycleUid: row.lifecycleUid });
+  const beforeParentDenial = drives.size;
+  const recordsBeforeParentDenial = await runCount();
+  writeFileSync(controlPath, "parent-denied");
+  await until(() => trace().some((e) => e.kind === "tool-parent-denied"), "native direct parent run denial");
+  check("MC-4 current direct parent without run refuses child tool start", trace().find((e) => e.kind === "tool-parent-denied")?.isError === true && drives.size === beforeParentDenial && await runCount() === recordsBeforeParentDenial);
+  // The denied call memoized a legacy view for this credential. The next connection must adopt
+  // its own accepted row when the restored parent makes it eligible for issued run authority.
+  grantActor(hostDir, { ...row, owner, actor: "cli", scope: ["spawn", "run", "supervise", "admin"], lifecycleUid: row.lifecycleUid });
+  for (const scenario of ["parent-restored", "stale-uid", "wrong-instance"]) {
+    const before = drives.size;
+    const recordsBefore = await runCount();
+    writeFileSync(controlPath, scenario);
+    await until(() => trace().some((e) => e.kind === `tool-${scenario}`), `native tool ${scenario}`);
+    check(`MC-5 ${scenario} uses authentic child caller without new acceptance on denial`, (trace().find((e) => e.kind === `tool-${scenario}`)?.isError === true) === (scenario !== "parent-restored") && drives.size === before + (scenario === "parent-restored" ? 1 : 0) && await runCount() === recordsBefore + (scenario === "parent-restored" ? 1 : 0));
+  }
+  writeFileSync(join(root, ".cotal", "agents", "toolbaseline.md"), "---\nname: toolbaseline\nagent: u4-seat\ncapabilities: []\nsubscribe: []\nallowSubscribe: []\nallowPublish: []\n---\nNative child without run.\n");
+  assert.equal((await manager.startAgent({ name: "toolbaseline" }, `${owner}.cli`)).ok, true);
+  const beforeMissingRun = drives.size;
+  const recordsBeforeMissingRun = await runCount();
+  await until(() => trace().some((e) => e.kind === "tool-missing-run"), "native child missing run refusal");
+  const missingRun = trace().find((e) => e.kind === "tool-missing-run")!;
+  check("MC-6 missing child run hides tool and broker-refuses MeshAgent.run", missingRun.hidden === true && missingRun.ok === false && drives.size === beforeMissingRun && await runCount() === recordsBeforeMissingRun);
+  successful(await endpoint.invokeService("manager", "run-answer", { runId: toolParent, stepKey: "/checkpoint:tool-parent#0", value: "release" }));
+  await until(async () => ((await status(toolParent)).status as { state?: string }).state === "completed", "tool parent released");
+  const program = `const seat = await spawn("owned"); await turn(seat, { name: "work", deadline: "20s" }); const answer = await ask(seat, { name: "estimate", schema: { estimate: "number", ready: "boolean" }, deadline: "20s" }); log("estimate", answer.estimate); await checkpoint("hold", "Inspect the native seat", { timeout: "1m" });`;
+  mainRun = await start(program);
+  await until(() => trace().some((e) => e.kind === "answer" && e.ok === true && e.run === mainRun), "native turn/ask answer", 40_000);
+  const derived = runDriverCaller(mainRun, owner);
+  const mapped = hosting.admittedCaller(derived);
+  const slots = (hosting as unknown as { runs: Map<string, { mediatorNc: Awaited<ReturnType<typeof connect>>; mediatorCreds: string }> }).runs;
+  const slot = slots.get(mainRun)!;
+  const admission = await readRunAdmission(await jetstreamManager(slot.mediatorNc), space, "manager", mainRun);
+  check("U4-1 native admitted run spawns, turns and receives the seat's typed answer", trace().some((e) => e.kind === "yield" && e.ok === true) && trace().some((e) => e.kind === "answer" && e.ok === true));
+  check("U4-1 caller attribution is the stock issued admission, not fixture-selected run authority", admission.admission.caller.owner === caller.owner && admission.admission.caller.actor === caller.actor && admission.admission.caller.uid === caller.uid && admission.admission.provenance.kind === "issued");
+  check("U4-2 live run driver maps to admitted owner actor and lifecycle", mapped?.owner === owner && mapped.actor === "cli" && mapped.uid === row.lifecycleUid);
+  check("U4-2 outside a held run has no admitted-caller mapping", hosting.admittedCaller(runDriverCaller("unheld-run", owner)) === undefined && hosting.admittedCaller({ owner, actor: "cli", uid: row.lifecycleUid! }) === undefined);
+  check("U4-2 native admin seam resolves the admitted ledger row, never synthetic actor", adminRequests.some((r) => r.owner === owner && r.actor === "cli" && r.lifecycleUid === row.lifecycleUid && r.authorized) && !adminRequests.some((r) => r.actor === derived.actor));
+  const native = trace().find((e) => e.kind === "joined")!;
+  const managed = (successful(await endpoint.invokeService("manager", "ps")) as unknown as Array<{ name: string; id: string; lifecycleUid: string; spawner: string }>).find((a) => a.name === "owned");
+  check("U4-1 spawned lifecycle and caller attribution match the actual native process", managed?.id === `${owner}.owned` && managed.lifecycleUid === native.uid && managed.spawner === `${owner}.${derived.actor}`);
+  const defined = loadAgentFile(join(root, ".cotal", "agents", "owned_content.md"));
+  check("U4-7 run-driven seat writes content through stock self-persona writer", trace().some((e) => e.kind === "persona" && e.ok === true) && defined.owner === `${owner}.owned` && defined.capabilities === undefined);
+  const unknown = await endpoint.invokeService("manager", "define-persona", { name: "injected", persona: "x", capabilities: ["admin"], owner: `${otherOwner}.cli` }).catch((e: unknown) => ({ reply: { ok: false, error: { message: String(e) } } }));
+  check("U4-7 unknown persona policy and owner fields refuse before writer", !unknown.reply.ok && !existsSync(join(root, ".cotal", "agents", "injected.md")));
+  const foreign = await endpoint.invokeService("manager", "define-persona", { name: "owned_content", persona: "take over another actor's content" });
+  check("U4-3 another actor cannot redefine known owned persona", !foreign.reply.ok && /not authorized/.test(foreign.reply.error?.message ?? "") && loadAgentFile(join(root, ".cotal", "agents", "owned_content.md")).owner === `${owner}.owned`);
+  // B authenticates its own genuine session. Its admin row does not confer admin at A's manager.
+  saveIdpSession(home, idpUrl, { token: signupB.token, sub: signupB.user.id, expiresAt: Math.floor(Date.now() / 1000) + 3600 });
+  const bMaterial = await cotalAuthProvider.userCredentials({ ...callArgs, space, actor: "cli" });
+  saveIdpSession(home, idpUrl, { token: signup.token, sub: signup.user.id, expiresAt: Math.floor(Date.now() / 1000) + 3600 });
+  const bEndpoint = new CotalEndpoint({ space, servers, ...bMaterial, lifecycleUid: findActorUnified(hostDir, otherOwner, "cli")!.lifecycleUid, channels: [], consume: false, registerPresence: false, watchPresence: false, watchChannels: false, card: { owner: otherOwner, actor: "cli", name: "fixture-other-owner", kind: "endpoint" } });
+  bEndpoint.on("error", () => {}); endpoints.push(bEndpoint); await bEndpoint.start();
+  const bPersona = await bEndpoint.invokeService("manager", "define-persona", { name: "b_content", persona: "B's content", agent: "u4-seat" });
+  check("U4-3 native other-owner persona remains stamped under its authenticated principal", bPersona.reply.ok && loadAgentFile(join(root, ".cotal", "agents", "b_content.md")).owner === `${otherOwner}.cli`);
+  const aChangesB = await endpoint.invokeService("manager", "define-persona", { name: "b_content", persona: "A cannot replace B" });
+  check("U4-3 admitted owner cannot replace another owner's known persona", !aChangesB.reply.ok && /not authorized/.test(aChangesB.reply.error?.message ?? ""));
+  grantActor(hostDir, { ...row, owner, actor: "cli", scope: ["spawn", "run", "supervise"], lifecycleUid: row.lifecycleUid });
+  const beforeForeign = { connectorResolutions, enrollments };
+  const foreignPersonaRun = await start('await spawn("b_content"); await checkpoint("foreign-hold", "Inspect refused foreign content", { timeout: "1m" });');
+  let foreignRunStatus: Record<string, unknown>;
+  await until(async () => {
+    foreignRunStatus = await status(foreignPersonaRun);
+    return ((foreignRunStatus.journal as Array<{ effect?: string; state?: string }>).some((e) => e.effect === "spawn" && e.state === "settled")) || trace().some((e) => e.kind === "joined" && e.actor === "b_content");
+  }, "foreign persona spawn reached its real terminal");
+  const foreignRows = successful(await endpoint.invokeService("manager", "ps")) as unknown as Array<{ name: string; id: string; spawner: string }>;
+  const foreignLive = foreignRows.find((a) => a.name === "b_content");
+  const foreignEntry = (foreignRunStatus!.journal as Array<{ effect?: string; state?: string; status?: string; errorCode?: string }>).find((e) => e.effect === "spawn" && e.state === "settled");
+  const namedRefusal = await endpoint.invokeService("manager", "spawn", { name: "b_content", events: true });
+  check("U4-3 admitted non-admin run cannot spawn another owner's known persona", foreignLive === undefined && foreignEntry?.status === "failed" && foreignEntry.errorCode === "L4000" && !namedRefusal.reply.ok && namedRefusal.reply.error?.message === 'no persona "b_content"');
+  if (foreignLive !== undefined) {
+    check("U4 blocker witness is a live run-owned seat from B's unchanged persona", foreignLive.id === `${owner}.b_content` && foreignLive.spawner === `${owner}.${runDriverCaller(foreignPersonaRun, owner).actor}` && loadAgentFile(join(root, ".cotal", "agents", "b_content.md")).owner === `${otherOwner}.cli` && !findActorUnified(hostDir, owner, "cli")!.scope.includes("admin"));
+    console.log("U4_PRODUCT_BLOCKER: non-admin A run launched B-owned b_content as A's managed seat; B's persona owner is unchanged and the native row attributes the spawn to A's run driver.");
+    throw new Error("U4-CROSS-OWNER-PERSONA-SPAWN: admitted non-admin run launched another owner's known persona");
+  }
+  const directForeign = await manager.startAgent({ name: "b_content", config: join(root, ".cotal", "agents", "b_content.md") }, `${owner}.cli`);
+  check("U4 persona direct config path refuses foreign content without owner disclosure", !directForeign.ok && directForeign.error === 'no persona "b_content"');
+  const held = manager as unknown as { agents: Map<string, unknown>; reserved: Set<string>; goalAcceptances: Map<string, { name: string }> };
+  check("U4 persona foreign refusal precedes connector enrollment goal acceptance and reservation", connectorResolutions === beforeForeign.connectorResolutions && enrollments === beforeForeign.enrollments && !held.agents.has("b_content") && !held.reserved.has("b_content") && ![...held.goalAcceptances.values()].some((a) => a.name === "b_content"));
+  const sameOwnerDefined = await endpoint.invokeService("manager", "define-persona", { name: "a_content", persona: "A's private content", agent: "u4-seat" });
+  check("U4 persona same-principal definition stays launchable to its admitted non-admin run", sameOwnerDefined.reply.ok);
+  const sameOwnerRun = await start('await spawn("a_content");');
+  await until(async () => ["completed", "failed"].includes(((await status(sameOwnerRun)).status as { state: string }).state), "same-owner persona native run");
+  check("U4 persona admitted caller mapping permits its own private content", ((await status(sameOwnerRun)).status as { state?: string }).state === "completed" && trace().some((e) => e.kind === "joined" && e.actor === "a_content"));
+  writeFileSync(join(root, ".cotal", "agents", "a_config.md"), `---\nname: a_config\nagent: u4-seat\nowner: ${owner}.cli\nsubscribe: []\nallowSubscribe: []\nallowPublish: []\n---\nNative direct owner content.\n`);
+  const directOwn = await manager.startAgent({ name: "a_config", config: join(root, ".cotal", "agents", "a_config.md") }, `${owner}.cli`);
+  if (directOwn.ok) await until(() => trace().some((e) => e.kind === "joined" && e.actor === "a_config"), "direct same-principal child presence");
+  check("U4 persona direct same-principal config stays launchable", directOwn.ok && trace().some((e) => e.kind === "joined" && e.actor === "a_config"));
+  writeFileSync(join(root, ".cotal", "agents", "shared.md"), "---\nname: shared\nagent: u4-seat\nsubscribe: []\nallowSubscribe: []\nallowPublish: []\n---\nUnowned operator content.\n");
+  const sharedRun = await start('await spawn("shared");');
+  await until(async () => ((await status(sharedRun)).status as { state?: string }).state === "completed", "unowned shared persona native run");
+  check("U4 persona non-admin admitted run may launch unowned operator content", trace().some((e) => e.kind === "joined" && e.actor === "shared"));
+  grantActor(hostDir, { ...row, owner, actor: "cli", scope: ["spawn", "run", "supervise", "admin"], lifecycleUid: row.lifecycleUid });
+  const adminRun = await start('await spawn("b_content");');
+  await until(async () => ["completed", "failed"].includes(((await status(adminRun)).status as { state: string }).state), "current admin native persona run");
+  check("U4 persona current native admin may launch a foreign card without changing its owner", ((await status(adminRun)).status as { state?: string }).state === "completed" && trace().some((e) => e.kind === "joined" && e.actor === "b_content") && loadAgentFile(join(root, ".cotal", "agents", "b_content.md")).owner === `${otherOwner}.cli`);
+  grantActor(hostDir, { ...row, owner, actor: "cli", scope: ["spawn", "run", "supervise"], lifecycleUid: row.lifecycleUid });
+  const demoted = await endpoint.invokeService("manager", "spawn", { name: "b_content", events: true });
+  check("U4 persona demoted current admin loses foreign spawn on its next served call", !demoted.reply.ok && demoted.reply.error?.message === 'no persona "b_content"');
+  grantActor(hostDir, { ...row, owner, actor: "cli", scope: ["spawn", "run", "supervise", "admin"], lifecycleUid: row.lifecycleUid });
+  const bSpawn = await bEndpoint.invokeService("manager", "spawn", { name: "owned", events: true });
+  check("U4-3 cross-owner event arming refuses by current admin gate before enrollment", !bSpawn.reply.ok && /admin/.test(bSpawn.reply.error?.message ?? ""));
+  const target = { mode: "any" as const, owner, actor: "owned", lifecycleUid: native.uid as string };
+  for (const command of ["turn", "despawn"] as const) {
+    const refused = await bEndpoint.invokeService("manager", command, command === "turn" ? { payload: "foreign turn", deadlineMs: 1000 } : { graceful: true }, { target });
+    check(`U4-3 other owner's actor cannot ${command} the known native seat`, !refused.reply.ok && refused.reply.error?.code === "permission-denied" && /admin/.test(refused.reply.error.message));
+  }
+  const wrong = await endpoint.invokeService("manager", "run-start", { source: `await spawn("owned", { placement: { endpoint: "manager", instanceId: "${mintLifecycleUid()}" }, cwd: "${root}" });` }, { deadlineMs: 10_000 });
+  check("U4-4 wrong placement refuses before run acceptance by instance name", !wrong.reply.ok && wrong.reply.error?.code === "unimplemented" && /own instance/.test(wrong.reply.error.message));
+  await until(async () => ((await status(mainRun!)).journal as Array<{ step?: string }>).some((e) => e.step === "/checkpoint:hold#0"), "native checkpoint recorded");
+  successful(await endpoint.invokeService("manager", "run-answer", { runId: mainRun, stepKey: "/checkpoint:hold#0", value: "release" }));
+  await until(async () => ((await status(mainRun!)).status as { state?: string } | undefined)?.state === "completed", "run completion", 30_000);
+  await until(() => !observer.getRoster().some((p) => p.card.id === `${owner}.owned` && p.status !== "offline"), "native seat leaves roster", 20_000);
+  const after = successful(await endpoint.invokeService("manager", "ps")) as unknown as Array<{ name: string }>;
+  check("U4-5 completed run releases its native seat without operator intervention", !after.some((a) => a.name === "owned"));
+  check("U4-2 completed run no longer maps an admitted caller", hosting.admittedCaller(derived) === undefined);
+  // A placed run uses only the participant registration. The auth host sees no workflow source.
+  writeFileSync(join(root, ".cotal", "agents", "placed.md"), "---\nname: placed\nagent: u4-seat\nsubscribe: []\nallowSubscribe: []\nallowPublish: []\n---\nNative placed seat.\n");
+  const placedRun = await start(`await spawn("placed", { placement: { endpoint: "manager", instanceId: "${state.instanceId}" }, cwd: "${root}" }); await checkpoint("placed-hold", "Inspect placed seat", { timeout: "1m" });`);
+  await until(async () => ((await status(placedRun)).journal as Array<{ step?: string }>).some((e) => e.step === "/checkpoint:placed-hold#0"), "placed native spawn settled");
+  const placedSlot = slots.get(placedRun)!;
+  const mediatorJwt = placedSlot.mediatorCreds.split("\n").find((line) => line.split(".").length === 3)!;
+  const mediatorClaims = JSON.parse(Buffer.from(mediatorJwt.split(".")[1]!, "base64url").toString("utf8")) as { nats: { pub: { allow: string[] } } };
+  check("U4-4 native placed spawn uses its registered participant instance", trace().some((e) => e.kind === "joined" && e.actor === "placed") && mediatorClaims.nats.pub.allow.some((s) => s.includes(`.ep.inst.manager.${state.instanceId}.spawn.`)));
+  successful(await endpoint.invokeService("manager", "run-answer", { runId: placedRun, stepKey: "/checkpoint:placed-hold#0", value: "release" }));
+  await until(async () => ((await status(placedRun)).status as { state?: string }).state === "completed", "placed run completed");
+  check("U4-5 native placed seat leaves managed status after successful run", !(successful(await endpoint.invokeService("manager", "ps")) as unknown as Array<{ name: string }>).some((a) => a.name === "placed"));
+  // A retained native run's next host admin question reads the live actor row, not its old bearer.
+  const revocationRun = await start('await checkpoint("grant-hold", "Inspect live grant", { timeout: "1m" });');
+  const revokedCaller = runDriverCaller(revocationRun, owner);
+  const managerGate = manager as unknown as { epAdminReach(c: EpCaller): Promise<boolean> };
+  check("U4-6 retained run admin reach starts from actual admitted actor ledger row", await managerGate.epAdminReach(revokedCaller));
+  grantActor(hostDir, { ...row, owner, actor: "cli", scope: ["spawn", "run", "supervise"], lifecycleUid: row.lifecycleUid });
+  check("U4-6 narrowed live grant demotes the next run-driven admin call", await managerGate.epAdminReach(revokedCaller) === false);
+  grantActor(hostDir, { ...row, owner, actor: "cli", scope: ["spawn", "run", "supervise", "admin"], lifecycleUid: row.lifecycleUid });
+  check("U4-6 restored exact incarnation regains only its current admin scope", await managerGate.epAdminReach(revokedCaller));
+  revokeActor(hostDir, owner, "cli");
+  check("U4-6 revoked admitted actor refuses admin at next host call", await managerGate.epAdminReach(revokedCaller).then((v) => v === false, () => true));
+  grantActor(hostDir, { ...row, owner, actor: "cli", scope: ["spawn", "run", "supervise", "admin"], lifecycleUid: mintLifecycleUid() });
+  check("U4-6 re-grant cannot authorize a predecessor run caller lifecycle", await managerGate.epAdminReach(revokedCaller) === false);
+  grantActor(hostDir, { ...row, owner, actor: "cli", scope: ["spawn", "run", "supervise", "admin"], lifecycleUid: row.lifecycleUid });
+  await until(async () => ((await status(revocationRun)).journal as Array<{ step?: string }>).some((e) => e.step === "/checkpoint:grant-hold#0"), "revocation run checkpoint");
+  successful(await endpoint.invokeService("manager", "run-answer", { runId: revocationRun, stepKey: "/checkpoint:grant-hold#0", value: "release" }));
+  await until(async () => ((await status(revocationRun)).status as { state?: string }).state === "completed", "revocation run released");
+  // A real admitted run remains parked while diagnostic pages observe it and synthetic records.
+  const inventoryRun = await start('await checkpoint("inventory-hold", "Keep inventory observation read-only", { timeout: "5m" });');
+  await until(async () => ((await status(inventoryRun)).journal as Array<{ step?: string }>).some((e) => e.step === "/checkpoint:inventory-hold#0"), "inventory checkpoint");
+  const inventoryBefore = await status(inventoryRun);
+  const beforePages = successful(await endpoint.invokeService("manager", "run-ps")) as unknown as Array<{ endpoint: string; runId: string }>;
+  const expectedRuns = new Set(beforePages.map((r) => `${r.endpoint}/${r.runId}`));
+  // These are valid create-only fixture records, not claimed live/admitted workers. Each row fits
+  // a page but their combined legacy reply exceeds the broker's ordinary one-MiB payload limit.
+  const createInventoryFixture = async (runId: string, holder: string): Promise<number> => {
+    const now = Date.now();
+    const fixtureCreds = await mintCreds(auth, newIdentity(), "run-driver", {
+      runDriver: { endpoint: "manager", runId, takeoverId: newTakeoverId(), instanceId: state.instanceId, epoch: 1 },
+    });
+    const fixtureNc = await connect({ servers, ...standaloneConnectOpts({ creds: fixtureCreds, tls: false }), maxReconnectAttempts: 0 });
+    connections.push(fixtureNc);
+    const fixtureKv = await openRecordsBucket(fixtureNc, space);
+    const revision = await createRunSpec(fixtureKv, "manager", runId, {
+      pins: { seed: "inventory-fixture", startedAt: now, yieldEvery: 1000, stepBudget: 1000, effectCeiling: 1000, languageVersion: "2" }, createdAt: now,
+    });
+    await writeRunStatus(fixtureKv, "manager", runId, {
+      observedSpecRevision: revision, state: "completed", holder,
+      epoch: 1, fencingToken: 1, journalHigh: -1, at: now,
+    });
+    await fixtureNc.close();
+    return revision;
+  };
+  for (let i = 0; i < 24; i++) {
+    const runId = `inventory-fixture-${i}`;
+    await createInventoryFixture(runId, "fixture".repeat(6500));
+    expectedRuns.add(`manager/${runId}`);
+  }
+  const largeLegacy = await endpoint.invokeService("manager", "run-ps");
+  check("inventory legacy oversize remains a surfaced refusal", largeLegacy.reply.ok === false && largeLegacy.reply.error?.code === "resource-exhausted");
+  const wireLengths: number[] = [];
+  const subscribe = controlNc.subscribe.bind(controlNc);
+  controlNc.subscribe = (subject, options) => {
+    const callback = options?.callback;
+    return subscribe(subject, callback === undefined ? options : { ...options, callback: (error, message) => {
+      if (!error) wireLengths.push(message.data.byteLength);
+      callback(error, message);
+    } });
+  };
+  let cursor: string | undefined;
+  let cut: number | undefined;
+  const observedRuns = new Set<string>();
+  let pageCount = 0;
+  try {
+    for (;;) {
+      if (++pageCount > 64) throw new Error("inventory fixture exceeded its page count bound");
+      const result = successful(await endpoint.invokeService("manager", "run-ps", { page: { limit: 8, ...(cursor !== undefined ? { cursor } : {}) } })) as unknown as RunListPage;
+      assert.equal(result.semantics, "diagnostic");
+      assert.equal(result.responder.instanceId, state.instanceId);
+      assert.equal(result.responder.epoch, controlService.responder.epoch);
+      cut ??= result.cutSeq;
+      assert.equal(result.cutSeq, cut);
+      assert.ok(result.storageReads <= 64 && result.items.length <= 8);
+      for (const item of result.items) {
+        const key = `${item.endpoint}/${item.runId}`;
+        assert.ok(expectedRuns.has(key) && !observedRuns.has(key));
+        observedRuns.add(key);
+      }
+      if (result.endObserved) break;
+      assert.ok(result.nextCursor && result.nextCursor !== cursor);
+      cursor = result.nextCursor;
+    }
+  } finally {
+    controlNc.subscribe = subscribe;
+  }
+  check("inventory native pages retain every fixture coordinate once", pageCount > 1 && observedRuns.size === expectedRuns.size);
+  check("inventory actual reply bytes fit both ceilings", wireLengths.length === pageCount && wireLengths.every((n) => n <= 65536 && n <= controlNc.info!.max_payload));
+  const badPageInput = (error: unknown) => error instanceof Error && "code" in error && error.code === "bad-request";
+  await assert.rejects(() => endpoint.invokeService("manager", "run-ps", { page: { limit: 17 } }), badPageInput);
+  check("inventory page limit refuses outside its bound", true);
+  await assert.rejects(() => endpoint.invokeService("manager", "run-ps", { page: { cursor: "!" } }), badPageInput);
+  check("inventory cursor encoding refuses before traversal", true);
+  assert.ok(cursor);
+  const cursorFields = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+  const otherManagerCursor = Buffer.from(JSON.stringify({ ...cursorFields, instanceId: mintLifecycleUid() })).toString("base64url");
+  const wrongManager = await endpoint.invokeService("manager", "run-ps", { page: { cursor: otherManagerCursor } });
+  check("inventory continuation refuses a different manager", wrongManager.reply.ok === false && wrongManager.reply.error?.code === "bad-request");
+  const largeRevision = await createInventoryFixture("inventory-unfit", "fixture".repeat(10000));
+  // Unsigned cursors are diagnostic coordinates. This selects the new row without pretending
+  // this explicitly partial lookup covers the earlier records or proves anything absent.
+  const unfitCursor = Buffer.from(JSON.stringify({ ...cursorFields, cutSeq: largeRevision, nextSeq: largeRevision })).toString("base64url");
+  const unfit = await endpoint.invokeService("manager", "run-ps", { page: { cursor: unfitCursor, limit: 1 } });
+  check("inventory refuses a single row that cannot fit without truncation", unfit.reply.ok === false && unfit.reply.error?.code === "resource-exhausted");
+  const inventoryAfter = await status(inventoryRun);
+  const beforeInventoryStatus = inventoryBefore.status as { state: string; holder: string; epoch: number; fencingToken: number };
+  const afterInventoryStatus = inventoryAfter.status as typeof beforeInventoryStatus;
+  check("inventory pages preserve the admitted run and pending checkpoint", JSON.stringify(inventoryAfter.spec) === JSON.stringify(inventoryBefore.spec) &&
+    afterInventoryStatus.state === beforeInventoryStatus.state && afterInventoryStatus.holder === beforeInventoryStatus.holder &&
+    afterInventoryStatus.epoch === beforeInventoryStatus.epoch && afterInventoryStatus.fencingToken === beforeInventoryStatus.fencingToken &&
+    (inventoryAfter.journal as Array<{ step?: string; state?: string }>).some((e) => e.step === "/checkpoint:inventory-hold#0" && e.state === "pending"));
+  const unpinnedPageCli = await cli(["run", "ps", "--page", "--space", space]);
+  check("inventory CLI refuses unpinned page mode", unpinnedPageCli.code === 1 && unpinnedPageCli.stderr.includes("diagnostic paging requires"));
+  const pageCli = await cli(["run", "ps", "--page", "--limit", "1", "--on", state.instanceId, "--space", space]);
+  check("inventory CLI emits one diagnostic page", pageCli.code === 0 && JSON.parse(pageCli.stdout).semantics === "diagnostic");
+  writeFileSync(join(root, ".cotal", "agents", "toolpage.md"), "---\nname: toolpage\nagent: u4-seat\ncapabilities: [run]\nsubscribe: []\nallowSubscribe: []\nallowPublish: []\n---\nRead one diagnostic inventory page.\n");
+  assert.equal((await manager.startAgent({ name: "toolpage" }, `${owner}.cli`)).ok, true);
+  await until(() => trace().some((e) => e.actor === "toolpage" && (e.kind === "tool-page" || e.kind === "tool-failure")), "native inventory tool page");
+  const toolPage = trace().find((e) => e.actor === "toolpage" && e.kind === "tool-page");
+  check("inventory MCP emits one bounded diagnostic page", toolPage?.isError !== true && typeof toolPage?.text === "string" && Buffer.byteLength(toolPage.text) <= 65536 && JSON.parse(toolPage.text).semantics === "diagnostic");
+  successful(await endpoint.invokeService("manager", "run-answer", { runId: inventoryRun, stepKey: "/checkpoint:inventory-hold#0", value: "release" }));
+  await until(async () => ((await status(inventoryRun)).status as { state?: string }).state === "completed", "inventory checkpoint released after observation");
+  // An attach whose link heals while its manager-caller exchange fails keeps reconnecting. `cotal
+  // attach` mints that view again on every re-establishment, after the base bearer exchange, and
+  // neither an exchange that did not answer nor one the auth service refused (its refusals include a
+  // pinned manager that is not live, as during a manager restart) means asking again cannot help.
+  // Neither does a base bearer exchange that did not answer, as on a loaded host.
+  // The CLI's broker link runs through a TCP proxy this cell severs and heals, and its exchanges
+  // through an HTTP proxy that drops the CLI's first base exchange after the link dies and, for the
+  // manager-caller view, drops the request or forwards it pinned to an absent instance, which the
+  // real auth service refuses with 401.
+  {
+    const serviceInfo = loadAuthServiceInfo(hostDir)!;
+    const absentInstance = `${"z".repeat(4)}${state.instanceId.slice(4)}`;
+    let managerCaller: "forward" | "drop" | "refuse" = "forward";
+    let dropped = 0, refused = 0, baseDrops = 0, baseDropped = 0;
+    const exchangeProxy = createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk: Buffer) => { body += chunk.toString("utf8"); });
+      req.on("end", () => {
+        let parsed: Record<string, unknown> | undefined;
+        try { parsed = JSON.parse(body) as Record<string, unknown>; } catch { /* not an exchange body */ }
+        if (parsed?.actor === "cli" && parsed.view === undefined && baseDrops > 0) { baseDrops--; baseDropped++; req.socket.destroy(); return; }
+        const isManagerCaller = parsed?.view === "manager-caller";
+        if (isManagerCaller && managerCaller === "drop") { dropped++; req.socket.destroy(); return; }
+        const sent = isManagerCaller && managerCaller === "refuse" ? JSON.stringify({ ...parsed, managerInstanceId: absentInstance }) : body;
+        const headers: Record<string, string> = {};
+        for (const key of ["content-type", "authorization"]) { const v = req.headers[key]; if (typeof v === "string") headers[key] = v; }
+        fetch(`${serviceInfo.url}${req.url}`, { method: req.method, headers, ...(sent ? { body: sent } : {}) }).then(async (up) => {
+          if (isManagerCaller && managerCaller === "refuse" && up.status === 401) refused++;
+          res.writeHead(up.status, { "content-type": up.headers.get("content-type") ?? "application/json" });
+          res.end(await up.text());
+        }, () => { req.socket.destroy(); });
+      });
+    });
+    const linkPort = await freePort();
+    const linkSockets = new Set<Socket>();
+    let link: TcpServer | undefined;
+    const healLink = () => new Promise<void>((res, rej) => {
+      const proxy = createTcpServer((client) => {
+        const up = tcpConnect(port, "127.0.0.1");
+        linkSockets.add(client); linkSockets.add(up);
+        const drop = () => { linkSockets.delete(client); linkSockets.delete(up); client.destroy(); up.destroy(); };
+        for (const ev of ["error", "close"] as const) { client.on(ev, drop); up.on(ev, drop); }
+        client.pipe(up); up.pipe(client);
+      });
+      proxy.on("error", rej);
+      proxy.listen(linkPort, "127.0.0.1", () => { link = proxy; res(); });
+    });
+    const severLink = () => new Promise<void>((res) => {
+      const proxy = link; link = undefined;
+      for (const sock of linkSockets) sock.destroy();
+      linkSockets.clear();
+      if (!proxy) return res();
+      proxy.close(() => res());
+    });
+    const recordCliMesh = (server: string) => {
+      process.env.COTAL_HOME = cliHome;
+      try { recordMesh({ space, server, root: hostRoot, mode: "user", policy: { events: "required" }, userAuth: assertUserAuthInfo(prepared.publicAuth), ts: new Date().toISOString() }); }
+      finally { process.env.COTAL_HOME = home; }
+    };
+    let attach: ChildProcess | undefined;
+    let out = "";
+    const running = () => attach !== undefined && attach.exitCode === null && attach.signalCode === null;
+    const settle = async (fn: () => boolean, ms: number) => { const end = Date.now() + ms; while (!fn() && running() && Date.now() < end) await wait(100); };
+    try {
+      await new Promise<void>((r) => exchangeProxy.listen(0, "127.0.0.1", () => r()));
+      writeFileSync(join(root, ".cotal", "agents", "attachseat.md"), "---\nname: attachseat\nagent: u4-seat\nsubscribe: []\nallowSubscribe: []\nallowPublish: []\n---\nA seat to attach to.\n");
+      assert.equal((await manager!.startAgent({ name: "attachseat" }, `${owner}.cli`)).ok, true);
+      await healLink();
+      recordCliMesh(`nats://127.0.0.1:${linkPort}`);
+      saveAuthServiceInfo(hostDir, { ...serviceInfo, url: `http://127.0.0.1:${(exchangeProxy.address() as { port: number }).port}` });
+      attach = spawn(process.execPath, [...process.execArgv, cotalBin, "attach", "--name", "attachseat", "--space", space],
+        { cwd: hostRoot, env: { ...cliEnv, COTAL_HOME: cliHome, COTAL_SKIP_CONNECTOR_SEED: "1" }, stdio: ["pipe", "pipe", "pipe"] });
+      for (const stream of [attach.stdout, attach.stderr]) stream!.on("data", (d) => { out += d.toString(); });
+      await settle(() => /attached to attachseat/.test(out), 60_000);
+      cell("attach over the healable link opens a session", /attached to attachseat/.test(out) && running(), out.slice(-800));
+      managerCaller = "drop";
+      baseDrops = 1;
+      await severLink();
+      await settle(() => /connection lost, reconnecting/.test(out), 60_000);
+      cell("...and says it is reconnecting when its link dies", /connection lost, reconnecting/.test(out) && running(), out.slice(-800));
+      await healLink();
+      await settle(() => dropped >= 2, 60_000);
+      cell("a reconnect whose base bearer exchange does not answer keeps the attach running and tries again", baseDropped === 1 && dropped >= 1 && running(), { baseDropped, dropped, exit: attach.exitCode, out: out.slice(-800) });
+      cell("a reconnect whose manager-caller exchange does not answer keeps the attach running and tries again", dropped >= 2 && running(), { dropped, exit: attach.exitCode, out: out.slice(-800) });
+      managerCaller = "refuse";
+      await settle(() => refused >= 2, 90_000);
+      cell("a reconnect whose manager-caller exchange the auth service refuses keeps the attach running and tries again", refused >= 2 && running(), { refused, exit: attach.exitCode, out: out.slice(-800) });
+      managerCaller = "forward";
+      await settle(() => /\[cotal: reconnected\]/.test(out), 90_000);
+      cell("...and reconnects once the exchange succeeds", /\[cotal: reconnected\]/.test(out) && running(), out.slice(-800));
+    } finally {
+      if (attach) await killAndAwaitExit(attach);
+      saveAuthServiceInfo(hostDir, serviceInfo);
+      recordCliMesh(servers);
+      await severLink();
+      if (exchangeProxy.listening) await new Promise<void>((r) => exchangeProxy.close(() => r()));
+    }
+  }
+  console.log(`INVENTORY_SCOPE: ${pageCount} pages, ${observedRuns.size} observed records, max reply ${Math.max(...wireLengths)} bytes; synthetic fixture records are not active lanes. No absence, restore or ownership proof.`);
+  console.log("U4_SCOPE: preserved native persona cells plus genuine managed PTY cotal_run start/status/answer/released-resume using its own bearerCmd; no provider/model, production or full Cloud composition acceptance.");
+} catch (error) {
+  fatal = error instanceof Error ? error.message : String(error);
+  console.log(`U4 native seat trace: ${JSON.stringify(trace()).slice(0, 2400)}`);
+  failed++;
+  console.error(`  ✗ FAIL: U4 native fixture completed all requested cells: ${fatal.replace(/\beyJ[\w-]+\.[\w-]+\.[\w-]+\b/g, "[redacted]").slice(0, 500)}`);
+} finally {
+  for (const connection of connections) await connection.close();
+  for (const endpoint of endpoints.reverse()) await endpoint.stop().catch(() => {});
+  await managerB?.stop({ withAgents: true }).catch(() => {});
+  await manager?.stop({ withAgents: true }).catch(() => {});
+  if (authChild) await killAndAwaitExit(authChild).catch(() => {});
+  await delivery?.stop().catch(() => {});
+  if (broker) await killAndAwaitExit(broker).catch(() => {});
+  if (idpServer) await new Promise<void>((r) => idpServer!.close(() => r()));
+  if (previousHome === undefined) delete process.env.COTAL_HOME; else process.env.COTAL_HOME = previousHome;
+  rmSync(scratch, { recursive: true, force: true });
+}
+console.log(`RUN OWNED AGENTS SMOKE (${passed} passed, ${failed} failed)`);
+process.exitCode = failed === 0 && !fatal ? 0 : 1;

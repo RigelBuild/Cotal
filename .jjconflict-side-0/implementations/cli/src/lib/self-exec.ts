@@ -1,0 +1,183 @@
+import { spawnSync } from "node:child_process";
+import { accessSync, constants, readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, join, resolve } from "node:path";
+import { cmdSpawnSpec, resolveOnPath } from "@cotal-ai/workspace";
+import { cliPackageRoot, entryScript } from "../seed/paths.js";
+
+/** Is this process running the CLI's own entry? Decided on the RESOLVED file, never on its name.
+ *
+ *  The entry is `process.argv[1]` through every symlink ({@link entryScript}), and it counts only
+ *  when the package that owns it ({@link cliPackageRoot}) is `cotal-ai` and the file is one of that
+ *  package's two entries: the `bin.cotal` its package.json declares (`dist/cotal.js`, which is what
+ *  an install and npx run), or `cotal.ts` beside that package.json (a checkout's `bin/cotal.ts`,
+ *  which `bin/tsconfig.json` compiles to that bin). `npm i -g` leaves `process.argv[1]` on
+ *  `<prefix>/bin/cotal`, a symlink into the package, and resolving it is what admits that shape.
+ *
+ *  A filename rule admitted any file NAMED `cotal.ts` or `cotal.js`, and one that reaches a detached
+ *  starter on load re-execs itself exactly as #1629 describes. Anything unresolvable is not the entry. */
+function runsCliEntry(): boolean {
+  try {
+    const entry = entryScript();
+    const root = cliPackageRoot();
+    const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { name?: unknown; bin?: { cotal?: unknown } | null };
+    const bin = pkg.bin?.cotal;
+    if (pkg.name !== "cotal-ai" || typeof bin !== "string") return false;
+    return [bin, "cotal.ts"].some((file) => {
+      try { return realpathSync(join(root, file)) === entry; } catch { return false; }
+    });
+  } catch {
+    return false;
+  }
+}
+
+/** This CLI's own invocation as argv: `[node, ...loaderFlags, entryScript]`. The loader flags carry
+ *  tsx in dev (so a re-exec can run the `.ts` entry) and are empty in prod (entry = compiled JS).
+ *  A daemon is started from {@link daemonArgv} instead.
+ *  Re-execed children (web, manager) and cmux pane commands use this so they never depend on
+ *  `cotal` being on PATH — works the same via `npx`, `npm i -g`, and a dev clone.
+ *
+ *  A RE-EXEC IS ONLY VALID FROM THE CLI'S OWN ENTRY, and that is checked here rather than at each
+ *  spawn site. Every caller appends a cotal subcommand (`supervise`, `deliver`, `ext add`) to this
+ *  argv and detaches the child, so the entry has to be the file that READS a subcommand. Started
+ *  from anything else the child re-runs THAT file with an argument it ignores, and a file that
+ *  reaches this on load spawns its own successor.
+ *
+ *  #1629 measured that: a smoke fixture calling `ensureControlPlane` under tsx had `process.argv[1]`
+ *  pointing at the suite, so the detached "manager" was the suite, which ran to the same call and
+ *  spawned the next generation. 970 generations in 4.7 hours on a persistent host, each holding a
+ *  nats-server and a delivery holder, until the chain was killed by pid. The guard cannot live in
+ *  the smoke harness: `startManagerDetached` unrefs its child on purpose, so nothing that owns the
+ *  suite's children can own it. It is a THROW rather than a skipped spawn, because a re-exec that
+ *  silently does not happen reports a healthy control plane over nothing. */
+export function selfArgv(): string[] {
+  const entry = process.argv[1];
+  if (entry === undefined || !runsCliEntry())
+    throw new Error(
+      `refusing to re-exec this process as \`cotal\`: it was started from ${entry === undefined ? "no entry file" : entry}, which is not the CLI's own entry (\`bin/cotal.ts\` in a checkout, or the \`cotal-ai\` package's \`dist/cotal.js\`, directly or through a symlink).\n` +
+        "A child spawned from that entry re-runs it with a cotal subcommand appended, which it does not read; if that file reaches this call on load, every child spawns the next one.\n" +
+        "NEXT: reach this through the `cotal` binary. A fixture that means to start a real daemon points `process.argv[1]` at the cotal entry first; one that does not must not call ensureManager, ensureDelivery, ensureControlPlane or ensureAuthService.",
+    );
+  // The daemon heap flags belong to the daemon a launcher started, not to the CLI's invocation, so
+  // a daemon's own re-exec of an ordinary command does not pass them on.
+  return [process.execPath, ...process.execArgv.filter((flag) => !DAEMON_NODE_FLAGS.includes(flag)), entry];
+}
+
+/** The node flags every daemon launcher puts on the daemon it starts: the manager, delivery and
+ *  auth daemons `cotal up` starts, every service the controller launches through this CLI, and the
+ *  unit entry `service install` writes. A 1 MB semi-space caps V8's young generation at 2 MB, where
+ *  Node 24 otherwise lets it grow to 64 MB; a daemon allocates little per second, so it gives up
+ *  little speed for that memory. One value, set here only; the container entry in deploy/docker
+ *  passes the same flag. */
+export const DAEMON_NODE_FLAGS: readonly string[] = ["--max-semi-space-size=1"];
+
+/** {@link selfArgv} for a long-lived daemon: the same verified entry, under {@link DAEMON_NODE_FLAGS}.
+ *  The flags come before any inherited loader flag, so a node flag the operator passed explicitly
+ *  still wins. */
+export function daemonArgv(): string[] {
+  const [node, ...self] = selfArgv();
+  return [node!, ...DAEMON_NODE_FLAGS, ...self];
+}
+
+/** True when launched via `npx` — the package is unpacked under `~/.npm/_npx/<hash>/…`. */
+export function isNpx(): boolean {
+  return /[/\\]_npx[/\\]/.test(process.argv[1] ?? "");
+}
+
+/** Is a *durable* `cotal` executable resolvable on PATH? A pure PATH scan (no exec):
+ *  {@link displayCmd} calls it for every user-facing hint, so it only resolves files, and the
+ *  `--version` exec probe stays in {@link verifiedCotalExecutables} for the recovery path.
+ *  Skips npx's transient shim: `npm exec` (npx) prepends the package's own
+ *  `<cache>/_npx/<hash>/node_modules/.bin` to PATH, and since `cotal-ai` declares a `cotal` bin,
+ *  that dir holds a throwaway `cotal`. Counting it would make a bare `npx cotal-ai setup` conclude
+ *  `cotal` is already installed — skipping the global-install offer and printing `cotal …` hints
+ *  the user can't run once npx exits. That shim is exactly what we're offering to make permanent. */
+export function cotalOnPath(): boolean {
+  return durableCotalsOnPath(process.env).length > 0;
+}
+
+export interface CotalExecutable {
+  readonly path: string;
+  readonly version: string;
+}
+
+/**
+ * Concrete durable `cotal` executables this host can prove exist and identify. This is deliberately
+ * NOT part of ordinary startup: it executes each candidate's side-effect-free `--version` surface,
+ * with a short timeout, only when a recovery path needs an executable rather than another bare
+ * `cotal` command that may resolve straight back to the failing binary.
+ *
+ * PATH entries are checked in order after transient npx bins are skipped, then the POSIX installer's
+ * default `~/.local/bin/cotal` is checked even when a service supplied a reduced PATH. Candidates
+ * are deduped by real path. A file counts only when it exits cleanly and its first line is exactly
+ * `cotal-ai <numeric semver>`.
+ */
+export function verifiedCotalExecutables(env: NodeJS.ProcessEnv = process.env): CotalExecutable[] {
+  const candidates = durableCotalsOnPath(env);
+  if (process.platform !== "win32") candidates.push(join(env.HOME || homedir(), ".local", "bin", "cotal"));
+
+  const seen = new Set<string>();
+  const verified: CotalExecutable[] = [];
+  for (const path of candidates) {
+    let identity: string;
+    try {
+      accessSync(path, constants.X_OK);
+      identity = realpathSync(path);
+    } catch {
+      continue;
+    }
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+
+    try {
+      const spec = cmdSpawnSpec(path, ["--version"], env);
+      const result = spawnSync(spec.file, spec.args, {
+        encoding: "utf8",
+        env,
+        timeout: 2000,
+        windowsVerbatimArguments: spec.windowsVerbatimArguments,
+      });
+      if (result.status !== 0 || result.error) continue;
+      const firstLine = `${result.stdout ?? ""}`.split(/\r?\n/, 1)[0];
+      const match = /^cotal-ai ([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$/.exec(firstLine);
+      if (match) verified.push({ path, version: match[1] });
+    } catch {
+      // A recovery hint is optional. An unlaunchable candidate is not evidence and is omitted.
+    }
+  }
+  return verified;
+}
+
+/** Every durable `cotal` executable on `env`'s PATH, in PATH order. Each entry is probed as an
+ *  absolute path because `join(".", "cotal")` is the bare name `cotal`, which {@link resolveOnPath}
+ *  would scan the whole PATH for, npx's transient bins included. */
+function durableCotalsOnPath(env: NodeJS.ProcessEnv): string[] {
+  return (env.PATH ?? "")
+    .split(delimiter)
+    .filter((dir) => dir && !isEphemeralNpxBin(dir))
+    .flatMap((dir) => resolveOnPath(resolve(dir, "cotal"), env) ?? []);
+}
+
+/** A PATH entry npx (`npm exec`) injected for the current run only — its `_npx` cache
+ *  `node_modules/.bin`. A `cotal` shim there disappears when npx exits, so it must not count as
+ *  `cotal` being installed. Matches the `_npx` cache segment on POSIX and Windows. */
+function isEphemeralNpxBin(dir: string): boolean {
+  return /[/\\]_npx[/\\]/.test(dir);
+}
+
+/** The copy-paste command prefix for user-facing hints: `cotal` when it's on PATH, `npx cotal-ai`
+ *  for an npx run, `pnpm cotal` in a dev clone. (Display only — re-execs use {@link selfArgv}.) */
+export function displayCmd(): string {
+  if (cotalOnPath()) return "cotal";
+  if (isNpx()) return "npx cotal-ai";
+  return "pnpm cotal";
+}
+
+/** The self-invocation as a shell-ready, double-quoted command prefix (for cmux pane commands).
+ *  Tokens are absolute paths with no single quotes, so the surrounding `bash -lc '…'` single-quote
+ *  wrapping stays intact through a login shell (e.g. nushell) before bash. */
+export function selfCotal(): string {
+  return selfArgv()
+    .map((a) => `"${a}"`)
+    .join(" ");
+}

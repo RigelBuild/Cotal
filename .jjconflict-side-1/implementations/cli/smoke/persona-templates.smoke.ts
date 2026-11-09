@@ -1,0 +1,190 @@
+/** Every persona this repo SHIPS declares the channels it reads and posts to.
+ *
+ *  The writer refuses a definition with no read set, which binds every caller that builds an
+ *  AgentDef and saves it. Setup does not: it writes its persona files as literal template strings,
+ *  so the writer's guard cannot see them and a template that omits the field would ship a persona
+ *  whose read or post set is a guess. This suite is the other half of that coverage.
+ *
+ *  It also enumerates the writers by OUTPUT PATH rather than by function name. Name-based searches
+ *  missed setup twice, because a writer can call any helper it likes but must eventually name the
+ *  directory it writes into. A new writer that appears here is not assumed wrong; it has to be
+ *  listed deliberately, which is the point.
+ */
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { parse as parseYaml } from "yaml";
+import { DEFAULT_AGENT, LEGACY_DEFAULT_AGENT, defaultPersonaFix, reconcileDefaultAgent } from "../src/lib/default-persona.js";
+
+let pass = 0;
+let fail = 0;
+const ok = (name: string, cond: boolean, extra?: unknown) => {
+  if (!cond) {
+    fail++;
+    console.log(`  ✗ FAIL: ${name}${extra !== undefined ? ` — ${JSON.stringify(extra)}` : ""}`);
+    return;
+  }
+  pass++;
+  console.log(`  ✓ ${name}`);
+};
+
+const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
+// The default's template lives with the writer every seeding command shares, and the guided team's
+// stay in setup. Each file is matched on its own, so a fence in one never pairs with one in the other.
+const templateSources = ["../src/commands/setup.ts", "../src/lib/default-persona.ts"].map((file) => readFileSync(fileURLToPath(new URL(file, import.meta.url)), "utf8"));
+
+// Every frontmatter block in setup's template literals. Anchored on the fences and on a `name:`
+// line ANYWHERE inside, not on the block starting with one: the managed-marker comment precedes
+// `name:` in the guided team's templates, and anchoring on the first line silently matched only
+// the one template that happens to start with it.
+const blocks = templateSources.flatMap((src) => [...src.matchAll(/---\n([\s\S]*?)\n---/g)])
+  .map((m) => m[1])
+  .filter((b) => /^name: /m.test(b));
+ok("setup ships at least the default persona plus the guided team", blocks.length >= 4, blocks.length);
+
+const frontmatter = new Map<string, Record<string, unknown>>();
+for (const raw of blocks) {
+  // Drop the `${MANAGED_MARKER}` interpolation line: it is a source-level expression, not YAML, and
+  // becomes a `#` comment only once the template is rendered. Reading the source means reading it
+  // before interpolation, so the suite has to skip what the file will not contain at runtime.
+  const block = raw
+    .split("\n")
+    .filter((l) => !l.includes("${") && !l.trimStart().startsWith("#"))
+    .join("\n");
+  let fm: Record<string, unknown>;
+  try {
+    fm = parseYaml(block) as Record<string, unknown>;
+  } catch (e) {
+    ok(`a shipped template parses as YAML`, false, String(e).slice(0, 120));
+    continue;
+  }
+  const name = String(fm.name ?? "(unnamed)");
+  frontmatter.set(name, fm);
+  ok(`${name} declares the channels it reads`, Array.isArray(fm.subscribe), fm.subscribe);
+  ok(`${name} explicitly declares a non-empty post ACL`, Array.isArray(fm.allowPublish) && fm.allowPublish.length > 0, fm.allowPublish);
+}
+
+const defaultAgent = frontmatter.get("default_agent");
+ok(
+  "default-channel-creation: default stays unsubscribed with wildcard read and post ACLs",
+  Array.isArray(defaultAgent?.subscribe) &&
+    defaultAgent.subscribe.length === 0 &&
+    Array.isArray(defaultAgent.allowSubscribe) &&
+    defaultAgent.allowSubscribe.length === 1 &&
+    defaultAgent.allowSubscribe[0] === ">" &&
+    Array.isArray(defaultAgent.allowPublish) &&
+    defaultAgent.allowPublish.length === 1 &&
+    defaultAgent.allowPublish[0] === ">",
+  defaultAgent,
+);
+
+ok(
+  "default-workflow-capability: the default declares spawn and run",
+  Array.isArray(defaultAgent?.capabilities) &&
+    defaultAgent.capabilities.includes("spawn") && defaultAgent.capabilities.includes("run"),
+  defaultAgent?.capabilities,
+);
+
+const legacyFrontmatter = parseYaml(LEGACY_DEFAULT_AGENT.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? "") as Record<string, unknown>;
+ok(
+  "legacy-migration-fixture: the frozen legacy template carries the empty post ACL",
+  Array.isArray(legacyFrontmatter.allowPublish) && legacyFrontmatter.allowPublish.length === 0,
+  legacyFrontmatter.allowPublish,
+);
+
+const fixtureRoot = mkdtempSync(join(tmpdir(), "cotal-persona-templates-"));
+try {
+  const legacyPath = join(fixtureRoot, "legacy", "default.md");
+  mkdirSync(join(fixtureRoot, "legacy"));
+  writeFileSync(legacyPath, LEGACY_DEFAULT_AGENT, { flag: "wx" });
+  const legacyResult = reconcileDefaultAgent(legacyPath);
+  const upgradedLegacy = readFileSync(legacyPath, "utf8");
+  ok(
+    "legacy-default-upgrade: the byte-exact legacy template gains wildcard post permission",
+    legacyResult === "migrated" && upgradedLegacy === DEFAULT_AGENT && /allowPublish: \[\">\"\]/.test(upgradedLegacy),
+    legacyResult,
+  );
+
+  const spawnOnlyPath = join(fixtureRoot, "spawn-only.md");
+  const spawnOnly = DEFAULT_AGENT.replace("capabilities: [spawn, run]", "capabilities: [spawn]");
+  writeFileSync(spawnOnlyPath, spawnOnly, { flag: "wx" });
+  ok(
+    "spawn-only-default-preservation: setup leaves existing capabilities unchanged",
+    reconcileDefaultAgent(spawnOnlyPath) === "unchanged" && readFileSync(spawnOnlyPath, "utf8") === spawnOnly,
+  );
+
+  const editedPath = join(fixtureRoot, "edited", "default.md");
+  const editedLegacy = `${LEGACY_DEFAULT_AGENT}\n# user edit\n`;
+  mkdirSync(join(fixtureRoot, "edited"));
+  writeFileSync(editedPath, editedLegacy, { flag: "wx" });
+  const editedResult = reconcileDefaultAgent(editedPath);
+  const preservedEdited = readFileSync(editedPath, "utf8");
+  ok(
+    "edited-default-preservation: a user-edited legacy persona stays byte-identical",
+    editedResult === "unchanged" && preservedEdited === editedLegacy,
+    editedResult,
+  );
+} finally {
+  rmSync(fixtureRoot, { recursive: true, force: true });
+}
+
+// The fix status, spawn and app-identity name for a missing default: `up` in the root of a space
+// this machine started writes it again, and any other space needs the file created.
+const upFix = defaultPersonaFix({ space: "s", root: "/r", origin: "up" });
+ok("default-persona-fix: a space this machine started is fixed by up in its root", upFix.command === "cotal up" && upFix.cwd === "/r", upFix);
+const fileFix = defaultPersonaFix({ space: "s", root: "/r", origin: "manual" });
+ok("default-persona-fix: any other space is fixed by creating the file in its catalog",
+  fileFix.command === "cotal persona create default --space s --file <persona.md>" && fileFix.cwd === undefined, fileFix);
+
+// The writer enumeration, by output path. Each entry is a file that names an agents directory AND
+// writes to it. Readers and path helpers are not listed. A new one fails this cell until someone
+// decides which half of the coverage it belongs to: the writer guard, or a template assertion.
+const KNOWN_WRITERS = [
+  "packages/core/src/agent-file.ts", // saveAgentFile — guards itself
+  "implementations/cli/src/commands/setup.ts", // the guided team's literal templates — asserted above
+  "implementations/cli/src/lib/default-persona.ts", // the default's literal template — asserted above
+];
+const searched = ["packages/core/src", "packages/workspace/src", "implementations", "extensions", "bin"];
+const found = new Set<string>();
+const walk = (dir: string) => {
+  let entries;
+  try {
+    entries = readdirSync(join(repoRoot, dir), { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    const rel = `${dir}/${e.name}`;
+    if (e.isDirectory()) {
+      if (e.name === "node_modules" || e.name === "dist" || e.name === "smoke") continue;
+      walk(rel);
+      continue;
+    }
+    if (!e.name.endsWith(".ts") || e.name.endsWith(".generated.ts")) continue;
+    const src = readFileSync(join(repoRoot, rel), "utf8");
+    // A writer NAMES a catalog path and WRITES on the same expression. Testing the two conditions
+    // file-wide instead flags any file that mentions the catalog anywhere and writes anything
+    // anywhere - which is how a persona READER that happens to write an unrelated file, or a caller
+    // that delegates the write to saveAgentFile, was counted as a writer. Match the call itself.
+    const lines = src.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const window = lines.slice(i, i + 3).join("\n");
+      const isWrite = /\b(?:writeFileSync|writePrivateRecord|createPrivateRecord)\(/.test(window);
+      if (!isWrite) continue;
+      // Shared writers write the path they were HANDED, so the call site names no directory. Match
+      // them by what they are rather than failing to see the files the guard rests on.
+      const target =
+        /["'`]agents["'`]|\.cotal\/agents|agentFilePath\(|cotalPath\("agents"/.test(window) ||
+        /export function (?:saveAgentFile|reconcileDefaultAgent)|function writeDemoAgent\(/.test(src);
+      if (target) found.add(rel);
+    }
+  }
+};
+for (const d of searched) walk(d);
+const unexpected = [...found].filter((f) => !KNOWN_WRITERS.includes(f));
+ok("no unlisted writer into the persona catalog", unexpected.length === 0, unexpected);
+for (const w of KNOWN_WRITERS) ok(`${w} is still a writer (the search still finds it)`, found.has(w));
+
+console.log(`\npersona templates: ${pass} passed, ${fail} failed`);
+process.exit(fail === 0 ? 0 : 1);

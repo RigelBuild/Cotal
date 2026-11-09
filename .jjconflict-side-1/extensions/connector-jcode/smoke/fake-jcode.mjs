@@ -1,0 +1,780 @@
+#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
+import { basename, dirname, join } from "node:path";
+
+const logPath = process.env.FAKE_JCODE_LOG;
+const log = (entry) => {
+  if (logPath) appendFileSync(logPath, JSON.stringify(entry) + "\n");
+};
+const alive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+function writeDaemonRecords(home, pid) {
+  mkdirSync(join(home, "active_pids"), { recursive: true });
+  writeFileSync(
+    join(home, "servers.json"),
+    JSON.stringify({ camp: { name: "camp", socket: join(home, "run", "jcode.sock"), pid, sessions: [] } }),
+  );
+  writeFileSync(join(home, "active_pids", "session_fake"), String(pid));
+}
+
+if (process.argv[2] === "serve") {
+  // Stand-in for the real `jcode serve` daemon: detached into its own session/group by the bridge,
+  // owner of the connector's MCP child, and it keeps executing after the bridge dies. The late
+  // record gate is tied to that observable teardown event, not to readiness timing: the daemon
+  // cannot publish either PID source until its spawning bridge is proven gone.
+  const home = realpathSync(process.env.JCODE_HOME);
+  const mcp = spawn(process.execPath, [process.argv[1], "mcp"], { stdio: "ignore" });
+  log({ ev: "daemon", pid: process.pid, mcp: mcp.pid });
+  if (process.env.FAKE_JCODE_RECORD_AFTER_BRIDGE_EXIT === "1") {
+    const bridgePid = Number(process.env.FAKE_JCODE_BRIDGE_PID);
+    if (!Number.isInteger(bridgePid) || bridgePid <= 1) throw new Error("fake daemon has no bridge PID gate");
+    while (alive(bridgePid)) await sleep(10);
+    log({ ev: "bridge_exit_observed", pid: bridgePid });
+    // Give the host's immediate post-bridge scan a deterministic empty pass. The schedule is now
+    // anchored after teardown, so a long readiness turn cannot accidentally make the record early.
+    await sleep(100);
+  }
+  writeDaemonRecords(home, process.pid);
+  log({ ev: "daemon_records_written", pid: process.pid });
+  setInterval(() => {}, 1000);
+  await new Promise(() => {});
+}
+if (process.argv[2] === "foreign") {
+  const child = spawn(process.execPath, [process.argv[1], "mcp"], { stdio: "ignore" });
+  log({ ev: "foreign", pid: process.pid, child: child.pid });
+  setInterval(() => {}, 1000);
+  await new Promise(() => {});
+}
+if (process.argv[2] === "mcp") {
+  setInterval(() => {}, 1000);
+  await new Promise(() => {});
+}
+if (process.argv.includes("--resume")) {
+  // The foreground client is an observer of the Harness API socket. It must be created while the
+  // mandatory readiness request is running, rather than leaving an operator at a blank terminal.
+  log({ ev: "tui", argv: process.argv.slice(2) });
+  process.on("SIGTERM", () => process.exit(0));
+  setInterval(() => {}, 1_000);
+} else if (process.argv[2] !== "api-bridge") {
+  process.stderr.write(`fake-jcode: expected api-bridge, got ${process.argv.slice(2).join(" ")}\n`);
+  process.exit(2);
+} else {
+// The harness can put arbitrary provider text on its structured effort-refusal response. This fake
+// lets the smoke exercise that downstream error path with a synthetic canary.
+const startupStderr = process.env.FAKE_JCODE_STARTUP_STDERR;
+if (startupStderr) {
+  process.stderr.write(`${startupStderr}\n`);
+  process.exit(3);
+}
+const at = process.argv.indexOf("--api-socket");
+const socketPath = at >= 0 ? process.argv[at + 1] : undefined;
+if (!socketPath) {
+  process.stderr.write("fake-jcode: --api-socket missing\n");
+  process.exit(2);
+}
+log({ ev: "argv", argv: process.argv.slice(2), env: Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("COTAL_") || key.startsWith("JCODE_"))) });
+
+if (process.env.FAKE_JCODE_STALE_PID) {
+  // Deliberately poison both Jcode PID sources with an unrelated, detached process. Write the
+  // socket with the SDK's alias spelling, so this reaches the SDK's own unsafe registry lookup;
+  // the foreign process has neither this private home's Jcode environment nor the launch nonce.
+  writeDaemonRecords(process.env.JCODE_HOME, Number(process.env.FAKE_JCODE_STALE_PID));
+} else if (process.env.FAKE_JCODE_DAEMON === "1") {
+  // Mirror the real topology: the bridge spawns the daemon into its own session, so no signal
+  // aimed at the bridge (or its group) can reach it, and the bridge's own exit leaves it running.
+  const daemonEnv = { ...process.env };
+  for (const key of Object.keys(daemonEnv)) if (key.startsWith("COTAL_")) delete daemonEnv[key];
+  const daemon = spawn(process.execPath, [process.argv[1], "serve"], {
+    detached: true,
+    stdio: "ignore",
+    env: { ...daemonEnv, FAKE_JCODE_BRIDGE_PID: String(process.pid) },
+  });
+  daemon.unref();
+  log({ ev: "daemon_spawned", pid: daemon.pid });
+}
+
+let attachedExisting;
+let createdFresh = false;
+let sessionWorkingDir;
+let orientationTurns = 0;
+let heldSteer = false;
+// Busy model, opt-in via FAKE_JCODE_BUSY_MODEL=1 so every existing suite keeps its exact
+// behaviour. What it encodes was MEASURED against real jcode 0.81.5 (R1, 2026-09-09), not invented:
+// a plain send against a busy agent is accepted and QUEUED and still gets `message_accepted`
+// immediately (~1ms, request_kind=message), while a no_reply send is REJECTED with an error frame
+// whose code is `internal`. Without this the fake answers every no_reply frame `ok`, so a
+// regression test written against it is green in both directions over a server that still rejects.
+const busyModel = process.env.FAKE_JCODE_BUSY_MODEL === "1";
+let turnBusy = false;
+let busyOwner;
+const queuedTurns = [];
+const initialSessionModel = process.env.FAKE_JCODE_DEFAULT_MODEL ?? "deepseek-v4-pro";
+let sessionModel = initialSessionModel;
+const sessionStatePath = process.env.FAKE_JCODE_SESSION_STATE;
+const journalPath = process.env.FAKE_JCODE_JOURNAL;
+const sessionJournalPaths = (sessionId) => [...new Set([
+  journalPath,
+  process.env.FAKE_JCODE_SESSION_JOURNAL,
+].filter(Boolean))];
+const appendJournal = (path, record) => {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, (existsSync(path) ? readFileSync(path, "utf8") : "") + `${JSON.stringify(record)}\n`);
+};
+const writeJournal = (sessionId) => {
+  if (!journalPath) return;
+  writeFileSync(
+    journalPath,
+    `${JSON.stringify({ meta: { model: sessionModel, session_id: sessionId ?? "fake-session" } })}\n`,
+  );
+  if (process.env.FAKE_JCODE_SESSION_JOURNAL)
+    appendJournal(process.env.FAKE_JCODE_SESSION_JOURNAL, { meta: { model: sessionModel, session_id: sessionId ?? "fake-session" } });
+};
+// Opt-in (#1868): append one durable `append_messages` record per EXECUTED turn, the shape the
+// real harness journals and the AG-UI emitter reads. The default journal stays meta-only so no
+// existing suite changes; with the knob, each turn_run leaves a durable record at the exact
+// cursor boundary the emitter resumes from.
+const foldJournal = () => {
+  if (!journalPath || existsSync(`${journalPath}.folded`)) return;
+  for (const path of sessionJournalPaths("fake-session")) {
+    const records = readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    writeFileSync(join(dirname(path), `${basename(path, ".journal.jsonl")}.json`), JSON.stringify({ id: basename(path, ".journal.jsonl"), messages: records.flatMap((record) => record.append_messages ?? []) }));
+    writeFileSync(path, "");
+  }
+  writeFileSync(`${journalPath}.folded`, "1");
+  log({ ev: "journal_folded", path: journalPath });
+};
+const appendTurnRecord = process.env.FAKE_JCODE_APPEND_RECORDS === "1"
+  ? (frame) => {
+      const content = process.env.FAKE_JCODE_FOLD_WITH_TOOL === "1" && String(frame.content ?? "").includes(process.env.FAKE_JCODE_FOLD_ON_CONTENT ?? "JCODE-JOURNAL-FOLD-1984")
+        ? [{ type: "tool_use", id: "checkpoint-tool", name: "bash", input: {} }]
+        : [{ type: "text", text: `turn output ${String(frame.content ?? "").slice(0, 40)}` }];
+      const rec = { append_messages: [{ role: "assistant", content, timestamp: new Date().toISOString() }] };
+      for (const path of sessionJournalPaths(frame.session_id)) {
+        mkdirSync(dirname(path), { recursive: true });
+        appendJournal(path, rec);
+      }
+    }
+  : undefined;
+const storedSession = () => {
+  if (sessionStatePath && existsSync(sessionStatePath)) return JSON.parse(readFileSync(sessionStatePath, "utf8"));
+  if (!createdFresh && !attachedExisting) return undefined;
+  return { session_id: attachedExisting ?? "fake-session", working_dir: sessionWorkingDir, transcript_bytes: 1 };
+};
+const saveSession = (session) => {
+  if (sessionStatePath) writeFileSync(sessionStatePath, JSON.stringify(session));
+};
+
+// Real jcode writes the new session to JCODE_HOME/sessions/session_<id>.json. It ACCEPTS
+// create_session even when that directory is unwritable and fails afterwards, during the first
+// turn, with `SESSION_PERSISTENCE ... error=Permission denied` and then a closed session. The
+// failure is recorded here and raised at that later point, because a fixture that fails at the
+// wrong point in the protocol certifies claims the real binary disproves.
+let sessionPersistenceError;
+const persistSession = (sessionId, workingDir) => {
+  const home = process.env.JCODE_HOME;
+  if (!home) return true;
+  const dir = join(home, "sessions");
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, `session_${sessionId}.json`),
+      JSON.stringify({ session_id: sessionId, working_dir: workingDir }),
+    );
+    return true;
+  } catch (error) {
+    sessionPersistenceError = error;
+    log({ ev: "session_persist_failed", path: dir, code: error.code ?? "unknown" });
+    process.stderr.write(`session index warmup skipped: ${error.message}\n`);
+    return false;
+  }
+};
+
+// One model turn. Lifted out of the send_message handler so a turn that arrives while the agent is
+// busy can be QUEUED and replayed later against its own connection, which is what the real server
+// does. Writes its events to the socket that submitted it rather than to whichever connection
+// happens to be current.
+function runTurn(frame, socket) {
+  const event = (body) => socket.write(JSON.stringify({ v: 1, ...body }) + "\n");
+  // A turn that is actually EXECUTED, as distinct from a frame that merely arrived. Every frame is
+  // logged on arrival, so the request log alone cannot tell "the session ran this" from "the session
+  // was handed this and dropped it" — which is exactly the distinction between a late delivery and a
+  // lost one. Carries the content so a fixture can ask whether ITS message ever ran.
+  log({ ev: "turn_run", session_id: frame.session_id, content: String(frame.content ?? "") });
+  appendTurnRecord?.(frame);
+  // Where the deferred persistence failure lands. Real jcode logs SESSION_PERSISTENCE at this
+  // point, fails to persist the session close state, and the session dies under the turn. Ordered
+  // after turn_run deliberately: the real seat does execute the turn before the persistence of its
+  // close state fails, so a fixture asking "did my message run" must still see it run here.
+  if (sessionPersistenceError) {
+    log({ ev: "session_persistence_error", code: sessionPersistenceError.code ?? "unknown" });
+    process.stderr.write(
+      `SESSION_PERSISTENCE session=${frame.session_id} error=${sessionPersistenceError.message}\nFailed to persist session close state\n`,
+    );
+    socket.destroy();
+    process.exit(1);
+  }
+  // A real Harness reports idle between tool rounds while the host's run() is still awaiting
+  // turn_done. That is the #1075 idle-during-drive wedge: the connector used that advisory status
+  // to refuse soft_interrupt even though the Cotal-owned turn was live.
+  if (process.env.FAKE_JCODE_IDLE_DURING_TURN === "1") {
+    log({ ev: "idle_during_turn", session_id: frame.session_id });
+    event({ ev: "session_status", session_id: frame.session_id, status: "idle" });
+  }
+  const closeOnContent = process.env.FAKE_JCODE_CLOSE_ON_CONTENT;
+  const closeAlwaysOnContent = process.env.FAKE_JCODE_CLOSE_ALWAYS_ON_CONTENT;
+  const closeOnceFile = process.env.FAKE_JCODE_CLOSE_ONCE_FILE;
+  const shouldClose =
+    (closeOnContent &&
+      String(frame.content).includes(closeOnContent) &&
+      (!closeOnceFile || !existsSync(closeOnceFile))) ||
+    (closeAlwaysOnContent && String(frame.content).includes(closeAlwaysOnContent));
+  if (shouldClose) {
+    if (closeOnceFile) writeFileSync(closeOnceFile, "closed");
+    socket.destroy();
+    // Model the bridge process going away rather than only one TCP/Unix connection. The
+    // recovery path must be able to launch a replacement bridge at the same private path.
+    setImmediate(() => server.close());
+    return;
+  }
+  turnBusy = true;
+  busyOwner = socket;
+  // A turn that STAYS OPEN, scoped by content. A real seat can take a message and then think for
+  // minutes, and any host bookkeeping keyed to the turn's completion is held for exactly that long.
+  // The turn is accepted normally and is genuinely running; only its completion is deferred until
+  // the fixture writes the release file. Scoped by content so readiness and post-join traffic still
+  // complete and the seat reaches the mesh, rather than grading a boot failure.
+  const holdMatch = process.env.FAKE_JCODE_HOLD_TURN_ON_CONTENT;
+  const noAcceptMatch = process.env.FAKE_JCODE_RUN_WITHOUT_ACCEPT_ON_CONTENT;
+  const noAcceptHold = process.env.FAKE_JCODE_RUN_WITHOUT_ACCEPT_HOLD_FILE;
+  // A no-acceptance run is held by its OWN file. It has to be held at all, or it completes and
+  // discharges the very acceptance debt it exists to express; and it cannot share the hold knob's
+  // release, because that knob is content-scoped to a different marker and is released earlier by
+  // the cell that owns it.
+  const heldAsNoAccept = Boolean(noAcceptMatch && noAcceptHold && String(frame.content).includes(noAcceptMatch));
+  const holdRelease = heldAsNoAccept ? noAcceptHold : process.env.FAKE_JCODE_HOLD_TURN_RELEASE_FILE;
+  if (heldAsNoAccept || (holdMatch && String(frame.content).includes(holdMatch))) {
+    log({ ev: "turn_held_open", content: frame.content });
+    const waitForRelease = () => {
+      if (holdRelease && !existsSync(holdRelease)) {
+        setTimeout(waitForRelease, 50).unref();
+        return;
+      }
+      log({ ev: "turn_hold_released", content: frame.content });
+      event({ ev: "text_delta", session_id: frame.session_id, text: "fake reply" });
+      log({ ev: "turn_done_emitted", content: frame.content });
+      event({ ev: "turn_done", session_id: frame.session_id });
+      turnBusy = false;
+      busyOwner = undefined;
+      const queued = queuedTurns.shift();
+      if (queued) queued();
+    };
+    setTimeout(waitForRelease, 50).unref();
+    return;
+  }
+  // The delay knob keeps a failure-path test observable: a host that tears down on the
+  // refusal is faster than a 100ms poll, so the turn must outlast the observer's window.
+  setTimeout(() => {
+    if (String(frame.content).includes("cotal_orientation") && process.env.FAKE_JCODE_FAIL_READINESS !== "1") {
+      const readyAfter = Number(process.env.FAKE_JCODE_ORIENTATION_DELAY_TURNS ?? "0");
+      orientationTurns++;
+      if (process.env.FAKE_JCODE_NEVER_ORIENTATION !== "1" && orientationTurns > readyAfter) {
+        log({ ev: "orientation_done", turn: orientationTurns });
+        event({ ev: "tool_done", session_id: frame.session_id, call_id: "orientation", name: "mcp__cotal__cotal_orientation", output: "ok" });
+        if (process.env.FAKE_JCODE_WITHHOLD_TURN_DONE === "1") {
+          // #1440: the required orientation call has arrived; keep the turn open so a host
+          // that still waits for turn_done times out and kills a functional seat.
+          log({ ev: "turn_done_withheld", content: frame.content });
+          return;
+        }
+        const externalMs = Number(process.env.FAKE_JCODE_EXTERNAL_TURN_MS ?? "0");
+        if (externalMs > 0) {
+          // A TUI-owned turn: the session is busy without a host send_message. The host only
+          // learns this from session_status. Delay past mesh join so the incoming handler is
+          // armed before the seat looks busy.
+          setTimeout(() => {
+            log({ ev: "external_turn", status: "working", session_id: frame.session_id });
+            event({ ev: "session_status", session_id: frame.session_id, status: "working" });
+            setTimeout(() => {
+              log({ ev: "external_turn", status: "idle", session_id: frame.session_id });
+              event({ ev: "session_status", session_id: frame.session_id, status: "idle" });
+              event({ ev: "turn_done", session_id: frame.session_id });
+            }, externalMs);
+          }, 400);
+        }
+      }
+    }
+    event({ ev: "text_delta", session_id: frame.session_id, text: "fake reply" });
+    const foldAfterRecord =
+      process.env.FAKE_JCODE_FOLD_AFTER_RECORD === "1" &&
+      (!process.env.FAKE_JCODE_FOLD_ON_CONTENT ||
+        String(frame.content ?? "").includes(process.env.FAKE_JCODE_FOLD_ON_CONTENT) ||
+        JSON.stringify(frame).includes(process.env.FAKE_JCODE_FOLD_ON_CONTENT));
+    const completeTurn = () => {
+      log({ ev: "turn_done_emitted", content: frame.content });
+      event({ ev: "turn_done", session_id: frame.session_id });
+      turnBusy = false;
+      busyOwner = undefined;
+      const next = queuedTurns.shift();
+      if (next) next();
+      // v8's measured boot, opt-in so no existing suite changes: its TUI submitted a recovered
+      // continuation that begins after the readiness turn finishes, so the host sees a real working
+      // transition before it sends the post-join notice. Emit this after readiness turn_done: putting
+      // working before that event lets the host immediately clear turnActive again and makes the
+      // supposedly deterministic busy fixture race its own completion frame.
+      if (process.env.FAKE_JCODE_BUSY_AFTER_READINESS === "1" && String(frame.content).includes("cotal_orientation")) {
+        turnBusy = true;
+        busyOwner = undefined;
+        if (process.env.FAKE_JCODE_BUSY_AFTER_READINESS_STATUS !== "1")
+          setTimeout(() => { turnBusy = false; }, Number(process.env.FAKE_JCODE_BUSY_HOLD_MS ?? "5000"));
+      }
+    };
+    if (!foldAfterRecord) return completeTurn();
+    const foldDelay = Number(process.env.FAKE_JCODE_FOLD_DELAY_MS ?? "0");
+    log({ ev: "journal_fold_scheduled", delay_ms: foldDelay });
+    if (Number.isFinite(foldDelay) && foldDelay > 0)
+      return void setTimeout(() => {
+        foldJournal();
+        completeTurn();
+      }, foldDelay);
+    foldJournal();
+    completeTurn();
+  }, Number(process.env.FAKE_JCODE_TURN_DELAY_MS ?? "10"));
+}
+
+let helloCount = 0;
+const liveSockets = new Set();
+const server = createServer((socket) => {
+  liveSockets.add(socket);
+  socket.on("close", () => liveSockets.delete(socket));
+  let buffered = "";
+  socket.setEncoding("utf8");
+  socket.on("data", (chunk) => {
+    buffered += chunk;
+    for (;;) {
+      const newline = buffered.indexOf("\n");
+      if (newline < 0) return;
+      const line = buffered.slice(0, newline);
+      buffered = buffered.slice(newline + 1);
+      if (!line) continue;
+      const frame = JSON.parse(line);
+      log({ ev: "request", frame });
+      // Recorded so a test can assert WHICH path the host took, not merely that it started.
+      if (frame.req === "create_session" || frame.req === "attach_session") {
+        log({ ev: "session_path", req: frame.req, session_id: frame.session_id ?? null });
+      }
+      const reply = (body) => socket.write(JSON.stringify({ v: 1, reply_to: frame.id, ...body }) + "\n");
+      const event = (body) => socket.write(JSON.stringify({ v: 1, ...body }) + "\n");
+      switch (frame.req) {
+        case "hello":
+          helloCount++;
+          // Failure-path fixtures keep the original daemon busy while the same bridge cannot
+          // complete a new handshake. This opt-in does not change the first connection.
+          if (helloCount > 1 && ["silent", "refusal"].includes(process.env.FAKE_JCODE_RECONNECT_HELLO)) {
+            const mode = process.env.FAKE_JCODE_RECONNECT_HELLO;
+            log({ ev: "reconnect_hello", mode });
+            if (mode === "refusal")
+              reply({ ev: "error", code: "unsupported_version", message: "synthetic permanent reconnect refusal" });
+            break;
+          }
+          reply({ ev: "hello_ok", version: 1, server: "fake-jcode/1", capabilities: ["sessions", "streaming"] });
+          break;
+        // A prior session is offered only when the harness is told to have one, so the same fake
+        // covers both a first launch (nothing to resume) and a restart (exactly one candidate).
+        case "list_sessions": {
+          const home = process.env.JCODE_HOME;
+          const sessionsDir = home ? join(home, "sessions") : "";
+          const emptySessions =
+            Boolean(sessionsDir) &&
+            existsSync(sessionsDir) &&
+            (() => {
+              try {
+                const stats = lstatSync(sessionsDir);
+                return stats.isDirectory() && readdirSync(sessionsDir).length === 0;
+              } catch {
+                return false;
+              }
+            })();
+          if (emptySessions || process.env.FAKE_JCODE_PANIC_LIST === "1") {
+            const panicPath = sessionsDir || "(unset-JCODE_HOME)/sessions";
+            process.stderr.write(
+              `thread 'tokio-runtime-worker' panicked at crates/jcode-harness-api-server/src/translate.rs:1707:38:\nchunk size must be non-zero\n`,
+            );
+            log({ ev: "empty_sessions_panic", path: panicPath });
+            socket.destroy();
+            process.exit(1);
+          }
+          const preset = process.env.FAKE_JCODE_SESSIONS;
+          const remembered = storedSession();
+          reply({ ev: "sessions", sessions: preset ? JSON.parse(preset) : remembered ? [remembered] : [] });
+          break;
+        }
+        case "attach_session":
+          if (
+            process.env.FAKE_JCODE_REFUSE_ATTACH_CODE &&
+            (!process.env.FAKE_JCODE_REFUSE_ATTACH_AFTER_FILE || existsSync(process.env.FAKE_JCODE_REFUSE_ATTACH_AFTER_FILE))
+          ) {
+            log({ ev: "attach_refused", code: process.env.FAKE_JCODE_REFUSE_ATTACH_CODE, session_id: frame.session_id });
+            reply({
+              ev: "error",
+              code: process.env.FAKE_JCODE_REFUSE_ATTACH_CODE,
+              message: process.env.FAKE_JCODE_REFUSE_ATTACH_MESSAGE ?? "synthetic persistent attach refusal",
+            });
+            break;
+          }
+          if (process.env.FAKE_JCODE_FAIL_ATTACH_ONCE_FILE && !existsSync(process.env.FAKE_JCODE_FAIL_ATTACH_ONCE_FILE)) {
+            writeFileSync(process.env.FAKE_JCODE_FAIL_ATTACH_ONCE_FILE, "failed");
+            log({ ev: "attach_failed_once", session_id: frame.session_id });
+            reply({ ev: "error", code: "unavailable", message: "synthetic transient attach failure" });
+            break;
+          }
+          attachedExisting = frame.session_id;
+          sessionWorkingDir = frame.working_dir ?? storedSession()?.working_dir;
+          saveSession({ session_id: frame.session_id, working_dir: sessionWorkingDir, transcript_bytes: 1 });
+          writeJournal(frame.session_id);
+          reply({ ev: "attached", session: { session_id: frame.session_id, working_dir: sessionWorkingDir, status: process.env.FAKE_JCODE_REATTACH_BUSY === "1" && turnBusy ? "working" : "idle" } });
+          break;
+        case "create_session":
+          createdFresh = true;
+          sessionWorkingDir = frame.working_dir;
+          // Real jcode v0.81.5 ACCEPTS create_session on a sessions/ it cannot write and only
+          // fails later, while persisting the session during the first turn. A fake that
+          // rejected the create would fail at the wrong point in the protocol and certify a
+          // connector claim the real binary disproves, so the persistence failure is recorded
+          // here and surfaced where the real one surfaces.
+          persistSession("fake-session", sessionWorkingDir);
+          saveSession({ session_id: "fake-session", working_dir: sessionWorkingDir, transcript_bytes: 1 });
+          writeJournal("fake-session");
+          reply({ ev: "attached", session: { session_id: "fake-session", working_dir: sessionWorkingDir, status: "idle" } });
+          break;
+        case "set_model":
+          if (process.env.FAKE_JCODE_REFUSE_MODEL === frame.model) {
+            reply({
+              ev: "error",
+              code: "invalid_request",
+              message: process.env.FAKE_JCODE_MODEL_ERROR ?? `model ${frame.model} was refused`,
+            });
+          } else {
+            if (typeof frame.model === "string" && frame.model.trim()) sessionModel = frame.model.trim();
+            writeJournal(attachedExisting ?? "fake-session");
+            reply({ ev: "ok" });
+          }
+          break;
+        case "detach_session":
+        case "ping":
+          reply({ ev: frame.req === "ping" ? "pong" : "ok" });
+          break;
+        case "set_reasoning_effort":
+          if (process.env.FAKE_JCODE_REFUSE_EFFORT === frame.effort) {
+            reply({
+              ev: "error",
+              code: "invalid_request",
+              message: process.env.FAKE_JCODE_EFFORT_ERROR ?? `Reasoning effort '${frame.effort}' is not supported (available: low, medium, high)`,
+            });
+          } else {
+            reply({ ev: "ok" });
+          }
+          break;
+        case "soft_interrupt": {
+          const lateReply = process.env.FAKE_JCODE_STEER_LATE_REPLY_FILE;
+          if (lateReply) {
+            const timer = setInterval(() => {
+              if (!existsSync(lateReply)) return;
+              clearInterval(timer);
+              // An unrelated late ok must never settle this request by event kind alone.
+              socket.write(JSON.stringify({ v: 1, ev: "ok", reply_to: frame.id + 100000 }) + "\n");
+              if (process.env.FAKE_JCODE_STEER_LATE_ERROR === "1")
+                reply({ ev: "error", code: "invalid_request", message: "owned late refusal" });
+              else reply({ ev: "ok" });
+              log({ ev: "late_steer_reply", id: frame.id });
+            }, 10);
+            timer.unref();
+            break;
+          }
+          const refusal = process.env.FAKE_JCODE_STEER_REFUSE;
+          if (refusal && (refusal === "1" || String(frame.content).includes(refusal))
+            && !(process.env.FAKE_JCODE_STEER_REFUSE_EXCEPT && String(frame.content).includes(process.env.FAKE_JCODE_STEER_REFUSE_EXCEPT))) {
+            const refuse = () => reply({ ev: "error", code: "invalid_request", message: "owned fixture refuses soft interrupt" });
+            const delay = Number(process.env.FAKE_JCODE_STEER_REFUSE_DELAY_MS ?? "0");
+            if (delay > 0) setTimeout(refuse, delay);
+            else refuse();
+            break;
+          }
+          // #1233: the measured failure is SILENCE, not a refusal and not a close. The bridge takes
+          // the frame and never answers it, so the client's request timeout is what ends the wait.
+          // A fixture that replied with an error instead would exercise a different code path and
+          // would leave the actual production shape ungraded.
+          if (process.env.FAKE_JCODE_ACCEPT_BEFORE_RECOVERY && [process.env.FAKE_JCODE_ACCEPT_BEFORE_RECOVERY, "SECOND_POST_LATCH_WAKE"].some((marker) => String(frame.content).includes(marker))) {
+            log({ ev: "accepted_native_copy", session_id: frame.session_id });
+            reply({ ev: "ok" });
+            break;
+          }
+          if (process.env.FAKE_JCODE_STEER_BLACKHOLE === "1") {
+            log({ ev: "steer_blackholed", session_id: frame.session_id });
+            break;
+          }
+          const releaseFile = process.env.FAKE_JCODE_STEER_RELEASE_FILE;
+          const idleFile = process.env.FAKE_JCODE_STEER_IDLE_FILE;
+          if (!heldSteer && releaseFile && idleFile) {
+            heldSteer = true;
+            log({ ev: "steer_held", session_id: frame.session_id });
+            const release = setInterval(() => {
+              if (!existsSync(releaseFile)) return;
+              clearInterval(release);
+              turnBusy = true;
+              event({ ev: "session_status", session_id: frame.session_id, status: "working" });
+              reply({ ev: "ok" });
+              const idle = setInterval(() => {
+                if (!existsSync(idleFile)) return;
+                clearInterval(idle);
+                turnBusy = false;
+                event({ ev: "session_status", session_id: frame.session_id, status: "idle" });
+              }, 10);
+              idle.unref();
+            }, 10);
+            release.unref();
+          } else {
+            reply({ ev: "ok" });
+          }
+          break;
+        }
+        case "get_runtime_info": {
+          // Measured Jcode can persist setModel to the session journal while RuntimeInfo.model still
+          // reports the old session default. The active provider and route list do identify the
+          // requested route, so lag mode keeps those authorities current while only model stays stale.
+          const model = process.env.FAKE_JCODE_RUNTIME_MODEL ??
+            (process.env.FAKE_JCODE_RUNTIME_MODEL_LAG === "1" ? initialSessionModel : sessionModel);
+          const provider = process.env.FAKE_JCODE_RUNTIME_PROVIDER ?? "fake-provider";
+          const routes = process.env.FAKE_JCODE_RUNTIME_ROUTES
+            ? JSON.parse(process.env.FAKE_JCODE_RUNTIME_ROUTES)
+            : [{ model, provider, api_method: "fake", available: true, detail: "fake route" }];
+          log({ ev: "runtime_info", model, provider, routes, session_model: sessionModel });
+          reply({
+            ev: "runtime_info",
+            session_id: frame.session_id,
+            provider,
+            model,
+            routes,
+          });
+          break;
+        }
+        case "send_message": {
+          if (["1", "internal"].includes(process.env.FAKE_JCODE_READINESS_REFUSAL) && !frame.no_reply && String(frame.content).includes("Call the cotal_orientation tool exactly once now")) {
+            const wrapped = process.env.FAKE_JCODE_READINESS_REFUSAL === "internal";
+            event({
+              ev: "error",
+              session_id: frame.session_id,
+              v: 1,
+              code: wrapped ? "internal" : "invalid_request",
+              message: wrapped ? 'OpenAI-compatible chat request failed\n  endpoint: http://127.0.0.1:12345/v1/chat/completions\n  model: rejected-model-id\n  auth: PRIVATE_PROVIDER_CANARY\n  status: 404 Not Found\n  response: {"error":{"code":"model_not_found","param":"model","message":"PRIVATE_PROVIDER_CANARY"}}\nLocal endpoint hint: PRIVATE_PROVIDER_CANARY' : JSON.stringify({ error: { code: "model_not_found", message: "model parameter rejected-model-id was refused by provider" } }),
+            });
+            break;
+          }
+          if (busyModel && turnBusy) {
+            if (frame.no_reply) {
+              // client_processing distinguishes the two topologies R1 measured: true when the busy
+              // turn belongs to this same connection, false when it belongs to another (v8's shape
+              // across all 81 of its events, where the TUI owns the turn and the connector sends).
+              log({
+                ev: "busy_agent_rejected",
+                client_processing: busyOwner === socket,
+                reason: "agent_busy",
+                request_kind: "context_message",
+                session_id: frame.session_id,
+              });
+              if (process.env.FAKE_JCODE_BUSY_AFTER_READINESS_STATUS === "1") {
+                // The host arms its client watcher after the readiness run returns and before it
+                // sends this notice. Publishing working from the refused notice therefore orders
+                // the status after the watcher, rather than racing a status written behind the
+                // readiness turn_done that completed the run.
+                log({ ev: "busy_after_readiness_status", status: "working", session_id: frame.session_id });
+                event({ ev: "session_status", session_id: frame.session_id, status: "working" });
+                const finishBusy = () => {
+                  turnBusy = false;
+                  log({ ev: "busy_after_readiness_status", status: "idle", session_id: frame.session_id });
+                  if (process.env.FAKE_JCODE_REATTACH_BUSY === "1") {
+                    // The native session outlives the original API socket. Its boundary is visible
+                    // to a reattached observer as well, as in the real preserved-session replay.
+                    for (const observer of liveSockets)
+                      observer.write(JSON.stringify({ v: 1, ev: "session_status", session_id: frame.session_id, status: "idle" }) + "\n");
+                  } else event({ ev: "session_status", session_id: frame.session_id, status: "idle" });
+                  const afterBusy = queuedTurns.shift();
+                  if (afterBusy) afterBusy();
+                };
+                const releaseFile = process.env.FAKE_JCODE_BUSY_RELEASE_FILE;
+                if (releaseFile) {
+                  const release = setInterval(() => {
+                    if (!existsSync(releaseFile)) return;
+                    clearInterval(release);
+                    finishBusy();
+                  }, 10);
+                  release.unref();
+                } else {
+                  setTimeout(finishBusy, Number(process.env.FAKE_JCODE_BUSY_HOLD_MS ?? "5000"));
+                }
+              }
+              reply({
+                ev: "error",
+                code: "internal",
+                message:
+                  "internal: Cannot handle context_message while the session is busy. Try again after the current turn finishes.",
+              });
+              const closeAfterNoticeFile = process.env.FAKE_JCODE_CLOSE_AFTER_BUSY_NOTICE_FILE;
+              if (closeAfterNoticeFile && !existsSync(closeAfterNoticeFile)) {
+                writeFileSync(closeAfterNoticeFile, "closed");
+                setImmediate(() => {
+                  socket.destroy();
+                  server.close();
+                });
+              }
+              break;
+            }
+            // Accepted and queued. The acknowledgement is immediate even though the turn is not:
+            // that is what keeps the SDK's plain path from stalling on its 10s accept wait.
+            //
+            // FAKE_JCODE_ACCEPT_DELAY_MS holds the acknowledgement open for a measurable window
+            // WITHOUT changing what is eventually delivered. The real SDK's `sendMessage` resolves
+            // on this same `message_accepted`, so any host work that happens after its await is,
+            // in real deployments, reachable by a concurrent path during exactly this interval.
+            // The frame is logged when it ARRIVES either way, so a delayed acknowledgement never
+            // hides a delivery — it only makes the host's post-await window observable.
+            const acceptDelayMs = Number(process.env.FAKE_JCODE_ACCEPT_DELAY_MS ?? "0");
+            // The measured loss shape: the frame is TAKEN and never acknowledged. No error, no
+            // refusal, no `message_accepted`, and the turn is never queued — which is exactly what a
+            // busy Harness can do, and what the SDK's accept wait cannot distinguish from success
+            // because it resolves on its own timeout. A host that treats its send as delivered here
+            // acks a message the session never saw.
+            //
+            // Scoped BY CONTENT to the delivery under test. Swallowing every busy send would also eat
+            // the host's own readiness and post-join traffic, so the seat would never reach the mesh
+            // and the fixture would grade a boot failure instead of the loss.
+            const swallowMatch = process.env.FAKE_JCODE_SWALLOW_QUEUED_SEND;
+            if (swallowMatch && String(frame.content).includes(swallowMatch)) {
+              log({ ev: "queued_send_swallowed", session_id: frame.session_id });
+              // A LATE acceptance for a send that was already given up on. The request is never
+              // answered in time, so the host's window lapses, and only afterwards does the Harness
+              // emit the session-only `message_accepted` that belongs to THIS send. Nothing about
+              // the event says so, which is the whole difficulty: by the time it arrives, a later
+              // send may be the one listening. A real Harness under load does exactly this, and a
+              // reviewer reproduced the consequence against the SDK directly.
+              const lateMs = Number(process.env.FAKE_JCODE_LATE_ACCEPT_AFTER_MS ?? "0");
+              if (lateMs > 0) {
+                setTimeout(() => {
+                  log({ ev: "late_accept_emitted", session_id: frame.session_id });
+                  event({ ev: "message_accepted", session_id: frame.session_id });
+                }, lateMs).unref();
+              }
+              break;
+            }
+            // RUN WITHOUT EVER ACKNOWLEDGING. This has to sit on the BUSY path as well as the plain
+            // one, and the first version of it did not: the seat under test is busy by construction,
+            // so a frame arriving here never reached the plain-path knob and the precondition read
+            // false while the cell looked like it had run. A reviewer hit the identical trap from
+            // the other direction and reported the resulting run as vacuous rather than as evidence.
+            //
+            // The turn genuinely RUNS and stays open having never emitted `message_accepted`, which
+            // is the only way to leave `unsettledLapsedDispatches` outstanding while later sends are
+            // themselves healthy. The hold knob cannot express it: it defers `turn_done` but
+            // acceptance is emitted first, so a held turn is always acknowledged.
+            const noAcceptRun = process.env.FAKE_JCODE_RUN_WITHOUT_ACCEPT_ON_CONTENT;
+            if (noAcceptRun && String(frame.content).includes(noAcceptRun)) {
+              log({ ev: "run_without_acceptance", session_id: frame.session_id, content: frame.content });
+              if (turnBusy) queuedTurns.push(() => runTurn(frame, socket));
+              else runTurn(frame, socket);
+              break;
+            }
+            const accept = () => {
+              event({ ev: "message_accepted", session_id: frame.session_id });
+              // Queue it only if the session is STILL busy. A queued turn is drained by whatever
+              // finishes next (a completing turn, or the end of the busy window), so a turn accepted
+              // AFTER that drain has already happened would sit in the queue forever with nothing
+              // left to shift it.
+              //
+              // That is not how a real server behaves, and the gap is observable: with a delayed
+              // acknowledgement the busy window can close while the acceptance is still pending, and
+              // the seat would then be idle with a turn it had acknowledged and never ran. A fixture
+              // in that state reports zero executions for a message that was genuinely delivered,
+              // which grades the fake rather than the host.
+              if (turnBusy) queuedTurns.push(() => runTurn(frame, socket));
+              else runTurn(frame, socket);
+            };
+            if (acceptDelayMs > 0) {
+              log({ ev: "accept_delayed", ms: acceptDelayMs, session_id: frame.session_id });
+              setTimeout(accept, acceptDelayMs).unref();
+            } else accept();
+            break;
+          }
+          if (frame.no_reply) {
+            reply({ ev: "ok" });
+            break;
+          }
+          const closeBeforeAccept = process.env.FAKE_JCODE_CLOSE_BEFORE_ACCEPT_ON_CONTENT;
+          const closeBeforeAcceptFile = process.env.FAKE_JCODE_CLOSE_BEFORE_ACCEPT_ONCE_FILE;
+          if (
+            closeBeforeAccept &&
+            String(frame.content).includes(closeBeforeAccept) &&
+            (!closeBeforeAcceptFile || !existsSync(closeBeforeAcceptFile))
+          ) {
+            if (closeBeforeAcceptFile) writeFileSync(closeBeforeAcceptFile, "closed");
+            const close = () => { socket.destroy(); server.close(); };
+            if (process.env.FAKE_JCODE_ERROR_BEFORE_CLOSE === "1") {
+              // Let run() subscribe to its event stream after acceptance. The close is held
+              // until the test observes the host handling this error, so the two paths differ.
+              event({ ev: "message_accepted", session_id: frame.session_id });
+              const sendError = setInterval(() => {
+                event({ ev: "error", session_id: frame.session_id,
+                  code: "internal", message: "synthetic error after request dispatch" });
+              }, 20);
+              const releaseFile = process.env.FAKE_JCODE_ERROR_CLOSE_RELEASE_FILE;
+              const release = setInterval(() => {
+                if (!releaseFile || !existsSync(releaseFile)) return;
+                clearInterval(sendError);
+                clearInterval(release);
+                close();
+              }, 10);
+              sendError.unref();
+              release.unref();
+            } else {
+              close();
+            }
+            break;
+          }
+          // RUN WITHOUT EVER ACKNOWLEDGING, which is the state that creates run-acceptance debt in
+          // the host and which this fake could not previously express: the hold knob defers
+          // `turn_done` but acceptance is emitted on the line below it, so a held turn is always
+          // acknowledged. A reviewer needed a turn that genuinely RUNS and stays open having never
+          // emitted `message_accepted`, because that is what makes the host's gate lapse and leaves
+          // `unsettledLapsedDispatches` outstanding while later sends are healthy.
+          const noAcceptRun = process.env.FAKE_JCODE_RUN_WITHOUT_ACCEPT_ON_CONTENT;
+          if (noAcceptRun && String(frame.content).includes(noAcceptRun)) {
+            log({ ev: "run_without_acceptance", session_id: frame.session_id, content: frame.content });
+            // WORKING, but never ACCEPTED. Suppressing `message_accepted` alone is not the real
+            // seat: the host tracks busy from `session_status` (host.ts turnActive), so without
+            // this the seat still reads IDLE, a later send takes the plain drive path, and the
+            // queue-turn tier under test is never reached. The distinction being modelled is a run
+            // that is visibly running yet owes an acknowledgement, which is exactly the pair.
+            event({ ev: "session_status", session_id: frame.session_id, status: "working" });
+            runTurn(frame, socket);
+            break;
+          }
+          event({ ev: "message_accepted", session_id: frame.session_id });
+          runTurn(frame, socket);
+          break;
+        }
+        default:
+          reply({ ev: "ok" });
+      }
+    }
+  });
+});
+server.listen(socketPath, () => log({ ev: "listening", socketPath, pid: process.pid }));
+process.on("SIGTERM", () => server.close(() => process.exit(0)));
+}

@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -ne 1 ] && [ "$#" -ne 3 ] && [ "$#" -ne 10 ]; then
+  echo "usage: verify-shard-inputs.sh <commit> [<shard> <count> [ci <node-path> <node-target> <node-sha> <pnpm-path> <pnpm-target> <pnpm-sha>]]" >&2
+  exit 2
+fi
+
+sha="$1"
+tmp="$(/usr/bin/mktemp)"
+trap '/bin/rm -f "$tmp"' EXIT
+
+for path in \
+  bin/smoke/ci-suites.txt \
+  bin/smoke/ci-suite-costs.json \
+  bin/smoke/ci-suites.mjs \
+  bin/smoke/shard.mjs \
+  bin/smoke/shard-pool.mjs \
+  bin/smoke/reap-smoke-brokers.mjs \
+  package.json \
+  pnpm-workspace.yaml
+do
+  /usr/bin/git --no-replace-objects show "$sha:$path" > "$tmp"
+  if ! /usr/bin/cmp -s "$tmp" "$path"; then
+    echo "tracked shard input changed after checkout: $path" >&2
+    exit 2
+  fi
+done
+
+committed_fragments="$(/usr/bin/git --no-replace-objects ls-tree -r --name-only "$sha" -- bin/smoke/ci-suites.d | /usr/bin/grep '\.txt$' || true)"
+working_fragments="$(/usr/bin/find bin/smoke/ci-suites.d -maxdepth 1 -type f -name '*.txt' -printf '%p\n' | /usr/bin/sort)"
+if [ "$committed_fragments" != "$working_fragments" ]; then
+  echo "tracked shard fragment inventory changed after checkout" >&2
+  exit 2
+fi
+while IFS= read -r path; do
+  [ -n "$path" ] || continue
+  /usr/bin/git --no-replace-objects show "$sha:$path" > "$tmp"
+  if ! /usr/bin/cmp -s "$tmp" "$path"; then
+    echo "tracked shard input changed after checkout: $path" >&2
+    exit 2
+  fi
+done <<EOF
+$committed_fragments
+EOF
+
+if [ "$#" -eq 1 ]; then
+  exit 0
+fi
+
+if [ "$#" -eq 10 ]; then
+  if [ "$4" != "ci" ]; then
+    echo "unknown execution profile: $4" >&2
+    exit 2
+  fi
+  node_bin="$5"
+  expected_node_target="$6"
+  expected_node_sha="$7"
+  pnpm_bin="$8"
+  expected_pnpm_target="$9"
+  expected_pnpm_sha="${10}"
+else
+  node_bin="$(command -v node || true)"
+  pnpm_bin="$(command -v pnpm || true)"
+  runner_home="${HOME:-/home/runner}"
+fi
+
+if [ ! -x "$node_bin" ] || [ ! -x "$pnpm_bin" ]; then
+  echo "node and pnpm must resolve to executable files" >&2
+  exit 2
+fi
+
+if [ "$#" -eq 10 ]; then
+  case "$node_bin" in
+    /opt/hostedtoolcache/node/22.*/*/bin/node) ;;
+    *) echo "unexpected CI node path: $node_bin" >&2; exit 2 ;;
+  esac
+  # pnpm/action-setup installs under the runner user's home. GitHub-hosted runners run as `runner`,
+  # Tenki runners as `tenki`; the shape below is what both produce, and the home is read back out of
+  # the matched path rather than assumed, so the clean environment further down names the home the
+  # toolchain actually lives in.
+  case "$pnpm_bin" in
+    /home/*/setup-pnpm/node_modules/.bin*/pnpm) ;;
+    *) echo "unexpected CI pnpm path: $pnpm_bin" >&2; exit 2 ;;
+  esac
+  runner_home="${pnpm_bin%/setup-pnpm/*}"
+  case "$runner_home" in
+    /home/runner|/home/tenki) ;;
+    *) echo "unexpected CI runner home: $runner_home" >&2; exit 2 ;;
+  esac
+  actual_node_target="$(/usr/bin/readlink -f "$node_bin")"
+  actual_pnpm_target="$(/usr/bin/readlink -f "$pnpm_bin")"
+  actual_node_sha="$(/usr/bin/sha256sum "$actual_node_target" | /usr/bin/cut -d' ' -f1)"
+  actual_pnpm_sha="$(/usr/bin/sha256sum "$actual_pnpm_target" | /usr/bin/cut -d' ' -f1)"
+  if [ "$actual_node_target" != "$expected_node_target" ] || [ "$actual_node_sha" != "$expected_node_sha" ]; then
+    echo "CI node changed after toolchain capture" >&2
+    exit 2
+  fi
+  if [ "$actual_pnpm_target" != "$expected_pnpm_target" ] || [ "$actual_pnpm_sha" != "$expected_pnpm_sha" ]; then
+    echo "CI pnpm changed after toolchain capture" >&2
+    exit 2
+  fi
+fi
+
+node_dir="${node_bin%/*}"
+pnpm_dir="${pnpm_bin%/*}"
+workspace="$(/bin/pwd -P)"
+runner_user="${runner_home##*/}"
+clean_path="$pnpm_dir:$node_dir:$runner_home/nats-bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+# env -i drops the Actions environment, including BASE/HEAD. The freeze smoke's
+# committed-list cell reds by name when those are absent, so the shard has to
+# re-supply the two revisions or CI reports a local-shaped false red.
+zero="0000000000000000000000000000000000000000"
+head_rev="${HEAD:-${GITHUB_SHA:-}}"
+base_rev="${BASE:-}"
+if [ -z "$base_rev" ] && [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH}" ]; then
+  base_rev="$("$node_bin" -e 'const fs=require("fs"); const e=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write((e.pull_request&&e.pull_request.base&&e.pull_request.base.sha)||e.before||"");' "${GITHUB_EVENT_PATH}")"
+fi
+if [ -z "$head_rev" ]; then
+  head_rev="$(/usr/bin/git --no-replace-objects rev-parse HEAD)"
+fi
+if [ -z "$base_rev" ] || [ "$base_rev" = "$zero" ]; then
+  base_rev="$(/usr/bin/git --no-replace-objects rev-parse HEAD^ 2>/dev/null || true)"
+fi
+if [ -n "$base_rev" ] && [ "$base_rev" != "$zero" ]; then
+  if ! /usr/bin/git --no-replace-objects cat-file -e "${base_rev}^{commit}" 2>/dev/null; then
+    /usr/bin/git --no-replace-objects fetch --no-tags --depth=1 origin "$base_rev" || true
+  fi
+fi
+
+exec /usr/bin/env -i \
+  PATH="$clean_path" \
+  HOME="$runner_home" \
+  USER="$runner_user" \
+  LOGNAME="$runner_user" \
+  SHELL=/usr/bin/bash \
+  TMPDIR=/tmp \
+  TMP=/tmp \
+  TEMP=/tmp \
+  LANG=C.UTF-8 \
+  LC_ALL=C.UTF-8 \
+  CI=true \
+  GITHUB_ACTIONS=true \
+  GITHUB_WORKSPACE="$workspace" \
+  RUNNER_TEMP=/tmp \
+  RUNNER_OS=Linux \
+  RUNNER_ARCH=X64 \
+  BASE="$base_rev" \
+  HEAD="$head_rev" \
+  "$node_bin" bin/smoke/shard.mjs "$2" "$3"

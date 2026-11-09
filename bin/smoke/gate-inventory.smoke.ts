@@ -74,9 +74,11 @@ type UngatedExemption = { reason: string; recheckBy: string };
 // manifest suite does.
 // 16 → 17 on 2026-11-01: the auth-oracle-order suite takes an installed npm prefix and an evidence
 // directory as arguments, which no CI job supplies.
+// The personal Codex native suite also needs an installed Codex CLI; its model is local and scripted.
+// The personal Codex local-mesh suite needs the same Codex CLI.
 // 17 → 21 on 2026-11-07: five upstream-red suites remain ungated per fork policy; backup-perms:live
 // left UNGATED when it was gated by a chain fragment.
-const EXPECTED_EXEMPTIONS = 21;
+const EXPECTED_EXEMPTIONS = 23;
 const standing = (reason: string): UngatedExemption => ({ reason, recheckBy: "2026-11-30" });
 /** The BROKEN backup entries name the responsible issue and why the suites cannot enter CI.
  *  #1285's backup-usermode failure is on the live stack. The three #643 suites are behind the
@@ -88,6 +90,8 @@ const UNGATED: Record<string, UngatedExemption> = {
   "smoke:orca:live": standing("drives the public orca CLI"),
   "smoke:orca-e2e:live": standing("drives the public orca CLI"), "smoke:pi": standing("needs a pi install"), "smoke:codex-live": standing("needs a logged-in codex CLI"),
   "smoke:codex-tui-live": standing("needs a codex TUI session"),
+  "smoke:personal-codex-native:live": standing("needs an installed codex CLI with native plugins and thread queue APIs; uses an isolated home and a local scripted model"),
+  "smoke:personal-codex-local:live": standing("needs an installed codex CLI with native plugins and thread queue APIs; uses an isolated home, local meshes and a local scripted model"),
   "smoke:jcode-live": standing("needs an installed, authenticated jcode CLI (COTAL_E2E_JCODE=1)"),
   "smoke:down-manifest-usermode:live": standing("needs a claude CLI on PATH to boot a real connector child"),
   "smoke:claude-plugin-refresh:live": standing("drives the real claude CLI on PATH against a scratch Claude config"),

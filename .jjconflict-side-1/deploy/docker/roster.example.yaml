@@ -1,0 +1,13 @@
+# A team roster: one entry per agent the supervisor boots on `supervise --roster`.
+# The number of agents is just the number of entries; mix connector types freely.
+# Each entry starts one agent the way `cotal spawn --detach` does. docs/define-a-team.md
+# ("Roster files") lists every key an entry takes.
+#
+# Persona + model come from the agent file (.cotal/agents/<name>.md), mounted read-only.
+# Auth is per connector type, supplied as env on the container (see compose.yaml):
+#   claude   -> CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`)
+#   opencode -> the env var of the provider behind each agent's model: (e.g. OPENCODE_API_KEY
+#               for opencode's hosted models, OPENAI_API_KEY for OpenAI)
+agents:
+  - { name: planner, agent: claude,   role: planner }
+  - { name: builder, agent: opencode, role: builder }

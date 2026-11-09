@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, readlinkSync, realpathSync, unlinkSync, type Stats } from "node:fs";
 import { dirname, join, parse, relative, resolve, sep } from "node:path";
 import {
-  CotalEndpoint, DEV_OWNER, accountRevocations, acquireLock, agentFilePath, assertKnownAgentCapabilities, assertValidRole, assertLifecycleToken, credsClaims, ensureDirNoSymlink, identityFromCreds,
+  DEV_OWNER, accountRevocations, acquireLock, agentFilePath, assertKnownAgentCapabilities, assertValidRole, assertLifecycleToken, credsClaims, ensureDirNoSymlink, identityFromCreds,
   loadAgentFile, mintCreds, mintLifecycleUid, newIdentity, principalKey, provisionAgentDurables, resolveReadAcl, writeSecretFileAtomic, writeSecretFileCreateOnly,
   type FlagValues, type HeldLock, type Identity, type ParsedArgs, type Profile, type SpaceAuth,
 } from "@cotal-ai/core";
@@ -16,6 +16,7 @@ import {
 
 import { staticMintAuthority } from "../lib/credential-authority.js";
 import { recordCredentialExport } from "../lib/credential-exports.js";
+import { withProvisioner } from "../lib/provisioner.js";
 import { noExpiryRecordPath, noExpiryRecordText } from "../lib/no-expiry-record.js";
 import { mintEndpointCaller } from "./mint-endpoint-caller.js";
 import { preflightOrExit } from "../lib/connect.js";
@@ -296,22 +297,8 @@ async function provisionForMint(
   onProvisioned: () => void,
 ): Promise<void> {
   await preflightOrExit(target);
-  const provisioner = new CotalEndpoint({
-    space: target.space,
-    servers: target.server,
-    tls: target.tlsRequired,
-    creds: await mintCreds(auth, newIdentity(), "provisioner"),
-    channels: [],
-    consume: false,
-    registerPresence: false,
-    watchPresence: false,
-    watchChannels: false,
-    card: { name: "mint-provisioner", role: "provisioner", kind: "endpoint" },
-  });
-  provisioner.on("error", () => {});
-  try {
-    await provisioner.start();
+  await withProvisioner({ space: target.space, servers: target.server, tls: target.tlsRequired, auth }, "mint-provisioner", async (provisioner) => {
     await provisionAgentDurables(provisioner, { owner: DEV_OWNER, actor: identity.id, lifecycleUid: options.lifecycleUid }, { ...options, subscribe: options.allowSubscribe });
     onProvisioned();
-  } finally { await provisioner.stop(); }
+  });
 }

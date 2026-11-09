@@ -1,0 +1,237 @@
+/**
+ * Delivery-daemon single-flight lease — a CAS-guarded key in the per-space `cotal_delivery_<space>` KV
+ * bucket. One key per shard ({@link leaseKey}); the holder is the live delivery daemon for that shard.
+ * Acquire is an ATOMIC `kv.create` (fails if a live lease exists) — a loud refusal-to-bind, so two
+ * daemons never split a durable's delivery. The bucket has a bucket-level TTL ({@link LEASE_TTL_MS}),
+ * so a CRASHED holder's lease key auto-expires and a fresh daemon can re-acquire; the holder renews
+ * (CAS `kv.update`) at ~half the TTL to stay alive. The same key is the daemon-readiness signal and
+ * the non-gating `cotal_channels` delivery-health signal (READ-ONLY for an agent — Component 6).
+ *
+ * The acquire/renew/release/read operations live as methods on {@link CotalEndpoint} (they reuse its
+ * connection + cred); this module is just the bucket-open helper + the record shape, mirroring
+ * `openMembersRegistry` / `openAclRegistry`.
+ */
+import { Kvm, type KV } from "@nats-io/kv";
+import { credsAuthenticator, type NatsConnection } from "@nats-io/transport-node";
+import { dialerFor } from "./endpoint.js";
+import { deliveryBucket, leaseKey, principalKey, DEV_OWNER } from "./subjects.js";
+import { idFromCreds } from "./identity.js";
+import { standaloneConnectOpts } from "./streams.js";
+
+/** The `holder` string a delivery daemon holding THIS credential will write into its lease row.
+ *
+ *  EXISTS BECAUSE THE OBVIOUS ANSWER IS WRONG, and was wrong at three separate call sites. A caller
+ *  that launches a daemon knows the cred it handed over, so `idFromCreds` looks like the daemon's
+ *  identity - and it is, at the connection layer. But the endpoint rewrites `card.id` in its
+ *  constructor to the wire PRINCIPAL dot-form `${owner}.${actor}` (`local.U...` in the static mode
+ *  the daemon runs in), and THAT is what lands in the row. Comparing a bare nkey against the row can
+ *  only ever be false, which is a comparison that silently never fires rather than one that fails
+ *  loudly. Derived here, once, so no caller has to re-derive a rule that lives in the endpoint. */
+export function deliveryLeaseHolderFor(creds: string): string {
+  return principalKey(DEV_OWNER, idFromCreds(creds)).key;
+}
+
+/** A delivery lease record: who holds the shard and since when (epoch ms; diagnostics + health surface),
+ *  plus `ready` — set true only AFTER the daemon has bound `ctl.delivery` + the fan-out/reader loops, so
+ *  "lease live" proves the RESPONDER is up, not merely that the single-flight slot was claimed. The lease
+ *  is CAS-created (`ready:false`) BEFORE binding (single-flight gate, prevents double-bind), then updated
+ *  to `ready:true` after `startPlane3` — and renews keep it true. */
+export interface DeliveryLeaseInfo {
+  holder: string;
+  /** WHICH RUN of that holder, not merely which principal. `holder` is the endpoint's wire identity,
+   *  and it is NOT unique per process: the daemon's cred is a FILE on disk that every restart re-reads
+   *  (`delivery-proc.ts` mints it once and re-launches against it), so a replacement daemon in the same
+   *  space authenticates as the same nkey and presents the same principal as the process it replaced.
+   *  A daemon asking "is this row still mine?" therefore cannot get a truthful answer from `holder`
+   *  alone, it would recognise its own SUCCESSOR's row as its own, keep serving a shard it had lost,
+   *  and CAS-release the row out from under the live holder. Minted per endpoint instance, so it
+   *  changes on every restart even when the credential does not.
+   *
+   *  Optional because rows written by daemons from before this field exist in live buckets; a row
+   *  without one cannot be proven ours (some other process wrote it), which is the safe reading. */
+  incarnation?: string;
+  /** Epoch ms when this incarnation acquired the shard. Unlike `since`, which every ready flip and
+   *  renewal re-stamps, it is written once at acquisition and carried on every later write. Optional
+   *  because rows written before this field exist; their acquisition time is unknown. */
+  acquiredAt?: number;
+  /** Epoch ms of this row's latest write: the acquisition, a ready flip, or a renewal. */
+  since: number;
+  ready: boolean;
+}
+
+/** A manager per-instance LIVENESS-lease record: which logical instance is live + how it was launched.
+ *  `runtime`/`root` let `spawn -f` fail LOUD on a mismatch instead of silently reusing a wrong-runtime /
+ *  foreign-checkout manager (no fallbacks); `pid` is a diagnostics + targeted-stop hint. Keyed per
+ *  {@link ManagerLeaseInfo.instanceId} ({@link import("./subjects.js").managerLeaseKey}) — per-instance
+ *  liveness, so a second manager's create does not THROW (distinct instance id ⇒ distinct key ⇒ both
+ *  acquire). Losing the key stops THAT instance only. */
+export interface ManagerLeaseInfo {
+  /** The manager endpoint id — `principalKey(owner, actor).key` dot-form (the endpoint card's
+   *  id), so it is DIRECTLY comparable to a control subject's `<owner>.<actor>` attribution:
+   *  the auth service's retirement rail (#29 piece 3) leader-reads this row and requires
+   *  holder == the subject-attributed requester principal, fresh per request. On an auth mesh every
+   *  instance of one space shares this holder (same owner+actor principal); {@link instanceId} is what
+   *  distinguishes them. */
+  holder: string;
+  /** The live LOGICAL manager instance id (persisted per workspace root, advanced-epoch on restart).
+   *  The KEY discriminator: two managers in one space share `holder` but have distinct `instanceId`. */
+  instanceId: string;
+  runtime: string;  // pty | tmux | cmux
+  root: string;     // resolved workspaceRoot (same-checkout check)
+  pid: number;      // OS pid
+  since: number;    // epoch ms
+}
+
+/** Open the delivery lease/readiness bucket (pre-created with a bucket-level TTL at `cotal up`; the
+ *  daemon binds, never creates). Read-only for an agent (Component 6 health), write-lease for the daemon. */
+export async function openDeliveryRegistry(
+  nc: import("@nats-io/transport-node").NatsConnection,
+  space: string,
+): Promise<KV> {
+  return new Kvm(nc).open(deliveryBucket(space));
+}
+
+/** Poll until the delivery daemon has acquired its shard-0 lease (i.e. is ready to serve `ctl.delivery`),
+ *  or the timeout elapses. Used by the CLI's `ensureDelivery` to wait for readiness before the manager
+ *  spawns agents (so their boot self-join finds the responder). Connects with the daemon's own scoped
+ *  creds (`id` sets the `_INBOX_<id>` prefix the cred's `sub.allow` permits for the kv.get reply).
+ *  Returns false on timeout / unreachable — the caller treats it as non-fatal (boot self-join reconciles).
+ *
+ *  `holder` is WHOSE readiness is being waited for, and it is NOT optional information (#837).
+ *  This used to accept ANY ready lease, which made it answer a question nobody asked: a daemon that
+ *  was SIGKILLed leaves its `ready:true` record behind for the rest of the bucket TTL, so a freshly
+ *  launched replacement that LOST the CAS and exited was reported ready off the corpse's lease —
+ *  `up` printed green with no daemon running at all. Pass the launched daemon's endpoint id
+ *  (`idFromCreds` of the cred it was given) to demand that daemon; pass `undefined` only when
+ *  ADOPTING a daemon that was already running, whose id is genuinely not knowable from here. */
+export async function waitForDeliveryLease(opts: {
+  servers: string;
+  space: string;
+  creds: string;
+  id: string;
+  holder: string | undefined;
+  timeoutMs?: number;
+}): Promise<boolean> {
+  const deadline = Date.now() + (opts.timeoutMs ?? 8000);
+  let nc: NatsConnection | undefined;
+  try {
+    nc = await dialerFor(opts.servers)({
+      servers: opts.servers,
+      authenticator: credsAuthenticator(new TextEncoder().encode(opts.creds)),
+      inboxPrefix: `_INBOX_${opts.id}`,
+      maxReconnectAttempts: 5,
+    });
+    const kv = await openDeliveryRegistry(nc, opts.space);
+    while (Date.now() < deadline) {
+      const e = await kv.get(leaseKey(0));
+      if (e && e.operation !== "DEL" && e.operation !== "PURGE") {
+        // READY (responder bound), not merely lease existence (single-flight slot claimed) — AND
+        // held by the daemon we are waiting for, when the caller named one. A foreign or stale
+        // holder's ready flag says nothing about ours.
+        try {
+          const info = e.json<DeliveryLeaseInfo>();
+          if (info.ready === true && (opts.holder === undefined || info.holder === opts.holder)) return true;
+        } catch { /* re-poll */ }
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  } catch {
+    /* daemon not up yet / bucket race — treat as not-ready */
+  } finally {
+    try {
+      await nc?.drain();
+    } catch {
+      /* ignore */
+    }
+  }
+  return false;
+}
+
+/** How long past a stale row's expiry {@link awaitLeaseExpiry} keeps looking before it gives up. The
+ *  broker removes an expired message on its own timer, not at the exact millisecond. */
+export const LEASE_EXPIRY_GRACE_MS = 5_000;
+
+/** How a wait for a dead holder's lease row to expire ended. `expired`: the row is gone and the key
+ *  can be created again. `rewritten`: the row changed revision while we waited, so some live process
+ *  wrote it and holds the lease. `timeout`: the row outlived its TTL plus the grace, unchanged.
+ *  `aborted`: the caller stopped the wait. */
+export type LeaseExpiryWait = "expired" | "rewritten" | "timeout" | "aborted";
+
+/** Wait out a lease row whose holder the caller has shown to be dead, until the bucket TTL removes
+ *  it (#4092). This never writes the key. A takeover by revision-checked update would act on the
+ *  caller's proof of death, and that proof is only as good as its view of one host. Waiting needs
+ *  no proof to be safe: a live holder renews its row before the TTL runs out, the revision moves,
+ *  and the wait returns `rewritten` for the caller to refuse. The proof only decides whether a
+ *  conflict is worth waiting on at all.
+ *
+ *  `read` returns the row's current revision and broker write time (epoch ms), or `undefined` when
+ *  no live row is there; a read that fails throws through. The wait is bounded from now as well as
+ *  from the row's write time, so a skewed clock cannot stretch it past one TTL plus the grace. */
+export async function awaitLeaseExpiry(opts: {
+  read: () => Promise<{ revision: number; created: number } | undefined>;
+  revision: number;
+  created: number;
+  ttlMs: number;
+  aborted?: () => boolean;
+  pollMs?: number;
+}): Promise<LeaseExpiryWait> {
+  const deadline = Math.min(opts.created, Date.now()) + opts.ttlMs + LEASE_EXPIRY_GRACE_MS;
+  for (;;) {
+    if (opts.aborted?.()) return "aborted";
+    const row = await opts.read();
+    if (row === undefined) return "expired";
+    if (row.revision !== opts.revision) return "rewritten";
+    if (Date.now() >= deadline) return "timeout";
+    await new Promise((r) => setTimeout(r, opts.pollMs ?? 250));
+  }
+}
+
+/** The time left before a row written at `created` expires under `ttlMs`, for an operator line. */
+export function leaseRemainingMs(created: number, ttlMs: number, now: number = Date.now()): number {
+  return Math.max(0, created + ttlMs - now);
+}
+
+/** Wait out the shard-0 delivery lease when it is held by `deadHolder`, a holder the caller has
+ *  shown to be dead (#4092). The CLI's `ensureDelivery` calls this before it starts a replacement
+ *  daemon: a daemon SIGKILLed, or one that exited because its broker went away, cannot release its
+ *  row, and a replacement started inside the remaining TTL loses the create and refuses to bind.
+ *
+ *  Returns `free` when no row is held, `other-holder` when a row names someone else (the caller
+ *  proved nothing about them, so their conflict is left to the daemon's own refusal), and otherwise
+ *  how {@link awaitLeaseExpiry} ended. `onWait` hears the remaining TTL once, before the wait.
+ *  Connects with the scoped delivery creds the caller minted. */
+export async function awaitDeadDeliveryLease(opts: {
+  servers: string;
+  space: string;
+  creds: string;
+  /** The broker's transport decision: true REQUIRES TLS on this credentialed connection. */
+  tls: boolean;
+  deadHolder: string;
+  ttlMs: number;
+  onWait: (remainingMs: number) => void;
+}): Promise<"free" | "other-holder" | LeaseExpiryWait> {
+  const nc = await dialerFor(opts.servers)({ servers: opts.servers, ...standaloneConnectOpts({ creds: opts.creds, tls: opts.tls }), maxReconnectAttempts: 5 });
+  try {
+    const kv = await openDeliveryRegistry(nc, opts.space);
+    const read = async () => {
+      const e = await kv.get(leaseKey(0));
+      return !e || e.operation === "DEL" || e.operation === "PURGE" ? undefined : e;
+    };
+    const row = await read();
+    if (row === undefined) return "free";
+    if (row.json<DeliveryLeaseInfo>().holder !== opts.deadHolder) return "other-holder";
+    const created = row.created.getTime();
+    opts.onWait(leaseRemainingMs(created, opts.ttlMs));
+    return await awaitLeaseExpiry({
+      read: async () => {
+        const e = await read();
+        return e && { revision: e.revision, created: e.created.getTime() };
+      },
+      revision: row.revision,
+      created,
+      ttlMs: opts.ttlMs,
+    });
+  } finally {
+    await nc.drain().catch(() => {});
+  }
+}

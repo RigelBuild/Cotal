@@ -1,7 +1,7 @@
 import { createHash, randomUUID, randomBytes } from "node:crypto";
 import { hostname } from "node:os";
-import { credsAuthenticator } from "@nats-io/transport-node";
-import { closeSync, constants, existsSync, fchmodSync, fchownSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { credsAuthenticator, RequestError } from "@nats-io/transport-node";
+import { closeSync, constants, existsSync, fchmodSync, fchownSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, dirname, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import Headless from "@xterm/headless";
@@ -94,7 +94,7 @@ import {
   renderOnceTask,
 } from "@cotal-ai/core";
 import { loadLaunchPersonaFile, PersonaSourceError } from "@cotal-ai/workspace";
-import { agentAuthState, agentCredsDir, agentLifecycleSecretFilePaths, agentSecretFilePaths, agentSecretKeyForFile, authDir, claimIdentityRecord, claimManagerSiblingIdentities, connectorInstallHint, DEFAULT_SEAT_CAP, DELIVERY_CREDS_KIND, extensionConnectors, findCotalRoot, getSpaceAuth, hasUserAuthState, loadExtensionsManifest, loadManagerInstanceIdentity, loadMeshes, localTrustOfSpace, manifestExtensionNames, materializeFromManifest, materializeSecretToFile, MEMBERSHIP_RW_CREDS_KIND, mergeLaunchOptions, probeLiveness, remintDaemonCreds, resolveAgentType, resolveOnPath, runtimeInstallHint, createManagerInstanceIdentity, SEAT_CAP_UNLIMITED, spaceKey, spaceMaterialKey, SYSTEM_CREDS_FILES, userAuthStateDir, workspaceSecretStore, writeRenewalRecord, type MeshEntry, type RenewalRecord, type SeatCap, type UserAuthInfo } from "@cotal-ai/workspace";
+import { agentAuthState, agentCredsDir, agentLifecycleSecretFilePaths, agentSecretFilePaths, agentSecretKeyForFile, authDir, claimIdentityRecord, claimManagerSiblingIdentities, connectorInstallHint, DEFAULT_SEAT_CAP, DELIVERY_CREDS_KIND, extensionConnectors, findCotalRoot, getSpaceAuth, hasUserAuthState, loadExtensionsManifest, loadManagerInstanceIdentity, loadMeshes, localTrustOfSpace, manifestExtensionNames, materializeFromManifest, materializeSecretToFile, MEMBERSHIP_RW_CREDS_KIND, mergeLaunchOptions, probeLiveness, remintDaemonCreds, resolveAgentType, resolveOnPath, runtimeInstallHint, createManagerInstanceIdentity, SEAT_CAP_UNLIMITED, spaceKey, spaceMaterialKey, SYSTEM_CREDS_FILES, userAuthStateDir, workspaceSecretStore, writeRenewalRecord, type ManagerInstanceIdentity, type MeshEntry, type RenewalRecord, type SeatCap, type UserAuthInfo } from "@cotal-ai/workspace";
 import type { ActionContext, AgentDef, RunAdmission, RunRevocation, AttachSession, Connector, ConnectorModelCatalog, ControlReply, CredHealth, DaemonStoreAnswer, DelegatedGrant, DeliveryLeaseInfo, EpCaller, EpErrorCode, EpErrorDetail, GrantOverreach, InlinePersona, IssuedSubjectPermissions, LaunchOpts, LaunchSpec, ManagedLifecycleHandoff, ManagerLeaseInfo, MeshLaunchAgent, Presence, RuntimeProvider, RuntimeReference, SecretStore, SecretStoreIdentity, SpaceAuth, StartupOutcome, UserAuthLaunch } from "@cotal-ai/core";
 import {
   createRuntime,
@@ -123,7 +123,7 @@ import { authorizeLaunch, authorizeNamedControl } from "./authorize.js";
 import { controlShutdown } from "./control-shutdown.js";
 import { RunHosting, servedRequestSubject } from "./run-hosting.js";
 import { enrolledAcl } from "./remote-authority.js";
-import { rejectionText } from "./rejection-text.js";
+import { rejectionText, attemptCleanup, describeCleanupFailures, type CleanupFailure } from "@cotal-ai/core";
 import { controlSession } from "./control-session.js";
 import { MAX_AGENTS, parseResumeCommitArgs, parseResumeControlArgs, parseResumeFinalizeArgs, readSeatRecord, removeSeatRecord, supervisePolicy, writeSeatRecord, type SeatRecord } from "./resume.js";
 import { TranscriptReceiver, type TranscriptClaim, type TranscriptReceiveInput } from "./transcript-receive.js";
@@ -471,16 +471,6 @@ function failedTerminal(error: string, source: { details?: unknown } | undefined
     }
   } catch { /* unreadable or not interchangeable */ }
   return { error: text };
-}
-
-/** Run one cleanup step, recording its failure in `failed` as `<what>: <reason>`. A step that threw
- *  would otherwise skip every step after it, and a swallowed one would leave nothing to report. */
-async function attemptCleanup(failed: string[], what: string, step: () => unknown): Promise<void> {
-  try {
-    await step();
-  } catch (err) {
-    failed.push(`${what}: ${rejectionText(err)}`);
-  }
 }
 
 /** Reject `p` with `Error(msg)` if it hasn't settled within `ms`; clears the timer when `p` settles so it
@@ -1608,9 +1598,8 @@ function resolveHarness(name: string, requires: readonly string[]): { binaries: 
 type LeaseState = "held" | "held-unrenewed" | "gone" | "unknown";
 
 /** True only when the delivery-admin rail has no bound responder. A timeout is a hung rail, not absence. */
-function isAbsentDeliveryAdmin(msg: string): boolean {
-  if (/timeout/i.test(msg)) return false;
-  return /no responders|\b503\b/i.test(msg);
+function isAbsentDeliveryAdmin(error: unknown): boolean {
+  return error instanceof RequestError && error.isNoResponders();
 }
 
 /** The store challenge went UNANSWERED while a delivery daemon exists: the rail timed out, or it had
@@ -1792,6 +1781,9 @@ export class Manager {
    *  {@link provisionEndpointGateOpen} idempotent (no core barrier change) and gives verified
    *  eviction a stable target (the predecessor's connections under this principal). Set in start(). */
   private managerServeIdentity!: Identity;
+  /** The local instance identity {@link admitExecutionState} already resolved. The ordinary start
+   *  adopts it instead of reading the same record again. */
+  private admittedLocalIdentity?: ManagerInstanceIdentity;
   private readonly onServiceIdentity?: ManagerOptions["onServiceIdentity"];
   /** The manager's v0.4 service-endpoint serve state — the serve handle +
    *  its dedicated connection, the STABLE serve identity (renewals re-mint the same nkey), the
@@ -2118,8 +2110,18 @@ export class Manager {
     this.pooled = opts.pooled === true;
     this.executionState = opts.execution === "none" ? { kind: "none" } : { kind: "runtime" };
     if (!this.remoteAuthority) {
-      const local = loadManagerInstanceIdentity(this.workspaceRoot, this.space);
-      if (local && existsSync(this.executionRecordPath(local.instanceId))) this.claimExecutionRecord(local.instanceId);
+      // A fresh root has no execution record, so construction does not read the identity. Records
+      // survive identity retirement; only the currently stored identity's record can be claimed.
+      const prefix = `manager-execution.${spaceKey(this.space)}.`;
+      const dir = join(this.workspaceRoot, ".cotal");
+      const hasRecord = existsSync(dir) && readdirSync(dir).some((name) => name.startsWith(prefix) && name.endsWith(".json"));
+      if (hasRecord) {
+        const local = loadManagerInstanceIdentity(this.workspaceRoot, this.space);
+        if (local && existsSync(this.executionRecordPath(local.instanceId))) {
+          this.claimExecutionRecord(local.instanceId);
+          this.admittedLocalIdentity = local;
+        }
+      }
     }
     if (this.executionState.kind === "runtime") this.runtime = createRuntime(opts.runtime ?? "auto", `cotal-${this.space}`);
     if (opts.pooled && this.executionState.kind === "runtime" && isCustodialRuntime(this.requiredRuntime))
@@ -2387,18 +2389,20 @@ export class Manager {
 
   private async admitExecutionState(): Promise<void> {
     if (!this.remoteAuthority) {
-      let local = loadManagerInstanceIdentity(this.workspaceRoot, this.space);
+      let local = this.admittedLocalIdentity;
+      this.admittedLocalIdentity = undefined;
       if (this.execution === "none") {
         const recorded = loadMeshes().find((m) => m.space === this.space);
         const auth = hasUserAuthState(this.workspaceRoot, this.space) && recorded?.mode === "user"
           ? await getSpaceAuth(this.secrets, this.space) : undefined;
         if (!auth)
           throw new Error("execution: none requires a genuine hosting user-auth root and its user-mode mesh record");
+        if (!local) local = loadManagerInstanceIdentity(this.workspaceRoot, this.space);
         if (local && !existsSync(this.executionRecordPath(local.instanceId)))
           throw new Error("execution: none refuses an existing unclassified manager instance; keep its runtime and retained state, or register a fresh control instance");
         if (!local) {
           const proposed = { instanceId: mintLifecycleUid(), serveIdentity: newIdentity() };
-          local = createManagerInstanceIdentity(this.workspaceRoot, this.space, proposed);
+          local = createManagerInstanceIdentity(this.workspaceRoot, this.space, () => proposed);
           if (local.instanceId !== proposed.instanceId)
             throw new Error("execution: none refuses a concurrently claimed unclassified manager identity");
         }
@@ -2412,9 +2416,11 @@ export class Manager {
           if (entries.some((entry) => entry.iid === localInstanceId && (entry.allocated !== undefined || entry.note !== undefined)))
             throw new Error("execution: none refuses retained seat or turn inventory before recovery; keep the execution-owning Manager");
         } finally { await nc.drain().catch(() => nc.close()); }
+        this.admittedLocalIdentity = local;
       } else {
-        local ??= createManagerInstanceIdentity(this.workspaceRoot, this.space, { instanceId: mintLifecycleUid(), serveIdentity: newIdentity() });
+        local ??= createManagerInstanceIdentity(this.workspaceRoot, this.space, () => ({ instanceId: mintLifecycleUid(), serveIdentity: newIdentity() }));
         this.claimExecutionRecord(local.instanceId);
+        this.admittedLocalIdentity = local;
       }
       return;
     }
@@ -2504,18 +2510,13 @@ export class Manager {
         this.managerInstanceId = this.remoteAuthority.instanceId;
         this.managerServeIdentity = this.remoteAuthority.identities.serve;
       } else {
-      const persisted = loadManagerInstanceIdentity(this.workspaceRoot, this.space);
-      if (persisted !== undefined) {
-        this.managerInstanceId = persisted.instanceId;
-        this.managerServeIdentity = persisted.serveIdentity;
-      } else {
-        const claimed = createManagerInstanceIdentity(this.workspaceRoot, this.space, {
-          instanceId: mintLifecycleUid(),
-          serveIdentity: newIdentity(),
-        });
+        // Admission already resolved this identity, including the first mint. A second claim here
+        // would stat the same record again.
+        const claimed = this.admittedLocalIdentity;
+        if (!claimed) throw new Error("manager start has no admitted local identity");
+        this.admittedLocalIdentity = undefined;
         this.managerInstanceId = claimed.instanceId;
         this.managerServeIdentity = claimed.serveIdentity;
-      }
       }
     }
     await this.onServiceIdentity?.(this.serviceIdentityObservation());
@@ -2789,7 +2790,7 @@ export class Manager {
       reply = await this.ep.requestDeliveryAdmin("reloadStoreIdentity", {}, timeoutMs);
     } catch (e) {
       const msg = rejectionText(e);
-      if (isAbsentDeliveryAdmin(msg)) return this.absentByLeaseRow(isUnansweredDeliveryAdmin(e));
+      if (isAbsentDeliveryAdmin(e)) return this.absentByLeaseRow(isUnansweredDeliveryAdmin(e));
       const failure = `could not challenge the delivery daemon's SecretStore: ${msg}`;
       throw isUnansweredDeliveryAdmin(e) ? new DeliveryAdminUnanswered(failure) : new Error(failure);
     }
@@ -2802,9 +2803,10 @@ export class Manager {
       answer = parseDaemonStoreAnswer(reply.data);
     } catch (e) {
       throw new Error(
-        `delivery daemon named an unreadable SecretStore: ${rejectionText(e)}. A daemon older ` +
-          `than #1694 replies with a bare store identity and no answerer binding; this manager ` +
-          `cannot establish which process answered, so nothing reminted - upgrade the delivery daemon`,
+        `delivery daemon named an unreadable SecretStore: ${rejectionText(e)}. Nothing reminted. ` +
+          `Check that delivery and manager use the same Cotal version, then restart delivery through its supervisor. ` +
+          `For a saved local delivery service: cotal down delivery --space ${this.space}, ` +
+          `then cotal up --space ${this.space}`,
       );
     }
     // The answerer's own claim first, so an honest non-holder is refused by its own admission and
@@ -5168,11 +5170,11 @@ export class Manager {
       // delete) that fresh spawn's just-provisioned durables. deprovision shreds the secret family
       // and revokes the grant, but only logs a failed revoke, so the revoke is attempted here first.
       // Each failure joins the refusal, so the caller learns what this spawn left behind.
-      const failed: string[] = [];
+      const failed: CleanupFailure[] = [];
       await attemptCleanup(failed, "revoke agent grant", () => provider.revokeAgent({ dir, owner, actor: name }));
       await attemptCleanup(failed, "deprovision", () =>
         this.deprovision({ id: principalKey(owner, name).key, name, lifecycleUid: opts.lifecycleUid, userOwner: owner, secretPaths: files }));
-      const leftover = failed.length ? `; cleanup failed: ${failed.join("; ")}` : "";
+      const leftover = failed.length ? `; cleanup failed: ${describeCleanupFailures(failed)}` : "";
       return { error: `agent auth preflight failed for "${name}": ${rejectionText(e)}${leftover}` };
     }
   }
@@ -5278,10 +5280,10 @@ export class Manager {
       // durable it never authored. A retry with the same requestId re-enters the same enrollment.
       // A failed removal joins the refusal instead of throwing, so every removal is attempted and
       // the refusal still reaches the caller.
-      const unshredded: string[] = [];
+      const unshredded: CleanupFailure[] = [];
       for (const family of files.actorToken === staged.actorToken ? [staged] : [staged, files])
         await this.shredUserSecrets(unshredded, family);
-      const leftover = unshredded.length ? `; cleanup failed: ${unshredded.join("; ")}` : "";
+      const leftover = unshredded.length ? `; cleanup failed: ${describeCleanupFailures(unshredded)}` : "";
       // A host that refused the enrollment enrolled nothing, so once every staged secret is gone
       // this attempt left nothing behind. A failure after the host answered, or a host that did not
       // answer, may have left a grant there.
@@ -5295,7 +5297,7 @@ export class Manager {
 
   /** Shred a user agent's secret family from the store and from disk. Every removal is attempted,
    *  and each failure joins `unshredded`, so one fault cannot leave the rest of the family behind. */
-  private async shredUserSecrets(unshredded: string[], family: { actorToken?: string; sentinelCreds?: string; health?: string }): Promise<void> {
+  private async shredUserSecrets(unshredded: CleanupFailure[], family: { actorToken?: string; sentinelCreds?: string; health?: string }): Promise<void> {
     for (const path of [family.actorToken, family.sentinelCreds])
       if (path) await attemptCleanup(unshredded, `secret ${path}`, () => this.secrets.delete(agentSecretKeyForFile(path, this.space)));
     for (const path of [family.actorToken, family.sentinelCreds, family.health])
@@ -5566,9 +5568,9 @@ export class Manager {
       // left every hosted seat's actor token, sentinel and health file on disk. It goes once the
       // grant is released and the child is gone, by the same rule as the local arm below: every
       // removal is attempted, and a failure keeps the name held instead of reaching the terminal.
-      const unshredded: string[] = [];
+      const unshredded: CleanupFailure[] = [];
       await this.shredUserSecrets(unshredded, a.secretPaths ?? agentLifecycleSecretFilePaths(this.workspaceRoot, this.space, a.name, a.lifecycleUid));
-      if (unshredded.length) throw new Error(`could not shred "${a.name}": ${unshredded.join("; ")}`);
+      if (unshredded.length) throw new Error(`could not shred "${a.name}": ${describeCleanupFailures(unshredded)}`);
       await this.requestRetirement(a);
       return;
     }
@@ -5597,7 +5599,7 @@ export class Manager {
     const files = a.secretPaths ?? agentLifecycleSecretFilePaths(this.workspaceRoot, this.space, a.name, a.lifecycleUid);
     // Every removal is attempted, and a failed one is thrown only after the broker teardown below,
     // so a file fault cannot strand the agent's durables and ACL row on the broker.
-    const unshredded: string[] = [];
+    const unshredded: CleanupFailure[] = [];
     if (files.creds) {
       const creds = files.creds;
       await attemptCleanup(unshredded, `secret ${creds}`, () => secrets.delete(agentSecretKeyForFile(creds, this.space)));
@@ -5633,7 +5635,7 @@ export class Manager {
         console.error(`revoke agent grant ${a.name}: ${rejectionText(e)}`);
       }
     }
-    const shredFailure = unshredded.length ? `could not shred "${a.name}": ${unshredded.join("; ")}` : undefined;
+    const shredFailure = unshredded.length ? `could not shred "${a.name}": ${describeCleanupFailures(unshredded)}` : undefined;
     try {
       const res = await this.deprovisionBroker(a);
       const h = this.retiring.get(a.name);
@@ -6397,7 +6399,15 @@ export class Manager {
     return false;
   }
 
-  /** Parse an untyped control-plane `start` request into {@link StartAgentOpts}. */
+  /** Parse a served `spawn` request into {@link StartAgentOpts}. The compiled spawn input contract
+   *  is the shape check: it already refused a non-mapping `launchOptions`, a `supervise` that is not
+   *  the closed `{ restarts, windowMs }` pair, and a list on `subscribe`, `allowSubscribe`,
+   *  `allowPublish`, `shareTools`, `join` or `callerAcl` that is not an array of strings. This reads
+   *  those fields as admitted, the way it reads the string fields. The connector still validates the
+   *  launch-option keys, and `startAgent` still refuses a supervise budget the seat record would not
+   *  take. `once` is shape-checked by that same contract. Its omitted `deadlineMs` takes the default
+   *  here, and a deadline past the scheduler's last instant is refused here, which the schema does
+   *  not express. */
   private opStart(args: Record<string, unknown>, caller: string, admin: boolean, hooks?: SpawnHooks, route: "one" | "all" | "inst" = "inst", authenticatedCaller?: EpCaller, served?: string): Promise<ControlReply> {
     if (args.resume !== undefined && args.continueSession !== undefined)
       return Promise.resolve({ ok: false, error: "resume and continueSession are mutually exclusive" });
@@ -6407,63 +6417,17 @@ export class Manager {
       return Promise.resolve({ ok: false, error: "launchOptions: expected a key:value mapping" });
     if (args.runtime !== undefined && (typeof args.runtime !== "string" || !args.runtime.trim()))
       return Promise.resolve({ ok: false, error: "runtime: expected a non-empty runtime name" });
-    let supervise: { restarts: number; windowMs: number } | undefined;
-    if (args.supervise !== undefined) {
-      const raw = args.supervise;
-      if (typeof raw !== "object" || raw === null || Array.isArray(raw))
-        return Promise.resolve({ ok: false, error: "supervise: expected { restarts, windowMs }" });
-      const rec = raw as Record<string, unknown>;
-      const extra = Object.keys(rec).filter((k) => k !== "restarts" && k !== "windowMs");
-      if (extra.length > 0)
-        return Promise.resolve({ ok: false, error: `supervise: unknown key ${extra[0]}; it takes restarts and windowMs` });
-      if (typeof rec.restarts !== "number" || !Number.isInteger(rec.restarts) || rec.restarts < 1)
-        return Promise.resolve({ ok: false, error: "supervise.restarts: expected a positive integer" });
-      if (typeof rec.windowMs !== "number" || !Number.isInteger(rec.windowMs) || rec.windowMs < 1)
-        return Promise.resolve({ ok: false, error: "supervise.windowMs: expected a positive integer" });
-      supervise = { restarts: rec.restarts, windowMs: rec.windowMs };
-    }
+    const supervise = args.supervise as { restarts: number; windowMs: number } | undefined;
     let once: StartAgentOpts["once"];
     if (args.once !== undefined) {
-      const raw = args.once;
-      if (typeof raw !== "object" || raw === null || Array.isArray(raw))
-        return Promise.resolve({ ok: false, error: "once: expected { deadlineMs? }" });
-      const rec = raw as Record<string, unknown>;
-      const extra = Object.keys(rec).filter((k) => k !== "deadlineMs");
-      if (extra.length > 0)
-        return Promise.resolve({ ok: false, error: `once: unknown key ${extra[0]}; it takes deadlineMs` });
+      const rec = args.once as { deadlineMs?: number };
       // The default is applied here, so every caller of the wire gets the same one.
       const d = rec.deadlineMs ?? ONCE_DEFAULT_DEADLINE_MS;
       if (d !== -1 && (typeof d !== "number" || !Number.isSafeInteger(d) || d < 1 || Date.now() + d > MAX_SCHEDULE_MS))
         return Promise.resolve({ ok: false, error: "once.deadlineMs: expected -1 (no deadline) or a positive whole number of milliseconds that ends by the deadline scheduler's last instant (the end of year 9999)" });
       once = { deadlineMs: d === -1 ? undefined : d };
     }
-    // ACL overrides arrive as string arrays or not at all — a malformed value is a bad request,
-    // not something to coerce (no fallbacks).
-    const strList = (v: unknown, flag: string): string[] | undefined => {
-      if (v === undefined) return undefined;
-      if (!Array.isArray(v) || v.some((s) => typeof s !== "string"))
-        throw new Error(`${flag}: expected an array of strings`);
-      return v as string[];
-    };
-    let subscribe: string[] | undefined, allowSubscribe: string[] | undefined, allowPublish: string[] | undefined, shareTools: string[] | undefined;
-    let join: string[] | undefined, callerAcl: StartAgentOpts["callerAcl"];
-    try {
-      subscribe = strList(args.subscribe, "subscribe");
-      allowSubscribe = strList(args.allowSubscribe, "allowSubscribe");
-      allowPublish = strList(args.allowPublish, "allowPublish");
-      shareTools = strList(args.shareTools, "shareTools");
-      join = strList(args.join, "join");
-      if (args.callerAcl !== undefined) {
-        const rec = args.callerAcl as Record<string, unknown> | null;
-        if (rec === null || typeof rec !== "object" || Array.isArray(rec)) throw new Error("callerAcl: expected an object");
-        const sub = strList(rec.allowSubscribe, "callerAcl.allowSubscribe");
-        const pub = strList(rec.allowPublish, "callerAcl.allowPublish");
-        if (!sub || !pub) throw new Error("callerAcl: allowSubscribe and allowPublish are both required");
-        callerAcl = { allowSubscribe: sub, allowPublish: pub };
-      }
-    } catch (e) {
-      return Promise.resolve({ ok: false, error: rejectionText(e) });
-    }
+    const callerAcl = args.callerAcl as StartAgentOpts["callerAcl"];
     // #373: the event-plane admission gate. `startAgent` resolves `eventsRequired || opts.events
     // !== false`, so omission ARMS the plane — a gate on the explicit bit alone is bypassed by
     // omitting it. The gate is on the DECISION, and it runs before connector resolution and
@@ -6518,12 +6482,12 @@ export class Manager {
         eventsNotice,
         cwd: args.cwd as string | undefined,
         prompt: args.prompt as string | undefined,
-        subscribe,
-        allowSubscribe,
-        allowPublish,
-        join,
+        subscribe: args.subscribe as string[] | undefined,
+        allowSubscribe: args.allowSubscribe as string[] | undefined,
+        allowPublish: args.allowPublish as string[] | undefined,
+        join: args.join as string[] | undefined,
         callerAcl,
-        shareTools,
+        shareTools: args.shareTools as string[] | undefined,
         ...(supervise !== undefined ? { supervise } : {}),
         ...(once !== undefined ? { once } : {}),
         ...(typeof args.runtime === "string" ? { runtime: args.runtime.trim() } : {}),
@@ -7749,9 +7713,9 @@ export class Manager {
             // A refused accept rolls the enrollment back: the host's grant through `provisioned`, and
             // this participant's secret family here, before the refusal returns. The hosted retirement
             // removes it too, but only once the host's release completes.
-            const unshredded: string[] = [];
+            const unshredded: CleanupFailure[] = [];
             await this.shredUserSecrets(unshredded, prep.files);
-            if (unshredded.length) throw new Error(`${rejectionText(e)}; cleanup failed: ${unshredded.join("; ")}`, { cause: e });
+            if (unshredded.length) throw new Error(`${rejectionText(e)}; cleanup failed: ${describeCleanupFailures(unshredded)}`, { cause: e });
             throw e;
           }
         }
@@ -9305,10 +9269,10 @@ export class Manager {
       if (slot?.lifecycleUid === target.lifecycleUid) this.despawnAuthorized(slot, true, false, `delegated retirement ${intentId}`);
       // The host owns the grant and the footprint, but the secret family enrollUserAgent wrote here
       // is this participant's, and no teardown arm of a delegated seat removes it.
-      const unshredded: string[] = [];
+      const unshredded: CleanupFailure[] = [];
       await this.shredUserSecrets(unshredded, (live ?? held?.target)?.secretPaths ?? agentLifecycleSecretFilePaths(this.workspaceRoot, this.space, name, target.lifecycleUid));
       if (unshredded.length) {
-        const error = `the host retired "${name}" at ${target.lifecycleUid}, but cleanup failed: ${unshredded.join("; ")}; the name stays held until a retried retirement intent removes it`;
+        const error = `the host retired "${name}" at ${target.lifecycleUid}, but cleanup failed: ${describeCleanupFailures(unshredded)}; the name stays held until a retried retirement intent removes it`;
         const hold = this.retiring.get(name);
         if (hold?.target.lifecycleUid === target.lifecycleUid) hold.lastError = error;
         return { ok: false, error };
@@ -12111,7 +12075,9 @@ export class Manager {
       }
       const secrets = this.secrets;
       const files = a.secretPaths ?? agentLifecycleSecretFilePaths(this.workspaceRoot, this.space, a.name, a.lifecycleUid);
-      const failed: string[] = [];
+      // The broker teardown mints its own credential, so a creds file that cannot be removed must not
+      // skip it. The failures are thrown together, so the terminal still stops at an incomplete cleanup.
+      const failed: CleanupFailure[] = [];
       if (files.creds) {
         const creds = files.creds;
         await attemptCleanup(failed, `secret ${creds}`, () => secrets.delete(agentSecretKeyForFile(creds, this.space)));
@@ -12130,7 +12096,7 @@ export class Manager {
           throw e;
         }
       });
-      if (failed.length) throw new Error(`cleanup failed: ${failed.join("; ")}`);
+      if (failed.length) throw new Error(`cleanup failed: ${describeCleanupFailures(failed)}`);
     };
     try {
       const retired = await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: a.id, lifecycleUid: a.lifecycleUid, alias: a.name }, async (t) => {

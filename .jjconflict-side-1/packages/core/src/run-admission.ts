@@ -1,0 +1,377 @@
+/**
+ * Run admission (SPEC 14.8): the immutable, manager-owned record of WHAT AUTHORITY a hosted
+ * workflow run was admitted under, beside the independent marker that revokes it.
+ *
+ * A hosted run acts on channels through the trusted mediator, whose credential is host-wide. The
+ * admission record is what confines that: it snapshots, at `run-start`, the caller's ISSUED
+ * ceiling (SPEC 13.15) as the run's channel ceiling, and every channel effect the host performs
+ * afterwards is checked against it. The record is created once, create-only, by a one-shot
+ * `run-admitter` credential the manager mints per run; the driver holds no grant on this store;
+ * the mediator reads it leader-served before each effect.
+ *
+ * Revocation is a SEPARATE create-only marker under its own key, so absence of revocation is a
+ * readable "no marker" on a store the reader can reach, never a missing record on a store it
+ * cannot. A failed read on either key is a refusal, not an absence.
+ *
+ * The store is its own bucket (`cotal_admission_<space>`, `allow_direct=false`): the driver-writable
+ * run/program/journal records and the registration-policy records are the wrong place for a
+ * record whose whole point is that the driver cannot influence it.
+ */
+import type { JetStreamManager, StreamConfig } from "@nats-io/jetstream";
+import type { KV, Kvm } from "@nats-io/kv";
+import { canonicalJson } from "./canonical.js";
+import { EpEnvelopeError } from "./endpoint-envelope.js";
+import { assertIdToken, endpointToken, type EpCaller } from "./endpoint-subjects.js";
+import { isCasLoss } from "./endpoint-records.js";
+import {
+  AUTHORITY_STORE_IMMUTABLE_FLAGS,
+  WRITE_ONCE_PER_KEY,
+  assertStoreShape,
+  assertIssuedSpace,
+  issuedPermitsPattern,
+  issuedPermitsSubject,
+  readIssuedSubjectPermissions,
+  type IssuedAuthorityRef,
+  type IssuedSubjectPermissions,
+} from "./issued-authority.js";
+import { chatSubject, token } from "./subjects.js";
+
+export function admissionBucket(space: string): string {
+  return `cotal_admission_${token(space)}`;
+}
+
+export function admissionKey(endpoint: string, runId: string): string {
+  return `admission.v1.${endpointToken(endpoint)}.${assertIdToken(runId, "runId")}`;
+}
+
+export function revocationKey(endpoint: string, runId: string): string {
+  return `revoked.v1.${endpointToken(endpoint)}.${assertIdToken(runId, "runId")}`;
+}
+
+/** Where a run's authority came from. `issued` is the only shape a served `run-start` admits;
+ *  `operator` is a local drive or an explicit migration, admitted from trusted operator evidence
+ *  the operator names, never inferred from program text. */
+export type RunAdmissionProvenance =
+  | { readonly kind: "issued"; readonly ref: IssuedAuthorityRef; readonly resolvedRevision: number }
+  | { readonly kind: "operator"; readonly by: string; readonly reason: string };
+
+/** What a user-auth run's starter could hand on when the run was admitted: its ledger row's scope
+ *  and channel lists, as the issuing host read them (§14.8). */
+export interface RunDelegation {
+  readonly scope: readonly string[];
+  readonly allowSubscribe: readonly string[];
+  readonly allowPublish: readonly string[];
+}
+
+export interface RunAdmission {
+  readonly version: 1;
+  readonly space: string;
+  readonly endpoint: string;
+  readonly runId: string;
+  /** The admitting manager instance. */
+  readonly instanceId: string;
+  /** The caller the run was admitted for: the issued triple, or the operator's principal. */
+  readonly caller: EpCaller;
+  /** The channel ceiling the run's effects are checked against: the caller's issued publish and
+   *  subscribe ceilings, verbatim. Explicit `none` is deny-all. */
+  readonly ceiling: IssuedSubjectPermissions;
+  readonly provenance: RunAdmissionProvenance;
+  readonly admittedAt: number;
+  /** Present when the starter was an operator instrument or held the admin set at admission
+   *  (SPEC 13.15): the run's spawns are exempt from the spawn bound, as the starter's own are.
+   *  Absent, every spawn the run makes is bounded by `ceiling`. An instrument's evidence expires
+   *  minutes after issue, so a long run could not tell this later. */
+  readonly spawnExempt?: true;
+  /** On a user-auth space, the starter's grant as admitted. Every spawn the run makes is bounded by
+   *  it together with the starter's current ledger row, so a grant the starter gains later is never
+   *  handed on. The issuing host writes it; a static admission carries none. */
+  readonly delegation?: RunDelegation;
+}
+
+export interface RunRevocation {
+  readonly version: 1;
+  readonly runId: string;
+  readonly reason: string;
+  readonly by: string;
+  readonly revokedAt: number;
+}
+
+function closed(value: unknown, keys: readonly string[], label: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be a plain record`);
+  for (const key of Object.keys(value)) if (!keys.includes(key)) throw new Error(`${label} carries an unsupported field ${key}`);
+  return value as Record<string, unknown>;
+}
+
+function callerSnapshot(value: unknown): EpCaller {
+  const raw = closed(value, ["owner", "actor", "uid", "generation"], "admission caller");
+  if (typeof raw.owner !== "string" || typeof raw.actor !== "string" || typeof raw.uid !== "string"
+    || (raw.generation !== undefined && typeof raw.generation !== "string"))
+    throw new Error("admission caller is malformed");
+  return Object.freeze({ owner: raw.owner, actor: raw.actor, uid: raw.uid, ...(raw.generation !== undefined ? { generation: raw.generation } : {}) }) as EpCaller;
+}
+
+function provenanceSnapshot(value: unknown): RunAdmissionProvenance {
+  const raw = closed(value, ["kind", "ref", "resolvedRevision", "by", "reason"], "admission provenance");
+  if (raw.kind === "issued") {
+    const ref = closed(raw.ref, ["space", "owner", "actor", "uid", "generation"], "admission issued ref");
+    if (!["space", "owner", "actor", "uid", "generation"].every((k) => typeof ref[k] === "string")
+      || typeof raw.resolvedRevision !== "number" || !Number.isSafeInteger(raw.resolvedRevision) || raw.resolvedRevision <= 0
+      || raw.by !== undefined || raw.reason !== undefined)
+      throw new Error("issued admission provenance is malformed");
+    const pinned: IssuedAuthorityRef = { space: ref.space as string, owner: ref.owner as string, actor: ref.actor as string, uid: ref.uid as string, generation: ref.generation as string };
+    return Object.freeze({ kind: "issued", ref: Object.freeze(pinned), resolvedRevision: raw.resolvedRevision });
+  }
+  if (raw.kind === "operator") {
+    if (typeof raw.by !== "string" || raw.by.length === 0 || typeof raw.reason !== "string" || raw.reason.length === 0
+      || raw.ref !== undefined || raw.resolvedRevision !== undefined)
+      throw new Error("operator admission provenance is malformed");
+    return Object.freeze({ kind: "operator", by: raw.by, reason: raw.reason });
+  }
+  throw new Error("unsupported admission provenance");
+}
+
+function delegationSnapshot(value: unknown): RunDelegation {
+  const raw = closed(value, ["scope", "allowSubscribe", "allowPublish"], "admission delegation");
+  const list = (v: unknown): readonly string[] => {
+    if (!Array.isArray(v) || !v.every((x) => typeof x === "string")) throw new Error("admission delegation lists must be arrays of strings");
+    return Object.freeze([...v as string[]]);
+  };
+  return Object.freeze({ scope: list(raw.scope), allowSubscribe: list(raw.allowSubscribe), allowPublish: list(raw.allowPublish) });
+}
+
+/** Validate a record at the consuming boundary: closed schema, version, coordinates. */
+export function admissionSnapshot(value: unknown): RunAdmission {
+  const raw = closed(value, ["version", "space", "endpoint", "runId", "instanceId", "caller", "ceiling", "provenance", "admittedAt", "spawnExempt", "delegation"], "run admission");
+  if (raw.version !== 1) throw new Error(`unsupported run admission version ${String(raw.version)}`);
+  if (typeof raw.space !== "string" || typeof raw.endpoint !== "string" || typeof raw.runId !== "string" || typeof raw.instanceId !== "string"
+    || typeof raw.admittedAt !== "number" || !Number.isSafeInteger(raw.admittedAt) || raw.admittedAt <= 0
+    || (raw.spawnExempt !== undefined && raw.spawnExempt !== true))
+    throw new Error("run admission is malformed");
+  assertIssuedSpace(raw.space);
+  endpointToken(raw.endpoint);
+  assertIdToken(raw.runId, "runId");
+  const caller = callerSnapshot(raw.caller);
+  const provenance = provenanceSnapshot(raw.provenance);
+  if (provenance.kind === "issued") {
+    const r = provenance.ref;
+    if (r.space !== raw.space || r.owner !== caller.owner || r.actor !== caller.actor || r.uid !== caller.uid || (caller as { generation?: string }).generation !== r.generation)
+      throw new Error("run admission's issued reference disagrees with its caller");
+  }
+  return Object.freeze({
+    version: 1, space: raw.space, endpoint: raw.endpoint, runId: raw.runId, instanceId: raw.instanceId,
+    caller, ceiling: readIssuedSubjectPermissions(raw.ceiling), provenance, admittedAt: raw.admittedAt,
+    ...(raw.spawnExempt === true ? { spawnExempt: true as const } : {}),
+    ...(raw.delegation !== undefined ? { delegation: delegationSnapshot(raw.delegation) } : {}),
+  });
+}
+
+export function revocationSnapshot(value: unknown, runId: string): RunRevocation {
+  const raw = closed(value, ["version", "runId", "reason", "by", "revokedAt"], "run revocation");
+  if (raw.version !== 1 || raw.runId !== runId || typeof raw.reason !== "string" || typeof raw.by !== "string"
+    || typeof raw.revokedAt !== "number" || !Number.isSafeInteger(raw.revokedAt) || raw.revokedAt <= 0)
+    throw new Error("run revocation is malformed");
+  return Object.freeze({ version: 1, runId, reason: raw.reason, by: raw.by, revokedAt: raw.revokedAt });
+}
+
+const enc = new TextEncoder();
+const dec = new TextDecoder("utf-8", { fatal: true });
+
+/** Leader-served point read of one admission-store key. Absence is `undefined`; a deletion
+ *  marker or an unreadable value is a refusal. */
+async function readLeader(jsm: JetStreamManager, space: string, key: string): Promise<{ value: unknown; revision: number } | undefined> {
+  const bucket = admissionBucket(space);
+  let m;
+  try {
+    m = await jsm.streams.getMessage(`KV_${bucket}`, { last_by_subj: `$KV.${bucket}.${key}` });
+  } catch (e) {
+    if ((e as { code?: unknown }).code === 10037) return undefined;
+    throw e;
+  }
+  if (!m) return undefined;
+  if (m.header?.get("KV-Operation"))
+    throw new EpEnvelopeError("failed-precondition", `admission row ${key} carries a deletion marker; a deletion is never absence (SPEC 14.8)`);
+  return { value: JSON.parse(dec.decode(m.data)), revision: m.seq };
+}
+
+/** Create the admission, create-only. A second create for the same run is a conflict: a run is
+ *  admitted once, and a re-admission is a new run (a fork) or an explicit migration. */
+export async function createRunAdmission(kv: KV, admission: RunAdmission): Promise<number> {
+  const snap = admissionSnapshot(admission);
+  try {
+    return await kv.create(admissionKey(snap.endpoint, snap.runId), enc.encode(canonicalJson(snap)));
+  } catch (e) {
+    if (isCasLoss(e)) throw new EpEnvelopeError("conflict", `run ${snap.runId} is already admitted; an admission is written once (SPEC 14.8)`);
+    throw e;
+  }
+}
+
+/** Create the revocation marker, create-only and idempotent on an existing marker. */
+export async function revokeRunAdmission(kv: KV, endpoint: string, revocation: RunRevocation): Promise<void> {
+  const snap = revocationSnapshot(revocation, revocation.runId);
+  // A marker is written naming who revoked the run and why, as an operator admission's provenance
+  // is. The READER stays tolerant of an empty field on purpose: a marker already written that way is
+  // still a revocation, and refusing to read it would make the run's admission unreadable, which
+  // also refuses the conclave cleanup a revoked run is still owed.
+  if (snap.by.length === 0 || snap.reason.length === 0)
+    throw new Error(`run revocation of ${snap.runId} names who revoked it and why; by and reason must be non-empty`);
+  try {
+    await kv.create(revocationKey(endpoint, snap.runId), enc.encode(canonicalJson(snap)));
+  } catch (e) {
+    if (!isCasLoss(e)) throw e;
+  }
+}
+
+/** One create-only cancellation dispatch. Unlike KV.create, put with expected sequence zero never
+ *  follows a failed create with a tombstone read and another write. The caller owns the guard and
+ *  records possible dispatch there; no awaited preparation follows it. */
+export async function commitRunCancellation(
+  kv: KV,
+  endpoint: string,
+  revocation: RunRevocation,
+  beforeDispatch: () => void,
+): Promise<"created" | "existed"> {
+  const snap = revocationSnapshot(revocation, revocation.runId);
+  if (snap.by.length === 0 || snap.reason.length === 0)
+    throw new Error("run cancellation must name who revoked it and why");
+  const key = revocationKey(endpoint, snap.runId);
+  const bytes = enc.encode(canonicalJson(snap));
+  beforeDispatch();
+  try {
+    await kv.put(key, bytes, { previousSeq: 0 });
+    return "created";
+  } catch (error) {
+    if (isCasLoss(error)) return "existed";
+    throw error;
+  }
+}
+
+export interface RunAdmissionView {
+  readonly admission: RunAdmission;
+  readonly revoked: RunRevocation | undefined;
+}
+
+/** Cancellation distinguishes absent authority from unreadable trusted state without parsing messages. */
+export async function readCancellationAdmission(jsm: JetStreamManager, space: string, endpoint: string, runId: string): Promise<RunAdmissionView> {
+  let entry: Awaited<ReturnType<typeof readLeader>>;
+  try { entry = await readLeader(jsm, space, admissionKey(endpoint, runId)); }
+  catch { throw new EpEnvelopeError("unavailable", "run-cancel admission is unreadable"); }
+  if (!entry) throw new EpEnvelopeError("permission-denied", "run-cancel request is not authorized");
+  try {
+    const admission = admissionSnapshot(entry.value);
+    if (admission.space !== space || admission.endpoint !== endpoint || admission.runId !== runId) throw new Error("coordinates differ");
+    const marker = await readLeader(jsm, space, revocationKey(endpoint, runId));
+    return { admission, revoked: marker ? revocationSnapshot(marker.value, runId) : undefined };
+  } catch { throw new EpEnvelopeError("unavailable", "run-cancel admission or marker is unreadable"); }
+}
+
+/** The admission a host acts on: the record must exist, match its coordinates, and carry no
+ *  revocation marker. Missing, unreadable, malformed, mismatched, or revoked all refuse. */
+export async function readRunAdmission(jsm: JetStreamManager, space: string, endpoint: string, runId: string): Promise<RunAdmissionView> {
+  const entry = await readLeader(jsm, space, admissionKey(endpoint, runId));
+  if (entry === undefined)
+    throw new EpEnvelopeError("permission-denied", `run ${runId} has no admission record on endpoint ${endpoint}; a run with no admission runs no channel effect (SPEC 14.8)`);
+  let admission: RunAdmission;
+  try {
+    admission = admissionSnapshot(entry.value);
+  } catch (e) {
+    throw new EpEnvelopeError("permission-denied", `run ${runId}'s admission record is unreadable (${(e as Error).message}); garbled trusted state never authorizes (SPEC 14.8)`);
+  }
+  if (admission.space !== space || admission.endpoint !== endpoint || admission.runId !== runId)
+    throw new EpEnvelopeError("permission-denied", `run ${runId}'s admission record names other coordinates (${admission.space}/${admission.endpoint}/${admission.runId}); refused (SPEC 14.8)`);
+  // Its own read of the marker, not a call into the display helper below. Sharing one reader was
+  // tried and measured: a mutation of the helper's key then breaks every host read too, so the
+  // suite dies at `resume` before the cell that grades the table ever runs, and the mutant is
+  // ungradable. The host path also has no business depending on a function whose contract is
+  // written for a listing.
+  const marker = await readLeader(jsm, space, revocationKey(endpoint, runId));
+  const revoked = marker === undefined ? undefined : revocationSnapshot(marker.value, runId);
+  return Object.freeze({ admission, revoked });
+}
+
+/**
+ * The revocation marker alone, without the admission record beside it.
+ *
+ * {@link readRunAdmission} refuses when the admission is missing, unreadable or names other
+ * coordinates, which is the only safe answer for a host about to perform a channel effect. A
+ * DISPLAY surface is in a different position: it is not about to act on the record, and refusing a
+ * whole listing because one row has no admission would hide every other row from the operator
+ * reading it. So a reader that only needs to know "was this revoked" reads the marker key and
+ * nothing else.
+ *
+ * A read that FAILS still throws. "No marker" and "could not look" are different answers, and a
+ * caller that cannot tell them apart would render a revoked run as live the moment the store went
+ * away.
+ */
+export async function readRunRevocation(jsm: JetStreamManager, space: string, endpoint: string, runId: string): Promise<RunRevocation | undefined> {
+  const marker = await readLeader(jsm, space, revocationKey(endpoint, runId));
+  return marker === undefined ? undefined : revocationSnapshot(marker.value, runId);
+}
+
+/** The channel checks a host applies, over the admitted ceiling. Concrete channels only: a
+ *  wildcard is not a channel a run can post to or await, and a generated name is checked after
+ *  it is derived, by the same rule. */
+export class RunAdmissionDenied extends EpEnvelopeError {
+  constructor(runId: string, what: string, channel: string) {
+    super("permission-denied", `run ${runId} is not admitted to ${what} channel "${channel}" (SPEC 14.8)`);
+    this.name = "RunAdmissionDenied";
+  }
+}
+
+export function assertAdmittedPublish(view: RunAdmissionView, channel: string, caller: EpCaller): void {
+  assertNotRevoked(view);
+  const subject = chatSubject(view.admission.space, caller.owner, caller.actor, channel);
+  if (!issuedPermitsSubject(view.admission.ceiling.publish, subject)) throw new RunAdmissionDenied(view.admission.runId, "publish to", channel);
+}
+
+export function assertAdmittedSubscribe(view: RunAdmissionView, channel: string): void {
+  assertNotRevoked(view);
+  const pattern = chatSubject(view.admission.space, "*", "*", channel);
+  if (!issuedPermitsPattern(view.admission.ceiling.subscribe, pattern)) throw new RunAdmissionDenied(view.admission.runId, "read", channel);
+}
+
+export function assertNotRevoked(view: RunAdmissionView): void {
+  if (view.revoked !== undefined)
+    throw new EpEnvelopeError("permission-denied", `run ${view.admission.runId} was revoked by ${view.revoked.by} (${view.revoked.reason}); no further channel effect runs (SPEC 14.8)`);
+}
+
+/** Native admission-store inputs, without creation, verification or admitted authority. */
+export function admissionStoreDefinition(space: string) {
+  return {
+    bucket: admissionBucket(space),
+    createOptions: { allow_direct: false },
+    hardenAfterCreate: { ...AUTHORITY_STORE_IMMUTABLE_FLAGS, ...WRITE_ONCE_PER_KEY },
+  };
+}
+
+/** Create-or-verify the admission store: `allow_direct=false`, file, no eviction. */
+export async function ensureAdmissionStore(jsm: JetStreamManager, kvm: Kvm, space: string): Promise<void> {
+  const definition = admissionStoreDefinition(space);
+  const bucket = definition.bucket;
+  const stream = `KV_${bucket}`;
+  // WRITE-ONCE PER KEY, AT THE BROKER. Both rows are create-only and the marker is permanent
+  // (SPEC 14.8), and the create-only CAS enforces neither on its own: the `run-admitter` holds a
+  // `$KV.<bucket>.<key>` publish row, and that row carries a plain replacement of the value, a
+  // `Nats-Rollup` header (which replaces the row, or with `all` empties the bucket), a deletion
+  // marker, and a per-key purge. None of them is a CAS write, so none loses the CAS, and a
+  // replacement leaves no marker for the deletion-marker read to catch. The three immutability
+  // flags close rollup, message delete and purge; write-once closes the rest, so the admission a
+  // host reads is the one that was admitted, and each run and each marker still gets its one write.
+  const shape = definition.hardenAfterCreate;
+  if (await jsm.streams.info(stream).catch(() => undefined) === undefined) {
+    await kvm.create(bucket, definition.createOptions);
+    const created = (await jsm.streams.info(stream)).config;
+    await jsm.streams.update(stream, { ...created, ...shape });
+  }
+  const cfg = (await jsm.streams.info(stream)).config;
+  assertAdmissionStoreConfig(cfg, space);
+}
+
+/** Pure native admission-store invariant checks, without an admission or migration effect. */
+export function assertAdmissionStoreConfig(cfg: StreamConfig, space: string): void {
+  const definition = admissionStoreDefinition(space);
+  const bucket = definition.bucket, shape = definition.hardenAfterCreate;
+  if (cfg.allow_direct !== false || cfg.storage !== "file" || (cfg.max_age ?? 0) !== 0 || (cfg.max_msgs ?? -1) > 0 || (cfg.max_bytes ?? -1) > 0
+    || !Array.isArray(cfg.subjects) || cfg.subjects.length !== 1 || cfg.subjects[0] !== `$KV.${bucket}.>`)
+    throw new Error(`the run admission store ${bucket} has a drifted shape (allow_direct=${String(cfg.allow_direct)}); an authority store is never silently adopted - reprovision it (SPEC 14.8)`);
+  assertStoreShape(cfg as unknown as Record<string, unknown>, shape, bucket, "SPEC 14.8");
+}

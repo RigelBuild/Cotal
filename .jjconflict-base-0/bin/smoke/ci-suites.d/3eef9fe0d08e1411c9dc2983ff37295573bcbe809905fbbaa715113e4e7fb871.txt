@@ -1,0 +1,3 @@
+# A presented credential's identity and capabilities come from its own grants, read against the
+# lifecycle uid it was minted with. A uid it does not name is refused rather than guessed.
+smoke:spawn-creds-grant

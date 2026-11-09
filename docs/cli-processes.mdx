@@ -77,6 +77,10 @@ inventories are not readable from the serve credential. See [control surface](co
 The manager prints what its boot inventory found once it is up, so a start that is refused prints
 no boot line.
 
+A remote manager's boot goal-index scan skips entries deleted after settlement or withdrawal and
+returns the remaining live entries for its owner. Purged entries and malformed live rows still
+refuse the scan; an ordinary terminal deletion does not prevent predecessor reconciliation.
+
 ## Spawn allowlist
 
 ```bash
@@ -107,7 +111,6 @@ Such a launch either left no process or is in the managed list, so a `cotal stop
 The holder runtime's synchronous `wave-seat-holder start` call is bounded to 15 seconds. It can
 exceed the manager's 10-second lease TTL; the manager renews its lease on a separate timer after
 the call returns.
-
 
 ### Control-only execution
 

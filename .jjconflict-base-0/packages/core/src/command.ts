@@ -1,0 +1,283 @@
+import { parseArgs, type ParseArgsOptionsConfig } from "node:util";
+import type { Extension, ExtensionRef } from "./registry.js";
+
+/** One shell-completion candidate. `value` is inserted on the command line; `description`
+ *  is a one-line hint shown by shells that support it (zsh, fish) and ignored by bash. */
+export interface CompletionItem {
+  value: string;
+  description?: string;
+}
+
+/** What a command's {@link Command.complete} returns for the current cursor position: the
+ *  candidates, plus a directive telling the shell glue how to treat them.
+ *  - `nofiles` (the norm for our completions): don't fall back to filename completion.
+ *  - `nospace`: don't append a trailing space (the value is a prefix, e.g. `owner/`).
+ *  - `default`: normal behaviour (a trailing space is added; files may be offered). */
+export interface CompletionResult {
+  items: CompletionItem[];
+  directive?: "default" | "nospace" | "nofiles";
+}
+
+/** One declared flag. The single source for parsing, `--help`, usage errors, and flag
+ *  completion — a command never hand-rolls `parseArgs` for a declared flag. */
+export interface FlagSpec {
+  /** Long name without dashes (`space`, `dry-run`). */
+  readonly name: string;
+  readonly type: "string" | "boolean";
+  /** Single-character short alias (`f` for `-f`). */
+  readonly short?: string;
+  /** Repeatable: `--opt a=1 --opt b=2` collects into an array (Node `parseArgs` `multiple`).
+   *  A repeated flag without this errors as a usage violation (last-wins is never silent). */
+  readonly multiple?: boolean;
+  /** Metavar shown in help for string flags, e.g. `<url>`. Defaults to `<value>`. */
+  readonly value?: string;
+  /** One-line help text. */
+  readonly description?: string;
+  /** For a command with no completer of its own: `files` completes this string flag's value from the
+   *  shell's file names. Without it the value offers no candidates. */
+  readonly completion?: "files";
+}
+
+/** What a command's `run` receives: the declared flags parsed strictly (an undeclared flag is
+ *  a usage error rendered by the dispatcher), the positionals, and the raw argv for the rare
+ *  command that needs it verbatim (e.g. the completion dispatcher). */
+export interface ParsedArgs {
+  readonly values: Record<string, string | boolean | undefined>;
+  readonly positionals: string[];
+  readonly raw: readonly string[];
+  /** Raw argument indices of the positionals, for a group forwarding a parsed child command. */
+  readonly positionalIndices?: readonly number[];
+}
+
+/** The values type DERIVED from a flag-spec tuple declared `as const` — so a command's one
+ *  `args.values as FlagValues<typeof FLAGS>` cast can never disagree with what the dispatcher
+ *  parses: add/retype/remove a flag in the spec and every stale use is a compile error. */
+export type FlagValues<F extends readonly FlagSpec[]> = {
+  [S in F[number] as S["name"]]?: S extends { multiple: true }
+    ? string[]
+    : S["type"] extends "boolean"
+      ? boolean
+      : string;
+};
+
+/** One example in a command's help: a whole command line that works as written, with `<name>` for a
+ *  value the reader fills in, and a note on what it does, in plain words, at most 60 characters and
+ *  with no closing period. A bare string is a command with no note, the form extensions written
+ *  before notes existed declare. */
+export type CommandExample = string | { readonly command: string; readonly note: string };
+
+/** One mode of a command (`ext add`), named by its first positional. It carries its own help, and
+ *  `aliases` are other first words that select it (`rm` for `remove`), scoped to this command. A
+ *  command that declares subcommands takes one as its first positional whenever it takes any, so
+ *  another first word is a usage error. */
+export interface Subcommand {
+  readonly name: string;
+  /** Literal nested modes, for scoped help/completion. The command still owns input validation. */
+  readonly subcommands?: readonly Subcommand[];
+  /** Names from the command's shared flags to display in this mode's help. Omit to show all. */
+  readonly flagNames?: readonly string[];
+  readonly summary: string;
+  /** An internal entry another process invokes: accepted, but never listed in help. */
+  readonly hidden?: boolean;
+  /** Overrides the generated `cotal <command> <name>` usage line. */
+  readonly usage?: string;
+  readonly aliases?: readonly string[];
+  /** Examples shown in its help, the most common use first. */
+  readonly examples?: readonly CommandExample[];
+  /** Structured outputs this mode implements. A mode that declares none reports as plain text with
+   *  the command's usual exit, whatever its command declares for the bare form. */
+  readonly outputs?: readonly OutputMode[];
+  /** This mode only reads. See {@link Command.reads}. */
+  readonly reads?: true;
+  /** Skip shared target preparation when this mode is offline or resolves its own caller target. */
+  readonly prepareMeshTarget?: false;
+}
+
+/** A structured output a command implements, beside its human text: one JSON document, a stream of
+ *  NDJSON records, or a documented line-oriented plain presentation. */
+export type OutputMode = "json" | "ndjson" | "plain";
+
+/**
+ * The contract for a composable CLI command — an {@link Extension} of kind
+ * `"command"`. An implementation (the mesh CLI, the manager …) self-registers its
+ * commands on import; the `cotal` binary resolves them from the registry.
+ */
+export interface Command extends Extension {
+  readonly kind: "command";
+  readonly name: string;
+  readonly summary: string;
+  /** Other exact words that dispatch to this command (`sp` for `spawn`). Never prefixes: the
+   *  registry refuses one that collides with any command's name or alias. */
+  readonly aliases?: readonly string[];
+  /** Declared modes, selected by the first positional. */
+  readonly subcommands?: readonly Subcommand[];
+  /** Structured outputs this command implements; human text is always available. In a command with
+   *  subcommands this covers the bare form, and each subcommand declares its own. */
+  readonly outputs?: readonly OutputMode[];
+  /** Examples shown in its help, the most common use first. */
+  readonly examples?: readonly CommandExample[];
+  /** The command only reads: a composition root installs and refreshes nothing before it runs, so a
+   *  read never repairs as a hidden prelude. In a command with subcommands this covers the bare form,
+   *  and each subcommand declares its own. Absent means the root may prepare what the command uses. */
+  readonly reads?: true;
+  /** Help grouping header (e.g. "Mesh", "Control plane"). Defaults to "Commands". */
+  readonly group?: string;
+  /** Overrides the generated usage line — for sub-grammar commands
+   *  (`send <dm <agent> | msg <channel> | ask <role>> "<text>"`) the generator can't express. */
+  readonly usage?: string;
+  /** Hide from the top-level help listing while keeping it runnable — for dev/test aids
+   *  (e.g. `demo`) that clutter the surface but stay documented and invocable. */
+  readonly hidden?: boolean;
+  /** Declared flags — parsed by the dispatcher ({@link parseCommandArgs}), rendered into help
+   *  and completion. Omit for a command that takes no flags. */
+  readonly flags?: readonly FlagSpec[];
+  /** Shared flag names displayed for the bare command. Execution still parses the full declaration. */
+  readonly flagNames?: readonly string[];
+  /** Positionals help label (e.g. `"<name-or-path>"`, `"<subcommand> …"`). Present ⇒
+   *  positionals are allowed; absent ⇒ a stray positional is a usage error. */
+  readonly positionals?: string;
+  /** Skip parsing: `run` sees only {@link ParsedArgs.raw}/`positionals` verbatim. For the
+   *  completion dispatcher, whose argv is another command's half-typed line. */
+  readonly rawArgs?: boolean;
+  /** Synchronous argument validation before installation, catalog refresh or other preparation.
+   *  This phase checks input only; it must not connect, write files or start a process. */
+  validate?(args: ParsedArgs): void;
+  /** Providers this invocation needs before {@link run}. The published CLI resolves missing refs
+   *  from operator-installed packages; library composition roots still require explicit imports. */
+  requiredExtensions?(args: ParsedArgs): readonly ExtensionRef[];
+  /** Optional shared preparation performed after parsing and before `run`. Help and completion do
+   *  not call it. Composition roots use this for cross-command prerequisites such as refreshing a
+   *  machine-local target catalog once, rather than repeating that policy in every command. */
+  prepare?(args: ParsedArgs): Promise<void>;
+  /** Explicitly opt out of composition-root target preparation when `--space` and `--server` are
+   *  daemon/configuration inputs rather than the shared mesh-target grammar. */
+  readonly prepareMeshTarget?: false;
+  /** The command installs its own interrupt notice. A composition root that reports an interrupt
+   *  before a command begins keeps that report past the command's start, until the command's notice
+   *  takes it over or the command releases it. */
+  readonly keepsStartupNotice?: true;
+  run(args: ParsedArgs): Promise<void>;
+  /** Optional shell-completion provider, owned by the command exactly as `run` is. Given the
+   *  args typed so far (everything after the command name; the last element is the word being
+   *  completed, possibly empty), returns the candidates for that position. Runs on every <TAB>
+   *  via the hidden `__complete` dispatcher, so it MUST be import-light and side-effect-free —
+   *  no network, no spawns. Omit it to offer no argument completion for this command.
+   *  Flag-name candidates are generated from {@link Command.flags} by the dispatcher, which also
+   *  completes every `--space` and `--creds` value; this hook supplies the other positional and value
+   *  candidates. */
+  complete?(argv: string[]): CompletionResult | Promise<CompletionResult>;
+}
+
+/** Parse `argv` against a command's declared flags — strict: an undeclared flag, a stray
+ *  positional (when the command declares none), or a repeat of a flag not declared `multiple`
+ *  throws an `ERR_PARSE_ARGS*` usage error, which the dispatcher renders as one red line plus
+ *  the command's help. */
+export function parseCommandArgs(cmd: Command, argv: string[]): ParsedArgs {
+  if (cmd.rawArgs) return { values: {}, positionals: [...argv], raw: argv, positionalIndices: argv.map((_, index) => index) };
+  const options: ParseArgsOptionsConfig = {};
+  for (const f of cmd.flags ?? []) {
+    options[f.name] = {
+      type: f.type,
+      ...(f.short ? { short: f.short } : {}),
+      ...(f.multiple ? { multiple: true } : {}),
+    };
+  }
+  // A value such as `-1` reads as an option to `parseArgs`, which refuses it as ambiguous. No option
+  // name starts with a digit, so a dash and a digit after a string option is that option's value.
+  // `origin` keeps each word's raw index for `positionalIndices`.
+  const args: string[] = [];
+  const origin: number[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const word = argv[i]!;
+    if (word === "--") {
+      for (let j = i; j < argv.length; j++) { args.push(argv[j]!); origin.push(j); }
+      break;
+    }
+    const long = /^--([^=]+)$/.exec(word)?.[1];
+    const short = /^-([^-])$/.exec(word)?.[1];
+    const name = long ?? (short === undefined ? undefined : Object.keys(options).find((key) => options[key]!.short === short));
+    const next = argv[i + 1];
+    if (name !== undefined && options[name]?.type === "string" && next !== undefined && /^-\d/.test(next)) {
+      args.push(long !== undefined ? `${word}=${next}` : `${word}${next}`);
+      origin.push(i++);
+      continue;
+    }
+    args.push(word);
+    origin.push(i);
+  }
+  const { values, positionals, tokens } = parseArgs({
+    args,
+    options,
+    allowPositionals: cmd.positionals !== undefined,
+    strict: true,
+    tokens: true,
+  });
+  // parseArgs keeps the last value of a repeated option with no error. Count the option tokens
+  // (`-f` and `--file` are the same option; words after `--` are positionals) and refuse a repeat.
+  const seen = new Set<string>();
+  for (const t of tokens) {
+    if (t.kind !== "option" || options[t.name]?.multiple) continue;
+    if (seen.has(t.name)) {
+      const short = options[t.name]?.short;
+      throw Object.assign(new TypeError(`Option '${short ? `-${short}, ` : ""}--${t.name}' cannot be repeated`), {
+        code: "ERR_PARSE_ARGS_REPEATED_OPTION",
+      });
+    }
+    seen.add(t.name);
+  }
+  return { values: values as ParsedArgs["values"], positionals, raw: argv, positionalIndices: tokens.filter((token) => token.kind === "positional").map((token) => origin[token.index]!) };
+}
+
+/** The command `word` names on a surface, by exact name or alias. A prefix never matches. */
+export function findCommand<C extends Command>(commands: readonly C[], word: string | undefined): C | undefined {
+  if (word === undefined) return undefined;
+  return commands.find((cmd) => cmd.name === word || (cmd.aliases ?? []).includes(word));
+}
+
+/** The subcommand `word` selects, by name or by one of its aliases. */
+export function findSubcommand(cmd: Pick<Command, "subcommands">, word: string | undefined): Subcommand | undefined {
+  if (word === undefined) return undefined;
+  return cmd.subcommands?.find((sub) => sub.name === word || (sub.aliases ?? []).includes(word));
+}
+
+/** Why a command's own declarations are inconsistent: an alias equal to its name, or two subcommands
+ *  sharing a name or alias. Empty means it is well formed. */
+export function commandDeclarationProblems(cmd: Command): string[] {
+  const problems: string[] = [];
+  if ((cmd.aliases ?? []).includes(cmd.name)) problems.push(`command "${cmd.name}" lists its own name as an alias`);
+  const scopedFlags = (path: string, names: readonly string[] | undefined): void => {
+    if (names === undefined) return;
+    const declared = new Set((cmd.flags ?? []).map((flag) => flag.name));
+    if (!Array.isArray(names) || names.some((name) => typeof name !== "string") || new Set(names).size !== names.length || names.some((name) => !declared.has(name))) problems.push(`command "${path}" lists invalid, duplicate or undeclared scoped-help flags`);
+  };
+  scopedFlags(cmd.name, cmd.flagNames);
+  const walk = (parent: string, children: readonly Subcommand[], depth: number): void => {
+    if (depth > 8) { problems.push(`command "${parent}" exceeds eight metadata nesting levels`); return; }
+    const seen = new Map<string, string>();
+    for (const sub of children) {
+      scopedFlags(`${parent} ${sub.name}`, sub.flagNames);
+      for (const word of [sub.name, ...(sub.aliases ?? [])]) {
+        const holder = seen.get(word);
+        if (holder !== undefined) problems.push(`command "${parent}": "${word}" names both subcommand ${holder} and ${sub.name}`);
+        seen.set(word, sub.name);
+      }
+      if (sub.subcommands) walk(`${parent} ${sub.name}`, sub.subcommands, depth + 1);
+    }
+  };
+  walk(cmd.name, cmd.subcommands ?? [], 1);
+  return problems;
+}
+
+/** The generated usage line: `cotal <name> [<positionals>] [flags…]`, honoring an explicit
+ *  {@link Command.usage} override. One source for `--help` and usage errors. */
+export function commandUsage(cmd: Command): string {
+  if (cmd.usage) return cmd.usage;
+  const parts = [`cotal ${cmd.name}`];
+  if (cmd.positionals) parts.push(cmd.positionals);
+  for (const f of cmd.flags ?? []) {
+    const long = `--${f.name}`;
+    const metavar = f.type === "string" ? ` ${f.value ?? "<value>"}` : "";
+    parts.push(`[${f.short ? `-${f.short}|` : ""}${long}${metavar}]`);
+  }
+  return parts.join(" ");
+}

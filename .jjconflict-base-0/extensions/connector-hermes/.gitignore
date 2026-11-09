@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+uv.lock
+# Generated esbuild bundle of the standalone sidecar (shipped via npm `files`, not git).
+# If we adopt `hermes plugins install <git-repo>` distribution, this gets vendored/committed instead.
+plugin/cotal/_sidecar/

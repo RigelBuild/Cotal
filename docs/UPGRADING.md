@@ -7,6 +7,47 @@ do when a deployment already exists, holds credentials, and cannot be torn down 
 release that breaks a running deployment gets a section here. Each section names what migrates on
 its own, what does not, and the order of the steps.
 
+## Workflow workers require the host's language package version
+
+The shipped workflow worker checks its `@cotal-ai/lang` package version against the version the host
+loaded. If they differ, the worker refuses before announcing readiness or running the program.
+The refusal names both versions and asks you to restart the manager. A host from an older release
+that does not send this version reports `unreported` and is refused too. The failed run does not
+end the manager process.
+
+After installing a new Cotal version, restart the manager through its supervisor before starting
+or resuming workflows. Keep the manager and its language package on the same installed version.
+An in-place package update does not update modules already loaded in the running host.
+
+This check compares package versions. It does not verify file contents replaced under the same
+version or provide a rolling-upgrade guarantee.
+
+## An incompatible delivery store answer prevents manager startup
+
+If delivery returns an unreadable SecretStore answer, the manager refuses startup or credential
+renewal. The refusal preserves the parser's reason and asks you to check that delivery and manager
+use the same Cotal version. The answer does not report a version, so a parse failure cannot establish
+which version the daemon runs. For example, delivery 0.68.0 names its responder but its filesystem
+store identity lacks the `id` required by later managers.
+
+When a manager started by the retained launcher exits during boot, `up` displays the private log
+path. If that launch's owned log ends with an error line, it also displays that line. It does not
+quote earlier errors, a replacement log or an ordinary console URL line.
+
+Restart delivery on its host through the supervisor that started it, using the manager's Cotal
+version. For a saved local delivery service, run `cotal down delivery --space <space>`, then
+`cotal up --space <space>`. Named `down` commands operate on saved services; they do not stop a legacy
+daemon represented only by a pidfile.
+
+For a legacy pidfile root, use the current CLI to run `cotal down` from the original folder, without
+`--space`. This stops that folder's whole stack. Then run `cotal up --space <space>`. An older CLI
+may refuse the newer connector seed generation, so do not switch back to the old executable for the
+stop. A root from before 0.111.0 also needs the [issued-store migration](#issued-authority-stores-after-01110)
+when `up` asks for it.
+
+This diagnostic does not provide a rolling upgrade or pin a running manager's worker modules to
+its loaded version. Those are separate upgrade concerns.
+
 ## The web dashboard starts on the space's own credential
 
 `cotal up` on a static space now mints a read-only `observer` credential for the dashboard, the
@@ -37,6 +78,28 @@ server is refused with a message naming `cotal setup`.
 - `cotal status` shows a `Claude wake channel` row with the entry's state.
 - A plain Claude Code session loads the entry and the installed plugin's server, which are the same
   command and arguments, as one process.
+
+## Identity mint helpers take a mint
+
+`createManagerInstanceIdentity` and `createAuthInstanceIdentity` from `@cotal-ai/workspace` now
+take `mint`, a function that returns the identity. They call it after reading no existing record.
+They used to take the identity itself, so minting that argument happened before the helper could
+adopt an existing record.
+
+A restart still returns the stored identity. A fresh root still creates one record, and a second
+start that arrives while the first is creating it still adopts that record.
+
+### What stops working
+
+A call that passes an identity object no longer typechecks. Plain JavaScript that still passes one
+fails when the helper tries to call it. `loadManagerInstanceIdentity` and
+`loadAuthInstanceIdentity` are unchanged.
+
+### Before the upgrade
+
+Pass a function that returns the identity. A caller that already holds one passes
+`() => identity`. A caller that used to read the record and mint only when it was missing now makes
+the one call, and the helper does that read.
 
 ## More streams take a history limit after 0.139.1
 

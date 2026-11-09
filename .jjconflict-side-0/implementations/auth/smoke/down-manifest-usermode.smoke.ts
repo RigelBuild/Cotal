@@ -1,0 +1,309 @@
+/**
+ * `down -f` USER-MODE teardown live smoke — the crashed-manager residual (found in review of the
+ * per-agent seam migration, and hit for real when a mesh supervisor died mid-flight):
+ *
+ *   user-mode deploy recorded in a `spawn -f` ownership ledger → the manager is SIGKILLed before any
+ *   deprovision runs (its lease key lingers to the bucket TTL) → a FRESH supervisor answers control
+ *   with an empty roster → `down -f`. The dead agent resolves as "not running", and before the fix
+ *   the local cred loop knew only the static `<name>.creds`, so it read the user-mode agent as
+ *   "proven absent": the ledger was deleted while the actor token, sentinel cred, and provider grant
+ *   row (the standing MINT authority) survived, with no scoped retry record left.
+ *
+ * Asserts the FIXED behavior: teardown recognizes the ledgered principal id as user-mode, revokes
+ * the grant row (owner+actor-keyed), deletes the token + sentinel through the secret-store seam,
+ * and only then completes and deletes the ledger. Scenario B repeats the choreography with a
+ * TAMPERED (symlinked) token materialization and asserts the suspect gate leaves the files in
+ * place while STILL revoking the grant row, so completion never deletes the ledger over standing
+ * authority.
+ *
+ * `spawn -f <manifest>` no longer deploys (it takes a persona file) and `team deploy` refuses a user
+ * mesh, so nothing current writes that ledger. `down -f` stays the retained route for a ledger an
+ * earlier release wrote (docs/UPGRADING.md, "Team commands in 0.91.0"), and this suite now guards
+ * that upgrade path: each agent launches through `spawn --detach` from a persona, and the suite writes
+ * the cotal-ledger/v1 file a pre-redesign `spawn -f` of the manifest would have left for it.
+ *
+ * Real binary, real broker, real Better Auth IdP, real device login; the worker boots a real
+ * `claude` connector child (killed immediately), so the claude CLI must be on PATH. Kills only
+ * what it starts. Needs nats-server on PATH; `pnpm build` first (subprocesses run built dist).
+ * Run: pnpm smoke:down-manifest-usermode:live
+ */
+import { spawn } from "node:child_process";
+import { execSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { canonicalLocalProcessPath, MANAGER_PIDFILE } from "@cotal-ai/workspace";
+import { assertSmokeSandboxDown, recordSmokeSandbox } from "@cotal-ai/smoke-kit";
+import { betterAuth } from "better-auth";
+import { memoryAdapter } from "better-auth/adapters/memory";
+import { jwt } from "better-auth/plugins/jwt";
+import { deviceAuthorization } from "better-auth/plugins/device-authorization";
+import { bearer } from "better-auth/plugins/bearer";
+import { toNodeHandler } from "better-auth/node";
+import { pickFreePort } from "./_free-port.js";
+import { approveDevice } from "./_device-approval.js";
+const TSX = join(import.meta.dirname, "..", "..", "..", "node_modules", ".bin", "tsx");
+
+const home = mkdtempSync(join(tmpdir(), "cotal-downf-home-"));
+const configDir = join(home, "xdg");
+process.env.COTAL_HOME = home;
+process.env.XDG_CONFIG_HOME = configDir;
+const root = mkdtempSync(join(tmpdir(), "cotal-downf-root-"));
+const sandbox = recordSmokeSandbox({ root, cotalHome: home, xdgConfigHome: configDir });
+const childEnv = { ...process.env, COTAL_HOME: home, XDG_CONFIG_HOME: configDir, COTAL_SKIP_CONNECTOR_SEED: "1" };
+
+const { establishIdpSession } = await import("../src/index.js");
+const { agentCredsDir } = await import("@cotal-ai/workspace");
+const { buildLedger, buildLedgerAgentRow, hashManifestSource, writeLedger } = await import("../../cli/src/lib/manifest/ledger.js");
+type DeviceLoginPrompt = import("../src/index.js").DeviceLoginPrompt;
+
+let pass = 0, fail = 0;
+const check = (name: string, cond: boolean, extra?: unknown) => {
+  if (cond) { pass++; console.log(`  ✓ ${name}`); }
+  else { fail++; console.log(`  ✗ FAIL: ${name}`, extra ?? ""); }
+};
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const PORT = await pickFreePort();
+const SERVER = `nats://127.0.0.1:${PORT}`;
+const SPACE = `downf-${Math.floor(Math.random() * 1e6)}`;
+const CLIENT_ID = "cotal-cli";
+const BIN = join(import.meta.dirname, "..", "..", "..", "bin", "cotal.ts");
+const CLAUDE = join(import.meta.dirname, "..", "..", "..", "extensions", "connector-claude-code");
+
+function cotal(args: string[], opts: { timeoutMs?: number } = {}): Promise<{ status: number | null; out: string; stdout: string }> {
+  return new Promise((resolvePromise) => {
+    const options = { cwd: root, env: childEnv };
+    assertSmokeSandboxDown(sandbox, args, options);
+    const child = spawn(TSX, [BIN, ...args], options);
+    let out = "", stdout = "";
+    child.stdout.on("data", (d: Buffer) => { out += d.toString(); stdout += d.toString(); });
+    child.stderr.on("data", (d: Buffer) => { out += d.toString(); });
+    const t = setTimeout(() => child.kill("SIGKILL"), opts.timeoutMs ?? 120_000);
+    child.on("close", (status) => { clearTimeout(t); resolvePromise({ status, out, stdout }); });
+  });
+}
+
+/** Launch `name` with `spawn --detach` from a persona that pins the claude connector, then write the
+ *  cotal-ledger/v1 file a pre-redesign `spawn -f <manifest>` would have left for it: one agent row
+ *  carrying the joined name, principal id and lifecycle uid from the launch receipt, indexed by the
+ *  manifest's content hash so `down -f <manifest>` finds it. Nothing is written when the launch did
+ *  not return a joined identity, so the cells below report that instead. */
+async function launchWithPreRedesignLedger(name: string, manifest: string, timeoutMs: number) {
+  const persona = `---\nname: ${name}\nagent: claude\n---\nIdle ${name} for the teardown repro.\n`;
+  mkdirSync(join(root, ".cotal", "agents"), { recursive: true });
+  writeFileSync(join(root, ".cotal", "agents", `${name}.md`), persona);
+  const run = await cotal(["spawn", name, "--detach", "--space", SPACE, "--json"], { timeoutMs });
+  let joined: { name: string; id: string; lifecycleUid: string } | undefined;
+  try {
+    type Receipt = { outcome?: string; result?: { name?: unknown; id?: unknown; lifecycleUid?: unknown } | null };
+    const envelope = JSON.parse(run.stdout.trim().split("\n").pop() ?? "") as Receipt;
+    const r = envelope.result;
+    if (envelope.outcome === "ok" && r && typeof r.name === "string" && typeof r.id === "string" && typeof r.lifecycleUid === "string")
+      joined = { name: r.name, id: r.id, lifecycleUid: r.lifecycleUid };
+  } catch { /* not one receipt; the launch cell prints the output */ }
+  if (run.status === 0 && joined)
+    writeLedger(root, buildLedger({
+      runId: randomBytes(8).toString("hex"), space: SPACE, server: SERVER,
+      manifestHash: hashManifestSource(readFileSync(manifest, "utf8")), manifestPath: manifest, channels: [],
+      agents: [buildLedgerAgentRow({ requested: name, hash: hashManifestSource(persona) }, joined)],
+    }));
+  return { ...run, joined };
+}
+
+// ---------- real Better Auth IdP ----------
+let handler: ReturnType<typeof toNodeHandler> | undefined;
+const idpSrv = createServer((req, res) => handler!(req, res));
+await new Promise<void>((r) => idpSrv.listen(0, "127.0.0.1", r));
+const origin = `http://127.0.0.1:${(idpSrv.address() as AddressInfo).port}`;
+const base = `${origin}/api/auth`;
+const ba = betterAuth({
+  baseURL: origin,
+  secret: "repro-only-better-auth-secret-0123456789",
+  database: memoryAdapter({ user: [], session: [], account: [], verification: [], jwks: [], deviceCode: [] }),
+  emailAndPassword: { enabled: true },
+  plugins: [
+    jwt({ jwt: { issuer: origin, audience: origin } }),
+    deviceAuthorization({ expiresIn: "2m", interval: "1s", validateClient: (id) => id === CLIENT_ID }),
+    bearer(),
+  ],
+});
+handler = toNodeHandler(ba);
+const signup = await ba.api.signUpEmail({
+  body: { email: "human@example.test", password: "correct-horse-battery", name: "Human 42" },
+  returnHeaders: true,
+});
+const cookie = signup.headers.get("set-cookie")!.split(";")[0];
+const approve = (userCode: string) => approveDevice({ base, cookie, origin }, userCode);
+
+let superviseChild: ReturnType<typeof spawn> | undefined;
+try {
+  console.log("1) up --user-auth");
+  const up = await cotal(["up", "--user-auth", "--idp", base, "--detach", "--server", SERVER, "--space", SPACE]);
+  check("up exits 0", up.status === 0, up.out.slice(-800));
+
+  console.log("2) device login + full cli grant");
+  const { sub } = await establishIdpSession({
+    dir: home, idpUrl: base, clientId: CLIENT_ID,
+    onPrompt: (p: DeviceLoginPrompt) => approve(p.userCode),
+  });
+  const grant = await cotal(["actor", "grant", "cli", "--sub", sub, "--full", "--scope", "spawn,role:default,admin", "--label", "repro human"]);
+  check("actor grant cli succeeds", grant.status === 0 && grant.out.includes("Actor grant stored"), grant.out.slice(-400));
+  // Isolated XDG + skip-seed: this suite is not a first-run seeder. The worker
+  // still boots a `claude` child, so install THIS WORKTREE's connector into the
+  // sandbox prefix, never the operator store.
+  const extAdd = await cotal(["ext", "add", CLAUDE]);
+  check("sandbox ext add of the worktree claude connector succeeds", extAdd.status === 0, extAdd.out);
+
+  console.log("3) user-mode launch (spawn --detach) + the ledger a pre-redesign `spawn -f` left");
+  // The manifest an earlier release deployed with `spawn -f`; `down -f` finds its ledger by this
+  // file's content hash.
+  const manifest = join(root, "mesh.yaml");
+  writeFileSync(manifest, `apiVersion: cotal/v1
+kind: Mesh
+space: ${SPACE}
+agent: claude
+broker: { servers: "${SERVER}", auth: user, idp: "${base}" }
+channels: {}
+agents:
+  worker:
+    instructions: "Idle worker for the teardown repro."
+`);
+  const deploy = await launchWithPreRedesignLedger("worker", manifest, 180_000);
+  check("spawn --detach exits 0 and its receipt names the joined worker", deploy.status === 0 && deploy.joined?.name === "worker", deploy.out.slice(-1200));
+
+  // This mesh's own segment (P1), not the bare creds dir: the manager files its incarnations under
+  // the space it supervises, so a scan of the flat level finds nothing and every "gone" check below
+  // would read true before teardown ever ran.
+  const credsDir = agentCredsDir(root, SPACE);
+  // The manager files each incarnation's user secrets lifecycle-keyed: `<name>.<uid>.<kind>`. Find
+  // the current incarnation's file by prefix (robust to the uid); returns a never-matching sentinel
+  // path when none exists, so a post-teardown "gone" check reads false correctly.
+  const incFile = (name: string, kind: string): string => {
+    const re = new RegExp(`^${name}\\.[a-z0-9]{26,32}\\.${kind.replace(/\./g, "\\.")}$`);
+    let hit: string | undefined;
+    try { hit = readdirSync(credsDir).find((f) => re.test(f)); } catch { /* no creds dir yet */ }
+    return join(credsDir, hit ?? `${name}.__no-incarnation__.${kind}`);
+  };
+  check("user-mode standing secrets exist (actor-token + sentinel)",
+    existsSync(incFile("worker", "actor-token")) && existsSync(incFile("worker", "sentinel.creds")));
+  check("no static creds file was written (user mode)", !existsSync(incFile("worker", "creds")) && !existsSync(join(credsDir, "worker.creds")));
+  const manifestsDir = join(root, ".cotal", "manifests");
+  const ledgers = readdirSync(manifestsDir).filter((f) => f.endsWith(".json"));
+  check("exactly one ownership ledger exists (the stand-in for a pre-redesign `spawn -f` ledger)", ledgers.length === 1, ledgers);
+  const ledger = JSON.parse(readFileSync(join(manifestsDir, ledgers[0]), "utf8")) as { created: { agents: Array<{ name: string; id: string }> } };
+  const entry = ledger.created.agents.find((a) => a.name === "worker");
+  check("ledger id is the user-mode principal (u_….worker)", /^u_[a-z2-7]{26}\.worker$/.test(entry?.id ?? ""), entry);
+
+  console.log("4) crash: SIGKILL the manager and its child (deprovision never runs)");
+  const mgrPid = Number(readFileSync(canonicalLocalProcessPath(MANAGER_PIDFILE, { root, space: SPACE }), "utf8").trim());
+  // Children first (the launched worker's process tree), then the manager itself.
+  const kids = (() => { try { return execSync(`pgrep -P ${mgrPid}`, { encoding: "utf8" }).trim().split("\n").filter(Boolean); } catch { return []; } })();
+  for (const k of kids) { try { execSync(`pkill -9 -P ${k}`); } catch { /* leaf */ } try { process.kill(Number(k), "SIGKILL"); } catch { /* gone */ } }
+  try { process.kill(mgrPid, "SIGKILL"); } catch { /* gone */ }
+  await wait(500);
+  check("manager is dead", (() => { try { process.kill(mgrPid, 0); return false; } catch { return true; } })());
+  check("secrets still standing after the crash",
+    existsSync(incFile("worker", "actor-token")) && existsSync(incFile("worker", "sentinel.creds")));
+
+  console.log("5) fresh supervisor (empty roster) answers control");
+  // The crashed holder's lease key lingers until the bucket TTL (MANAGER_LEASE_TTL_MS = 10s) and
+  // blocks a replacement's acquire — wait it out first, like the real recovery did.
+  await wait(13_000);
+  let superviseOut = "";
+  superviseChild = spawn(TSX, [BIN, "supervise", "--space", SPACE, "--server", SERVER], {
+    cwd: root, env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
+  superviseChild.stdout!.on("data", (d: Buffer) => { superviseOut += d.toString(); });
+  superviseChild.stderr!.on("data", (d: Buffer) => { superviseOut += d.toString(); });
+  // Wait until the replacement holds the lease and answers ps (down -f needs controlOk).
+  let psOk = false;
+  for (let i = 0; i < 60 && !psOk; i++) {
+    await wait(1000);
+    const ps = await cotal(["ps", "--space", SPACE], { timeoutMs: 20_000 });
+    psOk = ps.status === 0;
+  }
+  check("replacement manager answers ps", psOk, superviseOut.slice(-800));
+
+  console.log("6) down -f removes the user-mode authority WITH the ledger");
+  // Resolve the exact incarnation files BEFORE teardown deletes them (a post-delete glob would
+  // trivially pass its own "gone" sentinel).
+  const workerTok = incFile("worker", "actor-token");
+  const workerSen = incFile("worker", "sentinel.creds");
+  const down = await cotal(["down", "-f", manifest], { timeoutMs: 120_000 });
+  check("down -f exits 0 (complete teardown)", down.status === 0, down.out.slice(-800));
+  check("teardown reports the user-mode authority removal", /removed user-mode authority for worker/.test(down.out), down.out.slice(-800));
+  check("ownership ledger is deleted (teardown complete)", readdirSync(manifestsDir).filter((f) => f.endsWith(".json")).length === 0);
+  check("actor token is gone", !existsSync(workerTok));
+  check("sentinel cred is gone", !existsSync(workerSen));
+  const actors = await cotal(["actor", "list"], { timeoutMs: 30_000 });
+  check("the grant row is revoked (actor list has no worker)", actors.status === 0 && !/\bworker\b/.test(actors.out), actors.out.slice(-400));
+
+  // ---- scenario B: a SUSPECT materialization must never shield the grant row ----
+  // (round-2 panel gate: symlink/irregular token or sentinel → files left in place, but the row
+  // is STILL revoked and completion may proceed, because nothing standing survives.)
+  console.log("7) second launch + ledger, crash, TAMPERED token (symlink): row revoked, ledger completes, files left");
+  const manifest2 = join(root, "mesh2.yaml");
+  writeFileSync(manifest2, `apiVersion: cotal/v1
+kind: Mesh
+space: ${SPACE}
+agent: claude
+broker: { servers: "${SERVER}", auth: user, idp: "${base}" }
+channels: {}
+agents:
+  worker2:
+    instructions: "Second worker for the suspect-materialization boundary."
+`);
+  const deploy2 = await launchWithPreRedesignLedger("worker2", manifest2, 180_000);
+  check("second spawn --detach exits 0 and joined worker2 (its ledger stands in for a pre-redesign `spawn -f`)",
+    deploy2.status === 0 && deploy2.joined?.name === "worker2", deploy2.out.slice(-800));
+  check("worker2 secrets exist", existsSync(incFile("worker2", "actor-token")) && existsSync(incFile("worker2", "sentinel.creds")));
+  // Crash the replacement supervisor + its child, again before any deprovision. The supervise
+  // cmdline carries this run's unique random SPACE token, so the sweep is surgically scoped.
+  const mgrPids2 = (() => { try { return execSync(`pgrep -f "supervise.*${SPACE}"`, { encoding: "utf8" }).trim().split("\n").filter(Boolean); } catch { return []; } })();
+  check("found the replacement supervisor to crash", mgrPids2.length > 0, mgrPids2);
+  for (const p of mgrPids2) {
+    const kids2 = (() => { try { return execSync(`pgrep -P ${p}`, { encoding: "utf8" }).trim().split("\n").filter(Boolean); } catch { return []; } })();
+    for (const k of kids2) { try { execSync(`pkill -9 -P ${k}`); } catch { /* leaf */ } try { process.kill(Number(k), "SIGKILL"); } catch { /* gone */ } }
+    try { process.kill(Number(p), "SIGKILL"); } catch { /* gone */ }
+  }
+  await wait(500);
+  const worker2Tok = incFile("worker2", "actor-token"); // the exact incarnation path the teardown will look for
+  check("worker2 secrets still standing after the second crash", existsSync(worker2Tok));
+  // TAMPER: swap the token materialization for a symlink — the suspect gate's boundary input. The
+  // symlink must sit at the SAME lifecycle-keyed path the teardown derives from the ledger uid.
+  writeFileSync(join(root, "decoy"), "not-a-secret");
+  rmSync(worker2Tok);
+  symlinkSync(join(root, "decoy"), worker2Tok);
+  await wait(13_000); // the crashed holder's lease again lingers to the bucket TTL
+  superviseChild = spawn(TSX, [BIN, "supervise", "--space", SPACE, "--server", SERVER], {
+    cwd: root, env: childEnv, stdio: "ignore" });
+  let psOk2 = false;
+  for (let i = 0; i < 60 && !psOk2; i++) {
+    await wait(1000);
+    const ps = await cotal(["ps", "--space", SPACE], { timeoutMs: 20_000 });
+    psOk2 = ps.status === 0;
+  }
+  check("third supervisor answers ps", psOk2);
+  const down2 = await cotal(["down", "-f", manifest2], { timeoutMs: 120_000 });
+  check("suspect: down -f exits 0 (a suspect file never shields the row)", down2.status === 0, down2.out.slice(-800));
+  check("suspect: warns and leaves the tampered file in place",
+    /unreadable\/unverifiable/.test(down2.out) && existsSync(worker2Tok), down2.out.slice(-600));
+  check("suspect: second ledger is deleted (teardown completes)", readdirSync(manifestsDir).filter((f) => f.endsWith(".json")).length === 0);
+  const actors2 = await cotal(["actor", "list"], { timeoutMs: 30_000 });
+  check("suspect: worker2 grant row IS revoked (no standing authority)", actors2.status === 0 && !/\bworker2\b/.test(actors2.out), actors2.out.slice(-400));
+
+  console.log(`\nDOWN-MANIFEST USER-MODE SMOKE ${fail === 0 ? "OK ✅" : "FAILED ❌"}  (${pass} passed, ${fail} failed)`);
+  if (fail) process.exitCode = 1;
+} catch (e) {
+  console.error("repro threw:", e);
+  process.exitCode = 1;
+} finally {
+  try { superviseChild?.kill("SIGKILL"); } catch { /* gone */ }
+  await cotal(["down"], { timeoutMs: 60_000 }).catch(() => ({ status: 1, out: "" }));
+  idpSrv.close();
+  rmSync(home, { recursive: true, force: true });
+  rmSync(root, { recursive: true, force: true });
+}

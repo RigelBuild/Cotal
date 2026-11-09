@@ -1,0 +1,1371 @@
+{
+  "officialSuiteRevision": "7de0e6a06031ede80028583dd45d0cd41105ae5b",
+  "publishedAjvGitHead": "0fba0b8e649909613cfce0999b149cd08f4a4987",
+  "official15": [
+    {
+      "id": "M01",
+      "case": "dynamicRef.json:0:A $dynamicRef to a $dynamicAnchor in the same schema resource behaves like a normal $ref to an $anchor",
+      "description": "An array of strings is valid",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://test.json-schema.org/dynamicRef-dynamicAnchor-same-schema/root",
+        "type": "array",
+        "items": {
+          "$dynamicRef": "#items"
+        },
+        "$defs": {
+          "foo": {
+            "$dynamicAnchor": "items",
+            "type": "string"
+          }
+        }
+      },
+      "value": [
+        "foo",
+        "bar"
+      ],
+      "expected": true,
+      "closureDigest": "sha256:e56c4a9ca922c70bcb71308579b77c09c8804a3631f045a8e420a17f03bd680b"
+    },
+    {
+      "id": "M02",
+      "case": "dynamicRef.json:1:A $dynamicRef to an $anchor in the same schema resource behaves like a normal $ref to an $anchor",
+      "description": "An array of strings is valid",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://test.json-schema.org/dynamicRef-anchor-same-schema/root",
+        "type": "array",
+        "items": {
+          "$dynamicRef": "#items"
+        },
+        "$defs": {
+          "foo": {
+            "$anchor": "items",
+            "type": "string"
+          }
+        }
+      },
+      "value": [
+        "foo",
+        "bar"
+      ],
+      "expected": true,
+      "closureDigest": "sha256:30fc54514669263be57c580dfaebc464d6ab144900efb5468ad491aee11b7d31"
+    },
+    {
+      "id": "M03",
+      "case": "dynamicRef.json:18:$dynamicRef points to a boolean schema",
+      "description": "follow $dynamicRef to a false schema",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+          "true": true,
+          "false": false
+        },
+        "properties": {
+          "true": {
+            "$dynamicRef": "#/$defs/true"
+          },
+          "false": {
+            "$dynamicRef": "#/$defs/false"
+          }
+        }
+      },
+      "value": {
+        "false": 1
+      },
+      "expected": false,
+      "closureDigest": "sha256:3f1e05c1eda32819a22cd90d8418e29c79525e74c5555cbad373aa23a880d8b2"
+    },
+    {
+      "id": "M09",
+      "case": "unevaluatedItems.json:8:unevaluatedItems with nested items",
+      "description": "with no additional items",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "unevaluatedItems": {
+          "type": "boolean"
+        },
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            }
+          },
+          true
+        ]
+      },
+      "value": [
+        "yes",
+        "no"
+      ],
+      "expected": true,
+      "closureDigest": "sha256:ecf4239d003352dd41a086df7d3ef1cebd6fc5bb0a956cc514563c56e88adab2"
+    },
+    {
+      "id": "M10",
+      "case": "unevaluatedItems.json:8:unevaluatedItems with nested items",
+      "description": "with invalid additional item",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "unevaluatedItems": {
+          "type": "boolean"
+        },
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            }
+          },
+          true
+        ]
+      },
+      "value": [
+        "yes",
+        false
+      ],
+      "expected": false,
+      "closureDigest": "sha256:ecf4239d003352dd41a086df7d3ef1cebd6fc5bb0a956cc514563c56e88adab2"
+    },
+    {
+      "id": "M11",
+      "case": "unevaluatedItems.json:21:unevaluatedItems depends on adjacent contains",
+      "description": "contains passes, second item is not evaluated",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "prefixItems": [
+          true
+        ],
+        "contains": {
+          "type": "string"
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        1,
+        2,
+        "foo"
+      ],
+      "expected": false,
+      "closureDigest": "sha256:859aa1d3db0154910c7547df1eb8fbefa05e4ca51200bfc05c5a6f4d73f0d990"
+    },
+    {
+      "id": "M12",
+      "case": "unevaluatedItems.json:22:unevaluatedItems depends on multiple nested contains",
+      "description": "7 not evaluated, fails unevaluatedItems",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "allOf": [
+          {
+            "contains": {
+              "multipleOf": 2
+            }
+          },
+          {
+            "contains": {
+              "multipleOf": 3
+            }
+          }
+        ],
+        "unevaluatedItems": {
+          "multipleOf": 5
+        }
+      },
+      "value": [
+        2,
+        3,
+        4,
+        7,
+        8
+      ],
+      "expected": false,
+      "closureDigest": "sha256:926a9fbc4a17600f75851dea131b96ca391b6beb064e587b15332eea71c3f8fb"
+    },
+    {
+      "id": "M13",
+      "case": "unevaluatedItems.json:23:unevaluatedItems and contains interact to control item dependency relationship",
+      "description": "only b's are invalid",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "contains": {
+            "const": "a"
+          }
+        },
+        "then": {
+          "if": {
+            "contains": {
+              "const": "b"
+            }
+          },
+          "then": {
+            "if": {
+              "contains": {
+                "const": "c"
+              }
+            }
+          }
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        "b",
+        "b"
+      ],
+      "expected": false,
+      "closureDigest": "sha256:19d0c9c67a4802d2496f9f6cb639f7af4c5f05df98d299561289745c05406eaa"
+    },
+    {
+      "id": "M14",
+      "case": "unevaluatedItems.json:23:unevaluatedItems and contains interact to control item dependency relationship",
+      "description": "only c's are invalid",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "contains": {
+            "const": "a"
+          }
+        },
+        "then": {
+          "if": {
+            "contains": {
+              "const": "b"
+            }
+          },
+          "then": {
+            "if": {
+              "contains": {
+                "const": "c"
+              }
+            }
+          }
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        "c",
+        "c"
+      ],
+      "expected": false,
+      "closureDigest": "sha256:19d0c9c67a4802d2496f9f6cb639f7af4c5f05df98d299561289745c05406eaa"
+    },
+    {
+      "id": "M15",
+      "case": "unevaluatedItems.json:23:unevaluatedItems and contains interact to control item dependency relationship",
+      "description": "only b's and c's are invalid",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "contains": {
+            "const": "a"
+          }
+        },
+        "then": {
+          "if": {
+            "contains": {
+              "const": "b"
+            }
+          },
+          "then": {
+            "if": {
+              "contains": {
+                "const": "c"
+              }
+            }
+          }
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        "c",
+        "b",
+        "c",
+        "b",
+        "c"
+      ],
+      "expected": false,
+      "closureDigest": "sha256:19d0c9c67a4802d2496f9f6cb639f7af4c5f05df98d299561289745c05406eaa"
+    },
+    {
+      "id": "M16",
+      "case": "unevaluatedItems.json:23:unevaluatedItems and contains interact to control item dependency relationship",
+      "description": "only a's and c's are invalid",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "contains": {
+            "const": "a"
+          }
+        },
+        "then": {
+          "if": {
+            "contains": {
+              "const": "b"
+            }
+          },
+          "then": {
+            "if": {
+              "contains": {
+                "const": "c"
+              }
+            }
+          }
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        "c",
+        "a",
+        "c",
+        "a",
+        "c"
+      ],
+      "expected": false,
+      "closureDigest": "sha256:19d0c9c67a4802d2496f9f6cb639f7af4c5f05df98d299561289745c05406eaa"
+    },
+    {
+      "id": "M17",
+      "case": "unevaluatedItems.json:24:unevaluatedItems with minContains = 0",
+      "description": "all items evaluated by contains",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "contains": {
+          "type": "string"
+        },
+        "minContains": 0,
+        "unevaluatedItems": false
+      },
+      "value": [
+        "foo",
+        "bar"
+      ],
+      "expected": true,
+      "closureDigest": "sha256:5acc35ff67d84755056b8486df2c1c8aa26175037a5e3cc76eaa2258646eb7fb"
+    },
+    {
+      "id": "M18",
+      "case": "unevaluatedItems.json:27:unevaluatedItems can see annotations from if without then and else",
+      "description": "valid in case if is evaluated",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "prefixItems": [
+            {
+              "const": "a"
+            }
+          ]
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        "a"
+      ],
+      "expected": true,
+      "closureDigest": "sha256:597d4cb86b9b1a3a006ac0639bb6839315471e1e3548ce88dc4bf6bbb2590d5f"
+    },
+    {
+      "id": "M19",
+      "case": "unevaluatedProperties.json:15:unevaluatedProperties with if/then/else, then not defined",
+      "description": "when if is true and has no unevaluated properties",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "properties": {
+            "foo": {
+              "const": "then"
+            }
+          },
+          "required": [
+            "foo"
+          ]
+        },
+        "else": {
+          "properties": {
+            "baz": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "baz"
+          ]
+        },
+        "unevaluatedProperties": false
+      },
+      "value": {
+        "foo": "then"
+      },
+      "expected": true,
+      "closureDigest": "sha256:0b8139beb16977587624fd5ff75306f85d69b07da39790e45ffdedd8dd48decd"
+    },
+    {
+      "id": "M20",
+      "case": "unevaluatedProperties.json:15:unevaluatedProperties with if/then/else, then not defined",
+      "description": "when if is false and has unevaluated properties",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "properties": {
+            "foo": {
+              "const": "then"
+            }
+          },
+          "required": [
+            "foo"
+          ]
+        },
+        "else": {
+          "properties": {
+            "baz": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "baz"
+          ]
+        },
+        "unevaluatedProperties": false
+      },
+      "value": {
+        "foo": "else",
+        "baz": "baz"
+      },
+      "expected": false,
+      "closureDigest": "sha256:0b8139beb16977587624fd5ff75306f85d69b07da39790e45ffdedd8dd48decd"
+    }
+  ],
+  "independent33": [
+    {
+      "id": "M01-C1",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://test.json-schema.org/dynamicRef-dynamicAnchor-same-schema/root",
+        "type": "array",
+        "items": {
+          "$dynamicRef": "#items"
+        },
+        "$defs": {
+          "foo": {
+            "$dynamicAnchor": "items",
+            "type": "string"
+          }
+        }
+      },
+      "value": [
+        "foo"
+      ],
+      "expected": true,
+      "closureDigest": "sha256:e56c4a9ca922c70bcb71308579b77c09c8804a3631f045a8e420a17f03bd680b",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M01-C2",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://test.json-schema.org/dynamicRef-dynamicAnchor-same-schema/root",
+        "type": "array",
+        "items": {
+          "$dynamicRef": "#items"
+        },
+        "$defs": {
+          "foo": {
+            "$dynamicAnchor": "items",
+            "type": "string"
+          }
+        }
+      },
+      "value": [
+        1
+      ],
+      "expected": false,
+      "closureDigest": "sha256:e56c4a9ca922c70bcb71308579b77c09c8804a3631f045a8e420a17f03bd680b",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M02-C1",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://test.json-schema.org/dynamicRef-anchor-same-schema/root",
+        "type": "array",
+        "items": {
+          "$dynamicRef": "#items"
+        },
+        "$defs": {
+          "foo": {
+            "$anchor": "items",
+            "type": "string"
+          }
+        }
+      },
+      "value": [
+        "foo"
+      ],
+      "expected": true,
+      "closureDigest": "sha256:30fc54514669263be57c580dfaebc464d6ab144900efb5468ad491aee11b7d31",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M02-C2",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://test.json-schema.org/dynamicRef-anchor-same-schema/root",
+        "type": "array",
+        "items": {
+          "$dynamicRef": "#items"
+        },
+        "$defs": {
+          "foo": {
+            "$anchor": "items",
+            "type": "string"
+          }
+        }
+      },
+      "value": [
+        1
+      ],
+      "expected": false,
+      "closureDigest": "sha256:30fc54514669263be57c580dfaebc464d6ab144900efb5468ad491aee11b7d31",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M03-C1",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+          "true": true,
+          "false": false
+        },
+        "properties": {
+          "true": {
+            "$dynamicRef": "#/$defs/true"
+          },
+          "false": {
+            "$dynamicRef": "#/$defs/false"
+          }
+        }
+      },
+      "value": {
+        "true": 1
+      },
+      "expected": true,
+      "closureDigest": "sha256:3f1e05c1eda32819a22cd90d8418e29c79525e74c5555cbad373aa23a880d8b2",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M03-C2",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+          "true": true,
+          "false": false
+        },
+        "properties": {
+          "true": {
+            "$dynamicRef": "#/$defs/true"
+          },
+          "false": {
+            "$dynamicRef": "#/$defs/false"
+          }
+        }
+      },
+      "value": {
+        "false": 1
+      },
+      "expected": false,
+      "closureDigest": "sha256:3f1e05c1eda32819a22cd90d8418e29c79525e74c5555cbad373aa23a880d8b2",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M09-C1",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "unevaluatedItems": {
+          "type": "boolean"
+        },
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            }
+          },
+          true
+        ]
+      },
+      "value": [
+        "yes",
+        "no"
+      ],
+      "expected": true,
+      "closureDigest": "sha256:ecf4239d003352dd41a086df7d3ef1cebd6fc5bb0a956cc514563c56e88adab2",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M09-C2",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "unevaluatedItems": {
+          "type": "boolean"
+        },
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            }
+          },
+          true
+        ]
+      },
+      "value": [
+        false
+      ],
+      "expected": true,
+      "closureDigest": "sha256:ecf4239d003352dd41a086df7d3ef1cebd6fc5bb0a956cc514563c56e88adab2",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M09-C3",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "unevaluatedItems": {
+          "type": "boolean"
+        },
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            }
+          },
+          true
+        ]
+      },
+      "value": [
+        1
+      ],
+      "expected": false,
+      "closureDigest": "sha256:ecf4239d003352dd41a086df7d3ef1cebd6fc5bb0a956cc514563c56e88adab2",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M10-C1",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "unevaluatedItems": {
+          "type": "boolean"
+        },
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            }
+          },
+          true
+        ]
+      },
+      "value": [],
+      "expected": true,
+      "closureDigest": "sha256:ecf4239d003352dd41a086df7d3ef1cebd6fc5bb0a956cc514563c56e88adab2",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M10-C2",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "unevaluatedItems": {
+          "type": "boolean"
+        },
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            }
+          },
+          true
+        ]
+      },
+      "value": [
+        "yes",
+        false
+      ],
+      "expected": false,
+      "closureDigest": "sha256:ecf4239d003352dd41a086df7d3ef1cebd6fc5bb0a956cc514563c56e88adab2",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M11-C1",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "prefixItems": [
+          true
+        ],
+        "contains": {
+          "type": "string"
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        1,
+        "foo"
+      ],
+      "expected": true,
+      "closureDigest": "sha256:859aa1d3db0154910c7547df1eb8fbefa05e4ca51200bfc05c5a6f4d73f0d990",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M11-C2",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "prefixItems": [
+          true
+        ],
+        "contains": {
+          "type": "string"
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        1,
+        2,
+        "foo"
+      ],
+      "expected": false,
+      "closureDigest": "sha256:859aa1d3db0154910c7547df1eb8fbefa05e4ca51200bfc05c5a6f4d73f0d990",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M12-C1",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "allOf": [
+          {
+            "contains": {
+              "multipleOf": 2
+            }
+          },
+          {
+            "contains": {
+              "multipleOf": 3
+            }
+          }
+        ],
+        "unevaluatedItems": {
+          "multipleOf": 5
+        }
+      },
+      "value": [
+        2,
+        3,
+        5
+      ],
+      "expected": true,
+      "closureDigest": "sha256:926a9fbc4a17600f75851dea131b96ca391b6beb064e587b15332eea71c3f8fb",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M12-C2",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "allOf": [
+          {
+            "contains": {
+              "multipleOf": 2
+            }
+          },
+          {
+            "contains": {
+              "multipleOf": 3
+            }
+          }
+        ],
+        "unevaluatedItems": {
+          "multipleOf": 5
+        }
+      },
+      "value": [
+        2,
+        3,
+        7
+      ],
+      "expected": false,
+      "closureDigest": "sha256:926a9fbc4a17600f75851dea131b96ca391b6beb064e587b15332eea71c3f8fb",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M13-C1",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "contains": {
+            "const": "a"
+          }
+        },
+        "then": {
+          "if": {
+            "contains": {
+              "const": "b"
+            }
+          },
+          "then": {
+            "if": {
+              "contains": {
+                "const": "c"
+              }
+            }
+          }
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        "a",
+        "b",
+        "c"
+      ],
+      "expected": true,
+      "closureDigest": "sha256:19d0c9c67a4802d2496f9f6cb639f7af4c5f05df98d299561289745c05406eaa",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M13-C2",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "contains": {
+            "const": "a"
+          }
+        },
+        "then": {
+          "if": {
+            "contains": {
+              "const": "b"
+            }
+          },
+          "then": {
+            "if": {
+              "contains": {
+                "const": "c"
+              }
+            }
+          }
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        "b",
+        "b"
+      ],
+      "expected": false,
+      "closureDigest": "sha256:19d0c9c67a4802d2496f9f6cb639f7af4c5f05df98d299561289745c05406eaa",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M14-C1",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "contains": {
+            "const": "a"
+          }
+        },
+        "then": {
+          "if": {
+            "contains": {
+              "const": "b"
+            }
+          },
+          "then": {
+            "if": {
+              "contains": {
+                "const": "c"
+              }
+            }
+          }
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        "a",
+        "b",
+        "c"
+      ],
+      "expected": true,
+      "closureDigest": "sha256:19d0c9c67a4802d2496f9f6cb639f7af4c5f05df98d299561289745c05406eaa",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M14-C2",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "contains": {
+            "const": "a"
+          }
+        },
+        "then": {
+          "if": {
+            "contains": {
+              "const": "b"
+            }
+          },
+          "then": {
+            "if": {
+              "contains": {
+                "const": "c"
+              }
+            }
+          }
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        "c",
+        "c"
+      ],
+      "expected": false,
+      "closureDigest": "sha256:19d0c9c67a4802d2496f9f6cb639f7af4c5f05df98d299561289745c05406eaa",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M15-C1",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "contains": {
+            "const": "a"
+          }
+        },
+        "then": {
+          "if": {
+            "contains": {
+              "const": "b"
+            }
+          },
+          "then": {
+            "if": {
+              "contains": {
+                "const": "c"
+              }
+            }
+          }
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        "a",
+        "b",
+        "c"
+      ],
+      "expected": true,
+      "closureDigest": "sha256:19d0c9c67a4802d2496f9f6cb639f7af4c5f05df98d299561289745c05406eaa",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M15-C2",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "contains": {
+            "const": "a"
+          }
+        },
+        "then": {
+          "if": {
+            "contains": {
+              "const": "b"
+            }
+          },
+          "then": {
+            "if": {
+              "contains": {
+                "const": "c"
+              }
+            }
+          }
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        "c",
+        "b",
+        "c",
+        "b",
+        "c"
+      ],
+      "expected": false,
+      "closureDigest": "sha256:19d0c9c67a4802d2496f9f6cb639f7af4c5f05df98d299561289745c05406eaa",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M16-C1",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "contains": {
+            "const": "a"
+          }
+        },
+        "then": {
+          "if": {
+            "contains": {
+              "const": "b"
+            }
+          },
+          "then": {
+            "if": {
+              "contains": {
+                "const": "c"
+              }
+            }
+          }
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        "a",
+        "b",
+        "c"
+      ],
+      "expected": true,
+      "closureDigest": "sha256:19d0c9c67a4802d2496f9f6cb639f7af4c5f05df98d299561289745c05406eaa",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M16-C2",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "contains": {
+            "const": "a"
+          }
+        },
+        "then": {
+          "if": {
+            "contains": {
+              "const": "b"
+            }
+          },
+          "then": {
+            "if": {
+              "contains": {
+                "const": "c"
+              }
+            }
+          }
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        "c",
+        "a",
+        "c",
+        "a",
+        "c"
+      ],
+      "expected": false,
+      "closureDigest": "sha256:19d0c9c67a4802d2496f9f6cb639f7af4c5f05df98d299561289745c05406eaa",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M17-C1",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "contains": {
+          "type": "string"
+        },
+        "minContains": 0,
+        "unevaluatedItems": false
+      },
+      "value": [],
+      "expected": true,
+      "closureDigest": "sha256:5acc35ff67d84755056b8486df2c1c8aa26175037a5e3cc76eaa2258646eb7fb",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M17-C2",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "contains": {
+          "type": "string"
+        },
+        "minContains": 0,
+        "unevaluatedItems": false
+      },
+      "value": [
+        "foo"
+      ],
+      "expected": true,
+      "closureDigest": "sha256:5acc35ff67d84755056b8486df2c1c8aa26175037a5e3cc76eaa2258646eb7fb",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M17-C3",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "contains": {
+          "type": "string"
+        },
+        "minContains": 0,
+        "unevaluatedItems": false
+      },
+      "value": [
+        1
+      ],
+      "expected": false,
+      "closureDigest": "sha256:5acc35ff67d84755056b8486df2c1c8aa26175037a5e3cc76eaa2258646eb7fb",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M18-C1",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "prefixItems": [
+            {
+              "const": "a"
+            }
+          ]
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        "a"
+      ],
+      "expected": true,
+      "closureDigest": "sha256:597d4cb86b9b1a3a006ac0639bb6839315471e1e3548ce88dc4bf6bbb2590d5f",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M18-C2",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "prefixItems": [
+            {
+              "const": "a"
+            }
+          ]
+        },
+        "unevaluatedItems": false
+      },
+      "value": [
+        "b"
+      ],
+      "expected": false,
+      "closureDigest": "sha256:597d4cb86b9b1a3a006ac0639bb6839315471e1e3548ce88dc4bf6bbb2590d5f",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M19-C1",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "properties": {
+            "foo": {
+              "const": "then"
+            }
+          },
+          "required": [
+            "foo"
+          ]
+        },
+        "else": {
+          "properties": {
+            "baz": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "baz"
+          ]
+        },
+        "unevaluatedProperties": false
+      },
+      "value": {
+        "foo": "then"
+      },
+      "expected": true,
+      "closureDigest": "sha256:0b8139beb16977587624fd5ff75306f85d69b07da39790e45ffdedd8dd48decd",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M19-C2",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "properties": {
+            "foo": {
+              "const": "then"
+            }
+          },
+          "required": [
+            "foo"
+          ]
+        },
+        "else": {
+          "properties": {
+            "baz": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "baz"
+          ]
+        },
+        "unevaluatedProperties": false
+      },
+      "value": {
+        "baz": "ok"
+      },
+      "expected": true,
+      "closureDigest": "sha256:0b8139beb16977587624fd5ff75306f85d69b07da39790e45ffdedd8dd48decd",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M19-C3",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "properties": {
+            "foo": {
+              "const": "then"
+            }
+          },
+          "required": [
+            "foo"
+          ]
+        },
+        "else": {
+          "properties": {
+            "baz": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "baz"
+          ]
+        },
+        "unevaluatedProperties": false
+      },
+      "value": {
+        "foo": "else",
+        "baz": "ok"
+      },
+      "expected": false,
+      "closureDigest": "sha256:0b8139beb16977587624fd5ff75306f85d69b07da39790e45ffdedd8dd48decd",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M20-C1",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "properties": {
+            "foo": {
+              "const": "then"
+            }
+          },
+          "required": [
+            "foo"
+          ]
+        },
+        "else": {
+          "properties": {
+            "baz": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "baz"
+          ]
+        },
+        "unevaluatedProperties": false
+      },
+      "value": {
+        "foo": "then"
+      },
+      "expected": true,
+      "closureDigest": "sha256:0b8139beb16977587624fd5ff75306f85d69b07da39790e45ffdedd8dd48decd",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    },
+    {
+      "id": "M20-C2",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "if": {
+          "properties": {
+            "foo": {
+              "const": "then"
+            }
+          },
+          "required": [
+            "foo"
+          ]
+        },
+        "else": {
+          "properties": {
+            "baz": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "baz"
+          ]
+        },
+        "unevaluatedProperties": false
+      },
+      "value": {
+        "foo": "else",
+        "baz": "baz"
+      },
+      "expected": false,
+      "closureDigest": "sha256:0b8139beb16977587624fd5ff75306f85d69b07da39790e45ffdedd8dd48decd",
+      "basis": "Independent spec-derived expectation, not executed or restated engine output"
+    }
+  ],
+  "closedPointer": {
+    "bundle": {
+      "root": {
+        "$ref": "cotal:sha256:cf464840c6156d1b17d933aacc99ef3efc425feae350dd599eeb98edafa632bf#/$defs/s"
+      },
+      "members": {
+        "sha256:cf464840c6156d1b17d933aacc99ef3efc425feae350dd599eeb98edafa632bf": {
+          "$id": "https://closed.invalid/m",
+          "$defs": {
+            "s": {
+              "type": "string"
+            }
+          },
+          "$ref": "#/$defs/s"
+        }
+      }
+    },
+    "values": [
+      "ok",
+      1
+    ],
+    "expected": [
+      true,
+      false
+    ]
+  },
+  "configurationGrid": [
+    {
+      "name": "shipped-pin",
+      "allErrors": true,
+      "inlineRefs": false
+    },
+    {
+      "name": "short-errors-no-inline",
+      "allErrors": false,
+      "inlineRefs": false
+    },
+    {
+      "name": "all-errors-inline-control",
+      "allErrors": true,
+      "inlineRefs": true
+    },
+    {
+      "name": "short-errors-inline-control",
+      "allErrors": false,
+      "inlineRefs": true
+    }
+  ],
+  "limits": "Direct Ajv upstream regressions, not shipped compileContract proof. All configs documented; inlineRefs=true and allErrors=false are diagnostic controls, NOT supported Cotal product changes."
+}

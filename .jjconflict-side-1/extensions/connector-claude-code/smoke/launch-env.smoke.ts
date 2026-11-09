@@ -1,0 +1,241 @@
+/**
+ * Claude seat env: the documented auth vars must reach the child; host-session markers must not.
+ *
+ * THE BLOCKER THIS GRADES. After launchEnv stopped inheriting, CLAUDE_CODE_OAUTH_TOKEN (the name
+ * docs/deploy.mdx and deploy/ tell operators a container Claude authenticates with) was silently
+ * absent: this connector called launchEnv with no providerKeys. A container has no Keychain, so
+ * the seat boots and then cannot reach Anthropic. That is the fallback failure mode an allowlist
+ * must not have: dropping a credential the docs promise.
+ *
+ * THE LIST IS NOT "every CLAUDE_CODE_*". CLAUDE_CODE_CHILD_SESSION / CLAUDECODE /
+ * CLAUDE_CODE_ENTRYPOINT stay withheld — those are how a nested `claude` decides it must not
+ * save a transcript, which is the defect #866 closed. The cells below name both sides so a
+ * prefix-forward of CLAUDE_CODE_* cannot pass as a fix.
+ *
+ * SPECIFIER BOUNDARY. The suite imports the connector by relative source path
+ * (`../src/extension.js`) and calls buildLaunch directly: no dist in the path, no build in the
+ * command. Mutation-proof can therefore grade src/extension.ts without a rebuild.
+ *
+ * Run: pnpm smoke:claude-launch-env
+ */
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { claudeConnector, CLAUDE_PROVIDER_KEYS } from "../src/extension.js";
+
+let pass = 0;
+let fail = 0;
+const check = (name: string, cond: boolean, extra?: unknown) => {
+  if (cond) {
+    pass++;
+    console.log(`  ✓ ${name}`);
+  } else {
+    fail++;
+    console.log(`  ✗ FAIL: ${name}`, extra ?? "");
+  }
+};
+
+interface ProviderEnvFixture {
+  providerKeys: string[];
+  providerCredentialKeys: Record<string, string[]>;
+  hostSessionMarkers: string[];
+  scope: string;
+}
+
+const parsedFixture: unknown = JSON.parse(
+  readFileSync(new URL("./fixtures/claude-provider-env.json", import.meta.url), "utf8"),
+);
+const EXPECTED_HOST_MARKERS = ["CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_ENTRYPOINT"] as const;
+const isStringArray = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((entry) => typeof entry === "string");
+const fixtureShapeValid =
+  typeof parsedFixture === "object" &&
+  parsedFixture !== null &&
+  isStringArray((parsedFixture as Partial<ProviderEnvFixture>).providerKeys) &&
+  typeof (parsedFixture as Partial<ProviderEnvFixture>).providerCredentialKeys === "object" &&
+  (parsedFixture as Partial<ProviderEnvFixture>).providerCredentialKeys !== null &&
+  Object.values((parsedFixture as Partial<ProviderEnvFixture>).providerCredentialKeys ?? {}).every(isStringArray) &&
+  isStringArray((parsedFixture as Partial<ProviderEnvFixture>).hostSessionMarkers) &&
+  typeof (parsedFixture as Partial<ProviderEnvFixture>).scope === "string" &&
+  ((parsedFixture as Partial<ProviderEnvFixture>).scope?.length ?? 0) > 0;
+check("the external provider fixture has the required shape", fixtureShapeValid);
+if (!fixtureShapeValid) throw new Error("invalid Claude provider environment fixture");
+const fixture = parsedFixture as ProviderEnvFixture;
+const markerSet = new Set(fixture.hostSessionMarkers);
+check(
+  "the external fixture pins all three and only the excluded Claude host-session markers",
+  markerSet.size === EXPECTED_HOST_MARKERS.length && EXPECTED_HOST_MARKERS.every((marker) => markerSet.has(marker)),
+  fixture.hostSessionMarkers,
+);
+const HOST_MARKERS = fixture.hostSessionMarkers;
+const UNRELATED = ["GH_TOKEN", "P3_OPERATOR_SECRET", "SOME_UNRELATED_SECRET"] as const;
+
+const expectedKeys = new Set(fixture.providerKeys);
+const actualKeys = new Set<string>(CLAUDE_PROVIDER_KEYS);
+const missingKeys = fixture.providerKeys.filter((key) => !actualKeys.has(key));
+const unexpectedKeys = CLAUDE_PROVIDER_KEYS.filter((key) => !expectedKeys.has(key));
+check(
+  "CLAUDE_PROVIDER_KEYS matches the external documented-key fixture in both directions",
+  missingKeys.length === 0 && unexpectedKeys.length === 0,
+  { missingKeys, unexpectedKeys },
+);
+check(
+  "the external documented-key fixture and CLAUDE_PROVIDER_KEYS contain no duplicates",
+  expectedKeys.size === fixture.providerKeys.length && actualKeys.size === CLAUDE_PROVIDER_KEYS.length,
+);
+
+for (const [flag, credentialKeys] of Object.entries(fixture.providerCredentialKeys)) {
+  const missingCredentials = credentialKeys.filter((key) => !actualKeys.has(key));
+  check(
+    `${flag} is not allowed without its documented credential set`,
+    actualKeys.has(flag) && credentialKeys.length > 0 && missingCredentials.length === 0,
+    { credentialKeys, missingCredentials },
+  );
+}
+
+for (const k of CLAUDE_PROVIDER_KEYS) process.env[k] = `smoke-${k}`;
+for (const k of HOST_MARKERS) process.env[k] = `parent-${k}`;
+for (const k of UNRELATED) process.env[k] = `parent-${k}`;
+
+const launch = claudeConnector.buildLaunch({ space: "smoke", name: "claude-1", events: false } as never);
+const env = launch.env ?? {};
+
+check(
+  "the connector declares the unique development-channels dialog title for PTY confirmation",
+  launch.confirm === "WARNING: Loading development channels",
+  launch.confirm,
+);
+
+check(
+  "CLAUDE_CODE_OAUTH_TOKEN reached the child",
+  env.CLAUDE_CODE_OAUTH_TOKEN === "smoke-CLAUDE_CODE_OAUTH_TOKEN",
+  env.CLAUDE_CODE_OAUTH_TOKEN,
+);
+check(
+  "ANTHROPIC_API_KEY reached the child",
+  env.ANTHROPIC_API_KEY === "smoke-ANTHROPIC_API_KEY",
+  env.ANTHROPIC_API_KEY,
+);
+check(
+  "ANTHROPIC_AUTH_TOKEN reached the child",
+  env.ANTHROPIC_AUTH_TOKEN === "smoke-ANTHROPIC_AUTH_TOKEN",
+  env.ANTHROPIC_AUTH_TOKEN,
+);
+check(
+  "CLAUDE_CODE_USE_BEDROCK reached the child",
+  env.CLAUDE_CODE_USE_BEDROCK === "smoke-CLAUDE_CODE_USE_BEDROCK",
+  env.CLAUDE_CODE_USE_BEDROCK,
+);
+
+for (const k of CLAUDE_PROVIDER_KEYS) {
+  check(`${k} is on CLAUDE_PROVIDER_KEYS and crossed`, env[k] === `smoke-${k}`, env[k]);
+}
+
+const leakedMarkers = HOST_MARKERS.filter((k) => k in env);
+check("Claude host-session markers were withheld", leakedMarkers.length === 0, leakedMarkers);
+
+for (const k of UNRELATED) {
+  check(`${k} was withheld (not a declared auth var)`, !(k in env));
+}
+
+// PATH reaches the child under either spelling. Windows env names are case-insensitive but keep
+// their source casing, so a host spelling `Path` must forward as `Path` and one spelling `PATH` must
+// forward as `PATH` — exactly once each, never both, since a case-duplicate chokes Windows process
+// creation. Both rows run on every platform on purpose: fixturing one spelling leaves the other free
+// to regress unseen, and asserting only `env.PATH` is how the `Path` failure (#1141) reached CI.
+const ambientPath = process.env.PATH ?? process.env.Path ?? "";
+check("the ambient PATH fixture is non-empty, so the rows below can discriminate", ambientPath.length > 0);
+for (const spelling of ["PATH", "Path"] as const) {
+  delete process.env.PATH;
+  delete process.env.Path;
+  process.env[spelling] = ambientPath;
+  const row =
+    claudeConnector.buildLaunch({ space: "smoke", name: `claude-path-${spelling}`, events: false } as never).env ?? {};
+  const forwarded = Object.keys(row).filter((k) => k.toLowerCase() === "path");
+  check(
+    `a host spelling of ${spelling} is forwarded exactly once, keeping its source casing`,
+    forwarded.length === 1 && forwarded[0] === spelling,
+    forwarded,
+  );
+  check(`${spelling} reaches the child with its value unchanged`, row[spelling] === ambientPath, row[spelling]);
+}
+delete process.env.Path;
+process.env.PATH = ambientPath;
+
+const opted = claudeConnector.buildLaunch({
+  space: "smoke",
+  name: "claude-2",
+  events: false,
+  envAllow: ["CLAUDE_CODE_CHILD_SESSION"],
+} as never).env ?? {};
+check(
+  "a host marker named on spawn.env is the explicit opt-in",
+  opted.CLAUDE_CODE_CHILD_SESSION === "parent-CLAUDE_CODE_CHILD_SESSION",
+  opted.CLAUDE_CODE_CHILD_SESSION,
+);
+check("an unnamed host marker stays withheld even when a sibling is opted in", !("CLAUDECODE" in opted));
+check(
+  "opt-in does not drop CLAUDE_CODE_OAUTH_TOKEN",
+  opted.CLAUDE_CODE_OAUTH_TOKEN === "smoke-CLAUDE_CODE_OAUTH_TOKEN",
+);
+
+// A managed seat has nobody at its terminal to answer a permission prompt, so the launch bypasses
+// prompts unless the operator's launch options name a permission flag themselves. The manager marks
+// a managed launch with its `cwd`; a foreground launch has none and keeps Claude's own mode.
+const permissionModes = (args: string[]): string[] =>
+  args.flatMap((a, i) => (a === "--permission-mode" ? [args[i + 1] ?? ""] : []));
+// A managed launch needs a declared cotal server: this project's .mcp.json names one, so the cells
+// below launch; a cwd without one, under a user config without one, refuses.
+const managedRoot = mkdtempSync(join(tmpdir(), "cotal-launch-env-"));
+const managedCwd = join(managedRoot, "project"); mkdirSync(managedCwd);
+writeFileSync(join(managedCwd, ".mcp.json"), JSON.stringify({ mcpServers: { cotal: { command: "node" } } }));
+const emptyProfile = join(managedRoot, "profile"); mkdirSync(emptyProfile);
+const bareCwd = join(managedRoot, "bare"); mkdirSync(bareCwd);
+const savedConfigDir = process.env.CLAUDE_CONFIG_DIR;
+process.env.CLAUDE_CONFIG_DIR = emptyProfile;
+let refusal = "";
+try { claudeConnector.buildLaunch({ space: "smoke", name: "claude-7", events: false, cwd: bareCwd } as never); } catch (e) { refusal = (e as Error).message; }
+if (savedConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = savedConfigDir;
+check("a managed launch with no declared cotal server refuses and names the remedy", /server:cotal/.test(refusal) && /cotal setup/.test(refusal), refusal);
+const defaultArgs = claudeConnector.buildLaunch({ space: "smoke", name: "claude-3", events: false, cwd: managedCwd } as never).args;
+check(
+  "a managed launch with no permission option bypasses permission prompts",
+  JSON.stringify(permissionModes(defaultArgs)) === JSON.stringify(["bypassPermissions"]),
+  permissionModes(defaultArgs),
+);
+const foregroundArgs = claudeConnector.buildLaunch({ space: "smoke", name: "claude-6", events: false } as never).args;
+check(
+  "a foreground launch with no permission option keeps Claude's own mode",
+  permissionModes(foregroundArgs).length === 0 && !foregroundArgs.includes("--dangerously-skip-permissions"),
+  foregroundArgs.filter((a) => a.includes("permission")),
+);
+const promptedArgs = claudeConnector.buildLaunch({
+  space: "smoke",
+  name: "claude-4",
+  events: false,
+  cwd: managedCwd,
+  launchOptions: { "permission-mode": "default" },
+} as never).args;
+check(
+  "an operator permission-mode option replaces the bypass default rather than adding to it",
+  JSON.stringify(permissionModes(promptedArgs)) === JSON.stringify(["default"]),
+  permissionModes(promptedArgs),
+);
+const skippedArgs = claudeConnector.buildLaunch({
+  space: "smoke",
+  name: "claude-5",
+  events: false,
+  launchOptions: { "dangerously-skip-permissions": "" },
+} as never).args;
+check(
+  "an operator skip-permissions option keeps the launch to that one flag",
+  permissionModes(skippedArgs).length === 0 && skippedArgs.includes("--dangerously-skip-permissions"),
+  skippedArgs.filter((a) => a.includes("permission")),
+);
+
+rmSync(managedRoot, { recursive: true, force: true });
+if (fail) {
+  console.log(`SUITE COMPLETE: ${pass} passed, ${fail} failed`);
+  process.exit(1);
+}
+console.log(`SUITE COMPLETE: ${pass} passed, 0 failed`);

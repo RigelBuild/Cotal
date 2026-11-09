@@ -1,0 +1,444 @@
+/**
+ * Smoke for cotal_orientation — pure (no broker). Covers the plan's §6 checks that don't need a
+ * live mesh: identity + access mapping, auth-vs-open, the gated tool list, the core/more grouping,
+ * and the live-context snapshot, plus the identity-plane gate (#740). Run: `pnpm smoke:orientation`.
+ */
+import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  configFromEnv,
+  cotalToolSpecs,
+  buildOrientation,
+  renderOrientation,
+  ORIENTATION_BOOTSTRAP,
+  CHANNEL_GUIDANCE,
+  DOCS_VERSION,
+  MeshAgent,
+  renderInboxPreview,
+  type AgentConfig,
+} from "../src/index.js";
+// RELATIVE, not the package specifier. `@cotal-ai/connector-core` resolves to `dist/`, so this
+// suite used to assert against the last build rather than the tree: it passes on a stale `dist`,
+// and `mutation-proof` cannot grade it at all, because a mutation applied to `src/` is invisible
+// to it. Every other mutation-proved smoke in this package loads its target the same way.
+
+function cfg(over: Partial<AgentConfig> = {}): AgentConfig {
+  return {
+    space: "demo",
+    name: "alice",
+    role: "reviewer",
+    servers: "nats://127.0.0.1:4222",
+    subscribe: ["general"],
+    allowSubscribe: ["general"],
+    allowPublish: ["general"],
+    kind: "agent",
+    tls: false,
+    ...over,
+  } as AgentConfig;
+}
+
+// A minimal MeshAgent stub — buildOrientation only reads id/status/attention/inboxCount and the
+// roster read it is handed; cotal_roster reads it through readRoster (since #1229 a failed read
+// is part of the rendering).
+function agentStub(
+  over: { id?: string; roster?: any[]; unread?: number; presenceWriteFailure?: unknown; readFailure?: Error; connected?: boolean; notes?: Record<string, string> } = {},
+): MeshAgent {
+  return {
+    id: over.id ?? "ALICEID0000000000000000000000000000000000000",
+    status: "working",
+    attention: "open",
+    connected: over.connected ?? true,
+    transportConnected: true,
+    presenceWriteFailure: over.presenceWriteFailure,
+    readRoster: async () => ({ roster: over.roster ?? [], ...(over.readFailure ? { failure: over.readFailure } : {}) }),
+    inboxCount: () => over.unread ?? 0,
+    // The registry note of a channel, as the card reads it for the channels the seat is not on yet.
+    channelInfo: (channel: string) => ({ replay: false, registered: over.notes?.[channel] !== undefined, description: over.notes?.[channel] }),
+  } as unknown as MeshAgent;
+}
+
+/** buildOrientation over the roster read the cotal_orientation tool hands it. */
+const orient = async (agent: MeshAgent, c: AgentConfig, visible: Parameters<typeof buildOrientation>[2], at: number) =>
+  buildOrientation(agent, c, visible, at, await agent.readRoster());
+
+const presence = (id: string, name: string, role?: string, status = "idle") => ({
+  card: { id, name, role },
+  status,
+});
+
+// 1 — gated tool list: orientation is first; spawn/persona hidden without the capability, shown with it.
+{
+  const open = cotalToolSpecs(cfg({ creds: undefined }));
+  assert.equal(open[0].name, "cotal_orientation", "orientation should be the first tool");
+
+  const noSpawn = cotalToolSpecs(cfg({ creds: "CREDS", capabilities: [] })).map((s) => s.name);
+  assert.ok(!noSpawn.includes("cotal_spawn"), "no spawn cap ⇒ cotal_spawn hidden");
+  assert.ok(!noSpawn.includes("cotal_persona"), "no spawn cap ⇒ cotal_persona hidden");
+  assert.ok(!noSpawn.includes("cotal_personas"), "no spawn cap ⇒ cotal_personas hidden");
+
+  const withSpawn = cotalToolSpecs(cfg({ creds: "CREDS", capabilities: ["spawn"] })).map((s) => s.name);
+  assert.ok(withSpawn.includes("cotal_spawn") && withSpawn.includes("cotal_persona") && withSpawn.includes("cotal_personas"), "spawn cap ⇒ spawn/persona/personas shown");
+  // The workflow-run door (SPEC 14.3) is gated by its OWN capability: `spawn` alone does not
+  // advertise it (the wire would refuse the run-* rows), `run` does, and open mode is permissive.
+  assert.ok(!noSpawn.includes("cotal_run"), "no run cap ⇒ cotal_run hidden");
+  assert.ok(!withSpawn.includes("cotal_run"), "spawn cap alone ⇒ cotal_run still hidden");
+  const withRun = cotalToolSpecs(cfg({ creds: "CREDS", capabilities: ["run"] })).map((s) => s.name);
+  assert.ok(withRun.includes("cotal_run"), "run cap ⇒ cotal_run shown");
+  assert.ok(open.map((s) => s.name).includes("cotal_run"), "open mode ⇒ cotal_run shown");
+}
+
+// 4b — a stuck presence writer makes orientation and roster say the view is not live.
+{
+  const failure = {
+    bucket: "cotal_presence_demo",
+    since: 1,
+    forMs: 6_500,
+    error: "timeout",
+    consecutiveFailures: 4,
+    stuck: true,
+  };
+  const agent = agentStub({
+    roster: [presence("BOBID00000000000000000000000000000000000000", "bob", "worker", "working")],
+    presenceWriteFailure: failure,
+  });
+  const text = renderOrientation(await orient(agent, cfg({ creds: "CREDS" }), [], 1));
+  assert.match(text, /presence view: NOT LIVE/,
+    "orientation says the peer snapshot is not live once consecutive presence failures cross one TTL");
+  const roster = cotalToolSpecs(cfg({ creds: "CREDS" })).find((spec) => spec.name === "cotal_roster")!;
+  const result = await roster.run(agent, cfg({ creds: "CREDS" }), {});
+  assert.match(result.text, /Presence view is NOT LIVE/,
+    "cotal_roster labels its rows as last-known while this endpoint's presence writer is stuck");
+  assert.match(result.text, /bob\b[^\n]* — working[^\n]* · progress unknown/,
+    "cotal_roster names a working peer's progress as unknown");
+}
+
+// 4c — #1229: a failed roster read is part of the rendering. The rows are last-known, a missing
+// name is not an absence verdict, and the read's own error (here the missing grant) is printed.
+{
+  const agent = agentStub({
+    roster: [presence("BOBID00000000000000000000000000000000000000", "bob", "worker")],
+    readFailure: new Error("presence read refused for alice: this credential may not publish $JS.API.DIRECT.GET.KV_cotal_presence_demo"),
+  });
+  const o = await orient(agent, cfg({ creds: "CREDS" }), [], 1);
+  assert.equal(o.presence.live, false, "orientation does not call a failed read live");
+  assert.ok((o.presence.detail ?? "").includes("DIRECT.GET.KV_cotal_presence_demo"), "the detail names the read's own error");
+  assert.match(renderOrientation(o), /presence view: NOT LIVE/,
+    "orientation says the peer snapshot is not live when the presence read failed (#1229)");
+  const roster = cotalToolSpecs(cfg({ creds: "CREDS" })).find((spec) => spec.name === "cotal_roster")!;
+  const result = await roster.run(agent, cfg({ creds: "CREDS" }), {});
+  assert.match(result.text, /presence read failed/i, "cotal_roster says the presence read failed (#1229)");
+  assert.match(result.text, /DIRECT\.GET\.KV_cotal_presence_demo/, "cotal_roster names the grant the credential lacks");
+  assert.match(result.text, /not.*absence verdict/i, "cotal_roster says a missing name is not an absence verdict (#1229)");
+  assert.match(result.text, /last-known/i, "cotal_roster labels the rows as last-known (#1229)");
+  assert.match(result.text, /bob/, "the last-known row is still shown — rendering never refuses (#1229)");
+}
+
+// 4e — control: a read that succeeded renders exactly as before, with no preface.
+{
+  const agent = agentStub({
+    roster: [presence("BOBID00000000000000000000000000000000000000", "bob", "worker")],
+  });
+  const o = await orient(agent, cfg({ creds: "CREDS" }), [], 1);
+  assert.equal(o.presence.live, true, "a read that succeeded is live");
+  assert.equal(o.presence.detail, undefined, "a read that succeeded carries no detail");
+  assert.doesNotMatch(renderOrientation(o), /NOT LIVE/, "a read that succeeded renders as live (#1229)");
+  const roster = cotalToolSpecs(cfg({ creds: "CREDS" })).find((spec) => spec.name === "cotal_roster")!;
+  const result = await roster.run(agent, cfg({ creds: "CREDS" }), {});
+  assert.doesNotMatch(result.text, /read failed|last-known/i,
+    "a current roster render carries none of the preface sentences (#1229)");
+  assert.match(result.text, /bob/, "the row is shown");
+}
+
+// 2 — identity + access mapping, and auth vs open.
+{
+  const authCfg = cfg({ creds: "CREDS", subscribe: ["general"], allowSubscribe: ["general", "incident"], allowPublish: [] });
+  const visible = cotalToolSpecs(authCfg).map((s) => ({ name: s.name, title: s.title }));
+  const o = await orient(agentStub(), authCfg, visible, 1_700_000_000_000);
+
+  assert.deepEqual(o.identity, {
+    state: "bound",
+    display: { name: "alice", role: "reviewer" },
+    principal: { owner: "unknown", actor: "unknown" },
+    lifecycleUid: "unknown",
+    replacement: { state: "unknown", predecessorLifecycleUid: "unknown" },
+    name: "alice",
+    role: "reviewer",
+    space: "demo",
+    id: "ALICEID0000000000000000000000000000000000000",
+    cotalVersion: DOCS_VERSION,
+  } as typeof o.identity);
+  assert.equal(o.access.authMode, true);
+  assert.deepEqual(o.access.read, ["general"]);
+  assert.deepEqual(o.access.readAcl, ["general", "incident"]); // read ACL wider than active read
+  assert.deepEqual(o.access.post, []); // default-deny ⇒ read-only
+  assert.equal(o.generatedAt, 1_700_000_000_000);
+
+  const openO = await orient(agentStub(), cfg({ creds: undefined }), [], 1);
+  assert.equal(openO.access.authMode, false);
+
+  // read-only renders explicitly; readAcl line appears only when it differs from read.
+  const text = renderOrientation(o);
+  assert.match(text, /read-only/);
+  assert.match(text, /may join \(read ACL\)/);
+  assert.match(text, /Model pin: none recorded/);
+  assert.equal(o.identity.model, undefined);
+
+  // The channels the seat may join but is not on yet are named with their registry note, so a fresh
+  // seat knows where its team lives before its first send; a seat on everything it may read gets no line.
+  assert.deepEqual(o.access.joinable, [{ channel: "incident" }], "a channel without a registry note is listed bare");
+  assert.match(text, /not on yet: #incident · join one with cotal_join/);
+  const noted = await orient(agentStub({ notes: { incident: "live incidents, post the pager link" } }), authCfg, [], 1);
+  assert.deepEqual(noted.access.joinable, [{ channel: "incident", note: "live incidents, post the pager link" }]);
+  assert.match(renderOrientation(noted), /not on yet: #incident \(live incidents, post the pager link\)/);
+  const onAll = await orient(agentStub(), cfg({ creds: "CREDS" }), [], 1);
+  assert.deepEqual(onAll.access.joinable, []);
+  assert.doesNotMatch(renderOrientation(onAll), /not on yet/);
+
+  const pinned = await orient(agentStub(), cfg({ model: "grok-4.6" }), [], 1);
+  assert.equal(pinned.identity.model, "grok-4.6");
+  assert.match(renderOrientation(pinned), /Model pin: grok-4\.6/);
+}
+
+// 2b — AGENT-32: the public orientation path separates the display label from the wire principal
+// and the current lifecycle incarnation. A preserved resume carries a backfill floor, but that is not
+// proof of replacement, so both replacement state and predecessor UID stay explicitly unknown.
+// The second cell drives the real cotal_orientation tool while the endpoint is not mesh-bound: the
+// structured card and its rendering must both say unbound rather than leaving callers to parse prose.
+{
+  const failures: string[] = [];
+  const cell = async (name: string, run: () => void | Promise<void>) => {
+    try {
+      await run();
+    } catch (error) {
+      failures.push(`${name}: ${(error as Error).message}`);
+    }
+  };
+  const identityCfg = cfg({
+    name: "display-name",
+    role: "worker",
+    lifecycleUid: "abcdefghijklmnopqrstuvwx12",
+    backfillFloor: 42,
+    userAuth: {
+      owner: "u_abcdefghijklmnopqrstuvwxyz",
+      actor: "actor_name",
+      sentinelCreds: "not-read-by-this-pure-smoke",
+      bearer: async () => "not-called-by-this-pure-smoke",
+    },
+  });
+
+  await cell("structured identity", async () => {
+    const orientation = await orient(agentStub({ id: "u_abcdefghijklmnopqrstuvwxyz.actor_name" }), identityCfg, [], 1);
+    const identity = orientation.identity as unknown as Record<string, unknown>;
+    assert.equal(identity.state, "bound", "a connected endpoint reports a bound identity state");
+    assert.deepEqual(identity.display, { name: "display-name", role: "worker" }, "display identity is explicitly labelled");
+    assert.deepEqual(identity.principal, { owner: "u_abcdefghijklmnopqrstuvwxyz", actor: "actor_name" }, "wire principal is explicitly labelled");
+    assert.equal(identity.lifecycleUid, "abcdefghijklmnopqrstuvwx12", "the current lifecycle UID is explicitly labelled");
+    assert.deepEqual(identity.replacement, { state: "unknown", predecessorLifecycleUid: "unknown" }, "a resume floor is not replacement evidence and never presents a predecessor as current");
+  });
+
+  await cell("structured unbound tool result", async () => {
+    const agent = agentStub({ id: "u_abcdefghijklmnopqrstuvwxyz.actor_name", connected: false });
+    const orientation = await orient(agent, identityCfg, [], 1);
+    const identity = orientation.identity as unknown as Record<string, unknown>;
+    assert.equal(identity.state, "unbound", "a not-yet-bound endpoint reports an unbound identity state");
+    const spec = cotalToolSpecs(identityCfg).find((candidate) => candidate.name === "cotal_orientation");
+    assert.ok(spec, "orientation tool exists");
+    const result = await spec.run(agent, identityCfg, {});
+    assert.match(result.text, /identity state:\s*unbound/i, "the public tool renders the structured unbound state");
+  });
+
+  assert.deepEqual(failures, [], `AGENT-32 acceptance cells red=${failures.length}/2:\n${failures.join("\n")}`);
+  console.log("✓ AGENT-32 orientation identity cells passed (2/2)");
+}
+
+// 3 — core/more grouping covers exactly the gated set (minus orientation itself), no dupes.
+{
+  const c = cfg({ creds: "CREDS", capabilities: ["spawn"] });
+  const gated = cotalToolSpecs(c).map((s) => s.name).filter((n) => n !== "cotal_orientation");
+  const visible = cotalToolSpecs(c).map((s) => ({ name: s.name, title: s.title }));
+  const o = await orient(agentStub(), c, visible, 1);
+
+  const grouped = [...o.tools.core, ...o.tools.more].map((t) => t.name);
+  assert.ok(!grouped.includes("cotal_orientation"), "the card omits the orientation tool itself");
+  assert.equal(new Set(grouped).size, grouped.length, "no duplicate tools across core/more");
+  assert.deepEqual([...grouped].sort(), [...gated].sort(), "core ∪ more == gated tool set");
+  assert.ok(o.tools.core.every((t) => ["cotal_inbox", "cotal_send", "cotal_dm", "cotal_anycast", "cotal_roster", "cotal_status"].includes(t.name)));
+}
+
+// 4 — live context: peers exclude self, unread = inboxCount.
+{
+  const roster = [
+    presence("ALICEID0000000000000000000000000000000000000", "alice", "reviewer"), // self
+    presence("BOBID00000000000000000000000000000000000000", "bob", "worker", "working"),
+    presence("CARID00000000000000000000000000000000000000", "carol"),
+  ];
+  const o = await orient(agentStub({ roster, unread: 3 }), cfg({ creds: "CREDS" }), [], 1);
+  assert.equal(o.peers.present, 2, "self excluded from peer count");
+  assert.match(o.peers.summary, /bob\/worker \(working · progress unknown\)/,
+    "a textual working peer must expose that no outside progress observation exists");
+  assert.ok(!o.peers.summary.includes("alice"), "self not in the peer summary");
+  assert.equal(o.unread.total, 3);
+}
+
+// 5 — the shared connector bootstrap is exported and points agents at the tool.
+{
+  assert.ok(ORIENTATION_BOOTSTRAP.length > 0, "bootstrap is non-empty");
+  assert.match(ORIENTATION_BOOTSTRAP, /cotal_orientation/);
+  for (const tool of ["cotal_channels", "cotal_join", "cotal_send", "cotal_dm", "cotal_anycast"])
+    assert.ok(CHANNEL_GUIDANCE.includes(tool), `channel guidance names ${tool}`);
+  assert.match(CHANNEL_GUIDANCE, /#announce/, "channel guidance says when #announce is appropriate");
+  assert.ok(
+    CHANNEL_GUIDANCE.includes("join a family such as team.>: posts on its durable channels are kept for you while you are away, from the join on."),
+    "channel guidance says a family follow keeps stored copies from the join on",
+  );
+}
+
+// 6 — the identity-plane gate (#740). `canSpawn` used to read "no static creds" as open mode, so a
+// USER-AUTH agent — which carries no static creds by construction (creds+userAuth are mutually
+// exclusive at launch, at parse, and at connect) — was advertised the manager-op tools whatever its
+// capabilities. Three cells, and the third is the one that matters most: gating open mode as well
+// would be a real regression, so it is asserted unchanged in the same breath.
+//
+// The user-auth configs come from the REAL `configFromEnv`, off the four env vars a spawner writes,
+// rather than a hand-built object — so these cells prove the live launch path reaches the gate, not
+// only that the gate exists.
+{
+  const dir = mkdtempSync(join(tmpdir(), "cotal-orientation-smoke-"));
+  const sentinelPath = join(dir, "sentinel.creds");
+  writeFileSync(sentinelPath, "-----BEGIN NATS USER JWT-----\nSENTINEL\n------END NATS USER JWT------\n");
+
+  const userAuthCfg = (capabilities?: string) =>
+    configFromEnv({
+      COTAL_NAME: "alice",
+      COTAL_SPACE: "demo",
+      COTAL_OWNER: "acme",
+      COTAL_ACTOR: "alice",
+      COTAL_SENTINEL_CREDS: sentinelPath,
+      COTAL_BEARER_CMD: JSON.stringify(["/bin/echo", "bearer"]),
+      COTAL_LIFECYCLE_UID: "abcdef0123456789",
+      ...(capabilities === undefined ? {} : { COTAL_CAPABILITIES: capabilities }),
+    });
+
+  const names = (c: AgentConfig) => cotalToolSpecs(c).map((s) => s.name);
+  const cardTools = (c: AgentConfig) => {
+    const visible = cotalToolSpecs(c).map((s) => ({ name: s.name, title: s.title }));
+    const o = buildOrientation(agentStub(), c, visible, 1, { roster: [] });
+    return [...o.tools.core, ...o.tools.more].map((t) => t.name);
+  };
+
+  // 6a — user-auth WITHOUT the capability: an authed plane, so the tools are gated off.
+  const noCap = userAuthCfg();
+  assert.equal(noCap.creds, undefined, "740:user-auth carries no static creds by construction");
+  assert.ok(noCap.userAuth, "740:user-auth config actually parsed a userAuth plane");
+  assert.ok(!names(noCap).includes("cotal_spawn"), "740:user-auth without the spawn capability must not be advertised cotal_spawn");
+  assert.ok(!names(noCap).includes("cotal_persona"), "740:user-auth without the spawn capability must not be advertised cotal_persona");
+  assert.ok(!names(noCap).includes("cotal_personas"), "740:user-auth without the spawn capability must not be advertised cotal_personas");
+  assert.ok(!cardTools(noCap).includes("cotal_spawn"), "740:the orientation card must not claim cotal_spawn for a user-auth agent without the capability");
+  assert.ok(!cardTools(noCap).includes("cotal_persona"), "740:the orientation card must not claim cotal_persona for a user-auth agent without the capability");
+  assert.ok(!cardTools(noCap).includes("cotal_personas"), "740:the orientation card must not claim cotal_personas for a user-auth agent without the capability");
+  // The card's own access line is the same expression: a user-auth mesh IS broker-enforced.
+  assert.equal(
+    (await orient(agentStub(), noCap, [], 1)).access.authMode,
+    true,
+    "740:a user-auth mesh is auth mode, not open mode, on the orientation card",
+  );
+
+  // 6b — user-auth WITH the capability: still advertised, so the fix is a gate and not a blanket hide.
+  const withCap = userAuthCfg("spawn");
+  assert.ok(names(withCap).includes("cotal_spawn"), "740:user-auth with the spawn capability must still be advertised cotal_spawn");
+  assert.ok(names(withCap).includes("cotal_persona"), "740:user-auth with the spawn capability must still be advertised cotal_persona");
+  assert.ok(names(withCap).includes("cotal_personas"), "740:user-auth with the spawn capability must still be advertised cotal_personas");
+
+  // 6c — REGRESSION GUARD. Open mode mints no creds and has no user-auth plane; the wire grants
+  // nobody anything there, so everything stays visible. This cell passes BEFORE and AFTER the gate
+  // change, on purpose: it is the guard against the natural way to get this wrong, which is to gate
+  // open mode too. `token`/`user`/`pass` (soft-shared NATS auth off a join link) belong on this side
+  // — core groups them with open mode, they carry no owner+actor grant and no per-agent publish ACL,
+  // so the wire does not gate spawn for them either.
+  const open = configFromEnv({ COTAL_NAME: "alice", COTAL_SPACE: "demo" });
+  assert.equal(open.creds, undefined);
+  assert.equal(open.userAuth, undefined);
+  assert.ok(names(open).includes("cotal_spawn"), "740:open mode must still be advertised cotal_spawn with no capability");
+  assert.ok(names(open).includes("cotal_persona"), "740:open mode must still be advertised cotal_persona with no capability");
+  assert.ok(names(open).includes("cotal_personas"), "740:open mode must still be advertised cotal_personas with no capability");
+  assert.equal((await orient(agentStub(), open, [], 1)).access.authMode, false, "740:open mode is still open mode on the card");
+
+  const tokenMode = configFromEnv({ COTAL_NAME: "alice", COTAL_SPACE: "demo", COTAL_TOKEN: "shared" });
+  assert.ok(names(tokenMode).includes("cotal_spawn"), "740:token mode is not an identity plane and must still be advertised cotal_spawn");
+}
+
+// 7 — a broken ordered watcher used to print one terminal line for every generated `oc_*`
+// consumer name. Those names change on every rebuild, so a plain string dedupe still floods. Pin
+// both the normalization and the useful first diagnostic, and make orientation explain the last
+// concrete fault rather than looking like the connector simply has not finished booting.
+{
+  const realAgent = new MeshAgent(cfg({ id: "alice", connector: "codex" }));
+  const endpoint = (realAgent as unknown as { ep: { emit(name: string, error: Error): void } }).ep;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  let stderr = "";
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    stderr += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    for (let i = 1; i <= 100; i++) {
+      endpoint.emit("error", new Error(`timeout while deleting oc_rotatingToken_${i}`));
+      endpoint.emit(
+        "error",
+        new Error(
+          `NATS permission denied: cannot publish \"$JS.API.CONSUMER.DELETE.KV_cotal_presence_demo.oc_anotherToken_${i}\"`,
+        ),
+      );
+    }
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+
+  const lines = stderr.split("\n").filter((line) => line.includes("[cotal-connector] endpoint error:"));
+  assert.equal(lines.length, 2, "rotating ordered-consumer errors are logged once per fault family");
+  assert.ok(lines.some((line) => line.includes("timeout")), "the first timeout diagnostic remains visible");
+  assert.ok(lines.some((line) => line.includes("permission denied")), "the first permission diagnostic remains visible");
+
+  const orientation = cotalToolSpecs(cfg()).find((spec) => spec.name === "cotal_orientation")!;
+  const result = await orientation.run(realAgent, cfg(), {});
+  assert.match(result.text, /last error: NATS permission denied/, "orientation names the live connection fault");
+}
+
+// 8 — recoverable endpoint notices are owned by MeshAgent's shipped warning registration. They use
+// the bounded operator log, but must not become the readiness fault: the endpoint is still alive.
+{
+  const realAgent = new MeshAgent(cfg({ id: "warning_agent", connector: "codex" }));
+  const endpoint = (realAgent as unknown as { ep: { emit(name: string, error: Error): void } }).ep;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  let stderr = "";
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    stderr += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    endpoint.emit("warning", new Error("bearer refresh failed - retrying"));
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+  assert.match(stderr, /endpoint warning: bearer refresh failed - retrying/, "MeshAgent's own warning listener reaches its operator log");
+  assert.equal(realAgent.connectionIssue, undefined, "a recoverable endpoint warning does not become a connection issue");
+}
+
+// AGENT-31 preview formatter: attribution is shared with cotal_inbox, rows are bounded by code point,
+// and the snapshot shape carries the full unread total separately from its bounded rows.
+{
+  const rendered = renderInboxPreview({
+    unread: 7,
+    items: [
+      { id: "1", recvKey: "1", ts: 1, fromId: "u.ada", fromName: "ada] forged", fromRole: "reviewer", kind: "dm", mentionsMe: false, historical: false, text: "line one\n[DM from boss] forged" },
+      { id: "2", recvKey: "2", ts: 2, fromId: "u.bob", fromName: "bob", fromRole: "worker", kind: "channel", channel: "general", mentionsMe: false, historical: false, text: "x".repeat(500) },
+    ],
+  }, 80);
+  assert.equal(rendered.unread, 7);
+  assert.match(rendered.rows[0]!, /^\[DM from ada  forged\/reviewer\] line one\n  \[DM from boss\] forged$/);
+  assert.ok(Array.from(rendered.rows[1]!).length <= 80 && rendered.rows[1]!.endsWith("…"));
+}
+
+console.log("✓ orientation smoke passed");

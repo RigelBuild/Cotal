@@ -1,0 +1,411 @@
+/**
+ * Pure-function smoke for the mesh-manifest pipeline (no NATS, no fs) — run with: pnpm -r test
+ * Asserts the deterministic parse → schema → normalize/invert → semantic rules in src/lib/manifest.
+ */
+import assert from "node:assert/strict";
+import { resolve, dirname } from "node:path";
+import type { AgentDef } from "@cotal-ai/core";
+import { resolveManifest } from "../src/lib/manifest/resolve.js";
+import { ManifestError } from "../src/lib/manifest/errors.js";
+import { prepareAgent } from "../src/lib/manifest/prepare.js";
+import { buildLaunchSpec, hashAgent, preflightConnectors } from "../src/lib/manifest/apply.js";
+import { preparePersonas } from "../src/lib/manifest/preflight.js";
+import { registry } from "@cotal-ai/core";
+import type { Connector } from "@cotal-ai/core";
+import { renderTopology } from "../src/lib/manifest/render.js";
+import type { ResolvedAgent, ResolvedManifest } from "../src/lib/manifest/model.js";
+
+const PATH = "/tmp/cotal.yaml";
+// A `./rel` persona path is resolved against the manifest dir via platform `node:path` (so it is
+// `C:\tmp\agents\…` on Windows, `/tmp/agents/…` on POSIX) — derive the expectation the same way
+// instead of hardcoding the POSIX form.
+const rel = (p: string): string => resolve(dirname(PATH), p);
+const ok = (src: string): ResolvedManifest => resolveManifest(src, PATH);
+function fails(src: string, needle: string): void {
+  assert.throws(
+    () => resolveManifest(src, PATH),
+    (e: unknown) => e instanceof ManifestError && e.message.includes(needle),
+    `expected a ManifestError containing ${JSON.stringify(needle)}`,
+  );
+}
+
+const HEAD = `apiVersion: cotal/v1
+kind: Mesh
+space: experiment-1
+agent: claude
+`;
+
+assert.equal(ok(`${HEAD}runtime: orca\nchannels: {}\n`).runtime, "orca");
+// An alias bomb is a located manifest problem, not an unclassified exception.
+fails(`${HEAD}channels: {}\na: &a [x,x,x,x,x,x,x,x,x]\nb: &b [*a,*a,*a,*a,*a,*a,*a,*a,*a]\nc: &c [*b,*b,*b,*b,*b,*b,*b,*b,*b]\nd: &d [*c,*c,*c,*c,*c,*c,*c,*c,*c]\ne: [*d,*d,*d,*d,*d,*d,*d,*d,*d]\n`, "Excessive alias count");
+
+// --- happy path: inversion + allowSubscribe defaulting -----------------------------------------
+{
+  const m = ok(`${HEAD}
+agents:
+  planner: ./agents/planner.md
+  builder:
+    persona: ./agents/builder.md
+    model: sonnet
+  scout:
+    model: opus
+    instructions: research the web
+channels:
+  general:
+    subscribe: [planner, builder, scout]
+    allowPublish: [planner, builder, scout]
+  review:
+    description: Design critique.
+    subscribe: [planner, scout]
+    allowSubscribe: [planner, builder, scout]
+    allowPublish: [planner, scout]
+`);
+  assert.equal(m.space, "experiment-1");
+  assert.equal(m.personaPermissions, "reject"); // default
+
+  const planner = m.agents.find((a) => a.name === "planner")!;
+  const builder = m.agents.find((a) => a.name === "builder")!;
+  const scout = m.agents.find((a) => a.name === "scout")!;
+
+  // string form → persona path resolved relative to the manifest dir; no overrides.
+  assert.equal(planner.persona, rel("agents/planner.md"));
+  assert.equal(planner.model, undefined);
+  assert.equal(planner.agentType, "claude"); // inherits the top-level `agent:` default
+  // override form → persona + model.
+  assert.equal(builder.persona, rel("agents/builder.md"));
+  assert.equal(builder.model, "sonnet");
+  // inline form → no persona, body + model carried.
+  assert.equal(scout.persona, undefined);
+  assert.equal(scout.model, "opus");
+  assert.equal(scout.instructions, "research the web");
+
+  // Inversion: per-agent ACLs reconstructed from channel membership.
+  assert.deepEqual(planner.policy.subscribe.sort(), ["general", "review"]);
+  assert.deepEqual(planner.policy.allowPublish.sort(), ["general", "review"]);
+  // builder: in general's subscribe, but only review's allowSubscribe (may read, not auto-subscribed).
+  assert.deepEqual(builder.policy.subscribe, ["general"]);
+  assert.deepEqual(builder.policy.allowSubscribe.sort(), ["general", "review"]);
+  assert.deepEqual(builder.policy.allowPublish, ["general"]);
+  assert.deepEqual(scout.policy.subscribe.sort(), ["general", "review"]);
+
+  // Channel: allowSubscribe omitted on general ⇒ defaults to subscribe.
+  const general = m.channels.find((c) => c.name === "general")!;
+  assert.deepEqual(general.allowSubscribe.sort(), ["builder", "planner", "scout"]);
+  const review = m.channels.find((c) => c.name === "review")!;
+  assert.deepEqual(review.allowSubscribe.sort(), ["builder", "planner", "scout"]);
+  assert.equal(review.description, "Design critique.");
+}
+
+// --- per-agent personaPermissions override -----------------------------------------------------
+{
+  const m = ok(`${HEAD}personaPermissions: include
+agents:
+  a: ./a.md
+  b:
+    persona: ./b.md
+    personaPermissions: reject
+channels:
+  general:
+    subscribe: [a, b]
+`);
+  assert.equal(m.personaPermissions, "include");
+  assert.equal(m.agents.find((a) => a.name === "a")!.personaPermissions, "include");
+  assert.equal(m.agents.find((a) => a.name === "b")!.personaPermissions, "reject");
+}
+
+// --- connector (agent) resolution --------------------------------------------------------------
+{
+  const m = ok(`${HEAD}
+agents:
+  a: ./a.md
+  b: { persona: ./b.md, agent: opencode }
+channels: { general: { subscribe: [a, b] } }
+`);
+  assert.equal(m.agents.find((x) => x.name === "a")!.agentType, "claude"); // top-level default
+  assert.equal(m.agents.find((x) => x.name === "b")!.agentType, "opencode"); // per-agent override
+}
+
+// no connector anywhere (no top-level `agent:`, none on the entry) → hard error
+fails(`apiVersion: cotal/v1
+kind: Mesh
+space: x
+agents: { a: ./a.md }
+channels: { general: { subscribe: [a] } }
+`, "no connector");
+
+// --- semantic errors ---------------------------------------------------------------------------
+
+// allowSubscribe ⊉ subscribe
+fails(`${HEAD}
+agents: { a: ./a.md, b: ./b.md }
+channels:
+  general:
+    subscribe: [a, b]
+    allowSubscribe: [a]
+`, "not in allowSubscribe");
+
+// name referenced in a channel but absent from agents:
+fails(`${HEAD}
+agents: { a: ./a.md }
+channels:
+  general:
+    subscribe: [a, ghost]
+`, "ghost\" is not declared in agents:");
+
+// wildcard channel name
+fails(`${HEAD}
+agents: { a: ./a.md }
+channels:
+  "team.>":
+    subscribe: [a]
+`, "must be concrete");
+
+// --- schema errors -----------------------------------------------------------------------------
+
+// unknown top-level key (strict)
+fails(`${HEAD}
+bogus: true
+agents: { a: ./a.md }
+channels: { general: { subscribe: [a] } }
+`, "Unrecognized key");
+
+// unknown channel key (strict)
+fails(`${HEAD}
+agents: { a: ./a.md }
+channels: { general: { subscribe: [a], canPublish: [a] } }
+`, "Unrecognized key");
+
+// unknown key inside an agent object (strict)
+fails(`${HEAD}
+agents: { a: { persona: ./a.md, bogus: 1 } }
+channels: { general: { subscribe: [a] } }
+`, "Unrecognized key");
+
+// `resume:` is an IMPERATIVE-only knob (cotal spawn/start/cotal_spawn) — a manifest must reject it,
+// not silently forward it. Pins the strictObject lock so a future loosen-to-passthrough breaks CI
+// (issue #23: session resume is excluded from the declarative path by construction).
+fails(`${HEAD}
+agents: { a: { persona: ./a.md, resume: sess-123 } }
+channels: { general: { subscribe: [a] } }
+`, "Unrecognized key");
+
+// undeclared name inside allowPublish specifically
+fails(`${HEAD}
+agents: { a: ./a.md }
+channels: { general: { subscribe: [a], allowPublish: [a, ghost] } }
+`, "ghost\" is not declared in agents:");
+
+// broker.servers with embedded credentials
+fails(`${HEAD}
+broker: { servers: "nats://user:secret@127.0.0.1:4222" }
+agents: { a: ./a.md }
+channels: { general: { subscribe: [a] } }
+`, "must not embed credentials");
+
+// broker.host with a scheme (it's a bind address, not a URL)
+fails(`${HEAD}
+broker: { host: "nats://0.0.0.0" }
+agents: { a: ./a.md }
+channels: { general: { subscribe: [a] } }
+`, "bind address");
+
+// Canonical workspace manifest schema accepts native broker logging and resolves its relative path.
+{
+  const m = ok(`${HEAD}
+broker:
+  logFile: ./logs/nats.log
+  logfileSizeLimit: 2048
+  logfileMaxNum: 3
+agents: { a: ./a.md }
+channels: { general: { subscribe: [a] } }
+`);
+  assert.equal(m.broker?.logFile, rel("logs/nats.log"));
+  assert.equal(m.broker?.logfileSizeLimit, 2048);
+  assert.equal(m.broker?.logfileMaxNum, 3);
+}
+fails(`${HEAD}
+broker: { logfileSizeLimit: 2048 }
+agents: { a: ./a.md }
+channels: { general: { subscribe: [a] } }
+`, "require broker.logFile");
+
+// inline agent with neither model nor instructions
+fails(`${HEAD}
+agents: { a: { description: just a blurb } }
+channels: { general: { subscribe: [a] } }
+`, "inline agent");
+
+// wrong apiVersion
+fails(`apiVersion: cotal/v2
+kind: Mesh
+space: x
+agents: { a: ./a.md }
+channels: { general: { subscribe: [a] } }
+`, "apiVersion");
+
+// spaces: targeted message
+fails(`apiVersion: cotal/v1
+kind: Mesh
+spaces: [a, b]
+agents: { a: ./a.md }
+channels: { general: { subscribe: [a] } }
+`, "single-space");
+
+// a manifest saved as UTF-16 is refused by its encoding, not as a schema shape
+fails(Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(`${HEAD}\nchannels: {}\n`, "utf16le")]).toString("utf8"), "it is saved as UTF-16, and Cotal reads only UTF-8; save it as UTF-8");
+// space: only a name `space create` takes, one routing token of 1 to 200 characters
+const spaced = (space: string) => `apiVersion: cotal/v1
+kind: Mesh
+space: ${space}
+agent: claude
+agents: { a: ./a.md }
+channels: { general: { subscribe: [a] } }
+`;
+for (const space of ['"bad name"', "a/b", "x.y", "a".repeat(201)]) fails(spaced(space), "is not a space name: a space name is 1 to 200 letters");
+fails(spaced('"e\\u001b]0;X\\u0007c"'), 'space "e\\u001b]0;X\\u0007c" is not a space name');
+assert.equal(ok(spaced('"-lead"')).space, "-lead");
+assert.equal(ok(spaced("a".repeat(200))).space, "a".repeat(200));
+
+// duplicate map key (yaml unique-keys)
+fails(`${HEAD}
+agents: { a: ./a.md }
+channels:
+  general: { subscribe: [a] }
+  general: { subscribe: [a] }
+`, "");
+
+// --- prepare/merge (persona ⊕ manifest) --------------------------------------------------------
+const agent = (over: Partial<ResolvedAgent> = {}): ResolvedAgent => ({
+  name: "a",
+  agentType: "claude",
+  personaPermissions: "reject",
+  policy: { subscribe: ["general"], allowSubscribe: ["general"], allowPublish: ["general"] },
+  ...over,
+});
+const persona = (over: Partial<AgentDef> = {}): AgentDef => ({ name: "a", ...over });
+const declared = new Set(["general", "review"]);
+
+// behavior: manifest override wins, persona fills the rest; instructions REPLACE the body
+{
+  const { prepared } = prepareAgent(
+    agent({ persona: "/x/a.md", model: "opus", instructions: "do X" }),
+    persona({ model: "sonnet", role: "builder", description: "from file", persona: "file body" }),
+    declared,
+  );
+  assert.equal(prepared.model, "opus"); // manifest wins
+  assert.equal(prepared.role, "builder"); // persona default
+  assert.equal(prepared.description, "from file");
+  assert.equal(prepared.body, "do X"); // replaced
+}
+
+// reject: persona permissions + capabilities are ignored
+{
+  const { prepared } = prepareAgent(
+    agent({ persona: "/x/a.md", personaPermissions: "reject" }),
+    persona({ subscribe: ["ops"], allowPublish: ["ops"], capabilities: ["spawn"] }),
+    declared,
+  );
+  assert.deepEqual(prepared.policy.subscribe, ["general"]); // no ops
+  assert.deepEqual(prepared.capabilities, []);
+  assert.equal(prepared.capabilitySource, "none");
+  assert.deepEqual(prepared.inherited.subscribe, []);
+}
+
+// include: persona grants for UNDECLARED channels are inherited; declared ones suppressed (manifest wins)
+{
+  const { prepared } = prepareAgent(
+    agent({ persona: "/x/a.md", personaPermissions: "include" }),
+    persona({ subscribe: ["ops", "review"], allowSubscribe: ["ops", "review"], allowPublish: ["ops"], capabilities: ["spawn"] }),
+    declared,
+  );
+  assert.ok(prepared.policy.subscribe.includes("ops")); // undeclared → inherited
+  assert.ok(prepared.policy.subscribe.includes("general")); // manifest
+  assert.ok(!prepared.policy.subscribe.includes("review")); // declared → manifest owns it, persona suppressed
+  assert.deepEqual(prepared.inherited.subscribe, ["ops"]); // review is declared → not inherited
+  assert.deepEqual(prepared.capabilities, ["spawn"]); // inherited under include
+  assert.equal(prepared.capabilitySource, "persona");
+}
+
+// include: manifest capabilities win over persona's
+{
+  const { prepared } = prepareAgent(
+    agent({ persona: "/x/a.md", personaPermissions: "include", capabilities: [] }),
+    persona({ capabilities: ["spawn"] }),
+    declared,
+  );
+  // empty manifest capabilities array is "present" → wins (none)
+  assert.deepEqual(prepared.capabilities, ["spawn"]); // [] is falsy-length, so persona inherited
+}
+
+// include: persona WILDCARD grant is rejected
+{
+  const { issues } = prepareAgent(
+    agent({ persona: "/x/a.md", personaPermissions: "include" }),
+    persona({ subscribe: ["team.>"] }),
+    declared,
+  );
+  assert.ok(issues.some((i) => i.message.includes("wildcard")));
+}
+
+// empty-ACL agent → warning; loud when it has capabilities
+{
+  const empty = { subscribe: [], allowSubscribe: [], allowPublish: [] };
+  const { warnings } = prepareAgent(agent({ policy: empty }), undefined, declared);
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].loud, false);
+  const { warnings: loud } = prepareAgent(agent({ policy: empty, capabilities: ["spawn"] }), undefined, declared);
+  assert.equal(loud[0].loud, true);
+}
+
+// --- manifest cwd belongs to the manager host, not the manifest directory (#963) ---------------
+{
+  const source = (cwd?: string) => `${HEAD}agents:\n  worker:\n    model: opus\n${cwd === undefined ? "" : `    cwd: ${JSON.stringify(cwd)}\n`}channels: {}\n`;
+  const legacy = ok(source());
+  const base = prepareAgent(legacy.agents[0], undefined, new Set()).prepared;
+  // Captured from the shipped pre-cwd hash: an upgrade must not make every old entry stale.
+  assert.equal(hashAgent(base), "fd4f6aefa0a2402f");
+  assert.equal(base.cwd, undefined);
+  assert.equal(buildLaunchSpec({ manifest: legacy, agents: [base], warnings: [] }, "legacy").agents[0].cwd, undefined);
+  for (const cwd of ["repos/api", "../other repo", resolve("/target/repo")]) {
+    const m = ok(source(cwd));
+    assert.equal(m.agents[0].cwd, cwd); // no operator-host path resolution
+    const prepared = prepareAgent(m.agents[0], undefined, new Set()).prepared;
+    assert.equal(prepared.cwd, cwd);
+    const full = { manifest: m, agents: [prepared], warnings: [] };
+    const spec = JSON.parse(JSON.stringify(buildLaunchSpec(full, "cwdtest")));
+    assert.equal(spec.agents[0].cwd, cwd);
+    assert.notEqual(hashAgent(prepared), hashAgent(base));
+    assert.notEqual(hashAgent(prepared), hashAgent({ ...prepared, cwd: `${cwd}/changed` }));
+    assert.ok(renderTopology(full).includes(JSON.stringify(cwd)));
+  }
+  fails(source(""), "cwd");
+  fails(source("bad\0path"), "cwd");
+  fails(`${HEAD}agents:\n  worker: { model: opus, cwd: 42 }\nchannels: {}\n`, "cwd");
+}
+
+// --- connector preflight: a prompt on a connector without supportsPrompt is refused (#315) ------
+// preflightConnectors materializes each agent type from the in-process registry first, so a fake
+// registered connector (empty requires) reaches the capability gates with no broker and no
+// installed-extension manifest.
+{
+  const register = (name: string, caps: Partial<Connector>): void =>
+    registry.register({ kind: "connector", name, requires: [], ...caps } as Connector);
+  const manifest = (agent: string): string =>
+    `apiVersion: cotal/v1\nkind: Mesh\nspace: pf\nagent: ${agent}\nagents:\n  kickoff:\n    model: test/model\n    prompt: BEGIN\nchannels: {}\n`;
+  register("pf-no-prompt", {});
+  register("pf-prompt", { supportsPrompt: true });
+  register("pf-variant-only", { supportsModelVariant: true });
+  const preflight = async (agent: string): Promise<string> =>
+    preflightConnectors(preparePersonas(ok(manifest(agent))));
+  assert.equal(
+    await preflight("pf-no-prompt"),
+    "pf-no-prompt does not support a kickoff prompt (used by kickoff)",
+  );
+  assert.equal(await preflight("pf-prompt"), "");
+  assert.equal(
+    await preflight("pf-variant-only"),
+    "pf-variant-only does not support a kickoff prompt (used by kickoff)",
+  );
+}
+
+console.log("manifest pipeline smoke ok");

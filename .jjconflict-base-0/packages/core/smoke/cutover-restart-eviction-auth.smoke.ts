@@ -1,0 +1,154 @@
+/**
+ * Local cutover restart smoke (D5 live-eviction proof): the current `MEMORY` resolver deployment applies
+ * trust-root changes by rewriting config and restarting the broker. That restart must make already-live
+ * stale connections unusable; reconnect then fails because the rotated broker no longer trusts their JWTs/signers.
+ *
+ * Run: pnpm smoke:cutover-restart-eviction
+ */
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { connect, credsAuthenticator, type NatsConnection } from "@nats-io/transport-node";
+import {
+  createSpaceAuth,
+  isReachable,
+  mintCreds,
+  mintMembershipObserverCreds,
+  newIdentity,
+  rotateDataAccountSigningKey,
+  rotateSystemAccount,
+  serverConfig,
+} from "../src/index.js";
+import { pickFreePort } from "./_free-port.js";
+import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
+
+const PORT = await pickFreePort();
+const SERVERS = `nats://127.0.0.1:${PORT}`;
+const enc = (s: string) => new TextEncoder().encode(s);
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const awaitExit = (proc: ReturnType<typeof spawn>, timeoutMs = 3000): Promise<void> =>
+  new Promise((resolve) => {
+    if (proc.exitCode !== null || proc.signalCode !== null) return resolve();
+    proc.once("exit", () => resolve());
+    setTimeout(resolve, timeoutMs);
+  });
+
+let pass = 0;
+let fail = 0;
+const check = (name: string, cond: boolean, extra?: unknown) => {
+  if (cond) {
+    pass++;
+    console.log(`  ✓ ${name}`);
+  } else {
+    fail++;
+    console.log(`  ✗ FAIL: ${name}`, extra ?? "");
+  }
+};
+
+async function waitReachable(): Promise<void> {
+  for (let i = 0; i < 50; i++) {
+    if (await isReachable(SERVERS)) return;
+    await wait(200);
+  }
+  throw new Error(`auth nats-server did not come up on ${PORT}`);
+}
+
+async function tryConnect(creds: string, id: string): Promise<"ok" | "rejected"> {
+  try {
+    const nc = await connect({
+      servers: SERVERS,
+      authenticator: credsAuthenticator(enc(creds)),
+      inboxPrefix: `_INBOX_${id}`,
+      maxReconnectAttempts: 0,
+    });
+    await nc.close();
+    return "ok";
+  } catch {
+    return "rejected";
+  }
+}
+
+async function liveConnect(creds: string, id: string): Promise<NatsConnection> {
+  return connect({
+    servers: SERVERS,
+    authenticator: credsAuthenticator(enc(creds)),
+    inboxPrefix: `_INBOX_${id}`,
+    maxReconnectAttempts: 5,
+    reconnectTimeWait: 100,
+  });
+}
+
+async function staleConnectionUnusable(nc: NatsConnection, timeoutMs = 20_000): Promise<boolean> {
+  const result = await Promise.race([
+    nc.closed().then(() => "closed" as const),
+    nc.flush().then(
+      () => "usable" as const,
+      () => "unusable" as const,
+    ),
+    wait(timeoutMs).then(() => "unusable" as const),
+  ]);
+  if (result !== "closed") await nc.close().catch(() => {});
+  return result !== "usable";
+}
+
+const space = `cutover-evict-${randomUUID().slice(0, 8)}`;
+const auth = await createSpaceAuth(space);
+const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+const conf = join(dir, "server.conf");
+writeFileSync(conf, serverConfig(auth, [auth], { transport: { kind: "plaintext" }, port: PORT, storeDir: join(dir, "js") }));
+let srv = spawn("nats-server", ["-c", conf], { stdio: "ignore" });
+// Re-owned on every restart. Owning only the FIRST child would leave the LIVE broker unowned
+// after a respawn while the suite still read as migrated: ownership held on a dead pid.
+let releaseBroker = teardownOnSignal(srv, dir);
+
+try {
+  await waitReachable();
+
+  const oldData = newIdentity();
+  const oldDataCreds = await mintCreds(auth, oldData, "probe", { expiresInSeconds: 300 });
+  const oldDataNc = await liveConnect(oldDataCreds, oldData.id);
+  check("old data-account cred is live before cutover", !oldDataNc.isClosed());
+
+  const oldObserver = newIdentity();
+  const oldObserverCreds = await mintMembershipObserverCreds(auth, oldObserver);
+  const oldObserverNc = await liveConnect(oldObserverCreds, oldObserver.id);
+  check("old membership-observer cred is live before cutover", !oldObserverNc.isClosed());
+
+  const rotatedData = await rotateDataAccountSigningKey(auth);
+  const rotated = await rotateSystemAccount(rotatedData);
+  const freshData = newIdentity();
+  const freshDataCreds = await mintCreds(rotated, freshData, "probe", { expiresInSeconds: 300 });
+  const freshObserver = newIdentity();
+  const freshObserverCreds = await mintMembershipObserverCreds(rotated, freshObserver);
+
+  srv.kill("SIGKILL");
+  await awaitExit(srv);
+  writeFileSync(conf, serverConfig(rotated, [rotated], { transport: { kind: "plaintext" }, port: PORT, storeDir: join(dir, "js") }));
+  releaseBroker();
+  srv = spawn("nats-server", ["-c", conf], { stdio: "ignore" });
+  releaseBroker = teardownOnSignal(srv, dir);
+  await waitReachable();
+
+  check("already-live stale data-account connection is unusable after local cutover restart", await staleConnectionUnusable(oldDataNc));
+  check(
+    "already-live stale membership-observer connection is unusable after local cutover restart",
+    await staleConnectionUnusable(oldObserverNc),
+  );
+  check("old data-account cred is broker-denied after restart", await tryConnect(oldDataCreds, oldData.id) === "rejected");
+  check("old membership-observer cred is broker-denied after restart", await tryConnect(oldObserverCreds, oldObserver.id) === "rejected");
+  check("fresh rotated data-account cred connects", await tryConnect(freshDataCreds, freshData.id) === "ok");
+  check("fresh reminted membership-observer cred connects", await tryConnect(freshObserverCreds, freshObserver.id) === "ok");
+} finally {
+  srv.kill();
+  await awaitExit(srv);
+  rmSync(dir, { recursive: true, force: true });
+  releaseBroker(); // last: ownership is held until this teardown has actually finished
+}
+
+if (fail) {
+  console.error(`\nCUTOVER RESTART EVICTION TEST FAILED (${fail} failed, ${pass} passed)`);
+  process.exit(1);
+}
+console.log(`\nCUTOVER RESTART EVICTION TEST PASSED ✅  (${pass} checks)`);

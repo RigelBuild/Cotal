@@ -1,0 +1,26 @@
+{
+  "grades": "tool",
+  "suite": [
+    "bin/smoke/live-job-conclusion.smoke.ts"
+  ],
+  "guard": "the real CI aggregate remains the sole job-level always aggregate while excluding manual acquisition",
+  "command": "pnpm smoke:live-job-conclusion",
+  "progressPattern": "  \u2713 ",
+  "completionMarker": "SUITE COMPLETE:",
+  "proveWith": "node scripts/mutation-proof.mjs --config bin/smoke/mutations/live-job-conclusion-manual-exclusion.json",
+  "why": [
+    "Restores the exact bare-always-only reader that failed on the actual combined CI gate. The named original workflow cell must redden. Real workflow and original classifier cells stay intact.",
+    "Full same smoke command after every source restoration. Source-only author executed none."
+  ],
+  "mutations": [
+    {
+      "name": "aggregate reader again overlooks its fixed manual exclusion",
+      "file": "bin/smoke/live-job-conclusion.smoke.ts",
+      "find": "    conditions[0] === \"    if: ${{ always() && github.event_name != 'workflow_dispatch' }}\");",
+      "replace": "    false);",
+      "expectRed": "ci-ok is the sole job-level always aggregate",
+      "cell": "ci-ok is the sole job-level always aggregate",
+      "afterRestore": "pnpm smoke:live-job-conclusion"
+    }
+  ]
+}

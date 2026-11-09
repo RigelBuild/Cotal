@@ -5342,7 +5342,7 @@ on a generation by a static issuer (a static incarnation's credential, an operat
 expires no later than the horizon. A static incarnation's generation has a horizon 30 days after
 its issuance; each renewal of its credential is capped at it, none is minted at or after it, and
 the incarnation is respawned to continue. An agent seat a terminal starts on a static space (a
-foreground spawn, a bare join) is issued against its own §13.1 lifecycle, activated before the mint
+foreground spawn, a bare join, a personal conversation's connection) is issued against its own §13.1 lifecycle, activated before the mint
 with `terminal` as its minting authority. Its generation's horizon is the expiry the person set, or
 the furthest a generation can name (`0xffffffff`, 2106-02-07); its credential expires with it and is
 never renewed. When the seat leaves cleanly the terminal retires the lifecycle, retiring its
@@ -6189,6 +6189,11 @@ split, mediated, written by the driver's commit path only.
   journal's tail, which nothing inside the journal can see, and the driver MUST refuse to resume it.
   Interior loss is the journal's own ordinal chain's.
 
+**Inventory reads.** The list-only run-operator credential additionally permits
+`$JS.API.DIRECT.GET.KV_cotal_records_<space>` for non-fencing inventory reads. This permission
+MUST NOT be added to single-run read or checkpoint-answer credentials. It grants no consumer
+creation or record writes. Admission and revocation reads MUST remain leader-served.
+
 **Native personal participation.** An approved personal native lifecycle MAY opt into workflow
 turns through the manager's self-mode `turn-participate` command. The request body is empty. The
 broker-authenticated caller triple is the lifecycle being authorized. The manager MUST fresh-check
@@ -6862,7 +6867,10 @@ The profile holds no other `CONSUMER.DELETE`. Its watch consumers are client-nam
 stream-wide, and a stream-wide grant lets one holder delete another principal's watch cursors and
 the delivery daemon's `fanout` durable. The broker removes these consumers at their inactive
 threshold (five minutes after the last interest), and a client MUST treat a refused delete of its
-own watch consumer as that outcome rather than as a failure.
+own watch consumer as that outcome rather than as a failure. A client MAY skip publishing that
+delete when it recorded the consumer as its own watch and the authenticated connection's known
+publish claims exclude the subject. Unknown claims or an unrecorded consumer do not establish this
+exception. A skipped delete does not prove the consumer is gone and grants no additional authority.
 
 ### Admin
 

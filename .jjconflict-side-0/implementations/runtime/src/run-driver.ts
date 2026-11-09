@@ -1,0 +1,842 @@
+/**
+ * The run driver: what actually advances a workflow run, and the only thing allowed to.
+ *
+ * A driver is not a scheduler and not a supervisor. Its whole job is to be the ONE process holding a
+ * run, to hand the interpreter a journal that is durable and complete, and to stop the moment it is
+ * no longer that process. Everything hard about the first and third parts lives in the activation
+ * barrier (`@cotal-ai/core`); everything hard about the middle lives in the language. This file is
+ * the join, and it is deliberately small — a driver with its own opinions about durability would be
+ * a second answer to a question that already has one.
+ *
+ * **Start and resume are the same act with one bit of difference**, and the bit is not cosmetic. A
+ * run's journal cannot say whether an empty subject means "never started" or "retired by purge", so
+ * the caller states which it means: `startRun` activates with `expect: "new"` and `driveRun` with
+ * `expect: "existing"`, and the barrier refuses the mismatch either way. That is why there are two
+ * entry points rather than one that guesses from what it finds.
+ *
+ * **The prefix the barrier replayed IS the journal the interpreter resumes from.** Not a copy of it,
+ * not a second read: the appender hands back exactly the records it validated as complete before it
+ * activated, so there is no window in which the driver could resume from a different prefix than the
+ * one it took the run over on.
+ *
+ * **A durability failure is not a run failure.** If the journal refuses an append — superseded,
+ * stalled, retired — the run is not "failed", it is no longer THIS process's to speak for. The
+ * distinction is the whole reason `RunJournalStore` maps those to L5010: a driver that reported them
+ * as an outcome would be writing down a conclusion about work it can no longer see.
+ */
+import {
+  wfjStreamName,
+  wfjSubject,
+  EpEnvelopeError,
+  activateRun,
+  readRunRecord,
+  createRunSpec,
+  recordRunProgram,
+  writeRunStatus,
+  assertJournalTailIntact,
+  RunJournalTailTruncated,
+  type RunStatusValue,
+  type RunFailure,
+  runFailureOf,
+  RunSuperseded,
+  RunJournalStalled,
+  StaleLeaseToken,
+  ActivationNotAuthorized,
+  RunNotResumable,
+  RunAlreadyStarted,
+  RunJournalPrefixTruncated,
+} from "@cotal-ai/core";
+import type { JetStreamClient, JetStreamManager } from "@nats-io/jetstream";
+import type { KV } from "@nats-io/kv";
+import {
+  Journal,
+  JournalAppendRejected,
+  run as runProgram,
+  resume as resumeProgram,
+  RunReleased,
+  RunHeld,
+  Cancelled,
+  type RootCancellationSource,
+  resolvePins,
+  RuntimeFault,
+  ENGINE_LANGUAGE_VERSION,
+  WALKER_LANGUAGE_VERSION,
+  PIN_DEFAULTS,
+  journalEntryKeyString,
+  type EffectHandler,
+  type JournalEntry,
+  type RunPins,
+  type RunResult,
+} from "@cotal-ai/lang";
+import { runOnHostedEngine } from "./engine-host.js";
+import { RunJournalStore, replayOwnJournal } from "./journal-store.js";
+import { releasableSeats } from "./run-scope-authority.js";
+
+/**
+ * What an entry in the engine table is handed: everything `drive()` prepared, with the pieces the
+ * two engines consume left whole. The walker takes the store-backed `journal`; the compiled engine
+ * takes the `store`, the activated `entries` and the `resultBytes` bound themselves, because its
+ * journal is rebuilt inside the worker thread and only the durable half stays out here. Both read
+ * the same `options`.
+ */
+interface HostedEngineRequest {
+  readonly source: string;
+  readonly journal: Journal;
+  readonly store: RunJournalStore;
+  readonly entries: readonly JournalEntry[];
+  readonly resultBytes?: number;
+  readonly options: {
+    readonly runId: string;
+    readonly handler: EffectHandler;
+    readonly shouldStop: () => string | undefined;
+    readonly cancellation?: RootCancellationSource;
+    readonly pins: RunPins;
+    readonly seed?: string;
+    readonly file?: string;
+    readonly effectCeiling?: number;
+    readonly stepBudget?: number;
+    readonly onLog?: (line: { readonly scope: string; readonly values: readonly unknown[] }) => void;
+  };
+}
+
+interface HostedEngine {
+  readonly version: string;
+  run(req: HostedEngineRequest): Promise<RunResult>;
+  resume(req: HostedEngineRequest): Promise<RunResult>;
+}
+
+/** The compiled engine consumes the same request either way: pins plus the activated entries say
+ *  whether this is a fresh run or a resume, exactly as they say it to the walker underneath. */
+const hostedEngineRun = (r: HostedEngineRequest): Promise<RunResult> =>
+  runOnHostedEngine({
+    source: r.source,
+    runId: r.options.runId,
+    pins: r.options.pins,
+    handler: r.options.handler,
+    store: r.store,
+    entries: r.entries,
+    ...(r.resultBytes !== undefined ? { resultBytes: r.resultBytes } : {}),
+    shouldStop: r.options.shouldStop,
+    ...(r.options.cancellation !== undefined ? { cancellation: r.options.cancellation } : {}),
+    ...(r.options.file !== undefined ? { file: r.options.file } : {}),
+    ...(r.options.seed !== undefined ? { seed: r.options.seed } : {}),
+    ...(r.options.effectCeiling !== undefined ? { effectCeiling: r.options.effectCeiling } : {}),
+    ...(r.options.stepBudget !== undefined ? { stepBudget: r.options.stepBudget } : {}),
+    ...(r.options.onLog !== undefined ? { onLog: r.options.onLog } : {}),
+  });
+
+/**
+ * THE LANGUAGE VERSIONS THIS BUILD'S DRIVER CAN HOST, most preferred first.
+ *
+ * This is a fact about the DRIVER, not about the language, and this build serves both: a fresh run
+ * is stamped "2" and executes on the compiled engine — the transform runs here, the program runs in
+ * a locked-down worker thread, and the effects and the durable journal stay in THIS process, bridged
+ * over a MessagePort so no socket, client or credential enters the isolate that holds the program
+ * (`engine-host.ts`) — and every version-1 record keeps routing to the walker, which is the
+ * walker's whole job. What a run is stamped with must be the version of the engine that will
+ * actually execute it: stamping "2" and calling the walker is REFUSED L5008, measured when this
+ * table held one entry.
+ *
+ * ORDER IS THE PRECEDENCE and it is declared, never derived: a fresh run takes the first entry. A
+ * sort over the keys would make "which version is preferred" a fact about string collation, which is
+ * not a thing anyone decided.
+ */
+const ENGINES: readonly HostedEngine[] = [
+  { version: ENGINE_LANGUAGE_VERSION, run: hostedEngineRun, resume: hostedEngineRun },
+  {
+    version: WALKER_LANGUAGE_VERSION,
+    run: (r) => runProgram(r.source, { ...r.options, journal: r.journal }),
+    resume: (r) => resumeProgram(r.source, r.journal, r.options),
+  },
+];
+
+/**
+ * A record whose `languageVersion` is not the string the wire contract declares (SPEC §14.3,
+ * core's run-record). Distinct from L5023 on purpose: L5023 says "a version this build does not
+ * serve", and folding a malformed field into it produced the self-contradictory sentence
+ * "recorded under language version 2 ... this build serves 2, 1" when the 2 was a number - the
+ * table compares strings, so a number misses every entry while printing like a served version.
+ * The writer that produced the record is the defect; the record is refused untouched.
+ */
+class RunRecordMalformed extends Error {
+  constructor(runId: string, got: unknown) {
+    super(
+      `run ${runId}'s record is malformed: \`languageVersion\` must be a string and this record carries a ${typeof got}`
+        + ` (${JSON.stringify(got) ?? String(got)}). No engine dispatch was attempted; the writer that produced this record is the defect to fix.`,
+    );
+    this.name = "RunRecordMalformed";
+  }
+}
+
+/**
+ * A resume found no run RECORD. That is two states, and they are repaired differently.
+ *
+ * NO RECORD IS NOT NO JOURNAL. `RunNotResumable` says the journal was retired or lost, and for a
+ * run that never existed that is exactly right. But a fresh run is ACTIVATED before it is pinned —
+ * deliberately, because a driver that pinned before winning would pin a run for the winner — so a
+ * crash in that window leaves a journal holding an activation and no step, and no spec anywhere.
+ * The old message sent an operator looking for a lost journal that is sitting right there, and the
+ * repair is the opposite one: nothing was performed, so the program is started again under a NEW
+ * id rather than hunted for.
+ *
+ * Read through this attempt's scoped replay durable. The driver holds no stream-wide point read,
+ * including on diagnostic paths.
+ */
+async function noRecordToResume(js: JetStreamClient, jsm: JetStreamManager, req: DriveRequest): Promise<Error> {
+  const replay = await replayOwnJournal(js, jsm, req.space, req.runId, req.lease.takeoverId);
+  const journalled = replay.records.length !== 0;
+  if (!journalled) return new RunNotResumable(req.runId, wfjSubject(req.space, req.runId));
+  return new Error(
+    `run ${req.runId} has a journal but no record: it was activated and then never pinned, which is the `
+    + `window between a driver winning the run and writing its spec. Nothing was performed under it — the `
+    + `journal holds the activation and no step — and the pins a resume would need were never recorded, so `
+    + `there is nothing here to resume and nothing to recover. Start the program again under a new run id.`,
+  );
+}
+
+/**
+ * The refusal for a recorded language no engine in this build serves, naming what it does serve.
+ *
+ * L5023 rather than L5008: L5008 is the same disagreement one layer in, where a record was handed to
+ * a SPECIFIC engine whose version differs and the repair is to run it on the engine that matches.
+ * Here there is no such engine to name, so it is a different sentence. The message carries the
+ * recorded version AND the served set, because "this build cannot" is only actionable if it says
+ * what it can.
+ */
+function unservedLanguage(version: string | undefined): RuntimeFault {
+  // A RECORD MAY NAME NO VERSION AT ALL, and it reaches this branch by the same route: written
+  // before the field existed, it matches no engine either. The two cases get different sentences
+  // because an operator acts on them differently, and because interpolating an absent value says
+  // the record claims "undefined" when what happened is that it claims nothing. MEASURED before the
+  // repair, through the driver: `recorded under language version undefined and this build serves 1`.
+  const met = version === undefined ? "names no language version at all" : `was recorded under language version ${version}`;
+  const repair = version === undefined
+    ? `identify the version this record was written under, and run it on a build that serves it`
+    : `run this record on a build whose engines serve version ${version}`;
+  return new RuntimeFault(
+    "L5023",
+    `this run ${met} and this build serves ${ENGINES.map((e) => e.version).join(", ")}. `
+      + `A record replays only on an engine that speaks its language: version 1 is the tree-walker and version 2 is the engine, and they are `
+      + `different languages rather than two speeds of one.\n\n`
+      + `Options\n  ${repair}\n  fork(run, <step>) start a new run on this build, keeping the prefix`,
+  );
+}
+
+/**
+ * The lease this driver holds the run under, from the work pool.
+ *
+ * `fencingToken` is `WorkLease.fencingToken` — monotonic per item, and the coordinate the barrier
+ * orders takeovers by. `holder` and `epoch` are the identity it is bound to: a token alone would let
+ * a returning process re-establish itself on a lease it still remembers, which is the same defect
+ * the barrier exists to prevent.
+ */
+export interface RunLease {
+  readonly holder: string;
+  readonly epoch: number;
+  readonly fencingToken: number;
+  /**
+   * The takeover id this driver's journal credential was minted for.
+   *
+   * It names the replay consumer, and a consumer name is one subject token, so it cannot be covered
+   * by a grant pattern — it has to be known when the rows are minted. That is when the lease is
+   * handed out, which is why it arrives with the lease rather than being chosen here.
+   */
+  readonly takeoverId: string;
+}
+
+/**
+ * A pause an operator can ask for while a run is being driven.
+ *
+ * The driver reads it before each effect it has not already recorded, so a pause takes effect at the
+ * next boundary and never in the middle of one. It is one-way on purpose: resuming is starting a
+ * drive again, which is the same act as any other takeover and goes through the barrier like one.
+ */
+export class PauseToken {
+  private why: string | undefined;
+
+  pause(reason: string): void {
+    this.why ??= reason;
+  }
+
+  get reason(): string | undefined {
+    return this.why;
+  }
+}
+
+export interface DriveRequest {
+  readonly space: string;
+  /**
+   * The endpoint HOSTING this driver — the manager daemon. It leads the run record's
+   * key, so a retirement drain and a per-endpoint enumeration both work by prefix.
+   */
+  readonly endpoint: string;
+  readonly runId: string;
+  /** The program. A resume MUST be handed the same source: a different one is a fork, not a resume. */
+  readonly source: string;
+  readonly lease: RunLease;
+  readonly handler: EffectHandler;
+  /**
+   * The records bucket. NOT optional, and deliberately so: the run record holds the pins a resume
+   * must read back and the high-water ordinal that is the only thing able to see a truncated
+   * journal tail. A driver that could run without it would skip both silently, which is the failure
+   * mode both exist to prevent.
+   */
+  readonly kv: KV;
+  readonly seed?: string;
+  readonly file?: string;
+  readonly effectCeiling?: number;
+  readonly stepBudget?: number;
+  /**
+   * The most bytes a settled `ok` result may canonicalize to, checked by the journal AHEAD of the
+   * append (L5006). The host that opens the broker connection knows its `max_payload` and passes
+   * the bound here; omitted, the journal enforces none and an oversized entry fails at the store
+   * (L5010) after the append was attempted.
+   */
+  readonly resultBytes?: number;
+  /**
+   * The ABSOLUTE work horizon this driver accepted the item under (`WorkLease.workExpiry`).
+   *
+   * Past it the pool has already reconciled the item, so a driver still appending is writing into a
+   * run the authority considers finished with. Nothing needs to be read to know this: the horizon is
+   * fixed at acceptance and never re-set (SPEC 13.8), which is exactly what makes it safe to check
+   * locally — unlike a lease deadline, whose current value is a fact on another machine and whose
+   * check would be a read-then-publish with a gap that cannot be closed.
+   */
+  readonly workExpiry?: number;
+  /** An operator's pause, honoured at the next effect boundary. */
+  readonly pause?: PauseToken;
+  /** Where the program's `log(...)` lines go. They are not journalled. */
+  readonly onLog?: (line: { readonly scope: string; readonly values: readonly unknown[] }) => void;
+  /** Root cancellation established by the hosting manager after observing its durable marker. */
+  readonly cancellation?: RootCancellationSource;
+  /** Shared host observation for classifying a revoked channel effect before root signalling. */
+  readonly cancellationObserved?: () => string | undefined;
+  /**
+   * Repair external state bound to the PREVIOUS holder, once this driver holds the run and before
+   * the program is resumed.
+   *
+   * The case that exists is timers: a checkpoint's armed schedule fires onto a subject derived from
+   * the instance and epoch that armed it, so a run adopted by another host has live timers firing
+   * where nobody is listening, and resuming the program does not repair that — the pause replays as
+   * pending and goes straight back to waiting. What to re-arm is the mesh handler's business, not
+   * the driver's, so the driver only says WHEN: after the activation, because arming timers for a
+   * run this process turned out not to hold would point another driver's fires at this one.
+   *
+   * A failure here is a failure to take the run over, and is not swallowed: a driver that resumed a
+   * program whose pauses it could not re-arm would look like it was holding a run it cannot advance.
+   *
+   * OPTIONAL BECAUSE IT IS AN OVERRIDE, NOT BECAUSE THE REPAIR IS. A handler that knows how to
+   * repair its own external state says so with an `adopted` method, and the driver calls that when
+   * no callback is supplied — found by review, which noticed that this hook had NO caller anywhere
+   * in the tree, so every adopted run left its timers armed at the predecessor's coordinates. A
+   * seam that every future host must remember to wire is a defect waiting on its first host.
+   */
+  readonly onActivated?: (entries: readonly JournalEntry[]) => Promise<void>;
+}
+
+/**
+ * A handler that owns external state bound to whoever was holding the run, and can repair it.
+ *
+ * Declared here rather than on `EffectHandler` because it is the DRIVER's concern: the language's
+ * handler interface describes performing effects, and nothing in `packages/lang` has a notion of one
+ * host taking a run over from another.
+ */
+export interface AdoptingHandler {
+  adopted(entries: readonly JournalEntry[]): Promise<unknown>;
+}
+
+const adoptionOf = (handler: unknown): AdoptingHandler | undefined =>
+  typeof (handler as AdoptingHandler | undefined)?.adopted === "function"
+    ? (handler as AdoptingHandler)
+    : undefined;
+
+/** A handler that can receive the seats a committed migration kept for the program under
+ *  `--adopt` (spec §11.2): the next `spawn` of each persona returns the recorded seat. */
+export interface SeatAdoptingHandler {
+  restoreMigratedSeats(entries: readonly JournalEntry[]): Promise<void>;
+}
+
+const seatAdoptionOf = (handler: unknown): SeatAdoptingHandler | undefined => {
+  const candidate = handler as Partial<SeatAdoptingHandler> & { adoptMigratedSeats?: unknown };
+  if (typeof candidate?.restoreMigratedSeats === "function") return candidate as SeatAdoptingHandler;
+  if (typeof candidate?.adoptMigratedSeats === "function")
+    throw new Error("a seat-adopting handler must provide restoreMigratedSeats; migration reads belong to its host");
+  return undefined;
+};
+
+/**
+ * A handler that can end the external state a cancelled branch left behind (§7.6): timers still
+ * armed, a wait's durable consumer still holding a position. Declared here for the same reason as
+ * {@link AdoptingHandler} — the language records the cancellation, and acting on the record is the
+ * driver's concern. A handler with no external state (the simulator) declares nothing and the
+ * discharge is the flip alone.
+ */
+export interface DischargingHandler {
+  discharge(entries: readonly JournalEntry[]): Promise<unknown>;
+}
+
+const dischargeOf = (handler: unknown): DischargingHandler | undefined =>
+  typeof (handler as DischargingHandler | undefined)?.discharge === "function"
+    ? (handler as DischargingHandler)
+    : undefined;
+
+/**
+ * A handler that can release the seats a completed run spawned. Declared beside
+ * {@link DischargingHandler} for the same reason: the journal records the spawns, and ending them
+ * when the run completes is the driver's concern.
+ */
+export interface ReleasingHandler {
+  release(entries: readonly JournalEntry[]): Promise<unknown>;
+}
+
+/**
+ * Release every seat a completed run spawned. A seat belongs to the run that spawned it, so a run
+ * that completes despawns its seats, winners and plain spawns alike, through the same despawn its
+ * cancellation sweep uses for losers. {@link releasableSeats} picks them: never a fork parent's,
+ * never one a fork may share, and never one a migration handed to a later spawn. Idempotent: a seat
+ * already gone is tolerated, so a crash between this and the completed note is repaired by the next
+ * completion.
+ */
+export async function releaseSeats(runId: string, entries: readonly JournalEntry[], handler: unknown): Promise<void> {
+  if (typeof (handler as ReleasingHandler | undefined)?.release !== "function") return;
+  const seats = releasableSeats(runId, entries);
+  if (seats.length > 0) await (handler as ReleasingHandler).release(seats);
+}
+
+/**
+ * Discharge every recorded cancellation whose flip is still owed: the second half of the design
+ * `cancel.issued` stages (#532). A scope that cancels its losers writes the INTENT with its
+ * outcome — `cancel: { losers, issued: false }` — because a journal write cancels nothing by
+ * itself; this is the runtime acting on that record. For each such scope entry the losers'
+ * subtree entries are handed to the handler to end their external state (idempotently — the live
+ * path usually cleaned up after itself, and this is the durable backstop for a process that died
+ * first), and only then is the entry re-appended with `issued: true`, so a flip in the journal is
+ * always DOWNSTREAM of the world being quiet.
+ *
+ * Two callers, and the premise each brings. At the run's COMPLETION every branch has settled, so
+ * the loser subtrees it hands the handler are final. At ADOPTION the prefix is a resumed journal:
+ * a recorded cancellation is still a cancellation (the losers' entries are what the crash left,
+ * and nothing inside a cancelled arm runs again), so the same walk is sound there, and it is what
+ * keeps recovery from waiting on a completion that may be hours away. A released run is not swept
+ * by either (this driver no longer holds it, and its appends would be refused), and a crash before
+ * either sweep is repaired by whichever comes next reading `issued: false` off the replayed prefix.
+ */
+export async function dischargeCancellations(
+  entries: readonly JournalEntry[],
+  store: { append(entry: JournalEntry): Promise<void> },
+  handler: unknown,
+): Promise<string[]> {
+  const flipped: string[] = [];
+  const discharger = dischargeOf(handler);
+  for (const e of entries) {
+    if (e.state !== "settled" || e.cancel === undefined || e.cancel.issued) continue;
+    const scopeKey = journalEntryKeyString(e);
+    if (discharger !== undefined) {
+      const prefixes = e.cancel.losers.map((b) => `${scopeKey}/b:${b}/`);
+      const losers = entries.filter((x) =>
+        x !== e && prefixes.some((p) => journalEntryKeyString(x).startsWith(p)));
+      await discharger.discharge(losers);
+    }
+    try {
+      await store.append({ ...e, cancel: { losers: e.cancel.losers, issued: true } });
+    } catch (err) {
+      // The same wrap `Journal.persist` gives every refused append: a flip the store would not
+      // take means this driver no longer holds the run, and that travels as L5010 — the caller
+      // grades it `released` — never as the completed program having failed.
+      throw new JournalAppendRejected(scopeKey, e.state, err as Error);
+    }
+    flipped.push(scopeKey);
+  }
+  return flipped;
+}
+
+/**
+ * What a drive attempt did, as a two-exit answer rather than a value plus exceptions.
+ *
+ * `completed` is the program finishing under this driver. `released` is this driver ceasing to hold
+ * the run — superseded, stalled, retired — which says nothing about the program and must never be
+ * recorded as if it did. A program that FAILS is still `completed`: the failure is the run's result,
+ * and the journal has it.
+ */
+export type DriveOutcome =
+  | { readonly status: "completed"; readonly result: RunResult }
+  | { readonly status: "released"; readonly reason: Error };
+
+/** Start a run that has never been driven. Refused if the journal already has records. */
+export async function startRun(
+  js: JetStreamClient,
+  jsm: JetStreamManager,
+  req: DriveRequest,
+): Promise<DriveOutcome> {
+  return await drive(js, jsm, req, "new");
+}
+
+/** Take over a run that already exists and drive it to quiescence. Refused if its journal is empty:
+ *  a run whose records were purged is retired, and re-running it would repeat what it already did. */
+export async function driveRun(
+  js: JetStreamClient,
+  jsm: JetStreamManager,
+  req: DriveRequest,
+): Promise<DriveOutcome> {
+  return await drive(js, jsm, req, "existing");
+}
+
+async function drive(
+  js: JetStreamClient,
+  jsm: JetStreamManager,
+  req: DriveRequest,
+  expect: "new" | "existing",
+): Promise<DriveOutcome> {
+  // The record FIRST, because two of the things it holds decide whether this attempt may proceed at
+  // all: the pins the run was started under, and how far its journal is known to have got.
+  const record = await readRunRecord(req.kv, req.endpoint, req.runId);
+  const recordedStatus = record?.status?.value;
+
+  let pins: RunPins;
+  let statusRevision: number | undefined;
+  // WHICH ENGINE RUNS THIS. A fresh run takes the first entry this build serves; a resume takes the
+  // one its RECORD names, and is refused if this build has none. Chosen here, before the pins, so a
+  // fresh run is stamped with the version of the engine that will actually execute it.
+  let engine: (typeof ENGINES)[number];
+  if (expect === "new") {
+    if (record !== undefined) {
+      // Not `RunAlreadyStarted` from the journal — this run has a SPEC, which is the stronger
+      // statement: it was started, pinned, and those pins are not this attempt's to re-decide.
+      return { status: "released", reason: new RunAlreadyStarted(req.runId, 0) };
+    }
+    engine = ENGINES[0]!;
+    // Resolved ONCE, here, from the host clock read exactly once — from here on the epoch is a
+    // recorded fact, and a second read could not be the same run's epoch.
+    pins = resolvePins(
+      {
+        runId: req.runId,
+        ...(req.seed !== undefined ? { seed: req.seed } : {}),
+        ...(req.effectCeiling !== undefined ? { effectCeiling: req.effectCeiling } : {}),
+        ...(req.stepBudget !== undefined ? { stepBudget: req.stepBudget } : {}),
+      },
+      req.handler.now(),
+      engine.version,
+    );
+  } else {
+    if (record === undefined) return { status: "released", reason: await noRecordToResume(js, jsm, req) };
+    // READ BACK, never re-derived. A default is a property of the interpreter, and the interpreter
+    // is the thing that may have changed between attempts.
+    pins = record.spec.value.pins as RunPins;
+    // THE FIELD DISPATCH READS IS CHECKED BEFORE THE TABLE IS CONSULTED. The cast above verifies
+    // nothing, and the table below compares strings: a record carrying the NUMBER 2 would miss
+    // every entry and be released as L5023 whose sentence says "recorded under language version 2"
+    // while "this build serves 2" - a self-contradiction handed to an operator. Absent stays with
+    // the table's own no-version sentence; any other non-string is a malformed record, refused by
+    // its own name. MEASURED before the repair, through this driver against a real broker.
+    const wireVersion: unknown = (record.spec.value.pins as unknown as Record<string, unknown>)["languageVersion"];
+    if (wireVersion !== undefined && typeof wireVersion !== "string") {
+      return { status: "released", reason: new RunRecordMalformed(req.runId, wireVersion) };
+    }
+    // AND THE ENGINE IS READ BACK WITH THEM. No fallback: a record whose language this build cannot
+    // speak is refused by name (L5023) rather than walked by whatever engine happens to be here,
+    // which would run a program under semantics it was never recorded under.
+    const served = ENGINES.find((e) => e.version === pins.languageVersion);
+    // RELEASED, NOT THROWN and not failed. This file's outcome contract is that a driver which is
+    // not the one to run something says so as `released`, and a run result is only ever a thing the
+    // program did: a build that does not serve this language has appended nothing, observed nothing
+    // and decided nothing about the program, so "failed" would be this layer inventing an outcome
+    // and a rejection would be an outcome shape the signature does not declare. It reads the same as
+    // the two refusals either side of it (`RunAlreadyStarted`, `RunNotResumable`) because it is the
+    // same kind of statement: not here, not this attempt.
+    if (served === undefined) return { status: "released", reason: unservedLanguage(pins.languageVersion) };
+    engine = served;
+  }
+
+  let appender;
+  try {
+    appender = await activateRun(js, jsm, {
+      space: req.space,
+      runId: req.runId,
+      holder: req.lease.holder,
+      fencingToken: req.lease.fencingToken,
+      epoch: req.lease.epoch,
+      takeoverId: req.lease.takeoverId,
+      at: req.handler.now(),
+      expect,
+    }, {
+      // BETWEEN the replay and the activation, which is the only place this check is worth
+      // anything: an activation appended over a rolled-back head is another record written into a
+      // journal already known to be wrong, at an ordinal the deleted records already used.
+      onReplayed: (replay) => {
+        assertJournalTailIntact(req.runId, recordedStatus, lastOrdinal(replay.records));
+      },
+    });
+  } catch (e) {
+    // Every one of these means "this driver does not hold this run", and none of them is a fact
+    // about the program. A caller that treated them as a run result would be recording a conclusion
+    // about work it never saw.
+    if (isNotOurs(e)) return { status: "released", reason: e as Error };
+    throw e;
+  }
+
+  const resumed = appender.steps() as readonly JournalEntry[];
+  // THE TAIL ANCHOR FOLLOWS EVERY APPEND once the run is noted `running`, so a record appended
+  // since this activation is covered before the program acts on it. Unset until then: the spec
+  // revision this write pins is read below, and the `running` note covers whatever came before it.
+  let anchor: ((journalHigh: number) => Promise<void>) | undefined;
+  const store = new RunJournalStore(appender, async (high) => {
+    if (anchor !== undefined) await anchor(high);
+  });
+  let flipped: ReadonlySet<string>;
+  try {
+    // The explicit callback wins; otherwise a handler that declares `adopted` repairs its own state.
+    // The default is the point: the hook was optional AND unwired, which is indistinguishable at
+    // runtime from a driver that has nothing to repair.
+    const adopt = req.onActivated ?? adoptionOf(req.handler)?.adopted.bind(req.handler);
+    if (adopt !== undefined) await adopt(resumed);
+    // The seats a committed migration kept for this program (`--adopt`), handed to the handler
+    // before the program runs so its next spawn of that persona receives one. Only on a resume: a
+    // fresh run has no migration behind it.
+    if (expect === "existing") {
+      const seats = seatAdoptionOf(req.handler);
+      if (seats !== undefined) {
+        await seats.restoreMigratedSeats(resumed);
+      }
+    }
+
+    // ADOPTION-TIME discharge, the recovery half of the `cancel.issued` stages: a crash between a
+    // scope's cancel record and its discharge leaves the losers' external state live — a seat still
+    // up in its worktree, a pause still armed — for as long as the resumed run keeps running. The
+    // completion sweep alone would wait until the END of a run that may hold the lease for hours,
+    // so recovery re-issues the owed cancellations before the engine performs any new step.
+    // Idempotent by the plane, exactly as the completion sweep is; an empty or fully-issued prefix
+    // is a no-op, so a fresh run pays nothing.
+    flipped = new Set(await dischargeCancellations(resumed, store, req.handler));
+  } catch (e) {
+    // The same grading the engine's own failures get below, because these two run on the far side
+    // of the activation and can lose the run the same way: a flip the store refused (L5010) is a
+    // successor holding the journal, and a re-arm the plane refused is that successor holding the
+    // pause. Both used to escape `drive()` raw, out of a function whose whole contract is that
+    // losing a run is an answer; a takeover between the activation and the first note was a crash.
+    if (e instanceof JournalAppendRejected || isNotOurs(e)) return { status: "released", reason: e as Error };
+    throw e;
+  }
+  // The prefix the barrier validated and activated on, not a second read of the subject — with
+  // the flips the sweep just appended applied in place, so the engine's picture of `issued` never
+  // lags the store it writes to and the completion sweep finds nothing left to re-issue. Both
+  // seeds below take THIS view: the journal, and the engine request that folds its own.
+  const seeded: readonly JournalEntry[] = resumed.map((e) =>
+    flipped.has(journalEntryKeyString(e)) && e.cancel !== undefined
+      ? { ...e, cancel: { losers: e.cancel.losers, issued: true } }
+      : e);
+  const journal = new Journal({
+    run: req.runId,
+    entries: seeded,
+    store,
+    ...(req.resultBytes !== undefined ? { resultBytes: req.resultBytes } : {}),
+  });
+
+  // Asked before every effect that is not already recorded. Both reasons are the HOST's and neither
+  // is the program's, so neither may be recorded as its outcome — the run stops where its journal
+  // already says it is, and the next driver resumes from there.
+  const shouldStop = (): string | undefined => {
+    if (req.workExpiry !== undefined) {
+      const now = req.handler.now();
+      if (now >= req.workExpiry) return `the work horizon ${req.workExpiry} passed at ${now}`;
+    }
+    return req.pause?.reason;
+  };
+
+  const options = {
+    runId: req.runId,
+    handler: req.handler,
+    shouldStop,
+    ...(req.cancellation !== undefined ? { cancellation: req.cancellation } : {}),
+    pins,
+    ...(req.seed !== undefined ? { seed: req.seed } : {}),
+    ...(req.file !== undefined ? { file: req.file } : {}),
+    ...(req.effectCeiling !== undefined ? { effectCeiling: req.effectCeiling } : {}),
+    ...(req.stepBudget !== undefined ? { stepBudget: req.stepBudget } : {}),
+    ...(req.onLog !== undefined ? { onLog: req.onLog } : {}),
+  };
+
+  // The spec is created AFTER the activation, not before: until this driver holds the run it has
+  // decided nothing, and a spec written by a driver that then lost the activation race would pin a
+  // run for a winner who never agreed to those pins.
+  if (expect === "new") {
+    await createRunSpec(req.kv, req.endpoint, req.runId, {
+      pins,
+      createdAt: pins.startedAt,
+    });
+    // The source beside the spec, so a resume, a takeover or a hosting daemon's restart reads the
+    // program back instead of being handed a file. After the spec for the same reason the spec is
+    // after the activation: a run that has a program record has a driver that pinned it.
+    await recordRunProgram(req.kv, req.endpoint, {
+      v: 1,
+      run: req.runId,
+      source: req.source,
+      ...(req.file !== undefined ? { file: req.file } : {}),
+      at: pins.startedAt,
+    });
+  }
+  // READ ON THE FAR SIDE OF THE FENCE, both revisions, from one read. The activation is what makes
+  // this driver the run's; a revision read BEFORE it is a number the loser was still free to move,
+  // and it did: a driver that discovers it lost writes its own `released` on the way out, which
+  // bumps the status revision the taker-over pinned, and the taker-over's first CAS then failed —
+  // out of the try below, past the outcome contract, as a raw throw from a legitimate takeover.
+  const activated = await readRunRecord(req.kv, req.endpoint, req.runId);
+  if (activated === undefined) {
+    // The spec is written above for a fresh run and existed already for a resume, so its absence
+    // here is the store disagreeing with a fact this driver established one line ago.
+    return { status: "released", reason: new RunNotResumable(req.runId, req.runId) };
+  }
+  const specRevision = activated.spec.revision;
+  statusRevision = activated.status?.revision;
+
+  try {
+    statusRevision = await note(req, "running", appender.journalHigh, specRevision, statusRevision);
+    anchor = async (high) => {
+      try {
+        statusRevision = await note(req, "running", high, specRevision, statusRevision);
+      } catch (e) {
+        // A takeover is the journal fence's to detect, and the append this follows already passed
+        // it. A moved revision whose record still names this lease is not one, so write over it
+        // once; a record naming any other lease is a fact this driver does not hold the run.
+        if (!isStatusConflict(e)) throw e;
+        const now = (await readRunRecord(req.kv, req.endpoint, req.runId))?.status;
+        if (now === undefined || now.value.holder !== req.lease.holder || now.value.epoch !== req.lease.epoch
+          || now.value.fencingToken !== req.lease.fencingToken) throw e;
+        statusRevision = await note(req, "running", high, specRevision, now.revision);
+      }
+    };
+  } catch (e) {
+    // A LOST CAS HERE IS A FACT, not a store hiccup: the only principal entitled to write this
+    // run's status is a driver that holds it, so someone moved the revision between this
+    // driver's activation and its first note and this driver is not the one running it. It has
+    // appended nothing and observed nothing, which is what `released` says. Every other failure
+    // is the store's and propagates untranslated.
+    if (!isStatusConflict(e)) throw e;
+    return { status: "released", reason: e as Error };
+  }
+
+  try {
+    const engineReq: HostedEngineRequest = {
+      source: req.source,
+      journal,
+      store,
+      entries: seeded,
+      ...(req.resultBytes !== undefined ? { resultBytes: req.resultBytes } : {}),
+      options,
+    };
+    const result = expect === "new" ? await engine.run(engineReq) : await engine.resume(engineReq);
+    // The discharge BEFORE the completed note: `result.journal` is the final folded record on both
+    // engines, and a crash between the two leaves `issued: false` for the next completion's sweep
+    // rather than a completed run whose discharge silently never happened.
+    await dischargeCancellations(result.journal.entries(), store, req.handler);
+    await releaseSeats(req.runId, result.journal.entries(), req.handler);
+    await noteFinal(req, "completed", appender.journalHigh, specRevision, statusRevision);
+    return { status: "completed", result };
+  } catch (e) {
+    // L5010 is the journal saying it could not record — the run is not this driver's any more. It
+    // arrives here rather than at the append because the interpreter is what was holding the stack.
+    if (e instanceof JournalAppendRejected) {
+      // Recorded on a BEST-EFFORT basis and never allowed to mask the real answer: the record is a
+      // projection, and a driver that could not append to the journal may not be able to write here
+      // either. What it must not do is turn a lost run into a different-looking failure.
+      await noteFinal(req, "released", appender.journalHigh, specRevision, statusRevision);
+      return { status: "released", reason: e };
+    }
+    // The host stopping is the same kind of answer: this driver no longer holds the run, and the
+    // program has neither failed nor finished.
+    if (e instanceof RunReleased || (e instanceof Cancelled
+      && (req.cancellation?.reason !== undefined || req.cancellationObserved?.() !== undefined))) {
+      await noteFinal(req, "released", appender.journalHigh, specRevision, statusRevision);
+      return { status: "released", reason: e };
+    }
+    // A HELD run is released with its journal already saying why: this host could not perform the
+    // next step (its entry is settled `refused`, or a held step's stays `pending`, L5025), the
+    // program has neither failed nor finished, and a capable host's resume continues there.
+    if (e instanceof RunHeld) {
+      await noteFinal(req, "released", appender.journalHigh, specRevision, statusRevision);
+      return { status: "released", reason: e };
+    }
+    // A program that FAILED is a fact about the program, and the run record is where a reader looks
+    // for it. Recorded, then re-raised: swallowing it here would leave the caller believing the
+    // driver finished normally.
+    await noteFinal(req, "failed", appender.journalHigh, specRevision, statusRevision, runFailureOf(e));
+    throw e;
+  }
+}
+
+function isNotOurs(e: unknown): boolean {
+  return (
+    e instanceof RunSuperseded ||
+    e instanceof RunJournalStalled ||
+    e instanceof StaleLeaseToken ||
+    e instanceof ActivationNotAuthorized ||
+    e instanceof RunNotResumable ||
+    e instanceof RunAlreadyStarted ||
+    e instanceof RunJournalPrefixTruncated
+  );
+}
+
+/** The last ordinal in a replayed prefix, or -1 for a run that has none yet. */
+function lastOrdinal(records: readonly { readonly record: { readonly n: number } }[]): number {
+  return records.length === 0 ? -1 : records[records.length - 1]!.record.n;
+}
+
+/** Write the run's status. Returns the new revision so the next write can pin it. */
+async function note(
+  req: DriveRequest,
+  state: RunStatusValue["state"],
+  journalHigh: number,
+  observedSpecRevision: number,
+  expectedRevision: number | undefined,
+  failure?: RunFailure,
+): Promise<number> {
+  return await writeRunStatus(
+    req.kv,
+    req.endpoint,
+    req.runId,
+    {
+      observedSpecRevision,
+      state,
+      holder: req.lease.holder,
+      epoch: req.lease.epoch,
+      fencingToken: req.lease.fencingToken,
+      journalHigh,
+      at: req.handler.now(),
+      ...(failure !== undefined ? { failure } : {}),
+    },
+    expectedRevision,
+  );
+}
+
+/** A CAS this driver lost: the status record moved under it, and the only principal entitled to
+ *  move it is a driver that holds the run. Every other broker failure is left untranslated. */
+function isStatusConflict(e: unknown): boolean {
+  return e instanceof EpEnvelopeError && e.code === "conflict";
+}
+
+/**
+ * The TERMINAL status write, where failing to make it must not replace the answer the caller
+ * is owed.
+ *
+ * By the time one of these runs the engine has already produced the run's outcome and the journal
+ * already holds it. The record is a projection of that journal; a driver that could not write the
+ * projection has still observed what it observed, and throwing here would replace a real answer
+ * (a completion, a release, the program's own failure) with a store error about a derived record.
+ * Loud on the way past, because a projection silently lagging its journal is worth knowing about.
+ */
+async function noteFinal(
+  req: DriveRequest,
+  state: RunStatusValue["state"],
+  journalHigh: number,
+  observedSpecRevision: number,
+  expectedRevision: number | undefined,
+  failure?: RunFailure,
+): Promise<void> {
+  try {
+    await note(req, state, journalHigh, observedSpecRevision, expectedRevision, failure);
+  } catch (e) {
+    console.error(
+      `run ${req.runId}: the "${state}" status write did not land (${(e as Error).message}); `
+      + "the journal is the authority and already holds the outcome",
+    );
+  }
+}

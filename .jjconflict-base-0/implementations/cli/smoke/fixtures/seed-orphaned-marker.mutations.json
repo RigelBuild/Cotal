@@ -1,0 +1,61 @@
+{
+  "suite": [
+    "implementations/cli/smoke/seed.smoke.ts",
+    "implementations/cli/smoke/seed-cases/harness.ts",
+    "implementations/cli/smoke/seed-cases/ambiguous-marker.smoke.ts"
+  ],
+  "guard": "a pending seed child marker whose reconcile parent is dead is repaired by the next command; a corrupt marker still fails loud",
+  "command": "pnpm smoke:seed",
+  "completionMarker": "seed smoke:",
+  "proveWith": "node scripts/mutation-proof.mjs --config implementations/cli/smoke/fixtures/seed-orphaned-marker.mutations.json",
+  "why": [
+    "A service restart killed `cotal spawn` between writing the pending child marker and the child's",
+    "first act. Every later command, `ext seed --repair` included, refused with `a connector seed may",
+    "be mid-flight` until the marker was removed by hand. One mutant per promise: the classification",
+    "that calls the dead-parent marker orphaned, and the boot gate that resumes it.",
+    "",
+    "Marker ownership: a child of an older reconcile must not take over or remove a newer one's marker.",
+    "Each transition runs under the marker lock, so the guard is checked in-process by",
+    "smoke:seed-checkout-store. Not proven: the lock itself serializing two real processes."
+  ],
+  "mutations": [
+    {
+      "name": "a pending marker with a dead parent is classified ambiguous again",
+      "file": "implementations/cli/src/seed/lock.ts",
+      "find": ": { kind: \"orphaned\", nonce: marker.nonce, path };",
+      "replace": ": { kind: \"ambiguous\", path };",
+      "afterRestore": "pnpm --filter @cotal-ai/cli build",
+      "expectRed": "\u2717 FAIL: dead-parent marker: the next command repairs and succeeds",
+      "cell": "\u2717 FAIL: dead-parent marker: the next command repairs and succeeds"
+    },
+    {
+      "name": "the boot gate does not resume an orphaned seed",
+      "file": "implementations/cli/src/seed/reconcile.ts",
+      "find": "        if (child.kind === \"orphaned\" && cursor) {",
+      "replace": "        if (child.kind === \"orphaned\" && cursor && process.pid < 0) {",
+      "afterRestore": "pnpm --filter @cotal-ai/cli build",
+      "expectRed": "\u2717 FAIL: dead-parent marker: the next command repairs and succeeds",
+      "cell": "\u2717 FAIL: dead-parent marker: the next command repairs and succeeds"
+    },
+    {
+      "name": "a stale child upgrades whatever marker it finds",
+      "file": "implementations/cli/src/seed/lock.ts",
+      "find": "    if (marker?.state !== \"pending\" || marker.nonce !== nonce || marker.parentPid !== parentPid) return false;",
+      "replace": "    if (marker === undefined) return false;",
+      "command": "pnpm smoke:seed-checkout-store",
+      "completionMarker": "seed-checkout-store smoke:",
+      "expectRed": "\u2717 FAIL: stale child: its live upgrade against a newer reconcile's marker is refused",
+      "cell": "\u2717 FAIL: stale child: its live upgrade against a newer reconcile's marker is refused"
+    },
+    {
+      "name": "a clear removes the marker whoever owns it",
+      "file": "implementations/cli/src/seed/lock.ts",
+      "find": "    if (marker?.nonce === nonce) rmSync(reconcileChildPath(), { force: true });",
+      "replace": "    rmSync(reconcileChildPath(), { force: true });",
+      "command": "pnpm smoke:seed-checkout-store",
+      "completionMarker": "seed-checkout-store smoke:",
+      "expectRed": "\u2717 FAIL: stale child: its clear leaves the newer live marker in place",
+      "cell": "\u2717 FAIL: stale child: its clear leaves the newer live marker in place"
+    }
+  ]
+}

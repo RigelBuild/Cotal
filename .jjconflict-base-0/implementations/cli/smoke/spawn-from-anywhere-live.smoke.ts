@@ -1,0 +1,171 @@
+/**
+ * LIVE-broker e2e for `cotal spawn` from anywhere — the half the hermetic smoke can't reach.
+ * `spawn-from-anywhere.smoke.ts` probes a CLOSED port; this spins REAL nats-server processes on
+ * isolated ports (COTAL_HOME sandboxed) and proves the resolver + preflight against them:
+ *
+ *  A. the round-4 fix end-to-end: an in-project target uses the RECORDED non-default server and
+ *     actually CONNECTS to it (not the hardcoded DEFAULT_SERVER).
+ *  B. probeConnect's split against REAL brokers: ok (live, open) vs auth-required (real auth broker)
+ *     vs unreachable (killed) — the input that drives preflight's error routing.
+ *  C. keep-on-real-death: a killed broker's entry is kept as offline by pruneStaleMeshes.
+ *  D. the registry dir is really 0700 after a real recordMesh.
+ *
+ * Needs `nats-server` on PATH (like the other broker smokes). Kills ONLY the PIDs it spawns —
+ * never pkill, so a co-running broker on :4222 is untouched. Run: pnpm smoke:spawn-from-anywhere:live
+ */
+import { spawn, type ChildProcess } from "node:child_process";
+import { createServer, type Server } from "node:net";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
+
+/** Resolve once the child has actually exited (or immediately if it already has); bounded by ms. */
+const awaitExit = (p: ChildProcess, ms = 5000): Promise<void> =>
+  new Promise((r) => {
+    if (p.exitCode !== null || p.signalCode !== null) return r();
+    p.once("exit", () => r());
+    setTimeout(r, ms).unref?.();
+  });
+
+// Sandbox the machine-home BEFORE importing core — homeCotalDir() reads COTAL_HOME per call, so the
+// real ~/.cotal is never touched.
+const home = mkdtempSync(join(tmpdir(), "cotal-live-home-"));
+process.env.COTAL_HOME = home;
+
+const { probeConnect, isReachable } = await import("@cotal-ai/core");
+const { resolveMeshTarget, recordMesh, loadMeshes, meshesDir } = await import("@cotal-ai/workspace");
+const { pruneStaleMeshes } = await import("../src/lib/meshes.js");
+const { connectOrExit, reachableOrExit } = await import("../src/lib/connect.js");
+
+let pass = 0;
+const kids: ChildProcess[] = [];
+let notNats: Server | undefined;
+const ok = (name: string, cond: boolean, extra?: unknown) => {
+  if (!cond) throw new Error(`FAIL: ${name}${extra !== undefined ? ` — ${JSON.stringify(extra)}` : ""}`);
+  pass++;
+  console.log(`  ✓ ${name}`);
+};
+
+/** A real nats-server on an isolated port; `auth` requires user/pass so a credless probe is rejected. */
+function startBroker(port: number, auth: boolean): ChildProcess {
+  // A tokened store dir is passed even though this broker runs without JetStream: `-sd` alone is
+  // accepted and writes nothing, and it is the only way the argv-matching reaper can ever claim
+  // this process if the suite is SIGKILLed.
+  const store = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+  const args = ["-a", "127.0.0.1", "-p", String(port), "-sd", store];
+  if (auth) args.push("--user", "u", "--pass", "p");
+  const cp = spawn("nats-server", args, { stdio: "ignore" });
+  teardownOnSignal(cp, store);
+  kids.push(cp);
+  return cp;
+}
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+async function waitReady(server: string, want: "ok" | "auth-required"): Promise<void> {
+  for (let i = 0; i < 50; i++) {
+    const p = await probeConnect(server, { timeoutMs: 400 });
+    if (want === "ok" && p.ok) return;
+    if (want === "auth-required" && !p.ok && p.reason === "auth-required") return;
+    await sleep(100);
+  }
+  throw new Error(`broker ${server} never reached ${want}`);
+}
+
+/** A genuine local project (has its own `.cotal/agents`). */
+function project(label: string): string {
+  const root = mkdtempSync(join(tmpdir(), `cotal-${label}-`));
+  mkdirSync(join(root, ".cotal", "agents"), { recursive: true });
+  writeFileSync(join(root, ".cotal", "agents", "default.md"), "---\nname: rev\nrole: reviewer\n---\n");
+  return root;
+}
+
+const projA = project("projA");
+const PORT_OPEN = await freePort();
+const PORT_AUTH = await freePort();
+const PORT_NOTNATS = await freePort();
+const SRV_OPEN = `nats://127.0.0.1:${PORT_OPEN}`;
+const SRV_AUTH = `nats://127.0.0.1:${PORT_AUTH}`;
+const SRV_NOTNATS = `nats://127.0.0.1:${PORT_NOTNATS}`;
+const ts = "2026-06-22T00:00:00.000Z";
+
+try {
+  // A + B(live ok) + D: open broker on a NON-default port, recorded for projA.
+  startBroker(PORT_OPEN, false);
+  await waitReady(SRV_OPEN, "ok");
+  recordMesh({ space: "alpha", server: SRV_OPEN, root: projA, mode: "open", ts });
+
+  ok(
+    "D: registry dir is really 0700 after recordMesh",
+    (statSync(meshesDir()).mode & 0o777) === 0o700,
+    (statSync(meshesDir()).mode & 0o777).toString(8),
+  );
+
+  const t = resolveMeshTarget(join(projA, "nested", "dir"));
+  ok("A: in-project resolves to the RECORDED :4455, not DEFAULT_SERVER", t.server === SRV_OPEN, t.server);
+  ok("A: source is local-recorded (registry-owned, quiet)", t.source === "local-recorded", t.source);
+  ok("A: open mesh resolves credless", t.auth === undefined, t.auth);
+
+  // Preflight's core against the LIVE broker (open → no creds): must connect.
+  const live = await probeConnect(t.server, {});
+  ok("B: probeConnect to the LIVE recorded broker → ok", live.ok === true, live);
+
+  // reachableOrExit — the raw-path reachability used by the `--creds` escape hatch and join's
+  // explicit path — RETURNS on a live open broker (it would process.exit() on failure, which would
+  // kill this run before the assertion; reaching it proves success).
+  await reachableOrExit(SRV_OPEN, {});
+  ok("B: reachableOrExit returns on a live open broker (raw-path reachability)", true);
+
+  // Escape hatch: `--server` + an UNREGISTERED `--space` (open remote mesh, no creds) bypasses the
+  // registry and connects bare, returning the flag values — no "no mesh named X" throw. ("rawopen"
+  // is not in the registry; only "alpha" is.)
+  const raw = await connectOrExit({ server: SRV_OPEN, space: "rawopen" }, "provisioner");
+  ok(
+    "B: connectOrExit(--server + unregistered --space) → raw open connect (escape hatch)",
+    raw.server === SRV_OPEN && raw.space === "rawopen" && raw.creds === undefined,
+    raw,
+  );
+
+  // B(auth-required): the unreachable-vs-auth split against a REAL auth broker.
+  startBroker(PORT_AUTH, true);
+  await waitReady(SRV_AUTH, "auth-required");
+  const credless = await probeConnect(SRV_AUTH, { timeoutMs: 800 });
+  ok(
+    "B: credless probe to a REAL auth broker → auth-required (not unreachable)",
+    !credless.ok && credless.reason === "auth-required",
+    credless,
+  );
+
+  // E: isReachable — the silent TCP+INFO liveness primitive (the fix). A live broker is reachable
+  // WITHOUT a credless connect, so an AUTH broker reports up with no broker-side auth-error log; a
+  // non-NATS listener is NOT reachable (we require a real `INFO {` greeting, not "any open port").
+  ok("E: isReachable(live open broker) → true", (await isReachable(SRV_OPEN)) === true);
+  ok("E: isReachable(live AUTH broker) → true (credless, no auth-error log)", (await isReachable(SRV_AUTH)) === true);
+  notNats = createServer((s) => s.end("hello, not nats\r\n"));
+  await new Promise<void>((res) => notNats!.listen(PORT_NOTNATS, "127.0.0.1", res));
+  ok("E: isReachable(non-NATS listener) → false (not 'any open port')", (await isReachable(SRV_NOTNATS)) === false);
+
+  // C: keep-on-real-death. Kill ONLY our 4455 child, then the entry is kept as offline.
+  const opener = kids[0]!;
+  opener.kill("SIGTERM");
+  for (let i = 0; i < 50 && opener.exitCode === null && opener.signalCode === null; i++) await sleep(100);
+  const dead = await probeConnect(SRV_OPEN, { timeoutMs: 800 });
+  ok("C: probeConnect to the killed broker → unreachable", !dead.ok && dead.reason === "unreachable", dead);
+  ok("E: isReachable(killed broker) → false", (await isReachable(SRV_OPEN)) === false);
+  ok("C: registry still holds alpha before prune", loadMeshes().some((m) => m.space === "alpha"));
+  await pruneStaleMeshes();
+  ok("C: pruneStaleMeshes keeps the dead entry as offline", loadMeshes().some((m) => m.space === "alpha"), loadMeshes());
+
+  console.log(`\nspawn-from-anywhere live e2e: ${pass} checks passed`);
+} finally {
+  await Promise.all(kids.map((cp) => {
+    try {
+      cp.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    return awaitExit(cp);
+  }));
+  try { notNats?.close(); } catch { /* already closed */ }
+  for (const d of [home, projA]) rmSync(d, { recursive: true, force: true });
+}
+process.exit(0);

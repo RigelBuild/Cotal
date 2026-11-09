@@ -1,0 +1,293 @@
+/**
+ * membership-feed smoke (the broker-sourced graph membership, end-to-end). Proves the derived feed is
+ * AUTHORITATIVE and broker-sourced — it surfaces SILENT subscribers (zero traffic), the UNION across an
+ * agent's connections, the merge of `live` (CONNZ) ∪ `durable` (members registry), excludes god-view
+ * taps, and prunes a live subscriber when it disconnects while keeping its durable arm.
+ *
+ * Spins up a real auth broker, mints the two scoped membership creds, connects silent subscribers + an
+ * admin god-tap, seeds a durable member, runs the core feed, and reads the derived bucket back. It
+ * also reads the feed through the shipped `CotalEndpoint.readMembership()` on an admin credential,
+ * which binds no consumer on the feed's stream, and on one minted without the Direct Get row, which
+ * is refused naming that grant (#4123).
+ *
+ * Run: pnpm smoke:membership-feed:auth   (needs `nats-server` on PATH; auth/JetStream, local-only)
+ */
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { connect, credsAuthenticator } from "@nats-io/transport-node";
+import { jetstreamManager } from "@nats-io/jetstream";
+import { Kvm } from "@nats-io/kv";
+import { encodeUser, fmtCreds } from "@nats-io/jwt";
+import { fromPublic, fromSeed } from "@nats-io/nkeys";
+import {
+  CotalEndpoint,
+  permissionsFor,
+  isReachable,
+  createSpaceAuth,
+  mintCreds,
+  mintMembershipObserverCreds,
+  provisionAgent,
+  mintLifecycleUid,
+  serverConfig,
+  newIdentity,
+  setupSpaceStreams,
+  startMembershipFeed,
+  openMembersRegistry,
+  commitMember,
+  chatSubject,
+  chatWildcard,
+  spacePrefix,
+  channelFromChatSubscription,
+  membershipBucket,
+  membershipKey,
+  principalKey,
+  DEV_OWNER,
+  MEMBERSHIP_FEED_KEY,
+} from "../src/index.js";
+import type { ChannelMembership, MembershipRecord } from "../src/index.js";
+import { pickFreePort } from "./_free-port.js";
+import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
+
+const PORT = await pickFreePort();
+const SERVERS = `nats://127.0.0.1:${PORT}`;
+const enc = (s: string) => new TextEncoder().encode(s);
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const eq = (a: string[] = [], b: string[]) => a.length === b.length && [...a].sort().every((x, i) => x === [...b].sort()[i]);
+let pass = 0, fail = 0;
+const check = (name: string, cond: boolean, extra?: unknown) => { if (cond) { pass++; console.log(`  ✓ ${name}`); } else { fail++; console.log(`  ✗ FAIL: ${name}`, extra ?? ""); } };
+
+const noop = { commitAcl: async () => {}, reissueAcl: async () => {}, provisionDmInbox: async () => {}, provisionDlvInbox: async () => {}, provisionTaskQueue: async () => {} };
+// Dev/static principal for an agent nkey: owner=DEV_OWNER ("local"), actor=the nkey. The feed keys BOTH
+// arms by this dot-form — the live arm from the CONNZ `principal:` tag, the durable arm from the members
+// registry — so seeds + lookups here use it (mirrors plane3-auth). A raw nkey would fork one agent in two.
+const pkey = (id: string) => principalKey(DEV_OWNER, id).key;
+
+const space = `membership-${randomUUID().slice(0, 8)}`;
+const auth = await createSpaceAuth(space); // sys.signingSeed lives in-memory here — mint the observer below
+const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+writeFileSync(join(dir, "server.conf"), serverConfig(auth, [auth], { transport: { kind: "plaintext" }, port: PORT, storeDir: join(dir, "js") }));
+const srv = spawn("nats-server", ["-c", join(dir, "server.conf")], { stdio: "ignore" });
+const releaseBroker = teardownOnSignal(srv, dir);
+
+const conns: Array<Awaited<ReturnType<typeof connect>>> = [];
+let feed: Awaited<ReturnType<typeof startMembershipFeed>> | undefined;
+try {
+  let up = false;
+  for (let i = 0; i < 50; i++) { if (await isReachable(SERVERS)) { up = true; break; } await wait(200); }
+  if (!up) throw new Error(`auth nats-server did not come up on ${PORT}`);
+
+  const mgrCreds = await mintCreds(auth, newIdentity(), "provisioner");
+  await setupSpaceStreams({ servers: SERVERS, space, creds: mgrCreds }); // creates the membership bucket
+  const observerCreds = await mintMembershipObserverCreds(auth, newIdentity());
+  const rwCreds = await mintCreds(auth, newIdentity(), "membership-rw");
+
+  // --- alice: a SILENT live subscriber, subs split across TWO connections (union test) ---
+  const alice = newIdentity();
+  const aliceCreds = await provisionAgent(noop, auth, alice, { subscribe: ["general"], allowSubscribe: ["general", "review.>", "logs"], lifecycleUid: mintLifecycleUid() });
+  const a1 = await connect({ servers: SERVERS, authenticator: credsAuthenticator(enc(aliceCreds)), name: "cotal:alice" });
+  conns.push(a1);
+  a1.subscribe(chatSubject(space, "*", "*", "general"));
+  a1.subscribe(chatSubject(space, "*", "*", "review.>")); // wildcard pattern preserved
+  await a1.flush();
+  const a1b = await connect({ servers: SERVERS, authenticator: credsAuthenticator(enc(aliceCreds)), name: "cotal:alice" });
+  conns.push(a1b);
+  a1b.subscribe(chatSubject(space, "*", "*", "logs")); // a second conn for the SAME nkey
+  await a1b.flush();
+
+  // --- bob: a durable member of #deploys (no live conn), written straight to the members registry ---
+  // The members registry is the DELIVERY daemon's to write (closure (i): the manager cred no longer holds
+  // a members-bucket grant). Seed with a `delivery` cred; it has no default `_INBOX`, so pin its per-id one.
+  const bob = newIdentity();
+  const seedId = newIdentity();
+  const seedNc = await connect({ servers: SERVERS, authenticator: credsAuthenticator(enc(await mintCreds(auth, seedId, "delivery"))), inboxPrefix: `_INBOX_${seedId.id}` });
+  conns.push(seedNc);
+  const members = await openMembersRegistry(seedNc, space);
+  const rec = (channel: string, owner: string): MembershipRecord => ({ channel, owner, lifecycleUid: mintLifecycleUid(), state: "durable-active", joinCursor: 0, activated: true, generation: 1, writerIdentity: "smoke", updatedAt: Date.now() });
+  await commitMember(members, rec("deploys", pkey(bob.id)));
+  await commitMember(members, rec("general", pkey(alice.id))); // alice is ALSO a durable member of #general (live ∪ durable union)
+
+  // --- a god-view tap (the web dashboard / a core tap) — must be EXCLUDED from membership ---
+  const adminId = newIdentity();
+  const adminCreds = await mintCreds(auth, adminId, "admin");
+  // The admin cred's inbox grant is `_INBOX_<id>.>`, so its connection must use that prefix (as the real
+  // CotalEndpoint does) for KV reads / ordered-consumer delivery to be allowed.
+  const adminConn = () => connect({ servers: SERVERS, authenticator: credsAuthenticator(enc(adminCreds)), inboxPrefix: `_INBOX_${adminId.id}`, name: "cotal:web" });
+  const webNc = await adminConn();
+  conns.push(webNc);
+  // The admin god-view is the enumerated MESSAGING plane (SPEC 13.9/13.11: chat/inst/svc; the
+  // space-wide `>` is broker-denied), so the real web tap is one sub per plane — chat.>
+  // exercises the <5-token guard, inst.>/svc.> the not-a-chat-subject guard.
+  for (const plane of ["chat", "inst", "svc"]) webNc.subscribe(`${spacePrefix(space)}.${plane}.>`);
+  await webNc.flush();
+
+  // --- a console-style observer: taps chatWildcard (`cotal.<space>.chat.>`) like `cotal console`. Must
+  // ALSO self-exclude, but via a DIFFERENT branch than the web tap (parseSubject's <5-token guard, not the
+  // !startsWith(".chat.") guard) — mitnick flagged that only the web branch was tested; socrates suspected
+  // a phantom reads-all node here. This pins that `cotal console` surfaces NO membership record. ---
+  const consoleId = newIdentity();
+  const consoleNc = await connect({ servers: SERVERS, authenticator: credsAuthenticator(enc(await mintCreds(auth, consoleId, "observer"))), inboxPrefix: `_INBOX_${consoleId.id}`, name: "cotal:console" });
+  conns.push(consoleNc);
+  consoleNc.subscribe(chatWildcard(space)); // cotal.<space>.chat.> — the console observer tap
+  await consoleNc.flush();
+
+  // --- dave: a legitimate BROAD-READ agent (allowSubscribe [">"]) — e.g. the seeded default persona. Its
+  // chat.*.> sub MUST surface as a `>` reader (the source-of-truth goal); it must NOT be dropped as if it
+  // were a god-tap (review-general/socrates: shape-based exclusion wrongly erased exactly these). ---
+  const dave = newIdentity();
+  const daveCreds = await provisionAgent(noop, auth, dave, { subscribe: ["general"], allowSubscribe: [">"], lifecycleUid: mintLifecycleUid() });
+  const dnc = await connect({ servers: SERVERS, authenticator: credsAuthenticator(enc(daveCreds)), name: "cotal:dave" });
+  conns.push(dnc);
+  dnc.subscribe(chatSubject(space, "*", "*", ">")); // chat.*.> — reads everything
+  await dnc.flush();
+
+  // --- run the feed and force a reconcile ---
+  feed = await startMembershipFeed({ servers: SERVERS, space, accountId: auth.account.pub, observerCreds, rwCreds, intervalMs: 60_000 });
+  await feed.poll();
+  await wait(400);
+
+  const readNc = await adminConn();
+  conns.push(readNc);
+  const readFeed = async () => {
+    const kv = await new Kvm(readNc).open(membershipBucket(space));
+    const out = new Map<string, ChannelMembership>();
+    let asOf: number | undefined;
+    for await (const k of await kv.keys()) {
+      const e = await kv.get(k); if (!e) continue;
+      if (k === MEMBERSHIP_FEED_KEY) { asOf = e.json<{ observedAt: number }>().observedAt; continue; }
+      out.set(k, e.json<ChannelMembership>());
+    }
+    return { out, asOf };
+  };
+
+  let { out, asOf } = await readFeed();
+  const aliceRec = out.get(membershipKey(pkey(alice.id)));
+  const bobRec = out.get(membershipKey(pkey(bob.id)));
+
+  check("silent live subscriber appears (zero traffic)", !!aliceRec);
+  check("live patterns unioned across an agent's connections (wildcards kept)", !!aliceRec && eq(aliceRec.live, ["general", "review.>", "logs"]), aliceRec?.live);
+  check("alice's durable arm merged in (live ∪ durable)", !!aliceRec && eq(aliceRec.durable, ["general"]), aliceRec?.durable);
+  check("durable-only member (no live conn) appears", !!bobRec && eq(bobRec.durable, ["deploys"]) && eq(bobRec.live, []), bobRec);
+  const daveRec = out.get(membershipKey(pkey(dave.id)));
+  check("the web god-tap (messaging-plane subs) self-excludes (no membership record)", !out.has(membershipKey(pkey(adminId.id))), [...out.keys()]);
+  check("a console-style chat.> tap self-excludes (no phantom reads-all node)", !out.has(membershipKey(pkey(consoleId.id))), [...out.keys()]);
+  check("channelFromChatSubscription(chatWildcard) is null — pins the console parseSubject<5 branch", channelFromChatSubscription(space, chatWildcard(space)) === null);
+  check("a broad-read agent (allowSubscribe '>') SURFACES as a `>` reader, not dropped", !!daveRec && daveRec.live.includes(">"), daveRec);
+  check("only the three real agents have records (infra conns contribute nothing)", out.size === 3, [...out.keys()]);
+  check("feed freshness heartbeat is stamped", typeof asOf === "number");
+
+  // --- the shipped snapshot read (#4123): paged batched Direct Gets on an admin endpoint bind no
+  // consumer on the feed's stream, and a credential minted without the Direct Get row is refused with
+  // the grant it lacks rather than scanned with a consumer the profile could not delete. ---
+  const jsm = await jetstreamManager(readNc);
+  const feedConsumers = async () => (await jsm.streams.info(`KV_${membershipBucket(space)}`)).state.consumer_count;
+  const consumersBeforeRead = await feedConsumers();
+  const reader = new CotalEndpoint({ space, servers: SERVERS, creds: adminCreds, channels: [], consume: false, watchPresence: false, registerPresence: false, watchChannels: false, card: { name: "snapshot-reader", kind: "endpoint" } });
+  reader.on("error", () => {});
+  await reader.start();
+  const snapshot = await reader.readMembership();
+  const consumersAfterRead = await feedConsumers();
+  check("CotalEndpoint.readMembership returns the feed's three records and its heartbeat",
+    snapshot.members.length === 3 && snapshot.asOf === asOf, { members: snapshot.members.map((m) => m.id), asOf: snapshot.asOf, feedAsOf: asOf });
+  check("…and binds no consumer on the feed's stream (#4123)", consumersAfterRead === consumersBeforeRead, { before: consumersBeforeRead, after: consumersAfterRead });
+  await reader.stop();
+  // Historical down-f uses this short-lived profile on static meshes. It already reads the
+  // feed via consumers, but must also carry the bare batched snapshot subject (#3738).
+  const teardownId = newIdentity();
+  const teardownUid = mintLifecycleUid();
+  const teardownCreds = await mintCreds(auth, teardownId, "teardown", { lifecycleUid: teardownUid });
+  const teardownReader = new CotalEndpoint({ space, servers: SERVERS, creds: teardownCreds, lifecycleUid: teardownUid,
+    channels: [], consume: false, watchPresence: false, registerPresence: false, watchChannels: false,
+    card: { name: "teardown-snapshot-reader", kind: "endpoint" } });
+  teardownReader.on("error", () => {});
+  await teardownReader.start();
+  try {
+    const teardownSnapshot = await teardownReader.readMembership();
+    check("teardown reads the same membership census as the admin reader (#3738)",
+      teardownSnapshot.asOf === snapshot.asOf && teardownSnapshot.members.length === snapshot.members.length);
+    check("teardown snapshot binds no membership consumer", await feedConsumers() === consumersAfterRead);
+    const grants = permissionsFor("teardown", space,
+      { owner: DEV_OWNER, actor: teardownId.id, connId: teardownId.id, lifecycleUid: teardownUid }, {}) as { pub: { allow: string[] } };
+    check("teardown membership grants cannot write the census",
+      !grants.pub.allow.some((row) => row.startsWith(`$KV.${membershipBucket(space)}.`)));
+  } finally { await teardownReader.stop(); }
+  const oldId = newIdentity();
+  const current = permissionsFor("admin", space, { owner: DEV_OWNER, actor: oldId.id, connId: oldId.id }, {}) as { pub: { allow: string[] }; sub: { allow: string[] } };
+  const directRow = `$JS.API.DIRECT.GET.KV_${membershipBucket(space)}`;
+  check("the current admin profile carries the feed's Direct Get row", current.pub.allow.includes(directRow));
+  const oldJwt = await encodeUser("pre-direct-get-admin", fromPublic(oldId.id), fromPublic(auth.account.pub),
+    { pub: { allow: current.pub.allow.filter((row) => row !== directRow) }, sub: current.sub },
+    { signer: fromSeed(enc(auth.account.signingSeed)) });
+  const oldReader = new CotalEndpoint({ space, servers: SERVERS, creds: new TextDecoder().decode(fmtCreds(oldJwt, fromSeed(enc(oldId.seed)))), channels: [], consume: false, watchPresence: false, registerPresence: false, watchChannels: false, card: { name: "old-admin", kind: "endpoint" } });
+  oldReader.on("error", () => {});
+  await oldReader.start();
+  const refused = await oldReader.readMembership().then(() => "answered", (e: Error) => e.message);
+  const consumersAfterRefused = await feedConsumers();
+  check("a credential minted without that row is refused naming the grant and the remint (#4123)",
+    refused.includes(directRow) && refused.includes("mint a new credential"), refused);
+  check("…and the refused read leaves no consumer either", consumersAfterRefused === consumersAfterRead, { before: consumersAfterRead, after: consumersAfterRefused });
+  await oldReader.stop();
+
+  // --- prune: alice's live connections drop; durable arm persists (the key reframe) ---
+  await a1.drain(); await a1b.drain();
+  await wait(300);
+  await feed.poll();
+  await wait(300);
+  ({ out } = await readFeed());
+  const aliceAfter = out.get(membershipKey(pkey(alice.id)));
+  check("a disconnected live subscriber keeps its durable membership", !!aliceAfter && eq(aliceAfter.durable, ["general"]), aliceAfter);
+  check("a disconnected live subscriber's live set is pruned to empty", !!aliceAfter && eq(aliceAfter.live, []), aliceAfter?.live);
+
+  // --- incomplete-sweep guard (review-general): a poll that gets ZERO CONNZ replies must NOT prune the
+  // live half or advance the freshness heartbeat. Simulate deterministically by running a feed with a
+  // MISMATCHED accountId, so the observer's CONNZ publish is denied (not in its pub.allow) → zero replies
+  // → complete:false → reconcile early-returns. The good feed is stopped first so only this one runs. ---
+  await feed.stop();
+  const before = await readFeed();
+  const beforeKeys = [...before.out.keys()].sort().join(",");
+  feed = await startMembershipFeed({ servers: SERVERS, space, accountId: auth.sys.pub /* wrong acct → CONNZ pub denied */, observerCreds, rwCreds, intervalMs: 60_000, maxWaitMs: 500 });
+  await feed.poll();
+  await wait(300);
+  const afterBad = await readFeed();
+  check("an incomplete CONNZ sweep does NOT prune existing membership", [...afterBad.out.keys()].sort().join(",") === beforeKeys, [...afterBad.out.keys()]);
+  check("an incomplete CONNZ sweep does NOT advance the freshness heartbeat", afterBad.asOf === before.asOf, { before: before.asOf, after: afterBad.asOf });
+
+  // --- teardown must not INVENT an error. `stop()` used to clear the timers and drain both connections
+  // without waiting for a poll already running, so that poll died on a connection pulled out from under
+  // it and its catch logged `poll failed ... connection closed` — for an ordinary shutdown, after the
+  // caller believed teardown was done. Graded here because the cost is not cosmetic: a false error in a
+  // teardown path reads as a leak to whoever greps the log next, and this one did exactly that.
+  //
+  // Driven the way the defect occurs and not by hand: `poll()` is started WITHOUT being awaited (which is
+  // how every real caller drives it, off a timer or a trigger), so a reconcile is genuinely in flight when
+  // `stop()` lands. The broker here is healthy and the account is the right one, so ANY `poll failed` in
+  // this arm is manufactured by the teardown and nothing else.
+  await feed.stop();
+  const logged: string[] = [];
+  const td = await startMembershipFeed({
+    servers: SERVERS, space, accountId: auth.account.pub, observerCreds, rwCreds,
+    intervalMs: 60_000, log: (m) => logged.push(m),
+  });
+  void td.poll();
+  await wait(25);
+  await td.stop();
+  await wait(400); // a poll drained out from under would have thrown and logged well inside this
+  check("stop() waits for a poll already in flight — teardown logs no manufactured failure",
+    logged.filter((m) => m.startsWith("poll failed")).length === 0, logged);
+  feed = undefined;
+
+  console.log(`\nMEMBERSHIP-FEED SMOKE ${fail === 0 ? "OK ✅" : "FAILED ❌"}  (${pass} passed, ${fail} failed)`);
+  if (fail) process.exitCode = 1;
+} catch (e) {
+  fail++;
+  console.error("  ✗ scenario threw:", e);
+  process.exitCode = 1;
+} finally {
+  try { await feed?.stop(); } catch { /* gone */ }
+  for (const c of conns) { try { await c.drain(); } catch { /* already drained */ } }
+  srv.kill("SIGKILL");
+  rmSync(dir, { recursive: true, force: true });
+  releaseBroker(); // last: ownership is held until this teardown has actually finished
+}

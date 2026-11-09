@@ -1,0 +1,100 @@
+{
+  "suite": [
+    "implementations/runtime/smoke/run-command.smoke.ts"
+  ],
+  "guard": "The `cotal run` command holds two identity seams: `answer` presents the checkpoint resume as the ARMING holder read back from the checkpoint record (resume is holder-bound, SPEC 13.10, and the CLI is not the driver), and every drive presents a PER-INVOCATION holder id, because the activation barrier relaxes the exact (token, holder, epoch) tuple as one process picking its own run back up, so a constant id would let concurrent drives co-activate through that relaxation. (COUNTING suite: cells print only on FAIL, so the completion marker is the final summary line, the one string a finished run always prints.)",
+  "command": "pnpm smoke:runtime-run-command",
+  "proveWith": "pnpm mutation-proof --config implementations/runtime/smoke/mutations/run-command.json",
+  "mutations": [
+    {
+      "name": "the answer presents as a fresh principal instead of the arming holder",
+      "file": "implementations/runtime/src/resolve-checkpoint.ts",
+      "find": "    presenter: holder,",
+      "replace": "    presenter: { id: \"cli-run\", lifecycleUid: \"u_mutant0000000000000000\" },",
+      "expectRed": "answer presents as the arming holder and is accepted",
+      "completionMarker": "run-command:",
+      "cell": "answer presents as the arming holder and is accepted",
+      "note": "The wire refuses a presenter that is not the arming holder (permission-denied, SPEC 13.10); the smoke converts that throw into the named cell going red rather than the suite dying. The anchor moved with the strand fix: the presenter is no longer supplied at the CLI call site, it is bound inside resolveCheckpoint off the checkpoint's own record, so the substitution now lives there. The substituted holder differs from the arming one in BOTH components (the arming id is cli-run-<hex> per invocation and the lifecycleUid never matches), so the refusal is on holder identity, not on one lucky field. Re-measured 2026-09-02 at the new anchor: the named cell reds FIRST with the SPEC 13.10 refusal, 18 ok 6 failed, and the suite EXITS red on its own \u2014 the re-measure also caught an unbounded `await orphan` in block 6b that HUNG the suite under this mutant class and is now raced against the same 15s bound as the completions beside it. Re-anchored 2026-09-06: the resolver split into locate (reads the holder) and answer (presents it), so the substitution now sits on `answerOpenCheckpoint`'s presenter."
+    },
+    {
+      "name": "a constant holder id lets concurrent drives co-activate through the exact-tuple relaxation",
+      "file": "implementations/runtime/src/run-command.ts",
+      "find": "  return { id: `cli_run_${uid.slice(0, 8)}`, lifecycleUid: mintLifecycleUid(), instanceId: uid.slice(0, 26) };",
+      "replace": "  return { id: \"cli_run_constant\", lifecycleUid: mintLifecycleUid(), instanceId: uid.slice(0, 26) };",
+      "expectRed": "concurrent drives never co-activate: every activation token is held exactly once",
+      "completionMarker": "run-command:",
+      "cell": "concurrent drives never co-activate: every activation token is held exactly once",
+      "note": "The defect measured at 753e82f8a: two concurrent resumes derive the same fencing token and epoch from one record read, and with the constant id the tuple is exact, so both activate and the journal records two activations sharing a token. The cell asserts the journal invariant across five concurrent pairs rather than which promise lost, because a lost race is a legitimate higher-token takeover while a shared token is impossible by design. The constant id keeps the per-invocation id's length, because the local admission mints its ceiling at the holder's coordinate and refuses a connection id shorter than 8 characters before the run starts."
+    },
+    {
+      "name": "the journal render drops an open pause's question",
+      "file": "implementations/runtime/src/run-host.ts",
+      "find": "    ...(typeof external?.asks === \"string\" ? { asks: external.asks } : {}),",
+      "replace": "    ...(typeof external?.asks === \"string\" ? {} : {}),",
+      "expectRed": "the journal render shows an open pause's question under the step an answer is addressed by",
+      "completionMarker": "run-command:",
+      "cell": "the journal render shows an open pause's question under the step an answer is addressed by",
+      "note": "An open checkpoint is answered by step key, and the only place a person can read WHAT it asks is this render. Without it the journal shows a pending row and no question, and the answerer has to guess what they are approving."
+    },
+    {
+      "name": "the journal row drops a settled pause's accepted value",
+      "file": "implementations/runtime/src/run-host.ts",
+      "find": "        ...(result.value !== undefined ? { value: result.value } : {}),",
+      "replace": "        ...({}),",
+      "expectRed": "show --json carries the accepted value, answerer, artifact, answer id and time on the settled pause",
+      "completionMarker": "run-command:",
+      "cell": "show --json carries the accepted value, answerer, artifact, answer id and time on the settled pause",
+      "note": "The outcome column remains `resolved`; only the accepted value disappears, so the end-to-end cell must name that loss. Re-anchored for the redesign, whose rendered journal is a summary table and whose JSON result carries the answer facts from this row."
+    },
+    {
+      "name": "an expired pause is exposed as answered",
+      "file": "implementations/runtime/src/run-host.ts",
+      "find": "    && result?.outcome === \"resolved\"",
+      "replace": "    && result !== undefined",
+      "expectRed": "an expired pause row carries no answer",
+      "completionMarker": "run-command:",
+      "cell": "an expired pause row carries no answer",
+      "note": "An expiry has no accepted answer. Even a malformed expired result carrying answer-shaped fields must not become an answer row."
+    },
+    {
+      "name": "an ordinary step is exposed as an answered pause",
+      "file": "implementations/runtime/src/run-host.ts",
+      "find": "  const answeredPause = e.kind === \"checkpoint\"",
+      "replace": "  const answeredPause = true",
+      "expectRed": "a non-pause step cannot expose answer-shaped result fields",
+      "completionMarker": "run-command:",
+      "cell": "a non-pause step cannot expose answer-shaped result fields",
+      "note": "Only a checkpoint's settled result is read as a pause answer (an ask's answer is read off its pause record since #2363). A different effect may legitimately return a record with the same field names. Re-anchored for #2363, which narrowed the guard from checkpoint-or-ask to checkpoint; the mutant still removes the kind guard and nothing else."
+    },
+    {
+      "name": "a local holder contains a forbidden owner-token separator",
+      "file": "implementations/runtime/src/run-command.ts",
+      "find": "  return { id: `cli_run_${uid.slice(0, 8)}`, lifecycleUid: mintLifecycleUid(), instanceId: uid.slice(0, 26) };",
+      "replace": "  return { id: `cli-run-${uid.slice(0, 8)}`, lifecycleUid: mintLifecycleUid(), instanceId: uid.slice(0, 26) };",
+      "expectRed": "local authenticated publish admission accepts its generated holder identity",
+      "completionMarker": "run-command:",
+      "cell": "local authenticated publish admission accepts its generated holder identity",
+      "note": "Exercise authenticated local admission with a publish channel; the forbidden separator must fail the named start cell before any workflow effect is performed. A none ceiling does not format a chat subject and cannot observe this defect."
+    },
+    {
+      "name": "the verb table drops the dispatch of migrate",
+      "file": "implementations/runtime/src/run-command.ts",
+      "find": "    else if (verb === \"migrate\") await migrate(values, planes, a, takeoverId);",
+      "replace": "    else if (verb === \"migrate\") { console.error(USAGE); process.exit(1); }",
+      "expectRed": "an admissible edit prints the report and exits 0",
+      "completionMarker": "run-command:",
+      "cell": "an admissible edit prints the report and exits 0",
+      "note": "The dispatch is the whole lane: migrateRun existed and no surface reached it. Dropping the dispatch back to the usage refusal is the base defect exactly, and the admissible cell is the one that cannot pass without the walk running: it asserts the report text and the exit code the dispatched verb produces."
+    },
+    {
+      "name": "the report claims admissible on a rejected orphan",
+      "file": "implementations/runtime/src/run-command.ts",
+      "find": "  if (!report.admissible) process.exitCode = 1;",
+      "replace": "  void report;",
+      "expectRed": "and the exit status is non-zero, because the check refused",
+      "completionMarker": "run-command:",
+      "cell": "and the exit status is non-zero, because the check refused",
+      "note": "The exit status is the verb's contract: 0 on admissible, non-zero on not, so a caller can branch without parsing the report. Voiding the refusal's exit code leaves the printed report intact and only the status wrong, which is the half a print-only assertion can never see."
+    }
+  ]
+}

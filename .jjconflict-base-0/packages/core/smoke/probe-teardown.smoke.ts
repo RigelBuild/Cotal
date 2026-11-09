@@ -1,0 +1,262 @@
+/** probeConnect must release the connection it never established (#389, #2156).
+ *
+ *  `probeConnect` exists to be pointed at addresses that may not answer, so it is the one connect
+ *  site where a failed dial is the NORMAL case rather than an error. Against an address that
+ *  BLACKHOLES (SYN unanswered) rather than REFUSES (RST), it used to return its correct verdict on
+ *  the deadline and then leak the pending socket: `@nats-io/transport-node`'s `NodeTransport.dial()`
+ *  holds the socket in a local until the handshake resolves, so `this.socket` is still undefined
+ *  when the client's connect timeout fires and `transport.close()` destroys nothing. One orphaned
+ *  socket per probe, freed only by the OS SYN timeout minutes later — so the PROCESS COULD NOT EXIT.
+ *
+ *  A second, distinct orphan (#2156): an address that completes the TCP handshake but sends its
+ *  `INFO` greeting after the probe's budget. There `this.socket` IS set, but the upstream client's
+ *  `_closed` guard only destroys it once `connected` is true, and `connected` is set only after the
+ *  greeting is read — so a timeout mid-greeting leaks the same way for a different reason.
+ *
+ *  Two claims, proven as two separate things, because only the second was ever broken:
+ *    TIMING   — the call returns inside its contract deadline. This was ALWAYS true; asserted so a
+ *               fix that bought exit-cleanliness by blowing the deadline cannot pass here.
+ *    RESOURCE — sockets return to baseline, and a probing process EXITS ON ITS OWN. Counted, never
+ *               assumed: a leak cell that does not count is vacuous.
+ *
+ *  All four address classes run, because the defect was address-class dependent and a cell that
+ *  only drives the broken ones cannot show that. The dialable case is the inverse control: it proves
+ *  the success path's teardown is real and that "no leak" is not just "no connection ever made".
+ *
+ *  This file NEVER touches a real deployment: every address is loopback or a non-routable literal,
+ *  asserted as the first thing it does. The teardown under test must be a real socket release —
+ *  an `unref`/force-exit would delete the symptom and this cell's ability to see a future hang. */
+import { createConnection, createServer, type AddressInfo } from "node:net";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync, readdirSync, readlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { isReachable, probeConnect } from "../src/endpoint.js";
+import { SMOKE_BROKER_TOKEN, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REFUSING = "nats://127.0.0.1:1"; // closed loopback port: answers RST
+const BLACKHOLE = "nats://192.0.2.1:4222"; // RFC-5737 TEST-NET-1: non-routable by standard
+const TIMEOUT_MS = 1_000;
+const N = 5;
+
+let pass = 0;
+const fail: string[] = [];
+function check(name: string, ok: boolean, detail?: unknown) {
+  if (ok) { pass++; console.log(`  ✓ ${name}`); return; }
+  fail.push(name);
+  console.log(`  ✗ ${name}${detail === undefined ? "" : `\n      ${JSON.stringify(detail)}`}`);
+}
+
+// ---------------------------------------------------------------------------
+// FIRST ACTION: nothing here may point at a real deployment.
+// ---------------------------------------------------------------------------
+for (const addr of [REFUSING, BLACKHOLE]) {
+  if (!/^nats:\/\/(127\.0\.0\.1|192\.0\.2\.\d+):/.test(addr))
+    throw new Error(`refusing to run: ${addr} is neither loopback nor a non-routable test literal`);
+  if (/cotal\.ai/i.test(addr)) throw new Error(`refusing to run: ${addr} names a real deployment`);
+}
+console.log("probe-teardown (#389): targets are loopback / RFC-5737 only\n");
+
+// ---------------------------------------------------------------------------
+// Socket census. /proc/self/fd is the ground truth for a leaked handle; Node's own
+// active-resource view is the second witness, so a leak has to hide from both.
+// ---------------------------------------------------------------------------
+const socketFds = (): number[] => {
+  const out: number[] = [];
+  for (const fd of readdirSync("/proc/self/fd")) {
+    try { if (readlinkSync(`/proc/self/fd/${fd}`).startsWith("socket:")) out.push(Number(fd)); }
+    catch { /* closed under us mid-scan */ }
+  }
+  return out;
+};
+const census = () => ({
+  sockets: socketFds().length,
+  handles: process.getActiveResourcesInfo().filter((r) => /socket|tcp/i.test(r)).length,
+});
+const settle = (ms = 250) => new Promise((r) => setTimeout(r, ms));
+
+// ---------------------------------------------------------------------------
+// PRECONDITION — the blackhole literal must really blackhole HERE.
+// If this environment answers 192.0.2.1 with an ICMP unreachable, the address REFUSES, the socket
+// dies on its own, and every assertion below would pass without exercising the defect at all. That
+// is the vacuous-green shape this whole file exists to prevent, so it is a hard failure, never a
+// skip: a cell that quietly stops testing is worse than one that is absent.
+// ---------------------------------------------------------------------------
+const rawDialOutcome = (host: string, port: number, ms: number) =>
+  new Promise<string>((resolve) => {
+    const s = createConnection({ host, port });
+    const done = (o: string) => { try { s.destroy(); } catch { /* gone */ } resolve(o); };
+    s.setTimeout(ms);
+    s.on("connect", () => done("connected"));
+    s.on("timeout", () => done("blackhole"));
+    s.on("error", (e: NodeJS.ErrnoException) => done(`error:${e.code}`));
+  });
+
+console.log("the fixtures are the classes this file claims they are");
+check("the blackhole literal really blackholes on this box (else every check below is vacuous)",
+  (await rawDialOutcome("192.0.2.1", 4222, 2_000)) === "blackhole");
+check("the refusing literal really refuses (ECONNREFUSED, not a silent drop)",
+  (await rawDialOutcome("127.0.0.1", 1, 2_000)) === "error:ECONNREFUSED");
+if (fail.length) { console.log("\nfixture preconditions failed — the rest would prove nothing"); process.exit(1); }
+
+// ---------------------------------------------------------------------------
+// A dialable broker, for the inverse control. Own scratch dir; the pid is recorded AT CREATION and
+// is the only pid this file will ever signal.
+// ---------------------------------------------------------------------------
+const scratch = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+const port = await new Promise<number>((resolve) => {
+  const srv = createServer();
+  srv.listen(0, "127.0.0.1", () => {
+    const { port: p } = srv.address() as AddressInfo;
+    srv.close(() => resolve(p)); // released before nats-server binds it
+  });
+});
+const DIALABLE = `nats://127.0.0.1:${port}`;
+writeFileSync(join(scratch, "nats.conf"),
+  `host: "127.0.0.1"\nport: ${port}\nstore_dir: "${join(scratch, "store")}"\njetstream: enabled\n`);
+const broker = spawn("nats-server", ["-c", join(scratch, "nats.conf")], { stdio: "ignore" });
+const releaseBroker = teardownOnSignal(broker, scratch);
+const BROKER_PID = broker.pid!;
+
+// ---------------------------------------------------------------------------
+// A forwarder in front of the same dialable broker, delaying every broker-to-client chunk by
+// 1400ms: the TCP handshake completes at once but the INFO greeting arrives after the probe's 1s
+// budget (#2156). We own this server and every socket it opens; all are closed in the `finally`
+// below, before the broker is stopped.
+// ---------------------------------------------------------------------------
+const forwarderSockets = new Set<import("node:net").Socket>();
+const forwarderSrv = createServer((client) => {
+  forwarderSockets.add(client);
+  const upstream = createConnection({ host: "127.0.0.1", port });
+  forwarderSockets.add(upstream);
+  client.on("data", (chunk: Buffer) => { try { upstream.write(chunk); } catch { /* gone */ } });
+  upstream.on("data", (chunk: Buffer) => {
+    setTimeout(() => { try { client.write(chunk); } catch { /* gone */ } }, 1_400);
+  });
+  const killUpstream = () => { try { upstream.destroy(); } catch { /* gone */ } };
+  client.on("close", killUpstream);
+  client.on("error", killUpstream);
+  upstream.on("error", () => { try { upstream.destroy(); } catch { /* gone */ } });
+  client.on("close", () => forwarderSockets.delete(client));
+  upstream.on("close", () => forwarderSockets.delete(upstream));
+});
+const forwarderPort = await new Promise<number>((resolve) => {
+  forwarderSrv.listen(0, "127.0.0.1", () => resolve((forwarderSrv.address() as AddressInfo).port));
+});
+const SLOW_GREETING = `nats://127.0.0.1:${forwarderPort}`;
+
+try {
+  let up = false;
+  for (let i = 0; i < 60 && !up; i++) {
+    up = (await rawDialOutcome("127.0.0.1", port, 200)) === "connected";
+    if (!up) await settle(100);
+  }
+  if (!up) throw new Error("the inverse-control broker never came up");
+
+  // -------------------------------------------------------------------------
+  // TIMING + RESOURCE, per address class, in one pass.
+  // -------------------------------------------------------------------------
+  for (const [label, addr, wantOk] of [
+    ["refusing", REFUSING, false],
+    ["dialable (INVERSE CONTROL)", DIALABLE, true],
+    ["blackholing", BLACKHOLE, false],
+    ["slow greeting", SLOW_GREETING, false],
+  ] as const) {
+    console.log(`\n${label}: ${addr}`);
+    await settle();
+    const before = census();
+    const results: string[] = [];
+    const started = Date.now();
+    for (let i = 0; i < N; i++) {
+      const r = await probeConnect(addr, { timeoutMs: TIMEOUT_MS });
+      results.push(r.ok ? "ok" : r.reason);
+    }
+    const elapsed = Date.now() - started;
+    await settle(); // a correct teardown has landed by now; a leaked socket has not
+    const after = census();
+
+    // WHICH answer — a probe that returns the wrong verdict quickly is not a fixed probe.
+    // A peer that took the connection and sent no greeting in time is there and not answering, the
+    // same `timeout` a dial that ran out of its budget gets, never `unreachable`.
+    const want = label === "slow greeting" ? "timeout" : wantOk ? "ok" : "unreachable";
+    check(label === "slow greeting"
+        ? "slow greeting: the gate refused the slow greeting inside the deadline as a timeout"
+        : `${label}: every probe returned ${want}`,
+      results.every((r) => r === want), results);
+    // TIMING: the contract deadline was never the broken half, and must not become it.
+    check(`${label}: ${N} probes finished inside ${N} deadlines (${elapsed}ms <= ${N * TIMEOUT_MS + 1500}ms)`,
+      elapsed <= N * TIMEOUT_MS + 1_500, { elapsed });
+    // RESOURCE: counted, both witnesses. THIS is the assertion #389 breaks.
+    check(`${label}: socket fds returned to baseline after ${N} probes (leaked 0)`,
+      after.sockets - before.sockets === 0, { before: before.sockets, after: after.sockets });
+    check(`${label}: no live socket handles left in the loop after ${N} probes`,
+      after.handles - before.handles === 0, { before: before.handles, after: after.handles });
+  }
+
+  // -------------------------------------------------------------------------
+  // isReachable is the OTHER function built to be pointed at addresses that may not answer, so it
+  // has the same risk profile. Its credless branch was always safe — it uses the owned-socket
+  // tcpInfoProbe — but its with-creds branch reaches the same connect() and leaked the same way.
+  // Both branches are asserted: the safe one so a future change cannot quietly route it into the
+  // leaky path, the fixed one because it is the defect. A dummy credential is enough to select the
+  // branch; the address never answers, so cred validity has no bearing on whether a socket is
+  // orphaned. The verdict is `false` either way, which is the point — it was never the wrong
+  // answer, only the wrong resource behaviour.
+  // -------------------------------------------------------------------------
+  console.log("\nisReachable: the same door, both branches");
+  const DUMMY_CREDS = "-----BEGIN NATS USER JWT-----\nnot.a.jwt\n------END NATS USER JWT------\n";
+  for (const [branch, opts] of [
+    ["credless", { timeoutMs: TIMEOUT_MS }],
+    ["with creds", { timeoutMs: TIMEOUT_MS, creds: DUMMY_CREDS }],
+  ] as const) {
+    await settle();
+    const before = census();
+    const out: boolean[] = [];
+    for (let i = 0; i < N; i++) out.push(await isReachable(BLACKHOLE, opts));
+    await settle();
+    const after = census();
+    check(`isReachable (${branch}): a blackholing address is not reachable`, out.every((r) => r === false), out);
+    check(`isReachable (${branch}): socket fds returned to baseline after ${N} calls (leaked 0)`,
+      after.sockets - before.sockets === 0, { before: before.sockets, after: after.sockets });
+  }
+
+  // -------------------------------------------------------------------------
+  // THE HANG, as its own end-to-end claim. Socket counts are the mechanism; "the process could not
+  // exit" was the user-visible defect, and only a real child process can show it. The child probes
+  // the blackhole and then falls off the end of its script holding nothing open on purpose, so its
+  // exit is a direct read of whether probeConnect released the socket. A leaked socket keeps the
+  // libuv loop alive and the child has to be killed instead.
+  // -------------------------------------------------------------------------
+  console.log("\nthe hang itself: a probing process exits on its own");
+  const child = spawnSync(process.execPath, [
+    "--import", "tsx", join(HERE, "probe-teardown.child.ts"), BLACKHOLE, String(TIMEOUT_MS),
+  ], { encoding: "utf8", timeout: 15_000, killSignal: "SIGKILL" });
+  check("the child printed its verdict (it got that far)", /RETURNED/.test(child.stdout ?? ""), child.stdout);
+  check("the child process EXITED BY ITSELF, and was not killed at the timeout",
+    child.signal === null && child.status === 0, { status: child.status, signal: child.signal, stderr: child.stderr?.slice(0, 400) });
+
+  console.log("\nthe hang itself, slow greeting: a probing process exits on its own");
+  const slowChild = spawnSync(process.execPath, [
+    "--import", "tsx", join(HERE, "probe-teardown.child.ts"), SLOW_GREETING, String(TIMEOUT_MS),
+  ], { encoding: "utf8", timeout: 15_000, killSignal: "SIGKILL" });
+  check("slow greeting: the child printed its verdict (it got that far)", /RETURNED/.test(slowChild.stdout ?? ""), slowChild.stdout);
+  check("slow greeting: the child process EXITED BY ITSELF, and was not killed at the timeout",
+    slowChild.signal === null && slowChild.status === 0, { status: slowChild.status, signal: slowChild.signal, stderr: slowChild.stderr?.slice(0, 400) });
+} finally {
+  for (const s of forwarderSockets) { try { s.destroy(); } catch { /* gone */ } }
+  forwarderSrv.close();
+  const comm = spawnSync("ps", ["-p", String(BROKER_PID), "-o", "comm="], { encoding: "utf8" }).stdout.trim();
+  // Same wide window as bind-fence: SIGTERM asks for a graceful shutdown, which flushes JetStream
+  // into the very tree the next line walks. The pid check stays — it is what proves the process
+  // under this pid is still the broker — and the handle is what we wait on.
+  if (comm === "nats-server") await killAndAwaitExit(broker, "SIGTERM");
+  rmSync(scratch, { recursive: true, force: true });
+  releaseBroker(); // last: ownership is held until this teardown has actually finished
+}
+
+console.log(fail.length === 0
+  ? `\nprobe-teardown (#389): ${pass} checks passed`
+  : `\nprobe-teardown (#389): ${fail.length} FAILED\n  - ${fail.join("\n  - ")}`);
+process.exit(fail.length === 0 ? 0 : 1);

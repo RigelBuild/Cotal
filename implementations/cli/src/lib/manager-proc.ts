@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { closeSync, readFileSync, rmSync } from "node:fs";
+import { closeSync, fstatSync, readFileSync, rmSync } from "node:fs";
 import { relative } from "node:path";
 import { DEFAULT_SERVER, openPrivateAppend, writePrivateRecord } from "@cotal-ai/core";
 import { daemonArgv } from "./self-exec.js";
@@ -18,6 +18,7 @@ import { c } from "../ui.js";
 import { stopLocalProcess } from "./local-process-stop.js";
 import { listManagerSeatsForSpare, printLegacyManagerSpareUncertainty, printSparedAgents, type SpareSeatRow } from "./teardown-spare.js";
 import { seedBeforeLaunch } from "../seed/launch.js";
+import { lastLoggedLine, type LogStart } from "./private-log.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -139,16 +140,35 @@ export function managerUp(space: string = folderSpace(), root: string = cotalRoo
 
 /** Whether a live `cotal supervise` process on this machine may be serving `space`. A supervisor
  *  records its pid under whatever folder it was started from, so no one root's record can rule it
- *  out; the process table can. One whose argv names no space serves what its folder or environment
- *  selects, so it counts, and a process table that cannot be listed proves nothing. */
+ *  out; the process table can. One whose argv names no space serves what its environment or folder
+ *  selects: a service unit sets `COTAL_SPACE` and passes no `--space`, so that variable names the
+ *  space it serves, and one it reads for another space is not a manager of this one. A supervisor
+ *  whose environment cannot be read or names no space counts, and a process table that cannot be
+ *  listed proves nothing. */
 export function supervisorMayServe(space: string): boolean {
-  const ps = spawnSync("ps", ["-A", "-ww", "-o", "args="], { encoding: "utf8" });
+  const ps = spawnSync("ps", ["-A", "-ww", "-o", "pid=,args="], { encoding: "utf8" });
   if (ps.error || ps.status !== 0) return true;
-  return ps.stdout.split("\n").some((command) => {
-    if (!commandIsCotalSupervisor(command)) return false;
-    const named = /(?:^|\s)--space(?:=|\s+)(\S+)/.exec(command)?.[1];
+  return ps.stdout.split("\n").some((line) => {
+    const row = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (!row || !commandIsCotalSupervisor(row[2]!)) return false;
+    const named = /(?:^|\s)--space(?:=|\s+)(\S+)/.exec(row[2]!)?.[1] ?? environmentSpace(Number(row[1]));
     return named === undefined || named === space;
   });
+}
+
+/** The `COTAL_SPACE` a process was started with, read from its environment; undefined when the
+ *  environment is unreadable (another user's process, or no procfs) or names no space. */
+function environmentSpace(pid: number): string | undefined {
+  let environ: string;
+  try {
+    environ = readFileSync(`/proc/${pid}/environ`, "latin1");
+  } catch {
+    return undefined;
+  }
+  for (const entry of environ.split("\0")) {
+    if (entry.startsWith("COTAL_SPACE=")) return entry.slice("COTAL_SPACE=".length) || undefined;
+  }
+  return undefined;
 }
 
 
@@ -196,6 +216,7 @@ export type ManagerStartOpts = {
 
 export function startManagerDetached(
   o: ManagerStartOpts = {},
+  onLogStart?: (start: LogStart) => void,
 ): number {
   const space = o.space ?? folderSpace();
   // BEFORE ANY RECORD OR LOG IS TOUCHED. `selfArgv` refuses when this process was not started from
@@ -240,8 +261,14 @@ export function startManagerDetached(
   ];
   // This is an INTERNAL child re-exec: the `up`/`spawn` that reached here already ran the first-run
   // connector seed, so the manager skips it on boot (a direct `cotal supervise` still seeds).
-  const child = spawn(node, args, { detached: true, stdio: ["ignore", fd, fd], env: { ...process.env, COTAL_SKIP_CONNECTOR_SEED: "1" } });
-  closeSync(fd);
+  let child: ReturnType<typeof spawn>;
+  try {
+    if (onLogStart) {
+      const info = fstatSync(fd);
+      onLogStart({ offset: info.size, dev: info.dev, ino: info.ino });
+    }
+    child = spawn(node, args, { detached: true, stdio: ["ignore", fd, fd], env: { ...process.env, COTAL_SKIP_CONNECTOR_SEED: "1" } });
+  } finally { closeSync(fd); }
   child.unref();
   // CANONICAL path, never a pre-upgrade one: a start that kept writing the root-scoped name would
   // keep minting the very records this change ends.
@@ -305,7 +332,7 @@ export function assertManagerRecordReplaceable(
  *  record publishes its own capability, which says nothing about the started process, so losing the
  *  record refuses. No deadline: the manager bounds its own boot waits (the delivery-admin one alone
  *  runs to a minute), so a deadline here could only misreport a slow boot. */
-async function awaitManagerUp(space: string, started: ProcessIdentityRecord | { pid: number }): Promise<void> {
+async function awaitManagerUp(space: string, started: ProcessIdentityRecord | { pid: number }, logStart?: LogStart): Promise<void> {
   const manager = `the manager started for space "${space}" (pid ${started.pid})`;
   if (!("token" in started))
     throw new Error(`cannot read the start identity of ${manager}, so its readiness cannot be told apart from another manager's. Its log is ${managerLogPath(space)}`);
@@ -317,8 +344,12 @@ async function awaitManagerUp(space: string, started: ProcessIdentityRecord | { 
       // Not published for the started process yet, or the record names another one: decided below.
     }
     const identity = assertRecordIdentity(started).kind;
-    if (identity === "gone" || identity === "mismatch")
-      throw new Error(`${manager} exited before it came up. It logged its reason to ${managerLogPath(space)}`);
+    if (identity === "gone" || identity === "mismatch") {
+      const recorded = parsePid(readPidfile(PID_PATH(space)) ?? "");
+      const reason = logStart && (recorded === undefined || recorded === started.pid)
+        ? lastLoggedLine(managerLogPath(space), logStart.offset, logStart) : undefined;
+      throw new Error(`${manager} exited before it came up.${reason ? `\n${reason}` : ""}\nIt logged its reason to ${managerLogPath(space)}`);
+    }
     if (parsePid(readPidfile(PID_PATH(space)) ?? "") !== started.pid)
       throw new Error(`${manager} lost ${PID_PATH(space)} to another process before it came up, so it is not the manager serving the space. Its log is ${managerLogPath(space)}`);
     await sleep(200);
@@ -339,8 +370,9 @@ export async function ensureManager(
   if (state === "alive") return { running: true, started: false };
   assertManagerRecordReplaceable(space, root, seams); // refuses on unknown / unattributable, reports foreign
   await seedBeforeLaunch();
-  const pid = startManagerDetached(o);
-  await awaitManagerUp(space, identityRecord(pid));
+  let logStart: LogStart | undefined;
+  const pid = startManagerDetached(o, (start) => { logStart = start; });
+  await awaitManagerUp(space, identityRecord(pid), logStart);
   return { running: true, started: true, pid };
 }
 
