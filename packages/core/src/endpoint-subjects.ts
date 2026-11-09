@@ -22,6 +22,19 @@ import { ROOT, spacePrefix, assertValidOwnerToken, assertLifecycleToken } from "
 // endpoint rails keep their import surface.
 export { assertLifecycleToken, mintLifecycleUid } from "./subjects.js";
 
+/** The owner and instance are both pinned by the remote-manager publish grant. */
+export function managerRegistrationFamilySubject(space: string, owner: string, instanceId: string): string {
+  return `${spacePrefix(space)}.manager-registration-family.${assertValidOwnerToken(owner)}.${assertLifecycleToken(instanceId, "instanceId")}`;
+}
+
+export function managerRegistrationFamilyFilter(space: string): string {
+  return `${spacePrefix(space)}.manager-registration-family.*.*`;
+}
+
+export function managerRegistrationFamilyReplyFilter(space: string): string {
+  return `${spacePrefix(space)}.manager-registration-family.*.*.reply.>`;
+}
+
 /** The v0.4 wire version this surface targets. Advertised (§6 `protocolVersion`) only at the
  *  §13.11 cutover — a change signal, not negotiation; nothing pre-cut should flip the card. */
 export const PROTOCOL_VERSION_V04 = "0.4";

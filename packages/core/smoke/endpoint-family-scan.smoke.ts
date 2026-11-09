@@ -23,6 +23,10 @@ import {
   IncompleteKvScan, type EpServeLedgerRow,
 } from "@cotal-ai/core";
 import { pickFreePort } from "./_free-port.js";
+import { makeLedgerScannerOverConnection, authorityScannerGrants } from "../../../implementations/auth/src/ledger-scanner.js";
+import { openAuthorityClient } from "../../../implementations/auth/src/authority-client.js";
+import { openRegistrationFamilyScan } from "../../../implementations/auth/src/registration-family-scan.js";
+import { requestManagerRegistrationFamily, remoteManagerServePrincipal } from "@cotal-ai/core";
 
 const evidence = process.env.FAMILY_SCAN_EVIDENCE_DIR;
 const dir = mkdtempSync(join(evidence ?? tmpdir(), SMOKE_BROKER_TOKEN));
@@ -49,6 +53,13 @@ try {
     connections.push(nc); return nc;
   };
   const provisioner = await open(await mintCreds(auth, newIdentity(), "provisioner"));
+  const owner = `u_${"a".repeat(26)}`;
+  const scanClient = await openAuthorityClient({ server: servers, space, dataAccount: { pub: auth.account.pub, signingSeed: auth.account.signingSeed }, label: "family-scan-smoke", grants: id => authorityScannerGrants(space, id), log: console.error });
+  const scanner = makeLedgerScannerOverConnection(scanClient.nc, space);
+  const host = await open(await mintCreds(auth, newIdentity(), "issuer", { principal: { owner, actor: "host" } }));
+  let dropChunk = false;
+  const responder = await openRegistrationFamilyScan({ server: servers, space, dataAccount: { pub: auth.account.pub, signingSeed: auth.account.signingSeed }, log: console.error, scanner, authKv: await new Kvm(host).open(epAuthBucket(space)), probeDropChunk: (seq, total) => dropChunk && total > 1 && seq === 1 });
+  const scanRemote = (nc: NatsConnection, instanceId: string) => requestManagerRegistrationFamily(nc, space, owner, instanceId);
   const jsm = await jetstreamManager(provisioner);
   const other = await open(await mintCreds(otherAuth, newIdentity(), "provisioner"));
   await (await new Kvm(other).open(epAuthBucket(otherSpace))).status();
@@ -102,7 +113,7 @@ try {
   const costs: number[] = [], remoteCosts: number[] = [];
   for (const count of [0, 7905, 12753]) {
     const instanceId = mintLifecycleUid(), setup = await execFor(instanceId);
-    await provisionEndpointGateOpen(setup.kv, { endpoint, instanceId, principal });
+    await provisionEndpointGateOpen(setup.kv, { endpoint, instanceId, principal: remoteManagerServePrincipal(owner, instanceId) });
     const writer = serveIssuanceGateKv(setup.kv, space, { endpoint, instanceId });
     const barrier = endpointRegistrationBarrier(setup.kv, space, { endpoint, instanceId, opId: mintLifecycleUid() });
     const expected = new Set<string>();
@@ -119,10 +130,16 @@ try {
     check(`${count}: enumeration leaves the gate unchanged`, before?.revision === after?.revision && Buffer.from(before!.value).equals(Buffer.from(after!.value)));
     check(`${count}: scan reclaims its native consumer`, (await jsm.streams.info(`KV_${epAuthBucket(space)}`)).state.consumer_count === consumersBefore);
     const remote = await remoteFor(instanceId);
-    const remoteMeasured = await measure(remote.nc, () => endpointRegistrationBarrier(remote.kv, space, { endpoint, instanceId, opId: mintLifecycleUid() }).enumerate());
+    const remoteMeasured = await measure(remote.nc, () => scanRemote(remote.nc, instanceId));
     const remoteRows = remoteMeasured.rows;
     remoteCosts.push(remoteMeasured.rpcRequests); record({ count, profile: "remote-manager-executor", ...remoteMeasured, rows: remoteRows.length });
     check(`${count}: host-signed remote executor sees the same exact family`, remoteRows.length === count && new Set(remoteRows.map(value => value.credentialId)).size === count && remoteRows.every(value => expected.has(value.credentialId) && value.state === "revoked"));
+    if (count === 7905) {
+      dropChunk = true;
+      let failure: unknown;
+      try { await scanRemote(remote.nc, instanceId); } catch (error) { failure = error; } finally { dropChunk = false; }
+      check("dropped family chunk fails closed", failure instanceof Error);
+    }
     check(`${count}: remote executor deletes its scan consumer`, (await jsm.streams.info(`KV_${epAuthBucket(space)}`)).state.consumer_count === consumersBefore);
     let remoteDenied: unknown;
     try { await (await new Kvm(remote.nc).open(epAuthBucket(otherSpace))).status(); } catch (error) { remoteDenied = error; }
@@ -141,10 +158,10 @@ try {
   check("remote executor also avoids per-row API requests", remoteCosts[2]! <= remoteCosts[1]! + 2);
 
   const instanceId = mintLifecycleUid(), active = await remoteFor(instanceId);
-  await provisionEndpointGateOpen(active.kv, { endpoint, instanceId, principal });
+  await provisionEndpointGateOpen(active.kv, { endpoint, instanceId, principal: remoteManagerServePrincipal(owner, instanceId) });
   const writer = serveIssuanceGateKv(active.kv, space, { endpoint, instanceId });
   const row = rowFor(instanceId); await writer.stage(row);
-  const barrier = endpointRegistrationBarrier(active.kv, space, { endpoint, instanceId, opId: mintLifecycleUid() });
+  const barrier = endpointRegistrationBarrier(active.kv, space, { endpoint, instanceId, opId: mintLifecycleUid(), enumerateFamily: () => scanRemote(active.nc, instanceId) });
   const observed = await barrier.observe(); assert.ok(observed);
   const frozen = await barrier.freeze(observed.revision); assert.notEqual(frozen, null);
   check("freeze still defeats an earlier mint commit", !await writer.commit(observed.revision));
@@ -155,7 +172,7 @@ try {
   check("stale freeze token still loses reopen", !await barrier.reopen(frozen! - 1, { generation: 1, processEpoch: 0, registrationRevision: 0, nameAuthorityRevision: 0 }));
 
   // A real consumer and bind count; only the clean premature end is a detector seam, as in kv-scan.smoke.
-  const bucket = active.kv as Bucket, realGet = bucket.js.consumers.getPushConsumer.bind(bucket.js.consumers);
+  const bucket = (await execFor(instanceId)).kv as Bucket, realGet = bucket.js.consumers.getPushConsumer.bind(bucket.js.consumers);
   const victim = Object.create(bucket) as KV;
   Object.defineProperty(victim, "js", { value: { ...bucket.js, consumers: { ...bucket.js.consumers,
     getPushConsumer: async (...args: Parameters<typeof realGet>): Promise<PushConsumer> => {
@@ -174,6 +191,8 @@ try {
   try { await barrier.enumerate(); } catch (error) { malformed = error; }
   check("malformed family evidence still refuses", malformed instanceof Error);
   check("parsing refusal leaves no scan consumer", (await jsm.streams.info(`KV_${epAuthBucket(space)}`)).state.consumer_count === beforeCut);
+  await responder.close();
+  await scanClient.close();
 } finally {
   for (const nc of connections) await nc.close().catch(() => {});
   const exited = broker.exitCode === null && broker.signalCode === null ? once(broker, "exit") : Promise.resolve();
@@ -181,5 +200,5 @@ try {
   if (evidence) writeFileSync(join(dir, "OUTCOME.json"), JSON.stringify({ passed, port, brokerExited: true }) + "\n", { mode: 0o600 });
   else rmSync(dir, { recursive: true, force: true });
 }
-assert.equal(passed, 43, "all family scan cells ran");
+assert.equal(passed, 44, "all family scan cells ran");
 console.log(`ENDPOINT FAMILY SCAN: ${passed} passed`);

@@ -9,6 +9,7 @@ import {
   epAuthBucket,
   fetchContractArtifact,
   foreignSlotHeldFrom,
+  requestManagerRegistrationFamily,
   principalKey,
   provisionEndpointGateOpen,
   publishContractArtifact,
@@ -71,6 +72,7 @@ export async function registerRemoteManagerAuthority(args: {
       instanceId: args.instanceId,
       opId: args.instanceId,
       evict: args.evict,
+      enumerateFamily: () => requestManagerRegistrationFamily(nc, args.space, args.owner, args.instanceId),
     });
     const register = () => registerServingInstance(recordsKv, {
       space: args.space,
