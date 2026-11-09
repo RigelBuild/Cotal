@@ -260,10 +260,10 @@ try {
 console.log("\nD. Native builders ship pty.node, and ARM loads it");
 shipsBothNatives("ci.yml", ciJobs);
 shipsBothNatives("changesets.yml", csJobs);
-const nativeEnv = [...`${pack}\n${version}\n${snapshot}`.matchAll(/SEAT_NATIVE_(?:X64|ARM64):[ \t]*(.+?)[ \t]*$/gm)].map((m) => m[1]);
+const nativeEnv = [...`${ciText}\n${csText}`.matchAll(/SEAT_NATIVE_(?:X64|ARM64):[ \t]*(.+?)[ \t]*$/gm)].map((m) => m[1]);
 check(
   "SEAT_NATIVE_X64 and SEAT_NATIVE_ARM64 name the builder directory, not one file",
-  nativeEnv.length === 6 && nativeEnv.every((v) => /\/seat-native-linux-(x64|arm64)$/.test(v)),
+  nativeEnv.length === 8 && nativeEnv.every((v) => /\/seat-native-linux-(x64|arm64)$/.test(v)),
   nativeEnv,
 );
 check(

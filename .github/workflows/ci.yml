@@ -274,8 +274,8 @@ jobs:
       - name: Assemble the seat SO_PEERCRED helpers
         run: node scripts/seat-assemble-natives.mjs
         env:
-          SEAT_NATIVE_X64: ${{ runner.temp }}/seat-native-linux-x64/peercred.node
-          SEAT_NATIVE_ARM64: ${{ runner.temp }}/seat-native-linux-arm64/peercred.node
+          SEAT_NATIVE_X64: ${{ runner.temp }}/seat-native-linux-x64
+          SEAT_NATIVE_ARM64: ${{ runner.temp }}/seat-native-linux-arm64
           SEAT_NATIVE_DARWIN_X64: ${{ runner.temp }}/seat-host-native/seat-native-darwin-x64/peercred.node
           SEAT_NATIVE_DARWIN_ARM64: ${{ runner.temp }}/seat-host-native/seat-native-darwin-arm64/peercred.node
           SEAT_NATIVE_WIN32_X64: ${{ runner.temp }}/seat-host-native/seat-native-win32-x64/peercred.node
