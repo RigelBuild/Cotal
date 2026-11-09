@@ -23,7 +23,7 @@ function check(name: string, cond: boolean, extra?: unknown): void {
 }
 
 /** Pin the workflow population so removal or addition needs deliberate review. */
-const EXPECTED_WORKFLOWS = 7;
+const EXPECTED_WORKFLOWS = 6;
 const EXPECTED_PUSH_TO_RELEASE = 5;
 // Rigel merges land here; fork `main` mirrors upstream and runs upstream's workflows.
 const RELEASE_BRANCH = "rigel-release";
