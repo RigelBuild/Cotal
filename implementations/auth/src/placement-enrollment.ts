@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, constants, fsyncSync, lstatSync, openSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fsyncSync, linkSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { acquireLockAsync, assertLifecycleToken, canonicalJson, contractDigest, EpEnvelopeError, isContractDigest, mkSecretDir, parsePlacementEnrollmentRequest, parsePlacementEnrollmentVerificationRequest, remoteManagerServePrincipal, type AcceptedIntent, type EnrollmentIdentity, type ExecutionAuthority, type ExecutionEffect, type PlacementEnrollmentRequest, type PlacementEnrollmentResult, type RemoteManagedAgentEnrollmentResult } from "@cotal-ai/core";
 import { findInteractiveActor, findManagedActor, assertWithinSpawnerGrant, withManagedGrantTransaction } from "./ledger.js";
@@ -12,9 +12,11 @@ export interface PlacementEnrollmentAuthorityOptions {
   accountPublicKey: string;
   proofSecret: string | Uint8Array;
   observeManagerGate: ObserveManagerGate;
-  reconciler?: ReconcilerPort;
-  authenticator?: ServiceAuthenticator;
-  rolePolicy?: RolePolicyPort;
+  reconciler: ReconcilerPort;
+  authenticator: ServiceAuthenticator;
+  rolePolicy: RolePolicyPort;
+  serializedForAlias<T>(owner: string, actor: string, action: () => Promise<T>): Promise<T>;
+  deprovisionFootprint(owner: string, actor: string, lifecycleUid: string, channels: string[]): Promise<void>;
   enrollManagedAgent(args: {
     owner: string;
     scope: string[];
@@ -30,7 +32,7 @@ export interface PlacementEnrollmentAuthority {
   verifyPlacementEnrollment(args: { caller: string; request: unknown }): Promise<{ identity: EnrollmentIdentity; active: true }>;
   enrollmentEffectStatus(args: { caller: string; effectId: string }): Promise<{ effectId: string; state: "effective" | "unknown" | "cancelled" | "pending"; enrollment?: EnrollmentIdentity; noLateEffects: boolean; privateCustody: "none" }>;
   closeEnrollmentEffect(args: { caller: string; effectId: string; fenceId: string }): Promise<{ effectId: string; state: "effective" | "unknown" | "cancelled" | "pending"; enrollment?: EnrollmentIdentity; noLateEffects: boolean; privateCustody: "none" }>;
-  retirePlacementEnrollment(args: { caller: string; operationId: string; identity: EnrollmentIdentity; fenceId: string }): Promise<{ state: "retired" | "unknown"; denialProofId?: string }>;
+  retirePlacementEnrollment(args: { caller: string; operationId: string; identity: EnrollmentIdentity; fenceId: string }): Promise<{ state: "retired" | "pending" | "unknown"; denialProofId?: string }>;
 }
 
 interface PendingRecord {
@@ -71,13 +73,12 @@ function journalDirectory(dir: string): string {
 }
 
 function durableCreate(directory: string, name: string, value: unknown): void {
-  const fd = openSync(join(directory, name), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  const temporary = join(directory, `.${randomUUID()}.tmp`);
+  const fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
   try {
-    writeFileSync(fd, canonicalJson(value));
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
+    try { writeFileSync(fd, canonicalJson(value)); fsyncSync(fd); } finally { closeSync(fd); }
+    linkSync(temporary, join(directory, name));
+  } finally { unlinkSync(temporary); }
   const parent = openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY);
   try { fsyncSync(parent); } finally { closeSync(parent); }
 }
@@ -101,6 +102,7 @@ function businessDigest(request: PlacementEnrollmentRequest, policy: PendingReco
     actorTokenHash: request.actorTokenHash,
     policy,
     enrollment: {
+      serveEpoch: enrollment.serveEpoch,
       space: enrollment.space,
       actor: enrollment.actor,
       instanceId: enrollment.instanceId,
@@ -119,7 +121,6 @@ function normalizedAcl(acl: EnrollmentAcl) {
 }
 
 async function matchPolicy(options: PlacementEnrollmentAuthorityOptions, request: PlacementEnrollmentRequest, role: string, roleTreeRevision: number, seatName: string): Promise<PendingRecord["policy"]> {
-  if (!options.rolePolicy) throw new EpEnvelopeError("unimplemented", "role policy port is not configured");
   const policy = await options.rolePolicy.enrollmentAcl({ space: request.enrollment.space, role, roleTreeRevision, seatName });
   const actual = canonicalJson(normalizedAcl(request.enrollment.target));
   const base = normalizedAcl(policy.base);
@@ -175,7 +176,7 @@ function parseStoredRecord(raw: unknown, request: PlacementEnrollmentRequest, di
   if (!sameAuthority(record.authority, request.authority)) {
     const savedClaim = record.authority.claim;
     const currentClaim = request.authority.claim;
-    if (savedClaim.instanceId !== currentClaim.instanceId || savedClaim.managerLifecycleUid !== currentClaim.managerLifecycleUid ||
+    if (savedClaim.instanceId !== currentClaim.instanceId ||
         savedClaim.accountPublicKey !== currentClaim.accountPublicKey || savedClaim.assignmentRevision !== currentClaim.assignmentRevision)
       fail("permission-denied", "placement enrollment replay has a different manager assignment", "not-executed");
   }
@@ -264,6 +265,15 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
         const stored = parseStoredRecord(candidate, request, businessDigest(request, policy));
         if (stored.owner !== args.owner) fail("permission-denied", "placement enrollment belongs to another owner", "not-executed");
         effectLease = await acquireLockAsync(join(directory, `${stored.effectId}.effect.lock`), { label: "enrollment effect" });
+        const indexName = `${stored.effectId}.index.json`;
+        const index = readRecord<unknown>(directory, indexName);
+        if (index === undefined) durableCreate(directory, indexName, { operationId: request.enrollmentOperationId });
+        else if (!isObject(index) || index.operationId !== request.enrollmentOperationId)
+          fail("conflict", "placement enrollment effect belongs to another operation");
+        if (readRecord<unknown>(directory, `${stored.effectId}.cancelled.json`) !== undefined)
+          fail("failed-precondition", "placement enrollment was not executed", "not-executed");
+        const latest = readRecord<unknown>(directory, completeName);
+        if (latest !== undefined) complete = parseStoredRecord(latest, request, businessDigest(request, policy));
         if (readRecord<unknown>(directory, `${stored.effectId}.closed.json`) !== undefined)
           fail("failed-precondition", "placement enrollment effect is closed", "not-executed");
         const lifecycleUid = assertHeldRow(options, args.owner, authorized.target.actor, request.actorTokenHash, request.authority.claim.instanceId,
@@ -272,7 +282,7 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
         const result = await managerEnrollment(options, args.owner, args.scope, request, args.sentinelCreds, args.agentBearerExchangeUrl);
         if (verifyMaterial(result, request, args.owner) !== lifecycleUid)
           fail("conflict", "managed enrollment replay returned another lifecycle", "unknown");
-        if (stored.state === "pending") {
+        if (stored.state === "pending" && complete === undefined) {
           const identity = identityFor(stored, args.owner, lifecycleUid);
           durableCreate(directory, completeName, { ...stored, state: "complete", identity });
           complete = { ...stored, state: "complete", identity };
@@ -286,7 +296,6 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
       }
       if (findManagedActor(options.dir, args.owner, authorized.target.actor) || findInteractiveActor(options.dir, args.owner, authorized.target.actor))
         fail("conflict", `managed agent ${args.owner}/${authorized.target.actor} is already held outside this placement operation`, "not-executed");
-      if (!options.reconciler) throw new EpEnvelopeError("unimplemented", "reconciler accepted-intent port is not configured");
       options.assertOpen();
       const admission = await options.reconciler.acceptedIntent({
         acceptanceId: request.acceptanceId,
@@ -317,9 +326,24 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
         roleTreeRevision: accepted.intent.roleTreeRevision,
         policy,
       };
+      const indexName = `${effect.effectId}.index.json`;
+      const index = readRecord<unknown>(directory, indexName);
+      if (index === undefined) durableCreate(directory, indexName, { operationId: request.enrollmentOperationId });
+      else if (!isObject(index) || index.operationId !== request.enrollmentOperationId)
+        fail("conflict", "placement enrollment effect belongs to another operation");
       durableCreate(directory, pendingName, record);
       options.assertOpen();
-      const result = await managerEnrollment(options, args.owner, args.scope, request, args.sentinelCreds, args.agentBearerExchangeUrl);
+      let result: RemoteManagedAgentEnrollmentResult;
+      try {
+        result = await managerEnrollment(options, args.owner, args.scope, request, args.sentinelCreds, args.agentBearerExchangeUrl);
+      } catch (error) {
+        const row = findManagedActor(options.dir, args.owner, authorized.target.actor);
+        if (!row || row.tokenHash !== request.actorTokenHash) {
+          durableCreate(directory, `${effect.effectId}.cancelled.json`, { effectId: effect.effectId });
+          fail("failed-precondition", "placement enrollment was not executed", "not-executed");
+        }
+        throw error;
+      }
       const lifecycleUid = verifyMaterial(result, request, args.owner);
       const identity = identityFor(record, args.owner, lifecycleUid);
       durableCreate(directory, completeName, { ...record, state: "complete", identity });
@@ -333,26 +357,24 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
     }
   };
 
-  const authenticate = async (caller: string) => {
-    if (!options.authenticator) throw new EpEnvelopeError("unimplemented", "service-authentication port is not configured");
-    if ((await options.authenticator.authenticateService(caller)).principal !== "reconciler")
+  const authenticate = async (caller: string, operation: string, request: unknown) => {
+    if ((await options.authenticator.authenticateService({ transportPrincipal: caller, operation, requestDigest: contractDigest(request) })).principal !== "reconciler")
       fail("permission-denied", "enrollment participant requires the reconciler service", "not-executed");
   };
-  const enrollmentEffectStatus = async ({ caller, effectId }: { caller: string; effectId: string }) => {
-    await authenticate(caller);
+  const effectStatus = async (effectId: string) => {
     if (!UUID.test(effectId)) fail("bad-request", "invalid effect id");
     const lease = await acquireLockAsync(join(directory, `${effectId}.effect.lock`), { label: "enrollment effect" });
     try {
     let complete: CompleteRecord | undefined;
     let pending: PendingRecord | undefined;
-    for (const name of readdirSync(directory)) {
-      if (name.endsWith(".complete.json")) {
-        const record = readRecord<CompleteRecord>(directory, name);
-        if (record?.effectId === effectId) complete = record;
-      } else if (name.endsWith(".pending.json")) {
-        const record = readRecord<PendingRecord>(directory, name);
-        if (record?.effectId === effectId) pending = record;
-      }
+    const index = readRecord<unknown>(directory, `${effectId}.index.json`);
+    if (index !== undefined) {
+      if (!isObject(index) || typeof index.operationId !== "string" || !UUID.test(index.operationId))
+        throw new EpEnvelopeError("unavailable", "placement enrollment effect index is corrupt");
+      complete = readRecord<CompleteRecord>(directory, `${index.operationId}.complete.json`);
+      pending = readRecord<PendingRecord>(directory, `${index.operationId}.pending.json`);
+      if ((complete && complete.effectId !== effectId) || (pending && pending.effectId !== effectId))
+        fail("unavailable", "placement enrollment effect index does not match journal");
     }
     if (!complete && pending) {
       const uid = assertHeldRow(options, pending.owner, pending.placement.name, pending.actorTokenHash, pending.authority.claim.instanceId);
@@ -362,14 +384,24 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
       }
     }
     const closed = readRecord<unknown>(directory, `${effectId}.closed.json`) !== undefined;
-    return { effectId, state: complete ? "effective" as const : closed ? "cancelled" as const : pending ? "unknown" as const : "pending" as const,
-      ...(complete ? { enrollment: complete.identity } : {}), noLateEffects: closed, privateCustody: "none" as const };
+    const cancelled = readRecord<unknown>(directory, `${effectId}.cancelled.json`) !== undefined;
+    return { effectId, state: complete ? "effective" as const : closed || cancelled ? "cancelled" as const : pending ? "unknown" as const : "pending" as const,
+      ...(complete ? { enrollment: complete.identity } : {}), noLateEffects: closed || cancelled, privateCustody: "none" as const };
     } finally { lease.release(); }
   };
+  const enrollmentEffectStatus = async ({ caller, effectId }: { caller: string; effectId: string }) => {
+    await authenticate(caller, "auth.enrollment-effect-status", { effectId });
+    return effectStatus(effectId);
+  };
   const closeEnrollmentEffect = async ({ caller, effectId, fenceId }: { caller: string; effectId: string; fenceId: string }) => {
-    await authenticate(caller);
+    await authenticate(caller, "auth.close-enrollment-effect", { effectId, fenceId });
     if (!UUID.test(effectId) || !UUID.test(fenceId)) fail("bad-request", "invalid effect or fence id");
-    const lease = await acquireLockAsync(join(directory, `${effectId}.effect.lock`), { label: "enrollment effect" });
+    const timeout = new Error("enrollment effect lock timed out");
+    const lease = await acquireLockAsync(join(directory, `${effectId}.effect.lock`), { label: "enrollment effect", waitMs: 30_000, onTimeout: () => timeout }).catch((error: unknown) => {
+      if (error === timeout) return undefined;
+      throw error;
+    });
+    if (!lease) return { effectId, state: "pending" as const, noLateEffects: false, privateCustody: "none" as const };
     try {
       const name = `${effectId}.closed.json`;
       const existing = readRecord<unknown>(directory, name);
@@ -377,10 +409,10 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
       else if (!isObject(existing) || existing.fenceId !== fenceId || existing.effectId !== effectId)
         fail("conflict", "enrollment effect was closed by another fence");
     } finally { lease.release(); }
-    return enrollmentEffectStatus({ caller, effectId });
+    return effectStatus(effectId);
   };
   const retirePlacementEnrollment = async ({ caller, operationId, identity, fenceId }: { caller: string; operationId: string; identity: EnrollmentIdentity; fenceId: string }) => {
-    await authenticate(caller);
+    await authenticate(caller, "auth.retire-placement-enrollment", { operationId, identity, fenceId });
     if (!UUID.test(operationId) || !UUID.test(fenceId)) fail("bad-request", "invalid retirement operation or fence id");
     const lock = await acquireLockAsync(join(directory, `${operationId}.retire.lock`), { label: "enrollment retirement" });
     try {
@@ -401,24 +433,28 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
       if (!pending) durableCreate(directory, pendingName, { identity, fenceId });
       const target = identity.target.lifecycle;
       const custody = { kind: "remote-manager" as const, instanceId: record.authority.claim.instanceId };
-      const gone = withManagedGrantTransaction(options.dir, (tx) => {
-        const row = tx.read(target.owner, target.actor);
-        if (row && (row.kind !== "managed-agent" || row.lifecycleUid !== target.lifecycleUid || row.tokenHash !== record.actorTokenHash)) return false;
-        if (row) tx.revokeManagedIf(target.owner, target.actor, { lifecycleUid: target.lifecycleUid, custody });
-        const after = tx.read(target.owner, target.actor);
+      const gone = await options.serializedForAlias(target.owner, target.actor, async () => {
+        const row = findManagedActor(options.dir, target.owner, target.actor);
+        if (row?.lifecycleUid === target.lifecycleUid) {
+          if (row.tokenHash !== record.actorTokenHash || row.custody?.kind !== custody.kind || row.custody.instanceId !== custody.instanceId)
+            return false;
+          await options.deprovisionFootprint(target.owner, target.actor, target.lifecycleUid, row.allowSubscribe);
+          withManagedGrantTransaction(options.dir, (tx) => tx.revokeManagedIf(target.owner, target.actor, { lifecycleUid: target.lifecycleUid, custody }));
+        }
+        const after = findManagedActor(options.dir, target.owner, target.actor);
         return !after || after.lifecycleUid !== target.lifecycleUid;
-      });
+      }).catch(() => false);
       if (!gone) return { state: "unknown" as const };
-      const denialProofId = randomUUID();
-      durableCreate(directory, name, { identity, fenceId, denialProofId });
+      const denialProofId = contractDigest({ operationId, identity, fenceId, grantGone: true, footprintGone: true });
+      durableCreate(directory, name, { operationId, identity, fenceId, grantGone: true, footprintGone: true, denialProofId });
       return { state: "retired" as const, denialProofId };
     } finally { lock.release(); }
   };
 
   const verifyPlacementEnrollment = async (args: { caller: string; request: unknown }): Promise<{ identity: EnrollmentIdentity; active: true }> => {
     options.assertOpen();
-    await authenticate(args.caller);
     const request = parsePlacementEnrollmentVerificationRequest(args.request);
+    await authenticate(args.caller, "auth.verify-placement-enrollment", request);
     const { identity, claim } = request;
     if (identity.target.lifecycle.space !== options.space || claim.accountPublicKey !== options.accountPublicKey)
       fail("permission-denied", "placement enrollment verification names another space or account", "not-executed");
@@ -432,7 +468,7 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
         gate.processEpoch !== claim.serveEpoch || gate.registrationRevision !== claim.currentRegistrationRevision)
       fail("permission-denied", "placement enrollment verification claim is not the current open manager registration", "not-executed");
     const record = complete as unknown as CompleteRecord;
-    if (record.authority.claim.instanceId !== claim.instanceId || record.authority.claim.managerLifecycleUid !== claim.managerLifecycleUid ||
+    if (record.authority.claim.instanceId !== claim.instanceId || record.authority.claim.accountPublicKey !== claim.accountPublicKey ||
         record.authority.claim.assignmentRevision !== claim.assignmentRevision)
       fail("permission-denied", "placement enrollment claim differs from its recorded assignment", "not-executed");
     const lifecycleUid = assertHeldRow(options, identity.target.lifecycle.owner, identity.target.lifecycle.actor,
