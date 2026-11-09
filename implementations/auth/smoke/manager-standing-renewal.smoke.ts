@@ -54,6 +54,7 @@ try {
   await awaitBrokerReady(() => isReachable(SERVERS), { servers: SERVERS, attempts: 50, delayMs: 100 });
   await setupSpaceStreams({ servers: SERVERS, space, creds: await mintCreds(auth, newIdentity(), "provisioner") });
   plane = await openAuthAuthorityPlane({ server: SERVERS, space, dir, identityRoot: dir, dataAccount, log: () => {} });
+  await plane.issueManagerServiceAuthority({ owner, scope: ["supervise"], request: { v: 1, kind: "manager-service-authority", operation: "prepare", space, actor: "cli", instanceId, managerLifecycleUid, requestId: `req${mintLifecycleUid()}`, identities: { supervisor: { id: held.supervisor.id }, executor: { id: held.executor.id }, serve: { id: held.serve.id }, goalWriter: { id: held.goalWriter.id }, sessionLedger: { id: held.sessionLedger.id } } } });
   const prepareCreds = await mintCreds(auth, held.executor, "remote-manager", {
     principal: { owner, actor: actors.executor }, remoteManager: { instanceId, owner, actor: actors.executor },
   });
@@ -228,6 +229,7 @@ try {
     const instanceIdB = mintLifecycleUid();
     const actorsB = remoteManagerActors(instanceIdB);
     const heldB = Object.fromEntries(names.map((n) => [n, newIdentity()])) as Record<Name, Identity>;
+    await plane.issueManagerServiceAuthority({ owner, scope: ["supervise"], request: { v: 1, kind: "manager-service-authority", operation: "prepare", space, actor: "cli", instanceId: instanceIdB, managerLifecycleUid: mintLifecycleUid(), requestId: `req${mintLifecycleUid()}`, identities: { supervisor: { id: heldB.supervisor.id }, executor: { id: heldB.executor.id }, serve: { id: heldB.serve.id }, goalWriter: { id: heldB.goalWriter.id }, sessionLedger: { id: heldB.sessionLedger.id } } } });
     const prepCredsB = await mintCreds(auth, heldB.executor, "remote-manager", {
       principal: { owner, actor: actorsB.executor }, remoteManager: { instanceId: instanceIdB, owner, actor: actorsB.executor },
     });

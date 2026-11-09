@@ -4,4 +4,4 @@
 "@cotal-ai/manager": patch
 ---
 
-Confine remote manager registration family enumeration to an auth-owned operation.
+Confine remote manager registration reads and family enumeration to auth-owned operations.

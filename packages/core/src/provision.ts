@@ -1986,10 +1986,8 @@ function remoteManagerPermissions(
         `${spacePrefix(space)}.epc.*`,
         `$JS.API.DIRECT.GET.${epcStreamName(space)}.${spacePrefix(space)}.epc.>`,
         `$JS.API.DIRECT.GET.${epcStreamName(space)}`,
-        `$JS.API.STREAM.MSG.GET.KV_${AUTH}`,
         managerRegistrationFamilySubject(space, pr.owner, iid),
         ...recordKeys.map((key) => `$JS.API.DIRECT.GET.KV_${REC}.$KV.${REC}.${key}`),
-        `$JS.API.STREAM.MSG.GET.KV_${REC}`,
         // LIVENESS REPLIES for the MANAGER plane (#1577), bounded to the `.reply.` leaf under a
         // caller's own request subject — the same row and the same bound as the local supervisor
         // profile holds.

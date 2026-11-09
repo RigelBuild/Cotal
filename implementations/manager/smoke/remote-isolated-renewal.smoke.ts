@@ -96,6 +96,7 @@ try {
   await awaitBrokerReady(() => isReachable(SERVERS), { servers: SERVERS, attempts: 50, delayMs: 100 });
   await setupSpaceStreams({ servers: SERVERS, space, creds: await mintCreds(auth, newIdentity(), "provisioner") });
   plane = await openAuthAuthorityPlane({ server: SERVERS, space, dir: tmp, identityRoot: tmp, dataAccount: { pub: auth.account.pub, signingSeed: auth.account.signingSeed }, log: () => {} });
+  await plane.issueManagerServiceAuthority({ owner, scope: ["supervise"], request: { v: 1, kind: "manager-service-authority", operation: "prepare", space, actor: "cli", instanceId, managerLifecycleUid, requestId: `req${mintLifecycleUid()}`, identities: { supervisor: { id: held.supervisor.id }, executor: { id: held.executor.id }, serve: { id: held.serve.id }, goalWriter: { id: held.goalWriter.id }, sessionLedger: { id: held.sessionLedger.id } } } });
   const TTL = 7;
   const initial = Object.fromEntries(await Promise.all(names.map(async (n) => [n, await sign(n, n === target ? TTL : 3600)]))) as Record<Name, string>;
   const registered = await registerRemoteManagerAuthority({

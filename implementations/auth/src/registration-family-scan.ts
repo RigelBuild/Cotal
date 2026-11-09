@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { assertLifecycleToken, assertNonce, assertValidOwnerToken, epcredFamilyPrefix, managerRegistrationFamilyFilter, managerRegistrationFamilyReplyFilter, managerRegistrationFamilySubject, parseLedgerRow, remoteManagerServePrincipal, serveIssuanceGateKv } from "@cotal-ai/core";
+import { assertCredentialIdTail, assertLifecycleToken, assertNonce, assertValidOwnerToken, epcredFamilyPrefix, epgateKey, eprepairKey, managerRegistrationFamilyFilter, managerRegistrationFamilyReplyFilter, managerRegistrationFamilySubject, parseLedgerRow, readEndpointGateGeneration, remoteManagerServePrincipal, serveIssuanceGateKv } from "@cotal-ai/core";
 import type { KV } from "@nats-io/kv";
 import { openAuthorityClient, type AuthorityClientOpts } from "./authority-client.js";
 import type { AuthLedgerScanner } from "./ledger-scanner.js";
@@ -17,10 +17,28 @@ export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts,
         const owner = assertValidOwnerToken(parts.at(-2) ?? ""), iid = assertLifecycleToken(parts.at(-1) ?? "", "instanceId");
         if (msg.subject !== managerRegistrationFamilySubject(opts.space, owner, iid)) throw new Error("invalid scan subject");
         const body: unknown = JSON.parse(new TextDecoder().decode(msg.data));
-        if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== 1 || !("nonce" in body) || typeof body.nonce !== "string") throw new Error("invalid scan request");
+        if (!body || typeof body !== "object" || Array.isArray(body) || !("nonce" in body) || typeof body.nonce !== "string") throw new Error("invalid scan request");
         reply = `${msg.subject}.reply.${assertNonce(body.nonce)}`;
         const gate = await serveIssuanceGateKv(opts.authKv, opts.space, { endpoint: "manager", instanceId: iid }).observe();
         if (!gate || gate.state === "retired" || gate.principal !== remoteManagerServePrincipal(owner, iid)) throw new Error("manager gate does not match requester");
+        if ("kind" in body) {
+          if (body.kind === "read" && Object.keys(body).length === 3 && "key" in body && typeof body.key === "string") {
+            const prefix = `${epcredFamilyPrefix("manager", iid)}.`;
+            if (body.key.startsWith(prefix)) assertCredentialIdTail(body.key.slice(prefix.length), "credentialId");
+            if (body.key !== epgateKey("manager", iid) && body.key !== eprepairKey("manager", iid) && !(body.key.startsWith(prefix) && body.key.length > prefix.length)) throw new Error("foreign registration read key");
+            const entry = await opts.authKv.get(body.key);
+            const result = entry ? { value: Buffer.from(entry.value).toString("base64"), revision: entry.revision, operation: entry.operation } : { absent: true };
+            client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce: body.nonce, ...result })));
+            continue;
+          }
+          if (body.kind === "generation" && Object.keys(body).length === 3 && "targetInstanceId" in body && typeof body.targetInstanceId === "string") {
+            const generation = await readEndpointGateGeneration(opts.authKv, { endpoint: "manager", instanceId: assertLifecycleToken(body.targetInstanceId) });
+            client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce: body.nonce, generation })));
+            continue;
+          }
+          throw new Error("invalid registration read request");
+        }
+        if (Object.keys(body).length !== 1) throw new Error("invalid scan request");
         const prefix = `${epcredFamilyPrefix("manager", iid)}.`;
         const rows = (await opts.scanner.scanEndpointCredentialFamily("manager", iid)).map(entry => {
           if (!entry.key.startsWith(prefix) || (entry.op && entry.op !== "PUT")) throw new Error("invalid family evidence");

@@ -121,6 +121,7 @@ import { controlShutdown } from "./control-shutdown.js";
 import { RunHosting, servedRequestSubject } from "./run-hosting.js";
 import { enrolledAcl } from "./remote-authority.js";
 import { rejectionText, attemptCleanup, describeCleanupFailures, type CleanupFailure } from "@cotal-ai/core";
+import { requestManagerRegistrationRead, type RegistrationReadEntry } from "@cotal-ai/core";
 import { controlSession } from "./control-session.js";
 import { MAX_AGENTS, parseResumeCommitArgs, parseResumeControlArgs, parseResumeFinalizeArgs, readReleasedSeatReference, readSeatRecord, removeReleasedSeatReference, removeSeatRecord, supervisePolicy, writeReleasedSeatReference, writeSeatRecord, type SeatRecord } from "./resume.js";
 import { TranscriptReceiver, type TranscriptClaim, type TranscriptReceiveInput } from "./transcript-receive.js";
@@ -3997,12 +3998,12 @@ export class Manager {
    */
   private async deregisterServiceOnStop(registrationRevision: number): Promise<void> {
     const iid = this.managerInstanceId;
-    const dereg = ({ recordsKv, authKv }: { recordsKv: KV; authKv: KV }): Promise<ServiceDeregistration> =>
+    const dereg = ({ recordsKv, authKv, read }: { recordsKv: KV; authKv: KV; read?: (key: string) => Promise<RegistrationReadEntry | null> }): Promise<ServiceDeregistration> =>
       deregisterServiceInstance(recordsKv, {
         endpoint: MANAGER_ENDPOINT,
         instanceId: iid,
         registrationRevision,
-        observeGeneration: () => readEndpointGateGeneration(authKv, { endpoint: MANAGER_ENDPOINT, instanceId: iid }),
+        observeGeneration: () => readEndpointGateGeneration(authKv, { endpoint: MANAGER_ENDPOINT, instanceId: iid, read }),
       });
     try {
       const outcome = await ((this.auth || this.remoteAuthority)
@@ -9265,7 +9266,7 @@ export class Manager {
    *  gate CAS, mint fence, spec/governance writes, and clean deregistration ride a one-shot scoped
    *  authority. The remote boot goal-index sweep instead uses the authenticated host-owned scan.
    *  This is NEVER the manager's standing seed/supervisor connection. */
-  private async withEndpointServeExecutor<T>(fn: (kvs: { recordsKv: KV; authKv: KV; nc: NatsConnection }) => Promise<T>): Promise<T> {
+  private async withEndpointServeExecutor<T>(fn: (kvs: { recordsKv: KV; authKv: KV; nc: NatsConnection; read?: (key: string) => Promise<RegistrationReadEntry | null> }) => Promise<T>): Promise<T> {
     const identity = this.remoteAuthority?.identities.executor ?? newIdentity();
     if (this.remoteAuthority && (!this.remoteExecutorCreds || inspectCredHealth(this.remoteExecutorCreds).state !== "healthy")) {
       // Shutdown has drained and discarded the standing serve context. Renew only its scoped
@@ -9285,7 +9286,13 @@ export class Manager {
     const nc = await this.dial({ ...standaloneConnectOpts({ creds, /* not yet wired to a recorded transport */ tls: false }), maxReconnectAttempts: 0 });
     try {
       const kvm = new Kvm(nc);
-      return await fn({ recordsKv: await kvm.open(recordsBucket(this.space)), authKv: await kvm.open(epAuthBucket(this.space)), nc });
+      const owner = this.remoteAuthority?.owner;
+      const read = owner === undefined ? undefined : async (key: string) => {
+        const result = await requestManagerRegistrationRead(nc, this.space, owner, this.managerInstanceId, { kind: "read", key });
+        if (typeof result === "number") throw new Error("invalid registration read result");
+        return result;
+      };
+      return await fn({ recordsKv: await kvm.open(recordsBucket(this.space), { allow_direct: Boolean(this.remoteAuthority) }), authKv: await kvm.open(epAuthBucket(this.space)), nc, read });
     } finally {
       await nc.drain().catch(() => nc.close());
     }
@@ -10069,8 +10076,8 @@ export class Manager {
    */
   private sessionServingCredentials(): SessionServing {
     const iid = this.managerInstanceId;
-    const gate = async <T>(fn: (authKv: KV) => Promise<T>): Promise<T> =>
-      this.withEndpointServeExecutor(({ authKv }) => fn(authKv));
+    const gate = async <T>(fn: (authKv: KV, read?: (key: string) => Promise<RegistrationReadEntry | null>) => Promise<T>): Promise<T> =>
+      this.withEndpointServeExecutor(({ authKv, read }) => fn(authKv, read));
     return {
       mint: async (grant) => {
         // Open mesh: no auth to mint from. The id still names the session so the ledger row and the
@@ -10105,8 +10112,8 @@ export class Manager {
         // Open mesh: nothing is minted and nothing is staged, so there is no gate to pin (see
         // ServingGatePin.gate — the stage refuses loudly if this is ever missing on an auth mesh).
         if (!this.auth && !this.remoteAuthority) return { key: epgateKey(MANAGER_ENDPOINT, instanceId), revision: 0 };
-        return gate(async (authKv) => {
-          const observed = await serveIssuanceGateKv(authKv, this.space, { endpoint: MANAGER_ENDPOINT, instanceId }).observe();
+        return gate(async (authKv, read) => {
+          const observed = await serveIssuanceGateKv(authKv, this.space, { endpoint: MANAGER_ENDPOINT, instanceId, read }).observe();
           if (observed === null)
             throw new Error(`the issuance gate for ${MANAGER_ENDPOINT}/${instanceId} vanished; a session credential never stages against a missing gate (SPEC 13.1)`);
           // The WHOLE observation rides the pin: the stage's fence compares every field of it, which
@@ -10129,8 +10136,8 @@ export class Manager {
         const observed = pin.gate;
         if (observed === undefined)
           throw new Error(`the redemption of session ${grant.sessionId} carries no gate observation for ${MANAGER_ENDPOINT}/${iid}; a session credential never stages unfenced (SPEC 13.1)`);
-        await gate(async (authKv) => {
-          const fence = serveIssuanceGateKv(authKv, this.space, { endpoint: MANAGER_ENDPOINT, instanceId: iid });
+        await gate(async (authKv, read) => {
+          const fence = serveIssuanceGateKv(authKv, this.space, { endpoint: MANAGER_ENDPOINT, instanceId: iid, read });
           await commitSiblingIssuance(fence, observed, {
             credentialId: cred.id,
             credentialKey: key,
@@ -10153,8 +10160,8 @@ export class Manager {
       },
       revoke: async (credentialId) => {
         if (!this.auth && !this.remoteAuthority) return; // open mesh: nothing was minted
-        await gate(async (authKv) => {
-          await markLedgerRowRevoked(authKv, epcredRowKey(MANAGER_ENDPOINT, iid, credentialId));
+        await gate(async (authKv, read) => {
+          await markLedgerRowRevoked(authKv, epcredRowKey(MANAGER_ENDPOINT, iid, credentialId), read);
         });
         this.sessionServingKeys.delete(credentialId);
       },

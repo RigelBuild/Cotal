@@ -10,10 +10,8 @@ import {
   fetchContractArtifact,
   foreignSlotHeldFrom,
   requestManagerRegistrationFamily,
-  principalKey,
-  provisionEndpointGateOpen,
+  requestManagerRegistrationRead,
   publishContractArtifact,
-  readEndpointGateGeneration,
   recordsBucket,
   registerServingInstance,
   serveIssuanceGateKv,
@@ -52,8 +50,13 @@ export async function registerRemoteManagerAuthority(args: {
   });
   try {
     const kvm = new Kvm(nc);
-    const recordsKv = await kvm.open(recordsBucket(args.space));
+    const recordsKv = await kvm.open(recordsBucket(args.space), { allow_direct: true });
     const authKv = await kvm.open(epAuthBucket(args.space));
+    const read = async (key: string) => {
+      const value = await requestManagerRegistrationRead(nc, args.space, args.owner, args.instanceId, { kind: "read", key });
+      if (typeof value === "number") throw new Error("unexpected registration read result");
+      return value;
+    };
     const store = await contractStoreContext(nc, args.space);
     const artifacts = managerClusterArtifacts();
     const all = [...managerAuthorityContractSource().artifacts, artifacts.document, artifacts.manifest];
@@ -63,9 +66,8 @@ export async function registerRemoteManagerAuthority(args: {
       const bytes = await fetchContractArtifact(store, contractRefToHex(digest));
       return bytes ? JSON.parse(new TextDecoder().decode(bytes)) : undefined;
     };
-    const principal = principalKey(args.owner, args.serveActor).key;
-    if ((await serveIssuanceGateKv(authKv, args.space, { endpoint: MANAGER_ENDPOINT, instanceId: args.instanceId }).observe()) === null)
-      await provisionEndpointGateOpen(authKv, { endpoint: MANAGER_ENDPOINT, instanceId: args.instanceId, principal });
+    if ((await serveIssuanceGateKv(authKv, args.space, { endpoint: MANAGER_ENDPOINT, instanceId: args.instanceId, read }).observe()) === null)
+      throw new Error("manager registration requires an auth-prepared gate");
     const authority = { authorize: (endpoint: string, owner: string) => ({ authorized: endpoint === MANAGER_ENDPOINT && owner === args.owner, revision: 0 }) };
     const barrier = endpointRegistrationBarrier(authKv, args.space, {
       endpoint: MANAGER_ENDPOINT,
@@ -73,6 +75,7 @@ export async function registerRemoteManagerAuthority(args: {
       opId: args.instanceId,
       evict: args.evict,
       enumerateFamily: () => requestManagerRegistrationFamily(nc, args.space, args.owner, args.instanceId),
+      read,
     });
     const register = () => registerServingInstance(recordsKv, {
       space: args.space,
@@ -82,11 +85,11 @@ export async function registerRemoteManagerAuthority(args: {
       authority,
       barrier,
       readClusterArtifact,
-      // #1393: same seam the local registration wires — a foreign slot is reclaimed only when that
-      // holder's own gate has provably reopened past the slot's stamp, over this connection's
-      // existing auth-bucket read grant.
-      observeHolderGeneration: (holderInstanceId) =>
-        readEndpointGateGeneration(authKv, { endpoint: MANAGER_ENDPOINT, instanceId: holderInstanceId }),
+      observeHolderGeneration: async (holderInstanceId) => {
+        const result = await requestManagerRegistrationRead(nc, args.space, args.owner, args.instanceId, { kind: "generation", targetInstanceId: holderInstanceId });
+        if (typeof result !== "number") throw new Error("invalid holder generation reply");
+        return result;
+      },
     });
     let registered: Awaited<ReturnType<typeof register>>;
     try {
