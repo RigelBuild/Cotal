@@ -3,7 +3,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { NatsConnection } from "@nats-io/transport-node";
 import type { EpServeLedgerRow } from "./endpoint-service.js";
 import { managerRegistrationFamilySubject } from "./endpoint-subjects.js";
-import { parseManagerRegistrationFamilyReply } from "./registration-family.js";
+import { RegistrationFamilyBusyError } from "./registration-read-client.js";
+import { parseManagerRegistrationFamilyRows } from "./registration-family.js";
 
 export async function requestManagerRegistrationFamily(nc: NatsConnection, space: string, owner: string, instanceId: string): Promise<EpServeLedgerRow[]> {
   const subject = managerRegistrationFamilySubject(space, owner, instanceId), nonce = randomBytes(18).toString("base64url");
@@ -20,6 +21,7 @@ export async function requestManagerRegistrationFamily(nc: NatsConnection, space
       const msg = await Promise.race([iterator.next(), timeout]);
       if (msg.done) throw new Error("registration family reply subscription closed");
       const chunk: unknown = JSON.parse(new TextDecoder().decode(msg.value.data));
+      if (chunk && typeof chunk === "object" && "nonce" in chunk && chunk.nonce === nonce && "error" in chunk && chunk.error === "busy" && Object.keys(chunk).length === 2) throw new RegistrationFamilyBusyError();
       if (!chunk || typeof chunk !== "object" || Array.isArray(chunk) || Object.keys(chunk).some(k => !["nonce", "scanId", "seq", "total", "rows", "rowCount", "complete"].includes(k)) ||
         !("nonce" in chunk) || chunk.nonce !== nonce || !("scanId" in chunk) || typeof chunk.scanId !== "string" || !/^[A-Za-z0-9_-]{22,64}$/.test(chunk.scanId) ||
         !("seq" in chunk) || chunk.seq !== seq || !("total" in chunk) || typeof chunk.total !== "number" || !Number.isSafeInteger(chunk.total) || chunk.total < 1 || chunk.total > 100000 ||
@@ -33,7 +35,7 @@ export async function requestManagerRegistrationFamily(nc: NatsConnection, space
       if (chunk.scanId !== scanId || chunk.total !== total || seq >= total) throw new Error("inconsistent registration family chunks");
       const last = seq === total - 1;
       if (last ? !("complete" in chunk && chunk.complete === true && "rowCount" in chunk && chunk.rowCount === rows.length + chunk.rows.length) : ("complete" in chunk || "rowCount" in chunk)) throw new Error("incomplete registration family chunks");
-      for (const row of parseManagerRegistrationFamilyReply(new TextEncoder().encode(JSON.stringify({ complete: true, rows: chunk.rows })), instanceId)) {
+      for (const row of parseManagerRegistrationFamilyRows(chunk.rows, instanceId)) {
         if (ids.has(row.credentialId)) throw new Error("duplicate registration family credential");
         ids.add(row.credentialId); rows.push(row);
       }

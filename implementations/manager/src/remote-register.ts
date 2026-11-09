@@ -13,6 +13,7 @@ import {
   requestManagerRegistrationRead,
   publishContractArtifact,
   recordsBucket,
+  registrationRecordsKv,
   registerServingInstance,
   serveIssuanceGateKv,
   standaloneConnectOpts,
@@ -50,7 +51,7 @@ export async function registerRemoteManagerAuthority(args: {
   });
   try {
     const kvm = new Kvm(nc);
-    const recordsKv = await kvm.open(recordsBucket(args.space), { allow_direct: true });
+    const recordsKv = registrationRecordsKv(await kvm.open(recordsBucket(args.space)), nc, args.space, args.owner, args.instanceId);
     const authKv = await kvm.open(epAuthBucket(args.space));
     const read = async (key: string) => {
       const value = await requestManagerRegistrationRead(nc, args.space, args.owner, args.instanceId, { kind: "read", key });
