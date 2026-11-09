@@ -1,6 +1,8 @@
 /** @module index */
 export { createPlacementEnrollmentAuthority, type PlacementEnrollmentAuthorityOptions } from "./placement-enrollment.js";
-export type { EnrollmentAcl, RolePolicyPort } from "@cotal-ai/core";
+export type { EnrollmentAcl, RolePolicyPort, ReconcilerPort, ServiceAuthenticator, ManagerClaimView, AcceptedPlacementView, PlacementAuthorityView, AcceptedIntentView, EnrollEffectView, EnrollmentIdentity, PlacementEnrollmentVerificationRequest } from "./placement-enrollment.js";
+export { parsePlacementEnrollmentRequest } from "@cotal-ai/core";
+export { parsePlacementEnrollmentVerificationRequest, parseEnrollmentIdentity } from "./placement-enrollment-types.js";
 export { mintServiceCallerPayloadObserverCreds, type ServiceCallerPayloadBootstrap } from "./service-caller-payload-bootstrap.js";
 export { deriveOwnerToken, deriveOwnerForIdpSubject, platformControlOwner } from "./derive.js";
 export { parsePlatformControlAuthorityRequest, type ManagerAuthorityHolder } from "./platform-control.js";
