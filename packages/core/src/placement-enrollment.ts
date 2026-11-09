@@ -4,7 +4,7 @@ import { isAccountNkey } from "./identity.js";
 import { parseRemoteManagedAgentEnrollmentRequest, type RemoteManagedAgentEnrollmentRequest, type RemoteManagedAgentEnrollmentResult } from "./remote-manager-authority.js";
 import { assertLifecycleToken, assertValidOwnerToken } from "./subjects.js";
 
-export interface ManagerClaim {
+export interface ManagerClaimView {
   accountPublicKey: string;
   instanceId: string;
   managerLifecycleUid: string;
@@ -13,37 +13,37 @@ export interface ManagerClaim {
   serveEpoch: number;
 }
 
-export interface Placement {
-  space: string;
+export interface AcceptedPlacementView {
+  space: "main";
   name: string;
   desiredRevision: number;
   seatRevision: number;
-  claim: ManagerClaim;
+  claim: ManagerClaimView;
   generation: number;
   operationId: string;
   workspace: string;
 }
 
-export interface ExecutionAuthority {
+export interface PlacementAuthorityView {
   subject: { acceptanceId: string; enrollmentOperationId: string; phase: "accepted" };
   placementOperationId: string;
   intentDigest: string;
-  claim: ManagerClaim;
+  claim: ManagerClaimView;
   launchRevision: number;
 }
 
-export interface AcceptedIntent {
+export interface AcceptedIntentView {
   acceptanceId: string;
-  intent: { digest: string; placement: Placement; role: string; roleTreeRevision: number; [field: string]: unknown };
+  intent: { digest: string; placement: AcceptedPlacementView; role: string; roleTreeRevision: number; [field: string]: unknown };
   acceptedListRevision: number;
   acceptedSeatRevision: number;
   enrollmentOperationId: string;
-  executionGate: { authority: ExecutionAuthority; state: "open" | "closing" | "closed"; fenceId?: string };
+  executionGate: { authority: PlacementAuthorityView; state: "open" | "closing" | "closed"; fenceId?: string };
 }
 
-export interface ExecutionEffect {
+export interface EnrollEffectView {
   effectId: string;
-  authority: ExecutionAuthority;
+  authority: PlacementAuthorityView;
   operationId: string;
   kind: "enroll" | "bind" | "create" | "bootstrap";
   state: "admitted" | "unknown" | "cancelled" | "effective";
@@ -69,14 +69,14 @@ export interface PlacementEnrollmentRequest {
   kind: "auth.enroll-placement";
   acceptanceId: string;
   enrollmentOperationId: string;
-  authority: ExecutionAuthority;
+  authority: PlacementAuthorityView;
   actorTokenHash: string;
   enrollment: RemoteManagedAgentEnrollmentRequest;
 }
 
 export interface PlacementEnrollmentVerificationRequest {
   identity: EnrollmentIdentity;
-  claim: ManagerClaim;
+  claim: ManagerClaimView;
 }
 
 export interface PlacementEnrollmentResult {
@@ -87,9 +87,9 @@ export interface PlacementEnrollmentResult {
 export interface ReconcilerPort {
   acceptedIntent(request: {
     acceptanceId: string;
-    authority: ExecutionAuthority;
+    authority: PlacementAuthorityView;
     actorTokenHash: string;
-  }): Promise<{ accepted: AcceptedIntent; effect: ExecutionEffect }>;
+  }): Promise<{ accepted: AcceptedIntentView; effect: EnrollEffectView }>;
 }
 
 export interface ServiceAuthenticator {
@@ -115,7 +115,7 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[], 
   if (keys.join(",") !== [...expected].sort().join(",")) fail(what, `must contain exactly ${expected.join(", ")}`);
 }
 
-function parseClaim(raw: unknown, what: string): ManagerClaim {
+function parseClaim(raw: unknown, what: string): ManagerClaimView {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) fail(what, "claim must be an object");
   const value = raw as Record<string, unknown>;
   exactKeys(value, ["accountPublicKey", "instanceId", "managerLifecycleUid", "assignmentRevision", "currentRegistrationRevision", "serveEpoch"], what);
@@ -138,7 +138,7 @@ function parseClaim(raw: unknown, what: string): ManagerClaim {
   };
 }
 
-function parseAuthority(raw: unknown, what: string): ExecutionAuthority {
+function parseAuthority(raw: unknown, what: string): PlacementAuthorityView {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) fail(what, "authority must be an object");
   const value = raw as Record<string, unknown>;
   exactKeys(value, ["subject", "placementOperationId", "intentDigest", "claim", "launchRevision"], what);
