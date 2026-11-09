@@ -54,6 +54,16 @@ try {
   await assert.rejects(service.enrollPlacement({ ...args, request: { ...request, authority: { ...authority, claim: { ...claim, instanceId: mintLifecycleUid() } } }, onDelivered: done }));
   assert.equal(commits, 0);
   console.log("  ✓ invalid effect, operation, hash and epoch refuse before writes");
+  const crashEffect = randomUUID();
+  effect = { ...effect, effectId: crashEffect };
+  const interrupted = createPlacementEnrollmentAuthority({ ...options, dir: mkdtempSync(join(dir, "crash-")), enrollManagedAgent: async () => { throw new Error("crash before commit"); } });
+  await assert.rejects(interrupted.enrollPlacement({ ...args, onDelivered: done }), /crash before commit/);
+  assert.equal((await interrupted.enrollmentEffectStatus({ caller: "reconciler", effectId: crashEffect })).state, "unknown");
+  const afterCrash = await interrupted.closeEnrollmentEffect({ caller: "reconciler", effectId: crashEffect, fenceId: randomUUID() });
+  assert.equal(afterCrash.state, "cancelled"); assert.equal(afterCrash.noLateEffects, true);
+  await assert.rejects(interrupted.enrollPlacement({ ...args, onDelivered: done }));
+  effect = { ...effect, effectId };
+  console.log("  ✓ pending crash closes as cancelled without late effects");
   await assert.rejects(service.enrollPlacement({ ...args, onDelivered: () => { throw new Error("reply interrupted"); } }), /reply interrupted/);
   const first = await createPlacementEnrollmentAuthority(options).enrollPlacement({ ...args, onDelivered: done });
   const replay = await service.enrollPlacement({ ...args, onDelivered: done });
