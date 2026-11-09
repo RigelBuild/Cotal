@@ -1312,6 +1312,8 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
         }),
         issue: async ({ actors, request: r }) => {
           const existing = await observeLegacyManagerGate(r.instanceId);
+          if ((r.operation === "prepare" || r.operation === "renew") && existing !== null && existing.principal !== remoteManagerServePrincipal(owner, r.instanceId))
+            throw new EpEnvelopeError("permission-denied", "manager instance belongs to another owner");
           if (r.operation === "prepare" && existing === null) {
             await provisionEndpointGateOpen(authKv, {
               endpoint: "manager", instanceId: r.instanceId, principal: remoteManagerServePrincipal(owner, r.instanceId),

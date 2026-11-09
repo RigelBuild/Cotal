@@ -26,7 +26,7 @@ import { pickFreePort } from "./_free-port.js";
 import { makeLedgerScannerOverConnection, authorityScannerGrants } from "../../../implementations/auth/src/ledger-scanner.js";
 import { openAuthorityClient } from "../../../implementations/auth/src/authority-client.js";
 import { openRegistrationFamilyScan } from "../../../implementations/auth/src/registration-family-scan.js";
-import { requestManagerRegistrationFamily, remoteManagerServePrincipal } from "@cotal-ai/core";
+import { requestManagerRegistrationFamily, requestManagerRegistrationRead, remoteManagerServePrincipal } from "@cotal-ai/core";
 
 const evidence = process.env.FAMILY_SCAN_EVIDENCE_DIR;
 const dir = mkdtempSync(join(evidence ?? tmpdir(), SMOKE_BROKER_TOKEN));
@@ -158,10 +158,15 @@ try {
   check("remote executor also avoids per-row API requests", remoteCosts[2]! <= remoteCosts[1]! + 2);
 
   const instanceId = mintLifecycleUid(), active = await remoteFor(instanceId);
-  await provisionEndpointGateOpen(active.kv, { endpoint, instanceId, principal: remoteManagerServePrincipal(owner, instanceId) });
-  const writer = serveIssuanceGateKv(active.kv, space, { endpoint, instanceId });
+  await provisionEndpointGateOpen((await execFor(instanceId)).kv, { endpoint, instanceId, principal: remoteManagerServePrincipal(owner, instanceId) });
+  const read = async (key: string) => {
+    const result = await requestManagerRegistrationRead(active.nc, space, owner, instanceId, { kind: "read", key });
+    if (typeof result === "number") throw new Error("unexpected read result");
+    return result;
+  };
+  const writer = serveIssuanceGateKv(active.kv, space, { endpoint, instanceId, read });
   const row = rowFor(instanceId); await writer.stage(row);
-  const barrier = endpointRegistrationBarrier(active.kv, space, { endpoint, instanceId, opId: mintLifecycleUid(), enumerateFamily: () => scanRemote(active.nc, instanceId) });
+  const barrier = endpointRegistrationBarrier(active.kv, space, { endpoint, instanceId, opId: mintLifecycleUid(), read, enumerateFamily: () => scanRemote(active.nc, instanceId) });
   const observed = await barrier.observe(); assert.ok(observed);
   const frozen = await barrier.freeze(observed.revision); assert.notEqual(frozen, null);
   check("freeze still defeats an earlier mint commit", !await writer.commit(observed.revision));

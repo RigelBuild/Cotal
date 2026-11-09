@@ -102,8 +102,8 @@ The CLI endpoint executor can acknowledge native flow control only for its space
 publication for other streams or accounts, no response wildcard and no longer credential lifetime.
 The remote Manager executor requests its own owner- and instance-pinned family from the auth
 plane's sealed scanner. It has no auth-stream consumer create, info or delete grants. Chunked
-replies must be complete and consistent or registration fails closed. Body-selected stream
-message reads on the auth and records streams remain granted.
+replies must be complete and consistent or registration fails closed. Auth reads use a closed
+owner- and instance-pinned operation; records reads use key-pinned direct get subjects.
 
 ## Agent tools
 
