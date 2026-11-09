@@ -242,6 +242,7 @@ const targetPath = (target: string) => join(fixture, "build", "Release", target,
 const validate = () => spawnSync(process.execPath, [join(ROOT, "packages/seat/scripts/assert-shipped-natives.mjs"), fixture], { encoding: "utf8", timeout: 10_000 });
 try {
   for (const [target, bytes] of headers) { mkdirSync(dirname(targetPath(target)), { recursive: true }); writeFileSync(targetPath(target), bytes); }
+  for (const arch of ["x64", "arm64"]) writeFileSync(join(dirname(targetPath(`linux-${arch}`)), "pty.node"), headers.get(`linux-${arch}`)!);
   check("all six matching container headers pass", validate().status === 0);
   for (const target of hostTargets) {
     rmSync(targetPath(target));

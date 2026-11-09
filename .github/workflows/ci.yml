@@ -397,8 +397,8 @@ jobs:
       - name: Transport liveness unit baseline
         run: pnpm smoke:transport-liveness
 
-# Native linux-x64 and linux-arm64 peercred.node and pty.node, then one pack on x64.
-# The platform matrix is Linux-only on this fork; Windows CI remains retired.
+  # Native linux-x64 and linux-arm64 peercred.node and pty.node, then one pack on x64.
+  # The platform matrix is Linux-only on this fork; Windows CI remains retired.
   workspace-native:
     if: ${{ github.event_name != 'workflow_dispatch' }}
     uses: ./.github/workflows/workspace-native.yml
