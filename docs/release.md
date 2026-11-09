@@ -6,15 +6,16 @@ Cotal uses [Changesets](https://github.com/changesets/changesets) to version and
 workspace packages under `packages/*`, `extensions/*`, and `implementations/*` to npm.
 `examples/**` is ignored, since it is not published.
 
-> **This fork does not publish.** The `@cotal-ai/*` npm packages belong to upstream `Cotal-AI/Cotal`.
+> **This fork does not publish to npm.** The `@cotal-ai/*` npm packages belong to upstream `Cotal-AI/Cotal`.
 > Here the workflow is renamed `.github/workflows/changesets.yml.disabled`, so GitHub never runs
 > it. The smoke suites still read it. Restore the `.yml` name only with a Rigel npm scope repoint.
 
 ## Rigel runtime release assets
 
-The `Rigel release` workflow runs on each push to `rigel-release`. It builds the runtime on `ubuntu-latest` and `macos-15`, then publishes `cotal-runtime-linux-x64.tar.gz`, `cotal-runtime-darwin-arm64.tar.gz`, and `SHA256SUMS` to a GitHub Release tagged `rigel-v<bin/package.json version>-<10-character commit sha>`.
+The `Rigel release` workflow runs on each push to `rigel-release`. It builds the runtime on `ubuntu-latest` and `macos-15`, then publishes `cotal-runtime-linux-x64.tar.gz`, `cotal-runtime-darwin-arm64.tar.gz`, and `SHA256SUMS` to a GitHub Release tagged `rigel-v<version>-<first 10 chars of SHA>`, where version comes from `bin/package.json`.
 Each archive contains the install tree under `cotal/`, including the `cotal-ai` launcher copy. The tag names the commit used for both builds.
-Runs are grouped by ref and queued without canceling an active release. Re-running the same commit is a no-op if its tag already points to that commit; a tag pointing elsewhere fails.
+Runs are grouped by ref and queued without canceling an active release. On rerun, a tag pointing elsewhere fails. A published Release with all three assets is a no-op; otherwise the workflow uploads missing assets and publishes a draft. If the tag exists but the Release cannot be read, restore the Release or remove the tag before retrying.
+Each published Release fires the release-published notifier workflow.
 
 ## 0.11 runtime migration
 

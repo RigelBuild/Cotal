@@ -53,6 +53,30 @@
       "replace": "  queue: ${{ github.ref == 'refs/heads/main' && 'max' || 'single' }}\n",
       "expectRed": "installer.yml: `queue` is a form this check understands",
       "cell": "is a form this check understands"
+    },
+    {
+      "name": "rigel-release cancels an active release",
+      "file": ".github/workflows/rigel-release.yml",
+      "find": "  cancel-in-progress: false\n",
+      "replace": "  cancel-in-progress: true\n",
+      "expectRed": "rigel-release.yml: does not cancel an active release",
+      "cell": "does not cancel an active release"
+    },
+    {
+      "name": "rigel-release uses a single pending slot",
+      "file": ".github/workflows/rigel-release.yml",
+      "find": "  queue: max\n",
+      "replace": "  queue: single\n",
+      "expectRed": "rigel-release.yml: resolves to max on a push",
+      "cell": "resolves to max on a push"
+    },
+    {
+      "name": "rigel-release loses its concurrency group",
+      "file": ".github/workflows/rigel-release.yml",
+      "find": "concurrency:\n  group: rigel-release-${{ github.ref }}\n  cancel-in-progress: false\n  queue: max\n",
+      "replace": "",
+      "expectRed": "exactly 5 of those declare a concurrency group",
+      "cell": "declare a concurrency group"
     }
   ]
 }

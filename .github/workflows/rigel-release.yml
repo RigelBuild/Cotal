@@ -8,6 +8,7 @@ on:
 permissions:
   contents: read
 
+# Queue every release push; see docs/release.md.
 concurrency:
   group: rigel-release-${{ github.ref }}
   cancel-in-progress: false
@@ -16,8 +17,9 @@ concurrency:
 jobs:
   build:
     runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
+    outputs:
+      sha: ${{ steps.metadata.outputs.sha }}
+      tag: ${{ steps.metadata.outputs.tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -27,13 +29,14 @@ jobs:
           - platform: darwin-arm64
             runner: macos-15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
-      - uses: pnpm/action-setup@v6.0.8
-      - uses: actions/setup-node@v6
+          persist-credentials: false
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          # Native .node helpers are ABI-bound; match the nodejs_24 that orion runs them under.
+          # Native .node helpers are ABI-bound; match the downstream consumer's Node version.
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
@@ -43,17 +46,16 @@ jobs:
         run: |
           set -euo pipefail
           sha="$(git rev-parse HEAD)"
-          short_sha="$(git rev-parse --short=10 HEAD)"
+          short_sha="${sha:0:10}"
           version="$(node -p "require('./bin/package.json').version")"
           commit_time="$(git show -s --format=%ct HEAD)"
           {
             echo "sha=$sha"
-            echo "short_sha=$short_sha"
             echo "tag=rigel-v${version}-${short_sha}"
             echo "commit_time=$commit_time"
           } >> "$GITHUB_OUTPUT"
       - name: Install GNU tar
-        if: runner.os == 'macOS'
+        if: matrix.platform == 'darwin-arm64'
         run: brew install gnu-tar
       - name: Assemble runtime archive
         env:
@@ -69,7 +71,7 @@ jobs:
           tar_bin=tar
           if [ "$PLATFORM" = darwin-arm64 ]; then tar_bin=gtar; fi
           "$tar_bin" --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$COMMIT_TIME" -czf "$RUNNER_TEMP/cotal-runtime-${PLATFORM}.tar.gz" -C "$asset_root" cotal
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cotal-runtime-${{ matrix.platform }}
           path: ${{ runner.temp }}/cotal-runtime-${{ matrix.platform }}.tar.gz
@@ -81,27 +83,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
-      - name: Prepare release metadata
-        id: metadata
-        run: |
-          set -euo pipefail
-          sha="$(git rev-parse HEAD)"
-          short_sha="$(git rev-parse --short=10 HEAD)"
-          version="$(node -p "require('./bin/package.json').version")"
-          {
-            echo "sha=$sha"
-            echo "tag=rigel-v${version}-${short_sha}"
-          } >> "$GITHUB_OUTPUT"
-      - uses: actions/download-artifact@v4
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: cotal-runtime-linux-x64
-          path: dist
-      - uses: actions/download-artifact@v4
-        with:
-          name: cotal-runtime-darwin-arm64
+          pattern: cotal-runtime-*
+          merge-multiple: true
           path: dist
       - name: Create checksums
         run: |
@@ -111,22 +100,6 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          SHA: ${{ steps.metadata.outputs.sha }}
-          TAG: ${{ steps.metadata.outputs.tag }}
-        run: |
-          set -euo pipefail
-          tag_ref="refs/tags/$TAG"
-          refs="$(git ls-remote --tags origin "$tag_ref" "$tag_ref^{}")"
-          if [ -n "$refs" ]; then
-            existing_sha="$(printf '%s\n' "$refs" | awk -v ref="$tag_ref^{}" '$2 == ref { print $1; exit }')"
-            if [ -z "$existing_sha" ]; then
-              existing_sha="$(printf '%s\n' "$refs" | awk -v ref="$tag_ref" '$2 == ref { print $1; exit }')"
-            fi
-            if [ "$existing_sha" = "$SHA" ]; then
-              echo "Release tag $TAG already points to $SHA; nothing to do."
-              exit 0
-            fi
-            echo "::error::Release tag $TAG already exists at $existing_sha, not $SHA."
-            exit 1
-          fi
-          gh release create "$TAG" --target "$SHA" --title "$TAG" --notes "Prebuilt Cotal runtime for $SHA." dist/cotal-runtime-linux-x64.tar.gz dist/cotal-runtime-darwin-arm64.tar.gz dist/SHA256SUMS
+          SHA: ${{ needs.build.outputs.sha }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: node scripts/rigel-release-publish.mjs
