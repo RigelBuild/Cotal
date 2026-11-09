@@ -54,9 +54,6 @@ jobs:
             echo "tag=rigel-v${version}-${short_sha}"
             echo "commit_time=$commit_time"
           } >> "$GITHUB_OUTPUT"
-      - name: Install GNU tar
-        if: matrix.platform == 'darwin-arm64'
-        run: brew install gnu-tar
       - name: Assemble runtime archive
         env:
           COMMIT_TIME: ${{ steps.metadata.outputs.commit_time }}

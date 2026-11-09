@@ -13,7 +13,7 @@
     "about it. That is the whole reason the guard is static, and it is also why the guard itself",
     "needs mutation proof rather than a green run.",
     "",
-    "The three mutations cover the concurrency failures this guard must reject.",
+    "The six mutations cover the concurrency failures this guard must reject.",
     "",
     "M1 restores the short `concurrency: <string>` form on installer.yml. This is the shape changesets.yml and",
     "installer.yml sat in, and it is the dangerous one precisely because it reads as a deliberate",
@@ -27,7 +27,8 @@
     "",
     "M3 replaces the expression with a form the reader does not know. It must FAIL rather than be",
     "skipped. A reader that silently ignores what it cannot parse is how a guard turns into a green",
-    "that means nothing, which is the failure mode this repo has hit more than once."
+    "that means nothing, which is the failure mode this repo has hit more than once.",
+    "M4–M6 make rigel-release cancel active runs, evict pending runs, or lose its group."
   ],
   "mutations": [
     {

@@ -1,6 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { isMainEntry } from './main-entry.mjs';
 
 const assets = ['cotal-runtime-linux-x64.tar.gz', 'cotal-runtime-darwin-arm64.tar.gz', 'SHA256SUMS'];
 
@@ -33,24 +32,31 @@ export function publish({ repository, tag, sha, run = runGh }) {
   if (object.type !== 'commit' || object.sha !== sha) {
     throw new Error(`Release tag ${tag} points to ${object.sha} (${object.type}), not ${sha}.`);
   }
-  let release;
-  try {
-    release = JSON.parse(invoke(['release', 'view', tag, '--json', 'isDraft,assets']));
-  } catch (error) {
-    throw new Error(`Tag ${tag} exists but its Release cannot be read. Restore the Release or remove the tag before retrying.`, { cause: error });
+  const view = run(['release', 'view', tag, '--json', 'isDraft,assets']);
+  if (view.status !== 0) {
+    if (/release not found/i.test(view.stderr)) {
+      throw new Error(`Tag ${tag} exists but its Release cannot be read. Restore the Release or remove the tag before retrying.`);
+    }
+    throw new Error(`gh release view ${tag} failed: ${view.stderr}`);
   }
+  const release = JSON.parse(view.stdout);
   const present = new Set(release.assets.map((asset) => asset.name));
-  const missing = assets.filter((name) => !present.has(name));
-  if (missing.length) invoke(['release', 'upload', tag, ...missing.map((name) => `dist/${name}`), '--clobber']);
+  const missing = assets.some(name => !present.has(name));
+  if (missing || release.isDraft) {
+    invoke(['release', 'upload', tag, ...assets.map(name => `dist/${name}`), '--clobber']);
+  }
   if (release.isDraft) invoke(['release', 'edit', tag, '--draft=false']);
-  if (!missing.length && !release.isDraft) console.log(`Release ${tag} already has all assets.`);
+  if (!missing && !release.isDraft) console.log(`Release ${tag} already has all assets.`);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isMainEntry(import.meta.url)) {
   try {
+    if (!process.env.GITHUB_REPOSITORY || !process.env.TAG || !process.env.SHA) {
+      throw new Error('GITHUB_REPOSITORY, TAG and SHA are required');
+    }
     publish({ repository: process.env.GITHUB_REPOSITORY, tag: process.env.TAG, sha: process.env.SHA });
   } catch (error) {
-    console.error(error);
+    console.error(error.message);
     process.exitCode = 1;
   }
 }

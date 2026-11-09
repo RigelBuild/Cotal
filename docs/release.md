@@ -12,10 +12,8 @@ workspace packages under `packages/*`, `extensions/*`, and `implementations/*` t
 
 ## Rigel runtime release assets
 
-The `Rigel release` workflow runs on each push to `rigel-release`. It builds the runtime on `ubuntu-latest` and `macos-15`, then publishes `cotal-runtime-linux-x64.tar.gz`, `cotal-runtime-darwin-arm64.tar.gz`, and `SHA256SUMS` to a GitHub Release tagged `rigel-v<version>-<first 10 chars of SHA>`, where version comes from `bin/package.json`.
-Each archive contains the install tree under `cotal/`, including the `cotal-ai` launcher copy. The tag names the commit used for both builds.
-Runs are grouped by ref and queued without canceling an active release. On rerun, a tag pointing elsewhere fails. A published Release with all three assets is a no-op; otherwise the workflow uploads missing assets and publishes a draft. If the tag exists but the Release cannot be read, restore the Release or remove the tag before retrying.
-Each published Release fires the release-published notifier workflow.
+Each push to `rigel-release` builds Linux x64 and macOS arm64 archives and publishes them with `SHA256SUMS` under `rigel-v<version>-<first 10 chars of SHA>`. Version comes from `bin/package.json`.
+Runs queue without cancellation. A tag pointing elsewhere fails. A complete published Release is a no-op; otherwise a rerun uploads all three assets and clears the draft flag. If the Release cannot be found, restore it or remove the tag before retrying.
 
 ## 0.11 runtime migration
 

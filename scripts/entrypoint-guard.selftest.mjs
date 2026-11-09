@@ -72,6 +72,7 @@ const PROBES = [
   },
   { script: "live-job-conclusion.mjs", argv: [], status: 1, stderr: "--result is required" },
   { script: "pr-head-gate.mjs", argv: [], status: 2, stderr: "usage: pnpm pr-head-gate <pull-request-number>" },
+  { script: "rigel-release-publish.mjs", argv: [], status: 1, stderr: "GITHUB_REPOSITORY, TAG and SHA are required" },
   {
     script: "verify-publish-closure.mjs",
     argv: [],
