@@ -1,6 +1,6 @@
 import { registryStores } from "./lifecycle-registry.js";
 import { createToolResultConsentSigner, makeToolResultConsentRecorder, type ToolResultConsentRecorder, type ToolResultConsentSignerOptions } from "./tool-result-consent.js";
-import { createPlacementEnrollmentAuthority, type PlacementEnrollmentAuthority } from "./placement-enrollment.js";
+import { boundPlacementDelivery, createPlacementEnrollmentAuthority, type PlacementEnrollmentAuthority } from "./placement-enrollment.js";
 import type { PlacementEnrollmentResult, ReconcilerPort, RolePolicyPort, ServiceAuthenticator } from "@cotal-ai/core";
 /**
  * The AUTH SERVICE daemon — the one server-side process a user-auth space runs alongside its broker
@@ -4396,9 +4396,7 @@ export async function handleManagerServiceAuthority(req: IncomingMessage, res: S
     const owner = deriveOwnerForIdpSubject(ctx.ownerSecret, ctx.bridgeIdp.issuer, verified.sub);
     let deliveryRelease: (() => void) | undefined;
     const onDelivered = (release: () => void) => {
-      const timer = setTimeout(() => { res.destroy(); finish(); }, 30_000);
-      let released = false;
-      const finish = () => { clearTimeout(timer); if (!released) { released = true; release(); } };
+      const finish = boundPlacementDelivery(release, () => res.destroy());
       deliveryRelease = finish;
       if (res.destroyed || res.writableFinished) { finish(); return; }
       res.once("finish", finish);

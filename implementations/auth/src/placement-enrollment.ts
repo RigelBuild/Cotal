@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, fsyncSync, linkSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { acquireLockAsync, assertLifecycleToken, canonicalJson, contractDigest, EpEnvelopeError, isContractDigest, mkSecretDir, parsePlacementEnrollmentRequest, parsePlacementEnrollmentVerificationRequest, remoteManagerServePrincipal, type AcceptedIntent, type EnrollmentIdentity, type ExecutionAuthority, type ExecutionEffect, type PlacementEnrollmentRequest, type PlacementEnrollmentResult, type RemoteManagedAgentEnrollmentResult } from "@cotal-ai/core";
+import { acquireLockAsync, assertLifecycleToken, canonicalJson, contractDigest, EpEnvelopeError, isContractDigest, mkSecretDir, parsePlacementEnrollmentRequest, parsePlacementEnrollmentVerificationRequest, remoteManagerServePrincipal, type AcceptedIntentView, type EnrollmentIdentity, type PlacementAuthorityView, type EnrollEffectView, type PlacementEnrollmentRequest, type PlacementEnrollmentResult, type RemoteManagedAgentEnrollmentResult } from "@cotal-ai/core";
 import { findInteractiveActor, findManagedActor, assertWithinSpawnerGrant, withManagedGrantTransaction } from "./ledger.js";
 import { authorizeRemoteManagedAgentEnrollment, type ObserveManagerGate } from "./managed-agent-enrollment.js";
 import { resolveReadAcl, type EnrollmentAcl, type ReconcilerPort, type RolePolicyPort, type ServiceAuthenticator } from "@cotal-ai/core";
@@ -44,8 +44,8 @@ interface PendingRecord {
   effectId: string;
   enrollmentOperationId: string;
   actorTokenHash: string;
-  authority: ExecutionAuthority;
-  placement: AcceptedIntent["intent"]["placement"];
+  authority: PlacementAuthorityView;
+  placement: AcceptedIntentView["intent"]["placement"];
   role: string;
   roleTreeRevision: number;
   policy: { kind: "base"; digest: string } | { kind: "override"; index: number; digest: string };
@@ -132,14 +132,14 @@ async function matchPolicy(options: PlacementEnrollmentAuthorityOptions, request
   return { kind: "override", index: match.index, digest: contractDigest(match.acl) };
 }
 
-function sameAuthority(a: ExecutionAuthority, b: ExecutionAuthority): boolean {
+function sameAuthority(a: PlacementAuthorityView, b: PlacementAuthorityView): boolean {
   return canonicalJson(a) === canonicalJson(b);
 }
 
-function parseAccepted(raw: unknown, authority: ExecutionAuthority): AcceptedIntent {
+function parseAccepted(raw: unknown, authority: PlacementAuthorityView): AcceptedIntentView {
   if (!isObject(raw) || !isObject(raw.intent) || !isObject(raw.intent.placement) || !isObject(raw.executionGate) || !isObject(raw.executionGate.authority))
     fail("unavailable", "reconciler accepted-intent answer is malformed", "unknown");
-  const accepted = raw as unknown as AcceptedIntent;
+  const accepted = raw as unknown as AcceptedIntentView;
   const { digest, ...intent } = accepted.intent;
   if (!UUID.test(accepted.acceptanceId) || !UUID.test(accepted.enrollmentOperationId) ||
       !uint(accepted.acceptedListRevision) || !uint(accepted.acceptedSeatRevision) ||
@@ -156,9 +156,9 @@ function parseAccepted(raw: unknown, authority: ExecutionAuthority): AcceptedInt
   return accepted;
 }
 
-function parseEffect(raw: unknown, authority: ExecutionAuthority, accepted: AcceptedIntent): ExecutionEffect {
+function parseEffect(raw: unknown, authority: PlacementAuthorityView, accepted: AcceptedIntentView): EnrollEffectView {
   if (!isObject(raw) || !isObject(raw.authority)) fail("unavailable", "reconciler enrollment effect is malformed", "unknown");
-  const effect = raw as unknown as ExecutionEffect;
+  const effect = raw as unknown as EnrollEffectView;
   if (!UUID.test(effect.effectId) || effect.kind !== "enroll" || effect.state !== "admitted" ||
       effect.operationId !== accepted.enrollmentOperationId || !sameAuthority(effect.authority, authority))
     fail("failed-precondition", "reconciler enrollment effect is not admitted for this authority", "not-executed");
@@ -226,6 +226,13 @@ function verifyMaterial(result: RemoteManagedAgentEnrollmentResult, request: Pla
     fail("unavailable", "managed enrollment returned material for another placement", "unknown");
   try { return assertLifecycleToken(result.material.lifecycleUid); }
   catch { return fail("unavailable", "managed enrollment returned an invalid lifecycle uid", "unknown"); }
+}
+
+export function boundPlacementDelivery(release: () => void, destroy: () => void, boundMs = 30_000): () => void {
+  let released = false;
+  const timer = setTimeout(() => { destroy(); finish(); }, boundMs);
+  const finish = () => { clearTimeout(timer); if (!released) { released = true; release(); } };
+  return finish;
 }
 
 export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentAuthorityOptions) {
@@ -480,4 +487,3 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
   return { enrollPlacement, verifyPlacementEnrollment, enrollmentEffectStatus, closeEnrollmentEffect, retirePlacementEnrollment };
 }
 
-export type { ReconcilerPort, ServiceAuthenticator } from "@cotal-ai/core";
