@@ -3,4 +3,4 @@
 "@cotal-ai/auth": patch
 ---
 
-Add closed placement enrollment and verification authority surfaces.
+Add placement enrollment with role-policy ACL checks and fenced, durable recovery.
