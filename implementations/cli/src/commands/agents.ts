@@ -2,7 +2,7 @@ import { DEV_OWNER, assertLifecycleToken, peerLabel, type CompletionResult, type
 import type { ControlTarget, Presentation } from "@cotal-ai/workspace";
 import {
   codeSpan, CommandFailure, findMesh, isCommandFailure, isConnectRefusal, localStackRoot, oneLine,
-  renderReport, plainFlag, presentationOf, resolveSeatControlTarget, targetFlags, writeResult,
+  renderReport, jsonFlag, plainFlag, presentationOf, resolveSeatControlTarget, targetFlags, writeResult,
   type Block, type ConnectFlags, type Cell, type OutputWarning, type Report, type Section, type Styled, type Tone,
   recordOperationSpace, resolveControlTarget,
 } from "@cotal-ai/workspace";
@@ -34,7 +34,6 @@ const nameFlag = (what: string) =>
 // seat); `--json` is the machine form (one JSON object per line, exactly the row the manager
 // sent). Mutually exclusive because they are two answers to "how should I read this".
 const wideFlag = { name: "wide", type: "boolean", description: "also print the per-seat facts the manager already records: cwd, pid, spawner, lifecycle uid, host/instance" } as const;
-const jsonFlag = { name: "json", type: "boolean", description: "machine-readable: one JSON object per seat per line (instance headers go to stderr)" } as const;
 const slotsFlag = { name: "slots", type: "boolean", description: "list the durable static slots instead of live seats; not with --wide" } as const;
 /** `--attest-gone`: the operator's statement that a deferred seat's processes are gone. */
 const attestGoneFlag = { name: "attest-gone", type: "string", value: "<reason>", description: "terminalize a deferred unreachable seat now; the reason is your statement that its processes are gone" } as const;
