@@ -45,7 +45,7 @@ import { readRecord, recordPath } from "@cotal-ai/seat";
 import { agentLifecycleSecretFilePaths } from "@cotal-ai/workspace";
 import { makeSeatRoot } from "@cotal-ai/smoke-kit";
 import { Manager, type FreeSlotCause } from "../src/manager.js";
-import type { ManagerStatus, ManagerStaticReconciliationFailure } from "../src/manager-service-contract.js";
+import { MANAGER_STATUS_CONTRACT, type ManagerStatus, type ManagerStaticReconciliationFailure } from "../src/manager-service-contract.js";
 import type { CustodialRuntime, RuntimeReapEvidence } from "../src/runtime/index.js";
 import { CustodialPtyRuntime } from "../src/runtime/custodial-pty.js";
 import { staticLifecycleTransport, readStaticSlot, activateStaticLifecycle, casStaticSlot, writeStaticSlotIntent } from "../src/static-lifecycle.js";
@@ -57,7 +57,7 @@ import { requestDeliveryAdminZeroMemberships } from "./_fake-delivery-admin.js";
 let failures = 0;
 let ran = 0;
 /** Intent, not a measurement: one per cell assertion below. A shortfall means a cell stopped running. */
-const EXPECTED_CHECKS = 30;
+const EXPECTED_CHECKS = 35;
 function check(label: string, cond: boolean, extra?: unknown): void {
   console.log(`${cond ? "✓" : "✗"} ${label}${cond ? "" : ` — ${JSON.stringify(extra) ?? ""}`}`);
   ran++;
@@ -79,7 +79,7 @@ const space = `custody-${randomUUID().slice(0, 8)}`;
 const auth = await createSpaceAuth(space);
 const { servers: SERVERS, stop: stopBroker } = await bootBroker(auth);
 const workspaceRoot = mkdtempSync(join(tmpdir(), "cotal-custody-ws-"));
-const ALIASES = ["retainer", "membersok", "membersmax", "predkept", "fatalres", "failrestart", "othref", "lateref", "membersweep", "clearme", "laterfail", "retryret", "retrymove", "escalate", "rekick", "unres", "unresfail", "unresheld", "resunproved", "resfail"];
+const ALIASES = ["retainer", "membersok", "membersmax", "retryerr", "retryexhaust", "retryforeign", "retryrelease", "predkept", "fatalres", "failrestart", "othref", "lateref", "membersweep", "clearme", "laterfail", "retryret", "retrymove", "escalate", "rekick", "unres", "unresfail", "unresheld", "resunproved", "resfail"];
 mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
 for (const alias of ALIASES)
   writeFileSync(join(workspaceRoot, ".cotal", "agents", `${alias}.md`), `---\nname: ${alias}\nrole: worker\nsubscribe: [general]\nallowSubscribe: [general]\nallowPublish: [general]\n---\nbody\n`);
@@ -167,8 +167,9 @@ const M = mgr as unknown as {
   ep: Record<string, unknown>;
   managerInstanceId: string;
   agents: Map<string, Managed>;
-  retiring: Map<string, { lifecycleUid: string }>;
+  retiring: Map<string, { target: { lifecycleUid: string } }>;
   staticReconcileItems: Map<string, { alias: string; attempts: number; maxAttempts: number }>;
+  staticReleasePending: Set<string>;
   staticReconcileSweepsInFlight: number;
   releaseStaticReconcileSweep: () => void;
   driveStaticRetirement: (a: { id: string; name: string; lifecycleUid: string }) => Promise<void>;
@@ -216,8 +217,8 @@ M.deprovisionBroker = async (a) => {
   cleanups.set(a.name, (cleanups.get(a.name) ?? 0) + 1);
   await deprovisionBroker(a);
 };
-// A one-shot forced CAS failure on one alias's slot row, injected at the executor transport.
 let failSlotCasFor: string | undefined;
+let failSlotCasAlwaysFor: string | undefined;
 // One-shot: on the second slot read inside one executor call, a racing writer swaps the row's reference.
 let swapRuntimeOn: { alias: string; to: RuntimeReference } | undefined;
 const withLifecycleExecutor = M.withLifecycleExecutor.bind(mgr);
@@ -234,6 +235,8 @@ M.withLifecycleExecutor = (pin, fn) => {
       return t.getRecord(key);
     },
     updateRecord: (key, value, rev) => {
+      if (failSlotCasAlwaysFor !== undefined && key === staticSlotKey(DEV_OWNER, failSlotCasAlwaysFor))
+        return Promise.reject(new Error("smoke: forced persistent slot CAS conflict"));
       if (failSlotCasFor !== undefined && key === staticSlotKey(DEV_OWNER, failSlotCasFor)) {
         failSlotCasFor = undefined;
         return Promise.reject(new Error("smoke: forced slot CAS conflict"));
@@ -554,6 +557,72 @@ try {
     check(`retry from retained, row ${label}: retainedReason${label === "retired" ? " and remedy are" : " is"} cleared and retainedCustody drops it`,
       it !== undefined && it.retainedReason === undefined && (label === "moved" || it.remedy === undefined) && after === counted - 1, { it, counted, after });
   }
+  // ── Live retirement retries an ordinary terminal error ────────────────────
+  {
+    const a = await spawnLive("retryerr");
+    failSlotCasFor = "retryerr";
+    M.despawnAuthorized(a, false, false, "smoke");
+    const sawLive = await until(() => item("retryerr") !== undefined, 10_000);
+    const statusWhileLive = MANAGER_STATUS_CONTRACT.output.validate(M.managerStatusData());
+    check("live retirement: status with a live-origin item validates against the closed status schema", sawLive && statusWhileLive === true, { sawLive, statusWhileLive, item: item("retryerr") });
+    const retired = await until(() => item("retryerr") === undefined && !M.retiring.has("retryerr"), 30_000);
+    failSlotCasFor = undefined;
+    const row = await readSlot("retryerr");
+    check("live retirement: a transient terminal error is retried and retires the same lifecycle",
+      retired && item("retryerr") === undefined && row?.phase === "retired" && row.lifecycleUid === a.lifecycleUid && !M.retiring.has("retryerr"), { retired, item: item("retryerr"), row, hold: M.retiring.get("retryerr") });
+  }
+
+  // ── Exhausted live retirement retains the alias ───────────────────────────
+  {
+    const a = await spawnLive("retryexhaust");
+    failSlotCasAlwaysFor = "retryexhaust";
+    M.despawnAuthorized(a, false, false, "smoke");
+    await until(() => item("retryexhaust")?.disposition === "retry-exhausted", 30_000);
+    failSlotCasAlwaysFor = undefined;
+    const row = await readSlot("retryexhaust");
+    const held = M.retiring.get("retryexhaust");
+    check("live retirement: exhausted retries report the failure and keep the lifecycle name held",
+      item("retryexhaust")?.attempts === item("retryexhaust")?.maxAttempts && /persistent slot CAS conflict/.test(item("retryexhaust")?.lastError ?? "") && row?.lifecycleUid === a.lifecycleUid && held?.target.lifecycleUid === a.lifecycleUid, { item: item("retryexhaust"), row, held });
+  }
+
+  // ── A live terminal failing under a pending operator release is left to that release ──
+  {
+    const a = await spawnLive("retryrelease");
+    const flightKey = JSON.stringify(["retryrelease", a.lifecycleUid]);
+    M.staticReleasePending.add(flightKey);
+    failSlotCasFor = "retryrelease";
+    M.despawnAuthorized(a, false, false, "smoke");
+    const cas = await until(() => failSlotCasFor === undefined, 10_000);
+    const despawned = await until(() => M.agents.get("retryrelease") === undefined, 10_000);
+    M.staticReleasePending.delete(flightKey);
+    failSlotCasFor = undefined;
+    check("live retirement failing under a pending operator release creates no retry item and keeps the alias held",
+      cas && despawned && item("retryrelease") === undefined && M.retiring.has("retryrelease"), { cas, despawned, item: item("retryrelease") });
+  }
+
+  // ── A changed durable lifecycle is never reached by a retry ────────────────
+  {
+    M.staticReconcileRetryDelaysMs = [10_000, 10_000, 10_000];
+    const a = await spawnLive("retryforeign");
+    const reference = refOf(a);
+    const mark = reaps.length;
+    const principal = principalKey(DEV_OWNER, a.id).key;
+    failSlotCasFor = "retryforeign";
+    M.despawnAuthorized(a, false, false, "smoke");
+    await until(() => item("retryforeign")?.disposition === "retry-scheduled", 30_000);
+    const foreignUid = mintLifecycleUid();
+    await withExecutor("retryforeign", a.id, a.lifecycleUid, async (t) => {
+      const slot = await readStaticSlot(t, DEV_OWNER, "retryforeign");
+      if (slot === undefined) throw new Error("retryforeign slot missing");
+      await casStaticSlot(t, { ...slot.row, lifecycleUid: foreignUid }, slot.revision);
+    });
+    await until(() => item("retryforeign")?.disposition === "refused", 30_000);
+    M.staticReconcileRetryDelaysMs = [1_500, 1_500, 1_500];
+    const row = await readSlot("retryforeign");
+    check("live retirement: a retry stops when the durable UID changes and does not reap the foreign lifecycle",
+      row?.lifecycleUid === foreignUid && !reaps.slice(mark).includes(reference.id) && M.retiring.get("retryforeign")?.target.lifecycleUid === a.lifecycleUid, { row, reaps: reaps.slice(mark), hold: M.retiring.get("retryforeign") });
+  }
+
 
   // ── An unreserved runtime's restart and resume record the replacement's reference, or stop it ──
   {

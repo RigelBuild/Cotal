@@ -380,7 +380,7 @@ const STARTUP_RECONCILING = "startup static lifecycle reconciliation";
 /** One initial terminal entry plus three re-drives. The short first retry absorbs a one-shot
  *  broker/eviction blip; the wider later spacing avoids hammering a persistently unavailable
  *  authority. The finite ~36s window is intentionally not a liveness inference: exhausting it
- *  leaves the durable alias held and requires a later manager start. */
+ *  leaves the durable alias held for a later manager start. */
 export const STATIC_RECONCILE_RETRY_DELAYS_MS = [1_000, 5_000, 30_000] as const;
 const STATIC_RECONCILE_MAX_ATTEMPTS = STATIC_RECONCILE_RETRY_DELAYS_MS.length + 1;
 
@@ -398,9 +398,11 @@ const UNREADABLE_EXPIRY_REMEDY =
 
 type StaticReconcileItem = ManagerStaticReconciliationFailure & {
   owner: string;
-  timer?: ReturnType<typeof setTimeout>;
+  timer?: NodeJS.Timeout;
   flight?: Promise<StaticReconcileAttempt>;
   retryFlight?: Promise<void>;
+  /** Set when a live despawn, not startup reconcile, created this item; its recovery deletes it. */
+  liveOrigin?: boolean;
 };
 
 /** One exact-terminal attempt's outcome, with the accounting of the broker teardown that attempt
@@ -5724,7 +5726,34 @@ export class Manager {
       // retiring → B1 ledger revoke → footprint cleanup (creds file + broker durables/ACL, INSIDE
       // the barrier) → gate retired → head retired → alias free. The eviction step is the process
       // kill the stop path already performed (static's best-effort eviction).
-      return this.driveStaticRetirement(a);
+      try {
+        await this.driveStaticRetirement(a, true);
+      } catch (error) {
+        // Deprovision callers are detached and fire-and-forget, so a static failure never rejects here.
+        // A retained terminal is already recorded by recordRetainedTerminal; an operator release owns its lifecycle.
+        if (error instanceof RuntimeReapUnproven) return;
+        if (this.staticReleasePending.has(JSON.stringify([a.name, a.lifecycleUid]))) return;
+        const row = { owner: DEV_OWNER, alias: a.name, actor: a.id, lifecycleUid: a.lifecycleUid };
+        const key = this.staticReconcileKey(row);
+        if (this.staticReconcileStopping) {
+          console.error(`! static retirement of "${a.name}" at uid ${a.lifecycleUid} failed during shutdown; the alias stays held for the next manager start`);
+          return;
+        }
+        console.error(`! static retirement of "${a.name}" at uid ${a.lifecycleUid} failed; retrying: ${rejectionText(error)}`);
+        if (this.staticReconcileItems.has(key)) return;
+        const item: StaticReconcileItem = {
+          ...row,
+          phase: "terminalizing",
+          attempts: 1,
+          maxAttempts: STATIC_RECONCILE_MAX_ATTEMPTS,
+          disposition: "retrying",
+          lastError: rejectionText(error),
+          liveOrigin: true,
+        };
+        this.staticReconcileItems.set(key, item);
+        this.scheduleStaticReconcileRetry(key, item);
+      }
+      return;
     }
     // Drop the local creds file FIRST + unconditionally — it is a usable identity on disk, useless for a
     // departed agent, so it must not survive even if the broker teardown below fails or times out. The
@@ -9630,7 +9659,7 @@ export class Manager {
    *  clear, so recovery is visible without becoming stale process-lifetime history. */
   private staticReconciliationStatus(): ManagerStaticReconciliationStatus {
     const failures = [...this.staticReconcileItems.values()]
-      .map(({ owner: _owner, timer: _timer, flight: _flight, retryFlight: _retryFlight, ...item }) => ({ ...item }))
+      .map(({ owner: _owner, timer: _timer, flight: _flight, retryFlight: _retryFlight, liveOrigin: _liveOrigin, ...item }) => ({ ...item }))
       .sort((a, b) => a.alias.localeCompare(b.alias));
     const state: ManagerStaticReconciliationStatus["state"] =
       this.staticReconcileLastSweep?.error !== undefined ? "failed" :
@@ -12811,13 +12840,13 @@ export class Manager {
       }
       return;
     }
-    if (row === undefined || row.owner !== item.owner || row.actor !== item.actor || row.lifecycleUid !== item.lifecycleUid) {
+    if (row === undefined || row.owner !== item.owner || row.alias !== item.alias || row.actor !== item.actor || row.lifecycleUid !== item.lifecycleUid) {
       item.disposition = "refused";
       item.retainedReason = undefined;
       item.remedy = "inspect the durable slot; reconciliation will not cross incarnations";
       item.lastError = row === undefined
         ? "the durable slot vanished; reconciliation never acts from the in-memory snapshot"
-        : `the durable slot moved to actor ${row.actor} uid ${row.lifecycleUid}; reconciliation never crosses incarnations`;
+        : `the durable slot moved to ${row.owner}/${row.alias} actor ${row.actor} uid ${row.lifecycleUid}; reconciliation never crosses incarnations`;
       console.error(`! static reconcile refused alias=${item.alias} phase=${item.phase} uid=${item.lifecycleUid}: ${item.lastError}`);
       return;
     }
@@ -12874,8 +12903,9 @@ export class Manager {
       let deprovision: DeprovisionResourceAccounting | undefined;
       try {
         await this.withRetirementSlot(() => this.driveStaticRetirement({ id: row.actor, name: row.alias, lifecycleUid: row.lifecycleUid, runtime: row.runtime }, true, false, (accounting) => { deprovision = accounting; }));
-        if (item.attempts === 1 && item.attestedGone === undefined) {
+        if (item.liveOrigin || (item.attempts === 1 && item.attestedGone === undefined)) {
           this.staticReconcileItems.delete(key);
+          if (item.liveOrigin) console.error(`✓ static reconcile recovered live retirement alias=${item.alias} uid=${item.lifecycleUid} attempts=${item.attempts}/${item.maxAttempts}`);
         } else {
           item.phase = "retired";
           item.disposition = "recovered";
