@@ -11,6 +11,7 @@ import { Kvm } from "@nats-io/kv";
 import { openAuthAuthorityPlane } from "../src/index.js";
 import { registerRemoteManagerAuthority } from "../../manager/src/remote-register.js";
 import { requestManagerRegistrationFamily, requestManagerRegistrationRead, serveIssuanceGateKv } from "@cotal-ai/core";
+import { actionContext, bindGoal, createGoal, commitGoalResult } from "@cotal-ai/core";
 import { SMOKE_BROKER_TOKEN, awaitBrokerReady, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
 
@@ -38,6 +39,7 @@ try {
       ["peer consumer delete denied", `$JS.API.CONSUMER.DELETE.KV_${epAuthBucket(space)}.peer`, ""],
       ["raw auth stream read denied", `$JS.API.STREAM.MSG.GET.KV_${epAuthBucket(space)}`, JSON.stringify({ last_by_subj: `$KV.${epAuthBucket(space)}.${epgateKey("manager", mintLifecycleUid())}` })],
       ["raw records stream read denied", `$JS.API.STREAM.MSG.GET.KV_${recordsBucket(space)}`, "{}"],
+      ["direct records read denied", `$JS.API.DIRECT.GET.KV_${recordsBucket(space)}.$KV.${recordsBucket(space)}.govern.manager`, ""],
       ["other instance scan publish denied", managerRegistrationFamilySubject(space, owner, mintLifecycleUid()), ""],
     ]) {
       const watch = openPublishDenialWatch(nc, subject, error => error, name);
@@ -60,17 +62,39 @@ try {
         assert.ok(denied instanceof Error && /permissions violation/i.test(denied.message));
         console.log("  ✓ another owner cannot publish to same instance scan");
       } finally { watch.release(); }
-      let denied = false;
-      const sub = foreign.subscribe(`${subject}.reply.*`, { callback: error => { if (error) denied = true; } });
-      await foreign.flush().catch(() => { denied = true; });
-      await delay(350);
-      sub.unsubscribe();
-      assert.ok(denied, "foreign owner reply subscription denied");
+      const denied = new Promise<Error>((resolve, reject) => {
+        const sub = foreign.subscribe(`${subject}.reply.*`, { callback: error => { if (error) { sub.unsubscribe(); resolve(error); } } });
+        void foreign.flush().catch(reject);
+      });
+      const error = await Promise.race([denied, delay(5000).then(() => { throw new Error("subscription denial not observed"); })]);
+      assert.match(error.message, /permissions violation/i);
       console.log("  ✓ another owner cannot subscribe to reply leaf");
     } finally { await foreign.close(); }
     const register = (evict: (principals: readonly string[]) => Promise<boolean[]>) => registerRemoteManagerAuthority({ space, server: servers, owner, instanceId, serveActor: remoteManagerActors(instanceId).serve, prepareCreds: creds, tlsRequired: false, evict });
-    await assert.rejects(requestManagerRegistrationRead(nc, space, owner, instanceId, { kind: "read", key: epgateKey("manager", mintLifecycleUid()) }));
+    await assert.rejects(requestManagerRegistrationRead(nc, space, owner, instanceId, { kind: "read", key: epgateKey("manager", mintLifecycleUid()) }), /invalid registration read reply|refused/i);
     console.log("  ✓ closed read refuses another instance gate");
+    const goalIdentity = newIdentity();
+    const goalCreds = await mintCreds(auth, goalIdentity, "goal-writer", { principal: { owner, actor: remoteManagerActors(instanceId).goalWriter }, goalWriter: { endpoint: "manager", remoteManager: { owner, instanceId } } });
+    const goal = await connect({ servers, ...standaloneConnectOpts({ creds: goalCreds, tls: false }), reconnect: false });
+    try {
+      const subject = `$JS.API.STREAM.MSG.GET.KV_${epAuthBucket(space)}`;
+      const watch = openPublishDenialWatch(goal, subject, error => error, "goal writer raw auth read");
+      try {
+        goal.publish(subject, new TextEncoder().encode("{}"));
+        const denied = await Promise.race([watch.denied.catch(error => error), delay(5000).then(() => { throw new Error("goal writer denial not observed"); })]);
+        assert.match(denied.message, /permissions violation/i);
+        console.log("  ✓ goal writer raw auth stream read denied");
+      } finally { watch.release(); }
+      assert.ok(await requestManagerRegistrationRead(goal, space, owner, instanceId, { kind: "read", key: epgateKey("manager", instanceId) }));
+      console.log("  ✓ goal writer closed gate read succeeds");
+      const caller = { owner, actor: "cli", uid: mintLifecycleUid() };
+      const ref = { endpoint: "manager", caller, goalId: "confinegoal" };
+      const ctx = await actionContext(goal, space);
+      await bindGoal(ctx, ref, "sha256:aa");
+      await createGoal(ctx, ref, { fingerprint: "sha256:aa", command: "spawn", caller: { id: `${owner}.cli`, lifecycleUid: caller.uid }, requestId: "req-confine", sourceSeq: 1, acceptedAt: 1000 });
+      assert.ok((await commitGoalResult(ctx, { ref, now: 1500, cause: "complete", state: "succeeded" })).won);
+      console.log("  ✓ remote goal writer commits a goal");
+    } finally { await goal.close(); }
     await register(async principals => principals.map(() => true));
     console.log("  ✓ first registration succeeds after prepare creates its gate");
     const kv = await new Kvm(nc).open(epAuthBucket(space));

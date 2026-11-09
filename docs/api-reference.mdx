@@ -84,6 +84,13 @@ site but may omit the caller that began an asynchronous request. Authentication,
 authorization and timeout deadlines are unchanged. Direct native dials and
 standalone helpers retain their existing diagnostic defaults.
 
+### Remote manager registration reads
+
+`requestManagerRegistrationRead` reads an instance's registration through its host.
+Records reads are leader-served and limited to the instance's spec, status and manager
+governance head. Family scans refuse a second concurrent scan for the same owner and
+instance with `RegistrationFamilyBusyError`; point reads can proceed during a scan.
+
 ### Temporary KV scans
 
 `liveKvEntries` uses native memory-backed state for its temporary ordered consumer. The backing

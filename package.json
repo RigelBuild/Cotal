@@ -708,7 +708,7 @@
     "smoke:bind-fence": "tsx packages/core/smoke/bind-fence.smoke.ts",
     "smoke:unfenced-responder": "tsx packages/core/smoke/unfenced-responder.smoke.ts",
     "smoke:ep-serve-gate": "tsx packages/core/smoke/endpoint-serve-gate.smoke.ts && pnpm smoke:ep-family-scan",
-    "smoke:ep-family-scan": "tsx packages/core/smoke/endpoint-family-scan.smoke.ts",
+    "smoke:ep-family-scan": "tsx implementations/auth/smoke/registration-family-scan.smoke.ts",
     "smoke:registration-reopen": "tsx packages/core/smoke/registration-reopen.smoke.ts",
     "smoke:environment-manager-grants": "tsx packages/core/smoke/environment-manager-grants.smoke.ts",
     "smoke:manager-service": "tsx implementations/manager/smoke/manager-service.smoke.ts",

@@ -97,7 +97,7 @@ import {
 import { assertServeGrantMintable, finalizeServeIssuance, type EpServeGrant, type EpIssuanceGate } from "./endpoint-service.js";
 import { parseServiceConnectionBinding, type ServiceConnectionBinding } from "./service-gate.js";
 import { SERVICE_ACCESS_TTL_SECONDS } from "./service-authority-limits.js";
-import { effectsBindGrants, poolOwnerBindGrants, goalWriterGrants, sessionLedgerGrants, epAuthBucket, sessionsBucket, epcStreamName, endpointPlaneStreamNames, eptReqStreamName, eptStreamName, hardenedAuthorityStreamNames, timerWriterDurable, timerWriterGrants } from "./endpoint-binding.js";
+import { effectsBindGrants, poolOwnerBindGrants, goalWriterGrants, environmentManagerGoalWriterGrants, sessionLedgerGrants, epAuthBucket, sessionsBucket, epcStreamName, endpointPlaneStreamNames, eptReqStreamName, eptStreamName, hardenedAuthorityStreamNames, timerWriterDurable, timerWriterGrants } from "./endpoint-binding.js";
 import { epsSubject, epCallerReplyFilter, assertGeneration, isIssuedCaller, AUTH_ENDPOINT, EP_CMD_RETIRE_LIFECYCLE, type EpCaller, type IssuedCaller } from "./endpoint-subjects.js";
 import { managerRegistrationFamilySubject } from "./endpoint-subjects.js";
 import { acceptedReadGrant, acceptedBucket, importNativeSubjectPermissions, issuedBucket, issuedHorizon, issuedPermitsPattern, issuedStoreStreamNames, prepareListing, writeAcceptedRow, type IssuanceSeam, type IssuedAuthorityRef, type ListingBinding, type ListingSeam, type PreparedListing } from "./issued-authority.js";
@@ -746,7 +746,7 @@ export interface MintOpts {
   /** `goal-writer` profile only (spawn-as-action): the endpoint whose action goals this
    *  standing connection may bind + commit ({@link goalWriterGrants}). REQUIRED for that profile;
    *  ignored by every other. */
-  goalWriter?: { endpoint: string };
+  goalWriter?: { endpoint: string; remoteManager?: { owner: string; instanceId: string } };
   /** `session-caller` profile only: the ONE §13.6 session whose two eps rails this
    *  credential may use — the serving endpoint, the fresh sessionId, and the serving epoch. REQUIRED
    *  for that profile; ignored by every other. The rows pin all three, so the cred authorizes
@@ -2004,7 +2004,6 @@ function remoteManagerPermissions(
         `$JS.API.DIRECT.GET.${epcStreamName(space)}.${spacePrefix(space)}.epc.>`,
         `$JS.API.DIRECT.GET.${epcStreamName(space)}`,
         managerRegistrationFamilySubject(space, pr.owner, iid),
-        ...recordKeys.map((key) => `$JS.API.DIRECT.GET.KV_${REC}.$KV.${REC}.${key}`),
         // LIVENESS REPLIES for the MANAGER plane (#1577), bounded to the `.reply.` leaf under a
         // caller's own request subject — the same row and the same bound as the local supervisor
         // profile holds.
@@ -2777,7 +2776,15 @@ function lifecycleExecutorPermissions(
  *  writes, and the leader-served fencing reads — plus the connection-scoped reply inbox. Disjoint
  *  from the endpoint's serve credential: a serve connection carries none of these rows, so it
  *  is broker-denied every goal write. */
-function goalWriterPermissions(space: string, pr: MintPrincipal, pin: { endpoint: string }): Record<string, unknown> {
+function goalWriterPermissions(space: string, pr: MintPrincipal, pin: { endpoint: string; remoteManager?: { owner: string; instanceId: string } }): Record<string, unknown> {
+  if (pin.remoteManager) {
+    const { owner, instanceId } = pin.remoteManager;
+    if (pin.endpoint !== "manager" || owner !== pr.owner || pr.actor !== `manager_goal_${assertLifecycleToken(instanceId)}`)
+      throw new Error("permissionsFor: invalid remote manager goal-writer pin");
+    const g = environmentManagerGoalWriterGrants(space, pr.connId);
+    const subject = managerRegistrationFamilySubject(space, owner, instanceId);
+    return { pub: { allow: [...g.publish, subject] }, sub: { allow: [...g.subscribe, `${subject}.reply.*`] } };
+  }
   const g = goalWriterGrants(space, pin.endpoint, pr.connId);
   return { pub: { allow: g.publish }, sub: { allow: g.subscribe } };
 }

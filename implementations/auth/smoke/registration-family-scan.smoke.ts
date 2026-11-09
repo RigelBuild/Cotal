@@ -12,8 +12,7 @@ import { join } from "node:path";
 import { connect, type NatsConnection } from "@nats-io/transport-node";
 import { jetstreamManager, type PushConsumer } from "@nats-io/jetstream";
 import { Kvm, type KV } from "@nats-io/kv";
-import { PermissionViolationError } from "@nats-io/nats-core";
-import { openPublishDenialWatch } from "../src/endpoint-publish-denial.js";
+import { openPublishDenialWatch } from "../../../packages/core/src/endpoint-publish-denial.js";
 import type { Bucket } from "@nats-io/kv/internal";
 import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import {
@@ -22,11 +21,11 @@ import {
   epgateKey, epcredRowKey, provisionEndpointGateOpen, serveIssuanceGateKv, endpointRegistrationBarrier,
   IncompleteKvScan, type EpServeLedgerRow,
 } from "@cotal-ai/core";
-import { pickFreePort } from "./_free-port.js";
-import { makeLedgerScannerOverConnection, authorityScannerGrants } from "../../../implementations/auth/src/ledger-scanner.js";
-import { openAuthorityClient } from "../../../implementations/auth/src/authority-client.js";
-import { openRegistrationFamilyScan } from "../../../implementations/auth/src/registration-family-scan.js";
-import { requestManagerRegistrationFamily, requestManagerRegistrationRead, remoteManagerServePrincipal } from "@cotal-ai/core";
+import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
+import { makeLedgerScannerOverConnection, authorityScannerGrants } from "../src/ledger-scanner.js";
+import { openAuthorityClient } from "../src/authority-client.js";
+import { openRegistrationFamilyScan } from "../src/registration-family-scan.js";
+import { requestManagerRegistrationFamily, requestManagerRegistrationRead, remoteManagerServePrincipal, RegistrationFamilyBusyError } from "@cotal-ai/core";
 
 const evidence = process.env.FAMILY_SCAN_EVIDENCE_DIR;
 const dir = mkdtempSync(join(evidence ?? tmpdir(), SMOKE_BROKER_TOKEN));
@@ -57,8 +56,16 @@ try {
   const scanClient = await openAuthorityClient({ server: servers, space, dataAccount: { pub: auth.account.pub, signingSeed: auth.account.signingSeed }, label: "family-scan-smoke", grants: id => authorityScannerGrants(space, id), log: console.error });
   const scanner = makeLedgerScannerOverConnection(scanClient.nc, space);
   const host = await open(await mintCreds(auth, newIdentity(), "issuer", { principal: { owner, actor: "host" } }));
-  let dropChunk = false;
-  const responder = await openRegistrationFamilyScan({ server: servers, space, dataAccount: { pub: auth.account.pub, signingSeed: auth.account.signingSeed }, log: console.error, scanner, authKv: await new Kvm(host).open(epAuthBucket(space)), probeDropChunk: (seq, total) => dropChunk && total > 1 && seq === 1 });
+  let corruption = "";
+  let scanStarted: (() => void) | undefined;
+  const responder = await openRegistrationFamilyScan({ server: servers, space, dataAccount: { pub: auth.account.pub, signingSeed: auth.account.signingSeed }, log: console.error, scanner, authKv: await new Kvm(host).open(epAuthBucket(space)), recordsKv: await new Kvm(provisioner).open(recordsBucket(space)), probeScanStarted: () => scanStarted?.(), probeChunks: chunks => {
+    if (chunks.length < 2 || !corruption) return chunks;
+    if (corruption === "drop") return chunks.slice(1);
+    if (corruption === "duplicate") return [chunks[0]!, chunks[0]!, ...chunks.slice(1)];
+    if (corruption === "order") return [chunks[1]!, chunks[0]!, ...chunks.slice(2)];
+    if (corruption === "count") return chunks.map((chunk, i) => i === chunks.length - 1 ? { ...chunk, rowCount: -1 } : chunk);
+    return chunks.map((chunk, i) => i === 1 ? { ...chunk, scanId: "A".repeat(24) } : chunk);
+  } });
   const scanRemote = (nc: NatsConnection, instanceId: string) => requestManagerRegistrationFamily(nc, space, owner, instanceId);
   const jsm = await jetstreamManager(provisioner);
   const other = await open(await mintCreds(otherAuth, newIdentity(), "provisioner"));
@@ -107,7 +114,7 @@ try {
       const error = await Promise.race([watch.denied.catch(error => error), new Promise<unknown>(resolve => {
         timer = setTimeout(() => resolve(new Error("broker denial not observed")), 5000);
       })]);
-      check(name, error instanceof PermissionViolationError && error.subject === subject);
+      check(name, error instanceof Error && /permissions violation/i.test(error.message));
     } finally { clearTimeout(timer); watch.release(); }
   };
   const costs: number[] = [], remoteCosts: number[] = [];
@@ -135,10 +142,25 @@ try {
     remoteCosts.push(remoteMeasured.rpcRequests); record({ count, profile: "remote-manager-executor", ...remoteMeasured, rows: remoteRows.length });
     check(`${count}: host-signed remote executor sees the same exact family`, remoteRows.length === count && new Set(remoteRows.map(value => value.credentialId)).size === count && remoteRows.every(value => expected.has(value.credentialId) && value.state === "revoked"));
     if (count === 7905) {
-      dropChunk = true;
-      let failure: unknown;
-      try { await scanRemote(remote.nc, instanceId); } catch (error) { failure = error; } finally { dropChunk = false; }
-      check("dropped family chunk fails closed", failure instanceof Error);
+      const peerId = mintLifecycleUid(), peer = await remoteFor(peerId);
+      await provisionEndpointGateOpen((await execFor(peerId)).kv, { endpoint, instanceId: peerId, principal: remoteManagerServePrincipal(owner, peerId) });
+      const started = new Promise<void>((resolve) => { scanStarted = resolve; });
+      const scanning = scanRemote(remote.nc, instanceId);
+      await started;
+      scanStarted = undefined;
+      await assert.rejects(scanRemote(remote.nc, instanceId), RegistrationFamilyBusyError);
+      check("overlapping same-instance scan is busy", true);
+      const peerRead = await requestManagerRegistrationRead(peer.nc, space, owner, peerId, { kind: "read", key: epgateKey(endpoint, peerId) });
+      const ownRead = await requestManagerRegistrationRead(remote.nc, space, owner, instanceId, { kind: "read", key: epgateKey(endpoint, instanceId) });
+      check("own point read completes while its family scan runs", ownRead !== null && typeof ownRead !== "number");
+      check("point read completes while another family scan runs", peerRead !== null && typeof peerRead !== "number");
+      await scanning;
+      for (const [mode, message] of [["drop", /invalid registration family chunk/], ["duplicate", /invalid registration family chunk/], ["order", /invalid registration family chunk/], ["count", /incomplete registration family chunks/], ["scanId", /inconsistent registration family chunks/]] as const) {
+        corruption = mode;
+        let failure: unknown;
+        try { await scanRemote(remote.nc, instanceId); } catch (error) { failure = error; } finally { corruption = ""; }
+        check(`${mode} family chunk fails closed`, failure instanceof Error && message.test(failure.message));
+      }
     }
     check(`${count}: remote executor deletes its scan consumer`, (await jsm.streams.info(`KV_${epAuthBucket(space)}`)).state.consumer_count === consumersBefore);
     let remoteDenied: unknown;
@@ -205,5 +227,5 @@ try {
   if (evidence) writeFileSync(join(dir, "OUTCOME.json"), JSON.stringify({ passed, port, brokerExited: true }) + "\n", { mode: 0o600 });
   else rmSync(dir, { recursive: true, force: true });
 }
-assert.equal(passed, 44, "all family scan cells ran");
+assert.equal(passed, 51, "all family scan cells ran");
 console.log(`ENDPOINT FAMILY SCAN: ${passed} passed`);

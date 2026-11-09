@@ -691,7 +691,7 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
   hold = await acquirePlaneClaim({ nc: barrier.nc, space, ledger: ledgerCand.tuple, records: recordsCand.tuple, oracle, log });
   const scanner = ledgerCand.activate(hold.guard);
   const recordsScanner = recordsCand.activate(hold.guard);
-  const registrationFamilyScan = await openRegistrationFamilyScan({ onConnection, server, space, dataAccount, log, scanner, authKv: await new Kvm(barrier.nc).open(epAuthBucket(space)) });
+  const registrationFamilyScan = await openRegistrationFamilyScan({ onConnection, server, space, dataAccount, log, scanner, authKv: await new Kvm(barrier.nc).open(epAuthBucket(space)), recordsKv: await new Kvm(barrier.nc).open(recordsBucket(space)) });
   unwind.push(() => registrationFamilyScan.close());
   // Mid-life disconnect = the FENCING event (security req: an owned scanner that dies must not
   // leave the plane half-running). First death wins: fence the guard with the ux state-3 copy,
@@ -1486,7 +1486,7 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
           );
           const credentials: import("@cotal-ai/core").RemoteManagerAuthorityMaterial["credentials"] = {};
           const siblingOn = (gate: ReturnType<typeof serveIssuanceGateKv>, observed: EpGateState) => async (key: "goalWriter" | "sessionLedger", profile: "goal-writer" | "session-ledger", actor: string) => {
-            const issued = await credential(key, profile, actor, profile === "goal-writer" ? { goalWriter: { endpoint: "manager" }, expiresInSeconds: standingTtl } : { expiresInSeconds: standingTtl });
+            const issued = await credential(key, profile, actor, profile === "goal-writer" ? { goalWriter: { endpoint: "manager", remoteManager: { owner, instanceId: r.instanceId } }, expiresInSeconds: standingTtl } : { expiresInSeconds: standingTtl });
             await commitSiblingIssuance(gate, observed, {
               credentialId: credentialIdOf(issued.jwt),
               credentialKey: r.identities[key].id,

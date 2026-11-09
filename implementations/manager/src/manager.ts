@@ -134,6 +134,7 @@ import { jetstream, jetstreamManager } from "@nats-io/jetstream";
 import { Kvm } from "@nats-io/kv";
 import {
   recordsBucket,
+  registrationRecordsKv,
   epAuthBucket,
   ensureAuthorityStores,
   ensureContractStore,
@@ -9556,7 +9557,8 @@ export class Manager {
         if (typeof result === "number") throw new Error("invalid registration read result");
         return result;
       };
-      return await fn({ recordsKv: await kvm.open(recordsBucket(this.space), { allow_direct: Boolean(this.remoteAuthority) }), authKv: await kvm.open(epAuthBucket(this.space)), nc, read });
+      const records = await kvm.open(recordsBucket(this.space));
+      return await fn({ recordsKv: owner === undefined ? records : registrationRecordsKv(records, nc, this.space, owner, this.managerInstanceId), authKv: await kvm.open(epAuthBucket(this.space)), nc, read });
     } finally {
       await nc.drain().catch(() => nc.close());
     }
@@ -10097,7 +10099,13 @@ export class Manager {
     // every other open-mesh property. It is also a read-then-CAS, so it NARROWS the commit window
     // rather than closing it. An AUTH mesh gets durable closure from the §13.1 barrier (revoke +
     // cluster-verified eviction BEFORE the epoch advance); an open mesh gets none.
-    gw.gate = serveIssuanceGateKv(await new Kvm(nc).open(epAuthBucket(this.space)), this.space, { endpoint: MANAGER_ENDPOINT, instanceId: this.managerInstanceId });
+    const owner = this.remoteAuthority?.owner;
+    const read = owner === undefined ? undefined : async (key: string) => {
+      const result = await requestManagerRegistrationRead(nc, this.space, owner, this.managerInstanceId, { kind: "read", key });
+      if (typeof result === "number") throw new Error("invalid registration read result");
+      return result;
+    };
+    gw.gate = serveIssuanceGateKv(await new Kvm(nc).open(epAuthBucket(this.space)), this.space, { endpoint: MANAGER_ENDPOINT, instanceId: this.managerInstanceId, read });
   }
 
   /** #2073: the goal-writer rail's closed-connection fault, the same bounded shape the serve rail
