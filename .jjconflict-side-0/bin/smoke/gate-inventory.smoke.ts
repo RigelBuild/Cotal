@@ -78,7 +78,8 @@ type UngatedExemption = { reason: string; recheckBy: string };
 // The personal Codex local-mesh suite needs the same Codex CLI.
 // 17 → 21 on 2026-11-07: five upstream-red suites remain ungated per fork policy; backup-perms:live
 // left UNGATED when it was gated by a chain fragment.
-const EXPECTED_EXEMPTIONS = 23;
+// 23 → 26: three new upstream suites remain ungated on main@upstream, per fork policy.
+const EXPECTED_EXEMPTIONS = 26;
 const standing = (reason: string): UngatedExemption => ({ reason, recheckBy: "2026-11-30" });
 /** The BROKEN backup entries name the responsible issue and why the suites cannot enter CI.
  *  #1285's backup-usermode failure is on the live stack. The three #643 suites are behind the
@@ -107,6 +108,10 @@ const UNGATED: Record<string, UngatedExemption> = {
   "smoke:chat-name": { reason: "BROKEN: upstream: ungated on pristine main e1a7998e; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:chat-open:live": { reason: "BROKEN: upstream: ungated on pristine main e1a7998e; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:standing-authenticator": { reason: "BROKEN: upstream: ungated on pristine main e1a7998e; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  // Upstream does not gate these suites; their test status has not been established.
+  "smoke:codex-setup-refresh": { reason: "upstream: ungated on main@upstream; disabled on sync per fork policy", recheckBy: "2026-12-31" },
+  "smoke:delivery-standby": { reason: "upstream: ungated on main@upstream; disabled on sync per fork policy", recheckBy: "2026-12-31" },
+  "smoke:space-export": { reason: "upstream: ungated on main@upstream; disabled on sync per fork policy", recheckBy: "2026-12-31" },
   // A STANDING DECISION, and only for the REAL-SESSION arm. The same suite is GATED as
   // `smoke:agui-map`, pointed at a fixture DERIVED from a real session by
   // `scripts/redact-claude-session.mjs` (whitelist by construction, identifiers pseudonymised
