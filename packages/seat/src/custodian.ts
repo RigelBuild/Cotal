@@ -232,6 +232,8 @@ async function serveSeat(
   // A zombie still reports its start token; the pidfd decides whether it had already exited.
   const childStartRead = processStartToken(proc.pid);
   const childStart = child.exited() ? undefined : childStartRead;
+  await pinned.holdAt("after-pin");
+  if (seam?.fail === "after-pin") throw new Error("test seam: startup failure after pinning");
   const term = new Headless.Terminal({
     cols: DEFAULT_COLS,
     rows: DEFAULT_ROWS,
