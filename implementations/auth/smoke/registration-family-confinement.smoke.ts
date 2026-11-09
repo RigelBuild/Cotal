@@ -26,12 +26,23 @@ try {
   await setupSpaceStreams({ servers, space, creds: await mintCreds(auth, newIdentity(), "provisioner") });
   const instanceId = mintLifecycleUid(), owner = `u_${"a".repeat(26)}`, actor = remoteManagerActors(instanceId).executor;
   const creds = await mintCreds(auth, newIdentity(), "remote-manager", { principal: { owner, actor }, remoteManager: { instanceId, owner, actor } });
-  const plane = await openAuthAuthorityPlane({ server: servers, space, dir, identityRoot: dir, dataAccount: { pub: auth.account.pub, signingSeed: auth.account.signingSeed }, log: () => {} });
+  let rewriteGateDuringMint = false;
+  const plane = await openAuthAuthorityPlane({ server: servers, space, dir, identityRoot: dir, dataAccount: { pub: auth.account.pub, signingSeed: auth.account.signingSeed }, log: () => {}, probeManagerMint: async () => {
+    if (!rewriteGateDuringMint) return;
+    rewriteGateDuringMint = false;
+    const provisioner = await connect({ servers, ...standaloneConnectOpts({ creds: await mintCreds(auth, newIdentity(), "endpoint-serve-executor", { endpointServeExecutor: { endpoint: "manager", instanceId } }), tls: false }), reconnect: false });
+    try {
+      const kv = await new Kvm(provisioner).open(epAuthBucket(space));
+      await kv.put(epgateKey("manager", instanceId), new TextEncoder().encode(JSON.stringify({ state: "open", generation: 1, processEpoch: 1, registrationRevision: 1, nameAuthorityRevision: 0, principal: `${owner}.${remoteManagerActors(instanceId).serve}` })));
+    } finally { await provisioner.close(); }
+  } });
   const identities = { supervisor: { id: newIdentity().id }, executor: { id: newIdentity().id }, serve: { id: newIdentity().id }, goalWriter: { id: newIdentity().id }, sessionLedger: { id: newIdentity().id } };
   const prepare = { v: 1 as const, kind: "manager-service-authority" as const, operation: "prepare" as const, space, actor: "cli", instanceId, managerLifecycleUid: mintLifecycleUid(), requestId: `req${mintLifecycleUid()}`, identities };
   await plane.issueManagerServiceAuthority({ owner, scope: ["supervise"], request: prepare });
-  await assert.rejects(plane.issueManagerServiceAuthority({ owner: `u_${"b".repeat(26)}`, scope: ["supervise"], request: prepare }), /another owner/);
-  console.log("  ✓ foreign owner prepare refuses before issuance");
+  rewriteGateDuringMint = true;
+  await assert.rejects(plane.issueManagerServiceAuthority({ owner, scope: ["supervise"], request: { ...prepare, requestId: `req${mintLifecycleUid()}` } }), /manager issuance gate changed while credentials were being minted/);
+  assert.equal(rewriteGateDuringMint, false);
+  console.log("  ✓ gate movement after signing refuses without releasing credentials");
   const nc = await connect({ servers, ...standaloneConnectOpts({ creds, tls: false }), reconnect: false });
   try {
     for (const [name, subject, data] of [

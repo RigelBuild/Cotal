@@ -4180,7 +4180,12 @@ same server-authorized `{ owner, managerActor, lifecycleUid, instanceId }` tuple
 mediator MUST reject any tuple mismatch, instance collision, contract substitution, or status/gate
 operation from another principal or lifecycle. It may publish only the contract artifacts staged by
 `prepare`; it may not use manager-service authority to publish a contract for any other endpoint.
-Retiring the family retires the instance record and gate together; no stale stage, registration,
+Family enumeration MUST use the sealed literal consumer and release its scan slot on completion or
+deadline expiry. Its absolute deadline is clamped to five minutes. The responder MUST abort and
+clean up an expired scan. Point reads MUST be capped at eight concurrent reads per owner and
+instance and 256 per responder; an excess request receives a typed busy refusal. Prepare and renewal
+MUST recheck the gate principal and registration revision after minting; a changed gate refuses the
+material. Retiring the family retires the instance record and gate together; no stale stage, registration,
 contract, status, or credential can activate a new lifecycle or another instance. `describe` and
 status report the manager instance's serving/degraded state without treating discovery as
 authorization (§13.9).

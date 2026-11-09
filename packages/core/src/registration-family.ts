@@ -1,14 +1,5 @@
-import { epcredRowKey, parseLedgerRow, type CredentialLedgerRow } from "./lifecycle-state.js";
+import { epcredRowKey, parseLedgerRow } from "./lifecycle-state.js";
 import type { EpServeLedgerRow } from "./endpoint-service.js";
-
-
-export function parseManagerRegistrationFamilyReply(data: Uint8Array, instanceId: string): EpServeLedgerRow[] {
-  const raw: unknown = JSON.parse(new TextDecoder().decode(data));
-  if (!raw || typeof raw !== "object" || Array.isArray(raw) || Object.keys(raw).some(k => k !== "complete" && k !== "rows") ||
-      !("complete" in raw) || raw.complete !== true || !("rows" in raw) || !Array.isArray(raw.rows))
-    throw new Error("invalid manager registration family reply");
-  return parseManagerRegistrationFamilyRows(raw.rows, instanceId);
-}
 
 export function parseManagerRegistrationFamilyRows(rows: unknown[], instanceId: string): EpServeLedgerRow[] {
   return rows.map((value: unknown) => {

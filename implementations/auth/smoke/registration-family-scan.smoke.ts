@@ -19,7 +19,7 @@ import {
   createBrokerAuth, createSpaceAccountAuth, mintCreds, mintPublicUserJwt, credsFromJwt, remoteManagerActors, newIdentity, serverConfig, setupSpaceStreams,
   isReachable, standaloneConnectOpts, mintLifecycleUid, principalKey, DEV_OWNER, epAuthBucket, recordsBucket,
   epgateKey, epcredRowKey, provisionEndpointGateOpen, serveIssuanceGateKv, endpointRegistrationBarrier,
-  IncompleteKvScan, type EpServeLedgerRow,
+  IncompleteKvScan, isConsumerNotFound, type EpServeLedgerRow,
 } from "@cotal-ai/core";
 import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
 import { makeLedgerScannerOverConnection, authorityScannerGrants } from "../src/ledger-scanner.js";
@@ -54,20 +54,42 @@ try {
   const provisioner = await open(await mintCreds(auth, newIdentity(), "provisioner"));
   const owner = `u_${"a".repeat(26)}`;
   const scanClient = await openAuthorityClient({ server: servers, space, dataAccount: { pub: auth.account.pub, signingSeed: auth.account.signingSeed }, label: "family-scan-smoke", grants: id => authorityScannerGrants(space, id), log: console.error });
-  const scanner = makeLedgerScannerOverConnection(scanClient.nc, space);
+  let stallNextFamilyScan = false;
+  let deadlineScanStarted: (() => void) | undefined;
+  let deadlineScanAborted: (() => void) | undefined;
+  const scanner = makeLedgerScannerOverConnection(scanClient.nc, space, { afterFirstFetch: async signal => {
+    if (!stallNextFamilyScan) return;
+    stallNextFamilyScan = false;
+    if (!signal) throw new Error("registration scan did not receive an abort signal");
+    deadlineScanStarted?.();
+    if (!signal.aborted) await once(signal, "abort");
+    deadlineScanAborted?.();
+  } });
   const host = await open(await mintCreds(auth, newIdentity(), "issuer", { principal: { owner, actor: "host" } }));
   let corruption = "";
   let scanStarted: (() => void) | undefined;
-  const responder = await openRegistrationFamilyScan({ server: servers, space, dataAccount: { pub: auth.account.pub, signingSeed: auth.account.signingSeed }, log: console.error, scanner, authKv: await new Kvm(host).open(epAuthBucket(space)), recordsKv: await new Kvm(provisioner).open(recordsBucket(space)), probeScanStarted: () => scanStarted?.(), probeChunks: chunks => {
+  let blockedReadInstance: string | undefined;
+  let blockedReadCount = 0;
+  let blockedReadGate: Promise<void> | undefined;
+  let blockedReadStarted: (() => void) | undefined;
+  const responder = await openRegistrationFamilyScan({ server: servers, space, dataAccount: { pub: auth.account.pub, signingSeed: auth.account.signingSeed }, log: console.error, scanner, authKv: await new Kvm(host).open(epAuthBucket(space)), recordsKv: await new Kvm(provisioner).open(recordsBucket(space)), probeScanStarted: () => scanStarted?.(), probePointRead: async instanceId => {
+    if (instanceId === blockedReadInstance && blockedReadGate) {
+      blockedReadCount++;
+      if (blockedReadCount === 8) blockedReadStarted?.();
+      await blockedReadGate;
+    }
+  }, probeChunks: chunks => {
     if (chunks.length < 2 || !corruption) return chunks;
     if (corruption === "drop") return chunks.slice(1);
     if (corruption === "duplicate") return [chunks[0]!, chunks[0]!, ...chunks.slice(1)];
     if (corruption === "order") return [chunks[1]!, chunks[0]!, ...chunks.slice(2)];
     if (corruption === "count") return chunks.map((chunk, i) => i === chunks.length - 1 ? { ...chunk, rowCount: -1 } : chunk);
+    if (corruption === "truncate") return chunks.map((chunk, i) => i === chunks.length - 1 ? { ...chunk, rows: (chunk.rows as unknown[]).slice(0, -1) } : chunk);
     return chunks.map((chunk, i) => i === 1 ? { ...chunk, scanId: "A".repeat(24) } : chunk);
   } });
-  const scanRemote = (nc: NatsConnection, instanceId: string) => requestManagerRegistrationFamily(nc, space, owner, instanceId);
+  const scanRemote = (nc: NatsConnection, instanceId: string, timeoutMs = 5 * 60_000) => requestManagerRegistrationFamily(nc, space, owner, instanceId, timeoutMs);
   const jsm = await jetstreamManager(provisioner);
+  const scannerJsm = await jetstreamManager(scanClient.nc);
   const other = await open(await mintCreds(otherAuth, newIdentity(), "provisioner"));
   await (await new Kvm(other).open(epAuthBucket(otherSpace))).status();
   check("other account's auth bucket genuinely exists", true);
@@ -155,7 +177,44 @@ try {
       check("own point read completes while its family scan runs", ownRead !== null && typeof ownRead !== "number");
       check("point read completes while another family scan runs", peerRead !== null && typeof peerRead !== "number");
       await scanning;
-      for (const [mode, message] of [["drop", /invalid registration family chunk/], ["duplicate", /invalid registration family chunk/], ["order", /invalid registration family chunk/], ["count", /incomplete registration family chunks/], ["scanId", /inconsistent registration family chunks/]] as const) {
+      let releasePointReads!: () => void;
+      let markPointReadsStarted!: () => void;
+      const pointReadGate = new Promise<void>(resolve => { releasePointReads = resolve; });
+      const pointReadsStarted = new Promise<void>(resolve => { markPointReadsStarted = resolve; });
+      blockedReadInstance = instanceId; blockedReadCount = 0; blockedReadGate = pointReadGate; blockedReadStarted = markPointReadsStarted;
+      const heldReads = Array.from({ length: 8 }, () => requestManagerRegistrationRead(remote.nc, space, owner, instanceId, { kind: "read", key: epgateKey(endpoint, instanceId) }));
+      await pointReadsStarted;
+      check("eight point reads for one instance are admitted concurrently", blockedReadCount === 8);
+      await assert.rejects(requestManagerRegistrationRead(remote.nc, space, owner, instanceId, { kind: "read", key: epgateKey(endpoint, instanceId) }), RegistrationFamilyBusyError);
+      check("the ninth concurrent point read for one instance is busy", true);
+      const peerReadAtCap = await requestManagerRegistrationRead(peer.nc, space, owner, peerId, { kind: "read", key: epgateKey(endpoint, peerId) });
+      check("another instance point read succeeds while the first instance is at its cap", peerReadAtCap !== null && typeof peerReadAtCap !== "number");
+      releasePointReads();
+      const completedReads = await Promise.all(heldReads);
+      blockedReadInstance = undefined; blockedReadGate = undefined; blockedReadStarted = undefined;
+      check("all admitted point reads complete after release", completedReads.length === 8 && completedReads.every(value => value !== null && typeof value !== "number"));
+      let markDeadlineScanStarted!: () => void;
+      let markDeadlineScanAborted!: () => void;
+      const deadlineStarted = new Promise<void>(resolve => { markDeadlineScanStarted = resolve; });
+      const deadlineAborted = new Promise<void>(resolve => { markDeadlineScanAborted = resolve; });
+      deadlineScanStarted = markDeadlineScanStarted; deadlineScanAborted = markDeadlineScanAborted; stallNextFamilyScan = true;
+      const timedOutScan = scanRemote(remote.nc, instanceId, 150);
+      await deadlineStarted;
+      deadlineScanStarted = undefined;
+      await assert.rejects(timedOutScan, /registration family scan timed out/);
+      await deadlineAborted;
+      deadlineScanAborted = undefined;
+      const stream = `KV_${epAuthBucket(space)}`;
+      let consumerAbsent = false;
+      for (let attempt = 0; attempt < 100 && !consumerAbsent; attempt++) {
+        try { await scannerJsm.consumers.info(stream, "cotal-ledger-scan"); }
+        catch (error) { if (!isConsumerNotFound(error)) throw error; consumerAbsent = true; }
+        if (!consumerAbsent) await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      check("deadline abort deletes the real literal consumer", consumerAbsent && (await jsm.streams.info(stream)).state.consumer_count === consumersBefore);
+      const freshScan = await scanRemote(remote.nc, instanceId);
+      check("deadline abort releases the process-wide scanner lock", freshScan.length === count);
+      for (const [mode, message] of [["drop", /invalid registration family chunk/], ["duplicate", /invalid registration family chunk/], ["order", /invalid registration family chunk/], ["count", /incomplete registration family chunks/], ["truncate", /incomplete registration family chunks/], ["scanId", /inconsistent registration family chunks/]] as const) {
         corruption = mode;
         let failure: unknown;
         try { await scanRemote(remote.nc, instanceId); } catch (error) { failure = error; } finally { corruption = ""; }
@@ -227,5 +286,5 @@ try {
   if (evidence) writeFileSync(join(dir, "OUTCOME.json"), JSON.stringify({ passed, port, brokerExited: true }) + "\n", { mode: 0o600 });
   else rmSync(dir, { recursive: true, force: true });
 }
-assert.equal(passed, 51, "all family scan cells ran");
+assert.equal(passed, 58, "all family scan cells ran");
 console.log(`ENDPOINT FAMILY SCAN: ${passed} passed`);

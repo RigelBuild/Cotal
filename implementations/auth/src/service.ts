@@ -520,6 +520,7 @@ export interface OpenAuthAuthorityPlaneOptions extends AuthServiceRuntimeOptions
     discovery?: (d: { registry: LifecycleRegistry; kill: () => Promise<void> }) => void | Promise<void>;
     effect?: (effect: ServiceHostEffect, scope: ServiceHostEffectScope) => void | Promise<void>;
   };
+  probeManagerMint?: () => void | Promise<void>;
 }
 
 /**
@@ -1511,18 +1512,28 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
             }, "manager-service renewal");
           }
           if (r.operation === "prepare" || r.operation === "renew") {
+            const checkedGate = await managerIssuanceGate(r.instanceId).observe();
+            if (!checkedGate || checkedGate.state !== "open" || checkedGate.principal !== remoteManagerServePrincipal(owner, r.instanceId))
+              throw new EpEnvelopeError("permission-denied", "manager issuance gate changed before credential minting");
+            if (r.operation === "renew" && checkedGate.processEpoch !== r.processEpoch)
+              throw new EpEnvelopeError("permission-denied", "manager process epoch changed before credential minting");
+            const ensureGateUnchanged = async (): Promise<void> => {
+              const current = await managerIssuanceGate(r.instanceId).observe();
+              if (!current || current.state !== "open" || current.principal !== checkedGate.principal ||
+                  current.registrationRevision !== checkedGate.registrationRevision || current.processEpoch !== checkedGate.processEpoch)
+                throw new EpEnvelopeError("conflict", "manager issuance gate changed while credentials were being minted");
+            };
             credentials.supervisor = await credential("supervisor", "remote-manager", actors.supervisor, {
               remoteManager: { instanceId: r.instanceId, owner, actor: actors.supervisor },
               expiresInSeconds: standingTtl,
             });
-            // The executor receives the exact instance-scoped registration/maintenance surface under
-            // a separate nkey and bounded five-minute lifetime. The participant retains it for the
-            // immediate goalidx boot sweep and clean service deregistration, and renews it in place
-            // before maintenance or deregistration once its retained credential is unhealthy.
+            await opts.probeManagerMint?.();
+            await ensureGateUnchanged();
             credentials.executor = await credential("executor", "remote-manager", actors.executor, {
               remoteManager: { instanceId: r.instanceId, owner, actor: actors.executor },
               expiresInSeconds: 5 * 60,
             });
+            await ensureGateUnchanged();
           }
           if (r.operation === "session") {
             const expectedProof = remoteManagerRegistrationProof(owner, registration);
