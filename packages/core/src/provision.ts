@@ -98,6 +98,7 @@ import { parseServiceConnectionBinding, type ServiceConnectionBinding } from "./
 import { SERVICE_ACCESS_TTL_SECONDS } from "./service-authority-limits.js";
 import { effectsBindGrants, poolOwnerBindGrants, goalWriterGrants, sessionLedgerGrants, epAuthBucket, sessionsBucket, epcStreamName, endpointPlaneStreamNames, eptReqStreamName, eptStreamName, hardenedAuthorityStreamNames, timerWriterDurable, timerWriterGrants } from "./endpoint-binding.js";
 import { epsSubject, epCallerReplyFilter, assertGeneration, isIssuedCaller, AUTH_ENDPOINT, EP_CMD_RETIRE_LIFECYCLE, type EpCaller, type IssuedCaller } from "./endpoint-subjects.js";
+import { managerRegistrationFamilySubject } from "./endpoint-subjects.js";
 import { acceptedReadGrant, acceptedBucket, importNativeSubjectPermissions, issuedBucket, issuedHorizon, issuedPermitsPattern, issuedStoreStreamNames, prepareListing, writeAcceptedRow, type IssuanceSeam, type IssuedAuthorityRef, type ListingBinding, type ListingSeam, type PreparedListing } from "./issued-authority.js";
 import { REGISTRY_ENDPOINTS_GRANT } from "./registry-contract.js";
 import { admissionBucket, admissionKey, revocationKey } from "./run-admission.js";
@@ -1986,9 +1987,7 @@ function remoteManagerPermissions(
         `$JS.API.DIRECT.GET.${epcStreamName(space)}.${spacePrefix(space)}.epc.>`,
         `$JS.API.DIRECT.GET.${epcStreamName(space)}`,
         `$JS.API.STREAM.MSG.GET.KV_${AUTH}`,
-        `$JS.API.CONSUMER.CREATE.KV_${AUTH}.>`,
-        `$JS.API.CONSUMER.INFO.KV_${AUTH}.>`,
-        `$JS.API.CONSUMER.DELETE.KV_${AUTH}.>`,
+        managerRegistrationFamilySubject(space, pr.owner, iid),
         ...recordKeys.map((key) => `$JS.API.DIRECT.GET.KV_${REC}.$KV.${REC}.${key}`),
         `$JS.API.STREAM.MSG.GET.KV_${REC}`,
         // LIVENESS REPLIES for the MANAGER plane (#1577), bounded to the `.reply.` leaf under a
@@ -2012,6 +2011,7 @@ function remoteManagerPermissions(
     sub: {
       allow: [
         `_INBOX_${pr.connId}.>`,
+        `${managerRegistrationFamilySubject(space, pr.owner, iid)}.reply.*`,
         // The manager-plane liveness SERVE filter (#1577): `live.manager.*.*`, queue-grouped, so a
         // credentialed peer's presence probe reaches this instance. A serve subscription on a
         // presence-only rail and not a widening of what a remote manager may read: the request body

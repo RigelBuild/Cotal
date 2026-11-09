@@ -100,8 +100,10 @@ pre-activation evidence still uses the tombstone-preserving leader walk.
 The CLI endpoint executor can acknowledge native flow control only for its space's auth KV stream
 (`$JS.FC.KV_<auth-bucket>.>`). Its data writes stay instance-key-pinned; it gains no flow-control
 publication for other streams or accounts, no response wildcard and no longer credential lifetime.
-The remote Manager executor profile is unchanged. A complete scan uses a bounded number of API
-requests plus native flow-control acknowledgments as its payload grows.
+The remote Manager executor requests its own owner- and instance-pinned family from the auth
+plane's sealed scanner. It has no auth-stream consumer create, info or delete grants. Chunked
+replies must be complete and consistent or registration fails closed. Body-selected stream
+message reads on the auth and records streams remain granted.
 
 ## Agent tools
 

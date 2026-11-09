@@ -105,6 +105,7 @@ import { S2A_INVOCATION_MS, openServiceHostEffect, openServiceHostOperations, ty
 import { SERVICE_ENDPOINT_AUTHORITY_PATH, SERVICE_ENDPOINT_HOST_PATH, answerServiceAuthority, serviceAuthorityDenied, serviceAuthorityInfo, serviceHostGranterFor, type ServiceAuthorityCaller, type ServiceAuthorityDoor } from "./service-endpoint-authority.js";
 import { validateServiceRenewalProof } from "./service-renewal.js";
 import { openAuthLedgerScannerCandidate } from "./ledger-scanner.js";
+import { openRegistrationFamilyScan } from "./registration-family-scan.js";
 import { openRecordsScannerCandidate } from "./records-scanner.js";
 import { acquirePlaneClaim, makeDeliveryAdminPlaneOracle, makeDeliveryAdminPrincipalOracle, scannerDeathCopy, planeClaimRefusal, type PlaneClaimHold, type PlaneLivenessOracle } from "./plane-claim.js";
 import { enumerateOperationIntents, resumeAgentTakeover, type EvictPrincipal } from "./credential-ledger.js";
@@ -681,6 +682,8 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
   hold = await acquirePlaneClaim({ nc: barrier.nc, space, ledger: ledgerCand.tuple, records: recordsCand.tuple, oracle, log });
   const scanner = ledgerCand.activate(hold.guard);
   const recordsScanner = recordsCand.activate(hold.guard);
+  const registrationFamilyScan = await openRegistrationFamilyScan({ onConnection, server, space, dataAccount, log, scanner, authKv: await new Kvm(barrier.nc).open(epAuthBucket(space)) });
+  unwind.push(() => registrationFamilyScan.close());
   // Mid-life disconnect = the FENCING event (security req: an owned scanner that dies must not
   // leave the plane half-running). First death wins: fence the guard with the ux state-3 copy,
   // close the sibling so a successor's reclaim isn't blocked by a half-dead pair, log loud.
@@ -2177,6 +2180,7 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
       await issuer.close();
       await discoveryClient?.close();
       const scannerFlight = closeScanners ??= (async () => {
+        await registrationFamilyScan.close();
         await authAdmin?.close();
         const results = await Promise.allSettled([reader.close(), recordsScanner.close(), scanner.close()]);
         const errors = results.filter((r): r is PromiseRejectedResult => r.status === "rejected").map((r) => r.reason);

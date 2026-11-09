@@ -401,7 +401,8 @@ export function endpointRegistrationBarrier(
   space: string,
   args: { endpoint: string; instanceId: string; opId: string;
     serviceRegistration?: { requestId: string; requestDigest: string };
-    evict?: (holderPrincipals: readonly string[]) => Promise<boolean[]> | boolean[] },
+    evict?: (holderPrincipals: readonly string[]) => Promise<boolean[]> | boolean[];
+    enumerateFamily?: () => Promise<EpServeLedgerRow[]> },
 ): import("./endpoint-service.js").EpIssuanceBarrier {
   const { endpoint } = args;
   const instanceId = assertLifecycleToken(args.instanceId, "instanceId");
@@ -460,6 +461,7 @@ export function endpointRegistrationBarrier(
         await assertEmptyServiceFamily();
         return [];
       }
+      if (args.enumerateFamily) return await args.enumerateFamily();
       const rows: import("./endpoint-service.js").EpServeLedgerRow[] = [];
       const prefix = `${epcredFamilyPrefix(endpoint, instanceId)}.`;
       // Read the retained family in one complete value pass, not one round trip per historical

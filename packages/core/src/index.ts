@@ -15,6 +15,8 @@ export type { RegistryService, RegistryServiceHandle, RegistryServiceInputs } fr
 export * from "./endpoint-envelope.js";
 export * from "./endpoint-records.js";
 export * from "./lifecycle-state.js";
+export * from "./registration-family.js";
+export * from "./registration-family-client.js";
 export * from "./environment-manager-grants.js";
 export * from "./lifecycle-saga.js";
 export * from "./native-uid-custody.js";
