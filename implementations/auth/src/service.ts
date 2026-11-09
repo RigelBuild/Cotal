@@ -1,7 +1,8 @@
 import { registryStores } from "./lifecycle-registry.js";
 import { createToolResultConsentSigner, makeToolResultConsentRecorder, type ToolResultConsentRecorder, type ToolResultConsentSignerOptions } from "./tool-result-consent.js";
 import { boundPlacementDelivery, createPlacementEnrollmentAuthority, type PlacementEnrollmentAuthority } from "./placement-enrollment.js";
-import type { PlacementEnrollmentResult, ReconcilerPort, RolePolicyPort, ServiceAuthenticator } from "@cotal-ai/core";
+import type { PlacementEnrollmentResult } from "@cotal-ai/core";
+import type { ReconcilerPort, RolePolicyPort, ServiceAuthenticator } from "./placement-enrollment.js";
 /**
  * The AUTH SERVICE daemon — the one server-side process a user-auth space runs alongside its broker
  * (the delivery-daemon pattern: spawned detached by `cotal up`, pid-filed per space, torn down by
@@ -1329,6 +1330,7 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
     serializedForAlias: (owner, actor, action) => serializedForAlias(opts.dir, owner, actor, action),
     deprovisionFootprint: (owner, actor, lifecycleUid, channels) => deprovisionManagedFootprint(owner, actor, lifecycleUid, channels.filter(isConcreteChannel)),
     enrollManagedAgent,
+    log,
   }) : undefined;
   return {
     ...callout,

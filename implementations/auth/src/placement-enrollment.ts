@@ -1,10 +1,83 @@
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, fsyncSync, linkSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { acquireLockAsync, assertLifecycleToken, canonicalJson, contractDigest, EpEnvelopeError, isContractDigest, mkSecretDir, parsePlacementEnrollmentRequest, parsePlacementEnrollmentVerificationRequest, remoteManagerServePrincipal, type AcceptedIntentView, type EnrollmentIdentity, type PlacementAuthorityView, type EnrollEffectView, type PlacementEnrollmentRequest, type PlacementEnrollmentResult, type RemoteManagedAgentEnrollmentResult } from "@cotal-ai/core";
+import { acquireLockAsync, assertLifecycleToken, canonicalJson, contractDigest, EpEnvelopeError, isContractDigest, mkSecretDir, remoteManagerServePrincipal, type PlacementEnrollmentRequest, type PlacementEnrollmentResult, type RemoteManagedAgentEnrollmentResult } from "@cotal-ai/core";
 import { findInteractiveActor, findManagedActor, assertWithinSpawnerGrant, withManagedGrantTransaction } from "./ledger.js";
 import { authorizeRemoteManagedAgentEnrollment, type ObserveManagerGate } from "./managed-agent-enrollment.js";
-import { resolveReadAcl, type EnrollmentAcl, type ReconcilerPort, type RolePolicyPort, type ServiceAuthenticator } from "@cotal-ai/core";
+import { parsePlacementEnrollmentRequest, resolveReadAcl } from "@cotal-ai/core";
+import { parsePlacementEnrollmentVerificationRequest } from "./placement-enrollment-types.js";
+export interface ManagerClaimView {
+  accountPublicKey: string;
+  instanceId: string;
+  managerLifecycleUid: string;
+  assignmentRevision: number;
+  currentRegistrationRevision: number;
+  serveEpoch: number;
+}
+
+export interface AcceptedPlacementView {
+  space: "main";
+  name: string;
+  desiredRevision: number;
+  seatRevision: number;
+  claim: ManagerClaimView;
+  generation: number;
+  operationId: string;
+  workspace: string;
+}
+
+export interface PlacementAuthorityView {
+  subject: { acceptanceId: string; enrollmentOperationId: string; phase: "accepted" };
+  placementOperationId: string;
+  intentDigest: string;
+  claim: ManagerClaimView;
+  launchRevision: number;
+}
+
+export interface AcceptedIntentView {
+  acceptanceId: string;
+  intent: { digest: string; placement: AcceptedPlacementView; role: string; roleTreeRevision: number; [field: string]: unknown };
+  acceptedListRevision: number;
+  acceptedSeatRevision: number;
+  enrollmentOperationId: string;
+  executionGate: { authority: PlacementAuthorityView; state: "open" | "closing" | "closed"; fenceId?: string };
+}
+
+export interface EnrollmentIdentity {
+  acceptanceId: string;
+  enrollmentOperationId: string;
+  enrollmentRef: string;
+  target: { seatName: string; lifecycle: { space: string; owner: string; actor: string; lifecycleUid: string }; generation: number };
+  intentDigest: string;
+}
+
+export interface PlacementEnrollmentVerificationRequest { identity: EnrollmentIdentity; claim: ManagerClaimView; }
+
+export interface EnrollEffectView {
+  effectId: string;
+  authority: PlacementAuthorityView;
+  operationId: string;
+  kind: "enroll" | "bind" | "create" | "bootstrap";
+  state: "admitted" | "unknown" | "cancelled" | "effective";
+  enrollment?: EnrollmentIdentity;
+  stageId?: string;
+  execution?: unknown;
+}
+
+export interface ReconcilerPort {
+  acceptedIntent(request: { acceptanceId: string; authority: PlacementAuthorityView; actorTokenHash: string }): Promise<{ accepted: AcceptedIntentView; effect: EnrollEffectView }>;
+}
+
+export interface ServiceAuthenticator {
+  authenticateService(request: { transportPrincipal: string; operation: string; requestDigest: string }): Promise<{ principal: string }>;
+}
+
+export type EnrollmentAcl = Pick<PlacementEnrollmentRequest["enrollment"]["target"], "subscribe" | "allowSubscribe" | "allowPublish" | "capabilities" | "role">;
+
+export interface RolePolicyPort {
+  enrollmentAcl(request: { space: string; role: string; roleTreeRevision: number; seatName: string }): Promise<{ base: EnrollmentAcl; overrides: EnrollmentAcl[] }>;
+}
+
 
 export interface PlacementEnrollmentAuthorityOptions {
   dir: string;
@@ -25,6 +98,7 @@ export interface PlacementEnrollmentAuthorityOptions {
     agentBearerExchangeUrl: string;
   }): Promise<RemoteManagedAgentEnrollmentResult>;
   assertOpen(): void;
+  log(line: string): void;
 }
 
 export interface PlacementEnrollmentAuthority {
@@ -102,7 +176,6 @@ function businessDigest(request: PlacementEnrollmentRequest, policy: PendingReco
     actorTokenHash: request.actorTokenHash,
     policy,
     enrollment: {
-      serveEpoch: enrollment.serveEpoch,
       space: enrollment.space,
       actor: enrollment.actor,
       instanceId: enrollment.instanceId,
@@ -252,7 +325,7 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
       proofSecret: options.proofSecret,
       observeManagerGate: async () => gate,
     });
-    if (gate?.registrationRevision !== request.authority.claim.currentRegistrationRevision || gate.processEpoch !== request.authority.claim.serveEpoch)
+    if (!gate || gate.registrationRevision !== request.authority.claim.currentRegistrationRevision || gate.processEpoch !== request.authority.claim.serveEpoch)
       fail("permission-denied", "placement enrollment claim does not match current manager registration", "not-executed");
 
     const held = await acquireLockAsync(join(directory, `${request.enrollmentOperationId}.lock`), { label: "placement enrollment", waitMs: 30_000 });
@@ -443,14 +516,18 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
       const gone = await options.serializedForAlias(target.owner, target.actor, async () => {
         const row = findManagedActor(options.dir, target.owner, target.actor);
         if (row?.lifecycleUid === target.lifecycleUid) {
-          if (row.tokenHash !== record.actorTokenHash || row.custody?.kind !== custody.kind || row.custody.instanceId !== custody.instanceId)
-            return false;
+          if (row.tokenHash !== record.actorTokenHash || row.custody?.kind !== custody.kind || row.custody.instanceId !== custody.instanceId) return false;
           await options.deprovisionFootprint(target.owner, target.actor, target.lifecycleUid, row.allowSubscribe);
           withManagedGrantTransaction(options.dir, (tx) => tx.revokeManagedIf(target.owner, target.actor, { lifecycleUid: target.lifecycleUid, custody }));
+        } else {
+          await options.deprovisionFootprint(target.owner, target.actor, target.lifecycleUid, []);
         }
         const after = findManagedActor(options.dir, target.owner, target.actor);
         return !after || after.lifecycleUid !== target.lifecycleUid;
-      }).catch(() => false);
+      }).catch((error: unknown) => {
+        options.log(`auth-service: placement enrollment retirement ${operationId} failed: ${error instanceof Error ? error.message : String(error)}`);
+        return false;
+      });
       if (!gone) return { state: "unknown" as const };
       const denialProofId = contractDigest({ operationId, identity, fenceId, grantGone: true, footprintGone: true });
       durableCreate(directory, name, { operationId, identity, fenceId, grantGone: true, footprintGone: true, denialProofId });
