@@ -113,13 +113,10 @@ function cell(name, ok, detail) {
   console.log(`${ok ? "ok  " : "FAIL"} ${name}${suffix}`);
 }
 
+/** @param {string} path @param {string[]} argv @param {Record<string, string | undefined>} [env] */
 function run(path, argv, env) {
+  // spawnSync omits a key whose value is undefined, which unsets an inherited variable.
   const childEnv = { ...process.env, ...env };
-  if (env) {
-    for (const [key, value] of Object.entries(env)) {
-      if (value === undefined) delete childEnv[key];
-    }
-  }
   const r = spawnSync(process.execPath, [path, ...argv], { cwd: ROOT, encoding: "utf8", env: childEnv });
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
