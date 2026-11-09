@@ -1,7 +1,7 @@
 import { registryStores } from "./lifecycle-registry.js";
 import { createToolResultConsentSigner, makeToolResultConsentRecorder, type ToolResultConsentRecorder, type ToolResultConsentSignerOptions } from "./tool-result-consent.js";
 import { createPlacementEnrollmentAuthority, type PlacementEnrollmentAuthority } from "./placement-enrollment.js";
-import type { PlacementEnrollmentResult, ReconcilerPort, ServiceAuthenticator } from "@cotal-ai/core";
+import type { PlacementEnrollmentResult, ReconcilerPort, RolePolicyPort, ServiceAuthenticator } from "@cotal-ai/core";
 /**
  * The AUTH SERVICE daemon — the one server-side process a user-auth space runs alongside its broker
  * (the delivery-daemon pattern: spawned detached by `cotal up`, pid-filed per space, torn down by
@@ -447,6 +447,8 @@ export interface AuthServiceRuntimeOptions {
   placementReconciler?: ReconcilerPort;
   /** Production binding comes with the reconciler integration. */
   placementAuthenticator?: ServiceAuthenticator;
+  /** Production binding comes with the role tree and reconciler integration. */
+  placementRolePolicy?: RolePolicyPort;
   interactiveManagerSelection?: "local-primary";
   /** Process-lifetime cancellation custody quotas. No eviction or automatic restart on exhaustion. */
   runCancelLimits?: RunCancelLimits;
@@ -1324,6 +1326,7 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
     dir: opts.dir, space, accountPublicKey: dataAccount.pub, proofSecret: dataAccount.signingSeed,
     observeManagerGate: observeLegacyManagerGate, reconciler: opts.placementReconciler,
     authenticator: opts.placementAuthenticator, assertOpen: refuseIfFenced,
+    rolePolicy: opts.placementRolePolicy,
     enrollManagedAgent,
   });
   return {
@@ -2935,6 +2938,7 @@ async function startAuthContext(o: AuthContextOptions): Promise<{ handle: Omit<A
     localManager: o.localManager,
     placementReconciler: o.placementReconciler,
     placementAuthenticator: o.placementAuthenticator,
+    placementRolePolicy: o.placementRolePolicy,
     ...(o.interactiveManagerSelection !== undefined ? { interactiveManagerSelection: o.interactiveManagerSelection } : {}),
     ...(o.runCancelLimits !== undefined ? { runCancelLimits: o.runCancelLimits } : {}),
     ...(o.standingRenewableTtlSeconds !== undefined ? { standingRenewableTtlSeconds: o.standingRenewableTtlSeconds } : {}),

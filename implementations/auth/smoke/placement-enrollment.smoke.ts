@@ -20,12 +20,16 @@ const base = { space: "main", actor: "cli", instanceId, managerLifecycleUid, ide
 const enrollment: RemoteManagedAgentEnrollmentRequest = { ...base, v: 1, kind: "manager-managed-agent-enrollment", requestId: `req${mintLifecycleUid()}`, registrationProof: remoteManagerCurrentRegistrationProof(proofSecret, owner, base, gate), serveEpoch: 7, target: { actor: "worker", tokenHash, capabilities: [], subscribe: [], allowPublish: [] } };
 const acceptanceId = randomUUID(), enrollmentOperationId = randomUUID(), placementOperationId = randomUUID(), effectId = randomUUID();
 const placement = { space: "main", name: "worker", desiredRevision: 1, seatRevision: 1, claim, generation: 1, operationId: placementOperationId, workspace: "work" };
-const content = { placement };
+const content = { placement, role: "worker-role", roleTreeRevision: 3 };
 const authority = { subject: { acceptanceId, enrollmentOperationId, phase: "accepted" as const }, placementOperationId, intentDigest: contractDigest(content), claim, launchRevision: 1 };
 const accepted = { acceptanceId, enrollmentOperationId, intent: { ...content, digest: authority.intentDigest }, acceptedListRevision: 1, acceptedSeatRevision: 1, executionGate: { authority, state: "open" as const } };
 let effect: ExecutionEffect = { effectId, authority, operationId: enrollmentOperationId, kind: "enroll", state: "admitted" };
 let commits = 0;
-const options = { dir, space: "main", accountPublicKey: claim.accountPublicKey, proofSecret, observeManagerGate: async () => gate, reconciler: { acceptedIntent: async () => ({ accepted, effect }) }, authenticator: { authenticateService: async (caller: string) => ({ principal: caller }) }, assertOpen: () => {}, enrollManagedAgent: async ({ request }: { request: RemoteManagedAgentEnrollmentRequest }) => {
+let policy = { base: { subscribe: [] as string[], allowSubscribe: [] as string[], allowPublish: [] as string[], capabilities: [] as string[], role: undefined as string | undefined }, overrides: [] as { subscribe: string[]; allowSubscribe: string[]; allowPublish: string[]; capabilities: string[]; role?: string }[] };
+const rolePolicy = { enrollmentAcl: async (input: { space: string; role: string; roleTreeRevision: number; seatName: string }) => {
+  assert.equal(input.role, "worker-role"); assert.equal(input.roleTreeRevision, 3); return policy;
+} };
+const options = { dir, space: "main", accountPublicKey: claim.accountPublicKey, proofSecret, observeManagerGate: async () => gate, reconciler: { acceptedIntent: async () => ({ accepted, effect }) }, rolePolicy, authenticator: { authenticateService: async (caller: string) => ({ principal: caller }) }, assertOpen: () => {}, enrollManagedAgent: async ({ request }: { request: RemoteManagedAgentEnrollmentRequest }) => {
   let row = findManagedActor(dir, owner, request.target.actor);
   if (!row) { commits++; row = grantManagedActor(dir, { owner, actor: request.target.actor, scope: [], allowSubscribe: [], allowPublish: [], lifecycleUid: mintLifecycleUid(), tokenHash: request.target.tokenHash, custody: { kind: "remote-manager", instanceId } }); }
   return { ...request, owner, material: { owner, actor: request.target.actor, lifecycleUid: row.lifecycleUid!, sentinelCreds: "sentinel", subscribe: [], allowSubscribe: [], allowPublish: [], agentBearerExchangeUrl: "https://example.test" } };
@@ -54,6 +58,9 @@ try {
   await assert.rejects(service.enrollPlacement({ ...args, request: { ...request, authority: { ...authority, claim: { ...claim, instanceId: mintLifecycleUid() } } }, onDelivered: done }));
   assert.equal(commits, 0);
   console.log("  ✓ invalid effect, operation, hash and epoch refuse before writes");
+  await assert.rejects(service.enrollPlacement({ ...args, request: { ...request, enrollment: { ...enrollment, target: { ...enrollment.target, allowPublish: ["extra"] } } }, onDelivered: done }), /role policy/);
+  assert.equal(commits, 0);
+  console.log("  ✓ widened ACL refuses before ledger write");
   const crashEffect = randomUUID();
   effect = { ...effect, effectId: crashEffect };
   const interrupted = createPlacementEnrollmentAuthority({ ...options, dir: mkdtempSync(join(dir, "crash-")), enrollManagedAgent: async () => { throw new Error("crash before commit"); } });
@@ -68,6 +75,10 @@ try {
   const first = await createPlacementEnrollmentAuthority(options).enrollPlacement({ ...args, onDelivered: done });
   const replay = await service.enrollPlacement({ ...args, onDelivered: done });
   assert.deepEqual(replay.identity, first.identity); assert.equal(commits, 1);
+  policy = { ...policy, base: { ...policy.base, allowPublish: ["changed"] } };
+  await assert.rejects(service.enrollPlacement({ ...args, onDelivered: done }));
+  policy = { ...policy, base: { ...policy.base, allowPublish: [] } };
+  console.log("  ✓ changed policy refuses replay");
   await assert.rejects(service.enrollPlacement({ ...args, request: { ...request, enrollment: { ...enrollment, target: { ...enrollment.target, label: "changed" } } }, onDelivered: done }));
   await assert.rejects(service.enrollPlacement({ ...args, request: { ...request, enrollment: { ...enrollment, serveEpoch: 6 }, authority: { ...authority, claim: { ...claim, serveEpoch: 6 } } }, onDelivered: done }));
   assert.deepEqual(await service.verifyPlacementEnrollment({ caller: "reconciler", request: { identity: first.identity, claim } }), { identity: first.identity, active: true });
@@ -77,16 +88,19 @@ try {
   console.log("  ✓ journal survives reopening before reply recovery");
   const secondAcceptance = randomUUID(), secondOperation = randomUUID(), secondEffect = randomUUID(), secondPlacement = randomUUID();
   const otherPlacement = { ...placement, name: "other", operationId: secondPlacement };
-  const otherAuthority = { ...authority, subject: { ...authority.subject, acceptanceId: secondAcceptance, enrollmentOperationId: secondOperation }, placementOperationId: secondPlacement, intentDigest: contractDigest({ placement: otherPlacement }) };
-  const otherAccepted = { ...accepted, acceptanceId: secondAcceptance, enrollmentOperationId: secondOperation, intent: { placement: otherPlacement, digest: otherAuthority.intentDigest }, executionGate: { authority: otherAuthority, state: "open" as const } };
+  const otherContent = { ...content, placement: otherPlacement };
+  const otherAuthority = { ...authority, subject: { ...authority.subject, acceptanceId: secondAcceptance, enrollmentOperationId: secondOperation }, placementOperationId: secondPlacement, intentDigest: contractDigest(otherContent) };
+  const otherAccepted = { ...accepted, acceptanceId: secondAcceptance, enrollmentOperationId: secondOperation, intent: { ...otherContent, digest: otherAuthority.intentDigest }, executionGate: { authority: otherAuthority, state: "open" as const } };
   const otherEffect: ExecutionEffect = { effectId: secondEffect, operationId: secondOperation, authority: otherAuthority, kind: "enroll", state: "admitted" };
   const otherService = createPlacementEnrollmentAuthority({ ...options, reconciler: { acceptedIntent: async () => ({ accepted: otherAccepted, effect: otherEffect }) } });
-  const otherRequest = { ...request, acceptanceId: secondAcceptance, enrollmentOperationId: secondOperation, authority: otherAuthority, enrollment: { ...enrollment, target: { ...enrollment.target, actor: "other" } } };
+  policy.overrides = [{ subscribe: [], allowSubscribe: [], allowPublish: ["other"], capabilities: [] }];
+  const otherRequest = { ...request, acceptanceId: secondAcceptance, enrollmentOperationId: secondOperation, authority: otherAuthority, enrollment: { ...enrollment, target: { ...enrollment.target, actor: "other", allowPublish: ["other"] } } };
   let release: (() => void) | undefined;
   await service.enrollPlacement({ ...args, onDelivered: (r) => { release = r; } });
   const fenceId = randomUUID(); let closed = false;
   const closing = service.closeEnrollmentEffect({ caller: "reconciler", effectId, fenceId }).then((result) => { closed = true; return result; });
   const second = await otherService.enrollPlacement({ ...args, request: otherRequest, onDelivered: done });
+  console.log("  ✓ checked-in override matches accepted intent role");
   assert.equal(second.identity.target.seatName, "other");
   console.log("  ✓ unrelated seat enrolls while another effect closes");
   await new Promise((resolve) => setTimeout(resolve, 25)); assert.equal(closed, false); assert.ok(release); release();

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { acquireLockAsync, assertLifecycleToken, canonicalJson, contractDigest, EpEnvelopeError, isContractDigest, mkSecretDir, parsePlacementEnrollmentRequest, parsePlacementEnrollmentVerificationRequest, remoteManagerServePrincipal, type AcceptedIntent, type EnrollmentIdentity, type ExecutionAuthority, type ExecutionEffect, type PlacementEnrollmentRequest, type PlacementEnrollmentResult, type RemoteManagedAgentEnrollmentResult } from "@cotal-ai/core";
 import { findInteractiveActor, findManagedActor, assertWithinSpawnerGrant, withManagedGrantTransaction } from "./ledger.js";
 import { authorizeRemoteManagedAgentEnrollment, type ObserveManagerGate } from "./managed-agent-enrollment.js";
-import type { ReconcilerPort, ServiceAuthenticator } from "@cotal-ai/core";
+import { resolveReadAcl, type EnrollmentAcl, type ReconcilerPort, type RolePolicyPort, type ServiceAuthenticator } from "@cotal-ai/core";
 
 export interface PlacementEnrollmentAuthorityOptions {
   dir: string;
@@ -14,6 +14,7 @@ export interface PlacementEnrollmentAuthorityOptions {
   observeManagerGate: ObserveManagerGate;
   reconciler?: ReconcilerPort;
   authenticator?: ServiceAuthenticator;
+  rolePolicy?: RolePolicyPort;
   enrollManagedAgent(args: {
     owner: string;
     scope: string[];
@@ -43,6 +44,9 @@ interface PendingRecord {
   actorTokenHash: string;
   authority: ExecutionAuthority;
   placement: AcceptedIntent["intent"]["placement"];
+  role: string;
+  roleTreeRevision: number;
+  policy: { kind: "base"; digest: string } | { kind: "override"; index: number; digest: string };
 }
 
 interface CompleteRecord extends Omit<PendingRecord, "state"> {
@@ -87,7 +91,7 @@ function readRecord<T>(directory: string, name: string): T | undefined {
   }
 }
 
-function businessDigest(request: PlacementEnrollmentRequest): string {
+function businessDigest(request: PlacementEnrollmentRequest, policy: PendingRecord["policy"]): string {
   const enrollment = request.enrollment;
   return contractDigest({
     acceptanceId: request.acceptanceId,
@@ -95,6 +99,7 @@ function businessDigest(request: PlacementEnrollmentRequest): string {
     placementOperationId: request.authority.placementOperationId,
     intentDigest: request.authority.intentDigest,
     actorTokenHash: request.actorTokenHash,
+    policy,
     enrollment: {
       space: enrollment.space,
       actor: enrollment.actor,
@@ -104,6 +109,26 @@ function businessDigest(request: PlacementEnrollmentRequest): string {
       identities: enrollment.identities,
     },
   });
+}
+
+function normalizedAcl(acl: EnrollmentAcl) {
+  const subscribe = acl.subscribe ?? [];
+  const sorted = (values: string[]) => [...new Set(values)].sort();
+  return { subscribe: sorted(subscribe), allowSubscribe: sorted(resolveReadAcl(subscribe, acl.allowSubscribe)),
+    allowPublish: sorted(acl.allowPublish ?? []), capabilities: sorted(acl.capabilities ?? []), role: acl.role ?? null };
+}
+
+async function matchPolicy(options: PlacementEnrollmentAuthorityOptions, request: PlacementEnrollmentRequest, role: string, roleTreeRevision: number, seatName: string): Promise<PendingRecord["policy"]> {
+  if (!options.rolePolicy) throw new EpEnvelopeError("unimplemented", "role policy port is not configured");
+  const policy = await options.rolePolicy.enrollmentAcl({ space: request.enrollment.space, role, roleTreeRevision, seatName });
+  const actual = canonicalJson(normalizedAcl(request.enrollment.target));
+  const base = normalizedAcl(policy.base);
+  if (canonicalJson(base) === actual) return { kind: "base", digest: contractDigest(base) };
+  const matches = policy.overrides.map((acl, index) => ({ acl: normalizedAcl(acl), index })).filter((entry) => canonicalJson(entry.acl) === actual);
+  if (matches.length !== 1) throw new EpEnvelopeError("permission-denied", "enrollment ACL does not match role policy");
+  const match = matches[0];
+  if (!match) throw new EpEnvelopeError("permission-denied", "enrollment ACL does not match role policy");
+  return { kind: "override", index: match.index, digest: contractDigest(match.acl) };
 }
 
 function sameAuthority(a: ExecutionAuthority, b: ExecutionAuthority): boolean {
@@ -118,6 +143,7 @@ function parseAccepted(raw: unknown, authority: ExecutionAuthority): AcceptedInt
   if (!UUID.test(accepted.acceptanceId) || !UUID.test(accepted.enrollmentOperationId) ||
       !uint(accepted.acceptedListRevision) || !uint(accepted.acceptedSeatRevision) ||
       accepted.acceptanceId !== authority.subject.acceptanceId || accepted.enrollmentOperationId !== authority.subject.enrollmentOperationId ||
+      typeof accepted.intent.role !== "string" || accepted.intent.role.length === 0 || !uint(accepted.intent.roleTreeRevision) ||
       !isContractDigest(digest) || digest !== authority.intentDigest || contractDigest(intent) !== digest ||
       accepted.intent.placement.space !== "main" || accepted.intent.placement.name.length === 0 ||
       accepted.intent.placement.operationId !== authority.placementOperationId ||
@@ -221,7 +247,6 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
     if (gate?.registrationRevision !== request.authority.claim.currentRegistrationRevision || gate.processEpoch !== request.authority.claim.serveEpoch)
       fail("permission-denied", "placement enrollment claim does not match current manager registration", "not-executed");
 
-    const digest = businessDigest(request);
     const held = await acquireLockAsync(join(directory, `${request.enrollmentOperationId}.lock`), { label: "placement enrollment", waitMs: 30_000 });
     let effectLease: { release(): void } | undefined;
     let deliveryOwnsLease = false;
@@ -232,7 +257,11 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
       let pending = readRecord<unknown>(directory, pendingName);
       let complete = readRecord<unknown>(directory, completeName);
       if (complete !== undefined || pending !== undefined) {
-        const stored = parseStoredRecord(complete ?? pending, request, digest);
+        const candidate = complete ?? pending;
+        if (!isObject(candidate) || typeof candidate.role !== "string" || !uint(candidate.roleTreeRevision) || !isObject(candidate.placement) || typeof candidate.placement.name !== "string")
+          throw new EpEnvelopeError("unavailable", "placement enrollment journal lacks role policy context");
+        const policy = await matchPolicy(options, request, candidate.role, candidate.roleTreeRevision, candidate.placement.name);
+        const stored = parseStoredRecord(candidate, request, businessDigest(request, policy));
         if (stored.owner !== args.owner) fail("permission-denied", "placement enrollment belongs to another owner", "not-executed");
         effectLease = await acquireLockAsync(join(directory, `${stored.effectId}.effect.lock`), { label: "enrollment effect" });
         if (readRecord<unknown>(directory, `${stored.effectId}.closed.json`) !== undefined)
@@ -268,6 +297,7 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
       if (accepted.intent.placement.space !== request.enrollment.space || accepted.intent.placement.name !== authorized.target.actor)
         fail("permission-denied", "enrollment target differs from the accepted placement", "not-executed");
       const effect = parseEffect(admission.effect, request.authority, accepted);
+      const policy = await matchPolicy(options, request, accepted.intent.role, accepted.intent.roleTreeRevision, accepted.intent.placement.name);
       effectLease = await acquireLockAsync(join(directory, `${effect.effectId}.effect.lock`), { label: "enrollment effect" });
       if (readRecord<unknown>(directory, `${effect.effectId}.closed.json`) !== undefined)
         fail("failed-precondition", "placement enrollment effect is closed", "not-executed");
@@ -275,7 +305,7 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
       const record: PendingRecord = {
         v: 1,
         state: "pending",
-        requestDigest: digest,
+        requestDigest: businessDigest(request, policy),
         effectId: effect.effectId,
         owner: args.owner,
         acceptanceId: request.acceptanceId,
@@ -283,6 +313,9 @@ export function createPlacementEnrollmentAuthority(options: PlacementEnrollmentA
         actorTokenHash: request.actorTokenHash,
         authority: request.authority,
         placement: accepted.intent.placement,
+        role: accepted.intent.role,
+        roleTreeRevision: accepted.intent.roleTreeRevision,
+        policy,
       };
       durableCreate(directory, pendingName, record);
       options.assertOpen();

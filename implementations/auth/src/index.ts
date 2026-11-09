@@ -1,5 +1,6 @@
 /** @module index */
 export { createPlacementEnrollmentAuthority, type PlacementEnrollmentAuthorityOptions, type ReconcilerPort, type ServiceAuthenticator } from "./placement-enrollment.js";
+export type { EnrollmentAcl, RolePolicyPort } from "@cotal-ai/core";
 export { mintServiceCallerPayloadObserverCreds, type ServiceCallerPayloadBootstrap } from "./service-caller-payload-bootstrap.js";
 export { deriveOwnerToken, deriveOwnerForIdpSubject, platformControlOwner } from "./derive.js";
 export { parsePlatformControlAuthorityRequest, type ManagerAuthorityHolder } from "./platform-control.js";

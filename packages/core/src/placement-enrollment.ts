@@ -34,7 +34,7 @@ export interface ExecutionAuthority {
 
 export interface AcceptedIntent {
   acceptanceId: string;
-  intent: { digest: string; placement: Placement; [field: string]: unknown };
+  intent: { digest: string; placement: Placement; role: string; roleTreeRevision: number; [field: string]: unknown };
   acceptedListRevision: number;
   acceptedSeatRevision: number;
   enrollmentOperationId: string;
@@ -96,6 +96,13 @@ export interface ReconcilerPort {
 /** Production binding comes with the reconciler integration. */
 export interface ServiceAuthenticator {
   authenticateService(caller: string): Promise<{ principal: string }>;
+}
+
+export type EnrollmentAcl = Pick<RemoteManagedAgentEnrollmentRequest["target"], "subscribe" | "allowSubscribe" | "allowPublish" | "capabilities" | "role">;
+
+/** Production binding comes with the role tree and reconciler integration. */
+export interface RolePolicyPort {
+  enrollmentAcl(request: { space: string; role: string; roleTreeRevision: number; seatName: string }): Promise<{ base: EnrollmentAcl; overrides: EnrollmentAcl[] }>;
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
