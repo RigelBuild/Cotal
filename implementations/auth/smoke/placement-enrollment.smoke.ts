@@ -29,7 +29,8 @@ let policy = { base: { subscribe: [] as string[], allowSubscribe: [] as string[]
 const rolePolicy = { enrollmentAcl: async (input: { space: string; role: string; roleTreeRevision: number; seatName: string }) => {
   assert.equal(input.role, "worker-role"); assert.equal(input.roleTreeRevision, 3); return policy;
 } };
-const options = { dir, space: "main", accountPublicKey: claim.accountPublicKey, proofSecret, observeManagerGate: async () => gate, reconciler: { acceptedIntent: async () => ({ accepted, effect }) }, rolePolicy, authenticator: { authenticateService: async (caller: string) => ({ principal: caller }) }, assertOpen: () => {}, enrollManagedAgent: async ({ request }: { request: RemoteManagedAgentEnrollmentRequest }) => {
+const deprovisioned: string[][] = [];
+const options = { dir, space: "main", accountPublicKey: claim.accountPublicKey, proofSecret, observeManagerGate: async () => gate, reconciler: { acceptedIntent: async () => ({ accepted, effect }) }, rolePolicy, authenticator: { authenticateService: async ({ transportPrincipal }: { transportPrincipal: string }) => ({ principal: transportPrincipal === "reconciler" ? "reconciler" : "unauthorized" }) }, serializedForAlias: async <T>(_owner: string, _actor: string, action: () => Promise<T>) => action(), deprovisionFootprint: async (_owner: string, _actor: string, _uid: string, channels: string[]) => { deprovisioned.push(channels); }, assertOpen: () => {}, enrollManagedAgent: async ({ request }: { request: RemoteManagedAgentEnrollmentRequest }) => {
   let row = findManagedActor(dir, owner, request.target.actor);
   if (!row) { commits++; row = grantManagedActor(dir, { owner, actor: request.target.actor, scope: [], allowSubscribe: [], allowPublish: [], lifecycleUid: mintLifecycleUid(), tokenHash: request.target.tokenHash, custody: { kind: "remote-manager", instanceId } }); }
   return { ...request, owner, material: { owner, actor: request.target.actor, lifecycleUid: row.lifecycleUid!, sentinelCreds: "sentinel", subscribe: [], allowSubscribe: [], allowPublish: [], agentBearerExchangeUrl: "https://example.test" } };
@@ -39,6 +40,10 @@ const request = { v: 1 as const, kind: "auth.enroll-placement" as const, accepta
 const args = { owner, scope: ["supervise"], request, sentinelCreds: "sentinel", agentBearerExchangeUrl: "https://example.test" };
 const done = (release: () => void) => release();
 try {
+  await assert.rejects(service.enrollmentEffectStatus({ caller: "manager", effectId }), /requires the reconciler service/);
+  await assert.rejects(service.closeEnrollmentEffect({ caller: "manager", effectId, fenceId: randomUUID() }), /requires the reconciler service/);
+  await assert.rejects(service.verifyPlacementEnrollment({ caller: "manager", request: { identity: { acceptanceId, enrollmentOperationId, enrollmentRef: "ref", target: { seatName: "worker", generation: 1, lifecycle: { space: "main", owner, actor: "worker", lifecycleUid: mintLifecycleUid() } }, intentDigest: authority.intentDigest }, claim } }), /requires the reconciler service/);
+  console.log("  ✓ participant operations refuse manager transport");
   const invalid = { ...effect, kind: "bind" as const }; effect = invalid;
   await assert.rejects(service.enrollPlacement({ ...args, onDelivered: done }));
   effect = { ...invalid, kind: "enroll", operationId: randomUUID() };
@@ -64,8 +69,9 @@ try {
   const crashEffect = randomUUID();
   effect = { ...effect, effectId: crashEffect };
   const interrupted = createPlacementEnrollmentAuthority({ ...options, dir: mkdtempSync(join(dir, "crash-")), enrollManagedAgent: async () => { throw new Error("crash before commit"); } });
-  await assert.rejects(interrupted.enrollPlacement({ ...args, onDelivered: done }), /crash before commit/);
-  assert.equal((await interrupted.enrollmentEffectStatus({ caller: "reconciler", effectId: crashEffect })).state, "unknown");
+  await assert.rejects(interrupted.enrollPlacement({ ...args, onDelivered: done }), /placement enrollment was not executed/);
+  assert.equal((await interrupted.enrollmentEffectStatus({ caller: "reconciler", effectId: crashEffect })).state, "cancelled");
+  await assert.rejects(interrupted.enrollPlacement({ ...args, onDelivered: done }), /placement enrollment was not executed/);
   const afterCrash = await interrupted.closeEnrollmentEffect({ caller: "reconciler", effectId: crashEffect, fenceId: randomUUID() });
   assert.equal(afterCrash.state, "cancelled"); assert.equal(afterCrash.noLateEffects, true);
   await assert.rejects(interrupted.enrollPlacement({ ...args, onDelivered: done }));
@@ -115,8 +121,14 @@ try {
   assert.equal(disconnectedOutcome.state, "effective"); assert.equal(disconnectedOutcome.noLateEffects, true);
   console.log("  ✓ disconnected reply releases close with effective enrollment");
   const operationId = randomUUID();
+  const failingRetirement = createPlacementEnrollmentAuthority({ ...options, deprovisionFootprint: async () => { throw new Error("deprovision failed"); } });
+  assert.equal((await failingRetirement.retirePlacementEnrollment({ caller: "reconciler", operationId, identity: first.identity, fenceId })).state, "unknown");
+  assert.ok(findManagedActor(dir, owner, first.identity.target.lifecycle.actor));
+  console.log("  ✓ footprint failure retains the grant and remains unknown");
   const retired = await service.retirePlacementEnrollment({ caller: "reconciler", operationId, identity: first.identity, fenceId });
   assert.equal(retired.state, "retired"); assert.ok(retired.denialProofId);
+  assert.equal(findManagedActor(dir, owner, first.identity.target.lifecycle.actor), undefined);
+  assert.deepEqual(deprovisioned, [[]]);
   assert.deepEqual(await service.retirePlacementEnrollment({ caller: "reconciler", operationId, identity: first.identity, fenceId }), retired);
   await assert.rejects(service.retirePlacementEnrollment({ caller: "manager", operationId, identity: first.identity, fenceId }));
   await assert.rejects(service.retirePlacementEnrollment({ caller: "reconciler", operationId, identity: first.identity, fenceId: randomUUID() }));

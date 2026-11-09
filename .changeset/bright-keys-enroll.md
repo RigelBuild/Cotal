@@ -1,6 +1,7 @@
 ---
-"@cotal-ai/core": patch
-"@cotal-ai/auth": patch
+"@cotal-ai/core": minor
+"@cotal-ai/auth": minor
 ---
 
-Add placement enrollment with role-policy ACL checks and fenced, durable recovery.
+Minor bump adding the placement enrollment API surface.
+The reconciler and role-policy ports have no production binding.

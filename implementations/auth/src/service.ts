@@ -343,7 +343,7 @@ export interface AuthAuthorityPlane extends CalloutAuthority {
     sentinelCreds: string;
     agentBearerExchangeUrl: string;
   }) => Promise<RemoteManagedAgentEnrollmentResult>;
-  placementEnrollment: PlacementEnrollmentAuthority;
+  placementEnrollment: PlacementEnrollmentAuthority | undefined;
   /** Host-owned retirement preparation (#1972): the prepare decision, then the target uid's broker
    *  footprint and grant are released, so the participant's terminal rail finds the grant gone. */
   prepareManagedAgentRetirement: (args: {
@@ -443,11 +443,9 @@ async function supervisorGeneration(session: IssuerSession, space: string, owner
 /** Trusted composition policy for unpinned interactive manager-caller requests. No request or CLI
  *  flag sets it. The local-primary policy refuses an unavailable local Manager without substitution. */
 export interface AuthServiceRuntimeOptions {
-  /** Production binding comes with the reconciler integration. */
+  /** If any placement port is unset, enrollment is unimplemented. */
   placementReconciler?: ReconcilerPort;
-  /** Production binding comes with the reconciler integration. */
   placementAuthenticator?: ServiceAuthenticator;
-  /** Production binding comes with the role tree and reconciler integration. */
   placementRolePolicy?: RolePolicyPort;
   interactiveManagerSelection?: "local-primary";
   /** Process-lifetime cancellation custody quotas. No eviction or automatic restart on exhaustion. */
@@ -1322,13 +1320,15 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
         },
       };
   };
-  const placementEnrollment = createPlacementEnrollmentAuthority({
+  const placementEnrollment = opts.placementReconciler && opts.placementAuthenticator && opts.placementRolePolicy ? createPlacementEnrollmentAuthority({
     dir: opts.dir, space, accountPublicKey: dataAccount.pub, proofSecret: dataAccount.signingSeed,
     observeManagerGate: observeLegacyManagerGate, reconciler: opts.placementReconciler,
     authenticator: opts.placementAuthenticator, assertOpen: refuseIfFenced,
     rolePolicy: opts.placementRolePolicy,
+    serializedForAlias: (owner, actor, action) => serializedForAlias(opts.dir, owner, actor, action),
+    deprovisionFootprint: (owner, actor, lifecycleUid, channels) => deprovisionManagedFootprint(owner, actor, lifecycleUid, channels.filter(isConcreteChannel)),
     enrollManagedAgent,
-  });
+  }) : undefined;
   return {
     ...callout,
     placementEnrollment,
@@ -3035,6 +3035,7 @@ async function startAuthContext(o: AuthContextOptions): Promise<{ handle: Omit<A
       },
       enrollPlacement: (args) => {
         if (publicUrl === undefined) throw new EpEnvelopeError("failed-precondition", "placement enrollment needs the public exchange face");
+        if (!plane.placementEnrollment) throw new EpEnvelopeError("unimplemented", "placement enrollment ports are not configured");
         return plane.placementEnrollment.enrollPlacement({ ...args, sentinelCreds: callout.sentinelCreds, agentBearerExchangeUrl: publicUrl });
       },
       prepareManagedAgentRetirement: plane.prepareManagedAgentRetirement,
@@ -4395,11 +4396,14 @@ export async function handleManagerServiceAuthority(req: IncomingMessage, res: S
     const owner = deriveOwnerForIdpSubject(ctx.ownerSecret, ctx.bridgeIdp.issuer, verified.sub);
     let deliveryRelease: (() => void) | undefined;
     const onDelivered = (release: () => void) => {
-      deliveryRelease = release;
-      if (res.destroyed || res.writableFinished) { release(); return; }
-      res.once("finish", release);
-      res.once("close", release);
-      res.once("error", release);
+      const timer = setTimeout(() => { res.destroy(); finish(); }, 30_000);
+      let released = false;
+      const finish = () => { clearTimeout(timer); if (!released) { released = true; release(); } };
+      deliveryRelease = finish;
+      if (res.destroyed || res.writableFinished) { finish(); return; }
+      res.once("finish", finish);
+      res.once("close", finish);
+      res.once("error", finish);
     };
     try {
       return send(res, 200, await dispatchManagerAuthorityRequest(ctx, owner, { request: body.request }, onDelivered));

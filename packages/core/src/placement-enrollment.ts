@@ -84,7 +84,6 @@ export interface PlacementEnrollmentResult {
   material: RemoteManagedAgentEnrollmentResult["material"];
 }
 
-/** Production binding comes with the reconciler integration. */
 export interface ReconcilerPort {
   acceptedIntent(request: {
     acceptanceId: string;
@@ -93,14 +92,12 @@ export interface ReconcilerPort {
   }): Promise<{ accepted: AcceptedIntent; effect: ExecutionEffect }>;
 }
 
-/** Production binding comes with the reconciler integration. */
 export interface ServiceAuthenticator {
-  authenticateService(caller: string): Promise<{ principal: string }>;
+  authenticateService(request: { transportPrincipal: string; operation: string; requestDigest: string }): Promise<{ principal: string }>;
 }
 
 export type EnrollmentAcl = Pick<RemoteManagedAgentEnrollmentRequest["target"], "subscribe" | "allowSubscribe" | "allowPublish" | "capabilities" | "role">;
 
-/** Production binding comes with the role tree and reconciler integration. */
 export interface RolePolicyPort {
   enrollmentAcl(request: { space: string; role: string; roleTreeRevision: number; seatName: string }): Promise<{ base: EnrollmentAcl; overrides: EnrollmentAcl[] }>;
 }
