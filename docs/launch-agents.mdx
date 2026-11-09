@@ -104,6 +104,9 @@ extensions include `@cotal-ai/tmux`, `@cotal-ai/cmux`, `@cotal-ai/orca`, `@cotal
 `@cotal-ai/zellij`. The OMP connector is installed as `@cotal-ai/omp`; choose it with
 `cotal spawn --harness omp`. Runtime names come from the registry.
 
+On Linux, a moved socket belonging to a live tmux server makes the session check fail, even when its path contains repeated whitespace.
+Cotal leaves that server's sessions in place.
+
 <Callout type="warn" title="Stopping the manager stops its pty seats">
 
 The built-in `pty` runtime has no hot update.

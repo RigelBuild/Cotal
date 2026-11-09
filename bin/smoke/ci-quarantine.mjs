@@ -60,9 +60,10 @@ export const QUARANTINED = {
   "smoke:web-history-cancellation": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:user-manager-transport": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:up-restore-reentry:live": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
-  "smoke:setup-provider-pack": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:remote-ef-continuity": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:presence-watch-rebind": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:setup-provider-pack": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:usage-format": { reason: "upstream: 6/428 cells fail on pristine main 3f124c77 (local run); quarantined on sync per fork policy", recheckBy: "2026-12-31" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */

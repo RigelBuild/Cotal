@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { discardSeatArtifacts } from "./artifacts.js";
-import { assertSeatId, capabilityToken, fencePath, processStatFields, readSeatFileNoFollow, recordPath, seatId, socketPath, type SeatRecord, readRecord } from "./record.js";
+import { assertSeatId, capabilityToken, exitPath, processStartToken, fencePath, processStatFields, readSeatFileNoFollow, recordPath, seatId, socketPath, type SeatRecord, readRecord } from "./record.js";
 import { CONFIRM_TIMEOUT_MS, unattendedMs, assertSocketPathFits, unsupportedTransport } from "./protocol.js";
 import { tryLockFd } from "./peercred.js";
 import type { CustodianTestSeam } from "./custodian.js";
@@ -319,11 +319,15 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup; spawne
   throw new Error(`custodian did not write a seat record at ${recPath}`);
 }
 
-/** The record of seat `id`, with its socket derived from the root and id. The seat directory may be
- *  owned by the agent uid, so a record naming another seat, or another socket, is not trusted. */
+/** The record of a seat about to be adopted. Refuses records naming another seat, and seats whose
+ *  custodian recorded the child's exit or is gone, because they cannot be safely adopted. */
 export function loadSeat(root: string, id: string): SeatRecord {
-  const rec = readRecord(recordPath(root, id));
-  if (rec.id !== id) throw new Error(`seat record at ${recordPath(root, id)} names seat ${rec.id}, not ${id}; refusing to adopt it`);
+  const path = recordPath(root, id);
+  const rec = readRecord(path);
+  if (rec.id !== id) throw new Error(`seat record at ${path} names seat ${rec.id}, not ${id}; refusing to adopt it`);
+  if (existsSync(exitPath(path))) throw new Error(`seat ${id} has exited (its custodian recorded the exit); reap it instead of adopting it`);
+  if (rec.custodianStart !== undefined && processStartToken(rec.custodianPid) !== rec.custodianStart)
+    throw new Error(`seat ${id} cannot be adopted: its custodian (pid ${rec.custodianPid}) is gone; reap it instead`);
   return { ...rec, socket: socketPath(root, id) };
 }
 

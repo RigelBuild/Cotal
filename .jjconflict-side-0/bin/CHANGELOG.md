@@ -1,5 +1,64 @@
 # cotal-ai
 
+## 0.151.1
+
+### Patch Changes
+
+- ee5e222: Make `cotal config` read the space a launch in the current folder uses when another space is selected. Write receipts and missing-persona warnings use the same space, while explicit `--space` and `--user` reads keep their scopes.
+- e4d9ba9: Finish the `--daemon-home` help sentence on every daemon page. Omitting the flag runs or reaches the default daemon, whose state lives in the Cotal home.
+- faf7c80: `cotal service` now points a stopped controller stack member at bare `cotal up`, and refuses to start or restart one by itself.
+  
+  Starting `stack-broker`, `stack-delivery` or `stack-manager` on its own, or the preset name that reaches it, launches the process and leaves the space unregistered, so later commands fail until `cotal down`. The start now stops before anything launches and tells you to run `cotal up`. The guard checks the saved adapter and controller journal, so a direct-process service with the same name still starts and restarts normally.
+- Updated dependencies [ee5e222]
+- Updated dependencies [1f0e175]
+- Updated dependencies [35d1c85]
+- Updated dependencies [acc85cf]
+- Updated dependencies [dd3d984]
+- Updated dependencies [faf7c80]
+- Updated dependencies [f84069e]
+  - @cotal-ai/cli@0.151.1
+  - @cotal-ai/workspace@0.151.1
+  - @cotal-ai/runtime@0.151.1
+  - @cotal-ai/core@0.151.1
+  - @cotal-ai/auth@0.151.1
+  - @cotal-ai/connector-core@0.151.1
+  - @cotal-ai/delivery@0.151.1
+  - @cotal-ai/manager@0.151.1
+  - @cotal-ai/registry@0.151.1
+  - @cotal-ai/seat@0.151.1
+
+## 0.151.0
+
+### Patch Changes
+
+- c986cc1: Host permission-scoped endpoint discovery inside the auth service with explicit registry opt-in.
+  
+  The builtin auth-service preset accepts `--registry`; multi-space auth manifests enable it per entry. Embedders supply `registryService` through the same auth lifecycle. Signing authority stays in auth, reader and serving credentials stay separate, serving renewal uses the native issuance fence, and restart recovery retains the original instance and native gate operation. The registry is disabled by default and stops with its auth plane.
+- Updated dependencies [c986cc1]
+- Updated dependencies [dacb515]
+- Updated dependencies [143a69e]
+- Updated dependencies [a50683c]
+- Updated dependencies [38f5bb2]
+- Updated dependencies [7350dcc]
+- Updated dependencies [9803e8d]
+- Updated dependencies [87e1810]
+- Updated dependencies [af1b5da]
+- Updated dependencies [2dc2c93]
+- Updated dependencies [e70e96d]
+- Updated dependencies [e7cb990]
+- Updated dependencies [b6ea792]
+- Updated dependencies [6661f53]
+  - @cotal-ai/core@0.151.0
+  - @cotal-ai/auth@0.151.0
+  - @cotal-ai/registry@0.151.0
+  - @cotal-ai/workspace@0.151.0
+  - @cotal-ai/cli@0.151.0
+  - @cotal-ai/connector-core@0.151.0
+  - @cotal-ai/manager@0.151.0
+  - @cotal-ai/delivery@0.151.0
+  - @cotal-ai/runtime@0.151.0
+  - @cotal-ai/seat@0.151.0
+
 ## 0.150.0
 
 ### Patch Changes

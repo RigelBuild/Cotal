@@ -1,5 +1,17 @@
 # @cotal-ai/lang
 
+## 0.151.1
+
+### Patch Changes
+
+- f84069e: The docs site now has a TypeScript reference for every published package, generated from source. Each of these packages' entry files gains a `@module index` comment so the reference names the main import path `index` instead of leaving it blank. The published code is otherwise unchanged.
+
+## 0.151.0
+
+### Patch Changes
+
+- 6e67bbf: A scope reached inside `once` is now refused with L4028 by its `dispatches` scope trait, the same row that gives it a request id and the effect ceiling. Before, the refusal named `conclave` by its literal kind, so a new scope kind that calls the handler would have compiled, run inside `once` with no refusal, and could have been dispatched again on resume. Shipped behaviour is unchanged: `conclave` is still the one scope that dispatches.
+
 ## 0.150.0
 
 ### Minor Changes

@@ -419,11 +419,21 @@ class ForegroundActorCollision extends CommandFailure {
 async function provisionFreshForeground<T>(
   requested: string,
   autoName: boolean,
+  userMode: boolean,
   provision: (name: string) => Promise<T>,
 ): Promise<{ name: string; provisioned: T }> {
   const occupied = new Set<string>();
   for (;;) {
-    const name = firstFreeName(requested, (candidate) => occupied.has(candidate));
+    let name: string;
+    try {
+      // The cap belongs to user mode alone, where the numbered name is the actor. Static and open
+      // mode key the actor on the minted nkey, so a numbered name there has no length to fit.
+      name = firstFreeName(requested, (candidate) => occupied.has(candidate), userMode ? { actorBound: true } : undefined);
+    } catch (e) {
+      // The series stops at the actor bound, so a base whose every fitting candidate is taken is a
+      // refusal, not a crash: nothing has been launched, issued or redeemed yet.
+      throw new CommandFailure("refused", "CONFLICT", e instanceof Error ? e.message : String(e));
+    }
     try {
       return { name, provisioned: await provision(name) };
     } catch (e) {
@@ -813,10 +823,13 @@ export async function launchManagedPersona(
     const unknown = reply.nativeOutcome !== "executed" || reply.unanswered;
     throw new CommandFailure(unknown ? "unknown" : "failed", unknown ? "OPERATION_UNKNOWN" : "OPERATION_FAILED", reply.error ? oneLine(reply.error) : "the manager did not confirm launch readiness", { target, native, remedy: "inspect `cotal ps` and the selected manager before retrying; this launch was not submitted again" });
   }
-  const { result, eventsNotice } = readManagedLaunch(reply, { space: t.space, requestedModel: values.model ?? null, detached: values.detach === true }, target);
+  const { result, eventsNotice, startupNotice } = readManagedLaunch(reply, { space: t.space, requestedModel: values.model ?? null, detached: values.detach === true }, target);
   const { streamsTerminal } = result;
   const presentation = presentationOf(values);
-  const warnings: OutputWarning[] = eventsNotice ? [{ code: "EVENT_PLANE_NOTICE", target, message: eventsNotice }] : [];
+  const warnings: OutputWarning[] = [
+    ...(eventsNotice ? [{ code: "EVENT_PLANE_NOTICE", target, message: eventsNotice }] : []),
+    ...(startupNotice ? [{ code: "STARTUP_NOTICE", target, message: `${result.name} joined, but ${startupNotice}` }] : []),
+  ];
   if (observer) {
     try { observer.ready(result, warnings); }
     catch { throw new CommandFailure("partial", "OPERATION_PARTIAL", "the agent joined, but the composite command could not record its native readiness; no replacement was launched", { target, changed: [result], remedy: "inspect the original agent and manager before another launch" }); }
@@ -1456,6 +1469,8 @@ export async function spawn(args: ParsedArgs): Promise<void> {
     });
 
   // A pre-minted credential cannot mint the roster probe's credential, so keep its requested name.
+  // User mode allocates during guarded provisioning below, without a static operator credential.
+  // Static/open mode uses its advisory roster check when this command can mint the probe credential.
   let name = target.mode === "user" || presented ? requested : await uniqueMeshName(requested, { space, server, auth });
 
   const agentType = resolveAgentType({ flag: values.agent, pin: def.agent, callerDefault: callerHarness(space) });
@@ -1650,7 +1665,7 @@ export async function spawn(args: ParsedArgs): Promise<void> {
     if (remote.material.allowPublish) allowPublish = remote.material.allowPublish;
     lifecycleUid = remote.material.lifecycleUid;
   } else if (remoteProvisioningUrl) {
-    const selected = await provisionFreshForeground(requested, values.name === undefined, (candidate) =>
+    const selected = await provisionFreshForeground(requested, values.name === undefined, target.mode === "user", (candidate) =>
       provisionRemoteUserForeground(target, candidate, { provisioningUrl: remoteProvisioningUrl }))
       .catch((e: unknown) => { if (e instanceof AgentAlreadyRunning) return e; throw e; });
     if (selected instanceof AgentAlreadyRunning) return reportAlreadyRunning(selected, values, target.space, target.server);
@@ -1676,7 +1691,7 @@ export async function spawn(args: ParsedArgs): Promise<void> {
     // preflight all happen BEFORE launch, so the spawned agent is never the first to discover a
     // dead auth plane.
     let eventGrant: string | undefined;
-    const selected = await provisionFreshForeground(requested, values.name === undefined, (candidate) =>
+    const selected = await provisionFreshForeground(requested, values.name === undefined, true, (candidate) =>
       provisionUserForeground(target, candidate, ref, {
         subscribe,
         allowSubscribe,

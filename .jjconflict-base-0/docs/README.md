@@ -213,6 +213,7 @@ The fork's design notes live in the RigelBuild docs repository.
 |---|---|
 | [API reference](overview.mdx) | Find Cotal CLI commands, agent tools, configuration fields, and data models. |
 | [Integration interfaces](api-reference.mdx) | Choose Cotal's CLI, endpoint commands, libraries, agent tools, wire protocol, or HTTP interfaces. |
+| [Mesh command catalog](mesh-commands.mdx) | Generated built-in command declarations, capabilities, targeting modes and input/output schemas. |
 
 ### CLI
 
