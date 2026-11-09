@@ -45,7 +45,7 @@ const matchesFilter = (subject: string, pattern: string): boolean => {
  *    later round (proving the drain re-reads `num_pending` to a fresh zero, not a stale local count). */
 export interface LiteralConsumerProbe {
   afterCreate?: () => Promise<void>;
-  afterFirstFetch?: () => Promise<void>;
+  afterFirstFetch?: (signal?: AbortSignal) => Promise<void>;
 }
 
 /** One subject's newest delivered row, WITH its KV operation so the caller's parse layer can treat
@@ -66,6 +66,7 @@ export interface LiteralConsumerScan {
   /** The full forced filter subject, `$KV.<bucket>.<...>.>`. */
   filter: string;
   probe?: LiteralConsumerProbe;
+  signal?: AbortSignal;
 }
 
 /**
@@ -74,7 +75,7 @@ export interface LiteralConsumerScan {
  * unconditional delete. Returns the newest row per delivered subject.
  */
 export async function drainLiteralConsumer(jsm: JetStreamManager, js: JetStreamClient, scan: LiteralConsumerScan): Promise<Map<string, DrainedRow>> {
-  const { label, stream, name, filter, probe } = scan;
+  const { label, stream, name, filter, probe, signal } = scan;
 
   // 1. FAIL-CLOSED pre-clean: PROVE the literal name absent before create (a leftover from a run
   // that crashed before its unconditional delete). Absence is proved ONLY by a confirmed delete
@@ -105,12 +106,11 @@ export async function drainLiteralConsumer(jsm: JetStreamManager, js: JetStreamC
   } catch (e) {
     throw new EpEnvelopeError("unavailable", `${label} could not create its consumer on ${stream} (${filter}); the scan fails closed (SPEC 13.9): ${(e as Error)?.message ?? String(e)}`);
   }
-
   try {
+    signal?.throwIfAborted();
     // 3. FULL bind-verify: the created consumer must carry EXACTLY the forced shape — the exact
     // name and single filter (no `filter_subjects` multi-filter), pull (no `deliver_subject`),
     // ephemeral (no `durable_name`), AckNone/LastPerSubject, memory storage, the bounded exact
-    // inactivity. A drifted or foreign consumer of this name never feeds a scan.
     const info = await jsm.consumers.info(stream, name);
     const cfg = info.config as {
       name?: string; filter_subject?: string; filter_subjects?: string[];
@@ -139,34 +139,38 @@ export async function drainLiteralConsumer(jsm: JetStreamManager, js: JetStreamC
     // subject. The completeness fence is num_pending===0 — NOT a per-fetch `got===want` assertion,
     // which a concurrent eviction (a@1 replaced by a@4 between the info read and the fetch) would
     // trip falsely. Last-write-wins by concrete subject, keeping the HIGHEST safe sequence.
+    signal?.throwIfAborted();
     const latest = new Map<string, DrainedRow>();
     const consumer = await js.consumers.get(stream, name);
     let noProgress = 0;
     for (let round = 0; ; round++) {
+      signal?.throwIfAborted();
       const pending = (await consumer.info()).num_pending;
       if (pending === 0) break;
       if (round >= MAX_DRAIN_ROUNDS)
         throw new EpEnvelopeError("unavailable", `${label} under ${filter} never settled to zero pending after ${round} rounds; the scan fails closed (SPEC 13.9)`);
       const iter = await consumer.fetch({ max_messages: Math.min(pending, 256), expires: 5_000 });
+      const stop = () => { void iter.close().catch(() => undefined); };
+      signal?.addEventListener("abort", stop, { once: true });
+      if (signal?.aborted) stop();
       let got = 0;
-      for await (const m of iter) {
-        got++;
-        // CLOSED subject validation, PER MESSAGE against THIS scan's exact filter: a foreign
-        // subject never enters the result, and a literal-name consumer swapped to a different
-        // config under the scan is refused loud instead of contaminating it.
-        if (!matchesFilter(m.subject, filter))
-          throw new EpEnvelopeError("internal", `${label} received subject ${m.subject} outside its requested filter ${filter}; refusing (a foreign re-resolution of the literal consumer name never feeds a scan, SPEC 13.9)`);
-        // Safe positive stream sequence before any ordering decision (a garbled/zero seq never
-        // wins a last-write-wins comparison).
-        if (!Number.isSafeInteger(m.seq) || m.seq <= 0)
-          throw new EpEnvelopeError("internal", `${label} received a non-positive/unsafe sequence ${m.seq} for ${m.subject}; refusing (SPEC 13.9)`);
-        const prev = latest.get(m.subject);
-        if (prev === undefined || m.seq > prev.seq)
-          latest.set(m.subject, { data: m.data, seq: m.seq, op: m.headers?.get("KV-Operation") || undefined });
+      try {
+        for await (const m of iter) {
+          signal?.throwIfAborted();
+          got++;
+          if (!matchesFilter(m.subject, filter))
+            throw new EpEnvelopeError("internal", `${label} received subject ${m.subject} outside its requested filter ${filter}; refusing (a foreign re-resolution of the literal consumer name never feeds a scan, SPEC 13.9)`);
+          if (!Number.isSafeInteger(m.seq) || m.seq <= 0)
+            throw new EpEnvelopeError("internal", `${label} received a non-positive/unsafe sequence ${m.seq} for ${m.subject}; refusing (SPEC 13.9)`);
+          const prev = latest.get(m.subject);
+          if (prev === undefined || m.seq > prev.seq)
+            latest.set(m.subject, { data: m.data, seq: m.seq, op: m.headers?.get("KV-Operation") || undefined });
+        }
+      } finally {
+        signal?.removeEventListener("abort", stop);
+        if (signal?.aborted) await iter.close().catch(() => undefined);
       }
-      if (round === 0 && probe?.afterFirstFetch) await probe.afterFirstFetch();
-      // A round that observed pending > 0 yet delivered nothing makes no progress toward the
-      // fresh zero; a bounded run of those fails closed rather than looping to the round cap.
+      if (round === 0 && probe?.afterFirstFetch) await probe.afterFirstFetch(signal);
       if (got === 0) {
         if (++noProgress >= MAX_NO_PROGRESS_ROUNDS)
           throw new EpEnvelopeError("unavailable", `${label} under ${filter} reported pending but delivered nothing for ${noProgress} rounds; the scan fails closed (SPEC 13.9)`);
@@ -174,6 +178,7 @@ export async function drainLiteralConsumer(jsm: JetStreamManager, js: JetStreamC
         noProgress = 0;
       }
     }
+    signal?.throwIfAborted();
     return latest;
   } finally {
     // 5. Unconditional cleanup (a leaked orphan is collected by the bounded inactivity).
