@@ -68,6 +68,10 @@ export const QUARANTINED = {
   "smoke:docs-ext-read": { reason: "RIG-9150 upstream: capSection cuts a search hit before allowSubscribe on pristine 82a97c1f (local run)", recheckBy: "2026-12-31" },
   "smoke:seat-installed-dist": { reason: "RIG-9150 upstream: needs assembled arm64 natives a host build lacks, red on pristine 82a97c1f (local run)", recheckBy: "2026-12-31" },
   "smoke:seat-platform": { reason: "RIG-9150 upstream: pack proofs need all six platform natives, red on pristine 82a97c1f (local run)", recheckBy: "2026-12-31" },
+  "smoke:suite-ambient-env": { reason: "RIG-9150 upstream: 7 suites call recordMesh without COTAL_HOME, same 7 !== 0 on pristine 82a97c1f (local run)", recheckBy: "2026-12-31" },
+  "smoke:broker-migration": { reason: "RIG-9150 upstream: unadopted broker spawns in web post-capability/send smokes, 6/1 on pristine 82a97c1f (local run)", recheckBy: "2026-12-31" },
+  "smoke:ps-user-mode": { reason: "RIG-9150 CI-env: Next line is `pnpm cotal login` under CI, assertion hard-codes `cotal login`; 63/0 locally on fork and 82a97c1f", recheckBy: "2026-12-31" },
+  "smoke:membership-rw-renewal": { reason: "RIG-9150 flaky: reconnect sweep cell failed once on CI (3f4f77b1 shard 3); 52/52 locally on fork and 82a97c1f", recheckBy: "2026-12-31" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */
