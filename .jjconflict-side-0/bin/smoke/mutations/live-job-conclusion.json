@@ -1,0 +1,75 @@
+{
+  "suite": [
+    "bin/smoke/live-job-conclusion.smoke.ts"
+  ],
+  "guard": "a live job that reaches its own deadline becomes a named red check, while a newer run for the same PR remains an intentional supersession",
+  "command": "pnpm smoke:live-job-conclusion",
+  "completionMarker": "SUITE COMPLETE",
+  "proveWith": "node scripts/mutation-proof.mjs --config bin/smoke/mutations/live-job-conclusion.json",
+  "why": [
+    "Sixteen consecutive main runs measured 1514-1517 seconds on live against a 1500-second job limit. The job was badged cancelled, exactly like a superseded PR revision, and ci-ok flattened both into the same failure.",
+    "The passing herdr hang was fixed separately. Eighteen subsequent successful live jobs measure 430-587 seconds, so this change does not raise the budget; it makes the next self-timeout legible.",
+    "The pure classifier is constructed because this pull request cannot force its own GitHub job to time out and still receive the result. The second mutation grades the production workflow binding separately.",
+    "A first workflow cut added a separate dependent diagnosis job. Hosted PR evidence showed a superseded run then queued that job and ci-ok sequentially, holding the replacement run behind two extra runner allocations. The classifier now lives inside the already-existing ci-ok aggregate."
+  ],
+  "mutations": [
+    {
+      "name": "a deadline cancellation is treated as an ordinary supersession again",
+      "file": "scripts/live-job-conclusion.mjs",
+      "find": "  if (durationSeconds >= timeoutSeconds)\n    return { kind: \"self-timeout\", durationSeconds, timeoutSeconds };",
+      "replace": "  if (durationSeconds >= timeoutSeconds)\n    return { kind: \"superseded\", supersedingRunId: 0 };",
+      "expectRed": "a job at the deadline is an explicit self-timeout",
+      "cell": "a job at the deadline is an explicit self-timeout"
+    },
+    {
+      "name": "ci-ok stops invoking the live cancellation classifier",
+      "file": ".github/workflows/ci.yml",
+      "find": "          node scripts/live-job-conclusion.mjs\n",
+      "replace": "          node --version\n",
+      "expectRed": "the workflow calls the committed classifier with the measured 25-minute budget",
+      "cell": "the workflow calls the committed classifier with the measured 25-minute budget"
+    },
+    {
+      "name": "seat-linux-arm64 becomes a second always-running aggregate",
+      "file": ".github/workflows/ci.yml",
+      "find": "  seat-linux-arm64:\n    if: ${{ github.event_name != 'workflow_dispatch' }}\n    name: seat load (linux-arm64, same artifact)\n    timeout-minutes: 15\n    needs: [seat-pack]\n    runs-on: ubuntu-24.04-arm\n",
+      "replace": "  seat-linux-arm64:\n    if: always()\n    name: seat load (linux-arm64, same artifact)\n    timeout-minutes: 15\n    needs: [seat-pack]\n    runs-on: ubuntu-24.04-arm\n",
+      "expectRed": "ci-ok is the sole job-level always aggregate",
+      "cell": "ci-ok is the sole job-level always aggregate",
+      "note": "The #1043 queue-hold was two always-running dependent jobs chained after cancel. ARM leaves may be needs of ci-ok, but they must not be always aggregates.",
+      "afterRestore": "pnpm smoke:live-job-conclusion"
+    },
+    {
+      "name": "ci-ok drops the ARM load leaf from needs",
+      "file": ".github/workflows/ci.yml",
+      "find": "    needs: [unit, smoke, live, platforms, seat-pack, seat-linux-arm64]\n",
+      "replace": "    needs: [unit, smoke, live, platforms, seat-pack]\n",
+      "expectRed": "ci-ok needs include unit, smoke, live, platforms, and the ARM validation leaves",
+      "cell": "ci-ok needs include unit, smoke, live, platforms, and the ARM validation leaves"
+    },
+    {
+      "name": "ci-ok drops the platforms job from needs",
+      "file": ".github/workflows/ci.yml",
+      "find": "    needs: [unit, smoke, live, platforms, seat-pack, seat-linux-arm64]\n",
+      "replace": "    needs: [unit, smoke, live, seat-pack, seat-linux-arm64]\n",
+      "expectRed": "ci-ok needs include unit, smoke, live, platforms, and the ARM validation leaves",
+      "cell": "ci-ok needs include unit, smoke, live, platforms, and the ARM validation leaves"
+    },
+    {
+      "name": "Gate stops requiring the ARM load leaf",
+      "file": ".github/workflows/ci.yml",
+      "find": "          [ \"${{ needs.unit.result }}\" = \"success\" ] && [ \"${{ needs.smoke.result }}\" = \"success\" ] && [ \"${{ needs.live.result }}\" = \"success\" ] && [ \"${{ needs.platforms.result }}\" = \"success\" ] && [ \"${{ needs.seat-pack.result }}\" = \"success\" ] && [ \"${{ needs.seat-linux-arm64.result }}\" = \"success\" ]\n",
+      "replace": "          [ \"${{ needs.unit.result }}\" = \"success\" ] && [ \"${{ needs.smoke.result }}\" = \"success\" ] && [ \"${{ needs.live.result }}\" = \"success\" ] && [ \"${{ needs.platforms.result }}\" = \"success\" ] && [ \"${{ needs.seat-pack.result }}\" = \"success\" ]\n",
+      "expectRed": "Gate fails unless all six direct needs succeed",
+      "cell": "Gate fails unless all six direct needs succeed"
+    },
+    {
+      "name": "Gate stops requiring the platforms job",
+      "file": ".github/workflows/ci.yml",
+      "find": "          [ \"${{ needs.unit.result }}\" = \"success\" ] && [ \"${{ needs.smoke.result }}\" = \"success\" ] && [ \"${{ needs.live.result }}\" = \"success\" ] && [ \"${{ needs.platforms.result }}\" = \"success\" ] && [ \"${{ needs.seat-pack.result }}\" = \"success\" ] && [ \"${{ needs.seat-linux-arm64.result }}\" = \"success\" ]\n",
+      "replace": "          [ \"${{ needs.unit.result }}\" = \"success\" ] && [ \"${{ needs.smoke.result }}\" = \"success\" ] && [ \"${{ needs.live.result }}\" = \"success\" ] && [ \"${{ needs.seat-pack.result }}\" = \"success\" ] && [ \"${{ needs.seat-linux-arm64.result }}\" = \"success\" ]\n",
+      "expectRed": "Gate fails unless all six direct needs succeed",
+      "cell": "Gate fails unless all six direct needs succeed"
+    }
+  ]
+}

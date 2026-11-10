@@ -1,0 +1,73 @@
+#!/usr/bin/env node
+/**
+ *
+ * The PR pack proof, Changesets publish, and snapshot publish all run this
+ * script. It does not compile. It does not run `pnpm build`.
+ */
+import { copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+
+const repo = dirname(fileURLToPath(new URL(".", import.meta.url)));
+const destRoot = join(repo, "packages", "seat", "build", "Release");
+
+function arg(flag, fallbackEnv) {
+  const i = process.argv.indexOf(flag);
+  if (i >= 0 && process.argv[i + 1]) return process.argv[i + 1];
+  if (fallbackEnv && process.env[fallbackEnv]) return process.env[fallbackEnv];
+  return undefined;
+}
+
+const x64 = arg("--x64", "SEAT_NATIVE_X64");
+const arm64 = arg("--arm64", "SEAT_NATIVE_ARM64");
+
+if (!x64 || !arm64) {
+  console.error(
+    `@cotal-ai/seat: linux-arm64 helper was not assembled into the publish tree. Pass --x64 and --arm64 (or SEAT_NATIVE_X64 and SEAT_NATIVE_ARM64) naming the native builder artifact directories before pack or publish.`,
+  );
+  process.exit(1);
+}
+if (!existsSync(x64)) {
+  console.error(`@cotal-ai/seat: linux-x64 native builder artifact missing at ${x64}`);
+  process.exit(1);
+}
+if (!existsSync(arm64)) {
+  console.error(
+    `@cotal-ai/seat: linux-arm64 helper was not assembled into the publish tree. Native builder artifact missing at ${arm64}`,
+  );
+  process.exit(1);
+}
+
+for (const [arch, src] of [
+  ["x64", x64],
+  ["arm64", arm64],
+]) {
+  const dir = join(destRoot, `linux-${arch}`);
+  mkdirSync(dir, { recursive: true });
+  for (const file of ["peercred.node", "pty.node"]) {
+    const from = join(src, file);
+    // Refuse here: skipping would leave a stale host build in place for the assert to accept.
+    if (!existsSync(from)) {
+      console.error(`@cotal-ai/seat: linux-${arch} native builder artifact missing ${from}`);
+      process.exit(1);
+    }
+    copyFileSync(from, join(dir, file));
+  }
+}
+
+for (const platform of ["darwin", "win32"]) for (const arch of ["x64", "arm64"]) {
+  const src = arg(`--${platform}-${arch}`, `SEAT_NATIVE_${platform.toUpperCase()}_${arch.toUpperCase()}`);
+  if (!src || !existsSync(src)) throw new Error(`@cotal-ai/seat: missing ${platform}-${arch} native builder artifact`);
+  const dir = join(destRoot, `${platform}-${arch}`);
+  mkdirSync(dir, { recursive: true });
+  copyFileSync(src, join(dir, "peercred.node"));
+}
+
+const assert = spawnSync(process.execPath, [join(repo, "packages", "seat", "scripts", "assert-shipped-natives.mjs")], {
+  cwd: repo,
+  encoding: "utf8",
+});
+if (assert.stdout) process.stdout.write(assert.stdout);
+if (assert.stderr) process.stderr.write(assert.stderr);
+if (assert.status !== 0) process.exit(assert.status ?? 1);

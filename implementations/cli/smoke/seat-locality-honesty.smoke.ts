@@ -177,7 +177,7 @@ console.log("5. a plain stop on a deferred seat names the seat's remedy, not abs
 }
 // DECLARED, not implied: a suite that ends early reddens no line, and `fail === 0` with a zero exit
 // reads as a pass in every one of those ways out. The count is checked however the process leaves.
-const EXPECTED_CELLS = 35;
+const EXPECTED_CELLS = 40;
 process.on("exit", () => {
   const ran = pass + fail;
   if (ran !== EXPECTED_CELLS) {

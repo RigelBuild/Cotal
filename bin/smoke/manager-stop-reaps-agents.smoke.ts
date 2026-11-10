@@ -381,8 +381,8 @@ try {
     { item: seatBItem(), credsB });
   ok("#964: explicit reap does not kill the independently spared child", pidA !== undefined && alive(pidA), { pidA });
 
-  // ── RETIRE phase (#4005): the released seat exits with no manager alive; the next manager on the
-  // same root finds its record, cannot adopt the gone seat, and retires its lifecycle. ──────────
+  // ── RETIRE phase (#4005): the released seat exits with no manager alive; without a delegated
+  // cgroup, the successor cannot prove its descendants gone and must retain the lifecycle. ─────
   if (pidA !== undefined) { try { process.kill(pidA, "SIGKILL"); } catch { /* already gone */ } }
   ok("#4005: the released seat's child is gone", pidA !== undefined && (await until(() => !alive(pidA), 10_000)), { pidA });
   let startError: string | undefined;
@@ -393,7 +393,15 @@ try {
     startError = (e as Error).message;
   }
   ok("#4005: a next manager starts on the root that released the seat", startError === undefined, { startError });
-  ok("#4005: the next manager retires the gone released seat (its minted credential is deprovisioned)", credsA !== undefined && (await until(() => !existsSync(credsA), 30_000)), { credsA, releasedRef: existsSync(releasedRef) });
+  const status3 = (mgr3 as unknown as { managerStatusData: () => RetainedView }).managerStatusData.bind(mgr3);
+  const seatAItem = () => status3().staticReconciliation.failures.find((f) => f.alias === "seatA");
+  ok(
+    "#4005: the next manager retains the released seat without cgroup proof",
+    (await until(() => seatAItem()?.retainedReason === "unprovable", 30_000)) &&
+      seatAItem()?.disposition === "refused" && /release-seat/.test(seatAItem()?.remedy ?? "") &&
+      credsA !== undefined && existsSync(credsA) && existsSync(releasedRef),
+    { item: seatAItem(), credsA, releasedRef: existsSync(releasedRef) },
+  );
 
   ok("every cell ran (silently skipped cells must not read as green)", pass + fail === EXPECTED_CELLS - 1, { pass, fail, expected: EXPECTED_CELLS - 1 });
 } catch (e) {

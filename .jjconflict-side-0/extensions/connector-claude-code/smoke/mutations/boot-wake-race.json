@@ -1,0 +1,44 @@
+{
+  "suite": [
+    "extensions/connector-claude-code/smoke/boot-wake-race.smoke.ts"
+  ],
+  "guard": "a wake dropped in the connector's boot window (message already pending before the claude/channel handshake activates) is re-fired by activation itself, so the session is never permanently deaf",
+  "command": "pnpm --filter @cotal-ai/connector-claude-code... build && pnpm smoke:claude-boot-wake",
+  "proveWith": "node scripts/mutation-proof.mjs --config extensions/connector-claude-code/smoke/mutations/boot-wake-race.json",
+  "why": [
+    "The cell asserts a NEGATIVE that is easy to satisfy by accident: 'the session eventually woke'.",
+    "Anything that nudges — a stray hook, a second delivery, an unrelated timer — would make it pass",
+    "while proving nothing about the boot window, so the recovery has to be traced to the one line",
+    "that performs it.",
+    "",
+    "THAT LINE IS THE ACTIVATION RECONCILE, not the durable re-announce. This fixture used to mutate",
+    "the re-announce in `connector-core/src/agent.ts`, from a time when the suite's recovery ran",
+    "through JetStream redelivery. It does not any more: the suite settles each scenario in a 500ms",
+    "window chosen so that no redelivery can have happened, and its header says the redelivery guard",
+    "lives in `smoke:cross-path-dedup` and `smoke:claude-wake`. So the old mutation changed nothing",
+    "this suite observes, the suite passed with it applied, and it graded UNGRADABLE rather than",
+    "either verdict. The re-announce is now graded where it is driven, in",
+    "`extensions/connector-core/smoke/mutations/durable-redelivery.json`.",
+    "",
+    "What is left here is the recovery this suite really does drive: `setChannelActive(false → true)`",
+    "reconciling one buffered wake, with nothing else in the window able to produce a nudge. The",
+    "mention branch above it is left in place, so the #917 scenario still passes and this mutation",
+    "reddens only the buffered-wake cell it names.",
+    "",
+    "REBUILD IS PART OF THE EXPERIMENT, NOT AN OPTIMIZATION. `command` builds the mutated source into",
+    "dist before each run, so `afterRestore` has to rebuild from the restored source; dist is",
+    "gitignored, and putting the source back is not enough to leave the tree honest."
+  ],
+  "mutations": [
+    {
+      "name": "B1 activation flips the flag without reconciling the wake that was already buffered",
+      "file": "extensions/connector-claude-code/src/hooks.ts",
+      "find": "        else if (agent.pendingWake() > 0) nudge();",
+      "replace": "",
+      "expectRed": "the claude/channel handshake reconciles a buffered wake that was already pending",
+      "cell": "the claude/channel handshake reconciles a buffered wake that was already pending",
+      "afterRestore": "pnpm --filter @cotal-ai/connector-claude-code... build",
+      "note": "Restores the #226 defect exactly: activation sets `channelActive` and stops there. `nudge()` returns early while inactive, and the retry timer is armed only from a REJECTED notify, which cannot happen when nudge returns before notifying. With this line gone nothing in the boot window wakes the session at all."
+    }
+  ]
+}

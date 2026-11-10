@@ -1,0 +1,58 @@
+{
+  "suite": [
+    "bin/smoke/suite-own-process-material.smoke.ts"
+  ],
+  "guard": "every file that defaults COTAL_SERVERS and then calls configFromEnv() on process.env must drop the COTAL_LAUNCH_MATERIAL pointer first",
+  "command": "pnpm smoke:suite-own-process-material",
+  "proveWith": "node scripts/mutation-proof.mjs --config bin/smoke/mutations/suite-own-process-material.json",
+  "why": [
+    "Issue #995. A launcher-spawned seat exports COTAL_LAUNCH_MATERIAL. A suite that then",
+    "defaults COTAL_SERVERS and calls configFromEnv() on process.env manufactures the two-carrier",
+    "launch the connector refuses. The ambient-env census cannot see this: it grades spreads into",
+    "children, and the refusal happens in the suite's OWN process.",
+    "",
+    "N1 restores the reported defect: hermes tool-parity loses its pointer drop. It must redden",
+    "the per-file cell, which is the census's only real output for a missing drop. The drop it",
+    "removes is the whole-prefix form, which is what those files carry now: the pointer starts with",
+    "COTAL_, so the prefix scrub is the drop.",
+    "",
+    "N2 removes the scrub from the suite issue #833 names by file, which is the live refusal a",
+    "reporter hits from inside a connected session.",
+    "",
+    "N3 is the census shrinking silently. Every per-file cell is generated from the census, so",
+    "walking only connector-hermes deletes cells rather than failing them, and a suite with",
+    "fewer cells still exits 0. The package-span cell is what makes that red.",
+    "",
+    "NO BUILD STEP: the suite reads source files off disk and imports nothing from a built",
+    "package, so there is no dist/ copy that could disagree with the mutation."
+  ],
+  "mutations": [
+    {
+      "name": "N1 hermes tool-parity loses its COTAL_ scrub, which is the reported defect",
+      "file": "extensions/connector-hermes/smoke/tool-parity.smoke.ts",
+      "find": "const inheritedBroker = process.env.COTAL_SERVERS !== undefined;\nfor (const key of Object.keys(process.env)) if (key.startsWith(\"COTAL_\")) delete process.env[key];\n",
+      "replace": "const inheritedBroker = process.env.COTAL_SERVERS !== undefined;\n",
+      "expectRed": "extensions/connector-hermes/smoke/tool-parity.smoke.ts drops COTAL_LAUNCH_MATERIAL from process.env",
+      "cell": "extensions/connector-hermes/smoke/tool-parity.smoke.ts drops COTAL_LAUNCH_MATERIAL from process.env",
+      "note": "The exact regression #995 names, in the form the file carries after #833. Without the scrub, a managed seat's pnpm test manufactures the two-carrier launch and is refused."
+    },
+    {
+      "name": "N2 the scrub sits AFTER configFromEnv, so the pair is still present when the refusal runs",
+      "file": "extensions/connector-core/smoke/tool-input-closed.smoke.ts",
+      "find": "for (const key of Object.keys(process.env)) if (key.startsWith(\"COTAL_\")) delete process.env[key];\n\nprocess.env.COTAL_SPACE ||= \"toolclosed\";",
+      "replace": "\nprocess.env.COTAL_SPACE ||= \"toolclosed\";",
+      "expectRed": "extensions/connector-core/smoke/tool-input-closed.smoke.ts drops COTAL_LAUNCH_MATERIAL from process.env",
+      "cell": "extensions/connector-core/smoke/tool-input-closed.smoke.ts drops COTAL_LAUNCH_MATERIAL from process.env",
+      "note": "Removing the scrub from the one suite issue #833 names by file. The pair is present when configFromEnv runs, which is the refusal the reporter hit."
+    },
+    {
+      "name": "N3 the census is scoped to connector-hermes, the package that reported the defect",
+      "file": "bin/smoke/suite-own-process-material.smoke.ts",
+      "find": "for (const file of sources(repoRoot)) {",
+      "replace": "for (const file of sources(join(repoRoot, \"extensions\", \"connector-hermes\"))) {",
+      "expectRed": "the census spans more than one package directory, so it is keyed on content and not on one connector",
+      "cell": "the census spans more than one package directory, so it is keyed on content and not on one connector",
+      "note": "Narrowing the walk does not FAIL the per-file cells, it stops emitting them. A suite with two files instead of six still exits 0 unless the span cell fires."
+    }
+  ]
+}

@@ -1,0 +1,140 @@
+{
+  "suite": [
+    "packages/seat/smoke/cgroup.smoke.ts"
+  ],
+  "guard": "layer 3 seat custody: only a contained seat cgroup proves a seat gone, a populated cgroup refuses a release, and no custodian child starts outside a seat cgroup a reap or release already removed",
+  "command": "pnpm --filter @cotal-ai/seat build && sudo env \"PATH=$PATH\" COTAL_SEAT_CGROUP_DELEGATED=1 COTAL_SEAT_CGROUP_REQUIRE=1 COTAL_SEAT_SMOKE_AGENT_UID=\"$(id -u cotal-seat-agent)\" node_modules/.bin/tsx packages/seat/smoke/cgroup.smoke.ts",
+  "proveWith": "node scripts/mutation-proof.mjs --config packages/seat/smoke/mutations/cgroup.json",
+  "why": [
+    "The containment and peer-uid cells need root, a delegated system scope and the cotal-seat-agent user; a mapped user namespace has no root-owned setpriv. The build stays unprivileged so restores and rebuilds keep owning dist.",
+    "COTAL_SEAT_CGROUP_REQUIRE=1 makes a skipped cell fail, so a mutation cannot survive on a host that skips its cell."
+  ],
+  "mutations": [
+    {
+      "name": "T5-M1 read populated 1 as empty",
+      "file": "packages/seat/src/cgroup.ts",
+      "find": "return /^populated 1$/m.test(",
+      "replace": "return /^populated 2$/m.test(",
+      "expectRed": "refusal: checkSeatRelease refuses a populated seat cgroup",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M2 skip seatCgroupContained",
+      "file": "packages/seat/src/reap.ts",
+      "find": " && seatCgroupContained(cg)) {\n    const evidence = await reapCgroup(",
+      "replace": ") {\n    const evidence = await reapCgroup(",
+      "expectRed": "migration attempt, shared uid: the reap is retained, not reaped, and the seat cgroup is not removed",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M3 read record.json before the cgroup",
+      "file": "packages/seat/src/reap.ts",
+      "find": "  const cg = opts.cgroup;\n  if (cg !== undefined && existsSync(",
+      "replace": "  if (!existsSync(recordPath(root, id))) return { outcome: \"absent\" };\n  const cg = opts.cgroup;\n  if (cg !== undefined && existsSync(",
+      "expectRed": "record-less seat: the reap is reaped, the child is gone and the cgroup removed",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M4 spawn the child without inSeatCgroup",
+      "file": "packages/seat/src/custodian.ts",
+      "find": "  if (launch.cgroup !== undefined) {\n    const cgroup = { path: launch.cgroup };",
+      "replace": "  if (launch.cgroup === \"never\") {\n    const cgroup = { path: launch.cgroup };",
+      "expectRed": "launch/reap fence: the reap of the empty cgroup is reaped, the move fails with ENOENT and no child exists",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M5 seal the fence before the cgroup rmdir",
+      "file": "packages/seat/src/reap.ts",
+      "find": "    const refusal = cg === undefined ? undefined : await removeEmptyCgroup(id, cg);\n    if (refusal !== undefined) return refusal;\n    ftruncateSync(fd, 0);\n    writeSync(fd, \"sealed\", 0);\n    fsyncSync(fd);",
+      "replace": "    ftruncateSync(fd, 0);\n    writeSync(fd, \"sealed\", 0);\n    fsyncSync(fd);\n    const refusal = cg === undefined ? undefined : await removeEmptyCgroup(id, cg);\n    if (refusal !== undefined) return refusal;",
+      "expectRed": "release/join race: the release refuses with populated, writes no seal, and the seat stays live",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M6 no seat cgroup rollback on a failed launch",
+      "file": "packages/seat/src/launcher.ts",
+      "find": "        removeSeatCgroup(created.cgroup);",
+      "replace": "        void created.cgroup;",
+      "expectRed": "launch rollback: a failed move throws and leaves no seat cgroup, no record and no child",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M7 seatCgroupPath accepts any base",
+      "file": "packages/seat/src/cgroup.ts",
+      "find": "return `${assertNormalUnderRoot(base, \"cgroup base\")}/seat-",
+      "replace": "return `${base}/seat-",
+      "expectRed": "bounds: seatCgroupPath rejects a `..` base, a trailing slash, a `.` segment and the bare root",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M9 a cell exits 0 with no tally",
+      "file": "packages/seat/smoke/cgroup.smoke.ts",
+      "find": "  console.log(`CELL_TALLY ${JSON.stringify({ pass, fail, skipped })}`);",
+      "replace": "  void pass;",
+      "expectRed": "with 0 tally line(s), none well-formed"
+    },
+    {
+      "name": "T5-M10 accept a seat cgroup under any base",
+      "file": "packages/seat/src/cgroup.ts",
+      "find": "  if (base === undefined || path !== seatCgroupPath(base, id)) throw",
+      "replace": "  if (base === undefined || !path.endsWith(`/seat-${id}`)) throw",
+      "expectRed": "wrong base: reap, check and seal reject a normalized seat cgroup under a sibling base and leave it",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T5-M11 a cell returns early with no checks",
+      "file": "packages/seat/smoke/cgroup.smoke.ts",
+      "find": "      case \"skipped\":\n        break;\n      case \"refusal\": {",
+      "replace": "      case \"skipped\":\n        break;\n      case \"refusal\": {\n        break;",
+      "expectRed": "cell refusal ran no passing check and did not report a skip"
+    },
+    {
+      "name": "T6-M1 the custodian serves its own uid, not the adopter's",
+      "file": "packages/seat/src/custodian.ts",
+      "find": "if (cred.uid !== launch.adopterUid) {",
+      "replace": "if (cred.uid !== process.getuid?.()) {",
+      "expectRed": "peer uid: a stop from the agent uid, and its hello with the right token, both get peer uid mismatch",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T6-M2 spawn the custodian as the launcher, not the agent uid",
+      "file": "packages/seat/src/launcher.ts",
+      "find": "[setpriv, \"--reuid\", String(agent.uid), \"--regid\", String(agent.gid), \"--clear-groups\",",
+      "replace": "[setpriv, \"--clear-groups\",",
+      "expectRed": "peer uid: the custodian and its child run as the agent uid",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T6-M3 read a seat file through a planted symlink",
+      "file": "packages/seat/src/record.ts",
+      "find": "  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);\n",
+      "replace": "  const fd = openSync(path, constants.O_RDONLY);\n",
+      "expectRed": "forged record: the agent's symlinked record.json is refused, not followed",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T6-M4 adopt the socket a record names",
+      "file": "packages/seat/src/launcher.ts",
+      "find": "  return { ...rec, socket: socketPath(root, id) };\n",
+      "replace": "  return rec;\n",
+      "expectRed": "forged record: adopt derives the socket from the root and id, not the record",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T6-M5 launch the agent without no_new_privs or an empty bounding set",
+      "file": "packages/seat/src/launcher.ts",
+      "find": "\"--clear-groups\", \"--no-new-privs\", \"--bounding-set=-all\", \"--\", ...custodianArgv]",
+      "replace": "\"--clear-groups\", \"--\", ...custodianArgv]",
+      "expectRed": "no_new_privs: the custodian and its child run with NoNewPrivs 1 and an empty bounding set",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    },
+    {
+      "name": "T6-M6 containment ignores members that can gain a capability",
+      "file": "packages/seat/src/cgroup.ts",
+      "find": "  return probe.status === 11 && membersCannotGainCaps(cg.path);\n",
+      "replace": "  return probe.status === 11;\n",
+      "expectRed": "no_new_privs: a seat member without no_new_privs makes seatCgroupContained false",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build"
+    }
+  ]
+}

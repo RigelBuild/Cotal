@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "include": ["/*"],
+  "exclude": [
+    "/_next/*",
+    "/pagefind/*",
+    "/*.txt",
+    "/*.xml",
+    "/*.svg",
+    "/*.png",
+    "/*.ico",
+    "/*.css",
+    "/*.js"
+  ]
+}

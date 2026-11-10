@@ -3816,16 +3816,12 @@ export class Manager {
     try {
       handle = runtime.adopt(reference);
     } catch (e) {
-      const reap = (runtime as { reap?: (reference: { kind: string; id: string }) => Promise<{ outcome?: string }> }).reap;
-      if (typeof reap !== "function") return;
-      let outcome: string | undefined;
       try {
-        outcome = (await reap.call(runtime, reference)).outcome;
+        await requireRuntimeReap(runtime, reference);
       } catch {
         // The runtime could not prove the seat gone. Leave the record for a later start.
         return;
       }
-      if (outcome !== "reaped") return;
       console.error(`! ${name}: the released seat is gone (${rejectionText(e)}); retiring its lifecycle`);
       handle = {
         name,
@@ -13094,7 +13090,6 @@ export class Manager {
           console.error(record.supervise
             ? `! ${row.alias}: the supervised seat its previous manager left was not restarted (${refusal}); retiring the lifecycle`
             : `! ${row.alias}: the seat its previous manager left was not adopted (${refusal}); retiring the lifecycle`);
-          this.dropSeatRecord({ name: row.alias, lifecycleUid: row.lifecycleUid });
           terminalRows.push(row);
         }
         const sweepDeprovision: DeprovisionResourceAccounting = {
@@ -13127,6 +13122,7 @@ export class Manager {
             this.staticReconcileItems.set(key, item);
           }
           const attempt = await this.attemptStaticReconcile(key, item, row);
+          if (attempt.succeeded) this.dropSeatRecord({ name: row.alias, lifecycleUid: row.lifecycleUid });
           if (attempt.deprovision) addDeprovisionAccounting(sweepDeprovision, attempt.deprovision);
           if (attempt.succeeded) sweep.succeeded++;
           else sweep.failed++;

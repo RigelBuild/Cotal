@@ -372,13 +372,14 @@ instrument.forEach(([name, , holds], i) => {
   check(`CONTROL (census instrument): ${name}`, holds(c), c);
 });
 
-// The real file. What each reviewed site does with a refusal:
+// The real file. What each reap site does with a refusal:
+//   adoptReleasedSeat: a failed adopt reaps before retiring; requireRuntimeReap refuses absent or retained.
 //   reapOrphanedResumeSeat: returns it, and the resume does not relaunch over that seat.
 //   reapOrphanSeat: lets it propagate into driveStaticRetirement, which holds the name.
 //   spawnCustodied: carries it into the throw, saying the seat was not proved gone.
 // restartSupervisedSeat no longer calls requireRuntimeReap. It proves the previous seat's local work
 // ended through runtime.reapWork before the resume launches, and a refusal there stays with that proof.
-const REVIEWED_SITES = ["Manager.reapOrphanSeat", "Manager.reapOrphanedResumeSeat", "Manager.spawnCustodied"];
+const REVIEWED_SITES = ["Manager.adoptReleasedSeat", "Manager.provePredecessor", "Manager.reapOrphanSeat", "Manager.reapOrphanedResumeSeat", "Manager.spawnCustodied"];
 const managerConfig = ts.getParsedCommandLineOfConfigFile(resolve(here, "..", "tsconfig.json"), {}, { ...ts.sys, onUnRecoverableConfigFileDiagnostic: (d) => { throw new Error(ts.flattenDiagnosticMessageText(d.messageText, " ")); } })!;
 const managerProgram = ts.createProgram({ rootNames: [managerFile], options: { ...managerConfig.options, noEmit: true } });
 const managerSource = managerProgram.getSourceFile(managerFile)!;

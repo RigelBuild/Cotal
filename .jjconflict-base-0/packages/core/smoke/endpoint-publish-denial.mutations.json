@@ -1,0 +1,59 @@
+{
+  "suite": [
+    "packages/core/smoke/endpoint-publish-denial.smoke.ts"
+  ],
+  "guard": "a broker-refused instance-rail invoke is permission-denied naming the subject, not an unanswered deadline, and the status watch is released",
+  "command": "pnpm smoke:ep-publish-denial:auth",
+  "completionMarker": "ENDPOINT PUBLISH DENIAL SMOKE",
+  "proveWith": "pnpm mutation-proof --config packages/core/smoke/endpoint-publish-denial.mutations.json",
+  "mutations": [
+    {
+      "name": "epCall never races the publish-denial watch, so a refused publish waits out the budget",
+      "file": "packages/core/src/endpoint-call.ts",
+      "find": "    const msg = await Promise.race([outcome, timeout, denialWatch.denied, cancelled]);",
+      "replace": "    denialWatch.denied.catch(() => {});\n    const msg = await Promise.race([outcome, timeout, cancelled]);",
+      "expectRed": "invoke is permission-denied, NOT a deadline",
+      "cell": "invoke is permission-denied, NOT a deadline"
+    },
+    {
+      "name": "the watch never matches the refused subject, so the call waits out the budget",
+      "file": "packages/core/src/endpoint-publish-denial.ts",
+      "find": "        if (s.error instanceof PermissionViolationError && s.error.subject === subject) {",
+      "replace": "        if (s.error instanceof PermissionViolationError && s.error.subject === \"\") {",
+      "expectRed": "describe is permission-denied, not a deadline",
+      "cell": "describe is permission-denied, not a deadline"
+    },
+    {
+      "name": "the refusal message omits the refused subject, so the grant to mint is unreadable",
+      "file": "packages/core/src/endpoint-call.ts",
+      "find": "      `the call for ${op.endpoint}.${op.command} was REFUSED BY THE BROKER, not unanswered: this caller's credential does not authorize publishing to \"${req.subject}\"${route.mode === \"inst\" ? ` (the instance rail for ${route.instanceId})` : \"\"}. The responder may be perfectly healthy; the grant is what is missing: the current credential did not authorize this route, command or target, and the broker does not say which (SPEC 13.2)`, undefined, \"not-executed\"), \"call\");",
+      "replace": "      `the call for ${op.endpoint}.${op.command} was REFUSED BY THE BROKER, not unanswered. The responder may be perfectly healthy; the grant is what is missing (SPEC 13.2)`, undefined, \"not-executed\"), \"call\");",
+      "expectRed": "invoke names the refused instance-rail subject",
+      "cell": "invoke names the refused instance-rail subject"
+    },
+    {
+      "name": "epCast never races the publish-denial watch, so a refused cast resolves as success",
+      "file": "packages/core/src/endpoint-call.ts",
+      "find": "    await Promise.race([\n      nc.flush().then(() => new Promise<void>((resolve) => setImmediate(resolve))),\n      denialWatch.denied,\n    ]);",
+      "replace": "    denialWatch.denied.catch(() => {});\n    await nc.flush();",
+      "expectRed": "a denied cast is permission-denied naming the refused subject, not success",
+      "cell": "a denied cast is permission-denied naming the refused subject, not success"
+    },
+    {
+      "name": "the probe never races the publish-denial watch, so a refused publish expires into unknown",
+      "file": "packages/core/src/endpoint-call.ts",
+      "find": "    return await Promise.race([verdict, denialWatch.denied]);",
+      "replace": "    denialWatch.denied.catch(() => {});\n    return await verdict;",
+      "expectRed": "a denied probe is permission-denied naming the refused subject, not unknown",
+      "cell": "a denied probe is permission-denied naming the refused subject, not unknown"
+    },
+    {
+      "name": "the status watch is never released, leaking one listener per call",
+      "file": "packages/core/src/endpoint-call.ts",
+      "find": "    denialWatch?.release();",
+      "replace": "    void denialWatch;",
+      "expectRed": "12 denied invokes leave the listener count where they found it",
+      "cell": "12 denied invokes leave the listener count where they found it"
+    }
+  ]
+}

@@ -1,0 +1,412 @@
+/**
+ * The §13.3 endpoint ERROR primitives, split out NODE-FREE: the catalog codes + the
+ * {@link EpEnvelopeError} a consuming boundary throws. The §13.6 session rail + terminal-frame codec
+ * need ONLY these, and they run in the browser console bundle — so the error must not drag in the
+ * envelope's schema/digest machinery (endpoint-envelope → schema-profile computes a digest at module
+ * load, i.e. `node:crypto`). `endpoint-envelope.ts` re-exports everything here, so no consumer's
+ * import path changes; the browser-safe modules (rail + codec) import EpEnvelopeError from HERE.
+ */
+
+/** The §13.3 error catalog. Extensions add codes only under reverse-DNS; any code (catalog or
+ *  extension) is one token of at most 64 bytes. */
+export const EP_ERROR_CODES = Object.freeze([
+  "bad-request", "unsupported-version", "op-mismatch", "class-mismatch", "target-mismatch",
+  "sender-mismatch", "unauthenticated", "permission-denied", "not-found", "already-exists",
+  "conflict", "contract-mismatch", "contract-invalid", "failed-precondition",
+  "deadline-exceeded", "cancelled", "expired", "unavailable", "unimplemented",
+  "resource-exhausted", "internal",
+] as const);
+export type EpErrorCode = (typeof EP_ERROR_CODES)[number];
+
+/** One `details[]` entry: `kind` is reverse-DNS-namespaced (§13.3), the rest is open. */
+export interface EpErrorDetail {
+  kind: string;
+  [key: string]: unknown;
+}
+
+/**
+ * `details[].kind` for a refusal raised because a responder ANSWERED but was not the incarnation
+ * this handle resolved against (§13.2): `failed-precondition` for a DIFFERENT instance, `expired`
+ * for the SAME instance at another EPOCH. It marks what the code alone cannot say — **the request
+ * drew an attributed reply from a live responder** — which rules out the reading "the incarnation
+ * is gone, resolve again". The reply may be a refusal or a result and the marker does not say
+ * which, so a retry here is a SECOND ATTEMPT that may duplicate an effect, never a repair.
+ */
+export const EP_UNBOUND_RESPONDER = "ai.cotal.ep.unbound-responder";
+
+/** The {@link EP_UNBOUND_RESPONDER} payload. Two producers: the describe-bound currency check (a
+ *  DIFFERENT instance) sets `answeredBy`/`boundTo`; the stale-epoch refusal (the SAME instance at
+ *  another epoch) sets `answeredEpoch`/`heldEpoch` and says in `reference` which epoch `heldEpoch`
+ *  is — `bind`, this caller's own resolve (so the handle is the stale side), or `registry`, the
+ *  responder's current registered epoch (so a responder behind it is superseded and still
+ *  answering). `boundTo` is set only where a bind exists. */
+export interface EpUnboundResponderDetail extends EpErrorDetail {
+  kind: typeof EP_UNBOUND_RESPONDER;
+  endpoint: string;
+  command: string;
+  /** The instance whose attributed reply was refused. */
+  answeredBy: string;
+  /** The instance this handle resolved against; absent when the caller holds no bind. */
+  boundTo?: string;
+  answeredEpoch?: number;
+  heldEpoch?: number;
+  reference?: "bind" | "registry";
+  /** Whether the call addressed one instance (`inst` rail) rather than the class queue. */
+  pinned: boolean;
+}
+
+/** True iff `e` carries the {@link EP_UNBOUND_RESPONDER} marker: a responder ANSWERED the request
+ *  (an attributed reply, which may be a refusal or a result), so retrying it is a second attempt
+ *  that may duplicate an effect, not a repair. */
+export function respondedButUnbound(e: unknown): boolean {
+  return e instanceof EpEnvelopeError && (e.details ?? []).some((d) => d.kind === EP_UNBOUND_RESPONDER);
+}
+
+/**
+ * `details[].kind` for a refusal raised because NO VALID REPLY REACHED THE CALLER: no responder on
+ * the subject, or the deadline elapsed with nothing attributed to the request's nonce. A frame that
+ * fails the request binding is dropped and is not an answer, so the marker means nothing
+ * ATTRIBUTABLE arrived, not that no bytes did. `unavailable`/`deadline-exceeded` alone is not
+ * evidence of silence — the same codes are raised where something did answer, or where a
+ * caller-side read failed after the describe — so a consumer stating a reachability verdict keys on
+ * this marker, never on the code.
+ */
+export const EP_UNANSWERED = "ai.cotal.ep.unanswered";
+
+/** The {@link EP_UNANSWERED} payload: the call that drew no reply, and the `ep` plane it rode. */
+export interface EpUnansweredDetail extends EpErrorDetail {
+  kind: typeof EP_UNANSWERED;
+  endpoint: string;
+  command: string;
+  /** The published request's envelope id, when no reply was observed. Not proof of acceptance. */
+  requestId?: string;
+  /** The plane the request was published on: the legacy plane or the versioned plane (issued, SPEC 13.15). */
+  rail?: string;
+}
+
+/** True iff `e` carries the {@link EP_UNANSWERED} marker: no valid reply reached the caller (no
+ *  responder, or the deadline elapsed with nothing attributed to the request). */
+export function unansweredRequest(e: unknown): boolean {
+  return e instanceof EpEnvelopeError && (e.details ?? []).some((d) => d.kind === EP_UNANSWERED);
+}
+
+/** The `ep` plane an unanswered request rode, off the {@link EP_UNANSWERED} marker: `ep` for a
+ *  legacy caller, the versioned plane for an issued one (SPEC 13.15). SPEC 13.15 makes the two rails disjoint
+ *  subject spaces at the broker, and an endpoint is required to serve both, so silence on one rail
+ *  says nothing about the other: a responder built before the versioned rail subscribes `ep` only
+ *  and is invisible to an issued caller. A surface that turns silence into a reachability verdict
+ *  scopes the verdict to this rail. `undefined` where the producer recorded no rail. */
+export function unansweredRail(e: unknown): string | undefined {
+  if (!(e instanceof EpEnvelopeError)) return undefined;
+  const d = (e.details ?? []).find((x) => x.kind === EP_UNANSWERED) as EpUnansweredDetail | undefined;
+  return typeof d?.rail === "string" ? d.rail : undefined;
+}
+
+/**
+ * `details[].kind` for a refusal raised because a caller-side read of the SERVICE REGISTRY failed
+ * or did not settle: the scatter's freeze (§13.5) or its mandatory reconcile. It marks the failure
+ * as the caller's own, establishing NOTHING about the responders — the freeze fails before any
+ * request goes out, and the reconcile fails after the gather, where members may all have answered
+ * and their replies simply could not be classified. A consumer must not read it as their silence.
+ */
+export const EP_REGISTRY_READ_FAILED = "ai.cotal.ep.registry-read-failed";
+
+/** The {@link EP_REGISTRY_READ_FAILED} payload: the call whose registry read failed. */
+export interface EpRegistryReadFailedDetail extends EpErrorDetail {
+  kind: typeof EP_REGISTRY_READ_FAILED;
+  endpoint: string;
+  command: string;
+}
+
+/** True iff `e` carries the {@link EP_REGISTRY_READ_FAILED} marker: a caller-side registry read
+ *  failed; the responders were not the failure. */
+export function registryReadFailed(e: unknown): boolean {
+  return e instanceof EpEnvelopeError && (e.details ?? []).some((d) => d.kind === EP_REGISTRY_READ_FAILED);
+}
+
+/**
+ * `details[].kind` for a refusal raised because the service registry was READ and lists no live
+ * instance of the endpoint (§13.5). An unreadable registry raises the same `failed-precondition`
+ * without it, so a surface that states "none is running" keys on this marker, never on the code.
+ */
+export const EP_NO_LIVE_INSTANCES = "ai.cotal.ep.no-live-instances";
+
+/** The {@link EP_NO_LIVE_INSTANCES} payload: the endpoint the registry lists no live instance of. */
+export interface EpNoLiveInstancesDetail extends EpErrorDetail {
+  kind: typeof EP_NO_LIVE_INSTANCES;
+  endpoint: string;
+}
+
+/** True iff `e` carries the {@link EP_NO_LIVE_INSTANCES} marker: the registry was read and lists no
+ *  live instance. */
+export function noLiveInstances(e: unknown): boolean {
+  return e instanceof EpEnvelopeError && (e.details ?? []).some((d) => d.kind === EP_NO_LIVE_INSTANCES);
+}
+
+/**
+ * `details[].kind` for a CALLER-side refusal raised before publish because the args carry a key the
+ * resolved input contract does not declare. That contract is the one the responder serves, so the
+ * key is one this caller sends and the responder does not know. Core cannot call that version skew,
+ * since args may be typed by hand; a surface that builds the args itself for a responder of its own
+ * release can.
+ */
+export const EP_UNDECLARED_ARG = "ai.cotal.ep.undeclared-arg";
+
+/** The {@link EP_UNDECLARED_ARG} payload: the key the contract does not declare, and the instance
+ *  the request was bound to when it binds one. Only that instance may serve the request, so it is
+ *  the responder whose contract refused the key. */
+export interface EpUndeclaredArgDetail extends EpErrorDetail {
+  kind: typeof EP_UNDECLARED_ARG;
+  property: string;
+  instanceId?: string;
+}
+
+/** The key a caller-side refusal names through {@link EP_UNDECLARED_ARG}, or `undefined`. */
+export function undeclaredArg(e: unknown): string | undefined {
+  if (!(e instanceof EpEnvelopeError)) return undefined;
+  return (e.details?.find((d) => d.kind === EP_UNDECLARED_ARG) as EpUndeclaredArgDetail | undefined)?.property;
+}
+
+/** The bound instance a caller-side {@link EP_UNDECLARED_ARG} refusal names, or `undefined` when the
+ *  request bound none. A surface naming the version skew asks this instance for its version. */
+export function undeclaredArgInstance(e: unknown): string | undefined {
+  if (!(e instanceof EpEnvelopeError)) return undefined;
+  return (e.details?.find((d) => d.kind === EP_UNDECLARED_ARG) as EpUndeclaredArgDetail | undefined)?.instanceId;
+}
+
+/**
+ * `details[].kind` for a refusal raised by the RESPONDER because the request declared a bound
+ * incarnation (`bind`, §13.3) that is not this instance: `failed-precondition` for a different
+ * instance, `expired` for the same instance at another epoch. It marks what no caller-side check
+ * can establish: **the command did not run, and no effect of it exists.**
+ *
+ * Set before the handler, before args validation, and before any seam that can consume a one-use
+ * proof, by the only party that knows which incarnation it is. {@link EP_UNBOUND_RESPONDER} is
+ * raised by the CALLER on the reply, after the responder has already acted — a report, not a
+ * guard. So a caller holding THIS marker may re-resolve and re-issue without risking a duplicate,
+ * which is exactly what a caller holding that one must not do.
+ */
+export const EP_BIND_REFUSED = "ai.cotal.ep.bind-refused";
+
+/** The {@link EP_BIND_REFUSED} payload: the incarnation the caller bound, and the one that
+ *  refused. Both ids are stated because either field alone can be the mismatching one — a
+ *  different instance, or the same instance at any other epoch — and the reader needs to see
+ *  which. */
+export interface EpBindRefusedDetail extends EpErrorDetail {
+  kind: typeof EP_BIND_REFUSED;
+  endpoint: string;
+  command: string;
+  /** What the request's `bind` block declared. */
+  boundTo: { instanceId: string; epoch: number };
+  /** The refusing instance's own identity. */
+  servedBy: { instanceId: string; epoch: number };
+}
+
+/** True iff an `EpError` CARRIES the {@link EP_BIND_REFUSED} marker, saying nothing about whether
+ *  the marker is believable. It is the claim's presence, not its acceptance.
+ *
+ *  The two questions come apart, and conflating them is what this pair exists to prevent. Whether a
+ *  caller may ACT on a bind refusal — re-issue a command it would otherwise never repeat — needs
+ *  the marker AND an explicit `not-executed`, which is {@link replyRefusedBeforeEffect}. Whether a
+ *  reply is CHECKED for self-consistency needs only the claim, because the contradiction being
+ *  checked is between the reply's BODY and the subject the broker pinned, and that is a
+ *  contradiction whatever the outcome field says — or does not say.
+ *
+ *  Gating the checks on the stronger predicate meant a reply could skip them by OMITTING a field,
+ *  so the least credible shape drew the least scrutiny. */
+export function bindRefusalMarked(e: EpError | undefined): boolean {
+  return (e?.details ?? []).some((d) => d.kind === EP_BIND_REFUSED);
+}
+
+/** True iff an `EpError` carries the {@link EP_BIND_REFUSED} marker: a responder refused BEFORE
+ *  executing, because it is not the incarnation the caller bound — the command did not run.
+ *
+ *  It takes an `EpError` and not a thrown value, unlike its sibling predicates, because this
+ *  refusal never arrives as a throw: it is the responder's own application-level failure and
+ *  those ride the reply (§13.5). A consumer reads it off `reply.error`.
+ *
+ *  A REPLY THAT CONTRADICTS ITSELF IS NOT A REFUSAL. The marker IS the assertion that the command
+ *  did not run, and {@link EpError.outcome} says a responder refusing before dispatch MUST carry
+ *  `not-executed` — but {@link EpBindRefusedDetail} carries no outcome of its own, so nothing in the
+ *  type stops a reply pairing the marker with `executed`. That combination is not merely odd: the
+ *  only consumer of this predicate re-issues a command **without** the {@link isRepeatSafeCommand}
+ *  gate, on the strength of the marker, so resolving the contradiction toward "refused" re-sends a
+ *  command the reply just said had ALREADY RUN. A present outcome that disagrees therefore wins, and
+ *  the reply is not read as a refusal.
+ *
+ *  AN ABSENT OUTCOME IS NOT A REFUSAL EITHER, and it is the same answer as `unknown` because the
+ *  spec says they are the same value: SPEC 1510, "an error reply that omits `outcome` MUST be read
+ *  as `unknown`". An earlier revision accepted absence, on the argument that a responder too old to
+ *  know the field emits exactly that and refusing it would stop core repairing splits for a third
+ *  party that is otherwise behaving. That argument does not survive SPEC 2271: a client MUST NOT
+ *  automatically re-issue a command declared `write` after any outcome that does not prove
+ *  non-execution, whatever `id` the re-issue carries, and `unknown` proves nothing. Since this
+ *  predicate is what licenses a re-issue that SKIPS {@link isRepeatSafeCommand}, accepting absence
+ *  made core re-issue writes on an outcome the spec says is `unknown`.
+ *
+ *  The cost is real and it is bounded: a responder that omits the field no longer has its splits
+ *  repaired. That responder is already non-conforming, because §13.3 requires a refusal raised
+ *  before dispatch to carry `not-executed`, so what it loses is a repair it was never owed. This
+ *  endpoint's own responder sets the field, so conforming deployments are unaffected. */
+export function replyRefusedBeforeEffect(e: EpError | undefined): boolean {
+  if (!bindRefusalMarked(e)) return false;
+  return e?.outcome === "not-executed";
+}
+
+/**
+ * `details[].kind` for a targeted request refused because the instance that received it holds no
+ * mapping for the target (§13.3). A resolver that knows only the targets its own instance hosts, as
+ * a manager's does, cannot tell a target a sibling hosts from one retired everywhere, so it says the
+ * one thing it knows. The code is `expired`, as for any missing mapping, and the refusal carries
+ * `not-executed`: a caller that reached the instance through the class queue may re-resolve and
+ * re-issue, and one that addressed the instance has its answer. The marker carries no payload, because the target is the request's own
+ * and the refusing instance is the reply subject's.
+ */
+export const EP_TARGET_UNMAPPED = "ai.cotal.ep.target-unmapped";
+
+/** True iff an `EpError` is a {@link EP_TARGET_UNMAPPED} refusal that states `not-executed`. An
+ *  absent outcome reads as `unknown` (§13.3), so the marker alone licenses no re-issue. */
+export function replyTargetUnmapped(e: EpError | undefined): boolean {
+  return e?.outcome === "not-executed" && (e.details ?? []).some((d) => d.kind === EP_TARGET_UNMAPPED);
+}
+
+/**
+ * `details[].kind` for a refusal raised because a lifecycle barrier already holds the actor
+ * (or the manager instance) being spawned. The manager already knows the blocked op, the
+ * head/gate state, the `opId`, and often the remedy; without this marker those facts die at
+ * the ControlReply string boundary and the caller sees a connector timeout or "unknown"
+ * (#873). The fields are the facts, not a second copy of the message.
+ */
+export const EP_LIFECYCLE_BLOCKED = "ai.cotal.ep.lifecycle-blocked";
+
+export type LifecycleBlockedOp = "registration" | "retirement" | "activation" | "takeover";
+export type LifecycleHeadState = "active" | "retiring" | "retired";
+export type LifecycleGateState = "frozen" | "retired";
+
+/** `headState` is set only by a site that read the lifecycle head and `gateState` only by one
+ *  that read the issuance gate: a gate frozen by a takeover says nothing about the head. */
+export interface LifecycleBlockedFacts {
+  blockedOp: LifecycleBlockedOp;
+  headState?: LifecycleHeadState;
+  gateState?: LifecycleGateState;
+  opId?: string;
+  remedy?: string;
+}
+
+export interface EpLifecycleBlockedDetail extends EpErrorDetail, LifecycleBlockedFacts {
+  kind: typeof EP_LIFECYCLE_BLOCKED;
+}
+
+export function lifecycleBlockedDetail(facts: LifecycleBlockedFacts): EpLifecycleBlockedDetail {
+  return { kind: EP_LIFECYCLE_BLOCKED, blockedOp: facts.blockedOp,
+    ...(facts.headState !== undefined ? { headState: facts.headState } : {}),
+    ...(facts.gateState !== undefined ? { gateState: facts.gateState } : {}),
+    ...(facts.opId !== undefined ? { opId: facts.opId } : {}),
+    ...(facts.remedy !== undefined ? { remedy: facts.remedy } : {}) };
+}
+
+/** Throw-site constructor: the catalog code plus the lifecycle-blocked marker as `details[0]`. */
+export function lifecycleBlocked(
+  code: EpErrorCode,
+  message: string,
+  facts: LifecycleBlockedFacts,
+  outcome?: EpEffectOutcome,
+): EpEnvelopeError {
+  return new EpEnvelopeError(code, message, [lifecycleBlockedDetail(facts)], outcome);
+}
+
+function detailsOf(source: unknown): EpErrorDetail[] | undefined {
+  if (source instanceof EpEnvelopeError) return source.details;
+  if (source && typeof source === "object" && Array.isArray((source as { details?: unknown }).details))
+    return (source as { details: EpErrorDetail[] }).details;
+  return undefined;
+}
+
+/** The lifecycle-blocked marker on a thrown envelope, an `EpError`, or a ControlReply-shaped object. */
+export function lifecycleBlockedFrom(source: unknown): EpLifecycleBlockedDetail | undefined {
+  return detailsOf(source)?.find((d): d is EpLifecycleBlockedDetail => d.kind === EP_LIFECYCLE_BLOCKED);
+}
+
+/**
+ * `details[].kind` for a launch refused because the owner already holds every seat this manager
+ * admits for one owner. The message states the refusal; these are the facts behind it, which a
+ * caller needs to render a remedy or decide on its own: how many seats the owner holds right now,
+ * and the ceiling it met. Without the marker those numbers die at the reply's string boundary and
+ * a structured caller can only re-read prose.
+ */
+export const EP_SEAT_CAP = "ai.cotal.ep.seat-cap";
+
+/** What a manager counted when it refused a launch: the owner, its live seats on that manager, and
+ *  the per-owner ceiling that manager enforces. `seats` is what the manager supervises for that
+ *  owner at the moment of the refusal, so `seats >= cap` holds wherever the marker is produced. */
+export interface SeatCapFacts {
+  owner: string;
+  seats: number;
+  cap: number;
+}
+
+export interface EpSeatCapDetail extends EpErrorDetail, SeatCapFacts {
+  kind: typeof EP_SEAT_CAP;
+}
+
+export function seatCapDetail(facts: SeatCapFacts): EpSeatCapDetail {
+  return { kind: EP_SEAT_CAP, owner: facts.owner, seats: facts.seats, cap: facts.cap };
+}
+
+/** Throw-site constructor: `resource-exhausted`, the seat-cap marker, and `not-executed`, because
+ *  the ceiling is consulted before the launch reserves a name or mints anything. */
+export function seatCapRefused(message: string, facts: SeatCapFacts): EpEnvelopeError {
+  return new EpEnvelopeError("resource-exhausted", message, [seatCapDetail(facts)], "not-executed");
+}
+
+/** The seat-cap marker on a thrown envelope, an `EpError`, or a ControlReply-shaped object. */
+export function seatCapFrom(source: unknown): EpSeatCapDetail | undefined {
+  return detailsOf(source)?.find((d): d is EpSeatCapDetail => d.kind === EP_SEAT_CAP);
+}
+
+/** Append a stable `[lifecycle …]` suffix so a string-only caller still carries the facts. */
+export function renderLifecycleBlocked(message: string, source: unknown): string {
+  const d = lifecycleBlockedFrom(source);
+  if (!d) return message;
+  const parts = [`blockedOp=${d.blockedOp}`];
+  for (const k of ["headState", "gateState", "opId", "remedy"] as const) {
+    const v = d[k];
+    if (typeof v === "string" && v.length > 0) parts.push(`${k}=${v}`);
+  }
+  const suffix = `[lifecycle ${parts.join(" ")}]`;
+  return message.includes(suffix) ? message : `${message} ${suffix}`;
+}
+
+/** §13.3 **Effect outcome**: whether the command's effect occurred. Emitted by the RESPONDER,
+ *  which is the only party that knows. An omitted `outcome` MUST be read as `unknown`, so absence
+ *  is never evidence of non-execution. */
+export type EpEffectOutcome = "executed" | "not-executed" | "unknown";
+
+/** The `EndpointReply.error` shape. */
+export interface EpError {
+  code: string;
+  message: string;
+  details?: EpErrorDetail[];
+  /** §13.3. A responder refusing BEFORE dispatching to the handler MUST carry `not-executed`;
+   *  one refusing AFTER the handler ran MUST carry `executed`; one that cannot tell MUST carry
+   *  `unknown` rather than guess. Absent on a caller-raised refusal, which is not a reply. */
+  outcome?: EpEffectOutcome;
+}
+
+/** A consuming-boundary rejection: the catalog code plus a human message. Boundaries convert it
+ *  to an `EndpointReply` error via {@link EpEnvelopeError.toEpError} (or, on reply-less planes,
+ *  to the §13.4 decision/quarantine fact carrying the same code). */
+export class EpEnvelopeError extends Error {
+  constructor(readonly code: EpErrorCode, message: string, readonly details?: EpErrorDetail[],
+              readonly outcome?: EpEffectOutcome) {
+    super(message);
+    this.name = "EpEnvelopeError";
+  }
+  toEpError(): EpError {
+    return {
+      code: this.code, message: this.message,
+      ...(this.details ? { details: this.details } : {}),
+      ...(this.outcome ? { outcome: this.outcome } : {}),
+    };
+  }
+}

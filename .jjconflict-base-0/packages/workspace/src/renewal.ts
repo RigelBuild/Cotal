@@ -1,0 +1,238 @@
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  credsClaims,
+  credsFingerprint,
+  credsProblem,
+  identityFromCreds,
+  mintCreds,
+  writeSecretFile,
+  type Profile,
+  type SecretStore,
+  type SpaceAuth,
+} from "@cotal-ai/core";
+import { getSpaceAuth } from "./auth-paths.js";
+import { RENEWAL_RECORD_FILE, renewalRecordPath } from "./renewal-path.js";
+import { workspaceSecretStore } from "./secret-store-fs.js";
+import { DELIVERY_CREDS_KIND, MEMBERSHIP_RW_CREDS_KIND, segmentedKey } from "./space-segmentation.js";
+
+/**
+ * D5 slice 5 class-2 standing renewal — the RENEWAL OWNER'S half, shared by the manager (the
+ * resident owner in every mesh mode) and `cotal doctor auth --fix` (the operator repair). The
+ * daemon's half is the explicit `reloadCreds` adoption op on the delivery-admin rail, plus each
+ * daemon's own 75% renewal timer (the delivery endpoint re-reads its source; the membership feed
+ * preflight-proves each candidate). Machine-local file work lives here in the workspace layer:
+ * implementations never import each other.
+ */
+
+/** The seed-less daemon creds a renewal owner re-signs. The $SYS kinds (membership-observer,
+ *  connection-evictor) are deliberately ABSENT: they are rotation-renewed — no persisted seed can
+ *  re-sign them, by design. Their keys are {@link membershipObserverCredsKey} /
+ *  {@link connectionEvictorCredsKey} — injectable, but never re-signable from a persisted seed.
+ *
+ *  `key` is a `(space) => key` BUILDER, not a literal, because these kinds are now per-space (§3.1):
+ *  one entry no longer names one location. `kind` stays beside it because that is what a
+ *  {@link RemintResult} reports and what an operator reads — see {@link RemintResult.file}.
+ *
+ *  The builders are {@link segmentedKey}, NOT the migrating per-kind resolvers: see that function for
+ *  why the renewal owner is one of the two owners that must not move material. */
+export const REMINTABLE_DAEMON_CREDS: ReadonlyArray<{
+  kind: string;
+  key: (space: string) => string;
+  profile: Profile;
+}> = [
+  { kind: DELIVERY_CREDS_KIND, key: (space) => segmentedKey(DELIVERY_CREDS_KIND, space), profile: "delivery" },
+  { kind: MEMBERSHIP_RW_CREDS_KIND, key: (space) => segmentedKey(MEMBERSHIP_RW_CREDS_KIND, space), profile: "membership-rw" },
+];
+
+export interface RemintResult {
+  /** THE KIND, never the segmented key. A remint result is mapped back to a daemon component by
+   *  literal comparison against the kind (`manager.ts:1147` attributes a fingerprint to
+   *  `expected.delivery` that way), so a `file` carrying a `space.<hex>/` prefix would match nothing
+   *  and the manager would silently stop attributing renewals. It is also what `doctor auth` prints,
+   *  which would otherwise start showing an operator hex. */
+  file: string;
+  /** true = re-signed; false = failed (see error); undefined ok with `skipped` = file absent. */
+  ok: boolean;
+  skipped?: "missing-file" | "no-auth";
+  error?: string;
+  /** EPHEMERAL SHA-256 of the JUST-RE-SIGNED cred's USER JWT — the EXPECTED-generation token the
+   *  renewal owner hands the daemon so an adoption reply can prove it adopted THIS generation, not
+   *  merely re-read some file. Present only on `ok`. NEVER persisted: the caller strips it before
+   *  writing the renewal record (a stable secret-derived token must not land on disk). */
+  fingerprint?: string;
+}
+
+/** Re-sign the daemon creds files for their EXISTING nkeys (a renewal must never swap a daemon's
+ *  identity — the daemon side pins it). Reads and writes through the secret-store seam; `store` is
+ *  the renewal owner's injection point, SYMMETRIC with the daemon's `runDelivery(args, store?)`.
+ *  The manager — the D5 standing-renewal owner, and a hosted-path caller (manager.ts calls this
+ *  unconditionally) — passes the SAME store it gives the daemon (its `ManagerOptions.secretStore`),
+ *  so a hosted composition re-signs into the store the daemon renews from, never a divergent one; no
+ *  store means the local workspace FS composition (keys = the paths under `.cotal/`).
+ *
+ *  The creds are PER-SPACE as of P7, so every store op is addressed by the entry's
+ *  `key(expectedSpace)` builder (§3.1) while every RESULT still reports the entry's `kind`.
+ *
+ *  `expectedSpace` (the caller's known space — the manager's `this.space`, doctor's resolved space) is
+ *  a REQUIRED positional and is validated against the store's signer: the daemon creds are SPACE-SCOPED,
+ *  so a store whose signer is for a DIFFERENT space (a swap after start, a misconfigured hosted mount)
+ *  must NOT re-sign — that would overwrite each last-good cred with one the space's broker rejects,
+ *  breaking the daemon on a value that looks freshly renewed. It is required (not optional) so the
+ *  unsafe no-space call cannot compile — the same claim-exceeds-enforcement trap the cross-space fix
+ *  would otherwise leave for the next caller. A signer that fails validation fails EVERY file
+ *  (`ok:false`), leaving the standing creds intact toward their loud expiry rather than clobbering them.
+ *  The store's ATOMIC put is load-bearing here, because the daemons re-read these values LIVE (the
+ *  delivery endpoint's 75% source refresh, the membership feed's 75% renewal fetch).
+ *
+ *  The last-good cred is NEVER overwritten with an UNPROVEN one — a bundle's JWT chain is self-bound,
+ *  not broker-bound (two `createSpaceAuth(space)` calls yield same-named, DIFFERENT-account chains), so
+ *  a same-label alternate signer could mint a broker-dead cred and CLOBBER the last-good (availability
+ *  loss). Proof before overwrite is one of: (1) `opts.preflight` — a disposable "does the broker accept
+ *  this cred" probe the caller owns (the manager passes a {@link probeConnect} over `this.servers`),
+ *  which gates EVERY candidate when supplied; or (2) AUTHORITY CONTINUITY — the candidate is signed by
+ *  the SAME account signing key (`iss`) as the current (last-good, already broker-accepted) cred, the
+ *  same authority the broker trusts, which the OFFLINE local repair (`doctor auth --fix`) relies on. A
+ *  same-label alternate account breaks continuity, so with no preflight it is refused, not clobbered.
+ *
+ *  Structured per-file results, never throws: a failed remint leaves the old cred running toward its
+ *  loud expiry and the caller records/reports the failure. */
+export async function remintDaemonCreds(
+  root: string,
+  expectedSpace: string,
+  store?: SecretStore,
+  opts?: { preflight?: (creds: string) => Promise<boolean> },
+): Promise<RemintResult[]> {
+  const s = store ?? workspaceSecretStore(root);
+  // Read + FULLY VALIDATE the SIGNER through the SAME store the daemon creds live in (symmetric with
+  // the daemon's `runDelivery(args, store)`) — reading it from the FS while writing the daemon creds
+  // to an injected store would split authority (signer ← disk, cred ← KMS): the class 3b closed for
+  // daemon creds, here for the signer. `getSpaceAuth(s, expectedSpace)` cross-checks the trust chain
+  // against the caller's space; a wrong-space or malformed signer THROWS (never re-signs).
+  let auth: SpaceAuth | undefined;
+  try {
+    auth = await getSpaceAuth(s, expectedSpace);
+  } catch (e) {
+    // Wrong-space / malformed signer: fail every file, DO NOT overwrite the last-good creds.
+    return REMINTABLE_DAEMON_CREDS.map(({ kind }) => ({ file: kind, ok: false, error: (e as Error).message }));
+  }
+  if (!auth) return REMINTABLE_DAEMON_CREDS.map(({ kind }) => ({ file: kind, ok: false, skipped: "no-auth" as const }));
+  const results: RemintResult[] = [];
+  for (const { kind, key, profile } of REMINTABLE_DAEMON_CREDS) {
+    // The KIND is what the result reports (see `RemintResult.file`); the per-space KEY is what the
+    // store is addressed by. Read and write MUST use the same one — a get on the key and a put on
+    // the kind would re-sign the live cred into a dead flat location and leave the live one to expire.
+    const file = kind;
+    try {
+      const current = await s.get(key(expectedSpace));
+      if (current === undefined) {
+        results.push({ file, ok: false, skipped: "missing-file" });
+        continue;
+      }
+      const next = await mintCreds(auth, identityFromCreds(current), profile);
+      // NEVER overwrite the last-good cred with an UNPROVEN one. A bundle's JWT chain is SELF-bound,
+      // not broker-bound (two `createSpaceAuth(space)` calls yield same-named, DIFFERENT-account chains),
+      // so `expectedSpace` + full-chain validity is not enough. Proof is one of:
+      //  (1) a broker PREFLIGHT — the manager's live "does the broker accept this cred" probe; OR
+      //  (2) AUTHORITY CONTINUITY — the candidate is signed by the SAME account signing key (`iss`) as
+      //      the current (last-good, already broker-accepted) cred, i.e. the same authority the broker
+      //      already trusts. This is what the OFFLINE local repair (`doctor auth --fix`, no live broker)
+      //      relies on. A same-label ALTERNATE account (full OR stripped) breaks continuity, so with no
+      //      preflight it is REFUSED — the last-good is preserved rather than clobbered by a broker-dead cred.
+      let proven: boolean;
+      let why: string;
+      if (opts?.preflight) {
+        proven = await opts.preflight(next);
+        why = "the broker refused the re-signed cred (wrong-account or unreachable signer)";
+      } else {
+        const iss = credsClaims(next).iss;
+        proven = iss !== undefined && iss === credsClaims(current).iss;
+        why = "the re-signed cred's signer is not the last-good cred's authority, and no broker preflight was supplied";
+      }
+      if (!proven) {
+        results.push({ file, ok: false, error: `${why} - last-good cred preserved` });
+        continue;
+      }
+      await s.put(key(expectedSpace), next);
+      results.push({ file, ok: true, fingerprint: credsFingerprint(next) });
+    } catch (e) {
+      results.push({ file, ok: false, error: (e as Error).message });
+    }
+  }
+  return results;
+}
+
+/** The re-signable daemon credentials whose stored bytes the NATS client cannot parse. Such a file
+ *  holds no key to re-sign, so neither the manager nor {@link remintDaemonCreds} can renew it in place,
+ *  and `cotal up` mints only a missing one. A value the store cannot read is not reported here. */
+export async function unparsableDaemonCreds(root: string, space: string, store?: SecretStore): Promise<string[]> {
+  const s = store ?? workspaceSecretStore(root);
+  const kinds: string[] = [];
+  for (const { kind, key } of REMINTABLE_DAEMON_CREDS) {
+    let current: string | undefined;
+    try { current = await s.get(key(space)); } catch { continue; }
+    if (current !== undefined && credsProblem(current) !== undefined) kinds.push(kind);
+  }
+  return kinds;
+}
+
+/** The renewal owner's audit record — what `cotal doctor auth` renders so "file re-signed" and
+ *  "daemon adopted" are distinguishable states, per the D5 panel gate. One file PER SPACE, overwritten
+ *  per pass: the CURRENT renewal state, not a log (history is the git/ops layer's job). */
+export interface RenewalRecord {
+  /** ISO timestamp of the renewal pass. */
+  ts: string;
+  /** Who ran the pass (e.g. "manager", "doctor --fix"). */
+  owner: string;
+  results: RemintResult[];
+  /** The daemon's explicit reloadCreds adoption outcome; absent when nothing was re-signed. */
+  adoption?: { ok: boolean; detail?: unknown; error?: string };
+  /** Which renewal authority this pass ran under (#1063): `"lease"` when the caller held the mesh's
+   *  one daemon-credential renewal lease before re-signing (broker-coordinated); `"offline"` when the
+   *  broker did not answer and the re-sign relied on signer continuity alone, uncoordinated. Absent
+   *  for a manager's pass (it always holds the lease; only `doctor auth --fix` needs to say which). */
+  authority?: "lease" | "offline";
+}
+
+/** `.cotal/renewal.<spaceKey>.json` — the renewal record's filename, PER-SPACE. The `{space}` is
+ *  expanded with the same injective hex `spaceKey` the pidfiles use (`manager.<space>.pid`,
+ *  `delivery.<space>.pid` via `canonicalLocalProcessPath`), because the record is per-tenant in
+ *  meaning exactly as they are: a root-scoped `renewal.json` gave one root one adoption verdict by
+ *  filename, so a second space's clean pass overwrote the first space's refusal and every reader
+ *  (`doctor auth`, `status --components`) then answered about the wrong renewal (#1850).
+ *
+ *  Defined with {@link renewalRecordPath} in `renewal-path.ts`, the dependency-neutral layout module
+ *  shared with the per-space reaper. */
+export { RENEWAL_RECORD_FILE, renewalRecordPath };
+
+/** The root-scoped name a pre-per-space build wrote the record under — the one place that history is
+ *  spelled. A READER fact only (see {@link renewalRecordPath}); `cotal clean` removes it with the
+ *  rest of a reset. */
+export const LEGACY_RENEWAL_RECORD_FILE = "renewal.json";
+
+/** The legacy root-scoped record, when one exists and the space has none of its own — a LABELLED
+ *  FACT for a reader to surface, never a fallback verdict (a root-only `renewal.json` names no
+ *  space, so whose pass it records cannot be known; reading it as this space's adoption outcome is
+ *  the #1850 defect in its silent form). */
+export function legacyRenewalRecord(root: string): { path: string } | undefined {
+  const path = join(root, ".cotal", LEGACY_RENEWAL_RECORD_FILE);
+  return existsSync(path) ? { path } : undefined;
+}
+
+export function writeRenewalRecord(root: string, space: string, record: RenewalRecord): void {
+  // REDACT the ephemeral generation token HERE, at the single persistence boundary, so no writer
+  // (the manager, `doctor auth --fix`, or any future caller) can leak the stable secret-derived
+  // fingerprint to `.cotal/renewal.<space>.json`. `JSON.stringify` then omits the `undefined` field.
+  const redacted: RenewalRecord = { ...record, results: record.results.map((r) => ({ ...r, fingerprint: undefined })) };
+  writeSecretFile(renewalRecordPath(root, space), JSON.stringify(redacted, null, 2));
+}
+
+export function readRenewalRecord(root: string, space: string): RenewalRecord | undefined {
+  const p = renewalRecordPath(root, space);
+  if (!existsSync(p)) return undefined;
+  try {
+    return JSON.parse(readFileSync(p, "utf8")) as RenewalRecord;
+  } catch {
+    return undefined; // a corrupt record is rendered as "no renewal record", never a crash
+  }
+}

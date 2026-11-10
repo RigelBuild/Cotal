@@ -1,0 +1,108 @@
+{
+  "suite": [
+    "implementations/runtime/smoke/mesh-wait.smoke.ts"
+  ],
+  "guard": "a wait's durable position survives a refused bind, and is deleted when the wait is genuinely over",
+  "command": "pnpm smoke:runtime-mesh-wait",
+  "completionMarker": "mesh-wait.smoke:",
+  "proveWith": "node scripts/mutation-proof.mjs --config implementations/runtime/smoke/mutations/wait-position.json",
+  "why": [
+    "The residual a review seat named and could not force. It reported the window honestly as",
+    "unresolved -- it had no chat stream to publish onto -- and the harness it needed already existed",
+    "in this suite, outside the files its brief allowed it to read.",
+    "",
+    "The handler's own comment promises that BIND BEFORE ACK makes a crash between the two",
+    "recoverable. True of a CRASH, which never runs the cleanup at all. Not true of a `ctx.bind` that",
+    "FAILS -- and a bind is a journal append, which a journal refuses in ordinary operation (L5010,",
+    "RunSuperseded). The cleanup ran on every exit, so the durable holding this run's position on the",
+    "channel was deleted on the way out; the retry carries no recorded sequence, because recording it",
+    "is exactly what failed, so it created a fresh consumer at `deliver_policy: \"new\"` and found",
+    "NOTHING. The message sat on the stream permanently invisible to that run, with nothing red.",
+    "",
+    "TWO DIRECTIONS, and they pull against each other, which is why both are mutated. Keeping the",
+    "consumer too eagerly leaks one per wait and re-opens the argument the handler settled when it",
+    "chose deletion over an inactivity threshold: a threshold could reap a LIVE wait's consumer while",
+    "its host was down, losing exactly the events the durable exists to hold. Deleting it too eagerly",
+    "is the defect above. The `over` flag is the whole distinction between them.",
+    "",
+    "NOT GRADED HERE, and named rather than implied: the redelivery that actually consumes the kept",
+    "position is NATS's `ack_wait` (server default). It was measured end-to-end twice -- the retry",
+    "found the message again and re-bound a sequence -- and is not re-run in the gate, because a",
+    "45-second sleep buys a fact about the broker rather than about this code.",
+    "",
+    "SPECIFIER BOUNDARY, and it is one config away rather than absent. Every mutation config in",
+    "this lane mutates a module its suite imports through a RELATIVE `../src/*.js` path, and no",
+    "command carries a build step -- all are bare `tsx` -- so the mutated bytes are the bytes the",
+    "suite loads. The suites in THIS directory nonetheless boot `@cotal-ai/core` and `@cotal-ai/lang`",
+    "through package specifiers that resolve to `dist`. So a future config that targets",
+    "`packages/lang/src` or `packages/core/src` under a `pnpm smoke:runtime-*` command would be VOID",
+    "ON ARRIVAL: the mutant would sit in `src` while the suite graded an untouched `dist`, and the",
+    "kill rate would measure module resolution rather than the guard. Either mutate the module the",
+    "suite imports relatively, or put a build between the mutation and the run."
+  ],
+  "mutations": [
+    {
+      "name": "the cleanup runs on every exit again, throw included",
+      "file": "implementations/runtime/src/mesh-handler.ts",
+      "find": "      else if (over) {\n        try {\n          await this.jsm.consumers.delete(stream, durable);",
+      "replace": "      else if (true) {\n        try {\n          await this.jsm.consumers.delete(stream, durable);",
+      "expectRed": "REPAIRED: the wait's position SURVIVES a refused bind — a throw is not the wait being over",
+      "cell": "REPAIRED: the wait's position SURVIVES a refused bind — a throw is not the wait being over",
+      "note": "The shipped state before the repair, and it passed the whole suite: no cell asked what happened to the position when the bind failed, because no cell could make a bind fail."
+    },
+    {
+      "name": "PARANOID: the position is kept on every exit, so an ENDED wait leaks its consumer",
+      "file": "implementations/runtime/src/mesh-handler.ts",
+      "find": "      else if (over) {\n        try {\n          await this.jsm.consumers.delete(stream, durable);",
+      "replace": "      else if (false) {\n        try {\n          await this.jsm.consumers.delete(stream, durable);",
+      "expectRed": "and its consumer is gone: an ENDED wait's position is worthless and is not left behind",
+      "cell": "and its consumer is gone: an ENDED wait's position is worthless and is not left behind",
+      "note": "The other direction, and the one a fix written from the bug report alone lands on. Keeping every position leaks a durable per wait and re-opens the argument the handler already settled against an inactivity threshold. Aimed at the TIMED-OUT ending rather than the matched one, because the matched ending is pinned by cell 1 and the timeout is the exit the flag is easiest to get wrong on."
+    },
+    {
+      "name": "the timed-out ending forgets to mark the wait over",
+      "file": "implementations/runtime/src/mesh-handler.ts",
+      "find": "        if (ended !== undefined) {\n          if (outer !== undefined && primary !== undefined) await this.cancelTimer(primary);\n          over = true;\n          return null;\n        }",
+      "replace": "        if (ended !== undefined) {\n          if (outer !== undefined && primary !== undefined) await this.cancelTimer(primary);\n          return null;\n        }",
+      "expectRed": "and its consumer is gone: an ENDED wait's position is worthless and is not left behind",
+      "cell": "and its consumer is gone: an ENDED wait's position is worthless and is not left behind",
+      "note": "Narrower than the blanket version above and it is the realistic regression: three separate returns each have to set the flag, and the deadline path is the one that does not look like an ending."
+    },
+    {
+      "name": "the match is ACKED before it is bound, which is the order the comment argues against",
+      "file": "implementations/runtime/src/mesh-handler.ts",
+      "find": "          await ctx.bind(this.services ? { ...waitBinding, chatSeq: m.seq } : { chatSeq: m.seq });\n          await m.ack();",
+      "replace": "          await m.ack();\n          await ctx.bind(this.services ? { ...waitBinding, chatSeq: m.seq } : { chatSeq: m.seq });",
+      "expectRed": "...with the matched message still unacked, which is what makes it recoverable at all",
+      "cell": "...with the matched message still unacked, which is what makes it recoverable at all",
+      "note": "The claim the handler's own comment makes and that nothing tested: in the other order the match is simply lost. With the ack first, the position survives the refused bind and is already past the message the run needs -- the same loss wearing a healthier shape, which is why the cell asserts the ack state and not merely that the consumer exists."
+    },
+    {
+      "name": "an idle wait's outer deadline is left armed when the window closes",
+      "file": "implementations/runtime/src/mesh-handler.ts",
+      "find": "        if (idleFor !== undefined && (await this.expired(primary)) !== undefined) {\n          if (outer !== undefined) await this.cancelTimer(outer);",
+      "replace": "        if (idleFor !== undefined && (await this.expired(primary)) !== undefined) {",
+      "expectRed": "the outer deadline is CLAIMED by the ending, not left armed for an hour",
+      "cell": "the outer deadline is CLAIMED by the ending, not left armed for an hour",
+      "note": "The shipped state before the repair: each expiry claimed only the deadline it read, so the sibling fired into a run that had moved on and sat unclaimed until the run's own discharge."
+    },
+    {
+      "name": "every fire-read failure is read as 'the timer has not fired yet'",
+      "file": "implementations/runtime/src/mesh-handler.ts",
+      "find": "        if ((e as { code?: unknown })?.code === 10037) return null;\n        throw e;",
+      "replace": "        void e;\n        return null;",
+      "expectRed": "the broker's refusal reaches the caller instead of reading as an unfired timer",
+      "cell": "the broker's refusal reaches the caller instead of reading as an unfired timer",
+      "note": "10037 is the stream saying there is no message on that subject, which IS 'not yet'. Every other error is the broker, and reading those as 'not yet' is how a wait with a timeout outlives its own durable deadline in silence."
+    },
+    {
+      "name": "a refused cancellation is swallowed as if it had settled underneath",
+      "file": "implementations/runtime/src/mesh-handler.ts",
+      "find": "      const settledAlready = e instanceof EpEnvelopeError\n        && (e.code === \"conflict\" || e.code === \"failed-precondition\");",
+      "replace": "      const settledAlready = true\n        || (e instanceof EpEnvelopeError && (e.code === \"conflict\" || e.code === \"failed-precondition\"));",
+      "expectRed": "and the refused claim is REPORTED, naming the pause and what it will do unread",
+      "cell": "and the refused claim is REPORTED, naming the pause and what it will do unread",
+      "note": "Measured 2026-09-03: KILLED, one cell, 61 ok 1 failed. The claim on a sibling deadline is best-effort and must never replace the caller's answer, so the failure can only be reported. Swallowed, a broker that refused looks exactly like the ordinary settled race and the operator is never told the run left live timers behind it."
+    }
+  ]
+}

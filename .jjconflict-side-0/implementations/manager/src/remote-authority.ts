@@ -1,0 +1,857 @@
+import { join } from "node:path";
+import {
+  credsFromJwt,
+  admissionSnapshot,
+  revocationSnapshot,
+  type RemoteRunRevokeRequest,
+  type RemoteRunCancelRequest,
+  type RemoteRunCancelResult,
+  type RemoteRunRevokeResult,
+  accountFromCreds,
+  isCredentialTransportUrl,
+  managedRetirementOpId,
+  mintLifecycleUid,
+  newIdentity,
+  parseGoalIndexEntry,
+  parseRemoteManagedAgentRuntimeResult,
+  remoteManagerActors,
+  remoteManagerParticipationAuthorizationRequest as coreParticipationAuthorizationRequest,
+  remoteManagerParticipationAuthorized as coreParticipationAuthorized,
+  REMOTE_MANAGER_IDENTITY_NAMES,
+  type Identity,
+  type RemoteManagerAdminAuthorizationRequest,
+  type RemoteManagerAdminAuthorizationResult,
+  type RemoteManagerParticipationAuthorizationRequest,
+  type RemoteManagerParticipationAuthorizationResult,
+  type RemoteManagerAuthorityMaterial,
+  type RemoteManagerAuthorityRequest,
+  type RemoteManagerGoalIndexScanRequest,
+  type RemoteManagerGoalIndexScanResult,
+  type RemoteManagerMaintenanceRequest,
+  type RemoteManagerMaintenanceResult,
+  type RemoteManagedAgentEnrollmentRequest,
+  type RemoteManagedAgentEnrollmentResult,
+  type RemoteManagedAgentPrepareRetirementRequest,
+  type RemoteManagedAgentPrepareRetirementResult,
+  type RemoteManagedAgentRuntimeRequest,
+  type RemoteManagedAgentRuntimeResult,
+  type RemoteRetainedAgentValidationRequest,
+  type RemoteRetainedAgentValidationResult,
+  type RemoteRunAdmissionRequest,
+  type RemoteRunAdmissionResult,
+  type RemoteRunAttemptRequest,
+  type RemoteRunAttemptResult,
+  type RunAdmission,
+  type RetainedAgentAuthority,
+} from "@cotal-ai/core";
+import { claimIdentityRecord, identityOf, spaceKey } from "@cotal-ai/workspace";
+import type { RunHostingContext } from "./run-hosting.js";
+
+export interface RemoteManagerIdentityState {
+  v: 1;
+  space: string;
+  instanceId: string;
+  lifecycleUid: string;
+  identities: {
+    supervisor: Identity;
+    executor: Identity;
+    serve: Identity;
+    goalWriter: Identity;
+    sessionLedger: Identity;
+  };
+}
+
+/** Written out by name so the compiler checks the five names against both the state and the wire
+ *  type. The order is `REMOTE_MANAGER_IDENTITY_NAMES` because the host echoes its parsed copy in that
+ *  order and the result checks compare the serialized value. */
+export function publicIdentities({ identities }: RemoteManagerIdentityState): RemoteManagerAuthorityRequest["identities"] {
+  return {
+    supervisor: { id: identities.supervisor.id },
+    executor: { id: identities.executor.id },
+    serve: { id: identities.serve.id },
+    goalWriter: { id: identities.goalWriter.id },
+    sessionLedger: { id: identities.sessionLedger.id },
+  };
+}
+
+function runRequestBase(state: RemoteManagerIdentityState, registrationProof: string, accountPublicKey: string, processEpoch: number) {
+  return {
+    v: 1 as const, space: state.space, actor: "cli", instanceId: state.instanceId,
+    managerLifecycleUid: state.lifecycleUid, requestId: `run${mintLifecycleUid()}`,
+    registrationProof, accountPublicKey, processEpoch,
+    identities: publicIdentities(state),
+  };
+}
+
+export function remoteRunAdmissionRequest(state: RemoteManagerIdentityState, proof: string, account: string, epoch: number, run: RemoteRunAdmissionRequest["run"]): RemoteRunAdmissionRequest {
+  return { ...runRequestBase(state, proof, account, epoch), kind: "manager-run-admission", run };
+}
+
+export function remoteRunAttemptRequest(state: RemoteManagerIdentityState, proof: string, account: string, epoch: number, coordinates: Pick<RemoteRunAttemptRequest, "attempt" | "operator">): RemoteRunAttemptRequest {
+  if ((coordinates.attempt === undefined) === (coordinates.operator === undefined)) throw new Error("remote run request requires exactly one attempt or operator");
+  return { ...runRequestBase(state, proof, account, epoch), kind: "manager-run-attempt", ...coordinates };
+}
+
+function exactKeys(value: unknown, keys: readonly string[], what: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value) || Object.keys(value).sort().join(",") !== [...keys].sort().join(","))
+    throw new Error(`${what} returned a non-closed result`);
+  return value as Record<string, unknown>;
+}
+
+/** No host result can substitute another admission, request, caller or instance. */
+export function remoteRunAdmission(result: RemoteRunAdmissionResult, request: RemoteRunAdmissionRequest): RunAdmission {
+  exactKeys(result, ["v", "kind", "requestId", "runId", "revision", "admission"], "manager run admission");
+  if (result.v !== 1 || result.kind !== request.kind || result.requestId !== request.requestId || result.runId !== request.run.runId ||
+      !Number.isSafeInteger(result.revision) || result.revision < 1)
+    throw new Error("manager run admission returned different request or run coordinates");
+  const admission = admissionSnapshot(result.admission);
+  if (admission.space !== request.space || admission.endpoint !== "manager" || admission.runId !== request.run.runId ||
+      admission.instanceId !== request.instanceId || admission.provenance.kind !== "issued")
+    throw new Error("manager run admission returned a foreign instance, run, or provenance");
+  return admission;
+}
+
+/** Materialize a complete, bounded JWT pair or exactly one operator JWT for held local nkeys. */
+export function remoteRunAttemptCredentials(
+  result: RemoteRunAttemptResult, request: RemoteRunAttemptRequest, owner: string,
+  identities: { driver: Identity; mediator: Identity } | { operator: Identity },
+): { driver: string; mediator: string } | { operator: string } {
+  const attempt = request.attempt !== undefined;
+  const fields = ["v", "kind", "space", "owner", "actor", "instanceId", "managerLifecycleUid", "requestId", "registrationProof", "accountPublicKey", "processEpoch", "identities", attempt ? "attempt" : "operator", "credentials"];
+  exactKeys(result, fields, "manager run attempt");
+  if (result.v !== 1 || result.kind !== request.kind || result.space !== request.space || result.owner !== owner ||
+      result.actor !== request.actor || result.instanceId !== request.instanceId || result.managerLifecycleUid !== request.managerLifecycleUid ||
+      result.requestId !== request.requestId || result.registrationProof !== request.registrationProof ||
+      result.accountPublicKey !== request.accountPublicKey || result.processEpoch !== request.processEpoch ||
+      JSON.stringify(result.identities) !== JSON.stringify(request.identities) ||
+      JSON.stringify(result.attempt ?? result.operator) !== JSON.stringify(request.attempt ?? request.operator))
+    throw new Error("manager run attempt returned different registration or grant coordinates");
+  const credentials = exactKeys(result.credentials, attempt ? ["driver", "mediator"] : ["operator"], "manager run credentials");
+  const materialize = (name: "driver" | "mediator" | "operator", identity: Identity): string => {
+    const row = exactKeys(credentials[name], ["jwt", "exp"], `manager run ${name} credential`);
+    if (typeof row.jwt !== "string" || row.jwt.length > 16_384 || row.jwt.split(".").length !== 3 ||
+        !Number.isSafeInteger(row.exp) || (row.exp as number) <= 0)
+      throw new Error(`manager run ${name} returned no bounded JWT`);
+    let claims: { exp?: unknown; sub?: unknown };
+    try { claims = JSON.parse(Buffer.from(row.jwt.split(".")[1]!, "base64url").toString("utf8")); }
+    catch { throw new Error(`manager run ${name} returned a malformed JWT`); }
+    if (claims.exp !== row.exp || claims.sub !== identity.id)
+      throw new Error(`manager run ${name} JWT differs from its expiry or held nkey`);
+    const creds = credsFromJwt(row.jwt, identity);
+    if (accountFromCreds(creds) !== request.accountPublicKey)
+      throw new Error(`manager run ${name} JWT names a foreign account`);
+    return creds;
+  };
+  if (attempt) {
+    if (!("driver" in identities) || identities.driver.id !== request.attempt?.driverId || identities.mediator.id !== request.attempt.mediatorId)
+      throw new Error("manager run attempt requested different local nkeys");
+    return { driver: materialize("driver", identities.driver), mediator: materialize("mediator", identities.mediator) };
+  }
+  if (!("operator" in identities) || identities.operator.id !== request.operator?.id)
+    throw new Error("manager run operator requested a different local nkey");
+  return { operator: materialize("operator", identities.operator) };
+}
+
+/** The signerless run callbacks over one registration. A caller supplies only the transport,
+ *  so every composition sends the host the run requests the stock manager sends. */
+export function remoteRunHosting(args: {
+  state: RemoteManagerIdentityState;
+  owner: string;
+  registrationProof: string;
+  accountPublicKey: string;
+  processEpoch: number;
+  requestRunAdmission: (request: RemoteRunAdmissionRequest) => Promise<RemoteRunAdmissionResult>;
+  requestRunSubmission?: (request: import("@cotal-ai/core").RemoteRunSubmissionRequest) => Promise<import("@cotal-ai/core").RemoteRunSubmissionResult>;
+  requestRunAttempt: (request: RemoteRunAttemptRequest) => Promise<RemoteRunAttemptResult>;
+  requestRunRevoke?: (request: RemoteRunRevokeRequest) => Promise<RemoteRunRevokeResult>;
+  requestRunCancel?: (request: RemoteRunCancelRequest) => Promise<RemoteRunCancelResult>;
+  call: (request: RemoteManagerAuthorityRequest) => Promise<RemoteManagerAuthorityMaterial>;
+}): Required<Pick<RunHostingContext, "admitRun" | "issueAttempt" | "issueOperator" | "renewRun" | "revokeRun">> & Pick<RunHostingContext, "submitRun" | "cancelRun"> {
+  const { state, owner, registrationProof, accountPublicKey, processEpoch } = args;
+  return {
+    submitRun: async ({ subject }) => {
+      if (!args.requestRunSubmission) throw new Error("issuing host does not implement keyed submissions");
+      const request: import("@cotal-ai/core").RemoteRunSubmissionRequest = {
+        ...runRequestBase(state, registrationProof, accountPublicKey, processEpoch), kind: "manager-run-submission", subject,
+      };
+      const r = await args.requestRunSubmission(request);
+      const allowed = ["v", "kind", "requestId", "winner", "view", "admission"];
+      if (!r || Object.keys(r).some(k => !allowed.includes(k)) || r.v !== 1 || r.kind !== request.kind
+        || r.requestId !== request.requestId || typeof r.winner !== "boolean" || !r.view)
+        throw new Error("invalid keyed submission issuer response");
+      return { ...r, ...(r.admission ? { admission: admissionSnapshot(r.admission) } : {}) };
+    },
+    cancelRun: async ({ stage, subject, cancel }) => {
+      if (!args.requestRunCancel) throw new Error("issuing host does not implement observed run cancellation");
+      const request: RemoteRunCancelRequest = { ...runRequestBase(state, registrationProof, accountPublicKey, processEpoch), kind: "manager-run-cancel", stage, subject, cancel };
+      const result = await args.requestRunCancel(request);
+      exactKeys(result, ["v", "kind", "requestId", "runId", "stage", stage === "inspect" ? "authority" : "result"], "manager run cancel");
+      if (result.v !== 1 || result.kind !== request.kind || result.requestId !== request.requestId || result.runId !== cancel.runId || result.stage !== stage)
+        throw new Error("manager run cancel returned different request coordinates");
+      if (result.stage === "inspect") {
+        if (!["original", "owner-interactive", "admin"].includes(result.authority)) throw new Error("manager run cancel returned an unknown authority class");
+        return result;
+      }
+      const answer = result.result;
+      if (answer?.kind === "committed") {
+        exactKeys(answer, ["kind", "outcome", "revocation"], "manager run cancel committed");
+        if (answer.outcome !== "created" && answer.outcome !== "existed") throw new Error("manager run cancel returned an unknown write outcome");
+        return { ...result, result: { ...answer, revocation: revocationSnapshot(answer.revocation, cancel.runId) } };
+      }
+      exactKeys(answer, ["kind", "code"], "manager run cancel refusal");
+      if ((answer.kind !== "refused-before-dispatch" && answer.kind !== "outcome-unknown")
+        || !["permission-denied", "failed-precondition", "deadline-exceeded", "resource-exhausted", "unavailable"].includes(answer.code))
+        throw new Error("manager run cancel returned an unknown dispatch disposition");
+      return result;
+    },
+    revokeRun: async (revoke) => {
+      if (args.requestRunRevoke === undefined) throw new Error("the issuing host supplies no closed run revoke request");
+      const request: RemoteRunRevokeRequest = { ...runRequestBase(state, registrationProof, accountPublicKey, processEpoch), kind: "manager-run-revoke", revoke };
+      const result = await args.requestRunRevoke(request);
+      exactKeys(result, ["v", "kind", "requestId", "runId", "revocation"], "manager run revoke");
+      if (result.v !== 1 || result.kind !== request.kind || result.requestId !== request.requestId || result.runId !== revoke.runId)
+        throw new Error("manager run revoke returned different request or run coordinates");
+      return revocationSnapshot(result.revocation, revoke.runId);
+    },
+    admitRun: async ({ runId, subject }) => {
+      const request = remoteRunAdmissionRequest(state, registrationProof, accountPublicKey, processEpoch, { runId, subject });
+      return remoteRunAdmission(await args.requestRunAdmission(request), request);
+    },
+    issueAttempt: async ({ runId, takeoverId, epoch, fencingToken, driver, mediator, served }) => {
+      const request = remoteRunAttemptRequest(state, registrationProof, accountPublicKey, processEpoch,
+        { attempt: { runId, takeoverId, epoch, fencingToken, driverId: driver.id, mediatorId: mediator.id, ...(served !== undefined ? { served } : {}) } });
+      const pair = remoteRunAttemptCredentials(await args.requestRunAttempt(request), request, owner, { driver, mediator });
+      if (!("driver" in pair)) throw new Error("host returned an operator instead of a run pair");
+      return pair;
+    },
+    issueOperator: async ({ identity, takeoverId, runId, answers, served }) => {
+      const request = remoteRunAttemptRequest(state, registrationProof, accountPublicKey, processEpoch,
+        { operator: { id: identity.id, takeoverId, ...(runId !== undefined ? { runId } : {}), ...(answers !== undefined ? { answers } : {}), ...(served !== undefined ? { served } : {}) } });
+      const credential = remoteRunAttemptCredentials(await args.requestRunAttempt(request), request, owner, { operator: identity });
+      if (!("operator" in credential)) throw new Error("host returned a run pair instead of an operator");
+      return credential.operator;
+    },
+    renewRun: async ({ runId, holder, takeoverId, epoch, fencingToken, driver, mediator }) => {
+      const request: RemoteManagerAuthorityRequest = {
+        ...remoteManagerAuthorityRequest(state, "cli", "renewRunDriver", { registrationProof }),
+        accountPublicKey, processEpoch,
+        run: { runId, holder, takeoverId, epoch, fencingToken, driverId: driver.id, mediatorId: mediator.id },
+      };
+      return remoteRunRenewalCredentials(await args.call(request), request, owner, driver, mediator);
+    },
+  };
+}
+
+export function remoteManagerAdminAuthorizationRequest(
+  state: RemoteManagerIdentityState,
+  actor: string,
+  registrationProof: string,
+  serveEpoch: number,
+  caller: { owner: string; actor: string; lifecycleUid: string },
+): RemoteManagerAdminAuthorizationRequest {
+  return {
+    v: 1,
+    kind: "manager-admin-authorization",
+    space: state.space,
+    actor,
+    instanceId: state.instanceId,
+    managerLifecycleUid: state.lifecycleUid,
+    requestId: `admin${mintLifecycleUid()}`,
+    registrationProof,
+    serveEpoch,
+    identities: publicIdentities(state),
+    caller,
+  };
+}
+
+/** Validate the untrusted host result before the boolean can gate a manager operation. */
+export function remoteManagerAdminAuthorized(
+  result: RemoteManagerAdminAuthorizationResult,
+  request: RemoteManagerAdminAuthorizationRequest,
+  expectedOwner: string,
+): boolean {
+  exactKeys(result, ["v", "kind", "space", "owner", "actor", "instanceId", "managerLifecycleUid", "requestId", "registrationProof", "serveEpoch", "identities", "caller", "authorized"], "manager admin authorization");
+  if (result.v !== 1 || result.kind !== "manager-admin-authorization" || result.space !== request.space ||
+      result.owner !== expectedOwner || result.actor !== request.actor || result.instanceId !== request.instanceId ||
+      result.managerLifecycleUid !== request.managerLifecycleUid || result.requestId !== request.requestId ||
+      result.registrationProof !== request.registrationProof || result.serveEpoch !== request.serveEpoch ||
+      JSON.stringify(result.identities) !== JSON.stringify(request.identities) || JSON.stringify(result.caller) !== JSON.stringify(request.caller) ||
+      typeof result.authorized !== "boolean")
+    throw new Error("manager admin authorization returned different lifecycle, identity, caller, owner, or boolean coordinates");
+  return result.authorized;
+}
+
+export function remoteManagerParticipationAuthorizationRequest(
+  state: RemoteManagerIdentityState,
+  actor: string,
+  registrationProof: string,
+  serveEpoch: number,
+  caller: { owner: string; actor: string; lifecycleUid: string },
+): RemoteManagerParticipationAuthorizationRequest {
+  return coreParticipationAuthorizationRequest(
+    { space: state.space, instanceId: state.instanceId, lifecycleUid: state.lifecycleUid, identities: publicIdentities(state) },
+    actor,
+    registrationProof,
+    serveEpoch,
+    caller,
+    `participate${mintLifecycleUid()}`,
+  );
+}
+
+export function remoteManagerParticipationAuthorized(
+  result: RemoteManagerParticipationAuthorizationResult,
+  request: RemoteManagerParticipationAuthorizationRequest,
+  expectedOwner: string,
+): boolean {
+  return coreParticipationAuthorized(result, request, expectedOwner);
+}
+
+function stateFile(root: string, space: string): string {
+  return join(root, ".cotal", `remote-manager.${spaceKey(space)}.json`);
+}
+
+function remoteManagerStateOf(space: string) {
+  return (raw: unknown): RemoteManagerIdentityState | undefined => {
+    const o = raw as Partial<RemoteManagerIdentityState> | null;
+    if (o?.v !== 1 || o.space !== space || typeof o.instanceId !== "string" || typeof o.lifecycleUid !== "string" || !o.identities) return undefined;
+    const supervisor = identityOf(o.identities.supervisor);
+    const executor = identityOf(o.identities.executor);
+    const serve = identityOf(o.identities.serve);
+    const goalWriter = identityOf(o.identities.goalWriter);
+    const sessionLedger = identityOf(o.identities.sessionLedger);
+    if (!supervisor || !executor || !serve || !goalWriter || !sessionLedger) return undefined;
+    return { v: 1, space, instanceId: o.instanceId, lifecycleUid: o.lifecycleUid, identities: { supervisor, executor, serve, goalWriter, sessionLedger } };
+  };
+}
+
+/** Load or create one participant-owned manager lifecycle identity. Private seeds never leave it. */
+export function loadOrCreateRemoteManagerIdentity(root: string, space: string): RemoteManagerIdentityState {
+  return claimIdentityRecord(stateFile(root, space), "the remote manager authority state", remoteManagerStateOf(space), () => ({
+    v: 1,
+    space,
+    instanceId: mintLifecycleUid(),
+    lifecycleUid: mintLifecycleUid(),
+    identities: {
+      supervisor: newIdentity(),
+      executor: newIdentity(),
+      serve: newIdentity(),
+      goalWriter: newIdentity(),
+      sessionLedger: newIdentity(),
+    },
+  }));
+}
+
+export function remoteManagerAuthorityRequest(
+  state: RemoteManagerIdentityState,
+  actor: string,
+  operation: RemoteManagerAuthorityRequest["operation"],
+  coordinates: Pick<RemoteManagerAuthorityRequest, "registrationProof" | "contractArtifacts" | "session" | "retirement" | "transferReader"> = {},
+): RemoteManagerAuthorityRequest {
+  const { registrationProof, contractArtifacts, session, retirement, transferReader } = coordinates;
+  const requestId = `${operation}${mintLifecycleUid()}`;
+  return {
+    v: 1,
+    kind: "manager-service-authority",
+    operation,
+    space: state.space,
+    actor,
+    instanceId: state.instanceId,
+    managerLifecycleUid: state.lifecycleUid,
+    requestId,
+    ...(registrationProof ? { registrationProof } : {}),
+    ...(contractArtifacts ? { contractArtifacts } : {}),
+    ...(session ? { session } : {}),
+    ...(retirement ? { retirement } : {}),
+    ...(transferReader ? { transferReader } : {}),
+    identities: publicIdentities(state),
+  };
+}
+
+export function remoteManagerMaintenanceRequest(
+  state: RemoteManagerIdentityState,
+  actor: string,
+  operation: RemoteManagerMaintenanceRequest["operation"],
+  targetInstanceId: string,
+  principals?: string[],
+): RemoteManagerMaintenanceRequest {
+  return {
+    v: 1,
+    kind: "manager-service-maintenance",
+    operation,
+    space: state.space,
+    actor,
+    instanceId: state.instanceId,
+    managerLifecycleUid: state.lifecycleUid,
+    requestId: `maintain${mintLifecycleUid()}`,
+    identities: publicIdentities(state),
+    targetInstanceId,
+    ...(principals ? { principals } : {}),
+  };
+}
+
+/** Bind a host maintenance result to every request coordinate and validate the returned evidence. */
+export function remoteManagerMaintenanceResult(
+  result: RemoteManagerMaintenanceResult,
+  request: RemoteManagerMaintenanceRequest,
+  expectedOwner: string,
+): RemoteManagerMaintenanceResult {
+  let resultField: "evictions" | "reconciliation";
+  if (request.operation === "evict-family-principal") resultField = "evictions";
+  else if (request.operation === "reconcile-registration") resultField = "reconciliation";
+  else {
+    const unhandled: never = request.operation;
+    throw new Error(`manager maintenance has no result for operation ${unhandled}`);
+  }
+  const expectedKeys = [
+    "v", "kind", "operation", "space", "owner", "actor", "instanceId", "managerLifecycleUid",
+    "requestId", "identities", "targetInstanceId", ...(request.principals ? ["principals"] : []),
+    resultField,
+  ];
+  exactKeys(result, expectedKeys, "manager maintenance");
+  if (result.v !== 1 || result.kind !== "manager-service-maintenance" || result.owner !== expectedOwner ||
+      result.operation !== request.operation || result.space !== request.space || result.actor !== request.actor ||
+      result.instanceId !== request.instanceId || result.managerLifecycleUid !== request.managerLifecycleUid ||
+      result.requestId !== request.requestId || result.targetInstanceId !== request.targetInstanceId ||
+      JSON.stringify(result.identities) !== JSON.stringify(request.identities) ||
+      JSON.stringify(result.principals) !== JSON.stringify(request.principals))
+    throw new Error("manager maintenance returned different lifecycle, target, principal, or owner coordinates");
+  if (request.operation === "evict-family-principal") {
+    const evictions = result.evictions;
+    if (!Array.isArray(evictions) || evictions.length !== request.principals!.length)
+      throw new Error("manager maintenance returned garbled or foreign eviction evidence");
+    for (const [i, e] of evictions.entries()) {
+      if (!e || typeof e !== "object" || Array.isArray(e) ||
+          Object.keys(e).some((key) => !["principal", "kicked", "remaining", "verifiedGone", "scanComplete", "note"].includes(key)) ||
+          e.principal !== request.principals![i] || !Number.isSafeInteger(e.kicked) || e.kicked < 0 ||
+          !Number.isSafeInteger(e.remaining) || e.remaining < 0 || typeof e.verifiedGone !== "boolean" || typeof e.scanComplete !== "boolean")
+        throw new Error("manager maintenance returned garbled or foreign eviction evidence");
+      if (e.verifiedGone && (!e.scanComplete || e.remaining !== 0))
+        throw new Error("manager maintenance returned contradictory eviction evidence");
+    }
+  } else if (request.operation === "reconcile-registration") {
+    const r = result.reconciliation;
+    const reportKeys = [
+      "endpoint", "instanceId", "holderPrincipal", "opId", "freezeToken", "before", "after", "liveness",
+      "familyRows", "revoked", "evicted", "holders", "holdersVerifiedBeforeAttempt",
+      "holdersVerifiedThisAttempt", "holdersRemaining", "repairCursorCleanup", "reopenedAtGeneration",
+    ];
+    const report = exactKeys(r, reportKeys, "manager maintenance reconciliation") as unknown as NonNullable<RemoteManagerMaintenanceResult["reconciliation"]>;
+    if (report.endpoint !== "manager" || report.instanceId !== request.targetInstanceId ||
+        !Number.isSafeInteger(report.freezeToken) || !Number.isSafeInteger(report.familyRows) || !Number.isSafeInteger(report.reopenedAtGeneration) ||
+        ![report.holderPrincipal, report.opId].every((value) => typeof value === "string" && value.length > 0) ||
+        ![report.revoked, report.evicted, report.holders, report.holdersVerifiedBeforeAttempt, report.holdersVerifiedThisAttempt, report.holdersRemaining]
+          .every((value) => Array.isArray(value) && value.every((item) => typeof item === "string")) ||
+        (report.repairCursorCleanup !== "deleted" && report.repairCursorCleanup !== "retained") ||
+        !report.liveness || report.liveness.state !== "gone" || typeof report.liveness.detail !== "string")
+      throw new Error("manager maintenance returned no closed matching reconciliation report");
+  } else {
+    const unhandled: never = request.operation;
+    throw new Error(`manager maintenance has no result for operation ${unhandled}`);
+  }
+  return result;
+}
+
+export function remoteRetainedAgentValidationRequest(
+  state: RemoteManagerIdentityState,
+  actor: string,
+  registrationProof: string,
+  serveEpoch: number,
+  target: { owner: string; actor: string; lifecycleUid: string },
+  actorToken: string,
+  sentinelCreds: string,
+): RemoteRetainedAgentValidationRequest {
+  return {
+    v: 1,
+    kind: "manager-retained-agent-validation",
+    space: state.space,
+    actor,
+    instanceId: state.instanceId,
+    managerLifecycleUid: state.lifecycleUid,
+    requestId: `validate${mintLifecycleUid()}`,
+    registrationProof,
+    serveEpoch,
+    identities: publicIdentities(state),
+    target,
+    actorToken,
+    sentinelCreds,
+  };
+}
+
+/** Activation returns the only proof valid for later retained validation. The caller-computable
+ * activation proof is deliberately not accepted as a fallback. */
+export function currentRegistrationProof(material: RemoteManagerAuthorityMaterial): string {
+  const proof = material.nextRegistrationProof;
+  if (typeof proof !== "string" || !/^sha256:[0-9a-f]{64}$/.test(proof))
+    throw new Error("manager-service activation returned no host-authenticated current registration proof");
+  if (proof === material.registrationProof)
+    throw new Error("manager-service activation substituted the caller-computable activation proof for the host-authenticated current registration proof");
+  return proof;
+}
+
+/** Bind a host result back to every request coordinate before Manager consumes its authority row. */
+export function retainedAgentAuthority(
+  result: RemoteRetainedAgentValidationResult,
+  request: RemoteRetainedAgentValidationRequest,
+): RetainedAgentAuthority {
+  exactKeys(result, [
+    "actor", "authority", "instanceId", "kind", "managerLifecycleUid", "owner",
+    "registrationProof", "requestId", "serveEpoch", "space", "target", "v",
+  ], "manager retained-agent validation");
+  if (result.v !== 1 || result.kind !== "manager-retained-agent-validation" ||
+      result.space !== request.space || result.actor !== request.actor || result.instanceId !== request.instanceId ||
+      result.managerLifecycleUid !== request.managerLifecycleUid || result.requestId !== request.requestId ||
+      result.registrationProof !== request.registrationProof || result.serveEpoch !== request.serveEpoch ||
+      JSON.stringify(result.target) !== JSON.stringify(request.target) || result.owner !== request.target.owner)
+    throw new Error("manager retained-agent validation returned different lifecycle or target coordinates");
+  const authority = result.authority;
+  if (!authority || typeof authority !== "object" || Array.isArray(authority) ||
+      Object.keys(authority).some((key) => !["owner", "actor", "lifecycleUid", "scope", "allowSubscribe", "allowPublish", "role", "parent"].includes(key)) ||
+      authority.owner !== request.target.owner || authority.actor !== request.target.actor ||
+      authority.lifecycleUid !== request.target.lifecycleUid || !Array.isArray(authority.scope) ||
+      !authority.scope.every((value) => typeof value === "string") ||
+      !Array.isArray(authority.allowSubscribe) || !authority.allowSubscribe.every((value) => typeof value === "string") ||
+      !Array.isArray(authority.allowPublish) || !authority.allowPublish.every((value) => typeof value === "string") ||
+      (authority.role !== undefined && typeof authority.role !== "string") ||
+      (authority.parent !== undefined && typeof authority.parent !== "string"))
+    throw new Error("manager retained-agent validation returned an invalid or replacement authority");
+  return authority;
+}
+
+export function remoteManagerGoalIndexScanRequest(
+  state: RemoteManagerIdentityState,
+  actor: string,
+  registrationProof: string,
+  serveEpoch: number,
+): RemoteManagerGoalIndexScanRequest {
+  return {
+    v: 1,
+    kind: "manager-goal-index-scan",
+    space: state.space,
+    actor,
+    instanceId: state.instanceId,
+    managerLifecycleUid: state.lifecycleUid,
+    requestId: `scan${mintLifecycleUid()}`,
+    registrationProof,
+    serveEpoch,
+    identities: publicIdentities(state),
+  };
+}
+
+/** Bind a host-owned goal-index scan back to its request and validate every returned row before the
+ * manager acts on it. The HTTP result is untrusted input even though the host authenticated it. */
+export function remoteManagerGoalIndexEntries(
+  result: RemoteManagerGoalIndexScanResult,
+  request: RemoteManagerGoalIndexScanRequest,
+  expectedOwner: string,
+): import("@cotal-ai/core").GoalIndexEntry[] {
+  exactKeys(result, ["v", "kind", "space", "owner", "actor", "instanceId", "managerLifecycleUid", "requestId", "registrationProof", "serveEpoch", "entries"], "manager goal-index scan");
+  if (result.v !== 1 || result.kind !== "manager-goal-index-scan" || result.space !== request.space ||
+      result.owner !== expectedOwner || result.actor !== request.actor || result.instanceId !== request.instanceId ||
+      result.managerLifecycleUid !== request.managerLifecycleUid || result.requestId !== request.requestId ||
+      result.registrationProof !== request.registrationProof || result.serveEpoch !== request.serveEpoch || !Array.isArray(result.entries))
+    throw new Error("manager goal-index scan returned different lifecycle coordinates");
+  // The entry's shape is core's record contract; the scan adds only the endpoint and the owner.
+  return result.entries.map((raw, index) => {
+    const entry = parseGoalIndexEntry(raw, `${index} of the manager goal-index scan`);
+    if (entry.endpoint !== "manager" || entry.owner !== expectedOwner)
+      throw new Error(`manager goal-index scan returned invalid entry ${index}`);
+    return entry;
+  });
+}
+
+/** Combine a host-signed JWT with the participant's private seed, after exact identity checks. */
+export function materialCredential(
+  material: RemoteManagerAuthorityMaterial,
+  name: keyof RemoteManagerAuthorityMaterial["credentials"],
+  identity: Identity,
+): string {
+  const credential = material.credentials[name];
+  if (!credential) throw new Error(`manager-service ${material.operation} returned no ${name} credential`);
+  let claims: { sub?: unknown; exp?: unknown };
+  try { claims = JSON.parse(Buffer.from(credential.jwt.split(".")[1] ?? "", "base64url").toString("utf8")) as { sub?: unknown; exp?: unknown }; }
+  catch { throw new Error(`manager-service ${name} credential is not a JWT`); }
+  if (claims.sub !== identity.id) throw new Error(`manager-service ${name} JWT is for ${String(claims.sub)}, not the requested identity ${identity.id}`);
+  const envelopeExpiry = Math.min(...Object.values(material.credentials).map((item) => item!.exp * 1000));
+  // `expiresAt` is the envelope's earliest member expiry, not a ceiling on every member. Prepare
+  // deliberately returns a short registration executor beside a longer-lived supervisor, so
+  // requiring each credential to expire no later than the minimum makes the legitimate supervisor
+  // impossible to materialize. Recompute the envelope minimum and then bind this JWT to its own
+  // advertised expiry. A forged later envelope or a JWT/entry disagreement still fails closed.
+  // There is no clock here on purpose: a credential past its `exp` is refused by the broker when
+  // the manager connects with it, which is where expiry is enforced.
+  if (claims.exp !== credential.exp || !Number.isFinite(envelopeExpiry) || material.expiresAt !== envelopeExpiry || credential.exp * 1000 < material.expiresAt)
+    throw new Error(`manager-service ${name} expiry does not match the material envelope`);
+  return credsFromJwt(credential.jwt, identity);
+}
+
+/** The shipped caller of the closed `renewStandingBundle` operation. Every coordinate comes from
+ * the held registration: the SAME identities and lifecycle, the host-authenticated current
+ * registration proof from activation, and the account the host's own issued supervisor JWT names.
+ * Only the process epoch is supplied per call, by the Manager's active serve grant. The whole
+ * five-key family is validated against the request before the Manager sees any of it. */
+export function remoteStandingBundleRenewal(args: {
+  state: RemoteManagerIdentityState;
+  owner: string;
+  registrationProof: string;
+  /** Host-issued supervisor credential; its signing account is the assigned account. */
+  supervisorCreds: string;
+  call: (request: RemoteManagerAuthorityRequest) => Promise<RemoteManagerAuthorityMaterial>;
+}): { accountPublicKey: string; renewStandingBundle: (processEpoch: number) => Promise<Record<keyof RemoteManagerIdentityState["identities"], string>> } {
+  const accountPublicKey = accountFromCreds(args.supervisorCreds);
+  if (!accountPublicKey) throw new Error("the host-issued supervisor credential names no account");
+  return {
+    accountPublicKey,
+    renewStandingBundle: async (processEpoch) => {
+      const request: RemoteManagerAuthorityRequest = {
+        ...remoteManagerAuthorityRequest(args.state, "cli", "renewStandingBundle", { registrationProof: args.registrationProof }),
+        accountPublicKey, processEpoch,
+      };
+      return remoteManagerRenewalCredentials(await args.call(request), request, args.owner, args.state.identities);
+    },
+  };
+}
+
+/** The whole standing family is validated before any holder receives one renewed credential.
+ * A mismatched echo, missing profile or foreign nkey leaves the current live family untouched. */
+export function remoteManagerRenewalCredentials(
+  material: RemoteManagerAuthorityMaterial,
+  request: RemoteManagerAuthorityRequest,
+  owner: string,
+  identities: RemoteManagerIdentityState["identities"],
+): Record<keyof RemoteManagerIdentityState["identities"], string> {
+  if (request.operation !== "renewStandingBundle" || material.operation !== request.operation ||
+      material.v !== 1 || material.kind !== request.kind || material.space !== request.space ||
+      material.owner !== owner || material.actor !== request.actor || material.instanceId !== request.instanceId ||
+      material.lifecycleUid !== request.managerLifecycleUid || material.requestId !== request.requestId ||
+      material.registrationProof !== request.registrationProof || material.accountPublicKey !== request.accountPublicKey ||
+      material.processEpoch !== request.processEpoch || material.run !== undefined ||
+      JSON.stringify(material.identities) !== JSON.stringify(request.identities) ||
+      JSON.stringify(material.actors) !== JSON.stringify(remoteManagerActors(request.instanceId)) ||
+      Object.values(material.credentials).some((credential) => credential === undefined) ||
+      Object.keys(material.credentials).sort().join(",") !== [...REMOTE_MANAGER_IDENTITY_NAMES].sort().join(","))
+    throw new Error("manager-service renewal returned different coordinates or an incomplete standing family");
+  for (const name of REMOTE_MANAGER_IDENTITY_NAMES) if (request.identities[name].id !== identities[name].id)
+    throw new Error("manager-service renewal identities differ from the caller-held nkeys");
+  const result = Object.fromEntries(REMOTE_MANAGER_IDENTITY_NAMES.map((name) => [name, materialCredential(material, name, identities[name])])) as
+    Record<(typeof REMOTE_MANAGER_IDENTITY_NAMES)[number], string>;
+  for (const name of REMOTE_MANAGER_IDENTITY_NAMES) if (accountFromCreds(result[name]) !== request.accountPublicKey)
+    throw new Error(`manager-service ${name} JWT names a foreign account`);
+  return result;
+}
+
+/** Validate the pair before a hosted drive replaces either connection's credential. The
+ * issuer's grant is checked by broker preflight at the adoption site, not by JWT decode. */
+export function remoteRunRenewalCredentials(
+  material: RemoteManagerAuthorityMaterial,
+  request: RemoteManagerAuthorityRequest,
+  owner: string,
+  driver: Identity,
+  mediator: Identity,
+): { driver: string; mediator: string } {
+  if (request.operation !== "renewRunDriver" || material.operation !== request.operation ||
+      material.v !== 1 || material.kind !== request.kind || material.space !== request.space ||
+      material.owner !== owner || material.actor !== request.actor || material.instanceId !== request.instanceId ||
+      material.lifecycleUid !== request.managerLifecycleUid || material.requestId !== request.requestId ||
+      material.registrationProof !== request.registrationProof || material.accountPublicKey !== request.accountPublicKey ||
+      material.processEpoch !== request.processEpoch ||
+      JSON.stringify(material.run) !== JSON.stringify(request.run) ||
+      JSON.stringify(material.identities) !== JSON.stringify(request.identities) ||
+      JSON.stringify(material.actors) !== JSON.stringify(remoteManagerActors(request.instanceId)) ||
+      Object.values(material.credentials).some((credential) => credential === undefined) ||
+      Object.keys(material.credentials).sort().join(",") !== "runDriver,runMediator" ||
+      request.run?.driverId !== driver.id || request.run?.mediatorId !== mediator.id)
+    throw new Error("manager-service run renewal returned different coordinates or an incomplete driver/mediator pair");
+  const result = { driver: materialCredential(material, "runDriver", driver), mediator: materialCredential(material, "runMediator", mediator) };
+  if (accountFromCreds(result.driver) !== request.accountPublicKey || accountFromCreds(result.mediator) !== request.accountPublicKey)
+    throw new Error("manager-service run renewal returned a foreign account");
+  return result;
+}
+
+export function expectedRemoteManagerActors(state: RemoteManagerIdentityState) {
+  return remoteManagerActors(state.instanceId);
+}
+
+/** Build one host-owned managed-agent enrollment request (#1972). The request carries the DIGEST of
+ *  the standing actor token, never the token: the participant has already written the plaintext at
+ *  0600, and the host's copy is a hash it can only compare against. */
+export function remoteManagedAgentEnrollmentRequest(
+  state: RemoteManagerIdentityState,
+  actor: string,
+  registrationProof: string,
+  serveEpoch: number,
+  target: RemoteManagedAgentEnrollmentRequest["target"],
+  spawn?: RemoteManagedAgentEnrollmentRequest["spawn"],
+): RemoteManagedAgentEnrollmentRequest {
+  return {
+    v: 1,
+    kind: "manager-managed-agent-enrollment",
+    space: state.space,
+    actor,
+    instanceId: state.instanceId,
+    managerLifecycleUid: state.lifecycleUid,
+    requestId: `enroll${mintLifecycleUid()}`,
+    registrationProof,
+    serveEpoch,
+    target,
+    ...(spawn !== undefined ? { spawn } : {}),
+    identities: publicIdentities(state),
+  };
+}
+
+/** Bind a host enrollment result back to every request coordinate and validate the returned
+ *  material before the manager launches a child against it. An HTTP body is untrusted input even
+ *  though the host authenticated the request that produced it. */
+export function remoteManagedAgentEnrollmentMaterial(
+  result: RemoteManagedAgentEnrollmentResult,
+  request: RemoteManagedAgentEnrollmentRequest,
+): RemoteManagedAgentEnrollmentResult["material"] {
+  const envelopeKeys = [
+    "v", "kind", "space", "owner", "actor", "instanceId", "managerLifecycleUid",
+    "requestId", "registrationProof", "serveEpoch", "material",
+  ];
+  // `runtimeIntent` is additive and display-only: older hosts omit it, and it is never authority.
+  // It is checked for shape and then dropped; nothing below reads it.
+  const { runtimeIntent, ...envelope } = (result ?? {}) as RemoteManagedAgentEnrollmentResult;
+  if (runtimeIntent !== undefined && (runtimeIntent === null || typeof runtimeIntent !== "object" ||
+      Object.keys(runtimeIntent).join(",") !== "state" || runtimeIntent.state !== "reserved"))
+    throw new Error('managed agent enrollment returned a runtimeIntent other than { state: "reserved" }');
+  if (result === null || typeof result !== "object" || Array.isArray(result))
+    throw new Error("managed agent enrollment returned a non-closed result");
+  exactKeys(envelope, envelopeKeys, "managed agent enrollment");
+  if (result.v !== 1 || result.kind !== "manager-managed-agent-enrollment" || result.space !== request.space ||
+      result.actor !== request.actor || result.instanceId !== request.instanceId ||
+      result.managerLifecycleUid !== request.managerLifecycleUid || result.requestId !== request.requestId ||
+      result.registrationProof !== request.registrationProof || result.serveEpoch !== request.serveEpoch ||
+      typeof result.owner !== "string" || result.owner.length === 0)
+    throw new Error("managed agent enrollment returned different lifecycle, request, or owner coordinates");
+  const m = result.material;
+  const materialKeys = ["owner", "actor", "lifecycleUid", "sentinelCreds", "subscribe", "allowSubscribe", "allowPublish", "agentBearerExchangeUrl"];
+  exactKeys(m, materialKeys, "managed agent enrollment material");
+  // The envelope owner and the material owner are the SAME authority. A result that disagreed with
+  // itself would let one field name the audited owner and the other the owner actually granted.
+  if (m.owner !== result.owner)
+    throw new Error("managed agent enrollment material names a different owner than its envelope");
+  if (m.actor !== request.target.actor)
+    throw new Error(`managed agent enrollment returned actor "${m.actor}", not the requested "${request.target.actor}"`);
+  if (typeof m.lifecycleUid !== "string" || !/^[a-z0-9]{26,32}$/.test(m.lifecycleUid))
+    throw new Error("managed agent enrollment returned no valid host-selected lifecycle uid");
+  if (typeof m.sentinelCreds !== "string" || m.sentinelCreds.length === 0)
+    throw new Error("managed agent enrollment returned no sentinel credentials");
+  for (const key of ["subscribe", "allowSubscribe", "allowPublish"] as const)
+    if (!Array.isArray(m[key]) || !m[key].every((value) => typeof value === "string" && value.length > 0))
+      throw new Error(`managed agent enrollment returned an invalid ${key} list`);
+  // The bearer endpoint the CHILD will present its standing token to. A plaintext or non-URL pin
+  // would put that token on the wire in the clear, so it is refused here rather than at first
+  // exchange, and a loopback literal is the only HTTP exception (the same rule agent-bearer keeps).
+  let url: URL;
+  try { url = new URL(m.agentBearerExchangeUrl); }
+  catch { throw new Error(`managed agent enrollment returned no usable agent bearer exchange URL (got ${JSON.stringify(m.agentBearerExchangeUrl)})`); }
+  if (!isCredentialTransportUrl(url))
+    throw new Error(`managed agent enrollment returned a non-HTTPS agent bearer exchange URL (${url.protocol}//) - the actor token must never cross plaintext off this machine`);
+  return m;
+}
+
+/** A managed agent's read and post channels as its enrollment asked for them and as the host
+ *  granted them. */
+export interface EnrolledAcl {
+  requested: { allowSubscribe: string[]; allowPublish: string[] };
+  effective: { allowSubscribe: string[]; allowPublish: string[] };
+}
+
+/** What the host granted beside what `requested` asked for, when the host's read or post list is
+ *  not the one asked for: a host may narrow a request to the account's grant instead of refusing
+ *  it. Undefined when the host granted what was asked. */
+export function enrolledAcl(
+  requested: { allowSubscribe?: readonly string[]; allowPublish?: readonly string[] },
+  material: Pick<RemoteManagedAgentEnrollmentResult["material"], "allowSubscribe" | "allowPublish">,
+): EnrolledAcl | undefined {
+  const asked = { allowSubscribe: [...(requested.allowSubscribe ?? [])], allowPublish: [...(requested.allowPublish ?? [])] };
+  const granted = { allowSubscribe: [...material.allowSubscribe], allowPublish: [...material.allowPublish] };
+  const same = (a: string[], b: string[]) => a.length === b.length && a.every((channel) => b.includes(channel));
+  return same(asked.allowSubscribe, granted.allowSubscribe) && same(asked.allowPublish, granted.allowPublish)
+    ? undefined
+    : { requested: asked, effective: granted };
+}
+
+/** Build one host-owned prepare-retirement request (#1972 phase P0/P1). The opId is DERIVED from the
+ *  target lifecycle, so a retry converges on the host's existing operation instead of opening a
+ *  second barrier over one head. */
+export function remoteManagedAgentPrepareRetirementRequest(
+  state: RemoteManagerIdentityState,
+  actor: string,
+  registrationProof: string,
+  serveEpoch: number,
+  target: { owner: string; actor: string; lifecycleUid: string },
+  opId: string,
+): RemoteManagedAgentPrepareRetirementRequest {
+  if (opId !== managedRetirementOpId(target.lifecycleUid))
+    throw new Error(`managed agent prepare-retirement opId "${opId}" is not the derived terminal operation for lifecycle ${target.lifecycleUid}`);
+  return {
+    v: 1,
+    kind: "manager-managed-agent-prepare-retirement",
+    space: state.space,
+    actor,
+    instanceId: state.instanceId,
+    managerLifecycleUid: state.lifecycleUid,
+    requestId: `prepare${mintLifecycleUid()}`,
+    registrationProof,
+    serveEpoch,
+    target,
+    opId,
+    identities: publicIdentities(state),
+  };
+}
+
+/** Bind a host prepare-retirement result to its request. Only an exact, closed `prepared: true`
+ *  answer permits the terminal auth barrier to start; anything else keeps the alias held. */
+export function remoteManagedAgentRetirementPrepared(
+  result: RemoteManagedAgentPrepareRetirementResult,
+  request: RemoteManagedAgentPrepareRetirementRequest,
+): void {
+  const keys = [
+    "v", "kind", "space", "owner", "actor", "instanceId", "managerLifecycleUid",
+    "requestId", "target", "opId", "prepared",
+  ];
+  exactKeys(result, keys, "managed agent prepare-retirement");
+  if (result.v !== 1 || result.kind !== "manager-managed-agent-prepare-retirement" || result.space !== request.space ||
+      result.actor !== request.actor || result.instanceId !== request.instanceId ||
+      result.managerLifecycleUid !== request.managerLifecycleUid || result.requestId !== request.requestId ||
+      result.owner !== request.target.owner || result.opId !== request.opId ||
+      JSON.stringify(result.target) !== JSON.stringify(request.target))
+    throw new Error("managed agent prepare-retirement returned different lifecycle, target, or operation coordinates");
+  if (result.prepared !== true)
+    throw new Error("managed agent prepare-retirement did not confirm the release; the terminal barrier must not start");
+}
+
+/** Build one hosted runtime create or status request for an already-enrolled managed agent. The
+ *  target is the host-selected coordinate the enrollment returned; there is no provider field. */
+export function remoteManagedAgentRuntimeRequest<K extends RemoteManagedAgentRuntimeRequest["kind"]>(
+  kind: K,
+  state: RemoteManagerIdentityState,
+  actor: string,
+  registrationProof: string,
+  serveEpoch: number,
+  target: { owner: string; actor: string; lifecycleUid: string },
+): Extract<RemoteManagedAgentRuntimeRequest, { kind: K }> {
+  return {
+    v: 1,
+    kind,
+    space: state.space,
+    actor,
+    instanceId: state.instanceId,
+    managerLifecycleUid: state.lifecycleUid,
+    requestId: `runtime${mintLifecycleUid()}`,
+    registrationProof,
+    serveEpoch,
+    target: { owner: target.owner, actor: target.actor, lifecycleUid: target.lifecycleUid },
+    identities: publicIdentities(state),
+  } as Extract<RemoteManagedAgentRuntimeRequest, { kind: K }>;
+}
+
+/** Bind a host runtime result to its request: closed, every coordinate echoed, closed enums. */
+export function remoteManagedAgentRuntimeState(
+  result: unknown,
+  request: RemoteManagedAgentRuntimeRequest,
+): RemoteManagedAgentRuntimeResult {
+  return parseRemoteManagedAgentRuntimeResult(result, request);
+}

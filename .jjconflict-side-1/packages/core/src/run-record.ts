@@ -1,0 +1,228 @@
+/**
+ * The run record: what a workflow run IS, beside the journal that says what it DID.
+ *
+ * The journal on WFJ is append-only and authoritative about events. This is last-value-wins and
+ * authoritative about state — who holds the run, what state it is in, and the PIN SET resolved once
+ * at start. Two runs of one program under different pins are two different runs, so a resume reads
+ * the pins back rather than re-deriving them: "the default" is a property of the interpreter, and
+ * the interpreter is the thing that may have changed between attempts.
+ *
+ * It also carries the one fact the journal cannot hold about itself: **how far the journal has
+ * got**. A record deleted from the TAIL of a run's subject leaves the survivors contiguous — the
+ * ordinal chain sees nothing missing, because the missing part is the part it would have compared
+ * against — and the per-subject head is recalculated backwards, so the fence accepts an append at a
+ * head the run already moved past. Measured end to end: the run replays SHORT and intact, a
+ * successor activates on it, and it resumes from a prefix that is missing work the run really did.
+ * No anchor inside the journal can detect that. `journalHigh` is the anchor OUTSIDE it.
+ *
+ * What that anchor covers, stated plainly because a guard believed to be wider than it is is worse
+ * than none: the driver writes it at each ACTIVATION and again after every append it makes while
+ * the run is `running`, before the append resolves to the language. So a record the program has
+ * acted on is covered, including one appended since the last takeover. The cost is one record
+ * write per append. Interior loss is the journal's own ordinal chain's.
+ */
+import type { KV } from "@nats-io/kv";
+import {
+  RECORD_KINDS,
+  createRecordEntry,
+  updateRecordEntry,
+  readRecord,
+  recordSpecKey,
+  recordStatusKey,
+  assertStatusValue,
+  type MergedRecord,
+} from "./endpoint-records.js";
+
+/**
+ * The pins, resolved. Structurally the language's `RunPins` — `@cotal-ai/core` does not depend on
+ * `@cotal-ai/lang`, and the wire shape is the contract between them rather than a shared type.
+ */
+export interface RunPinsValue {
+  readonly seed: string;
+  /** The run's logical epoch. `now()` derives from THIS, never from the resuming host's clock. */
+  readonly startedAt: number;
+  readonly yieldEvery: number;
+  readonly stepBudget: number;
+  readonly effectCeiling: number;
+  readonly languageVersion: string;
+}
+
+/**
+ * The immutable half: what this run IS, decided once and never re-decided.
+ *
+ * Deliberately NOT carrying a program hash yet. The interpreter reports one, but only after a run,
+ * and a hash computed here from the source would be a different function's answer wearing the same
+ * name — the divergence check that matters is per-step and the language already makes it from the
+ * recorded input hashes. A source-identity pin is its own item, not a field filled with a guess.
+ */
+export interface RunSpecValue {
+  readonly v: 1;
+  readonly run: string;
+  readonly pins: RunPinsValue;
+  readonly createdAt: number;
+  /**
+   * Present on a fork's child: the parent run and the step key the cut excluded. Lineage is a
+   * fact about what this run IS, decided once at the fork, so it lives in the immutable half.
+   * Absent on a run started fresh, and legal to be absent on a child recorded before this field
+   * existed: absence reads as "lineage unknown", never as "not a fork".
+   */
+  readonly forkedFrom?: { readonly run: string; readonly step: string };
+}
+
+/**
+ * What a run is doing now.
+ *
+ * `released` and `failed` are not the same thing and the distinction is the point: a program that
+ * failed has a result and the journal has it, while a released run has no result at all — its
+ * driver stopped holding it. Recording one as the other would write down a conclusion about work
+ * nobody observed.
+ */
+export type RunState = "running" | "released" | "completed" | "failed";
+
+export interface RunStatusValue {
+  readonly v: 1;
+  readonly observedSpecRevision: number;
+  readonly state: RunState;
+  readonly holder: string;
+  readonly epoch: number;
+  readonly fencingToken: number;
+  /**
+   * The highest journal ordinal this run is KNOWN to have reached, written at each activation.
+   * A replay whose last ordinal is BELOW this has lost records from its tail.
+   */
+  readonly journalHigh: number;
+  readonly at: number;
+  /**
+   * Why a `failed` run failed: the language code its error carries, when it has one, and its message,
+   * bounded to {@link RUN_FAILURE_MESSAGE_LIMIT} characters. Only a failed status has it, and a
+   * failed status recorded before it existed has none.
+   */
+  readonly failure?: RunFailure;
+}
+
+/** A failed run's cause, as its status records it. */
+export interface RunFailure { readonly code?: string; readonly message: string }
+
+/** The longest failure message a run status records; a longer one is cut and marked. */
+export const RUN_FAILURE_MESSAGE_LIMIT = 4000;
+
+/** The status record's view of an error a program failed with: an `L` code when it carries one, and
+ *  its message, cut to the limit. */
+export function runFailureOf(error: unknown): RunFailure {
+  const e = error as { code?: unknown; message?: unknown } | null;
+  const message = typeof e?.message === "string" && e.message ? e.message : String(error);
+  return {
+    ...(typeof e?.code === "string" && /^L\d{4}$/.test(e.code) ? { code: e.code } : {}),
+    message: message.length > RUN_FAILURE_MESSAGE_LIMIT ? `${message.slice(0, RUN_FAILURE_MESSAGE_LIMIT - 1)}…` : message,
+  };
+}
+
+/** A run's journal is missing records from its END — which nothing inside the journal can see. */
+export class RunJournalTailTruncated extends Error {
+  constructor(
+    readonly run: string,
+    readonly recordedHigh: number,
+    readonly replayedHigh: number,
+  ) {
+    super(
+      `run ${run}: the journal replayed to ordinal ${replayedHigh}, but this run is recorded as having reached ${recordedHigh}. ` +
+        `Records are missing from the END of the subject: the surviving prefix is contiguous, so the ordinal chain cannot see it, ` +
+        `and the subject's head has rolled back with them. Resuming here would repeat work the run already did. ` +
+        `Recover the missing records or retire the run; do not drive it.`,
+    );
+    this.name = "RunJournalTailTruncated";
+  }
+}
+
+/** Read a run's record. `undefined` = this run has never been started. */
+export async function readRunRecord(
+  kv: KV,
+  endpoint: string,
+  runId: string,
+): Promise<MergedRecord<RunSpecValue, RunStatusValue> | undefined> {
+  return await readRecord<RunSpecValue, RunStatusValue>(kv, RECORD_KINDS.run, [endpoint, runId]);
+}
+
+/** The run coordinates a renewal issuer compares, as {@link observeHostedRunAttempt} reads them. */
+export type HostedRunAttempt = Pick<RunStatusValue, "state" | "holder" | "epoch" | "fencingToken"> & {
+  readonly takeoverId: string;
+  readonly instanceId: string;
+};
+
+/**
+ * The activated attempt of a run hosted by one registered manager, read from the authoritative run
+ * record for a renewal issuer. The hosting manager writes the attempt holder as
+ * `<supervisor id>.<takeoverId>`, so the instance is bound only when that prefix is the caller's
+ * REGISTERED supervisor id. A holder under any other prefix reports no instance, which a renewal
+ * gate refuses as a mismatch. `registered` must come from verified registration state, never from
+ * the renewal request. `null` = no record or no status.
+ */
+export async function observeHostedRunAttempt(
+  kv: KV,
+  endpoint: string,
+  runId: string,
+  registered: { readonly supervisorId: string; readonly instanceId: string },
+): Promise<HostedRunAttempt | null> {
+  const status = (await readRunRecord(kv, endpoint, runId))?.status?.value;
+  if (!status) return null;
+  const dot = status.holder.lastIndexOf(".");
+  const prefix = dot > 0 ? status.holder.slice(0, dot) : "";
+  const takeoverId = dot > 0 ? status.holder.slice(dot + 1) : "";
+  return {
+    state: status.state, holder: status.holder, takeoverId, epoch: status.epoch, fencingToken: status.fencingToken,
+    instanceId: prefix !== "" && prefix === registered.supervisorId ? registered.instanceId : "",
+  };
+}
+
+/**
+ * Create a run's spec. Create-only: a spec that already exists means this run was started before,
+ * and starting it again under a fresh set of pins would be a different run wearing the same id.
+ */
+export async function createRunSpec(
+  kv: KV,
+  endpoint: string,
+  runId: string,
+  value: Omit<RunSpecValue, "v" | "run">,
+): Promise<number> {
+  const spec: RunSpecValue = { v: 1, run: runId, ...value };
+  return await createRecordEntry(kv, recordSpecKey(RECORD_KINDS.run, [endpoint, runId]), spec);
+}
+
+/**
+ * Write a run's status. `expectedRevision` is `undefined` for the first write and the last read
+ * revision thereafter — the CAS is what keeps two drivers from taking turns overwriting each
+ * other's view of who holds the run.
+ */
+export async function writeRunStatus(
+  kv: KV,
+  endpoint: string,
+  runId: string,
+  value: Omit<RunStatusValue, "v">,
+  expectedRevision?: number,
+): Promise<number> {
+  const status = assertStatusValue({ v: 1 as const, ...value });
+  // Through the key BUILDER, never a join of our own: it is what asserts the endpoint and the run
+  // id are grammatical tokens, and a run id that tokenized loose would write into another run's key.
+  const key = recordStatusKey(RECORD_KINDS.run, [endpoint, runId]);
+  return expectedRevision === undefined
+    ? await createRecordEntry(kv, key, status)
+    : await updateRecordEntry(kv, key, status, expectedRevision);
+}
+
+/**
+ * The tail check, run BETWEEN the replay and the activation.
+ *
+ * Before, and not after, because an activation appended over a rolled-back head is itself a record
+ * written into a journal we already know is wrong — and it would be written at an ordinal the
+ * deleted records already used, which is a hole the chain would then blame on someone else.
+ */
+export function assertJournalTailIntact(
+  runId: string,
+  recorded: RunStatusValue | undefined,
+  replayedHigh: number,
+): void {
+  if (recorded === undefined) return;
+  if (replayedHigh < recorded.journalHigh) {
+    throw new RunJournalTailTruncated(runId, recorded.journalHigh, replayedHigh);
+  }
+}

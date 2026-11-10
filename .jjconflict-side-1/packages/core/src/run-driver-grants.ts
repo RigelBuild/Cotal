@@ -1,0 +1,238 @@
+/**
+ * Per-run driver and trusted host credentials. The driver appends its journal and writes its
+ * own records. Broker-wide read verbs and checkpoint/registry authority stay on the host,
+ * which exposes run-bound operations and never hands this credential to the driver.
+ */
+import { createHash } from "node:crypto";
+import { spacePrefix, chatStream, presenceBucket, channelBucket, membersBucket, aclBucket, assertInboxConnId, assertPrincipalOwnerToken, DEV_OWNER } from "./subjects.js";
+import { endpointToken, assertIdToken, assertLifecycleToken, epCallerReplyFilter, type EpCaller } from "./endpoint-subjects.js";
+import { recordsBucket } from "./endpoint-records.js";
+import { admissionBucket } from "./run-admission.js";
+import {
+  runDriverJournalGrants,
+  runJournalReplayGrants,
+  recordsKvStreamName,
+  epfStreamName,
+  eptStreamName,
+  epcStreamName,
+} from "./endpoint-binding.js";
+import { epRequestGrantRows, epDescribeAllGrantRow, BASELINE_LIFECYCLE_ENDPOINT } from "./endpoint-grants.js";
+
+/**
+ * The run-stable caller triple used by durable actions. Actor and uid derive from the run id;
+ * the trusted host supplies the admitted owner. Omitting owner preserves the static/local caller.
+ * This validates the owner's grammar, not its authority: a program cannot choose its owner here.
+ * A platform `p_…` owner is admitted for the platform control manager's own runs (SPEC 13.1).
+ * Goal facts key on this triple, so grants and effects must use the same original owner on resume.
+ * Grammar: actor is `[A-Za-z0-9_]+` and uid is `[a-z0-9]{26,32}`, both satisfied by digest slices.
+ */
+export function runDriverCaller(runId: string, owner: string = DEV_OWNER): EpCaller {
+  assertPrincipalOwnerToken(owner, { allowLocal: true, allowPlatform: true });
+  const h = createHash("sha256").update(assertIdToken(runId, "runId"), "utf8").digest("hex");
+  return { owner, actor: `wf_${h.slice(0, 12)}`, uid: h.slice(12, 38) };
+}
+
+/** Coordinates for the driver/host pair: replay is takeover-pinned; host schedules also pin instance and epoch. */
+export interface RunDriverGrantArgs {
+  /** The endpoint hosting the driver: the manager daemon. Leads every record key. */
+  endpoint: string;
+  runId: string;
+  /** The authenticated admission owner. Omitted only on the existing static/local path. */
+  owner?: string;
+  /** The takeover attempt this credential is minted for; names the replay durable (SPEC 14.6). */
+  takeoverId: string;
+  /** The driving instance's id and epoch: the coordinates its timer schedules are addressed by. */
+  instanceId: string;
+  epoch: number;
+  /** EXPLICIT PLACEMENT TARGET (#1616): the manager endpoint-instance the program named for a
+   *  `cwd` spawn. The descriptor is the one the existing instance-dispatch API already accepts —
+   *  `{ endpoint, instanceId }`, routed as `EpRoute { mode: "inst", instanceId }`
+   *  (endpoint-invoke.ts) — not a new field. Absent ⇒ legacy cwd-omitted behavior, unchanged. */
+  placement?: { instanceId: string };
+}
+
+export function runDriverGrants(space: string, args: RunDriverGrantArgs, connId: string): { publish: string[]; subscribe: string[] } {
+  const endpoint = endpointToken(args.endpoint);
+  const run = assertIdToken(args.runId, "runId");
+  if (args.owner !== undefined) assertPrincipalOwnerToken(args.owner, { allowLocal: true, allowPlatform: true });
+  assertLifecycleToken(args.instanceId, "instanceId");
+  if (!Number.isSafeInteger(args.epoch) || args.epoch < 0) throw new Error(`epoch ${args.epoch} is not an unsigned integer`);
+  const records = recordsBucket(space);
+  return {
+    publish: [
+      ...runDriverJournalGrants(space, run, args.takeoverId),
+      `$KV.${records}.run.${endpoint}.${run}.>`,
+      `$KV.${records}.program.${endpoint}.${run}`,
+      `$KV.${records}.notice.${endpoint}.${run}.>`,
+      `$KV.${records}.migration.${endpoint}.${run}.>`,
+      "$JS.API.INFO",
+    ],
+    subscribe: [`_INBOX_${assertInboxConnId(connId)}.>`],
+  };
+}
+
+/** The ONLY operations explicit placement adds reach for (#1616). `describe` is listed because the
+ *  baseline describe row is class-rail only, so a PINNED resolve is broker-refused without it. */
+export const PLACEMENT_COMMANDS: readonly string[] = Object.freeze(["describe", "resolve-cwd", "spawn"]);
+
+/** The owner-mode lifecycle commands a placed run addresses on its placement instance. A seat placed
+ *  there is mapped only by that instance's resolver, so on the class rail every other member refuses
+ *  its turn as unmapped and a turn to a live seat can run out of re-issues. Same target bound as the
+ *  class row (the caller's owner), on the one placed instance only. */
+export const PLACED_LIFECYCLE_COMMANDS: readonly string[] = Object.freeze(["turn"]);
+
+/** Trusted, per-run host connection. The endpoint-wide checkpoint writes and body-selected
+ *  records/fact/timer/chat reads are its residual authority. The runtime confines those verbs
+ *  behind journal-checked operations; this profile must never be given to the run driver.
+ *  It can replay this run's journal to authorize effects, but cannot append a journal entry. */
+export function runMediatorGrants(space: string, args: RunDriverGrantArgs, connId: string): { publish: string[]; subscribe: string[] } {
+  const e = endpointToken(args.endpoint);
+  const run = assertIdToken(args.runId, "runId");
+  const iid = assertLifecycleToken(args.instanceId, "instanceId");
+  if (!Number.isSafeInteger(args.epoch) || args.epoch < 0) throw new Error(`epoch ${args.epoch} is not an unsigned integer`);
+  const p = spacePrefix(space);
+  const records = recordsBucket(space);
+  const caller = runDriverCaller(run, args.owner);
+  const CHAT = chatStream(space);
+  const PKV = `KV_${presenceBucket(space)}`;
+  const publish = [
+    // Read this run's journal to authorize host operations.
+    ...runJournalReplayGrants(space, run, args.takeoverId),
+    // Run-owned state and the mediated checkpoint writer.
+    `$KV.${records}.run.${e}.${run}.>`,
+    `$KV.${records}.program.${e}.${run}`,
+    `$KV.${records}.notice.${e}.${run}.>`,
+    `$KV.${records}.migration.${e}.${run}.>`,
+    `$KV.${records}.cp.${e}.>`,
+    `$JS.API.STREAM.MSG.GET.${recordsKvStreamName(space)}`,
+    // The checkpoint plane: settle facts (publish), the fact read, the schedule request pinned to
+    // this attempt's coordinates, and the fire read.
+    `${p}.epf.${e}.cp.>`,
+    `$JS.API.STREAM.MSG.GET.${epfStreamName(space)}`,
+    `${p}.ept.${e}.${iid}.${args.epoch}.*.schedule`,
+    `$JS.API.STREAM.MSG.GET.${eptStreamName(space)}`,
+    // Channels: the frontier read a conclave cursors on, the by-sequence re-read of a matched
+    // message, and the per-step `wfw_` wait durable (create/bind/ack/delete).
+    `$JS.API.STREAM.INFO.${CHAT}`,
+    `$JS.API.STREAM.MSG.GET.${CHAT}`,
+    `$JS.API.CONSUMER.CREATE.${CHAT}.>`,
+    `$JS.API.CONSUMER.INFO.${CHAT}.>`,
+    `$JS.API.CONSUMER.MSG.NEXT.${CHAT}.>`,
+    `$JS.API.CONSUMER.DELETE.${CHAT}.>`,
+    `$JS.ACK.${CHAT}.>`,
+    // Presence: the ordered-consumer read every agent holds (liveness for turn, down, conclave,
+    // worktree claims).
+    `$JS.API.STREAM.INFO.${PKV}`,
+    `$JS.API.CONSUMER.CREATE.${PKV}.>`,
+    `$JS.API.CONSUMER.INFO.${PKV}.>`,
+    `$JS.API.CONSUMER.DELETE.${PKV}.>`,
+    "$JS.FC.>",
+    // Conclaves: the channel registry row and the membership rows a conclave writes and reads.
+    `$KV.${channelBucket(space)}.>`,
+    `$JS.API.STREAM.MSG.GET.KV_${channelBucket(space)}`,
+    `$KV.${membersBucket(space)}.>`,
+    `$JS.API.STREAM.MSG.GET.KV_${membersBucket(space)}`,
+    // The member lifecycle's exact read-ACL row a conclave reads around each membership row it
+    // writes (#4995): a read only, keyed by the row the write names.
+    `$JS.API.STREAM.MSG.GET.KV_${aclBucket(space)}`,
+    // The manager's lifecycle commands, as the run's own caller: describe (the resolve), spawn
+    // (untargeted creation), inspect (whether a seat whose presence lapsed is still running), turn
+    // and despawn (owner mode, pinned to the caller's owner), and the reserved goal cancel that
+    // withdraws a turn the run cancelled (untargeted: it reaches only the caller's own goals).
+    epDescribeAllGrantRow(space, caller),
+    ...epRequestGrantRows(space, { endpoint: BASELINE_LIFECYCLE_ENDPOINT, command: "spawn" }, caller),
+    ...epRequestGrantRows(space, { endpoint: BASELINE_LIFECYCLE_ENDPOINT, command: "inspect" }, caller),
+    ...epRequestGrantRows(space, { endpoint: BASELINE_LIFECYCLE_ENDPOINT, command: "turn", target: { mode: "owner", tOwner: caller.owner } }, caller),
+    ...epRequestGrantRows(space, { endpoint: BASELINE_LIFECYCLE_ENDPOINT, command: "cancel" }, caller),
+    ...epRequestGrantRows(space, { endpoint: BASELINE_LIFECYCLE_ENDPOINT, command: "despawn", target: { mode: "owner", tOwner: caller.owner } }, caller),
+    // #1616 TARGET-BOUND PLACEMENT REACH. Minted ONLY when the program named an explicit target,
+    // and then only for that ONE validated instance: the three placement operations, and `turn` on
+    // the seats placed there, owner-pinned exactly as the class row. `routes: []`
+    // suppresses the class `one` row entirely, so this adds NO anycast fallback and no wildcard:
+    // `epRequestGrantRows` emits the single `ep.inst.<endpoint>.<iid>.<command>` row per command.
+    // Issuance stays inside the delegating caller's authority — the rows are stamped with the run's
+    // own caller block, so naming a target in a program grants nothing the caller could not do.
+    ...(args.placement === undefined
+      ? []
+      : [
+          ...PLACEMENT_COMMANDS.flatMap((command) => epRequestGrantRows(space, {
+            endpoint: BASELINE_LIFECYCLE_ENDPOINT, command, routes: [], instanceId: args.placement!.instanceId,
+          }, caller)),
+          ...PLACED_LIFECYCLE_COMMANDS.flatMap((command) => epRequestGrantRows(space, {
+            endpoint: BASELINE_LIFECYCLE_ENDPOINT, command, routes: [], instanceId: args.placement!.instanceId,
+            target: { mode: "owner", tOwner: caller.owner },
+          }, caller)),
+        ]),
+    // The contract store fetch a resolve performs (the subject-scoped form every agent holds).
+    `$JS.API.DIRECT.GET.${epcStreamName(space)}.${p}.epc.>`,
+    // The run's admission and revocation rows (SPEC 14.8): a leader-served read before every
+    // channel effect. READ only; the admitter writes them.
+    `$JS.API.STREAM.MSG.GET.KV_${admissionBucket(space)}`,
+    "$JS.API.INFO",
+  ];
+  return { publish, subscribe: [epCallerReplyFilter(space, caller), `_INBOX_${assertInboxConnId(connId)}.>`] };
+}
+
+/** One served run-surface call's coordinates (SPEC 14.3). */
+export interface RunOperatorGrantArgs {
+  /** The endpoint hosting the runs: the manager daemon. Leads every record key. */
+  endpoint: string;
+  /** The ONE run this call replays. Absent for `run-ps`, which walks records and replays no
+   *  journal, and for the answering form, which replays nothing (the pause was already found). A
+   *  replay durable's name is one token, so no pattern spans runs: the run is pinned at mint or
+   *  there is no journal row at all. */
+  runId?: string;
+  /** The takeover id this call's journal replay durable is named by, one per call. */
+  takeoverId: string;
+  /** Present for the SECOND half of `run-answer` and NOTHING else: the call files an answer record
+   *  and settles ONE checkpoint, named by its token. The token is found first, under the read form,
+   *  by replaying the run's journal; only then is this form minted, so the write rows are pinned to
+   *  the one pause being answered and reach no other pause on the endpoint. */
+  answers?: { token: string };
+}
+
+/**
+ * The RUN OPERATOR's rows (SPEC 14.3): what the hosting manager needs to SERVE a run's reads and
+ * answers without driving it. Minted per served call on its own connection so the serve rails
+ * never carry a run's journal or records reach.
+ *
+ * `run-ps` walks the run records consumer-free; `run-status` also replays the named run's journal
+ * through a per-call durable. Both are READS and hold no write row at all. `run-answer` is two
+ * calls on two credentials: a READ that replays the journal to find the open pause's token, then
+ * an ANSWERING form (`answers: { token }`) that files the answer record and settles that ONE
+ * checkpoint. Its three writes are pinned to the token, so an answering credential reaches no
+ * other pause of the endpoint, and it holds no replay row at all. The records and EPF reads are
+ * stream-wide by the store's own design (a KV point read is `STREAM.MSG.GET` on the one backing
+ * stream, and a fact read the same on EPF), the same as every commit-side profile's fencing read.
+ * No publish on any journal subject, no run or program record write, no consumer verb on the
+ * records store.
+ */
+export function runOperatorGrants(space: string, args: RunOperatorGrantArgs, connId: string): { publish: string[]; subscribe: string[] } {
+  const e = endpointToken(args.endpoint);
+  const records = recordsBucket(space);
+  const token = args.answers === undefined ? undefined : assertIdToken(args.answers.token, "checkpoint token");
+  const publish = [
+    // The run and program records of the endpoint, read through the leader-served point read and
+    // the consumer-free walk.
+    `$JS.API.STREAM.MSG.GET.${recordsKvStreamName(space)}`,
+    // A run-ps names no run, so it is the only form that lists the space. One message per
+    // STREAM.MSG.GET grows past the caller's fixed budget once a space holds a few hundred
+    // lifetime runs (#5854). The records bucket allows Direct Get, and a batched one returns
+    // 1024 messages a request. The read and answer forms name one run and keep the point read.
+    ...(args.runId === undefined && args.answers === undefined
+      ? [`$JS.API.DIRECT.GET.${recordsKvStreamName(space)}`]
+      : []),
+    // The run's admission and revocation rows (SPEC 14.8): a resume, takeback or served read
+    // decides on them before any drive. READ only; the admitter writes them.
+    `$JS.API.STREAM.MSG.GET.KV_${admissionBucket(space)}`,
+    // The named run's journal replay, read-only, under this call's own takeover id.
+    ...(args.runId === undefined ? [] : runJournalReplayGrants(space, args.runId, args.takeoverId)),
+    // An ANSWER of one pause: its answer record (create-only), the checkpoint status a settle
+    // moves, the one-use settle fact, and the fact read the settle's convergence performs.
+    ...(token === undefined
+      ? []
+      : [`$KV.${records}.answer.${e}.${token}.>`, `$KV.${records}.cp.${e}.${token}.>`, `${spacePrefix(space)}.epf.${e}.cp.${token}`, `$JS.API.STREAM.MSG.GET.${epfStreamName(space)}`]),
+    "$JS.API.INFO",
+  ];
+  return { publish, subscribe: [`_INBOX_${assertInboxConnId(connId)}.>`] };
+}

@@ -1,0 +1,57 @@
+{
+  "suite": [
+    "packages/lang/smoke/surface.smoke.ts"
+  ],
+  "guard": "Appendix A of the language reference and CATALOG are two renderings of ONE table: the same codes, each exactly once, each carrying the title the code actually raises. A reader repairing a program searches the document for the title the tool printed, so a document that lists a code the code does not raise, or a title the code no longer says, sends that reader nowhere. (FAIL-FAST suite: markers are upstream of the cells they guard.)",
+  "command": "pnpm smoke:lang-surface",
+  "proveWith": "pnpm mutation-proof --config packages/lang/smoke/mutations/catalog-rows.json",
+  "mutations": [
+    {
+      "name": "a catalog title drifts from the row that renders it",
+      "file": "packages/lang/src/errors.ts",
+      "find": "  L5024: \"A recorded value has no canonical form\",",
+      "replace": "  L5024: \"A recorded value has no canonical shape\",",
+      "expectRed": "and every one of those",
+      "completionMarker": "ok Appendix A lists exactly the catalog's codes",
+      "cell": "and every one of those 99 rows carries the title the code raises",
+      "note": "The REAL drift, replayed. L5024's row read \"A recorded binding has no canonical form\" while the code raised \"A recorded value has no canonical form\" from 5e606152 to c38b2ee8, because the rule grew to cover a failure's detail and a scope's result and the row was left behind. The set cell cannot see this: the codes still match one for one. Only the title cell reds, which is why the two are not one conjunction."
+    },
+    {
+      "name": "the catalog loses a code the document still lists",
+      "file": "packages/lang/src/errors.ts",
+      "find": "  L5021: \"Resume over a journal without the run's pins\",",
+      "replace": "",
+      "expectRed": "Appendix A lists exactly the catalog's codes",
+      "completionMarker": "ok every js block in docs/workflows.md validates as written",
+      "cell": "Appendix A lists exactly the catalog's codes, 99 of them, each once",
+      "note": "The other direction, and the one a title comparison alone would miss: the document keeps a row whose code no longer exists. L5021 is chosen because no cell in this suite raises or names it, so the mutant reaches the set comparison rather than reding something upstream. The set cell runs BEFORE the title cell, so under this mutant it is the first red and the title cell never runs."
+    },
+    {
+      "name": "a code outside the catalog is thrown again",
+      "file": "packages/lang/src/perform.ts",
+      "find": "      throw new InterpreterDefect(`the primitive ${name}`);",
+      "replace": "      throw new RuntimeFault(\"L1000\", `${name} is not implemented in this interpreter`);",
+      "expectRed": "every code this package THROWS is one the catalog carries",
+      "cell": "every code this package THROWS is one the catalog carries",
+      "note": "Appendix A and the catalog agree perfectly about a code that is in NEITHER. L1000 was thrown at eight sites and no reader could look it up."
+    },
+    {
+      "name": "an engine site throws a code outside the catalog, one directory down from the walker",
+      "file": "packages/lang/src/engine/ctx.ts",
+      "find": "          throw new InterpreterDefect(`the operator ${op}`);",
+      "replace": "          throw new RuntimeFault(\"L1000\", `unsupported operator ${op}`);",
+      "expectRed": "every code this package THROWS is one the catalog carries",
+      "cell": "every code this package THROWS is one the catalog carries",
+      "note": "The scan read src/*.ts and called the package clean while src/engine/ threw L1000 at eleven sites, seven of them in the multi-line spelling a per-line match could not see either. The scan now walks every file the package ships and matches across lines; this mutant puts the code back at the walker's twin and must red the same cell."
+    },
+    {
+      "name": "an engine site throws a code outside the catalog in the MULTI-LINE spelling",
+      "file": "packages/lang/src/engine/ctx.ts",
+      "find": "          throw new InterpreterDefect(`the operator ${op}`);",
+      "replace": "          throw new RuntimeFault(\n            \"L1000\",\n            `unsupported operator ${op}`,\n          );",
+      "expectRed": "every code this package THROWS is one the catalog carries",
+      "cell": "every code this package THROWS is one the catalog carries",
+      "note": "The other half of the scan fix. Seven of the engine's eleven L1000 sites were spelled with the code on the line after the constructor, and a per-line match read them as clean; the single-line mutant above cannot tell a whole-file match from a per-line one. A scan refactored back to lines keeps the recursive walk, keeps the single-line mutant red, and ships this spelling again."
+    }
+  ]
+}

@@ -1,0 +1,1306 @@
+/**
+ * The manager as a WORKFLOW-RUN HOST (SPEC 14.3): where a run's driver lives when nobody's
+ * terminal is holding it.
+ *
+ * The manager serves five commands: `run-start` and `run-resume` hand a program to a driver hosted
+ * IN THIS PROCESS and answer with the run id once the attempt's status record is a fact in the
+ * store (or with why it never became one); `run-answer` resolves an open checkpoint;
+ * `run-status` and `run-ps` read. The manager knows nothing about the language: it resolves the
+ * registered {@link RunHost} by name and drives through that contract, so `@cotal-ai/runtime` stays
+ * an implementation the manager never imports.
+ *
+ * Every drive rides its OWN connection under its OWN credential, never the serve connection and
+ * never the manager's supervisor identity. On an auth mesh that credential is the per-run,
+ * per-takeover `run-driver` profile (SPEC 14.6), minted from the space signer with the attempt's
+ * exact coordinates, and re-minted for the same nkey on the renewal loop so a run parked for days
+ * outlives the credential's TTL. A served read or answer rides a one-shot `run-operator` credential
+ * minted for that one call, so the serve handler's reach over the records store is exactly the
+ * call's and expires with it; an answer is two such calls, the read that finds the pause and then
+ * a write pinned to that pause's token. An open mesh has no credential system and connects bare.
+ *
+ * A registered signerless user-auth manager may host runs only with all four closed callbacks.
+ * Its issuer checks the admitted caller and signs the fixed attempt profiles for manager-held
+ * nkeys; the runtime derives its stable effect caller under the admitted owner's account.
+ *
+ * A manager restart takes its runs back: at boot, every run recorded `running` under this
+ * endpoint is resumed under a fresh takeover, epoch + 1, from its recorded program. A run whose
+ * predecessor died mid-pause is picked up where its journal says it is; nothing about the crash is
+ * recorded as the program's outcome. Until that reconcile has returned, `run-start` and
+ * `run-resume` are refused `unavailable`: a resume served while the reconcile is still collecting
+ * would launch a second attempt of a run the reconcile is about to take back.
+ *
+ * ONE ATTEMPT PER RUN, HELD SYNCHRONOUSLY. A run's slot in the live map is claimed before the
+ * first await of a launch and released only by that attempt's own end: its drive's completion, or
+ * any refusal on the way to one, the admission cap included. So two concurrent resumes, or a
+ * resume racing the boot reconcile, cannot both reach the activation barrier, and a refused
+ * attempt leaves nothing behind that a later one would read as held. Each attempt
+ * also presents its OWN holder id (the manager's endpoint id plus the takeover id): the journal's
+ * activation barrier admits an identical (token, holder, epoch) tuple as the same process picking
+ * its run back up, so a constant holder id would let two attempts co-activate through that
+ * relaxation instead of one being refused.
+ */
+import { randomBytes } from "node:crypto";
+import { credsAuthenticator, type NatsConnection } from "@nats-io/transport-node";
+import { jetstream, jetstreamManager } from "@nats-io/jetstream";
+import { Kvm, type KV } from "@nats-io/kv";
+import {
+  COTAL_LANG_RUN_HOST,
+  DEFAULT_SERVER,
+  EpEnvelopeError,
+  LANG_PROBLEM_DETAIL_KIND,
+  RUN_ACTIVATION_WAIT_MS,
+  RUN_HOST_KIND,
+  dialerFor,
+  inspectCredHealth,
+  mintCreds,
+  newIdentity,
+  newTakeoverId,
+  admissionBucket,
+  createRunAdmission,
+  issuedSpawnerStanding,
+  bindAndAdmitRunSubmission, readRunSubmission, submissionFingerprint, newSubmissionRunId, KEYED_SUBMISSION_MAX_DEADLINE_MS,
+  canonicalJson,
+  type RunSubmissionView, type RemoteRunSubmissionResult,
+  readRunAdmission,
+  revokeRunAdmission,
+  commitRunCancellation,
+  readRunCancelInput,
+  readCancellationAdmission,
+  runCancelCoordinates,
+  readRunCancellationStatus,
+  type RunCancelResult,
+  type RunCancelAuthority,
+  readRunRevocation,
+  type RunRevocation,
+  withIssuerSession,
+  epRequestSubject,
+  isIssuedCaller,
+  issuedPermitsSubject as importedIssuedPermitsSubject,
+  EP_UNBOUND_CALLER_AUTHORITY,
+  runDriverCaller,
+  type EpCaller,
+  type EpServeContext,
+  type RunAdmission,
+  type RunAdmissionView,
+  openRecordsBucket,
+  readRunProgram,
+  readRunRecord,
+  registry,
+  standaloneConnectOpts,
+  walkKvEntries,
+  type Identity,
+  type RunHost,
+  type RunHostDrive,
+  type RunHostOpenPause,
+  type RunHostAcceptedAnswer,
+  type RunHostOutcome,
+  type RunHostPlanes,
+  type RunListRow,
+  type RunListPage,
+  type RunListRequest,
+  type RunProgramValue,
+  type RunStatusValue,
+  type RunStatusView,
+  type SpaceAuth,
+  rejectionText,
+} from "@cotal-ai/core";
+
+/** What the host needs from the manager: its coordinates and its trust material. */
+export interface RunHostingContext {
+  readonly space: string;
+  readonly servers: string | undefined;
+  /** The endpoint hosting the runs: the manager's own service name. */
+  readonly endpoint: string;
+  /** The registration instance id, the coordinate a checkpoint's timer schedule is addressed by. */
+  readonly instanceId: string;
+  /** This manager process, as a checkpoint's holder-bound resume names it. Each attempt's holder
+   *  id is derived from `id` and the takeover id (see the header). */
+  readonly holder: { readonly id: string; readonly lifecycleUid: string };
+  /** The space signer on an auth mesh; undefined on an open mesh (bare connections). */
+  readonly auth: SpaceAuth | undefined;
+  readonly log: (line: string) => void;
+  /** Signerless host: the closed `renewRunDriver` issuance for one live attempt's SAME driver and
+   *  mediator nkeys. When set, renewal never mints locally; a refusal keeps last-good and records
+   *  debt on the slot. */
+  readonly renewRun?: (args: {
+    runId: string; holder: string; takeoverId: string; epoch: number; fencingToken: number;
+    driver: Identity; mediator: Identity;
+  }) => Promise<{ driver: string; mediator: string }>;
+  /** Signerless host: the closed first-run admission (`admitRemoteRun` on the issuing host). The
+   *  manager forwards only the served v1 request subject it rebuilt from the parsed context and the
+   *  run id it minted; the host resolves the issued caller and writes the admission. Separate from
+   *  `renewRun`. Delegation to this registered host, not a proof of an arbitrary message. */
+  readonly admitRun?: (args: { runId: string; subject: string }) => Promise<RunAdmission>;
+  /** Distinct observed keyed protocol. Absence refuses keyed commands, never legacy fallback. */
+  readonly submitRun?: (args: { subject: string }) => Promise<RemoteRunSubmissionResult>;
+  /** Signerless host: the closed first-attempt/resume issuance for caller-held driver and mediator
+   *  nkeys (`authorizeRemoteRunAttempt` then host signing). The host derives epoch/fence from the
+   *  run record and refuses a revoked or foreign admission. Never used for renewal. */
+  readonly issueAttempt?: (args: { runId: string; takeoverId: string; epoch: number; fencingToken: number; driver: Identity; mediator: Identity;
+    /** The served `run-resume` subject when a caller asked for this attempt; absent for a boot reconcile. */
+    served?: string }) => Promise<{ driver: string; mediator: string }>;
+  /** Issuing-host revoke under the authenticated holder, never the local by argument. */
+  readonly revokeRun?: (args: { runId: string; reason: string }) => Promise<RunRevocation>;
+  readonly cancelRun?: (args: { stage: "inspect" | "commit"; subject: string; cancel: import("@cotal-ai/core").RunCancelInput }) => Promise<import("@cotal-ai/core").RemoteRunCancelResult>;
+  /** Signerless host: one served read or answer's `run-operator` creds for a caller-held nkey (the
+   *  callback combines the host JWT with the local seed, as `renewRun` does). */
+  readonly issueOperator?: (args: { identity: Identity; takeoverId: string; runId?: string; answers?: { runId: string; stepKey: string; amend?: true };
+    /** The served `run-answer` subject, carried with `answers`. */
+    served?: string }) => Promise<string>;
+}
+
+/** The signerless callback set. RunHosting is remote exactly when ALL four are supplied; a partial
+ *  set refuses construction, and nothing falls back to a local signer or a bare connection. */
+const REMOTE_CALLBACKS = ["admitRun", "issueAttempt", "issueOperator", "renewRun"] as const;
+
+interface HostedRun {
+  readonly runId: string;
+  readonly takeoverId: string;
+  readonly epoch: number;
+  /** The attempt's journal fencing token, set with the epoch at launch. */
+  readonly fencingToken?: number;
+  readonly identity: Identity;
+  readonly mediatorIdentity: Identity;
+  placements: readonly { endpoint: string; instanceId: string }[];
+  /** The caller the run was admitted for, set at launch: whose grant the run's own caller is
+   *  checked against ({@link RunHosting.admittedCaller}). */
+  caller?: EpCaller;
+  /** The run's admission, set at launch: what bounds the run's spawns ({@link RunHosting.runAdmission}). */
+  admission?: RunAdmission;
+  /** Set once the connection is up; a slot reserved before that holds neither. */
+  nc?: NatsConnection;
+  mediatorNc?: NatsConnection;
+  drive?: RunHostDrive;
+  activated?: boolean;
+  outcome?: RunHostOutcome;
+  /** The current credential, re-minted in place by the renewal loop; the authenticator reads it
+   *  on every (re)connect. Undefined on an open mesh. */
+  creds?: string;
+  mediatorCreds?: string;
+  /** Signerless renewal refused or unadoptable: last-good stays in place, nothing is minted. */
+  renewalDebt?: { at: number; reason: string };
+}
+
+const DEFAULT_CHECKPOINT_TIMEOUT = "1h";
+/** How many launches (start or resume) may be in their activation wait at once. Each holds a
+ *  standing connection and a minted credential; past this a caller is refused `resource-exhausted`
+ *  before anything is written, rather than letting a burst of starts pin unbounded connections for
+ *  the wait's length. */
+const MAX_LAUNCHING = 8;
+
+
+/** The request subject this host served, rebuilt from the parsed context: what a signerless host
+ *  forwards to the issuing host, which re-parses it. */
+export function servedRequestSubject(space: string, ctx: EpServeContext): string {
+  const p = ctx.subject;
+  return epRequestSubject(space, {
+    route: p.route === "inst" ? { mode: "inst", instanceId: p.instanceId! } : { mode: p.route },
+    endpoint: p.endpoint, command: p.command, ...(p.target !== null ? { target: p.target } : {}), caller: p.caller, nonce: p.nonce,
+  });
+}
+
+export class RunHosting {
+  private readonly runs = new Map<string, HostedRun>();
+  private readonly cancellations = new Map<string, { runId: string; reason: string; observed: boolean; mayHaveDispatched: boolean }>();
+  /** The launches in their activation wait, each with its run id once one is known. */
+  private readonly launching = new Map<symbol, string | undefined>();
+  private reconciled = false;
+  private stopping = false;
+
+  private readonly remote: boolean;
+
+  constructor(private readonly ctx: RunHostingContext) {
+    const present = REMOTE_CALLBACKS.filter((k) => ctx[k] !== undefined);
+    if (present.length !== 0 && present.length !== REMOTE_CALLBACKS.length)
+      throw new Error(`signerless run hosting needs every closed callback (${REMOTE_CALLBACKS.join(", ")}); got only ${present.join(", ")}`);
+    this.remote = present.length === REMOTE_CALLBACKS.length;
+    if (this.remote && ctx.auth !== undefined) throw new Error("signerless run hosting holds no space signer");
+  }
+
+  /** The one registered run host. Absent means the composition root never imported the runtime,
+   *  which is a configuration error named here rather than a silent no-op surface. */
+  private host(): RunHost {
+    return registry.resolve<RunHost>(RUN_HOST_KIND, COTAL_LANG_RUN_HOST);
+  }
+
+  /** The boot gate: no launch is served until the reconcile has taken back what a predecessor
+   *  was driving (see the header). */
+  private assertReconciled(): void {
+    if (!this.reconciled)
+      throw new EpEnvelopeError("unavailable", "the manager is still taking back the workflow runs a predecessor was driving; retry shortly (SPEC 14.3)");
+  }
+
+  /** `run-start`: validate, mint the id, ADMIT the run under the caller's issued authority
+   *  (SPEC 14.8), launch the drive, answer. The drive continues off-handler.
+   *
+   *  Admission is what confines the run: the caller's request rode the versioned rail, so the
+   *  broker pinned its generation; the evidence the issuer recorded for that generation is
+   *  resolved (active, source live, linearized by a second read) and its ceiling becomes the
+   *  run's channel ceiling. A legacy arrival carries no binding and is refused by name, never
+   *  routed through the host's own authority. */
+  async start(ctx: EpServeContext, args: { source: string; file?: string; timeout?: string }): Promise<{ runId: string }> {
+    this.assertReconciled();
+    const host = this.host();
+    const verdict = host.validate(args.source, args.file);
+    const placements = verdict.ok ? verdict.placements ?? [] : [];
+    if (!verdict.ok) {
+      // The refusal carries every problem, as the runtime's own records, so a caller (a person at
+      // the CLI, an agent at the tool) can fix the program without a second round-trip. The
+      // rendered source frame stays out of it: the caller holds the source, and a refusal is not
+      // the place to echo it back.
+      throw new EpEnvelopeError(
+        "bad-request",
+        `the program does not validate (${verdict.errors.length} problem${verdict.errors.length === 1 ? "" : "s"})`,
+        verdict.errors.map((e) => ({ kind: LANG_PROBLEM_DETAIL_KIND, ...withoutFrame(e) })),
+      );
+    }
+    if (placements.length > 1)
+      throw new EpEnvelopeError("unimplemented", "this manager hosts a run with placed spawns on one manager instance only; split the program or drive it locally rather than widening one run credential across hosts");
+    // Minted here, never caller-supplied: the records table binds run-id minting to the driver.
+    // 128 bits, the width the spec's other minted identifiers carry.
+    const runId = `run-${randomBytes(16).toString("hex")}`;
+    // The launch slot is taken before the admission is written, so a start refused at the limit
+    // writes nothing.
+    const release = this.reserveLaunch(runId);
+    try {
+      const admission = await this.admit(ctx, runId);
+      await this.launch(host, {
+        mode: "new",
+        runId,
+        source: args.source,
+        ...(args.file !== undefined ? { file: args.file } : {}),
+        epoch: 1,
+        fencingToken: 1,
+        timeout: args.timeout ?? DEFAULT_CHECKPOINT_TIMEOUT,
+        admission,
+        placements,
+      }, undefined, release);
+    } finally {
+      release();
+    }
+    return { runId };
+  }
+
+  /** `requestEndsAt` is on this process's monotonic clock, measured from the serve layer's own
+   *  receive sample; it never leaves this process. */
+  private keyedCoordinates(ctx: EpServeContext): { caller: EpCaller; requestEndsAt: number } {
+    const caller = ctx.subject.caller, bind = ctx.request.bind;
+    if (ctx.subject.rail !== "v1" || !isIssuedCaller(caller))
+      throw new EpEnvelopeError(
+        "permission-denied",
+        `keyed runs bind to the caller's issued authority, and this request rode the legacy rail with none; re-mint the credential as an issuance and call on the versioned rail (SPEC 13.15, 14)`,
+        [{ kind: EP_UNBOUND_CALLER_AUTHORITY, owner: caller.owner, actor: caller.actor, uid: caller.uid }],
+      );
+    if (ctx.subject.route !== "inst" || ctx.subject.instanceId !== this.ctx.instanceId || !bind || bind.instanceId !== this.ctx.instanceId
+      || bind.epoch !== ctx.identity.epoch || !Number.isFinite(ctx.receivedAtMonotonicMs)
+      || !Number.isSafeInteger(ctx.request.deadlineMs) || ctx.request.deadlineMs! <= 0)
+      throw new EpEnvelopeError("permission-denied", "keyed runs require fresh issued exact-instance/epoch contracts and original receive deadline");
+    if (ctx.request.deadlineMs! > KEYED_SUBMISSION_MAX_DEADLINE_MS)
+      throw new EpEnvelopeError("bad-request", `keyed deadlineMs exceeds the ${KEYED_SUBMISSION_MAX_DEADLINE_MS}ms request budget`);
+    return { caller, requestEndsAt: ctx.receivedAtMonotonicMs! + ctx.request.deadlineMs! };
+  }
+
+  /** The binding winner alone launches. Duplicates observe, even if an earlier admission is
+   * absent. A lost reply never allocates a replacement run or repairs an incomplete binding. */
+  async startKeyed(ctx: EpServeContext, args: { source: string; file?: string; timeout?: string }): Promise<RunSubmissionView> {
+    this.assertReconciled();
+    const { caller, requestEndsAt } = this.keyedCoordinates(ctx), host = this.host();
+    const verdict = host.validate(args.source, args.file);
+    if (!verdict.ok) throw new EpEnvelopeError("bad-request", "keyed program does not validate", verdict.errors.map(e => ({ kind: LANG_PROBLEM_DETAIL_KIND, ...withoutFrame(e) })));
+    const placements = verdict.placements ?? [];
+    if (placements.length > 1) throw new EpEnvelopeError("unimplemented", "keyed run may place spawns on one manager instance only");
+    // A launch refusal after the binding would leave an admission that no duplicate or read ever
+    // launches, so the stopping and capacity refusals, and the slot, are taken before it.
+    const release = this.reserveLaunch();
+    let slot: HostedRun | undefined;
+    try {
+      let result: { winner: boolean; view: RunSubmissionView; admission?: RunAdmission };
+      if (this.remote) {
+        if (!this.ctx.submitRun) throw new EpEnvelopeError("unimplemented", "this issuer does not support keyed submissions");
+        const remote = await this.ctx.submitRun({ subject: this.servedSubject(ctx) });
+        result = remote;
+        if (remote.view.submissionId !== ctx.request.id || remote.view.instanceId !== this.ctx.instanceId
+          || remote.view.processEpoch !== ctx.identity.epoch || remote.view.fingerprint !== submissionFingerprint(ctx.request, ctx.subject).fingerprint)
+          throw new EpEnvelopeError("internal", "issuer keyed response names other submission coordinates");
+      } else {
+        const auth = this.ctx.auth;
+        if (!auth || !isIssuedCaller(caller)) throw new EpEnvelopeError("unimplemented", "keyed runs require issued static or signerless authority");
+        const ref = { space: this.ctx.space, owner: caller.owner, actor: caller.actor, uid: caller.uid, generation: caller.generation };
+        const resolved = await withIssuerSession({ servers: this.ctx.servers ?? DEFAULT_SERVER, space: this.ctx.space, auth, tls: false }, s => s.store.resolve(ref, s.sourceIsLive));
+        const subject = this.servedSubject(ctx);
+        if (!importedIssuedPermitsSubject(resolved.evidence.permissions.publish, subject))
+          throw new EpEnvelopeError("permission-denied", "issued ceiling does not permit keyed start");
+        const runId = newSubmissionRunId();
+        slot = this.claim(runId, placements);
+        const admission: RunAdmission = { version: 1, space: this.ctx.space, endpoint: this.ctx.endpoint,
+          runId, instanceId: this.ctx.instanceId, caller, ceiling: resolved.evidence.permissions,
+          provenance: { kind: "issued", ref, resolvedRevision: resolved.revision }, admittedAt: Date.now(),
+          ...(issuedSpawnerStanding(resolved.evidence) !== "bounded" ? { spawnExempt: true as const } : {}) };
+        result = await this.withAdmitter(runId, (kv, jsm) => bindAndAdmitRunSubmission({ kv, jsm, admission,
+          submissionId: ctx.request.id, fingerprint: submissionFingerprint(ctx.request, ctx.subject).fingerprint,
+          processEpoch: ctx.identity.epoch, deadline: { requestEndsAt,
+            ...(resolved.evidence.expiresAt !== undefined ? { authorityExpiresAt: resolved.evidence.expiresAt * 1000 } : {}) },
+          assertCurrent: async () => {
+            const fresh = await withIssuerSession({ servers: this.ctx.servers ?? DEFAULT_SERVER, space: this.ctx.space, auth, tls: false }, s => s.store.resolve(ref, s.sourceIsLive));
+            if (fresh.revision !== resolved.revision || canonicalJson(fresh.evidence) !== canonicalJson(resolved.evidence))
+              throw new EpEnvelopeError("permission-denied", "original keyed authority changed; retain its binding");
+          } }), { caller, id: ctx.request.id });
+      }
+      if (!result.winner || !result.admission) return this.submissionActivation(result.view);
+      const admission = result.admission;
+      if (admission.runId !== result.view.runId || admission.instanceId !== this.ctx.instanceId
+        || admission.caller.owner !== caller.owner || admission.caller.actor !== caller.actor || admission.caller.uid !== caller.uid
+        || !isIssuedCaller(admission.caller) || !isIssuedCaller(caller) || admission.caller.generation !== caller.generation)
+        throw new EpEnvelopeError("internal", "keyed admission names another caller/run/instance");
+      if (performance.now() >= requestEndsAt) return { ...result.view, reason: "reconcile-held; original callback deadline elapsed before activation" };
+      // The signerless issuer mints the run id, so that slot is claimed on the winning reply.
+      slot ??= this.claim(admission.runId, placements);
+      await this.launch(host, { mode: "new", runId: admission.runId, source: args.source,
+        ...(args.file !== undefined ? { file: args.file } : {}), epoch: 1, fencingToken: 1,
+        timeout: args.timeout ?? DEFAULT_CHECKPOINT_TIMEOUT, admission: { admission, revoked: undefined }, placements }, slot, release);
+      return { ...result.view, state: "activated" };
+    } finally {
+      release();
+      if (slot !== undefined && slot.drive === undefined) this.free(slot);
+    }
+  }
+
+  async submissionStatus(ctx: EpServeContext, submissionId: string): Promise<RunSubmissionView> {
+    const { caller } = this.keyedCoordinates(ctx);
+    if (this.remote) {
+      if (!this.ctx.submitRun) throw new EpEnvelopeError("unimplemented", "this issuer does not support submission reads");
+      const r = await this.ctx.submitRun({ subject: this.servedSubject(ctx) });
+      if (r.winner || r.admission || r.view.submissionId !== submissionId || r.view.instanceId !== this.ctx.instanceId
+        || r.view.processEpoch !== ctx.identity.epoch) throw new EpEnvelopeError("internal", "invalid issuer submission read");
+      return this.submissionActivation(r.view);
+    }
+    const auth = this.ctx.auth;
+    if (!auth || !isIssuedCaller(caller)) throw new EpEnvelopeError("unimplemented", "keyed read needs issued authority");
+    const ref = { space: this.ctx.space, owner: caller.owner, actor: caller.actor, uid: caller.uid, generation: caller.generation };
+    await withIssuerSession({ servers: this.ctx.servers ?? DEFAULT_SERVER, space: this.ctx.space, auth, tls: false }, async s => {
+      const resolved = await s.store.resolve(ref, s.sourceIsLive);
+      if (!importedIssuedPermitsSubject(resolved.evidence.permissions.publish, this.servedSubject(ctx)))
+        throw new EpEnvelopeError("permission-denied", "issued ceiling does not permit submission read");
+    });
+    const view = await this.withAdmitter(newSubmissionRunId(), (_kv, jsm) => readRunSubmission({ jsm,
+      space: this.ctx.space, endpoint: this.ctx.endpoint, caller, submissionId, instanceId: this.ctx.instanceId, processEpoch: ctx.identity.epoch }));
+    return this.submissionActivation(view);
+  }
+
+  private async submissionActivation(view: RunSubmissionView): Promise<RunSubmissionView> {
+    if (view.state !== "admitted" || !view.runId) return view;
+    try {
+      const record = await this.withOperator({ runId: view.runId }, (_planes, kv) => readRunRecord(kv, this.ctx.endpoint, view.runId!));
+      return record?.status ? { ...view, state: "activated" } : view;
+    } catch { return { ...view, state: "indeterminate", reason: "bound admission exists; activation observation unavailable" }; }
+  }
+
+  /** Resolve the caller's issued authority and write the run's admission record, create-only,
+   *  BEFORE the driver is launched and before the start reply. The ceiling is the evidence's,
+   *  verbatim; nothing is read from a mutable ledger or an agent file. */
+  private async admit(ctx: EpServeContext, runId: string): Promise<RunAdmissionView> {
+    const caller = ctx.subject.caller;
+    const auth = this.ctx.auth;
+    if (auth === undefined && !this.remote)
+      throw new EpEnvelopeError("unimplemented", `an open mesh issues no caller authority and keeps no admission, so it hosts no run in space ${this.ctx.space}; runs need a static-auth mesh (SPEC 14.8)`);
+    if (ctx.subject.rail !== "v1" || !isIssuedCaller(caller))
+      throw new EpEnvelopeError(
+        "permission-denied",
+        `run-start binds a run to the caller's issued authority, and this request rode the legacy rail with none; re-mint the credential as an issuance and call on the versioned rail (SPEC 13.15, 14.8)`,
+        [{ kind: EP_UNBOUND_CALLER_AUTHORITY, owner: caller.owner, actor: caller.actor, uid: caller.uid }],
+      );
+    if (this.remote) return { admission: await this.admitRemote(this.ctx.admitRun!, ctx, runId), revoked: undefined };
+    if (auth === undefined) throw new EpEnvelopeError("unimplemented", "an open mesh admits no hosted run (SPEC 14.8)");
+    const ref = { space: this.ctx.space, owner: caller.owner, actor: caller.actor, uid: caller.uid, generation: caller.generation };
+    const resolved = await withIssuerSession({ servers: this.ctx.servers ?? DEFAULT_SERVER, space: this.ctx.space, auth, tls: false }, (s) =>
+      s.store.resolve(ref, s.sourceIsLive));
+    const admission: RunAdmission = {
+      version: 1,
+      space: this.ctx.space,
+      endpoint: this.ctx.endpoint,
+      runId,
+      instanceId: this.ctx.instanceId,
+      caller,
+      ceiling: resolved.evidence.permissions,
+      provenance: { kind: "issued", ref, resolvedRevision: resolved.revision },
+      admittedAt: Date.now(),
+      // Whether the starter's own spawns are bounded, decided now: an instrument's evidence expires
+      // minutes after issue, and the run's spawns may come hours later.
+      ...(issuedSpawnerStanding(resolved.evidence) !== "bounded" ? { spawnExempt: true as const } : {}),
+    };
+    await this.withAdmitter(runId, (kv) => createRunAdmission(kv, admission));
+    return { admission, revoked: undefined };
+  }
+
+  /** The signerless arm of {@link admit}: the issuing host resolves and writes; this host only
+   *  checks the answer names the run, endpoint, instance and caller it asked for. */
+  private async admitRemote(admitRun: NonNullable<RunHostingContext["admitRun"]>, ctx: EpServeContext, runId: string): Promise<RunAdmission> {
+    const p = ctx.subject;
+    const subject = this.servedSubject(ctx);
+    const admission = await admitRun({ runId, subject });
+    const c = admission.caller;
+    if (admission.runId !== runId || admission.endpoint !== this.ctx.endpoint || admission.space !== this.ctx.space ||
+        admission.instanceId !== this.ctx.instanceId || !isIssuedCaller(c) || !isIssuedCaller(p.caller) ||
+        c.owner !== p.caller.owner || c.actor !== p.caller.actor || c.uid !== p.caller.uid || c.generation !== p.caller.generation)
+      throw new EpEnvelopeError("internal", `run ${runId}: the issuing host answered an admission for other coordinates; refused`);
+    return admission;
+  }
+
+  private servedSubject(ctx: EpServeContext): string {
+    return servedRequestSubject(this.ctx.space, ctx);
+  }
+
+  /** On a signerless host a caller's `run-resume` or `run-answer` is forwarded with the subject it
+   *  served (SPEC 14.8). A legacy-rail resume is refused here, before anything is forwarded; an
+   *  answer is forwarded either way, and the issuing host accepts a legacy one only from a live
+   *  managed seat of the run's owner. */
+  private served(ctx: EpServeContext | undefined, command: "run-resume" | "run-answer"): string | undefined {
+    if (!this.remote) return undefined;
+    if (ctx === undefined) throw new EpEnvelopeError("internal", `a signerless host forwards a served ${command}; none was given`);
+    const caller = ctx.subject.caller;
+    if (command === "run-resume" && (ctx.subject.rail !== "v1" || !isIssuedCaller(caller)))
+      throw new EpEnvelopeError(
+        "permission-denied",
+        `run-resume on this manager rides the versioned rail with the caller's issued authority, and this request rode the legacy rail with none (SPEC 13.15, 14.8)`,
+        [{ kind: EP_UNBOUND_CALLER_AUTHORITY, owner: caller.owner, actor: caller.actor, uid: caller.uid }],
+      );
+    return this.servedSubject(ctx);
+  }
+
+  /** One admission-store write over an ephemeral `run-admitter` credential pinned to this run. */
+  private async withAdmitter<T>(runId: string, fn: (kv: KV, jsm: import("@nats-io/jetstream").JetStreamManager) => Promise<T>, submission?: { caller: EpCaller; id: string }): Promise<T> {
+    const auth = this.ctx.auth;
+    if (auth === undefined) throw new EpEnvelopeError("unimplemented", "an open mesh admits no hosted run (SPEC 14.8)");
+    const nc = await dialerFor(this.ctx.servers ?? DEFAULT_SERVER)({
+      servers: this.ctx.servers ?? DEFAULT_SERVER,
+      ...standaloneConnectOpts({
+        creds: await mintCreds(auth, newIdentity(), "run-admitter", { runAdmitter: { endpoint: this.ctx.endpoint, runId, ...(submission ? { submission } : {}) } }),
+        /* not yet wired to a recorded transport */ tls: false,
+      }),
+      maxReconnectAttempts: 0,
+    });
+    try {
+      return await fn(await new Kvm(nc).open(admissionBucket(this.ctx.space)), await jetstreamManager(nc));
+    } finally {
+      await nc.drain().catch(() => nc.close());
+    }
+  }
+
+  /** The admission a resume, takeover or reconcile continues under: the ORIGINAL record, with
+   *  its current revocation state. A new requester cannot widen it; a run with none was admitted
+   *  before SPEC 14.8 or by a host that never admitted it, and is not resumed here. */
+  private async admitted(runId: string): Promise<RunAdmissionView> {
+    return await this.withOperator({ runId }, (planes) => readRunAdmission(planes.jsm, this.ctx.space, this.ctx.endpoint, runId));
+  }
+
+  /** A run's admission and revocation marker, read leader-served as {@link admitted} reads them,
+   *  whether or not this manager hosts the run. The manager reads them before each of the run's
+   *  spawns, a spawn the run placed on this manager included (SPEC 14.8). */
+  async admission(runId: string): Promise<RunAdmissionView> {
+    return await this.admitted(runId);
+  }
+
+  /** Input precedes serving/reconciliation for cancellation, unlike the keyed commands. */
+  validateCancellation(ctx: EpServeContext, raw: unknown): void {
+    runCancelCoordinates(ctx, this.ctx.instanceId);
+    readRunCancelInput(raw);
+  }
+
+  private cancelPending(runId: string): boolean {
+    return [...this.cancellations.values()].some(entry => entry.runId === runId);
+  }
+
+  private assertNoCancel(runId: string): void {
+    if (this.cancelPending(runId))
+      throw new EpEnvelopeError("failed-precondition", "a local cancellation is pending for this run", [{ kind: "ai.cotal.run.cancel-pending", runId }]);
+  }
+
+  private cancelEligible(slot: HostedRun, status: RunStatusValue | undefined): boolean {
+    return this.runs.get(slot.runId) === slot && (!slot.drive || !slot.activated
+      || (status?.holder === `${this.ctx.holder.id}.${slot.takeoverId}` && status.epoch === slot.epoch && status.fencingToken === slot.fencingToken));
+  }
+
+  private observeCancellation(runId: string): void {
+    for (const entry of this.cancellations.values()) if (entry.runId === runId) entry.observed = true;
+  }
+
+  private clearObservedCancellation(runId: string): void {
+    if (this.runs.has(runId)) return;
+    for (const [key, entry] of this.cancellations) if (entry.runId === runId && entry.observed) this.cancellations.delete(key);
+  }
+
+  /** A served cancellation reports local observations, never cross-host cessation or process cleanup. */
+  async cancel(ctx: EpServeContext, raw: unknown): Promise<RunCancelResult> {
+    const endsAt = runCancelCoordinates(ctx, this.ctx.instanceId);
+    const input = readRunCancelInput(raw);
+    this.assertReconciled();
+    if (this.stopping) throw new EpEnvelopeError("unavailable", "the manager is stopping");
+    const auth = this.ctx.auth;
+    const caller = ctx.subject.caller;
+    if ((!auth && !this.remote) || !isIssuedCaller(caller)) throw new EpEnvelopeError("permission-denied", "run-cancel request is not authorized");
+    if (this.remote && !this.ctx.cancelRun) throw new EpEnvelopeError("unimplemented", "the issuing host run-cancel door is not connected");
+    const budget = (): void => {
+      if (performance.now() >= endsAt) throw new EpEnvelopeError("deadline-exceeded", "run-cancel original request budget expired");
+    };
+    const subject = this.servedSubject(ctx);
+    let authority: RunCancelAuthority = "original";
+    const current = async (): Promise<void> => {
+      budget();
+      if (this.remote) {
+        const inspected = await this.ctx.cancelRun!({ stage: "inspect", subject, cancel: input });
+        if (inspected.stage !== "inspect" || inspected.runId !== input.runId) throw new EpEnvelopeError("unavailable", "invalid run-cancel inspection response");
+        authority = inspected.authority;
+        budget();
+        return;
+      }
+      await withIssuerSession({ servers: this.ctx.servers ?? DEFAULT_SERVER, space: this.ctx.space, auth: auth!, tls: false }, async session => {
+        const resolved = await session.store.resolve({ space: this.ctx.space, owner: caller.owner, actor: caller.actor, uid: caller.uid, generation: caller.generation }, session.sourceIsLive);
+        if (!importedIssuedPermitsSubject(resolved.evidence.permissions.publish, subject))
+          throw new EpEnvelopeError("permission-denied", "run-cancel request is not authorized");
+      });
+      budget();
+    };
+    await current();
+    // Cancellation reads records and admission after revocation, and also before a spec exists.
+    // Use the existing endpoint inventory reader: run-scoped issuance requires an unrevoked
+    // admission. This reader carries no answer writes and cancellation reads no run journal.
+    const read = <T>(fn: (planes: RunHostPlanes) => Promise<T>): Promise<T> => this.withOperator({}, fn);
+    const admission = await read(planes => readCancellationAdmission(planes.jsm, this.ctx.space, this.ctx.endpoint, input.runId));
+    budget();
+    const original = admission.admission.caller;
+    if (!this.remote && (original.owner !== caller.owner || original.actor !== caller.actor || original.uid !== caller.uid))
+      throw new EpEnvelopeError("permission-denied", "run-cancel request is not authorized");
+    const readStatus = async (): Promise<RunStatusValue | undefined> => {
+      budget();
+      try {
+        const status = await read(planes => readRunCancellationStatus(planes.jsm, this.ctx.space, this.ctx.endpoint, input.runId));
+        budget();
+        return status;
+      } catch (error) { budget(); throw error; }
+    };
+    let status = await readStatus();
+    let marker = admission.revoked;
+    let duplicate: boolean | null = marker !== undefined;
+    const reply = (phase: RunCancelResult["observed"]["phase"], driveOutcome?: RunHostOutcome): RunCancelResult => ({
+      runId: input.runId, authority, duplicate,
+      ...(marker ? { revocation: { by: marker.by, reason: marker.reason, revokedAt: marker.revokedAt } } : {}),
+      observed: { processEpoch: ctx.identity.epoch, phase,
+        ...(status ? { recordedState: status.state, holder: status.holder, runEpoch: status.epoch, fencingToken: status.fencingToken } : {}),
+        ...(driveOutcome ? { driveOutcome } : {}) },
+    });
+    if (status?.state === "completed" || status?.state === "failed") {
+      if (marker) {
+        this.observeCancellation(input.runId);
+        this.clearObservedCancellation(input.runId);
+      }
+      return reply("terminal");
+    }
+    const slot = this.runs.get(input.runId);
+    if ((!slot || !this.cancelEligible(slot, status)) && status?.state === "running") {
+      if (!marker) throw new EpEnvelopeError("failed-precondition", "run is not driven by this manager's current attempt");
+      this.observeCancellation(input.runId);
+      this.clearObservedCancellation(input.runId);
+      return reply("not-driven-here");
+    }
+    let intent = this.cancellations.get(subject);
+    if (intent && (intent.runId !== input.runId || intent.reason !== input.reason))
+      throw new EpEnvelopeError("permission-denied", "run-cancel request identity changed");
+    if (intent && !marker)
+      throw new EpEnvelopeError("deadline-exceeded", "run-cancel request remains pending; no second dispatch", undefined, "unknown");
+    if (!intent) {
+      intent = { ...input, observed: false, mayHaveDispatched: false };
+      this.cancellations.set(subject, intent);
+    }
+    if (!marker) {
+      try {
+        if (this.remote) {
+          budget();
+          const olderUnknown = intent.mayHaveDispatched;
+          intent.mayHaveDispatched = true;
+          const committed = await this.ctx.cancelRun!({ stage: "commit", subject, cancel: input });
+          if (committed.stage !== "commit" || committed.runId !== input.runId) throw new EpEnvelopeError("unavailable", "invalid run-cancel commit response");
+          if (committed.result.kind !== "committed") {
+            // A no-dispatch response cannot erase ambiguity from an older call or issuer lifetime.
+            if (committed.result.kind === "refused-before-dispatch" && !olderUnknown) intent.mayHaveDispatched = false;
+            throw new EpEnvelopeError(committed.result.code, "run-cancel issuer did not establish a marker",
+              undefined, committed.result.kind === "outcome-unknown" ? "unknown" : "not-executed");
+          }
+          duplicate = committed.result.outcome === "existed";
+          marker = committed.result.revocation;
+        } else {
+          let created: RunRevocation | undefined;
+          const outcome = await this.withAdmitter(input.runId, async kv => {
+            await current();
+            created = { version: 1, runId: input.runId, by: `${caller.owner}.${caller.actor}`, reason: input.reason, revokedAt: Date.now() };
+            return commitRunCancellation(kv, this.ctx.endpoint, created, () => {
+              budget();
+              intent!.mayHaveDispatched = true;
+            });
+          });
+          duplicate = outcome === "existed";
+          marker = outcome === "created" ? created
+            : await read(planes => readRunRevocation(planes.jsm, this.ctx.space, this.ctx.endpoint, input.runId));
+          if (!marker) throw new EpEnvelopeError("unavailable", "run-cancel marker is not yet observed");
+        }
+      } catch (error) {
+        if (performance.now() < endsAt) {
+          try { marker = await read(planes => readRunRevocation(planes.jsm, this.ctx.space, this.ctx.endpoint, input.runId)); }
+          catch { /* Unknown reads preserve the pending intent. */ }
+        }
+        if (marker) duplicate = null;
+        else {
+          // A prior possible dispatch is sticky, including across another invocation of this key.
+          if (!intent.mayHaveDispatched && performance.now() < endsAt) {
+            try {
+              const absent = await read(planes => readRunRevocation(planes.jsm, this.ctx.space, this.ctx.endpoint, input.runId));
+              if (!absent && this.cancellations.get(subject) === intent) this.cancellations.delete(subject);
+            } catch { /* No absence proof. */ }
+          }
+          if (intent.mayHaveDispatched) throw new EpEnvelopeError("deadline-exceeded", "run-cancel write outcome is unknown", undefined, "unknown");
+          throw error;
+        }
+      }
+    }
+    this.observeCancellation(input.runId);
+    if (slot?.outcome) {
+      this.clearObservedCancellation(input.runId);
+      return reply("stopped", slot.outcome);
+    }
+    if (!slot || this.runs.get(input.runId) !== slot) {
+      this.clearObservedCancellation(input.runId);
+      return reply(slot && !slot.drive ? "launch-abandoned" : "not-driven-here");
+    }
+    // A preactivation slot may have activated while the marker was being written. Re-observe
+    // before selecting its handle; an old holder observation cannot stop a superseded attempt.
+    if (slot.activated) status = await readStatus();
+    if (slot.outcome) {
+      this.clearObservedCancellation(input.runId);
+      return reply("stopped", slot.outcome);
+    }
+    if (!this.cancelEligible(slot, status)) return reply("not-driven-here");
+    if (slot.drive) slot.drive.cancel(input.reason);
+    while (performance.now() < endsAt) {
+      if (slot.outcome) { this.clearObservedCancellation(input.runId); return reply("stopped", slot.outcome); }
+      if (this.runs.get(input.runId) !== slot && !slot.drive) {
+        this.clearObservedCancellation(input.runId);
+        return reply("launch-abandoned");
+      }
+      await new Promise(resolve => setTimeout(resolve, Math.min(25, Math.max(1, endsAt - performance.now()))));
+    }
+    return reply("stop-requested");
+  }
+
+  /** Revoke a hosted run (SPEC 14.8): the marker is create-only and independent of the immutable
+   *  admission; every later channel effect of the run refuses on reading it, and a drive parked in
+   *  a wait ends within one poll. Idempotent. */
+  async revoke(runId: string, by: string, reason: string): Promise<RunRevocation> {
+    if (this.remote) {
+      if (this.ctx.revokeRun === undefined) throw new EpEnvelopeError("unimplemented", "the issuing host supplies no closed run revoke callback");
+      return await this.ctx.revokeRun({ runId, reason });
+    }
+    await this.withAdmitter(runId, (kv) => revokeRunAdmission(kv, this.ctx.endpoint, { version: 1, runId, by, reason, revokedAt: Date.now() }));
+    const revocation = await this.withOperator({ runId }, (planes) => readRunRevocation(planes.jsm, this.ctx.space, this.ctx.endpoint, runId));
+    if (revocation === undefined) throw new EpEnvelopeError("internal", `run ${runId}: revoke wrote no readable marker`);
+    return revocation;
+  }
+
+  /** `run-resume`: take a recorded run over under a fresh takeover and continue it from its journal.
+   *  The source is the recorded program; a run started before programs were recorded has no
+   *  hosted resume, and says so. The slot is claimed before the record read, so a second resume
+   *  arriving during it is a conflict rather than a second attempt. */
+  async resume(args: { runId: string; timeout?: string }, ctx?: EpServeContext): Promise<{ runId: string }> {
+    this.assertReconciled();
+    const host = this.host();
+    const served = this.served(ctx, "run-resume");
+    const slot = this.claim(args.runId);
+    let found: { status: RunStatusValue | undefined; program: RunProgramValue | undefined; admission: RunAdmissionView } | undefined;
+    try {
+      found = await this.withOperator({ runId: args.runId }, async (planes, kv) => {
+        const record = await readRunRecord(kv, this.ctx.endpoint, args.runId);
+        if (record === undefined) return undefined;
+        const program = await readRunProgram(kv, this.ctx.endpoint, args.runId);
+        // The ORIGINAL admission, with its current revocation state (SPEC 14.8): a resume never
+        // re-admits under the resuming caller, and a revoked run is not continued.
+        const admission = await readRunAdmission(planes.jsm, this.ctx.space, this.ctx.endpoint, args.runId);
+        if (admission.revoked !== undefined)
+          throw new EpEnvelopeError("permission-denied", `run ${args.runId} was revoked by ${admission.revoked.by} (${admission.revoked.reason}); a revoked run is not resumed`);
+        return { status: record.status?.value, program, admission };
+      });
+      if (found === undefined)
+        throw new EpEnvelopeError("not-found", `run ${args.runId}: no record on endpoint ${this.ctx.endpoint}; a run that was never started cannot be resumed`);
+      // A completed or failed run's journal already holds its outcome. Driving it again would only
+      // replay that outcome under a new epoch and holder, as the boot reconcile never does.
+      const state = found.status?.state;
+      if (state === "completed" || state === "failed")
+        throw new EpEnvelopeError("failed-precondition", `run ${args.runId} ${state === "completed" ? "is already completed" : "has already failed"}, so there is nothing to resume; a resume continues a run that is running or released`);
+      if (found.program === undefined)
+        throw new EpEnvelopeError("failed-precondition", `run ${args.runId}: no program is recorded for it, so a hosted resume has no source to run; drive it from a terminal with \`cotal run resume ${args.runId} --local --file <program>\``);
+      const verdict = host.validate(found.program.source, found.program.file);
+      if (!verdict.ok)
+        throw new EpEnvelopeError("failed-precondition", `run ${args.runId}: its recorded program no longer validates on this host`);
+      if ((verdict.placements?.length ?? 0) > 1)
+        throw new EpEnvelopeError("unimplemented", `run ${args.runId}: its placed spawns name more than one manager instance, which this host does not widen one run credential across`);
+      slot.placements = verdict.placements ?? [];
+    } catch (e) {
+      // Nothing was launched: the slot is this call's to give back.
+      this.free(slot);
+      throw e;
+    }
+    // From here the slot is the launch's: every refusal there frees it, or the drive's own end does.
+    await this.launch(host, {
+      mode: "existing",
+      runId: args.runId,
+      source: found.program.source,
+      ...(found.program.file !== undefined ? { file: found.program.file } : {}),
+      admission: found.admission,
+      epoch: (found.status?.epoch ?? 0) + 1,
+      fencingToken: (found.status?.fencingToken ?? 0) + 1,
+      timeout: args.timeout ?? DEFAULT_CHECKPOINT_TIMEOUT,
+      ...(served !== undefined ? { served } : {}),
+    }, slot);
+    return { runId: args.runId };
+  }
+
+  /** `run-answer`: resolve an open checkpoint, or an open `ask` attempt, through the driver's door.
+   *  Two credentials: a READ that replays the run's journal to the open pause, then an ANSWERING
+   *  one minted for that pause's token alone, so the writes reach no other pause on the endpoint.
+   *  `by` is the caller as the manager knows them, decided by the serve layer from the
+   *  authenticated principal (SPEC 14.5), never read from the request. */
+  async answer(
+    args: { runId: string; endpoint?: string; stepKey: string; value?: unknown; artifact?: string },
+    by: string,
+    authorize?: (open: RunHostOpenPause) => void | Promise<void>,
+    ctx?: EpServeContext,
+  ): Promise<unknown> {
+    const host = this.host();
+    const served = this.served(ctx, "run-answer");
+    const endpoint = args.endpoint ?? this.ctx.endpoint;
+    let open: RunHostOpenPause;
+    try {
+      open = await this.withOperator({ endpoint, runId: args.runId }, (planes, _kv, takeoverId) =>
+        host.locate(planes, { endpoint, runId: args.runId, takeoverId, stepKey: args.stepKey }));
+    } catch (e) {
+      // The resolver's own refusal is a fact about the run, worded for the caller: no open
+      // checkpoint at that key is `not-found`; the plane's own envelope errors pass through.
+      if (e instanceof EpEnvelopeError) throw e;
+      if (e instanceof Error && e.name === "CheckpointNotOpen") throw new EpEnvelopeError("not-found", e.message);
+      throw e;
+    }
+    await authorize?.(open);
+    return await this.withOperator({ endpoint, answers: { runId: args.runId, stepKey: args.stepKey, token: open.token }, ...(served !== undefined ? { served } : {}) }, (planes) =>
+      host.answer(planes, {
+        endpoint,
+        open,
+        by,
+        ...(args.value !== undefined ? { value: args.value } : {}),
+        ...(args.artifact !== undefined ? { artifact: args.artifact } : {}),
+        now: Date.now(),
+      }));
+  }
+
+  /** `run-answer` with `amend`: file a later answer beside a settled pause's accepted one. The same
+   *  two credentials an answer rides: a READ that replays the journal to the settled step and reads
+   *  which answer its settle accepted, then an ANSWERING one minted for that token alone. Nothing
+   *  is presented, so the pause stays settled. `by` is decided by the serve layer, as for an answer. */
+  async amend(
+    args: { runId: string; endpoint?: string; stepKey: string; value?: unknown; artifact?: string },
+    by: string,
+    authorize?: (accepted: RunHostAcceptedAnswer) => void | Promise<void>,
+    ctx?: EpServeContext,
+  ): Promise<unknown> {
+    const host = this.host();
+    const served = this.served(ctx, "run-answer");
+    const endpoint = args.endpoint ?? this.ctx.endpoint;
+    let accepted: RunHostAcceptedAnswer;
+    try {
+      accepted = await this.withOperator({ endpoint, runId: args.runId }, (planes, _kv, takeoverId) =>
+        host.locateAccepted(planes, { endpoint, runId: args.runId, takeoverId, stepKey: args.stepKey }));
+    } catch (e) {
+      if (e instanceof EpEnvelopeError) throw e;
+      if (e instanceof Error && e.name === "CheckpointNotAmendable") throw new EpEnvelopeError("not-found", e.message);
+      throw e;
+    }
+    await authorize?.(accepted);
+    return await this.withOperator({ endpoint, answers: { runId: args.runId, stepKey: args.stepKey, token: accepted.token, amend: true }, ...(served !== undefined ? { served } : {}) }, (planes) =>
+      host.amend(planes, {
+        endpoint,
+        accepted,
+        by,
+        ...(args.value !== undefined ? { value: args.value } : {}),
+        ...(args.artifact !== undefined ? { artifact: args.artifact } : {}),
+        now: Date.now(),
+      }));
+  }
+
+  /** `run-status`: the record plus the journal view, or one page of it with `journal`. */
+  async status(args: { runId: string; endpoint?: string; journal?: { offset: number } }, ctx?: EpServeContext): Promise<RunStatusView> {
+    const host = this.host();
+    const endpoint = args.endpoint ?? this.ctx.endpoint;
+    if (args.journal !== undefined && ctx?.replyFits === undefined) throw new EpEnvelopeError("failed-precondition", "this serving path cannot measure a journal page");
+    const context = ctx?.replyFits === undefined ? undefined : { replyFits: ctx.replyFits };
+    const view = await this.withOperator({ endpoint, runId: args.runId }, (planes, _kv, takeoverId) =>
+      host.status(planes, { endpoint, runId: args.runId, takeoverId, ...(args.journal !== undefined ? { journal: args.journal } : {}) }, context));
+    if (view === undefined) throw new EpEnvelopeError("not-found", `run ${args.runId}: no record on endpoint ${endpoint}`);
+    return view;
+  }
+
+  /** `run-ps`: every run recorded on the endpoint (or every endpoint). */
+  async list(args: { endpoint?: string }): Promise<RunListRow[]>;
+  async list(args: RunListRequest, ctx: EpServeContext): Promise<RunListRow[] | RunListPage>;
+  async list(args: RunListRequest, ctx?: EpServeContext): Promise<RunListRow[] | RunListPage> {
+    const host = this.host();
+    const scope = args.endpoint !== undefined ? { endpoint: args.endpoint } : {};
+    if (args.page === undefined)
+      return await this.withOperator(scope, (planes) => host.list(planes, scope));
+    if (host.listPage === undefined || ctx?.replyFits === undefined)
+      throw new EpEnvelopeError("failed-precondition", "this host does not support diagnostic inventory pages");
+    const page = args.page;
+    const context = {
+      responder: { instanceId: ctx.identity.instanceId, epoch: ctx.identity.epoch },
+      issueUntil: performance.now() + Math.min(2000, ctx.request.deadlineMs ?? 2000),
+      replyFits: ctx.replyFits,
+    };
+    return await this.withOperator(scope, (planes) => host.listPage!(planes, { ...scope, page }, context));
+  }
+
+  /** Boot: take back every run this endpoint recorded `running`. A dead predecessor's drive left
+   *  its status at `running`; a successor resumes each one under a fresh takeover. A run with no
+   *  recorded program is left alone and named: nothing can be resumed without its source. Never
+   *  fatal to the manager; a run that cannot be taken back is logged, not lost (its journal
+   *  stands). Opens the boot gate on return, whichever way it went: a reconcile that could not
+   *  read the store leaves the family serving, since a later resume by hand is the remedy. */
+  async reconcile(): Promise<void> {
+    try {
+      await this.takeBack();
+    } finally {
+      this.reconciled = true;
+    }
+  }
+
+  private async takeBack(): Promise<void> {
+    let inherited: { runId: string; epoch: number; fencingToken: number; source: string; file?: string; admission: RunAdmissionView }[] = [];
+    try {
+      inherited = await this.withOperator({}, async (planes, kv) => {
+        const out: typeof inherited = [];
+        for (const e of await walkKvEntries(kv, `run.${this.ctx.endpoint}.*.spec`)) {
+          const runId = e.key.split(".")[2];
+          if (runId === undefined) continue;
+          const record = await readRunRecord(kv, this.ctx.endpoint, runId);
+          const status = record?.status?.value;
+          if (status === undefined || status.state !== "running") continue;
+          const program = await readRunProgram(kv, this.ctx.endpoint, runId);
+          if (program === undefined) {
+            this.ctx.log(`! run ${runId} is recorded running with no recorded program; it cannot be taken back here - resume it from a terminal with \`cotal run resume ${runId} --local --file <program>\``);
+            continue;
+          }
+          // A run whose admission is missing, unreadable or revoked is NOT taken back (SPEC 14.8):
+          // it stays parked, named in the log, until an operator admits or revokes it explicitly.
+          let admission: RunAdmissionView;
+          try {
+            admission = await readRunAdmission(planes.jsm, this.ctx.space, this.ctx.endpoint, runId);
+          } catch (e) {
+            this.ctx.log(`! run ${runId} stays parked: ${rejectionText(e)}`);
+            continue;
+          }
+          if (admission.revoked !== undefined) {
+            this.ctx.log(`! run ${runId} stays parked: revoked by ${admission.revoked.by} (${admission.revoked.reason})`);
+            continue;
+          }
+          out.push({ runId, epoch: status.epoch + 1, fencingToken: status.fencingToken + 1, source: program.source, ...(program.file !== undefined ? { file: program.file } : {}), admission });
+        }
+        return out;
+      });
+    } catch (e) {
+      this.ctx.log(`! workflow-run boot reconcile failed: ${rejectionText(e)} - runs a predecessor was driving stay parked until the next restart or a \`cotal run resume <runId>\``);
+      return;
+    }
+    if (inherited.length === 0) return;
+    const host = this.host();
+    for (const r of inherited) {
+      try {
+        const verdict = host.validate(r.source, r.file);
+        if (!verdict.ok) throw new Error("the recorded program no longer validates on this host");
+        if ((verdict.placements?.length ?? 0) > 1) throw new Error("its placed spawns name more than one manager instance");
+        await this.launch(host, { mode: "existing", runId: r.runId, source: r.source, ...(r.file !== undefined ? { file: r.file } : {}), epoch: r.epoch, fencingToken: r.fencingToken, timeout: DEFAULT_CHECKPOINT_TIMEOUT, admission: r.admission, placements: verdict.placements ?? [] });
+      } catch (e) {
+        this.ctx.log(`! run ${r.runId} could not be taken back: ${rejectionText(e)}`);
+      }
+    }
+    this.ctx.log(`workflow-run boot reconcile: took back ${inherited.length} run(s) recorded running`);
+  }
+
+  /** Renewal: re-mint every live drive's `run-driver` credential for the SAME nkey and attempt
+   *  coordinates when it is past its renewal point; the connection presents the fresh one on its
+   *  next (re)connect. Open mesh: nothing to renew. */
+  async renew(): Promise<void> {
+    if (this.ctx.renewRun) return this.renewRemote(this.ctx.renewRun);
+    const auth = this.ctx.auth;
+    if (!auth) return;
+    for (const run of this.runs.values()) {
+      const pin = {
+        endpoint: this.ctx.endpoint, runId: run.runId, takeoverId: run.takeoverId,
+        instanceId: this.ctx.instanceId, epoch: run.epoch,
+        ...(run.placements.length === 1 ? { placement: { instanceId: run.placements[0]!.instanceId } } : {}),
+      };
+      if (run.creds !== undefined && inspectCredHealth(run.creds).state !== "healthy") {
+        try {
+          run.creds = await mintCreds(auth, run.identity, "run-driver", { runDriver: pin });
+        } catch (e) {
+          this.ctx.log(`! run-driver renewal for ${run.runId}: ${rejectionText(e)}`);
+        }
+      }
+      if (run.mediatorCreds !== undefined && inspectCredHealth(run.mediatorCreds).state !== "healthy") {
+        try {
+          run.mediatorCreds = await mintCreds(auth, run.mediatorIdentity, "run-mediator", { runMediator: pin });
+        } catch (e) {
+          this.ctx.log(`! run-mediator renewal for ${run.runId}: ${rejectionText(e)}`);
+        }
+      }
+    }
+  }
+
+  /** Both-or-none adoption of the host-issued pair for the attempt's own coordinates. The pair is
+   *  adopted only while the same attempt still holds the slot; anything else keeps last-good. */
+  private async renewRemote(renewRun: NonNullable<RunHostingContext["renewRun"]>): Promise<void> {
+    for (const run of [...this.runs.values()]) {
+      if (run.creds === undefined || run.mediatorCreds === undefined || run.fencingToken === undefined) continue;
+      if (inspectCredHealth(run.creds).state === "healthy" && inspectCredHealth(run.mediatorCreds).state === "healthy") continue;
+      try {
+        const pair = await renewRun({
+          runId: run.runId, holder: `${this.ctx.holder.id}.${run.takeoverId}`, takeoverId: run.takeoverId,
+          epoch: run.epoch, fencingToken: run.fencingToken, driver: run.identity, mediator: run.mediatorIdentity,
+        });
+        for (const [name, cred] of [["driver", pair.driver], ["mediator", pair.mediator]] as const)
+          if (typeof cred !== "string" || inspectCredHealth(cred).state !== "healthy")
+            throw new Error(`host returned an unusable run-${name} credential`);
+        // Neither holder changes until BOTH candidates have proved broker connectivity. A JWT
+        // with coherent local claims can still carry a bad signature or a revoked account.
+        for (const cred of [pair.driver, pair.mediator]) {
+          const candidate = await dialerFor(this.ctx.servers ?? DEFAULT_SERVER)({
+            servers: this.ctx.servers ?? DEFAULT_SERVER,
+            ...standaloneConnectOpts({ creds: cred, tls: false }),
+            maxReconnectAttempts: 0,
+          });
+          await candidate.close();
+        }
+        if (this.stopping || this.runs.get(run.runId) !== run)
+          throw new Error("the attempt left this host while its renewal was in flight");
+        run.creds = pair.driver;
+        run.mediatorCreds = pair.mediator;
+        run.renewalDebt = undefined;
+        await Promise.all([
+          run.nc?.reconnect().catch(() => {}),
+          run.mediatorNc?.reconnect().catch(() => {}),
+        ]);
+      } catch (e) {
+        const reason = rejectionText(e);
+        run.renewalDebt = { at: Date.now(), reason };
+        this.ctx.log(`! run-driver/mediator renewal for ${run.runId}: ${reason} - last-good kept, nothing minted locally`);
+      }
+    }
+  }
+
+  /** Shutdown: ask every drive to stop at its next boundary and drain the connections of those
+   *  that reach one. A drive parked in a pause reaches no boundary; its connection is closed under
+   *  it, so nothing it writes on the way out can land and its record stays `running`, which is what
+   *  the next incarnation's reconcile takes back. A slot still launching holds no drive yet; its
+   *  launch sees `stopping` and closes its own connection. */
+  async stop(): Promise<void> {
+    this.stopping = true;
+    const live = [...this.runs.values()].filter((r): r is HostedRun & { nc: NatsConnection; drive: RunHostDrive } => r.nc !== undefined && r.drive !== undefined);
+    this.runs.clear();
+    for (const run of live) run.drive.release("the hosting manager is stopping");
+    await Promise.all(live.map(async (run) => {
+      const reached = await Promise.race([run.drive.done.then(() => true), new Promise<false>((r) => setTimeout(() => r(false), 2_000))]);
+      if (reached) await run.nc.drain().catch(() => run.nc.close());
+      else await run.nc.close();
+      await run.mediatorNc?.close();
+    }));
+  }
+
+  /** The admitted caller of the run this manager drives under `caller`, the run's own derived
+   *  caller (SPEC 14.8); `undefined` for any other caller. */
+  admittedCaller(caller: EpCaller): EpCaller | undefined {
+    for (const run of this.runs.values()) {
+      if (run.caller === undefined) continue;
+      const derived = runDriverCaller(run.runId, run.caller.owner);
+      if (derived.owner === caller.owner && derived.actor === caller.actor && derived.uid === caller.uid) return run.caller;
+    }
+    return undefined;
+  }
+
+  /** The admission of the run this manager drives under `caller`, the run's own derived caller;
+   *  `undefined` for any other caller. A run's spawns are bounded by it (SPEC 14.8). */
+  runAdmission(caller: EpCaller): RunAdmission | undefined {
+    for (const run of this.runs.values()) {
+      if (run.admission === undefined) continue;
+      const derived = runDriverCaller(run.runId, run.admission.caller.owner);
+      if (derived.owner === caller.owner && derived.actor === caller.actor && derived.uid === caller.uid) return run.admission;
+    }
+    return undefined;
+  }
+
+  /** How many drives this incarnation holds; the status surface reads it. */
+  get liveCount(): number {
+    return this.runs.size;
+  }
+
+  /** Claim a run's slot SYNCHRONOUSLY: the one place the occupancy rule is decided, with no await
+   *  between the check and the set. A held slot is a conflict for every later claimant until the
+   *  attempt that holds it ends. */
+  private claim(runId: string, placements: readonly { endpoint: string; instanceId: string }[] = []): HostedRun {
+    this.assertNoCancel(runId);
+    if (this.runs.has(runId)) throw new EpEnvelopeError("conflict", `run ${runId} is being driven by this manager already`);
+    const takeoverId = newTakeoverId();
+    const slot: HostedRun = { runId, takeoverId, epoch: 0, identity: newIdentity(), mediatorIdentity: newIdentity(), placements };
+    this.runs.set(runId, slot);
+    return slot;
+  }
+
+  /** Release a slot, only if it is still this attempt's: a later attempt of the same run is a new
+   *  entry and is never removed by an earlier one's end. */
+  private free(slot: HostedRun): void {
+    if (this.runs.get(slot.runId) === slot) this.runs.delete(slot.runId);
+    this.clearObservedCancellation(slot.runId);
+  }
+
+  /** Launch one attempt on a slot. The slot is claimed here when the caller has not already
+   *  (`start`), and is this launch's to give back from the first line: every refusal below,
+   *  including the two before a drive is attempted, frees a slot whose drive never started. */
+  private async launch(
+    host: RunHost,
+    req: { mode: "new" | "existing"; runId: string; source: string; file?: string; epoch: number; fencingToken: number; timeout: string; admission: RunAdmissionView; placements?: readonly { endpoint: string; instanceId: string }[]; served?: string },
+    claimed?: HostedRun,
+    reserved?: () => void,
+  ): Promise<void> {
+    const slot = claimed ?? this.claim(req.runId, req.placements ?? []);
+    let release = reserved;
+    try {
+      if (this.stopping) throw new EpEnvelopeError("unavailable", "the manager is stopping and hosts no new drives");
+      release ??= this.reserveLaunch(req.runId);
+      await this.drive(host, req, slot);
+    } catch (e) {
+      // A slot whose drive never started is freed here; one whose drive exists is freed by that
+      // drive's own end, so the run reads as held until its attempt has stopped.
+      if (slot.drive === undefined) this.free(slot);
+      throw e;
+    } finally {
+      release?.();
+    }
+  }
+
+  /** Take one launching unit, or refuse while stopping or at MAX_LAUNCHING. The refusal names the
+   *  runs holding the units and is `not-executed`, because it comes before any write. The release
+   *  is idempotent. */
+  private reserveLaunch(runId?: string): () => void {
+    if (this.stopping) throw new EpEnvelopeError("unavailable", "the manager is stopping and hosts no new drives");
+    if (this.launching.size >= MAX_LAUNCHING) {
+      const holding = [...this.launching.values()].filter((id): id is string => id !== undefined);
+      throw new EpEnvelopeError("resource-exhausted",
+        `${MAX_LAUNCHING} workflow runs are activating on this manager already, the most it activates at once${holding.length ? ` (${holding.join(", ")})` : ""}; nothing was written`,
+        undefined, "not-executed");
+    }
+    const unit = Symbol("launch");
+    this.launching.set(unit, runId);
+    return () => { this.launching.delete(unit); };
+  }
+
+  private async drive(
+    host: RunHost,
+    req: { mode: "new" | "existing"; runId: string; source: string; file?: string; epoch: number; fencingToken: number; timeout: string; admission: RunAdmissionView; placements?: readonly { endpoint: string; instanceId: string }[]; served?: string },
+    slot: HostedRun,
+  ): Promise<void> {
+    const { takeoverId, identity, mediatorIdentity } = slot;
+    const auth = this.ctx.auth;
+    if (this.remote && slot.placements.some((p) => p.instanceId !== this.ctx.instanceId))
+      throw new EpEnvelopeError("unimplemented", `run ${req.runId}: a signerless host places a spawn only on its own instance ${this.ctx.instanceId}; drive a program placing one elsewhere from a static-auth manager`);
+    const issued = this.remote
+      ? await this.ctx.issueAttempt!({ runId: req.runId, takeoverId, epoch: req.epoch, fencingToken: req.fencingToken, driver: identity, mediator: mediatorIdentity, ...(req.served !== undefined ? { served: req.served } : {}) })
+      : undefined;
+    const creds = issued ? issued.driver : auth
+      ? await mintCreds(auth, identity, "run-driver", {
+          runDriver: { endpoint: this.ctx.endpoint, runId: req.runId, takeoverId, instanceId: this.ctx.instanceId, epoch: req.epoch },
+        })
+      : undefined;
+    const placement = slot.placements.length === 1 ? { instanceId: slot.placements[0]!.instanceId } : undefined;
+    const mediatorCreds = issued ? issued.mediator : auth
+      ? await mintCreds(auth, mediatorIdentity, "run-mediator", {
+          runMediator: { endpoint: this.ctx.endpoint, runId: req.runId, takeoverId, instanceId: this.ctx.instanceId, epoch: req.epoch, ...(placement !== undefined ? { placement } : {}) },
+        })
+      : undefined;
+    // The attempt's coordinates on the slot before the connection: the renewal loop re-mints from
+    // these, and the epoch is a per-attempt fact.
+    const holder: HostedRun = Object.assign(slot, { epoch: req.epoch, fencingToken: req.fencingToken, caller: req.admission.admission.caller, admission: req.admission.admission, ...(creds !== undefined ? { creds, mediatorCreds } : {}) });
+    const enc = new TextEncoder();
+    // A STANDING connection: the drive may park for hours inside a pause, so it reconnects without
+    // bound and presents whatever credential the renewal loop last minted.
+    const nc = await dialerFor(this.ctx.servers ?? DEFAULT_SERVER)({
+      servers: this.ctx.servers ?? DEFAULT_SERVER,
+      ...(creds !== undefined
+        ? { authenticator: (nonce?: string) => credsAuthenticator(enc.encode(holder.creds!))(nonce), inboxPrefix: `_INBOX_${identity.id}` }
+        : {}),
+      maxReconnectAttempts: -1,
+    });
+    let planes: RunHostPlanes;
+    let mediator: RunHostPlanes;
+    let mediatorNc: NatsConnection | undefined;
+    try {
+      planes = { nc, js: jetstream(nc), jsm: await jetstreamManager(nc), kv: await openRecordsBucket(nc, this.ctx.space), space: this.ctx.space };
+      mediatorNc = await dialerFor(this.ctx.servers ?? DEFAULT_SERVER)({
+        servers: this.ctx.servers ?? DEFAULT_SERVER,
+        ...(mediatorCreds !== undefined
+          ? { authenticator: (nonce?: string) => credsAuthenticator(enc.encode(holder.mediatorCreds!))(nonce), inboxPrefix: `_INBOX_${mediatorIdentity.id}` }
+          : {}),
+        maxReconnectAttempts: -1,
+      });
+      mediator = { nc: mediatorNc, js: jetstream(mediatorNc), jsm: await jetstreamManager(mediatorNc), kv: await openRecordsBucket(mediatorNc, this.ctx.space), space: this.ctx.space };
+      // Checked AFTER the last await before the drive starts: a stop that landed during the
+      // connect has already cleared the live map, and a drive started now would be nobody's.
+      if (this.stopping) throw new EpEnvelopeError("unavailable", "the manager is stopping and hosts no new drives");
+      this.assertNoCancel(req.runId);
+    } catch (e) {
+      await mediatorNc?.close();
+      await nc.drain().catch(() => nc.close());
+      throw e;
+    }
+    const max = nc.info?.max_payload;
+    // The holder this attempt activates as: this process AND this attempt (see the header).
+    const attemptHolder = { id: `${this.ctx.holder.id}.${takeoverId}`, lifecycleUid: this.ctx.holder.lifecycleUid };
+    let drive: RunHostDrive;
+    try {
+      drive = host.drive(planes, {
+        mode: req.mode,
+        endpoint: this.ctx.endpoint,
+        runId: req.runId,
+        source: req.source,
+        ...(req.file !== undefined ? { file: req.file } : {}),
+        lease: { holder: attemptHolder.id, epoch: req.epoch, fencingToken: req.fencingToken, takeoverId },
+        holder: attemptHolder,
+        instanceId: this.ctx.instanceId,
+        epoch: req.epoch,
+        defaultCheckpointTimeout: req.timeout,
+        admission: req.admission,
+        cancellationObserved: () => this.runs.get(req.runId) === holder
+          ? [...this.cancellations.values()].find(entry => entry.runId === req.runId && entry.observed)?.reason
+          : undefined,
+        // The broker's own max_payload, minus headroom for the record envelope around the entry.
+        ...(typeof max === "number" && max > 4096 ? { resultBytes: max - 4096 } : {}),
+        // The program's log lines are not journalled; this process's log is where they are read.
+        onLog: (text) => this.ctx.log(`run ${req.runId}: log ${text}`),
+      }, mediator);
+    } catch (error) {
+      await nc.close();
+      await mediatorNc?.close();
+      throw error;
+    }
+    holder.nc = nc;
+    holder.mediatorNc = mediatorNc;
+    holder.drive = drive;
+    holder.activated = false;
+    const activation = this.activated(mediator.kv, req, drive).then(() => { holder.activated = true; });
+    void drive.done.then(async (out) => {
+      holder.outcome = out;
+      this.ctx.log(`run ${req.runId}: ${describeOutcome(out)}`);
+      this.free(holder);
+      // The activation wait reads the record over this connection; it finishes before the drain.
+      await activation.catch(() => undefined);
+      await nc.drain().catch(() => nc.close());
+      await mediatorNc?.drain().catch(() => mediatorNc?.close());
+    });
+    try {
+      await activation;
+    } catch (e) {
+      // An attempt that never activated in time is not left holding a slot and a connection with
+      // nobody's word on it: it is released, and a drive that reaches no boundary within a
+      // moment has its connection closed under it, the same way a stop treats a parked drive.
+      // Its own end then frees the slot.
+      drive.release(`the hosting manager gave up waiting for its activation: ${rejectionText(e)}`);
+      const reached = await Promise.race([drive.done.then(() => true), new Promise<false>((r) => setTimeout(() => r(false), 2_000))]);
+      if (!reached) {
+        await nc.close();
+        await mediatorNc?.close();
+      }
+      throw e;
+    }
+    this.ctx.log(`run ${req.runId}: ${req.mode === "new" ? "started" : "resumed"} on endpoint ${this.ctx.endpoint} (epoch ${req.epoch}, takeover ${takeoverId})`);
+  }
+
+  /** Answer only once this attempt's status is recorded, or the drive has said why it never was:
+   *  a caller handed an id for a run whose activation then failed would find nothing under it. A
+   *  run that completes inside the wait has its record and is answered like any other. */
+  private async activated(kv: KV, req: { runId: string; epoch: number }, drive: RunHostDrive): Promise<void> {
+    const recorded = async (): Promise<boolean> =>
+      (await readRunRecord(kv, this.ctx.endpoint, req.runId))?.status?.value.epoch === req.epoch;
+    const settled = drive.done.then((out) => ({ out }));
+    const deadline = Date.now() + RUN_ACTIVATION_WAIT_MS;
+    for (;;) {
+      if (await recorded()) return;
+      const early = await Promise.race([settled, new Promise<undefined>((r) => setTimeout(() => r(undefined), 50))]);
+      if (early !== undefined) {
+        if (await recorded()) return;
+        throw new EpEnvelopeError(
+          early.out.status === "failed" ? "internal" : "failed-precondition",
+          `run ${req.runId} did not start: ${describeOutcome(early.out)}`,
+        );
+      }
+      if (Date.now() > deadline)
+        throw new EpEnvelopeError("unavailable", `run ${req.runId}: its drive has not activated after ${RUN_ACTIVATION_WAIT_MS / 1000}s and was released; \`cotal run\` shows what it recorded, and a \`cotal run resume ${req.runId}\` tries again`);
+    }
+  }
+
+  /** One served read or answer over a one-shot `run-operator` connection (open mesh: bare). The
+   *  takeover id the rows are minted for is handed to `fn`, so a journal replay inside names the
+   *  durable the credential admits. Only an answering call holds the answer and settle writes,
+   *  and those are pinned to the one pause it names. */
+  private async withOperator<T>(
+    scope: { endpoint?: string; runId?: string; answers?: { runId: string; stepKey: string; token: string; amend?: true }; served?: string },
+    fn: (planes: RunHostPlanes, kv: KV, takeoverId: string) => Promise<T>,
+  ): Promise<T> {
+    const takeoverId = newTakeoverId();
+    const endpoint = scope.endpoint ?? this.ctx.endpoint;
+    const auth = this.ctx.auth;
+    const pin = { takeoverId, ...(scope.runId !== undefined ? { runId: scope.runId } : {}) };
+    const answers = scope.answers;
+    if (this.remote && endpoint !== this.ctx.endpoint)
+      throw new EpEnvelopeError("permission-denied", `a signerless host serves reads and answers for its own endpoint ${this.ctx.endpoint} only`);
+    const operator = newIdentity();
+    const creds = this.remote
+      ? await this.ctx.issueOperator!({
+          identity: operator, ...pin,
+          // The host reads the pause's token off the run's journal itself; it is never handed one.
+          ...(answers !== undefined ? { answers: { runId: answers.runId, stepKey: answers.stepKey, ...(answers.amend === true ? { amend: true as const } : {}) } } : {}),
+          ...(scope.served !== undefined ? { served: scope.served } : {}),
+        })
+      : auth ? await mintCreds(auth, operator, "run-operator", { runOperator: { endpoint, ...pin, ...(answers !== undefined ? { answers: { token: answers.token } } : {}) } }) : undefined;
+    const nc = await dialerFor(this.ctx.servers ?? DEFAULT_SERVER)({
+      servers: this.ctx.servers ?? DEFAULT_SERVER,
+      ...(creds !== undefined
+        ? standaloneConnectOpts({
+            creds,
+            /* not yet wired to a recorded transport */ tls: false,
+          })
+        : {}),
+      maxReconnectAttempts: 0,
+    });
+    try {
+      const kv = await openRecordsBucket(nc, this.ctx.space);
+      return await fn({ nc, js: jetstream(nc), jsm: await jetstreamManager(nc), kv, space: this.ctx.space }, kv, takeoverId);
+    } finally {
+      await nc.drain().catch(() => nc.close());
+    }
+  }
+}
+
+/** A validation problem without its rendered source frame (the caller holds the source). */
+function withoutFrame(e: Record<string, unknown>): Record<string, unknown> {
+  const where = e.where;
+  if (where === null || typeof where !== "object") return e;
+  const { frame: _frame, ...rest } = where as Record<string, unknown>;
+  return { ...e, where: rest };
+}
+
+function describeOutcome(out: RunHostOutcome): string {
+  if (out.status === "completed") return `completed in ${out.steps} step(s)`;
+  if (out.status === "released") return `released - ${out.reason.name}: ${out.reason.message.split("\n")[0]}`;
+  return `failed - ${out.error.code ? `${out.error.code} ` : ""}${out.error.name}: ${out.error.message.split("\n")[0]}`;
+}

@@ -1,0 +1,237 @@
+{
+  "suite": [
+    "bin/smoke/verify-publish-closure.smoke.ts"
+  ],
+  "guard": "pnpm smoke:verify-publish-closure",
+  "command": "pnpm smoke:verify-publish-closure",
+  "completionMarker": "SUITE COMPLETE",
+  "grades": "tool",
+  "proveWith": "pnpm mutation-proof --config bin/smoke/mutations/verify-publish-closure.json",
+  "why": "The gate decides whether a release version reached npm across the whole lockstep closure. Its two failure directions are silent and opposite: calling registry lag a partial publish (a false alarm, which gets a gate switched off) and calling a partial publish complete (a Release cut for a version that did not fully ship). Each mutation below breaks one of those decisions and must be caught by the cell named, so the suite is shown to discriminate rather than merely to pass. Every mutated file is the gate's own code or its generator -- no shipped product source -- which is what grades:\"tool\" asserts.",
+  "mutations": [
+    {
+      "name": "the old stability window ends a clean incomplete run as PARTIAL again",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "  if (elapsedMs >= opts.deadlineMs) {",
+      "replace": "  if (unchangedForMs >= opts.stableWindowMs && missing.length < total) return { state: \"partial\", missing, why: \"stability-window\" };\n  if (elapsedMs >= opts.deadlineMs) {",
+      "expectRed": "a package that appears after the old stability window but before the deadline reaches PUBLISHED",
+      "cell": "a package that appears after the old stability window but before the deadline reaches PUBLISHED"
+    },
+    {
+      "name": "success tolerates one missing package, so a dropped sibling still reads as published",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "  if (missing.length === 0) return { state: \"published\" };",
+      "replace": "  if (missing.length <= 1) return { state: \"published\" };",
+      "expectRed": "cotal-ai being live does NOT clear the gate while a sibling is missing (the #1254 defect)",
+      "cell": "cotal-ai being live does NOT clear the gate while a sibling is missing (the #1254 defect)"
+    },
+    {
+      "name": "closure stops being derived and becomes the single package the old gate checked",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "  return [...new Set(names)].sort();",
+      "replace": "  return [\"cotal-ai\"];",
+      "expectRed": "the closure is derived from .changeset/config.json, matching every name in the fixed group",
+      "cell": "the closure is derived from .changeset/config.json, matching every name in the fixed group"
+    },
+    {
+      "name": "a clean incomplete reading at the deadline is called PARTIAL without positive evidence",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "    return { state: \"unsettled\", missing, why: \"deadline\" };",
+      "replace": "    return { state: \"partial\", missing, why: \"deadline\" };",
+      "expectRed": "two clean 404s held to the deadline remain UNSETTLED because either can still be slow",
+      "cell": "two clean 404s held to the deadline remain UNSETTLED because either can still be slow"
+    },
+    {
+      "name": "a stability window narrower than the poll interval is silently widened instead of refused",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "    throw new Error(\"--stable-window-ms must be at least --poll-interval-ms\");",
+      "replace": "    opts.stableWindowMs = opts.pollIntervalMs;",
+      "expectRed": "a stability window narrower than the poll interval is refused (it would re-admit one sample)",
+      "cell": "a stability window narrower than the poll interval is refused (it would re-admit one sample)"
+    },
+    {
+      "name": "scoped package names stop being percent-encoded, so every scoped read 404s",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "  return `${base}/${pkg.replace(\"@\", \"%40\").replace(\"/\", \"%2f\")}/${version}`;",
+      "replace": "  return `${base}/${pkg}/${version}`;",
+      "expectRed": "a scoped package encodes as %40scope%2fname in the per-version path",
+      "cell": "a scoped package encodes as %40scope%2fname in the per-version path"
+    },
+    {
+      "name": "the generated header stops being prepended, so the committed declaration no longer matches the emit",
+      "file": "bin/smoke/gen-publish-closure-dts.mts",
+      "find": "    return `${HEADER}\\n${emitted.replace(/^#!.*\\n/, \"\")}`;",
+      "replace": "    return `${emitted.replace(/^#!.*\\n/, \"\")}`;",
+      "expectRed": "the committed .d.mts is byte-identical to a fresh emit from the module (run pnpm gen:publish-closure-dts)",
+      "cell": "the committed .d.mts is byte-identical to a fresh emit from the module (run pnpm gen:publish-closure-dts)"
+    },
+    {
+      "name": "a push that published NOTHING is reported as a partial publish, reddening every version-PR push",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "  if (missing.length === total && unchangedForMs >= opts.stableWindowMs) return { state: \"none\", missing };",
+      "replace": "  if (missing.length === total + 1 && unchangedForMs >= opts.stableWindowMs) return { state: \"none\", missing };",
+      "expectRed": "a wholly absent version is NONE (published nothing), never PARTIAL",
+      "cell": "a wholly absent version is NONE (published nothing), never PARTIAL"
+    },
+    {
+      "name": "the COTAL_ scrub stops matching, so a live credential reaches the spawned child",
+      "file": "bin/smoke/verify-publish-closure.smoke.ts",
+      "find": "  for (const key of Object.keys(env)) if (key.startsWith(\"COTAL_\")) delete env[key];",
+      "replace": "  for (const key of Object.keys(env)) if (key.startsWith(\"COTAL_NEVER_MATCHES_\")) delete env[key];",
+      "expectRed": "no COTAL_ variable reaches the spawned child, even when one is set in this process",
+      "cell": "no COTAL_ variable reaches the spawned child, even when one is set in this process"
+    },
+    {
+      "name": "transport errors are merged back into the missing set, so an outage reads as absence",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "      errored.push(pkg);\n      continue;",
+      "replace": "      missing.push(pkg);\n      continue;",
+      "expectRed": "a total registry outage is UNSETTLED, never NONE \u2014 an unreachable registry is not an absent package",
+      "cell": "a total registry outage is UNSETTLED, never NONE \u2014 an unreachable registry is not an absent package"
+    },
+    {
+      "name": "an unclean scan is allowed to reach a decisive verdict again",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "  const clean = errored.length === 0;",
+      "replace": "  const clean = true;",
+      "expectRed": "an errored scan cannot be PUBLISHED even when every reachable package is live",
+      "cell": "an errored scan cannot be PUBLISHED even when every reachable package is live"
+    },
+    {
+      "name": "any non-200 is treated as absence again, so a 5xx reads as an unpublished package",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "    else {\n      errored.push(pkg);\n      failed.push(pkg);\n    }",
+      "replace": "    else missing.push(pkg);",
+      "expectRed": "a total 5xx outage is UNSETTLED, not NONE \u2014 a registry that will not answer has published nothing to say",
+      "cell": "a total 5xx outage is UNSETTLED, not NONE \u2014 a registry that will not answer has published nothing to say"
+    },
+    {
+      "name": "404 stops counting as absence, so a genuine partial publish can never be detected",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "    if (status === 404) missing.push(pkg);",
+      "replace": "    if (status === 410) missing.push(pkg);",
+      "expectRed": "a genuine held 404 on one package remains UNSETTLED because a clean 404 is not failure evidence",
+      "cell": "a genuine held 404 on one package remains UNSETTLED because a clean 404 is not failure evidence"
+    },
+    {
+      "name": "redirects are followed again, so a 302 onto a generic 200 reads as a published package",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "      fetchImpl(url, { method: \"GET\", redirect: \"manual\", signal: AbortSignal.timeout(remainingMs) }),",
+      "replace": "      fetchImpl(url, { method: \"GET\", signal: AbortSignal.timeout(remainingMs) }),",
+      "expectRed": "a registry that redirects onto a generic 200 does NOT report published \u2014 a followed redirect is not presence",
+      "cell": "a registry that redirects onto a generic 200 does NOT report published \u2014 a followed redirect is not presence"
+    },
+    {
+      "name": "the read is awaited unbounded again, so a socket that never answers parks the gate past its own deadline",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "    return await Promise.race([\n      fetchImpl(url, { method: \"GET\", redirect: \"manual\", signal: AbortSignal.timeout(remainingMs) }),\n      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(\"read budget expired\")), remainingMs); }),\n    ]);",
+      "replace": "    return await fetchImpl(url, { method: \"GET\", redirect: \"manual\", signal: AbortSignal.timeout(remainingMs) });",
+      "cell": "a registry that accepts the connection and never answers still settles inside the budget",
+      "expectRed": "a registry that accepts the connection and never answers still settles inside the budget"
+    },
+    {
+      "name": "the per-read budget stops shrinking, so a hung read cannot be cut short by the time already spent",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "    const remainingMs = Math.max(0, budgetEndsAt - Date.now());",
+      "replace": "    const remainingMs = opts.deadlineMs;",
+      "cell": "the shipped command exits 2 (cannot tell) against a registry that never answers, rather than being killed",
+      "expectRed": "the shipped command exits 2 (cannot tell) against a registry that never answers, rather than being killed"
+    },
+    {
+      "name": "elapsed is read from the injected clock alone, so a run whose reads all time out polls forever",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "    const elapsedMs = Math.max(now() - started, Date.now() - ioStarted);",
+      "replace": "    const elapsedMs = now() - started;",
+      "cell": "spending the real budget ends the run even when the injected clock has not moved",
+      "expectRed": "spending the real budget ends the run even when the injected clock has not moved"
+    },
+    {
+      "name": "the body validation is skipped, so any 200 is presence again (#1257)",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "        const body = await res.json();\n        if (body && body.name === pkg && body.version === version) continue;",
+      "replace": "        continue;",
+      "expectRed": "a 200 with the wrong version in the body is NOT presence \u2014 it is no evidence (#1257)",
+      "cell": "a 200 with the wrong version in the body is NOT presence \u2014 it is no evidence (#1257)"
+    },
+    {
+      "name": "a wrong-version body is accepted as presence (#1257)",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "        if (body && body.name === pkg && body.version === version) continue;",
+      "replace": "        if (body && body.name === pkg) continue;",
+      "expectRed": "a 200 with the wrong version in the body is NOT presence \u2014 it is no evidence (#1257)",
+      "cell": "a 200 with the wrong version in the body is NOT presence \u2014 it is no evidence (#1257)"
+    },
+    {
+      "name": "a wrong-name body is accepted as presence (#1257)",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "        if (body && body.name === pkg && body.version === version) continue;",
+      "replace": "        if (body && body.version === version) continue;",
+      "expectRed": "a 200 naming a different package in the body is NOT presence (#1257)",
+      "cell": "a 200 naming a different package in the body is NOT presence (#1257)"
+    },
+    {
+      "name": "one transient errored poll ends the run instead of being retried",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "    if (confirmedErrored.length === 0) return { state: \"polling\", missing, errored };",
+      "replace": "    return { state: \"unsettled\", missing, errored, why: \"transport\" };",
+      "expectRed": "one all-error poll near the deadline neither resets nor ends a run that then reaches PUBLISHED",
+      "cell": "one all-error poll near the deadline neither resets nor ends a run that then reaches PUBLISHED"
+    },
+    {
+      "name": "the error bound is off by one and confirms the nth failed poll",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "      (pkg) => (consecutiveErrors.get(pkg) ?? 0) > opts.maxConsecutiveErrorPolls,",
+      "replace": "      (pkg) => (consecutiveErrors.get(pkg) ?? 0) >= opts.maxConsecutiveErrorPolls,",
+      "expectRed": "the configured error bound tolerates exactly n consecutive registry failures",
+      "cell": "the configured error bound tolerates exactly n consecutive registry failures"
+    },
+    {
+      "name": "the old deadline arm treats one clean 404 as positive PARTIAL evidence again",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "  if (elapsedMs >= opts.deadlineMs) {\n    return { state: \"unsettled\", missing, why: \"deadline\" };\n  }",
+      "replace": "  if (elapsedMs >= opts.deadlineMs) {\n    if (missing.length === 1 && total > 1) return { state: \"partial\", missing, why: \"deadline-evidence\" };\n    return { state: \"unsettled\", missing, why: \"deadline\" };\n  }",
+      "expectRed": "0.49.0 shape: one clean 404 at the 600s deadline is UNSETTLED, not PARTIAL",
+      "cell": "0.49.0 shape: one clean 404 at the 600s deadline is UNSETTLED, not PARTIAL"
+    },
+    {
+      "name": "the re-check flag selects an invalid long poll interval instead of its short defaults",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "  const opts = parseOptions(argv, recheck ? RECHECK_DEFAULTS : DEFAULTS);",
+      "replace": "  const opts = parseOptions(argv, recheck ? { ...RECHECK_DEFAULTS, pollIntervalMs: 60_000 } : DEFAULTS);",
+      "expectRed": "the re-check entry reports PUBLISHED for an already present version without publishing",
+      "cell": "the re-check entry reports PUBLISHED for an already present version without publishing"
+    },
+    {
+      "name": "the re-check entry accepts a malformed version",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "    throw new Error(`invalid version: ${version}`);",
+      "replace": "    process.stderr.write(`invalid version ignored: ${version}\\n`);",
+      "expectRed": "the re-check entry refuses a malformed version",
+      "cell": "the re-check entry refuses a malformed version"
+    },
+    {
+      "name": "confirmed non-404 failures are promoted back to a false PARTIAL verdict",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "    return { state: \"unsettled\", missing, errored, why: failed.length > 0 ? \"registry-error\" : \"transport\" };",
+      "replace": "    if (missing.length === 0 && failed.length === 1 && errored.length === 1) return { state: \"partial\", missing: failed, errored, why: \"registry-error\" };\n    return { state: \"unsettled\", missing, errored, why: failed.length > 0 ? \"registry-error\" : \"transport\" };",
+      "expectRed": "the configured error bound ends n+1 package-specific failures as UNSETTLED, never PARTIAL",
+      "cell": "the configured error bound ends n+1 package-specific failures as UNSETTLED, never PARTIAL"
+    },
+    {
+      "name": "the UNSETTLED CLI labels errored packages as missing again",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "    if (result.errored?.length > 0) process.stdout.write(`  errored: ${result.errored.join(\" \")}\\n`);",
+      "replace": "    if (result.errored?.length > 0) process.stdout.write(`  missing: ${result.errored.join(\" \")}\\n`);",
+      "expectRed": "the shipped command reports repeated non-404 failures as ERRORED, not MISSING or PARTIAL",
+      "cell": "the shipped command reports repeated non-404 failures as ERRORED, not MISSING or PARTIAL"
+    },
+    {
+      "name": "re-check defaults omit inherited registry and error-bound options again",
+      "file": "scripts/verify-publish-closure.mjs",
+      "find": "export const RECHECK_DEFAULTS = {\n  registryBase: DEFAULTS.registryBase,\n  pollIntervalMs: 1_000,\n  stableWindowMs: 5_000,\n  deadlineMs: 15_000,\n  maxConsecutiveErrorPolls: DEFAULTS.maxConsecutiveErrorPolls,\n};",
+      "replace": "export const RECHECK_DEFAULTS = {\n  pollIntervalMs: 1_000,\n  stableWindowMs: 5_000,\n  deadlineMs: 15_000,\n};",
+      "expectRed": "re-check defaults retain every operator option from the normal gate",
+      "cell": "re-check defaults retain every operator option from the normal gate"
+    }
+  ]
+}

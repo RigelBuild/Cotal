@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": { "jsx": "react-jsx" },
+  "include": ["bin/**/*", "implementations/**/*", "packages/**/*", "extensions/**/*", "examples/**/*"],
+  "exclude": ["node_modules", "**/node_modules", ".runs"]
+}

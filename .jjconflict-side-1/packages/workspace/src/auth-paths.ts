@@ -1,0 +1,1469 @@
+import { CommandFailure } from "./output.js";
+import { existsSync, linkSync, lstatSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, type Dirent, type Stats } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { join, dirname, resolve, sep } from "node:path";
+import { homeCotalDir, homeRecordEntries, userCotalDir } from "./cotal-home.js";
+import {
+  composeSpaceAuth,
+  isWellFormedUnicode,
+  jwtIssuedAt,
+  mkSecretDir,
+  newIdentity,
+  oneLine,
+  validateSpaceAuthForRead,
+  writeSecretFile,
+  writeSecretFileAtomic,
+  writeSecretFileCreateOnly,
+  type BrokerAuth,
+  type Identity,
+  type SecretStore,
+  type SpaceAccountAuth,
+  type SpaceAuth,
+} from "@cotal-ai/core";
+
+/**
+ * On-disk auth-material I/O for a local checkout's `.cotal/` — machine-local path resolution plus
+ * reading/writing the space trust material. Lives in `@cotal-ai/workspace` (not core) because it's a
+ * workstation concern — *where a checkout's `.cotal/` is on THIS disk* — not part of the wire
+ * protocol. The minting / JWT / `nats-server` config machinery stays in `@cotal-ai/core`; these
+ * helpers persist its output. `SpaceAuth` is core's type — imported here, owned there.
+ *
+ * Deliberately explicit-root/path APIs: no ambient `findAndMint()` that fuses root discovery with
+ * signing. File modes (0700 dirs / 0600 files) and the no-arbitrary-delete posture are preserved.
+ *
+ * The per-agent standing secrets used to live here too. Series P1 keys them per space, which makes
+ * that surface depend on `space-segmentation.ts` — which depends on THIS module — so it moved up to
+ * `agent-secrets.ts` rather than inverting the dependency. `creds` still appears here twice, as the
+ * one sibling of the auth dir that neither the legacy-state migration nor the user-auth enumeration
+ * treats as a space; that is what lets a tenant's agent-secret segment live inside it.
+ */
+
+const AUTH_FILE = "auth.json";
+
+export function authDir(root: string): string {
+  return join(root, ".cotal", "auth");
+}
+
+/** `<root>/.cotal/stack-controller.json`, the whole-stack journal `cotal up` writes for this root. */
+export function stackJournalPath(root: string): string {
+  return join(root, ".cotal", "stack-controller.json");
+}
+
+/** The root a folder's stack journal names, read for that field alone. Undefined when the folder has
+ *  no journal, or one that is not a small regular file naming a root. */
+export function stackJournalRoot(root: string): string | undefined {
+  const path = stackJournalPath(root);
+  try {
+    const file = lstatSync(path);
+    if (!file.isFile() || file.size > 64 * 1024) return undefined;
+    const value = JSON.parse(readFileSync(path, "utf8")) as { root?: unknown } | null;
+    return typeof value?.root === "string" ? value.root : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The way back for a project folder moved away from `recordedRoot`, the folder its records name. A
+ *  broker from an earlier release that kept running there may have created empty folders at that path,
+ *  which a plain move back would nest the project inside. */
+export function movedRootRemedy(recordedRoot: string): string {
+  return existsSync(recordedRoot)
+    ? `move what is now at ${recordedRoot} aside, such as empty folders a running broker created there, then move this folder back to ${recordedRoot} and run the command again there`
+    : `move this folder back to ${recordedRoot}, then run the command again there`;
+}
+
+/** The longest space name `space create` and `cotal up` accept. A local file that carries a space
+ *  spells its {@link spaceKey}, twice the name's length, beside up to about 90 other bytes, and a
+ *  file name holds at most 255 bytes, so a longer name could be prepared but not started. */
+export const SPACE_NAME_MAX = 64;
+
+/** The one-line refusal for a space name longer than {@link SPACE_NAME_MAX}, or undefined. */
+export function spaceNameTooLong(space: string): string | undefined {
+  return space.length > SPACE_NAME_MAX ? `the space name has ${space.length} characters, and a space name holds at most ${SPACE_NAME_MAX}, because the names of the local files that carry it spell it twice over` : undefined;
+}
+
+/** The ONE injective, case-safe space key: lowercase hex of the space's UTF-8 bytes. Every
+ *  tenant-keyed namespace derives its key from this — the account filename, the user-auth state
+ *  dir, the auth secret-store keys, and the machine mesh registry — because every namespace that
+ *  invented its own encoding (raw name, `encodeURIComponent`) turned out to alias: ASCII case is
+ *  preserved by those, so on a case-insensitive filesystem (the macOS/Windows default) `alpha` and
+ *  `Alpha` addressed ONE path and the second tenant silently absorbed the first. Hex over
+ *  `[0-9a-f]` cannot case-fold-collide, cannot contain a separator, and round-trips exactly. */
+export function spaceKey(space: string): string {
+  if (!space) throw new Error("a space name is required");
+  if (space === "." || space === "..")
+    throw new Error(`"${space}" cannot name a space - its state would escape the space's own segment`);
+  // The hex key is injective ONLY over well-formed strings: `Buffer.from(s,"utf8")` maps EVERY lone
+  // surrogate to U+FFFD, so `"\uD800"`, `"\uDFFF"` and `"�"` would all key to `efbfbd` - two
+  // such spaces collapse to one `account.<key>.json`/`space.<key>` and the undercount/aliasing
+  // class hex was introduced to close re-opens, sourced from malformed Unicode instead of ASCII
+  // case. Reject the ill-formed input at THE one builder; every legitimate name (BMP, combining,
+  // supplementary/emoji via PAIRED surrogates) is well-formed and passes untouched.
+  if (!isWellFormedUnicode(space))
+    throw new Error(`"${space}" is not a well-formed Unicode string (unpaired surrogate) - it cannot name a space`);
+  return Buffer.from(space, "utf8").toString("hex");
+}
+
+/** The space whose {@link spaceKey} is `key`, or undefined when `key` is not one `spaceKey` produces
+ *  (empty, odd-length or non-lowercase-hex, a body that does not round-trip, or one that decodes to a
+ *  name `spaceKey` refuses). The one decoder every `<prefix><key><suffix>` reader strips down to, so a
+ *  stray name a writer here cannot produce answers undefined instead of throwing. */
+export function spaceFromKey(key: string): string | undefined {
+  if (key.length === 0 || key.length % 2 !== 0 || !/^[0-9a-f]+$/.test(key)) return undefined;
+  const space = Buffer.from(key, "hex").toString("utf8");
+  if (space === "" || space === "." || space === "..") return undefined;
+  return spaceKey(space) === key ? space : undefined;
+}
+
+/** THE per-space path/key segment — `space.<hex>`, the {@link spaceKey} under a fixed prefix so a
+ *  segment is self-describing on disk and can never collide with a reserved sibling of the auth
+ *  dir (`broker.json`, `account.<hex>.json`, `server.conf`, `creds/`): none of those start with
+ *  `space.`, and the hex body cannot smuggle one in. Consumed by the state dir AND the auth
+ *  secret-store key builders; two independently-guarded encoders were the defect generator (one
+ *  gains a rule the other doesn't), so keep exactly one.
+ *
+ *  The non-collision claim now spans a WIDER namespace than the auth dir. Segmenting the root-scoped
+ *  P7 material puts a `space.<hex>` directly under `.cotal/`, so the guarantee must hold against the
+ *  children of `.cotal/` too (`agents`, `auth`, `nats`, `manifests`, the `*.creds`/`*.pid`/`*.log`
+ *  files, and `auth-service.<spaceKey>.pid`, which is the nearest miss). It does, for the same
+ *  reason: no `.cotal` child begins with `space.`. That held by ACCIDENT until something asserted
+ *  it — `RESERVED_COTAL_CHILDREN` in `space-segmentation.ts` carries the list and
+ *  `smoke:space-segmentation` is the guard, so a future `.cotal` child named `space.*` fails a suite
+ *  instead of silently aliasing a tenant's segment. */
+export function spaceSegment(space: string): string {
+  return `space.${spaceKey(space)}`;
+}
+
+const SPACE_SEGMENT_PREFIX = "space.";
+
+/** The space a canonical segment encodes, or undefined when the name is not one {@link spaceSegment}
+ *  wrote (wrong prefix, non-hex body, or a body that does not round-trip). Enumeration and the
+ *  legacy-layout shim both need this to tell the canonical namespace from strays. */
+export function spaceFromSegment(name: string): string | undefined {
+  if (!name.startsWith(SPACE_SEGMENT_PREFIX)) return undefined;
+  return spaceFromKey(name.slice(SPACE_SEGMENT_PREFIX.length));
+}
+
+/** The SPACE-SCOPED user-auth state dir (`<root>/.cotal/auth/space.<hex>`) — the one layout fact
+ *  the workstation layer owns about user auth: the auth provider persists its material under this
+ *  dir (opaque to us). A regular provider pin inside the real directory marks user-auth state.
+ *  Keyed by {@link spaceSegment} so two case-differing tenants can never share one state dir and no space
+ *  name can alias a reserved sibling of the auth dir. Fails loud on a degenerate space — BEFORE
+ *  any caller can mutate at an aliased path.
+ *
+ *  Also the ONE migration point for pre-hex layouts (`<authDir>/<encodeURIComponent(space)>`):
+ *  every consumer of a space's user-auth state — the marker check, the provider's `dir`, and the
+ *  secret-store keys resolved beside it — obtains this path first, so renaming the legacy dir to
+ *  the canonical segment HERE means no flow can ever read (or worse, `ensure*`-REGENERATE) beside
+ *  material the old layout still holds. Deliberately not in {@link hasUserAuthState} alone: a
+ *  user-mode connect through a registry record never consults the marker before minting. */
+export function userAuthStateDir(root: string, space: string, options: { readonly readOnly?: boolean } = {}): string {
+  const canonical = join(authDir(root), spaceSegment(space));
+  migrateLegacyUserAuthState(root, space, canonical, options);
+  return canonical;
+}
+
+/** One-time shim for state dirs written before the hex segment. Byte-exact only: the legacy name
+ *  must appear verbatim in the directory listing — a mere `existsSync` would case-fold on
+ *  macOS/Windows and migrate a DIFFERENT space's dir. `creds` is the agent-creds dir, the one
+ *  legacy spelling that was always an alias rather than state, so it is excluded rather than
+ *  renamed out from under every agent secret. Only a dir carrying a provider pin migrates — an
+ *  empty husk is a crashed enable, not state.
+ *
+ *  The one irreducibly AMBIGUOUS case fails LOUD: a space literally named `space.<validhex>` has a
+ *  pre-hex dir whose name IS a canonical segment of a DIFFERENT space (e.g. `space.616c706861` is
+ *  both that space's legacy dir and the canonical home of `alpha`). Nothing on disk can say which
+ *  space owns it, so migrating either way would misattribute state - silently reading it as static
+ *  (the old bug: a user-auth space flips, and `mint` writes static admin creds) or stealing another
+ *  tenant's canonical dir. Refuse and make the operator disambiguate, rather than infer ownership
+ *  from the directory spelling. */
+function migrateLegacyUserAuthState(root: string, space: string, canonical: string, options: { readonly readOnly?: boolean }): void {
+  const legacyName = encodeURIComponent(space);
+  if (legacyName === "creds") return;
+  const dir = authDir(root);
+  const legacyPath = join(dir, legacyName);
+  // Cheap gate first: nothing even case-insensitively at the legacy path ⇒ no pre-hex dir to weigh,
+  // so the canonical path (whatever state it is in) is authoritative and we skip the readdir. The
+  // legacy check must run BEFORE trusting a present canonical dir: `existsSync(canonical)` alone
+  // does NOT prove migration completed - an EMPTY canonical husk (a crashed new-layout enable)
+  // beside REAL pre-hex state would let a bare canonical read flip a user-auth space to static and
+  // `mint` write admin creds.
+  if (!existsSync(legacyPath)) return;
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw e;
+  }
+  // Byte-exact (existsSync case-folds a sibling), and a real provider pin - an empty husk at the
+  // legacy path is a crashed enable, not state, so it neither migrates nor blocks.
+  const hit = entries.find((e) => e.name === legacyName && e.isDirectory());
+  if (!hit || !pathHasUserAuthMarker(legacyPath)) return;
+  if (options.readOnly) throw new CommandFailure("refused", "LIFECYCLE_BLOCKED", "this observation encountered legacy user-auth state requiring migration; no directory was moved and static mode was not inferred", { target: { space }, remedy: "complete this root's supported explicit migration before retrying the observation" });
+  // Real pre-hex state exists for this space. Two situations are irreducibly ambiguous and FAIL
+  // LOUD rather than guess: (1) the legacy name is also another space's canonical segment; (2) a
+  // canonical dir already exists (a crashed/partial new-layout enable) - migrating would either
+  // steal it or need a merge we cannot infer. Only when the canonical path is ABSENT is the rename
+  // unambiguous.
+  if (spaceFromSegment(legacyName) !== undefined)
+    throw new Error(
+      `${legacyPath} is ambiguous: it is the pre-hex user-auth state dir of space "${space}" AND a canonical segment of space "${spaceFromSegment(legacyName)}" - refusing to guess which tenant owns it. Move it to ${canonical} yourself if it belongs to "${space}", or remove it.`,
+    );
+  if (existsSync(canonical))
+    throw new Error(
+      `both the canonical ${canonical} and the pre-hex ${legacyPath} hold user-auth state for "${space}" - refusing to guess which is current (canonical existence alone does not prove the migration completed). Merge or remove one, then retry.`,
+    );
+  renameSync(legacyPath, canonical);
+}
+
+/** The provider's first-written user-auth pins. Workspace owns the LOCATION of a space's user-auth
+ *  state ({@link userAuthStateDir}) and the fact that one of these files inside it marks the space
+ *  user-auth-enabled; the auth provider owns their contents. `idp.json` is written first at enable and
+ *  `callout.json` right after, so EITHER marks a real state dir. The pin check is what makes the marker
+ *  sound where a bare `existsSync` is not: neither file can appear inside a sibling like `creds/`, nor
+ *  can a plain file (`broker.json`, `account.<hex>.json`) that aliases the state-dir PATH ever satisfy
+ *  it (a file has no children). */
+const USER_AUTH_MARKER_FILES = ["idp.json", "callout.json"] as const;
+
+function pathHasUserAuthMarker(dir: string): boolean {
+  let st;
+  try {
+    st = lstatSync(dir);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw e;
+  }
+  if (!st.isDirectory()) return false;
+  // The pin check must be errno-disciplined like the dir stat above: a bare `existsSync` maps EVERY
+  // failure (EACCES, ELOOP, EIO, …) to `false`, which reads a REAL but momentarily unreadable
+  // user-auth state dir as "static mode" — and a caller like `mint` then writes static admin creds
+  // onto a user-auth space. Only ENOENT means "this pin is absent"; anything else is uncertainty
+  // about a trust marker, and uncertainty fails CLOSED (loud), never open.
+  return USER_AUTH_MARKER_FILES.some((f) => {
+    try {
+      return lstatSync(join(dir, f)).isFile();
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw e;
+    }
+  });
+}
+
+/** Whether `space` is user-auth-enabled ON DISK under `root` — the authoritative marker, NOT a bare
+ *  `existsSync` on {@link userAuthStateDir}: only a real provider pin inside a real directory
+ *  counts. The state-dir read goes through {@link userAuthStateDir}, so a pre-hex legacy layout
+ *  has already been migrated by the time the marker is checked. */
+export function hasUserAuthState(root: string, space: string, options: { readonly readOnly?: boolean } = {}): boolean {
+  return pathHasUserAuthMarker(userAuthStateDir(root, space, options));
+}
+
+/** Every space with user-auth state under this auth dir, detectable WITHOUT `broker.json`/accounts:
+ *  each enabled space is a `space.<hex>` subdirectory carrying a provider pin. The enumerating
+ *  companion to {@link hasUserAuthState}; both share {@link pathHasUserAuthMarker} so a single
+ *  space and the whole-dir sweep can never disagree on what "user-auth on disk" means. Pre-hex
+ *  legacy dirs are reported too (decoded from their verbatim names), so a guard reading this stays
+ *  fail-closed before the one-time migration has run. */
+export function userAuthSpacesOnDisk(dir: string): string[] {
+  if (!existsSync(dir)) return []; // no auth dir at all — nothing user-auth here
+  const out = new Set<string>();
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    if (!e.isDirectory() || e.name === "creds" || !pathHasUserAuthMarker(join(dir, e.name))) continue;
+    const canonical = spaceFromSegment(e.name);
+    if (canonical !== undefined) {
+      out.add(canonical);
+      continue;
+    }
+    try {
+      out.add(decodeURIComponent(e.name)); // legacy layout — verbatim name, decoded
+    } catch {
+      /* a stray dir that decodes as neither layout is not a space */
+    }
+  }
+  return [...out];
+}
+
+/** Materialize a store secret into a 0600 file for a process that can only read files — the
+ *  agent-bearer re-exec (`--token-file`) and the launch-time creds handoff. The STORE is the
+ *  source of truth; the file is a caller-owned projection at an explicit path (under the local FS
+ *  composition, a byte-identical rewrite of the key's own location). An absent key fails loud:
+ *  materializing nothing would hand the subprocess an empty credential. Lives here, OUTSIDE core,
+ *  by decision — core's seam stays get/put/delete; where a projection lands on THIS machine is a
+ *  workstation concern. */
+export async function materializeSecretToFile(store: SecretStore, key: string, path: string): Promise<void> {
+  const value = await store.get(key);
+  if (value === undefined)
+    throw new Error(`secret "${key}" is not in the store - cannot materialize it at ${path}`);
+  mkSecretDir(dirname(path)); // harden the parent BEFORE the secret lands
+  writeSecretFileAtomic(path, value);
+}
+
+/** Find the project's `.cotal/` by walking up from `start` (like git finds `.git`), returning the
+ *  directory that *contains* `.cotal/`. Falls back to `start` when none is found up the tree (a
+ *  fresh setup creates `.cotal/` there). Lets `cotal` run from any subdirectory of a project. */
+export function findCotalRoot(start: string = process.cwd()): string {
+  let dir = resolve(start);
+  for (;;) {
+    if (existsSync(join(dir, ".cotal"))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return resolve(start);
+    dir = parent;
+  }
+}
+
+/** Why `<root>/.cotal` cannot hold the folder's records: it exists and is not a directory, such as a
+ *  notes file named `.cotal`. Undefined when it is a directory or absent. */
+export function cotalDirProblem(root: string): string | undefined {
+  const path = join(root, ".cotal");
+  let stat: Stats;
+  try {
+    stat = statSync(path);
+  } catch {
+    return undefined;
+  }
+  return stat.isDirectory() ? undefined : `${path} is a ${stat.isFile() ? "file" : "special file"}, not a directory, so it cannot hold this folder's Cotal records`;
+}
+
+/** Why a project folder's path cannot hold a stack: it contains a control character, such as a tab or a
+ *  newline, which a stack journal does not record, or a bidirectional formatting mark, which can make
+ *  one path display as another. The path is named as {@link oneLine} shows it. Undefined when it can. */
+export function rootPathProblem(root: string): string | undefined {
+  const found = /[\p{Cc}\p{Bidi_Control}]/u.exec(root)?.[0];
+  if (found === undefined) return undefined;
+  const code = found.codePointAt(0)!, hex = code.toString(16).toUpperCase().padStart(4, "0");
+  const names: Record<number, string> = { 9: "a tab", 10: "a newline", 13: "a carriage return", 27: "an escape character", 127: "a delete character" };
+  const name = names[code] ?? (/\p{Cc}/u.test(found) ? `the control character U+${hex}` : `the bidirectional formatting mark U+${hex}`);
+  return `the folder path ${oneLine(root)} contains ${name}, and a project path may hold neither control characters nor bidirectional formatting marks`;
+}
+
+/** The control directory `path` is or lies in: a root's `.cotal`, or the Cotal home. The default home
+ *  holds records only, so every path under it lies in it. A home `COTAL_HOME` redirects may hold
+ *  project folders beside its records, so under it only the home itself and its record entries
+ *  ({@link homeRecordEntries}) count. */
+export function controlDirectory(path: string): string | undefined {
+  const home = resolve(homeCotalDir());
+  if (path === home) return home;
+  if (path.startsWith(`${home}${sep}`)) {
+    if (home === resolve(userCotalDir()) || homeRecordEntries.has(path.slice(home.length + 1).split(sep)[0]!)) return home;
+  }
+  const parts = path.split(sep), at = parts.indexOf(".cotal");
+  return at === -1 ? undefined : parts.slice(0, at + 1).join(sep);
+}
+
+/** Why `root` cannot be a project folder: it is, or is in, a control directory, by its own path or by
+ *  the physical path its links lead to. A `.cotal` made there would sit among that directory's
+ *  credentials and records, and start a second stack inside another project's. `project` is the
+ *  folder that control directory belongs to, absent for the machine home's. Undefined when it can. */
+export function rootControlProblem(root: string): { controlDirectory: string; project?: string; message: string } | undefined {
+  const path = resolve(root);
+  let physical: string | undefined;
+  try { physical = realpathSync.native(path); } catch { physical = undefined; }
+  const control = controlDirectory(path) ?? (physical === undefined ? undefined : controlDirectory(physical));
+  if (control === undefined) return undefined;
+  const project = control === resolve(homeCotalDir()) ? undefined : dirname(control);
+  const holds = project === undefined ? "this machine's own records" : `the Cotal records of the project ${project}`;
+  return { controlDirectory: control, project, message: `${path} is ${path === control || physical === control ? "" : "in "}the control directory ${control}, which holds ${holds}, so it cannot be a project folder` };
+}
+
+/** Where `<root>/.cotal` leads when it is a symlink, such as a link to another project's `.cotal`.
+ *  Undefined when it is a real directory, absent, or a link that leads nowhere. */
+export function cotalDirLink(root: string): string | undefined {
+  const path = join(root, ".cotal");
+  try {
+    return lstatSync(path).isSymbolicLink() ? realpathSync(path) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** {@link findCotalRoot} for a caller that must run inside a workspace that already exists, such as
+ *  the delivery daemon: the same walk, but no `.cotal/` anywhere up the tree is a refusal naming the
+ *  directory the walk started from. The start directory is not a root anyone set up, and reading
+ *  credentials from it only surfaces later as some other, misleading failure. */
+export function requireCotalRoot(start: string = process.cwd()): string {
+  const root = findCotalRoot(start);
+  if (!existsSync(join(root, ".cotal")))
+    throw new Error(`no .cotal/ in ${resolve(start)} or any directory above it`);
+  return root;
+}
+
+/** What the CWD WALK would have resolved, when that disagrees with the root a command actually used.
+ *
+ *  This exists because the two can disagree silently and the disagreement is invisible in the
+ *  output. `findCotalRoot` accepts any directory merely NAMED `.cotal`, and `~/.cotal` is one on
+ *  every install, because that is where the mesh registry lives. So every cwd under `$HOME` that is
+ *  not inside a project walks up to the HOME directory, and if that directory's auth holds the same
+ *  space under a different trust chain - an older mesh, a decommissioned one, a copy - a command
+ *  that re-derives its seed from the cwd mints a credential the broker never trusted. That was
+ *  issue #722: the failure reached the operator as a bare `Authorization Violation` naming neither
+ *  root.
+ *
+ *  Comparison is on the account PUBLIC key: it identifies the chain, and no secret material is read
+ *  for the answer or available to a caller rendering it. Returns undefined when there is nothing to
+ *  say - the walk agrees with the resolved root, or the walked root holds no auth for this space, or
+ *  it holds the SAME chain (a second checkout of the same mesh, which is legitimate and silent).
+ *
+ *  It REPORTS. It does not choose: a caller that silently preferred one root over the other would be
+ *  the same defect with a different winner. It also never THROWS - a fault reading either root is
+ *  reported as nothing to say, because a detector that can abort its caller is that same defect once
+ *  more, wearing the cwd's failure instead of its answer. */
+export function divergentCwdAnchor(resolvedRoot: string, space: string, cwd?: string): { cwdRoot: string } | undefined {
+  // A detector that can THROW is the cwd deciding the command's fate by another route, which is the
+  // defect this function exists to end rather than relocate. `loadSpaceAuth` refuses unreadable
+  // trust material loudly - right for a root a command is about to USE, wrong for one it has just
+  // declared it is not using: a half-written `~/.cotal/auth/broker.json` would kill an attach whose
+  // seed came from elsewhere, and on the reconnect path that throw is classified transient and
+  // retried forever, printing a disk-parse error as though the link were down.
+  //
+  // Silence here is not a fallback, it is the accurate answer. The question is "does the walked root
+  // hold a DIFFERENT chain for this space", and it can only be answered by comparing two legible
+  // chains: an unreadable walked root asserts nothing, and an unreadable RESOLVED root leaves
+  // nothing to compare against, so claiming divergence would be a statement this code cannot make.
+  // Neither case hides a real problem, because corruption in the root the command actually reads
+  // still surfaces loudly from the path that reads it.
+  // `findCotalRoot` is INSIDE the guard rather than before it, because its default argument is
+  // `process.cwd()`, which throws when the process's working directory has been deleted out from
+  // under it. That is the one input on which this function could still end its caller, and a
+  // contract that says it never throws has to hold for every statement, not only for the ones the
+  // fault was found in. The comment sits out here and not in the block because the block is a
+  // mutation anchor, and an anchor that spans prose breaks the moment someone rewords the prose.
+  let cwdRoot: string;
+  let here: SpaceAuth | undefined;
+  let there: SpaceAuth | undefined;
+  try {
+    cwdRoot = findCotalRoot(cwd);
+    if (resolve(cwdRoot) === resolve(resolvedRoot)) return undefined;
+    here = loadSpaceAuth(authDir(cwdRoot), space);
+    there = here ? loadSpaceAuth(authDir(resolvedRoot), space) : undefined;
+  } catch {
+    return undefined;
+  }
+  if (!here) return undefined;
+  if (there && here.account.pub === there.account.pub) return undefined;
+  return { cwdRoot };
+}
+
+// ---- broker trust and space accounts are SEPARATE persisted authorities (W4) ----
+//
+// A nats-server trusts exactly one operator and one system account, so broker trust is per-BROKER
+// and has exactly one owner on disk (`auth/broker.json`). Each space owns only its own data account
+// (`auth/account.<key>.json`, a flat file beside `broker.json`, named by {@link spaceAccountFile})
+// and REFERENCES broker trust rather than embedding it. Embedding it per space is the bug this split
+// exists to prevent: a rotation done through space A would update A's embedded copy while space B
+// kept loading a stale one and resurrected dead broker trust.
+//
+// The composed {@link SpaceAuth} is a READ view only (see core's `composeSpaceAuth`); there is no
+// persisted document with that shape any more. The pre-W4 monolith is migration INPUT only.
+
+const BROKER_FILE = "broker.json";
+const SPACE_ACCOUNT_PREFIX = "account.";
+const SPACE_ACCOUNT_SUFFIX = ".json";
+
+/** Where the one broker trust record lives. */
+export function brokerAuthPath(dir: string): string {
+  return join(dir, BROKER_FILE);
+}
+
+/** The persisted MANAGER INSTANCE identity (P2 item 3, SPEC 13.6 item 7): the LOGICAL instanceId
+ *  (stable across restart, so a restart re-registers the SAME id with an ADVANCED epoch and the
+ *  (i) fence bites) + the serve nkey identity (so re-registration reuses the SAME gate principal —
+ *  provisionEndpointGateOpen stays idempotent, no core barrier change, and eviction targets a
+ *  stable principal). Holds a private seed, so it lands in a HARDENED secret file in the space's
+ *  segment of this root (see {@link rootIdentityFile}). */
+export interface ManagerInstanceIdentity {
+  instanceId: string;
+  serveIdentity: { id: string; seed: string };
+}
+const MANAGER_INSTANCE = "the manager instance identity";
+/** The nkey identity a persisted record holds at `v`, or undefined when `v` is not one: the check
+ *  every identity record's `parse` applies to each nkey it holds. */
+export function identityOf(v: unknown): Identity | undefined {
+  const k = v as { id?: unknown; seed?: unknown } | null | undefined;
+  if (typeof k?.id !== "string" || k.id.length === 0 || typeof k.seed !== "string" || k.seed.length === 0) return undefined;
+  return { id: k.id, seed: k.seed };
+}
+/** The shape both the manager and the auth plane persist as their instance identity. */
+function instanceIdentityOf(raw: unknown): ManagerInstanceIdentity | undefined {
+  const r = raw as { instanceId?: unknown; serveIdentity?: unknown } | null;
+  const serveIdentity = identityOf(r?.serveIdentity);
+  if (typeof r?.instanceId !== "string" || r.instanceId.length === 0 || serveIdentity === undefined) return undefined;
+  return { instanceId: r.instanceId, serveIdentity };
+}
+/** An identity record of this root, `<root>/.cotal/space.<hex>/<name>`. It is state of this root,
+ *  so it stays out of `.cotal/auth`: that folder is what an operator copies to give another root a
+ *  mesh's trust, and an identity copied with it made the other root's manager this root's logical
+ *  instance. An older build kept the record at a `legacy` path; the first touch moves it here, so an
+ *  upgraded root restarts as the same instance (SPEC 13.6). A `legacy` entry that is not a regular
+ *  file is refused like the record itself, so a dangling link cannot pass for a fresh root and mint
+ *  a new identity. */
+function rootIdentityFile(root: string, space: string, name: string, ...legacy: string[]): string {
+  const path = join(root, ".cotal", spaceSegment(space), name);
+  for (const from of legacy) {
+    if (!authRecordStat(from, "an identity record")) continue;
+    mkSecretDir(dirname(path));
+    // A link, not a rename: it never replaces a record already at `path`, and a concurrent first
+    // touch that linked first is the same inode, which tells it apart from a second record.
+    try { linkSync(from, path); } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") continue;
+      if (code !== "EEXIST") throw e;
+      // lstat, as the readers do: stat would follow a link on either side to the other's inode,
+      // pass the two entries as one record and remove the only regular copy.
+      const old = authRecordStat(from, "an identity record");
+      const current = authRecordStat(path, "an identity record");
+      if (old && (!current || old.ino !== current.ino || old.dev !== current.dev))
+        throw new Error(`both ${path} and the older ${from} hold an identity record for space "${space}" - refusing to guess which belongs to this root. Remove the one that did not come from this root, then retry.`);
+    }
+    rmSync(from, { force: true });
+  }
+  return path;
+}
+function managerInstanceFile(root: string, space: string): string {
+  return rootIdentityFile(root, space, "manager-instance.json", join(authDir(root), `manager-instance.${spaceKey(space)}.json`));
+}
+/** Load this workspace root's persisted manager instance identity for `space`, or undefined if a
+ *  manager has never registered here. A present-but-MALFORMED file fails LOUD: minting a fresh id
+ *  over it would orphan the prior registration and break the restart-fence guarantee, so a restart
+ *  never silently becomes a fresh instance (no-fallbacks). */
+export function loadManagerInstanceIdentity(root: string, space: string): ManagerInstanceIdentity | undefined {
+  return readManagerInstanceRecord(managerInstanceFile(root, space));
+}
+
+/** First-start identity mint through {@link claimIdentityRecord}: of N concurrent creators on a
+ *  fresh root, exactly one creates the file and the others adopt the winner. `mint` runs only when
+ *  no record exists, so a restart does not mint a lifecycle uid and a serve nkey it then discards. */
+export function createManagerInstanceIdentity(root: string, space: string, mint: () => ManagerInstanceIdentity): ManagerInstanceIdentity {
+  return claimIdentityRecord(managerInstanceFile(root, space), MANAGER_INSTANCE, instanceIdentityOf, mint);
+}
+
+/** The manager's goal-writer and session-ledger nkeys for `space`. Both are siblings of the serve
+ *  identity in its §13.1 credential family and persist for the same reason: the family never drops
+ *  a row and every re-registration verify-evicts each holder it ever staged, so a fresh pair per
+ *  boot made each restart sweep two more holders than the one before. */
+export interface ManagerSiblingIdentities {
+  goalWriter: { id: string; seed: string };
+  sessionLedger: { id: string; seed: string };
+}
+function managerSiblingFile(root: string, space: string): string {
+  return rootIdentityFile(root, space, "manager-siblings.json", join(authDir(root), `manager-siblings.${spaceKey(space)}.json`));
+}
+function siblingIdentitiesOf(raw: unknown): ManagerSiblingIdentities | undefined {
+  const r = raw as { goalWriter?: unknown; sessionLedger?: unknown } | null;
+  const goalWriter = identityOf(r?.goalWriter);
+  const sessionLedger = identityOf(r?.sessionLedger);
+  return goalWriter && sessionLedger ? { goalWriter, sessionLedger } : undefined;
+}
+/** This root's manager sibling identities for `space`, minted on the first start and read back on
+ *  every later one through {@link claimIdentityRecord}, so concurrent first starts adopt one pair. */
+export function claimManagerSiblingIdentities(root: string, space: string): ManagerSiblingIdentities {
+  return claimIdentityRecord(
+    managerSiblingFile(root, space),
+    "the manager sibling identities",
+    siblingIdentitiesOf,
+    () => ({ goalWriter: newIdentity(), sessionLedger: newIdentity() }),
+  );
+}
+
+/** The AUTH PLANE's persisted instance identity (#399 M2): a stable `instanceId` + serve nkey so
+ *  a restart re-registers the SAME `svc.auth.<instanceId>` instance (`registerServiceInstance`
+ *  advances the process epoch on a re-registration and fences the predecessor rather than minting
+ *  a fresh, un-fenced one). Mirrors {@link ManagerInstanceIdentity} exactly; kept as its own type
+ *  (not a reuse) because it is a distinct persisted principal for a distinct served endpoint. */
+export interface AuthInstanceIdentity {
+  instanceId: string;
+  serveIdentity: { id: string; seed: string };
+}
+const AUTH_INSTANCE = "the auth instance identity";
+/** The auth plane's record sits beside the manager's. An older build kept it in `.cotal/auth` under
+ *  the plane's state dir. For a CLI root that dir is the root's user-auth state dir, inside the folder
+ *  an operator copies; a hosted context passes its state dir as the root, so its record sat in the
+ *  root's own `.cotal/auth`. */
+function authInstanceFile(root: string, space: string): string {
+  const legacyName = `auth-instance.${spaceKey(space)}.json`;
+  return rootIdentityFile(root, space, "auth-instance.json", join(authDir(userAuthStateDir(root, space)), legacyName), join(authDir(root), legacyName));
+}
+/** Load this workspace root's persisted auth-plane instance identity for `space`, or undefined if
+ *  the auth plane has never registered here. A present-but-MALFORMED file fails LOUD: minting a
+ *  fresh id over it would orphan the prior registration and break the restart-fence guarantee. */
+export function loadAuthInstanceIdentity(root: string, space: string): AuthInstanceIdentity | undefined {
+  return readIdentityRecord(authInstanceFile(root, space), AUTH_INSTANCE, instanceIdentityOf);
+}
+
+/** First-start identity mint for the auth plane, as {@link createManagerInstanceIdentity}. */
+export function createAuthInstanceIdentity(root: string, space: string, mint: () => AuthInstanceIdentity): AuthInstanceIdentity {
+  return claimIdentityRecord(authInstanceFile(root, space), AUTH_INSTANCE, instanceIdentityOf, mint);
+}
+
+/** Remove this root's auth-plane instance record for `space`. A hosted context calls it once its
+ *  injected store holds the record, so the serve seed no longer sits in its state dir. */
+export function removeAuthInstanceIdentity(root: string, space: string): void {
+  rmSync(authInstanceFile(root, space), { force: true });
+}
+
+/** The outcome of {@link retireManagerInstanceIdentity}. `removed` means this call deleted the
+ *  record that matched `expected`. `absent` means no record exists for the space: a retry after an
+ *  earlier `removed`, or a record that was never created. It never reports that this call deleted
+ *  anything, so a caller that cannot prove it created the record must not count it as retired. */
+export type ManagerInstanceIdentityRetirement = { outcome: "removed" } | { outcome: "absent" };
+
+function sameManagerInstanceIdentity(a: ManagerInstanceIdentity, b: ManagerInstanceIdentity): boolean {
+  return a.instanceId === b.instanceId && a.serveIdentity.id === b.serveIdentity.id && a.serveIdentity.seed === b.serveIdentity.seed;
+}
+
+function readManagerInstanceRecord(f: string): ManagerInstanceIdentity | undefined {
+  return readIdentityRecord(f, MANAGER_INSTANCE, instanceIdentityOf);
+}
+
+/** Deterministic instrumentation hooks for testing concurrent retirement races. Hooks do not
+ *  replace filesystem operations: each callback returns before the real rename or link runs. */
+export interface RetireManagerInstanceIdentityOpts {
+  /** Invoked after the initial pre-check passes and immediately before `renameSync`. */
+  readonly onBeforeRename?: () => void;
+  /** Invoked if the captured record differs from expected, immediately before attempting `linkSync`. */
+  readonly onBeforeLinkBack?: () => void;
+}
+
+/**
+ * Delete this root's persisted manager instance identity for `space`, only when the stored record
+ * is the complete `expected` identity (instanceId, serve nkey id and serve seed).
+ *
+ * It refuses, throwing an error that starts with `manager-instance-identity-retire-refused`, when
+ * the entry is not regular, does not parse, is malformed, or holds another identity. A missing
+ * record returns `absent` and never establishes ownership. The record is renamed to a private name
+ * in its own directory and checked again there before deletion. A changed captured record is
+ * linked back only if the canonical path is still free; on a collision both records are preserved.
+ *
+ * This establishes only which record was deleted. It is not proof that a manager stopped: the
+ * caller must hold its own stop and ownership evidence before retiring. A normal restart keeps the
+ * identity, and retirement is for failed-new-space compensation or terminal retirement.
+ */
+export function retireManagerInstanceIdentity(
+  root: string,
+  space: string,
+  expected: ManagerInstanceIdentity,
+  opts?: RetireManagerInstanceIdentityOpts,
+): ManagerInstanceIdentityRetirement {
+  const path = managerInstanceFile(root, space);
+  const refuse = (why: string): never => {
+    throw new Error(`manager-instance-identity-retire-refused: space "${space}" at ${path}: ${why}`);
+  };
+  let current: ManagerInstanceIdentity | undefined;
+  try { current = readManagerInstanceRecord(path); } catch (e) { return refuse((e as Error).message); }
+  if (current === undefined) return { outcome: "absent" };
+  if (!sameManagerInstanceIdentity(current, expected)) return refuse("the stored identity is not the expected generation");
+
+  opts?.onBeforeRename?.();
+  const captured = `${path}.retiring.${randomUUID()}`;
+  try { renameSync(path, captured); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { outcome: "absent" };
+    throw new Error(`manager-instance-identity-retire-refused: space "${space}" at ${path}: capture failed`, { cause: e });
+  }
+  let held: ManagerInstanceIdentity | undefined;
+  try { held = readManagerInstanceRecord(captured); } catch { held = undefined; }
+  if (held === undefined || !sameManagerInstanceIdentity(held, expected)) {
+    opts?.onBeforeLinkBack?.();
+    try { linkSync(captured, path); unlinkSync(captured); } catch {
+      return refuse(`the record changed before deletion and could not be put back; it is kept at ${captured}`);
+    }
+    return refuse("the record changed before deletion and was put back");
+  }
+  unlinkSync(captured);
+  return { outcome: "removed" };
+}
+
+/** One space's account record filename. The FS path and the store key are both built on it,
+ *  because the local store resolves a key to that path byte for byte. */
+function spaceAccountFile(space: string): string {
+  return `${SPACE_ACCOUNT_PREFIX}${spaceKey(space)}${SPACE_ACCOUNT_SUFFIX}`;
+}
+
+/**
+ * The per-seat WRITER GENERATION: which custody of one seat's identity is current.
+ *
+ * It is not a second identity. The seat's identity stays its `lifecycleUid`, unchanged across a
+ * move, because the durables are keyed by it and a resume must recover it. The generation says
+ * which host may write as that identity now, and it is monotonic, so it survives a clock that is
+ * wrong in a way a time-based lease does not.
+ *
+ * It follows the three rules {@link ManagerInstanceIdentity}'s file established:
+ * space-scoped by a hex key (an auth dir is a shared namespace and a raw space token can collide or
+ * case-fold), published by exclusive create, and loud on a malformed record rather than minted over,
+ * because minting over it is how a stale host would become authoritative again.
+ */
+export interface SeatWriterGeneration {
+  readonly space: string;
+  readonly name: string;
+  readonly lifecycleUid: string;
+  readonly generation: number;
+}
+
+/** One file per CLAIMED GENERATION, not one per seat. The exclusive create has to be on the
+ *  successor VALUE, or a host that legitimately takes custody twice would collide with its own
+ *  earlier claim and a fresh host would win a create that proves nothing. `<seat>.<generation>`
+ *  makes "claim generation N" the atomic act. */
+function seatGenerationFile(root: string, space: string, name: string, generation: number): string {
+  return join(authDir(root), `${seatGenerationPrefix(space, name)}${generation}.json`);
+}
+
+/** Both parts are {@link spaceKey}, so the seat key inherits every rule the space key has. They are
+ *  joined by a NUL byte, so a NUL inside either part would let two different (space, seat) pairs
+ *  spell one key and one seat's claim refuse the other's. */
+function seatGenerationPrefix(space: string, name: string): string {
+  if (space.includes("\u0000") || name.includes("\u0000"))
+    throw new Error(`seat ${JSON.stringify(name)} in space ${JSON.stringify(space)} cannot hold a writer generation: NUL separates the space from the seat in its key`);
+  return `seat-generation.${spaceKey(space)}00${spaceKey(name)}.`;
+}
+
+/**
+ * Claim a whole set of seat writer generations, or none of them.
+ *
+ * Each claim is its own exclusive create, so a later one can lose even when every earlier one
+ * succeeded. A claim is a create that can never be made again, so a partial set would let one
+ * refusal consume the retry over the very same input. This creates them in order and, on any
+ * failure, removes the files IT created in this call before rethrowing.
+ *
+ * The compensation is deliberately narrow. It unlinks by the exact path it wrote and nothing else,
+ * so it can never remove a generation another destination holds. An unlink that finds the file
+ * already gone is fine; any other unlink error is reported alongside the original failure rather
+ * than replacing it, because the original is why the operation is failing and the unlink error is
+ * why the tree is not clean.
+ *
+ * No lock, no retry, no fallback: a lost create still refuses the whole set.
+ */
+export function claimSeatWriterGenerations(
+  root: string,
+  claims: readonly SeatWriterGeneration[],
+): readonly SeatWriterGeneration[] {
+  const written: string[] = [];
+  for (const claim of claims) {
+    try {
+      advanceSeatWriterGeneration(root, claim);
+    } catch (error) {
+      const undoFailures: string[] = [];
+      for (const path of written) {
+        try {
+          rmSync(path);
+        } catch (e) {
+          if ((e as NodeJS.ErrnoException).code !== "ENOENT")
+            undoFailures.push(`${path}: ${(e as Error).message}`);
+        }
+      }
+      if (undoFailures.length)
+        throw new Error(
+          `${(error as Error).message}; additionally, these generations claimed by this attempt could not be released and must be removed by hand: ${undoFailures.join("; ")}`,
+        );
+      throw error;
+    }
+    written.push(seatGenerationFile(root, claim.space, claim.name, claim.generation));
+  }
+  return claims;
+}
+
+/** The highest generation this host has claimed for a seat, or undefined when it never has.
+ *  A present-but-malformed record fails LOUD, for the reason {@link loadManagerInstanceIdentity}
+ *  gives: replacing it is how custody silently returns to a host that lost it. */
+export function loadSeatWriterGeneration(root: string, space: string, name: string): SeatWriterGeneration | undefined {
+  const prefix = seatGenerationPrefix(space, name);
+  const dir = authDir(root);
+  if (!existsSync(dir)) return undefined;
+  let held: SeatWriterGeneration | undefined;
+  for (const entry of readdirSync(dir)) {
+    if (!entry.startsWith(prefix) || !entry.endsWith(".json")) continue;
+    const f = join(dir, entry);
+    const parsed = readAuthRecord<SeatWriterGeneration>(f, "a seat writer generation");
+    if (parsed === undefined) continue;
+    if (parsed === null || typeof parsed !== "object"
+      || parsed.space !== space || parsed.name !== name
+      || typeof parsed.lifecycleUid !== "string" || parsed.lifecycleUid.length === 0
+      || !Number.isInteger(parsed.generation) || parsed.generation < 0
+      || entry !== `${prefix}${parsed.generation}.json`)
+      throw new Error(`the persisted seat writer generation at ${f} is malformed; refusing to mint a fresh generation over it - that is how a stale host becomes authoritative again`);
+    if (!held || parsed.generation > held.generation)
+      held = { space, name, lifecycleUid: parsed.lifecycleUid, generation: parsed.generation };
+  }
+  return held;
+}
+
+/**
+ * Take custody of a seat at `claim.generation` by exclusive create, before anything launches.
+ *
+ * The publication primitive is {@link createManagerInstanceIdentity}'s, and the resolution of a
+ * lost create is deliberately NOT: that helper adopts the winner on EEXIST, because two managers
+ * sharing one logical instanceId is the intended outcome there. Here a lost create means two hosts
+ * are claiming one seat, which is the condition this fence exists to stop, so it refuses. Same
+ * primitive, opposite disposition.
+ */
+export function advanceSeatWriterGeneration(
+  root: string,
+  claim: SeatWriterGeneration,
+): SeatWriterGeneration {
+  if (!Number.isInteger(claim.generation) || claim.generation < 0)
+    throw new Error(`a seat writer generation must be a non-negative integer; got ${JSON.stringify(claim.generation)}`);
+  const path = seatGenerationFile(root, claim.space, claim.name, claim.generation);
+  const dir = authDir(root);
+  mkSecretDir(dir);
+  try {
+    writeSecretFileCreateOnly(path, JSON.stringify(claim, null, 2));
+    return claim;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    throw new Error(
+      `seat-writer-generation-create-lost: generation ${claim.generation} of seat ${JSON.stringify(claim.name)} in space ${JSON.stringify(claim.space)} is already claimed; refusing to resume as a second writer`,
+    );
+  }
+}
+
+/** The lstat of a trust path that holds an auth-material record, or undefined when it is absent:
+ *   - a non-regular entry (symlink, directory, fifo) is REFUSED, never followed — nothing in this
+ *     module writes one, so following it would trust material this module cannot vouch for (and
+ *     enumeration counts the same entry as corrupt: one answer everywhere);
+ *   - only ENOENT means absent; any other errno is uncertainty about trust material and throws. */
+function authRecordStat(f: string, what: string): Stats | undefined {
+  let st;
+  try {
+    st = lstatSync(f);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw e;
+  }
+  if (!st.isFile())
+    throw new Error(`${f} is not a regular file - refusing to read ${what} through it; remove or restore the real record`);
+  return st;
+}
+
+/** Read one auth-material record: the file's raw text, or undefined when absent. Shared by every
+ *  load/save below so the readers cannot disagree: the entry is checked by {@link authRecordStat},
+ *  and the JSON parse is wrapped so a truncated/hand-edited record surfaces as one legible sentence
+ *  naming the file, never a raw SyntaxError deep in a caller. */
+function readAuthRecord<T>(f: string, what: string): T | undefined {
+  if (!authRecordStat(f, what)) return undefined;
+  try {
+    return JSON.parse(readFileSync(f, "utf8")) as T;
+  } catch (e) {
+    throw new Error(`${f} does not parse as ${what} (${e instanceof Error ? e.message : String(e)}) - restore it from backup or remove it deliberately`);
+  }
+}
+
+/** A persisted identity record, or undefined when absent. Every identity reads through
+ *  {@link readAuthRecord}, so they refuse the same entries, and a record `parse` rejects fails LOUD:
+ *  minting over it would orphan the identity it held. */
+function readIdentityRecord<T>(f: string, what: string, parse: (raw: unknown) => T | undefined): T | undefined {
+  const raw = readAuthRecord<unknown>(f, what);
+  if (raw === undefined) return undefined;
+  const record = parse(raw);
+  if (record === undefined)
+    throw new Error(`${f} is not a well-formed record of ${what} - restore it from backup or remove it deliberately`);
+  return record;
+}
+
+/**
+ * A persisted identity record of this root: the stored one, or on a fresh root `mint()`'s,
+ * published by exclusive create. Of N concurrent first mints exactly one creates the file and the
+ * others adopt it, so a loser never keeps the identity it minted in memory; an atomic rename would
+ * let it. A loser that cannot read the winner refuses with `identity-record-create-lost`.
+ */
+export function claimIdentityRecord<T>(path: string, what: string, parse: (raw: unknown) => T | undefined, mint: () => T): T {
+  const stored = readIdentityRecord(path, what, parse);
+  if (stored !== undefined) return stored;
+  mkSecretDir(dirname(path));
+  const candidate = mint();
+  try {
+    writeSecretFileCreateOnly(path, JSON.stringify(candidate, null, 2));
+    return candidate;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    const winner = readIdentityRecord(path, what, parse);
+    if (winner === undefined)
+      throw new Error(`identity-record-create-lost: exclusive create of ${what} at ${path} lost and the existing record could not be adopted`);
+    return winner;
+  }
+}
+
+/** The space a canonical account filename encodes, or undefined when the name is not one THIS module
+ *  wrote (wrong prefix/suffix, non-hex body, or a body that does not round-trip back to the same
+ *  filename). Enumeration treats an undefined result as a corrupt/foreign record, never as a tenant. */
+function spaceFromAccountFile(name: string): string | undefined {
+  if (!name.startsWith(SPACE_ACCOUNT_PREFIX) || !name.endsWith(SPACE_ACCOUNT_SUFFIX)) return undefined;
+  return spaceFromKey(name.slice(SPACE_ACCOUNT_PREFIX.length, name.length - SPACE_ACCOUNT_SUFFIX.length));
+}
+
+/** Whether `v` carries the {@link SpaceAccountAuth} account material a reader will dereference. A
+ *  record can round-trip its `space` yet be semantically empty (`{"space":"alpha"}`, no `account`),
+ *  which a name-only check counts as a tenant - then `composeSpaceAuth`/`status` crash on
+ *  `account.jwt` of undefined. "Validated inventory" must mean the shape those readers compose, so
+ *  the fields they read (pub/jwt/signingSeed/signingPub, all non-empty strings) are required here. */
+function isAccountShape(v: unknown): boolean {
+  if (v === null || typeof v !== "object") return false;
+  const a = v as Record<string, unknown>;
+  return (["pub", "jwt", "signingSeed", "signingPub"] as const).every((k) => typeof a[k] === "string" && (a[k] as string).length > 0);
+}
+
+/** Where one space's own account record lives: a FLAT file beside `broker.json`, named by
+ *  {@link spaceAccountFile}. Flat (not `<space>/account.json`) because `<authDir>/<space>/` is
+ *  {@link userAuthStateDir}; hex-keyed because a raw space name in the filename both aliased that
+ *  user-auth marker and case-folded on macOS/Windows. The name of a space is authoritative in the
+ *  document, so enumeration never has to trust the filename beyond finding the record. */
+export function spaceAccountPath(dir: string, space: string): string {
+  return join(dir, spaceAccountFile(space));
+}
+
+/** Runtime-validate a system-account generation. `readAuthRecord` is only a type CAST over JSON,
+ *  so a hand-edited string/float/negative/unsafe value would otherwise flow into the successor
+ *  arithmetic and destroy the discriminator ("0"+1 is "01"; at 2^53, gen+1 === gen). ONLY an
+ *  ABSENT field reads as 0 - that is the one shape a pre-generation record can have, because the
+ *  writer always emits a number. An explicit JSON `null` can only come from tampering/corruption,
+ *  and defaulting it would turn a doctored current record into a "generation-0 predecessor" and
+ *  re-arm the very rollback this field exists to refuse (found live in review). Every PRESENT
+ *  value must be a non-negative safe integer or the record is corrupt - fail closed BEFORE any
+ *  idempotent/successor handling. */
+function brokerGen(v: unknown, where: string): number {
+  if (v === undefined) return 0;
+  if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0)
+    throw new Error(`${where}: system-account generation ${JSON.stringify(v)} is not a non-negative integer - the record is corrupt; restore it from backup`);
+  return v;
+}
+
+/** The overwrite guard every broker-trust writer shares — the FS writer ({@link saveBrokerAuth})
+ *  and the seam writer ({@link putSpaceAuth}) both reduce through here, so the refusals can never
+ *  drift between the two (the one-guarded-encoder discipline). `f` labels the record in errors (the
+ *  file path or the store key — both non-material). Returns the generation the write must carry.
+ *
+ *  Overwriting the broker record is only safe for the SAME operator (a system-account rotation
+ *  keeps the operator SEED and only re-issues its JWT + `sys`). A DIFFERENT operator seed means a
+ *  fresh broker root - every space account here is signed by the current operator, so replacing it
+ *  orphans them ALL. That is exactly what a naive `createSpaceAuth` for a second space on this root
+ *  would do; refuse it loud rather than silently break the existing tenants. A new space must be
+ *  signed by the existing broker, never mint its own. */
+function guardBrokerOverwrite(f: string, existing: BrokerAuth, broker: BrokerAuth): number {
+  if (existing.operator?.seed !== broker.operator.seed)
+    throw new Error(
+      `${f} already holds a different broker operator - refusing to overwrite it: every space account on this broker is signed by the current operator, so replacing it would orphan them all. Sign the new space under the existing broker instead of minting a fresh operator.`,
+    );
+  // Same operator: the write must still move FORWARD. "Same seed" alone would let a stale
+  // pre-rotation value (e.g. a copy held in memory across a rotateSystemAccount) overwrite the
+  // newer record and resurrect the RETIRED system account. The discriminator is the GENERATION:
+  // rotateSystemAccount bumps it in memory, so a sys-changing value is writable only when it is
+  // the DIRECT SUCCESSOR of the current record - a pre-rotation copy is generations behind even
+  // when the record itself never held it (rotation persisted first). The JWT `iat` alone cannot
+  // order generations - it is second-resolution, so a rotation minted within the same second as
+  // its predecessor is `iat`-equal yet a different authority (found live in review); it stays
+  // only as a belt against a hand-edited gen smuggling a provably OLDER sys back in.
+  if (!existing.sys?.jwt)
+    throw new Error(`${f} holds broker trust without a system-account JWT - the record is corrupt; restore it from backup before overwriting`);
+  // BOTH generations validate before EITHER branch: a malformed value refuses even on the
+  // byte-identical idempotent path, rather than being silently absorbed and rewritten - a
+  // corrupt input never gets a success exit from a trust write.
+  const persistedGen = brokerGen(existing.gen, f);
+  const incomingGen = brokerGen(broker.gen, "the value being written");
+  const sysUnchanged = existing.sys.pub === broker.sys.pub && existing.sys.jwt === broker.sys.jwt;
+  if (sysUnchanged) {
+    return persistedGen; // idempotent re-save of the current authority - the generation holds
+  }
+  if (incomingGen !== persistedGen + 1)
+    throw new Error(
+      `${f} is at system-account generation ${persistedGen} and a system-account change must be its direct successor (generation ${persistedGen + 1}), but the value being written carries generation ${incomingGen} - refusing the stale write: it would resurrect a retired system account. Rotate from the current broker record and save that result.`,
+    );
+  if (jwtIssuedAt(broker.sys.jwt) < jwtIssuedAt(existing.sys.jwt))
+    throw new Error(
+      `${f} holds a NEWER system account (issued ${jwtIssuedAt(existing.sys.jwt)}) than the value being written (issued ${jwtIssuedAt(broker.sys.jwt)}) - refusing the rollback: it would resurrect a retired system account.`,
+    );
+  return incomingGen; // the successor generation the rotation minted
+}
+
+/** Refuse to persist a stripped/blank broker half through ANY writer: `stripSpaceAuth` blanks the
+ *  operator, and a blank value must never own (or blank) the broker record. Shared by the FS and
+ *  seam writers for the same no-drift reason as {@link guardBrokerOverwrite}. */
+function assertWritableBrokerTrust(broker: BrokerAuth, who: string): void {
+  if (!broker.operator.seed || !broker.operator.jwt || !broker.sys.pub)
+    throw new Error(`${who}: refusing to persist blank broker trust - a stripped auth value cannot own the broker record`);
+}
+
+/** Persist BROKER trust. `sys.signingSeed` is STRIPPED before writing: it is broker-admin minting
+ *  capability, so it never lands on disk (it lives only in the in-memory {@link createBrokerAuth}
+ *  result). A composition that must add spaces after first boot has to hold that seed in a
+ *  BROKER-scoped secret store instead; see core's `BrokerAuth`. */
+export function saveBrokerAuth(dir: string, broker: BrokerAuth): void {
+  assertWritableBrokerTrust(broker, "saveBrokerAuth");
+  const f = brokerAuthPath(dir);
+  const existing = readAuthRecord<BrokerAuth>(f, "broker trust");
+  let gen: number;
+  if (existing) {
+    gen = guardBrokerOverwrite(f, existing, broker);
+  } else {
+    // No broker record - but that alone must not authorize a FRESH operator: with account records
+    // present (broker.json lost, tenants intact) an unconditional write would install a new
+    // operator and orphan every tenant. The write is a legitimate REPAIR only when the incoming
+    // operator provably signed the existing accounts, so verify each one; and the check must range
+    // over the VALIDATED inventory - an unreadable record might be a real tenant, so any corrupt
+    // entry keeps the refusal (the same fail-closed posture as the broker-wide guard).
+    // Residual (accepted): two concurrent FIRST-TIME writes on a genuinely fresh root both pass
+    // this check and last-writer-wins; real usage serializes on the single `up`/store per root.
+    gen = brokerGen(broker.gen, "the value being written"); // a fresh record keeps the value's generation (0 if new)
+    const { spaces, corrupt } = accountInventory(dir);
+    if (corrupt.length > 0)
+      throw new Error(
+        `${dir} has no broker record but holds unreadable account record(s) (${corrupt.join(", ")}) - refusing to install an operator while the tenant list is uncertain; repair or remove them first`,
+      );
+    for (const space of spaces) {
+      const account = loadSpaceAccountAuth(dir, space);
+      if (!account) continue; // raced away since the inventory read - nothing left to orphan
+      try {
+        composeSpaceAuth(broker, account);
+      } catch (e) {
+        throw new Error(
+          `${dir} has no broker record but holds accounts for ${spaces.join(", ")}, and the operator being written did not sign "${space}" (${e instanceof Error ? e.message : String(e)}) - refusing to install it: the existing tenants would be orphaned. Restore the original broker.json from backup instead.`,
+        );
+      }
+    }
+  }
+  mkSecretDir(dir); // harden the auth dir BEFORE the secret lands (private ACL on win32, 0700 POSIX)
+  const onDisk: BrokerAuth = { operator: broker.operator, sys: { pub: broker.sys.pub, jwt: broker.sys.jwt }, gen };
+  writeSecretFile(f, JSON.stringify(onDisk, null, 2));
+}
+
+/** Load BROKER trust, or undefined if auth was never set up here. Reads the pre-W4 monolith as
+ *  MIGRATION INPUT when the broker record does not exist yet. */
+export function loadBrokerAuth(dir: string): BrokerAuth | undefined {
+  const broker = readAuthRecord<BrokerAuth>(brokerAuthPath(dir), "broker trust");
+  if (broker) return broker;
+  const legacy = loadLegacySpaceAuth(dir);
+  return legacy ? { operator: legacy.operator, sys: legacy.sys } : undefined;
+}
+
+/** Persist ONE space's account record. Never carries broker material. Refuses to overwrite a record
+ *  that already holds a DIFFERENT space: with an injective hex key that only happens on a corrupted
+ *  or hand-swapped file, and silently replacing one tenant's signing authority with another's must
+ *  fail loud. */
+export function saveSpaceAccountAuth(dir: string, spaceAccount: SpaceAccountAuth): void {
+  const target = spaceAccountPath(dir, spaceAccount.space);
+  const existing = readAuthRecord<SpaceAccountAuth>(target, "a space account record");
+  if (existing && existing.space !== spaceAccount.space)
+    throw new Error(`${target} holds space "${existing.space}"; refusing to overwrite it with "${spaceAccount.space}"`);
+  mkSecretDir(dirname(target));
+  const onDisk: SpaceAccountAuth = { space: spaceAccount.space, account: spaceAccount.account };
+  writeSecretFile(target, JSON.stringify(onDisk, null, 2));
+}
+
+/** Load ONE space's account record, or undefined. Reads the pre-W4 monolith as MIGRATION INPUT when
+ *  the per-space record does not exist yet AND that monolith is for this same space - a monolith for
+ *  a DIFFERENT space must never satisfy a load for this one. */
+export function loadSpaceAccountAuth(dir: string, space: string): SpaceAccountAuth | undefined {
+  const doc = readAuthRecord<SpaceAccountAuth>(spaceAccountPath(dir, space), "a space account record");
+  if (doc) {
+    if (doc.space !== space)
+      throw new Error(`${spaceAccountPath(dir, space)} holds space "${doc.space}", not "${space}" - the account record was renamed or corrupted`);
+    if (!isAccountShape(doc.account))
+      throw new Error(`${spaceAccountPath(dir, space)} is missing its account material (pub/jwt/signingSeed/signingPub) - the record is corrupt; restore it from backup`);
+    return doc;
+  }
+  const legacy = loadLegacySpaceAuth(dir);
+  if (!legacy || legacy.space !== space) return undefined;
+  return { space: legacy.space, account: legacy.account };
+}
+
+/** The pre-W4 single-document trust material. MIGRATION INPUT ONLY - nothing writes this shape now. */
+function loadLegacySpaceAuth(dir: string): SpaceAuth | undefined {
+  return readAuthRecord<SpaceAuth>(join(dir, AUTH_FILE), "pre-W4 trust material");
+}
+
+/** Load the COMPOSED read view of one space's trust chain, or undefined if either authority is
+ *  missing. The space key is REQUIRED: once a broker holds N accounts, a root-wide "the auth" load is
+ *  intrinsically ambiguous, and picking a default silently would let (for example) a manager bound to
+ *  space B mint B's agents into space A's account. Composition also asserts that this account really
+ *  was signed by this broker's operator. */
+export function loadSpaceAuth(dir: string, space: string): SpaceAuth | undefined {
+  // The STRIPPED SIGNER bundle (`cotal mint --signer`, mounted read-only at `auth/auth.json` in a
+  // containerized manager) is the one legacy shape that can never compose: `stripSpaceAuth`
+  // deliberately blanks the broker root-of-trust and keeps only this space's account signing
+  // material, so there is no signature chain to verify - its trust IS the operator's decision to
+  // mount it (unchanged from pre-split). Recognize it precisely - split records absent, monolith
+  // present for THIS space, operator blanked, signing seed present - and return it as-is; any
+  // other shape must compose and verify the account really was signed by this broker's operator.
+  if (!authRecordStat(brokerAuthPath(dir), "broker trust") && !authRecordStat(spaceAccountPath(dir, space), "a space account record")) {
+    const legacy = loadLegacySpaceAuth(dir);
+    if (legacy && legacy.space === space && !legacy.operator?.seed && legacy.account?.signingSeed)
+      return legacy;
+  }
+  const broker = loadBrokerAuth(dir);
+  const spaceAccount = loadSpaceAccountAuth(dir, space);
+  if (!broker || !spaceAccount) return undefined;
+  return composeSpaceAuth(broker, spaceAccount);
+}
+
+/** The composed trust of the ONE space this auth dir holds - the space-blind convenience for callers
+ *  that predate multi-space (a folder's own mesh, `mint` in a checkout, a status read). Fails loud
+ *  when the root holds several, via {@link soleSpaceOf}. Prefer {@link loadSpaceAuth} with an
+ *  explicit space wherever the caller can know it. */
+export function loadSoleSpaceAuth(dir: string): SpaceAuth | undefined {
+  const space = soleSpaceOf(dir);
+  return space ? loadSpaceAuth(dir, space) : undefined;
+}
+
+/** Persist a composed value by DECOMPOSING it into its two authorities. This is the migration-era
+ *  writer for the many existing callers that hold a composed {@link SpaceAuth}; it is safe because
+ *  there is exactly ONE broker record, so writing broker trust through any space updates the single
+ *  owner rather than a per-space copy. It refuses a stripped value outright: `stripSpaceAuth` blanks
+ *  the operator and system account, and decomposing that would blank broker persistence. */
+export function saveSpaceAuth(dir: string, auth: SpaceAuth): void {
+  saveBrokerAuth(dir, auth); // throws on a stripped/blank broker half
+  saveSpaceAccountAuth(dir, auth);
+}
+
+/** The ONE space this auth dir holds, for the legacy paths that predate multi-space and carry no
+ *  explicit space (a folder's "its own" space, a root-wide daemon remint). Undefined when the root
+ *  has no auth at all.
+ *
+ *  FAILS LOUD when the root holds several, rather than picking the first or a "current": a
+ *  space-blind caller that silently picks is exactly how a component bound to space B mints into
+ *  space A's account. Callers that can know their space must pass it explicitly instead of using
+ *  this; this exists so the remaining space-blind paths become a loud error rather than a wrong
+ *  answer the day a root holds two. */
+export function soleSpaceOf(dir: string): string | undefined {
+  const { spaces, corrupt } = accountInventory(dir);
+  if (corrupt.length > 0)
+    throw new Error(
+      `${dir} holds ${corrupt.length} unreadable account record(s) (${corrupt.join(", ")}) - refusing to name a sole space while the tenant count is uncertain; repair or remove them`,
+    );
+  if (spaces.length === 0) return undefined;
+  if (spaces.length > 1)
+    throw new Error(
+      `${dir} holds accounts for ${spaces.length} spaces (${spaces.join(", ")}) - this operation has no explicit space and refuses to pick one; pass the space explicitly`,
+    );
+  return spaces[0];
+}
+
+/** Refuse a BROKER-WIDE operation on a root that hosts several spaces - or whose tenant list cannot
+ *  be read with certainty.
+ *
+ *  Distinct from {@link soleSpaceOf}'s ambiguity, and the distinction is the whole point: the
+ *  broker process, its JetStream store and the single `.cotal/auth` broker record are shared by
+ *  every space on the root, so naming a space cannot scope `down`, `clean store|all`, `backup` or a
+ *  restore - they would apply to all of them regardless. Sending the operator after a `--space` they
+ *  cannot use (two of these commands do not even take one) is a dead end dressed as advice, so this
+ *  refusal names the blast radius and stops, and stays a refusal until per-space teardown exists.
+ *
+ *  A corrupt/foreign account record is refused too, NOT skipped: an under-count is the fail-open
+ *  this guard exists to prevent - a file that occupies the account namespace but will not validate
+ *  might be a real tenant, so the blast radius is unknown and a broker-wide delete must not proceed. */
+export function assertSingleSpaceBroker(dir: string, operation: string): void {
+  const { spaces, corrupt } = accountInventory(dir);
+  if (corrupt.length > 0)
+    throw new Error(
+      `${operation} is broker-wide and this broker's tenant list is not fully readable (${corrupt.join(", ")}) - refusing to act while the blast radius is uncertain; repair or remove those account records first`,
+    );
+  if (spaces.length > 1)
+    throw new Error(
+      `${operation} is broker-wide, and this broker hosts ${spaces.length} spaces (${spaces.join(", ")}) - it would apply to every one of them, and naming a single space cannot scope it; a per-space form does not exist yet`,
+    );
+}
+
+/** The VALIDATED tenant inventory of an auth dir - the ONE read of "how many tenants" every other
+ *  surface derives from (the broker-wide guards, `soleSpaceOf`, `cotal status`, the target
+ *  resolver). Four surfaces each reading the disk their own way is how an under-count slips past
+ *  exactly one of them; there must be a single answer.
+ *
+ *  `spaces` are the tenants whose account records are regular files that parse, carry a `space`
+ *  equal to their own injective filename key, and round-trip. `corrupt` is every entry that
+ *  OCCUPIES the account namespace (`account.*.json`) yet fails any of that - including a
+ *  non-regular entry (symlink, directory): `Dirent.isFile()` is lstat-semantics, so skipping those
+ *  would drop a tenant whose record was symlinked while `loadSpaceAccountAuth`'s path still
+ *  resolved it - the exact under-count the guards exist to refuse. The authoritative name is the
+ *  record's own `space`, never inferred from the filename. `corrupt` is what turns the guards
+ *  fail-CLOSED: an unreadable record is uncertainty about how many tenants exist, and a
+ *  broker-wide operation must not proceed on an under-count. */
+export function accountInventory(dir: string): { spaces: string[]; corrupt: string[] } {
+  const spaces: string[] = [];
+  const corrupt: string[] = [];
+  // Only absence is absent: `existsSync` would read a folder this account cannot enter as missing,
+  // and count no tenants under a `.cotal` it cannot read. That failure propagates like any other.
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    entries = [];
+  }
+  for (const entry of entries) {
+    if (!entry.name.startsWith(SPACE_ACCOUNT_PREFIX) || !entry.name.endsWith(SPACE_ACCOUNT_SUFFIX)) continue;
+    // From here the entry CLAIMS the account namespace; anything wrong is corruption, never a skip.
+    const fromName = spaceFromAccountFile(entry.name);
+    if (fromName === undefined || !entry.isFile()) {
+      corrupt.push(entry.name);
+      continue;
+    }
+    let doc: { space?: unknown; account?: unknown };
+    try {
+      doc = JSON.parse(readFileSync(join(dir, entry.name), "utf8")) as { space?: unknown; account?: unknown };
+    } catch {
+      corrupt.push(entry.name);
+      continue;
+    }
+    // The name must round-trip AND the record must carry the account material it claims to.
+    // "Validated inventory" has to mean the shape a reader will compose, or a semantically-empty
+    // record (`{"space":"alpha"}`, no `account`) counts as a tenant here and then crashes the very
+    // `status`/compose path this inventory exists to keep fail-closed. Match the SpaceAccountAuth
+    // fields those readers dereference; a missing/blank one is corruption, not a tenant.
+    if (typeof doc.space !== "string" || doc.space !== fromName || !isAccountShape(doc.account)) {
+      corrupt.push(entry.name);
+      continue;
+    }
+    spaces.push(doc.space);
+  }
+  // The pre-W4 monolith counts as a tenant too; one that will not read counts as CORRUPT, not as
+  // absent - a reader like `status` must see the uncertainty, not crash or under-count on it.
+  try {
+    const legacy = loadLegacySpaceAuth(dir);
+    if (legacy && typeof legacy.space === "string" && legacy.space && !spaces.includes(legacy.space)) spaces.push(legacy.space);
+  } catch {
+    corrupt.push(AUTH_FILE);
+  }
+  return { spaces: spaces.sort(), corrupt: corrupt.sort() };
+}
+
+/** Every space that has a VALID account record under this auth dir. The broker's tenant list on disk;
+ *  names come from each record's authoritative `space`. Callers that must act on the blast radius use
+ *  {@link assertSingleSpaceBroker} / {@link soleSpaceOf}, which also refuse on an unreadable record. */
+export function listSpaceAccounts(dir: string): string[] {
+  return accountInventory(dir).spaces;
+}
+
+/** The accounts a broker config must PRELOAD: every tenant this auth dir holds, with `current` first.
+ *
+ *  The MEMORY resolver is a whole-broker map, so the rendered config IS the tenant list - it does not
+ *  add the space being booted to whatever the running broker already trusts, it replaces the set.
+ *  Rendering from the one space a `cotal up` was asked for therefore evicts every sibling silently:
+ *  the broker starts, that space works, and every cred minted under the others is refused with
+ *  nothing printed anywhere. A render reads this, never a single space.
+ *
+ *  `current` comes from the CALLER because the caller's copy can be fresher than the disk - a space
+ *  minted moments ago, or an account whose trust record this same boot just rotated - and rendering
+ *  the stale on-disk copy of the space being booted is the other half of the same bug.
+ *
+ *  Fail-CLOSED on a corrupt record, like the guards above: a file that occupies the account namespace
+ *  but will not validate may be a real tenant, and rendering without it is precisely the silent
+ *  eviction this exists to prevent. */
+export function preloadSpaceAccounts(dir: string, current: SpaceAccountAuth): SpaceAccountAuth[] {
+  const { spaces, corrupt } = accountInventory(dir);
+  if (corrupt.length > 0)
+    throw new Error(
+      `${dir} holds ${corrupt.length} unreadable account record(s) (${corrupt.join(", ")}) - refusing to render a broker config while the tenant list is uncertain: a tenant left out of the config is evicted from the broker. Repair or remove them`,
+    );
+  const siblings = spaces
+    .filter((space) => space !== current.space)
+    .map((space) => {
+      const account = loadSpaceAccountAuth(dir, space);
+      // The inventory validated this record moments ago, so an absent one means it went away between
+      // the two reads. Refusing beats rendering a config that drops it.
+      if (!account) throw new Error(`${spaceAccountPath(dir, space)} disappeared while the broker config was being rendered - re-run the command`);
+      return { space: account.space, account: account.account };
+    });
+  return [{ space: current.space, account: current.account }, ...siblings];
+}
+
+// ---- the split trust records as SecretStore kinds (the signer-bearing seam) ----
+//
+// The trust material is the highest-blast-radius secret kind - whoever holds a space's account
+// signing seed mints any cred in that account - so signer-bearing paths read and write it through
+// the SecretStore seam: a hosted composition injects its own store (KMS/Vault) and no signing seed
+// lands on the hosted disk, while the local default resolves byte-for-byte to the same files the FS
+// readers/writers above use. The seam speaks the SPLIT layout (one broker record + per-space account
+// records); the pre-W4 monolith key exists only as migration input and as the documented container
+// signer mount (`cotal mint --signer` → `.cotal/auth/auth.json`, read-only, for `supervise`).
+
+/** THE store key of the broker trust record. Under the workspace store (rooted at `.cotal`) it
+ *  resolves byte-for-byte to `.cotal/auth/broker.json`. One source for every signer-bearing tier -
+ *  a drifted literal would silently split the kind. */
+export const BROKER_AUTH_KEY = `auth/${BROKER_FILE}`;
+
+/** The LEGACY monolith store key (`auth/auth.json`) - migration INPUT and the container signer
+ *  mount only; nothing writes this shape now (see the layout note above). */
+export const SPACE_AUTH_KEY = `auth/${AUTH_FILE}`;
+
+/** THE store key of one space's account record - `auth/account.<key>.json`, the same
+ *  {@link spaceAccountFile} the FS layout uses. */
+export function spaceAccountKey(space: string): string {
+  return `auth/${spaceAccountFile(space)}`;
+}
+
+/** Parse one store record. Errors name ONLY the key, never the stored bytes: unlike the FS reader
+ *  ({@link readAuthRecord}, whose errors describe files on the operator's own disk), a store value
+ *  may be hosted or attacker-influenced, and nothing sourced from it may reach a caller's log. */
+function parseStoreRecord<T>(raw: string, key: string, what: string): T {
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(`the ${what} (${key}) is not valid JSON - repair or replace the store value`);
+  }
+}
+
+/** Validate a legacy-monolith store value without letting ANY stored field into the error: the
+ *  wrapped message names only the key and the caller-provided (trusted) space label. Accepts both a
+ *  full bundle (validated over the whole JWT chain, which also catches a relabel) and the stripped
+ *  container signer projection (validated over its mintable account material) - see core's
+ *  {@link validateSpaceAuthForRead}. */
+function validateStoredSpaceAuth(value: SpaceAuth, key: string, space: string): SpaceAuth {
+  try {
+    return validateSpaceAuthForRead(value, space);
+  } catch {
+    throw new Error(
+      `the space trust bundle (${key}) failed trust-chain validation for space "${space}" - the store value is corrupt or mislabeled; repair or replace it`,
+    );
+  }
+}
+
+/** Load one space's COMPOSED trust view through the seam - THE reader for signer-bearing paths (the
+ *  manager's signer hold, the renewal owner, CLI mint/backup/restore/…). The store is the sole
+ *  authority for the material; the space is REQUIRED for the same reason as {@link loadSpaceAuth}'s:
+ *  a root-wide "the auth" read is ambiguous the moment a broker holds two accounts (space-blind CLI
+ *  paths resolve theirs first via {@link getSoleSpaceAuth}). Mirrors the FS reader's shapes exactly -
+ *  split records compose (and verify the account really was signed by this broker's operator), either
+ *  half may still come from the legacy monolith during migration, and with both split records absent
+ *  the monolith is read whole (full bundle or the stripped container signer) and validated against
+ *  the caller's space; there a wrong-space or malformed value fails LOUD rather than reading as
+ *  absent, because the monolith names exactly one tenant. Every error names only store keys and the
+ *  caller's own space label, never the stored bytes. */
+export async function getSpaceAuth(store: SecretStore, space: string): Promise<SpaceAuth | undefined> {
+  const accountKey = spaceAccountKey(space);
+  const brokerRaw = await store.get(BROKER_AUTH_KEY);
+  const accountRaw = await store.get(accountKey);
+  const legacyRaw = brokerRaw === undefined || accountRaw === undefined ? await store.get(SPACE_AUTH_KEY) : undefined;
+  if (brokerRaw === undefined && accountRaw === undefined) {
+    if (legacyRaw === undefined) return undefined;
+    const legacy = parseStoreRecord<SpaceAuth>(legacyRaw, SPACE_AUTH_KEY, "space trust bundle");
+    return validateStoredSpaceAuth(legacy, SPACE_AUTH_KEY, space);
+  }
+  const legacy = legacyRaw !== undefined ? parseStoreRecord<SpaceAuth>(legacyRaw, SPACE_AUTH_KEY, "space trust bundle") : undefined;
+  const broker: BrokerAuth | undefined =
+    brokerRaw !== undefined
+      ? parseStoreRecord<BrokerAuth>(brokerRaw, BROKER_AUTH_KEY, "broker trust record")
+      : legacy
+        ? { operator: legacy.operator, sys: legacy.sys }
+        : undefined;
+  let account: SpaceAccountAuth | undefined;
+  if (accountRaw !== undefined) {
+    const doc = parseStoreRecord<SpaceAccountAuth>(accountRaw, accountKey, "space account record");
+    if (doc.space !== space)
+      throw new Error(`the space account record (${accountKey}) does not name space "${space}" - it was renamed or corrupted; repair or replace it`);
+    if (!isAccountShape(doc.account))
+      throw new Error(`the space account record (${accountKey}) is missing its account material - the record is corrupt; restore it from backup`);
+    account = doc;
+  } else if (legacy && legacy.space === space) {
+    account = { space: legacy.space, account: legacy.account };
+  }
+  if (!broker || !account) return undefined;
+  try {
+    return composeSpaceAuth(broker, account);
+  } catch {
+    throw new Error(
+      `the trust records (${BROKER_AUTH_KEY} + ${accountKey}) failed trust-chain validation for space "${space}" - the store values are corrupt, mismatched, or outside one broker/account trust chain; repair or replace them`,
+    );
+  }
+}
+
+/** The seam companion of {@link loadSoleSpaceAuth} for the space-blind CLI paths: the FS inventory
+ *  (tenant NAMES only - non-secret) supplies the one space this root holds, failing loud on several
+ *  via {@link soleSpaceOf}, and the store stays the sole authority for the trust material itself.
+ *  Every space-blind caller is a workstation CLI verb with the root's auth dir on this disk; a
+ *  hosted composition knows its space and calls {@link getSpaceAuth} directly. */
+export async function getSoleSpaceAuth(store: SecretStore, dir: string): Promise<SpaceAuth | undefined> {
+  const space = soleSpaceOf(dir);
+  return space ? getSpaceAuth(store, space) : undefined;
+}
+
+/** The LOCAL trust position a remote-authority manager must know about, read without ever
+ *  composing or validating another tenant's material (#1944).
+ *
+ *  The one question under remote authority is "does THIS space's own local signing trust exist
+ *  under this store", because that alone is the conflict of authorities a supervisor refuses.
+ *  Three facts answer it, and nothing else is read:
+ *   - this space's own account record key (`auth/account.<key>.json`) — its presence IS the
+ *     space's split-layout trust, whatever the bytes say;
+ *   - the legacy monolith key (`auth/auth.json`) — a value that names this space is the
+ *     pre-split layout's same fact. A value that names another space is that tenant's trust and
+ *     reports nothing here. The parse rides the STORE's own discipline ({@link parseStoreRecord}
+ *  semantics, same message the composed reader prints), so an unreadable value refuses loud
+ *  rather than being swallowed into a proceed — but errors carry only the KEY and the space
+ *  label, never stored bytes.
+ *   - the broker record key (`auth/broker.json`) is deliberately NOT consulted: it is one per
+ *  root and shared by every static space in the split layout, so it names no tenant and can
+ *  never be this space's own trust.
+ *
+ *  Exported for the manager (the one remote-authority caller); lives here so the key spellings
+ *  and the parse message cannot drift from the reader that owns them. */
+export async function localTrustOfSpace(store: SecretStore, space: string): Promise<{ present: boolean }> {
+  const accountRaw = await store.get(spaceAccountKey(space));
+  if (accountRaw !== undefined) return { present: true };
+  const legacyRaw = await store.get(SPACE_AUTH_KEY);
+  if (legacyRaw === undefined) return { present: false };
+  // The ONE parse discipline this module owns: the same reader, the same message, no drift.
+  const doc = parseStoreRecord<{ space?: unknown }>(legacyRaw, SPACE_AUTH_KEY, "space trust bundle");
+  return { present: doc.space === space };
+}
+
+/** Persist a composed value through the seam by DECOMPOSING it into its two records - the seam
+ *  writer with the SAME refusals as the FS pair ({@link saveBrokerAuth}/{@link saveSpaceAccountAuth},
+ *  shared via {@link guardBrokerOverwrite}): a stripped value, a foreign-operator overwrite, a stale
+ *  or rolled-back system-account generation, and another tenant's account record all refuse loud.
+ *  All guards run BEFORE either put, so a refusal never leaves a half-written pair. `sys.signingSeed`
+ *  never lands at rest (broker-admin minting capability; the record shape drops it).
+ *
+ *  With NO broker record in the store, the FS writer's whole-inventory orphan check cannot run - a
+ *  {@link SecretStore} has no enumeration - so it ranges over the ADDRESSABLE records instead: this
+ *  space's own account and the legacy monolith, each of which the incoming operator must have signed.
+ *  That is complete for a hosted store (scoped per-tenant inside its own resolve, per the seam's
+ *  design) and for every same-space local repair; a lost broker.json beside a DIFFERENT tenant's
+ *  account on the local FS stays covered by the FS writer wherever {@link saveSpaceAuth} is the
+ *  writer (accepted residual, documented here rather than silently absorbed). */
+export async function putSpaceAuth(store: SecretStore, auth: SpaceAuth): Promise<void> {
+  assertWritableBrokerTrust(auth, "putSpaceAuth");
+  const accountKey = spaceAccountKey(auth.space);
+  const existingBrokerRaw = await store.get(BROKER_AUTH_KEY);
+  const existingBroker =
+    existingBrokerRaw !== undefined ? parseStoreRecord<BrokerAuth>(existingBrokerRaw, BROKER_AUTH_KEY, "broker trust record") : undefined;
+  let gen: number;
+  if (existingBroker) {
+    gen = guardBrokerOverwrite(BROKER_AUTH_KEY, existingBroker, auth);
+  } else {
+    gen = brokerGen(auth.gen, "the value being written");
+    for (const [key, what] of [
+      [accountKey, "space account record"],
+      [SPACE_AUTH_KEY, "space trust bundle"],
+    ] as const) {
+      const raw = await store.get(key);
+      if (raw === undefined) continue;
+      const doc = parseStoreRecord<{ space?: unknown; account?: unknown }>(raw, key, what);
+      if (typeof doc.space !== "string" || !isAccountShape(doc.account))
+        throw new Error(
+          `the store has no broker record but holds an unreadable ${what} (${key}) - refusing to install an operator while the tenant list is uncertain; repair or remove it first`,
+        );
+      try {
+        composeSpaceAuth(auth, { space: doc.space, account: doc.account as SpaceAccountAuth["account"] });
+      } catch {
+        throw new Error(
+          `the store has no broker record but holds a ${what} (${key}) the operator being written did not sign - refusing to install it: the existing tenant would be orphaned. Restore the original broker trust instead.`,
+        );
+      }
+    }
+  }
+  const existingAccountRaw = await store.get(accountKey);
+  if (existingAccountRaw !== undefined) {
+    const doc = parseStoreRecord<SpaceAccountAuth>(existingAccountRaw, accountKey, "space account record");
+    if (doc.space !== auth.space)
+      throw new Error(`the space account record (${accountKey}) does not name space "${auth.space}" - refusing to overwrite another tenant's account record`);
+  }
+  const brokerAtRest: BrokerAuth = { operator: auth.operator, sys: { pub: auth.sys.pub, jwt: auth.sys.jwt }, gen };
+  const accountAtRest: SpaceAccountAuth = { space: auth.space, account: auth.account };
+  await store.put(BROKER_AUTH_KEY, JSON.stringify(brokerAtRest, null, 2));
+  await store.put(accountKey, JSON.stringify(accountAtRest, null, 2));
+}
+
+/** Remove the space trust material through the seam - the authoritative delete for a non-FS store.
+ *  BROKER-WIDE by nature (the broker record dies with its last space's account), so its one caller
+ *  is `clean all` AFTER the failure gate and the {@link assertSingleSpaceBroker} guard - on a
+ *  multi-tenant root that guard refuses long before this runs. Deletes the space's account record,
+ *  the broker record, and the legacy monolith. Idempotent. */
+export async function deleteSpaceAuth(store: SecretStore, space: string): Promise<void> {
+  await store.delete(spaceAccountKey(space));
+  await store.delete(BROKER_AUTH_KEY);
+  await store.delete(SPACE_AUTH_KEY);
+}

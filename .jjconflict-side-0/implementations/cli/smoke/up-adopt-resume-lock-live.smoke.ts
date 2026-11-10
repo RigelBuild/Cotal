@@ -1,0 +1,253 @@
+/**
+ * LIVE PROBE (F1): an ADOPTING `cotal up` must complete its resume while the re-entry holds the
+ * root maintenance lock.
+ *
+ * This is the corner the P2 lock hand-off opened. Before that change a resume re-entry held NO
+ * lock (`startupLock = resumeAttempt ? undefined : acquire(...)`), so the resume helpers could
+ * safely take one for themselves. The re-entry now INHERITS the recovery's lock, and the two adopt
+ * helpers — `resumeProvenOrdinaryListener` and `resumeProvenRestoreListener` — still called
+ * `completeResumeActivation` WITHOUT it. Its journal writers then self-acquired against a lock this
+ * same process already owned. The lock is not reentrant and cannot stale-reap its way out, because
+ * the recorded owner is alive: it is us. So the acquire took the "held by a live owner" refusal and
+ * the adopt threw.
+ *
+ * That is the availability half of the P2 fix: the render stayed serialized (P2 itself is closed),
+ * but a resume that recovers by ADOPTING an already-live listener — instead of spawning a
+ * competitor over the same store — stopped completing.
+ *
+ * Driven through the REAL command, as a subprocess, against a REAL broker:
+ *
+ *  1. CONTROL - the interrupted resume stops at the requested boundary (exit 89), leaves the
+ *     journal `resume-committed`, and leaves its bound listener ALIVE. Without all three the
+ *     recovery below would not take the adopt branch at all, and a pass would be vacuous. This is
+ *     the fixture proving it reached the precondition, not an assertion about the fix.
+ *  2. SUBJECT - the recovering `cotal up` adopts that live listener and exits 0, consuming the
+ *     journal. It must NOT fail on a maintenance-lock refusal: that exact refusal is the finding,
+ *     so it is asserted against by name rather than left to a bare non-zero exit.
+ *
+ * The same resume carries the broker's JetStream store cap (`--max-file-store`, #1888): the fresh
+ * boot renders it and nats-server applies it, the cut journals it, a resume asking for a different
+ * cap is refused CONFLICT before anything starts, naming both caps and the way to change it, the bare
+ * resume re-renders it, and the adopted mesh record keeps it, with the attach host and the session
+ * ceiling. A resume asking for another `--server` is refused the same way.
+ *
+ * Sandboxes COTAL_HOME under a scratch base with proven-clean `.cotal` ancestry; kills only its own
+ * children. Needs `nats-server` on PATH.
+ * Run: pnpm smoke:up-adopt-resume-lock:live
+ */
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { join, resolve as resolvePath } from "node:path";
+import { assertSmokeSandboxDown, freePort, recordSmokeSandbox } from "@cotal-ai/smoke-kit";
+import { makeScratch, assertScratchHeld } from "../../../bin/smoke/_scratch.js";
+
+const scratch = makeScratch("cotal-up-adopt-lock-");
+const home = mkdtempSync(join(scratch, "home-"));
+const root = mkdtempSync(join(scratch, "root-"));
+const configDir = join(home, "xdg");
+const sandbox = recordSmokeSandbox({ root, cotalHome: home, xdgConfigHome: configDir });
+process.env.COTAL_HOME = home;
+
+const WT = resolvePath(import.meta.dirname, "..", "..", "..");
+const CLI = join(WT, "bin", "cotal.ts");
+const TSX = join(WT, "node_modules", ".bin", "tsx");
+const journalPath = join(root, ".cotal", "maintenance", "v1", "journal.json");
+const resumeDocPath = join(root, ".cotal", "maintenance", "v1", "resume.json");
+const openConfPath = join(root, ".cotal", "server-open.conf");
+// Roomy enough for the fixture's real writes. What is under test is that the cap is rendered and
+// resumed, not where it sits.
+const CAP = 17179869184;
+// The broker runs from the root, so a store inside it is named relative to it.
+const cappedBlock = `jetstream { store_dir: ${JSON.stringify(join(".cotal", "nats"))}, max_file_store: ${CAP} }`;
+const openConfJetStream = (): string =>
+  existsSync(openConfPath) ? readFileSync(openConfPath, "utf8").split("\n").filter((l) => l.startsWith("jetstream")).join("\n") : "";
+const recorded = (space: string): { attachHost?: unknown; maxSessions?: unknown; maxFileStore?: unknown } | undefined => {
+  const dir = join(home, "meshes");
+  for (const f of existsSync(dir) ? readdirSync(dir).filter((n) => n.endsWith(".json")) : []) {
+    const entry = JSON.parse(readFileSync(join(dir, f), "utf8")) as { space?: string; attachHost?: unknown; maxSessions?: unknown; maxFileStore?: unknown };
+    if (entry.space === space) return entry;
+  }
+  return undefined;
+};
+const recordedCap = (space: string): unknown => recorded(space)?.maxFileStore;
+
+let pass = 0;
+const ok = (name: string, cond: boolean, extra?: unknown) => {
+  if (!cond) throw new Error(`FAIL: ${name}${extra !== undefined ? ` - ${JSON.stringify(extra)}` : ""}`);
+  pass++;
+  console.log(`  ✓ ${name}`);
+};
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * The ambient environment with every `COTAL_` key stripped, then this smoke's own sandbox put back.
+ *
+ * A suite can be run from a mesh-joined session, and that environment carries a live credential path
+ * and a live broker URL. The child here is the real `cotal` CLI, which DOES read connection material,
+ * so spreading `process.env` in unfiltered points it at the CALLER's mesh instead of this sandbox —
+ * and it would pass while doing it, which is the failure mode worth naming: not a red, a false green.
+ * Strip first, then re-add the one variable the children are meant to see.
+ * Enforced by bin/smoke/suite-ambient-env.smoke.ts.
+ */
+const baseEnv = (() => {
+  const copy = { ...process.env };
+  for (const key of Object.keys(copy)) if (key.startsWith("COTAL_")) delete copy[key];
+  return { ...copy, COTAL_HOME: home, XDG_CONFIG_HOME: configDir, COTAL_SKIP_CONNECTOR_SEED: "1" };
+})();
+
+/** Blocking `cotal <args>`, the way an operator runs it. */
+function runSync(args: string[], extraEnv: Record<string, string> = {}) {
+  const options = {
+    cwd: root,
+    env: { ...baseEnv, ...extraEnv },
+    encoding: "utf8" as const,
+    timeout: 240_000,
+  };
+  assertSmokeSandboxDown(sandbox, args, options);
+  return spawnSync(TSX, [CLI, ...args], options);
+}
+
+type Journal = {
+  state?: string;
+  listenerProof?: { processOwner?: { pid?: number } };
+  managerCommit?: { state?: string };
+  ordinaryResume?: { attemptId?: string };
+};
+const journal = (): Journal =>
+  existsSync(journalPath) ? (JSON.parse(readFileSync(journalPath, "utf8")) as Journal) : {};
+
+const alive = (pid: number | undefined): boolean => {
+  if (!Number.isInteger(pid) || (pid ?? 0) <= 0) return false;
+  try { process.kill(pid as number, 0); return true; } catch { return false; }
+};
+
+try {
+  mkdirSync(join(root, ".cotal"), { recursive: true });
+  assertScratchHeld(root, "up adopt resume lock fixture");
+
+  const port = await freePort();
+  const server = `nats://127.0.0.1:${port}`;
+  const space = "adopt_alpha";
+
+  console.log("1) CONTROL: an interrupted resume leaves a committed journal and a LIVE listener");
+  const first = runSync(["up", "--detach", "--open", "--server", server, "--space", space, "--host", "127.0.0.1", "--max-sessions", "7", "--max-file-store", String(CAP)]);
+  ok("the ordinary boot exited 0", first.status === 0, `${first.stdout ?? ""}${first.stderr ?? ""}`.slice(-1200));
+  ok("the fresh boot renders --max-file-store into the jetstream block", openConfJetStream() === cappedBlock, openConfJetStream());
+  const natsLog = readFileSync(join(root, ".cotal", "nats.log"), "utf8");
+  ok("…and nats-server starts with that cap", /\[INF\]\s+Max Storage:\s+16\.00 GB$/m.test(natsLog),
+    natsLog.split("\n").filter((l) => l.includes("Max Storage")));
+  ok("…and the mesh record keeps the cap", recordedCap(space) === CAP, recordedCap(space));
+
+  // The cut describes the manager over the ep rails, so it must not be taken until the manager has
+  // finished registering there. `up --detach` returns ~2s BEFORE that registration lands (measured,
+  // 3/3 on an idle box), and a describe issued into the gap can miss the registration and then wait
+  // out its whole 10s deadline rather than retry - a refusal reproduced 1-in-4 with no load at all.
+  // A registry write is the cheapest question that only answers once the manager is there. A rail
+  // that never answers is a broken fixture, not the residual, so this waits rather than reporting
+  // the cut's refusal as the finding.
+  let railsUp = false;
+  for (let i = 0; i < 30 && !railsUp; i++) {
+    if (runSync(["channel", "set", "railprobe", "--desc", "rails", "--space", space]).status === 0) railsUp = true;
+    else await sleep(5_000);
+  }
+  ok("the manager answers on the ep rails before the cut", railsUp);
+
+  const cut = runSync(["down", "--preserve-state"]);
+  ok("the cut exited 0", cut.status === 0, `${cut.stdout ?? ""}${cut.stderr ?? ""}`.slice(-1200));
+  const resumeLaunch = (JSON.parse(readFileSync(resumeDocPath, "utf8")) as { launch?: { maxFileStore?: unknown } }).launch;
+  ok("the cut journals the store cap in the preserved launch", resumeLaunch?.maxFileStore === CAP, resumeLaunch);
+
+  const mismatched = runSync(["up", "--detach", "--server", server, "--space", space, "--max-file-store", String(CAP * 2)]);
+  const mismatchLog = `${mismatched.stdout ?? ""}${mismatched.stderr ?? ""}`;
+  ok("a resume asking for a different --max-file-store is refused CONFLICT, exit 2, naming both caps and the way to change it",
+    mismatched.status === 2 && mismatchLog.includes(`--max-file-store ${CAP * 2} is not the file store cap that down --preserve-state recorded here (${CAP})`)
+      && mismatchLog.includes("Code:    CONFLICT") && mismatchLog.includes(`resume with \`cotal up\` without --max-file-store; to use ${CAP * 2}, stop the resumed mesh with \`cotal down\`, then run \`cotal up --max-file-store ${CAP * 2}\``),
+    { status: mismatched.status, log: mismatchLog.slice(-1200) });
+  ok("…and leaves the preserved state ready", journal().state === "ready", journal().state);
+  // Refused before anything binds, so the other address needs no free port.
+  const elsewhere = `nats://127.0.0.1:${port === 65535 ? port - 1 : port + 1}`;
+  const moved = runSync(["up", "--detach", "--server", elsewhere, "--space", space]);
+  const movedLog = `${moved.stdout ?? ""}${moved.stderr ?? ""}`;
+  ok("a resume asking for another --server is refused CONFLICT, exit 2, naming both addresses and the way to change it",
+    moved.status === 2 && movedLog.includes(`--server ${elsewhere} is not the broker address that down --preserve-state recorded here (${server})`)
+      && movedLog.includes("Code:    CONFLICT") && movedLog.includes(`resume with \`cotal up\` without --server; to use ${elsewhere}, stop the resumed mesh with \`cotal down\`, then run \`cotal up --server ${elsewhere}\``),
+    { status: moved.status, log: movedLog.slice(-1200) });
+  ok("…and leaves the preserved state ready too", journal().state === "ready", journal().state);
+
+  // Stop the resume right after the manager commit. The listener it spawned is detached, so it
+  // outlives this interrupted driver - which is precisely what makes the next `up` ADOPT rather
+  // than spawn a competitor over the same store.
+  const interrupted = runSync(
+    ["up", "--detach", "--server", server, "--space", space],
+    { COTAL_SMOKE_EXIT_AFTER_RESUME_COMMIT: "1" },
+  );
+  ok("the resume stopped at the commit boundary (exit 89)", interrupted.status === 89,
+    { status: interrupted.status, log: `${interrupted.stdout ?? ""}${interrupted.stderr ?? ""}`.slice(-1500) });
+
+  const committed = journal();
+  ok("the journal is `resume-committed`", committed.state === "resume-committed", committed.state);
+  ok("…with awaiting-finalize manager evidence", committed.managerCommit?.state === "awaitingFinalize",
+    committed.managerCommit);
+  const boundPid = committed.listenerProof?.processOwner?.pid;
+  ok("…and its bound listener is ALIVE (the adopt precondition)", alive(boundPid), { boundPid });
+  ok("the bare resume re-renders the preserved store cap", openConfJetStream() === cappedBlock, openConfJetStream());
+
+  const attemptId = committed.ordinaryResume?.attemptId;
+  let pausedLog: string | undefined;
+  if (process.platform === "win32") {
+    console.log("  SKIP: the listener INFO timeout control needs POSIX SIGSTOP/SIGCONT");
+  } else {
+    ok("the journal holds an ordinary attempt and no restore", typeof attemptId === "string" && !("restore" in committed));
+    // Pause only the listener this interrupted resume owns. Restore it before any assertion or
+    // teardown, then use the existing successful recovery below as the positive control.
+    process.kill(boundPid!, "SIGSTOP");
+    let paused: ReturnType<typeof runSync>;
+    try {
+      paused = runSync(["up", "--detach", "--server", server, "--space", space]);
+    } finally {
+      process.kill(boundPid!, "SIGCONT");
+    }
+    pausedLog = `${paused.stdout ?? ""}${paused.stderr ?? ""}`;
+    ok("the paused listener refuses at its INFO timeout with outcome unknown",
+      paused.status === 3 && pausedLog.includes("OPERATION_UNKNOWN") && pausedLog.includes("listener INFO timed out"),
+      { status: paused.status, log: pausedLog });
+    ok("the failed read leaves the ordinary journal committed", journal().state === "resume-committed");
+  }
+
+  console.log("\n2) SUBJECT: the recovering `cotal up` ADOPTS that live listener under the inherited lock");
+  const recovered = runSync(["up", "--detach", "--server", server, "--space", space]);
+  const log = `${recovered.stdout ?? ""}${recovered.stderr ?? ""}`;
+  // Assert the refusal by NAME. A bare non-zero check would also go red for an unrelated reason and
+  // would report this finding for something that is not it.
+  ok("the adopt did not fail on a maintenance-lock refusal",
+    !/held by a live owner|holds this root|recovery is already in progress|maintenance lock/i.test(log),
+    { status: recovered.status, log: log.slice(-2000) });
+  ok("the adopting resume exited 0", recovered.status === 0, { status: recovered.status, log: log.slice(-2000) });
+  ok("…and the finalized resume consumed its maintenance journal", !existsSync(journalPath), journal());
+  ok("the adopted mesh record keeps the store cap", recordedCap(space) === CAP, recordedCap(space));
+  ok("…and the attach host and the session ceiling", recorded(space)?.attachHost === "127.0.0.1" && recorded(space)?.maxSessions === 7, recorded(space));
+
+  if (pausedLog !== undefined) {
+    ok("the INFO failure names the ordinary resume attempt, not a restore",
+      pausedLog.includes(`resume attempt ${attemptId} listener INFO timed out`) && !pausedLog.includes("restore listener"),
+      pausedLog);
+  }
+  runSync(["down"]);
+  console.log(`\nUP ADOPT RESUME LOCK SMOKE OK ✅  (${pass} passed)`);
+} catch (e) {
+  console.error("  ✗ FAIL:", (e as Error).message);
+  process.exitCode = 1;
+} finally {
+  try { runSync(["down"]); } catch { /* best effort */ }
+  await sleep(500);
+  // Every runtime record this root holds, whatever space each belongs to. The records are
+  // space-keyed now (`manager.<hex>.pid`), and a teardown running after a failure cannot assume
+  // which spaces got as far as writing one, so it matches the SHAPE rather than a fixed name list.
+  // The pre-segmentation root-scoped spelling matches too, so a root an older build left behind is
+  // still swept.
+  for (const name of readdirSync(join(root, ".cotal")).filter((n) => /^(nats|manager|delivery)\.([^.]+\.)?pid$/.test(n))) {
+    const pid = Number.parseInt(readFileSync(join(root, ".cotal", name), "utf8").trim(), 10);
+    if (Number.isInteger(pid) && pid > 0) try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+  }
+  rmSync(scratch, { recursive: true, force: true });
+}

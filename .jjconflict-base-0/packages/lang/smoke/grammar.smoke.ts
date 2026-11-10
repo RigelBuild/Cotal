@@ -1,0 +1,698 @@
+/**
+ * The validator's proof: every rule the design doc calls mechanical is actually mechanical.
+ *
+ * The point of this suite is negative. A program that could reach ambient IO, an ambient clock,
+ * hidden concurrency, or a journal key that cannot survive an edit must FAIL TO PARSE, not merely
+ * be discouraged. Each case below is written the way an LLM would naturally write it, because
+ * those are the programs the rules have to catch.
+ */
+import { validate, type ValidateResult } from "../src/grammar.js";
+import { CATALOG, LangErrors, type LangErrorCode } from "../src/errors.js";
+
+let pass = 0;
+const ok = (name: string, cond: boolean, extra?: unknown) => {
+  if (!cond) throw new Error(`FAIL: ${name}${extra !== undefined ? ` - ${JSON.stringify(extra)}` : ""}`);
+  pass++;
+  console.log(`  ok ${name}`);
+};
+
+/** Assert the program is rejected, and that `code` is among the reasons. */
+const rejects = (name: string, code: LangErrorCode, source: string) => {
+  try {
+    validate(source);
+  } catch (e) {
+    if (!(e instanceof LangErrors)) throw new Error(`FAIL: ${name} - wrong error type ${String(e)}`);
+    const codes = e.errors.map((x) => x.code);
+    ok(name, codes.includes(code), codes);
+    return;
+  }
+  throw new Error(`FAIL: ${name} - expected rejection with ${code}, program was accepted`);
+};
+
+const accepts = (name: string, source: string) => {
+  try {
+    validate(source);
+    ok(name, true);
+  } catch (e) {
+    const detail = e instanceof LangErrors ? e.render() : String(e);
+    throw new Error(`FAIL: ${name} - expected acceptance\n${detail}`);
+  }
+};
+
+// ---- 1) the shape of a real program parses ------------------------------------------------
+
+// The module body IS the workflow, so this is written with top-level await as the design doc's
+// section 1 example writes it — with one correction the design's own section 9.6 demands: the
+// fanned-out reviewers no longer share the builders' worktree, because two agents in one working
+// tree inside a concurrent scope is exactly what L3022 rejects below. If this shape ever stops
+// parsing, the language has stopped being the thing the design describes.
+accepts(
+  "the worked example from the design doc, at the top level",
+  `
+const team = channel("feat-auth");
+const planner = await spawn("planner", { worktree: "wt-1", join: [team] });
+const builder = await spawn("builder", { worktree: "wt-1", join: [team], permits: { turns: 40 } });
+
+await turn(planner, { name: "draft-plan" });
+
+const approval = await checkpoint("approve-plan", "Approve the plan?", { timeout: "10m", onExpiry: "proceed" });
+if (approval.status === "expired") {
+  await notify([planner, builder], { decision: "approve-plan", outcome: "auto-proceeded" });
+}
+
+let r = await turn(builder, { name: "build" });
+while (r.status === "blocked") {
+  await notify([planner], { decision: "build", outcome: "blocked" });
+  await turn(planner, { name: "unblock" });
+  r = await turn(builder, { name: "build" });
+}
+
+const reviews = await fanOut(
+  ["security", "perf"],
+  async (lens) => turn(await spawn("reviewer", { join: [team], role: lens }), { name: "review" }),
+  { name: "reviews", key: (lens) => lens },
+);
+log(reviews);
+`,
+);
+
+// ---- 2) determinism holes are unwriteable, not discouraged --------------------------------
+
+rejects("Date is not reachable", "L2012", "async function f() { const t = Date.now(); return t; }");
+rejects("Math.random is not reachable", "L2012", "async function f() { return Math.random(); }");
+rejects("fetch is not reachable", "L2012", 'async function f() { return fetch("https://x"); }');
+rejects("setTimeout is not reachable", "L2012", "async function f() { setTimeout(f, 1); }");
+rejects("process is not reachable", "L2012", "async function f() { return process.env.HOME; }");
+rejects("globalThis is not reachable", "L2012", "async function f() { return globalThis; }");
+
+// The tamed replacements ARE reachable, so the restriction costs nothing an author needs.
+accepts(
+  "now, random and log are the sanctioned replacements",
+  'async function f() { log(now(), random()); await sleep("1m"); }',
+);
+
+// ---- 3) hidden concurrency is unwriteable -------------------------------------------------
+
+rejects(
+  "Promise.all cannot smuggle concurrency past the journal",
+  "L2011",
+  "async function f(a, b) { return Promise.all([turn(a, { name: \"x\" }), turn(b, { name: \"y\" })]); }",
+);
+accepts(
+  "the sanctioned form is the record-shaped parallel",
+  'async function f(a, b) { await parallel({ x: () => turn(a, { name: "x" }), y: () => turn(b, { name: "y" }) }, { name: "both" }); }',
+);
+
+// ---- 4) journal keys that cannot survive an edit are refused ------------------------------
+
+rejects(
+  "turn without a name has no durable key",
+  "L3012",
+  'async function f(a) { await turn(a, { deadline: "20m" }); }',
+);
+rejects(
+  "a computed step name cannot be read statically",
+  "L3013",
+  "async function f(a, n) { await turn(a, { name: n }); }",
+);
+rejects(
+  "a malformed step name is refused",
+  "L3014",
+  'async function f(a) { await turn(a, { name: "Build Step" }); }',
+);
+rejects(
+  "ask without a name has no durable key",
+  "L3012",
+  'async function f(a) { await ask(a, { schema: { days: "number" } }); }',
+);
+rejects(
+  "checkpoint needs a literal name",
+  "L3013",
+  'async function f(n) { await checkpoint(n, "ok?", { timeout: "10m" }); }',
+);
+rejects(
+  "a record-form branch key with a reserved character would forge a scope path",
+  "L3025",
+  'await parallel({ "a/b": async () => 1 }, { name: "p" });',
+);
+// A fanOut's first argument is its items, so their property names are not branch keys. The keys it
+// does mint are refused at run time (keys.smoke.ts).
+accepts(
+  "a fanOut's items are not read as branch keys",
+  'await fanOut({ "a/b": 1 }, async (x) => x, { name: "f", key: (x) => x });',
+);
+
+// ---- 5) closed option bags answer with a signature ----------------------------------------
+
+rejects(
+  "an unknown option key is not silently ignored",
+  "L3011",
+  'async function f(a) { await turn(a, { name: "build", timeuot: "20m" }); }',
+);
+
+{
+  // The whole point of closed bags: the error hands the author the accepted keys and an example.
+  let rendered = "";
+  try {
+    validate('async function f(a) { await turn(a, { name: "build", timeuot: "20m" }); }');
+  } catch (e) {
+    rendered = (e as LangErrors).render();
+  }
+  // Pinned on the full fix line, not on "deadline" alone: that word also appears in the signature
+  // below it, so the loose pin passed on the signature even if the accepted-key list broke. One
+  // site is a pin; two is a coincidence waiting (counted, not assumed).
+  ok(
+    "the typo error names the accepted keys",
+    rendered.includes("Accepted keys: name, deadline"),
+    rendered.slice(0, 200),
+  );
+  ok("the typo error carries the callee signature", rendered.includes("turn(agent, { name, deadline? })"));
+  ok("the typo error carries a working example", rendered.includes('await turn(builder, { name: "build" })'));
+  ok("the blame frame is in user coordinates", rendered.includes("1 | async function f(a)"));
+}
+
+// ---- 5b) notify is a decision, not a message -----------------------------------------------
+
+// `notify` is the only primitive that moves program-authored bytes toward an agent's context, so
+// this is where the "conversation is the data plane" rule is easiest to break by accident. The
+// bound is what makes it hard: eight short scalars in a labelled table cannot carry an
+// instruction.
+accepts(
+  "a bounded decision record is fine",
+  'const a = await spawn("x");\nawait notify([a], { decision: "build", outcome: "blocked", detail: { attempt: 3, sha: "abc123" } });',
+);
+rejects(
+  "prose in a decision token is refused",
+  "L3043",
+  'const a = await spawn("x");\nawait notify([a], { decision: "the build step", outcome: "blocked" });',
+);
+rejects(
+  "an extra top-level field is refused",
+  "L3043",
+  'const a = await spawn("x");\nawait notify([a], { decision: "build", outcome: "blocked", instructions: "now go fix it" });',
+);
+rejects(
+  "a nested detail value is refused",
+  "L3043",
+  'const a = await spawn("x");\nawait notify([a], { decision: "build", outcome: "blocked", detail: { plan: { steps: 3 } } });',
+);
+rejects(
+  "a long detail string is refused",
+  "L3043",
+  `const a = await spawn("x");\nawait notify([a], { decision: "build", outcome: "blocked", detail: { note: "${"x".repeat(200)}" } });`,
+);
+rejects(
+  "more than eight detail keys is refused",
+  "L3043",
+  'const a = await spawn("x");\nawait notify([a], { decision: "build", outcome: "blocked", detail: { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9 } });',
+);
+rejects(
+  "a fact with no outcome is refused",
+  "L3043",
+  'const a = await spawn("x");\nawait notify([a], { decision: "build" });',
+);
+
+// The design's section 1 example, verbatim, semicolon-free and with an un-awaited spawn. Both
+// reviewers made this the test of whether the document describes the language it ships.
+accepts(
+  "the design's section 1 example parses exactly as written",
+  `const team    = channel("feat-auth")
+const planner = await spawn("planner", { worktree: "wt-1", join: [team] })
+const builder = await spawn("builder", { worktree: "wt-1", join: [team],
+                                         permits: { turns: 40, spend: "5usd" } })
+
+await turn(planner, { name: "draft-plan" })
+await checkpoint("approve-plan", "approve the plan?", { timeout: "10m", onExpiry: "proceed" })
+
+let r = await turn(builder, { name: "build" })
+while (r.status === "blocked") {
+  await turn(planner, { name: "unblock" })
+  r = await turn(builder, { name: "build" })
+}`,
+);
+
+// ---- 5c) width controls: the nearest legitimate input must still be admitted ------------------
+
+// Every refusal above is compatible with a rule that refuses far too much, and "right in shape,
+// wrong in width" is the failure a refusal-only suite cannot see. Each of these sits exactly at
+// the boundary the rule draws and MUST pass.
+{
+  const eightKeys = "a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8";
+  accepts(
+    "exactly eight detail keys is at the cap, not over it",
+    `const a = await spawn("x");\nawait notify([a], { decision: "build", outcome: "blocked", detail: { ${eightKeys} } });`,
+  );
+  accepts(
+    "a detail string of exactly 128 characters is admitted",
+    `const a = await spawn("x");\nawait notify([a], { decision: "build", outcome: "blocked", detail: { note: "${"x".repeat(128)}" } });`,
+  );
+  accepts(
+    "detail values may be strings, numbers and booleans",
+    'const a = await spawn("x");\nawait notify([a], { decision: "build", outcome: "ok", detail: { sha: "abc", n: 3, clean: true } });',
+  );
+  accepts("a fact with no detail at all is admitted", 'const a = await spawn("x");\nawait notify([a], { decision: "build", outcome: "ok" });');
+}
+{
+  const name64 = "a".repeat(64);
+  accepts("a step name of exactly 64 characters is admitted", `const a = await spawn("x");\nawait turn(a, { name: "${name64}" });`);
+  rejects("65 characters is over the cap", "L3014", `const a = await spawn("x");\nawait turn(a, { name: "${"a".repeat(65)}" });`);
+  accepts("a single-character step name is admitted", 'const a = await spawn("x");\nawait turn(a, { name: "b" });');
+  accepts("digits and inner hyphens are admitted", 'const a = await spawn("x");\nawait turn(a, { name: "build-2-final" });');
+}
+{
+  // The fanOut lint must not fire on the documented default, which is items carrying a string id.
+  const withIds = 'await fanOut([{ id: "a" }, { id: "b" }], async (i) => turn(await spawn("r", { role: i.id }), { name: "review" }), { name: "reviews" });';
+  const r = validate(withIds);
+  ok("items carrying a string id are not linted: that is the documented default", r.warnings.length === 0, r.warnings.map((w) => w.code));
+
+  const noIds = 'await fanOut(["security", "perf"], async (i) => turn(await spawn("r"), { name: "review" }), { name: "reviews" });';
+  ok(
+    "items that visibly carry no id still are",
+    validate(noIds).warnings.some((w) => w.code === "L3021"),
+  );
+
+  const computed = 'const items = range(3);\nawait fanOut(items, async (i) => turn(await spawn("r"), { name: "review" }), { name: "reviews" });';
+  ok(
+    "a computed list is not judged statically: the runtime decides it",
+    validate(computed).warnings.length === 0,
+    validate(computed).warnings.map((w) => w.code),
+  );
+}
+
+// ---- 5d) concurrency must be explicit, not implied by the text -------------------------------
+
+// Banning Promise is not enough: calling an async function is itself a way to start work, and
+// the program text then reads as concurrency the runtime does not provide.
+rejects(
+  "a primitive call held in a variable is refused",
+  "L2013",
+  'const a = await spawn("x");\nconst p = turn(a, { name: "build" });\nawait p;',
+);
+rejects(
+  "a bare un-awaited primitive statement is refused",
+  "L2013",
+  'const a = await spawn("x");\nmonitor(a);',
+);
+accepts(
+  "awaited is fine, and so is a combinator thunk",
+  'const a = await spawn("x");\nawait monitor(a);\nawait parallel({ one: () => turn(a, { name: "b" }) }, { name: "p" });',
+);
+
+// ---- 5d') `once` admits only `ask`, and the validator refuses any other effect it can see (L2033) --
+
+// Every step under `once` is at-most-once and only an `ask` can be held on resume, so the run refuses
+// anything else with L4028; these passed validate and a hosted start, then failed every run.
+rejects("a sleep inside once is refused before the run", "L2033", 'const r = await once(async () => {\n  await sleep("1s")\n  return 1\n}, { name: "nap-once" });\nlog("r", r);');
+rejects("and so is one in a helper the body calls by name", "L2033", 'async function nap() {\n  await sleep("1s")\n}\nconst r = await once(async () => {\n  await nap()\n  return 1\n}, { name: "nap-once" });\nlog("r", r);');
+rejects("a checkpoint inside once is refused", "L2033", 'const r = await once(async () => await checkpoint("go", "Go?"), { name: "o" });\nlog("r", r);');
+rejects("an effect in a scope nested in once is refused", "L2033", 'const a = await spawn("x");\nconst r = await once(async () => await parallel({ t: () => turn(a, { name: "t" }) }, { name: "p" }), { name: "o" });\nlog("r", r);');
+accepts("an ask inside once is admitted", 'const a = await spawn("one");\nconst r = await once(async () => await ask(a, { name: "publish", schema: { commentId: "number" } }), { name: "publish-360" });\nlog(r.commentId);');
+accepts("a helper with a sleep is fine where once does not call it", 'async function nap() {\n  await sleep("1s")\n}\nawait nap();\nconst a = await spawn("one");\nconst r = await once(async () => await ask(a, { name: "q", schema: { n: "number" } }), { name: "o" });\nlog(r.n);');
+
+// ---- 5e) a branch may not write a binding it captured (L2032) ---------------------------------
+
+// This is the program that was found by EXECUTING rather than by reading, and it is the
+// worst-behaved one in the language: live, `a` finishes last so `winner` is "a" and the run takes
+// `a-won`; on resume the journalled sleeps return instantly, the assignments run in launch order
+// instead of completion order, `winner` is "b", and the resumed run PERFORMS `b-won`. A replay that
+// abandons the recorded path and does new work, with no divergence raised, because no effect's
+// inputs changed. Freeze-on-share cannot see it: nothing crosses an effect boundary.
+rejects(
+  "the captured-write program is refused",
+  "L2032",
+  'let winner = "none";\nawait parallel({\n  a: async () => { await sleep("5s", { name: "a" }); winner = "a"; },\n  b: async () => { await sleep("1s", { name: "b" }); winner = "b"; },\n}, { name: "p" });\nif (winner === "a") { await sleep("1s", { name: "a-won" }); } else { await sleep("1s", { name: "b-won" }); }',
+);
+rejects(
+  "a compound write is the same defect",
+  "L2032",
+  'let n = 0;\nawait parallel({ a: async () => { n += 1; }, b: async () => { n += 2; } }, { name: "p" });',
+);
+rejects(
+  "and so is an increment",
+  "L2032",
+  'let n = 0;\nawait race({ a: async () => { n++; return 1; }, b: async () => 2 }, { name: "r" });',
+);
+rejects(
+  "a fanOut body is a concurrent thunk too",
+  "L2032",
+  'let seen = 0;\nawait fanOut(["a", "b"], async (x) => { seen = 1; return x; }, { name: "f", key: (x) => x });',
+);
+rejects(
+  "nesting does not launder it: the write is still outside the thunk that makes it",
+  "L2032",
+  'let winner = "none";\nawait parallel({ a: async () => { if (true) { winner = "a"; } } }, { name: "p" });',
+);
+// A BRANCH IS A BRANCH HOWEVER IT IS SPELLED. This is the same program with the arrows replaced by
+// named declarations. A `branchThunks` that looks only at function nodes written at the call site
+// finds no branches at all in `parallel({ a, b })`, so both spellings are pinned here.
+rejects(
+  "a NAMED branch is checked, not skipped because it was declared elsewhere",
+  "L2032",
+  'let winner = "none";\nasync function a() { await sleep("5s", { name: "a" }); winner = "a"; }\nasync function b() { await sleep("1s", { name: "b" }); winner = "b"; }\nawait parallel({ a, b }, { name: "p" });',
+);
+rejects(
+  "and so is a branch named through a const arrow",
+  "L2032",
+  'let n = 0;\nconst bump = async () => { n += 1; };\nawait race({ bump, other: async () => 2 }, { name: "r" });',
+);
+rejects(
+  "a fanOut whose body is named is checked too",
+  "L2032",
+  'let seen = 0;\nasync function mark(x) { seen = 1; return x; }\nawait fanOut(["a"], mark, { name: "f", key: (i) => i });',
+);
+// One level down, and invisible at the combinator call: the branch writes nothing, the helper does.
+rejects(
+  "a helper the branch CALLS is followed, because the write is the same defect one level down",
+  "L2032",
+  'let winner = "none";\nfunction claim(who) { winner = who; }\nawait parallel({ a: async () => { await sleep("5s", { name: "a" }); claim("a"); }, b: async () => { await sleep("1s", { name: "b" }); claim("b"); } }, { name: "p" });',
+);
+accepts(
+  "but a helper that only touches its own locals stays ordinary shared code",
+  'function label(x) { let out = x; out = out + "!"; return out; }\nawait parallel({ a: async () => label("a"), b: async () => label("b") }, { name: "p" });',
+);
+// A NAME the branch declared is that name, not the program-level function that happens to share it.
+// Without this, following the call graph would reach a function the branch never calls and blame it
+// — the failure mode that turns a real rule into one authors work around.
+accepts(
+  "a name a branch bound itself is not the program function of the same name",
+  'let flag = 0;\nfunction bump() { flag = 1; }\nfunction apply(bump) { return bump(1); }\nawait parallel({ a: async () => apply((x) => x), b: async () => 2 }, { name: "p" });',
+);
+// THE SAME RULE AT THE COMBINATOR CALL, which is where it was missing. The branch here is the
+// PARAMETER `branch`, which only returns 1; the top-level `branch` is never passed and never
+// called. Resolving the name through a program-wide map instead of through its binding rejected
+// this program for a write in a function it does not use — an unrelated declaration elsewhere
+// making a clean program unwriteable, which is how a real rule becomes one authors route around.
+// The branch that arrives through a parameter is UNPROVEN, not innocent: the interpreter's
+// concurrency-depth check refuses the write at runtime if one is ever made.
+accepts(
+  "a branch identifier resolves through its BINDING: a parameter is not the program function of the same name",
+  'let flag = 0;\nfunction branch() { flag = 1; }\nasync function use(branch) { await parallel({ branch }, { name: "p" }); }\nawait use(async () => 1);',
+);
+accepts(
+  "and a helper called only from sequential code is not a branch at all",
+  'let notes = "";\nfunction note(x) { notes = x; }\nnote("start");\nawait parallel({ a: async () => 1 }, { name: "p" });',
+);
+// The other half of the rule, and the half that decides whether it is usable. A branch that writes
+// only what it declared is ordinary code, and the language would be much worse if this were caught.
+accepts(
+  "a branch writing its OWN binding is fine",
+  'await parallel({ a: async () => { let n = 0; n += 1; return n; }, b: async () => 2 }, { name: "p" });',
+);
+accepts(
+  "so is writing a parameter",
+  'await fanOut(["a"], async (x) => { let y = x; y = y + "!"; return y; }, { name: "f", key: (i) => i });',
+);
+accepts(
+  "and returning the value instead of assigning it is the repair the error asks for",
+  'const r = await race({ a: async () => "a", b: async () => "b" }, { name: "r" });\nlog(r.index);',
+);
+// `conclave` is one body with nothing to race, but a settled conclave is replayed without entering
+// its body, so a write from inside it happens on the live run only.
+rejects(
+  "a conclave body may not write an outer binding, because its replay never runs the write",
+  "L2032",
+  'let notes = "";\nconst a = await spawn("x");\nawait conclave([a], async (ch) => { notes = ch.channel; return 1; }, { name: "t" });\nlog(notes);',
+);
+// A `waitUntil` probe and its `terminal` run in each observation's own frame and are not called on
+// the replay of a settled wait, so they answer to the rule a `once` body does.
+rejects(
+  "a waitUntil probe may not write an outer binding",
+  "L2032",
+  'let seen = "none";\nawait waitUntil(async () => { seen = "x"; return "done"; }, { name: "c", every: "1m", deadline: "1h" });\nlog(seen);',
+);
+rejects(
+  "nor push onto an outer array",
+  "L2032",
+  'const seen = [];\nawait waitUntil(async () => { seen.push("x"); return "done"; }, { name: "c", every: "1m", deadline: "1h" });\nlog(seen);',
+);
+rejects(
+  "and neither may its terminal predicate",
+  "L2032",
+  'let looks = 0;\nawait waitUntil(async () => "done", { name: "c", every: "1m", deadline: "1h", terminal: (o) => { looks = looks + 1; return o === "done"; } });\nlog(looks);',
+);
+accepts(
+  "a probe writing its own binding is fine",
+  'const r = await waitUntil(async () => { let own = "x"; own = own + "y"; return own; }, { name: "c", every: "1m", deadline: "1h", terminal: (o) => o === "xy" });\nlog(r);',
+);
+
+// ---- 5f) a literal written where a duration goes must be one (L2034) --------------------------
+
+// Each passed validate and a hosted start, then failed its run at the call with the same text.
+for (const lit of ['""', '"-1s"', '"1.5s"', '"PT5M"', '"5"', "5000", '" 5s"', '"5S"', '"5sec"', '"5m30s"', '"1w"', "null", "-1000", "`5`"])
+  rejects(`sleep(${lit}) is refused before the run`, "L2034", `await sleep(${lit});`);
+rejects("a checkpoint timeout is checked", "L2034", 'await checkpoint("gate", "Go?", { timeout: "PT5M" });');
+rejects("a wait timeout is checked", "L2034", 'await wait(replied(await spawn("x")), { timeout: "5" });');
+rejects("an idle duration is checked", "L2034", 'await wait(idle(channel("team"), "10 min"), { timeout: "1h" });');
+rejects("a turn deadline is checked", "L2034", 'const a = await spawn("x");\nawait turn(a, { name: "t", deadline: "1.5h" });');
+rejects("an ask deadline is checked", "L2034", 'const a = await spawn("x");\nawait ask(a, { name: "q", schema: { n: "number" }, deadline: 60 });');
+rejects("a waitUntil cadence is checked", "L2034", 'await waitUntil(async () => true, { name: "w", every: "1.5s", deadline: "1h" });');
+rejects("and so is duration()", "L2034", 'log(duration("5"));');
+accepts("a well-formed duration, a template one and a computed one are fine", 'const d = "1m";\nawait sleep("5s");\nawait sleep(`0ms`);\nawait sleep(d);\nawait checkpoint("gate", "Go?", { timeout: null });\nlog(duration("10m"));');
+
+// ---- 6) the Jessie diff --------------------------------------------------------------------
+
+rejects("no classes", "L1001", "class Foo { }");
+rejects("no this", "L1002", "function f() { return this; }");
+rejects("no var", "L1003", "var x = 1;");
+rejects("no for-in", "L1004", "function f(o) { for (const k in o) { log(k); } }");
+rejects("no in operator", "L1004", 'function f(o) { return "a" in o; }');
+rejects("no generators", "L1005", "function* g() { }");
+rejects("no regex literals", "L1007", "function f(s) { return /a+/.test(s); }");
+rejects("no accessors", "L1015", "const o = { get x() { return 1; } };");
+rejects("no instanceof", "L1016", "function f(x) { return x instanceof Error; }");
+rejects("no tagged templates", "L1018", "function f(t) { return t`hi`; }");
+rejects("no new", "L1019", "function f() { return new Thing(); }");
+rejects("no imports", "L1020", 'import { x } from "y";');
+rejects("no delete", "L1021", "function f(o) { delete o.x; }");
+rejects("no do-while", "L1022", "function f() { do { log(1); } while (false); }");
+rejects("no computed property names", "L1011", "function f(k) { return { [k]: 1 }; }");
+// ASI is ALLOWED, against Jessie: the author writes the JavaScript it would write anyway, which
+// is frequently semicolon-free, and ASI is parse-deterministic so determinism is untouched. Only
+// the two constructs where a newline genuinely changes meaning stay errors.
+accepts("semicolon-free source is ordinary", 'const a = await spawn("x")\nlog(a)\n');
+// The TITLE is part of the error, and it was naming a rule this language does not have: an author
+// reading "Missing semicolon" over semicolon-free code that the validator accepts everywhere else
+// is being told the opposite of what is true.
+ok("L1008 is titled for invalid syntax and the hazard, not for a semicolon rule that does not exist", CATALOG.L1008 === "Invalid syntax or newline hazard", CATALOG.L1008);
+accepts("explicit terminators are fine too", 'const a = await spawn("x");\nlog(a);\n');
+// Source that does not parse, a NUL byte included, keeps L1008, and its fix used to say there is no
+// automatic semicolon insertion, the opposite of the rule above.
+try {
+  validate('log("a")\u0000\nlog("b")\n');
+  ok("a NUL byte is refused as source that does not parse, with no claim about semicolons", false, "accepted");
+} catch (e) {
+  const err = e instanceof LangErrors ? e.errors[0] : undefined;
+  ok("a NUL byte is refused as source that does not parse, with no claim about semicolons",
+    err?.code === "L1008" && err.cause.includes("not valid JavaScript") && err.cause.includes("Unexpected character") && err.fix === "Fix the syntax at the marked position.", err ?? e);
+}
+rejects(
+  "a return whose value is on the next line is a hazard",
+  "L1008",
+  'function f() {\n  return\n  42;\n}',
+);
+rejects(
+  "a line starting with ( continues the one above it",
+  "L1008",
+  'const a = await spawn("x")\n(log(a));\n',
+);
+rejects(
+  "a line starting with [ does the same",
+  "L1008",
+  'const a = await spawn("x")\n[1, 2];\n',
+);
+// A for-header's declaration and update have no terminator of their own: the loop's semicolons
+// separate them. Requiring one there would reject every for loop, which the retry pattern needs.
+accepts(
+  "a for loop header is not an ASI violation",
+  'for (let i = 0; i < 3; i = i + 1) {\n  log(i);\n}\n',
+);
+accepts("a for-of header is not an ASI violation", 'for (const k of range(3)) {\n  log(k);\n}\n');
+rejects("no array elision", "L1012", "const a = [1, , 3];");
+rejects("no labels", "L1017", "function f() { outer: while (true) { break outer; } }");
+rejects("unbraced branches are refused", "L1009", "function f(x) { if (x) log(1); }");
+rejects("switch cases must terminate", "L1010", "function f(x) { switch (x) { case 1: log(1); default: break; } }");
+rejects(
+  "await inside a non-async function is refused",
+  "L1023",
+  'function f(a) { await turn(a, { name: "x" }); }',
+);
+
+// async/await itself is the one deviation from Jessie, and it must work in both positions.
+accepts("async and await are restored", 'async function f(a) { await turn(a, { name: "build" }); }');
+accepts("top-level await is the normal program shape", 'const a = await spawn("x");\nawait turn(a, { name: "build" });');
+
+// ---- 7) static name resolution -------------------------------------------------------------
+
+rejects("an unknown identifier is a parse error", "L2001", "function f() { return bulider; }");
+rejects("shadowing a primitive is refused", "L2002", "const turn = 1;");
+rejects("shadowing a builtin as a parameter is refused", "L2002", "function f(log) { return log; }");
+rejects("const cannot be reassigned", "L2003", "function f() { const x = 1; x = 2; return x; }");
+rejects("const cannot be an array destructuring target", "L2003", "const c = 0;\n[c] = [1];");
+rejects("const cannot be an object destructuring target", "L2003", "const c = 0;\n({ c } = { c: 1 });");
+rejects("const cannot be a for-of target", "L2003", "const c = 0;\nfor (c of [1]) {}");
+accepts(
+  "let destructuring and for-of targets, and a field of a const, are writable",
+  "let c = 0;\n[c] = [1];\n({ c } = { c: 2 });\nfor (c of [3]) {}\nconst o = { a: 0 };\n[o.a] = [1];",
+);
+
+{
+  // A misspelled name must point at the fix, since this is the most common repair an LLM makes.
+  let rendered = "";
+  try {
+    validate("function f() { return bulider; }");
+  } catch (e) {
+    rendered = (e as LangErrors).render();
+  }
+  ok("the unknown-name error lists the builtins", rendered.includes("keys, values"), rendered.slice(0, 160));
+}
+
+// Legitimate uses of the same shapes must still pass.
+accepts("record fields are not identifiers to resolve", 'function f(r) { return r.status === "done"; }');
+accepts("shorthand and destructuring bind properly", "function f(r) { const { status, at } = r; return { status, at }; }");
+accepts("function declarations hoist within their block", "function a() { return b(); } function b() { return 1; }");
+accepts("catch binds its parameter", 'async function f(a) { try { await turn(a, { name: "x" }); } catch (e) { log(e); } }');
+accepts("role-parametric procedures are the reuse mechanism",
+  'async function review(author, reviewer) { await turn(author, { name: "write" }); await turn(reviewer, { name: "review" }); }');
+
+// ---- 8) errors are collected, not reported one at a time ----------------------------------
+
+{
+  let count = 0;
+  try {
+    validate("var x = 1;\nclass C { }\nfunction f() { return this; }");
+  } catch (e) {
+    count = (e as LangErrors).errors.length;
+  }
+  ok("all errors surface in one pass", count >= 3, count);
+}
+
+// ---- 9) the lints that warn rather than fail ----------------------------------------------
+
+{
+  // ⚠️ `validate` THROWS on a rejected program, so a RETURNED result is the proof of legality and
+  // there is no `errors` field to inspect. The previous check read `r.errors === undefined`, which
+  // is the decoration the comment beside it warned against wearing a check's clothes: the property
+  // does not exist on `ValidateResult`, so the clause was `undefined === undefined` and COULD NOT
+  // FAIL. Catching the throw is what makes acceptance falsifiable: a rejection now reddens this
+  // cell and names the codes, instead of crashing the suite or passing silently.
+  let r: ValidateResult | undefined;
+  let rejectedWith: string | undefined;
+  try {
+    r = validate(
+      'async function f(a, b) { await parallel([() => turn(a, { name: "x" }), () => turn(b, { name: "y" })], { name: "both" }); }',
+    );
+  } catch (e) {
+    rejectedWith = (e as LangErrors).errors.map((x) => x.code).join(", ");
+  }
+  ok("array-form parallel is legal, and this can now FAIL: `validate` throws on a rejected program, so a returned result is the proof and a throw reddens here naming the codes", r !== undefined, rejectedWith ?? "accepted");
+  ok("array-form parallel is linted", r?.warnings.some((w) => w.code === "L3023") === true, r?.warnings.map((w) => w.code));
+}
+{
+  // A list whose items visibly carry no id: the source shows there is no stable key.
+  const r = validate('await fanOut(["a", "b"], async (i) => turn(await spawn("r"), { name: "review" }), { name: "reviews" });');
+  ok("fanOut over visibly unkeyable items is linted", r.warnings.some((w) => w.code === "L3021"), r.warnings.map((w) => w.code));
+}
+{
+  const r = validate('async function f(items, g) { await fanOut(items, g, { name: "reviews", key: (i) => i.id }); }');
+  ok("fanOut with a key is clean", r.warnings.length === 0, r.warnings.map((w) => w.code));
+}
+
+
+// ---- the dead zone is refused when the program is read (L2004) --------------------------------
+//
+// A `let`/`const` binds the WHOLE block, so a reference above the declaration resolves to it and,
+// executed, would find a binding with no value yet: JavaScript's temporal dead zone, a guaranteed
+// runtime ReferenceError in straight-line code. This language refuses it statically, the way it
+// refuses an unknown name — and the interpreter shipped the OTHER reading (the reference resolved
+// to the outer binding and logged "outer"), which is not a meaning JavaScript has ever given this
+// program. Measured before the rule existed.
+
+rejects("a block reference above a shadowing `let` is the dead zone, not the outer binding", "L2004",
+  'let x = "outer"; { log(x); let x = "inner"; }');
+rejects("a reference above the declaration in the same block", "L2004", "{ log(y); const y = 2; }");
+rejects("a parameter default may not read a LATER parameter", "L2004",
+  "let b = 9; function f(a = b, b = 1) { return a; } log(f());");
+rejects("a parameter default may not read its own parameter", "L2004", "function f(a = a) { return a; }");
+rejects("an assignment above the declaration is the same dead zone", "L2004", "{ x = 5; let x = 1; }");
+accepts("a nested function may reference a binding declared later: it runs later",
+  "function g() { return x; } let x = 1; log(g());");
+accepts("mutual recursion through hoisted declarations stays legal",
+  "function even(n) { return n === 0 ? true : odd(n - 1); } function odd(n) { return n === 0 ? false : even(n - 1); } log(even(4));");
+accepts("a parameter default may read an EARLIER parameter", "function f(a = 1, b = a) { return b; } log(f());");
+accepts("shadowing with the reference below the declaration is ordinary", 'let x = "o"; { let x = "i"; log(x); } log(x);');
+
+// ---- a named function expression binds its own name inside itself ------------------------------
+
+accepts("a named function expression recurses through its own name",
+  "const f = function walk(n) { return n === 0 ? 0 : walk(n - 1); }; log(f(2));");
+rejects("but the name does not leak into the enclosing scope", "L2001",
+  "const f = function walk(n) { return n; }; log(walk);");
+rejects("and a builtin's name cannot be taken as the inner name", "L2002",
+  "const f = function sort(n) { return n; }; log(f(1));");
+
+// ---- bigint literals are refused (L1030) -------------------------------------------------------
+//
+// Numbers here are IEEE doubles with a canonical JSON form; a bigint has neither, so it could not
+// be journalled or cross an effect boundary. Measured before the rule: `1n` validated, ran, and
+// produced a value whose typeof no admitted kind names.
+
+rejects("a bigint literal is not a value here", "L1030", "log(1n);");
+rejects("even in arithmetic that never crosses a boundary", "L1030", "log(1n + 2n === 3n);");
+
+// ---- two agents MUST NOT share a worktree concurrently (L3022, the static half) ----------------
+//
+// The runtime guard (L4008) owns the computed case; this owns what the source shows. Sequential
+// reuse is legal, and so is the same worktree twice inside ONE branch (that branch runs alone).
+
+rejects("two parallel branches spawning into one literal worktree", "L3022",
+  `await parallel({
+     a: async () => { await spawn("dev", { name: "a", worktree: "wt-1" }); },
+     b: async () => { await spawn("dev", { name: "b", worktree: "wt-1" }); },
+   }, { name: "build" });`);
+rejects("two race branches spawning into one literal worktree", "L3022",
+  `await race({
+     a: async () => { await spawn("dev", { name: "a", worktree: "wt-1" }); },
+     b: async () => { await spawn("dev", { name: "b", worktree: "wt-1" }); },
+   }, { name: "r" });`);
+rejects("a fanOut whose function spawns a literal worktree runs it in every branch", "L3022",
+  `await fanOut(["x", "y"], async (item) => { await spawn("dev", { name: "s", worktree: "wt-1" }); }, { name: "f", key: (i) => i });`);
+rejects("named branch functions are branches too: two of them into one literal worktree", "L3022",
+  `async function a() { await spawn("dev", { name: "a", worktree: "wt-1" }); }
+   async function b() { await spawn("dev", { name: "b", worktree: "wt-1" }); }
+   await parallel({ a, b }, { name: "build" });`);
+rejects("the array form resolves its named branches the same way", "L3022",
+  `async function a() { await spawn("dev", { name: "a", worktree: "wt-1" }); }
+   async function b() { await spawn("dev", { name: "b", worktree: "wt-1" }); }
+   await race([a, b], { name: "r" });`);
+rejects("a named fanOut function that spawns a literal worktree runs it in every branch", "L3022",
+  `async function each(item) { await spawn("dev", { name: "s", worktree: "wt-1" }); }
+   await fanOut(["x", "y"], each, { name: "f", key: (i) => i });`);
+accepts("named branches with their own worktrees are legal",
+  `async function a() { await spawn("dev", { name: "a", worktree: "wt-1" }); }
+   async function b() { await spawn("dev", { name: "b", worktree: "wt-2" }); }
+   await parallel({ a, b }, { name: "build" });`);
+accepts("sequential reuse of a worktree is legal",
+  `await spawn("dev", { name: "a", worktree: "wt-1" });
+   await spawn("dev", { name: "b", worktree: "wt-1" });`);
+accepts("branches with their own worktrees are legal",
+  `await parallel({
+     a: async () => { await spawn("dev", { name: "a", worktree: "wt-1" }); },
+     b: async () => { await spawn("dev", { name: "b", worktree: "wt-2" }); },
+   }, { name: "build" });`);
+accepts("one branch spawning the same worktree twice runs alone in it",
+  `await parallel({
+     a: async () => { await spawn("dev", { name: "a", worktree: "wt-1" }); await spawn("dev", { name: "b", worktree: "wt-1" }); },
+     b: async () => { await sleep("1s", { name: "nap" }); },
+   }, { name: "build" });`);
+accepts("a conclave runs its function once, so a literal worktree in it is not shared",
+  `const a = await spawn("dev", { name: "a" });
+   const b = await spawn("dev", { name: "b" });
+   await conclave([a, b], async (ch) => { await spawn("dev", { name: "s", worktree: "wt-1" }); }, { name: "triage" });`);
+accepts("a computed worktree is the runtime guard's to decide",
+  `const wt = "wt-" + "1";
+   await parallel({
+     a: async () => { await spawn("dev", { name: "a", worktree: wt }); },
+     b: async () => { await spawn("dev", { name: "b", worktree: wt }); },
+   }, { name: "build" });`);
+
+console.log(`grammar.smoke: ${pass} checks passed`);

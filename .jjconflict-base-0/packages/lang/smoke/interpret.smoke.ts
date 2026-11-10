@@ -1,0 +1,1580 @@
+/**
+ * The end-to-end proof: real cotal-lang programs, executed.
+ *
+ * Every other suite in this package tests a component. This one runs programs, and it is the only
+ * place the central durability claim can actually be tested, because that claim is about what the
+ * interpreter does with the journal, not about what either part does alone.
+ *
+ * The strongest test here is section 2, and its trick is worth stating: a resumed run is given an
+ * EMPTY simulation script. The simulator refuses every unscripted effect, so if any journalled
+ * effect were re-performed the resume would die with L6001. Completing is therefore proof that
+ * nothing re-ran, rather than an assertion that it did not.
+ */
+import { run, resume, RunDivergence } from "../src/interpret.js";
+import { requestId } from "../src/keys.js";
+import { WALKER_LANGUAGE_VERSION, resolvePins, type RunPins } from "../src/pins.js";
+import { SimHandler } from "../src/sim.js";
+import { Journal, type JournalEntry } from "../src/journal.js";
+import { EffectError, EffectRefused, RunReleased, type EffectContext } from "../src/effects.js";
+
+/** Collect what a program logged. A program has no return value: its outcome is what it did. */
+const logged: unknown[][] = [];
+const sink = (line: { scope: string; values: readonly unknown[] }) => {
+  logged.push([...line.values]);
+};
+
+let pass = 0;
+const ok = (name: string, cond: boolean, extra?: unknown) => {
+  if (!cond) throw new Error(`FAIL: ${name}${extra !== undefined ? ` - ${JSON.stringify(extra)}` : ""}`);
+  pass++;
+  console.log(`  ok ${name}`);
+};
+
+const keysOf = (j: Journal) =>
+  j.entries().map((e) => `${e.scope}/${e.name === "" ? e.kind : `${e.kind}:${e.name}`}#${e.occurrence}`);
+
+// ---- 1) a real program runs -------------------------------------------------------------------
+
+const PROGRAM = `
+const team = channel("feat-auth");
+const planner = await spawn("planner", { worktree: "wt-1", join: [team] });
+const builder = await spawn("builder", { worktree: "wt-1", join: [team] });
+
+await turn(planner, { name: "draft-plan" });
+
+const approval = await checkpoint("approve-plan", "Approve the plan?", { timeout: "10m", onExpiry: "proceed" });
+if (approval.status === "expired") {
+  await notify([planner], { decision: "approve-plan", outcome: "auto-proceeded" });
+}
+
+let r = await turn(builder, { name: "build" });
+let rounds = 0;
+while (r.status === "blocked") {
+  rounds = rounds + 1;
+  await turn(planner, { name: "unblock" });
+  r = await turn(builder, { name: "build" });
+}
+`;
+
+const SCRIPT = {
+  turns: {
+    "draft-plan": { status: "done" } as const,
+    build: [{ status: "blocked" }, { status: "done" }] as const,
+    unblock: { status: "done" } as const,
+  },
+  checkpoints: { "approve-plan": { status: "resolved", value: true, at: 0 } as const },
+  clock: { start: 1_000_000 },
+};
+
+let firstJournal: Journal;
+// Every replay below is a resume and carries the pins the recorded run was pinned to: re-resolving
+// them would put the replay on this host's clock and a re-seeded PRNG, silently.
+let firstPins: RunPins;
+{
+  const r = await run(PROGRAM, { runId: "r-1", handler: new SimHandler(SCRIPT) });
+  firstJournal = r.journal;
+  firstPins = r.pins;
+  const keys = keysOf(r.journal);
+  ok("the program ran to completion", keys.length > 0);
+  ok(
+    "and journalled the steps under their names, in the order they ran",
+    JSON.stringify(keys) ===
+      JSON.stringify([
+        "/spawn:planner#0",
+        "/spawn:builder#0",
+        "/turn:draft-plan#0",
+        "/checkpoint:approve-plan#0",
+        "/turn:build#0",
+        "/turn:unblock#0",
+        "/turn:build#1",
+      ]),
+    keys,
+  );
+  ok("the retry loop gave the second build its own occurrence", keys.includes("/turn:build#1"));
+  ok("a resolved checkpoint did not take the expired branch", !keys.some((k) => k.startsWith("/notify")));
+  ok("every entry settled", r.journal.entries().every((e) => e.state === "settled"));
+}
+
+// ---- 2) resume performs NO effect it already has ------------------------------------------------
+
+{
+  // An EMPTY script: the simulator refuses every unscripted effect, so reaching the end proves
+  // that nothing was re-performed. This is the claim the whole durability design rests on.
+  const replayed = new Journal({ run: "r-1", entries: firstJournal.entries() });
+  const empty = new SimHandler({});
+  const r = await resume(PROGRAM, replayed, { runId: "r-1", pins: firstPins, handler: empty });
+  // The proof was real and IMPLICIT: an empty script refuses every unscripted effect, so reaching
+  // this line meant nothing re-ran. Written as `true` it was indistinguishable from decoration, so
+  // it now counts what the handler actually did rather than relying on the absence of a throw.
+  ok("a resumed run performs ZERO effects", empty.performed().length === 0, empty.performed());
+  ok(
+    "and the journal is unchanged: no new entries, no re-runs",
+    JSON.stringify(keysOf(r.journal)) === JSON.stringify(keysOf(firstJournal)),
+    keysOf(r.journal),
+  );
+}
+
+// ---- 3) a failure is durable too, and a program that catches it carries on ------------------------
+
+{
+  // The agent dies on the second build. This program has no handler for that, so the run fails.
+  const crashed = new SimHandler({ ...SCRIPT, faults: [{ at: "turn:build#1", kind: "agent-down" }] });
+  let failed = false;
+  let partial: Journal | null = null;
+  try {
+    await run(PROGRAM, { runId: "r-3", handler: crashed });
+  } catch (e) {
+    failed = e instanceof EffectError && e.kind === "agent-down";
+    partial = (e as EffectError & { journal?: Journal }).journal ?? null;
+  }
+  ok("an injected agent death fails the run", failed);
+  void partial;
+
+  // The retry pattern from the design doc's D1: a loop plus try/catch, standing in for the
+  // `rescue` keyword. Each attempt gets a fresh occurrence, so the retry re-runs by construction
+  // rather than by anything unwinding the journal.
+  const RETRY = `
+let builder = await spawn("builder", { worktree: "wt-1" });
+let built = null;
+for (let attempt = 0; attempt < 3; attempt = attempt + 1) {
+  try {
+    built = await turn(builder, { name: "build" });
+    break;
+  } catch (e) {
+    if (e.kind !== "agent-down") { throw e; }
+    builder = await spawn("builder", { worktree: "wt-1" });
+  }
+}
+log(built.status);
+`;
+  logged.length = 0;
+  const r = await run(RETRY, {
+    runId: "r-3b",
+    onLog: sink,
+    handler: new SimHandler({
+      turns: { build: [{ status: "done" }, { status: "done" }] },
+      faults: [{ at: "turn:build#0", kind: "agent-down" }],
+    }),
+  });
+  ok("a loop plus try/catch recovers from a death, with no rescue keyword", (logged[0] ?? [])[0] === "done", logged[0]);
+  const keys = keysOf(r.journal);
+  ok(
+    "the failed attempt and the retry are separate journal entries",
+    keys.includes("/turn:build#0") && keys.includes("/turn:build#1"),
+    keys,
+  );
+  ok(
+    "the failed attempt is recorded as failed, not erased",
+    r.journal.entries().some((e) => e.kind === "turn" && e.occurrence === 0 && e.status === "failed"),
+  );
+
+  // And it replays: the recorded failure is re-thrown, the catch runs again, the retry replays.
+  const again = new Journal({ run: "r-3b", entries: r.journal.entries() });
+  logged.length = 0;
+  await resume(RETRY, again, { runId: "r-3b", pins: r.pins, handler: new SimHandler({}), onLog: sink });
+  ok("a recovered run replays end to end with no effects performed", (logged[0] ?? [])[0] === "done", logged[0]);
+}
+
+// ---- 4) concurrency: two branches, one step name ----------------------------------------------------
+
+{
+  const CONCURRENT = `
+const a = await spawn("reviewer", { role: "security" });
+const b = await spawn("reviewer", { role: "perf" });
+const out = await parallel({
+  security: () => turn(a, { name: "review" }),
+  perf: () => turn(b, { name: "review" }),
+}, { name: "reviews" });
+`;
+  const r = await run(CONCURRENT, {
+    runId: "r-4",
+    handler: new SimHandler({ turns: { review: [{ status: "done" }, { status: "done" }] } }),
+  });
+  const keys = keysOf(r.journal);
+  ok(
+    "the same step name in two branches gets two distinct keys",
+    keys.includes("/parallel:reviews#0/b:security/turn:review#0") &&
+      keys.includes("/parallel:reviews#0/b:perf/turn:review#0"),
+    keys,
+  );
+  ok("and neither branch collided onto the other's occurrence", new Set(keys).size === keys.length);
+
+  // The same emptiness proof, now for a concurrent program: replay must touch no handler.
+  const again = new Journal({ run: "r-4", entries: r.journal.entries() });
+  const emptyC = new SimHandler({});
+  await resume(CONCURRENT, again, { runId: "r-4", pins: r.pins, handler: emptyC });
+  ok("a concurrent run replays performing ZERO effects", emptyC.performed().length === 0, emptyC.performed());
+}
+
+// ---- 5) fanOut keys by item, not by index -------------------------------------------------------------
+
+{
+  const FAN = `
+const t = channel("t");
+const reviews = await fanOut(
+  ["security", "perf"],
+  async (lens) => turn(await spawn("reviewer", { role: lens, join: [t] }), { name: "review" }),
+  { name: "reviews", key: (lens) => lens },
+);
+`;
+  const r = await run(FAN, {
+    runId: "r-5",
+    handler: new SimHandler({ turns: { review: [{ status: "done" }, { status: "done" }] } }),
+  });
+  const keys = keysOf(r.journal);
+  ok(
+    "each fan-out branch is namespaced by its key",
+    keys.includes("/fanOut:reviews#0/b:security/turn:review#0") &&
+      keys.includes("/fanOut:reviews#0/b:perf/turn:review#0"),
+    keys,
+  );
+}
+
+// ---- 6) fanOut refuses an unstable key -----------------------------------------------------------------
+
+{
+  const BAD = `
+const out = await fanOut([{ n: 1 }, { n: 2 }], async (i) => turn(await spawn("r"), { name: "review" }), { name: "reviews" });
+`;
+  let threw = "";
+  try {
+    await run(BAD, { runId: "r-6", handler: new SimHandler({ turns: { review: { status: "done" } } }) });
+  } catch (e) {
+    threw = (e as Error).message;
+  }
+  ok("items with no stable key are refused at run time", threw.includes("L3021"), threw.slice(0, 120));
+
+  // The width control: the same mechanism, one variable changed. Items that DO carry a string id
+  // must run, or the rule is refusing the documented default along with the broken case.
+  const GOOD = `
+const out = await fanOut(
+  [{ id: "security" }, { id: "perf" }],
+  async (i) => turn(await spawn("r", { role: i.id }), { name: "review" }),
+  { name: "reviews" },
+);
+`;
+  const good = await run(GOOD, {
+    runId: "r-6b",
+    handler: new SimHandler({ turns: { review: [{ status: "done" }, { status: "done" }] } }),
+  });
+  const gk = keysOf(good.journal);
+  ok(
+    "items carrying a string id key the branches by that id, with no key function",
+    gk.includes("/fanOut:reviews#0/b:security/turn:review#0") && gk.includes("/fanOut:reviews#0/b:perf/turn:review#0"),
+    gk,
+  );
+
+  // And duplicate keys must be refused: two branches sharing a namespace would overwrite each
+  // other's steps, which is the same defect as having no key at all.
+  const DUP = `
+const out = await fanOut(
+  [{ id: "same" }, { id: "same" }],
+  async (i) => turn(await spawn("r"), { name: "review" }),
+  { name: "reviews" },
+);
+`;
+  let dup = "";
+  try {
+    await run(DUP, { runId: "r-6c", handler: new SimHandler({ turns: { review: { status: "done" } } }) });
+  } catch (e) {
+    dup = (e as Error).message;
+  }
+  ok("duplicate branch keys are refused before any branch launches", dup.includes("L3024") && dup.includes("duplicate"), dup.slice(0, 100));
+}
+
+// ---- 7) a changed input diverges rather than replaying the wrong answer -------------------------------------
+
+{
+  // The checkpoint prompt is what a human read, so changing it invalidates the recorded approval.
+  const EDITED = PROGRAM.replace("Approve the plan?", "Approve the REVISED plan?");
+  const j = new Journal({ run: "r-1", entries: firstJournal.entries() });
+  let div: RunDivergence | null = null;
+  try {
+    await resume(EDITED, j, { runId: "r-1", pins: firstPins, handler: new SimHandler({}) });
+  } catch (e) {
+    div = e instanceof RunDivergence ? e : null;
+  }
+  ok("editing what the human saw diverges the resume", div !== null);
+  ok("and the error names the exact step", div?.stepKey === "/checkpoint:approve-plan#0", div?.stepKey);
+  ok("and offers fork as the repair", div?.message.includes('fork(run, "/checkpoint:approve-plan#0")') === true);
+
+  // A `catch` never sees the divergence. Measured before the rule: the resume below caught
+  // `{ code: "L4000", kind: "host" }`, logged past it, and performed a NEW effect against the
+  // journal it had just diverged from.
+  const performed: string[] = [];
+  class Counting extends SimHandler {
+    override async sleep(req: Parameters<SimHandler["sleep"]>[0], ctx: Parameters<SimHandler["sleep"]>[1]) {
+      performed.push(req.duration);
+      return await super.sleep(req, ctx);
+    }
+  }
+  const first = await run(`await sleep("1m")`, { runId: "r-div", handler: new SimHandler({}) });
+  const j2 = new Journal({ run: "r-div", entries: first.journal.entries() });
+  let swallowed: unknown;
+  try {
+    await resume(
+      `try { await sleep("2m") } catch (e) { log("caught", e.code) }\nawait sleep("3m", { name: "later" })`,
+      j2,
+      { runId: "r-div", pins: first.pins, handler: new Counting() },
+    );
+  } catch (e) {
+    swallowed = e;
+  }
+  ok("a workflow's catch does not swallow a divergence", swallowed instanceof RunDivergence, `${(swallowed as Error)?.name}`);
+  ok("and no effect was performed past it: the handler was asked for nothing and the journal has no later step",
+    performed.length === 0 && j2.entries().every((e) => e.name !== "later"), { performed, entries: j2.entries().map((e) => e.name) });
+
+  // The inverse control: a `catch` still catches an ordinary program error, and the run goes on
+  // performing effects after it. Without this cell "uncatchable divergence" could widen to "catch
+  // is broken" with nothing red.
+  performed.length = 0;
+  const ordinary = await run(
+    `try { throw { code: "E-mine" } } catch (e) { log("caught", e.code) }\nawait sleep("3m", { name: "later" })`,
+    { runId: "r-ord", handler: new Counting() },
+  );
+  ok("a catch still catches an ordinary program error and the run performs the effect after it",
+    performed.join(",") === "3m" && ordinary.journal.entries().some((e) => e.name === "later" && e.status === "ok"),
+    { performed, entries: ordinary.journal.entries().map((e) => [e.name, e.status]) });
+
+  // AND `finally` IS BOUND BY THE SAME LAW. Measured before the rule: a finalizer performed a NEW
+  // effect after a divergence, and a `finally { throw ... }` REPLACED the divergence, which an
+  // outer catch then swallowed as an ordinary error — the two doors §7 just closed, reopened by
+  // the cleanup clause. An uncatchable fault now unwinds past the finalizer too.
+  performed.length = 0;
+  logged.length = 0;
+  {
+    const j3 = new Journal({ run: "r-div", entries: first.journal.entries() });
+    let out: unknown;
+    try {
+      await resume(
+        `try { await sleep("2m") } finally { log("cleanup"); await sleep("4m", { name: "cleanup" }) }`,
+        j3,
+        { runId: "r-div", pins: first.pins, handler: new Counting(), onLog: sink },
+      );
+    } catch (e) {
+      out = e;
+    }
+    ok("a `finally` does not run past a divergence: no effect, no log, and the divergence survives",
+      out instanceof RunDivergence && performed.length === 0 && logged.length === 0
+        && j3.entries().every((e) => e.name !== "cleanup"),
+      { out: `${(out as Error)?.name}`, performed, logged });
+  }
+  {
+    const j4 = new Journal({ run: "r-div", entries: first.journal.entries() });
+    let out: unknown;
+    try {
+      await resume(
+        `try { await sleep("2m") } finally { throw { code: "mine" } }`,
+        j4,
+        { runId: "r-div", pins: first.pins, handler: new Counting() },
+      );
+    } catch (e) {
+      out = e;
+    }
+    ok("and a `finally { throw }` cannot replace a divergence with a catchable error",
+      out instanceof RunDivergence, `${(out as Error)?.name} ${String((out as { code?: string })?.code)}`);
+  }
+  // The inverse control, JavaScript's own meaning: for ORDINARY completions the finalizer runs,
+  // and its abrupt completion replaces the try's (measured before the fix: `try { return 1 }
+  // finally { return 2 }` returned 1 — the finalizer's completion was discarded).
+  performed.length = 0;
+  logged.length = 0;
+  {
+    const r = await run(
+      `function f() { try { return 1; } finally { log("ran"); return 2; } }
+try { throw { code: "E" } } catch (e) { log("caught") } finally { await sleep("5m", { name: "tidy" }) }
+log("f", f());`,
+      { runId: "r-fin", handler: new Counting(), onLog: sink },
+    );
+    ok("an ordinary path still runs its finalizer, performs its effects, and a finally return wins",
+      performed.join(",") === "5m" && r.journal.entries().some((e) => e.name === "tidy" && e.status === "ok")
+        && JSON.stringify(logged) === '[["caught"],["ran"],["f",2]]',
+      { performed, logged });
+  }
+}
+
+// ---- 8) an edit to an observation-stopping limit DOES diverge -----------------------------------
+
+/**
+ * This section used to claim the opposite, and asserted it with a hardcoded `true`.
+ *
+ * Both halves were wrong. The claim inverted when the hash rule was corrected: a timeout STOPS
+ * OBSERVATION, so a record made under 10m cannot answer what a 30m wait would have seen, and
+ * editing it has to diverge rather than replay. And the assertion could not have noticed either
+ * way, because it never looked at the resume it had just performed. A test that passes `true` is
+ * a comment with a green tick next to it.
+ */
+{
+  const RETIMED = PROGRAM.replace('timeout: "10m"', 'timeout: "30m"');
+  const j = new Journal({ run: "r-1", entries: firstJournal.entries() });
+  let diverged: unknown;
+  try {
+    await resume(RETIMED, j, { runId: "r-1", pins: firstPins, handler: new SimHandler({}) });
+  } catch (e) {
+    diverged = e;
+  }
+  ok("editing a timeout diverges rather than replaying", diverged instanceof RunDivergence, String(diverged).slice(0, 70));
+  ok(
+    "and it names the checkpoint whose observation window moved",
+    (diverged as RunDivergence)?.stepKey?.includes("checkpoint"),
+    (diverged as RunDivergence)?.stepKey,
+  );
+}
+
+// ---- 9) time advances only at effect boundaries ---------------------------------------------------------------
+
+{
+  const CLOCK = `
+const a = await spawn("x");
+const t0 = now();
+const t1 = now();
+await sleep("2h");
+const t2 = now();
+log(t0, t1, t2);
+`;
+  logged.length = 0;
+  await run(CLOCK, { runId: "r-9", handler: new SimHandler({ clock: { start: 0 } }), onLog: sink });
+  const [t0, t1, t2] = (logged[0] ?? []) as number[];
+  const t = { t0: t0 as number, t1: t1 as number, t2: t2 as number };
+  ok("two reads with no effect between them return the same instant", t.t0 === t.t1, t);
+  ok("and a sleep moves the clock by its full duration", t.t2 - t.t1 === 2 * 3_600_000, t);
+}
+
+// ---- 10) randomness is deterministic under replay ----------------------------------------------------------------
+
+{
+  const RAND = `
+const a = await spawn("x");
+await turn(a, { name: "go" });
+log(random());
+`;
+  const script = { turns: { go: { status: "done" } as const } };
+  logged.length = 0;
+  const first = await run(RAND, { runId: "r-10", seed: "seed-1", handler: new SimHandler(script), onLog: sink });
+  const firstDraw = (logged[0] ?? [])[0];
+  logged.length = 0;
+  await resume(
+    RAND,
+    new Journal({ run: "r-10", entries: first.journal.entries() }),
+    { runId: "r-10", pins: first.pins, handler: new SimHandler({}), onLog: sink },
+  );
+  const replayDraw = (logged[0] ?? [])[0];
+  ok("a replayed run draws the same random value", firstDraw === replayDraw, { firstDraw, replayDraw });
+  logged.length = 0;
+  await run(RAND, { runId: "r-10", seed: "seed-2", handler: new SimHandler(script), onLog: sink });
+  ok("a different seed draws a different value", firstDraw !== (logged[0] ?? [])[0]);
+}
+
+// ---- 11) ?? is Orc's otherwise -----------------------------------------------------------------------------------
+
+{
+  const OTHERWISE = `
+const a = await spawn("x");
+const reply = await wait(replied(a), { name: "await-reply", timeout: "20m" });
+const chased = reply ?? await turn(a, { name: "chase" });
+log(chased.status);
+`;
+  logged.length = 0;
+  await run(OTHERWISE, {
+    runId: "r-11",
+    onLog: sink,
+    handler: new SimHandler({
+      events: { "await-reply": [null] },
+      turns: { chase: { status: "done" } },
+    }),
+  });
+  ok("a timed-out event resolves null and ?? takes the fallback", (logged[0] ?? [])[0] === "done", logged[0]);
+}
+
+// ---- 12) values crossing an effect boundary are frozen ------------------------------------------------------------
+
+{
+  const FREEZE = `
+const a = await spawn("x");
+const r = await turn(a, { name: "go" });
+let caught = "none";
+try {
+  r.status = "tampered";
+} catch (e) {
+  caught = "frozen";
+}
+log(caught, r.status);
+`;
+  logged.length = 0;
+  await run(FREEZE, {
+    runId: "r-12",
+    onLog: sink,
+    handler: new SimHandler({ turns: { go: { status: "done" } } }),
+  });
+  const v = { caught: (logged[0] ?? [])[0] as string, status: (logged[0] ?? [])[1] as string };
+  // Whether the assignment throws or is silently ignored, what must hold is that the recorded
+  // result cannot be edited underneath the journal.
+  ok("a journalled result cannot be mutated by the program", v.status === "done", v);
+}
+
+// ---- 13) an edited sleep duration diverges rather than keeping the old path -------------------
+
+/**
+ * This suite was 29 checks green while this was broken, which is the reason the section exists.
+ *
+ * §5.12 puts `sleep.duration` on the HASHED side: it determines the recorded fact, because a
+ * resumed run reads the elapsed time back through the run clock and branches on it. The
+ * interpreter hashed `null`, so editing 1h to 1m left the recorded hash matching and the resumed
+ * run silently kept the path the OLD duration had chosen. No divergence, no error, wrong branch.
+ *
+ * Nothing here tested it because every existing resume test replays a program it did not edit.
+ * A durability suite that never edits the source cannot see a hashing bug at all.
+ */
+{
+  const timed = (d: string) => `
+const t0 = now();
+await sleep("${d}", { name: "pause" });
+if (now() - t0 >= 1800000) { await sleep("1s", { name: "long-path" }); }
+else { await sleep("1s", { name: "short-path" }); }
+`;
+  const live = await run(timed("1h"), { runId: "r-13", handler: new SimHandler({ clock: { start: 0 } }) });
+  ok("a long sleep takes the long path", keysOf(live.journal).some((k) => k.includes("long-path")), keysOf(live.journal));
+
+  let diverged: unknown;
+  try {
+    await resume(timed("1m"), live.journal, { runId: "r-13", pins: live.pins, handler: new SimHandler({ clock: { start: 0 } }) });
+  } catch (e) {
+    diverged = e;
+  }
+  ok("editing the duration diverges instead of replaying", diverged instanceof RunDivergence, String(diverged).slice(0, 60));
+  // Pinned on the step, not merely on the class: divergence must be reported for the SLEEP whose
+  // input changed, not for whatever the run happened to reach first.
+  ok("and it names the sleep as the changed step", (diverged as RunDivergence)?.stepKey?.includes("sleep:pause"), (diverged as RunDivergence)?.stepKey);
+}
+
+// ---- 14) the raw outcome is journalled and today's policy decides the disposition --------------
+
+/**
+ * The reapply half of the hash rule, which was prose for a day and is now executable.
+ *
+ * A handler reports WHAT HAPPENED and never whether it throws. The journal holds that raw fact,
+ * and `onExpiry` is applied from current source after the journal is consulted, on the live path
+ * and the replay path alike. Written the other way round the rule cannot work: a handler that
+ * throws L4007 makes the journal record `failed`, and a replay under an edited `proceed` then has
+ * nothing but an error to reinterpret.
+ *
+ * So the test is a MIGRATION, not a replay: edit only the disposition, change nothing about the
+ * recorded fact, and require the resumed run to take the other path.
+ */
+{
+  const gate = (onExpiry: string) => `
+const c = await checkpoint("gate", "ok?", { timeout: "1m", onExpiry: "${onExpiry}" });
+if (c.status === "expired") { await sleep("1s", { name: "continued" }); }
+`;
+  const script = { checkpoints: { gate: { status: "expired" as const, by: "sim" } }, clock: { start: 0 } };
+
+  const live = await run(gate("proceed"), { runId: "r-14", handler: new SimHandler(script) });
+  ok("under proceed the program continues", keysOf(live.journal).some((k) => k.includes("continued")));
+
+  const recorded = live.journal.entries().find((e) => e.kind === "checkpoint")?.result;
+  // Pinned on the RAW shape, not on the program-facing one: if the handler's disposition ever gets
+  // baked in here, every reapply below becomes unreachable and this is the assertion that says so.
+  ok(
+    "the journal holds the RAW outcome, not the program's view",
+    JSON.stringify(recorded).includes('"outcome":"expired"'),
+    recorded,
+  );
+
+  let threw: unknown;
+  try {
+    await resume(gate("fail"), live.journal, { runId: "r-14", pins: live.pins, handler: new SimHandler(script) });
+  } catch (e) {
+    threw = e;
+  }
+  ok("editing onExpiry to fail makes the resume throw", (threw as { code?: string })?.code === "L4007", String(threw).slice(0, 60));
+}
+
+// ---- 14a) L4007 says where the expired deadline came from --------------------------------------
+//
+// The same expiry under the checkpoint's own `timeout` and under the run's default printed the same
+// sentence, so a reader could not tell which deadline to raise.
+{
+  const expire = async (opts: string) => {
+    try {
+      await run(`await checkpoint("gate", "ok?"${opts});`, { runId: "r-14a", handler: new SimHandler({ checkpoints: { gate: { status: "expired" } } }) });
+    } catch (e) { return e as { code?: string; message?: string }; }
+    return undefined;
+  };
+  const own = await expire(', { timeout: "3s" }');
+  ok("an expiry under the checkpoint's own timeout names that timeout in L4007",
+    own?.code === "L4007" && (own.message ?? "").includes('The deadline came from its own timeout of "3s".') && (own.message ?? "").includes("raise its timeout")
+      && !(own.message ?? "").includes("run's default"), own?.message);
+  const dflt = await expire("");
+  ok("an expiry with no timeout of its own names the run's default in L4007",
+    dflt?.code === "L4007" && (dflt.message ?? "").includes("It sets no timeout of its own, so the deadline came from the run's default.")
+      && (dflt.message ?? "").includes("give it a timeout of its own, or start the run with a longer default"), dflt?.message);
+}
+
+// ---- 14b) the record EVERY non-escalating checkpoint writes ------------------------------------
+//
+// Three sites write an `attempts` array: the live escalation, the recovery of an open hop, and this
+// one, which every checkpoint that does not escalate takes. An engineering review severed this
+// third site, writing `settled: "expired"` in place of the outcome, and all fifteen suites stayed
+// green, because the outcome was only ever read on the escalating chain. It is the most travelled
+// of the three and it was the unguarded one.
+{
+  const PLAIN = `
+const c = await checkpoint("gate", "ok?", { timeout: "1m" });
+log(c.status);
+`;
+  const r = await run(PLAIN, {
+    runId: "r-14b",
+    handler: new SimHandler({ checkpoints: { gate: { status: "resolved", value: true, by: "d" } }, clock: { start: 0 } }),
+  });
+  const rec = (r.journal.entries()[0]?.result as { attempts?: { attempt: number; requestId: string; settled?: string; to?: string | null }[] })?.attempts ?? [];
+  ok(
+    "a checkpoint that never escalates records one attempt, what it settled as, and no recipient",
+    rec.length === 1 && rec[0]?.attempt === 0 && rec[0]?.settled === "resolved" && rec[0]?.to === undefined,
+    rec,
+  );
+}
+
+// ---- 15) escalation: one entry, two identities -------------------------------------------------
+
+/**
+ * The program made ONE call, so there is one journal entry: the interpreter owns key allocation
+ * and a second mint must not become a second occurrence. But two mints need two IDENTITIES, and
+ * both have to be derivable BEFORE their mint, or a crash between minting and recording leaves
+ * live work that nothing in the journal names.
+ *
+ * The failure this replaces had no third answer: reusing one id makes the second mint resolve as
+ * cached against the first attempt, and inventing one at mint time breaks the rule that an
+ * identity is journalled before dispatch.
+ */
+{
+  const ESCALATE = `
+const c = await checkpoint("gate", "Approve?", { timeout: "1m", onExpiry: "escalate", to: "david" });
+log(c.status);
+`;
+  const logs: unknown[] = [];
+  // Capture the id the HANDLER was actually given at each mint. Asserting on the recorded chain
+  // alone is not enough: the chain is written from the derivation, so both mints could receive the
+  // SAME identity and the record would still show two different strings. What matters is what
+  // arrived at the far side, which is the thing a resumed run has to reproduce.
+  const seen: string[] = [];
+  const sim = new SimHandler({
+      // First mint expires, the escalated one is answered.
+      checkpoints: { gate: [{ status: "expired", by: "sim" }, { status: "resolved", value: true, by: "david" }] },
+      clock: { start: 0 },
+  });
+  const inner = sim.checkpoint.bind(sim);
+  (sim as unknown as { checkpoint: unknown }).checkpoint = async (req: never, ctx: { requestId: string }) => {
+    seen.push(ctx.requestId);
+    return inner(req, ctx as never);
+  };
+  const r = await run(ESCALATE, { runId: "r-15", onLog: (l) => logs.push(l.values[0]), handler: sim });
+
+  ok("the two mints were issued under DIFFERENT identities", seen.length === 2 && seen[0] !== seen[1], seen);
+
+  const cps = r.journal.entries().filter((e) => e.kind === "checkpoint");
+  ok("escalation stays inside ONE journal entry", cps.length === 1, cps.length);
+  ok("and that entry is occurrence 0, not a second occurrence", cps[0]?.occurrence === 0);
+
+  const attempts = (cps[0]?.result as { attempts?: { attempt: number; requestId: string; settled?: string; to?: string | null }[] })?.attempts ?? [];
+  ok("the entry records both attempts", attempts.length === 2, attempts);
+  ok(
+    "each attempt has its OWN identity, derivable before its mint",
+    attempts[0]?.requestId !== undefined && attempts[1]?.requestId !== undefined
+      && attempts[0]?.requestId !== attempts[1]?.requestId,
+    attempts.map((a) => a.requestId),
+  );
+  ok("the program sees the escalated answer", logs[0] === "resolved", logs);
+  // The rest of each attempt's record, which the cells above never read: the identities can be
+  // perfect while the row says the wrong thing happened. Nothing in this package consumes
+  // `settled` or `to` today, so a drift there is silent until the first consumer trusts it, and
+  // both were measured as unasserted: attempt 0's `settled` flipped from `expired` to `resolved`,
+  // and the escalation's `to` dropped entirely, each left every lang suite green. The record's
+  // whole job is to say what happened to whom, so it is asserted here rather than believed.
+  ok(
+    "each attempt records what it settled as, and the escalation records who it went to",
+    attempts[0]?.settled === "expired" && attempts[1]?.settled === "resolved" && attempts[1]?.to === "david",
+    attempts,
+  );
+
+  // THE LINE I FLAGGED AS WEAKEST, now asserted rather than believed. Attempt 1's identity is
+  // derived from the checkpoint's input projection; if that projection ever drifts from the value
+  // the entry is actually keyed by, the id stops being a function of its step and recovery would
+  // reissue under something the far side never saw. Nothing else in the suite would notice.
+  const entryHash = cps[0]?.inputHash;
+  const derivedFromEntry = requestId("r-15", { scope: [], kind: "checkpoint", name: "gate", occurrence: 0 }, entryHash ?? "", 1);
+  ok(
+    "attempt 1's id is derived from the entry's OWN inputHash",
+    derivedFromEntry === attempts[1]?.requestId,
+    { derivedFromEntry, recorded: attempts[1]?.requestId, entryHash },
+  );
+}
+
+// ---- 16) the three recovery rules a reviewer found unguarded ------------------------------------
+
+{
+  // (a) A COMPLETED ESCALATION TERMINATES AS EXPIRED, not as a throw. One hop, and a second expiry
+  // settles exactly as `proceed` would. Treating escalate as a throwing disposition made a
+  // finished chain raise L4007, which is the opposite of what the stop rule says.
+  const ESC = `
+const c = await checkpoint("gate", "Approve?", { timeout: "1m", onExpiry: "escalate", to: "david" });
+log(c.status);
+`;
+  const logs: unknown[] = [];
+  let threw: unknown;
+  try {
+    await run(ESC, {
+      runId: "r-16a",
+      onLog: (l) => logs.push(l.values[0]),
+      handler: new SimHandler({
+        checkpoints: { gate: [{ status: "expired", by: "s" }, { status: "expired", by: "s" }] },
+        clock: { start: 0 },
+      }),
+    });
+  } catch (e) {
+    threw = e;
+  }
+  ok("a twice-expired escalation does not throw", threw === undefined, String(threw).slice(0, 60));
+  ok("it settles as expired and the program decides", logs[0] === "expired", logs);
+}
+
+{
+  // (b) RECOVERY SUBMITS UNDER THE RECORDED IDENTITY. Re-deriving agrees whenever nothing moved,
+  // which is why it read as correct; the whole point of writing the id down is the case where it
+  // does not. Plant a different id on the pending row and require the handler to see THAT.
+  const P = `await turn(await spawn("a", { name: "a" }), { name: "go" });\n`;
+  const live = await run(P, { runId: "r-16b", handler: new SimHandler({ turns: { go: { status: "done" } } }) });
+  const entries = live.journal.entries().map((e) =>
+    e.kind === "turn" ? { ...e, state: "pending" as const, status: undefined, requestId: "PLANTED-ID" } : e,
+  );
+
+  const seen: string[] = [];
+  const sim = new SimHandler({ turns: { go: { status: "done" } } });
+  const innerTurn = sim.turn.bind(sim);
+  (sim as unknown as { turn: unknown }).turn = async (req: never, ctx: { requestId: string }) => {
+    seen.push(ctx.requestId);
+    return innerTurn(req, ctx as never);
+  };
+  await run(P, { runId: "r-16b", handler: sim, pins: live.pins, journal: new Journal({ run: "r-16b", entries }) });
+  ok("a pending effect is reissued under the RECORDED id", seen.includes("PLANTED-ID"), seen);
+}
+
+{
+  // (c) THE PENDING ROW NAMES THE OPEN ATTEMPT BEFORE THE HOP IS ISSUED. Without this a crash
+  // after the second mint leaves the far side holding work under an identity the journal never
+  // recorded, and recovery reissues the first attempt and collects its cached expiry.
+  const ESC = `await checkpoint("gate", "?", { timeout: "1m", onExpiry: "escalate", to: "d" });\n`;
+  // Read the JOURNAL ROW during the second mint. An earlier version of this compared the id passed
+  // to the handler against the id in the recorded chain, and both come from the same derivation:
+  // deleting the journal write left every check green. The property is about the ROW, so the test
+  // has to look at the row, while the hop is in flight and before anything settles.
+  const journal = new Journal({ run: "r-16c" });
+  let rowIdAtSecondMint: string | undefined;
+  const sim = new SimHandler({
+    checkpoints: { gate: [{ status: "expired", by: "s" }, { status: "resolved", value: 1, by: "d" }] },
+    clock: { start: 0 },
+  });
+  const innerCp = sim.checkpoint.bind(sim);
+  let call = 0;
+  const r = await run(ESC, {
+    runId: "r-16c",
+    journal,
+    handler: new Proxy(sim, {
+      get(t, prop, recv) {
+        if (prop !== "checkpoint") return Reflect.get(t, prop, recv);
+        return async (req: never, ctx: { requestId: string; key: unknown }) => {
+          call += 1;
+          if (call === 2) {
+            rowIdAtSecondMint = journal.entries().find((e) => e.kind === "checkpoint")?.requestId;
+          }
+          return innerCp(req, ctx as never);
+        };
+      },
+    }) as never,
+  });
+  const chain = (r.journal.entries()[0]?.result as { attempts?: { requestId: string }[] })?.attempts ?? [];
+  ok(
+    "the pending ROW names attempt 1 while the hop is in flight",
+    rowIdAtSecondMint !== undefined && rowIdAtSecondMint === chain[1]?.requestId,
+    { rowIdAtSecondMint, recorded: chain[1]?.requestId },
+  );
+}
+
+// ---- 17) recovery completes the OPEN attempt; it does not replay the hop ------------------------
+
+/**
+ * The escalation chain was recoverable in the sense that a resumed run finished. It was not
+ * recoverable in the sense that the run told the truth about what happened.
+ *
+ * Two failures, one root. `perform` always ran the live body, so a run resuming with attempt 1 open
+ * called the handler, saw an expiry, and escalated AGAIN under the same identity: the far side
+ * served its own cached expiry back and the interpreter counted it as a second observation, so the
+ * one-hop stop rule was satisfied on paper by a hop that never happened. And the non-escalating
+ * return arm wrote `attempt: 0` as a literal, so recovering an attempt-1 mint that RESOLVED erased
+ * the hop from the record and left the journal claiming the escalated mint was the original.
+ *
+ * Neither is visible from the outside: the program gets a plausible answer both times. What is
+ * wrong is the journal, which is the only thing a later fork, migration or audit can read. So the
+ * assertions here are about the handler call count and the recorded chain, not the return value.
+ */
+{
+  const ESC = `
+const c = await checkpoint("gate", "Approve?", { timeout: "1m", onExpiry: "escalate", to: "david" });
+log(c.status);
+`;
+  // THE CRASHED JOURNAL IS TAKEN, NOT WRITTEN. An earlier version of this hand-planted
+  // `{ requestId: id1, attempt: 1 }` onto the row, which tested the recovery logic against a fixture
+  // the test itself authored: deleting the journal write that records the index left every check
+  // below green, because the fixture supplied what the code had stopped storing. So the row is
+  // snapshotted from a REAL run, from inside the second mint, which is exactly the instant a host
+  // can die with work outstanding.
+  let atSecondMint: readonly JournalEntry[] = [];
+  // ...and a SECOND snapshot, taken one instant later: after the escalation attempt's own bind has
+  // completed, but before its terminal settles. `atSecondMint` above is taken as the second call
+  // ENTERS, so it cannot see whether that attempt records anything at all. A security review showed
+  // what that costs: give the escalated call a bind that SUCCEEDS and records nothing
+  // (`{ ...ctx, attempt: 1, bind: async () => {} }` at the reissue site) and the whole package stays
+  // green, 84 checks here and 43 in `sim.smoke`, while a crash between the handler returning and the
+  // terminal has an ACTIVE row with no external reference to rebind to. The sim-side arms cannot see
+  // it either: they prove the handler awaits whatever bind it is handed, and this is the interpreter
+  // handing it a useless one.
+  let afterSecondBind: readonly JournalEntry[] = [];
+  let journalBinds = 0;
+  let bindsBeforeSecond = 0;
+  let bindsDuringSecond = -1;
+  const live = await (async () => {
+    const bare = new Journal({ run: "r-17" });
+    // Count the journal writes the INTERPRETER drives, so the cell below can say the escalation
+    // attempt's bind reached the journal rather than merely that the row carries some fact.
+    const journal = new Proxy(bare, {
+      get(t, prop, recv) {
+        if (prop !== "bind") return Reflect.get(t, prop, recv);
+        return async (...args: Parameters<Journal["bind"]>) => {
+          journalBinds += 1;
+          return t.bind(...args);
+        };
+      },
+    });
+    const sim = new SimHandler({
+      checkpoints: { gate: [{ status: "expired", by: "s" }, { status: "resolved", value: 1, by: "d" }] },
+      clock: { start: 0 },
+    });
+    const innerCp = sim.checkpoint.bind(sim);
+    let call = 0;
+    return await run(ESC, {
+      runId: "r-17",
+      journal,
+      handler: new Proxy(sim, {
+        get(t, prop, recv) {
+          if (prop !== "checkpoint") return Reflect.get(t, prop, recv);
+          return async (req: never, ctx: never) => {
+            call += 1;
+            if (call !== 2) return innerCp(req, ctx);
+            atSecondMint = journal.entries().map((e) => ({ ...e }));
+            bindsBeforeSecond = journalBinds;
+            // Wrap the context the INTERPRETER supplied, so what is measured is the bind the
+            // interpreter passes rather than one this test authored.
+            const supplied = ctx as unknown as { bind: (e: Readonly<Record<string, unknown>>) => Promise<void> };
+            const watched = {
+              ...(ctx as object),
+              bind: async (e: Readonly<Record<string, unknown>>) => {
+                await supplied.bind(e);
+                afterSecondBind = journal.entries().map((x) => ({ ...x }));
+                bindsDuringSecond = journalBinds - bindsBeforeSecond;
+              },
+            };
+            return innerCp(req, watched as never);
+          };
+        },
+      }) as never,
+    });
+  })();
+
+  const chain = (live.journal.entries()[0]?.result as { attempts?: { attempt: number; requestId: string }[] })?.attempts ?? [];
+  const id0 = chain[0]?.requestId as string;
+  const id1 = chain[1]?.requestId as string;
+  ok("the live chain gives two distinct identities to recover from", id0 !== undefined && id1 !== undefined && id0 !== id1, { id0, id1 });
+
+  const openRow = atSecondMint.find((e) => e.kind === "checkpoint");
+  ok("the row a crash would leave behind is still pending", openRow?.state === "pending", openRow);
+  // Both halves, because an id without an index cannot say how much of the chain is spent.
+  ok("and it names the open attempt's identity AND its index", openRow?.requestId === id1 && openRow?.attempt === 1, {
+    requestId: openRow?.requestId,
+    attempt: openRow?.attempt,
+    expected: id1,
+  });
+
+  // The half the row above cannot reach: that the escalation attempt BOUND something, onto the row
+  // that is still active, before it settled. Asserted on the pending state as well as on the fact,
+  // because an external reference that only appears after the terminal is no use to a crash.
+  //
+  // Asserted as a WRITE the interpreter drove, not as a field that happens to be present. `reissueAs`
+  // carries the row forward with `{ ...entry, requestId, attempt }`, so attempt 0's `external`
+  // SURVIVES into attempt 1 and the two are indistinguishable by value: the sim binds the same step
+  // key both times. A cell that only read the field was green under the no-op mutant, measured, which
+  // is why this counts the journal binds the escalation attempt actually caused.
+  const boundRow = afterSecondBind.find((e) => e.kind === "checkpoint");
+  ok(
+    "the escalation attempt drives its OWN journal bind, on the still-active row, before its terminal",
+    bindsDuringSecond === 1 &&
+      boundRow?.state === "pending" &&
+      (boundRow?.external as { simCheckpoint?: unknown } | undefined)?.simCheckpoint !== undefined,
+    { bindsDuringSecond, state: boundRow?.state, external: boundRow?.external, attempt: boundRow?.attempt },
+  );
+
+  /** Exactly what survived the crash, replayed back at the interpreter. */
+  const crashed = () => new Journal({ run: "r-17", entries: atSecondMint });
+
+  for (const [label, outcome, expected] of [
+    ["resolves", { status: "resolved", value: 1, by: "d" }, "resolved"],
+    ["expires", { status: "expired", by: "s" }, "expired"],
+  ] as const) {
+    const seen: string[] = [];
+    const logs: unknown[] = [];
+    const sim = new SimHandler({ checkpoints: { gate: outcome as never }, clock: { start: 0 } });
+    const innerCp = sim.checkpoint.bind(sim);
+    const spied = new Proxy(sim, {
+      get(t, prop, recv) {
+        if (prop !== "checkpoint") return Reflect.get(t, prop, recv);
+        return async (req: never, ctx: { requestId: string }) => {
+          seen.push(ctx.requestId);
+          return innerCp(req, ctx as never);
+        };
+      },
+    });
+
+    const r = await run(ESC, {
+      runId: "r-17", journal: crashed(), pins: live.pins, handler: spied as never, onLog: (l) => logs.push(l.values[0]),
+    });
+
+    // THE COUNT IS THE TEST. One mint is outstanding, so exactly one call completes it. Two calls
+    // means the hop was replayed, and the second one lands on an id the far side already answered.
+    ok(`recovering an open hop that ${label} calls the handler exactly once`, seen.length === 1, seen);
+    ok(`and submits under the RECORDED attempt-1 id`, seen[0] === id1, { saw: seen[0], expected: id1 });
+
+    const rec = (r.journal.entries()[0]?.result as { attempts?: { attempt: number; requestId: string; settled?: string; to?: string | null }[] })?.attempts ?? [];
+    ok(`and the recovered chain still records both attempts`, rec.length === 2, rec);
+    ok(`and attempt 1 stays numbered 1 rather than being relabelled the first`, rec[1]?.attempt === 1 && rec[1]?.requestId === id1, rec);
+    ok(`and attempt 0 keeps its own identity in the record`, rec[0]?.requestId === id0 && rec[0]?.requestId !== rec[1]?.requestId, rec);
+    // The RECOVERY arm writes its own attempts array, and it is a different write site from the live
+    // escalation the cell above section 16 reads. An engineering review severed this one, flipping
+    // attempt 0 to `resolved` and dropping attempt 1's recipient, and every suite stayed green: the
+    // outcome and the recipient were asserted on the live chain only. A resumed run is precisely
+    // when nobody is left to remember what happened, so the record has to carry it here too.
+    ok(
+      `and the recovered chain records that attempt 0 expired, what attempt 1 settled as, and who it went to`,
+      rec[0]?.settled === "expired" && rec[1]?.settled === expected && rec[1]?.to === "david",
+      rec,
+    );
+    ok(`and the program sees ${expected}`, logs[0] === expected, logs);
+  }
+}
+
+// ---- 18) the escalated mint does not ask the far side to escalate -------------------------------
+
+/**
+ * The interpreter owns the one-hop rule, and it can only own it if nobody else is invited to hop.
+ * The second mint carried `onExpiry: "escalate"` verbatim, so a production handler that honours the
+ * disposition on the wire would mint a third attempt under an identity this journal never
+ * allocated: live work nothing can name, which is the exact failure the attempt ids exist to
+ * prevent. The simulator does not read `onExpiry` at all, so no existing test could see this.
+ */
+{
+  const ESC = `await checkpoint("gate", "Approve?", { timeout: "1m", onExpiry: "escalate", to: "david" });\n`;
+  const reqs: { onExpiry?: string; to?: string }[] = [];
+  const sim = new SimHandler({
+    checkpoints: { gate: [{ status: "expired", by: "s" }, { status: "resolved", value: 1, by: "d" }] },
+    clock: { start: 0 },
+  });
+  const innerCp = sim.checkpoint.bind(sim);
+  await run(ESC, {
+    runId: "r-18",
+    handler: new Proxy(sim, {
+      get(t, prop, recv) {
+        if (prop !== "checkpoint") return Reflect.get(t, prop, recv);
+        return async (req: { onExpiry?: string; to?: string }, ctx: never) => {
+          reqs.push(req);
+          return innerCp(req as never, ctx);
+        };
+      },
+    }) as never,
+  });
+
+  ok("the first mint does ask for the escalation", reqs[0]?.onExpiry === "escalate", reqs[0]);
+  ok("the escalated mint does NOT, so the far side cannot hop again", reqs[1]?.onExpiry !== "escalate", reqs[1]);
+  ok("and it still addresses the escalation target", reqs[1]?.to === "david", reqs[1]);
+}
+
+// ---- 19) the other half of recovery: RE-BIND, do not re-issue ----------------------------------
+
+/**
+ * `requestId` is what a resumed run submits under; `external` is what the previous attempt LEARNED
+ * and wrote down before awaiting a terminal. The handler is required to re-bind to that resource
+ * rather than create a second one, and nothing in this suite had ever checked that the interpreter
+ * hands it over — the id half was tested twice and the resource half not at all. A `resume` that
+ * silently arrived as `undefined` would look exactly like a first attempt, which is the duplicate
+ * side effect the whole mechanism exists to prevent.
+ *
+ * Checked here rather than assumed, because this entry now carries two identity fields instead of
+ * one and `external` rides beside them.
+ */
+{
+  const P = `await turn(await spawn("a", { name: "a" }), { name: "go" });\n`;
+  const script = { turns: { go: { status: "done" as const } } };
+  const live = await run(P, { runId: "r-19", handler: new SimHandler(script) });
+
+  // The crash: the turn bound a real resource and never settled.
+  const entries = live.journal.entries().map((e) =>
+    e.kind === "turn"
+      ? { ...e, state: "pending" as const, status: undefined, result: undefined, endedAt: undefined,
+          requestId: "REQ-19", external: { simGoal: "goal-42" } }
+      : e,
+  );
+
+  let sawResume: unknown;
+  let sawId: string | undefined;
+  let sawAttempt: unknown;
+  const sim = new SimHandler(script);
+  const innerTurn = sim.turn.bind(sim);
+  (sim as unknown as { turn: unknown }).turn = async (req: never, ctx: { requestId: string; attempt: number; resume?: unknown }) => {
+    sawResume = ctx.resume;
+    sawId = ctx.requestId;
+    sawAttempt = ctx.attempt;
+    return innerTurn(req, ctx as never);
+  };
+  await run(P, { runId: "r-19", handler: sim, pins: live.pins, journal: new Journal({ run: "r-19", entries }) });
+
+  ok("a recovered effect is handed the resource the crashed attempt bound", JSON.stringify(sawResume) === JSON.stringify({ simGoal: "goal-42" }), sawResume);
+  ok("alongside the recorded identity to submit under", sawId === "REQ-19", sawId);
+  // An entry written before the index existed is attempt 0, which is what it is for every effect
+  // that cannot hop. Reading `undefined` here would make `ctx.attempt > 0` throw off a NaN compare
+  // rather than take the ordinary path.
+  ok("and an entry with no recorded index recovers as attempt 0", sawAttempt === 0, sawAttempt);
+}
+
+// ── the host's stop: a driver leaving is not a program failing ───────────────────────────────
+//
+// A driver holds its run under an absolute work horizon and can be asked to hand it back. Neither
+// is a fact about the workflow, so neither may be RECORDED as one — the run has to stop where its
+// journal already says it is, so the next driver resumes from there rather than from a fiction.
+{
+  const P = `
+let a = await sleep("1s")
+let b = await sleep("1s")
+let c = await sleep("1s")
+`;
+  let effects = 0;
+  const journal = new Journal({ run: "r-stop" });
+  let released: unknown;
+  // Resolved once, here, because the recorded run is released rather than returned and there is no
+  // result to take pins from — and both resumes below have to be the SAME run as it.
+  const stopPins = resolvePins({ runId: "r-stop" }, 0, WALKER_LANGUAGE_VERSION);
+  try {
+    await run(P, {
+      runId: "r-stop",
+      handler: new SimHandler({}),
+      journal,
+      pins: stopPins,
+      // Stop before the SECOND effect: the first must have run to completion, so the cell is about
+      // a stop between effects rather than a run that never started.
+      shouldStop: () => (effects++ === 1 ? "work horizon reached" : undefined),
+    });
+  } catch (e) { released = e; }
+  ok("a host that stops before the next effect releases the run rather than failing it",
+    released instanceof RunReleased, `${(released as Error)?.name}`);
+  ok("and it carries the host's reason, not a fabricated program error",
+    (released as RunReleased)?.reason === "work horizon reached", (released as RunReleased)?.reason);
+
+  // The load-bearing half. A pending entry here would be a durable record of work nobody performed,
+  // and the next driver would recover it — handing a resume token for a handler that never ran.
+  const entries = journal.entries();
+  ok("the effect it stopped before was never begun: one settled entry, nothing pending",
+    entries.length === 1 && entries[0]!.state === "settled",
+    entries.map((e) => e.state));
+
+  // And the run walks back to exactly where it stopped, which is the whole reason for stopping
+  // between effects rather than inside one.
+  const finished = await resume(P, new Journal({ run: "r-stop", entries }), { runId: "r-stop", pins: stopPins, handler: new SimHandler({}) });
+  ok("a fresh driver resumes it from there and finishes it",
+    finished.journal.entries().length === 3 && finished.journal.entries().every((e) => e.state === "settled"),
+    finished.journal.entries().map((e) => e.state));
+  ok("replaying the recorded prefix is not itself stopped: it performs nothing to stop before",
+    (await (async () => {
+      let asked = 0;
+      await resume(P, new Journal({ run: "r-stop", entries }), {
+        runId: "r-stop", pins: stopPins, handler: new SimHandler({}),
+        shouldStop: () => { asked += 1; return undefined; },
+      });
+      return asked;
+    })()) === 2, "the two effects that were NOT recorded");
+}
+
+// ── and a release inside a CONCURRENCY SCOPE is not an outcome either ────────────────────────
+//
+// The cell above is the sequential seam. This is the same stop landing while the walker is inside a
+// scope, and it is the case that was wrong (#862): the release fell past the scope's ladder of
+// classes that must not be recorded, settled as an `L4000` scope-fault carrying the release's own
+// text, and a resume with a HEALTHY host then replayed that entry and threw. A plain host stop
+// permanently ended any run that happened to be inside a scope, while the identical stop one
+// statement earlier resumed cleanly.
+//
+// Both scopes that launch thunks are covered, because they share the path. The resume is the point:
+// settling nothing leaves the scope pending, a pending scope re-enters, and settling is idempotent,
+// so the run finishes where it stopped rather than carrying a durable failure.
+for (const [label, scopeName, P] of [
+  ["parallel", "both", `
+await parallel({
+  a: async () => { await sleep("1m"); return 1; },
+  b: async () => { await sleep("2m"); return 2; },
+}, { name: "both" });
+`],
+  ["fanOut", "each", `
+await fanOut([1, 2], async (n) => { await sleep("1m"); return n; }, { name: "each", key: (n) => "k" + n });
+`],
+] as const) {
+  const runId = `r-stop-${label}`;
+  const journal = new Journal({ run: runId });
+  const pins = resolvePins({ runId }, 0, WALKER_LANGUAGE_VERSION);
+  let effects = 0;
+  let released: unknown;
+  try {
+    await run(P, {
+      runId,
+      handler: new SimHandler({}),
+      journal,
+      pins,
+      shouldStop: () => (effects++ === 1 ? "host stop" : undefined),
+    });
+  } catch (e) { released = e; }
+  ok(`a host stop inside ${label} releases the run rather than failing it`,
+    released instanceof RunReleased, `${(released as Error)?.name}`);
+
+  // The defect was here, and this reads the JOURNAL'S OWN SHAPE rather than an error message. A
+  // message match would go quietly green the day the release text is reworded, while the bug it
+  // guards returned; the durable claim is that this scope settles NOTHING. Under the reverted fix
+  // the same entry is `settled` with `status: "failed"` and `error.code: "L4000"`, so each of the
+  // three conditions below is one the defect actually breaks.
+  const entries = journal.entries();
+  const scope = entries.find((e) => e.kind === label && e.name === scopeName);
+  ok(`and the ${label} scope entry stays PENDING rather than recording the release as its outcome`,
+    scope !== undefined
+      && scope.state === "pending"
+      && (scope as { status?: string }).status === undefined
+      && (scope as { error?: unknown }).error === undefined,
+    scope === undefined
+      ? "no scope entry at all"
+      : {
+          state: scope.state,
+          status: (scope as { status?: string }).status,
+          error: (scope as { error?: { code?: string } }).error?.code,
+        });
+
+  // And the consequence that made it critical rather than cosmetic. NOT resuming without throwing:
+  // that alone passes for an implementation that settles the scope `ok` with an invented value and
+  // then releases, which finishes the resume while silently skipping the arm that never ran. So the
+  // claim is what the journal HOLDS afterwards: the scope settled, and BOTH arms performed, one of
+  // which had not run when the host stopped. Measured on the correct implementation: three entries,
+  // all settled, two of them the branch effects.
+  let resumeErr: unknown;
+  let after: readonly JournalEntry[] = [];
+  try {
+    const r = await resume(P, new Journal({ run: runId, entries }), { runId, pins, handler: new SimHandler({}) });
+    after = r.journal.entries();
+  } catch (e) { resumeErr = e; }
+  ok(`so a healthy driver resumes past a ${label} it was stopped inside`,
+    resumeErr === undefined, `${(resumeErr as Error)?.name}: ${(resumeErr as Error)?.message}`);
+  ok(`and the ${label} arm that had not run when the host stopped is performed on that resume`,
+    after.length === 3
+      && after.every((e) => e.state === "settled")
+      && after.filter((e) => e.kind === "sleep").length === 2,
+    after.map((e) => `${e.kind}:${e.name}/${e.state}`));
+}
+
+// A release inside a RACE is not a candidate and cancels nothing: work already in flight can
+// still win. Arm `a` parks its sleep before the driver stops, arm `b`'s boundary releases, and
+// every later boundary would release too. The sleep already issued is the handler's to finish,
+// it lands, `a` wins, the scope settles, and nothing is left to perform, so the run completes
+// with no entry anywhere recording a cancellation nobody chose. A released rejection that
+// counted as a candidate would instead "win by failing" with the earliest clock, cancel the
+// arm that could still win, and durably poison its in-flight entry.
+{
+  const runId = "r-stop-race";
+  const journal = new Journal({ run: runId });
+  const pins = resolvePins({ runId }, 0, WALKER_LANGUAGE_VERSION);
+  let stops = 0;
+  let outcome: unknown;
+  const P = `
+const r = await race({
+  a: async () => { await sleep("1m"); return "won"; },
+  b: async () => { await sleep("2m"); return "lost"; },
+}, { name: "either" });
+log(r.index, r.value);
+`;
+  const logged: unknown[][] = [];
+  try {
+    await run(P, {
+      runId,
+      handler: new SimHandler({}),
+      journal,
+      pins,
+      shouldStop: () => (stops++ >= 1 ? "host stop" : undefined),
+      onLog: (l) => logged.push([...l.values]),
+    });
+  } catch (e) {
+    outcome = e;
+  }
+  ok("a race whose sibling was released still lets in-flight work win, and the run completes",
+    outcome === undefined, `${(outcome as Error)?.name}: ${(outcome as Error)?.message?.slice(0, 60)}`);
+  ok("with the surviving arm as the winner", logged[0]?.[0] === "a" && logged[0]?.[1] === "won", logged);
+  ok("and no entry anywhere records a cancellation nobody chose",
+    journal.entries().every((e) => e.status !== "cancelled")
+      && journal.entries().find((e) => e.kind === "race")?.status === "ok",
+    journal.entries().map((e) => `${e.kind}:${e.name}/${e.status}`));
+
+  const replayLog: unknown[][] = [];
+  await resume(P, new Journal({ run: runId, entries: journal.entries() }), {
+    runId, pins, handler: new SimHandler({}), onLog: (l) => replayLog.push([...l.values]),
+  });
+  ok("and a resume replays the same winner from the record", replayLog[0]?.[0] === "a", replayLog);
+}
+
+// A REFUSED APPEND inside a race outranks any winner. The journal refused to record the ask arm's
+// outcome (here the L5006 result bound, ahead of the settling append), so completing the race
+// would settle a scope over an entry the run can no longer record, and a resume would
+// short-circuit the settled scope past the step forever. The unwind must fire even though the
+// sleep arm won: a candidate winner is a decision, a refused append is the journal saying the run
+// can no longer keep decisions.
+{
+  const runId = "r-race-refused-append";
+  const journal = new Journal({ run: runId, resultBytes: 200 });
+  const pins = resolvePins({ runId }, 0, WALKER_LANGUAGE_VERSION);
+  const P = `
+const a = await spawn("w", { name: "a" });
+const r = await race({
+  big: async () => { const v = await ask(a, { name: "q", schema: {} }); return v; },
+  other: async () => { await sleep("2m"); return "other"; },
+}, { name: "either" });
+log("winner", r.index, r.value);
+`;
+  let outcome: unknown;
+  try {
+    await run(P, { runId, pins, journal, handler: new SimHandler({ asks: { q: { blob: "x".repeat(400) } } }) });
+  } catch (e) { outcome = e; }
+  const o = outcome as { name?: string; code?: string } | undefined;
+  ok("a refused append inside a race unwinds the run even though a sibling won",
+    o?.name === "EffectResultTooLarge" && o?.code === "L5006", `${o?.name} ${o?.code}`);
+  ok("and the race entry settles nothing over it",
+    journal.entries().find((e) => e.kind === "race")?.state === "pending",
+    journal.entries().map((e) => `${e.kind}:${e.name}/${e.state}`));
+  ok("and the refused step is still pending, not recorded as anything it is not",
+    journal.entries().find((e) => e.kind === "ask")?.state === "pending",
+    journal.entries().find((e) => e.kind === "ask")?.status);
+}
+
+// A HELD arm inside a race rides the same rule. The ask is refused (L5016), its entry settles
+// `refused`, and the heal law says a resume that REACHES it performs it live — but a resume
+// short-circuits a settled scope. So if the sleeping sibling's win settled the race over the held
+// arm, the heal would be buried forever inside a scope no walk re-enters. The unwind must fire
+// despite the winner, and the same journal on a capable host must then complete.
+{
+  class RefusingAsk extends SimHandler {
+    override async ask(): Promise<never> {
+      throw new EffectRefused("L5016", "ask(…) rides machinery that has not landed on this host");
+    }
+  }
+  const runId = "r-race-held";
+  const pins = resolvePins({ runId }, 0, WALKER_LANGUAGE_VERSION);
+  const journal = new Journal({ run: runId });
+  const P = `
+const a = await spawn("w", { name: "a" });
+const r = await race({
+  big: async () => { const v = await ask(a, { name: "q", schema: {} }); return v; },
+  other: async () => { await sleep("2m"); return "other"; },
+}, { name: "either" });
+log("winner", r.index);
+`;
+  let held: unknown;
+  try {
+    await run(P, { runId, pins, journal, handler: new RefusingAsk({}) });
+  } catch (e) { held = e; }
+  const h = held as { name?: string; code?: string } | undefined;
+  ok("a held arm inside a race unwinds the run even though a sibling won",
+    h?.name === "RunHeld" && h?.code === "L5025", `${h?.name} ${h?.code}`);
+  ok("with the step settled refused, not buried under the winner",
+    journal.entries().find((e) => e.kind === "ask")?.status === "refused",
+    journal.entries().map((e) => `${e.kind}:${e.name}/${e.status ?? e.state}`));
+  let healed: unknown;
+  try {
+    await run(P, { runId, pins, journal, handler: new SimHandler({ asks: { q: { ok: true } } }) });
+  } catch (e) { healed = e; }
+  ok("and the same journal on a capable host performs the refused arm live and completes the race",
+    healed === undefined && journal.entries().find((e) => e.kind === "race")?.status === "ok",
+    `${(healed as Error)?.name}: ${(healed as Error)?.message?.slice(0, 60)}`);
+}
+
+// ── a program cannot catch its host leaving ──────────────────────────────────────────────────
+//
+// `try` is the workflow's own handling of the world going wrong, and a driver's shutdown is not the
+// world going wrong. A program that could catch it would carry on performing effects past the
+// horizon it was granted, which is the thing the stop exists to end — the same reason `Cancelled`
+// and a refused journal append are uncatchable.
+{
+  const P = `
+try {
+  let a = await sleep("1s")
+  let b = await sleep("1s")
+} catch (e) {
+  await notify(["ops"], { decision: "swallow", outcome: "caught" })
+}
+`;
+  let effects = 0;
+  const journal = new Journal({ run: "r-stop-2" });
+  let released: unknown;
+  try {
+    await run(P, {
+      runId: "r-stop-2", handler: new SimHandler({}), journal,
+      shouldStop: () => (effects++ === 1 ? "paused" : undefined),
+    });
+  } catch (e) { released = e; }
+  ok("a workflow's catch does not swallow its host's stop", released instanceof RunReleased,
+    `${(released as Error)?.name}`);
+  // The fact is a VALID one on purpose. With a malformed fact the effect boundary refuses it
+  // (L3043) and this assertion goes green whether the stop worked or not — the assertion would
+  // still read correctly and would have stopped being about the stop.
+  ok("and the catch block performed nothing: no notify was recorded",
+    journal.entries().every((e) => e.kind !== "notify"), journal.entries().map((e) => e.kind));
+}
+
+// ---- 18) freeze on share holds at the share, and survives a serialized journal ------------------
+//
+// Both directions of the boundary, measured open before the fix: an effect's INPUT stayed writable
+// after the dispatch (the program mutated the schema it had just shared, no L2031, so the run's
+// value disagreed with its recorded hash), and a REPLAYED result read back from a serialized
+// journal came back as fresh deserialized data, writable again.
+{
+  const spawned = `const a = await spawn("w", { name: "a" });
+const fact = { decision: "ship", outcome: "approved" };
+await notify([a], fact, { name: "n" });
+fact.outcome = "flipped";`;
+  let caught: unknown;
+  try {
+    await run(spawned, { runId: "r-frz", handler: new SimHandler({}) });
+  } catch (e) {
+    caught = e;
+  }
+  {
+    // ALREADY FROZEN IS NOT ALREADY DEEP-FROZEN. A handler that returns a SHALLOWLY frozen record
+    // stopped the walk at its first node, so the nested container came back writable and the
+    // program mutated a recorded value with no L2031.
+    class ShallowHandler extends SimHandler {
+      override async turn(req: Parameters<SimHandler["turn"]>[0], ctx: EffectContext) {
+        void req; void ctx;
+        return Object.freeze({ status: "done" as const, inner: { touched: false } }) as never;
+      }
+    }
+    let verdict = "no throw";
+    try {
+      await run(`
+const a = await spawn("w", { name: "a" });
+const r = await turn(a, { name: "t" });
+r.inner.touched = true;
+`, { runId: "r-shallow", handler: new ShallowHandler({}) });
+    } catch (e) { verdict = (e as { code?: string }).code ?? (e as Error).message; }
+    ok("a result frozen only at its top level is still frozen THROUGH: the nested write is L2031",
+      verdict === "L2031", verdict);
+  }
+
+  ok("an effect's input is frozen AT the share: mutating it afterwards is L2031",
+    String((caught as Error)?.message).startsWith("L2031"), String(caught).slice(0, 60));
+
+  // The notify arm freezes its fact on its own, so the cell above cannot see the BLANKET freeze at
+  // the boundary. The options bag can: no per-primitive arm touches it, so a schema that stays
+  // writable after a `checkpoint` means the share-time freeze is gone (the measured pre-fix
+  // defect). The deep record rides a checkpoint here because the reference handler now enforces
+  // the ask schema shorthand (L4022), which admits no nested values.
+  const asked = `const sch = { deep: { x: 1 } };
+await checkpoint("q", "ok?", { schema: sch });
+sch.deep.x = 2;`;
+  let bagCaught: unknown;
+  try {
+    await run(asked, { runId: "r-frz3", handler: new SimHandler({ checkpoints: { q: { status: "resolved", by: "sim" } } }) });
+  } catch (e) {
+    bagCaught = e;
+  }
+  ok("the options bag crosses like any input: a checkpoint's schema is frozen at the share (L2031)",
+    String((bagCaught as Error)?.message).startsWith("L2031"), String(bagCaught).slice(0, 60));
+
+  // The policy builds the record the program receives AFTER the journal froze the raw outcome, so
+  // the record itself is a second value that crosses. A write to one of its own fields is L2031,
+  // the same as a write into the nested value the share already froze.
+  const statusWrite = `const r = await checkpoint("q", "ok?", { timeout: "1h" });
+r.status = "changed";`;
+  let statusCaught: unknown;
+  try {
+    await run(statusWrite, { runId: "r-frz-status", handler: new SimHandler({ checkpoints: { q: { status: "resolved", value: { inner: "kept" }, by: "sim" } } }) });
+  } catch (e) {
+    statusCaught = e;
+  }
+  ok("a checkpoint result's own field is frozen with the result: assigning status is L2031",
+    String((statusCaught as Error)?.message).startsWith("L2031"), String(statusCaught).slice(0, 60));
+
+  const SRC = `const a = await spawn("w", { name: "a" });
+a.agent = "changed";`;
+  const first = await run(`const a = await spawn("w", { name: "a" });`, { runId: "r-frz2", handler: new SimHandler({}) });
+  // The round trip is the point: a durable store hands back parsed JSON, not the objects the live
+  // run froze.
+  const thawed = JSON.parse(JSON.stringify(first.journal.entries())) as readonly JournalEntry[];
+  let replayCaught: unknown;
+  try {
+    await resume(SRC, new Journal({ run: "r-frz2", entries: thawed }), { runId: "r-frz2", pins: first.pins, handler: new SimHandler({}) });
+  } catch (e) {
+    replayCaught = e;
+  }
+  ok("a replayed result out of a SERIALIZED journal is frozen again: writing it is L2031",
+    String((replayCaught as Error)?.message).startsWith("L2031"), String(replayCaught).slice(0, 60));
+}
+
+// ---- 19) a capability refusal holds the run, and a capable host heals it ------------------------
+//
+// `refused` over `failed` is the difference between a run that waits and a run that is broken
+// forever. A handler that cannot perform an effect attempted nothing, so nothing about the run is
+// decided: the halt is uncatchable like a release, the entry keeps the refusal under the handler's
+// code, and the same journal under a capable handler performs the step live and completes.
+{
+  class RefusingSpawn extends SimHandler {
+    override async spawn(): Promise<never> {
+      throw new EffectRefused("L5016", "spawn(…) rides machinery that has not landed on this host");
+    }
+  }
+  const P = `
+try {
+  const a = await spawn("w", { name: "a" });
+  await sleep("1s", { name: "after" });
+} finally {
+  await notify(["ops"], { decision: "cleanup", outcome: "ran" })
+}
+`;
+  // Pinned up front, like the host-stop cells: a run that halts has no result to take pins from,
+  // and the heal below has to be the SAME run.
+  const heldPins = resolvePins({ runId: "r-held" }, 0, WALKER_LANGUAGE_VERSION);
+  const journal = new Journal({ run: "r-held" });
+  let held: unknown;
+  try {
+    await run(P, { runId: "r-held", handler: new RefusingSpawn({}), journal, pins: heldPins });
+  } catch (e) {
+    held = e;
+  }
+  ok("the refusal halts the run uncatchably, past try and finally alike",
+    (held as Error)?.name === "RunHeld" && (held as { code?: string })?.code === "L5025",
+    `${(held as Error)?.name}`);
+  ok("and the finalizer performed nothing: no notify was recorded",
+    journal.entries().every((e) => e.kind !== "notify"), journal.entries().map((e) => e.kind));
+  const entry = journal.entries().find((e) => e.kind === "spawn");
+  ok("the entry records the refusal, never a failure",
+    entry?.state === "settled" && entry?.status === "refused" && entry?.error?.code === "L5016",
+    { status: entry?.status, code: entry?.error?.code });
+
+  let healed: unknown = null;
+  try {
+    await run(P, { runId: "r-held", handler: new SimHandler({}), journal, pins: heldPins });
+  } catch (e) {
+    healed = e;
+  }
+  ok("the same journal on a capable host performs the step live and completes",
+    healed === null, `${(healed as Error)?.name}: ${(healed as Error)?.message?.slice(0, 80)}`);
+  ok("with the spawn settled ok over the refusal, and the finalizer's notify recorded",
+    journal.entries().find((e) => e.kind === "spawn")?.status === "ok"
+      && journal.entries().some((e) => e.kind === "notify"),
+    journal.entries().map((e) => `${e.kind}/${e.status ?? e.state}`));
+}
+
+// ---- 20) one agent, one turn at a time ----------------------------------------------------------
+//
+// Two branches turning the same handle used to dispatch concurrently, with nothing anywhere
+// serializing them. The queue lives at the seam both engines share, so the probe is the handler
+// itself: its high-water mark of concurrently open turns is the whole claim.
+{
+  class ProbeHandler extends SimHandler {
+    active = 0;
+    peak = 0;
+    override async turn(req: Parameters<SimHandler["turn"]>[0], ctx: EffectContext) {
+      this.active += 1;
+      this.peak = Math.max(this.peak, this.active);
+      try {
+        return await super.turn(req, ctx);
+      } finally {
+        this.active -= 1;
+      }
+    }
+  }
+  const TURNS = { turns: { t1: { status: "done" as const }, t2: { status: "done" as const } } };
+  const same = new ProbeHandler(TURNS);
+  await run(`
+const a = await spawn("w", { name: "a" });
+await parallel({
+  one: async () => { await turn(a, { name: "t1" }) },
+  two: async () => { await turn(a, { name: "t2" }) },
+})
+`, { runId: "r-turnq", handler: same });
+  ok("two concurrent turns on ONE handle never overlap: the dispatch serializes them",
+    same.peak === 1, same.peak);
+
+  // AN ASK OCCUPIES THE SEAT TOO. A host relays an ask to the agent as a turn, so an ask beside a
+  // turn on one handle is the same two-turns-at-once this queue exists to prevent; the ask was
+  // dispatched outside it and the invariant held only for programs that never ask.
+  class MixedProbe extends SimHandler {
+    active = 0;
+    peak = 0;
+    private async guard<T>(f: () => Promise<T>): Promise<T> {
+      this.active += 1;
+      this.peak = Math.max(this.peak, this.active);
+      try { return await f(); } finally { this.active -= 1; }
+    }
+    override async turn(req: Parameters<SimHandler["turn"]>[0], ctx: EffectContext) {
+      return await this.guard(async () => await super.turn(req, ctx));
+    }
+    override async ask(req: Parameters<SimHandler["ask"]>[0], ctx: EffectContext) {
+      return await this.guard(async () => await super.ask(req, ctx));
+    }
+  }
+  const mixed = new MixedProbe({ turns: { t1: { status: "done" as const } }, asks: { q1: { estimate: 3 } } });
+  await run(`
+const a = await spawn("w", { name: "a" });
+await parallel({
+  one: async () => { await turn(a, { name: "t1" }) },
+  two: async () => { await ask(a, { name: "q1", schema: { estimate: "number" } }) },
+})
+`, { runId: "r-askq", handler: mixed });
+  ok("an ask and a turn on ONE handle never overlap either: one queue covers both dispatch sites",
+    mixed.peak === 1, mixed.peak);
+
+  const different = new ProbeHandler(TURNS);
+  await run(`
+const a = await spawn("w", { name: "a" });
+const b = await spawn("w2", { name: "b" });
+await parallel({
+  one: async () => { await turn(a, { name: "t1" }) },
+  two: async () => { await turn(b, { name: "t2" }) },
+})
+`, { runId: "r-turnq2", handler: different });
+  ok("while turns on two DIFFERENT handles still overlap: the queue is per agent, not global",
+    different.peak === 2, different.peak);
+}
+
+// ---- the free string builtins gate their RECEIVER with the gate's own sentence --------------------
+//
+// `trim(5)` refused L4016 already, by the host: `(5).trim` is undefined, the call throws, and
+// `guarded` converts the TypeError. Same code as the gate, so no program's meaning moved; what
+// moved is the sentence, which named a host shape ("is not a function") instead of the rule.
+{
+  const refusals: string[] = [];
+  await run(`
+try { trim(5); } catch (e) { log(e.code, e.message); }
+try { lower(true); } catch (e) { log(e.code, e.message); }
+try { upper(null); } catch (e) { log(e.code, e.message); }
+`, { runId: "gate-receiver", handler: new SimHandler({}), onLog: (l) => refusals.push(JSON.stringify(l.values)) });
+  ok("a free string builtin refuses a non-string receiver as L4016 with the gate's sentence, not the host's",
+    refusals.length === 3 && refusals.every((r) => r.includes('"L4016"') && r.includes("must be a string") && !r.includes("is not a function")),
+    refusals);
+}
+
+console.log(`interpret.smoke: ${pass} checks passed`);

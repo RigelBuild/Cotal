@@ -1,0 +1,50 @@
+--- a/src/unix/pty.cc
++++ b/src/unix/pty.cc
+@@ -389,6 +389,7 @@
+ 
+   pid_t pid;
+   int master = -1;
++  int pidfd = -1;
+ #if defined(__APPLE__)
+   int argc = argv_.Length();
+   int argl = argc + 4;
+@@ -484,6 +485,10 @@
+         _exit(1);
+       }
+     default:
++#if defined(__linux__)
++      // Open the pidfd before SetupExitCallback's waitpid thread can reap the child and free its pid.
++      pidfd = syscall(SYS_pidfd_open, pid, 0);
++#endif
+       if (pty_nonblock(master) == -1) {
+         throw Napi::Error::New(napiEnv, "Could not set master fd to nonblocking.");
+       }
+@@ -494,6 +499,7 @@
+   obj.Set("fd", Napi::Number::New(napiEnv, master));
+   obj.Set("pid", Napi::Number::New(napiEnv, pid));
+   obj.Set("pty", Napi::String::New(napiEnv, ptsname(master)));
++  if (pidfd >= 0) obj.Set("pidfd", Napi::Number::New(napiEnv, pidfd));
+ 
+   // Set up process exit callback.
+   Napi::Function cb = info[10].As<Napi::Function>();
+--- a/lib/unixTerminal.js
++++ b/lib/unixTerminal.js
+@@ -24,7 +24,9 @@
+ var tty = require("tty");
+ var terminal_1 = require("./terminal");
+ var utils_1 = require("./utils");
+-var native = utils_1.loadNativeModule('pty');
++// @cotal-ai/seat: load the pty.node this package builds, keyed by arch like peercred.node.
++var nativeDir = path.join(__dirname, '..', '..', '..', 'build', 'Release', 'linux-' + process.arch);
++var native = { dir: nativeDir, module: require(path.join(nativeDir, 'pty.node')) };
+ var pty = native.module;
+ var helperPath = native.dir + '/spawn-helper';
+ helperPath = path.resolve(__dirname, helperPath);
+@@ -125,6 +127,7 @@
+             }
+         });
+         _this._pid = term.pid;
++        _this._pidfd = term.pidfd;
+         _this._fd = term.fd;
+         _this._pty = term.pty;
+         _this._file = file;

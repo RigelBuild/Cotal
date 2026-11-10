@@ -1,0 +1,378 @@
+/**
+ * Channel-registry test (open mode — no auth). Spins up its OWN nats-server and verifies the
+ * registry + replay mechanism end-to-end:
+ *   - registry round-trip: seed → read, effective-replay precedence, merge-on-write, validation;
+ *   - concurrent writers on different fields all keep their field, and a write that keeps losing
+ *     the revision race refuses rather than overwriting;
+ *   - replay on join: a replay channel backfills history (as `historical`), a no-replay one doesn't;
+ *   - the tail drop: pre-join history on a no-replay channel is suppressed (not leaked live);
+ *   - dynamic join/leave: consumers.update mid-session, idempotent re-join, can't-leave-last;
+ *   - rebind: a reconnect is a pure tail resume — no re-backfill.
+ * Run: pnpm smoke:channels
+ */
+import { strict as assert } from "node:assert";
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { connect } from "@nats-io/transport-node";
+import { jetstream } from "@nats-io/jetstream";
+import type { KV } from "@nats-io/kv";
+import {
+  CotalEndpoint, seedChannelRegistry, readChannelRegistry, deleteChannels, clearChannel, effectiveReplay, effectiveDeliveryClass,
+  ensureDefaultDeliveryClass, validateChannelConfig, mintLifecycleUid, openChannelRegistry, writeChannelConfig, writeChannelDefaults,
+  ChannelRegistryConflict,
+  isReachable, chatSubject, DEV_OWNER, type CotalMessage, type Delivery, type MessageMeta,
+} from "../src/index.js";
+import { pickFreePort } from "./_free-port.js";
+import { SMOKE_BROKER_TOKEN, awaitBrokerReady, teardownOnSignal } from "@cotal-ai/smoke-kit";
+
+// Fresh OS-assigned port per run: a fixed port means a single leaked broker (from a crashed/failed
+// prior run) collides with — or serves stale JetStream state to — every subsequent run, which reads
+// as a flaky gate. A fresh port isolates each run even if teardown ever leaks. Paired with an await-exit in
+// `finally` (a SIGKILLed child does not release the socket synchronously) so a clean run never leaks.
+const PORT = await pickFreePort();
+const servers = `nats://127.0.0.1:${PORT}`;
+const space = "chansmoke";
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** Poll a condition until it holds or the timeout elapses — for "the expected messages have arrived"
+ *  waits. Replaces fixed `sleep()` before positive assertions: backfill (Direct-Get) and live delivery
+ *  complete in variable time under load, so a tight fixed wait flakes. Absence checks still settle via a
+ *  plain sleep (you cannot poll for non-arrival). Returns the final condition value for the assertion. */
+const until = async (cond: () => boolean, timeoutMs = 8000, stepMs = 50): Promise<boolean> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond() && Date.now() < deadline) await sleep(stepMs);
+  return cond();
+};
+const textOf = (m: CotalMessage) => m.parts.map((p) => (p.kind === "text" ? p.text : "")).join("");
+
+interface Rec { channel?: string; text: string; historical: boolean; kind?: MessageMeta["kind"] }
+function recorder(name: string, id: string, channels: string[], opts: { backfillFloor?: number } = {}) {
+  const got: Rec[] = [];
+  const ep = new CotalEndpoint({ space, servers, card: { name, kind: "agent", id }, channels, lifecycleUid: mintLifecycleUid(), ...opts });
+  ep.on("error", () => {});
+  ep.on("message", (m: CotalMessage, d: Delivery, meta?: MessageMeta) => {
+    got.push({ channel: m.channel, text: textOf(m), historical: meta?.historical ?? false, kind: meta?.kind });
+    d.ack();
+  });
+  return { ep, got };
+}
+const has = (got: Rec[], text: string) => got.filter((g) => g.text === text);
+
+const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+const srv = spawn("nats-server", ["-js", "-p", String(PORT), "-sd", join(dir, "js")], { stdio: "ignore" });
+const releaseBroker = teardownOnSignal(srv, dir);
+let pass = 0;
+const check = (name: string, cond: boolean, extra?: unknown) => {
+  assert.ok(cond, `${name}${extra !== undefined ? ` — ${JSON.stringify(extra)}` : ""}`);
+  pass++;
+  console.log(`  ✓ ${name}`);
+};
+
+try {
+  await awaitBrokerReady(() => isReachable(servers), { servers, attempts: 50, delayMs: 200 });
+
+  // ---- registry round-trip ----
+  await seedChannelRegistry({ servers, space, file: { defaults: { replay: false }, channels: { log: { replay: true }, incident: { replay: true }, chat: { replay: false }, review: { description: "Design critique", instructions: "Be specific." } } } });
+  const reg = await readChannelRegistry({ servers, space });
+  check("registry round-trips", reg.defaults?.replay === false && reg.channels?.log.replay === true && reg.channels?.review.description === "Design critique");
+  check("effective replay precedence", effectiveReplay(reg.channels!.log, reg.defaults) === true && effectiveReplay(reg.channels!.review, reg.defaults) === false && effectiveReplay(undefined, undefined) === true);
+  await seedChannelRegistry({ servers, space, file: { channels: { review: { description: "Critique v2" } } } });
+  const reg2 = await readChannelRegistry({ servers, space });
+  check("merge-on-write keeps other fields", reg2.channels?.review.description === "Critique v2" && reg2.channels?.review.instructions === "Be specific.");
+  // A write whose every value already holds is not written, so repeating a set changes no revision.
+  {
+    const nc = await connect({ servers });
+    try {
+      const kv = await openChannelRegistry(nc, space);
+      const before = (await kv.get("review"))?.revision;
+      const same = await seedChannelRegistry({ servers, space, file: { channels: { review: { description: "Critique v2", instructions: "Be specific." } } } });
+      const after = (await kv.get("review"))?.revision;
+      const changed = await writeChannelConfig(kv, "review", { description: "Critique v2", instructions: "Be precise." });
+      const last = (await kv.get("review"))?.revision;
+      check("a write whose values already hold writes nothing and resolves false; one changed value writes and resolves true",
+        same === false && before !== undefined && after === before && changed === true && last !== undefined && last > before, { before, after, last });
+    } finally {
+      await nc.drain();
+    }
+  }
+  // Writers setting different fields at once all land: a write that loses the revision race reads
+  // the entry again and merges again.
+  {
+    const nc = await connect({ servers });
+    try {
+      const kv = await openChannelRegistry(nc, space);
+      await Promise.all([{ description: "D" }, { instructions: "I" }, { replayWindow: "2h" }, { replay: false }, { deliveryClass: "durable" as const }]
+        .map((patch) => writeChannelConfig(kv, "race", patch)));
+      const raced = (await readChannelRegistry({ servers, space })).channels?.race;
+      check("five concurrent writers on different fields of one channel all keep their field",
+        raced?.description === "D" && raced.instructions === "I" && raced.replayWindow === "2h" && raced.replay === false && raced.deliveryClass === "durable", raced);
+      const defaultsKv = await openChannelRegistry(nc, `${space}-race`, { create: true });
+      await Promise.all([writeChannelDefaults(defaultsKv, { replayWindow: "1h" }), writeChannelDefaults(defaultsKv, { deliveryClass: "live" }), writeChannelDefaults(defaultsKv, { replay: true })]);
+      const racedDefaults = (await readChannelRegistry({ servers, space: `${space}-race` })).defaults;
+      check("concurrent defaults writers all keep their field", racedDefaults?.replayWindow === "1h" && racedDefaults.deliveryClass === "live" && racedDefaults.replay === true, racedDefaults);
+    } finally {
+      await nc.drain();
+    }
+  }
+  // A key other writers keep changing refuses rather than overwriting, and any other failure is itself.
+  {
+    let writes = 0;
+    const casLoss = Object.assign(new Error("wrong last sequence"), { code: 10071 });
+    const contested = {
+      get: async () => ({ key: "x", revision: 1, operation: "PUT", json: () => ({}) }),
+      update: async () => { throw casLoss; },
+      put: async () => { writes++; return 1; },
+    } as unknown as KV;
+    await assert.rejects(writeChannelConfig(contested, "x", { description: "y" }), ChannelRegistryConflict);
+    check("a write that keeps losing the revision race throws ChannelRegistryConflict and writes nothing", writes === 0);
+    const down = { get: async () => null, put: async () => { throw new Error("broker down"); } } as unknown as KV;
+    await assert.rejects(writeChannelConfig(down, "x", { description: "y" }), /broker down/);
+    check("a write failure that is not a lost race propagates as itself", true);
+  }
+  const specialChannels = Object.fromEntries([
+    ["__proto__", { description: "Prototype token" }],
+    ["constructor", { description: "Constructor token" }],
+  ]);
+  await seedChannelRegistry({ servers, space, file: { channels: specialChannels } });
+  const specialReg = await readChannelRegistry({ servers, space });
+  check("registry preserves special channel tokens as own keys",
+    Object.hasOwn(specialReg.channels ?? {}, "__proto__")
+      && specialReg.channels?.__proto__?.description === "Prototype token"
+      && Object.hasOwn(specialReg.channels ?? {}, "constructor")
+      && (specialReg.channels?.["constructor"] as { description?: string } | undefined)?.description === "Constructor token");
+  check("registry read keeps the normal object prototype", Object.getPrototypeOf(specialReg.channels) === Object.prototype);
+  assert.throws(() => validateChannelConfig({ description: "x".repeat(1000) }), /too long/);
+  check("validation rejects oversize", true);
+
+  // ---- default delivery class written at space creation (SPEC §4: on the wire, not inferred) ----
+  const dcSpace = `${space}-dc`;
+  check("writes default deliveryClass when unset", (await ensureDefaultDeliveryClass({ servers, space: dcSpace, deliveryClass: "durable" })) === true);
+  const dcReg = await readChannelRegistry({ servers, space: dcSpace });
+  check("default deliveryClass is discoverable on the wire", dcReg.defaults?.deliveryClass === "durable" && effectiveDeliveryClass(undefined, dcReg.defaults) === "durable");
+  check("idempotent re-write is a no-op", (await ensureDefaultDeliveryClass({ servers, space: dcSpace, deliveryClass: "durable" })) === false);
+  check("clobber-safe: an existing class wins over the profile default", (await ensureDefaultDeliveryClass({ servers, space: dcSpace, deliveryClass: "live" })) === false
+    && (await readChannelRegistry({ servers, space: dcSpace })).defaults?.deliveryClass === "durable");
+
+  // ---- replay on join ----
+  const A = new CotalEndpoint({ space, servers, card: { name: "A", kind: "agent", id: "A_pub" }, channels: ["log", "chat", "general", "incident"], lifecycleUid: mintLifecycleUid() });
+  A.on("error", () => {});
+  await A.start();
+  await sleep(300);
+  await A.multicast("log-hist-1", { channel: "log" });
+  await A.multicast("log-hist-2", { channel: "log" });
+  await A.multicast("chat-hist-1", { channel: "chat" });
+  await A.multicast("incident-hist-1", { channel: "incident" });
+  await sleep(300);
+
+  const B = recorder("B", "B_join", ["log", "chat"]);
+  await B.ep.start();
+  check("replay channel backfills history (historical)", await until(() => B.got.filter((g) => g.channel === "log" && g.historical).length === 2));
+  check("no-replay channel does not backfill", has(B.got, "chat-hist-1").length === 0);
+
+  B.got.length = 0;
+  await A.multicast("log-live-1", { channel: "log" });
+  await A.multicast("chat-live-1", { channel: "chat" });
+  await until(() => has(B.got, "log-live-1").length === 1 && has(B.got, "chat-live-1").length === 1);
+  check("live delivery, no dup, not historical", has(B.got, "log-live-1").length === 1 && has(B.got, "log-live-1")[0].historical === false && has(B.got, "chat-live-1").length === 1);
+  check("multicast is authenticated kind=channel", has(B.got, "log-live-1")[0].kind === "channel");
+
+  // ---- kind authentication: a forged payload `to` can't masquerade as a DM (§5 regression) ----
+  // Raw-publish a chat message carrying a forged `to: <B's id>` straight to A's chat subject.
+  // The payload `from` is A (so it passes the endpoint's subject-binds-from authenticity guard),
+  // but the DELIVERING subject is `chat.*` → B must classify it kind="channel", NEVER "dm".
+  B.got.length = 0;
+  {
+    const nc = await connect({ servers });
+    const js = jetstream(nc);
+    // Deliberately NOT annotated `CotalMessage`: the union is exclusive, and a frame carrying both
+    // `channel` and `to` is precisely the forgery under test. The wire is bytes; this is those bytes.
+    const forged = {
+      id: randomUUID(),
+      ts: Date.now(),
+      space,
+      from: A.ref(),          // MUST be the publishing endpoint A — binds payload.from to subject sender
+      channel: "log",
+      to: "B_join",           // the forgery: a payload `to` pointing at B
+      parts: [{ kind: "text", text: "forged-dm-probe" }],
+    };
+    // A's principal is owner=DEV_OWNER ("local"), actor=its connId ("A_pub"); publish onto A's own
+    // chat subject so the forged frame's from.id (A.card.id = "local.A_pub") binds the subject sender.
+    const subject = chatSubject(space, DEV_OWNER, "A_pub", "log");
+    await js.publish(subject, JSON.stringify(forged), { msgID: forged.id });
+    await nc.close();
+  }
+  await until(() => has(B.got, "forged-dm-probe").length === 1);
+  const probe = has(B.got, "forged-dm-probe");
+  check("forged DM is delivered to the receiver", probe.length === 1);
+  check("forged DM is authenticated as kind=channel, not dm", probe[0].kind === "channel" && !probe.some((r) => r.kind === "dm"));
+
+  // ---- dynamic join (replay) + idempotent ----
+  B.got.length = 0;
+  const jr = await B.ep.joinChannel("incident");
+  await until(() => B.got.filter((g) => g.channel === "incident" && g.historical).length === 1);
+  check("dynamic join backfills replay channel", jr.joined === true && jr.backfilled === 1 && B.got.filter((g) => g.channel === "incident" && g.historical).length === 1);
+  // Open mode has no manager → no Plane-3 backstop, so a durable-class join is live-only (durable:false).
+  check("re-join is a no-op", JSON.stringify(await B.ep.joinChannel("incident")) === JSON.stringify({ joined: false, backfilled: 0, durable: false }));
+
+  // ---- dynamic join (no-replay) → tail drop suppresses pre-join history ----
+  B.got.length = 0;
+  await A.multicast("general-hist", { channel: "general" });
+  await sleep(200);
+  const jg = await B.ep.joinChannel("general");
+  await sleep(400);
+  check("no-replay join: no backfill + pre-join history suppressed by the drop", jg.backfilled === 0 && has(B.got, "general-hist").length === 0);
+  await A.multicast("general-live", { channel: "general" });
+  await until(() => has(B.got, "general-live").length === 1);
+  check("live delivery works after no-replay join", has(B.got, "general-live").length === 1);
+
+  // ---- dynamic leave ----
+  B.got.length = 0;
+  await B.ep.leaveChannel("chat");
+  await sleep(200);
+  await A.multicast("chat-after-leave", { channel: "chat" });
+  await sleep(400);
+  check("leave stops delivery", has(B.got, "chat-after-leave").length === 0);
+  // Leaving any channel is now manager-free — just close the core-sub (there is no legacy durable to
+  // refuse the leave, and no last-channel restriction).
+  await B.ep.leaveChannel("incident");
+  check("leaving the last channel succeeds (manager-free core-sub close)", (await B.ep.leaveChannel("general")).left === true);
+
+  // ---- restart (a fresh endpoint instance) backfills its boot channels' replay history ----
+  // Stage 5: there is no per-instance chat durable + cursor — a fresh instance re-reads its boot
+  // channels' replay history as a "catching up" block. (A same-instance broker reconnect resumes live
+  // without re-backfilling; see firstConnect. The durable backstop, auth, redelivers any missed window.)
+  await B.ep.stop();
+  await sleep(300);
+  const B2 = recorder("B", "B_join", ["log"]);
+  await B2.ep.start();
+  await until(() => B2.got.filter((g) => g.channel === "log" && g.historical).length >= 2);
+  check("a fresh instance backfills its boot channel's replay history", B2.got.filter((g) => g.channel === "log" && g.historical).length >= 2);
+
+  // ---- backfill floor: a resumed seat catches up from its prior incarnation's cut, not the window ----
+  await B2.ep.stop();
+  await sleep(300);
+  const frontier = await A.chatFrontier();
+
+  // (a) floor at the current frontier: nothing before it is re-delivered, and the live tail still works.
+  const Bf1 = recorder("B", "B_join", ["log"], { backfillFloor: frontier });
+  await Bf1.ep.start();
+  await sleep(800);
+  check("backfill floor at the frontier receives no historical", Bf1.got.filter((g) => g.historical).length === 0);
+  await A.multicast("log-floor-live", { channel: "log" });
+  await until(() => has(Bf1.got, "log-floor-live").length === 1);
+  check("live multicast still arrives with a floor set, not historical", has(Bf1.got, "log-floor-live").length === 1 && has(Bf1.got, "log-floor-live")[0].historical === false);
+  await Bf1.ep.stop();
+
+  // (b) a message posted after the floor is the only one backfilled.
+  const frontier2 = await A.chatFrontier();
+  await A.multicast("log-hist-3", { channel: "log" });
+  await sleep(300);
+  const Bf2 = recorder("B", "B_join", ["log"], { backfillFloor: frontier2 });
+  await Bf2.ep.start();
+  await until(() => Bf2.got.filter((g) => g.historical).length >= 1);
+  check("backfill floor catches up on exactly what was posted after it", Bf2.got.filter((g) => g.historical).length === 1 && has(Bf2.got, "log-hist-3")[0]?.historical === true);
+  await Bf2.ep.stop();
+
+  // (c) no floor: the fresh-joiner contract is unchanged (still backfills the retained window).
+  const Bf3 = recorder("B", "B_join", ["log"]);
+  await Bf3.ep.start();
+  await until(() => Bf3.got.filter((g) => g.historical).length >= 3);
+  check("no floor: a fresh joiner still backfills at least three historical", Bf3.got.filter((g) => g.historical).length >= 3);
+  await Bf3.ep.stop();
+
+  // (d) a floor above the frontier: nothing to read, no throw, live still works.
+  const Bf4 = recorder("B", "B_join", ["log"], { backfillFloor: frontier + 1000 });
+  await Bf4.ep.start();
+  await sleep(800);
+  check("backfill floor above the frontier receives no historical and does not throw", Bf4.got.filter((g) => g.historical).length === 0);
+  await A.multicast("log-floor-above-live", { channel: "log" });
+  await until(() => has(Bf4.got, "log-floor-above-live").length === 1);
+  check("live multicast still arrives with a floor above the frontier", has(Bf4.got, "log-floor-above-live").length === 1);
+  await Bf4.ep.stop();
+
+  // (e) the manager's own shape: a non-consuming endpoint reads the frontier the cut records.
+  const M = new CotalEndpoint({
+    space, servers, card: { name: "m", kind: "endpoint", id: "m_pub" }, channels: [],
+    consume: false, registerPresence: false, watchPresence: false, watchChannels: false,
+  });
+  M.on("error", () => {});
+  await M.start();
+  let managerFrontier: number | undefined;
+  let managerFrontierError = "";
+  try {
+    managerFrontier = await M.chatFrontier();
+  } catch (e) {
+    managerFrontierError = (e as Error).message;
+  }
+  await M.stop();
+  check(
+    "a non-consuming endpoint reads the chat frontier for a preservation cut",
+    managerFrontier !== undefined && managerFrontier === (await A.chatFrontier()),
+    managerFrontierError || managerFrontier,
+  );
+
+  // ---- restart with a CHANGED config backfills the full (replay) boot set ----
+  const B3 = recorder("B", "B_join", ["log", "incident"]); // boot set now log + incident (both have history)
+  await B3.ep.start();
+  await until(() => B3.got.filter((g) => g.channel === "incident" && g.historical).length >= 1 && B3.got.filter((g) => g.channel === "log" && g.historical).length >= 2);
+  check("restart backfills both boot channels' replay history",
+    B3.got.filter((g) => g.channel === "incident" && g.historical).length >= 1 && B3.got.filter((g) => g.channel === "log" && g.historical).length >= 2);
+
+  // ---- native time-window backfill (Direct-Get start_time) ----
+  await seedChannelRegistry({ servers, space, file: { channels: { recent: { replay: true, replayWindow: "1s" }, archive: { replay: true, replayWindow: "1h" } } } });
+  await A.multicast("recent-old", { channel: "recent" });
+  await A.multicast("archive-old", { channel: "archive" });
+  await sleep(1500); // age both past the 1s window
+  const W = recorder("W", "W_join", ["recent", "archive"]);
+  await W.ep.start();
+  await until(() => W.got.filter((g) => g.channel === "archive" && g.historical).length === 1);
+  check("time window EXCLUDES messages older than it", has(W.got, "recent-old").length === 0);
+  check("wider window INCLUDES them", W.got.filter((g) => g.channel === "archive" && g.historical).length === 1);
+
+  // ---- wildcard subscription: [c, c.>] delivers the parent AND its subtree ----
+  // Regression: `c.>` must not swallow bare `c` in the filter collapse (else the parent channel
+  // stops being delivered), and joining a wildcard channel must not do a per-channel registry
+  // get (`>` is an illegal KV key — `joinPolicyFresh` skips it). A flat sub gets no subtree.
+  const RW = recorder("RW", "RW_wild", ["review", "review.>"]); // flat parent + whole subtree
+  const RF = recorder("RF", "RF_flat", ["review"]);             // flat parent only
+  await RW.ep.start();
+  await RF.ep.start();
+  await sleep(300);
+  await A.multicast("rev-flat", { channel: "review" });
+  await A.multicast("rev-sec", { channel: "review.security" });
+  await A.multicast("rev-deep", { channel: "review.a.b" });
+  await until(() => has(RW.got, "rev-flat").length === 1 && has(RW.got, "rev-sec").length === 1 && has(RW.got, "rev-deep").length === 1 && has(RF.got, "rev-flat").length === 1);
+  check("wildcard sub keeps the flat parent (collapse didn't drop it)", has(RW.got, "rev-flat").length === 1);
+  check("wildcard sub receives the subtree (review.>)", has(RW.got, "rev-sec").length === 1 && has(RW.got, "rev-deep").length === 1);
+  check("flat sub gets the parent but never the subtree", has(RF.got, "rev-flat").length === 1 && RF.got.every((g) => g.channel === "review"));
+  await RW.ep.stop();
+  await RF.ep.stop();
+
+  await A.stop();
+  await B3.ep.stop();
+  await W.ep.stop();
+
+  // ---- removal reports only the entries it removed ----
+  await seedChannelRegistry({ servers, space, file: { channels: { gone: { description: "to remove" }, purgeme: { description: "to purge" } } } });
+  check("deleteChannels returns only the channels that had an entry", JSON.stringify(await deleteChannels({ servers, space, channels: ["gone", "never"] })) === JSON.stringify(["gone"]));
+  check("deleting it again removes nothing", (await deleteChannels({ servers, space, channels: ["gone"] })).length === 0 && !Object.hasOwn((await readChannelRegistry({ servers, space })).channels ?? {}, "gone"));
+  const cleared = await clearChannel({ servers, space, channel: "purgeme" });
+  const clearedAgain = await clearChannel({ servers, space, channel: "purgeme" });
+  check("clearChannel says it removed the entry, and a repeat says it did not", cleared.removed === true && clearedAgain.removed === false, { cleared, clearedAgain });
+  console.log(`\nCHANNEL REGISTRY TESTS PASSED ✅  (${pass} checks)`);
+} finally {
+  // Await the broker's ACTUAL exit before cleanup — SIGKILL signals the child but does not free the
+  // port synchronously; returning early (the old `await sleep(150)`) can leave the broker alive past
+  // teardown, leaking it onto the port. Bounded by a timeout so teardown can never hang.
+  srv.kill("SIGKILL");
+  await new Promise<void>((resolve) => {
+    if (srv.exitCode !== null || srv.signalCode !== null) return resolve();
+    srv.once("exit", () => resolve());
+    setTimeout(resolve, 3000);
+  });
+  rmSync(dir, { recursive: true, force: true });
+  releaseBroker(); // last: ownership is held until this teardown has actually finished
+}
+process.exit(0);

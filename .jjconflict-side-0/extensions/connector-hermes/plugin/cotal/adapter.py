@@ -1,0 +1,374 @@
+"""Cotal gateway platform adapter.
+
+Inbound: the sidecar pushes mesh messages over the bridge; the adapter builds a ``MessageEvent``
+and calls ``handle_message`` — which wakes an idle session or **queues + interrupts a running one**
+(the gateway's own busy handling), so a peer can DRIVE a live turn, not just leave a message.
+Outbound: the gateway hands a turn's reply to ``send()``, which the adapter routes back to that
+message's mesh origin (the channel it came in on, or a DM to the sender), as a reply to it.
+
+A DM answering a question one of this gateway's sessions asked goes to that session, not to
+``dm:<sender>`` (see replies.py).
+
+With ``gateway.platforms.cotal.single_session: true`` every mesh message runs in one session
+(chat ``mesh``), so the agent has one context across peers. A reply then goes to the origin of the
+message it answers, and a message waits until the running turn ends instead of interrupting it.
+
+With ``gateway.platforms.cotal.channel_replies: false`` a turn's reply to a channel message is not
+posted: the agent posts there only by calling ``cotal_send``. DM replies and explicit sends that name
+no delivered message (``send_message``, cron delivery) are unchanged.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import uuid
+from typing import Any, Optional
+
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
+from gateway.config import Platform, PlatformConfig
+
+from . import hooks, replies
+from .bridge_client import get_client
+from .resume import seed_chat
+from .framing import format_injection
+
+logger = logging.getLogger(__name__)
+# How many delivered messages a turn reply can still name as the one it answers.
+MAX_ANSWERING = 1024
+SINGLE_CHAT_ID = replies.SINGLE_CHAT_ID
+# How often a held message re-checks that the shared session is idle.
+IDLE_POLL_SECONDS = 1.0
+# Appended to a channel message's text when channel replies are off, outside the peer's body.
+CHANNEL_QUIET_NOTE = (
+    "(Your reply to this channel message is not posted. Call cotal_send to post in the channel, "
+    "or cotal_dm to answer one peer; otherwise nothing is sent.)"
+)
+
+
+
+def chat_type_for(chat_id: str) -> Optional[str]:
+    """The chat type of a chat_id minted on inbound, or None for an id this adapter did not mint."""
+    if chat_id.startswith("channel:"):
+        return "group"
+    if chat_id.startswith("dm:") or chat_id == SINGLE_CHAT_ID:
+        return "dm"
+    return None
+
+
+def _target_for(chat_id: str) -> dict:
+    """Reverse the chat_id minted on inbound back into a mesh reply target."""
+    if chat_id.startswith("channel:"):
+        return {"channel": chat_id[len("channel:"):]}
+    if chat_id.startswith("dm:"):
+        return {"peerId": chat_id[len("dm:"):]}
+    return {}
+
+
+class CotalAdapter(BasePlatformAdapter):
+    def __init__(self, config: PlatformConfig) -> None:
+        super().__init__(config, Platform("cotal"))
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._client = get_client()
+        # message id -> the contextId of a message delivered into its sender's own chat, for the
+        # turn reply that names it (the gateway's ``reply_to``).
+        self._answering: dict[str, Optional[str]] = {}
+        extra = getattr(config, "extra", None) or {}
+        self._single = extra.get("single_session") is True
+        # Only an explicit false turns channel replies off, so an absent or malformed value keeps
+        # the default behavior.
+        self._channel_replies = extra.get("channel_replies") is not False
+        # A peer is an agent, so a bare silence marker is a valid answer to it; Hermes otherwise
+        # replaces the marker with an error notice and sends that.
+        self._silence_ok = extra.get("peer_silence") is True
+        # Keys of channel messages delivered here, so a turn reply anchored to one can be dropped.
+        self._channel_keys: dict[str, None] = {}
+        # message id -> the mesh reply target of a message delivered into the shared session.
+        self._origins: dict[str, dict] = {}
+        self._turn_done = asyncio.Event()
+        # The origin of the turn the shared session runs or last ran, for sends that name no message
+        # (progress, a turn-error notice). It changes only when the next turn starts.
+        self._running: Optional[dict] = None
+        # True while the shared session runs a turn no delivered message started; its sends go nowhere.
+        self._internal_turn = False
+        # Messages held or running in the shared session, each resolved once its turn is admitted;
+        # one lock admits them in order.
+        self._held: dict[str, asyncio.Future] = {}
+        self._admit = asyncio.Lock()
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Connect the bridge and start receiving.
+
+        ``is_reconnect`` is keyword-only and arrives from the gateway's reconnect watcher, which
+        has passed it at every call site since hermes-agent 0.18. Upstream asks adapters holding a
+        server-side queue to preserve it across a reconnect so messages sent during the outage are
+        delivered rather than dropped.
+
+        This bridge has no server-side queue of its own to preserve, so there is nothing to keep
+        here. What it does have is the mesh stream behind the sidecar, and the redelivery contract
+        that protects it is the ack: ``_maybe_ack`` acks a message only once the inject coroutine
+        has completed, so anything in flight when the platform dropped was never acked and is
+        redelivered by the stream. Preserving outage-time messages is therefore already the
+        behaviour on both paths, and it is the reason this method must not silently discard
+        in-flight state on the reconnect path.
+
+        What the flag does change is the restart. ``disconnect`` calls ``BridgeClient.close``,
+        which latches the stop event and leaves the reader thread terminated. A reconnect that
+        merely called ``start`` again would find ``_reader`` already set, return without starting
+        anything, and produce a platform that reports connected while receiving nothing at all,
+        which is the quiet failure mode this connector exists to avoid. On a reconnect the client
+        is therefore reopened explicitly before the reader is started.
+        """
+        self._loop = asyncio.get_running_loop()
+        if is_reconnect:
+            # Clear the latched stop and drop the dead reader, so start() below really starts one.
+            #
+            # OFF-LOOP, and that is not incidental. `reopen` joins the closed reader with a bounded
+            # wait so a thread still unwinding is not mistaken for a live one, and a reader wedged
+            # in a blocking recv makes that wait run to its full timeout. Calling it inline here
+            # would stall the gateway's event loop for that whole period, freezing every other
+            # platform in the process to repair this one. Measured at 2.00s against a wedged
+            # reader, which is exactly the kind of pause an operator would report as the gateway
+            # hanging on reconnect. `to_thread` keeps the loop free while the join runs.
+            await asyncio.to_thread(self._client.reopen)
+        self._client.start(self._on_incoming)  # reader thread → _on_incoming
+
+        # THE BRIDGE MUST BE PROVED LIVE BEFORE THE PLATFORM IS CALLED CONNECTED.
+        #
+        # Marking connected is what removes this platform from anyone's attention: upstream's
+        # watcher only ever revisits platforms in `_failed_platforms`, entry to which requires a
+        # failed connect or a NOTIFIED retryable fatal, and there is no periodic health probe of a
+        # platform believed connected. A dying reader thread notifies nothing by itself. So a
+        # reader that is absent or already dead here would produce a platform reporting connected
+        # and deaf for the lifetime of the process, which is precisely the failure this connector
+        # exists to prevent.
+        #
+        # Reporting it as a RETRYABLE fatal is what turns the gateway's existing machinery into a
+        # real safety net: the platform enters `_failed_platforms` and the background reconnect
+        # queue picks it up, rather than the operator being the health check.
+        if self._client.reader_is_dead():
+            self._set_fatal_error(
+                "cotal_bridge_reader_dead",
+                "cotal bridge reader thread is not running, so no mesh traffic can arrive",
+                retryable=True,
+            )
+            await self._notify_fatal_error()
+            return False
+
+        self._mark_connected()
+        hooks.relay("gateway_startup")  # present + free
+        return True
+
+    async def disconnect(self) -> None:
+        hooks.relay("gateway_shutdown")
+        self._client.close()
+        self._mark_disconnected()
+
+    async def send(
+        self, chat_id: str, content: str, reply_to: Any = None, metadata: Any = None
+    ) -> SendResult:
+        # The gateway delivers a turn's reply here → route it back to the message's mesh origin. A
+        # reply to a message delivered here names it and copies its contextId (it belongs to the
+        # asker); otherwise the sidecar pairs a DM reply with its peer's oldest unanswered message.
+        answered = str(reply_to) if reply_to is not None else None
+        if self._single and chat_id == SINGLE_CHAT_ID:
+            # The shared chat names no peer: the reply goes to where the answered message came from.
+            # Progress and notices name no message and go to the origin of the latest turn.
+            target = self._origins.get(answered) if answered else None
+            if target is None and self._running and "channel" in self._running and not self._channel_replies:
+                # An unanchored send in a channel turn (progress, a notice) falls back to the channel.
+                return SendResult(success=True, message_id=uuid.uuid4().hex)
+            target = target or self._running
+            if target is None and self._internal_turn:
+                logger.info("cotal: a turn no peer message started has no mesh origin; its reply is not sent")
+                return SendResult(success=True, message_id=uuid.uuid4().hex)
+            if target is None:
+                logger.warning("cotal: a send to the shared chat names no delivered message (%r) and no turn has run; it is not sent", reply_to)
+                return SendResult(success=False, error="cotal reply has no mesh origin")
+            if "channel" in target and not self._channel_replies:
+                # A shared-chat send is a turn's own output, never an explicit send, so a channel
+                # turn's reply is dropped here.
+                logger.info("cotal: channel_replies is off; a shared-chat send to #%s is not posted", target["channel"])
+                return SendResult(success=True, message_id=uuid.uuid4().hex)
+        else:
+            # An explicit chat (send_message, cron delivery) goes where it names, in either mode.
+            target = _target_for(chat_id)
+        if answered in self._channel_keys and "channel" in target:
+            # Channel posts are tool-only: a turn's text reply would cost every subscriber a turn.
+            logger.debug("cotal: channel_replies is off; a reply to #%s is not posted", target["channel"])
+            return SendResult(success=True, message_id=uuid.uuid4().hex)
+        if answered not in self._answering:
+            answered = None
+        self._client.reply(target, content, answered, self._answering.get(answered) if answered else None)
+        return SendResult(success=True, message_id=uuid.uuid4().hex)
+
+    def _set_running(self, origin: Optional[dict]) -> None:
+        self._running = origin
+        replies.set_running(origin)
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        await super().on_processing_start(event)
+        if self._single:
+            # A turn the adapter did not inject (a background completion) has no peer to answer: its
+            # source is the shared chat's last sender, so it is never a reply target.
+            origin = self._origins.get(str(event.message_id)) if event.message_id is not None else None
+            self._internal_turn = origin is None
+            self._set_running(origin)
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
+        await super().on_processing_complete(event, outcome)
+        self._turn_done.set()
+
+    async def _wait_until_idle(self, source: Any) -> None:
+        """Hold a message while the shared session runs a turn, so it queues behind the turn rather
+        than interrupting it. The sidecar pushes the next message only after this one is delivered,
+        so the rest stay buffered on the mesh, in order. A guard whose task has exited does not hold."""
+        key = self._source_session_key(source)
+        while key in self._active_sessions and not self._session_task_is_stale(key):
+            self._turn_done.clear()
+            try:
+                await asyncio.wait_for(self._turn_done.wait(), IDLE_POLL_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+
+    def _framed(self, msg: dict) -> str:
+        text = format_injection(msg, show_channel=self._single)
+        if msg.get("kind") == "channel" and not self._channel_replies:
+            # On its own unindented line, so a peer body (always indented) cannot imitate it.
+            text += "\n" + CHANNEL_QUIET_NOTE
+        return text
+
+    async def get_chat_info(self, chat_id: str) -> dict:
+        if chat_id.startswith("channel:"):
+            return {"name": "#" + chat_id[len("channel:"):], "type": "group"}
+        return {"name": chat_id, "type": "dm"}
+
+    # ---- inbound (bridge reader thread → gateway loop) -----------------------
+
+    def _on_incoming(self, msg: dict) -> None:
+        """Called off-loop by the bridge reader; hop onto the gateway loop to inject the turn."""
+        loop = self._loop
+        if loop is None:
+            return
+        fut = asyncio.run_coroutine_threadsafe(self._inject(msg), loop)
+        fut.add_done_callback(lambda f: self._maybe_ack(msg, f))
+
+    def _maybe_ack(self, msg: dict, fut: Any) -> None:
+        """Ack a message on the mesh stream once it has been surfaced into a turn.
+
+        VALIDATION GATE (open confirmation #4): ``handle_message`` returning means the event was
+        *queued*, not necessarily *consumed into a turn*. On the pinned Hermes line, confirm the
+        completion point and, if needed, move this ack to a real processing-complete hook/wrapper —
+        do NOT relax it to ack-on-queue (a mesh message that never reaches the model must redeliver
+        after a crash). Until proven, this acks on the inject coroutine completing without error.
+        """
+        recv_key = msg.get("recvKey")
+        if not recv_key or fut.cancelled():
+            return
+        exc = fut.exception()
+        if exc is None:
+            # Address the bridge by the per-delivery receive key (#624): the wire id of an id-less
+            # message is "", which the truthiness check below would silently never deliver-ack, and
+            # the bridge's own guard would then never clear its in-flight slot.
+            self._client.delivered(recv_key)
+
+    async def _inject(self, msg: dict) -> None:
+        kind = msg.get("kind")
+        sender = msg.get("fromName") or "peer"
+
+        if kind == "channel":
+            ch = msg.get("channel") or "general"
+            chat_id, chat_name = f"channel:{ch}", f"#{ch}"
+            target = {"channel": ch}
+        else:  # dm / anycast → a turn whose reply goes straight back to the sender
+            chat_id, chat_name = f"dm:{msg.get('fromId')}", sender
+            target = {"peerId": msg.get("fromId")}
+        # The shared session keys replies by message, so an id-less message is keyed by its receive key.
+        key = (msg.get("id") or msg.get("recvKey")) if self._single else msg.get("id")
+        if self._single:
+            chat_id, chat_name = SINGLE_CHAT_ID, "Cotal mesh"
+        if kind == "channel" and key and not self._channel_replies:
+            self._channel_keys[key] = None
+            if len(self._channel_keys) > MAX_ANSWERING:
+                del self._channel_keys[next(iter(self._channel_keys))]
+        chat_type = chat_type_for(chat_id)
+
+        # A known context id routes a DM to the cotal session that asked. An answer with no matching
+        # context id uses the ordinary session keyed by its sender.
+        asker = replies.asking_session(msg.get("contextId")) if msg.get("answersQuestion") is True else None
+        if asker:
+            # The asking turn's origin is not needed: an answer's turn replies to the answerer.
+            asker.pop("origin", None)
+            if asker.get("chat_type") == "dm" and asker.get("chat_id"):
+                # A DM session is keyed by chat id, so the turn can name the peer that answered.
+                asker.update(user_id=msg.get("fromId"), user_name=sender)
+            source = self.build_source(**asker)
+        else:
+            if msg.get("id"):
+                self._answering[msg["id"]] = msg.get("contextId")
+                if len(self._answering) > MAX_ANSWERING:
+                    del self._answering[next(iter(self._answering))]
+            source = self.build_source(
+                chat_id=chat_id,
+                chat_name=chat_name,
+                chat_type=chat_type,
+                user_id=msg.get("fromId"),
+                user_name=sender,
+            )
+        event = MessageEvent(
+            # Peers are agents: `/approve`, bare `yes`, and `/restart` must reach the model as text.
+            # Never let a peer run gateway commands or approve a tool call.
+            allow_gateway_control=False,
+            # A PEER NAMES ITSELF AND WRITES ITS OWN BODY, so neither is framing. This text is
+            # auto-injected into a turn rather than returned when the model asks, so the model never
+            # had the chance to distrust it, and the attribution plus the body go through one
+            # neutralization rather than being concatenated raw. Measured against the raw form: a
+            # body carrying a newline produced a second attribution line, reading as a message from
+            # a peer that never sent one, and a sender naming itself `Ada] hi [dm from Boss` closed
+            # the real attribution and opened a forged one. Same rule, same character class, as
+            # `framing.ts` on the TypeScript side.
+            text=self._framed(msg),
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=key,
+        )
+        if self._silence_ok:
+            event.reply_expected = False
+        # `cotal spawn --resume`: a chat whose session is still empty starts as a branch of the
+        # launcher's fork, so its first turn carries the source context. No await sits between the
+        # check and the switch inside seed_chat, so a second message for the same chat sees it done.
+        fork = os.environ.get("COTAL_HERMES_FORK_SESSION")
+        if fork:
+            seed_chat(getattr(self, "_session_store", None), source, fork)
+        if not self._single:
+            await self.handle_message(event)
+            return
+        if key in self._held:
+            # A resubscribe pushed it again while it waits: one turn, and no ack before it is admitted.
+            await asyncio.shield(self._held[key])
+            return
+        admitted = asyncio.get_running_loop().create_future()
+        self._held[key] = admitted
+        try:
+            async with self._admit:
+                await self._wait_until_idle(source)
+                self._origins[key] = target
+                if len(self._origins) > MAX_ANSWERING:
+                    del self._origins[next(iter(self._origins))]
+                self._set_running(target)
+                await self.handle_message(event)
+            admitted.set_result(None)
+        except BaseException as e:
+            if isinstance(e, asyncio.CancelledError):
+                admitted.cancel()
+            else:
+                admitted.set_exception(e)
+                admitted.exception()  # retrieved here, so an unwaited future logs nothing
+            raise
+        finally:
+            del self._held[key]

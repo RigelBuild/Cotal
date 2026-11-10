@@ -1,0 +1,10 @@
+{
+  "name": "cotal",
+  "version": "0.0.0",
+  "description": "Connect Claude Code to a Cotal mesh for presence, messaging and role requests. Includes MCP tools, lifecycle hooks and native incoming-message delivery in supported Code sessions. Each conversation joins only when it calls cotal_connect.",
+  "author": { "name": "Cotal", "url": "https://cotal.ai" },
+  "homepage": "https://cotal.ai",
+  "repository": "https://github.com/Cotal-AI/Cotal",
+  "license": "Apache-2.0",
+  "keywords": ["cotal", "multi-agent", "mesh", "nats", "coordination"]
+}

@@ -1,0 +1,148 @@
+{
+  "suite": [
+    "implementations/delivery/smoke/delivery-watchdog-evidence.smoke.ts",
+    "implementations/delivery/smoke/delivery-starvation.smoke.ts",
+    "packages/core/smoke/delivery-lease.smoke.ts"
+  ],
+  "guard": "the delivery daemon distinguishes 'the broker is gone' from 'this process did not get scheduled', it stays up and serves under local starvation, and still exits when the broker is genuinely gone or its lease is genuinely held by another daemon (#1318)",
+  "command": "pnpm smoke:delivery-watchdog-evidence",
+  "completionMarker": "DELIVERY-WATCHDOG-EVIDENCE SMOKE",
+  "proveWith": "node scripts/mutation-proof.mjs --config bin/smoke/mutations/delivery-starvation.json",
+  "why": [
+    "Pure-suite entries grade the lease decision, the loop-lag meter and the transport's own probe budget.",
+    "Live M1 targets the resident transport health lag-credit guard. Its real daemon must survive a bounded scheduling burst, recover, and still fence prolonged transport loss.",
+    "Live lease, startup signal and caught-startup-failure mutations keep their real broker and daemon entrypoints. Build before each mutation and rebuild restored source."
+  ],
+  "mutations": [
+    {
+      "name": "M1-live the same defect, graded end to end against a real daemon and a real broker",
+      "file": "implementations/delivery/src/transport-health.ts",
+      "find": "elapsed - this.lag.starvedMsWithin(elapsed)",
+      "replace": "elapsed",
+      "expectRed": "E6 and it never claimed the broker was gone",
+      "cell": "E6 and it never claimed the broker was gone",
+      "command": "pnpm --filter @cotal-ai/delivery... build > /dev/null && pnpm smoke:delivery-starvation",
+      "completionMarker": "DELIVERY-STARVATION SMOKE",
+      "afterRestore": "pnpm --filter @cotal-ai/delivery... build > /dev/null",
+      "note": "Removing actual resident-health scheduling credit makes the short disconnected CPU-duty burst exceed the loss window and announce broker loss. E6 observes shutdown initiation; E5 can still see the process alive while asynchronous shutdown drains. The healthy transport and prolonged-loss controls remain separate."
+    },
+    {
+      "name": "M5 CONTROL: a lease genuinely held by another daemon no longer ends this one",
+      "file": "implementations/delivery/src/watchdog.ts",
+      "find": "    case \"taken\": return \"exit\";",
+      "replace": "    case \"taken\": return \"keep-serving\";",
+      "expectRed": "G5 STILL exits on `taken`, the single-holder guarantee is preserved",
+      "cell": "G5 STILL exits on `taken`, the single-holder guarantee is preserved",
+      "note": "Positive control for the guarantee the repair must preserve. Two daemons serving one shard SPLIT a durable's delivery, which is a correctness failure rather than an availability one."
+    },
+    {
+      "name": "M6 CONTROL: an unanswerable lease question is treated as a negative answer again",
+      "file": "implementations/delivery/src/watchdog.ts",
+      "find": "    case \"unknown\": return \"keep-serving\";",
+      "replace": "    case \"unknown\": return \"exit\";",
+      "expectRed": "G3 REFUSES to exit on `unknown`, an unanswerable question is not a negative answer",
+      "cell": "G3 REFUSES to exit on `unknown`, an unanswerable question is not a negative answer",
+      "note": "The incident's second exit line, `lost the lease (wrong last sequence: 0)`, in decision form. The genuine-takeover cell stays green in the same run, so the refusing case and the accepting case are graded separately rather than by one assertion."
+    },
+    {
+      "name": "M11 CONTROL: the ws transport loses its larger probe budget",
+      "file": "packages/core/src/endpoint.ts",
+      "find": "  return wsServers(servers) ? 5000 : 1000;",
+      "replace": "  return 1000;",
+      "expectRed": "M6 the probe budget is the transport's own: ws gets 5s, tcp gets 1s",
+      "cell": "M6 the probe budget is the transport's own: ws gets 5s, tcp gets 1s",
+      "command": "pnpm --filter @cotal-ai/core --filter @cotal-ai/delivery... build > /dev/null && pnpm smoke:delivery-watchdog-evidence",
+      "afterRestore": "pnpm --filter @cotal-ai/delivery... build > /dev/null",
+      "note": "Anchored where the budget is DECIDED rather than where the daemon reads it. isReachable gives a ws(s) broker 5s because it rides an HTTPS edge where TLS, upgrade, INFO and auth routinely exceed a second, and the daemon's start-up reachability check takes that default. Anchoring on the daemon call site instead was UNGRADEABLE: the pure suite never loads delivery.ts, and the mutation runner said so rather than reporting a false kill.",
+      "completionMarker": "DELIVERY-WATCHDOG-EVIDENCE SMOKE"
+    },
+    {
+      "name": "M12 CONTROL: a departing daemon deletes its replacement lease on the way out",
+      "file": "packages/core/src/endpoint.ts",
+      "find": "    if (revision === undefined) return;\n    await (await this.deliveryRegistry()).delete(leaseKey(shardIndex), { previousSeq: revision });",
+      "replace": "    await (await this.deliveryRegistry()).delete(leaseKey(shardIndex));",
+      "expectRed": "a release arguing a STALE revision leaves the row in place, silently",
+      "cell": "a release arguing a STALE revision leaves the row in place, silently",
+      "command": "pnpm smoke:delivery-lease:auth",
+      "completionMarker": "DELIVERY-LEASE SMOKE",
+      "note": "RE-ANCHORED, AND THE MOVE IS ITSELF A MEASUREMENT. This was anchored on F7 of the live suite and it SURVIVED once shutdown began re-reading the row and releasing at the BROKER's revision: the daemon no longer argues a token that could belong to a successor, so no end-to-end cell can feel any more whether that delete is conditional. That is a real coverage gap rather than a defect that went away - the compare-and-swap is the last thing standing between a departing daemon and its replacement's row, and with it removed nothing downstream would notice. So the claim moves to where it can still be argued directly, against the seam itself: a release arguing a stale revision must leave the row ALONE. Drop `previousSeq` and the delete succeeds unconditionally, which is exactly the deletion of somebody else's lease the original anchor described. A REVIEWER FINDING, and the merge blocker. Every takeover path ends in shutdown(1), and shutdown released the lease with an UNCONDITIONAL KV delete. By the time a daemon exits because another daemon took the shard, the row belongs to the replacement, so the polite release deleted the new holder lease and left the shard unserved. That is the #1318 outage again, reached through the lease path instead of the broker watch. Only a live cell can see it: leaseAction was always correct, and the damage happened downstream of the decision."
+    },
+    {
+      "name": "M14 the daemon serves the shard while it works out whether the shard is still its own",
+      "file": "packages/core/src/endpoint.ts",
+      "find": "  async quiescePlane3(): Promise<void> {\n    this.plane3Quiesced = true;\n",
+      "replace": "  async quiescePlane3(): Promise<void> {\n    this.plane3Quiesced = true;\n    if (Date.now() > 0) return;\n",
+      "expectRed": "G7d the overlap ENDED while the loser was still alive, not by the loser exiting",
+      "cell": "G7d the overlap ENDED while the loser was still alive, not by the loser exiting",
+      "command": "pnpm --filter @cotal-ai/core --filter @cotal-ai/delivery... build > /dev/null && pnpm smoke:delivery-starvation",
+      "completionMarker": "DELIVERY-STARVATION SMOKE",
+      "afterRestore": "pnpm --filter @cotal-ai/delivery... build > /dev/null",
+      "note": "A REGRESSION THIS BRANCH INTRODUCED, found in review. Turning a failed renew from a verdict into a question is the fix, but the daemon asked the question while still bound: fan-out, the inbox reader and both delivery control responders stayed up across the ownership re-read AND across the atomic create that may follow it. A CAS keeps one lease ROW, not one SERVER, so a replacement that won the shard in that window shared the durables with the loser. Graded live because the damage is entirely in what the process is BOUND to, which no pure predicate can see.\n\nANCHORED ON G7d, AND THE TWO CELLS IT IS *NOT* ANCHORED ON ARE THE INSTRUCTIVE PART. (a) Not G9: the mutant returns from quiescePlane3() after setting the flag but before unbinding anything, and the CALLER still runs noteQuiesce(), so the daemon prints 'stopped serving shard' before its ownership verdict and the transcript ORDER stays correct while nothing was actually unbound. G9 grades what the daemon SAID; this mutant lies. (b) Not G7e, which no longer exists: it sampled whether the daemon had decided at the instant the responder count fell to 1, which only works if the test process is scheduled between the child's two writes, and it reddened on CI for that reason rather than on behaviour. G7d grades the OBSERVABLE the mutant actually breaks: control subscriptions stay at 2 and never resolve to 1 while the loser is alive, because the responders were never unbound. Three reviewers independently reached G7d; an earlier anchor on G9 was mine and was wrong. MEASURED, not declared: applying this mutation under a gate that held end to end reds TWO cells, G7d and G7g, with the sentinel firing and every section reporting (96 passed, 2 failed; the unmutated accept control in the same session is 98/0). G7d is the declared kill: control subscriptions stay at 2 and never fall to 1 while the loser is alive, with the CONNZ sampler answering throughout, so the responders were demonstrably never unbound. G7g reds for the same root cause one layer out: quiescePlane3 also stops the fan-out and reader CONSUMERS, and the early return skips that too, so the loser keeps its parked pulls on the fan-out durable after the arbitration. Both are consequences of the same un-unbinding and neither is incidental. A reviewer independently ran this mutant against the previous anchor and measured G9 GREEN with peakBound 2 and answeredSubs 244, which is the direct evidence that the transcript-order cell cannot see this defect."
+    },
+    {
+      "name": "M15 `unknown` is treated as permission to keep serving the shard",
+      "file": "implementations/delivery/src/watchdog.ts",
+      "find": "  return reading.kind === \"held\";",
+      "replace": "  return reading.kind === \"held\" || reading.kind === \"unknown\";",
+      "expectRed": "N2 `unknown` REFUSES to serve, not being able to ask is not permission to act",
+      "cell": "N2 `unknown` REFUSES to serve, not being able to ask is not permission to act",
+      "note": "The seam's own hardest case, and the one most likely to be 'simplified' away by someone noticing that leaseAction already returns keep-serving for `unknown`. It does, and that is correct: the PROCESS must survive a broker it cannot ask, which is the whole of #1318. But surviving is not serving. A daemon that cannot find out who owns the shard has no basis for continuing to act on it, and widening this gate to `unknown` re-opens the split-durable window through the one path where the daemon has the least evidence. N7 catches the same widening structurally (exactly one of the four readings may serve), so the shape is graded as well as the case."
+    },
+    {
+      "name": "M18 a lease row is proven ours by its PRINCIPAL alone, ignoring which run wrote it",
+      "file": "packages/core/src/endpoint.ts",
+      "find": "    return info.holder === this.card.id && info.incarnation !== undefined && info.incarnation === this.leaseIncarnation;",
+      "replace": "    return info.holder === this.card.id;",
+      "expectRed": "R9 a row with OUR holder but another run's incarnation is NOT adopted as our own",
+      "cell": "R9 a row with OUR holder but another run's incarnation is NOT adopted as our own",
+      "command": "pnpm --filter @cotal-ai/core --filter @cotal-ai/delivery... build > /dev/null && pnpm smoke:delivery-starvation",
+      "completionMarker": "DELIVERY-STARVATION SMOKE",
+      "afterRestore": "pnpm --filter @cotal-ai/delivery... build > /dev/null",
+      "note": "THE PLAUSIBLE WRONG FIX, pinned so nobody re-lands it. The defect this replaced compared the row against the bare connection nkey while the endpoint stamps the principal dot-form, which made `held` unreachable; the obvious repair is to compare principals, and it is still wrong. The daemon's cred is a FILE every restart re-reads, so a replacement daemon presents the SAME principal as the process it replaced. A displaced daemon would then read its successor's row as its own, keep serving a shard it had lost, and CAS-release the live holder's row on the way out. Measured rather than argued: this mutation reddens R9 AND F5/F6/G9/G10/G12, with G12 reporting two live ctl.delivery servers - the split the lease exists to prevent."
+    },
+    {
+      "name": "M19 the signal handlers go back to being armed only at the END of start-up",
+      "file": "implementations/delivery/src/delivery.ts",
+      "find": "    process.on(\"SIGINT\", earlySigint);\n    process.on(\"SIGTERM\", earlySigterm);",
+      "replace": "",
+      "expectRed": "W4 the lease row is GONE, not stranded for the bucket TTL",
+      "cell": "W4 the lease row is GONE, not stranded for the bucket TTL",
+      "command": "pnpm --filter @cotal-ai/delivery... build > /dev/null && pnpm smoke:delivery-starvation",
+      "completionMarker": "DELIVERY-STARVATION SMOKE",
+      "afterRestore": "pnpm --filter @cotal-ai/delivery... build > /dev/null",
+      "note": "WHERE THE HANDLERS ARE ARMED IS THE FIX, and a placement cannot be defended by any assertion about a return value, so it needs its own mutation. Deleting the arming restores the inherited shape exactly: the later `process.off` of the same two functions becomes a no-op that removes listeners never added, which is what the shipped daemon effectively had. Between the CAS-create of the lease row and a handler registered at the END of start-up, SIGTERM takes Node's DEFAULT action - immediate death, no release - and the row claims the shard for the rest of the 30s bucket TTL with no process behind it, so the next daemon is refused outright. Graded end to end against a real daemon, hence the build: the suite spawns through bin/cotal.ts, which resolves the package to its BUILD, and a source-only edit would grade nothing. Measured: this reddens W4-W7 and leaves all 81 other cells green."
+    },
+    {
+      "name": "M20 the start-up release goes back to being reachable only from a process-level guard",
+      "file": "implementations/delivery/src/delivery.ts",
+      "find": "    if (releaseOnStartupFailure !== undefined) {\n      console.error(`\\u2717 delivery: start-up failed - releasing the shard before exiting`);\n      try { await releaseOnStartupFailure(); } catch { /* the throw below is the report */ }\n    }\n    throw e;",
+      "replace": "    throw e;",
+      "expectRed": "X4 the lease row is GONE, a caught start-up rejection still released the shard",
+      "cell": "X4 the lease row is GONE, a caught start-up rejection still released the shard",
+      "command": "pnpm --filter @cotal-ai/delivery... build > /dev/null && pnpm smoke:delivery-starvation",
+      "completionMarker": "DELIVERY-STARVATION SMOKE",
+      "afterRestore": "pnpm --filter @cotal-ai/delivery... build > /dev/null",
+      "note": "A REVIEWER FINDING, and it disproved a claim this repair was already making. `uncaughtException` and `unhandledRejection` do not see a start-up rejection on the path that ships: `runCli` awaits the command inside its OWN try/catch, so the rejection is HANDLED, the CLI prints one line and exits 1, and neither listener ever runs. Deleting this catch body restores exactly that state, leaving the process-level guards in place and the shard stranded for the bucket TTL with the replacement refused. Measured: X4, X5 and X6 redden while all 90 other cells stay green, so the cells grade the caught-rejection door specifically rather than start-up failure in general."
+    },
+    {
+      "name": "M21 CONTROL: the union sums tick charges that overlap after a backward clock step",
+      "file": "implementations/delivery/src/watchdog.ts",
+      "find": "      lo = Math.min(lo, s); hi = Math.max(hi, e);",
+      "replace": "      merged.push([s, e]);",
+      "expectRed": "H10 backward-step tick charges retain their wall-clock union, not their scalar sum",
+      "cell": "H10 backward-step tick charges retain their wall-clock union, not their scalar sum",
+      "command": "pnpm smoke:delivery-watchdog-evidence",
+      "note": "Tick is now the only charge source. A backward clock step makes its two 10000ms charges overlap, with a union of 10250ms rather than a sum of 20000ms. The consumer also measures elapsed wall time. This metadata points to the tick-only cell; no new mutation run is claimed."
+    },
+    {
+      "name": "M22 CONTROL: the union merges disjoint charges, crediting the calm time between two separate stalls",
+      "file": "implementations/delivery/src/watchdog.ts",
+      "find": "      if (e < lo || s > hi) { merged.push([s, e]); continue; }",
+      "replace": "      if (false) { merged.push([s, e]); continue; }",
+      "expectRed": "H9 disjoint tick stalls accumulate without charging the interval between them",
+      "cell": "H9 disjoint tick stalls accumulate without charging the interval between them",
+      "command": "pnpm smoke:delivery-watchdog-evidence",
+      "note": "The tick-only cell charges [250,2250] and [2500,5000], totaling 4500ms. Merging these disjoint spans would incorrectly include the 250ms interval between them. This metadata names the replacement cell; no new mutation run is claimed."
+    }
+  ]
+}

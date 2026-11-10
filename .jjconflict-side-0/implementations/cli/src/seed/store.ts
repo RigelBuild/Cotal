@@ -1,0 +1,105 @@
+import { chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { dirname, join, relative, sep } from "node:path";
+import { provenance } from "@cotal-ai/workspace";
+import { assertReleasedSeedWriter, seedStoreDir, seedStorePath, shippedSourceDir } from "./paths.js";
+import { sharedPlacements } from "./shared.js";
+
+/**
+ * The durable seed store: a stable, per-generation copy of each shipped connector payload that
+ * `ext add --install-links` can normalize a `file:` dep against (a volatile `npx` source would later
+ * fail to reify). One directory per generation keeps an in-flight refresh from clobbering the bytes a
+ * running manager's connectors still resolve; the old generation is GC'd only once nothing references
+ * it.
+ */
+
+/** Everything except a nested `node_modules` (npm resolves deps fresh; peers are junction-linked by
+ *  the `ext add` path) and VCS metadata. The exclusion is RELATIVE to the payload root — a published
+ *  connector lives UNDER `.../node_modules/cotal-ai/seeded-connectors/<name>`, so matching
+ *  `node_modules` anywhere in the absolute path would reject the root itself and copy nothing. */
+function payloadFilter(root: string, from: string): boolean {
+  const segments = relative(root, from).split(sep);
+  return !segments.includes("node_modules") && !segments.includes(".git");
+}
+
+// Install sources can be read-only (a package-manager store); copies keep those modes and
+// would block the next forced re-stage from deleting them.
+function makeTreeOwnerWritable(path: string): void {
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink()) return;
+  if ((stat.mode & 0o200) === 0) chmodSync(path, stat.mode | 0o200);
+  if (stat.isDirectory()) {
+    for (const name of readdirSync(path)) makeTreeOwnerWritable(join(path, name));
+  }
+}
+
+function removeTree(path: string): void {
+  if (!existsSync(path)) return;
+  makeTreeOwnerWritable(path);
+  rmSync(path, { recursive: true, force: true });
+}
+
+/**
+ * Stage a built-in connector's shipped payload into `store/<generation>/<name>` and return that
+ * stable path (the spec `ext add` installs from). Idempotent: an intact prior copy is reused unless
+ * `force` re-materializes it (a `--force`/`--reset` repair). The copy is staged into a sibling temp
+ * dir and renamed into place, so a crash mid-copy never leaves a half-written payload at the final
+ * path for a later run to `ext add` from.
+ */
+export function stageSeedPayload(generation: string, name: string, opts: { force?: boolean } = {}): string {
+  const dest = seedStorePath(generation, name);
+  if (!opts.force && existsSync(join(dest, "package.json"))) return dest;
+  assertReleasedSeedWriter(generation, "write");
+  const src = shippedSourceDir(name);
+  const shared = sharedPlacements(name, src);
+  const staging = `${dest}.staging`;
+  removeTree(staging);
+  removeTree(dest);
+  mkdirSync(dirname(dest), { recursive: true, mode: 0o700 });
+  cpSync(src, staging, { recursive: true, filter: (from) => payloadFilter(src, from) });
+  // A published payload's docs data ships once for every connector; put a copy back where it was packed.
+  for (const { rel, source } of shared) {
+    const to = join(staging, ...rel.split("/"));
+    if (existsSync(to)) throw new Error(`the shipped payload for "${name}" holds ${rel} and also ships it shared - reinstall cotal-ai`);
+    mkdirSync(dirname(to), { recursive: true });
+    copyFileSync(source, to);
+  }
+  makeTreeOwnerWritable(staging);
+  renameSync(staging, dest); // atomic within the store: the final path only ever holds a complete payload
+  // Announce the write on the provenance channel. This store is operator-global (a sibling of the
+  // shared `extensions/` prefix, moved only by `XDG_CONFIG_HOME`), so re-seeding it from a non-released
+  // checkout silently makes those bytes the machine-wide payload for that generation key; naming the
+  // path here lets the line read as the machine-wide action it is. Only on a real materialization: the
+  // idempotent early return above (an intact prior copy) writes nothing and stays silent.
+  //
+  // THE BOUND, stated where the claim is made: this announce is AFTER the commit, so it names what
+  // happened. Announcing BEFORE the rename would trade that for a worse lie (a named write that then
+  // failed). A stderr fault neither fails the seed nor drops the line silently: the provenance
+  // channel's failure policy moves the line to stdout, and a run whose stdout fails too exits 1. Only
+  // a stderr closed or redirected away at launch loses it silently.
+  provenance.wrote(`operator-global seed store payload (${name})`, dest);
+  return dest;
+}
+
+/**
+ * GC seed-store generations other than `keepGeneration`, but ONLY those no live manifest entry still
+ * installs from (its normalized `file:` spec points under the generation dir). This is the commit
+ * predicate: a prior generation is removed only after every seeded entry has been re-added from the
+ * new one, so a running manager never loses the bytes its connectors resolve.
+ */
+export function gcSeedStore(keepGeneration: string, referencedSpecs: readonly string[]): void {
+  const root = seedStoreDir();
+  if (!existsSync(root)) return;
+  for (const gen of readdirSync(root)) {
+    if (gen === keepGeneration) continue;
+    const genDir = join(root, gen);
+    const referenced = referencedSpecs.some((spec) => spec === genDir || spec.startsWith(genDir + sep));
+    if (referenced) continue;
+    assertReleasedSeedWriter(keepGeneration, "garbage-collect");
+    removeTree(genDir);
+    // Announce the DELETE for the same reason the write above is announced: this store is
+    // operator-global, so dropping a generation from it is a machine-wide act performed by a command
+    // the operator ran for a local reason. It is announced AFTER the removal, so the line reports
+    // what happened rather than what was intended.
+    provenance.removed(`operator-global seed store generation (${gen})`, genDir);
+  }
+}

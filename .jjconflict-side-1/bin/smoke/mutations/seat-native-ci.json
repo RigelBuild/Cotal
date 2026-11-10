@@ -1,0 +1,128 @@
+{
+  "suite": ["bin/smoke/seat-native-ci.smoke.ts"],
+  "guard": "Both native Linux archives reach the PR pack and qualified cold candidate; release publication consumes that candidate through the secure preflight",
+  "command": "pnpm smoke:seat-native-ci",
+  "completionMarker": "SUITE COMPLETE",
+  "mutations": [
+    {
+      "name": "PR pack drops the arm64 builder from needs",
+      "file": ".github/workflows/ci.yml",
+      "find": "  seat-pack:\n    if: ${{ github.event_name != 'workflow_dispatch' }}\n    name: seat pack (assembled)\n    timeout-minutes: 20\n    needs: [seat-native-linux-x64, seat-native-linux-arm64, workspace-native]\n",
+      "replace": "  seat-pack:\n    if: ${{ github.event_name != 'workflow_dispatch' }}\n    name: seat pack (assembled)\n    timeout-minutes: 20\n    needs: [seat-native-linux-x64, workspace-native]\n",
+      "expectRed": "ci.yml seat-pack needs both native linux builders",
+      "cell": "ci.yml seat-pack needs both native linux builders"
+    },
+    {
+      "name": "PR pack stops downloading the arm64 artifact",
+      "file": ".github/workflows/ci.yml",
+      "find": "      - uses: actions/download-artifact@v4\n        with:\n          name: seat-native-linux-arm64\n          path: ${{ runner.temp }}/seat-native-linux-arm64\n      - uses: actions/download-artifact@v4\n        with:\n          pattern: seat-native-darwin-*\n",
+      "replace": "      - uses: actions/download-artifact@v4\n        with:\n          pattern: seat-native-darwin-*\n",
+      "expectRed": "ci.yml seat-pack downloads both native linux artifacts",
+      "cell": "ci.yml seat-pack downloads both native linux artifacts"
+    },
+    {
+      "name": "PR pack stops calling the shared pack assembler",
+      "file": ".github/workflows/ci.yml",
+      "find": "        run: sh scripts/ci-seat-pack.sh\n",
+      "replace": "        run: echo skip-assemble\n",
+      "expectRed": "ci.yml seat-pack runs the shared seat pack assembler",
+      "cell": "ci.yml seat-pack runs the shared seat pack assembler"
+    },
+    {
+      "name": "Cold candidate drops the native builder dependency",
+      "file": ".github/workflows/cold-setup.yml",
+      "find": "  candidate:\n    needs: [native, workspace-native]\n",
+      "replace": "  candidate:\n    needs: [workspace-native]\n",
+      "expectRed": "cold candidate needs the native builder matrix",
+      "cell": "cold candidate needs the native builder matrix"
+    },
+    {
+      "name": "Cold candidate drops the arm64 artifact",
+      "file": ".github/workflows/cold-setup.yml",
+      "find": "          name: cold-native-arm64\n          path: ${{ runner.temp }}/cold-native-arm64\n",
+      "replace": "          name: missing-arm64\n          path: ${{ runner.temp }}/cold-native-arm64\n",
+      "expectRed": "cold candidate downloads both native artifacts",
+      "cell": "cold candidate downloads both native artifacts"
+    },
+    {
+      "name": "Cold candidate skips native assembly",
+      "file": ".github/workflows/cold-setup.yml",
+      "find": "      - run: node scripts/seat-assemble-natives.mjs\n",
+      "replace": "      - run: echo skip-assemble\n",
+      "expectRed": "cold candidate assembles natives before packing",
+      "cell": "cold candidate assembles natives before packing"
+    },
+    {
+      "name": "Changesets version job drops the npm-publish Environment",
+      "file": ".github/workflows/changesets.yml.disabled",
+      "find": "    environment: npm-publish\n    permissions:\n      contents: write\n",
+      "replace": "    permissions:\n      contents: write\n",
+      "expectRed": "changesets.yml version job is bound to the npm-publish Environment",
+      "cell": "changesets.yml version job is bound to the npm-publish Environment"
+    },
+    {
+      "name": "Changesets snapshot job drops the npm-publish Environment",
+      "file": ".github/workflows/changesets.yml.disabled",
+      "find": "    environment: npm-publish\n    permissions:\n      contents: read\n",
+      "replace": "    permissions:\n      contents: read\n",
+      "expectRed": "changesets.yml snapshot job is bound to the npm-publish Environment",
+      "cell": "changesets.yml snapshot job is bound to the npm-publish Environment"
+    },
+    {
+      "name": "ci.yml x64 builder uploads only peercred.node",
+      "file": ".github/workflows/ci.yml",
+      "find": "          path: packages/seat/build/Release/linux-x64/\n",
+      "replace": "          path: packages/seat/build/Release/linux-x64/peercred.node\n",
+      "expectRed": "ci.yml seat-native-linux-x64 uploads the whole linux-x64/ directory (peercred.node and pty.node)",
+      "cell": "ci.yml seat-native-linux-x64 uploads the whole linux-x64/ directory (peercred.node and pty.node)"
+    },
+    {
+      "name": "ci.yml arm64 builder uploads only peercred.node",
+      "file": ".github/workflows/ci.yml",
+      "find": "          path: packages/seat/build/Release/linux-arm64/\n",
+      "replace": "          path: packages/seat/build/Release/linux-arm64/peercred.node\n",
+      "expectRed": "ci.yml seat-native-linux-arm64 uploads the whole linux-arm64/ directory (peercred.node and pty.node)",
+      "cell": "ci.yml seat-native-linux-arm64 uploads the whole linux-arm64/ directory (peercred.node and pty.node)"
+    },
+    {
+      "name": "changesets.yml x64 builder uploads only peercred.node",
+      "file": ".github/workflows/changesets.yml.disabled",
+      "find": "          path: packages/seat/build/Release/linux-x64/\n",
+      "replace": "          path: packages/seat/build/Release/linux-x64/peercred.node\n",
+      "expectRed": "changesets.yml seat-native-linux-x64 uploads the whole linux-x64/ directory (peercred.node and pty.node)",
+      "cell": "changesets.yml seat-native-linux-x64 uploads the whole linux-x64/ directory (peercred.node and pty.node)"
+    },
+    {
+      "name": "changesets.yml arm64 builder uploads only peercred.node",
+      "file": ".github/workflows/changesets.yml.disabled",
+      "find": "          path: packages/seat/build/Release/linux-arm64/\n",
+      "replace": "          path: packages/seat/build/Release/linux-arm64/peercred.node\n",
+      "expectRed": "changesets.yml seat-native-linux-arm64 uploads the whole linux-arm64/ directory (peercred.node and pty.node)",
+      "cell": "changesets.yml seat-native-linux-arm64 uploads the whole linux-arm64/ directory (peercred.node and pty.node)"
+    },
+    {
+      "name": "ci.yml arm64 builder drops the symbol-version ceiling",
+      "file": ".github/workflows/ci.yml",
+      "find": "      - name: Native symbol-version ceiling\n        run: node packages/seat/scripts/assert-native-ceiling.mjs\n      - uses: actions/upload-artifact@v4\n        with:\n          name: seat-native-linux-arm64\n",
+      "replace": "      - uses: actions/upload-artifact@v4\n        with:\n          name: seat-native-linux-arm64\n",
+      "expectRed": "ci.yml seat-native-linux-arm64 enforces the native symbol-version ceiling before upload",
+      "cell": "ci.yml seat-native-linux-arm64 enforces the native symbol-version ceiling before upload"
+    },
+    {
+      "name": "PR pack names one native file instead of the builder directory",
+      "file": ".github/workflows/ci.yml",
+      "find": "          SEAT_NATIVE_X64: ${{ runner.temp }}/seat-native-linux-x64\n          SEAT_NATIVE_ARM64: ${{ runner.temp }}/seat-native-linux-arm64\n",
+      "replace": "          SEAT_NATIVE_X64: ${{ runner.temp }}/seat-native-linux-x64/peercred.node\n          SEAT_NATIVE_ARM64: ${{ runner.temp }}/seat-native-linux-arm64\n",
+      "expectRed": "SEAT_NATIVE_X64 and SEAT_NATIVE_ARM64 name the builder directory, not one file",
+      "cell": "SEAT_NATIVE_X64 and SEAT_NATIVE_ARM64 name the builder directory, not one file"
+    },
+    {
+      "name": "ARM load job stops running the pinned PTY probe",
+      "file": ".github/workflows/ci.yml",
+      "find": "        run: node src/packages/seat/smoke/fixtures/pinned-load.mjs \"${RUNNER_TEMP}/seat-prefix/node_modules/@cotal-ai/seat\"\n",
+      "replace": "        run: echo skip-pinned-load\n",
+      "expectRed": "ci.yml seat-linux-arm64 runs the pinned PTY load probe against the installed tarball",
+      "cell": "ci.yml seat-linux-arm64 runs the pinned PTY load probe against the installed tarball"
+    }
+  ]
+}

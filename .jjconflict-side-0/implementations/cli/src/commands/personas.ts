@@ -1,0 +1,297 @@
+import { readFileSync } from "node:fs";
+import {
+  agentFilePath,
+  assertValidName,
+  loadAgentFile,
+  oneLine,
+  personaDir,
+  type CompletionResult,
+  type ParsedArgs,
+} from "@cotal-ai/core";
+import { parseCommaList, recordOperationSpace, renderReport, targetFlags, terminalWidth, wrapWords } from "@cotal-ai/workspace";
+import { commitPersona, editPersona, personaCatalog, personaPath, readPersonaSource, requirePersonaSource, reservedPersonaName, serializePersona, validatePersona } from "../lib/persona-files.js";
+import { completedFlagValue, completingFlagValue, positionalsForCompletion } from "../lib/completion.js";
+import { catalogFolderProblem, catalogReadRefusal, listPersonaNames, readPersonas, type PersonaEntry } from "../lib/personas.js";
+import { openTransient, type ConnectValues } from "../lib/transient.js";
+import { c } from "../ui.js";
+
+/**
+ * `cotal personas` — list and manage the local persona catalog (`.cotal/agents/*.md`),
+ * modelled on `cotal channels`. Workspace-local file editing, NOT a mesh operation: it reads
+ * and writes the files directly (instant, works offline). The privileged, ownership-checked
+ * path stays in the manager's `definePersona` for *agents* defining personas over the wire.
+ *
+ *   cotal personas [list] [--verbose] [--running]
+ *   cotal personas show <name>
+ *   cotal personas edit <name>
+ *   cotal personas new <name> (--prompt <text> | --from <file|->) [--role <r>] [--model <m>] [--force]
+ *   cotal personas rm <name> --force
+ *
+ * WHICH CATALOG IT ACTS ON. Every subcommand resolves the MESH's root through
+ * {@link resolveMeshTarget} — the same resolution `cotal spawn` uses — and never the cwd.
+ * "Local" above means "files on this machine, not a wire call"; it does not mean "whatever
+ * directory you are standing in". Those two readings came apart badly: until this was fixed the
+ * listing took `listPersonas()`'s silent cwd default while `spawn` passed the resolved mesh root,
+ * so from one cwd `personas` listed a set `spawn` could not launch a single member of.
+ *
+ * That also makes `--space`/`--server` real HERE, not just for the `--running` overlay: naming a
+ * mesh now moves the catalog the command reads and writes, so two spaces give two answers from
+ * one cwd. Mesh resolution is offline and pure (registry + `current` + the cwd project, no
+ * broker), so the offline subcommands stay offline.
+ */
+
+/** Persona names are also filenames and spawn names — mirror the `cotal_persona` tool's pattern. */
+const NAME_RE = /^[A-Za-z0-9_-]+$/;
+
+export async function personas(args: ParsedArgs): Promise<void> {
+  const positionals = args.positionals;
+  const values = args.values as { role?: string; model?: string; prompt?: string; from?: string; subscribe?: string; verbose?: boolean; force?: boolean; running?: boolean; space?: string; server?: string; creds?: string };
+
+  switch (positionals[0] ?? "list") {
+    case "list":
+      return list(values.verbose === true, values.running === true, values);
+    case "show":
+      return show(positionals[1], values);
+    case "edit":
+      return edit(positionals[1], values);
+    case "new":
+      return create(positionals[1], values);
+    case "rm":
+      return remove(positionals[1], values.force === true, values);
+    default:
+      return usage();
+  }
+}
+
+/**
+ * The root whose `.cotal/agents` this command acts on: the RESOLVED MESH's, honouring
+ * `--space`/`--server`, exactly as `cotal spawn` resolves it.
+ *
+ * Resolution is offline and pure (registry + `current` + the cwd project) so `show`/`edit`/`new`/
+ * `rm` and the plain listing still work with no broker. It is deliberately NOT wrapped in a cwd
+ * fallback: when the target cannot be resolved the command says so and exits, because the only
+ * alternative is to silently act on some other directory's catalog — the exact defect this
+ * command is being fixed for. `--creds` is auth material, not a location, so it plays no part
+ * here; it stays what it always was, an input to the live `--running` overlay.
+ */
+function targetRoot(values: { space?: string; server?: string }): string {
+  return personaCatalog(values).root;
+}
+
+/** Argument completion: subcommands, then persona names for `show`/`rm`. */
+export function personasComplete(argv: string[]): CompletionResult {
+  const flags = [
+    ...targetFlags,
+    { name: "role", type: "string" },
+    { name: "model", type: "string" },
+    { name: "prompt", type: "string" },
+    { name: "from", type: "string" },
+    { name: "subscribe", type: "string" },
+    { name: "verbose", type: "boolean", short: "v" },
+    { name: "running", type: "boolean" },
+    { name: "force", type: "boolean" },
+  ] as const;
+  const flag = completingFlagValue(argv, flags);
+  if (flag?.name === "from") return { items: [], directive: "default" };
+
+  const positionals = positionalsForCompletion(argv, flags);
+  const subs: CompletionResult = {
+    items: [
+      { value: "list", description: "list the persona catalog" },
+      { value: "show", description: "print a persona's card" },
+      { value: "edit", description: "open a persona in $EDITOR" },
+      { value: "new", description: "create a persona" },
+      { value: "rm", description: "delete a persona" },
+    ],
+    directive: "nofiles",
+  };
+  if (positionals.length <= 1) return subs; // completing the subcommand
+  if (positionals[0] === "show" || positionals[0] === "edit" || positionals[0] === "rm") {
+    // Complete from the TARGET mesh's catalog, matching what the subcommand will actually open —
+    // a <TAB> that offers a name the command then reports as missing is worse than no completion.
+    // Resolved offline (no probe), and FAIL CLOSED: with no single target, offer nothing rather
+    // than throw into the operator's shell (the same posture as `spawnComplete`). A catalog folder
+    // that cannot be read fails the completion instead, naming it.
+    let root: string;
+    try {
+      root = personaCatalog({
+        space: completedFlagValue(argv, flags, "space"),
+        server: completedFlagValue(argv, flags, "server"),
+      }).root;
+    } catch {
+      return { items: [], directive: "nofiles" };
+    }
+    return { items: listPersonaNames(root).map((value) => ({ value })), directive: "nofiles" };
+  }
+  return { items: [], directive: "nofiles" };
+}
+
+async function list(verbose: boolean, running: boolean, values: ConnectValues): Promise<void> {
+  // A refusal names the space it read, as `persona` names it.
+  const { root, space } = personaCatalog(values);
+  recordOperationSpace(space);
+  // A catalog folder that is a file or a looping link is not an empty catalog.
+  const folder = catalogFolderProblem(personaDir(root));
+  if (folder) throw folder;
+  // Only an absent folder is an empty catalog. One that cannot be read is refused, as `persona` refuses it.
+  let entries: PersonaEntry[];
+  try { entries = readPersonas(root); }
+  catch (error) { throw catalogReadRefusal(personaDir(root), error); }
+  if (!entries.length) {
+    console.log(
+      c.dim(`no personas in ${personaDir(root)}\n`) +
+        c.dim('create one:  `cotal personas new <name> --prompt "<who they are>"`'),
+    );
+    return;
+  }
+  // `--running` is an explicit live overlay: connect, snapshot who's present, and mark each persona.
+  // Fails loud if the mesh is unreachable (presentNames exits) — never a silent best-effort. The
+  // marks follow the mesh they were read from, as every other report that reads one begins.
+  const overlay = running ? await presentNames(values) : undefined;
+  const present = overlay?.names;
+  if (overlay) console.log(`${renderReport({ space: overlay.space, sections: [] }, "rich", process.stdout)}\n`);
+  // A catalog travels with a cloned repo, so every value read from it is shown with its control
+  // characters escaped, as `persona` and `persona show` show them.
+  const pad = Math.max(...entries.map((e) => oneLine(e.name).length));
+  for (const e of entries) {
+    const name = oneLine(e.name).padEnd(pad);
+    if (e.error) {
+      // A parser diagnostic spans lines, the reason and then an excerpt with a caret under the
+      // fault, so each line is escaped and printed on its own.
+      const [reason = "", ...excerpt] = e.error.trimEnd().split(/\r?\n/).filter((line) => line.trim());
+      console.log(`${c.red(name)}  ${c.red("⨯ unparseable")} ${c.dim(oneLine(reason))}`);
+      for (const line of excerpt) console.log(c.dim(`    ${oneLine(line)}`));
+      continue;
+    }
+    const d = e.def!;
+    const live = present ? (present.has(e.name) ? c.green("● running") : c.dim("○ not running")) : undefined;
+    const meta = [d.role && c.cyan(oneLine(d.role)), d.model && c.dim(`model=${oneLine(d.model)}`), d.owner && c.dim(`owner=${oneLine(d.owner)}`), live]
+      .filter(Boolean)
+      .join("  ");
+    console.log(`${c.bold(name)}  ${meta}`.trimEnd());
+    if (e.link !== undefined) console.log(c.yellow(`  ! ${oneLine(e.path)} is a link to ${oneLine(e.link)}; persona show, edit and remove refuse a link`));
+    const desc = d.description ?? firstLine(d.persona);
+    // The preview wraps under its indent at the terminal's width, so none of it is cut off. Verbose
+    // prints the whole body next, so a summary that is its first line is not printed twice.
+    if (desc && !(verbose && desc.trim() === firstLine(d.persona))) for (const line of wrapWords(oneLine(desc), terminalWidth(process.stdout) - 2)) console.log(c.dim(`  ${line}`));
+    if (verbose && d.persona) console.log(d.persona.split(/\r?\n/).map((line) => `    ${oneLine(line)}`).join("\n") + "\n");
+  }
+}
+
+/** Snapshot the names currently present on the mesh — the live overlay behind `personas list
+ *  --running` — with the space they were read from. The transient endpoint reads the roster once at
+ *  start. A name is "running" when an agent of exactly that name is present and not offline. */
+async function presentNames(values: ConnectValues): Promise<{ space: string; names: Set<string> }> {
+  const { ep, space } = await openTransient(values, "personas");
+  try {
+    return { space, names: new Set(ep.getRoster().filter((p) => p.status !== "offline").map((p) => p.card.name)) };
+  } finally {
+    await ep.stop();
+  }
+}
+
+function show(name: string | undefined, values: { space?: string; server?: string }): void {
+  if (!name) return usage();
+  // A bad name, a missing persona and an invalid definition are refused as `persona show` refuses them.
+  const path = personaPath(targetRoot(values), name);
+  const bytes = requirePersonaSource(path).bytes;
+  validatePersona(bytes, path);
+  // The canonical card (frontmatter + persona body). Piped or redirected it is the file byte for
+  // byte and nothing else, so `show p > p.md` copies it. A catalog travels with a cloned repo, so on
+  // a terminal its control characters are escaped, as `persona show` shows them, under its path.
+  if (!process.stdout.isTTY) {
+    process.stdout.write(bytes);
+    return;
+  }
+  console.log(c.dim(path));
+  process.stdout.write(bytes.toString("utf8").split(/\r?\n/).map(oneLine).join("\n"));
+}
+
+/** `cotal personas edit <name>` — open the card in the `editor` preference ($VISUAL, then $EDITOR,
+ *  then the saved one), validate a private draft, then compare and commit through the shared local writer. */
+async function edit(name: string | undefined, values: { space?: string; server?: string }): Promise<void> {
+  if (!name) return usage();
+  const catalog = personaCatalog(values);
+  const edit = await editPersona(personaPath(catalog.root, name), name, catalog);
+  if (edit.action === "saved") console.log(c.green(`✓ saved "${name}"`));
+  else if (edit.action === "unchanged") console.log(c.dim(`"${name}" is unchanged, so nothing was saved`));
+  else console.log(c.yellow(`edit cancelled: the editor exited with status ${edit.status}, so nothing was saved${edit.draft ? `; your draft is kept in ${edit.draft}` : ""}`));
+}
+
+async function create(name: string | undefined, v: { role?: string; model?: string; prompt?: string; from?: string; subscribe?: string; force?: boolean; space?: string; server?: string }): Promise<void> {
+  if (!name) return usage();
+  if (!NAME_RE.test(name)) {
+    console.error(c.red(`invalid persona name "${name}": use letters, digits, "_" or "-"`));
+    process.exit(1);
+  }
+  assertValidName(name); // shared reserved-character guard (also rejects "/")
+  const reserved = reservedPersonaName(name);
+  if (reserved) {
+    console.error(c.red(reserved));
+    process.exit(1);
+  }
+
+  const path = agentFilePath(targetRoot(v), name);
+  const expected = readPersonaSource(path);
+  if (expected && !v.force) {
+    console.error(c.red(`persona "${name}" already exists - pass --force to overwrite`));
+    console.error(c.dim(path));
+    process.exit(1);
+  }
+
+  // Body from --prompt <text>, or --from <file|-> (- = stdin). No fallback — one must be given.
+  let persona: string;
+  if (v.prompt !== undefined) persona = v.prompt;
+  else if (v.from !== undefined) persona = readFileSync(v.from === "-" ? 0 : v.from, "utf8");
+  else {
+    console.error(c.red('provide the persona body: --prompt "<text>"  or  --from <file|->'));
+    process.exit(1);
+  }
+  persona = persona.trim();
+  if (!persona) {
+    console.error(c.red("persona body is empty"));
+    process.exit(1);
+  }
+
+  // The channels it reads are stated, never guessed: `--subscribe a,b` or `--subscribe ""` for an
+  // agent that reads none. There is no default, because the two possible ones are both wrong - a
+  // channel the author did not ask for, or an empty set indistinguishable from forgetting to say.
+  if (v.subscribe === undefined) {
+    console.error(c.red("--subscribe is required: name the channels this persona reads"));
+    console.error(c.dim('e.g. --subscribe general   or   --subscribe "" for an agent reachable only by direct message'));
+    process.exit(1);
+  }
+  const subscribe = parseCommaList(v.subscribe);
+
+  const bytes = await serializePersona({ name, role: v.role, model: v.model, persona, subscribe });
+  commitPersona(path, expected, bytes);
+  console.log(c.green(`✓ wrote persona "${name}"`));
+  console.log(c.dim(`${path}\nspawn it:  \`cotal spawn ${name}${v.role ? ` --role ${v.role}` : ""}\``));
+}
+
+function remove(name: string | undefined, force: boolean, values: { space?: string; server?: string }): void {
+  if (!name) return usage();
+  const path = agentFilePath(targetRoot(values), name);
+  const expected = requirePersonaSource(path);
+  if (!force) {
+    console.error(c.red(`refusing to delete "${name}" without --force`));
+    console.error(c.dim(`cotal personas rm ${name} --force`));
+    process.exit(1);
+  }
+  commitPersona(path, expected, undefined);
+  console.log(c.green(`✓ removed persona "${name}"`));
+}
+
+function firstLine(s?: string): string | undefined {
+  return s?.split("\n").find((l) => l.trim())?.trim();
+}
+
+function usage(): never {
+  console.error(
+    c.red(
+      "usage: cotal personas <list [--verbose] [--running] | show <name> | edit <name> | " +
+        'new <name> (--prompt <text> | --from <file|->) --subscribe <a,b|""> [--role <r>] [--model <m>] [--force] | rm <name> --force>',
+    ),
+  );
+  process.exit(1);
+}

@@ -1,0 +1,52 @@
+---
+title: "Connect OMP (alpha)"
+description: "Run OpenCode Mesh Provider sessions on a Cotal mesh."
+kind: Guide
+audience: operators
+---
+
+Connect [OpenCode Mesh Provider](https://github.com/anthropics/omp) sessions to a running Cotal mesh.
+First [start the mesh](run-a-mesh.mdx), install `omp`, and make it available on the host that will run the agent.
+Cotal includes the OMP connector as `@cotal-ai/omp` and loads its bundled Cotal extension when you spawn an OMP session.
+
+## Launch OMP
+
+```bash
+cotal spawn --harness omp
+```
+
+A bare spawn runs OMP in this terminal. Add `--detach` to launch through a manager and return after readiness.
+Use `--model <model>` to select a model, or set `model:` in an agent file. The connector passes the model name to OMP unchanged.
+
+Use `--prompt <text>` for the first turn. The prompt cannot start with `-` or `@`, which OMP parses as an option or file reference.
+
+OMP supports the event plane by default. Use `--no-events` to opt out where the space permits it. OMP events contain completed messages, not live text deltas. See [Connector comparison](connectors.mdx#compare-delivery-and-transports).
+
+## Resume or continue a session
+
+Use `--resume` to fork an existing OMP transcript into a new meshed session. The source transcript is unchanged:
+
+```bash
+cotal spawn --harness omp --resume <omp-session-id>
+```
+
+Use `--continue` to open that exact session in place:
+
+```bash
+cotal spawn --harness omp --continue <omp-session-id>
+```
+
+Only OMP connectors that declare session continuation accept `--continue`. It is not a fork, and it cannot be combined with `--resume`.
+
+## Configure OMP
+
+The OMP connector does not support model variants or selected MCP tool sharing. Its only connector launch options are `config` and `reapplyConfig`:
+
+```bash
+cotal spawn --harness omp --opt config=<omp-config.yaml>
+cotal spawn --harness omp --continue <omp-session-id> --opt config=<omp-config.yaml> --opt reapplyConfig=true
+```
+
+`config` adds an OMP configuration overlay. A resumed or continued session keeps its saved model and thinking level by default; `reapplyConfig=true` asks OMP to apply those values from the overlay. The option has no effect on a fresh session.
+
+For launch modes and shared connector limits, see [Launch agents](launch-agents.mdx). For session lifecycle and event behavior, see the [OMP connector reference](omp-connector-reference.mdx).

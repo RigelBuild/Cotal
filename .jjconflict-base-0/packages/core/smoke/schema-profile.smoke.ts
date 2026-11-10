@@ -1,0 +1,397 @@
+/** D27 execution-profile proofs for schema-profile.ts: full 2020-12 features validate, the
+ *  closure is closed (no ambient resolution), and every bound refuses loudly at registration
+ *  time with contract-invalid — distinct from invocation-time arg rejection (SPEC §13.7). */
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import {
+  compileContractSchema, compileContract, createCompiledContractCache, serviceContractTable, ContractInvalidError,
+  SCHEMA_PROFILE, VOID_SCHEMA, VOID_SCHEMA_ARTIFACT_DIGEST, VOID_SCHEMA_DIGEST,
+} from "../src/schema-profile.js";
+import { contractDigest } from "../src/canonical.js";
+
+let pass = 0;
+const ok = (name: string, cond: boolean, extra?: unknown) => {
+  if (!cond) throw new Error(`FAIL: ${name}${extra !== undefined ? ` — ${JSON.stringify(extra)}` : ""}`);
+  pass++;
+  console.log(`  ✓ ${name}`);
+};
+const refuses = (name: string, fn: () => unknown, needle: string) => {
+  try {
+    fn();
+  } catch (e) {
+    ok(name, e instanceof ContractInvalidError && e.message.includes(needle), (e as Error).message);
+    return;
+  }
+  throw new Error(`FAIL: ${name} — expected contract-invalid`);
+};
+
+// 1) Full 2020-12 features that zod's converter cannot represent MUST validate here:
+//    if/then/else, not, dependentRequired, unevaluatedProperties, local $defs/$ref, oneOf.
+const rich = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  properties: {
+    kind: { $ref: "#/$defs/kind" },
+    mode: { oneOf: [{ const: "fast" }, { const: "safe" }] },
+    retries: { type: "integer" },
+  },
+  required: ["kind"],
+  if: { properties: { kind: { const: "timed" } } },
+  then: { required: ["retries"] },
+  not: { required: ["forbidden"] },
+  dependentRequired: { retries: ["mode"] },
+  unevaluatedProperties: false,
+  $defs: { kind: { enum: ["plain", "timed"] } },
+};
+const validate = compileContractSchema({ root: rich });
+ok("full 2020-12 compiles (if/then, not, dependentRequired, unevaluated, $defs, oneOf)", true);
+ok("valid args pass", validate({ kind: "plain" }) === true);
+ok("if/then enforced", validate({ kind: "timed" }) === false);
+ok("dependentRequired enforced", validate({ kind: "plain", retries: 2 }) === false);
+ok("unevaluatedProperties enforced", validate({ kind: "plain", extra: 1 }) === false);
+ok("conditional satisfied validates", validate({ kind: "timed", retries: 1, mode: "fast" }) === true);
+
+// 2) Digest-pinned bundle members resolve locally; nothing is fetched.
+const member = { $schema: "https://json-schema.org/draft/2020-12/schema", type: "string", minLength: 2 };
+const memberDigest = contractDigest(member);
+const withMember = compileContractSchema({
+  root: { type: "object", properties: { name: { $ref: `cotal:${memberDigest}` } }, required: ["name"] },
+  members: { [memberDigest]: member },
+});
+ok("digest-pinned member resolves from the bundle", withMember({ name: "ok" }) === true && withMember({ name: "x" }) === false);
+
+// 3) Closure violations refuse loudly at registration.
+// #4012: meta-validation is pinned, not inherited, so a malformed keyword value refuses.
+refuses("malformed keyword value refused (type: 5)", () =>
+  compileContractSchema({ root: { type: 5 } }), "schema is invalid");
+refuses("malformed keyword value refused (minLength: -1)", () =>
+  compileContractSchema({ root: { type: "string", minLength: -1 } }), "schema is invalid");
+refuses("http $ref refused (no ambient resolution)", () =>
+  compileContractSchema({ root: { $ref: "https://example.com/schema.json" } }), "external $ref");
+refuses("file $ref refused", () =>
+  compileContractSchema({ root: { $ref: "file:///etc/schema.json" } }), "external $ref");
+refuses("missing digest member refused (closed bundle)", () =>
+  compileContractSchema({ root: { $ref: `cotal:${contractDigest({ marker: "absent" })}` } }), "unresolved digest reference");
+refuses("malformed member key refused", () =>
+  compileContractSchema({ root: { type: "object" }, members: { "sha256:short": {} } }), "not a sha256 digest");
+
+// 4) Bounds: depth and document size refuse before compilation.
+let deep: Record<string, unknown> = { type: "string" };
+for (let i = 0; i <= SCHEMA_PROFILE.maxDepth + 2; i++) deep = { type: "object", properties: { n: deep } };
+refuses("depth bomb refused", () => compileContractSchema({ root: deep }), "depth");
+refuses("oversized document refused", () =>
+  compileContractSchema({ root: { type: "string", description: "x".repeat(SCHEMA_PROFILE.maxDocumentBytes + 1) } }), "bytes");
+
+// 5) An uncompilable schema is contract-invalid, not a crash.
+refuses("broken schema is contract-invalid", () =>
+  compileContractSchema({ root: { type: "object", properties: { a: { $ref: "#/$defs/missing" } } } }), "does not compile");
+
+// 6) Bounded pattern complexity (both regex surfaces).
+refuses("pattern bomb refused", () =>
+  compileContractSchema({ root: { type: "string", pattern: "(a|b)".repeat(SCHEMA_PROFILE.maxPatternChars) } }), "complexity bound");
+refuses("patternProperties key bomb refused", () =>
+  compileContractSchema({ root: { type: "object", patternProperties: { ["x".repeat(SCHEMA_PROFILE.maxPatternChars + 1)]: { type: "string" } } } }), "complexity bound");
+
+// 6b) THERE IS NO SUBSCHEMA-NODE CEILING, AND THIS PINS THE CONSEQUENCE RATHER THAN LEAVING IT
+// IMPLIED. A node bound was proposed as the structural replacement for the CPU-time budget that
+// refused the manager's own service contract on Windows CI ("125ms of CPU ... 80ms elapsed" — CPU
+// above wall clock is only possible with concurrent threads, so that number was mostly V8's JIT).
+// It was removed because neither candidate basis survived measurement: cost has no knee (a 14x
+// spread at one node count), and the codegen RangeError it was meant to sit below is not a node-
+// count edge but a STACK-BUDGET edge (#1551): it moves linearly with `--stack-size` and with the
+// caller's own frame depth, which a frozen node count cannot express regardless of which value it
+// picks.
+//
+// So the shape the byte/depth/ref-chain bounds always missed is now ADMITTED, and asserting that it
+// COMPILES is the point: a silently re-added ceiling would fail here, and whoever adds it has to
+// come to this case and argue for the number.
+{
+  const heavy: Record<string, unknown> = {};
+  for (let i = 0; i < 1000; i++) heavy[`p${i}`] = { type: "string", pattern: `^a{0,4}b${i}c[0-9]{1,3}$`, minLength: 1, maxLength: 40 };
+  // ~90KB, inside maxDocumentBytes and maxClosureBytes, depth 2, ref-chain 0, every pattern legal.
+  ok("the expensive-but-legal schema is ADMITTED (no node ceiling stands in front of it)", (() => {
+    compileContractSchema({ root: { type: "object", properties: heavy, additionalProperties: false } });
+    return true;
+  })());
+}
+{
+  // BOOLEANS ARE SUBSCHEMAS — `false` is a valid 2020-12 schema and each branch is a compile unit.
+  // That fact was load-bearing for the node count and is now load-bearing for the VOCABULARY walk
+  // one section down, which must treat a boolean as a schema position rather than as a scalar.
+  ok("a schema with boolean branches compiles", (() => {
+    compileContractSchema({ root: { anyOf: [{ type: "string" }, false, true] } });
+    return true;
+  })());
+  // STATED, NOT ASSERTED, because asserting it would put its cost in the gate: 40,000 boolean
+  // branches is 240KB — inside every byte bound — and compiles in ~3.8s. It is admitted. That is
+  // the honest price of removing an unfounded bound: a one-time registration cost, paid by a
+  // principal that already holds the authority to register a contract, in exchange for not refusing
+  // real contracts on a constant nobody could defend.
+}
+// 6c) THE ADMITTED VOCABULARY. The profile refuses an unrecognised keyword rather than ignoring it
+// as JSON Schema would, because counting only what you recognise is what let `contentSchema` and
+// `dependencies` through uncounted. This is the ONLY change in this area that REFUSES MORE, so it
+// is the only one that can break a document that registered before — which makes an untested
+// version of it the worst thing in the file.
+//
+// The refusal has to reach EVERY schema position, or a keyword hides one level down from the walk.
+{
+  refuses("an unadmitted keyword at the root refuses", () =>
+    compileContractSchema({ root: { type: "object", "x-vendor": true } }), "admitted vocabulary");
+  refuses("an unadmitted keyword nested under properties refuses", () =>
+    compileContractSchema({ root: { type: "object", properties: { a: { type: "string", fooBar: 1 } } } }), "admitted vocabulary");
+  refuses("an unadmitted keyword inside $defs refuses", () =>
+    compileContractSchema({ root: { $defs: { d: { type: "string", weird: 1 } }, $ref: "#/$defs/d" } }), "admitted vocabulary");
+}
+// AND THE THREE WAYS THIS COULD BE RIGHT IN SHAPE AND WRONG IN WIDTH. Each of these is a schema a
+// reasonable person writes, and each would be refused by a naive version of the walk. Asserting only
+// the refusals above would pass just as happily with a guard that rejects everything.
+{
+  // 1. INERT ANNOTATIONS ARE ADMITTED. Refusing a contract for carrying documentation would be an
+  //    absurd outcome, and the whole 2020-12 annotation vocabulary is listed for that reason.
+  ok("every inert annotation keyword is admitted", (() => {
+    compileContractSchema({ root: { type: "string", title: "t", description: "d", $comment: "c",
+      deprecated: true, readOnly: true, writeOnly: false, examples: [1], default: 2 } });
+    return true;
+  })());
+  // 2. USER-CHOSEN NAMES ARE NOT KEYWORDS. The keys of `properties` are field names; a walk that
+  //    checked every object key against the vocabulary would refuse a schema with a field called
+  //    `name`. These fields are named after keywords precisely because that is the hostile case.
+  ok("property names that collide with keywords are not treated as vocabulary", (() => {
+    compileContractSchema({ root: { type: "object", properties: { type: { type: "string" }, items: { type: "string" }, not: { type: "string" } } } });
+    return true;
+  })());
+  // 3. INSTANCE DATA IS NOT A SCHEMA. `default`, `examples` and `const`/`enum` values are arbitrary
+  //    JSON, so descending into them would refuse a legitimate default whose object happens to
+  //    carry a key nobody enumerated.
+  ok("arbitrary keys inside default/examples/enum data are not vocabulary", (() => {
+    compileContractSchema({ root: { type: "object", default: { anythingGoes: 1 }, examples: [{ alsoFine: 2 }], enum: [{ q: 1 }] } });
+    return true;
+  })());
+}
+{
+  // WHAT ACTUALLY CATCHES A SCHEMA THE COMPILER CANNOT BUILD: the try/catch around `ajv.compile`,
+  // which normalises any codegen failure to `contract-invalid`. It has been doing this the whole
+  // time, including for the RangeError the node bound was proposed to pre-empt — and, since
+  // #1551, naming the compiler's shape and the overflowing width rather than the caller's schema
+  // when the failure IS that RangeError (see the dedicated child-process cell below).
+  //
+  // This particular check stays proven with a DETERMINISTIC non-compiling schema (a dangling
+  // `$ref`) rather than with the RangeError itself: reaching the overflow in-process at a fixed
+  // width depends on THIS process's stack budget and frame depth (#1551), so a width chosen here
+  // would silently stop overflowing on a different host or Node build. The overflow gets its own
+  // deterministic cell instead, in a child process with a reduced `--stack-size`.
+  refuses("a schema the compiler rejects is contract-invalid, not a thrown RangeError", () =>
+    compileContractSchema({ root: { type: "object", properties: { a: { $ref: "#/$defs/absent" } } } }),
+    "does not compile");
+}
+
+// 7) A member that does not hash to its digest key refuses (also the cache-soundness gate).
+refuses("forged member content refused", () =>
+  compileContractSchema({
+    root: { $ref: `cotal:${memberDigest}` },
+    members: { [memberDigest]: { type: "number" } },
+  }), "does not hash");
+
+// 8) Closure identity is the §13.7 manifest digest (root digest + reachable members, sorted).
+ok("self-contained closure digest is the manifest digest",
+  compileContract({ root: member }).closureDigest === contractDigest({ v: 1, root: memberDigest, members: [] }));
+const memberedRoot = { type: "object", properties: { name: { $ref: `cotal:${memberDigest}` } } };
+ok("membered closure digest lists the reachable member",
+  compileContract({ root: memberedRoot, members: { [memberDigest]: member } }).closureDigest
+  === contractDigest({ v: 1, root: contractDigest(memberedRoot), members: [memberDigest] }));
+
+// 9) The void schema's digests are the fixed values every payload-free side pins.
+ok("void artifact digest is contractDigest({type:'null'})", VOID_SCHEMA_ARTIFACT_DIGEST === contractDigest({ type: "null" }));
+ok("void closure digest is its manifest digest", VOID_SCHEMA_DIGEST === contractDigest({ v: 1, root: VOID_SCHEMA_ARTIFACT_DIGEST, members: [] }));
+ok("the void schema validates null only", (() => {
+  const v = compileContractSchema({ root: VOID_SCHEMA });
+  return v(null) === true && v({}) === false && v("x") === false;
+})());
+
+// 10) The compiled LRU: hit reuses, capacity evicts, eviction recompiles.
+const cache = createCompiledContractCache(2);
+const a = cache.compile({ root: member });
+ok("cache hit returns the same compiled validator", cache.compile({ root: member }).validate === a.validate && cache.size() === 1);
+cache.compile({ root: { type: "integer" } });
+cache.compile({ root: { type: "boolean" } });
+ok("capacity bounds the cache", cache.size() === 2);
+ok("an evicted closure recompiles to a fresh validator", cache.compile({ root: member }).validate !== a.validate);
+
+// 11) The safe-subset pattern gate: length alone does not bound backtracking, and a
+//     nested-quantifier denylist alone does not either.
+refuses("nested-repetition pattern refused (the ^(a+)+$ exponential class)", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^(a+)+$" } }), "repeats a group");
+refuses("bounded-brace repetition of a quantified group refused", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^(a*){2,}$" } }), "repeats a group");
+refuses("backreference pattern refused", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^(a)\\1$" } }), "backreference");
+refuses("ambiguous alternation under repetition refused (the ^(a|aa)+$ exponential class)", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^(a|aa)+$" } }), "ambiguous alternation");
+refuses("overlapping variable repetitions in sequence refused (the a*a* polynomial class)", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^a*a*a*b$" } }), "overlapping variable repetitions");
+refuses("overlap through a nullable separator refused (a*b?a*)", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^a*b?a*$" } }), "overlapping variable repetitions");
+refuses("repeated nullable body refused ((a?)*)", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^(a?)*$" } }), "repeats a group");
+refuses("lookaround refused (outside the safe subset)", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^(?=a)ab$" } }), "safe subset");
+refuses("an unanchored pattern refused (Ajv tests unanchored → O(n²) at every start position)", () =>
+  compileContractSchema({ root: { type: "string", pattern: "[0b]*$" } }), "start anchor");
+refuses("an unanchored alternation branch refused (^a|b$ leaves the 2nd branch unpinned)", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^[ba]+|[0b]*$" } }), "start anchor");
+refuses("double-negated class overlap refused ([^\\D]* \\d* is digit* digit*)", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^[^\\D]*\\d*X$" } }), "overlapping variable repetitions");
+refuses("unknown alphanumeric escape refused (\\cA is control-A, not literal c+A)", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^\\cA*\\cA*X$" } }), "safe subset");
+refuses("astral overlap refused (an emoji is ONE code point under /u)", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^😀*😀*X$" } }), "overlapping variable repetitions");
+refuses("surrogate escapes refused", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^\\uD83D\\uDE00*$" } }), "surrogate");
+refuses("repetition hidden in a leading alternation refused ((a*|b)a*)", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^(a*|b)a*X$" } }), "overlapping variable repetitions");
+refuses("repetition hidden in a trailing alternation refused (a*(a*|b))", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^a*(a*|b)X$" } }), "overlapping variable repetitions");
+refuses("repetitions hidden in both alternations refused ((a*|b)(a*|b))", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^(a*|b)(a*|b)X$" } }), "overlapping variable repetitions");
+ok("a disjoint repetition hidden in an alternation still compiles ((a*|c)b*)", (() => {
+  const v = compileContractSchema({ root: { type: "string", pattern: "^(a*|c)b*X$" } });
+  return v("aabbX") === true && v("cbX") === true && v("aaY") === false;
+})());
+refuses("overlapping FINITE-range repetitions refused (a{0,100000}a{0,100000} is not constant)", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^a{0,100000}a{0,100000}X$" } }), "overlapping variable repetitions");
+refuses("finite range hidden in an alternation refused ((a{0,9}|b)a{0,9})", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^(a{0,100000}|b)a{0,100000}X$" } }), "overlapping variable repetitions");
+refuses("a chain of overlapping optionals refused (a?a?a?a? is bounded-backtracking)", () =>
+  compileContractSchema({ root: { type: "string", pattern: "^a?a?a?a?X$" } }), "overlapping variable repetitions");
+ok("a single optional still compiles (colou?r)", (() => {
+  const v = compileContractSchema({ root: { type: "string", pattern: "^colou?r$" } });
+  return v("color") === true && v("colour") === true && v("colouur") === false;
+})());
+ok("disjoint finite ranges still compile (\\d{1,9}[a-z]{1,9})", (() => {
+  const v = compileContractSchema({ root: { type: "string", pattern: "^[0-9]{1,9}[a-z]{1,9}$" } });
+  return v("12ab") === true && v("12") === false;
+})());
+ok("negated classes and braced code points still compile", (() => {
+  const v = compileContractSchema({ root: { type: "string", pattern: "^[^a-z]+x\\u{1F600}*$" } });
+  return v("A1x😀") === true && v("abc") === false;
+})());
+ok("the (…)? label idiom still compiles (a ? adds one alternative, not per-character ambiguity)", (() => {
+  const v = compileContractSchema({ root: { type: "string", pattern: "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" } });
+  return v("ok-1") === true && v("-no") === false;
+})());
+ok("disjoint alternation under repetition still compiles ((a|b)+)", (() => {
+  const v = compileContractSchema({ root: { type: "string", pattern: "^(a|b)+$" } });
+  return v("abab") === true && v("c") === false;
+})());
+ok("disjoint sequential repetitions and fixed counts still compile", (() => {
+  const v = compileContractSchema({ root: { type: "string", pattern: "^[a-z]+[0-9]*-\\d{4}$" } });
+  return v("ab12-2026") === true && v("ab-26") === false;
+})());
+ok("the digest-shape pattern still compiles", (() => {
+  const v = compileContractSchema({ root: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" } });
+  return v(`sha256:${"a".repeat(64)}`) === true && v("sha256:xyz") === false;
+})());
+
+// 12) I-JSON violations in a schema surface as contract-invalid, never a raw canonicalizer error.
+refuses("lone-surrogate schema is contract-invalid", () =>
+  compileContractSchema({ root: { type: "string", description: "bad \ud800" } }), "I-JSON");
+
+// 13) Unreachable members refuse deterministically — cold, warm, and forged alike (nothing
+//     unverified or outside the closure identity ever reaches the compiler).
+refuses("unreachable extra member refused", () =>
+  compileContractSchema({ root: { type: "string" }, members: { [memberDigest]: member } }), "unreachable");
+refuses("unreachable FORGED member refused", () =>
+  compileContractSchema({ root: { type: "string" }, members: { [contractDigest({ type: "number" })]: { type: "boolean" } } }), "unreachable");
+const warm = createCompiledContractCache(4);
+warm.compile({ root: { type: "string" } });
+refuses("extras refuse even when the closure is already cached (no history dependence)", () =>
+  warm.compile({ root: { type: "string" }, members: { [memberDigest]: member } }), "unreachable");
+
+// 14) A reachable-member $id collision is contract-invalid, not a raw ajv error.
+const idA = { $id: "urn:test:same", type: "string" };
+const idB = { $id: "urn:test:same", type: "number" };
+const dA = contractDigest(idA);
+const dB = contractDigest(idB);
+refuses("member $id collision is contract-invalid", () =>
+  compileContractSchema({
+    root: { type: "object", properties: { a: { $ref: `cotal:${dA}` }, b: { $ref: `cotal:${dB}` } } },
+    members: { [dA]: idA, [dB]: idB },
+  }), "does not compile");
+
+// 15) THE OVERFLOW ITSELF (#1551): a wide but legal object schema — admitted by every ceiling
+// above — overflows the generated validator's call stack at compile, and the caller-facing error
+// must name the compiler's shape and the overflowing width, not the schema. The overflow's own
+// width is a function of THIS process's stack budget and frame depth (see the pin comment on
+// `AJV_PROFILE_OPTIONS`), so it cannot be reached deterministically in THIS process at a fixed
+// property count — a width chosen here would silently stop overflowing on a different host or
+// Node build. A CHILD PROCESS with a reduced `--stack-size` fixes both problems: the reduced
+// budget makes a modest width overflow every time, and the child is disposable, so nothing about
+// this process's own call depth leaks into the result.
+//
+// The smoke's existing 1000-property width (section 6b, admitted with the profile's real stack
+// budget) is re-run in the SAME child, at the SAME reduced budget, as a positive control: it must
+// still compile, so a failure at the larger width is provably about the WIDTH and not about the
+// reduced budget alone.
+{
+  const schemaProfileModule = fileURLToPath(new URL("../src/schema-profile.js", import.meta.url));
+  const overflowWidth = 2000; // ~2.3x the smoke's 1000-property control width
+  const childScript = `
+    import { compileContractSchema } from ${JSON.stringify(schemaProfileModule)};
+    function heavy(n) {
+      const props = {};
+      for (let i = 0; i < n; i++) props["p" + i] = { type: "string", pattern: "^a{0,4}b" + i + "c[0-9]{1,3}$", minLength: 1, maxLength: 40 };
+      return { type: "object", properties: props, additionalProperties: false };
+    }
+    compileContractSchema({ root: heavy(1000) });
+    console.log("CONTROL_1000_OK");
+    try {
+      compileContractSchema({ root: heavy(${overflowWidth}) });
+      console.log("OVERFLOW_DID_NOT_THROW");
+    } catch (e) {
+      console.log("OVERFLOW_MESSAGE " + JSON.stringify(e.message));
+      console.log("OVERFLOW_NAME " + e.constructor.name);
+    }
+  `;
+  const child = spawnSync(process.execPath, ["--stack-size=256", "--import", "tsx", "-e", childScript], {
+    encoding: "utf8", timeout: 30_000, killSignal: "SIGKILL",
+  });
+  const out = child.stdout ?? "";
+  ok("positive control: the smoke's 1000-property width still compiles at the reduced stack budget",
+    out.includes("CONTROL_1000_OK"), { status: child.status, stderr: child.stderr?.slice(0, 2000) });
+  ok(`a ${overflowWidth}-property object overflows the reduced stack deterministically`,
+    !out.includes("OVERFLOW_DID_NOT_THROW") && /OVERFLOW_MESSAGE/.test(out), out);
+  ok("the overflow names the compiler's generated-code shape, the overflowing width, and that every profile ceiling had already admitted the schema — not the caller's schema",
+    out.includes("OVERFLOW_NAME") && out.includes("ContractInvalidError")
+    && new RegExp(`generated validator's code shape overflowed.*compiling a ${overflowWidth}-property object.*every profile ceiling.*had already admitted`).test(out)
+    && !out.includes("document is") && !/is \d+ bytes \(profile max/.test(out) && !out.includes("nesting exceeds"),
+    out);
+}
+
+// 16) Published service tables stay lazy without exposing replaceable command validators.
+{
+  let inputReads = 0;
+  const table = serviceContractTable([
+    { name: "probe", get input() { inputReads++; return { type: "string" }; }, output: VOID_SCHEMA },
+    { name: "invalid", input: { type: 5 }, output: VOID_SCHEMA },
+  ]);
+  ok("service contract table is frozen before any command is compiled", Object.isFrozen(table.contracts) && inputReads === 0);
+  ok("enumeration and membership do not compile command schemas",
+    Object.keys(table.contracts).join(",") === "probe,invalid" && "probe" in table.contracts && inputReads === 0);
+  ok("undeclared commands and prototype names have no contract",
+    table.contracts.absent === undefined && table.contracts.constructor === undefined && !("toString" in table.contracts));
+  ok("command descriptors cannot be replaced or deleted",
+    !Reflect.set(table.contracts, "probe", {}) && !Reflect.deleteProperty(table.contracts, "probe"));
+  ok("a frozen service table cannot acquire a new command", !Reflect.set(table.contracts, "injected", {}));
+  const pair = table.contracts.probe;
+  ok("the first access compiles once and keeps the same pair", inputReads === 1 && table.contracts.probe === pair && inputReads === 1);
+  ok("the compiled pair and both compiled contracts are frozen",
+    Object.isFrozen(pair) && Object.isFrozen(pair.input) && Object.isFrozen(pair.output));
+  ok("a caller cannot swap the pair's input validator", !Reflect.set(pair, "input", pair.output));
+  ok("the original input and output validators still decide their own schemas",
+    pair.input.validate("text") && !pair.input.validate(null) && pair.output.validate(null) && !pair.output.validate("text"));
+  refuses("an invalid unused command compiles only when accessed", () => table.contracts.invalid, "schema is invalid");
+}
+
+console.log(`schema-profile.smoke: ${pass} checks passed`);
+await import("./schema-meta-cache.smoke.js");

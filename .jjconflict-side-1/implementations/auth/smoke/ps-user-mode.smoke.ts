@@ -1,0 +1,892 @@
+/**
+ * USER-MODE `cotal ps` (fix/ps-option3 C): mode chosen up front — ep.one, not scatter.
+ *
+ *   1. up --user-auth + device login + admin grant (the arm-2 shape that may reach ps)
+ *   2. cotal ps exits 0 (the product claim C authorises)
+ *   3. manager killed — ps says no manager answered and lists your agents from presence, exit 0,
+ *      never a bare empty list
+ *
+ * Spawn-only `status --components` runs under `actor grant --full` after the admin ps
+ * cells, then the admin grant is restored. That cell records the manager-caller exchange
+ * and requires the instance id this machine's live manager persisted. A call with the
+ * manager pidfile hidden stays serving and is not pinned. A live pid whose identity file
+ * is hidden is refused and names the instance that answered. Refusal of other
+ * spawn-only commands stays in user-spawn.smoke.ts B1e.
+ * Gated: a RED here is C or the user-mode connect path broken.
+ *
+ * STEP 3 follows the product decision that a user-auth `ps` with no manager answering is not an
+ * error: it says so, lists the agents presence shows, read-only, and names how to start the manager.
+ * What it must never be is a bare empty list, which reads as "no agents".
+ */
+import { execFileSync, spawn } from "node:child_process";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { betterAuth } from "better-auth";
+import { memoryAdapter } from "better-auth/adapters/memory";
+import { jwt } from "better-auth/plugins/jwt";
+import { deviceAuthorization } from "better-auth/plugins/device-authorization";
+import { bearer } from "better-auth/plugins/bearer";
+import { toNodeHandler } from "better-auth/node";
+import { pickFreePort } from "./_free-port.js";
+import { assertScratchHeld, foreignRootFor, killManagerAtRoot, makeScratch } from "../../../bin/smoke/_scratch.js";
+import { assertSmokeSandboxDown, recordSmokeSandbox, type SmokeSandboxAnchor } from "@cotal-ai/smoke-kit";
+import { approveDevice } from "./_device-approval.js";
+
+// Sandbox the temp root BEFORE minting the fixture. `findCotalRoot` walks to `/` unbounded, so a
+// `.cotal` above `tmpdir()` makes `cotal up` write `manager.pid` into that ancestor. Step 4 then
+// finds no pid, skips its kill, and grades a LIVE manager's honest "(no managed agents)" as the
+// empty-success defect it is meant to catch. On Linux/CI `os.tmpdir()` is `/tmp`, so a stray
+// `/tmp/.cotal` there hits this suite every time; on macOS the temp root is `/var/folders/…` and is
+// clean, which is why it stayed green locally. Measured: exit 0 + "(no managed agents)" under a
+// poisoned base, 5/5 under a clean one, at the same commit.
+const scratch = makeScratch("cotal-psuser-");
+// Assigned inside the ONE setup transaction below. Everything between `makeScratch` and the main
+// body is fallible, and guarding it a line at a time is how the first attempt at this left the
+// cookie read, the auth construction and the port pick outside the guard while a comment claimed
+// otherwise. One transaction or none.
+let home!: string;
+let root!: string;
+let configDir!: string;
+let sandbox!: SmokeSandboxAnchor;
+let establishIdpSession!: typeof import("../src/index.js").establishIdpSession;
+
+// Was `cotal up` ever INVOKED? Not "did it succeed" — a failed, timed-out or signalled `up` can still
+// have launched detached processes, and those are exactly the ones whose pidfiles must survive.
+// Attribution evidence is earned by the attempt, not by the outcome.
+let upAttempted = false;
+// Step 3b replaces the stack's own registry entry with a discovered one and records other entries on
+// the same root and broker. `cotal down` stops a stack only through its one owned registration, and
+// leaves a broker running while another registered space names its address, so teardown puts the
+// original entry back and removes the rest first.
+let restoreStackRegistration: (() => void) | undefined;
+type DeviceLoginPrompt = import("../src/index.js").DeviceLoginPrompt;
+
+let pass = 0, fail = 0;
+const check = (n: string, v: boolean, x?: unknown) => {
+  v ? (pass++, console.log(`  ✓ ${n}`)) : (fail++, console.log(`  ✗ FAIL: ${n}`, x ?? ""));
+};
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+let SERVER!: string;
+let PUBLIC_EXCHANGE_PORT!: number;
+const SPACE = `psuser-${Math.floor(Math.random() * 1e6)}`;
+const CLIENT_ID = "cotal-cli";
+const BIN = join(import.meta.dirname, "..", "..", "..", "bin", "cotal.ts");
+const TSX = join(import.meta.dirname, "..", "..", "..", "node_modules", ".bin", "tsx");
+
+/**
+ * How the child ENDED is part of the result, not a detail of the wrapper.
+ *
+ * `status: null` is reported for ANY signal death — this suite's own timeout, an external
+ * SIGTERM/SIGKILL, an OOM kill, a supervisor sweep — and a launch failure never fires `exit` at
+ * all. Every one of those yields the exact shape step 4's cell demands (`status !== 0`, no
+ * "(no managed agents)"), so any of them lets a run that proved nothing print PASS. A `timedOut`
+ * flag alone is not enough: it only knows about OUR timer.
+ *
+ * So carry all four routes and let {@link mustHaveRun} insist on the only gradeable outcome —
+ * the child exited by itself, with a real numeric code.
+ */
+// How long to keep draining inherited stdio after the direct child exits. Long enough for the tail
+// a detached component flushes (measured ~450ms), short enough that a long-lived one cannot hang
+// the suite. Exceeding it is reported, never absorbed.
+const DRAIN_MS = 2_000;
+
+type Run = {
+  status: number | null;
+  out: string;
+  timedOut: boolean;
+  signal: NodeJS.Signals | null;
+  launchError?: string;
+  /** Descendants held the inherited pipes past the drain bound: `out` is a PREFIX, not the whole. */
+  stdioTimedOut?: boolean;
+};
+/** The manager-instance.json whose instanceId is `instanceId`, under `dir`. */
+function managerIdentityPath(dir: string, instanceId: string): string | undefined {
+  const pending = [dir];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined || !existsSync(current)) continue;
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const path = join(current, entry.name);
+      if (entry.isDirectory()) pending.push(path);
+      else if (entry.isFile() && entry.name === "manager-instance.json") {
+        try {
+          const parsed = JSON.parse(readFileSync(path, "utf8")) as { instanceId?: unknown };
+          if (parsed.instanceId === instanceId) return path;
+        } catch {
+          // A record this cell cannot read is not the one it hides.
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+function cotal(args: string[], timeoutMs = 120_000): Promise<Run> {
+  return new Promise((res) => {
+    const options = {
+      cwd: root, env: { ...process.env, COTAL_HOME: home, XDG_CONFIG_HOME: configDir, COTAL_SKIP_CONNECTOR_SEED: "1" }, stdio: [...(["ignore", "pipe", "pipe"] as const)],
+    };
+    assertSmokeSandboxDown(sandbox, args, options);
+    const child = spawn(TSX, [BIN, ...args], options);
+    let out = "";
+    let timedOut = false;
+    let settled = false;
+    let exited = false;
+    let status: number | null = null;
+    let signal: NodeJS.Signals | null = null;
+    let drain: NodeJS.Timeout | undefined;
+    // One settle path. A launch error otherwise leaves this Promise pending until the timer, and the
+    // failure then wears the wrong label — "timed out" for something that never started.
+    const done = (r: Run) => { if (settled) return; settled = true; clearTimeout(cmd); clearTimeout(drain); res(r); };
+    // Descendants still hold our pipe ends. Stop waiting, drop them, and SAY the output is partial
+    // rather than grading a prefix silently.
+    const giveUpOnStdio = () => { child.stdout?.destroy(); child.stderr?.destroy(); done({ status, out, timedOut, signal, stdioTimedOut: true }); };
+    const cmd = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+      // A kill cannot close pipes an already-exited child handed to a detached descendant, so the
+      // command timeout has to be able to settle by itself or this wrapper hangs forever.
+      if (exited) giveUpOnStdio(); else drain = setTimeout(giveUpOnStdio, DRAIN_MS);
+    }, timeoutMs);
+    child.on("error", (e) => done({ status: null, out, timedOut, signal: null, launchError: e.message }));
+    child.stdout!.on("data", (d: Buffer) => { out += d.toString(); });
+    child.stderr!.on("data", (d: Buffer) => { out += d.toString(); });
+    // TWO PHASE. `exit` gives the direct child's outcome; `close` gives the COMPLETE output, because
+    // pipes handed to DETACHED descendants keep carrying text after the child dies (measured:
+    // `out: ""` at exit 26ms, `out: "STREAM.INFO"` at close 453ms) and every cell below that reads
+    // output content would otherwise judge text that had not arrived. But waiting only for `close`
+    // hangs whenever a long-lived detached component holds the pipe — which `cotal` creates on
+    // purpose. So: record the outcome at `exit`, keep draining, and bound that drain.
+    child.on("exit", (s, sg) => { exited = true; status = s; signal = sg; drain = setTimeout(giveUpOnStdio, DRAIN_MS); });
+    child.on("close", (s, sg) => done({ status: s ?? status, out, timedOut, signal: sg ?? signal }));
+  });
+}
+
+/** Refuse to grade anything but a self-terminated child with a real exit code. Fatal, because every
+ *  rejected shape here is one that would otherwise SATISFY the cells below. */
+function mustHaveRun(r: Run, what: string): void {
+  const why =
+    r.launchError ? `never launched (${r.launchError})`
+    : r.timedOut ? "was SIGKILLed by this suite's timeout"
+    : r.signal ? `was killed by ${r.signal} from outside this suite`
+    : r.stdioTimedOut ? "left its output incomplete (detached descendants held the pipes past the drain bound)"
+    : r.status === null ? "ended with neither an exit code nor a signal"
+    : null;
+  if (why === null) return;
+  process.exitCode = 1;
+  throw new Error(
+    `${what} ${why}: that yields status null and no output, which is exactly the shape the ` +
+      `empty-success cell treats as a pass. Grading it would be a false green.`,
+  );
+}
+
+/**
+ * ONE SETUP TRANSACTION. Everything between `makeScratch` and the main body happens in here, and a
+ * throw anywhere in it removes the scratch and closes the IdP before rethrowing.
+ *
+ * Guarding this a step at a time does not work, and the previous attempt is the proof: it wrapped
+ * the listen and the signup, left the cookie read, the auth construction and the port pick outside,
+ * and carried a comment claiming everything fallible was covered. A forced null `set-cookie` then
+ * threw past it, stranding the scratch AND leaving the IdP listening so the process survived to the
+ * harness's 120s kill. The unit that needs to be atomic is the whole setup, not each fallible line.
+ *
+ * The stakes are higher than tidiness since the anchor landed: a leaked scratch owns a `.cotal`, so
+ * what gets left behind is a live capture hazard for whatever runs under that temp base next — the
+ * exact poison this suite exists to detect, manufactured on its own error path.
+ */
+let handler: ReturnType<typeof toNodeHandler> | undefined;
+let idpSrv: ReturnType<typeof createServer> | undefined;
+let base!: string;
+let origin!: string;
+let cookie!: string;
+/** The IdP under test, built once from its origin. `betterAuth` is generic in its options, and
+ *  `Auth<O>` is invariant in `O`, so a binding declared as the DEFAULT `ReturnType<typeof betterAuth>`
+ *  (that is, `Auth<BetterAuthOptions>`) cannot hold the concretely-typed value this call returns.
+ *  Naming the construction gives the binding the exact instantiation and keeps `ba.api` typed. */
+const buildIdpAuth = (idpOrigin: string) => betterAuth({
+  baseURL: idpOrigin,
+  secret: "repro-only-better-auth-secret-0123456789",
+  database: memoryAdapter({ user: [], session: [], account: [], verification: [], jwks: [], deviceCode: [] }),
+  emailAndPassword: { enabled: true },
+  plugins: [
+    jwt({ jwt: { issuer: idpOrigin, audience: idpOrigin } }),
+    deviceAuthorization({ expiresIn: "2m", interval: "1s", validateClient: (id) => id === CLIENT_ID }),
+    bearer(),
+  ],
+});
+let ba!: ReturnType<typeof buildIdpAuth>;
+try {
+  home = mkdtempSync(join(scratch, "home-"));
+  configDir = join(home, "xdg");
+  process.env.COTAL_HOME = home;
+  process.env.XDG_CONFIG_HOME = configDir;
+  root = mkdtempSync(join(scratch, "root-"));
+  // ANCHOR THE ROOT BEFORE ANY PRODUCT COMMAND RUNS. `findCotalRoot` stops at the first `.cotal`
+  // starting from the directory itself, so owning one here makes every later resolution from this
+  // root land on this root - during `up`, during `ps`, and during `down` - no matter what appears
+  // above it in between. Ownership then does not depend on the timing of any check, which is the
+  // only way to close a race against a child that re-resolves cwd for itself.
+  sandbox = recordSmokeSandbox({ root, cotalHome: home, xdgConfigHome: configDir });
+  ({ establishIdpSession } = await import("../src/index.js"));
+  SERVER = `nats://127.0.0.1:${await pickFreePort()}`;
+  PUBLIC_EXCHANGE_PORT = await pickFreePort();
+
+  idpSrv = createServer((req, res) => handler!(req, res));
+  // The listen-failure listener is REMOVED on success. Left installed, it outlives the Promise it
+  // belongs to: a later server error then invokes an already-settled reject, which is a no-op, so
+  // the error is silently consumed and the run continues on a broken IdP. That is worse than having
+  // no handler at all, since an unhandled `error` on an EventEmitter at least throws.
+  await new Promise<void>((r, rej) => {
+    const onListenError = (e: Error) => rej(e);
+    idpSrv!.once("error", onListenError);
+    idpSrv!.listen(0, "127.0.0.1", () => { idpSrv!.off("error", onListenError); r(); });
+  });
+  // From here the server is live for the rest of the run, so errors get a PERSISTENT handler that
+  // reds the suite rather than either crashing it mid-fixture (losing teardown) or vanishing.
+  idpSrv.on("error", (e) => {
+    process.exitCode = 1;
+    console.error(`  ! IdP server error after listen: ${e.message} — the suite's verdict below cannot be trusted`);
+  });
+  origin = `http://127.0.0.1:${(idpSrv.address() as AddressInfo).port}`;
+  base = `${origin}/api/auth`;
+  ba = buildIdpAuth(origin);
+  handler = toNodeHandler(ba);
+  const signup = await ba.api.signUpEmail({
+    body: { email: "human@example.test", password: "correct-horse-battery", name: "Human 42" },
+    returnHeaders: true,
+  });
+  const setCookie = signup.headers.get("set-cookie");
+  if (!setCookie) throw new Error("IdP signup returned no set-cookie header");
+  cookie = setCookie.split(";")[0];
+} catch (e) {
+  // A listening server keeps the process alive past the throw, and `finally` is not reachable from
+  // out here — so both the server and the scratch are this handler's responsibility.
+  // `Server.close()` reports through its CALLBACK, not by throwing — a `try/catch` around it sees
+  // nothing, so the previous "reporting" version was still blind and the message below still
+  // asserted a close it had not observed. Await the callback and say what actually happened.
+  // `ERR_SERVER_NOT_RUNNING` is the benign case: the failure came before `listen`, so there was
+  // never a server to close.
+  let closed = "not created";
+  if (idpSrv) {
+    const err = await new Promise<NodeJS.ErrnoException | undefined>((r) => idpSrv!.close((x) => r(x ?? undefined)));
+    closed = !err ? "closed"
+      : err.code === "ERR_SERVER_NOT_RUNNING" ? "never listened"
+      : `CLOSE FAILED (${err.code ?? err.message}) — a listening server may still hold this process open`;
+  }
+  rmSync(scratch, { recursive: true, force: true });
+  throw new Error(`fixture setup failed (scratch removed, IdP: ${closed}): ${(e as Error).message}`, { cause: e });
+}
+const approve = (userCode: string) => approveDevice({ base, cookie, origin }, userCode);
+
+try {
+  console.log("1) up --user-auth");
+  // DIRECT EXISTENCE, not a consequence of it. `foreignRootFor(root) === null` is ALSO true with no
+  // anchor at all under the clean ancestry makeScratch builds, so it cannot tell "anchored" from
+  // "nothing here" on an ordinary run - it would have let CI delete the load-bearing anchor and stay
+  // green. Assert the thing itself; keep the resolution cell beside it as the consequence.
+  // Read ONCE, so the graded cell and the fatal branch cannot report different things about the
+  // same instant.
+  const anchored = existsSync(join(root, ".cotal"));
+  check("the fixture root OWNS its .cotal (the anchor exists)", anchored, root);
+  // FATAL HERE, before any product command. A failed `check` alone only increments the tally and
+  // lets `up` run UNANCHORED — the precise state whose race this anchor exists to remove. The suite
+  // would still exit red, but only after starting a mesh that could root anywhere.
+  if (!anchored) {
+    process.exitCode = 1;
+    throw new Error(`FIXTURE FAILURE: the anchor ${join(root, ".cotal")} is missing, so no product command below can be trusted to root here.`);
+  }
+  const captor = foreignRootFor(root);
+  check("...and therefore outranks any ancestor", captor === null, captor);
+  if (captor) { process.exitCode = 1; throw new Error(`anchor missing: ${root} resolves to ${captor}`); }
+  upAttempted = true;
+  const up = await cotal(["up", "--user-auth", "--idp", base, "--detach", "--server", SERVER, "--space", SPACE,
+    "--exchange-public-port", String(PUBLIC_EXCHANGE_PORT)]);
+  // Attribute HOW `up` ended before reading its status: a signalled or timed-out `up` reports
+  // `status: null`, which reads only as "non-zero" and loses why.
+  mustHaveRun(up, "`cotal up`");
+  check("up exits 0", up.status === 0, up.out.slice(-600));
+  if (up.status !== 0) { process.exitCode = 1; throw new Error("fixture"); }
+  await wait(3000);
+
+  /** Whether output carries credential material: a JWT (bearer or user JWT), a NATS creds block or an
+   *  nkey seed. */
+  const leaksCredential = (out: string): boolean =>
+    /eyJ[A-Za-z0-9_-]{8,}\.eyJ/.test(out) || /BEGIN (NATS|USER NKEY)/.test(out) || /\bS[AUON][A-Z2-7]{56}\b/.test(out);
+  console.log("2) device login + admin grant");
+  const { sub } = await establishIdpSession({
+    dir: home, idpUrl: base, clientId: CLIENT_ID,
+    onPrompt: (p: DeviceLoginPrompt) => approve(p.userCode),
+  });
+  const grant = await cotal(["actor", "grant", "cli", "--sub", sub, "--full", "--scope", "spawn,role:default,admin", "--label", "ps human"]);
+  check("actor grant succeeds", grant.status === 0 && /^Actor grant stored$/m.test(grant.out), grant.out.slice(-300));
+
+  console.log("3) cotal ps under user-mode admin bearer (C: ep.one)");
+  const ps = await cotal(["ps", "--space", SPACE], 20_000);
+  console.log(`   exit=${ps.status}\n` + ps.out.split("\n").map((l) => `   | ${l}`).join("\n").slice(0, 600));
+  check("user-mode ps exits 0 (C: ep.one path)", ps.status === 0, ps.status);
+  check("user-mode ps does not die on STREAM.INFO (would mean it still scattered)",
+    !/STREAM\.INFO/.test(ps.out), ps.out.slice(-200));
+  const psJson = await cotal(["ps", "--json", "--space", SPACE], 20_000);
+  const psEnvelope = (() => { try { return JSON.parse(psJson.out.split("\n").find((line) => line.startsWith('{"schemaVersion"')) ?? "") as { outcome: string; target: { scope: string; managerInstanceId: string | null } }; } catch { return undefined; } })();
+  check("user-mode ps --json targets the one authorized manager by its instance id",
+    psJson.status === 0 && psEnvelope?.outcome === "ok" && psEnvelope.target.scope === "manager" && /^[a-z0-9]{26,32}$/.test(psEnvelope.target.managerInstanceId ?? ""),
+    psJson.out.slice(-600));
+  check("user-mode ps --json carries no bearer, sentinel or nkey seed", !leaksCredential(psJson.out), psJson.out.slice(-600));
+
+  console.log("3a) cotal who under the same bearer: the one manager answers for this user's own seats");
+  const whoJson = await cotal(["who", "--json", "--space", SPACE], 20_000);
+  const whoEnvelope = (() => { try { return JSON.parse(whoJson.out.split("\n").find((line) => line.startsWith('{"schemaVersion"')) ?? "") as { outcome: string; completeness: string; result: { managers: string } | null; warnings: { code: string }[] }; } catch { return undefined; } })();
+  check("user-mode who labels the manager's answer as covering this user's own seats",
+    whoEnvelope?.result?.managers === "partial" && whoEnvelope.warnings.some((w) => w.code === "MANAGED_SCOPE"), whoJson.out.slice(-600));
+  check("that label is not a part left unread: user-mode who exits 0, ok and complete",
+    whoJson.status === 0 && whoEnvelope?.outcome === "ok" && whoEnvelope.completeness === "complete", whoJson.out.slice(-600));
+
+  // The admin grant above hides this defect: `--full` alone is the documented owner
+  // grant (scope spawn,role:default, no admin). Later cells need the admin grant back.
+  console.log("3a spawn-only) status --components under the documented owner grant");
+  try {
+    const narrowed = await cotal(["actor", "grant", "cli", "--sub", sub, "--full", "--label", "spawn-only status"], 60_000);
+    mustHaveRun(narrowed, "the spawn-only owner grant");
+    check("the documented --full grant stores the spawn-only owner scope", narrowed.status === 0 && /^Actor grant stored$/m.test(narrowed.out), narrowed.out.slice(-300));
+    const { canonicalLocalProcessPath, loadManagerInstanceIdentity, MANAGER_PIDFILE, userAuthStateDir } = await import("@cotal-ai/workspace");
+    const { loadAuthServiceInfo, saveAuthServiceInfo } = await import("../src/store-file.js");
+    const pidPath = canonicalLocalProcessPath(MANAGER_PIDFILE, { root, space: SPACE });
+    const pid = Number(readFileSync(pidPath, "utf8").trim());
+    const localId = loadManagerInstanceIdentity(root, SPACE)?.instanceId;
+    check("the live manager persists the instance status must pin", typeof localId === "string" && localId.length > 0, { pid, instanceId: localId ?? null });
+    const dir = userAuthStateDir(root, SPACE);
+    const info = loadAuthServiceInfo(dir);
+    if (!info) throw new Error(`fixture auth service info is missing at ${dir}`);
+    const exchanges: { view?: unknown; managerInstanceId?: unknown }[] = [];
+    const proxy = createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      const raw = Buffer.concat(chunks);
+      if ((req.url ?? "").startsWith("/exchange")) {
+        try {
+          const body = JSON.parse(raw.toString("utf8")) as { view?: unknown; managerInstanceId?: unknown };
+          exchanges.push({ view: body.view, managerInstanceId: body.managerInstanceId });
+        } catch {
+          exchanges.push({});
+        }
+      }
+      try {
+        const upstream = await fetch(new URL(req.url ?? "/", info.url), {
+          method: req.method,
+          headers: {
+            ...(req.headers["content-type"] ? { "content-type": String(req.headers["content-type"]) } : {}),
+            ...(req.headers.authorization ? { authorization: String(req.headers.authorization) } : {}),
+          },
+          body: req.method === "GET" || req.method === "HEAD" ? undefined : raw,
+        });
+        const bytes = Buffer.from(await upstream.arrayBuffer());
+        const type = upstream.headers.get("content-type");
+        res.writeHead(upstream.status, type ? { "content-type": type } : undefined);
+        res.end(bytes);
+      } catch (e) {
+        res.writeHead(502);
+        res.end(e instanceof Error ? e.message : String(e));
+      }
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", () => resolve()));
+    const bound = proxy.address();
+    if (bound === null || typeof bound === "string") throw new Error("the exchange recorder did not bind");
+    saveAuthServiceInfo(dir, { ...info, url: `http://127.0.0.1:${bound.port}` });
+    try {
+      const components = await cotal(["status", "--components", "--space", SPACE], 30_000);
+      mustHaveRun(components, "spawn-only status --components");
+      const plain = components.out.replace(/\x1b\[[0-9;]*m/g, "");
+      const managerLine = plain.split("\n").find((line) => /^  manager /.test(line)) ?? plain.slice(-600);
+      console.log(`   spawn-only status --components (exit=${components.status}):\n` +
+        plain.split("\n").filter((line) => /Component Health|^  (manager|delivery|web|broker) /.test(line)).map((line) => `   | ${line}`).join("\n").slice(0, 1200));
+      check("spawn-only status --components exits 0", components.status === 0, managerLine);
+      check("spawn-only status --components manager row is serving", /^  manager {9,}serving /m.test(plain), managerLine);
+      check("spawn-only status reports this machine's manager instance", typeof localId === "string" && plain.includes(`service instance ${localId}`), managerLine);
+      const pinned = exchanges.filter((body) => body.view === "manager-caller" && typeof body.managerInstanceId === "string" && body.managerInstanceId.length > 0 && body.managerInstanceId === localId);
+      check("spawn-only status pins the manager-caller exchange to this machine's manager", typeof localId === "string" && localId.length > 0 && pinned.length > 0, { localId: localId ?? null, exchanges });
+      const managerLineOf = (out: string): string => {
+        const plain = out.replace(/\x1b\[[0-9;]*m/g, "");
+        return plain.split("\n").find((line) => /^  manager /.test(line)) ?? plain.slice(-600);
+      };
+
+      exchanges.length = 0;
+      const hiddenPid = `${pidPath}.smoke-hidden`;
+      renameSync(pidPath, hiddenPid);
+      try {
+        const unpinned = await cotal(["status", "--components", "--space", SPACE], 30_000);
+        mustHaveRun(unpinned, "status with no local manager record");
+        const unpinnedPlain = unpinned.out.replace(/\x1b\[[0-9;]*m/g, "");
+        const unpinnedLine = managerLineOf(unpinned.out);
+        console.log(`   no local manager record (exit=${unpinned.status}): ${unpinnedLine}`);
+        check("no local manager record: components manager row is still serving", /^  manager {9,}serving /m.test(unpinnedPlain), unpinnedLine);
+        check("no local manager record: the row names the instance that answered", typeof localId === "string" && unpinnedPlain.includes(`service instance ${localId}`), unpinnedLine);
+        const caller = exchanges.filter((body) => body.view === "manager-caller");
+        check("no local manager record: the manager-caller exchange is not pinned", caller.length > 0 && caller.every((body) => body.managerInstanceId === undefined), caller);
+      } finally {
+        if (existsSync(hiddenPid)) renameSync(hiddenPid, pidPath);
+      }
+
+      const identityPath = typeof localId === "string" ? managerIdentityPath(join(root, ".cotal"), localId) : undefined;
+      check("the persisted manager identity file is on this root", typeof identityPath === "string", identityPath ?? null);
+      if (typeof identityPath === "string" && typeof localId === "string") {
+        exchanges.length = 0;
+        const hiddenIdentity = `${identityPath}.smoke-hidden`;
+        renameSync(identityPath, hiddenIdentity);
+        try {
+          const unknown = await cotal(["status", "--components", "--space", SPACE], 30_000);
+          mustHaveRun(unknown, "status with the manager identity hidden");
+          const unknownPlain = unknown.out.replace(/\x1b\[[0-9;]*m/g, "");
+          const unknownLine = managerLineOf(unknown.out);
+          console.log(`   identity hidden (exit=${unknown.status}): ${unknownLine}`);
+          check("a live manager whose instance id is not recorded is refused", /^  manager {9,}refused /m.test(unknownPlain), unknownLine);
+          check("a hidden identity is not reported as this process serving", !unknownPlain.includes(`service instance ${localId}`) && (unknownPlain.includes(`answered by manager instance ${localId}`) || unknownPlain.includes("serve probe refused")), unknownLine);
+          check("that row is not reported as serving", !/^  manager {9,}serving /m.test(unknownPlain), unknownLine);
+        } finally {
+          if (existsSync(hiddenIdentity)) renameSync(hiddenIdentity, identityPath);
+        }
+
+        const original = readFileSync(identityPath, "utf8");
+        const fakeId = localId.endsWith("xxxx") ? `${localId.slice(0, -4)}yyyy` : `${localId.slice(0, -4)}xxxx`;
+        const field = `"instanceId":"${localId}"`;
+        const spaced = `"instanceId": "${localId}"`;
+        const edited = original.includes(field)
+          ? original.replace(field, `"instanceId":"${fakeId}"`)
+          : original.includes(spaced)
+            ? original.replace(spaced, `"instanceId": "${fakeId}"`)
+            : undefined;
+        check("the identity file names this instance in one field", edited !== undefined && edited !== original, identityPath);
+        if (edited !== undefined && edited !== original) {
+          exchanges.length = 0;
+          writeFileSync(identityPath, edited);
+          try {
+            const mismatch = await cotal(["status", "--components", "--space", SPACE], 30_000);
+            mustHaveRun(mismatch, "status pinned to a different instance");
+            const mismatchPlain = mismatch.out.replace(/\x1b\[[0-9;]*m/g, "");
+            const mismatchLine = managerLineOf(mismatch.out);
+            console.log(`   other instance (exit=${mismatch.status}): ${mismatchLine}`);
+            check("a different persisted instance is not reported as this process serving", !/^  manager {9,}serving /m.test(mismatchPlain) && /^  manager {9,}refused /m.test(mismatchPlain), mismatchLine);
+            check("that probe pinned the other instance id", exchanges.some((body) => body.view === "manager-caller" && body.managerInstanceId === fakeId), exchanges);
+          } finally {
+            writeFileSync(identityPath, original);
+          }
+        }
+      }
+    } finally {
+      saveAuthServiceInfo(dir, info);
+      await new Promise<void>((resolve, reject) => proxy.close((err) => err ? reject(err) : resolve()));
+    }
+  } finally {
+    const restore = await cotal(["actor", "grant", "cli", "--sub", sub, "--full", "--scope", "spawn,role:default,admin", "--label", "ps human"], 60_000);
+    mustHaveRun(restore, "restoring the fixture's admin grant after the spawn-only status cell");
+    check("the later checks receive the admin grant again after the spawn-only status cell", restore.status === 0, restore.out.slice(-500));
+  }
+
+  console.log("3a history) native user-auth reads through its channel grant");
+  const historyText = `native history ${Date.now()}`;
+  const sentHistory = await cotal(["send", "-c", "general", historyText, "--space", SPACE], 20_000);
+  check("the native history fixture sends a channel message through the CLI", sentHistory.status === 0, sentHistory.out.slice(-500));
+  const nativeHistory = await cotal(["history", "general", "--json", "--space", SPACE], 20_000);
+  const historyEnvelope = (() => { try { return JSON.parse(nativeHistory.out.split("\n").find((line) => line.startsWith('{"schemaVersion"')) ?? "") as { result: { kind: string; items: { channel: string | null; text: string; seq: number | null }[] } | null }; } catch { return undefined; } })();
+  check("native user-auth history reads the sent channel message with no stream sequence",
+    nativeHistory.status === 0 && historyEnvelope?.result?.kind === "history" && historyEnvelope.result.items.some((row) => row.channel === "general" && row.text === historyText && row.seq === null), nativeHistory.out.slice(-1200));
+  const readHistoryError = (r: Run): string | undefined => { try { return (JSON.parse(r.out.split("\n").find((line) => line.startsWith('{"schemaVersion"')) ?? "") as { error?: { code: string } }).error?.code; } catch { return undefined; } };
+  const nativeDms = await cotal(["history", "--dms", "--json", "--space", SPACE], 20_000);
+  check("native user-auth history refuses DMs without an audit credential",
+    nativeDms.status === 2 && readHistoryError(nativeDms) === "PERMISSION_DENIED", nativeDms.out.slice(-600));
+  const nativeSequence = await cotal(["history", "general", "--since", "1", "--json", "--space", SPACE], 20_000);
+  check("native user-auth history refuses a stream-sequence read as unsupported",
+    nativeSequence.status === 2 && readHistoryError(nativeSequence) === "UNSUPPORTED", nativeSequence.out.slice(-600));
+
+  console.log("3a retirement) an in-flight history read cannot cross a real human re-grant");
+  {
+    const { connectOrThrow, endpointAuth } = await import("@cotal-ai/workspace");
+    const { CotalEndpoint } = await import("@cotal-ai/core");
+    const connection = await connectOrThrow({ space: SPACE }, "observer");
+    const held = new CotalEndpoint({ space: SPACE, servers: SERVER, ...endpointAuth(connection),
+      lifecycleUid: connection.epCaller!.uid, channels: [], consume: false, registerPresence: false,
+      watchPresence: false, card: { name: "held-history", kind: "endpoint" } });
+    held.on("error", () => {});
+    let rotated = false;
+    let releasePull: (() => void) | undefined;
+    try {
+      await held.start();
+      const firstPage = await held.channelHistoryPage("general");
+      check("the predecessor connection can read before retirement",
+        firstPage.items.some((m) => m.parts.some((p) => p.kind === "text" && p.text === historyText)));
+      const internals = held as unknown as { nc: import("@nats-io/transport-node").NatsConnection; js: import("@nats-io/jetstream").JetStreamClient };
+      const predecessor = internals.nc;
+      const get = internals.js.consumers.get.bind(internals.js.consumers);
+      let enteredPull!: () => void;
+      const entered = new Promise<void>((resolve) => { enteredPull = resolve; });
+      const release = new Promise<void>((resolve) => { releasePull = resolve; });
+      internals.js.consumers.get = async (...args) => {
+        const consumer = await get(...args);
+        enteredPull();
+        await release;
+        return consumer;
+      };
+      const pending = held.channelHistoryPage("general").then(
+        () => ({ error: "returned a page" }), (e: Error) => ({ error: `${e.name}: ${e.message}` }));
+      const began = await Promise.race([entered.then(() => true), pending.then(() => false)]);
+      check("a real predecessor history consumer is paused before its pull", began);
+      if (!began) throw new Error("history retirement fixture never reached its live pull checkpoint");
+      const nextGrant = await cotal(["actor", "grant", "cli", "--sub", sub, "--scope", "",
+        "--allow-subscribe", "history.next", "--allow-publish", "history.next"], 60_000);
+      mustHaveRun(nextGrant, "the native history re-grant");
+      rotated = nextGrant.status === 0;
+      check("the real actor re-grant retires the predecessor before granting a different channel", rotated, nextGrant.out.slice(-500));
+      releasePull!();
+      const interrupted = await pending;
+      check("retirement closes the predecessor connection and prevents its paused pull from returning a page",
+        rotated && predecessor.isClosed() && /closed|disconnect|not started|cut short|permission|authoriz/i.test(interrupted.error), interrupted);
+      const copied = new CotalEndpoint({ space: SPACE, servers: SERVER, ...endpointAuth(connection),
+        lifecycleUid: connection.epCaller!.uid, channels: [], consume: false, registerPresence: false,
+        watchPresence: false, card: { name: "copied-history", kind: "endpoint" } });
+      copied.on("error", () => {});
+      let copiedError = "connected";
+      try { await copied.start(); } catch (e) { copiedError = (e as Error).message; }
+      finally { await copied.stop(); }
+      check("a copied predecessor bearer cannot reconnect after the native re-grant",
+        /authoriz|authentic|denied|revok|retir/i.test(copiedError), copiedError);
+      const nextText = `successor history ${Date.now()}`;
+      const nextSent = await cotal(["send", "-c", "history.next", nextText, "--space", SPACE], 20_000);
+      const nextHistory = await cotal(["history", "history.next", "--json", "--space", SPACE], 20_000);
+      check("the successor reads only its newly granted channel through the real CLI",
+        nextSent.status === 0 && nextHistory.status === 0 && nextHistory.out.includes(nextText) && !nextHistory.out.includes(historyText), nextHistory.out.slice(-800));
+      const priorChannel = await cotal(["history", "general", "--json", "--space", SPACE], 20_000);
+      check("the successor cannot read the predecessor's channel",
+        priorChannel.status === 2 && readHistoryError(priorChannel) === "PERMISSION_DENIED", priorChannel.out.slice(-500));
+      // A real occupied reader exercises the command's timeout outcome, not a thrown stub page.
+      const current = await connectOrThrow({ space: SPACE }, "observer");
+      const busy = new CotalEndpoint({ space: SPACE, servers: SERVER, ...endpointAuth(current),
+        lifecycleUid: current.epCaller!.uid, channels: [], consume: false, registerPresence: false,
+        watchPresence: false, card: { name: "busy-history", kind: "endpoint" } });
+      busy.on("error", () => {});
+      await busy.start();
+      const { jetstreamManager } = await import("@nats-io/jetstream");
+      const { chatStream, chatHistDurable, chatSubject } = await import("@cotal-ai/core");
+      const api = await jetstreamManager((busy as unknown as { nc: import("@nats-io/transport-node").NatsConnection }).nc);
+      const name = chatHistDurable(current.epCaller!.owner, current.epCaller!.actor, current.epCaller!.uid);
+      try {
+        await api.consumers.add(chatStream(SPACE), { name, description: "fixture-busy-owner",
+          filter_subject: chatSubject(SPACE, "*", "*", "history.next"), ack_policy: "none",
+          deliver_policy: "all", mem_storage: true, inactive_threshold: 30_000_000_000 });
+        const unread = await cotal(["history", "history.next", "--json", "--space", SPACE], 20_000);
+        check("a busy native history read reports a known failed read, not an unknown operation",
+          unread.status === 5 && readHistoryError(unread) === "OPERATION_FAILED", unread.out.slice(-700));
+      } finally {
+        await api.consumers.delete(chatStream(SPACE), name).catch(() => {}); // fixture-owned consumer
+        await busy.stop();
+      }
+
+    } finally {
+      releasePull?.();
+      await held.stop();
+      if (rotated) {
+        const restore = await cotal(["actor", "grant", "cli", "--sub", sub, "--full", "--scope", "spawn,role:default,admin", "--label", "ps human"], 60_000);
+        mustHaveRun(restore, "restoring the fixture's admin grant");
+        check("the later ps checks receive a fresh restored admin grant", restore.status === 0, restore.out.slice(-500));
+      }
+    }
+  }
+
+  console.log("3b) empty registry discovers the user-mode space, then ps/status resolve it");
+  const { findMesh, loadMeshes, removeMesh, removeMeshes, recordMesh, setCurrent, canonicalRoot, targetFromEntry, userAuthStateDir, workspaceSecretStore } = await import("@cotal-ai/workspace");
+  const { loadCalloutAuth } = await import("../src/index.js");
+  const original = findMesh(SPACE);
+  if (!original?.userAuth) throw new Error("fixture has no user-auth registry entry to advertise");
+  restoreStackRegistration = () => {
+    removeMeshes(loadMeshes().filter((m) => m.space !== SPACE && (m.server === original.server || canonicalRoot(m.root ?? "") === canonicalRoot(root))).map((m) => m.space));
+    recordMesh(original);
+  };
+  const callout = await loadCalloutAuth(workspaceSecretStore(root), SPACE);
+  if (!callout) throw new Error("fixture has no callout sentinel credential");
+  let catalogFails = false;
+  let catalogRequests = 0;
+  let includeJoining = false;
+  let includeListed = false;
+  let includeWorkflow = false;
+  let includeSupervise = false;
+  const originalHandler = handler!;
+  handler = (async (req, res) => {
+    const url = new URL(req.url!, origin);
+    if (url.pathname === "/exchange") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      const upstream = await fetch(`http://127.0.0.1:${PUBLIC_EXCHANGE_PORT}/exchange`, {
+        method: req.method,
+        headers: { "content-type": req.headers["content-type"] ?? "application/json" },
+        body: Buffer.concat(chunks),
+      });
+      res.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
+      return void res.end(Buffer.from(await upstream.arrayBuffer()));
+    }
+    if (url.pathname === "/catalog") {
+      catalogRequests++;
+      if (catalogFails) return void res.writeHead(503).end();
+      res.writeHead(200, { "content-type": "application/json", etag: '"ps-catalog-v1"' });
+      const registration = (space: string) => ({
+        space,
+        server: original.server,
+        tlsRequired: false,
+        userAuth: { ...original.userAuth, endpoints: { url: origin }, sentinelCredsPath: undefined },
+        sentinelCreds: callout.sentinelCreds,
+      });
+      return void res.end(JSON.stringify({
+        v: 1,
+        account: { idpUrl: base, issuer: origin, sub },
+        spaces: [{
+          id: "catalog-space",
+          slug: SPACE,
+          name: "Shared project",
+          kind: "local-test",
+          role: "admin",
+          registration: registration(SPACE),
+        },
+        ...(includeJoining ? [{ id: "joining-space", slug: "joining", name: "Joining project", kind: "local-test", role: "admin", registration: registration("joining") }] : []),
+        ...(includeListed ? [{ id: "listed-space", slug: "listed", name: "Listed project", kind: "local-test", role: "admin", registration: registration("listed") }] : []),
+        ...(includeWorkflow ? [{ id: "workflow-space", slug: "workflow_new", name: "Workflow new", kind: "local-test", role: "admin", registration: registration("workflow_new") }] : []),
+        ...(includeSupervise ? [{ id: "supervise-space", slug: "supervise_new", name: "Supervise new", kind: "local-test", role: "admin", registration: registration("supervise_new") }] : []),
+        ],
+      }));
+    }
+    if (url.pathname === "/api/auth/token") {
+      const capture = { writeHead: res.writeHead.bind(res) };
+      const old = res.writeHead.bind(res);
+      res.writeHead = ((status: number, headers?: Record<string, string>) => old(status, {
+        ...headers,
+        link: `<${origin}/catalog>; rel="https://cotal.ai/relations/space-catalog"`,
+      })) as typeof res.writeHead;
+      void capture;
+    }
+    return originalHandler(req, res);
+  }) as typeof handler;
+  removeMesh(SPACE);
+  const catalogCache = join(home, "space-catalogs.json");
+  rmSync(catalogCache, { force: true });
+  // The shipped command in its own process. This process already holds the IdP JWT that the login
+  // above minted, for up to a minute, and that held response predates the catalog link advertised here.
+  const synced = await cotal(["sync", "--idp", base], 20_000);
+  mustHaveRun(synced, "`cotal sync`");
+  execFileSync("pnpm", ["--filter", "@cotal-ai/auth", "build"], { cwd: join(import.meta.dirname, "..", "..", ".."), stdio: "ignore" });
+  execFileSync("pnpm", ["--filter", "@cotal-ai/cli", "build"], { cwd: join(import.meta.dirname, "..", "..", ".."), stdio: "ignore" });
+  check("the empty registry was repopulated as a discovered user-mode target", findMesh(SPACE)?.origin === "catalog", { entry: findMesh(SPACE), sync: synced.out.slice(-300) });
+  check("the display name is not a registry key", findMesh("Shared project") === undefined && findMesh(SPACE)?.catalogName === "Shared project", findMesh(SPACE));
+  check("the discovered entry resolves through the ordinary synchronous target path", targetFromEntry(findMesh(SPACE)!, original.server, "registry").mode === "user");
+  const discoveredPs = await cotal(["ps", "--space", SPACE], 20_000);
+  const discoveredStatus = await cotal(["status", "--wide", "--space", SPACE], 20_000);
+  check("ps succeeds against the discovered space with no meshes add", discoveredPs.status === 0, discoveredPs.out.slice(-300));
+  check("status resolves the discovered space and names it a saved catalog entry in the full report",
+    discoveredStatus.status === 0 && new RegExp(`^ +→ ${SPACE} .*· saved catalog entry$`, "m").test(discoveredStatus.out), discoveredStatus.out.slice(-600));
+  // #1832: a discovered user-mode space's user-auth material is the REGISTRY ENTRY (origin
+  // "catalog", userAuth.remote + pins + sentinel file), not a local provisioning, so the login
+  // `ps` uses must answer status too. The verbatim base behaviour is recorded in the lane notes:
+  // the login row said "no user-auth material on this machine", the live snapshot said "needs a
+  // signed-in, granted login", and `--components` printed `serve probe refused: Authorization
+  // Violation` with exit 3.
+  check("discovered space: bare status shows the signed-in subject, not a no-material refusal",
+    discoveredStatus.status === 0 && discoveredStatus.out.includes("session until") && !discoveredStatus.out.includes("no user-auth material"),
+    discoveredStatus.out.slice(-600));
+  // The live snapshot needs a GRANTED login, and the grant is a ledger row: for a discovered space
+  // the ledger runs where the space was provisioned, so the honest row is "grant not checkable"
+  // and the snapshot defers. Asserting a roster here would demand status connect on an ungranted
+  // bearer, which the renderer deliberately does not do.
+  check("discovered space: bare status names the grant as not checkable (no local ledger) rather than demanding a login",
+    /^ +Grant: +○ not checkable on this machine$/m.test(discoveredStatus.out) && !discoveredStatus.out.includes("no user-auth material"),
+   discoveredStatus.out.slice(-600));
+  const discoveredHistory = await cotal(["history", "general", "--json", "--space", SPACE], 20_000);
+  check("the native remote-catalog history path reads the same message without local grant lookup",
+    findMesh(SPACE)?.userAuth?.remote === true && discoveredHistory.status === 0 && discoveredHistory.out.includes(historyText),
+    discoveredHistory.out.slice(-1000));
+  check("native local and remote history outputs contain no credential material",
+    !leaksCredential(nativeHistory.out) && !leaksCredential(discoveredHistory.out), discoveredHistory.out.slice(-500));
+  const discoveredComponents = await cotal(["status", "--space", SPACE, "--components"], 30_000);
+  console.log(`   #1832 status --components on the discovered space (exit=${discoveredComponents.status}):\n` +
+    discoveredComponents.out.split("\n").filter((l) => /Component Health|^  (manager|delivery|web|broker) /.test(l.replace(/\x1b\[[0-9;]*m/g, ""))).map((l) => `   | ${l}`).join("\n").slice(0, 1200));
+  check("discovered space: components probes as the signed-in login, never a raw Authorization Violation",
+    !/Authorization Violation/i.test(discoveredComponents.out),
+    discoveredComponents.out.slice(-600));
+  check("discovered space: components manager row answers the real service probe (serving: live fixture manager)",
+    /^  manager {9,}serving /m.test(discoveredComponents.out.replace(/\x1b\[[0-9;]*m/g, "")),
+    discoveredComponents.out.slice(-600));
+  // Signed-out machine, same registry shape: a MANUAL remote entry (the `meshes add --from`
+  // registration path) is subject to no catalog gate, so removing the session grades the status
+  // login row alone. The discovered entry stays untouched; the manual entry pins the same IdP and
+  // the same broker, so the only difference from the cells above is the missing login session —
+  // exactly the state under test.
+  const sessionsFile = join(home, "idp-sessions.json");
+  const sessionsBytes = existsSync(sessionsFile) ? readFileSync(sessionsFile) : Buffer.from("{}");
+  const { persistRemoteUserEntry } = await import("../../cli/src/commands/meshes-add.js");
+  const signedOutSpace = `${SPACE}-signedout`;
+  persistRemoteUserEntry(signedOutSpace, original.server, root, {
+    space: signedOutSpace,
+    server: original.server,
+    tlsRequired: false,
+    userAuth: {
+      provider: "cotal",
+      idp: { url: base, issuer: origin, audience: origin },
+      endpoints: { url: origin },
+    },
+    sentinelCreds: callout.sentinelCreds,
+  }, false, false);
+  (await import("../src/index.js")).deleteIdpSession(home, base);
+  try {
+    const signedOutStatus = await cotal(["status", "--space", signedOutSpace], 30_000);
+    console.log(`   #1832 signed-out bare status (exit=${signedOutStatus.status}):\n` +
+      signedOutStatus.out.split("\n").filter((l) => /login|live snapshot/.test(l.replace(/\x1b\[[0-9;]*m/g, ""))).map((l) => `   | ${l}`).join("\n"));
+    check("discovered space, signed out: status says not signed in with the exact login command",
+      signedOutStatus.status === 0 &&
+        /^ +Account: +● not signed in$/m.test(signedOutStatus.out) &&
+        new RegExp(`^Next\n(?: .*\n)* +cotal login --idp ${base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} +Sign in to the selected space$`, "m").test(signedOutStatus.out) &&
+        !signedOutStatus.out.includes("no user-auth material"),
+      signedOutStatus.out.slice(-600));
+    const signedOutPs = await cotal(["ps", "--json", "--space", signedOutSpace], 30_000);
+    check("signed out: ps --json is one AUTH_REQUIRED envelope that names the login, exit 2",
+      signedOutPs.status === 2 && /"code":"AUTH_REQUIRED"/.test(signedOutPs.out) && signedOutPs.out.includes(`login --idp ${base}`),
+      signedOutPs.out.slice(-600));
+    check("signed out: the refusal carries no credential material", !leaksCredential(signedOutPs.out), signedOutPs.out.slice(-600));
+  } finally {
+    if (sessionsBytes !== undefined) writeFileSync(sessionsFile, sessionsBytes);
+    removeMesh(signedOutSpace);
+  }
+  includeJoining = true;
+  const beforeUseRefresh = catalogRequests;
+  const discoveredUse = await cotal(["use", "joining"], 20_000);
+  check("use refreshes a positional catalog miss inside the freshness window and selects its slug",
+    discoveredUse.status === 0 && catalogRequests === beforeUseRefresh + 1 && findMesh("joining")?.origin === "catalog",
+    { out: discoveredUse.out, catalogRequests, beforeUseRefresh });
+  includeWorkflow = true;
+  const beforeRunRefresh = catalogRequests;
+  const discoveredRun = await cotal(["run", "ps", "--space", "workflow_new"], 20_000);
+  check("a self-registered target-bearing command receives dispatcher catalog preparation",
+    catalogRequests === beforeRunRefresh + 1 && findMesh("workflow_new")?.origin === "catalog" && !discoveredRun.out.includes('no mesh named "workflow_new"'),
+    { status: discoveredRun.status, out: discoveredRun.out.slice(-400), catalogRequests, beforeRunRefresh });
+  includeSupervise = true;
+  const beforeSuperviseRefresh = catalogRequests;
+  const discoveredSupervise = await cotal(["supervise", "--space", "supervise_new", "--server", "nats://127.0.0.1:1"], 20_000);
+  check("a copied target-flag command receives dispatcher catalog preparation",
+    catalogRequests === beforeSuperviseRefresh + 1 && findMesh("supervise_new")?.origin === "catalog" &&
+      discoveredSupervise.out.includes('does not match registered space "supervise_new"') && !discoveredSupervise.out.includes("neither hosting"),
+    { status: discoveredSupervise.status, out: discoveredSupervise.out.slice(-400), catalogRequests, beforeSuperviseRefresh });
+  recordMesh({ space: "manual-current", server: original.server, root, mode: "open", origin: "manual", ts: new Date().toISOString() });
+  setCurrent("manual-current");
+  includeListed = true;
+  await wait(5_100);
+  const beforeMeshesRefresh = catalogRequests;
+  const discoveredMeshes = await cotal(["meshes"], 20_000);
+  check("meshes refreshes discovery despite a manual current and local root",
+    discoveredMeshes.status === 0 && catalogRequests === beforeMeshesRefresh + 1 && discoveredMeshes.out.includes("listed") && findMesh("listed")?.origin === "catalog",
+    { out: discoveredMeshes.out.slice(-600), catalogRequests, beforeMeshesRefresh });
+  catalogFails = true;
+  await wait(5_100);
+  const beforeLocalRm = catalogRequests;
+  const localRm = await cotal(["meshes", "rm", "ghost"], 20_000);
+  check("meshes rm stays registry-local during a stale catalog outage",
+    localRm.status === 1 && localRm.out.includes('no mesh named "ghost" is registered') && catalogRequests === beforeLocalRm,
+    { out: localRm.out, catalogRequests, beforeLocalRm });
+  const expired = await cotal(["ps", "--space", SPACE], 20_000);
+  check("an expired discovered target refuses ps when its required refresh fails",
+    expired.status === 2 && expired.out.includes("space catalog") && catalogRequests >= 3, { out: expired.out.slice(-400), catalogRequests, cache: readFileSync(join(home, "space-catalogs.json"), "utf8") });
+  const expiredJson = await cotal(["ps", "--json", "--space", SPACE], 20_000);
+  check("under --json that refusal is one DEPENDENCY_UNAVAILABLE envelope",
+    expiredJson.status === 2 && /"code":"DEPENDENCY_UNAVAILABLE"/.test(expiredJson.out) && /"outcome":"refused"/.test(expiredJson.out), expiredJson.out.slice(-400));
+
+  console.log("4) kill manager — ps says no manager answered, never a bare empty list");
+  // 3b leaves this space as a discovered entry whose catalog now fails, and ps refuses that target
+  // before it asks any manager. This cell grades the stack's own registration.
+  restoreStackRegistration?.();
+  // The mesh can only root somewhere else if a `.cotal` appeared above the scratch mid-run; witness
+  // it here so that shows up as itself and not as the cell below.
+  assertScratchHeld(root, "fixture root");
+  // Fatal, not conditional. `if (existsSync(pid)) kill()` cannot distinguish "manager dead" from
+  // "manager never found" — and under a captured root it is always the second, which is precisely
+  // how a live manager came to be graded as a bare empty success.
+  // Not a check(): it cannot fail here (the helper throws), and a cell that cannot fail only
+  // inflates the pass count. Log the pid so the transcript shows WHICH process died.
+  console.log(`   killed manager pid ${await killManagerAtRoot(root)} — the cell below grades a DEAD mesh`);
+  const psDead = await cotal(["ps", "--space", SPACE], 20_000);
+  console.log(`   dead exit=${psDead.status}\n` + psDead.out.split("\n").map((l) => `   | ${l}`).join("\n").slice(0, 500));
+  // Fatal BEFORE grading, not a cell alongside it.
+  mustHaveRun(psDead, "the dead-manager `cotal ps`");
+  check("dead manager: ps says no manager answered and lists presence, exit 0, never a bare empty list",
+    psDead.status === 0 && /No manager answered/.test(psDead.out) && !/No managed agents/.test(psDead.out), { status: psDead.status, out: psDead.out.slice(-400) });
+  check("dead manager: its Next is the stack's own bare cotal up", /^\s+cotal up\s/m.test(psDead.out), psDead.out.slice(-400));
+
+  console.log(`\nPS USER MODE ${fail === 0 ? "OK ✅" : "FAILED ❌"}  (${pass} passed, ${fail} failed)`);
+} catch (e) {
+  console.error("ps-user-mode threw:", e);
+  process.exitCode = 1;
+} finally {
+  // Every teardown step runs INDEPENDENTLY. A throw anywhere in a finalizer aborts the rest of it,
+  // so one bad line leaves a live broker and a scratch behind — a teardown that fails OPEN, which is
+  // worse than one that never ran, because the suite still reports its verdict. Measured for real:
+  // an unwired identifier in this block once aborted cleanup mid-flight and stranded a nats-server.
+  // A failing step is RED, not a log line. Cleanup that quietly declines and still lets the suite
+  // exit 0 is the same false-green class as everything else on this branch, just moved to the end.
+  const step = async (label: string, fn: () => unknown | Promise<unknown>): Promise<void> => {
+    try {
+      await fn();
+    } catch (e) {
+      process.exitCode = 1;
+      console.error(`  ! teardown step "${label}" FAILED: ${(e as Error).message}`);
+    }
+  };
+  // `cotal down` re-resolves its root from cwd, so under a FOREIGN root it aims at that root's
+  // `.cotal` and signals pids this fixture never started — another lane's manager, on the one path
+  // where the suite has already concluded something is wrong. Cleanup must not be the most
+  // dangerous thing the suite does.
+  let meshStopped = false;
+  await step("stop the mesh", async () => {
+    // AN ANCHOR, NOT A GATE. `cotal down` is a child that re-resolves its own root from cwd, so no
+    // check performed here can bind what it will decide a moment later — a pre-spawn `foreignRootFor`
+    // returning null then losing to a `.cotal` created before the spawn was measured killing a
+    // foreign process. A time-of-check test cannot win a time-of-use race.
+    //
+    // What CAN close it is a fact that outranks anything appearing afterwards: `findCotalRoot` stops
+    // at the FIRST `.cotal` starting from the directory itself, so once `root/.cotal` exists the
+    // child's resolution IS `root`, permanently, whatever appears above it later. That is the only
+    // condition under which a root-resolving teardown is safe here.
+    if (!existsSync(join(root, ".cotal"))) {
+      const foreign = foreignRootFor(root);
+      throw new Error(
+        `refusing \`cotal down\`: ${root} does not own a .cotal, so the child would resolve to whatever root `
+          + `wins from its cwd and could signal processes this suite never started`
+          + (upAttempted
+            ? `. A mesh may have started under ${foreign ? join(foreign, ".cotal") : "another root"} — stop it by hand.`
+            : `. Nothing was started.`),
+      );
+    }
+    restoreStackRegistration?.();
+    const down = await cotal(["down", "--with-agents"], 60_000);
+    // The same standard the graded cells get: `cotal()` resolves for a timeout, a signal death and a
+    // launch failure alike, so an unchecked `await` treats every one of those as a successful stop.
+    mustHaveRun(down, "`cotal down`");
+    if (down.status !== 0) throw new Error(`\`cotal down\` exited ${down.status}: ${down.out.slice(-300)}`);
+    meshStopped = true;
+  });
+  // Same callback shape as the setup handler: `close()` never throws, so `step` would have graded
+  // this successful no matter what happened. Reject on a real error so the step goes red; treat
+  // ERR_SERVER_NOT_RUNNING as benign, since it only means the server was already down.
+  await step("close the IdP", () => new Promise<void>((res, rej) => {
+    if (!idpSrv) return res();
+    idpSrv.close((err) => (err && (err as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING" ? rej(err) : res()));
+  }));
+  await step("remove the scratch", () => {
+    // Only once nothing is left to find. The scratch's `.cotal` holds the pidfiles that are the only
+    // way to locate a mesh this suite failed to stop; deleting them turns a recoverable orphan into
+    // an anonymous one.
+    if (upAttempted && !meshStopped) {
+      process.exitCode = 1;
+      console.error(
+        `  ! PRESERVING ${scratch}: the mesh was not confirmed stopped, and its .cotal holds the pidfiles `
+          + `needed to find and stop whatever is still running.`,
+      );
+      return;
+    }
+    rmSync(scratch, { recursive: true, force: true }); // home and root live under it
+  });
+}
+if (fail) process.exitCode = 1;

@@ -1,0 +1,340 @@
+/**
+ * Register owned smoke brokers and store directories for synchronous exit and signal cleanup.
+ *
+ * Suites still need normal-path teardown: stop the broker, await its exit, remove its temporary store,
+ * and release its registration. Ownership here does not replace that lifecycle. The exit and
+ * SIGINT/SIGTERM/SIGHUP handlers cover interruptions that prevent a suite's finally block from
+ * running. Keep both hooks: a runner may turn an unhandled signal into an ordinary exit, while
+ * plain Node does not run exit handlers for a signal with its default disposition.
+ *
+ * Ownership follows the spawned ChildProcess handle. Command-line matching can miss valid broker
+ * launches or select unrelated processes, and a referenced config file may already be deleted.
+ * Use `pnpm smoke:broker-migration` for the current tracked spawn-site census and adoption checks.
+ *
+ * SIGKILL cannot run these hooks. The store-directory token records its owner's pid and optional
+ * runner scope for a separate orphan reaper; the reaper must distinguish an orphan from a live
+ * owner's broker. Neither the token nor this helper makes a missing normal teardown safe.
+ */
+import { spawnSync, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
+import { readFileSync, readlinkSync, rmSync } from "node:fs";
+import { basename } from "node:path";
+
+/** The stable half of the token: what marks a store dir as a smoke broker's at all. */
+export const SMOKE_BROKER_PREFIX = "cotal-smoke-broker-";
+
+/**
+ * The minted token: the prefix plus THIS PROCESS'S PID, so the dir records not just "a smoke broker"
+ * but "whose". A broker started through this helper is recognizable after its owner is SIGKILLed; a
+ * broker started around it is not, so a reaper is only ever as complete as migration.
+ *
+ * THE PID IS HERE BECAUSE MARKING THE BROKER WAS NOT ENOUGH, and the gap was live rather than
+ * theoretical. A reaper matching the prefix alone claims every migrated suite's broker, not every
+ * LEAKED one, and two suites run concurrently on a shared box constantly. Reproduced: a second lane
+ * minting through this token and holding its broker with the owner still alive was listed for the
+ * kill by a prefix-only reaper. It would have SIGKILLed a live broker mid-run and reddened that lane
+ * with a diagnosis pointing at its own code, which is the "worse than no reaper" case exactly.
+ *
+ * Every call site keeps working unchanged, because this is still just a `mkdtemp` prefix. Sites that
+ * append their own tag after it still match, since the owner is parsed from the pid segment rather
+ * than from the whole name.
+ */
+export const SMOKE_BROKER_TOKEN = `${SMOKE_BROKER_PREFIX}${process.pid}-${scopeToken()}`;
+
+/** Recover the runner's scope through children that clear their inherited environment. */
+function scopeToken(): string {
+  let scope = process.env.SMOKE_BROKER_SCOPE?.trim();
+  let pid = process.ppid;
+  for (let hop = 0; !scope && pid > 1 && hop < 16; hop++) {
+    try {
+      scope = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0")
+        .find((entry) => entry.startsWith("SMOKE_BROKER_SCOPE="))
+        ?.slice("SMOKE_BROKER_SCOPE=".length).trim();
+    } catch { /* An ancestor may still carry the scope when this parent is unreadable. */ }
+    if (scope) break;
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const parent = Number(stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[1]);
+      if (!Number.isInteger(parent)) break;
+      pid = parent;
+    } catch { break; }
+  }
+  // Standalone suites retain the unscoped token. The digest keeps paths bounded and contains no name.
+  return scope ? `s${createHash("sha256").update(scope).digest().subarray(0, 16).toString("base64url")}-` : "";
+}
+
+/**
+ * Kill a broker and DO NOT RETURN until it is actually gone, so the caller's `rmSync` cannot race a
+ * process still writing into the tree it is walking.
+ *
+ * This exists because that race is not theoretical. `bind-fence` sent SIGTERM and removed its tree on
+ * the next line; in CI the recursive walk hit a directory nats-server had just written back into and
+ * the suite died on `ENOTEMPTY: directory not empty, rmdir
+ * '/tmp/cotal-smoke-broker-LilWsp/jetstream/$G/streams/KV_cotal_records_bindfence/msgs'` after every
+ * one of its cells had passed.
+ *
+ * SIGTERM is the reason the window is wide: it asks nats-server to shut down GRACEFULLY, and a
+ * graceful shutdown FLUSHES JetStream state to disk. So the signal that is polite to the broker is
+ * precisely the one that keeps it writing while the removal walks. Modelled on a fixture that flushes
+ * for 250ms after SIGTERM, removing straight away failed 4 times out of 4; waiting for the exit first
+ * succeeded 4 out of 4.
+ *
+ * A NOTE ON WHAT DOES NOT WORK, so nobody re-derives it from the docs. Node's own retry options on
+ * `rmSync` (`maxRetries`/`retryDelay`) name ENOTEMPTY explicitly and look like the native answer. They
+ * are not: measured on the same fixture they failed 4 out of 4 while burning 5.7 seconds, because the
+ * retry re-attempts the failed `rmdir` and never re-walks the directory, so files created during the
+ * first walk are never removed and the `rmdir` can never succeed. Waiting is the fix; retrying is not.
+ *
+ * Never throws — it runs on the teardown path, where a throw would replace the real cause of death.
+ * If the broker ignores the first signal it is escalated to SIGKILL rather than waited on forever.
+ */
+export async function killAndAwaitExit(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM", timeoutMs = 10_000): Promise<void> {
+  const dead = (): boolean => child.exitCode !== null || child.signalCode !== null;
+  if (dead()) return;
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  const after = (ms: number): Promise<"timeout"> => new Promise((r) => setTimeout(() => r("timeout"), ms).unref());
+  try {
+    child.kill(signal);
+  } catch {
+    return; // already gone; `exit` may never fire, and there is nothing left to wait for
+  }
+  if ((await Promise.race([exited.then(() => "exited" as const), after(timeoutMs)])) === "timeout") {
+    // It ignored the polite signal. Escalate rather than hang the suite's teardown forever.
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      return;
+    }
+    await Promise.race([exited, after(2_000)]);
+  }
+}
+
+interface Owned {
+  readonly child?: ChildProcess;
+  readonly storeDir?: string;
+}
+
+const owned = new Set<Owned>();
+let armed = false;
+
+function takeOwned(): Owned[] {
+  const entries = [...owned];
+  owned.clear();
+  return entries;
+}
+
+function removeOwnedPaths(entries: readonly Owned[]): void {
+  for (const o of entries) {
+    if (o.storeDir !== undefined) {
+      try {
+        rmSync(o.storeDir, { recursive: true, force: true });
+      } catch (e) {
+        console.error(`smoke broker teardown: could not remove ${o.storeDir}: ${(e as Error).message}`);
+      }
+    }
+  }
+}
+
+const stillAlive = (pid: number): boolean => {
+  try { process.kill(pid, 0); }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+  // IT ANSWERED, WHICH IS NOT THE SAME AS RUNNING. A child this process spawned and then killed
+  // becomes a ZOMBIE until it is waited on, and a zombie still accepts signal 0, so `kill(pid, 0)`
+  // reports it alive forever. That is not a corner case here: the suite's own `finally` SIGKILLs the
+  // broker first and this helper runs afterwards on the exit hook, so the common green path hits it
+  // every time. Measured directly: after `child.kill("SIGKILL")`, `/proc/<pid>/stat` reads `Z` while
+  // `kill(pid, 0)` keeps succeeding, so the loop below burned its full 3s deadline and then printed
+  // `pid N did not exit before path cleanup` about a process that had already died. A false alarm on
+  // a teardown path is worse than silence, because it is the line someone reads while diagnosing a
+  // real leak. A zombie holds no port and no file, which is all this wait exists to protect against.
+  // ON A PLATFORM WITHOUT PROCFS this reads as gone rather than alive, and that direction is
+  // deliberate: the only cost is skipping a wait that exists to avoid an rmSync race, while the
+  // other direction would hang every teardown for the full deadline on macOS. The wait is a
+  // best-effort guard, not a correctness requirement, so losing it off Linux is acceptable and
+  // silently hanging there is not.
+  try { return !/^Z/.test(readFileSync(`/proc/${pid}/stat`, "utf8").split(") ").pop()?.split(" ")[0] ?? ""); }
+  catch { return false; } // no procfs entry: it is gone
+};
+
+/** Synchronously stop an exact child by OS pid. Exit/signal hooks cannot await promises reliably:
+ * the runner can terminate the process while a promise is pending. Waiting on OS liveness before
+ * removing paths closes the opposite race, where nats-server recreates store files after rmSync. */
+function killOwnedChild(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid === undefined) return;
+  try { child.kill("SIGKILL"); } catch { return; }
+  const deadline = Date.now() + 3_000;
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  while (stillAlive(pid) && Date.now() < deadline) Atomics.wait(pause, 0, 0, 10);
+  if (stillAlive(pid)) console.error(`smoke broker teardown: pid ${pid} did not exit before path cleanup`);
+}
+
+/** Synchronous exit/signal teardown. Never throws: this runs while the process is already exiting. */
+function reap(): void {
+  const entries = takeOwned();
+  for (const o of entries) if (o.child !== undefined) killOwnedChild(o.child);
+  removeOwnedPaths(entries);
+}
+
+function arm(): void {
+  if (armed) return;
+  armed = true;
+  // THESE TWO ARE INDEPENDENTLY SUFFICIENT UNDER `tsx`, established by disabling each in turn and
+  // watching the suite stay green both times. With a signal listener registered, tsx delivers the
+  // signal and the handler reaps. With none, tsx converts the signal into an ordinary exit and the
+  // `exit` handler reaps: measured directly, a fixture registering only `process.on("exit")`, sent
+  // SIGTERM at its own pid, printed `EXIT HANDLER RAN code=143`.
+  //
+  // Both are kept because the sufficiency is runner-specific, not universal: under plain `node` a
+  // default-disposition SIGTERM terminates without running an `exit` handler at all, and there the
+  // signal handlers are the only thing left. The suite prints that they are UNOBSERVED here rather
+  // than letting a green run imply this runner proved them.
+  //
+  // READ THIS BEFORE DELETING EITHER ONE. These two are JOINTLY graded, never individually, because
+  // tsx converts an unhandled signal into an exit; the suite cannot tell the legs apart and a
+  // mutation on either is UNGRADABLE by construction. Under a runner that does not convert, each leg
+  // is load-bearing alone. So deleting the signal registration is green here and silently broken
+  // anywhere else, and nothing will tell you.
+  process.on("exit", reap);
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    // A NAMED handler removed with `process.off`, never `removeAllListeners`: this helper is meant to
+    // go into many suites, and removing every listener for a signal would silently disable cleanup a
+    // suite had already registered, then re-raise so the default kills the process before the
+    // disabled handler could ever matter.
+    const onSignal = (): void => {
+      process.off(sig, onSignal);
+      reap();
+      // Registering a listener suppresses the default termination, so re-raise after synchronous
+      // cleanup. A killed seat must still report the signal rather than a clean exit.
+      process.kill(process.pid, sig);
+    };
+    process.on(sig, onSignal);
+  }
+}
+
+/**
+ * Print which nats-server binary a broker runs. Suites spawn the bare name, so the server under test
+ * is whatever the spawn's PATH reaches first, and two boxes can report the same green against
+ * different servers unless the run names the one it used (#371). The binary is read from
+ * `/proc/<pid>/exe`, the file the kernel runs for this child: repeating exec's search from this
+ * process names another file whenever the spawn's env, cwd or PATH differs from ours. That binary's
+ * own `--version` decides whether the child is a broker, because a server started under another name
+ * is still the server under test, and every broker is probed, because a binary replaced at the same
+ * path between two brokers is a different server.
+ * Announcing here covers the live suites without a list, because `pnpm smoke:broker-migration`
+ * refuses a test broker that is not handed to {@link teardownOnSignal} unless it carries the explicit
+ * opt-out marker. A child whose binary cannot be run or does not answer `--version` within ten seconds,
+ * or that was started under a nats-server name and whose binary reports no nats-server version,
+ * throws: a run that cannot name its server cannot vouch for what it measured. Without procfs there is
+ * no running image to read, so the run says the binary is unrecorded rather than guess.
+ */
+function announceBroker(child: ChildProcess): void {
+  // A reaped child's pid may already be another process's, and a child that never started ran nothing.
+  if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  const named = /^nats-server/.test(basename(child.spawnfile));
+  if (process.platform !== "linux") {
+    if (named) console.error(`smoke broker: nats-server binary not recorded: ${process.platform} has no /proc/<pid>/exe`);
+    return;
+  }
+  const exe = `/proc/${child.pid}/exe`;
+  let bin: string;
+  try { bin = readlinkSync(exe); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return; // a zombie: it exited before it could serve
+    throw error;
+  }
+  // Run the link, not the path it reads as: a binary unlinked or replaced while it runs reads as
+  // `<path> (deleted)`, a path that is gone or holds another file, but the link still runs its image.
+  // Bounded, and killed by a signal it cannot ignore, because this blocks the event loop: a binary that
+  // never answers would otherwise hold the suite and keep the armed signal teardown from ever running.
+  // That kill reaches the probe alone, so the probe leads its own process group and the whole group is
+  // killed once it returns: a process it forked would otherwise outlive it with nothing owning it.
+  // spawnSync's native side reads `detached` as spawn's does, but only spawn documents it and Node's
+  // types follow the docs, so the options are a const the types accept rather than a refused literal.
+  const options = { encoding: "utf8", timeout: 10_000, killSignal: "SIGKILL", detached: true } as const;
+  const probe = spawnSync(exe, ["--version"], options);
+  // pid 0 is a probe that never started, and kill(-0) would signal this process's own group.
+  if (probe.pid > 0) {
+    try { process.kill(-probe.pid, "SIGKILL"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+  }
+  if (probe.error !== undefined) {
+    // Exec fails ENOENT for a child that exited since the readlink and also for a live one whose ELF
+    // interpreter is gone, so only the child's own state can excuse a probe that did not run.
+    if (!stillAlive(child.pid)) return;
+    throw new Error(`smoke broker: could not run ${bin} --version: ${probe.error.message}`);
+  }
+  // Anchored on the program name: a wrapper handed over before it execs the server runs its
+  // interpreter, and an interpreter such as node also prints a bare `v<semver>`.
+  const version = /^nats-server: v(\d+\.\d+\.\d+\S*)/m.exec(probe.stdout)?.[1];
+  if (version !== undefined) console.error(`smoke broker: nats-server ${version} at ${bin}`);
+  else if (named) throw new Error(`smoke broker: ${bin} --version reported no nats-server version: ${`${probe.stdout}${probe.stderr}`.trim()}`);
+}
+
+/**
+ * Take ownership of an already-spawned broker. Returns a `release` for the suite's own `finally`:
+ * it kills the broker if the suite has not already torn it down itself, and forgets the entry. The
+ * store directory remains the suite's to remove, because a restart-shaped suite starts its next
+ * broker on the same directory and this helper must not remove a tree the next broker still needs.
+ * A second `SIGKILL` on an already-exited child is a no-op, so a site that kills and then releases
+ * is unchanged. A child running nats-server is also announced by binary and version; see
+ * {@link announceBroker}.
+ */
+export function teardownOnSignal(child: ChildProcess, storeDir?: string): () => void {
+  arm();
+  const entry: Owned = { child, ...(storeDir === undefined ? {} : { storeDir }) };
+  owned.add(entry);
+  // After ownership, so a broker whose binary cannot be named is still reaped when this throws.
+  announceBroker(child);
+  return () => {
+    if (owned.delete(entry)) killOwnedChild(child);
+  };
+}
+
+/** Own one exact temporary path before it receives credential or broker bytes. Unlike
+ * {@link teardownOnSignal}, this needs no child handle, so registration can precede the dangerous
+ * write instead of leaving a create-before-register crash window. The caller still removes the path
+ * on its normal path, then releases this backstop last. */
+export function teardownPathOnSignal(path: string): () => void {
+  arm();
+  const entry: Owned = { storeDir: path };
+  owned.add(entry);
+  return () => owned.delete(entry);
+}
+
+/**
+ * Poll `probe` until it answers `true`, or throw once `attempts` calls have all answered `false`.
+ *
+ * This is the other half of the readiness loop every suite hand-rolls as
+ * `for (let i = 0; i < N; i++) { if (await isReachable(servers)) break; await sleep(ms); }` — a
+ * shape with no exhaustion arm, so a suite that spent the whole wait finding the broker down still
+ * falls through and dials it anyway, and the first thing to speak is a nats-core dial error with a
+ * stack into `node_modules` instead of a sentence naming the broker. See issue #1249.
+ *
+ * `probe` is the caller's own reachability check (typically `() => isReachable(servers)`), passed
+ * in rather than imported, so this package keeps declaring no dependencies (`core-boundary.smoke.ts`
+ * enforces that). `attempts` and `delayMs` are the site's own numbers — unchanged by adopting this.
+ *
+ * `output`, when given, is the site's own collected broker stdout/stderr (as the issue's second
+ * comment describes: a suite that already throws on exhaustion still throws away the one thing that
+ * would make the failure diagnosable — was the port merely stolen, or did the broker fail to start
+ * and say why). On exhaustion the thrown message includes that output trimmed to its last 2000
+ * bytes, or the words `no broker output collected` when `output()` returns an empty string.
+ */
+export async function awaitBrokerReady(
+  probe: () => Promise<boolean>,
+  opts: { servers: string; attempts: number; delayMs: number; output?: () => string },
+): Promise<void> {
+  const { servers, attempts, delayMs, output } = opts;
+  const started = Date.now();
+  for (let i = 0; i < attempts; i++) {
+    if (await probe()) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+  }
+  const elapsedMs = Date.now() - started;
+  const collected = output?.() ?? "";
+  const tail = collected === "" ? "no broker output collected" : collected.slice(-2000);
+  throw new Error(
+    `nats-server at ${servers} never became reachable after ${attempts} attempts (${elapsedMs}ms elapsed) - ${tail}`,
+  );
+}

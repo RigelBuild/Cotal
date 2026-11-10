@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cotal console</title>
+    <link rel="stylesheet" href="/assets/xterm.css" />
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+        background: #0b0d10;
+        color: #d7dce2;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+      header {
+        padding: 8px 14px;
+        border-bottom: 1px solid #1c2127;
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+      }
+      header h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: 0.04em; }
+      header .meta { color: #6b7480; font-size: 12px; }
+      #grid {
+        flex: 1;
+        display: grid;
+        gap: 1px;
+        background: #1c2127;
+        padding: 1px;
+        overflow: hidden;
+        grid-auto-rows: minmax(0, 1fr);
+      }
+      .pane { display: flex; flex-direction: column; background: #000; min-width: 0; min-height: 0; }
+      .pane .bar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 10px;
+        background: #0f1216;
+        border-bottom: 1px solid #1c2127;
+      }
+      .pane .name { font-weight: 600; }
+      .pane .role { color: #6b7480; }
+      .dot { width: 8px; height: 8px; border-radius: 50%; background: #6b7480; }
+      .dot.running { background: #3fb950; }
+      .dot.exited { background: #f85149; }
+      .pane .term { flex: 1; min-width: 0; min-height: 0; overflow: hidden; padding: 4px; }
+      #empty { margin: auto; color: #6b7480; text-align: center; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>COTAL CONSOLE</h1>
+      <span class="meta" id="meta">connecting…</span>
+    </header>
+    <div id="grid"><div id="empty">no agents yet: <code>cotal start --agent claude --name …</code></div></div>
+
+    <script src="/assets/xterm.js"></script>
+    <script src="/assets/addon-fit.js"></script>
+    <!-- The mesh §13.6 session client bundle (wsconnect + core rail + frame codec). -->
+    <script src="/session-bundle.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

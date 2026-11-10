@@ -1,0 +1,443 @@
+import type { Extension, ExtensionRef } from "./registry.js";
+import type { McpServerSpec } from "./connector-config.js";
+import type { StartupBlocker, StartupReply } from "./startup-confirm.js";
+
+/** User-mode launch identity shared by the manager, connector and launch-material carrier. The
+ *  sentinel is a file path, and the bearer command is argv. The material reader checks its rebuilt
+ *  value against `Required<UserAuthLaunch>` so added optional fields also need explicit validation. */
+export interface UserAuthLaunch {
+  owner: string;
+  actor: string;
+  sentinelCredsPath: string;
+  bearerCmd: string[];
+}
+
+/** Identity + mesh coordinates the manager hands a connector to launch an agent. */
+export interface LaunchOpts {
+  space: string;
+  name: string;
+  role?: string;
+  /** Stable agent id (the nkey public key). When set, the launched session adopts it
+   *  as its `card.id` instead of generating a random one — so the id the launcher
+   *  provisioned is the id the agent presents, and later ACLs key on it. */
+  id?: string;
+  /** Path to a minted creds file (auth mode). Passed to the session so it authenticates
+   *  as `id`; absent when the mesh runs open. */
+  creds?: string;
+  /** USER-MODE launch (a user-auth mesh): the agent's owner+actor principal, the PATH to its
+   *  sentinel-creds copy, and the argv it execs for a fresh bearer. The connector forwards these
+   *  verbatim (`COTAL_OWNER` / `COTAL_ACTOR` / `COTAL_SENTINEL_CREDS` / `COTAL_BEARER_CMD` as JSON
+   *  argv) — like {@link creds}, host-local pointers, opaque to core. Mutually exclusive with
+   *  `creds`/`id` (the principal IS the identity; connectors throw on a conflicting combination). */
+  userAuth?: UserAuthLaunch;
+  /** The incarnation's lifecycle UID (SPEC §13.1), minted by the launcher at spawn. The connector
+   *  forwards it (`COTAL_LIFECYCLE_UID`) so the session's endpoint binds its lifecycle-keyed
+   *  dm/dlv/chathist durables — the same exact names its credential pins. */
+  lifecycleUid?: string;
+  /** The CHAT stream sequence this incarnation had reached before a preservation cut (manager-
+   *  recorded). The connector forwards it (`COTAL_BACKFILL_FLOOR`) so the session's boot backfill
+   *  reads only what came after it instead of the whole retained window. Absent on a fresh launch. */
+  backfillFloor?: number;
+  /** The accepted-row token of the credential's issuance (SPEC 13.15), chosen by the launcher at
+   *  mint. The connector forwards it (`COTAL_ACCEPTED_TOKEN`) so the session's endpoint reads the
+   *  generation the issuer bound and pins it into its caller rails. Static issued launches only. */
+  acceptedToken?: string;
+  servers?: string;
+  /** The agent's resolved access policy — the SAME read/post set the manager mints the agent's
+   *  creds from. The connector forwards it (`COTAL_SUBSCRIBE` / `COTAL_ALLOW_SUBSCRIBE` /
+   *  `COTAL_ALLOW_PUBLISH`) so the session's runtime read set matches its credentials. Essential
+   *  for manifest spawns, whose materialized persona carries NO access frontmatter: without it the
+   *  connector has nothing to read its channel set from, so the agent joins nothing even though its
+   *  creds authorize channels. An absent list is omitted (the connector then defers to the persona
+   *  file or the join link, and joins nothing if neither names a channel). An empty one is forwarded
+   *  empty, so the session keeps the empty list the creds were minted from. */
+  subscribe?: string[];
+  allowSubscribe?: string[];
+  allowPublish?: string[];
+  /** Control-plane capabilities the manager granted this agent (e.g. `["spawn"]`) — the SAME set
+   *  the creds were provisioned from. Forwarded as `COTAL_CAPABILITIES` so the connector exposes the
+   *  matching control-plane tools (cotal_spawn / cotal_persona). Without it a manifest-spawned agent —
+   *  whose materialized persona carries no `capabilities:` frontmatter — gets none, so those tools stay
+   *  hidden even though its creds authorize them. */
+  capabilities?: string[];
+  /** Path to an agent definition file (`.cotal/agents/<name>.md`). The connector
+   *  passes it through (`COTAL_AGENT_FILE`) so the joined session reads its own
+   *  card from it, and applies the file's persona at launch. */
+  configPath?: string;
+  /** The model the launcher resolved: the `--model` flag, else the agent file's `model:`. The
+   *  launcher checks and records this value, so a connector renders it as given in its host form
+   *  (Claude `--model`, OpenCode `config.model`, Hermes `HERMES_MODEL`) and never re-reads it from
+   *  {@link configPath}, which may have changed since. Absent means the harness default. */
+  model?: string;
+  /** The model variant the launcher resolved: the `--variant` flag, else the agent file's
+   *  `variant:`. A connector-defined variant of the selected/default model (for example
+   *  provider-specific reasoning effort), rendered as given like {@link model}. A connector that
+   *  supports variants renders it in its host form; unsupported connectors fail loud rather than
+   *  silently ignoring it. */
+  variant?: string;
+  /** Opaque, connector-specific launch options — an arbitrary key→value map core forwards VERBATIM
+   *  and never inspects. Connectors forward well-shaped keys raw into their own host form (CLI flags,
+   *  config, env); a connector with no option surface fails loud. Fed by `--opt k=v`, a persona's
+   *  `launchOptions:` mapping, or a manifest `launchOptions:` — merged per key. */
+  launchOptions?: Record<string, unknown>;
+  /** An initial message for the session to act on the moment it starts (`cotal spawn --prompt`).
+   *  A connector delivers it as the harness's first turn or throws at launch; it never ignores it,
+   *  because an operator who passed a prompt is waiting on the turn it starts. Gated upstream by
+   *  {@link Connector.supportsPrompt}, so a prompt on a connector that cannot deliver one is
+   *  refused before any provisioning. */
+  prompt?: string;
+  /** This seat is started for one `once` task, which the manager relays to it as a turn. A
+   *  connector that launches processes outside the seat's own process records them from launch on,
+   *  so {@link Connector.retireAfterExit} can prove them gone. */
+  once?: boolean;
+  /** An OPAQUE prior-session handle to FORK FROM when launching — never reused, never resolved by
+   *  core. Like `creds` / `configPath`, this is a HOST-LOCAL pointer (into e.g. `~/.claude`), NOT a
+   *  portable value like `model`: it only means something on the machine that produced it. A
+   *  connector that honors it MUST fork a new session id from that transcript (Claude
+   *  `--resume <id> --fork-session`), so the meshed agent gets a fresh session and the original is
+   *  left untouched — resuming MUST NOT hijack the source session. A connector that can't fork
+   *  THROWS at {@link Connector.buildLaunch} rather than silently spawning fresh. */
+  resume?: string;
+  /** A carried {@link resume} (docs/design/resume-transfer.md section 7): the transcript was carried
+   *  from another host and staged by the manager. `home` is the seat-private config home the manager
+   *  created for this seat, `transcript` the staged copy the connector places into it, and `cwd` the
+   *  seat's working directory, which the home must trust. Only a connector that declares
+   *  {@link Connector.resumeTranscript} receives it. */
+  carried?: { home: string; transcript: string; cwd: string };
+  /** Exact session of THIS connector process to continue after a supervised process restart.
+   *  Distinct from {@link resume}: `resume` forks FROM an existing transcript into a new session;
+   *  `continueSession` reopens the already-meshed session itself. Manager-internal only, never a
+   *  CLI/manifest/model-provided field. A connector that cannot preserve its mesh surface across
+   *  same-session continuation throws rather than silently launching fresh. */
+  continueSession?: string;
+  /** Existing host session to reopen for a manifest `continuity: exact` agent. Unlike
+   *  {@link continueSession}, the session must already exist: a connector that honors it fails the
+   *  launch when the host has no such session, never creating an empty one under that id. Crash
+   *  recovery keeps `continueSession`, because a seat that never took a turn has no stored session
+   *  yet. Manager-internal only, never a CLI/manifest/model-provided field. */
+  reopenSession?: string;
+  /** Publish this session's AG-UI event plane to the agent's own event channel (see
+   *  {@link Connector.eventChannel}), so an external observer or UI can read what the agent actually
+   *  did as structured events rather than as prose (sets `COTAL_EVENTS`). Defaults to ON for a
+   *  connector that declares an event channel; set `false` to opt out (`--no-events`).
+   *
+   *  The flag ARMS the emitter. It is deliberately separate from the grant the manager mints from
+   *  {@link Connector.eventChannel}: holding publish rights on a channel is not a request to publish
+   *  to it, so a hand-written `allowPublish` entry cannot turn events on for a session the launch
+   *  path never armed. */
+  events?: boolean;
+  /** The selected registration requires this session's structured event plane. A launcher sets this
+   *  from trusted registration material; connectors carry it into launch material for session-side
+   *  enforcement as well as arming the emitter. */
+  eventsRequired?: boolean;
+  /** Operator MCP servers to SHARE with this agent, resolved from the cotal config by the caller
+   *  (see {@link connectorServers}). Keyed by server name, `.mcp.json`-shaped, with `${VAR}`
+   *  secret refs intact. A connector renders them into its own host format. Host-native discovery
+   *  remains the connector's default unless the caller requests an exclusive selection.
+   *  Connectors that don't support sharing throw on a non-empty map. */
+  mcpServers?: Record<string, McpServerSpec>;
+  /** The caller explicitly narrowed MCP sharing, including an empty selection. A connector with
+   *  native discovery uses this intent to retain its host's per-spawn isolation policy. */
+  mcpServersExclusive?: boolean;
+  /** Extra environment names an operator deliberately declared in `spawn.env`, resolved by the
+   *  caller exactly as {@link mcpServers} is. The default supplies no extras: the child receives the
+   *  fixed OS allow-list, the machine-wide `COTAL_*` operator knobs, and connector-declared inputs
+   *  only. Connectors never read Cotal config themselves. Host-session markers are not forwarded unless
+   *  named here. */
+  envAllow?: readonly string[];
+  /** Absolute harness executable paths resolved by the manager during boot, keyed by the connector's
+   * declared `requires` names. Managed launches use these exact files rather than resolving PATH
+   * again later. Absent for standalone/foreground launches that have no manager boot inventory. */
+  resolvedBinaries?: Readonly<Record<string, string>>;
+  /** The manager's workspace root. Connectors that keep per-agent local state (e.g. the OpenCode
+   *  connector's SQLite DB + serve pidfile) pin it here so a per-agent working directory ({@link cwd})
+   *  — which can point at any repo — doesn't scatter that state into the target tree. */
+  workspaceRoot?: string;
+  /** The authorized directory a supervised seat runs in, set by the manager beside runtime spawn.
+   *  A connector can declare native startup choices for that directory. A foreground launch runs
+   *  in the operator's terminal and omits it. */
+  cwd?: string;
+}
+
+/** The `once` seat a {@link Connector.retireAfterExit} call is about: the launch inputs that
+ *  locate what the connector recorded for it. */
+export interface OnceSeat {
+  space: string;
+  name: string;
+  lifecycleUid: string;
+  /** The manager's workspace root, as {@link LaunchOpts.workspaceRoot} carried it at launch. */
+  workspaceRoot: string;
+}
+
+/** A recipe for starting an agent as a mesh node — command, args, and extra env. */
+export interface LaunchSpec {
+  command: string;
+  args: string[];
+  env?: Record<string, string>;
+  /** Auto-clear a one-time spawn prompt: when this text appears in the agent's
+   *  early output, the runtime presses Enter once so a supervised launch stays
+   *  non-interactive. Matched after stripping ANSI + whitespace (TUIs position
+   *  text with cursor moves, not spaces); a text with nothing left after stripping, `""` included,
+   *  is refused before the seat starts. */
+  confirm?: string;
+  /** Optional native startup choices, answered in order before confirm. A choice marked
+   * `optional` may be passed over for the next one. Only the startup watch may answer them;
+   * ordinary tool permissions remain the harness's responsibility. */
+  confirmBefore?: readonly StartupReply[];
+  /** Optional texts that show the harness reached its input screen without showing confirm, for a
+   * harness that shows that prompt only in some setups. Each is matched within one visible line,
+   * normalized like confirm. Seen on two consecutive screen reads, it ends the startup watch with
+   * no key. Requires confirm. */
+  confirmReady?: readonly string[];
+  /** Optional native startup screens the watch never answers, such as a harness's first-run setup or
+   * a safety warning only its user may accept. Each is matched like a confirmBefore prompt. While one
+   * is on screen no key is sent, and when the startup bound ends with one on screen the failure names
+   * its reason. Requires confirm. */
+  confirmBlockers?: readonly StartupBlocker[];
+  /** A line the startup watch must see on a screen read after the Enter that answered
+   *  {@link confirm}, before it records `confirmed`. It is read across consecutive lines however a
+   *  narrow pane wraps it, ignoring whitespace and the box or bar marks at each line's edges. It has
+   *  a bound of its own, as long as the prompt's. Use it when answering the prompt does not by itself
+   *  show the state a launch needs, as Claude's registration notice shows its channel server was
+   *  admitted. */
+  confirmNotice?: string;
+  /** This agent's local control endpoint — the OS path its lifecycle hooks connect to (passed in
+   *  the child env as `COTAL_CONTROL_SOCKET`/`COTAL_CONTROL_TOKEN`), plus the first-frame `token`
+   *  that authenticates it. The connector mints it in `buildLaunch`; the manager keeps it IN MEMORY
+   *  (never persisted — token hygiene) to send a cooperative `{op:"shutdown"}` on a runtime that
+   *  can't deliver a clean exit signal (ConPTY/Windows). Both the Claude Code (MCP server) and
+   *  OpenCode (in-process plugin) connectors mint one; absent only for a connector with no control
+   *  plane at all. */
+  control?: { path: string; token: string };
+  /** Connector-owned host-session state file. A supervised restart reads this exact manager-provided
+   *  path after process exit, then verifies the successor reports the same session over `control`.
+   *  Contains no transcript or credential; currently used by Pi for its current session id. */
+  sessionStatePath?: string;
+  /** Where a `resume` launch records its fork's provenance, for a connector whose seat makes the fork
+   *  after launch: a JSON file the seat writes holding `source` (the session id it forked),
+   *  `transcriptSha256` (SHA-256 over the source transcript as it read it) and `title` when the
+   *  source has one. The manager records it on the seat's resume document, and `cotal ps` shows it.
+   *  The manager keeps a title of at most 1024 characters, so the connector refuses before launch a
+   *  source whose title is longer. */
+  resumeRecordPath?: string;
+  /** Private temporary directories this launch wrote for its child to read (a persona carrier, an
+   *  MCP config file), from `writeLaunchArtifact`. The launcher that spawns this spec owns them: it
+   *  removes them with `discardLaunchArtifacts` once it has proved the child gone (see core
+   *  launch-artifacts). */
+  artifacts?: string[];
+}
+
+/** One provider-specific model variant. `options` is opaque connector metadata for UIs; core never
+ *  interprets it or feeds it back into launch. */
+export interface ModelVariantInfo {
+  name: string;
+  options?: Record<string, unknown>;
+}
+
+/** One model a connector can launch. `id` is the value to pass as {@link LaunchOpts.model}; variants
+ *  are selected separately via {@link LaunchOpts.variant}. */
+export interface ModelInfo {
+  id: string;
+  name?: string;
+  provider?: string;
+  variants?: ModelVariantInfo[];
+}
+
+/** Connector-provided model catalog. Optional by design: some hosts have no local model-list API. */
+export interface ModelCatalog {
+  source?: string;
+  models: ModelInfo[];
+  /** Set by a connector whose install exposes no catalog it can list, saying why and what to pass
+   *  instead. The manager reports that connector `supported: false` rather than as a failed read. */
+  unavailable?: string;
+}
+
+export interface ModelCatalogOpts {
+  refresh?: boolean;
+  /** Absolute harness paths the manager resolved at boot, keyed by the connector's `requires` names.
+   *  The same record a managed launch receives as {@link LaunchOpts.resolvedBinaries}. A catalog reads
+   *  these files rather than resolving the bare name again, so it runs the binary a spawn will run.
+   *  Absent when no manager boot inventory exists, as for a standalone call. */
+  resolvedBinaries?: Readonly<Record<string, string>>;
+}
+
+/** Manager-facing wrapper for one connector's catalog lookup. */
+export interface ConnectorModelCatalog extends ModelCatalog {
+  agent: string;
+  supported: boolean;
+  error?: string;
+}
+
+/**
+ * A bridge that knows how to launch one agent type (Claude Code, OpenCode, the CLI
+ * peer …) as a Cotal mesh node — an {@link Extension} of kind `"connector"`.
+ * `name` is the agent type it handles — the key the manager resolves by.
+ * Connectors self-register on import; the manager resolves them from the registry,
+ * and core stays ignorant of which ones exist.
+ */
+export interface Connector extends Extension {
+  readonly kind: "connector";
+  readonly name: string;
+  /** Connector-owned setup surface. The base CLI resolves this through the extension registry and
+   * never carries a harness's asset names or native install commands itself. */
+  readonly setup?: ExtensionRef;
+  buildLaunch(opts: LaunchOpts): LaunchSpec;
+  /** Optional model catalog hook. The manager calls this for selector UIs; launch remains authority-free
+   *  and still accepts any string the operator supplies. */
+  listModels?(opts?: ModelCatalogOpts): ModelCatalog | Promise<ModelCatalog>;
+  /** The channel this connector publishes an agent's AG-UI event plane to (see
+   *  {@link LaunchOpts.events}). OPTIONAL: only connectors that actually emit implement it, and
+   *  asking for `events` from one that does not FAILS LOUD in the manager rather than minting a
+   *  grant nothing will ever use.
+   *
+   *  It takes the agent's PRINCIPAL, never its display name. A display name is UI convenience and is
+   *  not an identity: this mesh permits two live agents to carry one name, so a name-keyed channel
+   *  fuses two principals' streams onto one subject and authorizes both onto it from the same
+   *  name-only value. The principal is the address. Connectors derive the channel with core's own
+   *  `eventChannel`, so the grant the manager mints here and the subject the session publishes to
+   *  are the same derivation and cannot drift. */
+  eventChannel?(principal: { owner: string; actor: string }): string;
+  /** External executables this connector invokes beyond `LaunchSpec.command` (e.g. the
+   *  `claude` / `opencode` CLI). A preflight PATH hint, not a full environment validator: the
+   *  manager resolves each at boot, passes the absolute path through {@link LaunchOpts.resolvedBinaries},
+   *  and fails with a clear error naming a missing one. Optional — omit for connectors
+   *  whose harness runs in-process. */
+  readonly requires?: readonly string[];
+  /** Directory of installable editor-plugin assets shipped with the connector
+   *  (e.g. a Claude Code plugin dir), when the agent type needs a one-time
+   *  plugin install. Consumers (like `cotal setup`) resolve it via the registry
+   *  so they never import the extension package directly. */
+  readonly pluginRoot?: string;
+  /** Whether this connector can honor {@link LaunchOpts.resume} (fork an existing session into the
+   *  mesh). The manager reads this as a PRE-MINT preflight: when `resume` is requested for a connector
+   *  that doesn't declare support, it fails loud BEFORE any provisioning side effect (mirrors the
+   *  {@link requires} PATH preflight) — so an unsupported resume can never mint-then-orphan creds +
+   *  durables. Default-deny: absent/false → not supported, and `buildLaunch` throwing on `resume`
+   *  stays as the backstop. Only a connector that forks-from a prior session (never hijacks it) sets
+   *  this `true`. */
+  readonly supportsResume?: boolean;
+  /** Where this connector's host keeps resumable transcripts, so the CLI can carry one to a manager
+   *  on another host (docs/design/resume-transfer.md section 10). A connector without it never receives
+   *  a carried transcript: its resume id resolves on the manager's host. */
+  readonly resumeTranscript?: ResumeTranscriptLocator;
+  /** Whether this connector can reopen the exact host session named by
+   *  {@link LaunchOpts.continueSession} after a supervised process crash. Default-deny. */
+  readonly supportsSessionContinuation?: boolean;
+  /** Whether this connector honors {@link LaunchOpts.reopenSession}: it reopens that existing host
+   *  session or fails the launch when it does not exist. Default-deny. */
+  readonly supportsSessionReopen?: boolean;
+  /** Whether a launch without {@link LaunchOpts.resume}, {@link LaunchOpts.continueSession} or
+   * {@link LaunchOpts.reopenSession} creates a new host session. This is the first-cutover
+   * continuity declaration: a manager may describe it as `fresh`, but must never infer it by
+   * connector name or by probing a live host. */
+  readonly supportsFreshStart?: boolean;
+  /**
+   * Whether this connector can tell its host that the advertised `cotal_*` list changed.
+   *
+   * Default-deny. The advertised `cotal_*` list is a function of the session's mesh
+   * config (spawn tools appear or vanish with the connection). A session that changes
+   * connection therefore changes the advertised surface. Some hosts can tell the
+   * session the list changed; some take a tool map once and cannot. Consumers above
+   * this boundary branch on THIS FLAG, never on the connector's name and never on
+   * the transport. A connection-changing op against a connector that does not declare
+   * this MUST fail loud ({@link refuseUnannouncedToolListChange}) rather than leave a
+   * stale list that still accepts the call and is denied at the wire.
+   */
+  readonly supportsToolListAnnounce?: boolean;
+  /** Whether this connector can honor {@link LaunchOpts.variant}. Default-deny so a variant request
+   *  fails before provisioning side effects in the manager. */
+  readonly supportsModelVariant?: boolean;
+  /** Whether this connector can honor {@link LaunchOpts.prompt} as the harness's first turn.
+   *  Default-deny, so a prompt on a connector that does not declare it fails before any
+   *  provisioning rather than being accepted and never submitted. */
+  readonly supportsPrompt?: boolean;
+  /** Whether a seat on this connector takes a relayed turn on an idle fresh session, hands it to
+   *  the harness at most once, and yields when the turn ends. A `once` spawn needs it. Declare it
+   *  only after a live check shows the harness doing all three; serving `turn-pending` is not
+   *  enough. Default-deny. */
+  readonly supportsTurnRelay?: boolean;
+  /** Why this connector cannot take a relayed turn, in a clause the manager appends to its
+   *  refusal of a `once` spawn. Only meaningful without {@link supportsTurnRelay}. */
+  readonly turnRelayRefusal?: string;
+  /** A `once` seat on this connector is served its task only when its startup watch ended
+   *  `confirmed` (the runtime's {@link AgentHandle.startupOutcome}). The value is the clause the
+   *  manager's failure gives for a `ready` outcome. A runtime that does not report the outcome
+   *  refuses such a spawn. */
+  readonly onceNeedsConfirmed?: string;
+  /** A seat on this connector is woken while idle by mesh traffic only when its startup watch ended
+   *  `confirmed`. A plain spawn whose watch ended `ready` still succeeds; its reply carries this
+   *  clause as `startupNotice` and the seat's `ps` row carries it, so the spawner and the operator
+   *  learn that the seat does not wake on its own. A runtime that does not report the outcome
+   *  carries no notice. */
+  readonly idleWakeNeedsConfirmed?: string;
+  /** The most once task text one turn frame of this connector carries, in UTF-16 code units, as
+   *  {@link renderOnceTask} renders it. A `once` spawn whose rendered task is longer is refused at
+   *  admission. Absent means the connector's frames carry any length. */
+  readonly turnFrameLimit?: number;
+  /** For a `once` seat whose process has exited: prove that nothing the connector can tie to the
+   *  seat's launches is still running outside that process, stopping what it ties. Resolves only with
+   *  that proof, and again with the same proof when asked after it was given; throws whenever it
+   *  cannot prove it, and the manager keeps the task's debt and asks again. The manager calls
+   *  `discard` once the debt is cleared. The proof covers only what the connector can tie to a
+   *  launch, so its implementation states what that is and what falls outside, such as a process
+   *  that hides its environment and detaches from its parent and group. A connector whose seat
+   *  launches nothing outside its own process does not implement it. */
+  retireAfterExit?(seat: OnceSeat): Promise<{ discard(): Promise<void> }>;
+  /**
+   * Connector-specific upper bound for reaching mesh presence after its process is launched.
+   *
+   * The manager's generic readiness window applies when absent. A connector whose documented
+   * bootstrap legitimately exceeds that generic window must declare a positive safe integer here,
+   * so a live slow boot is not terminalized `uncertain` before it can join. This is a bounded wait,
+   * not an application-health promise: presence still means only that the seat joined the mesh.
+   */
+  readonly readinessTimeoutMs?: number;
+  /** One short clause telling the operator what to expect on a FOREGROUND spawn, appended to the
+   *  "spawning <name> on the mesh" line. What happens next differs per harness — one opens on an
+   *  interactive gate, another paints a full-screen UI after a pause — and a hint naming the wrong
+   *  one is worse than none: someone waits for a prompt that will never appear and reads the
+   *  startup as hung. Omit when there is nothing specific to say. */
+  readonly launchHint?: string;
+  /** The screen, named for the operator, at which a launch with these options waits for the
+   *  operator before its session joins the mesh, such as Claude's session picker for a resume with
+   *  no session id. Undefined when the launch joins on its own. The manager reports such a launch
+   *  ready once its process runs, without waiting for presence. */
+  waitsForOperator?(launchOptions: Record<string, unknown> | undefined): string | undefined;
+}
+
+/** Finds the transcript of a resumable session on this host. */
+export interface ResumeTranscriptLocator {
+  /** The transcript file of session `id` under the host configuration `env` names, with the session's
+   *  title when it has one, or `undefined` when this host holds no session `id`. Throws when the id is
+   *  ambiguous or names a session by title rather than by id. */
+  find(id: string, env: NodeJS.ProcessEnv): { path: string; title?: string } | undefined;
+}
+
+/** The only continuity classes a maintenance report may promise for a connector. */
+export type SessionContinuityClass = "exact" | "fork" | "fresh" | "drain-only";
+
+/**
+ * Classify continuity from declared connector capabilities only. A host throwing while probed is
+ * not capability evidence, and connector names are deliberately not part of this decision.
+ */
+export function sessionContinuityClass(
+  connector: Pick<Connector, "supportsResume" | "supportsSessionContinuation" | "supportsFreshStart">,
+): SessionContinuityClass {
+  if (connector.supportsSessionContinuation) return "exact";
+  if (connector.supportsResume) return "fork";
+  return connector.supportsFreshStart ? "fresh" : "drain-only";
+}
+
+/**
+ * Refuse a connection-changing op when the connector cannot announce the resulting
+ * tool-list change. Name-blind: callers pass the connector they resolved, never a
+ * string of known harnesses, and the refusal itself names none. Default-deny:
+ * absent/false throws. Returns void when the connector declared
+ * {@link Connector.supportsToolListAnnounce}.
+ */
+export function refuseUnannouncedToolListChange(connector: Pick<Connector, "supportsToolListAnnounce">): void {
+  if (connector.supportsToolListAnnounce === true) return;
+  throw new Error(
+    "this connector cannot announce a tool-list change, so a connection change is refused rather than leaving a stale advertised surface",
+  );
+}

@@ -1,0 +1,316 @@
+import { readFileSync, writeFileSync, lstatSync, renameSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { dirname, join, resolve } from "node:path";
+import { stringify as stringifyYaml } from "yaml";
+import { z } from "zod";
+import { assertDerivedOwnerToken, assertKnownAgentCapabilities, assertValidChannel, assertValidName, ensureDirNoSymlink, isConcreteChannel, realDirNoSymlink, unlinkFileNoFollow, type MeshLaunchAgent, type MeshLaunchSpec } from "@cotal-ai/core";
+
+/**
+ * Load + materialize a resolved launch spec for `supervise --launch`.
+ *
+ * The CLI's manifest resolver produces the spec (`cotal-launch/v1`); the manager treats it as
+ * **untrusted input** — strict schema, path-safe run id + agent names — then materializes each
+ * agent's persona to a **transient, non-authoritative** file under `.cotal/run/<runId>/agents/`
+ * (never `.cotal/agents/`, never persona-discoverable). Creds are minted from the spec's `policy`,
+ * not from this file, so the file carries no ACL/capability frontmatter.
+ */
+
+// A NATS-/path-safe token: connector type, role (a route token), capability, run id. Keeps a
+// hand-edited/malicious launch spec from feeding rewritten route/capability strings into the manager
+// path (channel policies are re-validated at provision time; these complete the untrusted contract).
+const TOKEN = /^[A-Za-z0-9_-]+$/;
+const RunId = z.string().regex(TOKEN, "runId must be a path-safe token ([A-Za-z0-9_-])");
+
+const LaunchAgentSchema = z.strictObject({
+  name: z.string().min(1),
+  agent: z.string().regex(TOKEN, "agent must be a connector token ([A-Za-z0-9_-])"),
+  role: z.string().regex(TOKEN, "role must be a route-safe token ([A-Za-z0-9_-])").optional(),
+  cwd: z.string().min(1).refine((s) => !s.includes("\0"), "cwd must not contain a NUL byte").optional(),
+  continuity: z.literal("exact").optional(),
+  model: z.string().refine((s) => s.trim() !== "", "must not be empty").optional(),
+  variant: z.string().refine((s) => s.trim() !== "", "must not be empty").optional(),
+  launchOptions: z.record(z.string(), z.unknown()).optional(),
+  description: z.string().optional(),
+  body: z.string().optional(),
+  prompt: z.string().min(1).optional(),
+  events: z.boolean().optional(),
+  capabilities: z.array(z.string().regex(/^[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)?$/, "capability must be a safe token, optionally role-namespaced (role:<r>)")).optional(),
+  subscribe: z.array(z.string()),
+  allowSubscribe: z.array(z.string()),
+  allowPublish: z.array(z.string()),
+  personaPath: z.string().optional(),
+  hash: z.string().regex(/^[A-Za-z0-9]+$/, "hash must be alphanumeric"),
+});
+
+// USER-AUTH meshes: the derived owner every launched agent runs under, stamped at apply time by
+// the logged-in operator (core `MeshLaunchSpec.owner`). Validated as a real derived token so a
+// hand-edited spec can't smuggle an arbitrary string into ownership attribution.
+const DerivedOwner = z.string().refine(
+  (o) => { try { assertDerivedOwnerToken(o); return true; } catch { return false; } },
+  "owner must be a derived owner token (u_ + 26 lowercase base32)",
+);
+
+const LaunchSpecSchema = z.strictObject({
+  apiVersion: z.literal("cotal-launch/v1"),
+  space: z.string().min(1),
+  runId: RunId,
+  owner: DerivedOwner.optional(),
+  agents: z.array(LaunchAgentSchema),
+});
+
+/** Parse + strictly validate a launch spec from untrusted JSON (a file OR an inline control-op
+ *  payload). Throws on any deviation — including an agent name that isn't a safe mesh/file token
+ *  (no path traversal). */
+export function parseLaunchSpec(json: unknown, label: string): MeshLaunchSpec {
+  const r = LaunchSpecSchema.safeParse(json);
+  if (!r.success)
+    throw new Error(`${label}: ${r.error.issues.map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`).join("; ")}`);
+  for (const a of r.data.agents) {
+    assertValidName(a.name); // names the transient file → must be safe
+    validateLaunchPolicy(a); // don't let --launch be a looser second manifest format
+  }
+  return r.data;
+}
+
+/** Parse + strictly validate a launch spec file ({@link parseLaunchSpec} on its contents). */
+export function loadLaunchSpec(path: string): MeshLaunchSpec {
+  let json: unknown;
+  try {
+    json = JSON.parse(readFileSync(path, "utf8"));
+  } catch (e) {
+    throw new Error(`launch spec ${path}: ${(e as Error).message}`);
+  }
+  return parseLaunchSpec(json, `launch spec ${path}`);
+}
+
+/** Persist a PUSHED (inline) launch spec under this manager's own `.cotal/run/<runId>.json`, so a
+ *  remote deploy leaves the same on-disk source the file path would: stale-restart and retained
+ *  resume ({@link launchSpecForRun}) read one place either way. Atomic temp-then-rename (exclusive
+ *  temp, never follows a pre-planted symlink), replacing any prior content for the runId — the
+ *  deploying CLI owns runId reuse semantics, the manager just holds the current spec. Callers pass
+ *  an already-validated spec, so `runId` is a safe token. */
+export function persistLaunchSpec(root: string, spec: MeshLaunchSpec): string {
+  const dir = ensureDirNoSymlink(root, ".cotal", "run");
+  const path = join(dir, `${spec.runId}.json`);
+  const tmp = join(dir, `.${spec.runId}.${randomBytes(4).toString("hex")}.tmp`);
+  writeFileSync(tmp, JSON.stringify(spec, null, 2), { mode: 0o600, flag: "wx" });
+  renameSync(tmp, path);
+  return path;
+}
+
+/** Resolve + load the launch spec for a run id, deriving the path from a known root rather than
+ *  accepting one. The `launch` control op (`spawn -f` onto a running manager) passes a `runId`, NOT a
+ *  path — so a (admin-only) caller can never make the manager read an arbitrary host-local JSON: the
+ *  id must be a safe token, `.cotal/run` must be a real (non-symlink) dir chain, and the spec file
+ *  itself must not be a symlink. Then the usual untrusted-input validation ({@link loadLaunchSpec})
+ *  applies, and the spec's self-declared `runId` must match the requested one. */
+export function launchSpecForRun(root: string, runId: string): MeshLaunchSpec {
+  if (!TOKEN.test(runId)) throw new Error(`unsafe runId ${JSON.stringify(runId)} (allowed: letters, digits, _ -)`);
+  const runDir = realDirNoSymlink(root, ".cotal", "run"); // refuse a symlinked .cotal / run parent
+  if (!runDir) throw new Error(`no launch spec for run ${runId} (.cotal/run is absent)`);
+  const path = join(runDir, `${runId}.json`);
+  let st;
+  try {
+    st = lstatSync(path);
+  } catch {
+    throw new Error(`no launch spec for run ${runId} at ${path}`);
+  }
+  if (st.isSymbolicLink()) throw new Error(`refusing to read launch spec "${path}": it is a symlink`);
+  const spec = loadLaunchSpec(path);
+  if (spec.runId !== runId) throw new Error(`launch spec runId "${spec.runId}" does not match requested "${runId}"`);
+  return spec;
+}
+
+
+/** Re-enforce the v1 manifest's policy constraints at the manager boundary so a hand-edited/malicious
+ *  launch spec can't smuggle in what the CLI schema would reject: concrete channels only (no wildcard
+ *  scopes — the v1 wildcard deferral), `subscribe ⊆ allowSubscribe`, and known capabilities. Channel
+ *  policies are re-checked again at provision time, but this fails BEFORE any provisioning side effect. */
+function validateLaunchPolicy(a: MeshLaunchAgent): void {
+  const where = `launch agent "${a.name}"`;
+  for (const [field, list] of [["subscribe", a.subscribe], ["allowSubscribe", a.allowSubscribe], ["allowPublish", a.allowPublish]] as const)
+    for (const ch of list) {
+      try {
+        assertValidChannel(ch);
+      } catch (e) {
+        throw new Error(`${where}: ${field}: ${(e as Error).message}`);
+      }
+      if (!isConcreteChannel(ch)) throw new Error(`${where}: ${field} "${ch}" is a wildcard - not allowed in a v1 launch spec`);
+    }
+  const missing = a.subscribe.filter((c) => !a.allowSubscribe.includes(c));
+  if (missing.length) throw new Error(`${where}: subscribe [${missing.join(", ")}] not within allowSubscribe`);
+  assertKnownAgentCapabilities(a.capabilities ?? [], where);
+}
+
+/** Materialize one resolved agent's persona to a transient file the connector reads, and return its
+ *  path. Carries only what a connector needs (identity/role/model/variant/description + body) plus a loud
+ *  generated-artifact header — never ACL/capability frontmatter (creds come from the spec's policy). */
+export function materializePersona(root: string, runId: string, a: MeshLaunchAgent): string {
+  // 0700 dirs created component-by-component, refusing a symlinked parent (writes can't escape the
+  // run tree); plus a lexical direct-child check on the final path as belt-and-suspenders.
+  const dir = ensureDirNoSymlink(root, ".cotal", "run", runId, "agents");
+  const path = resolve(dir, `${a.name}.md`);
+  if (dirname(path) !== dir) throw new Error(`unsafe agent name "${a.name}" - persona path escapes ${dir}`);
+  const fm = ["---", `name: ${a.name}`];
+  if (a.role) fm.push(`role: ${scalar(a.role)}`);
+  if (a.model) fm.push(`model: ${scalar(a.model)}`);
+  if (a.variant) fm.push(`variant: ${scalar(a.variant)}`);
+  if (a.description) fm.push(`description: ${scalar(a.description)}`);
+  fm.push("---", "");
+  const src = a.personaPath ?? "the manifest";
+  const header = `<!-- Generated runtime artifact from a cotal mesh manifest (run ${runId}). Do NOT edit - regenerated on each launch and deleted by \`cotal down\`. Edit ${src} instead. This file is not a reusable persona and carries no access authority. -->`;
+  const body = a.body ? `${a.body.trim()}\n` : "";
+  // Atomic replace via an exclusive temp (never follows a symlink pre-planted at either path): the
+  // file is a derived artifact of the spec, so regenerating is always correct — a plain `wx` here
+  // made RE-launching an agent in the same run (a re-apply after a partial deploy failure, or a
+  // re-pushed remote spec) fail EEXIST on a leftover from the first attempt.
+  const tmp = resolve(dir, `.${a.name}.${randomBytes(4).toString("hex")}.tmp`);
+  writeFileSync(tmp, `${fm.join("\n")}${header}\n\n${body}`, { mode: 0o600, flag: "wx" });
+  renameSync(tmp, path);
+  return path;
+}
+
+/** The snapshots unsaved inline personas launch from (SPEC 13.7). No spawn may name a file here. */
+export function inlinePersonaDir(root: string): string {
+  return join(root, ".cotal", "run", "inline");
+}
+
+/** One lifecycle's inline persona snapshot. The path is keyed by the lifecycle uid, so the file is
+ *  that lifecycle's, as its lifecycle-keyed credential file is. */
+export function inlineSnapshotPath(root: string, lifecycleUid: string): string {
+  return join(inlinePersonaDir(root), `${lifecycleUid}.md`);
+}
+
+/** Write the snapshot an unsaved inline persona launches from, create-only and 0600, and return its
+ *  path. Like {@link materializePersona} it carries only what a connector reads, after a generated
+ *  artifact header, and never an access field: the grant comes from the spawn. The body follows the
+ *  frontmatter, so a body that starts with `---` reads back as body. */
+export function writeInlineSnapshot(
+  root: string,
+  lifecycleUid: string,
+  p: { name: string; role?: string; model?: string; variant?: string; description?: string; body?: string },
+): string {
+  const dir = ensureDirNoSymlink(root, ".cotal", "run", "inline");
+  const path = resolve(dir, `${lifecycleUid}.md`);
+  if (dirname(path) !== dir) throw new Error(`unsafe lifecycle uid "${lifecycleUid}" - snapshot path escapes ${dir}`);
+  // The catalog writer's serializer, so every string the record accepted reads back as itself.
+  const fm: Record<string, string> = { name: p.name };
+  if (p.role) fm.role = p.role;
+  if (p.model) fm.model = p.model;
+  if (p.variant) fm.variant = p.variant;
+  if (p.description) fm.description = p.description;
+  const header = `<!-- Generated runtime artifact: the inline persona of lifecycle ${lifecycleUid}, written by its spawn. Do NOT edit - the seat refuses a changed snapshot on restart, and the file is deleted when the seat retires. It is not a reusable persona and carries no access authority. -->`;
+  const body = p.body ? `${p.body.trim()}\n` : "";
+  // Create-only (`wx` never follows a link planted at the path): the uid is fresh, so a file already
+  // there is not this spawn's to replace.
+  writeFileSync(path, `---\n${stringifyYaml(fm, { lineWidth: 0 }).trimEnd()}\n---\n${header}\n\n${body}`, { mode: 0o600, flag: "wx" });
+  return path;
+}
+
+/** Remove one lifecycle's snapshot without following a link: `.cotal/run/inline` must be a real
+ *  directory chain and the snapshot a regular file, as the run tree's other destructive callers
+ *  require. A snapshot that is not there counts as removed; anything refused or not removed throws. */
+export function removeInlineSnapshot(root: string, lifecycleUid: string): void {
+  const dir = realDirNoSymlink(root, ".cotal", "run", "inline");
+  if (!dir) return;
+  const path = resolve(dir, `${lifecycleUid}.md`);
+  if (dirname(path) !== resolve(dir)) throw new Error(`unsafe lifecycle uid "${lifecycleUid}" - snapshot path escapes ${dir}`);
+  unlinkFileNoFollow(path);
+}
+
+/** Build the manager spawn opts for a launch agent: identity/role/model/variant + the resolved object
+ *  (which carries the ACL authority) + the materialized configPath. */
+export function launchAgentToStartOpts(a: MeshLaunchAgent, configPath: string, owner?: string, runId?: string): {
+  name: string;
+  agent: string;
+  cwd?: string;
+  role?: string;
+  model?: string;
+  variant?: string;
+  events?: boolean;
+  config: string;
+  resolved: MeshLaunchAgent;
+  owner?: string;
+  launchRef?: { runId: string; requested: string; hash: string };
+} {
+  return {
+    name: a.name,
+    agent: a.agent,
+    cwd: a.cwd,
+    role: a.role,
+    model: a.model,
+    variant: a.variant,
+    events: a.events,
+    config: configPath,
+    resolved: a,
+    owner,
+    launchRef: runId ? { runId, requested: a.name, hash: a.hash } : undefined,
+  };
+}
+
+/** The host session the manager last bound to a `continuity: exact` manifest agent, keyed by its
+ *  declared name. Only the manager writes it, after the connector proved the session it runs. */
+export interface ContinuityAssignment {
+  version: 1;
+  space: string;
+  name: string;
+  connector: string;
+  cwd: string;
+  sessionId: string;
+}
+
+const ContinuityAssignmentSchema = z.strictObject({
+  version: z.literal(1),
+  space: z.string().min(1),
+  name: z.string().min(1),
+  connector: z.string().min(1),
+  cwd: z.string().min(1),
+  sessionId: z.string().trim().min(1).max(4096),
+});
+
+/** The session to reopen for `continuity: exact`, or undefined when none was recorded yet (the first
+ *  launch starts a new session). An assignment recorded for another space, connector or directory is
+ *  refused rather than reopened: attaching it would restore a different seat's history. */
+export function readContinuityAssignment(root: string, want: Omit<ContinuityAssignment, "version" | "sessionId">): string | undefined {
+  const dir = realDirNoSymlink(root, ".cotal", "continuity");
+  if (!dir) return undefined;
+  const path = join(dir, `${want.name}.json`);
+  let st;
+  try {
+    st = lstatSync(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Error(`continuity assignment ${path}: ${(e as Error).message}`);
+  }
+  if (!st.isFile()) throw new Error(`refusing continuity assignment ${path}: it is not a regular file`);
+  let parsed: ContinuityAssignment;
+  try {
+    parsed = ContinuityAssignmentSchema.parse(JSON.parse(readFileSync(path, "utf8")));
+  } catch (e) {
+    throw new Error(`continuity assignment ${path} is malformed (${(e as Error).message})`);
+  }
+  for (const key of ["space", "name", "connector", "cwd"] as const)
+    if (parsed[key] !== want[key])
+      throw new Error(
+        `continuity: exact for "${want.name}": its recorded session belongs to ${key} ${JSON.stringify(parsed[key])}, ` +
+          `not ${JSON.stringify(want[key])}; refusing to reopen it. Remove ${path} to start a new session.`,
+      );
+  return parsed.sessionId;
+}
+
+/** Record (or replace) a `continuity: exact` agent's session, atomically and 0600. */
+export function writeContinuityAssignment(root: string, assignment: Omit<ContinuityAssignment, "version">): void {
+  const dir = ensureDirNoSymlink(root, ".cotal", "continuity");
+  const path = join(dir, `${assignment.name}.json`);
+  const tmp = join(dir, `.${assignment.name}.${randomBytes(4).toString("hex")}.tmp`);
+  writeFileSync(tmp, JSON.stringify({ version: 1, ...assignment }, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+  renameSync(tmp, path);
+}
+
+/** Quote a frontmatter scalar so the agent-file parser reads it back unchanged (it strips a matching
+ *  outer quote pair). Plain tokens pass through; anything with structural chars is double-quoted. */
+function scalar(v: string): string {
+  if (v === v.trim() && !/^\[/.test(v) && !/[:#"'\r\n]/.test(v)) return v;
+  if (!v.includes('"') && !/[\r\n]/.test(v)) return `"${v}"`;
+  return JSON.stringify(v.replace(/[\r\n]+/g, " "));
+}

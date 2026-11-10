@@ -1,0 +1,271 @@
+/**
+ * Topology membership smoke (no NATS, no test runner): pnpm --filter @cotal-ai/cli test
+ *
+ * Two halves. The FOLD: `foldTopo` overlays the broker-authoritative membership feed onto the
+ * traffic graph (silent subscribers become nodes, subscriptions become live/durable links, wide
+ * readers are badged rather than spoked, bounded wildcards expand against known channels, a member
+ * that also has traffic is not double-counted, and an absent feed leaves the fold as it was). The
+ * MODEL: `MeshView` reads and watches the feed through a stub endpoint and classifies what it saw
+ * into the four states the header pill can honestly say, with the error path driven for real: a
+ * failed read is `unreadable` with its reason and its overlay withheld, an absent bucket is
+ * `traffic-only`, a later successful read clears the reason, a failed watch is named as such.
+ */
+import { EventEmitter } from "node:events";
+import type { CotalEndpoint, MembershipChange, MembershipSnapshot, Presence } from "@cotal-ai/core";
+import type { FeedEntry } from "../src/console/mesh.js";
+// By dist path, the same module the package name resolves to, so a MeshView mutation is graded against the build its command runs.
+import { MeshView, type MembershipView } from "../../../packages/workspace/dist/view/index.js";
+import { foldTopo, membershipFreshness } from "../src/console/ui/topo/model.js";
+
+let failures = 0;
+function check(label: string, cond: boolean, extra?: unknown): void {
+  console.log(`${cond ? "✓" : "✗"} ${label}`);
+  if (!cond) { failures++; if (extra !== undefined) console.log("   ", extra); }
+}
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const NOW = 1_000_000_000_000;
+const agent = (id: string, name: string, status: Presence["status"] = "idle"): Presence => ({
+  card: { id, name, kind: "agent", role: name }, status, ts: NOW,
+});
+const feedMsg = (fromName: string, channel: string): FeedEntry => ({
+  id: fromName + channel, ts: NOW - 1000, from: { id: "ID_" + fromName, name: fromName },
+  delivery: "multicast", channel, text: "hi",
+});
+
+console.log("1. the fold overlays a readable snapshot");
+// Roster: alice is present and has traffic; the feed also names a SILENT subscriber (bea, no
+// traffic, not on the roster), a durable-offline member (cid), a wide reader, and a bounded wildcard.
+const agents: Presence[] = [agent("ID_alice", "alice", "working")];
+const feed: FeedEntry[] = [feedMsg("alice", "general")];
+const snapshot: MembershipSnapshot = {
+  asOf: NOW,
+  members: [
+    { id: "ID_alice", live: ["general"], durable: [], observedAt: NOW },
+    { id: "ID_bea", live: ["general"], durable: [], observedAt: NOW },
+    { id: "ID_cid", live: [], durable: ["backend"], observedAt: NOW },
+    { id: "ID_wide", live: [">"], durable: [], observedAt: NOW },
+    { id: "ID_team", live: ["team.>"], durable: [], observedAt: NOW },
+  ],
+};
+const knownChannels = ["general", "backend", "team.build", "team.qa"];
+const nameOf = (id: string) => id.replace(/^ID_/, "");
+const g = foldTopo(feed, agents, { membership: { snapshot }, knownChannels, now: NOW, nameOf });
+const node = (id: string) => g.byKey.get("a:" + id);
+const links = (id: string) => g.memberships.filter((m) => m.agent === "a:" + id);
+check("silent subscriber becomes a node (member, lastTs 0)", node("ID_bea")?.member === true && node("ID_bea")?.lastTs === 0);
+check("silent subscriber gets a live link to its channel", links("ID_bea").some((l) => l.channel === "c:general" && l.state === "live"));
+check("silent channel hub materialized", g.byKey.has("c:general"));
+check("durable-offline member gets a durable link", links("ID_cid").some((l) => l.channel === "c:backend" && l.state === "durable"));
+check("durable channel hub materialized", g.byKey.has("c:backend"));
+check("wide reader flagged, no per-hub spoke", node("ID_wide")?.wide === true && links("ID_wide").length === 0);
+check("bounded wildcard expands to both concretes (live)", (() => {
+  const l = links("ID_team").map((m) => m.channel).sort();
+  return l.length === 2 && l[0] === "c:team.build" && l[1] === "c:team.qa" && links("ID_team").every((m) => m.state === "live");
+})());
+const aliceNodes = g.nodes.filter((n) => n.key === "a:ID_alice");
+check("a member with traffic is one node, member:true", aliceNodes.length === 1 && aliceNodes[0].member === true);
+check("a member with traffic keeps its traffic edge", g.edges.some((e) => e.src === "a:ID_alice" && e.dst === "c:general"));
+
+console.log("1b. a durable family row expands over the durable-class channels under it");
+// fay follows team.> and is offline: her family row stores copies for team.build (durable) and none for
+// team.qa (live). gus reads team.qa live and also holds the family row.
+const famSnapshot: MembershipSnapshot = {
+  asOf: NOW,
+  members: [
+    { id: "ID_fay", live: [], durable: ["team.>"], observedAt: NOW },
+    { id: "ID_gus", live: ["team.qa"], durable: ["team.>"], observedAt: NOW },
+  ],
+};
+const fam = foldTopo([], [], { membership: { snapshot: famSnapshot }, knownChannels, durableChannels: ["backend", "team.build"], now: NOW, nameOf });
+const famLinks = (id: string) => fam.memberships.filter((m) => m.agent === "a:" + id).map((m) => `${m.channel}:${m.state}`).sort();
+check("an offline family follower gets a durable link to each durable-class channel under it, and none to a live one",
+  JSON.stringify(famLinks("ID_fay")) === JSON.stringify(["c:team.build:durable"]), famLinks("ID_fay"));
+check("a live read wins over the family row on its channel", JSON.stringify(famLinks("ID_gus")) === JSON.stringify(["c:team.build:durable", "c:team.qa:live"]), famLinks("ID_gus"));
+check("the family itself is not drawn as a channel hub", !fam.byKey.has("c:team.>"), [...fam.byKey.keys()]);
+
+console.log("2. same-name principals remain separate authoritative members");
+const sameNameAgents: Presence[] = [agent("ID_sam_1", "sam"), agent("ID_sam_2", "sam")];
+const sameNameSnapshot: MembershipSnapshot = {
+  asOf: NOW,
+  members: [
+    { id: "ID_sam_1", live: ["red"], durable: [], observedAt: NOW },
+    { id: "ID_sam_2", live: ["blue"], durable: [], observedAt: NOW },
+  ],
+};
+const sameName = foldTopo([], sameNameAgents, {
+  membership: { snapshot: sameNameSnapshot },
+  knownChannels: ["red", "blue"],
+  now: NOW,
+});
+const sameNameNodes = sameName.nodes.filter((n) => n.kind === "agent" && n.name === "sam");
+check("two principals with one display name remain two topology nodes", sameNameNodes.length === 2, sameNameNodes);
+check(
+  "same-name principals keep separate membership spokes",
+  sameName.memberships.length === 2 && new Set(sameName.memberships.map((m) => m.agent)).size === 2,
+  sameName.memberships,
+);
+
+console.log("3. the fold withholds an overlay it could not read, and degrades cleanly when there is none");
+const disowned = foldTopo(feed, agents, { membership: { snapshot, unreadable: "permissions violation" }, knownChannels, now: NOW, nameOf });
+check("an unreadable feed draws NO membership links, even with a last snapshot in hand", disowned.memberships.length === 0);
+check("...and adds no phantom nodes", disowned.nodes.filter((n) => n.kind === "agent").length === 1);
+const bare = foldTopo(feed, agents, { now: NOW });
+check("no feed at all: no memberships, no phantom nodes", bare.memberships.length === 0 && bare.nodes.filter((n) => n.kind === "agent").length === 1);
+
+console.log("3. the four pill states, in the order that keeps them honest");
+const fresh = (m: MembershipView, now = NOW) => membershipFreshness(now, m);
+check("a snapshot with a young heartbeat reads live", fresh({ snapshot }).label === "live");
+check("a snapshot older than 45 s reads stale", fresh({ snapshot }, NOW + 60_000).label === "stale");
+check("a snapshot with members but no heartbeat reads stale (no freshness to claim)", fresh({ snapshot: { asOf: undefined, members: snapshot.members } }).label === "stale");
+check("an empty, never-written feed reads traffic-only", fresh({ snapshot: { asOf: undefined, members: [] } }).label === "traffic-only");
+check("no read yet reads traffic-only", fresh({}).label === "traffic-only");
+const un = fresh({ snapshot, unreadable: "permissions violation" });
+check("a failing read reads unreadable WITH its reason, even over a live snapshot", un.label === "unreadable" && un.reason === "permissions violation", un);
+// The two cases that pin the ORDER rather than just the labels: an unreadable feed whose snapshot
+// is empty or missing satisfies the traffic-only test too, so only checking `unreadable` FIRST
+// keeps "we could not read it" from being reported as "the mesh has no daemon writing one".
+check(
+  "a failing read over an empty snapshot reads unreadable, not traffic-only",
+  fresh({ snapshot: { asOf: undefined, members: [] }, unreadable: "permissions violation" }).label === "unreadable",
+  fresh({ snapshot: { asOf: undefined, members: [] }, unreadable: "permissions violation" }),
+);
+check(
+  "a failing read with no snapshot at all reads unreadable, not traffic-only",
+  fresh({ unreadable: "permissions violation" }).label === "unreadable",
+  fresh({ unreadable: "permissions violation" }),
+);
+
+console.log("5. MeshView classifies what its endpoint answers (the error path driven for real)");
+/** The smallest endpoint MeshView.start() touches, with the two membership calls scripted. */
+class StubEndpoint extends EventEmitter {
+  space = "stub";
+  readAnswer: () => Promise<MembershipSnapshot> = () => Promise.resolve({ asOf: NOW, members: [] });
+  watchAnswer: (cb: (change: MembershipChange) => void, onClosed?: (e: Error) => void) => Promise<{ stop(): Promise<void> }> = (cb, onClosed) => { this.onChange = cb; this.onClosed = onClosed; return Promise.resolve({ stop: async () => {} }); };
+  onChange?: (change: MembershipChange) => void;
+  onClosed?: (e: Error) => void;
+  reads = 0;
+  async start() {}
+  async stop() {}
+  getRoster(): Presence[] { return []; }
+  tap() {}
+  listChannels: () => Promise<{ channel: string; messages: number }[]> = async () => [];
+  channelDeliveryClass(channel: string) { return channel === "team.build" ? "durable" : "live"; }
+  async dmHistory() { return []; }
+  async channelHistory() { return []; }
+  ref() { return { id: "stub", name: "stub" }; }
+  readMembership() { this.reads++; return this.readAnswer(); }
+  watchMembership(cb: (change: MembershipChange) => void, onClosed?: (e: Error) => void) { return this.watchAnswer(cb, onClosed); }
+}
+/** What the watch delivers for one agent's record and for the daemon's heartbeat (#4904). */
+const memberChange: MembershipChange = { type: "member", id: "a:x", operation: "PUT", revision: 7, update: true, member: { id: "a:x", live: ["ops"], durable: [], observedAt: NOW } };
+const heartbeat = (asOf: number): MembershipChange => ({ type: "heartbeat", revision: 8, update: true, asOf });
+async function viewOver(stub: StubEndpoint): Promise<{ view: MeshView; m: () => MembershipView }> {
+  const view = new MeshView(stub as unknown as CotalEndpoint, {});
+  await view.start();
+  await wait(50);
+  return { view, m: () => view.snapshot().membership };
+}
+{
+  const stub = new StubEndpoint();
+  stub.readAnswer = () => Promise.reject(new Error("permissions violation for subscription to KV_cotal_membership_stub"));
+  const { view, m } = await viewOver(stub);
+  check("a read that throws lands as unreadable, reason kept", m().unreadable !== undefined && /permissions violation/.test(m().unreadable ?? ""), m());
+  check("...and never as a connection error", view.snapshot().status.error === undefined, view.snapshot().status);
+  check("...and the pill says unreadable", membershipFreshness(NOW, m()).label === "unreadable");
+  // The watch fires, the read now succeeds: the reason clears and the snapshot is live.
+  stub.readAnswer = () => Promise.resolve(snapshot);
+  stub.onChange?.(heartbeat(NOW + 1));
+  await wait(300);
+  check("a heartbeat over a FAILED read is the retry: the reason clears and the snapshot is read", m().unreadable === undefined && m().snapshot?.asOf === NOW, m());
+  await view.stop();
+}
+{
+  // The channel rows carry each channel's class, which the topology lens hands foldTopo as the durable
+  // channels a family row expands over (#5404).
+  const stub = new StubEndpoint();
+  stub.listChannels = async () => [{ channel: "team.build", messages: 1 }, { channel: "team.chat", messages: 2 }];
+  const { view } = await viewOver(stub);
+  const rows = view.snapshot().channels.map((c) => `${c.channel}:${c.deliveryClass}`);
+  check("the channel rows carry each channel's class from the endpoint", JSON.stringify(rows) === JSON.stringify(["team.build:durable", "team.chat:live"]), rows);
+  await view.stop();
+}
+{
+  // #4904: the daemon rewrites the heartbeat every poll with nothing else changed. Over a readable
+  // snapshot that moves `asOf` and nothing else, so it must cost no bucket read; a member change does.
+  const stub = new StubEndpoint();
+  stub.readAnswer = () => Promise.resolve(snapshot);
+  const { view, m } = await viewOver(stub);
+  const readsAfterStart = stub.reads;
+  stub.onChange?.(heartbeat(NOW + 5_000));
+  await wait(300);
+  check("a heartbeat over a readable snapshot moves asOf without a bucket read", m().snapshot?.asOf === NOW + 5_000 && m().snapshot?.members.length === 5 && stub.reads === readsAfterStart, { asOf: m().snapshot?.asOf, reads: stub.reads, readsAfterStart });
+  stub.onChange?.({ type: "replayed", revision: 8 });
+  await wait(300);
+  check("a replayed marker costs no read either", stub.reads === readsAfterStart, { reads: stub.reads, readsAfterStart });
+  stub.onChange?.(memberChange);
+  await wait(300);
+  check("a member change reads the feed back in full", stub.reads === readsAfterStart + 1 && m().snapshot?.asOf === NOW, { reads: stub.reads, readsAfterStart, asOf: m().snapshot?.asOf });
+  await view.stop();
+}
+{
+  const stub = new StubEndpoint();
+  const missing = Object.assign(new Error("stream not found"), { api_error: { err_code: 10059 }, code: 404 });
+  stub.readAnswer = () => Promise.reject(missing);
+  stub.watchAnswer = () => Promise.reject(missing);
+  const { view, m } = await viewOver(stub);
+  check("an absent bucket (no daemon) is traffic-only, not unreadable", m().unreadable === undefined && membershipFreshness(NOW, m()).label === "traffic-only", m());
+  await view.stop();
+}
+{
+  const stub = new StubEndpoint();
+  stub.watchAnswer = () => Promise.reject(new Error("watch refused"));
+  const { view, m } = await viewOver(stub);
+  check("a failing WATCH over a readable feed is named as the watch's failure", /^watch: watch refused/.test(m().unreadable ?? ""), m());
+  await view.stop();
+}
+{
+  const stub = new StubEndpoint();
+  stub.readAnswer = () => Promise.resolve(snapshot);
+  const { view, m } = await viewOver(stub);
+  check("MeshView starts live off a readable feed before the closed-watch cell", m().unreadable === undefined && m().snapshot?.asOf === NOW, m());
+  stub.onClosed?.(new Error("membership watch closed"));
+  await wait(50);
+  check("a watch that closes after setup is named as the watch's failure, never as a connection error", /^watch: membership watch closed/.test(m().unreadable ?? ""), m());
+  check("...and never as a connection error", view.snapshot().status.error === undefined, view.snapshot().status);
+  stub.onChange?.(memberChange);
+  await wait(300);
+  check("...and a later change clears the reason, leaving a live snapshot", m().unreadable === undefined && m().snapshot?.asOf === NOW, m());
+  await view.stop();
+}
+{
+  const stub = new StubEndpoint();
+  stub.readAnswer = () => Promise.resolve(snapshot);
+  const { view, m } = await viewOver(stub);
+  check("a readable feed is carried as the snapshot, no reason", m().unreadable === undefined && m().snapshot?.members.length === 5, m());
+  await view.stop();
+}
+
+console.log("6. A broker restart's presence error clears when the presence view is current again (AGENT-2889)");
+{
+  // The endpoint's real order across a broker restart, measured: the transport reconnects with no
+  // new `connection`, the view goes stale, `stream not found` arrives, and the view is current once
+  // the space is provisioned again.
+  const stub = new StubEndpoint();
+  const { view } = await viewOver(stub);
+  stub.emit("connection", { connected: true });
+  stub.emit("presence-view", { state: "stale" });
+  stub.emit("error", new Error("stream not found"));
+  check("the outage error is shown while the presence view is stale", view.snapshot().status.error === "stream not found", view.snapshot().status);
+  stub.emit("presence-view", { state: "current" });
+  check("the outage error clears once the presence view is current again", view.snapshot().status.error === undefined, view.snapshot().status);
+  // Control: an error raised while the view is current is not an outage's, so recovery never clears it.
+  stub.emit("error", new Error("permission denied"));
+  stub.emit("presence-view", { state: "stale" });
+  stub.emit("presence-view", { state: "current" });
+  check("an error raised while the view was current stays until a new connection", view.snapshot().status.error === "permission denied", view.snapshot().status);
+  await view.stop();
+}
+
+console.log(`\n${failures === 0 ? "TOPO-MEMBERSHIP SMOKE OK ✅" : "TOPO-MEMBERSHIP SMOKE FAILED ❌"} (${failures} failed)`);
+process.exit(failures === 0 ? 0 : 1);

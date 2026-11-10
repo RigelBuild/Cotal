@@ -1,0 +1,272 @@
+/**
+ * `epRailFailure` polarity smoke: the CLI's ep-rail renderer states the reachability verdict ("no
+ * manager reachable" / "instance … did not answer") from core's answer-provenance markers, never from
+ * the catalog code. Review of the manager-split lane found the code-keyed version printing "no
+ * manager reachable" for a manager that had ANSWERED (a responder's own `ok:false` describe reply is
+ * rethrown under its code, `unavailable` included; a store read after an answered describe raises the
+ * same code) and for a registry read on the caller's own side (the scatter reconcile).
+ *
+ * Part 1 grades the renderer on hand-built errors, one cell per producer shape (each names the core
+ * site it stands for). Part 2 drives the PUBLIC `askManager` against a real broker: a describe
+ * responder that answers `ok:false unavailable` (the exact repro from review), a describe answered
+ * `ok:true` whose cluster document is not in the store (the post-describe store read), no
+ * responder at all (the positive control for the verdict, unpinned and pinned), and #1630's
+ * version skew: an ISSUED caller against a serve loop that subscribes the unversioned rail only,
+ * where the manager is up and answering and the verdict must be scoped to the `ep.v1` rail.
+ */
+import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { connect } from "@nats-io/transport-node";
+import {
+  EpEnvelopeError, EP_UNANSWERED, EP_UNBOUND_RESPONDER, EP_REGISTRY_READ_FAILED, EP_UNDECLARED_ARG,
+  describeEndpoint, isReachable, parseEpSubject, epReplySubject, spacePrefix, unansweredRequest,
+} from "@cotal-ai/core";
+import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
+import { cliVersion } from "../src/lib/version.js";
+import { SMOKE_BROKER_TOKEN, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { askManager, epRailFailure } from "../../../packages/workspace/dist/control/index.js";
+import { cliControl } from "../src/lib/control.js";
+
+let pass = 0, fail = 0;
+const c = (name: string, cond: boolean, extra?: unknown) => {
+  if (cond) pass++;
+  else { fail++; console.log(`  ✗ FAIL: ${name}`, extra ?? ""); }
+};
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const IID = "1".repeat(26);
+// Every shape of the reachability verdict, so a NEGATIVE assertion on it cannot be satisfied by
+// a rewording. The rail-scoped form (#1630) is a third spelling of the same claim.
+const VERDICT = /no manager reachable|no manager answered on the ep\.|did not answer/;
+const ep = (code: ConstructorParameters<typeof EpEnvelopeError>[0], message: string, details?: ConstructorParameters<typeof EpEnvelopeError>[2]) => new EpEnvelopeError(code, message, details);
+const unansweredMark = { kind: EP_UNANSWERED, endpoint: "manager", command: "ps" };
+const registryMark = { kind: EP_REGISTRY_READ_FAILED, endpoint: "manager", command: "ps" };
+
+console.log("epRailFailure polarity (hand-built errors, one per producer shape):");
+{
+  // endpoint-verbs.ts epCall: the broker's no-responders control frame (marked).
+  const r = epRailFailure(cliControl, ep("unavailable", "no responder for manager.ps (SPEC 13.5)", [unansweredMark]));
+  c("no-responder (marked) unpinned: unanswered=true and the verdict is stated", r.unanswered === true && r.error?.startsWith("no manager reachable on the ep rails (unavailable: no responder for manager.ps") === true, r);
+  const p = epRailFailure(cliControl, ep("unavailable", "no responder for manager.ps (SPEC 13.5)", [unansweredMark]), { instanceId: IID });
+  c("no-responder (marked) pinned: names the instance, never 'no manager reachable'", p.unanswered === true && p.error === `manager instance ${IID} did not answer (unavailable: no responder for manager.ps (SPEC 13.5))`, p);
+}
+{
+  // endpoint-verbs.ts epCall: the reply deadline elapsed (marked).
+  const r = epRailFailure(cliControl, ep("deadline-exceeded", "no reply to manager.ps within the 2000ms budget (SPEC 13.5)", [unansweredMark]));
+  c("reply-deadline (marked): unanswered=true and the verdict is stated", r.unanswered === true && VERDICT.test(r.error ?? ""), r);
+  // endpoint-invoke.ts describe: no describe reply within the deadline (marked, command "describe").
+  const d = epRailFailure(cliControl, ep("deadline-exceeded", "no describe reply from manager within 10000ms", [{ kind: EP_UNANSWERED, endpoint: "manager", command: "describe" }]));
+  c("describe-deadline (marked): unanswered=true and the verdict is stated", d.unanswered === true && VERDICT.test(d.error ?? ""), d);
+}
+{
+  // #1630: the same unanswered describe, told apart by the RAIL it rode. SPEC 13.15 keeps `ep` and
+  // `ep.v1` disjoint at the broker and requires an endpoint to serve both, so silence on `ep.v1` is
+  // what a manager older than the versioned rail looks like from an issued caller: up, on the
+  // roster, serving `ep`, unreachable here. The verdict is scoped to the rail and says so.
+  const v1Mark = { kind: EP_UNANSWERED, endpoint: "manager", command: "describe", rail: "ep.v1" };
+  const v1 = ep("deadline-exceeded", "no describe reply from manager within 10000ms on the ep.v1 rail", [v1Mark]);
+  const r = epRailFailure(cliControl, v1);
+  c("versioned rail unpinned: the verdict names ep.v1 and never pronounces the mesh managerless",
+    r.unanswered === true && r.error?.startsWith("no manager answered on the ep.v1 rail (deadline-exceeded: no describe reply from manager") === true
+    && r.error.includes("disjoint at the broker (SPEC 13.15)") && r.error.includes("does not tell no manager running apart from one older than ep.v1")
+    && !r.error.includes("no manager reachable"), r);
+  const p = epRailFailure(cliControl, v1, { instanceId: IID });
+  c("versioned rail pinned: names the instance AND the rail its silence was on",
+    p.unanswered === true && p.error?.startsWith(`manager instance ${IID} did not answer on the ep.v1 rail (`) === true && p.error.includes("SPEC 13.15"), p);
+  // The LEGACY rail keeps the unscoped verdict: there is no second rail its silence could be hiding
+  // a manager on, so "no manager reachable" is the whole of what was observed.
+  const l = epRailFailure(cliControl, ep("deadline-exceeded", "no describe reply from manager within 10000ms on the ep rail", [{ ...v1Mark, rail: "ep" }]));
+  c("legacy rail: the verdict is unchanged and carries no 13.15 tail",
+    l.unanswered === true && l.error?.startsWith("no manager reachable on the ep rails (") === true && !l.error.includes("13.15"), l);
+  // THE SEAM A CALLER MUST DECIDE ON, pinned because one stopped: `cotal update`'s
+  // `reportRunningManager` read "no manager is running" off the HEADLINE, which this change reworded
+  // for an issued caller, so it threw instead of reporting "none". `unanswered` is the fact, it is
+  // rail-independent, and an unpinned call cannot produce the other wording, so a caller that keys
+  // on it survives every rewording of the sentence beside it.
+  c("the `unanswered` marker is the same on both rails, so a caller never has to read the headline",
+    r.unanswered === true && l.unanswered === true && r.error !== l.error, { versioned: r.error, legacy: l.error });
+}
+{
+  // endpoint-invoke.ts describeEndpoint `reply.ok !== true`: the responder's OWN ok:false describe reply, rethrown under its code (unmarked).
+  const r = epRailFailure(cliControl, ep("unavailable", "describe(manager) failed: trusted auth view failed"));
+  c("answered ok:false describe (`unavailable`, unmarked): unanswered=false, printed as is, NO verdict", r.unanswered === false && r.error === "unavailable: describe(manager) failed: trusted auth view failed", r);
+  const p = epRailFailure(cliControl, ep("unavailable", "describe(manager) failed: trusted auth view failed"), { instanceId: IID });
+  c("answered ok:false describe pinned: still no 'did not answer'", p.unanswered === false && !VERDICT.test(p.error ?? ""), p);
+}
+{
+  // endpoint-contract-store.ts fetchContractArtifact: a store read AFTER an answered describe (unmarked `unavailable`).
+  const r = epRailFailure(cliControl, ep("unavailable", "the contract-store read for abc failed (a failed observation is never absence, SPEC 13.7): stream not found"));
+  c("post-describe store read (`unavailable`, unmarked): unanswered=false, NO verdict", r.unanswered === false && r.error?.startsWith("unavailable: the contract-store read") === true && !VERDICT.test(r.error), r);
+  // endpoint-verbs.ts epCall `one`: a VALID reply landed with no budget left to verify currency (unmarked `deadline-exceeded`).
+  const b = epRailFailure(cliControl, ep("deadline-exceeded", "no budget left to verify the `one` responder's currency within 2000ms (SPEC 13.5)"));
+  c("valid reply, no budget left (`deadline-exceeded`, unmarked): unanswered=false, NO verdict", b.unanswered === false && !VERDICT.test(b.error ?? ""), b);
+  // endpoint-verbs.ts epCall / endpoint-invoke.ts describeEndpoint: the caller's own reply subscription failed (unmarked `unavailable`).
+  const s = epRailFailure(cliControl, ep("unavailable", "the caller's reply subscription failed: boom"));
+  c("caller-side subscription failure (`unavailable`, unmarked): unanswered=false, NO verdict", s.unanswered === false && !VERDICT.test(s.error ?? ""), s);
+}
+{
+  // endpoint-verbs.ts scatter reconcile: did not settle (`unavailable`) / unreadable (`failed-precondition`), both marked registry-read.
+  const r = epRailFailure(cliControl, ep("unavailable", "the scatter registration reconcile did not settle within its 3000ms bound (SPEC 13.5: deadline mandatory, never a hung scatter)", [registryMark]));
+  c("reconcile did not settle (registry-marked `unavailable`): the registry outcome, NO reachability verdict", r.unanswered === false && r.error?.startsWith("the manager registry could not be read") === true && r.error.includes("unavailable: the scatter registration reconcile did not settle") && !VERDICT.test(r.error), r);
+  const u = epRailFailure(cliControl, ep("failed-precondition", "the scatter registration reconcile is unreadable; an unreadable registry is failed-precondition, never an empty success (SPEC 13.5): kv down", [registryMark]));
+  c("reconcile unreadable (registry-marked `failed-precondition`): the registry outcome, no --on hint", u.unanswered === false && u.error?.startsWith("the manager registry could not be read") === true && !u.error.includes("--on"), u);
+  const f = epRailFailure(cliControl, ep("deadline-exceeded", "the scatter freeze for manager did not settle within the 8000ms budget (SPEC 13.5)", [registryMark]));
+  c("scatter freeze deadline (registry-marked `deadline-exceeded`): the registry outcome, NO reachability verdict", f.unanswered === false && f.error?.startsWith("the manager registry could not be read") === true && !VERDICT.test(f.error), f);
+}
+{
+  // The unpinned class-queue split (EP_UNBOUND_RESPONDER on failed-precondition): the --on hint is
+  // offered only to a caller that DECLARED it has the flag (a `pin` present) and did not pass it.
+  const mark = { kind: EP_UNBOUND_RESPONDER, endpoint: "manager", command: "ps", answeredBy: "2".repeat(26), boundTo: IID, pinned: false };
+  const r = epRailFailure(cliControl, ep("failed-precondition", "a different instance answered", [mark]), {});
+  c("unpinned split on a caller WITH --on (pin declared, not passed): printed as is plus the --on hint, NO verdict", r.unanswered === false && r.error?.endsWith("Pin one manager instance with --on <instance> (the whole id, as `ps` prints it) to avoid the split.") === true && !VERDICT.test(r.error), r);
+  const n = epRailFailure(cliControl, ep("failed-precondition", "a different instance answered", [mark]));
+  c("the same split on a caller WITHOUT --on (`models`, `up`, `down`: no pin declared): printed as is, NO --on hint", n.unanswered === false && n.error === "failed-precondition: a different instance answered", n);
+  const p = epRailFailure(cliControl, ep("failed-precondition", "a different instance answered", [mark]), { instanceId: IID });
+  c("pinned split: no --on hint (it was passed)", p.unanswered === false && !p.error?.includes("--on"), p);
+  const x = epRailFailure(cliControl, ep("expired", "same instance, other epoch", [{ ...mark, answeredEpoch: 4, heldEpoch: 3, reference: "bind" }]), {});
+  c("marked `expired` (stale-epoch bind): printed as is, no --on hint, NO verdict", x.unanswered === false && x.error === "expired: same instance, other epoch", x);
+}
+{
+  const r = epRailFailure(cliControl, ep("permission-denied", "the describe for manager was REFUSED BY THE BROKER, not unanswered"));
+  c("broker-refused describe: printed as is, NO verdict", r.unanswered === false && r.error === "permission-denied: the describe for manager was REFUSED BY THE BROKER, not unanswered", r);
+  const n = epRailFailure(cliControl, new Error("connection closed"));
+  c("a non-EpEnvelopeError carries no provenance: message alone, unanswered=false, NO verdict", n.unanswered === false && n.error === "connection closed", n);
+  const np = epRailFailure(cliControl, new Error("connection closed"), { instanceId: IID });
+  c("a non-EpEnvelopeError pinned: still no 'did not answer'", np.unanswered === false && np.error === "connection closed", np);
+}
+{
+  // endpoint-call.ts buildRequest: a key the manager's contract does not declare, refused before
+  // publish. The version the manager reports says which side is older and so which one to update.
+  const cli = cliVersion();
+  const undeclared = () => new EpEnvelopeError("bad-request", 'args do not validate against the input schema: / must NOT have additional properties: "runtime"', [{ kind: EP_UNDECLARED_ARG, property: "runtime", instanceId: IID }], "not-executed");
+  const head = `bad-request: args do not validate against the input schema: / must NOT have additional properties: "runtime". That is version skew: this CLI runs Cotal ${cli} and sends "runtime", which the manager's contract does not declare.`;
+  const older = epRailFailure(cliControl, undeclared(), { instanceId: IID }, "0.1.0");
+  c("undeclared key, older manager: names its version, calls it the older side, and names its update and restart",
+    older.unanswered === false && older.error === `${head} The manager runs Cotal 0.1.0, so it is the older side: on its host run \`cotal update --self\`, then \`cotal manager restart\`, or use a CLI at Cotal 0.1.0`, older);
+  const newer = epRailFailure(cliControl, undeclared(), { instanceId: IID }, "999.0.0");
+  c("undeclared key, newer manager: this CLI is the older side and is updated with `cotal update --self`",
+    newer.error === `${head} The manager runs Cotal 999.0.0, so this CLI is the older side: update it with \`cotal update --self\``, newer);
+  const same = epRailFailure(cliControl, undeclared(), { instanceId: IID }, cli);
+  c("undeclared key, same version: another build of that version, never an older or newer side",
+    same.error === `${head} The manager also reports Cotal ${cli}, so one side is another build of that version, such as a source checkout: rebuild or reinstall that side`, same);
+  const unknown = epRailFailure(cliControl, undeclared(), { instanceId: IID });
+  c("undeclared key, no reported version: no side is named, and the manager is asked to run at this CLI's version",
+    unknown.error === `${head} The manager did not report its version. Run the manager at Cotal ${cli}, or use a CLI at the manager's version`, unknown);
+}
+
+// ── Part 2: the public askManager path against a real broker (open mesh) ──
+console.log("askManager against a real broker:");
+const PORT = await pickFreePort();
+const sd = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+const broker = spawn("nats-server", ["-js", "-sd", sd, "-p", String(PORT), "-a", "127.0.0.1"], { stdio: "ignore" });
+const releaseBroker = teardownOnSignal(broker, sd);
+const SERVER = `nats://127.0.0.1:${PORT}`;
+const SPACE = "eprail";
+const enc = new TextEncoder(), dec = new TextDecoder();
+try {
+  let up = false;
+  for (let i = 0; i < 50 && !up; i++) { up = await isReachable(SERVER); if (!up) await wait(100); }
+  if (!up) throw new Error("broker did not come up");
+  const nc = await connect({ servers: SERVER });
+  {
+    // The retry runs from a timer after the initial publish. Closing the real connection before that
+    // tick must reject the describe as a normal caller-visible failure, not escape as an uncaught
+    // ClosedConnectionError and terminate this process.
+    const closingNc = await connect({ servers: SERVER });
+    const started = Date.now();
+    const pending = describeEndpoint(closingNc, SPACE, "manager", { owner: "local", actor: "cliabc", uid: "u".repeat(26) }, { deadlineMs: 1000 });
+    setTimeout(() => { void closingNc.drain(); }, 100);
+    let e: unknown;
+    try { await pending; } catch (err) { e = err; }
+    c("live: a connection closing before the describe retry rejects cleanly instead of throwing from the timer",
+      (e as { code?: string })?.code === "unavailable" && (e as Error)?.message.includes("closed connection") && Date.now() - started < 1000, e);
+  }
+  /** A describe responder for `manager` on the class rail that answers every request with `body`. */
+  const serveDescribe = (body: (id: string) => Record<string, unknown>) => nc.subscribe(`${spacePrefix(SPACE)}.ep.one.manager.describe.>`, {
+    callback: (err, msg) => {
+      if (err) return;
+      const p = parseEpSubject(msg.subject);
+      if (!p || p.plane !== "request") return;
+      const { id } = JSON.parse(dec.decode(msg.data)) as { id: string };
+      nc.publish(epReplySubject(SPACE, { endpoint: "manager", instanceId: IID, epoch: 1, caller: p.caller, nonce: p.nonce }), enc.encode(JSON.stringify(body(id))));
+    },
+  });
+  {
+    // Issue #1003: a detached manager can register after the control command has already published
+    // its describe. Core NATS discards that first request, so the resolver must re-publish the SAME
+    // read-only bootstrap inside the original deadline. Model the startup gap without `cotal up`:
+    // begin askManager with no responder, then register one before the 10s describe budget expires.
+    const pending = askManager(cliControl, SPACE, SERVER, "ps", undefined, {}, "any", 2000);
+    await wait(300);
+    const sub = serveDescribe((id) => ({ v: 1, id, ok: false, error: { code: "unavailable", message: "registered after the first describe" } }));
+    await nc.flush();
+    const r = await pending;
+    await sub.drain();
+    c("live: a manager registering after the first describe is reached by a retry inside the original deadline",
+      r.ok === false && r.unanswered === false && r.error === "unavailable: describe(manager) failed: registered after the first describe", r);
+  }
+  {
+    // The review repro: a manager ANSWERS the describe with ok:false unavailable (core's own describe
+    // handler produces exactly this when its trusted auth view failed).
+    const sub = serveDescribe((id) => ({ v: 1, id, ok: false, error: { code: "unavailable", message: "trusted auth view failed" } }));
+    const r = await askManager(cliControl, SPACE, SERVER, "ps", undefined, {}, "any", 2000);
+    await sub.drain();
+    c("live: an ANSWERED ok:false `unavailable` describe is not 'no manager reachable' (the responder's own cause is printed)",
+      r.ok === false && r.unanswered === false && r.error === "unavailable: describe(manager) failed: trusted auth view failed", r);
+  }
+  {
+    // A describe answered ok:true whose cluster document is not in the store: the failure is the
+    // caller's post-describe store read, after a manager answered.
+    const digest = "e".repeat(64);
+    const sub = serveDescribe((id) => ({ v: 1, id, ok: true, data: { public: true, descriptor: { endpoint: "manager", owner: "local", clusters: [{ digest, commands: ["ps"] }] } } }));
+    const r = await askManager(cliControl, SPACE, SERVER, "ps", undefined, {}, "any", 2000);
+    await sub.drain();
+    c("live: an answered describe followed by a failed store read is not 'no manager reachable' (unanswered=false)",
+      r.ok === false && r.unanswered === false && r.error?.startsWith("unavailable: the contract-store read for") === true && !VERDICT.test(r.error), r);
+  }
+  {
+    // Positive control: nobody serves `manager` at all. The describe deadline (10s in askManagerEp)
+    // is the unanswered producer on this path; the verdict is stated, unpinned and pinned.
+    const [r, p] = await Promise.all([
+      askManager(cliControl, SPACE, SERVER, "ps", undefined, {}, "any", 2000),
+      askManager(cliControl, SPACE, SERVER, "ps", undefined, {}, "any", 2000, { instanceId: IID }),
+    ]);
+    c("live: no responder at all, unpinned: unanswered=true and 'no manager reachable' (the positive control)",
+      r.ok === false && r.unanswered === true && r.error?.startsWith("no manager reachable on the ep rails (deadline-exceeded: no describe reply from manager") === true, r);
+    c("live: no responder at all, pinned: unanswered=true and 'instance … did not answer'",
+      p.ok === false && p.unanswered === true && p.error?.startsWith(`manager instance ${IID} did not answer (deadline-exceeded: no describe reply from manager`) === true, p);
+  }
+  {
+    // #1630, live: a 0.49.0-shape client against a serve loop that subscribes the UNVERSIONED rail
+    // only, which is what a 0.48.2 manager is. `serveDescribe` above filters `…ep.one.manager.…`,
+    // so an issued caller's `…ep.v1.one.manager.…` describe never reaches it while a legacy
+    // caller's does: one serve loop, one variable, and the manager is demonstrably up for both.
+    // Measured on the mesh in #1630 as `cotal run ps` exiting 1 against an idle, healthy manager.
+    const legacyCaller = { owner: "local", actor: "cliabc", uid: "u".repeat(26) };
+    const issuedCaller = { ...legacyCaller, generation: "a1b2".repeat(8) };
+    const sub = serveDescribe((id) => ({ v: 1, id, ok: false, error: { code: "unavailable", message: "answered on the legacy rail" } }));
+    await nc.flush();
+    let legacy: unknown;
+    try { await describeEndpoint(nc, SPACE, "manager", legacyCaller, { deadlineMs: 2000 }); } catch (e) { legacy = e; }
+    c("live: the ep-only serve loop ANSWERS a legacy caller (the control: this manager is serving)",
+      legacy instanceof EpEnvelopeError && legacy.code === "unavailable" && unansweredRequest(legacy) === false, legacy);
+    let issued: unknown;
+    try { await describeEndpoint(nc, SPACE, "manager", issuedCaller, { deadlineMs: 2000 }); } catch (e) { issued = e; }
+    await sub.drain();
+    c("live: the same loop never sees an ISSUED caller's describe, and the refusal names the rail it rode",
+      unansweredRequest(issued) && (issued as EpEnvelopeError).message.includes("on the ep.v1 rail"), issued);
+    const r = epRailFailure(cliControl, issued);
+    c("live: the CLI renders the ep.v1 skew as a named refusal, not as 'no manager reachable'",
+      r.unanswered === true && r.error?.startsWith("no manager answered on the ep.v1 rail (") === true
+      && r.error.includes("SPEC 13.15") && !r.error.includes("no manager reachable"), r);
+  }
+  await nc.drain();
+} finally {
+  await killAndAwaitExit(broker);
+  rmSync(sd, { recursive: true, force: true });
+  releaseBroker(); // last: ownership is held until this teardown has actually finished
+}
+
+console.log(`\n${fail === 0 ? "EP-RAIL-FAILURE POLARITY SMOKE OK ✅" : "EP-RAIL-FAILURE POLARITY SMOKE FAILED"}  (${pass} passed, ${fail} failed)`);
+process.exit(fail === 0 ? 0 : 1);
