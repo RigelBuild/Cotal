@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Native-job gate: refuse a host build whose .node files need a newer glibc, libstdc++ or C++ ABI
- * than the seat README promises. Measured on ubuntu:24.04 (the ubuntu-latest image), pty.node
+ * than the seat README promises. Measured on Ubuntu 24.04, pty.node
  * needs GLIBC_2.34 (forkpty), GLIBCXX_3.4.22 and CXXABI_1.3.9; peercred.node needs GLIBC_2.4.
  *
  * usage: assert-native-ceiling.mjs [dir]   default: build/Release/linux-<process.arch>

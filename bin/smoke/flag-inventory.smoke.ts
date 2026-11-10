@@ -69,7 +69,7 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
   setup: { flags: ["configure-only:boolean", "connection-file:string", "demo:boolean", "destination:string", "detach:boolean:d", "full:boolean", "harness:string:H", "json:boolean:j", "on:string", "plain:boolean", "project:string", "runtime:string", "skills:boolean", "space:string:s", "start:boolean", "yes:boolean:y"], positionals: false },
   // `--space`/`--server`/`--creds` (2026-09): after disk reconciliation, `update` reports the
   // selected running manager's custody generation. `--check` reads without changing anything.
-  update: { flags: [...TARGET, "check:boolean", "json:boolean:j", "plain:boolean", "self:boolean"], positionals: false },
+  update: { flags: [...TARGET, "check:boolean", "json:boolean:j", "on:string", "plain:boolean", "self:boolean"], positionals: false },
   // The command kernel's local entries (2026-10): `help [command…] [--all]` and `version`.
   help: { flags: ["all:boolean"], positionals: true },
   version: { flags: ["json:boolean:j"], positionals: false },
@@ -138,7 +138,7 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
   // `space` (2026-10): the registered spaces and one in full, on the structured output contract.
   // `space add` (2026-10) registers a space that runs elsewhere, from `--server` or a user-auth bundle;
   // `space delete` previews with `--dry-run`.
-  space: { flags: ["adopt:boolean", "allow-unencrypted-overlay:boolean", "dry-run:boolean", "file:string:f", "force:boolean", "from:string", "json:boolean:j", "mode:string", "plain:boolean", "root:string", "server:string", "tls:boolean", "yes:boolean:y"], positionals: true },
+  space: { flags: ["adopt:boolean", "allow-unencrypted-overlay:boolean", "dry-run:boolean", "file:string:f", "force:boolean", "from:string", "json:boolean:j", "mode:string", "out:string", "plain:boolean", "root:string", "server:string", "tls:boolean", "yes:boolean:y"], positionals: true },
   // `sync` (2026-09): refresh the signed-in space catalogs; `--idp` narrows the refresh to one account.
   // `--json` and `--plain` (2026-10): the refresh on the structured output contract.
   sync: { flags: ["idp:string", "json:boolean:j", "plain:boolean"], positionals: false },
@@ -157,14 +157,16 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
   // its minted --lifecycle-uid; --lifecycle-uid is refused outside that launch (guarded in run).
   // `--expect-owner` / `--expect-lifecycle-uid` (2026-10, #2420): the owner and lifecycle UID a
   // delegated child's COTAL_MANAGED_HANDOFF_FILE must carry; refused without that handoff.
+  // Short forms -n/-m/-C/-p/-H. `--harness` picks the application, `--foreground` runs it directly,
+  // `--restarts`/`--restart-window` ask the manager to supervise it, `--enrollment-file` redeems one.
   spawn: {
     flags: [
       "agent:string", "allow-publish:string", "allow-stale:string", "allow-subscribe:string",
-      "config:string", "continue:string", "creds:string", "cwd:string", "detach:boolean:d", "dry-run:boolean",
-      "events:boolean", "expect-lifecycle-uid:string", "expect-owner:string", "file:string:f",
-      "lifecycle-uid:string", "live-only:boolean", "model:string", "name:string", "no-events:boolean",
-      "on:string", "opt:string", "prompt:string", "resume:string", "role:string", "runtime:string",
-      "server:string", "share-tools:string", "space:string", "subscribe:string", "variant:string",
+      "config:string", "continue:string", "creds:string", "cwd:string:C", "detach:boolean:d", "dry-run:boolean",
+      "enrollment-file:string", "events:boolean", "expect-lifecycle-uid:string", "expect-owner:string", "expires-at:string", "expires-in:string", "file:string:f",
+      "foreground:boolean", "harness:string:H", "json:boolean:j", "lifecycle-uid:string", "live-only:boolean", "model:string:m", "name:string:n", "no-events:boolean",
+      "on:string", "opt:string", "plain:boolean", "prompt:string:p", "restart-window:string", "restarts:string", "resume:string", "role:string", "runtime:string",
+      "server:string", "share-tools:string", "space:string:s", "subscribe:string", "variant:string",
     ],
     positionals: true,
   },
@@ -178,7 +180,7 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
   attach: { flags: [...TARGET, "name:string", "no-reconnect:boolean", "on:string"], positionals: true },
   // `stop <agent>`; `--self` stops the calling seat from its own shell and `--force` asks for the
   // hard despawn.
-  stop: { flags: [...TARGET, "force:boolean", "json:boolean:j", "name:string", "on:string", "plain:boolean", "self:boolean"], positionals: true },
+  stop: { flags: [...TARGET, "attest-gone:string", "force:boolean", "json:boolean:j", "name:string", "on:string", "plain:boolean", "self:boolean"], positionals: true },
   // `input` (2026-08): type one line into a seat without attaching. `--text` is a VALUE
   // flag on purpose, so a payload that starts with `/` or `-` (a harness command such as
   // `/compact`) is taken verbatim instead of being parsed as an option; `--no-enter` is a declared
@@ -228,7 +230,7 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
   // `history clear` confirms with `--yes` and previews with `--dry-run`; `--force` is the removed
   // spelling and refuses with that remedy. `history limit` sets the chat stream's limit with
   // `--max-age` and `--per-sender`.
-  history: { flags: [...TARGET, "dms:boolean", "dry-run:boolean", "follow:boolean", "force:boolean", "from:string", "grep:string", "json:boolean:j", "limit:string", "max-age:string", "per-sender:string", "plain:boolean", "since:string", "yes:boolean:y"], positionals: true },
+  history: { flags: [...TARGET, "dm-max-age:string", "dm-per-sender:string", "dms:boolean", "dry-run:boolean", "follow:boolean", "force:boolean", "from:string", "grep:string", "inbox-max-age:string", "inbox-per-agent:string", "json:boolean:j", "limit:string", "max-age:string", "per-sender:string", "plain:boolean", "since:string", "yes:boolean:y"], positionals: true },
   watch: { flags: [...TARGET, "json:boolean:j", "plain:boolean", "view:string"], positionals: false },
   // Held DMs of one agent, or one exact retired durable with `--durable`.
   pending: { flags: ["creds:string", "durable:string", "json:boolean:j", "limit:string", "plain:boolean", "server:string", "space:string"], positionals: true },
@@ -295,7 +297,7 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
     flags: [
       "allow-publish:string", "allow-subscribe:string", "channels:string", "endpoint:string", "expires-at:string",
       "expires-in:string", "force:boolean", "full:boolean", "identity:string", "json:boolean:j", "label:string",
-      "no-expiry:boolean", "out:string", "owner:string", "parent:string", "plain:boolean", "profile:string", "provision:boolean",
+      "new-incarnation:boolean", "no-expiry:boolean", "out:string", "owner:string", "parent:string", "plain:boolean", "profile:string", "provision:boolean",
       "replace:boolean", "role:string", "scope:string", "server:string", "space:string:s", "sub:string", "yes:boolean:y",
     ],
     positionals: true,
@@ -321,11 +323,11 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
   // scripts, containers) and warn on each run. `up` launches the twins, which share each entry's
   // declaration without the warning.
   supervise: {
-    flags: ["console-host:string", "console-port:string", "execution:string", "launch:string", "max-sessions:string", "name:string", "resume-attempt:string", "resume-commit-file:string", "resume-commit-sha256:string", "resume-commit-token:string", "roster:string", "runtime:string", "seat-cap:string", "server:string", "space:string", "spawn:string", "ws-port:string"],
+    flags: ["console-host:string", "console-port:string", "execution:string", "launch:string", "max-sessions:string", "name:string", "resume-attempt:string", "resume-commit-file:string", "resume-commit-sha256:string", "resume-commit-token:string", "roster:string", "runtime:string", "seat-cap:string", "server:string", "space:string", "spawn-allowlist:string", "spawn:string", "ws-port:string"],
     positionals: false,
   },
   "__daemon-manager": {
-    flags: ["console-host:string", "console-port:string", "execution:string", "launch:string", "max-sessions:string", "name:string", "resume-attempt:string", "resume-commit-file:string", "resume-commit-sha256:string", "resume-commit-token:string", "roster:string", "runtime:string", "seat-cap:string", "server:string", "space:string", "spawn:string", "ws-port:string"],
+    flags: ["console-host:string", "console-port:string", "execution:string", "launch:string", "max-sessions:string", "name:string", "resume-attempt:string", "resume-commit-file:string", "resume-commit-sha256:string", "resume-commit-token:string", "roster:string", "runtime:string", "seat-cap:string", "server:string", "space:string", "spawn-allowlist:string", "spawn:string", "ws-port:string"],
     positionals: false,
   },
   deliver: {
@@ -358,7 +360,7 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
       // its twin take it; the native service child, which runs the one primary, does not.
       "callout-only:boolean",
       "exchange-public-port:string", "exchange-public-url:string", "exchange-trusted-proxy:boolean",
-      "port:string", "server:string", "service-endpoints:boolean", "space:string",
+      "port:string", "registry:boolean", "server:string", "service-endpoints:boolean", "space:string",
       // `--auth-timeout` (2026-10): the broker's auth callout timeout in seconds, from `up`.
       "auth-timeout:string",
       // `--spaces` (2026-10, #4819): several spaces served from one callout process.
@@ -370,7 +372,7 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
     flags: [
       "advertised-server:string", "agent-provisioning-url:string", "callout-only:boolean",
       "exchange-public-port:string", "exchange-public-url:string", "exchange-trusted-proxy:boolean",
-      "port:string", "server:string", "service-endpoints:boolean", "space:string", "auth-timeout:string", "spaces:string",
+      "port:string", "registry:boolean", "server:string", "service-endpoints:boolean", "space:string", "auth-timeout:string", "spaces:string",
     ],
     positionals: false,
   },
@@ -401,7 +403,7 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
     flags: [
       "advertised-server:string", "agent-provisioning-url:string", "exchange-public-port:string",
       "exchange-public-url:string", "exchange-trusted-proxy:boolean", "launch-request:string", "port:string",
-      "ready-file:string", "root:string", "server:string", "service-endpoints:boolean", "service-instance:string",
+      "ready-file:string", "registry:boolean", "root:string", "server:string", "service-endpoints:boolean", "service-instance:string",
       "space:string", "auth-timeout:string",
     ],
     positionals: false,

@@ -414,6 +414,7 @@ interrupted. Ctrl-C ends it at once with exit 130, as it ends the commands above
 | Observe | [`watch`](cli-observation.mdx#watch) | Follow authorized activity without starting, stopping or attaching agents |
 | Observe | [`console`](cli-observation.mdx#console) | Legacy, hidden from `cotal help`: the protocol TUI; `watch` replaces it |
 | Manager | [`runtimes`](cli-agents.mdx#runtimes) | List the agent runtimes the manager can spawn through and whether each is reachable |
+| Manager | [`allowlist`](cli-processes.mdx#spawn-allowlist) | Replace a running manager's spawn allowlist |
 | Manager | [`reconcile-gate`](cli-maintenance.mdx#reconcile-gate) | Hidden from `cotal help`, which lists `manager reconcile`: unfreeze an issuance gate left frozen by a crashed restart when the successor cannot boot-heal it (holder gone, complete CONNZ sweep) |
 | Manager | [`deregister-instance`](cli-endpoints.mdx#endpoint-deregister) | Hidden from `cotal help`: the old spelling of `endpoint deregister`, which refuses and names it |
 | Manager | [`seats`](cli-agents.mdx#seats) | Hidden from `cotal help`, which lists `manager seats`: list the pty seat custodians an earlier Linux manager left, and drain the ones whose agent has exited |

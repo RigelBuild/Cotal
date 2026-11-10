@@ -218,7 +218,7 @@ export type Profile =
   | "environment-manager-executor"
   | "environment-manager-goal-writer";
 /** Runtime list of credential profile labels for claim classification. */
-export const PROFILES = [
+export const PROFILES = Object.freeze([
   "agent", "manager-caller", "observer", "admin", "supervisor", "provisioner", "deprovisioner",
   "retirement-requester", "lifecycle-executor", "endpoint-serve-executor", "operator", "purger",
   "backup", "restore", "delivery", "membership-rw", "probe", "channel-writer", "channel-purger",
@@ -228,7 +228,7 @@ export const PROFILES = [
   "remote-manager", "environment-bootstrap", "environment-manager-supervisor",
   "environment-manager-executor", "environment-manager-goal-writer", "dm-reader", "issued-store-recreate",
   "registry-reader",
-] as const satisfies readonly Profile[];
+] as const satisfies readonly Profile[]);
 
 type _AllProfiles = Exclude<Profile, (typeof PROFILES)[number]> extends never ? true : never;
 const _allProfiles: _AllProfiles = true;
