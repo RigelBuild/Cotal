@@ -50,11 +50,10 @@ export function identityVerdict(pid: number, start: string): "live" | "gone" {
 
 export interface SeatReapOpts {
   graceMs?: number;
-  /** The seat's derived cgroup. Contained, it decides the outcome before `record.json` is read. */
+  /** The derived seat cgroup is the only evidence that can authorize a reap. */
   cgroup?: SeatCgroup;
 }
-
-// `undefined`: a concurrent reap or release removed the cgroup, so there is no seat cgroup to prove.
+// An absent cgroup during a concurrent reap cannot establish this seat's membership.
 async function reapCgroup(id: string, cg: SeatCgroup, graceMs: number): Promise<SeatReapEvidence | undefined> {
   try {
     killSeatCgroup(cg);
@@ -65,7 +64,8 @@ async function reapCgroup(id: string, cg: SeatCgroup, graceMs: number): Promise<
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return undefined;
-    return { outcome: "retained", reason: "members-remain", stop: "no-custodian", detail: `seat ${id} cgroup ${cg.path}${code ? ` (${code})` : ""}: ${(e as Error).message}` };
+    const reason = code === undefined ? (e as Error).message : `${code}: ${(e as Error).message}`;
+    return { outcome: "retained", reason: "members-remain", stop: "no-custodian", detail: `seat ${id} cgroup ${cg.path}: ${reason}` };
   }
   return { outcome: "reaped", detail: `seat ${id} cgroup ${cg.path} killed, read populated 0 and was removed` };
 }

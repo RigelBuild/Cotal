@@ -15,6 +15,7 @@ const AFFECTED = [
   "@cotal-ai/smoke-kit",
   "@cotal-ai/tmux",
   "@cotal-ai/delivery",
+  "@cotal-ai/registry",
 ] as const;
 
 const WORKSPACE_PACKAGE_DIRS = {
@@ -46,10 +47,13 @@ const WORKSPACE_PACKAGE_DIRS = {
   "@cotal-ai/runtime": "implementations/runtime",
   "@cotal-ai/linear": "implementations/linear",
   "@cotal-ai/web": "implementations/web",
+  "@cotal-ai/tui": "implementations/tui",
   "@cotal-ai/core": "packages/core",
   "@cotal-ai/lang": "packages/lang",
   "@cotal-ai/seat": "packages/seat",
   "@cotal-ai/workspace": "packages/workspace",
+  "@cotal-ai/registry": "implementations/registry",
+  "@cotal-ai/docs-content": "tools/docs-content",
 } as const;
 
 const PRIVATE_NO_TESTS = new Set([
@@ -81,6 +85,7 @@ const discoverWorkspacePackages = (): Record<string, string> => {
   visit("extensions", 1);
   visit("implementations", 1);
   visit("examples", 2);
+  visit("tools", 1);
   const binManifest = JSON.parse(readFileSync(join(ROOT, "bin", "package.json"), "utf8")) as { name?: string };
   if (typeof binManifest.name === "string") found[binManifest.name] = "bin";
   return found;
@@ -101,9 +106,9 @@ const check = (name: string, condition: boolean, detail?: unknown): void => {
 const discovered = discoverWorkspacePackages();
 const pinnedEntries = Object.entries(WORKSPACE_PACKAGE_DIRS).sort(([a], [b]) => a.localeCompare(b));
 const discoveredEntries = Object.entries(discovered).sort(([a], [b]) => a.localeCompare(b));
-check("the pinned workspace inventory contains exactly 32 packages", pinnedEntries.length === 32, pinnedEntries);
+check("the pinned workspace inventory contains exactly 35 packages", pinnedEntries.length === 35, pinnedEntries);
 check("independent workspace discovery exactly matches the pinned package inventory", JSON.stringify(discoveredEntries) === JSON.stringify(pinnedEntries), { discoveredEntries, pinnedEntries });
-check("the pinned affected package set contains exactly 11 packages", AFFECTED.length === 11, AFFECTED);
+check("the pinned affected package set contains exactly 12 packages", AFFECTED.length === 12, AFFECTED);
 
 for (const [name, dir] of Object.entries(WORKSPACE_PACKAGE_DIRS)) {
   const manifest = JSON.parse(readFileSync(join(ROOT, dir, "package.json"), "utf8")) as { name?: string; private?: boolean; scripts?: { test?: string } };

@@ -69,18 +69,22 @@ type UngatedExemption = { reason: string; recheckBy: string };
 // re-explained. It had been exempt as debt while silently grading nothing, the daemon it spawned
 // refused at startup, and the refusal satisfied its own "exits when the broker is gone" assertion.
 // 25 → 15: the whole remaining untriaged set went the same way on 2026-10-01, ten suites run and
-// then gated. What is left is standing decisions plus the five BROKEN backup suites below.
-// 15 → 14 on the fork: `smoke:backup-perms:live` is gated (and held in ci-quarantine.mjs).
-const EXPECTED_EXEMPTIONS = 14;
+// then gated. What is left is standing decisions plus the backup BROKEN suites below.
+// 15 → 16 on 2026-10-19: the Claude plugin refresh suite drives a real claude CLI, as the user-mode
+// manifest suite does.
+// 16 → 17 on 2026-11-01: the auth-oracle-order suite takes an installed npm prefix and an evidence
+// directory as arguments, which no CI job supplies.
+// The personal Codex native suite also needs an installed Codex CLI; its model is local and scripted.
+// The personal Codex local-mesh suite needs the same Codex CLI.
+// 17 → 21 on 2026-11-07: five upstream-red suites remain ungated per fork policy; backup-perms:live
+// left UNGATED when it was gated by a chain fragment.
+// 23 → 26: three new upstream suites remain ungated on main@upstream, per fork policy.
+// 26 → 29: three upstream suites are not gated on main@upstream; keep them out of the fork gate.
+const EXPECTED_EXEMPTIONS = 29;
 const standing = (reason: string): UngatedExemption => ({ reason, recheckBy: "2026-11-30" });
-const untriagedExemption = (reason: string): UngatedExemption => ({ reason, recheckBy: "2026-09-30" });
-/** The BROKEN class carried `untriagedExemption`, which says nobody has looked. Someone had: each
- *  backup entry below names its issue, its commit, and the assertion that failed. What they need is a
- *  fuse tied to the issue rather than a marker that misreports the state of the record. Premise
- *  re-verified 2026-10-01: #643 and #1285 are both still OPEN, so every entry's stated cause still
- *  holds and none of them can enter CI while red. Re-dated with that decision, not bumped. These
- *  cannot be discharged by running them here: #1285 is under a standing instruction not to resume,
- *  and the other four are live backup suites blocked behind it on the same chain. */
+/** The BROKEN backup entries name the responsible issue and why the suites cannot enter CI.
+ *  #1285's backup-usermode failure is on the live stack. The three #643 suites are behind the
+ *  failing backup-perms:live suite on the && chain, so their status is unknown. */
 const brokenExemption = (reason: string): UngatedExemption => ({ reason, recheckBy: "2026-11-30" });
 
 const UNGATED: Record<string, UngatedExemption> = {
@@ -88,12 +92,30 @@ const UNGATED: Record<string, UngatedExemption> = {
   "smoke:orca:live": standing("drives the public orca CLI"),
   "smoke:orca-e2e:live": standing("drives the public orca CLI"), "smoke:pi": standing("needs a pi install"), "smoke:codex-live": standing("needs a logged-in codex CLI"),
   "smoke:codex-tui-live": standing("needs a codex TUI session"),
+  "smoke:personal-codex-native:live": standing("needs an installed codex CLI with native plugins and thread queue APIs; uses an isolated home and a local scripted model"),
+  "smoke:personal-codex-local:live": standing("needs an installed codex CLI with native plugins and thread queue APIs; uses an isolated home, local meshes and a local scripted model"),
   "smoke:jcode-live": standing("needs an installed, authenticated jcode CLI (COTAL_E2E_JCODE=1)"),
   "smoke:down-manifest-usermode:live": standing("needs a claude CLI on PATH to boot a real connector child"),
-  "smoke:backup-usermode:live": brokenExemption("BROKEN: RIG-4260: backup inventory mismatch; preserve owner-secret restore refusal coverage"),
-  "smoke:backup-restore:live": brokenExemption("BROKEN: RIG-4260: blocked by backup-perms in the old chain; restore needs JetStream storage and user-auth service"),
-  "smoke:backup-conservation:live": brokenExemption("BROKEN: RIG-4260: blocked by backup-perms in the old chain; underscore space name is refused"),
-  "smoke:backup-faults:live": brokenExemption("BROKEN: RIG-4260: backup fault and replay scenarios still need independent repair"),
+  "smoke:claude-plugin-refresh:live": standing("drives the real claude CLI on PATH against a scratch Claude config"),
+  "smoke:auth-oracle-order:live": standing("takes an installed npm prefix and a new evidence directory as arguments"),
+  "smoke:backup-usermode:live": brokenExemption("BROKEN: red; cause unconfirmed (measured on a host with a live stack); #1285; already-red so it cannot enter CI"),
+  // These three are #643's remaining ungated backup live suites, not an inventory mystery.
+  "smoke:backup-restore:live": brokenExemption("BROKEN: never executed; blocked behind failing backup-perms:live on the && chain at 2850a5a2e; status unknown; #643"),
+  "smoke:backup-conservation:live": brokenExemption("BROKEN: never executed; blocked behind failing backup-perms:live on the && chain at 2850a5a2e; status unknown; #643"),
+  "smoke:backup-faults:live": brokenExemption("BROKEN: never executed; blocked behind failing backup-perms:live on the && chain at 2850a5a2e; status unknown; #643"),
+  // These upstream-red suites remain disabled on the fork until upstream fixes them.
+  "smoke:auth-login-name": { reason: "BROKEN: upstream: ungated on pristine main e1a7998e; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:chat-compose": { reason: "BROKEN: upstream: ungated on pristine main e1a7998e; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:chat-name": { reason: "BROKEN: upstream: ungated on pristine main e1a7998e; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:chat-open:live": { reason: "BROKEN: upstream: ungated on pristine main e1a7998e; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:standing-authenticator": { reason: "BROKEN: upstream: ungated on pristine main e1a7998e; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  // Upstream does not gate these suites; their test status has not been established.
+  "smoke:codex-setup-refresh": { reason: "upstream: ungated on main@upstream; disabled on sync per fork policy", recheckBy: "2026-12-31" },
+  "smoke:delivery-standby": { reason: "upstream: ungated on main@upstream; disabled on sync per fork policy", recheckBy: "2026-12-31" },
+  "smoke:space-export": { reason: "upstream: ungated on main@upstream; disabled on sync per fork policy", recheckBy: "2026-12-31" },
+  "smoke:registry-host": { reason: "upstream: ungated on main@upstream; disabled on sync per fork policy", recheckBy: "2026-12-31" },
+  "smoke:registry-host-cli": { reason: "upstream: ungated on main@upstream; disabled on sync per fork policy", recheckBy: "2026-12-31" },
+  "smoke:runtime-migration-orphan-pause": { reason: "upstream: ungated on main@upstream; disabled on sync per fork policy", recheckBy: "2026-12-31" },
   // A STANDING DECISION, and only for the REAL-SESSION arm. The same suite is GATED as
   // `smoke:agui-map`, pointed at a fixture DERIVED from a real session by
   // `scripts/redact-claude-session.mjs` (whitelist by construction, identifiers pseudonymised
@@ -115,7 +137,7 @@ const UNGATED: Record<string, UngatedExemption> = {
   // plane3-activation:auth 6/0, plane3-gate:auth 3/0, self-serve-join-coverage:auth 17/0. All ten
   // passed, so all ten were GATED through `bin/smoke/ci-suites.d/` fragments rather than
   // re-explained, which is the exit this gate asks for and the one that takes the count down instead
-  // of resetting its clock. `untriagedExemption` is kept because the next entry will want it.
+  // of resetting its clock.
 };
 
 /**
@@ -155,16 +177,25 @@ const pkg = JSON.parse(packageText) as { scripts: Record<string, string> };
 const GATE_SCRIPTS = new Set(["smoke:ci", "smoke:ci:offline"]);
 const all = new Set(Object.keys(pkg.scripts).filter((k) => (k === "smoke" || k.startsWith("smoke:")) && !GATE_SCRIPTS.has(k)));
 
-/** Suites INVOKED by a script body. Anchored on `pnpm [run] <name>`, because a script is reached by
- *  being invoked, not by being mentioned.
- *
- *  A delimiter-anchored match on the bare word is NOT sufficient and briefly shipped here: every
- *  suite path contains `/smoke/`, so `tsx packages/core/smoke/members.smoke.ts` matched the bare
- *  `smoke` script and marked it reached. The audited set then looked one larger AND one more
- *  reached, and the unreached count did not move — a wrong answer that changed nothing visible.
- *  The pattern written to be careful about boundaries was less careful than the one it replaced. */
+type SmokeInvocation = { script: string; selector?: string };
+const invocationCache = new Map<string, SmokeInvocation[]>();
+
+/** One interpretation for direct and package-filtered pnpm smoke invocations. */
+function smokeInvocations(body: string): SmokeInvocation[] {
+  const cached = invocationCache.get(body);
+  if (cached) return cached;
+  const pattern = /\bpnpm\s+(?:(?:-F|--filter)(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s+)?(?:run\s+)?(smoke(?::[A-Za-z0-9:_-]+)?)(?![A-Za-z0-9:_/.-])/g;
+  const invocations = [...body.matchAll(pattern)].map((match) => {
+    const selector = match[1] ?? match[2] ?? match[3];
+    return { script: match[4]!, ...(selector === undefined ? {} : { selector }) };
+  });
+  invocationCache.set(body, invocations);
+  return invocations;
+}
+
+/** Package-local invocations do not make same-named root scripts reachable. */
 function suitesIn(body: string): string[] {
-  return [...body.matchAll(/\bpnpm\s+(?:run\s+)?(smoke(?::[A-Za-z0-9:_-]+)?)(?![A-Za-z0-9:_/.-])/g)].map((m) => m[1]);
+  return smokeInvocations(body).filter((call) => call.selector === undefined).map((call) => call.script);
 }
 
 /** The body to GRADE for a script. `smoke:ci` runs a list file rather than naming its suites inline
@@ -183,8 +214,16 @@ const bodyOf = (name: string): string => (name === "smoke:ci" ? ciChainBody() : 
 const ROOTS = ["smoke:ci", "test"];
 const wfDir = join(ROOT, ".github", "workflows");
 const roots = new Set<string>(ROOTS.filter((r) => r in pkg.scripts));
-for (const f of readdirSync(wfDir).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml")))
-  for (const s of suitesIn(readFileSync(join(wfDir, f), "utf8"))) if (s in pkg.scripts) roots.add(s);
+// A workflow can also run a list file through the shard runner (`COTAL_CI_SUITES: <file>` beside
+// `node bin/smoke/shard.mjs`), as the platforms job does. Every suite such a list names is a root.
+const listFiles = new Set<string>();
+for (const f of readdirSync(wfDir).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"))) {
+  const text = readFileSync(join(wfDir, f), "utf8");
+  for (const s of suitesIn(text)) if (s in pkg.scripts) roots.add(s);
+  for (const m of text.matchAll(/\bCOTAL_CI_SUITES\s*[:=]\s*["']?([^\s"']+)/g)) listFiles.add(m[1]);
+}
+const workflowLists = [...listFiles].sort().map((file) => ({ file, suites: readCiSuites(join(ROOT, file)) as string[] }));
+for (const { suites } of workflowLists) for (const s of suites) if (s in pkg.scripts) roots.add(s);
 
 const reached = new Set<string>();
 const frontier = [...roots];
@@ -352,20 +391,13 @@ const workspaceManifest = (pkgName: string): Record<string, string> | null => {
 };
 const dangling: Array<[string, string]> = [];
 for (const name of Object.keys(pkg.scripts))
-  for (const segment of bodyOf(name).split("&&")) {
-    const filtered = /(?:^|\s)(?:-F|--filter)\s+(\S+)/.exec(segment);
-    if (filtered) {
-      // `pnpm -F <pkg>... build` selects a dependency closure; only a smoke target needs resolving.
-      const target = suitesIn(segment).find((t) => t !== name);
-      if (!target) continue;                       // a build step, nothing to resolve
-      const pkgName = filtered[1].replace(/\.\.\.$/, "");
+  for (const { script: target, selector } of smokeInvocations(bodyOf(name))) {
+    if (selector !== undefined) {
+      const pkgName = selector.replace(/\.\.\.$/, "");
       const scripts = workspaceManifest(pkgName);
       if (scripts === null) dangling.push([name, `${target} (in unresolvable package ${pkgName})`]);
       else if (!(target in scripts)) dangling.push([name, `${target} (absent from ${pkgName})`]);
-      continue;
-    }
-    for (const target of suitesIn(segment))
-      if (target !== name && !(target in pkg.scripts)) dangling.push([name, target]);
+    } else if (target !== name && !(target in pkg.scripts)) dangling.push([name, target]);
   }
 if (dangling.length) {
   fail++;
@@ -397,6 +429,17 @@ if (missingChainEntries.length) {
   console.log(`  ✓ the smoke:ci chain file holds ${chain.length} suites, no duplicates`);
 }
 
+// A list a workflow runs is a chain too, so a name it holds must be a defined script.
+for (const { file, suites } of workflowLists) {
+  const missing = suites.filter((suite) => !(suite in pkg.scripts));
+  if (missing.length) {
+    fail++;
+    console.log(`  ✗ FAIL: ${file}, which a workflow runs, names ${missing.length} missing script(s): ${missing.join(", ")}`);
+  } else {
+    console.log(`  ✓ ${file}, which a workflow runs, names ${suites.length} defined script(s)`);
+  }
+}
+
 // An allowlist that outlives its entries rots into a place where gating a suite goes unnoticed.
 if (staleAllowlist.length) {
   fail++;
@@ -415,8 +458,9 @@ console.log(`\n  ${untriaged.length} of the ungated set are UNTRIAGED debt (not 
 const broken = ungated.filter((s) => (UNGATED[s]?.reason ?? "").startsWith(BROKEN)).sort();
 // `smoke:lifecycle-files` left this set when upstream gated it (passed on 2026-10-01).
 const expectedBroken = [
-  "smoke:backup-conservation:live", "smoke:backup-faults:live", "smoke:backup-restore:live",
-  "smoke:backup-usermode:live",
+  "smoke:auth-login-name", "smoke:backup-conservation:live", "smoke:backup-faults:live",
+  "smoke:backup-restore:live", "smoke:backup-usermode:live", "smoke:chat-compose", "smoke:chat-name",
+  "smoke:chat-open:live", "smoke:standing-authenticator",
 ];
 if (broken.join() !== expectedBroken.join()) {
   fail++;

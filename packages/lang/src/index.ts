@@ -8,6 +8,8 @@
  *
  * This package is pure: it depends on nothing else in the repo, so the validator, the key
  * machinery, and the simulation handler run with no broker and no mesh.
+ *
+ * @module index
  */
 
 export {
@@ -81,6 +83,8 @@ export {
 
 export {
   Cancelled,
+  RootCancellation,
+  type RootCancellationSource,
   RunReleased,
   EffectRefused,
   RunHeld,
@@ -103,7 +107,9 @@ export {
   type NotifyFact,
   type NotifyRequest,
   type ObserveRequest,
+  type ParticipantRequest,
   type SleepRequest,
+  type InlineSpawnDefinition,
   type SpawnRequest,
   type TurnRequest,
   type TurnResultValue,
@@ -120,7 +126,9 @@ export {
 export {
   RecordingHandler,
   dryRun,
+  dryRunOutcome,
   renderReport,
+  type DryRunFailure,
   type DryRunOptions,
   type DryRunReport,
   type PlannedAgent,

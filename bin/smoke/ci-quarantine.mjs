@@ -18,6 +18,7 @@ export const QUARANTINED = {
   "smoke:mutation-fixtures": { reason: "upstream: 91 dead mutation anchors on pristine main; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:required-arg-seam": { reason: "upstream: call-site pins 229/179 vs 247/193 and an unverifiable tls site in control-target.ts on pristine main; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:instrument-instance-pin": { reason: "upstream: red on main CI runs 38756147210 and 38753177566; 2/61 fail locally on the merge; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:flag-inventory": { reason: "upstream: history golden omits dm-max-age/dm-per-sender/inbox-max-age/inbox-per-agent on pristine main e1a7998e; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:custody-exit-proof": { reason: "upstream asserts a numeric pid/pgid reap that the fork's custody contract (#72/#73) forbids; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:seat-reap-group-identity": { reason: "upstream's 'ambiguous group ownership refuses reaping' cell expects a thrown refusal; the fork's custody contract (#72/#73) returns retained/unprovable evidence instead; quarantined unchanged on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:freeslot-barrier:live": { reason: "upstream expects a static orphan with no custody reference to retire; the fork's custody contract (#72/#73) refuses an unproven reap; quarantined on sync per Matt", recheckBy: "2026-12-31" },
@@ -59,9 +60,10 @@ export const QUARANTINED = {
   "smoke:web-history-cancellation": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:user-manager-transport": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:up-restore-reentry:live": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
-  "smoke:setup-provider-pack": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:remote-ef-continuity": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:presence-watch-rebind": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:setup-provider-pack": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:usage-format": { reason: "upstream: 6/428 cells fail on pristine main 3f124c77 (local run); quarantined on sync per fork policy", recheckBy: "2026-12-31" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */

@@ -1,6 +1,6 @@
-import { appendFileSync, chmodSync, closeSync, existsSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { inSeatCgroup } from "./cgroup.js";
+import { chmodSync, closeSync, existsSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
+import { inSeatCgroup } from "./cgroup.js";
 import { argsAsStringForTest, dropPidfdForTest, NoChildStarted, spawnPinned, type PinnedPty } from "./pty.js";
 import Headless from "@xterm/headless";
 import { SerializeAddon } from "@xterm/addon-serialize";
@@ -23,7 +23,7 @@ import {
   type ServerMessage,
 } from "./protocol.js";
 import { ConnectorDiagnosticReader } from "./diagnostic.js";
-import { RECORD_VERSION, bootToken, exitPath, processStartToken, writeRecord, type SeatRecord } from "./record.js";
+import { RECORD_VERSION, appendPrivate, bootToken, exitPath, processStartToken, writePrivate, writeRecord, type SeatRecord } from "./record.js";
 import { StartupConfirmGate } from "./startup-confirm.js";
 
 export interface CustodianLaunch {
@@ -41,6 +41,8 @@ export interface CustodianLaunch {
   logPath?: string;
   confirm?: string;
   confirmBefore?: readonly import("./startup-confirm.js").StartupReply[];
+  confirmReady?: readonly string[];
+  confirmBlockers?: readonly import("./startup-confirm.js").StartupBlocker[];
   /** Who started this custodian: the launcher's run marker, carried so a census can attribute an
    *  orphan to its run without walking `/proc/*\/cwd` (#1648). */
   run?: string;
@@ -109,7 +111,7 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
 
   const note = (line: string): void => {
     try {
-      if (launch.logPath) appendFileSync(launch.logPath, line, { mode: 0o600 });
+      if (launch.logPath) appendPrivate(launch.logPath, line);
       else process.stderr.write(line);
     } catch {
       /* the seat directory may already be gone */
@@ -160,23 +162,19 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
       if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
     }
 
-    // Built before the child exists, so a prompt that cannot match starts nothing.
-    if (launch.confirmBefore?.length && launch.confirm === undefined) throw new Error("startup choices require a final confirmation prompt");
-    confirmGate = launch.confirm === undefined ? undefined : new StartupConfirmGate(launch.confirm, launch.confirmBefore);
-    // Read before the spawn so a missing custodian identity fails with no child.
+    // Build confirmation before the child exists, then pin this custodian's identity.
+    if ((launch.confirmBefore?.length || launch.confirmReady?.length || launch.confirmBlockers?.length) && launch.confirm === undefined) throw new Error("startup choices require a final confirmation prompt");
+    confirmGate = launch.confirm === undefined ? undefined : new StartupConfirmGate(launch.confirm, launch.confirmBefore, launch.confirmReady, launch.confirmBlockers);
     const start = processStartToken(process.pid);
     if (start === undefined) throw new Error(`cannot read the process start identity of custodian ${process.pid} from /proc`);
     custodianStart = start;
     bootId = bootToken();
-
     if (seam?.dropPidfd) dropPidfdForTest();
     if (typeof launch.args === "string") throw new Error("args as a string is not supported on unix.");
   } catch (e) {
     discardArtifacts(launch.artifacts);
     throw e;
   }
-  // A throw here sends nothing: without a pidfd this process cannot name the child, and its exit
-  // hangs up the PTY instead.
   let proc: PinnedPty;
   try {
     if (seam?.argsAsString) argsAsStringForTest();
@@ -188,8 +186,6 @@ async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefi
       env: launch.env,
     });
   } catch (e) {
-    // Only a fork proved never to have run frees the files. Any other throw may come after the fork
-    // (an unpinned child), which can still be reading them, so they stay.
     if (e instanceof NoChildStarted) discardArtifacts(launch.artifacts);
     await holdAt("unpinned");
     throw e;
@@ -224,18 +220,16 @@ async function serveSeat(
   const { custodianStart, bootId, seam, confirmGate, note, discardArtifacts } = pinned;
   const child = proc.handle;
   const oomPref = preferSeatForOomKill(proc.pid);
-  if (!oomPref.applied) note(`oom preference not applied to child ${proc.pid}: ${oomPref.reason}\n`);
-  // Timer callbacks log through this: a throw there would end the custodian before the escalation.
-  const logNote = (note: string): void => {
-    if (!launch.logPath) return;
+  const logNote = (line: string): void => {
     try {
-      appendFileSync(launch.logPath, note, { mode: 0o600 });
+      if (launch.logPath) appendPrivate(launch.logPath, line);
+      else process.stderr.write(line);
     } catch {
-      /* best effort; the send already happened */
+      /* the seat directory may already be gone */
     }
   };
-  // A zombie still reports its start token; keep it only if the pidfd still reported the child live
-  // after the read, so the token cannot belong to a reused pid.
+  if (!oomPref.applied) note(`oom preference not applied to child ${proc.pid}: ${oomPref.reason}\n`);
+  // A zombie still reports its start token; the pidfd decides whether it had already exited.
   const childStartRead = processStartToken(proc.pid);
   const childStart = child.exited() ? undefined : childStartRead;
   await pinned.holdAt("after-pin");
@@ -284,8 +278,8 @@ async function serveSeat(
     waiters.clear();
   };
 
-  // The pidfd, never `/proc/<pid>`: a reused pid must not read as this child still running.
   const childGone = (): boolean => child.exited();
+
 
   /**
    * Mark a child that its pidfd shows gone as exited WITHOUT a status, but only once node-pty has had
@@ -370,14 +364,7 @@ async function serveSeat(
       if (settling || controllers.size > 0) return;
       // An unattended custodian has nobody to tell, so record the reason where an operator reading
       // an empty seat directory can still find it.
-      const note = `${JSON.stringify({ unattended: true, afterMs: UNATTENDED_MS, childPid: proc.pid, custodianPid: process.pid, run: launch.run })}\n`;
-      if (launch.logPath) {
-        try {
-          appendFileSync(launch.logPath, note, { mode: 0o600 });
-        } catch {
-          /* the seat directory may already be gone */
-        }
-      }
+      note(`${JSON.stringify({ unattended: true, afterMs: UNATTENDED_MS, childPid: proc.pid, custodianPid: process.pid, run: launch.run })}\n`);
       if (alive) {
         // `seenClient` gates the settle, and a custodian nobody ever adopted must still be able to
         // exit: without this the stop below kills the child and the settle refuses, which is the
@@ -425,25 +412,19 @@ async function serveSeat(
     // sees half a record.
     const exitFile = exitPath(launch.recordPath);
     try {
-      writeFileSync(`${exitFile}.tmp`, `${JSON.stringify(exit)}\n`, { mode: 0o600 });
+      writePrivate(`${exitFile}.tmp`, `${JSON.stringify(exit)}\n`);
       renameSync(`${exitFile}.tmp`, exitFile);
     } catch (e) {
       // A seat directory that is already gone has nobody left to read the record. Any other failure
       // loses the only account a later reap has, so it is said where an operator can find it, and
       // the reap reports the record missing or unreadable.
       if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
-        const line = `exit record not written: ${(e as Error).message}\n`;
         try {
           unlinkSync(`${exitFile}.tmp`);
         } catch {
           /* never created */
         }
-        try {
-          if (launch.logPath) appendFileSync(launch.logPath, line, { mode: 0o600 });
-          else process.stderr.write(line);
-        } catch {
-          /* the log can sit on the same failed storage */
-        }
+        note(`exit record not written: ${(e as Error).message}\n`);
       }
     }
     // The child is gone, so it has made every read it will make. Remove its files before anyone is
@@ -791,7 +772,7 @@ async function serveSeat(
           /* the lock goes with the fd at exit */
         }
         const announced = `${JSON.stringify({ ready: true, childPid: proc.pid, custodianPid: process.pid })}\n`;
-        if (launch.logPath) logNote(announced);
+        if (launch.logPath) note(announced);
         else process.stdout.write(announced);
         armUnobservedHandoff();
         armUnattended();
@@ -815,7 +796,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   custody(launch, testSeam).catch((err) => {
     const text = `${(err as Error).stack ?? (err as Error).message}\n`;
     try {
-      if (launch.logPath) appendFileSync(launch.logPath, text, { mode: 0o600 });
+      if (launch.logPath) appendPrivate(launch.logPath, text);
       else process.stderr.write(text);
     } catch {
       process.stderr.write(text);

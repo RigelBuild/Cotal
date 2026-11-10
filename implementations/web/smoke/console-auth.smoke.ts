@@ -24,15 +24,17 @@
  */
 import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
-import { closeSync, fchmodSync, fstatSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fchmodSync, fstatSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isReachable, setupSpaceStreams } from "@cotal-ai/core";
-import { PortInUseError, SMOKE_BROKER_TOKEN, freePort, onFreePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import { createContext, runInContext } from "node:vm";
 import ts from "typescript";
-import { CROSS_ORIGIN, LAUNCH_TOKEN_ALREADY_USED, UNAUTHENTICATED, makeAuthGate, openDetachedLog, webProcess } from "../src/web.js";
+import { WEB_READINESS_HEADER, WEB_READINESS_PATH, WEB_SESSION_FILE } from "@cotal-ai/workspace";
+import { CROSS_ORIGIN, LAUNCH_TOKEN_ALREADY_USED, UNAUTHENTICATED, clientAssets, makeAuthGate, openDetachedLog, webProcess } from "../src/web.js";
+import { bootWeb, startWeb } from "./boot-web.js";
 
 let pass = 0;
 const check = (name: string, cond: boolean, extra?: unknown) => {
@@ -48,7 +50,7 @@ const q = (s = "") => new URLSearchParams(s);
 type Req = { headers: Record<string, string | undefined>; url: string };
 // `url` matters only to the readiness nonce, which opens ONE path; every other cell is
 // path-independent and takes the default.
-const META = "/api/meta";
+const META = WEB_READINESS_PATH;
 const req = (headers: Record<string, string | undefined> = {}, url = "/"): Req => ({ headers, url });
 
 // ── 1. WHAT THE GATE DECIDES ────────────────────────────────────────────────────────────────────
@@ -166,18 +168,18 @@ const req = (headers: Record<string, string | undefined> = {}, url = "/"): Req =
 {
   const gate = makeAuthGate(PORT);
   check("the readiness nonce is accepted on the one path it opens",
-    gate.check(req({ "x-cotal-readiness": gate.readinessNonce }, META) as never, q()) === undefined);
+    gate.check(req({ [WEB_READINESS_HEADER]: gate.readinessNonce }, META) as never, q()) === undefined);
   // The nonce is never consumed and lives as long as the process, so a nonce good everywhere would
   // make `web.session` a standing full-surface credential sitting beside a single-use link. Every
   // negative below carries the RIGHT path, so what refuses them is the comparison and not the route.
   check("a VALID readiness nonce on any other path is refused (it opens /api/meta, not the surface)",
     (() => {
-      const r = gate.check(req({ "x-cotal-readiness": gate.readinessNonce }, "/") as never, q());
+      const r = gate.check(req({ [WEB_READINESS_HEADER]: gate.readinessNonce }, "/") as never, q());
       return r !== undefined && "refuse" in r && r.refuse === UNAUTHENTICATED;
     })());
   check("a WRONG readiness nonce is refused (the check is a comparison, not a presence test)",
     (() => {
-      const r = gate.check(req({ "x-cotal-readiness": "wrong" }, META) as never, q());
+      const r = gate.check(req({ [WEB_READINESS_HEADER]: "wrong" }, META) as never, q());
       return r !== undefined && "refuse" in r && r.refuse === UNAUTHENTICATED;
     })());
   // SAME-LENGTH negatives. Every wrong secret in this suite was the string `wrong`, which differs in
@@ -196,14 +198,14 @@ const req = (headers: Record<string, string | undefined> = {}, url = "/"): Req =
   check("NON-VACUITY: the nonce sweep covers EVERY index, not a sample",
     nonceIdx.length === gate.readinessNonce.length && nonceIdx.length > 3, { n: nonceIdx.length });
   const nonceSurvivors = nonceIdx.filter((i) => {
-    const r = gate.check(req({ "x-cotal-readiness": flip(gate.readinessNonce, i) }, META) as never, q());
+    const r = gate.check(req({ [WEB_READINESS_HEADER]: flip(gate.readinessNonce, i) }, META) as never, q());
     return !(r !== undefined && "refuse" in r && r.refuse === UNAUTHENTICATED);
   });
   check("a same-length readiness nonce differing at ANY SINGLE index is refused (content, not length, not some bytes)",
     nonceSurvivors.length === 0, { acceptedAtPositions: nonceSurvivors });
   check("the readiness nonce does NOT consume the launch token (the parent polls; the browser still needs it)",
     (() => {
-      gate.check(req({ "x-cotal-readiness": gate.readinessNonce }, META) as never, q());
+      gate.check(req({ [WEB_READINESS_HEADER]: gate.readinessNonce }, META) as never, q());
       const after = gate.check(req() as never, q(`k=${gate.launchToken}`));
       return after !== undefined && "exchange" in after;
     })());
@@ -239,7 +241,7 @@ const req = (headers: Record<string, string | undefined> = {}, url = "/"): Req =
   {
     const g6 = makeAuthGate(PORT);
     const evilReady = g6.check(
-      req({ origin: "https://evil.example", "x-cotal-readiness": g6.readinessNonce }, META) as never, q());
+      req({ origin: "https://evil.example", [WEB_READINESS_HEADER]: g6.readinessNonce }, META) as never, q());
     check("a cross-origin request carrying a VALID readiness nonce is still refused as `cross-origin`",
       evilReady !== undefined && "refuse" in evilReady && evilReady.refuse === CROSS_ORIGIN, evilReady);
   }
@@ -300,7 +302,7 @@ const gateInit = stmts[2] !== undefined && ts.isVariableStatement(stmts[2])
 // STRUCTURAL, not an enumeration of route syntax. Two earlier versions of this cell were beaten by
 // the same move: the first compared the gate against ONE named route (`/feed`), and the second
 // against every `if (path === "` / `if (path.startsWith("` dispatch — which silently omitted the
-// SHIPPED STATIC DISPATCH (`PAGE[path]` then `if (file)`), so moving that block above the gate left
+// SHIPPED STATIC DISPATCH (`client.get(path)` then `if (file)`), so moving that block above the gate left
 // `/`, `/graph` and every asset unauthenticated with all 68 cells green.
 //
 // A list of route shapes can always omit one, and the omission is invisible. So this asserts the
@@ -419,7 +421,7 @@ check("…and EXECUTION STOPS for the replayed link as well", rp.routeReached ==
 // `path === "/graph"` therefore stayed green while the ACTUAL printed launch URL is `/`, which would
 // have burned the token, served the page, and never set a session cookie. The one path that matters
 // most was the one path not driven.
-for (const exPath of ["/", "/graph", "/app.js"]) {
+for (const exPath of ["/", "/graph", "/assets/index.js"]) {
   const e = runGateBlock({ exchange: "SESSIONVALUE" }, exPath);
   check(`an exchange on ${exPath} sets the cookie and redirects THERE (the printed launch URL is "/")`,
     e.status === 302 && (e.headers["set-cookie"] ?? "").includes("SESSIONVALUE") && e.headers.location === exPath,
@@ -449,7 +451,7 @@ check("…and EXECUTION STOPS after the redirect (the exchange answers; it does 
 // predicate with `path === "/api/roster"` therefore refused exactly the cases the suite drove and
 // let `/feed`, the static assets and the channel-delete POST fall straight through, surviving 49/49.
 // A gate is worthless if it is a gate for one path.
-const ROUTE_PATHS = ["/", "/feed", "/app.js", "/api/meta", "/api/roster", "/api/channel/delete"];
+const ROUTE_PATHS = ["/", "/feed", "/assets/index.js", WEB_READINESS_PATH, "/api/roster", "/api/channel/delete"];
 check("NON-VACUITY: the refusal sweep covers several paths INCLUDING the destructive one",
   ROUTE_PATHS.length > 1 && ROUTE_PATHS.includes("/api/channel/delete"), ROUTE_PATHS);
 // STRUCTURAL INDEPENDENCE, because a sweep is a SAMPLE and a sample can always be evaded — the path
@@ -587,7 +589,7 @@ check("POSITIVE CONTROL for the sentinel: an ALLOWED request DOES reach the rout
         writeHead: (s: number, h: Record<string, string>) => { rec.status = s; rec.headers = h ?? {}; },
         end: (b?: string) => { rec.body = b ?? ""; },
       },
-      CROSS_ORIGIN, SESSION_COOKIE: "cotal_web_session", READINESS_HEADER: "x-cotal-readiness",
+      CROSS_ORIGIN, SESSION_COOKIE: "cotal_web_session",
       __routeReached: () => { rec.routeReached = true; }, globalThis: undefined, console, JSON,
     };
     ctx.globalThis = ctx;
@@ -607,7 +609,7 @@ check("POSITIVE CONTROL for the sentinel: an ALLOWED request DOES reach the rout
   const replay = drive(real, `/?k=${real.launchToken}`);
   check("REAL GATE → REAL HANDLER: replaying the REAL spent token is refused as `launch-token-already-used`",
     replay.status === 401 && JSON.parse(replay.body).error === LAUNCH_TOKEN_ALREADY_USED, replay);
-  const withNonce = drive(real, "/api/meta", { "x-cotal-readiness": real.readinessNonce });
+  const withNonce = drive(real, WEB_READINESS_PATH, { [WEB_READINESS_HEADER]: real.readinessNonce });
   check("REAL GATE → REAL HANDLER: the REAL readiness nonce is accepted and reaches the route",
     withNonce.status === 0 && withNonce.routeReached === true, withNonce);
   check("NON-VACUITY: the session the REAL exchange minted is a non-empty secret",
@@ -663,72 +665,11 @@ check("…and does not short-circuit to a plain string comparison",
 check("…and the LENGTH-MISMATCH branch still does the work before failing, so a wrong length costs the same as a wrong value",
   secretEqualsSrc.includes("timingSafeEqual(ab, ab)"), { secretEqualsSrc });
 
-// ── 6. THE SESSION FILE'S MODE, DRIVEN AGAINST A REAL FILE ──────────────────────────────────────
-// This file holds the launch URL and the readiness nonce, so its mode is a credential boundary. No
-// cell reached it at all: deleting the descriptor chmod, or writing 0644, went 68/68 green. And the
-// bug it guards is specifically the STALE file — `mode:` on writeFileSync applies at CREATION only,
-// so the interesting case is a pre-existing permissive file, not a fresh one.
-{
-  const writeBlock = webTs.slice(
-    webTs.indexOf('    const sfd = openSync(sessionPath, "w", 0o600);'),
-    webTs.indexOf("    process.once(\"exit\", () => rmSync(sessionPath, { force: true }));"),
-  );
-  check("the session-file write block was lifted out of the shipped source", writeBlock.includes("openSync("),
-    { len: writeBlock.length });
-  check("CONTROL: a block that is not in the file lifts nothing",
-    webTs.indexOf('    const sfd = openSyncNothing(') === -1);
-
-  const dir = mkdtempSync(join(tmpdir(), "cotal-web-session-"));
-  const sessionPath = join(dir, "web.session");
-  // PRE-CREATE IT PERMISSIVE. This is the whole point: a fresh file would pass even with the chmod
-  // deleted, so a cell that only ever writes a new file proves nothing about the defect.
-  // fchmod ON THE DESCRIPTOR, because `mode:` at creation is masked by the process umask — under
-  // `umask 077` the "permissive" fixture was created 0600 and the non-vacuity cell below failed
-  // before any shipped code ran. A suite whose result depends on the operator's umask is not a
-  // suite; the fixture has to set the mode it claims to set.
-  {
-    const pfd = openSync(sessionPath, "w");
-    try { fchmodSync(pfd, 0o644); writeFileSync(pfd, "stale"); } finally { closeSync(pfd); }
-  }
-  check("NON-VACUITY: the stale file really is permissive before the shipped block runs",
-    (statSync(sessionPath).mode & 0o777) === 0o644, (statSync(sessionPath).mode & 0o777).toString(8));
-
-  const source = ts.transpileModule(`globalThis.__write = () => { ${writeBlock} };`,
-    { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
-  // THE MODE AT THE INSTANT OF THE WRITE, not afterwards. Swapping the chmod and the write leaves the
-  // final mode 0600 and the final content correct — so a cell that inspects the file afterwards
-  // passes while the secret was written into a WORLD-READABLE file and narrowed a moment later. A
-  // credential exposed for an instant is exposed. This wrapper records the descriptor's mode at the
-  // moment the bytes go in.
-  let modeAtWrite: number | undefined;
-  const recordingWrite = (fd: number, data: string) => {
-    modeAtWrite = fstatSync(fd as number).mode & 0o777;
-    return writeFileSync(fd, data);
-  };
-  const ctx: Record<string, unknown> = {
-    openSync, fchmodSync, writeFileSync: recordingWrite, closeSync, JSON,
-    sessionPath, launchUrl: "http://127.0.0.1:7799/?k=x", gate: { readinessNonce: "n" }, bound: { address: "127.0.0.1", port: PORT },
-    globalThis: undefined, console,
-  };
-  ctx.globalThis = ctx;
-  runInContext(source, createContext(ctx), { filename: "web.ts (session write)" });
-  (ctx.__write as () => void)();
-
-  check("the secret is written into an ALREADY-0600 descriptor — narrowed BEFORE the bytes, not after",
-    modeAtWrite === 0o600, { modeAtWrite: modeAtWrite?.toString(8) });
-  check("the shipped write NARROWS a stale permissive session file to 0600 (mode is enforced on every write, not only at creation)",
-    (statSync(sessionPath).mode & 0o777) === 0o600, (statSync(sessionPath).mode & 0o777).toString(8));
-  // BOTH FIELDS. The file is a two-field credential and only one of them was asserted: dropping
-  // `readiness` from the written JSON left the mode cells and the launch-URL cell green at 110/110,
-  // while the parent's reader derived `undefined` — measured — so `--detach` would send no readiness
-  // header, poll a surface that correctly refuses it, and time out. Parse once, assert both.
-  const written = JSON.parse(readFileSync(sessionPath, "utf8")) as Record<string, unknown>;
-  check("…and the file still holds the launch URL it was asked to write",
-    written.launchUrl === "http://127.0.0.1:7799/?k=x", written);
-  check("…AND the readiness nonce, the second credential `--detach` polls with (without it the parent sends no header and never sees ready)",
-    written.readiness === "n", written);
-  rmSync(dir, { recursive: true, force: true });
-}
+// ── 6. RETIRED: THE LEGACY SESSION FILE'S MODE ───────────────────────────────────────────────────
+// This section lifted the inline `web.session` write out of `web.ts`. That file is now written only
+// by `web()` without a service lifecycle, which no command reaches: the `web` service preset writes
+// its own owner-private session record create-only beside its ready file. The legacy writer,
+// `writeWebSession`, delegates to core's `writePrivateRecord`.
 
 // ── 7. THE SESSION FILE IS SWEPT WITH THE PROCESS ───────────────────────────────────────────────
 // The exit handler removes `web.session`, but an exit handler does not run on SIGKILL, and the file
@@ -742,7 +683,7 @@ check("…and the LENGTH-MISMATCH branch still does the work before failing, so 
 // cell in this file green while `down` sweeps nothing.
 {
   check("`web.session` is declared as a process artifact, so `down` sweeps it when the exit handler did not",
-    (webProcess.artifacts ?? []).includes("web.session"), webProcess.artifacts);
+    (webProcess.artifacts ?? []).includes(WEB_SESSION_FILE), webProcess.artifacts);
   check("CONTROL: the artifact check is not vacuous — a file that is not declared is not found",
     !(webProcess.artifacts ?? []).includes("web.session.not-declared"), webProcess.artifacts);
 }
@@ -771,29 +712,17 @@ check("…and the LENGTH-MISMATCH branch still does the work before failing, so 
     await setupSpaceStreams({ servers: server, space: "consoleauthlog" });
 
     let output = "";
-    let token = "";
-    const webPort = await onFreePort(async (port) => {
-      child = spawn(process.execPath, [
-        "--import", "tsx", fileURLToPath(new URL("./run-web.mts", import.meta.url)),
-        "--server", server, "--space", "consoleauthlog", "--port", String(port), "--no-open",
-      ], { stdio: ["ignore", "pipe", "pipe"] });
-      child.stdout?.on("data", (data: Buffer) => { output += data.toString(); });
-      child.stderr?.on("data", (data: Buffer) => { output += data.toString(); });
-      const taken = `Port ${port} is in use`;
-      for (let i = 0; i < 200 && !output.includes(taken); i++) {
-        token = output.match(/\?k=([A-Za-z0-9_-]{32,})/)?.[1] ?? "";
-        if (token) break;
-        await wait(50);
-      }
-      if (!token && output.includes(taken)) throw new PortInUseError(port, output);
-      return port;
+    const web = await bootWeb({
+      server, space: "consoleauthlog",
+      onSpawn: (spawned) => { child = spawned; }, onOutput: (text) => { output += text; },
     });
+    const webPort = web.port;
+    const token = web.launchUrl === undefined ? "" : new URL(web.launchUrl).searchParams.get("k") ?? "";
     check("LOG-LEAK FIXTURE: the real process printed a real launch token", token.length >= 32, output.slice(-300));
 
-    const exchanged = await fetch(`http://127.0.0.1:${webPort}/?k=${token}`, { redirect: "manual" });
-    const cookie = exchanged.headers.get("set-cookie")?.split(";")[0] ?? "";
-    check("LOG-LEAK FIXTURE: the real token minted a real session", exchanged.status === 302 && cookie.startsWith("cotal_web_session="),
-      { status: exchanged.status, cookie: cookie.slice(0, 24) });
+    const cookie = web.cookie ?? "";
+    check("LOG-LEAK FIXTURE: the real token minted a real session", web.exchangeStatus === 302 && cookie.startsWith("cotal_web_session="),
+      { status: web.exchangeStatus, cookie: cookie.slice(0, 24) });
 
     output = "";
     const encodedToken = [...token].map((ch) => `%${ch.charCodeAt(0).toString(16).padStart(2, "0")}`).join("");
@@ -847,6 +776,32 @@ check("…and the LENGTH-MISMATCH branch still does the work before failing, so 
           { form, where, status: attack.status, log: output });
       }
     }
+
+    // 8b. A STATIC ROW PAST THE GATE ANSWERS WITH ITS FILE OR WITH THE CATCH'S 500 NAMING THE READ.
+    // The route wrote its 200 before reading, so a failed read reached the catch with the status
+    // already sent and the browser ran an empty script as a success (#3417). The client build is
+    // an allow-list read at startup, so a row whose file is gone is made here: the page's script is
+    // moved aside after the server has listed it, fetched, and put back.
+    const assets = clientAssets(fileURLToPath(new URL("../dist/web", import.meta.url)));
+    const script = [...assets.keys()].find((route) => route.startsWith("/assets/") && route.endsWith(".js"));
+    check("STATIC FIXTURE: the client build lists the page's script", script !== undefined, [...assets.keys()]);
+    const scriptFile = assets.get(script!)!.path;
+    const served = await fetch(`http://127.0.0.1:${webPort}${script}`, { headers: { cookie } });
+    const servedBody = Buffer.from(await served.arrayBuffer());
+    check("STATIC CONTROL: a row whose file reads is served whole, so the refusal below is about the read",
+      served.status === 200 && servedBody.equals(readFileSync(scriptFile)), { status: served.status, bytes: servedBody.length });
+    renameSync(scriptFile, `${scriptFile}.aside`);
+    let failed: Response;
+    let failedBody: string;
+    try {
+      failed = await fetch(`http://127.0.0.1:${webPort}${script}`, { headers: { cookie } });
+      failedBody = await failed.text();
+    } finally {
+      renameSync(`${scriptFile}.aside`, scriptFile);
+    }
+    check("a static row whose file cannot be read answers 500 naming the failed read, never an empty 200",
+      failed.status === 500 && failed.headers.get("content-type") === "application/json" && failedBody.includes("ENOENT"),
+      { status: failed.status, body: failedBody });
   } finally {
     child?.kill("SIGTERM");
     broker.kill("SIGTERM");
@@ -887,21 +842,10 @@ check("…and the LENGTH-MISMATCH branch still does the work before failing, so 
     let output = "";
     const childEnv = { ...process.env };
     for (const key of Object.keys(childEnv)) if (key.startsWith("COTAL_")) delete childEnv[key];
-    let served = false;
-    await onFreePort(async (port) => {
-      child = spawn(process.execPath, [
-        "--import", "tsx", fileURLToPath(new URL("./run-web.mts", import.meta.url)),
-        "--server", server, "--space", "consoleauthdetached", "--port", String(port), "--no-open",
-      ], { env: { ...childEnv, COTAL_WEB_DETACHED_LOG: "1" }, stdio: ["ignore", "pipe", "pipe"] });
-      child.stdout?.on("data", (data: Buffer) => { output += data.toString(); });
-      child.stderr?.on("data", (data: Buffer) => { output += data.toString(); });
-      const taken = `Port ${port} is in use`;
-      for (let i = 0; i < 200 && !output.includes(taken); i++) {
-        const response = await fetch(`http://127.0.0.1:${port}/api/meta`).catch(() => undefined);
-        if (response?.status === 401) { served = true; break; }
-        await wait(50);
-      }
-      if (!served && output.includes(taken)) throw new PortInUseError(port, output);
+    const { ready: served } = await startWeb({
+      server, space: "consoleauthdetached", env: { ...childEnv, COTAL_WEB_DETACHED_LOG: "1" },
+      onSpawn: (spawned) => { child = spawned; }, onOutput: (text) => { output += text; },
+      ready: async (_printed, port) => (await fetch(`http://127.0.0.1:${port}${WEB_READINESS_PATH}`).catch(() => undefined))?.status === 401,
     });
     await wait(100);
     check("the real detached child writes startup diagnostics but no live launch URL to its persisted stream",

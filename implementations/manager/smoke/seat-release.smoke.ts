@@ -92,6 +92,7 @@ let sealOverride: RuntimeReleaseCheck | undefined;
 let failRemoveOnce = false;
 const fakeSession = { cols: 80, rows: 24, backlog: () => Buffer.alloc(0), onData: () => () => {}, onExit: () => () => {}, write: () => {}, resize: () => {} };
 const fakeRuntime: ReleasableRuntime = {
+  streamsTerminal: false,
   kind: "pty",
   reserve: () => ({ kind: "pty", id: randomUUID().replaceAll("-", "") }),
   spawn: (name, _spec, _cwd, reference): AgentHandle => {

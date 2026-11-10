@@ -44,11 +44,12 @@ export const ompConnector: Connector = {
     const sessionStatePath = stateRoot ? join(stateRoot, `${opts.name}-${opts.lifecycleUid ?? "unmanaged"}.json`) : undefined;
     if (stateRoot) mkSecretDir(stateRoot);
     if (sessionStatePath) rmSync(sessionStatePath, { force: true });
+    const artifacts: string[] = [];
     const env: Record<string, string> = {
       ...launchEnv({ providerKeys: PI_PROVIDER_KEYS, envAllow: opts.envAllow }), ...aclEnv(opts),
-      ...materialEnv({ creds: opts.creds, servers: opts.servers, controlToken: control.token, eventsRequired: opts.eventsRequired, userAuth: opts.userAuth }),
       COTAL_SPACE: opts.space, COTAL_NAME: opts.name,
     };
+    Object.assign(env, materialEnv({ creds: opts.creds, servers: opts.servers, controlToken: control.token, eventsRequired: opts.eventsRequired, userAuth: opts.userAuth }, artifacts));
     if (launchArmsEvents(opts)) {
       if (!opts.workspaceRoot) throw new Error("omp connector: events were requested without workspaceRoot for the durable event log");
       env.COTAL_EVENTS = "1"; env.COTAL_WORKSPACE_ROOT = opts.workspaceRoot;
@@ -84,7 +85,7 @@ export const ompConnector: Connector = {
     }
     env.COTAL_CONTROL_SOCKET = control.path;
     if (sessionStatePath) env.COTAL_PI_SESSION_STATE = sessionStatePath;
-    return { command: opts.resolvedBinaries?.omp ?? "omp", args, env, control, sessionStatePath };
+    return { command: opts.resolvedBinaries?.omp ?? "omp", args, env, control, sessionStatePath, ...(artifacts.length > 0 ? { artifacts } : {}) };
   },
 };
 

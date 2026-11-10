@@ -21,7 +21,7 @@
  */
 import type { NatsConnection } from "@nats-io/transport-node";
 import {
-  EpEnvelopeError, openSessionRail, encodeTerminalData, terminalFrameBytes, decodeTerminalFrame,
+  EpEnvelopeError, openSessionRail, encodeTerminalData, terminalFrameBytes, decodeTerminalFrame, rejectionText,
   type SessionGrant, type SessionRail, type AttachSession, type TerminalFrame,
 } from "@cotal-ai/core";
 
@@ -259,7 +259,7 @@ export function serveSessionBridge(opts: ServeSessionBridgeOpts): SessionBridge 
       p = decodeTerminalFrame(data);
     } catch (e) {
       droppedFrames++;
-      console.error(`! session ${opts.grant.sessionId}: dropped an undecodable caller frame #${droppedFrames} (${(e as Error).message})`);
+      console.error(`! session ${opts.grant.sessionId}: dropped an undecodable caller frame #${droppedFrames} (${rejectionText(e)})`);
       return;
     }
     switch (p.k) {

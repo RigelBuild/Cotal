@@ -155,10 +155,9 @@
  * arrival it does not list (a `.php` naming the seam was the probe) is read by nothing and reddens
  * nothing. SKIP_DIRS is the same bet on directories: adding `examples` to it drops six container
  * files from the walk with every cell still green, because the census that guards the walk shares
- * the same skip list and simply sees a smaller tree. And the COUNTS measure population, not
- * identity, so moving sites between files is indistinguishable from losing them; the split into a
- * total and an untypechecked half catches a move ACROSS the halves, and nothing catches a move
- * within one.
+ * the same skip list and simply sees a smaller tree. The per-file census now catches a counted
+ * source disappearing even if another file adds a call. A hidden call compensated within the same
+ * file remains outside that census's identity bound.
  *
  * That last boundary COMPOSES with the door spellings below, and the composition is worth stating
  * because neither half is alarming alone. A door spelling is a way to write a call this reader does
@@ -168,9 +167,8 @@
  * runtime sits in the tree. That pair is only needed to hide an ALREADY COUNTED call; a call written
  * in a non-admitted spelling from the start is never counted, so adding one costs nothing at all. That was reproduced here rather than reasoned about: one site converted
  * to a nested table with `tls` dropped, one plain compensating call added, suite green at 143 of 143.
- * The counts are therefore NOT cover for the door. They pin that the SEEN population stays seen, and
- * even that only against an author who does not add a call while removing one. Closing it needs
- * identity rather than population, which is the site manifest named below and a different instrument.
+ * Total counts alone are therefore NOT cover for the door. The per-file census blocks that
+ * cross-file replacement, but cannot distinguish two calls exchanged within one file.
  *
  * THE DELIBERATE AUTHOR IS OUT OF SCOPE, by this file's construction rather than by omission, and
  * saying so is what keeps the paragraph above from reading as a security claim it cannot make. Every
@@ -179,17 +177,19 @@
  * a dummy call to a dummy manifest line. What such an instrument actually buys is accidental-drift
  * visibility, and the accidental form is the narrow real one: two unrelated edits landing in a single
  * change, one refactoring a site into a table and one adding a call elsewhere in the same half. That
- * is the case a follow-up earns, and the shape it should take is PER-FILE exact counts rather than
- * file and line, since line numbers would redden on every unrelated edit to a touched file and
- * reintroduce exactly the cry-wolf tax this design exists to avoid.
+ * is the case the per-file exact counts address. They do not pin line numbers, since those would
+ * redden on every unrelated edit to a touched file.
  *
  * A FOURTH boundary is the TREE ITSELF, and it matters more now that the counts are matched exactly
  * rather than as floors. This walk reads the FILESYSTEM, not the commit, so a working copy that has
  * run a build carries files a fresh clone does not. `node_modules`, `dist`, `build` and friends are
  * skipped, but a generated bundle landing outside those names is not: the Hermes sidecar at
  * `extensions/connector-hermes/plugin/cotal/_sidecar/` is gitignored build output and IS walked.
- * Today it costs nothing, measured both ways: 94/67 with the bundle present and 94/67 with it moved
- * aside. It is on the record because an EXACT count turns any future divergence into a red that
+ * The bundle adds one outside-smoke call: a clean checkout has 321/244 and a built checkout has
+ * 322/244. Packing `cotal-ai` (or `pnpm --dir bin seeded-connectors`) copies the same bundle to
+ * `bin/seeded-connectors/hermes/`, which is gitignored too and adds one more. Each copy has its own
+ * one-site pin, required whenever that artifact exists. An EXACT count otherwise
+ * turns this divergence into a red that
  * depends on whether someone ran `pnpm bundle`, which is a property of a disk rather than of a
  * revision. Reading it is deliberate rather than an oversight, since that bundle SHIPS in the
  * connector package: a seam call inside it would be real, and skipping it would be a hole in shipped
@@ -250,6 +250,9 @@
  * Run: pnpm smoke:required-arg-seam
  */
 import ts from "typescript";
+import { parse as parseMarkdown, postprocess, preprocess } from "micromark";
+import { gfm } from "micromark-extension-gfm";
+import { mdxjs } from "micromark-extension-mdxjs";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, dirname, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -431,12 +434,27 @@ const SEAMS: Seam[] = [
   // reads the lease row back from the bucket and takes it over, so the fixture's renew and release
   // are judged from the broker rather than from the fixture's own bookkeeping. Under `smoke/`, so
   // both counts move by one. It states `tls: false`.
-  // 229/179 -> 235/185: the fork's custody suites add six smoke-side calls, three in
-  // implementations/manager/smoke/custody-fail-closed.smoke.ts and three in seat-release.smoke.ts
-  // (one reads the lifecycle record via core readRecord). All state `tls: false`.
-  { fn: "standaloneConnectOpts", key: "tls", sites: 235, untypecheckedSites: 185 },
+  // 386/303 -> 392/309: the fork's custody suites add six smoke-side calls, three each in
+  // implementations/manager/smoke/custody-fail-closed.smoke.ts and seat-release.smoke.ts. All state
+  // `tls: false`.
+  { fn: "standaloneConnectOpts", key: "tls", sites: 392, untypecheckedSites: 309 },
 ];
-
+const SITE_COUNTS = JSON.parse(readFileSync(new URL("./required-arg-sites.json", import.meta.url), "utf8")) as Record<string, number>;
+const SIDECARS = [
+  "extensions/connector-hermes/plugin/cotal/_sidecar/standalone.cjs",
+  "bin/seeded-connectors/hermes/plugin/cotal/_sidecar/standalone.cjs",
+];
+/** Each built sidecar bundles manager-call.ts, so it carries a copy of every call counted there. */
+const SIDECAR_SITES = SITE_COUNTS["extensions/connector-core/src/manager-call.ts"];
+const countsByFile = (sites: Site[]): Record<string, number> => {
+  const counts: Record<string, number> = {};
+  for (const site of sites) counts[site.file] = (counts[site.file] ?? 0) + 1;
+  return counts;
+};
+const censusDrift = (expected: Record<string, number>, actual: Record<string, number>): string[] =>
+  [...new Set([...Object.keys(expected), ...Object.keys(actual)])].sort()
+    .filter((file) => expected[file] !== actual[file])
+    .map((file) => `${file}: found ${actual[file] ?? 0}, expected ${expected[file] ?? 0}`);
 /**
  * Directories the walk does not enter, named one by one on purpose. An earlier cut skipped every
  * dot-directory with a single `startsWith(".")`, which is a hole nobody wrote down: a source file
@@ -463,7 +481,10 @@ const EXTS = [".ts", ".tsx", ".mts", ".cts", ".mjs", ".cjs", ".js", ".jsx"];
  *    frontmatter is YAML, and its body mixes markdown with ESM, so any extraction here would be a
  *    guess. The file is therefore not parsed at all; instead the seam's NAME appearing anywhere in
  *    it is itself a failure that says so. Crude, exact, and fail-closed: a tripwire cannot bless a
- *    call, only refuse to answer for one.
+ *    call, only refuse to answer for one. The one thing taken out first is MDX's literal code: the
+ *    site's own tokenizer (the extensions `website/scripts/sync-docs.mjs` renders with) marks code
+ *    fences and code spans, which a page renders as text and never runs. ESM, expressions, JSX and
+ *    prose all stay in, and a page the tokenizer refuses is tripwired whole.
  */
 const CONTAINERS: Record<string, "frontmatter" | "script" | "tripwire"> = {
   ".astro": "frontmatter",
@@ -1698,18 +1719,34 @@ function extensionsPresent(dir: string, acc: Set<string> = new Set()): Set<strin
   return acc;
 }
 
+/**
+ * An MDX page with its code fences and code spans blanked, line breaks kept so a reported line is
+ * still the page's own. The page is tokenized as the site renders it; one the tokenizer refuses comes
+ * back unchanged, so its code is tripwired along with everything else.
+ */
+function withoutMdxCode(text: string): string {
+  let events: ReturnType<typeof postprocess>;
+  try { events = postprocess(parseMarkdown({ extensions: [mdxjs(), gfm()] }).document().write(preprocess()(text, undefined, true))); }
+  catch { return text; }
+  const chars = text.split("");
+  for (const [kind, { type, start, end }] of events)
+    if (kind === "enter" && (type === "codeFenced" || type === "codeText"))
+      for (let i = start.offset; i < end.offset; i++) if (chars[i] !== "\n" && chars[i] !== "\r") chars[i] = " ";
+  return chars.join("");
+}
+
 function sitesIn(file: string, text: string, seam: Seam): Site[] {
   // A tripwire container is never parsed, so it can only ever REFUSE. Naming the seam in a file this
   // reader cannot read is the one thing it can detect, and it is enough to force the question.
-  const tripwire = (from: number, why: string): Site[] => {
-    const at = text.indexOf(seam.fn, from);
+  const tripwire = (from: number, why: string, src = text): Site[] => {
+    const at = src.indexOf(seam.fn, from);
     return at < 0 ? [] : [{
       file, line: text.slice(0, at).split("\n").length, verdict: "unverifiable",
       detail: `\`${seam.fn}\` is named ${why}, which this reader cannot isolate without that language's own compiler; move the call into a source it can read, or teach this check to extract it`,
     }];
   };
   if (CONTAINERS[extOf(file)] === "tripwire")
-    return tripwire(0, `in a ${extOf(file)} file, whose executable part is mixed into its prose`);
+    return tripwire(0, `in a ${extOf(file)} file, whose executable part is mixed into its prose`, extOf(file) === ".mdx" ? withoutMdxCode(text) : text);
   const programs = parseAll(file, text);
   // A file that does not PARSE is refused rather than scanned, because the recovery tree the parser
   // hands back is not the program: it invents nodes that no valid source can produce, and a rule
@@ -1995,6 +2032,16 @@ console.log("A. the reader itself, on fixtures whose verdicts are known");
     mdx(`import { standaloneConnectOpts } from "x";`)[0]?.verdict === "unverifiable");
   check("...and is silent when it does not name the seam, so it is a tripwire and not a ban",
     mdx(`# just documentation`).length === 0);
+  check("...and silent when the seam is named only in a code fence or code span, which the page renders and never runs",
+    mdx("Use `standaloneConnectOpts` here.\n\n```ts\nstandaloneConnectOpts({ creds: c });\n```\n").length === 0);
+  check("...while naming it in prose, an expression or JSX outside code still refuses",
+    mdx(`Call standaloneConnectOpts here.`)[0]?.verdict === "unverifiable"
+    && mdx(`{standaloneConnectOpts({ creds: c })}`)[0]?.verdict === "unverifiable"
+    && mdx(`<Box opts={standaloneConnectOpts({ creds: c })} />`)[0]?.verdict === "unverifiable");
+  check("...at the real line of the real page, past a fence that also names it",
+    mdx("```ts\nstandaloneConnectOpts({ creds: c });\n```\n\n{standaloneConnectOpts({ creds: c })}")[0]?.line === 5);
+  check("...and a page the tokenizer refuses is tripwired whole, its code included",
+    mdx("```ts\nstandaloneConnectOpts({ creds: c });\n```\n\n{")[0]?.line === 2);
   // Inline `<script>` in HTML/SVG, which five pages here already carry. An earlier cut EXCLUDED
   // these on the reasoning that a browser cannot reach a NATS seam; that reasoning was wrong as
   // stated (browsers run NATS over WebSocket) and the true reason lived in another file, which is
@@ -2412,6 +2459,15 @@ console.log("A. the reader itself, on fixtures whose verdicts are known");
     one(`const src = { tls: undefined as any };\nconst { tls } = src;\nstandaloneConnectOpts({ creds: c, tls });`) === "missing-key");
   check("...while the same source holding a real boolean is untouched",
     one(`const src = { tls: false };\nconst { tls } = src;\nstandaloneConnectOpts({ creds: c, tls });`) === "has-key");
+  // An identifier bound to a member read is accepted without checking the member's value.
+  // `const options = { tls: undefined as any }; const tls = options.tls;` also passes here,
+  // while the runtime seam rejects it. This fixture covers the accepted syntax only.
+  check("an identifier bound to a resolved mesh's TLS member read is accepted",
+    one(`const mesh = resolveMeshTarget(cwd, { space, server });\nconst tls = mesh.tlsRequired;\nstandaloneConnectOpts({ creds: c, tls });`) === "has-key");
+  check("a const bound to false states an explicit TLS decision",
+    one(`const tls = false;\nstandaloneConnectOpts({ creds: c, tls });`) === "has-key");
+  check("a const bound to undefined still fails the explicit TLS decision check",
+    one(`const tls = undefined;\nstandaloneConnectOpts({ creds: c, tls });`) === "missing-key");
   check("...and a PRODUCER written here is refused where it is called, as the inline invocation is",
     one(`const mk = () => ({ tls: undefined as any });\nconst { tls } = mk();\nstandaloneConnectOpts({ creds: c, tls });`) === "unverifiable");
   check("...in the declaration spelling too, since the shape is the producer and not the arrow",
@@ -2561,6 +2617,21 @@ console.log("A. the reader itself, on fixtures whose verdicts are known");
 }
 
 console.log("\nB. the seam, across every source the compiler may or may not read");
+{
+  const call = "standaloneConnectOpts({ tls: false });";
+  const scan = (file: string, text: string) => summarize(sitesIn(file, text, SEAMS[0])).sites;
+  const expected = countsByFile([...scan("a.ts", call), ...scan("b.ts", call)]);
+  check("per-file counts accept the same sites without line-number pins",
+    censusDrift(expected, countsByFile([...scan("a.ts", `\n\n${call}`), ...scan("b.ts", call)])).length === 0);
+  check("per-file counts refuse replacing a hidden site with a call in another file at the same total",
+    censusDrift(expected, countsByFile(scan("b.ts", `${call}\n${call}`))).length === 2);
+  check("per-file counts name a newly added source rather than absorbing it into the population",
+    censusDrift(expected, countsByFile([...scan("a.ts", call), ...scan("b.ts", call), ...scan("new.ts", call)])).length === 1);
+}
+check("the literal per-file census accounts for the source and smoke totals",
+  Object.values(SITE_COUNTS).every((n) => Number.isSafeInteger(n) && n > 0)
+  && Object.values(SITE_COUNTS).reduce((a, b) => a + b, 0) === SEAMS[0].sites
+  && Object.entries(SITE_COUNTS).filter(([file]) => file.includes("/smoke/")).reduce((n, [, count]) => n + count, 0) === SEAMS[0].untypecheckedSites);
 const files = sources(ROOT);
 check("the scan reached a source tree at all (a zero-file walk would pass every cell below)", files.length > 500, files.length);
 
@@ -2589,6 +2660,14 @@ check("every container language present in this tree has a recorded decision, re
 for (const seam of SEAMS) {
   const all = files.flatMap((f) => sitesIn(relative(ROOT, f), readFileSync(f, "utf8"), seam));
   const { sites, aliased, bad, untypechecked } = summarize(all);
+  if (process.argv.includes("--census")) console.log(`REQUIRED_ARG_CENSUS ${JSON.stringify({ seam: seam.fn, sites })}`);
+  const walked = new Set(files.map((file) => relative(ROOT, file).split(sep).join("/")));
+  const sidecars = SIDECARS.filter((sidecar) => walked.has(sidecar));
+  const expectedByFile = { ...SITE_COUNTS, ...Object.fromEntries(sidecars.map((sidecar) => [sidecar, SIDECAR_SITES])) };
+  const normalized = sites.map((site) => ({ ...site, file: site.file.split(sep).join("/") }));
+  const drift = censusDrift(expectedByFile, countsByFile(normalized));
+  check(`\`${seam.fn}\`: every file matches its reviewed exact call count`, drift.length === 0, drift);
+  const expectedSites = seam.sites + sidecars.length * SIDECAR_SITES;
   // Printed on SUCCESS as well as failure: a legitimate removal then shows the number to put back,
   // instead of sending the next author into this file to find out what the floor should become.
   console.log(`  · ${seam.fn}: ${sites.length} call sites (${untypechecked.length} under smoke/, ${sites.length - untypechecked.length} outside smoke/)`);
@@ -2609,11 +2688,10 @@ for (const seam of SEAMS) {
   // and each of those deserves a human look rather than an inequality that absorbs it.
   //
   // The cost is honest and small: a PR that legitimately adds or removes a seam call site updates
-  // one number here, and the failure prints both counts so there is nothing to work out. What this
-  // still cannot do is notice a site that moves BETWEEN files, since a count carries no identity,
-  // which is why the reader above refuses what it cannot resolve instead of relying on this.
-  check(`\`${seam.fn}\`: the scan finds EXACTLY ${seam.sites} call sites (if you added or removed one, update this number deliberately)`,
-    sites.length === seam.sites, { found: sites.length, expected: seam.sites });
+  // the per-file census and the totals here. The per-file check distinguishes cross-file changes,
+  // but a replacement inside the same file still requires review.
+  check(`\`${seam.fn}\`: the scan finds EXACTLY ${expectedSites} call sites (if you added or removed one, update the per-file census deliberately)`,
+    sites.length === expectedSites, { found: sites.length, expected: expectedSites });
 
   // Keep the smoke subtree census separate: a bare "> 0" would miss disappearing sites.
   // The legacy field name is not a typecheck coverage claim; packages now typecheck their smokes.

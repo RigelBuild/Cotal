@@ -5,12 +5,12 @@ authenticated local protocol a manager worker uses to adopt that handle.
 
 **Tier:** `packages/` (leaf). Depends on PTY and terminal-mirror libraries, not on
 `@cotal-ai/core`, workspace, implementations, connectors, or NATS. The manager's `pty` runtime
-is the first production caller.
+calls it only to adopt and reap seats an earlier manager left under a custodian.
 
 Linux is the production transport in this cut. `create`/`spawn`/`adopt` in this package throw a
 named `custody transport unsupported on <platform>` error on darwin and win32. There is no
-in-process node-pty fallback here. The manager's `pty` runtime still spawns in-process off
-Linux and only `adopt` throws that named error.
+in-process node-pty fallback here. The manager's `pty` runtime spawns in-process on every
+platform. Its custodial `adopt` and `reap` are Linux-only and throw that named error elsewhere.
 
 `peerCredentials(socket)` and its `PeerCredentials` type are exported from the package root.
 For a connected Linux Unix socket, the function returns the kernel's peer `pid`, `uid` and
@@ -19,32 +19,44 @@ against their own authorization policy; a PID is not a lifecycle or ownership fe
 throws for an unsupported transport or missing native helper, and for a socket without a
 file descriptor. No PTY or custodian is started by reading the peer identity.
 
+The same helper also carries the host primitives the local `cotal daemon` endpoint uses, which,
+unlike custody, are built for Linux, macOS and Windows (`src/host.ts`): `localPeerCredentials`
+(Linux `SO_PEERCRED`; macOS `LOCAL_PEERCRED`, the uid `getpeereid(3)` reads, with
+`LOCAL_PEERPID`), `lockExclusiveNb` (`flock(2)`; on Windows `LockFileEx` on one byte past any
+content), `processStartTime` (macOS and Windows), `darwinUserCacheDir`, `darwinLaunchdJob` (a
+read-only `SMJobCopyDictionary` lookup of a loaded job, resolved at run time because Apple
+deprecated it with no replacement and documents its contents as unstable), and on Windows
+`windowsUserSid`, `windowsDirSecurity`, `listenPipe` and `connectPipe`. The pipe functions create,
+connect and authenticate a named pipe in native code, because Node's own pipe server creates it
+with a default DACL that admits Everyone and Anonymous for reading and accepts remote clients:
+every instance gets a protected DACL granting only the user's SID, `FILE_FLAG_FIRST_PIPE_INSTANCE`
+on the first and `PIPE_REJECT_REMOTE_CLIENTS` on all, and each side reads the other's process
+token user and creation time before a connection is handed to Node as a descriptor.
+`native/peercred_win32.c` documents each flag.
+
 The custodian raises its child's `oom_score_adj` to 500 and writes one line to `custodian.log`
-when the kernel refuses.
+when the kernel refuses. The manager's in-process `pty` runtime applies the same preference
+through the exported `preferSeatForOomKill`.
 
 The Linux natives are compiled for the host arch by `pnpm build`: the `SO_PEERCRED` helper
 `peercred.node` and `pty.node`, built from the vendored `node-pty@1.2.0-beta.12` source in
 `native/node-pty/` plus `pidfd.patch`, which opens a pidfd for each forked child. That is a
 developer tree, not a publishable one: it prints a host-dev-build banner and writes
-`build/Release/linux-<arch>/`. Pack and publish require both `linux-x64` (ELF e_machine 62) and
-`linux-arm64` (ELF e_machine 183) directories, copied in by `scripts/seat-assemble-natives.mjs`
-from native builder jobs. `prepack` and `prepublishOnly` assert all four files, then compile
-TypeScript without rebuilding a native. The ARM load job installs the same packed tarball
 with no rebuild. The compile uses the `include/node` directory next to the running
-Node binary, not a hardcoded `/usr/include/node`. Off Linux the compile script is a no-op, so
-Windows `pnpm build` does not need headers or a C compiler. There is no `binding.gyp`, so
+Node binary, not a hardcoded `/usr/include/node`. Off Linux `pnpm build` skips the compile, so
+a macOS or Windows `pnpm build` does not need headers or a C compiler. `pnpm build:native`
+compiles for the host on all three: macOS with `cc`, targeting macOS 11 like the workspace binding, into
+`build/Release/darwin-<arch>/`, Windows with `cl.exe` from the MSVC Developer Command Prompt against
+the Node headers and import library the workspace binding pins in `native/node-sdk.json`, into
+`build/Release/win32-<arch>/`. Until a macOS or Windows helper is built or shipped, the host
+primitives throw that it is missing. There is no `binding.gyp` in the package, so
 `pnpm install` does not infer `node-gyp rebuild`. Customer `npm i` does not compile it. A host
 without a compiler installs the prebuilt natives; a missing native, an unsupported
 `linux-<arch>`, or a load failure throws rather than compiling in place.
 
-**Minimum glibc 2.34.** The natives are built on the plain `ubuntu-latest` and
-`ubuntu-24.04-arm` runners, and `pty.node` binds `forkpty` at `GLIBC_2.34`; it also needs
-`GLIBCXX_3.4.22` and `CXXABI_1.3.9`. `scripts/assert-native-ceiling.mjs` fails a native job
-whose build needs anything newer. The child pidfd needs Linux 5.3; on an older kernel the
-custodian refuses to launch rather than custody a child it cannot name.
-
 The package.json has no `os` / `cpu` / libc fields. Manager depends on this package on every
-platform: off Linux it still loads, and only `adopt` throws the named custody-transport error.
+platform: off Linux it still loads, and custody adoption, reaping and `cotal seats` throw the named
+custody-transport error.
 Gating install would skip the package on darwin and win32 and break that path. A musl or
 non-Linux host that reaches `peerCredentials` throws; there is no compile fallback and no
 silent degrade. First use of the helper is the right place for that refusal.
@@ -60,10 +72,6 @@ observer of an exited child, keeps the process. A connected socket that never au
 not: it owns no session, no output subscription and no wait, so a settle owes it nothing. A seat
 whose child has already exited at listen stays up briefly so the launcher can adopt it.
 
-A reap never signals a numeric pid or process group. It proves a seat gone only through its
-contained cgroup. Without that proof it returns retained/unprovable, requesting a custodian stop
-when it can read the record. A reaped seat's record stays until explicit release with
-`removeSeatCustody`.
 
 A custodian with no authenticated controller stops its child and exits after `UNATTENDED_MS`
 (ten minutes, overridable at launch with `COTAL_SEAT_UNATTENDED_MS`). The window restarts at each
@@ -82,8 +90,6 @@ read, or whose start and boot identity do not tie its pids to this boot, is repo
 and left on disk, with or without `drain`. On a host that publishes no boot identity, no record
 can be tied to this boot, so every one is refused. A seat whose child still holds its recorded start
 identity is reported as `live-child` and never signalled. With `drain`, every other seat goes
-through `reapSeat`. One it cannot prove gone is reported as `refused` and left on disk.
-`cotal seats [--drain]` is the operator command over it.
 
 Generation CAS, the crash journal, N/N-1 protocol compatibility, and manager-worker activation
 are later milestones. This package currently speaks a single implicit controller.

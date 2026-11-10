@@ -2,7 +2,7 @@
  * Claude seat env: the documented auth vars must reach the child; host-session markers must not.
  *
  * THE BLOCKER THIS GRADES. After launchEnv stopped inheriting, CLAUDE_CODE_OAUTH_TOKEN (the name
- * docs/deploy.md and deploy/ tell operators a container Claude authenticates with) was silently
+ * docs/deploy.mdx and deploy/ tell operators a container Claude authenticates with) was silently
  * absent: this connector called launchEnv with no providerKeys. A container has no Keychain, so
  * the seat boots and then cannot reach Anthropic. That is the fallback failure mode an allowlist
  * must not have: dropping a credential the docs promise.
@@ -18,7 +18,9 @@
  *
  * Run: pnpm smoke:claude-launch-env
  */
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { claudeConnector, CLAUDE_PROVIDER_KEYS } from "../src/extension.js";
 
 let pass = 0;
@@ -178,19 +180,40 @@ check(
 );
 
 // A managed seat has nobody at its terminal to answer a permission prompt, so the launch bypasses
-// prompts unless the operator's launch options name a permission flag themselves.
+// prompts unless the operator's launch options name a permission flag themselves. The manager marks
+// a managed launch with its `cwd`; a foreground launch has none and keeps Claude's own mode.
 const permissionModes = (args: string[]): string[] =>
   args.flatMap((a, i) => (a === "--permission-mode" ? [args[i + 1] ?? ""] : []));
-const defaultArgs = claudeConnector.buildLaunch({ space: "smoke", name: "claude-3", events: false } as never).args;
+// A managed launch needs a declared cotal server: this project's .mcp.json names one, so the cells
+// below launch; a cwd without one, under a user config without one, refuses.
+const managedRoot = mkdtempSync(join(tmpdir(), "cotal-launch-env-"));
+const managedCwd = join(managedRoot, "project"); mkdirSync(managedCwd);
+writeFileSync(join(managedCwd, ".mcp.json"), JSON.stringify({ mcpServers: { cotal: { command: "node" } } }));
+const emptyProfile = join(managedRoot, "profile"); mkdirSync(emptyProfile);
+const bareCwd = join(managedRoot, "bare"); mkdirSync(bareCwd);
+const savedConfigDir = process.env.CLAUDE_CONFIG_DIR;
+process.env.CLAUDE_CONFIG_DIR = emptyProfile;
+let refusal = "";
+try { claudeConnector.buildLaunch({ space: "smoke", name: "claude-7", events: false, cwd: bareCwd } as never); } catch (e) { refusal = (e as Error).message; }
+if (savedConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = savedConfigDir;
+check("a managed launch with no declared cotal server refuses and names the remedy", /server:cotal/.test(refusal) && /cotal setup/.test(refusal), refusal);
+const defaultArgs = claudeConnector.buildLaunch({ space: "smoke", name: "claude-3", events: false, cwd: managedCwd } as never).args;
 check(
-  "a launch with no permission option bypasses permission prompts",
+  "a managed launch with no permission option bypasses permission prompts",
   JSON.stringify(permissionModes(defaultArgs)) === JSON.stringify(["bypassPermissions"]),
   permissionModes(defaultArgs),
+);
+const foregroundArgs = claudeConnector.buildLaunch({ space: "smoke", name: "claude-6", events: false } as never).args;
+check(
+  "a foreground launch with no permission option keeps Claude's own mode",
+  permissionModes(foregroundArgs).length === 0 && !foregroundArgs.includes("--dangerously-skip-permissions"),
+  foregroundArgs.filter((a) => a.includes("permission")),
 );
 const promptedArgs = claudeConnector.buildLaunch({
   space: "smoke",
   name: "claude-4",
   events: false,
+  cwd: managedCwd,
   launchOptions: { "permission-mode": "default" },
 } as never).args;
 check(
@@ -210,6 +233,7 @@ check(
   skippedArgs.filter((a) => a.includes("permission")),
 );
 
+rmSync(managedRoot, { recursive: true, force: true });
 if (fail) {
   console.log(`SUITE COMPLETE: ${pass} passed, ${fail} failed`);
   process.exit(1);

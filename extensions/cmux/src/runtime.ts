@@ -8,11 +8,9 @@ import {
   type AgentHandle,
   type ConfirmPane,
   type LaunchSpec,
-  type Pane,
   type Runtime,
   type RuntimeProvider,
-  type Tab,
-  type TerminalLayout,
+  type StartupOutcome,
 } from "@cotal-ai/core";
 import * as cmux from "./driver.js";
 
@@ -27,15 +25,20 @@ function shellQuote(s: string): string {
 }
 
 /** cmux can't run a command in a fresh surface directly, and panes start under a login shell
- *  (maybe nushell) before bash — so we write each pane's launch as a temp bash script and point
- *  the tab at it, sidestepping all shell quoting (callers pass argv, never shell strings). `login`
- *  runs it as a login shell (`bash -l`) so the user's PATH is present — setup's panes run further
- *  `cotal` subcommands that resolve `claude`. `exec env …` (not `exec …`): exec can't take KEY=val
- *  assignments, so `env` applies them and then execs the command. `isolate` (agent-spawn panes)
- *  adds `-i` so the pane inherits ONLY the connector-declared env, not the cmux server's (P3 — the
- *  operator's unrelated secrets don't reach a spawned agent); setup panes keep the inherited env. */
-export function paneCommand(pane: Pane, login: boolean, isolate = false): { command: string; dir: string } {
-  const env = Object.entries(pane.env ?? {}).map(([k, v]) => `${k}=${shellQuote(v)}`);
+ *  (maybe nushell) before bash — so we write the pane's launch as a temp bash script and point
+ *  the tab at it, sidestepping all shell quoting (callers pass argv, never shell strings).
+ *  `exec env -i …` (not `exec …`): exec can't take KEY=val assignments, so `env` applies them and
+ *  then execs the command, and `-i` makes the pane inherit ONLY the connector-declared env, not the
+ *  cmux server's (P3 — the operator's unrelated secrets don't reach a spawned agent). */
+export function paneCommand(pane: { command: string; args?: string[]; cwd?: string; env?: Record<string, string> }): {
+  command: string;
+  dir: string;
+} {
+  const env = Object.entries(pane.env ?? {}).map(([k, v]) => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k))
+      throw new Error(`cmux: refusing to render unsafe env var name ${JSON.stringify(k)}`);
+    return `${k}=${shellQuote(v)}`;
+  });
   const cmd = [...env, shellQuote(pane.command), ...(pane.args ?? []).map(shellQuote)].join(" ");
   const cd = pane.cwd ? `cd ${shellQuote(pane.cwd)}\n` : "";
   // The script holds the pane's env inline (the agent's creds + control token, and any provider key).
@@ -45,26 +48,15 @@ export function paneCommand(pane: Pane, login: boolean, isolate = false): { comm
   // exits instead of running the agent when the removal fails; a caller whose cmux command fails
   // removes `dir` itself, since nothing will run the script.
   const dir = mkdtempSync(join(tmpdir(), "cotal-pane-"));
-  const script = `#!/usr/bin/env bash\nrm -rf -- ${shellQuote(dir)} || exit\n${cd}exec env ${isolate ? "-i " : ""}${cmd}\n`;
+  const script = `#!/usr/bin/env bash\nrm -rf -- ${shellQuote(dir)} || exit\n${cd}exec env -i ${cmd}\n`;
   const scriptPath = join(dir, "launch.sh");
   writeFileSync(scriptPath, script, { mode: 0o600 });
-  return { command: `bash ${login ? "-l " : ""}${shellQuote(scriptPath)}`, dir };
+  return { command: `bash ${shellQuote(scriptPath)}`, dir };
 }
 
 /** A single-terminal pane node in cmux's layout JSON. */
 function surface(command: string): unknown {
   return { pane: { surfaces: [{ type: "terminal", command }] } };
-}
-
-/** Translate a backend-agnostic {@link Tab} into a cmux layout JSON string — the one place that
- *  knows cmux's layout shape. One pane → a bare terminal; several → a split (`direction` + `split`
- *  ratio). These panes run under a login shell. */
-function cmuxLayout(label: string, tab: Tab): string {
-  const nodes = tab.panes.map((p) => surface(paneCommand(p, true).command));
-  if (nodes.length === 1 && !tab.split) return JSON.stringify(nodes[0]);
-  if (!tab.split)
-    throw new Error(`cmux layout "${label}": ${nodes.length} panes need a split (direction + ratio)`);
-  return JSON.stringify({ direction: tab.split.direction, split: tab.split.ratio, children: nodes });
 }
 
 /**
@@ -77,6 +69,8 @@ function cmuxLayout(label: string, tab: Tab): string {
  */
 export class CmuxRuntime implements Runtime {
   readonly kind = "cmux";
+  readonly streamsTerminal = false;
+  readonly reportsStartupOutcome = true;
 
   spawn(name: string, spec: LaunchSpec, cwd: string): AgentHandle {
     // `name` becomes a temp-script key and a `cotal-<name>` tab id — keep it a bare token
@@ -93,13 +87,9 @@ export class CmuxRuntime implements Runtime {
     let launch: { command: string; dir: string };
     let watch: ((pane: ConfirmPane) => void) | undefined;
     try {
-      if (spec.confirmBefore?.length && spec.confirm === undefined) throw new Error("startup choices require a final confirmation prompt");
-      watch = spec.confirm === undefined ? undefined : confirmWatch(spec.confirm, spec.confirmBefore);
-      launch = paneCommand(
-        { command: spec.command, args: spec.args, env: spec.env, cwd },
-        false,
-        true, // isolate: spawned agent gets ONLY the connector-declared env (P3)
-      );
+      if ((spec.confirmBefore?.length || spec.confirmReady?.length || spec.confirmBlockers?.length) && spec.confirm === undefined) throw new Error("startup choices require a final confirmation prompt");
+      watch = spec.confirm === undefined ? undefined : confirmWatch(spec.confirm, spec.confirmBefore, spec.confirmReady, spec.confirmBlockers, spec.confirmNotice);
+      launch = paneCommand({ command: spec.command, args: spec.args, env: spec.env, cwd });
     } catch (err) {
       throw new SpawnRefused((err as Error).message);
     }
@@ -113,7 +103,9 @@ export class CmuxRuntime implements Runtime {
       throw err;
     }
 
+    let startup: StartupOutcome = "pending";
     watch?.({
+      settled: (outcome) => { startup = outcome; },
       read: () => (cmux.workspaceState(workspace) === "exited" ? undefined : cmux.readScreen({ workspace })),
       enter: () => cmux.sendKey("enter", { workspace }, CONFIRM_CALL),
       down: () => cmux.sendKey("down", { workspace }, CONFIRM_CALL),
@@ -130,6 +122,7 @@ export class CmuxRuntime implements Runtime {
     return {
       name,
       kind: "cmux",
+      startupOutcome: () => startup,
       status: () => {
         try {
           return cmux.workspaceState(workspace);
@@ -182,19 +175,3 @@ export const cmuxRuntimeProvider: RuntimeProvider = {
 };
 
 registry.register(cmuxRuntimeProvider);
-
-/** Self-registering terminal-layout provider — lets a caller (e.g. `cotal setup`) open/close
- *  cmux tabs by resolving `registry.resolve("terminal","cmux")`, so an implementation drives cmux
- *  without importing this package. The caller passes a backend-agnostic {@link Tab};
- *  {@link cmuxLayout} turns it into cmux's native layout JSON here, so no cmux-specific shape lives
- *  in the caller. */
-export const cmuxTerminalProvider: TerminalLayout = {
-  kind: "terminal",
-  name: "cmux",
-  available: () => cmux.available(),
-  open: (label, tab, opts) => cmux.openWorkspace(label, cmuxLayout(label, tab), opts),
-  close: (ref) => cmux.closeWorkspace(ref),
-  refs: (label) => cmux.workspaceRefs(label),
-};
-
-registry.register(cmuxTerminalProvider);

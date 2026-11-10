@@ -1,6 +1,6 @@
 import type { CotalEndpoint, Presence } from "@cotal-ai/core";
 import { runCommand, type CommandCtx } from "../src/console/commands.js";
-import type { MeshSnapshot } from "../src/view/mesh-view.js";
+import type { MeshSnapshot } from "@cotal-ai/workspace/view";
 
 type TestEndpoint = Pick<CotalEndpoint, "unicast">;
 type TestCommandCtx = Omit<CommandCtx, "ep"> & { ep: TestEndpoint };
