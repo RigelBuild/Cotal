@@ -72,6 +72,7 @@ export const QUARANTINED = {
   "smoke:broker-migration": { reason: "RIG-9150 upstream: unadopted broker spawns in web post-capability/send smokes, 6/1 on pristine 82a97c1f (local run)", recheckBy: "2026-12-31" },
   "smoke:ps-user-mode": { reason: "RIG-9150 CI-env: Next line is `pnpm cotal login` under CI, assertion hard-codes `cotal login`; 63/0 locally on fork and 82a97c1f", recheckBy: "2026-12-31" },
   "smoke:membership-rw-renewal": { reason: "RIG-9150 flaky: reconnect sweep cell failed once on CI (3f4f77b1 shard 3); 52/52 locally on fork and 82a97c1f", recheckBy: "2026-12-31" },
+  "smoke:signal-exits:live": { reason: "RIG-9150 CI-env: CI cannot signal nats-server pid 1 (EPERM), leaving manager stop unknown; 16/18 cells pass", recheckBy: "2026-12-31" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */
