@@ -1,3 +1,2 @@
-# Install-probe CI shape (#1412): the install-probe and release jobs exist with the right
-# dependency edges in changesets.yml.
+# Live install-probe CI shape: cold qualification and installer lanes.
 smoke:install-probe-ci

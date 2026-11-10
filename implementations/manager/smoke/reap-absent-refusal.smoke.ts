@@ -378,7 +378,7 @@ instrument.forEach(([name, , holds], i) => {
 //   spawnCustodied: carries it into the throw, saying the seat was not proved gone.
 // restartSupervisedSeat no longer calls requireRuntimeReap. It proves the previous seat's local work
 // ended through runtime.reapWork before the resume launches, and a refusal there stays with that proof.
-const REVIEWED_SITES = ["Manager.reapOrphanSeat", "Manager.reapOrphanedResumeSeat", "Manager.spawnCustodied"];
+const REVIEWED_SITES = ["Manager.provePredecessor", "Manager.reapOrphanSeat", "Manager.reapOrphanedResumeSeat", "Manager.spawnCustodied"];
 const managerConfig = ts.getParsedCommandLineOfConfigFile(resolve(here, "..", "tsconfig.json"), {}, { ...ts.sys, onUnRecoverableConfigFileDiagnostic: (d) => { throw new Error(ts.flattenDiagnosticMessageText(d.messageText, " ")); } })!;
 const managerProgram = ts.createProgram({ rootNames: [managerFile], options: { ...managerConfig.options, noEmit: true } });
 const managerSource = managerProgram.getSourceFile(managerFile)!;

@@ -17,6 +17,7 @@ import {
 import { authDir, recordMesh, saveSpaceAuth } from "@cotal-ai/workspace";
 import { SMOKE_BROKER_TOKEN, emitSentinel } from "@cotal-ai/smoke-kit";
 import { runCli } from "@cotal-ai/cli";
+import "@cotal-ai/auth";
 import { Manager } from "../src/manager.js";
 import { bootBroker } from "./_boot-broker.js";
 
@@ -53,7 +54,7 @@ async function runMint(argv: string[]): Promise<{ out: string; code: number }> {
   console.error = (...args: unknown[]) => { lines.push(args.join(" ")); };
   process.exit = ((next?: number) => { code ??= next ?? 0; throw new ExitSignal(); }) as never;
   try {
-    await runCli(registry, ["mint", ...argv]);
+    await runCli(registry, ["auth", "mint", ...argv]);
   } catch (error) {
     if (!(error instanceof ExitSignal)) throw error;
   } finally {
@@ -99,7 +100,10 @@ try {
   check("JWT contains every spawn caller permission row", spawnRows.every((row) => originalFacts.pubAllow.includes(row)), {
     missing: spawnRows.filter((row) => !originalFacts.pubAllow.includes(row)),
   });
-  check("mint prints its capabilities", /capabilities:\s+spawn/.test(minted.out), minted.out);
+  check("mint summary reports the agent grants", /^\s*Profile:\s+agent$/m.test(minted.out)
+    && /^\s*May read:\s+no channel$/m.test(minted.out)
+    && /^\s*May post:\s+no channel$/m.test(minted.out)
+    && /^\s*Role:\s+none$/m.test(minted.out), minted.out);
 
   const peerRoot = join(dir, "peer");
   mkdirSync(join(peerRoot, ".cotal"), { recursive: true });

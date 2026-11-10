@@ -195,6 +195,9 @@ class FakeMesh {
     throw new Error(`FakeMesh: no turn was surfaced, so nothing can be committed: ${goalIds.join(",")}`);
   }
 
+  // The dispatch note is a no-op for run turns; a once task is never surfaced here.
+  noteTurnsDispatched(_goalIds: readonly string[]): void {}
+
   async setStatus(status: string, activity?: string): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, status === "working" && activity === "thinking" ? 3 : 0));
     this.statuses.push({ status, activity });

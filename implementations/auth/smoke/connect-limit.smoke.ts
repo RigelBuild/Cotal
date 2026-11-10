@@ -227,7 +227,8 @@ try {
   const gap = (calls[2] ?? Infinity) - (calls[1] ?? 0);
   // Its tokens are born past their renewal window, so the rebuild after the third call may renew at
   // once: the cell grades the gap the wait set, not how many calls followed it.
-  check("a bearer source's retryAfterSeconds is kept exactly: asked again after 7s, not on the 2.5-5s backoff", calls.length >= 3 && gap >= 7_000 && gap < 9_000, { calls: calls.length, gap });
+  // A timer starts from libuv's cached loop time, which the source's Date.now() stamp can lead by a few ms; 2.5-5s backoff stays far below.
+  check("a bearer source's retryAfterSeconds is kept exactly: asked again after 7s, not on the 2.5-5s backoff", calls.length >= 3 && gap >= 6_990 && gap < 9_000, { calls: calls.length, gap });
   await pacedEp.stop();
 
   await calloutNc.close();

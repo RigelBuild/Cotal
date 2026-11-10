@@ -175,10 +175,11 @@ try {
     if (out.state !== "credential") throw new Error(`fixture credential failed: ${JSON.stringify(out)}`);
     return out;
   };
+  type GateRow = { state: string; generation: number; processEpoch: number; registrationRevision: number;
+    serviceAuthority: { activationIssued: boolean; registration?: { requestId: string; operationId: string }; pendingRegistration?: { operationId: string; requestId: string } } };
   const gate = async (ep: string, iid: string) => {
     const e = (await authKv.get(epgateKey(ep, iid)))!;
-    return { revision: e.revision, row: JSON.parse(dec.decode(e.value)) as { state: string; generation: number; processEpoch: number;
-      serviceAuthority: { activationIssued: boolean; registration?: { requestId: string; operationId: string }; pendingRegistration?: { operationId: string; requestId: string } } } };
+    return { revision: e.revision, row: JSON.parse(dec.decode(e.value)) as GateRow };
   };
   const indexOf = async (ep: string, iid: string) => {
     const e = await authKv.get(`svcintx.${endpointToken(ep)}.${iid}`);
@@ -383,11 +384,19 @@ try {
   }, { at: "registering:barrier", resumed: "registered", cancelled: "revoking:deny-new-landed" });
   const gd = await gate(ordersEp, d.sr.instanceId);
   c.check("E(d) the resumed registration completes the same operation", gd.row.serviceAuthority.registration?.operationId === engineId(ownerA, d.run.r), gd.row);
-  let eStop = "";
+  let eStop = "", eOperationId = "", eSpecCommitted = false;
+  let eGateAtStop: GateRow | undefined;
   await point("(e) spec written, no reopen", "org.example.stop-e", async (s) => {
-    const id = await simIntent(ownerA, s.proposal); eStop = await simSpec(s, s.proposal, id); return { r: s.proposal, who: "a" };
+    const id = await simIntent(ownerA, s.proposal); eOperationId = id; eStop = await simSpec(s, s.proposal, id);
+    eGateAtStop = (await gate(s.ep, s.instanceId)).row;
+    const specAtStop = await recordsKv.get(recordSpecKey(RECORD_KINDS.svc, [s.ep, s.instanceId]));
+    eSpecCommitted = specAtStop?.operation === "PUT";
+    return { r: s.proposal, who: "a" };
   }, { at: "registering:barrier", resumed: "registered", cancelled: "revoking:deny-new-landed" });
-  c.check("E(e) the stop came from the stopped reopen, which left the gate frozen", /sim stop before reopen/.test(eStop) && /left frozen/.test(eStop), eStop);
+  c.check("E(e) a stopped reopen leaves the committed spec behind its frozen registration gate",
+    /sim stop before reopen/.test(eStop) && /reopen's outcome is unknown.*gate is still frozen/.test(eStop) && eSpecCommitted && eGateAtStop?.state === "frozen"
+    && eGateAtStop.serviceAuthority.pendingRegistration?.operationId === eOperationId,
+    { error: eStop, gate: eGateAtStop, specCommitted: eSpecCommitted });
   const f = await point("(f) registered, reply lost", ordersEp, async (s) => { await registered(s); return { r: s.proposal, who: "a" }; },
     { at: "registered", resumed: "registered", cancelled: "revoking:deny-new-landed" });
   const gf = await gate(ordersEp, f.sr.instanceId), fAgain = await viaProvider("a", f.run.r), gf2 = await gate(ordersEp, f.sr.instanceId);

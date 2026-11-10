@@ -60,7 +60,7 @@ const navigation = [
         group('Embedding reference', ['exports', 'endpoints', 'remote-clients', 'daemons', 'provisioning', 'schema-inspection', 'service-authority', 'service-custody', 'service-host', 'service-access', 'service-callers', 'manager', 'delegated-seats'].map(name => page(`docs/embedding-${name}.mdx`))),
         group('Connector reference', [
           page('docs/connector-runtime-reference.mdx'),
-          ...['claude', 'opencode', 'codex', 'hermes', 'jcode', 'pi'].map(name => page(`docs/${name}-connector-reference.mdx`)),
+          ...['claude', 'opencode', 'codex', 'hermes', 'jcode', 'pi', 'omp'].map(name => page(`docs/${name}-connector-reference.mdx`)),
         ]),
       ]),
     ]),

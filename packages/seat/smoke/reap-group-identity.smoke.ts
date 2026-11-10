@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { processStartToken, reapSeat } from "../src/index.js";
+import { processStartToken, reapSeat, type SeatReapEvidence } from "../src/index.js";
 
 if (process.platform !== "linux") {
   const root = mkdtempSync(join(tmpdir(), "seat-group-unsupported-"));
@@ -66,12 +66,12 @@ try {
     attempted.push(pid);
     throw Object.assign(new Error("fixture intercepted prospective signal"), { code: "EPERM" });
   }) as typeof process.kill;
-  let refusal = "";
-  try { await reapSeat(root, id, { graceMs: 400 }); } catch (error) { refusal = (error as Error).message; }
+  let evidence: SeatReapEvidence | undefined;
+  try { evidence = await reapSeat(root, id, { graceMs: 400 }); }
   finally { process.kill = realKill; }
   check("dead-leader numeric group cannot authorize a signal", attempted.length === 0);
-  check("unverified group descendant retains its exact identity", processStartToken(descendant) === descendantStart);
-  check("ambiguous group ownership refuses reaping", /group ownership is unproved/.test(refusal));
+  check("unverified group stays alive with its exact identity", processStartToken(descendant) === descendantStart && groupOf(descendant) === leader.pid);
+  check("ambiguous group reports retained/unprovable with the fork's stop reason", evidence?.outcome === "retained" && evidence.reason === "unprovable" && evidence.stop === "no-custodian" && /has no contained cgroup proof; stop no-custodian/.test(evidence.detail));
   check("ambiguous group retains the custody record", existsSync(record));
   assert.equal(checks, 8);
   console.log(`SEAT GROUP IDENTITY (${checks} passed, 0 failed; simulated stale record, real kernel group)`);

@@ -948,6 +948,7 @@ const makeCrashHandle = (name: string) => {
       for (const fn of [...exits]) fn();
     },
     waitForExit: async () => {},
+    waitForWorkExit: async () => { if (running) throw new Error("work is still running"); },
     interrupt: () => {},
     attach: () => session,
     crash: () => {
@@ -964,6 +965,7 @@ let rosterTick = 1;
 const localAgents = (localMgr as unknown as { agents: Map<string, { id: string; name: string; lifecycleUid: string; restart?: { recovering: boolean } }> }).agents;
 (localMgr as unknown as { runtime: unknown }).runtime = {
   kind: "pty",
+  supportsWorkClosure: true,
   spawn: (name: string, spec: { env?: Record<string, string | undefined> }) => {
     localSpecs.push({ name, env: spec.env ? { ...spec.env } : undefined });
     return makeCrashHandle(name);

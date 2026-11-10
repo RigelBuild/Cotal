@@ -97,7 +97,7 @@ let spawnAs: RuntimeReference | undefined;
 const fakeSession = { cols: 80, rows: 24, backlog: () => Buffer.alloc(0), onData: () => () => {}, onExit: () => () => {}, write: () => {}, resize: () => {} };
 const fakeHandle = (name: string, reference: RuntimeReference | undefined): AgentHandle => {
   let running = true;
-  return { name, kind: "pty", reference, status: () => running ? "running" : "exited", stop: () => { running = false; }, waitForExit: async () => { running = false; }, interrupt: () => {}, attach: () => fakeSession };
+  return { name, kind: "pty", reference, status: () => running ? "running" : "exited", stop: () => { running = false; }, waitForExit: async () => { running = false; }, waitForWorkExit: async () => {}, interrupt: () => {}, attach: () => fakeSession };
 };
 /** A seat whose stop is only a request: its exit is proved when the smoke calls `exit()`, and never
  *  once `refuse()` makes every exit wait reject. */
@@ -135,10 +135,12 @@ function gatedHandle(name: string): { handle: AgentHandle; stopped: () => boolea
     refuse: () => { refused = true; },
   };
 }
-const fakeRuntime: CustodialRuntime = {
+const fakeRuntime: CustodialRuntime & { supportsWorkClosure: true; reapWork: (reference: RuntimeReference) => Promise<void> } = {
   kind: "pty",
   streamsTerminal: false,
+  supportsWorkClosure: true,
   reserve: () => ({ kind: "pty", id: randomUUID().replaceAll("-", "") }),
+  reapWork: async () => {},
   spawn: (name, _spec, _cwd, reference) => {
     spawnCalls++;
     if (failNextSpawn) {
@@ -177,7 +179,7 @@ const M = mgr as unknown as {
   retryStaticReconcile: (key: string) => Promise<void>;
   userMode: boolean;
   unrecordedCustody: Map<string, RuntimeReference>;
-  spawnCustodied: (name: string, spec: unknown, cwd: string, reserved: RuntimeReference, slot: { id: string; lifecycleUid: string }) => Promise<AgentHandle>;
+  spawnCustodied: (runtime: CustodialRuntime, name: string, spec: unknown, cwd: string, reserved: RuntimeReference, slot: { id: string; lifecycleUid: string }) => Promise<AgentHandle>;
   staticReconcileRetryDelaysMs: readonly number[];
   staticLifecycleEvict?: (principal: string) => Promise<EvictionResult>;
   withLifecycleExecutor: Executor;
@@ -533,8 +535,13 @@ try {
     const mark = reaps.length;
     spawnAs = got;
     M.userMode = true;
-    const outcome = await M.spawnCustodied("nostatic", {}, workspaceRoot, reserved, { id: newIdentity().id, lifecycleUid: uid }).then(() => "spawned", (e: unknown) => String(e));
-    M.userMode = false;
+    let outcome: string;
+    try {
+      outcome = await M.spawnCustodied(fakeRuntime, "nostatic", {}, workspaceRoot, reserved, { id: newIdentity().id, lifecycleUid: uid }).then(() => "spawned", (e: unknown) => String(e));
+    } finally {
+      M.userMode = false;
+      spawnAs = undefined;
+    }
     check("no static row: a mismatched spawn reaps got inline before failing, and unrecordedCustody stays untouched",
       /spawned seat was reaped/.test(outcome) && reaps.slice(mark).join() === got.id && !M.unrecordedCustody.has(uid), { outcome, reaps: reaps.slice(mark) });
   }
@@ -634,6 +641,7 @@ try {
     let nextHandle: ((name: string) => AgentHandle) | undefined;
     M.runtime = {
       kind: "pty",
+      supportsWorkClosure: true,
       spawn: (name: string) => {
         const h = nextHandle?.(name) ?? fakeHandle(name, { kind: "pty", id: randomUUID().replaceAll("-", "") });
         nextHandle = undefined;
@@ -641,6 +649,11 @@ try {
         return h;
       },
       reap: fakeRuntime.reap,
+      // This fixture models an unreserved runtime with positive proof of work closure.
+      reapWork: async (reference: RuntimeReference) => {
+        const outcome = await fakeRuntime.reap(reference);
+        if (outcome.outcome !== "reaped") throw new Error(`fake work remains: ${JSON.stringify(outcome)}`);
+      },
     };
     // A restart waits for a heartbeat newer than the exited seat's, so the roster must move; while
     // `holdReady` is set it does not, and the replacement's readiness stays pending.

@@ -6,7 +6,7 @@
   "guard": "the shipped topology detector accepts only the fixed manual exclusion and refuses unsupported topology",
   "command": "pnpm smoke:shard-stability",
   "progressPattern": "^ok [0-9]+ - |  \u2713 ",
-  "completionMarker": "# tests 5",
+  "completionMarker": "# tests 8",
   "proveWith": "node scripts/mutation-proof.mjs --config bin/smoke/mutations/shard-stability-workflow.json",
   "why": [
     "Every child drives the actual shipped detector CLI with real committed workflow and registry blobs. No copied parser or replaced verdict. Existing six index controls still run first.",
@@ -19,8 +19,8 @@
       "file": "bin/smoke/shard-stability.ts",
       "find": "  const allowedJobKeys = new Set([\"if\", \"needs\", \"name\", \"timeout-minutes\", \"runs-on\", \"strategy\", \"steps\"]);",
       "replace": "  const allowedJobKeys = new Set([\"needs\", \"name\", \"timeout-minutes\", \"runs-on\", \"strategy\", \"steps\"]);",
-      "expectRed": "the shipped detector accepts only the fixed manual exclusion on an unchanged ordinary topology",
-      "cell": "the shipped detector accepts only the fixed manual exclusion on an unchanged ordinary topology",
+      "expectRed": "the shipped detector accepts shard BASE/HEAD env with unchanged topology",
+      "cell": "the shipped detector accepts shard BASE/HEAD env with unchanged topology",
       "afterRestore": "pnpm smoke:shard-stability"
     },
     {
@@ -30,6 +30,15 @@
       "replace": "  if (jobConditions.some((line) => line !== \"    if: ${{ github.event_name != 'workflow_dispatch' }}\" && line !== \"    if: ${{ true }}\")) return null;",
       "expectRed": "the shipped detector refuses unsupported smoke job conditions instead of inventing topology",
       "cell": "the shipped detector refuses unsupported smoke job conditions instead of inventing topology",
+      "afterRestore": "pnpm smoke:shard-stability"
+    },
+    {
+      "name": "topology reader refuses an extra guarded shard-step env key",
+      "file": "bin/smoke/shard-stability.ts",
+      "find": "  const guardedRevisionEnv = activeShardStep.length === 6 &&",
+      "replace": "  const guardedRevisionEnv = activeShardStep.length >= 6 &&",
+      "expectRed": "the shipped detector refuses an extra env key on the guarded shard step",
+      "cell": "the shipped detector refuses an extra env key on the guarded shard step",
       "afterRestore": "pnpm smoke:shard-stability"
     }
   ]
