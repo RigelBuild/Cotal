@@ -136,6 +136,7 @@ const PRODUCERS: Record<Profile, () => string[]> = {
   "run-operator": via("run-operator", { runOperator: { endpoint: EP, runId: "run-sweep", takeoverId: "tk000002" } }),
   "endpoint-evictor": via("endpoint-evictor"),
   issuer: via("issuer"),
+  "webhook-publisher": via("webhook-publisher"),
   "registry-reader": via("registry-reader"),
   "run-admitter": via("run-admitter", { runAdmitter: { endpoint: EP, runId: "run-sweep" } }),
   "transfer-writer": via("transfer-writer", { transferWriter: { instanceId: IID, hex: "0".repeat(64) } }),

@@ -414,7 +414,7 @@ export async function send(args: ParsedArgs): Promise<void> {
   const warnings: OutputWarning[] = [];
   const senderNameValue = senderName(typeof values.creds === "string" ? values.creds : undefined);
   const senderActor = `cli_${createHash("sha256").update(senderNameValue).digest("hex")}`;
-  const opened = await openTransient(values, senderNameValue, { throwOnRefusal: true, senderActor, report: (level) => {
+  const opened = await openTransient(values, senderNameValue, { throwOnRefusal: true, senderActor, presenceOnly: input.mode !== "msg", report: (level) => {
     warnings.push({ code: level === "error" ? "SENDER_CONNECTION_WARNING" : "SENDER_WARNING", target: { destination: input.target }, message: "The transient sender reported a connection or delivery warning; its receipt confirms only the stated storage outcome." });
   } });
   const { ep, space, connection } = opened;

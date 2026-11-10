@@ -42,7 +42,7 @@ const factsText = (item: Row): string => {
 /** Authorized live presence, not the endpoint-registration or saved-reference inventory. */
 export async function endpoints(args: ParsedArgs): Promise<void> {
   const presentation = presentationOf(args.values);
-  const { ep, space } = await openTransient(args.values as ConnectValues, "endpoints", { throwOnRefusal: true });
+  const { ep, space } = await openTransient(args.values as ConnectValues, "endpoints", { throwOnRefusal: true, presenceOnly: true });
   recordOperationSpace(space);
   let items: Row[];
   try {

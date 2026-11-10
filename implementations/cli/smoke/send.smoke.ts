@@ -55,7 +55,25 @@ import { authDir, recordMesh, saveSpaceAuth, setCurrent } from "@cotal-ai/worksp
 import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-const EXPECTED = 85;
+const EXPECTED = 89;
+function rosterItems(stdout: string): Array<{ name: string; role?: string; reportedStatus?: string }> | undefined {
+  try {
+    const value: unknown = JSON.parse(stdout);
+    if (typeof value !== "object" || value === null || !("result" in value)) return undefined;
+    const result: unknown = value.result;
+    if (typeof result !== "object" || result === null || !("items" in result) || !Array.isArray(result.items)) return undefined;
+    const items: Array<{ name: string; role?: string; reportedStatus?: string }> = [];
+    for (const item of result.items) {
+      if (typeof item !== "object" || item === null || !("name" in item) || typeof item.name !== "string") return undefined;
+      if ("role" in item && item.role !== undefined && typeof item.role !== "string") return undefined;
+      if ("reportedStatus" in item && item.reportedStatus !== undefined && typeof item.reportedStatus !== "string") return undefined;
+      items.push({ name: item.name, ...(typeof item.role === "string" ? { role: item.role } : {}), ...(typeof item.reportedStatus === "string" ? { reportedStatus: item.reportedStatus } : {}) });
+    }
+    return items;
+  } catch {
+    return undefined;
+  }
+}
 let pass = 0;
 let fail = 0;
 const check = (name: string, cond: boolean, extra?: unknown) => {
@@ -232,7 +250,28 @@ try {
   bob.on("message", onBobMessage);
   bob.on("error", (error: Error) => console.error("! bob:", error.message));
   await bob.start();
+  const webhookPublisherCreds = join(tmp, "webhook-publisher.creds");
+  writeFileSync(webhookPublisherCreds, await mintCreds(auth, newIdentity(), "webhook-publisher"), { mode: 0o600 });
   await wait(800);
+  const webhookRoster = await run(["endpoints", "--json", "--space", space, "--server", servers, "--creds", webhookPublisherCreds]);
+  const webhookItems = rosterItems(webhookRoster.stdout);
+  check("webhook-publisher credentials read endpoints JSON with name, role, and presence values",
+    webhookRoster.code === 0 && webhookItems?.some((item) => item.name === "bob" && item.role === "reviewer" && item.reportedStatus === "idle") === true,
+    { result: webhookRoster, bob: webhookItems?.find((item) => item.name === "bob") });
+  const webhookDmText = `webhook-dm-${randomUUID().slice(0, 6)}`;
+  const webhookDm = await run(["send", "-t", "bob", webhookDmText, "--space", space, "--server", servers, "--creds", webhookPublisherCreds]);
+  const webhookRoleText = `webhook-role-${randomUUID().slice(0, 6)}`;
+  const webhookRole = await run(["send", "-r", "reviewer", webhookRoleText, "--space", space, "--server", servers, "--creds", webhookPublisherCreds]);
+  const webhookChannelText = `webhook-channel-${randomUUID().slice(0, 6)}`;
+  const webhookChannel = await run(["send", "-c", "general", webhookChannelText, "--space", space, "--server", servers, "--creds", webhookPublisherCreds, "--json"]);
+  await wait(500);
+  check("webhook-publisher credentials DM a live participant using a presence-only roster read",
+    webhookDm.code === 0 && got.some((message) => message.route === "DM" && message.text === webhookDmText), { result: webhookDm, received: got.filter((message) => message.text === webhookDmText) });
+  check("webhook-publisher credentials send to a role using a presence-only roster read",
+    webhookRole.code === 0 && got.some((message) => message.route === "ANY:reviewer" && message.text === webhookRoleText), { result: webhookRole, received: got.filter((message) => message.text === webhookRoleText) });
+  check("webhook-publisher credentials cannot send to a channel",
+    webhookChannel.code !== 0 && webhookChannel.stdout.includes('"outcome":"refused"') && !got.some((message) => message.text === webhookChannelText), webhookChannel);
+
 
   const repeated = Array.from({ length: 3 }, (_, n) => `stable-sender-${n}-${randomUUID()}`);
   const repeatedResults = [];

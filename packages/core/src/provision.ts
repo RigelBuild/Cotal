@@ -157,6 +157,8 @@ export type Profile =
   // bind/terminal facts + goal-record writes ({@link goalWriterGrants}), a dedicated connection
   // disjoint from the serve credential. Standing, re-minted on renewal like the serve cred.
   | "goal-writer"
+  // The dedicated integration publisher can write DMs and anycast, then read live presence only.
+  | "webhook-publisher"
   // The console/CLI per-session CALLER credential: rails-only for ONE §13.6 session,
   // TTL-bound to it, never standing. Static = face-minted from the seed; user mode = the callout.
   | "session-caller"
@@ -228,6 +230,7 @@ export const PROFILES = Object.freeze([
   "remote-manager", "environment-bootstrap", "environment-manager-supervisor",
   "environment-manager-executor", "environment-manager-goal-writer", "dm-reader", "issued-store-recreate",
   "registry-reader",
+  "webhook-publisher",
 ] as const satisfies readonly Profile[]);
 
 type _AllProfiles = Exclude<Profile, (typeof PROFILES)[number]> extends never ? true : never;
@@ -302,6 +305,7 @@ export const CREDENTIAL_LIFETIMES: Record<CredentialKind, CredentialLifetimePoli
   "manager-caller": { class: "mixed", note: "short-lived user-auth view bound to the bearer expiry and one manager instance" },
   observer: { class: "static-operator-managed", note: "out-of-band dashboard/audit credential from `cotal mint`" },
   admin: { class: "static-operator-managed", note: "out-of-band elevated dashboard/audit credential from `cotal mint`" },
+  "webhook-publisher": { class: "static-operator-managed", note: "dedicated long-running webhook bridge publisher; mint and rotate through the space signer" },
   supervisor: { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "manager's always-on endpoint; the manager holds the DATA seed and self-remints via the endpoint creds source" },
   delivery: { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "server-side Plane-3 daemon; seed-less - the manager re-signs .cotal/delivery.creds for the SAME nkey, requests delivery-admin reloadCreds for explicit adoption, and the endpoint source re-read is only a backstop" },
   "membership-rw": { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "membership feed writer; seed-less - the manager re-signs the membership-rw.creds store key for the SAME nkey, the feed adopts it on a 75% preflight-proven renewal timer (its active self-heal), and delivery-admin reloadCreds is the explicit adoption on top" },
@@ -1434,6 +1438,7 @@ export function permissionsFor(
     return restoreProfilePermissions(space, pr.connId, opts.restore);
   }
   if (profile === "operator") return operatorPermissions(space, pr); // human-CLI client (send/dm/ask)
+  if (profile === "webhook-publisher") return webhookPublisherPermissions(space, pr);
   if (profile === "probe") return probePermissions(pr); // connect-only liveness/auth preflight
   if (profile === "channel-writer") return channelWriterPermissions(space, pr); // channel-registry writes
   if (profile === "channel-purger") return channelPurgerPermissions(space, pr); // channel-writer + CHAT purge
@@ -2037,6 +2042,23 @@ function remoteManagerPermissions(
         ...(isSupervisorActor ? [livenessServeFilter(space, "manager")] : []),
       ],
     },
+  };
+}
+
+/** The dedicated webhook publisher: self-attributed DM and anycast, plus a live-presence read. */
+function webhookPublisherPermissions(space: string, pr: MintPrincipal): Record<string, unknown> {
+  const PKV = `KV_${presenceBucket(space)}`;
+  return {
+    pub: {
+      allow: [
+        unicastSubject(space, "*", "*", pr.owner, pr.actor),
+        anycastSubject(space, "*", pr.owner, pr.actor),
+        "$JS.API.INFO",
+        `$JS.API.STREAM.INFO.${PKV}`,
+        `$JS.API.DIRECT.GET.${PKV}`,
+      ],
+    },
+    sub: { allow: [`_INBOX_${pr.connId}.>`] },
   };
 }
 
