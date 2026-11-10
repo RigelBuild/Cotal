@@ -12,17 +12,20 @@ import { join } from "node:path";
 import { connect, type NatsConnection } from "@nats-io/transport-node";
 import { jetstreamManager, type PushConsumer } from "@nats-io/jetstream";
 import { Kvm, type KV } from "@nats-io/kv";
-import { PermissionViolationError } from "@nats-io/nats-core";
-import { openPublishDenialWatch } from "../src/endpoint-publish-denial.js";
+import { openPublishDenialWatch } from "../../../packages/core/src/endpoint-publish-denial.js";
 import type { Bucket } from "@nats-io/kv/internal";
 import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import {
   createBrokerAuth, createSpaceAccountAuth, mintCreds, mintPublicUserJwt, credsFromJwt, remoteManagerActors, newIdentity, serverConfig, setupSpaceStreams,
   isReachable, standaloneConnectOpts, mintLifecycleUid, principalKey, DEV_OWNER, epAuthBucket, recordsBucket,
   epgateKey, epcredRowKey, provisionEndpointGateOpen, serveIssuanceGateKv, endpointRegistrationBarrier,
-  IncompleteKvScan, type EpServeLedgerRow,
+  IncompleteKvScan, isConsumerNotFound, type EpServeLedgerRow,
 } from "@cotal-ai/core";
-import { pickFreePort } from "./_free-port.js";
+import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
+import { makeLedgerScannerOverConnection, authorityScannerGrants } from "../src/ledger-scanner.js";
+import { openAuthorityClient } from "../src/authority-client.js";
+import { openRegistrationFamilyScan } from "../src/registration-family-scan.js";
+import { requestManagerRegistrationFamily, requestManagerRegistrationRead, remoteManagerServePrincipal, RegistrationFamilyBusyError, RegistrationFamilyRefusedError } from "@cotal-ai/core";
 
 const evidence = process.env.FAMILY_SCAN_EVIDENCE_DIR;
 const dir = mkdtempSync(join(evidence ?? tmpdir(), SMOKE_BROKER_TOKEN));
@@ -49,7 +52,49 @@ try {
     connections.push(nc); return nc;
   };
   const provisioner = await open(await mintCreds(auth, newIdentity(), "provisioner"));
+  const owner = `u_${"a".repeat(26)}`;
+  const scanClient = await openAuthorityClient({ server: servers, space, dataAccount: { pub: auth.account.pub, signingSeed: auth.account.signingSeed }, label: "family-scan-smoke", grants: id => authorityScannerGrants(space, id), log: console.error });
+  let failAfterFirstChunk = false;
+  let stallNextFamilyScan = false;
+  let deadlineScanStarted: (() => void) | undefined;
+  let deadlineScanAborted: (() => void) | undefined;
+  const scanner = makeLedgerScannerOverConnection(scanClient.nc, space, { afterFirstFetch: async signal => {
+    if (!stallNextFamilyScan) return;
+    stallNextFamilyScan = false;
+    if (!signal) throw new Error("registration scan did not receive an abort signal");
+    deadlineScanStarted?.();
+    if (!signal.aborted) await once(signal, "abort");
+    deadlineScanAborted?.();
+  } });
+  const host = await open(await mintCreds(auth, newIdentity(), "issuer", { principal: { owner, actor: "host" } }));
+  let corruption = "";
+  let scanStarted: (() => void) | undefined;
+  let blockedReadInstance: string | undefined;
+  let blockedReadCount = 0;
+  let blockedReadGate: Promise<void> | undefined;
+  let blockedReadStarted: (() => void) | undefined;
+  const responder = await openRegistrationFamilyScan({ server: servers, space, dataAccount: { pub: auth.account.pub, signingSeed: auth.account.signingSeed }, log: console.error, scanner, authKv: await new Kvm(host).open(epAuthBucket(space)), recordsKv: await new Kvm(provisioner).open(recordsBucket(space)), probeScanStarted: () => scanStarted?.(), probePointRead: async instanceId => {
+    if (instanceId === blockedReadInstance && blockedReadGate) {
+      blockedReadCount++;
+      if (blockedReadCount === 8) blockedReadStarted?.();
+      await blockedReadGate;
+    }
+  }, probeChunks: chunks => {
+    if (failAfterFirstChunk) return (function* () {
+      yield chunks[0]!;
+      throw new Error("probe failed after first chunk");
+    })();
+    if (chunks.length < 2 || !corruption) return chunks;
+    if (corruption === "drop") return chunks.slice(1);
+    if (corruption === "duplicate") return [chunks[0]!, chunks[0]!, ...chunks.slice(1)];
+    if (corruption === "order") return [chunks[1]!, chunks[0]!, ...chunks.slice(2)];
+    if (corruption === "count") return chunks.map((chunk, i) => i === chunks.length - 1 ? { ...chunk, rowCount: -1 } : chunk);
+    if (corruption === "truncate") return chunks.map((chunk, i) => i === chunks.length - 1 ? { ...chunk, rows: (chunk.rows as unknown[]).slice(0, -1) } : chunk);
+    return chunks.map((chunk, i) => i === 1 ? { ...chunk, scanId: "A".repeat(24) } : chunk);
+  } });
+  const scanRemote = (nc: NatsConnection, instanceId: string, timeoutMs = 5 * 60_000) => requestManagerRegistrationFamily(nc, space, owner, instanceId, timeoutMs);
   const jsm = await jetstreamManager(provisioner);
+  const scannerJsm = await jetstreamManager(scanClient.nc);
   const other = await open(await mintCreds(otherAuth, newIdentity(), "provisioner"));
   await (await new Kvm(other).open(epAuthBucket(otherSpace))).status();
   check("other account's auth bucket genuinely exists", true);
@@ -96,13 +141,13 @@ try {
       const error = await Promise.race([watch.denied.catch(error => error), new Promise<unknown>(resolve => {
         timer = setTimeout(() => resolve(new Error("broker denial not observed")), 5000);
       })]);
-      check(name, error instanceof PermissionViolationError && error.subject === subject);
+      check(name, error instanceof Error && /permissions violation/i.test(error.message));
     } finally { clearTimeout(timer); watch.release(); }
   };
   const costs: number[] = [], remoteCosts: number[] = [];
   for (const count of [0, 7905, 12753]) {
     const instanceId = mintLifecycleUid(), setup = await execFor(instanceId);
-    await provisionEndpointGateOpen(setup.kv, { endpoint, instanceId, principal });
+    await provisionEndpointGateOpen(setup.kv, { endpoint, instanceId, principal: remoteManagerServePrincipal(owner, instanceId) });
     const writer = serveIssuanceGateKv(setup.kv, space, { endpoint, instanceId });
     const barrier = endpointRegistrationBarrier(setup.kv, space, { endpoint, instanceId, opId: mintLifecycleUid() });
     const expected = new Set<string>();
@@ -119,10 +164,73 @@ try {
     check(`${count}: enumeration leaves the gate unchanged`, before?.revision === after?.revision && Buffer.from(before!.value).equals(Buffer.from(after!.value)));
     check(`${count}: scan reclaims its native consumer`, (await jsm.streams.info(`KV_${epAuthBucket(space)}`)).state.consumer_count === consumersBefore);
     const remote = await remoteFor(instanceId);
-    const remoteMeasured = await measure(remote.nc, () => endpointRegistrationBarrier(remote.kv, space, { endpoint, instanceId, opId: mintLifecycleUid() }).enumerate());
+    const remoteMeasured = await measure(remote.nc, () => scanRemote(remote.nc, instanceId));
     const remoteRows = remoteMeasured.rows;
     remoteCosts.push(remoteMeasured.rpcRequests); record({ count, profile: "remote-manager-executor", ...remoteMeasured, rows: remoteRows.length });
     check(`${count}: host-signed remote executor sees the same exact family`, remoteRows.length === count && new Set(remoteRows.map(value => value.credentialId)).size === count && remoteRows.every(value => expected.has(value.credentialId) && value.state === "revoked"));
+    if (count === 7905) {
+      const peerId = mintLifecycleUid(), peer = await remoteFor(peerId);
+      await provisionEndpointGateOpen((await execFor(peerId)).kv, { endpoint, instanceId: peerId, principal: remoteManagerServePrincipal(owner, peerId) });
+      const started = new Promise<void>((resolve) => { scanStarted = resolve; });
+      const scanning = scanRemote(remote.nc, instanceId);
+      await started;
+      scanStarted = undefined;
+      await assert.rejects(scanRemote(remote.nc, instanceId), RegistrationFamilyBusyError);
+      check("overlapping same-instance scan is busy", true);
+      const peerRead = await requestManagerRegistrationRead(peer.nc, space, owner, peerId, { kind: "read", key: epgateKey(endpoint, peerId) });
+      const ownRead = await requestManagerRegistrationRead(remote.nc, space, owner, instanceId, { kind: "read", key: epgateKey(endpoint, instanceId) });
+      check("own point read completes while its family scan runs", ownRead !== null && typeof ownRead !== "number");
+      check("point read completes while another family scan runs", peerRead !== null && typeof peerRead !== "number");
+      await scanning;
+      let releasePointReads!: () => void;
+      let markPointReadsStarted!: () => void;
+      const pointReadGate = new Promise<void>(resolve => { releasePointReads = resolve; });
+      const pointReadsStarted = new Promise<void>(resolve => { markPointReadsStarted = resolve; });
+      blockedReadInstance = instanceId; blockedReadCount = 0; blockedReadGate = pointReadGate; blockedReadStarted = markPointReadsStarted;
+      const heldReads = Array.from({ length: 8 }, () => requestManagerRegistrationRead(remote.nc, space, owner, instanceId, { kind: "read", key: epgateKey(endpoint, instanceId) }));
+      await pointReadsStarted;
+      check("eight point reads for one instance are admitted concurrently", blockedReadCount === 8);
+      await assert.rejects(requestManagerRegistrationRead(remote.nc, space, owner, instanceId, { kind: "read", key: epgateKey(endpoint, instanceId) }), RegistrationFamilyBusyError);
+      check("the ninth concurrent point read for one instance is busy", true);
+      const peerReadAtCap = await requestManagerRegistrationRead(peer.nc, space, owner, peerId, { kind: "read", key: epgateKey(endpoint, peerId) });
+      check("another instance point read succeeds while the first instance is at its cap", peerReadAtCap !== null && typeof peerReadAtCap !== "number");
+      releasePointReads();
+      const completedReads = await Promise.all(heldReads);
+      blockedReadInstance = undefined; blockedReadGate = undefined; blockedReadStarted = undefined;
+      check("all admitted point reads complete after release", completedReads.length === 8 && completedReads.every(value => value !== null && typeof value !== "number"));
+      let markDeadlineScanStarted!: () => void;
+      let markDeadlineScanAborted!: () => void;
+      const deadlineStarted = new Promise<void>(resolve => { markDeadlineScanStarted = resolve; });
+      const deadlineAborted = new Promise<void>(resolve => { markDeadlineScanAborted = resolve; });
+      deadlineScanStarted = markDeadlineScanStarted; deadlineScanAborted = markDeadlineScanAborted; stallNextFamilyScan = true;
+      const timedOutScan = scanRemote(remote.nc, instanceId, 150);
+      await deadlineStarted;
+      deadlineScanStarted = undefined;
+      await assert.rejects(timedOutScan, /registration family scan timed out/);
+      await deadlineAborted;
+      deadlineScanAborted = undefined;
+      const stream = `KV_${epAuthBucket(space)}`;
+      let consumerAbsent = false;
+      for (let attempt = 0; attempt < 100 && !consumerAbsent; attempt++) {
+        try { await scannerJsm.consumers.info(stream, "cotal-ledger-scan"); }
+        catch (error) { if (!isConsumerNotFound(error)) throw error; consumerAbsent = true; }
+        if (!consumerAbsent) await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      check("deadline abort deletes the real literal consumer", consumerAbsent && (await jsm.streams.info(stream)).state.consumer_count === consumersBefore);
+      const freshScan = await scanRemote(remote.nc, instanceId);
+      check("deadline abort releases the process-wide scanner lock", freshScan.length === count);
+      for (const [mode, message] of [["drop", /invalid registration family chunk/], ["duplicate", /invalid registration family chunk/], ["order", /invalid registration family chunk/], ["count", /incomplete registration family chunks/], ["truncate", /incomplete registration family chunks/], ["scanId", /inconsistent registration family chunks/]] as const) {
+        corruption = mode;
+        let failure: unknown;
+        try { await scanRemote(remote.nc, instanceId); } catch (error) { failure = error; } finally { corruption = ""; }
+        check(`${mode} family chunk fails closed`, failure instanceof Error && message.test(failure.message));
+      }
+      failAfterFirstChunk = true;
+      let failedScan: unknown;
+      try { await scanRemote(remote.nc, instanceId); } catch (error) { failedScan = error; } finally { failAfterFirstChunk = false; }
+      check("failure after first family chunk returns a plain scan failure", failedScan instanceof Error &&
+        !(failedScan instanceof RegistrationFamilyRefusedError) && /registration family scan failed/.test(failedScan.message));
+    }
     check(`${count}: remote executor deletes its scan consumer`, (await jsm.streams.info(`KV_${epAuthBucket(space)}`)).state.consumer_count === consumersBefore);
     let remoteDenied: unknown;
     try { await (await new Kvm(remote.nc).open(epAuthBucket(otherSpace))).status(); } catch (error) { remoteDenied = error; }
@@ -139,12 +247,32 @@ try {
   check("large retained families do not add per-row API requests", costs[2]! <= costs[1]! + 2);
 
   check("remote executor also avoids per-row API requests", remoteCosts[2]! <= remoteCosts[1]! + 2);
+  const retiredId = mintLifecycleUid(), retired = await remoteFor(retiredId), retiredWriter = await execFor(retiredId);
+  await retiredWriter.kv.put(epgateKey(endpoint, retiredId), new TextEncoder().encode(JSON.stringify({ state: "retired", generation: 1, processEpoch: 0, registrationRevision: 0, nameAuthorityRevision: 0, principal: remoteManagerServePrincipal(owner, retiredId), op: { opId: mintLifecycleUid(), kind: "retirement" } })));
+  let releaseRetiredReads!: () => void;
+  const retiredReadsGate = new Promise<void>(resolve => { releaseRetiredReads = resolve; });
+  const retiredReadsStarted = new Promise<void>(resolve => { blockedReadStarted = resolve; });
+  blockedReadInstance = retiredId; blockedReadCount = 0; blockedReadGate = retiredReadsGate;
+  const heldRetiredReads = Array.from({ length: 8 }, () => requestManagerRegistrationRead(retired.nc, space, owner, retiredId, { kind: "read", key: epgateKey(endpoint, retiredId) }));
+  try {
+    await retiredReadsStarted;
+    await assert.rejects(requestManagerRegistrationRead(retired.nc, space, owner, retiredId, { kind: "read", key: epgateKey(endpoint, retiredId) }), RegistrationFamilyBusyError);
+    check("the ninth concurrent retired gate read is busy", true);
+  } finally { releaseRetiredReads(); }
+  await Promise.all(heldRetiredReads);
+  blockedReadInstance = undefined; blockedReadGate = undefined; blockedReadStarted = undefined;
+
 
   const instanceId = mintLifecycleUid(), active = await remoteFor(instanceId);
-  await provisionEndpointGateOpen(active.kv, { endpoint, instanceId, principal });
-  const writer = serveIssuanceGateKv(active.kv, space, { endpoint, instanceId });
+  await provisionEndpointGateOpen((await execFor(instanceId)).kv, { endpoint, instanceId, principal: remoteManagerServePrincipal(owner, instanceId) });
+  const read = async (key: string) => {
+    const result = await requestManagerRegistrationRead(active.nc, space, owner, instanceId, { kind: "read", key });
+    if (typeof result === "number") throw new Error("unexpected read result");
+    return result;
+  };
+  const writer = serveIssuanceGateKv(active.kv, space, { endpoint, instanceId, read });
   const row = rowFor(instanceId); await writer.stage(row);
-  const barrier = endpointRegistrationBarrier(active.kv, space, { endpoint, instanceId, opId: mintLifecycleUid() });
+  const barrier = endpointRegistrationBarrier(active.kv, space, { endpoint, instanceId, opId: mintLifecycleUid(), read, enumerateFamily: () => scanRemote(active.nc, instanceId) });
   const observed = await barrier.observe(); assert.ok(observed);
   const frozen = await barrier.freeze(observed.revision); assert.notEqual(frozen, null);
   check("freeze still defeats an earlier mint commit", !await writer.commit(observed.revision));
@@ -155,7 +283,7 @@ try {
   check("stale freeze token still loses reopen", !await barrier.reopen(frozen! - 1, { generation: 1, processEpoch: 0, registrationRevision: 0, nameAuthorityRevision: 0 }));
 
   // A real consumer and bind count; only the clean premature end is a detector seam, as in kv-scan.smoke.
-  const bucket = active.kv as Bucket, realGet = bucket.js.consumers.getPushConsumer.bind(bucket.js.consumers);
+  const bucket = (await execFor(instanceId)).kv as Bucket, realGet = bucket.js.consumers.getPushConsumer.bind(bucket.js.consumers);
   const victim = Object.create(bucket) as KV;
   Object.defineProperty(victim, "js", { value: { ...bucket.js, consumers: { ...bucket.js.consumers,
     getPushConsumer: async (...args: Parameters<typeof realGet>): Promise<PushConsumer> => {
@@ -174,6 +302,8 @@ try {
   try { await barrier.enumerate(); } catch (error) { malformed = error; }
   check("malformed family evidence still refuses", malformed instanceof Error);
   check("parsing refusal leaves no scan consumer", (await jsm.streams.info(`KV_${epAuthBucket(space)}`)).state.consumer_count === beforeCut);
+  await responder.close();
+  await scanClient.close();
 } finally {
   for (const nc of connections) await nc.close().catch(() => {});
   const exited = broker.exitCode === null && broker.signalCode === null ? once(broker, "exit") : Promise.resolve();
@@ -181,5 +311,5 @@ try {
   if (evidence) writeFileSync(join(dir, "OUTCOME.json"), JSON.stringify({ passed, port, brokerExited: true }) + "\n", { mode: 0o600 });
   else rmSync(dir, { recursive: true, force: true });
 }
-assert.equal(passed, 43, "all family scan cells ran");
+assert.equal(passed, 60, "all family scan cells ran");
 console.log(`ENDPOINT FAMILY SCAN: ${passed} passed`);

@@ -20,6 +20,8 @@ import { isCasLoss as isRawCasLoss } from "./endpoint-records.js";
 import { assertLifecycleToken } from "./endpoint-subjects.js";
 import { epgateKey, epcredFamilyPrefix, epcredRowKey, eprepairKey, parseEndpointGate, parseLedgerRow, parseEndpointRepairCursor, type CredentialLedgerRow, type EndpointGateRow, type EndpointRepairCursor } from "./lifecycle-state.js";
 import type { EpGateState, EpIssuanceGate, EpServeLedgerRow } from "./endpoint-service.js";
+import type { RegistrationReadEntry } from "./registration-read-client.js";
+type KvRead = (key: string) => Promise<RegistrationReadEntry | null>;
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -28,7 +30,7 @@ const dec = new TextDecoder();
  *  already exists succeeds only when the stored bytes match (a retry of the SAME issuance), and
  *  CONFLICTs when they differ (a staged name never silently re-binds the row revocation/audit
  *  relies on). A create loss whose cause is not a CAS conflict fails the mint CLOSED. */
-export async function createRowByteIdempotent(kv: KV, key: string, value: unknown): Promise<void> {
+export async function createRowByteIdempotent(kv: KV, key: string, value: unknown, read: KvRead = key => kv.get(key)): Promise<void> {
   const bytes = JSON.stringify(value);
   try {
     // KV.create can recreate a tombstone. A staged identity must have no prior history.
@@ -36,7 +38,7 @@ export async function createRowByteIdempotent(kv: KV, key: string, value: unknow
   } catch (e) {
     if (!isRawCasLoss(e))
       throw new EpEnvelopeError("unavailable", `creating the row ${key} is ambiguous; the mint fails closed (SPEC 13.1): ${(e as Error)?.message ?? String(e)}`);
-    const existing = await kv.get(key);
+    const existing = await read(key);
     if (!existing || existing.operation !== "PUT" || dec.decode(existing.value) !== bytes)
       throw new EpEnvelopeError("conflict", `the row ${key} exists with FOREIGN content; a staged name never silently re-binds (SPEC 13.1)`);
   }
@@ -45,9 +47,9 @@ export async function createRowByteIdempotent(kv: KV, key: string, value: unknow
 /** CAS a credential-ledger row `active` -> `revoked` at its observed revision (retrying on a CAS
  *  loss). Idempotent on an already-revoked row; FAILS LOUD on an absent/DEL row — a vanished
  *  never-delete ledger row is corruption, never a "never staged" idempotence case. */
-export async function markLedgerRowRevoked(kv: KV, key: string): Promise<"revoked" | "already-revoked"> {
+export async function markLedgerRowRevoked(kv: KV, key: string, read: KvRead = key => kv.get(key)): Promise<"revoked" | "already-revoked"> {
   for (let attempt = 0; attempt < 4; attempt++) {
-    const entry = await kv.get(key);
+    const entry = await read(key);
     if (!entry)
       throw new EpEnvelopeError("failed-precondition", `no credential-ledger row exists at ${key}; a revocation mark needs its row (SPEC 13.1)`);
     if (entry.operation !== "PUT")
@@ -68,8 +70,8 @@ export async function markLedgerRowRevoked(kv: KV, key: string): Promise<"revoke
 /** Read and parse the endpoint gate at `key`: `null` when absent, and a DEL marker THROWS. The one
  *  read of an `epgate` row in this module, so the mint fence, the registration barrier and the
  *  generation reader cannot refuse or parse the key two ways. */
-async function readEndpointGate(kv: KV, key: string): Promise<{ row: EndpointGateRow; revision: number } | null> {
-  const entry = await kv.get(key);
+async function readEndpointGate(kv: KV, key: string, read: KvRead = key => kv.get(key)): Promise<{ row: EndpointGateRow; revision: number } | null> {
+  const entry = await read(key);
   if (!entry) return null;
   if (entry.operation !== "PUT")
     throw new EpEnvelopeError("failed-precondition", `the endpoint gate ${key} carries a ${entry.operation} marker; a gate is never deleted (corruption, not absence, SPEC 13.12)`);
@@ -80,8 +82,8 @@ async function readEndpointGate(kv: KV, key: string): Promise<{ row: EndpointGat
  *  {@link import("./endpoint-service.js").EpIssuanceBarrier.observe} return. It carries every row
  *  field, so a field added to the gate row reaches both. `space` is carried for the core's
  *  space-bond defense (the KV IS the space bucket). */
-async function endpointGateState(kv: KV, space: string, endpoint: string, instanceId: string): Promise<EpGateState | null> {
-  const cur = await readEndpointGate(kv, epgateKey(endpoint, instanceId));
+async function endpointGateState(kv: KV, space: string, endpoint: string, instanceId: string, read?: KvRead): Promise<EpGateState | null> {
+  const cur = await readEndpointGate(kv, epgateKey(endpoint, instanceId), read);
   return cur === null ? null : { space, endpoint, lifecycleUid: instanceId, ...cur.row, revision: cur.revision };
 }
 
@@ -99,12 +101,12 @@ async function endpointGateState(kv: KV, space: string, endpoint: string, instan
  *  this may reason about, so it fails closed rather than answering a number. */
 export async function readEndpointGateGeneration(
   kv: KV,
-  args: { endpoint: string; instanceId: string },
+  args: { endpoint: string; instanceId: string; read?: KvRead },
 ): Promise<number> {
   const { endpoint } = args;
   const instanceId = assertLifecycleToken(args.instanceId, "instanceId");
   const key = epgateKey(endpoint, instanceId);
-  const cur = await readEndpointGate(kv, key);
+  const cur = await readEndpointGate(kv, key, args.read);
   if (cur === null)
     throw new EpEnvelopeError("failed-precondition", `no endpoint gate at ${key}; an instance's generation is read from its gate, and an absent gate is not a generation (SPEC 13.1)`);
   return cur.row.generation;
@@ -118,7 +120,7 @@ export async function readEndpointGateGeneration(
  *  and the manager's endpoint-serve wiring drive ONE fence; the auth `kvServeIssuanceGate` wraps
  *  this by unwrapping its branded `SessionAuthStore` to `(kv, space)`. `space` is carried on the
  *  observed gate for the core mint's space-bond defense (the KV IS the space bucket). */
-export function serveIssuanceGateKv(kv: KV, space: string, args: { endpoint: string; instanceId: string }): EpIssuanceGate {
+export function serveIssuanceGateKv(kv: KV, space: string, args: { endpoint: string; instanceId: string; read?: KvRead }): EpIssuanceGate {
   const { endpoint } = args;
   const instanceId = assertLifecycleToken(args.instanceId, "instanceId");
   const key = epgateKey(endpoint, instanceId);
@@ -126,7 +128,7 @@ export function serveIssuanceGateKv(kv: KV, space: string, args: { endpoint: str
     // No gate => null, and the core mint refuses a null observe (fails closed). The state carries
     // the registered serving principal, so the core mint fence binds the minted owner.actor to it
     // (§13.1: a sibling actor cannot win the gate).
-    observe: () => endpointGateState(kv, space, endpoint, instanceId),
+    observe: () => endpointGateState(kv, space, endpoint, instanceId, args.read),
     stage: async (row: EpServeLedgerRow) => {
       // The staged row must BE this gate's instance — a foreign endpoint/instance row through this
       // adapter is a caller bug, never silently redirected into another family.
@@ -134,7 +136,7 @@ export function serveIssuanceGateKv(kv: KV, space: string, args: { endpoint: str
         throw new EpEnvelopeError("failed-precondition", `the staged serve row names ${row.endpoint}/${row.lifecycleUid} but this gate serves ${endpoint}/${instanceId}; a row never crosses families (SPEC 13.1)`);
       if (typeof row.exp !== "number")
         throw new EpEnvelopeError("failed-precondition", `the staged serve row for ${endpoint}/${instanceId} carries no expiry; the normative ledger row requires one (SPEC 13.1)`);
-      const current = await readEndpointGate(kv, key);
+      const current = await readEndpointGate(kv, key, args.read);
       if (current?.row.serviceAuthority && (current.row.state !== "open"
         || !current.row.serviceAuthority.activationIssued
         || !serviceGateApprovalLive(current.row.serviceAuthority, Math.floor(Date.now() / 1000))))
@@ -150,10 +152,10 @@ export function serveIssuanceGateKv(kv: KV, space: string, args: { endpoint: str
       // Round-trip the writer's own bytes through the consuming parser BEFORE the create: a row
       // this trusted path would itself refuse to read never lands durably.
       parseLedgerRow(enc.encode(JSON.stringify(ledgerRow)), rowKey);
-      await createRowByteIdempotent(kv, rowKey, ledgerRow);
+      await createRowByteIdempotent(kv, rowKey, ledgerRow, args.read);
     },
     verifyServiceIssuance: async (row, observed) => {
-      const rowKey = epcredRowKey(endpoint, instanceId, row.credentialId), entry = await kv.get(rowKey);
+      const rowKey = epcredRowKey(endpoint, instanceId, row.credentialId), entry = await (args.read ?? (key => kv.get(key)))(rowKey);
       if (!entry || entry.operation !== "PUT") throw new EpEnvelopeError("unavailable", "native service issuance evidence is missing");
       const stored = parseLedgerRow(entry.value, rowKey);
       if (!row.serviceConnection || stored.state !== "active" || stored.holderPrincipal !== row.holderPrincipal
@@ -161,7 +163,7 @@ export function serveIssuanceGateKv(kv: KV, space: string, args: { endpoint: str
         || contractDigest(stored.sourceChain) !== contractDigest(row.sourceChain)
         || !stored.serviceConnection || contractDigest(stored.serviceConnection) !== contractDigest(row.serviceConnection))
         throw new EpEnvelopeError("permission-denied", "native service issuance evidence does not match this connection");
-      const current = await endpointGateState(kv, space, endpoint, instanceId);
+      const current = await endpointGateState(kv, space, endpoint, instanceId, args.read);
       if (!current || current.authorityFamily !== "service" || current.state !== "open")
         throw new EpEnvelopeError("permission-denied", "native service issuance gate is no longer open");
       const { revision: beforeRevision, ...before } = observed, { revision: afterRevision, ...after } = current;
@@ -169,7 +171,7 @@ export function serveIssuanceGateKv(kv: KV, space: string, args: { endpoint: str
         throw new EpEnvelopeError("permission-denied", "native service issuance authority changed after its gate CAS");
     },
     commit: async (expectedRevision: number) => {
-      const entry = await kv.get(key);
+      const entry = await (args.read ?? (key => kv.get(key)))(key);
       if (!entry || entry.operation !== "PUT" || entry.revision !== expectedRevision) return false;
       const current = parseEndpointGate(entry.value, key);
       if (current.state !== "open") return false;
@@ -187,7 +189,7 @@ export function serveIssuanceGateKv(kv: KV, space: string, args: { endpoint: str
       // `revoke` runs ONLY after a successful `stage` (finalizeServeIssuance's non-win cleanup), so
       // the row MUST exist. markLedgerRowRevoked is idempotent on an already-revoked row and FAILS
       // LOUD on an absent/DEL row (corruption, never a "never staged" idempotence case).
-      await markLedgerRowRevoked(kv, epcredRowKey(endpoint, instanceId, row.credentialId));
+      await markLedgerRowRevoked(kv, epcredRowKey(endpoint, instanceId, row.credentialId), args.read);
     },
   };
 }
@@ -288,9 +290,10 @@ export async function loadEndpointRepairCursor(
   kv: KV,
   endpoint: string,
   instanceId: string,
+  read: KvRead = key => kv.get(key),
 ): Promise<{ cursor: EndpointRepairCursor; revision: number } | null> {
   const key = eprepairKey(endpoint, instanceId);
-  const entry = await kv.get(key);
+  const entry = await read(key);
   if (!entry || entry.operation !== "PUT") return null;
   return { cursor: parseEndpointRepairCursor(entry.value, key), revision: entry.revision };
 }
@@ -303,17 +306,20 @@ export async function saveEndpointRepairCursor(
   instanceId: string,
   cursor: EndpointRepairCursor,
   expectedRevision: number | null,
+  read: KvRead = key => kv.get(key),
 ): Promise<number> {
   const key = eprepairKey(endpoint, instanceId);
   parseEndpointRepairCursor(enc.encode(JSON.stringify(cursor)), key);
   const bytes = enc.encode(JSON.stringify(cursor));
   if (expectedRevision === null) {
     try {
-      return await kv.create(key, bytes);
+      const current = await read(key);
+      const previousSeq = current && current.operation !== "PUT" ? current.revision : 0;
+      return await kv.put(key, bytes, { previousSeq });
     } catch (e) {
       if (!isRawCasLoss(e))
         throw new EpEnvelopeError("unavailable", `creating the repair cursor ${key} is ambiguous; the repair stays frozen (SPEC 13.1): ${(e as Error)?.message ?? String(e)}`);
-      const existing = await kv.get(key);
+      const existing = await read(key);
       if (!existing || existing.operation !== "PUT" || dec.decode(existing.value) !== JSON.stringify(cursor))
         throw new EpEnvelopeError("conflict", `the repair cursor ${key} exists with FOREIGN content; refusing to reuse another repair's progress`);
       return existing.revision;
@@ -367,7 +373,7 @@ export function repairCursorMatches(
  *  token is never re-bound). */
 export async function provisionEndpointGateOpen(
   kv: KV,
-  args: { endpoint: string; instanceId: string; principal: string; authorityFamily?: EndpointGateRow["authorityFamily"] },
+  args: { endpoint: string; instanceId: string; principal: string; authorityFamily?: EndpointGateRow["authorityFamily"]; read?: KvRead },
 ): Promise<void> {
   const { endpoint } = args;
   const instanceId = assertLifecycleToken(args.instanceId, "instanceId");
@@ -377,7 +383,7 @@ export async function provisionEndpointGateOpen(
   // Round-trip through the boundary parser BEFORE the create (a gate this path would refuse to read
   // never lands durably — e.g. a non-owner-grammar principal).
   parseEndpointGate(enc.encode(JSON.stringify(row)), key);
-  await createRowByteIdempotent(kv, key, row);
+  await createRowByteIdempotent(kv, key, row, args.read);
 }
 
 /** The §13.1 endpoint-registration ISSUANCE BARRIER over a bound KV — the production barrier a
@@ -401,14 +407,15 @@ export function endpointRegistrationBarrier(
   space: string,
   args: { endpoint: string; instanceId: string; opId: string;
     serviceRegistration?: { requestId: string; requestDigest: string };
-    evict?: (holderPrincipals: readonly string[]) => Promise<boolean[]> | boolean[] },
+    evict?: (holderPrincipals: readonly string[]) => Promise<boolean[]> | boolean[];
+    enumerateFamily?: () => Promise<EpServeLedgerRow[]>; read?: KvRead },
 ): import("./endpoint-service.js").EpIssuanceBarrier {
   const { endpoint } = args;
   const instanceId = assertLifecycleToken(args.instanceId, "instanceId");
   const opId = assertLifecycleToken(args.opId, "opId");
   const key = epgateKey(endpoint, instanceId);
   const evict = args.evict ?? ((holderPrincipals: readonly string[]) => holderPrincipals.map(() => false)); // FAIL-CLOSED: no evictor ⇒ eviction not verified (a takeover fails closed)
-  const observed = () => readEndpointGate(kv, key);
+  const observed = () => readEndpointGate(kv, key, args.read);
   const assertEmptyServiceFamily = async () => {
     const current = await observed();
     if (!current?.row.serviceAuthority || current.row.state !== "frozen" || current.row.op.kind !== "registration" || current.row.op.opId !== opId)
@@ -427,7 +434,7 @@ export function endpointRegistrationBarrier(
   };
   return {
     operationId: opId,
-    observe: () => endpointGateState(kv, space, endpoint, instanceId),
+    observe: () => endpointGateState(kv, space, endpoint, instanceId, args.read),
     freeze: async (expectedRevision: number) => {
       const cur = await observed();
       if (cur === null || cur.revision !== expectedRevision || cur.row.state !== "open") return null;
@@ -460,6 +467,7 @@ export function endpointRegistrationBarrier(
         await assertEmptyServiceFamily();
         return [];
       }
+      if (args.enumerateFamily) return await args.enumerateFamily();
       const rows: import("./endpoint-service.js").EpServeLedgerRow[] = [];
       const prefix = `${epcredFamilyPrefix(endpoint, instanceId)}.`;
       // Read the retained family in one complete value pass, not one round trip per historical
@@ -482,7 +490,7 @@ export function endpointRegistrationBarrier(
       return rows;
     },
     revoke: async (row) => {
-      await markLedgerRowRevoked(kv, epcredRowKey(endpoint, instanceId, row.credentialId));
+      await markLedgerRowRevoked(kv, epcredRowKey(endpoint, instanceId, row.credentialId), args.read);
     },
     evict: async (holderPrincipals: readonly string[]) => evict(holderPrincipals),
     reopen: async (token: number, successor) => {
@@ -524,8 +532,8 @@ export function endpointRegistrationBarrier(
       }
     },
     progress: {
-      load: () => loadEndpointRepairCursor(kv, endpoint, instanceId),
-      save: (cursor, expectedRevision) => saveEndpointRepairCursor(kv, endpoint, instanceId, cursor, expectedRevision),
+      load: () => loadEndpointRepairCursor(kv, endpoint, instanceId, args.read),
+      save: (cursor, expectedRevision) => saveEndpointRepairCursor(kv, endpoint, instanceId, cursor, expectedRevision, args.read),
       clear: (expectedRevision) => deleteEndpointRepairCursor(kv, endpoint, instanceId, expectedRevision),
     },
   };

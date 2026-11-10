@@ -137,6 +137,9 @@ try {
   await cell(4, async () => {
     assert.ok(prepared && activated && registered);
     const registrationProof = remoteManagerClient.currentRegistrationProof(activated);
+    const executorRenewal = remoteManagerClient.remoteManagerAuthorityRequest(state, "cli", "renew", { registrationProof });
+    assert.ok((await call(executorRenewal)).credentials.executor);
+    await assert.rejects(call({ ...executorRenewal, registrationProof: `sha256:${"0".repeat(64)}` }), /proof does not match/);
     const renewalRequest = remoteManagerClient.remoteManagerAuthorityRequest(state,"cli","renewStandingBundle",{registrationProof});
     renewalRequest.accountPublicKey = a.accountPublicKey; renewalRequest.processEpoch = registered.processEpoch;
     const renewed = await call(renewalRequest);
@@ -165,6 +168,20 @@ try {
     const changed = remoteManagerClient.remoteManagerAuthorityRequest(state,"cli","prepare");
     changed.identities.supervisor = {id:newIdentity().id};
     await assert.rejects(call(changed),/different ceiling/);
+    const gateKey = epgateKey("manager", state.instanceId);
+    const originalGate = await (await new Kvm(reader!.nc).open(epAuthBucket(a.space))).get(gateKey);
+    assert.ok(originalGate);
+    const gate = JSON.parse(new TextDecoder().decode(originalGate.value)) as { processEpoch: number };
+    const writer = await connect({ servers: fx.servers, ...standaloneConnectOpts({ creds: await mintCreds(a.auth, newIdentity(), "endpoint-serve-executor", { endpointServeExecutor: { endpoint: "manager", instanceId: state.instanceId } }), tls: false }) });
+    try {
+      const gateKv = await new Kvm(writer).open(epAuthBucket(a.space));
+      await gateKv.update(gateKey, new TextEncoder().encode(JSON.stringify({ ...gate, processEpoch: gate.processEpoch + 1 })), originalGate.revision);
+      try {
+        await assert.rejects(call(executorRenewal), /proof does not match/);
+      } finally {
+        await gateKv.put(gateKey, originalGate.value);
+      }
+    } finally { await writer.close(); }
   });
   await cell(5, async () => {
     admin = false;
@@ -233,7 +250,7 @@ try {
     try {
       const authKv = await new Kvm(heldNc).open(epAuthBucket(a.space));
       const gateKey = epgateKey("manager", stateC.instanceId);
-      const retired = JSON.parse(new TextDecoder().decode((await authKv.get(gateKey))!.value)) as Record<string, unknown>;
+      const retired = JSON.parse(new TextDecoder().decode((await (await new Kvm(reader!.nc).open(epAuthBucket(a.space))).get(gateKey))!.value)) as Record<string, unknown>;
       assert.equal(retired.state, "retired");
       delete retired.op;
       await authKv.put(gateKey, new TextEncoder().encode(JSON.stringify({ ...retired, state: "open" })));

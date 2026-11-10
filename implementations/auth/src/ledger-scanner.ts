@@ -110,7 +110,7 @@ export interface AuthLedgerScanner {
    *  agent family (markers included). */
   scanCredentialFamily(lifecycleUid: string): Promise<RawScanEntry[]>;
   /** LastPerSubject over one endpoint instance's `epcred.<endpoint>.<instanceId>.>` family. */
-  scanEndpointCredentialFamily(endpoint: string, instanceId: string): Promise<RawScanEntry[]>;
+  scanEndpointCredentialFamily(endpoint: string, instanceId: string, signal?: AbortSignal): Promise<RawScanEntry[]>;
   /** LastPerSubject over `bysrc.<issuerKeyId>.<id>.>` — the current last of every lineage-index row
    *  under one handle. */
   scanBysrc(issuerKeyId: string, id: string): Promise<RawScanEntry[]>;
@@ -225,9 +225,9 @@ function buildScanner(nc: NatsConnection, space: string, onClose: () => Promise<
 
   // The RAW scan — MODULE-PRIVATE (a closure over the owned connection): no caller ever supplies
   // `prefix`; the closed ops below force it from a validated id.
-  const scanOnce = async (prefix: string): Promise<RawScanEntry[]> => {
+  const scanOnce = async (prefix: string, signal?: AbortSignal): Promise<RawScanEntry[]> => {
     const latest = await drainLiteralConsumer(await jsmOf(), jsOf(), {
-      label: "the sealed scanner", stream, name: SCANNER_CONSUMER_NAME, filter: `$KV.${bucket}.${prefix}>`, probe,
+      label: "the sealed scanner", stream, name: SCANNER_CONSUMER_NAME, filter: `$KV.${bucket}.${prefix}>`, probe, signal,
     });
     const out: RawScanEntry[] = [];
     for (const [subject, v] of latest) out.push({ key: subject.slice(keyPrefixLen), data: v.data, seq: v.seq, op: v.op });
@@ -241,8 +241,8 @@ function buildScanner(nc: NatsConnection, space: string, onClose: () => Promise<
     scanManagerGates: () => serialized(() => guardedScan(guard, () => scanOnce("epgate.manager."))),
     scanCredentialFamily: (lifecycleUid: string) =>
       serialized(() => guardedScan(guard, () => scanOnce(`cred.${assertLifecycleToken(lifecycleUid)}.`))),
-    scanEndpointCredentialFamily: (endpoint: string, instanceId: string) =>
-      serialized(() => guardedScan(guard, () => scanOnce(`epcred.${endpointToken(endpoint)}.${assertLifecycleToken(instanceId, "instanceId")}.`))),
+    scanEndpointCredentialFamily: (endpoint: string, instanceId: string, signal?: AbortSignal) =>
+      serialized(() => guardedScan(guard, () => scanOnce(`epcred.${endpointToken(endpoint)}.${assertLifecycleToken(instanceId, "instanceId")}.`, signal))),
     scanBysrc: (issuerKeyId: string, id: string) =>
       serialized(() => guardedScan(guard, () => scanOnce(`bysrc.${assertSegment(issuerKeyId, "issuerKeyId")}.${assertSegment(id, "handle id")}.`))),
     scanStageFamily: () => serialized(() => guardedScan(guard, () => scanOnce("stage."))),

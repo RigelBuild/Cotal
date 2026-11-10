@@ -1,5 +1,8 @@
 import { registryStores } from "./lifecycle-registry.js";
 import { createToolResultConsentSigner, makeToolResultConsentRecorder, type ToolResultConsentRecorder, type ToolResultConsentSignerOptions } from "./tool-result-consent.js";
+import { boundPlacementDelivery, createPlacementEnrollmentAuthority, type PlacementEnrollmentAuthority } from "./placement-enrollment.js";
+import type { PlacementEnrollmentResult } from "@cotal-ai/core";
+import type { ReconcilerPort, RolePolicyPort, ServiceAuthenticator } from "./placement-enrollment.js";
 /**
  * The AUTH SERVICE daemon — the one server-side process a user-auth space runs alongside its broker
  * (the delivery-daemon pattern: spawned detached by `cotal up`, pid-filed per space, torn down by
@@ -105,6 +108,7 @@ import { S2A_INVOCATION_MS, openServiceHostEffect, openServiceHostOperations, ty
 import { SERVICE_ENDPOINT_AUTHORITY_PATH, SERVICE_ENDPOINT_HOST_PATH, answerServiceAuthority, serviceAuthorityDenied, serviceAuthorityInfo, serviceHostGranterFor, type ServiceAuthorityCaller, type ServiceAuthorityDoor } from "./service-endpoint-authority.js";
 import { validateServiceRenewalProof } from "./service-renewal.js";
 import { openAuthLedgerScannerCandidate } from "./ledger-scanner.js";
+import { openRegistrationFamilyScan } from "./registration-family-scan.js";
 import { openRecordsScannerCandidate } from "./records-scanner.js";
 import { acquirePlaneClaim, makeDeliveryAdminPlaneOracle, makeDeliveryAdminPrincipalOracle, scannerDeathCopy, planeClaimRefusal, type PlaneClaimHold, type PlaneLivenessOracle } from "./plane-claim.js";
 import { enumerateOperationIntents, resumeAgentTakeover, type EvictPrincipal } from "./credential-ledger.js";
@@ -340,6 +344,7 @@ export interface AuthAuthorityPlane extends CalloutAuthority {
     sentinelCreds: string;
     agentBearerExchangeUrl: string;
   }) => Promise<RemoteManagedAgentEnrollmentResult>;
+  placementEnrollment: PlacementEnrollmentAuthority | undefined;
   /** Host-owned retirement preparation (#1972): the prepare decision, then the target uid's broker
    *  footprint and grant are released, so the participant's terminal rail finds the grant gone. */
   prepareManagedAgentRetirement: (args: {
@@ -439,6 +444,10 @@ async function supervisorGeneration(session: IssuerSession, space: string, owner
 /** Trusted composition policy for unpinned interactive manager-caller requests. No request or CLI
  *  flag sets it. The local-primary policy refuses an unavailable local Manager without substitution. */
 export interface AuthServiceRuntimeOptions {
+  /** If any placement port is unset, enrollment is unimplemented. */
+  placementReconciler?: ReconcilerPort;
+  placementAuthenticator?: ServiceAuthenticator;
+  placementRolePolicy?: RolePolicyPort;
   interactiveManagerSelection?: "local-primary";
   /** Process-lifetime cancellation custody quotas. No eviction or automatic restart on exhaustion. */
   runCancelLimits?: RunCancelLimits;
@@ -512,6 +521,7 @@ export interface OpenAuthAuthorityPlaneOptions extends AuthServiceRuntimeOptions
     discovery?: (d: { registry: LifecycleRegistry; kill: () => Promise<void> }) => void | Promise<void>;
     effect?: (effect: ServiceHostEffect, scope: ServiceHostEffectScope) => void | Promise<void>;
   };
+  probeManagerMint?: () => void | Promise<void>;
 }
 
 /**
@@ -681,6 +691,8 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
   hold = await acquirePlaneClaim({ nc: barrier.nc, space, ledger: ledgerCand.tuple, records: recordsCand.tuple, oracle, log });
   const scanner = ledgerCand.activate(hold.guard);
   const recordsScanner = recordsCand.activate(hold.guard);
+  const registrationFamilyScan = await openRegistrationFamilyScan({ onConnection, server, space, dataAccount, log, scanner, authKv: await new Kvm(barrier.nc).open(epAuthBucket(space)), recordsKv: await new Kvm(barrier.nc).open(recordsBucket(space)) });
+  unwind.push(() => registrationFamilyScan.close());
   // Mid-life disconnect = the FENCING event (security req: an owned scanner that dies must not
   // leave the plane half-running). First death wins: fence the guard with the ux state-3 copy,
   // close the sibling so a successor's reclaim isn't blocked by a half-dead pair, log loud.
@@ -1182,8 +1194,147 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
     ...(verifyCallerPayload !== undefined ? { checkCallerPayload } : {}),
     refuse: refuseIfFenced,
   });
+  const enrollManagedAgent: AuthAuthorityPlane["enrollManagedAgent"] = async ({ owner, scope, request, sentinelCreds, agentBearerExchangeUrl }) => {
+      refuseIfFenced();
+      const r = await authorizeRemoteManagedAgentEnrollment({ owner, scope, proofSecret: dataAccount.signingSeed, space, request, observeManagerGate: observeLegacyManagerGate });
+      const t = r.target;
+      const subscribe = t.subscribe ?? [];
+      // An omitted or empty read list reads the subscribe set, so the bound, the row and the
+      // footprint all take the read set it resolves to.
+      const allowSubscribe = resolveReadAcl(subscribe, t.allowSubscribe);
+      const { lifecycleUid, row } = await serializedForAlias(opts.dir, owner, t.actor, async () => {
+        // The custody this enrollment attests: the instance the authorized request names, checked
+        // against its current registration above. Never a field of the participant's target.
+        const custody = { kind: "remote-manager" as const, instanceId: r.instanceId };
+        // The helper's parent is the caller this host observed asking for it, not the manager, so
+        // the ledger bounds the helper by that caller's grant (SPEC 13.6). A retry of an enrollment
+        // whose row stands answers from that row, whose parent was decided when it was written, so
+        // it consumes no observation.
+        const spawner = findManagedActor(opts.dir, owner, t.actor)?.tokenHash === t.tokenHash ? undefined : await resolveRemoteSpawner({
+          request: r, owner, takeObserved: takeObservedSpawnRequest, readAdmission: readRunStarterAdmission,
+        });
+        // ONE synchronous transaction for the read, the decision and the write, so an
+        // enrollment in another process (or a provider grant) cannot land between them.
+        const decided = withManagedGrantTransaction(opts.dir, (tx) => {
+          const current = tx.read(owner, t.actor);
+          const held = current?.kind === "managed-agent" ? current : undefined;
+          // The token digest names one enrollment. A held row with this request's digest is that
+          // enrollment retried, so it answers the same uid; any other held row is a lifecycle that
+          // still runs, and taking its grant would strand it.
+          if (held !== undefined && held.tokenHash !== t.tokenHash)
+            throw new EpEnvelopeError("conflict", `managed agent "${t.actor}" is enrolled at lifecycle ${held.lifecycleUid}; prepare that lifecycle's retirement before enrolling a successor`);
+          // A retry is this enrollment only if the held row records this exact custody. A row with
+          // none, or with another, is never upgraded or adopted here.
+          if (held !== undefined && (held.custody === undefined || !sameManagedGrantCustody(held.custody, custody)))
+            throw new EpEnvelopeError("conflict", `managed agent "${t.actor}" is held at lifecycle ${held.lifecycleUid} under another custody; it was not adopted by this enrollment`);
+          // A retry provisions the read this request resolves to, so it is this enrollment only if
+          // that read is the one its grant records. A grant an older host wrote for a target that
+          // named only a subscribe set records no read.
+          if (held !== undefined && !(new Set(held.allowSubscribe).size === new Set(allowSubscribe).size && held.allowSubscribe.every((ch) => allowSubscribe.includes(ch))))
+            throw new EpEnvelopeError("conflict", `managed agent "${t.actor}" is enrolled at lifecycle ${held.lifecycleUid} to read [${held.allowSubscribe.join(", ")}], and this retry reads [${allowSubscribe.join(", ")}]; prepare that lifecycle's retirement and enroll it again`);
+          // A retry walks the held grant again: its spawner chain may have narrowed since the
+          // first answer, and provisioning would restore what it took away.
+          if (held !== undefined) {
+            assertWithinSpawnerGrant(opts.dir, held, "spawn");
+            return { lifecycleUid: held.lifecycleUid!, row: held, wrote: false };
+          }
+          if (spawner === undefined)
+            throw new EpEnvelopeError("conflict", `managed agent "${t.actor}" was enrolled for this token and is gone; enroll it again`);
+          // A run's helper is also bounded by what the run's starter held at admission, beside the
+          // walk over the starter's current row below.
+          if (spawner.run !== undefined)
+            assertWithinRunDelegation(spawner.run.runId, spawner.run.starter, spawner.run.delegation, {
+              owner, actor: t.actor, scope: t.capabilities ?? [], allowSubscribe, allowPublish: t.allowPublish ?? [], role: t.role,
+            });
+          // A fresh uid is never one a retirement tombstoned, and only the host can make that
+          // promise. The grant's envelope walk refuses an over-wide request before any durable exists.
+          const lifecycleUid = mintLifecycleUid();
+          const row = tx.grantManaged({
+            owner,
+            actor: t.actor,
+            scope: t.capabilities ?? [],
+            allowSubscribe,
+            allowPublish: t.allowPublish ?? [],
+            ...(t.role !== undefined ? { role: t.role } : {}),
+            ...(t.label !== undefined ? { label: t.label } : {}),
+            parent: spawner.parent,
+            lifecycleUid,
+            tokenHash: t.tokenHash,
+            custody,
+          });
+          return { lifecycleUid, row, wrote: true };
+        });
+        const { lifecycleUid, row } = decided;
+        try {
+          const identity = newIdentity();
+          const provisioner = new CotalEndpoint({
+            space,
+            servers: server,
+            onConnection: (nc) => onConnection?.(nc, `cotal:provisioner:${space}`),
+            channels: [],
+            creds: await mintCreds(issuerAuth(), identity, "provisioner"),
+            card: { id: identity.id, name: "provisioner", role: "provisioner", kind: "endpoint" },
+            registerPresence: false,
+            watchPresence: false,
+            watchChannels: false,
+            consume: false,
+          });
+          await provisioner.start();
+          try {
+            await provisionAgentDurables(provisioner, { owner, actor: t.actor, lifecycleUid }, { subscribe, allowSubscribe, role: row.role });
+          } finally {
+            await provisioner.stop();
+          }
+        } catch (e) {
+          // A retried enrollment's first answer may already have reached the participant, so its
+          // grant stays. A grant this call wrote gave the participant no uid, so it can never be
+          // retired: it and any durable it got must go now. The revoke removes only the row this
+          // call wrote: same uid AND same custody, read under the grant lock.
+          if (decided.wrote) {
+            revokeManagedActorIf(opts.dir, owner, t.actor, { lifecycleUid, custody });
+            await deprovisionManagedFootprint(owner, t.actor, lifecycleUid, []).catch((err) =>
+              opts.log(`auth-service: refused enrollment of ${owner}/${t.actor} left durables at ${lifecycleUid}: ${err instanceof Error ? err.message : String(err)}`));
+          }
+          throw e;
+        }
+        return { lifecycleUid, row };
+      });
+      return {
+        v: 1,
+        kind: "manager-managed-agent-enrollment",
+        space,
+        owner,
+        actor: r.actor,
+        instanceId: r.instanceId,
+        managerLifecycleUid: r.managerLifecycleUid,
+        requestId: r.requestId,
+        registrationProof: r.registrationProof,
+        serveEpoch: r.serveEpoch,
+        material: {
+          owner,
+          actor: t.actor,
+          lifecycleUid,
+          sentinelCreds,
+          subscribe,
+          allowSubscribe,
+          allowPublish: row.allowPublish,
+          agentBearerExchangeUrl,
+        },
+      };
+  };
+  const placementEnrollment = opts.placementReconciler && opts.placementAuthenticator && opts.placementRolePolicy ? createPlacementEnrollmentAuthority({
+    dir: opts.dir, space, accountPublicKey: dataAccount.pub, proofSecret: dataAccount.signingSeed,
+    observeManagerGate: observeLegacyManagerGate, reconciler: opts.placementReconciler,
+    authenticator: opts.placementAuthenticator, assertOpen: refuseIfFenced,
+    rolePolicy: opts.placementRolePolicy,
+    serializedForAlias: (owner, actor, action) => serializedForAlias(opts.dir, owner, actor, action),
+    deprovisionFootprint: (owner, actor, lifecycleUid, channels) => deprovisionManagedFootprint(owner, actor, lifecycleUid, channels.filter(isConcreteChannel)),
+    enrollManagedAgent,
+    log,
+  }) : undefined;
   return {
     ...callout,
+    placementEnrollment,
     openChatSession: async (args) => {
       refuseIfFenced();
       return chat.admit(args);
@@ -1309,6 +1460,10 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
         }),
         issue: async ({ actors, request: r }) => {
           const existing = await observeLegacyManagerGate(r.instanceId);
+          if (existing !== null && existing.principal !== remoteManagerServePrincipal(owner, r.instanceId))
+            throw new EpEnvelopeError("permission-denied", "manager instance belongs to another owner");
+          if (r.operation === "session" || r.operation === "transferReader")
+            assertCurrentManagerGate(existing, r.instanceId, r.operation === "session" ? r.session?.epoch : undefined, owner, `manager-service ${r.operation}`);
           if (r.operation === "prepare" && existing === null) {
             await provisionEndpointGateOpen(authKv, {
               endpoint: "manager", instanceId: r.instanceId, principal: remoteManagerServePrincipal(owner, r.instanceId),
@@ -1336,7 +1491,7 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
           );
           const credentials: import("@cotal-ai/core").RemoteManagerAuthorityMaterial["credentials"] = {};
           const siblingOn = (gate: ReturnType<typeof serveIssuanceGateKv>, observed: EpGateState) => async (key: "goalWriter" | "sessionLedger", profile: "goal-writer" | "session-ledger", actor: string) => {
-            const issued = await credential(key, profile, actor, profile === "goal-writer" ? { goalWriter: { endpoint: "manager" }, expiresInSeconds: standingTtl } : { expiresInSeconds: standingTtl });
+            const issued = await credential(key, profile, actor, profile === "goal-writer" ? { goalWriter: { endpoint: "manager", remoteManager: { owner, instanceId: r.instanceId } }, expiresInSeconds: standingTtl } : { expiresInSeconds: standingTtl });
             await commitSiblingIssuance(gate, observed, {
               credentialId: credentialIdOf(issued.jwt),
               credentialKey: r.identities[key].id,
@@ -1353,26 +1508,33 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
             });
             return issued;
           };
-          if (r.operation === "renew") {
-            // `renew` carries no epoch on the wire, so its staleness is the proof's to refuse.
-            const gate = managerIssuanceGate(r.instanceId);
-            await assertCurrentManagerRegistration(r, undefined, {
-              owner, proofSecret: dataAccount.signingSeed, observeManagerGate: async () => await gate.observe(),
-            }, "manager-service renewal");
-          }
           if (r.operation === "prepare" || r.operation === "renew") {
+            const checkedGate = await managerIssuanceGate(r.instanceId).observe();
+            if (!checkedGate || checkedGate.state !== "open" || checkedGate.principal !== remoteManagerServePrincipal(owner, r.instanceId))
+              throw new EpEnvelopeError("permission-denied", "manager issuance gate changed before credential minting");
+            if (r.operation === "renew") {
+              // The proof binds the current epoch and registration; renew carries no epoch field.
+              await assertCurrentManagerRegistration(r, undefined, {
+                owner, proofSecret: dataAccount.signingSeed, observeManagerGate: async () => checkedGate,
+              }, "manager-service renewal");
+            }
+            const ensureGateUnchanged = async (): Promise<void> => {
+              const current = await managerIssuanceGate(r.instanceId).observe();
+              if (!current || current.state !== "open" || current.principal !== checkedGate.principal ||
+                  current.registrationRevision !== checkedGate.registrationRevision || current.processEpoch !== checkedGate.processEpoch)
+                throw new EpEnvelopeError("conflict", "manager issuance gate changed while credentials were being minted");
+            };
             credentials.supervisor = await credential("supervisor", "remote-manager", actors.supervisor, {
               remoteManager: { instanceId: r.instanceId, owner, actor: actors.supervisor },
               expiresInSeconds: standingTtl,
             });
-            // The executor receives the exact instance-scoped registration/maintenance surface under
-            // a separate nkey and bounded five-minute lifetime. The participant retains it for the
-            // immediate goalidx boot sweep and clean service deregistration, and renews it in place
-            // before maintenance or deregistration once its retained credential is unhealthy.
+            await opts.probeManagerMint?.();
+            await ensureGateUnchanged();
             credentials.executor = await credential("executor", "remote-manager", actors.executor, {
               remoteManager: { instanceId: r.instanceId, owner, actor: actors.executor },
               expiresInSeconds: 5 * 60,
             });
+            await ensureGateUnchanged();
           }
           if (r.operation === "session") {
             const expectedProof = remoteManagerRegistrationProof(owner, registration);
@@ -1694,134 +1856,7 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
         observeManagerGate: observeLegacyManagerGate,
       });
     },
-    enrollManagedAgent: async ({ owner, scope, request, sentinelCreds, agentBearerExchangeUrl }) => {
-      refuseIfFenced();
-      const r = await authorizeRemoteManagedAgentEnrollment({ owner, scope, proofSecret: dataAccount.signingSeed, space, request, observeManagerGate: observeLegacyManagerGate });
-      const t = r.target;
-      const subscribe = t.subscribe ?? [];
-      // An omitted or empty read list reads the subscribe set, so the bound, the row and the
-      // footprint all take the read set it resolves to.
-      const allowSubscribe = resolveReadAcl(subscribe, t.allowSubscribe);
-      const { lifecycleUid, row } = await serializedForAlias(opts.dir, owner, t.actor, async () => {
-        // The custody this enrollment attests: the instance the authorized request names, checked
-        // against its current registration above. Never a field of the participant's target.
-        const custody = { kind: "remote-manager" as const, instanceId: r.instanceId };
-        // The helper's parent is the caller this host observed asking for it, not the manager, so
-        // the ledger bounds the helper by that caller's grant (SPEC 13.6). A retry of an enrollment
-        // whose row stands answers from that row, whose parent was decided when it was written, so
-        // it consumes no observation.
-        const spawner = findManagedActor(opts.dir, owner, t.actor)?.tokenHash === t.tokenHash ? undefined : await resolveRemoteSpawner({
-          request: r, owner, takeObserved: takeObservedSpawnRequest, readAdmission: readRunStarterAdmission,
-        });
-        // ONE synchronous transaction for the read, the decision and the write, so an
-        // enrollment in another process (or a provider grant) cannot land between them.
-        const decided = withManagedGrantTransaction(opts.dir, (tx) => {
-          const current = tx.read(owner, t.actor);
-          const held = current?.kind === "managed-agent" ? current : undefined;
-          // The token digest names one enrollment. A held row with this request's digest is that
-          // enrollment retried, so it answers the same uid; any other held row is a lifecycle that
-          // still runs, and taking its grant would strand it.
-          if (held !== undefined && held.tokenHash !== t.tokenHash)
-            throw new EpEnvelopeError("conflict", `managed agent "${t.actor}" is enrolled at lifecycle ${held.lifecycleUid}; prepare that lifecycle's retirement before enrolling a successor`);
-          // A retry is this enrollment only if the held row records this exact custody. A row with
-          // none, or with another, is never upgraded or adopted here.
-          if (held !== undefined && (held.custody === undefined || !sameManagedGrantCustody(held.custody, custody)))
-            throw new EpEnvelopeError("conflict", `managed agent "${t.actor}" is held at lifecycle ${held.lifecycleUid} under another custody; it was not adopted by this enrollment`);
-          // A retry provisions the read this request resolves to, so it is this enrollment only if
-          // that read is the one its grant records. A grant an older host wrote for a target that
-          // named only a subscribe set records no read.
-          if (held !== undefined && !(new Set(held.allowSubscribe).size === new Set(allowSubscribe).size && held.allowSubscribe.every((ch) => allowSubscribe.includes(ch))))
-            throw new EpEnvelopeError("conflict", `managed agent "${t.actor}" is enrolled at lifecycle ${held.lifecycleUid} to read [${held.allowSubscribe.join(", ")}], and this retry reads [${allowSubscribe.join(", ")}]; prepare that lifecycle's retirement and enroll it again`);
-          // A retry walks the held grant again: its spawner chain may have narrowed since the
-          // first answer, and provisioning would restore what it took away.
-          if (held !== undefined) {
-            assertWithinSpawnerGrant(opts.dir, held, "spawn");
-            return { lifecycleUid: held.lifecycleUid!, row: held, wrote: false };
-          }
-          if (spawner === undefined)
-            throw new EpEnvelopeError("conflict", `managed agent "${t.actor}" was enrolled for this token and is gone; enroll it again`);
-          // A run's helper is also bounded by what the run's starter held at admission, beside the
-          // walk over the starter's current row below.
-          if (spawner.run !== undefined)
-            assertWithinRunDelegation(spawner.run.runId, spawner.run.starter, spawner.run.delegation, {
-              owner, actor: t.actor, scope: t.capabilities ?? [], allowSubscribe, allowPublish: t.allowPublish ?? [], role: t.role,
-            });
-          // A fresh uid is never one a retirement tombstoned, and only the host can make that
-          // promise. The grant's envelope walk refuses an over-wide request before any durable exists.
-          const lifecycleUid = mintLifecycleUid();
-          const row = tx.grantManaged({
-            owner,
-            actor: t.actor,
-            scope: t.capabilities ?? [],
-            allowSubscribe,
-            allowPublish: t.allowPublish ?? [],
-            ...(t.role !== undefined ? { role: t.role } : {}),
-            ...(t.label !== undefined ? { label: t.label } : {}),
-            parent: spawner.parent,
-            lifecycleUid,
-            tokenHash: t.tokenHash,
-            custody,
-          });
-          return { lifecycleUid, row, wrote: true };
-        });
-        const { lifecycleUid, row } = decided;
-        try {
-          const identity = newIdentity();
-          const provisioner = new CotalEndpoint({
-            space,
-            servers: server,
-            onConnection: (nc) => onConnection?.(nc, `cotal:provisioner:${space}`),
-            channels: [],
-            creds: await mintCreds(issuerAuth(), identity, "provisioner"),
-            card: { id: identity.id, name: "provisioner", role: "provisioner", kind: "endpoint" },
-            registerPresence: false,
-            watchPresence: false,
-            watchChannels: false,
-            consume: false,
-          });
-          await provisioner.start();
-          try {
-            await provisionAgentDurables(provisioner, { owner, actor: t.actor, lifecycleUid }, { subscribe, allowSubscribe, role: row.role });
-          } finally {
-            await provisioner.stop();
-          }
-        } catch (e) {
-          // A retried enrollment's first answer may already have reached the participant, so its
-          // grant stays. A grant this call wrote gave the participant no uid, so it can never be
-          // retired: it and any durable it got must go now. The revoke removes only the row this
-          // call wrote: same uid AND same custody, read under the grant lock.
-          if (decided.wrote) {
-            revokeManagedActorIf(opts.dir, owner, t.actor, { lifecycleUid, custody });
-            await deprovisionManagedFootprint(owner, t.actor, lifecycleUid, []).catch((err) =>
-              opts.log(`auth-service: refused enrollment of ${owner}/${t.actor} left durables at ${lifecycleUid}: ${err instanceof Error ? err.message : String(err)}`));
-          }
-          throw e;
-        }
-        return { lifecycleUid, row };
-      });
-      return {
-        v: 1,
-        kind: "manager-managed-agent-enrollment",
-        space,
-        owner,
-        actor: r.actor,
-        instanceId: r.instanceId,
-        managerLifecycleUid: r.managerLifecycleUid,
-        requestId: r.requestId,
-        registrationProof: r.registrationProof,
-        serveEpoch: r.serveEpoch,
-        material: {
-          owner,
-          actor: t.actor,
-          lifecycleUid,
-          sentinelCreds,
-          subscribe,
-          allowSubscribe,
-          allowPublish: row.allowPublish,
-          agentBearerExchangeUrl,
-        },
-      };
-    },
+    enrollManagedAgent,
     prepareManagedAgentRetirement: async ({ owner, scope, request }) => {
       refuseIfFenced();
       const r = await authorizeRemoteManagedAgentPrepareRetirement({ owner, scope, proofSecret: dataAccount.signingSeed, space, request, observeManagerGate: observeLegacyManagerGate });
@@ -2177,6 +2212,7 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
       await issuer.close();
       await discoveryClient?.close();
       const scannerFlight = closeScanners ??= (async () => {
+        await registrationFamilyScan.close();
         await authAdmin?.close();
         const results = await Promise.allSettled([reader.close(), recordsScanner.close(), scanner.close()]);
         const errors = results.filter((r): r is PromiseRejectedResult => r.status === "rejected").map((r) => r.reason);
@@ -2912,6 +2948,9 @@ async function startAuthContext(o: AuthContextOptions): Promise<{ handle: Omit<A
     dataAccount: { pub: keys.dataAccount.pub, signingSeed: keys.dataAccount.signingSeed },
     log,
     localManager: o.localManager,
+    placementReconciler: o.placementReconciler,
+    placementAuthenticator: o.placementAuthenticator,
+    placementRolePolicy: o.placementRolePolicy,
     ...(o.interactiveManagerSelection !== undefined ? { interactiveManagerSelection: o.interactiveManagerSelection } : {}),
     ...(o.runCancelLimits !== undefined ? { runCancelLimits: o.runCancelLimits } : {}),
     ...(o.standingRenewableTtlSeconds !== undefined ? { standingRenewableTtlSeconds: o.standingRenewableTtlSeconds } : {}),
@@ -3005,6 +3044,11 @@ async function startAuthContext(o: AuthContextOptions): Promise<{ handle: Omit<A
         if (publicUrl === undefined)
           throw new EpEnvelopeError("failed-precondition", "managed agent enrollment needs the public exchange face, where the enrolled agent's bearer exchanges - start the auth service with --exchange-public-port");
         return plane.enrollManagedAgent({ ...args, sentinelCreds: callout.sentinelCreds, agentBearerExchangeUrl: publicUrl });
+      },
+      enrollPlacement: (args) => {
+        if (publicUrl === undefined) throw new EpEnvelopeError("failed-precondition", "placement enrollment needs the public exchange face");
+        if (!plane.placementEnrollment) throw new EpEnvelopeError("unimplemented", "placement enrollment ports are not configured");
+        return plane.placementEnrollment.enrollPlacement({ ...args, sentinelCreds: callout.sentinelCreds, agentBearerExchangeUrl: publicUrl });
       },
       prepareManagedAgentRetirement: plane.prepareManagedAgentRetirement,
       scanManagerGoalIndex: plane.scanManagerGoalIndex,
@@ -3295,6 +3339,7 @@ interface HandlerCtx {
   verifyManagedAgentPrepareRetirement: AuthAuthorityPlane["verifyManagedAgentPrepareRetirement"];
   verifyManagedAgentRuntime: AuthAuthorityPlane["verifyManagedAgentRuntime"];
   enrollManagedAgent: (args: HumanHolder & { request: RemoteManagedAgentEnrollmentRequest }) => Promise<RemoteManagedAgentEnrollmentResult>;
+  enrollPlacement: (args: { owner: string; scope: string[]; request: unknown; onDelivered: (release: () => void) => void }) => Promise<PlacementEnrollmentResult>;
   prepareManagedAgentRetirement: AuthAuthorityPlane["prepareManagedAgentRetirement"];
   scanManagerGoalIndex: (args: HumanHolder & { request: import("@cotal-ai/core").RemoteManagerGoalIndexScanRequest }) => ReturnType<AuthAuthorityPlane["scanManagerGoalIndex"]>;
   authorizeManagerAdmin: (args: HumanHolder & { request: RemoteManagerAdminAuthorizationRequest }) => ReturnType<AuthAuthorityPlane["authorizeManagerAdmin"]>;
@@ -3327,17 +3372,24 @@ interface HandlerCtx {
   retireChatSession: AuthAuthorityPlane["retireChatSession"];
 }
 
-type ManagerAuthorityDispatchCtx = Pick<HandlerCtx, "space" | "dir" | "secrets" | "managerServiceAuthority" | "maintainRemoteManager" | "validateRetainedAgent" | "enrollManagedAgent" | "prepareManagedAgentRetirement" | "scanManagerGoalIndex" | "authorizeManagerAdmin" | "authorizeManagerParticipation" | "admitManagerRun" | "submitManagerRun" | "issueManagerRunAttempt" | "revokeManagerRun" | "cancelManagerRun">;
+type ManagerAuthorityDispatchCtx = Pick<HandlerCtx, "space" | "dir" | "secrets" | "managerServiceAuthority" | "maintainRemoteManager" | "validateRetainedAgent" | "enrollManagedAgent" | "prepareManagedAgentRetirement" | "scanManagerGoalIndex" | "authorizeManagerAdmin" | "authorizeManagerParticipation" | "admitManagerRun" | "submitManagerRun" | "issueManagerRunAttempt" | "revokeManagerRun" | "cancelManagerRun"> & Partial<Pick<HandlerCtx, "enrollPlacement">>;
 
 /** Dispatch one already-authenticated manager-authority body through the fixed host validator. */
 export async function dispatchManagerAuthorityRequest(
   ctx: ManagerAuthorityDispatchCtx,
   owner: string,
   body: { request: unknown },
+  onDelivered?: (release: () => void) => void,
 ): Promise<unknown> {
   if (body.request === null || typeof body.request !== "object" || Array.isArray(body.request))
     throw new Error("manager-service authority request must be an object");
   const request = body.request as { kind?: unknown; actor?: unknown };
+  if (request.kind === "auth.enroll-placement") {
+    const placement = body.request as { enrollment?: { actor?: unknown } };
+    if (typeof placement.enrollment?.actor !== "string" || !ctx.enrollPlacement || !onDelivered) throw new EpEnvelopeError("permission-denied", "placement enrollment needs an authenticated response channel");
+    const row = ledgerAuthorizeGrant(ctx.dir)(owner, placement.enrollment.actor);
+    return ctx.enrollPlacement({ owner, scope: row.scope ?? [], request: body.request, onDelivered });
+  }
   if (typeof request.actor !== "string") throw new Error("manager-service authority request requires an actor");
   const row = ledgerAuthorizeGrant(ctx.dir)(owner, request.actor);
   // #1972: this service owns the ledger and the space's provisioning authority, so it is the host
@@ -4354,7 +4406,21 @@ export async function handleManagerServiceAuthority(req: IncomingMessage, res: S
   try {
     const verified = await verifyIdpToken(body.idpToken, ctx.bridgeIdp);
     const owner = deriveOwnerForIdpSubject(ctx.ownerSecret, ctx.bridgeIdp.issuer, verified.sub);
-    return send(res, 200, await dispatchManagerAuthorityRequest(ctx, owner, { request: body.request }));
+    let deliveryRelease: (() => void) | undefined;
+    const onDelivered = (release: () => void) => {
+      const finish = boundPlacementDelivery(release, () => res.destroy());
+      deliveryRelease = finish;
+      if (res.destroyed || res.writableFinished) { finish(); return; }
+      res.once("finish", finish);
+      res.once("close", finish);
+      res.once("error", finish);
+    };
+    try {
+      return send(res, 200, await dispatchManagerAuthorityRequest(ctx, owner, { request: body.request }, onDelivered));
+    } catch (error) {
+      deliveryRelease?.();
+      throw error;
+    }
   } catch (e) {
     const reason = e instanceof Error ? e.message : String(e);
     // A conflict, such as a name another lifecycle holds or a stale serve epoch, answers 409.
