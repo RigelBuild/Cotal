@@ -138,6 +138,14 @@ try {
         console.log(`  ✓ ${name}`);
       } finally { watch.release(); }
     }
+    const otherInstanceSubject = managerRegistrationFamilySubject(space, owner, mintLifecycleUid());
+    const instanceReplyDenial = new Promise<Error>((resolve, reject) => {
+      const sub = nc.subscribe(`${otherInstanceSubject}.reply.*`, { callback: error => { if (error) { sub.unsubscribe(); resolve(error); } } });
+      void nc.flush().catch(reject);
+    });
+    const instanceReplyError = await Promise.race([instanceReplyDenial, delay(5000).then(() => { throw new Error("subscription denial not observed"); })]);
+    assert.match(instanceReplyError.message, /permissions violation/i);
+    console.log("  ✓ another instance cannot subscribe to reply leaf");
     const otherOwner = `u_${"b".repeat(26)}`;
     const foreignCreds = await mintCreds(auth, newIdentity(), "remote-manager", { principal: { owner: otherOwner, actor }, remoteManager: { instanceId, owner: otherOwner, actor } });
     const foreign = await connect({ servers, ...standaloneConnectOpts({ creds: foreignCreds, tls: false }), reconnect: false });
@@ -167,6 +175,10 @@ try {
       error => error instanceof Error && !(error instanceof RegistrationFamilyRefusedError) && /registration read failed/.test(error.message));
     console.log("  ✓ invalid generation target is a plain registration read failure");
     await setManagerGate("retired");
+    const retiredGate = await requestManagerRegistrationRead(nc, space, owner, instanceId, { kind: "read", key: epgateKey("manager", instanceId) });
+    assert.ok(retiredGate && typeof retiredGate !== "number" && JSON.parse(new TextDecoder().decode(retiredGate.value)).state === "retired");
+    await assert.rejects(requestManagerRegistrationRead(nc, space, owner, instanceId, { kind: "read", key: eprepairKey("manager", instanceId) }),
+      error => error instanceof RegistrationFamilyRefusedError);
     await assert.rejects(requestManagerRegistrationFamily(nc, space, owner, instanceId, 1000),
       error => error instanceof RegistrationFamilyRefusedError);
     await setManagerGate("open");

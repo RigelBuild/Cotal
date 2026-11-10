@@ -49,6 +49,7 @@ import { hostname, tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { clean, cotalPty } from "../../implementations/cli/smoke/_console-pty.js";
 import { approveDevice } from "../../implementations/auth/smoke/_device-approval.js";
+import { openRegistrationFixture, type RegistrationFixture } from "../../implementations/auth/smoke/_registration-family-fixture.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const awaitExit = (child: ChildProcess, ms = 5_000): Promise<void> =>
@@ -122,12 +123,15 @@ writeFileSync(
   }),
 );
 
-/** Run the registration half the supervisor runs, over the target it resolved, as one line. */
+/** Run registration with the same instance-bound executor profile the host issues to production managers. */
 const drive = async (target: { server: string; tlsRequired: boolean }): Promise<string> => {
   const instanceId = mintLifecycleUid();
-  const prepareCreds = await mintCreds(auth, newIdentity(), "endpoint-serve-executor", {
-    endpointServeExecutor: { endpoint: MANAGER_ENDPOINT, instanceId },
+  const owner = "local";
+  const actor = remoteManagerActors(instanceId).executor;
+  const prepareCreds = await mintCreds(auth, newIdentity(), "remote-manager", {
+    principal: { owner, actor }, remoteManager: { instanceId, owner, actor },
   });
+  await registrationFixture!.prepare(owner, instanceId);
   try {
     const registered = await registerRemoteManagerAuthority({
       space,
@@ -168,6 +172,7 @@ let releaseTrustBroker: (() => void) | undefined;
 let releaseBrokerStoreTrust: (() => void) | undefined;
 let idpServer: ReturnType<typeof createHttpServer> | undefined;
 let authServiceKid: ChildProcess | undefined;
+let registrationFixture: RegistrationFixture | undefined;
 const releaseRoots: string[] = [];
 /** Kill the broker and remove every artifact this suite made. Idempotent: cell D asserts on it
  *  where the banner can still count the verdict, and the `finally` repeats it for the paths that
@@ -176,6 +181,7 @@ let tornDown = false;
 const teardown = async (): Promise<void> => {
   if (tornDown) return;
   tornDown = true;
+  await registrationFixture?.close();
   process.chdir(tmpdir());
   await Promise.all(kids.map(async (child) => { if (child.exitCode === null) child.kill("SIGKILL"); await awaitExit(child); }));
   rmSync(brokerStore, { recursive: true, force: true });
@@ -203,6 +209,7 @@ try {
   // `setupSpaceStreams` also runs `createEndpointStreams`, so the records + endpoint-auth buckets and
   // the contract store the registration writes into exist before either cell dials.
   await setupSpaceStreams({ servers: tcpServer, space, creds: await mintCreds(auth, newIdentity(), "provisioner") });
+  registrationFixture = await openRegistrationFixture(tcpServer, space, auth);
 
   // A registered remote user-auth mesh whose broker is published over websocket. `root` holds no
   // user-auth marker, so this machine is a PARTICIPANT: exactly the case supervise routes through

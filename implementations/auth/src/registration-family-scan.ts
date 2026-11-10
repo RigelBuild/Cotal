@@ -36,9 +36,16 @@ export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts,
       } else {
         if (Object.keys(body).length !== 2 || !("deadline" in body) || typeof body.deadline !== "number" || !Number.isSafeInteger(body.deadline) || body.deadline <= Date.now()) throw new Error("invalid scan request");
       }
-      const gate = await serveIssuanceGateKv(opts.authKv, opts.space, { endpoint: "manager", instanceId: iid }).observe();
+      const gateEntry = await opts.authKv.get(epgateKey("manager", iid));
+      const gate = await serveIssuanceGateKv(opts.authKv, opts.space, { endpoint: "manager", instanceId: iid, read: async () => gateEntry }).observe();
       if (!gate && pointRead && body.kind === "read" && Object.keys(body).length === 3 && "key" in body && body.key === epgateKey("manager", iid)) {
         client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce, absent: true })));
+        return;
+      }
+      // The owner may observe its own retired gate, but no other registration data.
+      if (gate?.state === "retired" && gate.principal === remoteManagerServePrincipal(owner, iid) && pointRead && body.kind === "read" && "key" in body && body.key === epgateKey("manager", iid)) {
+        const result = gateEntry ? { value: Buffer.from(gateEntry.value).toString("base64"), revision: gateEntry.revision, operation: gateEntry.operation } : { absent: true };
+        client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce, ...result })));
         return;
       }
       if (!gate || gate.state === "retired" || gate.principal !== remoteManagerServePrincipal(owner, iid)) throw new RegistrationFamilyAuthorizationError("manager gate does not match requester");

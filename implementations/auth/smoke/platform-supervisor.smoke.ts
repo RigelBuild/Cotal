@@ -137,6 +137,9 @@ try {
   await cell(4, async () => {
     assert.ok(prepared && activated && registered);
     const registrationProof = remoteManagerClient.currentRegistrationProof(activated);
+    const executorRenewal = remoteManagerClient.remoteManagerAuthorityRequest(state, "cli", "renew", { registrationProof });
+    assert.ok((await call(executorRenewal)).credentials.executor);
+    await assert.rejects(call({ ...executorRenewal, registrationProof: `sha256:${"0".repeat(64)}` }), /proof does not match/);
     const renewalRequest = remoteManagerClient.remoteManagerAuthorityRequest(state,"cli","renewStandingBundle",{registrationProof});
     renewalRequest.accountPublicKey = a.accountPublicKey; renewalRequest.processEpoch = registered.processEpoch;
     const renewed = await call(renewalRequest);
@@ -233,7 +236,7 @@ try {
     try {
       const authKv = await new Kvm(heldNc).open(epAuthBucket(a.space));
       const gateKey = epgateKey("manager", stateC.instanceId);
-      const retired = JSON.parse(new TextDecoder().decode((await authKv.get(gateKey))!.value)) as Record<string, unknown>;
+      const retired = JSON.parse(new TextDecoder().decode((await (await new Kvm(reader!.nc).open(epAuthBucket(a.space))).get(gateKey))!.value)) as Record<string, unknown>;
       assert.equal(retired.state, "retired");
       delete retired.op;
       await authKv.put(gateKey, new TextEncoder().encode(JSON.stringify({ ...retired, state: "open" })));

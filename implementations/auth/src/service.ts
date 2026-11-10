@@ -1508,19 +1508,16 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
             });
             return issued;
           };
-          if (r.operation === "renew") {
-            // `renew` carries no epoch on the wire, so its staleness is the proof's to refuse.
-            const gate = managerIssuanceGate(r.instanceId);
-            await assertCurrentManagerRegistration(r, undefined, {
-              owner, proofSecret: dataAccount.signingSeed, observeManagerGate: async () => await gate.observe(),
-            }, "manager-service renewal");
-          }
           if (r.operation === "prepare" || r.operation === "renew") {
             const checkedGate = await managerIssuanceGate(r.instanceId).observe();
             if (!checkedGate || checkedGate.state !== "open" || checkedGate.principal !== remoteManagerServePrincipal(owner, r.instanceId))
               throw new EpEnvelopeError("permission-denied", "manager issuance gate changed before credential minting");
-            if (r.operation === "renew" && checkedGate.processEpoch !== r.processEpoch)
-              throw new EpEnvelopeError("permission-denied", "manager process epoch changed before credential minting");
+            if (r.operation === "renew") {
+              // The proof binds the current epoch and registration; renew carries no epoch field.
+              await assertCurrentManagerRegistration(r, undefined, {
+                owner, proofSecret: dataAccount.signingSeed, observeManagerGate: async () => checkedGate,
+              }, "manager-service renewal");
+            }
             const ensureGateUnchanged = async (): Promise<void> => {
               const current = await managerIssuanceGate(r.instanceId).observe();
               if (!current || current.state !== "open" || current.principal !== checkedGate.principal ||
