@@ -1,10 +1,10 @@
-// Fork-only: rjc runs this pre-push hook before every rigel-release PR. Upstream has no hk.pkl.
+// Fork-only: rjc runs this pre-push hook before every rigel-release PR.
 amends "package://github.com/jdx/hk/releases/download/v2.11.0/hk@2.11.0#/Config.pkl"
-
-default_branch = "rigel-release"
 
 hooks {
     ["pre-push"] {
+        // A hung install or build fails the hook instead of blocking rjc submit.
+        timeout = "15m"
         steps {
             ["typecheck"] = new Step {
                 check = "pnpm install --frozen-lockfile && pnpm typecheck"
