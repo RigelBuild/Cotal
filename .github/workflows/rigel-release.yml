@@ -1,0 +1,102 @@
+name: Rigel release
+
+on:
+  push:
+    branches:
+      - rigel-release
+
+permissions:
+  contents: read
+
+# Queue every release push; see docs/release.md.
+concurrency:
+  group: rigel-release-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      sha: ${{ steps.metadata.outputs.sha }}
+      tag: ${{ steps.metadata.outputs.tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-latest
+          - platform: darwin-arm64
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          # Native .node helpers are ABI-bound; match the downstream consumer's Node version.
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Prepare release metadata
+        id: metadata
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          short_sha="${sha:0:10}"
+          version="$(node -p "require('./bin/package.json').version")"
+          commit_time="$(git show -s --format=%ct HEAD)"
+          {
+            echo "sha=$sha"
+            echo "tag=rigel-v${version}-${short_sha}"
+            echo "commit_time=$commit_time"
+          } >> "$GITHUB_OUTPUT"
+      - name: Assemble runtime archive
+        env:
+          COMMIT_TIME: ${{ steps.metadata.outputs.commit_time }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          asset_root="$RUNNER_TEMP/cotal-runtime-asset"
+          mkdir -p "$asset_root/cotal"
+          cp -R bin extensions implementations packages examples node_modules package.json pnpm-workspace.yaml "$asset_root/cotal/"
+          cp -R bin "$asset_root/cotal/cotal-ai"
+          ln -sfn ../../../cotal-ai "$asset_root/cotal/node_modules/.pnpm/node_modules/cotal-ai"
+          tar_bin=tar
+          if [ "$PLATFORM" = darwin-arm64 ]; then tar_bin=gtar; fi
+          "$tar_bin" --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$COMMIT_TIME" -czf "$RUNNER_TEMP/cotal-runtime-${PLATFORM}.tar.gz" -C "$asset_root" cotal
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cotal-runtime-${{ matrix.platform }}
+          path: ${{ runner.temp }}/cotal-runtime-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: cotal-runtime-*
+          merge-multiple: true
+          path: dist
+      - name: Create checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum cotal-runtime-linux-x64.tar.gz cotal-runtime-darwin-arm64.tar.gz > SHA256SUMS
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.build.outputs.sha }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: node scripts/rigel-release-publish.mjs

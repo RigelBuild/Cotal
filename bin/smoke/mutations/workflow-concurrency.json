@@ -13,7 +13,7 @@
     "about it. That is the whole reason the guard is static, and it is also why the guard itself",
     "needs mutation proof rather than a green run.",
     "",
-    "The three mutations cover the concurrency failures this guard must reject.",
+    "The six mutations cover the concurrency failures this guard must reject.",
     "",
     "M1 restores the short `concurrency: <string>` form on installer.yml. This is the shape changesets.yml and",
     "installer.yml sat in, and it is the dangerous one precisely because it reads as a deliberate",
@@ -27,7 +27,9 @@
     "",
     "M3 replaces the expression with a form the reader does not know. It must FAIL rather than be",
     "skipped. A reader that silently ignores what it cannot parse is how a guard turns into a green",
-    "that means nothing, which is the failure mode this repo has hit more than once."
+    "that means nothing, which is the failure mode this repo has hit more than once.",
+    "",
+    "M4-M6 make rigel-release cancel active runs, evict pending runs, or lose its group."
   ],
   "mutations": [
     {
@@ -53,6 +55,30 @@
       "replace": "  queue: ${{ github.ref == 'refs/heads/main' && 'max' || 'single' }}\n",
       "expectRed": "installer.yml: `queue` is a form this check understands",
       "cell": "is a form this check understands"
+    },
+    {
+      "name": "rigel-release cancels an active release",
+      "file": ".github/workflows/rigel-release.yml",
+      "find": "  cancel-in-progress: false\n",
+      "replace": "  cancel-in-progress: true\n",
+      "expectRed": "rigel-release.yml: does not cancel an active release",
+      "cell": "does not cancel an active release"
+    },
+    {
+      "name": "rigel-release uses a single pending slot",
+      "file": ".github/workflows/rigel-release.yml",
+      "find": "  queue: max\n",
+      "replace": "  queue: single\n",
+      "expectRed": "rigel-release.yml: resolves to max on a push",
+      "cell": "resolves to max on a push"
+    },
+    {
+      "name": "rigel-release loses its concurrency group",
+      "file": ".github/workflows/rigel-release.yml",
+      "find": "concurrency:\n  group: rigel-release-${{ github.ref }}\n  cancel-in-progress: false\n  queue: max\n",
+      "replace": "",
+      "expectRed": "exactly 5 of those declare a concurrency group",
+      "cell": "declare a concurrency group"
     }
   ]
 }

@@ -1,0 +1,1 @@
+smoke:rigel-release-publish

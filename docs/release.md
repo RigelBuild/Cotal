@@ -6,9 +6,14 @@ Cotal uses [Changesets](https://github.com/changesets/changesets) to version and
 workspace packages under `packages/*`, `extensions/*`, and `implementations/*` to npm.
 `examples/**` is ignored, since it is not published.
 
-> **This fork does not publish.** The `@cotal-ai/*` npm packages belong to upstream `Cotal-AI/Cotal`.
+> **This fork does not publish to npm.** The `@cotal-ai/*` npm packages belong to upstream `Cotal-AI/Cotal`.
 > Here the workflow is renamed `.github/workflows/changesets.yml.disabled`, so GitHub never runs
 > it. The smoke suites still read it. Restore the `.yml` name only with a Rigel npm scope repoint.
+
+## Rigel runtime release assets
+
+Each push to `rigel-release` builds Linux x64 and macOS arm64 archives and publishes them with `SHA256SUMS` under `rigel-v<version>-<first 10 chars of SHA>`. Version comes from `bin/package.json`. The darwin-arm64 build calls GNU tar as `gtar`, which the [macos-15 arm64 runner image](https://github.com/actions/runner-images/blob/main/images/macos/macos-15-arm64-Readme.md) ships.
+Runs queue without cancellation. A tag pointing elsewhere fails. A complete published Release is a no-op; otherwise a rerun uploads all three assets, clearing the draft flag only if the Release is a draft. If the Release cannot be found, restore it or remove the tag before retrying.
 
 ## 0.11 runtime migration
 

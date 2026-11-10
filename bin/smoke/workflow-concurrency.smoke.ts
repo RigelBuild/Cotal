@@ -24,10 +24,10 @@ function check(name: string, cond: boolean, extra?: unknown): void {
 
 /** Pin the workflow population so removal or addition needs deliberate review. */
 const EXPECTED_WORKFLOWS = 6;
-const EXPECTED_PUSH_TO_MAIN = 4;
+const EXPECTED_PUSH_TO_RELEASE = 5;
 // Rigel merges land here; fork `main` mirrors upstream and runs upstream's workflows.
 const RELEASE_BRANCH = "rigel-release";
-const EXPECTED_GROUPED = 4;
+const EXPECTED_GROUPED = 5;
 
 /** What a concurrency key can be: absent, a literal, or one of the expressions this repo uses.
  *  `unknown` is deliberately terminal. */
@@ -56,7 +56,7 @@ function resolve(raw: string): Resolved {
 interface Wf {
   file: string;
   /** True when a push to the release branch can start this workflow. */
-  pushesMain: boolean;
+  pushesRelease: boolean;
   /** True when the file uses the short `concurrency: <string>` form, which cannot carry `queue`. */
   shortForm: boolean;
   hasConcurrency: boolean;
@@ -73,7 +73,7 @@ function parse(file: string): Wf {
   const text = readFileSync(join(DIR, file), "utf8");
   const lines = text.split("\n");
 
-  const wf: Wf = { file, pushesMain: false, shortForm: false, hasConcurrency: false };
+  const wf: Wf = { file, pushesRelease: false, shortForm: false, hasConcurrency: false };
 
   // `on:` block, to the next top-level key.
   const onIdx = lines.findIndex((l) => /^on:\s*$/.test(l) || /^on:\s*\S/.test(l));
@@ -84,8 +84,8 @@ function parse(file: string): Wf {
       if (/^\S/.test(l) && l.trim() !== "") break; // dedent to a new top-level key
       if (/^\s{2}push:/.test(l)) inPush = true;
       else if (/^\s{2}\S/.test(l)) inPush = false;
-      if (inPush && l.replace(/^\s+-\s*/, "").trim() === RELEASE_BRANCH && /^\s+-/.test(l)) wf.pushesMain = true;
-      if (inPush && /branches:\s*\[(.*)\]/.exec(l)?.[1]?.split(",").some((b) => b.trim().replace(/^(['"])(.*)\1$/, "$2") === RELEASE_BRANCH)) wf.pushesMain = true;
+      if (inPush && l.replace(/^\s+-\s*/, "").trim() === RELEASE_BRANCH && /^\s+-/.test(l)) wf.pushesRelease = true;
+      if (inPush && /branches:\s*\[(.*)\]/.exec(l)?.[1]?.split(",").some((b) => b.trim().replace(/^(['"])(.*)\1$/, "$2") === RELEASE_BRANCH)) wf.pushesRelease = true;
     }
   }
 
@@ -112,13 +112,13 @@ function parse(file: string): Wf {
 
 const files = readdirSync(DIR).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml")).sort();
 const all = files.map(parse);
-const pushers = all.filter((w) => w.pushesMain);
+const pushers = all.filter((w) => w.pushesRelease);
 
 console.log("A. the population, so no check below can pass by finding nothing");
 check(`exactly ${EXPECTED_WORKFLOWS} workflow files (update deliberately if you added one)`,
   files.length === EXPECTED_WORKFLOWS, { found: files.length, files });
-check(`exactly ${EXPECTED_PUSH_TO_MAIN} of them can be started by a push to ${RELEASE_BRANCH}`,
-  pushers.length === EXPECTED_PUSH_TO_MAIN, { found: pushers.map((w) => w.file) });
+check(`exactly ${EXPECTED_PUSH_TO_RELEASE} of them can be started by a push to ${RELEASE_BRANCH}`,
+  pushers.length === EXPECTED_PUSH_TO_RELEASE, { found: pushers.map((w) => w.file) });
 
 const grouped = pushers.filter((w) => w.hasConcurrency);
 check(`exactly ${EXPECTED_GROUPED} of those declare a concurrency group, so only those can evict`,
@@ -128,18 +128,20 @@ console.log("\nB. every release-push workflow that HAS a group queues rather tha
 // A workflow with no group cannot evict: nothing is grouped, so nothing is ever pending behind
 // anything. It is checked above by count rather than waived silently here, so removing a group
 // somewhere else shows up as a moved number rather than as one fewer cell.
-for (const w of grouped) {
-  // The short form is the trap `changesets.yml` and `installer.yml` sat in. It reads as a
-  // deliberate minimal choice and silently selects `queue: single`, the evicting default.
-  check(`${w.file}: uses the mapping form, so it can carry \`queue\``, !w.shortForm, { shortForm: w.shortForm });
-  if (w.shortForm) continue;
-
+function checkQueue(w: Wf): void {
+  check(`${w.file}: uses the mapping form, so it can carry queue`, !w.shortForm, { shortForm: w.shortForm });
+  if (w.shortForm) return;
   const q = w.queue === undefined ? undefined : resolve(w.queue);
-  check(`${w.file}: declares \`queue\``, q !== undefined);
-  if (!q) continue;
+  check(`${w.file}: declares queue`, q !== undefined);
+  if (!q) return;
   check(`${w.file}: \`queue\` is a form this check understands`, q.kind !== "unknown", { raw: w.queue });
   const onPush = q.kind === "literal" ? q.value : q.kind === "byEvent" ? q.push : undefined;
-  check(`${w.file}: resolves to \`max\` on a push to ${RELEASE_BRANCH} (got ${onPush ?? "unresolvable"})`, onPush === "max");
+  check(`${w.file}: resolves to max on a push to ${RELEASE_BRANCH} (got ${onPush ?? "unresolvable"})`, onPush === "max");
+}
+for (const w of grouped) {
+  // A release push queues rather than evicts, so each run is graded.
+  if (w.file === "rigel-release.yml") check(`${w.file}: does not cancel an active release`, w.cancel === "false");
+  checkQueue(w);
 }
 
 console.log("\nC. nothing can resolve to the forbidden pairing");
@@ -164,10 +166,7 @@ for (const w of all) {
 }
 
 console.log(`\n${fail === 0 ? "WORKFLOW CONCURRENCY SMOKE OK ✅" : "WORKFLOW CONCURRENCY SMOKE FAILED ❌"}  (${pass} passed, ${fail} failed)`);
-// Printed on BOTH outcomes, deliberately, and this is not cosmetic. The marker means the suite
-// REACHED ITS END, not that it passed, which is what lets mutation-proof tell a real named red from
-// a run that died in the middle and reddened for an unrelated reason. Gating it on success graded
-// all three mutations INCONCLUSIVE: each was red and correctly named, and each was refused for
-// having stopped early, because the only evidence it had not was the line this print withheld.
+// Print on both outcomes so mutation-proof can distinguish a named failure
+// from a suite that stopped before reaching its end.
 console.log(`SUITE COMPLETE: ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
