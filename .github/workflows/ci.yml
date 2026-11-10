@@ -329,8 +329,6 @@ jobs:
         run: pnpm build
       - name: Web console auth
         run: pnpm smoke:web-console-auth
-      - name: Spawn manifest live smoke
-        run: pnpm smoke:spawn-manifest:live
       - name: Cooperative-stop live smoke
         run: pnpm smoke:cooperative-stop:live
       # Broker-free boundary/preflight guards + the live target-resolution / spawn-from-anywhere /

@@ -157,6 +157,8 @@ const GOLDEN: Record<string, { flags: string[]; positionals: boolean; rawArgs?: 
   // its minted --lifecycle-uid; --lifecycle-uid is refused outside that launch (guarded in run).
   // `--expect-owner` / `--expect-lifecycle-uid` (2026-10, #2420): the owner and lifecycle UID a
   // delegated child's COTAL_MANAGED_HANDOFF_FILE must carry; refused without that handoff.
+  // Short forms -n/-m/-C/-p/-H. `--harness` picks the application, `--foreground` runs it directly,
+  // `--restarts`/`--restart-window` ask the manager to supervise it, `--enrollment-file` redeems one.
   spawn: {
     flags: [
       "agent:string", "allow-publish:string", "allow-stale:string", "allow-subscribe:string",

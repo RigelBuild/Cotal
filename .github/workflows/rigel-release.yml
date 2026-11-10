@@ -25,7 +25,7 @@ jobs:
       matrix:
         include:
           - platform: linux-x64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - platform: darwin-arm64
             runner: macos-15
     steps:
@@ -41,6 +41,9 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+      - name: Check native glibc ceiling
+        if: matrix.platform == 'linux-x64'
+        run: node packages/seat/scripts/assert-native-ceiling.mjs
       - name: Prepare release metadata
         id: metadata
         run: |
