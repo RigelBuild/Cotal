@@ -42,13 +42,6 @@ export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts,
         client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce, absent: true })));
         return;
       }
-      // The owner may observe its own retired gate, but no other registration data.
-      if (gate?.state === "retired" && gate.principal === remoteManagerServePrincipal(owner, iid) && pointRead && body.kind === "read" && "key" in body && body.key === epgateKey("manager", iid)) {
-        const result = gateEntry ? { value: Buffer.from(gateEntry.value).toString("base64"), revision: gateEntry.revision, operation: gateEntry.operation } : { absent: true };
-        client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce, ...result })));
-        return;
-      }
-      if (!gate || gate.state === "retired" || gate.principal !== remoteManagerServePrincipal(owner, iid)) throw new RegistrationFamilyAuthorizationError("manager gate does not match requester");
       if (pointRead) {
         const key = `${owner}.${iid}`, count = pointReadsByInstance.get(key) ?? 0;
         if (pointReadsTotal >= 256 || count >= 8) {
@@ -68,6 +61,13 @@ export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts,
         controller = new AbortController();
         scanTimer = setTimeout(() => controller!.abort(), Math.max(0, deadline - Date.now()));
       }
+      // The owner may observe its own retired gate, but no other registration data.
+      if (gate?.state === "retired" && gate.principal === remoteManagerServePrincipal(owner, iid) && pointRead && body.kind === "read" && "key" in body && body.key === epgateKey("manager", iid) && gateEntry) {
+        await opts.probePointRead?.(iid);
+        client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce, value: Buffer.from(gateEntry.value).toString("base64"), revision: gateEntry.revision, operation: gateEntry.operation })));
+        return;
+      }
+      if (!gate || gate.state === "retired" || gate.principal !== remoteManagerServePrincipal(owner, iid)) throw new RegistrationFamilyAuthorizationError("manager gate does not match requester");
       if (pointRead) {
         if (body.kind === "records" && Object.keys(body).length === 3 && "key" in body && typeof body.key === "string") {
           const keys = [recordSpecKey(RECORD_KINDS.svc, ["manager", iid]), recordStatusKey(RECORD_KINDS.svc, ["manager", iid]), recordAtomicKey(GOVERN_HEAD, ["manager"])];

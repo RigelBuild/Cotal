@@ -168,6 +168,20 @@ try {
     const changed = remoteManagerClient.remoteManagerAuthorityRequest(state,"cli","prepare");
     changed.identities.supervisor = {id:newIdentity().id};
     await assert.rejects(call(changed),/different ceiling/);
+    const gateKey = epgateKey("manager", state.instanceId);
+    const originalGate = await (await new Kvm(reader!.nc).open(epAuthBucket(a.space))).get(gateKey);
+    assert.ok(originalGate);
+    const gate = JSON.parse(new TextDecoder().decode(originalGate.value)) as { processEpoch: number };
+    const writer = await connect({ servers: fx.servers, ...standaloneConnectOpts({ creds: await mintCreds(a.auth, newIdentity(), "endpoint-serve-executor", { endpointServeExecutor: { endpoint: "manager", instanceId: state.instanceId } }), tls: false }) });
+    try {
+      const gateKv = await new Kvm(writer).open(epAuthBucket(a.space));
+      await gateKv.update(gateKey, new TextEncoder().encode(JSON.stringify({ ...gate, processEpoch: gate.processEpoch + 1 })), originalGate.revision);
+      try {
+        await assert.rejects(call(executorRenewal), /proof does not match/);
+      } finally {
+        await gateKv.put(gateKey, originalGate.value);
+      }
+    } finally { await writer.close(); }
   });
   await cell(5, async () => {
     admin = false;

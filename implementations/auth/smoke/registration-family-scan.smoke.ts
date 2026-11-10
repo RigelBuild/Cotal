@@ -247,6 +247,21 @@ try {
   check("large retained families do not add per-row API requests", costs[2]! <= costs[1]! + 2);
 
   check("remote executor also avoids per-row API requests", remoteCosts[2]! <= remoteCosts[1]! + 2);
+  const retiredId = mintLifecycleUid(), retired = await remoteFor(retiredId), retiredWriter = await execFor(retiredId);
+  await retiredWriter.kv.put(epgateKey(endpoint, retiredId), new TextEncoder().encode(JSON.stringify({ state: "retired", generation: 1, processEpoch: 0, registrationRevision: 0, nameAuthorityRevision: 0, principal: remoteManagerServePrincipal(owner, retiredId), op: { opId: mintLifecycleUid(), kind: "retirement" } })));
+  let releaseRetiredReads!: () => void;
+  const retiredReadsGate = new Promise<void>(resolve => { releaseRetiredReads = resolve; });
+  const retiredReadsStarted = new Promise<void>(resolve => { blockedReadStarted = resolve; });
+  blockedReadInstance = retiredId; blockedReadCount = 0; blockedReadGate = retiredReadsGate;
+  const heldRetiredReads = Array.from({ length: 8 }, () => requestManagerRegistrationRead(retired.nc, space, owner, retiredId, { kind: "read", key: epgateKey(endpoint, retiredId) }));
+  try {
+    await retiredReadsStarted;
+    await assert.rejects(requestManagerRegistrationRead(retired.nc, space, owner, retiredId, { kind: "read", key: epgateKey(endpoint, retiredId) }), RegistrationFamilyBusyError);
+    check("the ninth concurrent retired gate read is busy", true);
+  } finally { releaseRetiredReads(); }
+  await Promise.all(heldRetiredReads);
+  blockedReadInstance = undefined; blockedReadGate = undefined; blockedReadStarted = undefined;
+
 
   const instanceId = mintLifecycleUid(), active = await remoteFor(instanceId);
   await provisionEndpointGateOpen((await execFor(instanceId)).kv, { endpoint, instanceId, principal: remoteManagerServePrincipal(owner, instanceId) });
@@ -296,5 +311,5 @@ try {
   if (evidence) writeFileSync(join(dir, "OUTCOME.json"), JSON.stringify({ passed, port, brokerExited: true }) + "\n", { mode: 0o600 });
   else rmSync(dir, { recursive: true, force: true });
 }
-assert.equal(passed, 59, "all family scan cells ran");
+assert.equal(passed, 60, "all family scan cells ran");
 console.log(`ENDPOINT FAMILY SCAN: ${passed} passed`);
