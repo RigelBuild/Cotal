@@ -22,8 +22,8 @@ const check = (name: string, cond: boolean, extra?: unknown) => {
 };
 
 const harness: Record<string, Harness> = HARNESS;
-check("HARNESS has exactly the eight branded connectors",
-  JSON.stringify(Object.keys(harness).sort()) === JSON.stringify(["claude", "codex", "hermes", "jcode", "omp", "opencode", "pi", "zellij"]),
+check("HARNESS has exactly the seven branded connectors",
+  JSON.stringify(Object.keys(harness).sort()) === JSON.stringify(["claude", "codex", "hermes", "jcode", "omp", "opencode", "pi"]),
   Object.keys(harness));
 
 for (const name of Object.keys(OFFICIAL_CONNECTORS)) {
