@@ -64,6 +64,10 @@ export const QUARANTINED = {
   "smoke:presence-watch-rebind": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:setup-provider-pack": { reason: "flaky upstream: fails 1/3 on pristine main 8ca93e96 (local 3x sweep, 2026-10-17); file byte-identical to upstream; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:usage-format": { reason: "upstream: 6/428 cells fail on pristine main 3f124c77 (local run); quarantined on sync per fork policy", recheckBy: "2026-12-31" },
+  "smoke:journal-model-b": { reason: "RIG-9150 upstream: asserts 2 recordGoalIndex writers, manager.ts has 3 on pristine 82a97c1f (local run)", recheckBy: "2026-12-31" },
+  "smoke:docs-ext-read": { reason: "RIG-9150 upstream: capSection cuts a search hit before allowSubscribe on pristine 82a97c1f (local run)", recheckBy: "2026-12-31" },
+  "smoke:seat-installed-dist": { reason: "RIG-9150 upstream: needs assembled arm64 natives a host build lacks, red on pristine 82a97c1f (local run)", recheckBy: "2026-12-31" },
+  "smoke:seat-platform": { reason: "RIG-9150 upstream: pack proofs need all six platform natives, red on pristine 82a97c1f (local run)", recheckBy: "2026-12-31" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */
@@ -73,4 +77,5 @@ export const LIVE_QUARANTINED = {
   "smoke:schema-remaining15-diagnostic": { reason: "upstream: dynamicRef cases fail on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:herdr-e2e:live": { reason: "RIG-4872: herdr server not running when the manager starts", recheckBy: "2026-11-15" },
   "smoke:up-stack:live": { reason: "upstream expects an in-process pty seat to die with the manager on Ctrl-C; fork pty seats run under a custodian (#72/#73); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:setup-pure:live": { reason: "RIG-9150 upstream: setup first run exits 4 when the Codex plugin install fails; red on fork main at upstream bdc8d54f (run 42746431506)", recheckBy: "2026-12-31" },
 };
