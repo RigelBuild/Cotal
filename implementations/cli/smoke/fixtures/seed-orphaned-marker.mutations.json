@@ -25,8 +25,8 @@
       "find": ": { kind: \"orphaned\", nonce: marker.nonce, path };",
       "replace": ": { kind: \"ambiguous\", path };",
       "afterRestore": "pnpm --filter @cotal-ai/cli build",
-      "expectRed": "\u2717 FAIL: dead-parent marker: the next command repairs and succeeds",
-      "cell": "\u2717 FAIL: dead-parent marker: the next command repairs and succeeds"
+      "expectRed": "\u2717 FAIL: dead-parent marker: the next boot repairs and succeeds",
+      "cell": "\u2717 FAIL: dead-parent marker: the next boot repairs and succeeds"
     },
     {
       "name": "the boot gate does not resume an orphaned seed",
@@ -34,8 +34,8 @@
       "find": "        if (child.kind === \"orphaned\" && cursor) {",
       "replace": "        if (child.kind === \"orphaned\" && cursor && process.pid < 0) {",
       "afterRestore": "pnpm --filter @cotal-ai/cli build",
-      "expectRed": "\u2717 FAIL: dead-parent marker: the next command repairs and succeeds",
-      "cell": "\u2717 FAIL: dead-parent marker: the next command repairs and succeeds"
+      "expectRed": "\u2717 FAIL: dead-parent marker: the next boot repairs and succeeds",
+      "cell": "\u2717 FAIL: dead-parent marker: the next boot repairs and succeeds"
     },
     {
       "name": "a stale child upgrades whatever marker it finds",

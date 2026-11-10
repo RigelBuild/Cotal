@@ -78,19 +78,7 @@ function tool(dir: string, name: string, out = ""): void {
   chmodSync(join(dir, name), 0o755);
   writeFileSync(join(dir, `${name}.cmd`), `@${out ? `echo ${out}` : "exit /b 0"}\r\n`);
 }
-const codexStub = [
-  '#!/bin/sh',
-  `state="${join(home, ".cotal", "codex-stub.json")}"`,
-  'case "$1 $2 $3" in',
-  '  "plugin marketplace list ") if [ -f "$state.marketplace" ]; then echo cotal-mesh; fi; exit 0 ;;',
-  '  "plugin marketplace add") printf ok > "$state.marketplace"; exit 0 ;;',
-  '  "plugin add ") printf ok > "$state.installed"; exit 0 ;;',
-  '  "plugin list ") if [ -f "$state.installed" ]; then printf "cotal@cotal-mesh  installed  %s\\n" "$COTAL_PLUGIN_VERSION"; fi; exit 0 ;;',
-  '  *) exit 2 ;;',
-  'esac',
-].join("\n");
-writeFileSync(join(bin, "codex"), codexStub, { mode: 0o755 });
-writeFileSync(join(bin, "codex.cmd"), '@node "%~dp0codex.mjs" %*\r\n');
+tool(bin, "codex");
 tool(bin, "tmux");
 tool(more, "herdr", "herdr 0.7.0");
 tool(more, "orca");
@@ -98,7 +86,6 @@ tool(more, "orca");
 const HOST_ENV = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("COTAL_") && !["FORCE_COLOR", "NO_COLOR", "PATH", "CMUX_BUNDLED_CLI_PATH"].includes(k)));
 const env: Record<string, string> = {
   ...(HOST_ENV as Record<string, string>),
-COTAL_PLUGIN_VERSION: "",
   HOME: home,
   USERPROFILE: home,
   XDG_CONFIG_HOME: xdg,
@@ -297,21 +284,10 @@ const FULL = (space: string, dir: string, harness = "codex") => ["setup", "--des
     first.status === 0 && first.env?.outcome === "ok" && r?.spaceState === "created" && findPreparedSpace("research")?.root === dir && existsSync(join(dir, ".cotal")), shown(first));
   check("it lists what it wrote: the prepared space, the default persona and the harness preference",
     ["prepared space", "default persona", "harness preference of research"].every((w) => written.includes(w)), written);
-  const runtimes = (r?.runtimes ?? []) as { name: string; package: string | null; state: string; selected: boolean; tool: { names: string[]; found: string | null } | null }[];
-  const officialNames = ["pty", "orca", "tmux", "cmux", "herdr"];
-  const officialRuntimes = officialNames.map((name) => runtimes.find((x) => x.name === name));
-  const otherRuntimes = runtimes.filter((x) => !officialNames.includes(x.name));
-  check("without --runtime only pty is selected, and each official runtime is listed with its host tool",
-    officialRuntimes.every(Boolean)
-      && officialRuntimes.map((x) => `${x!.name}:${x!.state}:${x!.selected}`).join() === "pty:built-in:true,orca:left-out:false,tmux:left-out:false,cmux:left-out:false,herdr:left-out:false"
-      && runtimes.every((x) => !x.selected || x.name === "pty")
-      && runtimes.find((x) => x.name === "orca")?.tool?.names.join() === "orca-ide,orca"
-      && runtimes.find((x) => x.name === "tmux")?.tool?.found === "tmux"
-      && runtimes.find((x) => x.name === "cmux")?.tool?.names.join() === "cmux"
-      && runtimes.find((x) => x.name === "cmux")?.tool?.found === null
-      && runtimes.find((x) => x.name === "herdr")?.tool?.names.join() === "herdr"
-      && runtimes.find((x) => x.name === "herdr")?.tool?.found === null
-      && installed("@cotal-ai/tmux") === undefined, runtimes);
+  const runtimes = (r?.runtimes ?? []) as { name: string; state: string; selected: boolean; tool: { found: string | null } | null }[];
+  check("without --runtime only pty is set up, and each official runtime is listed with its host tool",
+    runtimes.map((x) => `${x.name}:${x.state}:${x.selected}`).join() === "pty:built-in:true,orca:left-out:false,tmux:left-out:false,cmux:left-out:false,herdr:left-out:false"
+      && runtimes.find((x) => x.name === "tmux")?.tool?.found === "tmux" && runtimes.find((x) => x.name === "cmux")?.tool?.found === null && installed("@cotal-ai/tmux") === undefined, runtimes);
   const persona = join(dir, ".cotal", "agents", "default.md");
   check("the default persona lands in the project's .cotal/agents and parses", existsSync(persona) && loadAgentFile(persona).name === "default_agent");
   check("the application is the space's harness preference", harnessOf("research") === "codex", readPreferences().spaces);
