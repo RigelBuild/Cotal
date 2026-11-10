@@ -116,6 +116,10 @@ jobs:
           exit "$rc"
       - name: Typecheck
         run: pnpm typecheck
+      # sync-docs (check:docs-site) imports website/ deps, which the root pnpm install does not cover.
+      - name: Install website deps
+        working-directory: website
+        run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Docs bundle in sync
         run: pnpm check:docsbundle
       # Broker-free and network-free; it reads the connector built by Typecheck.
