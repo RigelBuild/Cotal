@@ -5,6 +5,7 @@ import { GOVERN_HEAD, RECORD_KINDS, recordAtomicKey, recordSpecKey, recordStatus
 import { openAuthorityClient, type AuthorityClientOpts } from "./authority-client.js";
 import type { AuthLedgerScanner } from "./ledger-scanner.js";
 
+class RegistrationFamilyAuthorizationError extends Error {}
 export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts, "server" | "space" | "dataAccount" | "log" | "onConnection"> & { scanner: AuthLedgerScanner; authKv: KV; recordsKv: KV; probeScanStarted?: () => void; probePointRead?: (instanceId: string) => void | Promise<void>; probeChunks?: (chunks: Record<string, unknown>[]) => Record<string, unknown>[] }) {
   const client = await openAuthorityClient({ ...opts, label: `cotal:registration-family:${opts.space}`,
     grants: () => ({ publish: [managerRegistrationFamilyReplyFilter(opts.space)], subscribe: [managerRegistrationFamilyFilter(opts.space)] }) });
@@ -41,18 +42,18 @@ export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts,
         client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce, absent: true })));
         return;
       }
-      if (!gate || gate.state === "retired" || gate.principal !== remoteManagerServePrincipal(owner, iid)) throw new Error("manager gate does not match requester");
+      if (!gate || gate.state === "retired" || gate.principal !== remoteManagerServePrincipal(owner, iid)) throw new RegistrationFamilyAuthorizationError("manager gate does not match requester");
       if (pointRead) {
         const key = `${owner}.${iid}`, count = pointReadsByInstance.get(key) ?? 0;
         if (pointReadsTotal >= 256 || count >= 8) {
-          client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce: body.nonce, error: "busy" })));
+          client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce, error: "busy" })));
           return;
         }
         pointReadsTotal++; pointReadsByInstance.set(key, count + 1); requestKey = `read:${key}`; claimed = true;
       } else {
         requestKey = `${owner}.${iid}`;
         if (inFlight.has(requestKey)) {
-          client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce: body.nonce, error: "busy" })));
+          client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce, error: "busy" })));
           return;
         }
         inFlight.add(requestKey); claimed = true;
@@ -64,27 +65,31 @@ export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts,
       if (pointRead) {
         if (body.kind === "records" && Object.keys(body).length === 3 && "key" in body && typeof body.key === "string") {
           const keys = [recordSpecKey(RECORD_KINDS.svc, ["manager", iid]), recordStatusKey(RECORD_KINDS.svc, ["manager", iid]), recordAtomicKey(GOVERN_HEAD, ["manager"])];
-          if (!keys.includes(body.key)) throw new Error("foreign registration records key");
+          if (!keys.includes(body.key)) throw new RegistrationFamilyAuthorizationError("foreign registration records key");
           await opts.probePointRead?.(iid);
           const entry = await opts.recordsKv.get(body.key);
           const result = entry ? { value: Buffer.from(entry.value).toString("base64"), revision: entry.revision, operation: entry.operation, created: entry.created.toISOString() } : { absent: true };
-          client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce: body.nonce, ...result })));
+          client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce, ...result })));
           return;
         }
         if (body.kind === "read" && Object.keys(body).length === 3 && "key" in body && typeof body.key === "string") {
           const prefix = `${epcredFamilyPrefix("manager", iid)}.`;
-          if (body.key.startsWith(prefix)) assertCredentialIdTail(body.key.slice(prefix.length), "credentialId");
-          if (body.key !== epgateKey("manager", iid) && body.key !== eprepairKey("manager", iid) && !(body.key.startsWith(prefix) && body.key.length > prefix.length)) throw new Error("foreign registration read key");
+          if (body.key.startsWith(prefix)) {
+            try { assertCredentialIdTail(body.key.slice(prefix.length), "credentialId"); }
+            catch { throw new RegistrationFamilyAuthorizationError("invalid registration credential key"); }
+          }
+          if (body.key !== epgateKey("manager", iid) && body.key !== eprepairKey("manager", iid) && !(body.key.startsWith(prefix) && body.key.length > prefix.length))
+            throw new RegistrationFamilyAuthorizationError("foreign registration read key");
           await opts.probePointRead?.(iid);
           const entry = await opts.authKv.get(body.key);
           const result = entry ? { value: Buffer.from(entry.value).toString("base64"), revision: entry.revision, operation: entry.operation } : { absent: true };
-          client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce: body.nonce, ...result })));
+          client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce, ...result })));
           return;
         }
         if (body.kind === "generation" && Object.keys(body).length === 3 && "targetInstanceId" in body && typeof body.targetInstanceId === "string") {
           await opts.probePointRead?.(iid);
           const generation = await readEndpointGateGeneration(opts.authKv, { endpoint: "manager", instanceId: assertLifecycleToken(body.targetInstanceId) });
-          client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce: body.nonce, generation })));
+          client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce, generation })));
           return;
         }
         throw new Error("invalid registration read request");
@@ -108,15 +113,15 @@ export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts,
         chunks[chunks.length - 1]!.push(row); size += length;
       }
       const scanId = randomBytes(18).toString("base64url");
-      const replies: Record<string, unknown>[] = chunks.map((chunkRows, seq) => ({ nonce: body.nonce, scanId, seq, total: chunks.length, rows: chunkRows, ...(seq === chunks.length - 1 ? { rowCount: rows.length, complete: true } : {}) }));
+      const replies: Record<string, unknown>[] = chunks.map((chunkRows, seq) => ({ nonce, scanId, seq, total: chunks.length, rows: chunkRows, ...(seq === chunks.length - 1 ? { rowCount: rows.length, complete: true } : {}) }));
       for (const chunk of opts.probeChunks?.(replies) ?? replies) {
         if (Date.now() >= deadline) controller!.abort();
         controller!.signal.throwIfAborted();
-        client.nc.publish(reply, new TextEncoder().encode(JSON.stringify(chunk)));
+        client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ ...chunk, nonce })));
       }
     } catch (error) {
       opts.log(`registration family scan refused: ${error instanceof Error ? error.message : String(error)}`);
-      if (reply && requestNonce) client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce: requestNonce, error: "refused" })));
+      if (requestNonce) client.nc.publish(`${msg.subject}.reply.${requestNonce}`, new TextEncoder().encode(JSON.stringify({ nonce: requestNonce, error: error instanceof RegistrationFamilyAuthorizationError ? "refused" : "failed" })));
     } finally {
       if (scanTimer !== undefined) clearTimeout(scanTimer);
       if (claimed && requestKey?.startsWith("read:")) {

@@ -100,18 +100,27 @@ async function exerciseAuthorityPaths() {
     const unpreparedCreds = await mintCreds(account.auth, probeIdentity, "remote-manager", {
       principal: { owner, actor: remoteManagerActors(plainInstance).executor },
       remoteManager: { instanceId: plainInstance, owner, actor: remoteManagerActors(plainInstance).executor } });
-    const probeClient = await connect({ servers: fx.servers,
-      ...standaloneConnectOpts({ creds: unpreparedCreds, tls: false }), reconnect: false });
-    try {
-      const absent = await requestManagerRegistrationRead(probeClient, space, owner, plainInstance,
-        { kind: "read", key: epgateKey("manager", plainInstance) });
-      assert.equal(absent, null, "the family reader returns the exact absent gate for a manager request");
-      passed++;
-      const managerKv = await new Kvm(probeClient).open(epAuthBucket(space));
-      await assert.rejects(() => managerKv.get(epgateKey("manager", plainInstance)), /permissions violation/i,
-        "the manager cannot read the gate directly from auth KV");
+    await cell("absent manager gate is returned by family read", async () => {
+      const probeClient = await connect({ servers: fx.servers,
+        ...standaloneConnectOpts({ creds: unpreparedCreds, tls: false }), reconnect: false });
+      try {
+        const absent = await requestManagerRegistrationRead(probeClient, space, owner, plainInstance,
+          { kind: "read", key: epgateKey("manager", plainInstance) });
+        assert.equal(absent, null, "the family reader returns the exact absent gate for a manager request");
+      } finally { await probeClient.close(); }
+    });
+    await cell("manager cannot read auth gate directly", async () => {
+      const probeClient = await connect({ servers: fx.servers,
+        ...standaloneConnectOpts({ creds: unpreparedCreds, tls: false }), reconnect: false });
+      try {
+        const managerKv = await new Kvm(probeClient).open(epAuthBucket(space));
+        await assert.rejects(() => managerKv.get(epgateKey("manager", plainInstance)), /permissions violation/i,
+          "the manager cannot read the gate directly from auth KV");
+      } finally { await probeClient.close(); }
+    });
+    await cell("registration refuses before auth prepare creates its gate", async () => {
       await assert.rejects(() => register(plainInstance, unpreparedCreds), /manager registration requires an auth-prepared gate/);
-    } finally { await probeClient.close(); }
+    });
     const preparedIdentity = { supervisor: newIdentity(), executor: newIdentity(), serve: newIdentity(), goalWriter: newIdentity(), sessionLedger: newIdentity() };
     const prepared = await plane.issueManagerServiceAuthority({ owner, scope: ["supervise"], request: {
       v: 1, kind: "manager-service-authority", operation: "prepare", space, actor: "cli",

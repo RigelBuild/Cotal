@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { connect } from "@nats-io/transport-node";
-import { createSpaceAuth, epAuthBucket, epgateKey, isReachable, managerRegistrationFamilySubject, mintCreds, mintLifecycleUid, newIdentity, recordsBucket, remoteManagerActors, serverConfig, setupSpaceStreams, standaloneConnectOpts } from "@cotal-ai/core";
+import { createSpaceAuth, epAuthBucket, epgateKey, eprepairKey, isReachable, managerRegistrationFamilySubject, mintCreds, mintLifecycleUid, newIdentity, recordsBucket, remoteManagerActors, serverConfig, setupSpaceStreams, standaloneConnectOpts, RegistrationFamilyRefusedError } from "@cotal-ai/core";
 import { openPublishDenialWatch } from "../../../packages/core/src/endpoint-publish-denial.js";
 import { Kvm } from "@nats-io/kv";
 import { openAuthAuthorityPlane } from "../src/index.js";
@@ -159,8 +159,27 @@ try {
       console.log("  ✓ another owner cannot subscribe to reply leaf");
     } finally { await foreign.close(); }
     const register = (evict: (principals: readonly string[]) => Promise<boolean[]>) => registerRemoteManagerAuthority({ space, server: servers, owner, instanceId, serveActor: remoteManagerActors(instanceId).serve, prepareCreds: creds, tlsRequired: false, evict });
-    await assert.rejects(requestManagerRegistrationRead(nc, space, owner, instanceId, { kind: "read", key: epgateKey("manager", mintLifecycleUid()) }), /invalid registration read reply|refused/i);
+    await assert.rejects(requestManagerRegistrationRead(nc, space, owner, instanceId, { kind: "read", key: epgateKey("manager", mintLifecycleUid()) }),
+      error => error instanceof RegistrationFamilyRefusedError);
     console.log("  ✓ closed read refuses another instance gate");
+    await setManagerGate("retired");
+    await assert.rejects(requestManagerRegistrationFamily(nc, space, owner, instanceId, 1000),
+      error => error instanceof RegistrationFamilyRefusedError);
+    await setManagerGate("open");
+    console.log("  ✓ family scan refuses a retired gate");
+    const noGateInstance = mintLifecycleUid();
+    const noGateActor = remoteManagerActors(noGateInstance).executor;
+    const noGateCreds = await mintCreds(auth, newIdentity(), "remote-manager", {
+      principal: { owner, actor: noGateActor }, remoteManager: { instanceId: noGateInstance, owner, actor: noGateActor } });
+    const noGateClient = await connect({ servers, ...standaloneConnectOpts({ creds: noGateCreds, tls: false }), reconnect: false });
+    try {
+      await assert.rejects(requestManagerRegistrationRead(noGateClient, space, owner, noGateInstance,
+        { kind: "read", key: eprepairKey("manager", noGateInstance) }),
+        error => error instanceof RegistrationFamilyRefusedError);
+      await assert.rejects(requestManagerRegistrationFamily(noGateClient, space, owner, noGateInstance, 1000),
+        error => error instanceof RegistrationFamilyRefusedError);
+      console.log("  ✓ absent non-gate read and family scan are authorization refusals");
+    } finally { await noGateClient.close(); }
     const goalIdentity = newIdentity();
     const goalCreds = await mintCreds(auth, goalIdentity, "goal-writer", { principal: { owner, actor: remoteManagerActors(instanceId).goalWriter }, goalWriter: { endpoint: "manager", remoteManager: { owner, instanceId } } });
     const goal = await connect({ servers, ...standaloneConnectOpts({ creds: goalCreds, tls: false }), reconnect: false });

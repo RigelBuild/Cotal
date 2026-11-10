@@ -25,6 +25,7 @@ export async function requestManagerRegistrationRead(nc: NatsConnection, space: 
     if (!raw || typeof raw !== "object" || Array.isArray(raw) || !("nonce" in raw) || raw.nonce !== nonce) throw new Error("invalid registration read reply");
     if ("error" in raw && raw.error === "busy" && Object.keys(raw).length === 2) throw new RegistrationFamilyBusyError();
     if ("error" in raw && raw.error === "refused" && Object.keys(raw).length === 2) throw new RegistrationFamilyRefusedError();
+    if ("error" in raw && raw.error === "failed" && Object.keys(raw).length === 2) throw new Error("registration read failed");
     if (request.kind === "generation") {
       if (Object.keys(raw).length !== 2 || !("generation" in raw) || typeof raw.generation !== "number" || !Number.isSafeInteger(raw.generation) || raw.generation < 0) throw new Error("invalid registration generation reply");
       return raw.generation;

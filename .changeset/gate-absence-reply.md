@@ -3,4 +3,4 @@
 "@cotal-ai/auth": patch
 ---
 
-Manager registration reads now return a nonce-bound absent result for a missing gate. The auth-owned responder also returns nonce-bound refusals, which clients handle as typed errors.
+Manager registration reads return a nonce-bound absent result for an exact missing gate read. The auth-owned responder sends typed refusals for gate and key authorization failures, and plain failures for other errors.
