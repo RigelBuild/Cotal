@@ -758,7 +758,7 @@ const baseCommands: Command[] = [
     name: "allowlist",
     group: "Manager",
     summary: "replace the manager's spawn allowlist - allowlist set <name>...",
-    usage: "allowlist set <name>... [--space <s>] [--server <url>] [--creds <path>] [--on <instance>]",
+    usage: "cotal allowlist set <name>... [--space <s>] [--server <url>] [--creds <path>] [--on <instance>]",
     positionals: "<set> <name>...",
     flags: allowlistFlags,
     run: allowlist,

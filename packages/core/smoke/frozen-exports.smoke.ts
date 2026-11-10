@@ -101,6 +101,7 @@ c(`every exported array (${arrays}) and plain-object (${objects}) collection in 
 // session rail and frame codec re-export for the console bundle. "./launch-material" is the
 // launch-material reader the lifecycle hook relay imports without loading the barrel, and
 // "./peer-label" is the peer label its frame rendering prints, for the same reason.
+// "./presence-ages" publishes the shared age formatters used by the browser roster.
 // "./secret-fs" is the secret-file writers the Claude native binding hook imports, again without
 // the barrel; it maps to an entry naming the barrel's writers, never the module and its test seam.
 // "./command", "./loopback" and "./subjects" are the argument parser, the loopback-literal check and
@@ -116,6 +117,7 @@ c(`every exported array (${arrays}) and plain-object (${objects}) collection in 
   const keys = Object.keys(pkg.exports ?? {});
   const ALLOWED_SUBPATHS = new Map<string, { module: string; additions: readonly string[] }>([
     ["./session-browser", { module: "session-browser", additions: [] }],
+    ["./presence-ages", { module: "presence-ages", additions: [] }],
     ["./launch-material", { module: "launch-material", additions: [] }],
     ["./peer-label", { module: "peer-label", additions: [] }],
     ["./secret-fs", { module: "secret-fs-entry", additions: [] }],
