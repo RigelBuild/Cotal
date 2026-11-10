@@ -11,21 +11,50 @@ export interface PeerCredentials {
   gid: number;
 }
 
+
 type PeercredNative = {
   peercred: (fd: number) => PeerCredentials;
-  tryLockFd: (fd: number) => boolean;
-  pidfdSignal: (pidfd: number, sig: "SIGTERM" | "SIGKILL") => "sent" | "gone";
-  pidfdExited: (pidfd: number) => boolean;
-  pidfdOpen: (pid: number) => number | null;
+  flockExclusiveNb?: (fd: number) => boolean;
+  processStartTime?: (pid: number) => string | undefined;
+  userCacheDir?: () => string;
+  launchdJob?: (label: string) => unknown;
+  tryLockFd?: (fd: number) => boolean;
+  pidfdSignal?: (pidfd: number, signal: "SIGTERM" | "SIGKILL") => "sent" | "gone";
+  pidfdExited?: (pidfd: number) => boolean;
+  pidfdOpen?: (pid: number) => number | null;
 };
 
 export const LINUX_NATIVE_ARCHES = ["x64", "arm64"] as const;
+/** The platforms and arches the helper has a source build for. Seat custody uses only Linux; the
+ *  host primitives in host.ts use all of them. */
+export const NATIVE_TARGETS = { linux: LINUX_NATIVE_ARCHES, darwin: ["x64", "arm64"], win32: ["x64", "arm64"] } as const;
 
-let loaded: PeercredNative | undefined;
+let loaded: unknown;
 
-export function nativeHelperPath(arch: string = process.arch): string {
+export function nativeHelperPath(arch: string = process.arch, platform: string = process.platform): string {
   const here = dirname(fileURLToPath(import.meta.url));
-  return join(here, "..", "build", "Release", `linux-${arch}`, "peercred.node");
+  return join(here, "..", "build", "Release", `${platform}-${arch}`, "peercred.node");
+}
+
+/** Load the helper for this platform and arch, or throw naming what is missing. Never compiles. */
+export function loadNativeHelper<T>(): T {
+  if (loaded) return loaded as T;
+  const platformArch = `${process.platform}-${process.arch}`;
+  const arches = (NATIVE_TARGETS as Record<string, readonly string[]>)[process.platform];
+  if (!arches?.includes(process.arch)) {
+    const supported = Object.entries(NATIVE_TARGETS).flatMap(([p, a]) => a.map((x) => `${p}-${x}`)).join(", ");
+    throw new Error(`@cotal-ai/seat: native helper unsupported on ${platformArch} (supported: ${supported})`);
+  }
+  const path = nativeHelperPath();
+  if (!existsSync(path)) throw new Error(`@cotal-ai/seat: native helper missing at ${path}`);
+  const require = createRequire(import.meta.url);
+  try {
+    loaded = require(path);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(`@cotal-ai/seat: native helper failed to load at ${path} for ${platformArch}: ${detail}`);
+  }
+  return loaded as T;
 }
 
 function isLinuxNativeArch(arch: string): arch is (typeof LINUX_NATIVE_ARCHES)[number] {
@@ -38,23 +67,10 @@ export function unsupportedNativeArch(platform: string, arch: string): Error {
   );
 }
 
-function loadNative(): PeercredNative {
-  if (loaded) return loaded;
+function loadLinuxNative(): PeercredNative {
   if (process.platform !== "linux") throw unsupportedTransport();
-  const platformArch = `${process.platform}-${process.arch}`;
   if (!isLinuxNativeArch(process.arch)) throw unsupportedNativeArch(process.platform, process.arch);
-  const path = nativeHelperPath(process.arch);
-  if (!existsSync(path)) throw new Error(`@cotal-ai/seat: SO_PEERCRED native helper missing at ${path}`);
-  const require = createRequire(import.meta.url);
-  try {
-    loaded = require(path) as PeercredNative;
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    throw new Error(
-      `@cotal-ai/seat: SO_PEERCRED native helper failed to load at ${path} for ${platformArch}: ${detail}`,
-    );
-  }
-  return loaded;
+  return loadNativeHelper<PeercredNative>();
 }
 
 export function socketFd(sock: Socket): number {
@@ -65,25 +81,40 @@ export function socketFd(sock: Socket): number {
 }
 
 export function peerCredentials(sock: Socket): PeerCredentials {
-  return loadNative().peercred(socketFd(sock));
+  return loadNativeHelper<PeercredNative>().peercred(socketFd(sock));
 }
 
-/** flock(LOCK_EX | LOCK_NB); false when another open file description holds the lock. */
+/** Exclusive non-blocking `flock(2)`; the kernel releases it when the last descriptor closes. */
+export function flockExclusiveNb(fd: number): boolean {
+  const lock = loadNativeHelper<PeercredNative>().flockExclusiveNb;
+  if (!lock) throw new Error("@cotal-ai/seat: flockExclusiveNb is unavailable on this native helper");
+  return lock(fd);
+}
+
+/** Lock the launch fence if no other open file description holds it. */
 export function tryLockFd(fd: number): boolean {
-  return loadNative().tryLockFd(fd);
+  const lock = loadLinuxNative().tryLockFd;
+  if (!lock) throw new Error("@cotal-ai/seat: tryLockFd is unavailable on this native helper");
+  return lock(fd);
 }
 
-/** pidfd_send_signal; ESRCH is "gone", any other failure throws. */
-export function pidfdSignal(pidfd: number, sig: "SIGTERM" | "SIGKILL"): "sent" | "gone" {
-  return loadNative().pidfdSignal(pidfd, sig);
+/** Send only supported signals through a pinned pidfd. */
+export function pidfdSignal(pidfd: number, signal: "SIGTERM" | "SIGKILL"): "sent" | "gone" {
+  const send = loadLinuxNative().pidfdSignal;
+  if (!send) throw new Error("@cotal-ai/seat: pidfdSignal is unavailable on this native helper");
+  return send(pidfd, signal);
 }
 
-/** pidfd_open; undefined when no process has that pid. The caller owns and must close the fd. */
+/** Open a process reference by pid, returning undefined when it has already exited. */
 export function pidfdOpen(pid: number): number | undefined {
-  return loadNative().pidfdOpen(pid) ?? undefined;
+  const open = loadLinuxNative().pidfdOpen;
+  if (!open) throw new Error("@cotal-ai/seat: pidfdOpen is unavailable on this native helper");
+  return open(pid) ?? undefined;
 }
 
-/** poll(POLLIN, 0) on the pidfd: true once the process it names has exited. */
+/** Read exit state from a pinned pidfd. */
 export function pidfdExited(pidfd: number): boolean {
-  return loadNative().pidfdExited(pidfd);
+  const exited = loadLinuxNative().pidfdExited;
+  if (!exited) throw new Error("@cotal-ai/seat: pidfdExited is unavailable on this native helper");
+  return exited(pidfd);
 }

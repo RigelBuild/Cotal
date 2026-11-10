@@ -9,15 +9,20 @@
  *  C. `attach` replies the holder-bound §13.6 session grant (no ws:// URL, no 127.0.0.1) and the
  *     mesh caller rail opens + handshakes over the real broker (item 6 replaced the loopback WS).
  *  D. `COTAL_DEFAULT_PERSONA` supplies the persona for a bare `spawn --detach`.
+ *  G. a persona the manager cannot find is refused (exit 2) with the manager's reason, and nothing launches.
+ *  I. an agent that exits at once fails OPERATION_FAILED (exit 5) with the manager's reason.
  *  E. the `start` tombstone errors, naming `spawn --detach` (subprocess through bin/cotal.ts).
- *  F. foreground `--creds` (no --detach) fails loud (subprocess).
+ *  F. `--foreground --creds` fails loud (subprocess).
+ *  H. a spawn in this terminal refuses a missing persona or connector with its code and Next, before
+ *     it prints that it is starting the application (subprocess).
  *
  * COTAL_HOME is sandboxed; kills ONLY the PIDs it spawns. Needs nats-server on PATH.
  * Run: pnpm smoke:spawn-detach:live   (build first — bin/cotal.ts subprocess checks run dist)
  */
 import { spawn as spawnProc, spawnSync, type ChildProcess } from "node:child_process";
 import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -32,12 +37,12 @@ const awaitExit = (p: ChildProcess, ms = 5000): Promise<void> =>
 const home = mkdtempSync(join(tmpdir(), "cotal-detach-home-"));
 process.env.COTAL_HOME = home;
 
-const { parseCommandArgs, probeConnect, registry, CotalEndpoint, openSessionRail } = await import("@cotal-ai/core");
+const { parseCommandArgs, probeConnect, registry, CotalEndpoint, openSessionRail, EpEnvelopeError } = await import("@cotal-ai/core");
 const { connect } = await import("@nats-io/transport-node");
-const { recordMesh } = await import("@cotal-ai/workspace");
+const { recordMesh, isCommandFailure, exitCode, commandFailureReport, renderReport } = await import("@cotal-ai/workspace");
 await import("@cotal-ai/cli"); // registers the CLI commands (spawn/stop/ps/attach) into the registry
 const { Manager } = await import("@cotal-ai/manager");
-import type { Command, Connector, ControlReply, LaunchOpts, SessionGrant } from "@cotal-ai/core";
+import type { AgentHandle, Command, Connector, ControlReply, LaunchOpts, LaunchSpec, RuntimeProvider, SessionGrant } from "@cotal-ai/core";
 const TSX = join(import.meta.dirname, "..", "..", "node_modules", ".bin", "tsx");
 
 let pass = 0;
@@ -49,6 +54,14 @@ const ok = (name: string, cond: boolean, extra?: unknown) => {
   console.log(`  ✓ ${name}`);
 };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** True when a receipt carries `heading` and names `name` on its own `Agent:` row. */
+const receiptFor = (out: string, heading: string, name: string): boolean =>
+  out.includes(heading) && out.split("\n").some((line) => /^Agent:\s/.test(line.trim()) && line.trim().slice(6).trim() === name);
+const joinedAs = (out: string, name: string): boolean => receiptFor(out, "Agent joined", name);
+const stopped = (out: string, name: string): boolean => receiptFor(out, "Agent stop acknowledged", name);
+const NO_AGENTS = /^\s*No managed agents\.$/m;
+/** A report read without its color, for the cells that run with `isTTY` forced on. */
+const plain = (text: string): string => text.replace(/\x1b\[[0-9;]*m/g, "");
 
 const PORT = await freePort();
 const SERVER = `nats://127.0.0.1:${PORT}`;
@@ -110,6 +123,68 @@ const e2eCon: Connector = {
   },
 };
 registry.register(e2eCon);
+// A connector whose child prints one line and exits at once: a launch the manager reports failed.
+const exitCon: Connector = {
+  kind: "connector",
+  name: "e2e-exit",
+  requires: ["node"],
+  buildLaunch: () => ({ command: "node", args: ["-e", "console.log('e2e-exit quits');process.exit(3)"], env: { PATH: process.env.PATH ?? "" } }),
+};
+registry.register(exitCon);
+// A runtime with NO terminal to stream — the shape tmux, cmux, orca and herdr have. It starts a
+// real child and its `attach()` throws its own guidance, as theirs do, and `attachCalls` counts
+// every attach the manager was asked to open: "the foreground launch did not attempt an attach" is
+// then measured at the runtime rather than read off the receipt that claims it.
+let attachCalls = 0;
+const noStream: RuntimeProvider = {
+  kind: "runtime",
+  name: "e2e-nostream",
+  available: () => true,
+  create: () => ({
+    kind: "e2e-nostream",
+    streamsTerminal: false,
+    spawn: (name: string, spec: LaunchSpec, cwd: string): AgentHandle => {
+      const child = spawnProc(spec.command, spec.args, { cwd, env: spec.env, stdio: "ignore" });
+      kids.push(child);
+      return {
+        name, kind: "e2e-nostream",
+        status: () => (child.exitCode === null && child.signalCode === null ? "running" : "exited"),
+        stop: () => { child.kill("SIGKILL"); },
+        waitForExit: () => awaitExit(child),
+        interrupt: () => {},
+        attach: () => {
+          attachCalls++;
+          throw new Error(`e2e-nostream runtime: watch this agent where it runs; agent "${name}" has no terminal here`);
+        },
+      };
+    },
+  }),
+};
+registry.register(noStream);
+// A runtime that declares a terminal but cannot open one: an attach that should work and fails, so
+// its refusal is a real attach failure rather than the no-terminal answer.
+const brokenStream: RuntimeProvider = {
+  kind: "runtime",
+  name: "e2e-brokenstream",
+  available: () => true,
+  create: () => ({
+    kind: "e2e-brokenstream",
+    streamsTerminal: true,
+    spawn: (name: string, spec: LaunchSpec, cwd: string): AgentHandle => {
+      const child = spawnProc(spec.command, spec.args, { cwd, env: spec.env, stdio: "ignore" });
+      kids.push(child);
+      return {
+        name, kind: "e2e-brokenstream",
+        status: () => (child.exitCode === null && child.signalCode === null ? "running" : "exited"),
+        stop: () => { child.kill("SIGKILL"); },
+        waitForExit: () => awaitExit(child),
+        interrupt: () => {},
+        attach: () => { throw new Error(`e2e-brokenstream runtime: the terminal of "${name}" could not be opened`); },
+      };
+    },
+  }),
+};
+registry.register(brokenStream);
 
 const cmd = (name: string): Command => {
   const c = registry.all<Command>("command").find((c) => c.name === name);
@@ -118,15 +193,18 @@ const cmd = (name: string): Command => {
 };
 /** Run a REAL CLI command exactly as the dispatcher would: kernel-parsed argv → run(). */
 const run = (name: string, argv: string[]) => cmd(name).run(parseCommandArgs(cmd(name), argv));
-/** Capture console.log output of a run (ps prints rows). */
+/** Capture what a run writes on stdout (ps prints a report, or one envelope under --json). */
 async function capture(fn: () => Promise<void>): Promise<string> {
   let out = "";
   const real = console.log;
+  const write = process.stdout.write;
   console.log = (...a: unknown[]) => void (out += a.join(" ") + "\n");
+  process.stdout.write = ((chunk: string) => ((out += chunk), true)) as typeof process.stdout.write;
   try {
     await fn();
   } finally {
     console.log = real;
+    process.stdout.write = write;
   }
   return out;
 }
@@ -160,7 +238,7 @@ try {
     ]),
   );
   ok("detached spawn reached the connector", lastOpts !== undefined);
-  ok("identity override joined as bard, not the file's poet", /spawned .*bard/.test(spawnOut) && lastOpts?.name === "bard", { spawnOut, name: lastOpts?.name });
+  ok("identity override joined as bard, not the file's poet", joinedAs(spawnOut, "bard") && lastOpts?.name === "bard", { spawnOut, name: lastOpts?.name });
   ok("prompt rode the control plane", lastOpts?.prompt === "compose", lastOpts?.prompt);
   ok("subscribe override beat the persona file", JSON.stringify(lastOpts?.subscribe) === JSON.stringify(["ops", "ops.x"]), lastOpts?.subscribe);
   ok("allow-subscribe override arrived", JSON.stringify(lastOpts?.allowSubscribe) === JSON.stringify(["ops", "ops.>"]), lastOpts?.allowSubscribe);
@@ -188,21 +266,25 @@ try {
   const psOut = await capture(() => run("ps", ["--space", SPACE]));
   ok("ps lists the detached agent under its OVERRIDDEN identity", /bard/.test(psOut) && !/poet/.test(psOut), psOut);
 
-  // B2 (#651, #905): the same rows, three presentations. BARE is one compact identity line per
-  // seat, including model and optional requested variant. WIDE adds one dim line of EXTRA operational
-  // facts without repeating that identity; pid is real and uid/instance/host attribute the seat.
-  // JSON is the manager's row verbatim, one line, parseable, fields equal to what the launch sent.
+  // B2 (#651, #905): the same rows, three presentations. BARE is a table with one compact identity
+  // row per seat, including model and optional requested variant. WIDE is one labeled record per
+  // seat that adds the EXTRA operational facts without repeating that identity; pid is real and
+  // uid/instance/host attribute the seat. JSON is one envelope whose items are the manager's rows
+  // verbatim, fields equal to what the launch sent.
   const psBare2 = await capture(() => run("ps", ["--space", SPACE]));
+  // The table is the block under the Agents heading, up to the blank line before Next.
+  const bareLines = (psBare2.split("\nAgents\n")[1] ?? "").split("\n\n")[0]!.split("\n").map((line) => line.trim());
   ok("bare ps stays compact and includes model plus requested variant identity",
-    psBare2.trim().split("\n").length === 1 && /e2e · fancy \(high\) · pty/.test(psBare2), psBare2);
+    bareLines.length === 2 && /^NAME\s+AGENT\s+PROCESS\s+MESH/.test(bareLines[0] ?? "") && /e2e · fancy \(high\) · pty/.test(bareLines[1] ?? ""), psBare2);
   const psWide = await capture(() => run("ps", ["--space", SPACE, "--wide"]));
   ok("ps --wide adds operational facts without duplicating model or requested variant",
-    /e2e · fancy \(high\) · pty/.test(psWide) && !/\n[^\n]*model fancy \(high\)/.test(psWide) && /pid \d+/.test(psWide) && /uid [a-z0-9]{26,}/.test(psWide) && /instance [a-z0-9]{26,}/.test(psWide) && /host /.test(psWide), psWide);
+    /agent:\s+e2e · fancy \(high\) · pty/.test(psWide) && !/model:?\s+fancy/.test(psWide) && /pid:\s+\d+/.test(psWide) && /uid:\s+[a-z0-9]{26,}/.test(psWide) && /instance:\s+[a-z0-9]{26,}/.test(psWide) && /host:\s+\S/.test(psWide), psWide);
   const psJson = await capture(() => run("ps", ["--space", SPACE, "--json"]));
-  let jsonRow: Record<string, unknown> | undefined;
-  try { jsonRow = JSON.parse(psJson.trim().split("\n").find((l) => l.includes("bard")) ?? ""); } catch { /* graded below */ }
-  ok("ps --json emits the manager's row verbatim, one JSON line",
-    jsonRow !== undefined && jsonRow.name === "bard" && jsonRow.model === "fancy" && jsonRow.variant === "high" && typeof jsonRow.pid === "number" && typeof jsonRow.lifecycleUid === "string" && typeof jsonRow.cwd === "string", psJson);
+  let psEnvelope: { outcome?: string; result?: { items?: Record<string, unknown>[] } } | undefined;
+  try { psEnvelope = JSON.parse(psJson); } catch { /* graded below */ }
+  const jsonRow = psEnvelope?.result?.items?.find((row) => row.name === "bard");
+  ok("ps --json is one envelope whose items carry the manager's row verbatim",
+    psEnvelope?.outcome === "ok" && psJson.trim().split("\n").length === 1 && jsonRow !== undefined && jsonRow.model === "fancy" && jsonRow.variant === "high" && typeof jsonRow.pid === "number" && typeof jsonRow.lifecycleUid === "string" && typeof jsonRow.cwd === "string", psJson);
 
   // B3 (#651, #905): a variant WITHOUT a model survives in the compact identity and JSON. The wide
   // continuation must not repeat it now that provenance lives in the identity row.
@@ -213,15 +295,14 @@ try {
     lutWide = await capture(() => run("ps", ["--space", SPACE, "--wide"]));
     if (!/lutist/.test(lutWide)) await sleep(250);
   }
-  // The identity is on the seat line; operational wide facts are on the continuation immediately after.
-  const lutLines = lutWide.split("\n");
-  const lutIdx = lutLines.findIndex((l) => /lutist/.test(l));
-  const lutFacts = lutIdx >= 0 ? (lutLines[lutIdx + 1] ?? "") : "";
+  // Each seat is one record; the identity is its agent field and the operational facts follow it.
+  const lutRecord = lutWide.split("\n\n").find((record) => /name:\s+lutist/.test(record)) ?? "";
+  const lutFacts = lutRecord.split("\n").filter((line) => !/^\s*(name|agent|process|mesh|auth):/.test(line)).join("\n");
   ok("ps --wide keeps a variant-without-model in identity and out of operational facts",
-    lutIdx >= 0 && /e2e · variant high · pty/.test(lutLines[lutIdx] ?? "") && !/variant high|model /.test(lutFacts), lutWide);
+    /agent:\s+e2e · variant high · pty/.test(lutRecord) && !/variant high|model/.test(lutFacts), lutWide);
   const lutJsonOut = await capture(() => run("ps", ["--space", SPACE, "--json"]));
   let lutJson: Record<string, unknown> | undefined;
-  try { lutJson = JSON.parse(lutJsonOut.trim().split("\n").find((l) => l.includes("lutist")) ?? ""); } catch { /* graded below */ }
+  try { lutJson = (JSON.parse(lutJsonOut) as { result: { items: Record<string, unknown>[] } }).result.items.find((row) => row.name === "lutist"); } catch { /* graded below */ }
   ok("ps --json carries the variant and omits model for a variant-only pin",
     lutJson?.variant === "high" && !("model" in (lutJson ?? {})), lutJsonOut);
   // Tear lutist down so it does not linger into the single-seat teardown assertion below.
@@ -283,9 +364,9 @@ try {
   await rnc.drain().catch(() => rnc.close());
 
   const stopOut = await capture(() => run("stop", ["--name", "bard", "--space", SPACE]));
-  ok("stop reports ✓", /stopped bard/.test(stopOut), stopOut);
+  ok("stop reports the acknowledged stop", stopped(stopOut, "bard"), stopOut);
   const psAfter = await capture(() => run("ps", ["--space", SPACE]));
-  ok("ps is empty after stop", /no managed agents/.test(psAfter), psAfter);
+  ok("ps is empty after stop", NO_AGENTS.test(psAfter), psAfter);
 
   // D — COTAL_DEFAULT_PERSONA supplies the persona for a bare detached spawn. The identity still
   // comes from --name, so this proves persona selection and identity override stay separate.
@@ -298,15 +379,55 @@ try {
       ok("COTAL_DEFAULT_PERSONA bare detached spawn reached the connector", lastOpts !== undefined);
       ok(
         "COTAL_DEFAULT_PERSONA picked poet while --name set identity",
-        /spawned .*envbard/.test(envOut) && lastOpts?.name === "envbard" && lastOpts?.role === "writer",
+        joinedAs(envOut, "envbard") && lastOpts?.name === "envbard" && lastOpts?.role === "writer",
         { envOut, name: lastOpts?.name, role: lastOpts?.role },
       );
       const envStop = await capture(() => run("stop", ["--name", "envbard", "--space", SPACE]));
-      ok("COTAL_DEFAULT_PERSONA spawned agent stops", /stopped envbard/.test(envStop), envStop);
+      ok("COTAL_DEFAULT_PERSONA spawned agent stops", stopped(envStop, "envbard"), envStop);
     } finally {
       if (prev === undefined) delete process.env.COTAL_DEFAULT_PERSONA;
       else process.env.COTAL_DEFAULT_PERSONA = prev;
     }
+  }
+
+  // G — a persona the manager cannot find is refused before anything ran, so the CLI reports a
+  // refusal (exit 2) carrying the manager's own reason and naming the file it looked for. An
+  // unknown outcome here would tell the operator to inspect a launch that never happened.
+  {
+    lastOpts = undefined as LaunchOpts | undefined;
+    let failure: unknown;
+    try {
+      await capture(() => run("spawn", ["ghost", "--detach", "--no-events", "--agent", "e2e", "--space", SPACE]));
+    } catch (e) {
+      failure = e;
+    }
+    const seen = isCommandFailure(failure) ? { outcome: failure.outcome, code: failure.code, message: failure.message, native: failure.native } : String(failure);
+    ok("a missing persona is a refusal the manager stated before execution, exit 2",
+      isCommandFailure(failure) && failure.outcome === "refused" && failure.native?.outcome === "not-executed" && exitCode(failure.outcome, failure.code) === 2, seen);
+    const missing = join(workspaceRoot, ".cotal", "agents", "ghost.md");
+    ok("...it shows the manager's reason, naming the persona file it looked for",
+      isCommandFailure(failure) && failure.message.includes('no persona "ghost"') && failure.message.includes(missing) && !failure.message.includes("\n"), seen);
+    ok("...and nothing launched", lastOpts === undefined, lastOpts?.name);
+    const psRefused = await capture(() => run("ps", ["--space", SPACE]));
+    ok("...and ps is still empty", NO_AGENTS.test(psRefused), psRefused);
+  }
+
+  // I — an agent whose process exits at once is a launch the manager reports failed. The CLI says so
+  // with the manager's reason, OPERATION_FAILED, exit 5, never as an unknown outcome.
+  {
+    let failure: unknown;
+    try {
+      await capture(() => run("spawn", ["poet", "--detach", "--no-events", "--agent", "e2e-exit", "--space", SPACE, "--name", "quitter"]));
+    } catch (e) {
+      failure = e;
+    }
+    const seen = isCommandFailure(failure) ? { outcome: failure.outcome, code: failure.code, message: failure.message, native: failure.native } : String(failure);
+    ok("an agent that exits at once fails OPERATION_FAILED, exit 5",
+      isCommandFailure(failure) && failure.outcome === "failed" && failure.code === "OPERATION_FAILED" && exitCode(failure.outcome, failure.code) === 5, seen);
+    ok("...with the manager's reason and the agent's last output",
+      isCommandFailure(failure) && failure.message.includes("quitter exited on launch") && failure.message.includes("e2e-exit quits"), seen);
+    const psExited = await capture(() => run("ps", ["--space", SPACE]));
+    ok("...and nothing is left running", NO_AGENTS.test(psExited), psExited);
   }
 
   // E/F run TRUE subprocesses through bin/cotal.ts with `extensions: true`, so the sandbox must
@@ -335,13 +456,69 @@ try {
     { encoding: "utf8", env: subEnv },
   );
   ok("sandbox ext add of the worktree claude connector succeeds", extAdd.status === 0, (extAdd.stderr + extAdd.stdout).slice(0, 300));
-  const fg = spawnSync(TSX, [join(import.meta.dirname, "..", "cotal.ts"), "spawn", "poet", "--creds", "/tmp/x.creds"], {
+  const fg = spawnSync(TSX, [join(import.meta.dirname, "..", "cotal.ts"), "spawn", "poet", "--foreground", "--creds", "/tmp/x.creds"], {
     encoding: "utf8",
-    // An inherited COTAL_LIFECYCLE_UID would pair the credential; this case is the unpaired one.
     env: { ...subEnv, COTAL_LIFECYCLE_UID: undefined },
   });
   ok("unpaired foreground --creds exits non-zero", fg.status === 1, fg.status);
   ok("unpaired foreground --creds names --lifecycle-uid", /lifecycle-paired.*--lifecycle-uid/.test(fg.stderr), fg.stderr.slice(0, 200));
+
+  // K — a local resume transcript must use the mesh the launch already selected (#4067).
+  // A registered TCP listener that sends no NATS INFO counts the resolver's two probes per sweep.
+  // The missing persona stops every case after carry, before an application can be launched.
+  {
+    const resumeRoot = mkdtempSync(join(tmpdir(), "cotal-detach-resume-"));
+    const callerRoot = join(resumeRoot, "caller");
+    const transcriptRoot = join(resumeRoot, "claude");
+    mkdirSync(callerRoot);
+    mkdirSync(join(resumeRoot, "offline"));
+    mkdirSync(join(transcriptRoot, "projects", "synthetic"), { recursive: true });
+    const heldId = "11111111-2222-4333-8444-555555555555";
+    const unheldId = "99999999-2222-4333-8444-555555555555";
+    writeFileSync(join(transcriptRoot, "projects", "synthetic", `${heldId}.jsonl`), '{"type":"user","message":{"role":"user","content":"synthetic carry probe"}}\n');
+    let accepts = 0;
+    const sockets = new Set<Socket>();
+    const tarpit = createServer((socket) => { accepts++; sockets.add(socket); socket.on("close", () => sockets.delete(socket)); });
+    await new Promise<void>((resolve) => tarpit.listen(0, "127.0.0.1", resolve));
+    const address = tarpit.address();
+    if (!address || typeof address === "string") throw new Error("resume probe listener has no TCP address");
+    const childRun = (args: string[]): Promise<{ status: number | null; out: string }> => new Promise((resolve) => {
+      const child = spawnProc(TSX, [join(import.meta.dirname, "..", "cotal.ts"), ...args], {
+        cwd: callerRoot, env: { ...subEnv, CLAUDE_CONFIG_DIR: transcriptRoot }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      kids.push(child);
+      let out = "";
+      child.stdout.on("data", (data: Buffer) => { out += data.toString(); });
+      child.stderr.on("data", (data: Buffer) => { out += data.toString(); });
+      const timeout = setTimeout(() => child.kill("SIGKILL"), 60_000);
+      child.once("close", (status) => { clearTimeout(timeout); resolve({ status, out }); });
+    });
+    try {
+      const added = await childRun(["space", "add", "resume-offline", "--server", `nats://127.0.0.1:${address.port}`, "--mode", "open", "--root", join(resumeRoot, "offline"), "--force"]);
+      ok("resume probe records its own offline broker", added.status === 0, added.out);
+      const cleared = await childRun(["use", "--clear"]);
+      ok("resume probe leaves the target to registry resolution", cleared.status === 0, cleared.out);
+      const on = (mgr as unknown as { managerInstanceId: string }).managerInstanceId;
+      for (const [label, id, explicit, expected] of [
+        ["held implicit", heldId, false, 2],
+        ["unheld implicit", unheldId, false, 2],
+        ["held explicit", heldId, true, 0],
+      ] as const) {
+        const before = accepts;
+        const result = await childRun(["spawn", "resume-missing", "--detach", "--agent", "claude", "--on", on, "--resume", id, "--cwd", workspaceRoot, ...(explicit ? ["--space", SPACE] : [])]);
+        const probes = accepts - before;
+        ok(`${label} resume reaches the missing-persona refusal without launching`, result.status === 2 && result.out.includes('no persona "resume-missing"'), result.out);
+        ok(`${label} resume carries only a transcript held here`, result.out.includes("carried session") === (id === heldId), result.out);
+        ok(`${label} resume does not repeat the registry sweep`, probes === expected, { probes, expected });
+      }
+    } finally {
+      const { removeMesh } = await import("@cotal-ai/workspace");
+      removeMesh("resume-offline");
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => tarpit.close(() => resolve()));
+      rmSync(resumeRoot, { recursive: true, force: true });
+    }
+  }
 
   console.log(`\nspawn-detach live e2e: ${pass} checks passed`);
 } finally {

@@ -16,10 +16,13 @@
  * defeating deny-new, so reads are leader-served `STREAM.MSG.GET` (never `DIRECT.GET`) AND the
  * store is proved primary/un-mirrored/non-evicting at bind. Any read/shape/parse failure DENIES
  * the connect; there is no file-only fallback.
+ * Target-UID custody is checked before the credential. Alias custody is checked by the root
+ * mapping read, or explicitly for a descendant, before this invocation can allow. Both callout
+ * passes execute fresh reads; no observation is reused across signing or connections.
  */
 import type { NatsConnection } from "@nats-io/transport-node";
 import { jetstreamManager, type JetStreamManager } from "@nats-io/jetstream";
-import { EpEnvelopeError, assertInboxConnId, epAuthBucket, recordsBucket } from "@cotal-ai/core";
+import { EpEnvelopeError, assertInboxConnId, epAuthBucket, recordsBucket, readRecordLeader, assertOrdinaryNativeMutation } from "@cotal-ai/core";
 import { assertAuthorityStreamShape, openLifecycleMappingReader, readLifecycleMappingLeader, type LifecycleMappingReader } from "./lifecycle-registry.js";
 import { credRowKey, parseLedgerRow, type CredentialLedgerRow } from "./credential-ledger.js";
 import type { ValidatedUserToken } from "./token.js";
@@ -75,6 +78,13 @@ function internals(reader: ConnectReader): ConnectReaderInternals {
   if (!i)
     throw new EpEnvelopeError("failed-precondition", "the connect reader was not constructed by openConnectReader(); a hand-assembled context never authorizes (SPEC 13.12)");
   return i;
+}
+
+/** PACKAGE-INTERNAL, never exported from the package index. Service-specific leader reads
+ * use the same branded, shape-proved connection without broadening ordinary connect syntax. */
+export function serviceConnectReaderStores(reader: ConnectReader): { space: string; jsm: JetStreamManager } {
+  const { space, jsm } = internals(reader);
+  return { space, jsm };
 }
 
 /**
@@ -162,6 +172,16 @@ export async function authorizeConnectCredential(reader: ConnectReader, t: Valid
   if (uid === undefined)
     throw new EpEnvelopeError("permission-denied", "the bearer carries no lifecycle claim; a credential row is keyed by lifecycle uid (SPEC 13.1)");
 
+  const { jsm, space } = internals(reader);
+  const custodyReader = {
+    async getRecord(key: string) {
+      const entry = await readRecordLeader(jsm, space, key);
+      return entry === undefined ? undefined : {
+        value: new TextEncoder().encode(JSON.stringify(entry.value)), revision: entry.revision, operation: "PUT" as const,
+      };
+    },
+  };
+  await assertOrdinaryNativeMutation(custodyReader, { lifecycleUid: uid });
   const row = await readCredRowLeader(reader, uid, credid);
   if (row === undefined)
     throw new EpEnvelopeError("permission-denied", `no credential row cred.${uid}.${credid}; a revoked or never-issued credential does not connect (deny-new, SPEC 13.1)`);
@@ -185,5 +205,8 @@ export async function authorizeConnectCredential(reader: ConnectReader, t: Valid
       throw new EpEnvelopeError("permission-denied", `the lifecycle head for "${t.owner}/${t.act.actor}" is "${head.mapping.state}", not active; a root credential of a retiring/retired incarnation does not connect (SPEC 13.1)`);
     if (head.mapping.currentCredentialId !== credid)
       throw new EpEnvelopeError("permission-denied", `the current root credential for "${t.owner}/${t.act.actor}" is ${head.mapping.currentCredentialId ?? "(none)"}, not ${credid}; a superseded root issuance does not connect (deny-new, SPEC 13.1)`);
+  } else {
+    // Root mapping reads already check alias custody. Descendants still need that check.
+    await assertOrdinaryNativeMutation(custodyReader, { owner: t.owner, actor: t.act.actor });
   }
 }

@@ -41,7 +41,7 @@
  * on every command, permanently.
  */
 import {
-  deregisterServiceInstance, describeEndpoint, epProbeInstanceInterest, unansweredRequest,
+  deregisterServiceInstance, describeEndpoint, epProbeInstanceInterest, unansweredRequest, rejectionText,
   readEndpointGateGeneration,
   type EpCaller, type EpInstanceLiveness, type ServiceDeregistration,
 } from "@cotal-ai/core";
@@ -119,7 +119,7 @@ export function makeInstanceProbe(
       const { responder } = await describeEndpoint(nc, args.space, args.endpoint, args.caller, { deadlineMs: describeMs, instanceId: args.instanceId });
       return { state: "answered", detail: `it answered a pinned describe at epoch ${responder.epoch}` };
     } catch (e) {
-      if (!unansweredRequest(e)) return { state: "unestablishable", detail: `the probe itself failed: ${(e as Error).message}` };
+      if (!unansweredRequest(e)) return { state: "unestablishable", detail: `the probe itself failed: ${rejectionText(e)}` };
       const silence = `no answer to a pinned describe within ${describeMs}ms`;
       let interest: EpInstanceLiveness;
       try {
@@ -127,7 +127,7 @@ export function makeInstanceProbe(
       } catch (err) {
         // The rail check is what turns silence into a verdict, so a rail check that could not RUN
         // leaves the silence meaning exactly what it meant before it: nothing.
-        return { state: "unestablishable", detail: `${silence}, and the broker's rail check could not run: ${(err as Error).message}` };
+        return { state: "unestablishable", detail: `${silence}, and the broker's rail check could not run: ${rejectionText(err)}` };
       }
       return interest === "gone"
         ? { state: "gone", detail: `${silence}, and the broker reports nothing subscribed on its rail` }

@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import ts from "typescript";
 import { firstFreeName, spawnNameError } from "../src/agent-file.js";
+import { assertBoundedOwner } from "../src/endpoint-subjects.js";
 import { assertValidOwnerToken } from "../src/subjects.js";
 
 let passed = 0;
@@ -37,6 +38,15 @@ function check(what: string, ok: boolean, detail?: unknown) {
 const mintable = (n: string) => {
   try {
     assertValidOwnerToken(n);
+    return true;
+  } catch {
+    return false;
+  }
+};
+/** What the exchange actually serves: the grammar plus the 64-character rail bound. */
+const servable = (n: string) => {
+  try {
+    assertBoundedOwner(n, "actor");
     return true;
   } catch {
     return false;
@@ -77,6 +87,12 @@ check(
   produced.length >= 10 && produced.length === SERIES && unmintable.length === 0,
   { produced, unmintable },
 );
+const unservable = produced.filter((n) => !servable(n));
+check(
+  `every name the numbering produces is an actor the exchange serves (checked ${produced.length})`,
+  produced.length >= 10 && unservable.length === 0,
+  { unservable },
+);
 check("…and they are all distinct, so the series still resolves collisions",
   produced.length >= 10 && new Set(produced).size === SERIES);
 check("…and the second instance is the one that used to be unmintable", produced[0] === "reviewer_2", {
@@ -94,10 +110,44 @@ check(
 // USER MODE narrows, and says why.
 check("user mode REFUSES a hyphenated name", spawnNameError("my-agent", { userMode: true }) !== undefined);
 check(
-  "…and the refusal names the actor token, not just 'unsafe'",
-  /actor token/.test(spawnNameError("my-agent", { userMode: true }) ?? ""),
+  "…and the refusal names the exchange, not just 'unsafe'",
+  /exchange refuses it/.test(spawnNameError("my-agent", { userMode: true }) ?? ""),
   { msg: spawnNameError("my-agent", { userMode: true }) },
 );
+
+// THE LENGTH BOUND (#4981). The grammar alone admits a name the exchange can never serve: its
+// permission rows are built through assertBoundedOwner, which refuses an actor past 64 characters.
+// The door must refuse that name itself, in user mode, before a spawn enrolls it.
+const OVER = `cloud_${"a".repeat(64)}`;
+check("instrument control: the over-long name is 70 characters and fits the token grammar",
+  OVER.length === 70 && mintable(OVER) && !servable(OVER));
+const OVER_REFUSAL = spawnNameError(OVER, { userMode: true });
+check("user mode REFUSES a name the exchange cannot serve (over 64 characters)",
+  OVER_REFUSAL !== undefined && /exceeds 64 characters/.test(OVER_REFUSAL),
+  { msg: OVER_REFUSAL });
+check("static/open mode still ACCEPTS that name (the actor there is the nkey, not the name)",
+  spawnNameError(OVER, { userMode: false }) === undefined);
+const AT_BOUND = "b".repeat(64);
+check("a name of exactly 64 characters is accepted in user mode (the bound is inclusive)",
+  AT_BOUND.length === 64 && servable(AT_BOUND) && spawnNameError(AT_BOUND, { userMode: true }) === undefined);
+
+// THE NUMBERED FORM. firstFreeName appends `_<n>`, so a base the door accepts becomes unservable at
+// its second live instance once the base is 63 or 64 characters. The numbering must stop at the
+// bound rather than hand that name out.
+const WIDE = "c".repeat(63);
+check("instrument control: a 63-character base is servable and its numbered form is not",
+  WIDE.length === 63 && servable(WIDE) && !servable(`${WIDE}_2`));
+let numberedRefusal = "";
+try { firstFreeName(WIDE, (n) => n === WIDE, { actorBound: true }); }
+catch (e) { numberedRefusal = e instanceof Error ? e.message : String(e); }
+check("numbering a taken 63-character base REFUSES instead of naming an unservable actor",
+  /64-character actor bound/.test(numberedRefusal), { msg: numberedRefusal });
+check("a free 63-character base is returned unchanged (the door judges the base, not the numbering)",
+  firstFreeName(WIDE, () => false, { actorBound: true }) === WIDE);
+// The bound is a user-mode fact. Static and open mode key the actor on the minted nkey, so the same
+// numbering without the cap keeps producing the numbered name it always produced.
+check("numbering past the bound without the cap still yields the numbered name (static/open mode)",
+  firstFreeName(WIDE, (n) => n === WIDE) === `${WIDE}_2`);
 
 // UPGRADE SAFETY. Static/open mode keys the actor on the nkey, so the narrow rule must NOT apply
 // there — an existing `my-agent` persona has to keep spawning across an upgrade.
@@ -110,28 +160,38 @@ for (const bad of ["../escape", "a/b", "a\\b", "with space", "dot.name", ""]) {
 }
 
 // THE DELEGATION, asserted structurally because it cannot be asserted behaviourally. The narrow
-// half must CALL the shipped validator rather than restate its alphabet. A restatement that is
-// correct today is behaviourally identical today — that is precisely what makes the drift silent,
-// and why every cell above stays green when the call is replaced by an equivalent regex. The only
-// moment the two disagree is after someone changes the token grammar, which is exactly the moment
-// nobody is looking at this door. So the cell reads the shipped source.
-//
-// Comments are STRIPPED first: the docstring above `spawnNameError` names `assertValidOwnerToken`
-// twice, and a cell that counted its own documentation would pass with the call deleted.
-const SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "src", "agent-file.ts"), "utf8")
-  .replace(/\/\*[\s\S]*?\*\//g, "")
-  .replace(/\/\/[^\n]*/g, "");
-const body = SRC.slice(SRC.indexOf("export function spawnNameError"));
-const fnBody = body.slice(0, body.indexOf("\n}") + 2);
+// half must CALL the validator the exchange's permission rows are built through, rather than restate
+// its alphabet or its 64-character bound. A restatement that is correct today is behaviourally
+// identical today, and the only moment the two disagree is after someone changes that validator,
+// which is exactly the moment nobody is looking at this door. So the cell parses the shipped source.
+const DOOR_AST = ts.createSourceFile(
+  "agent-file.ts",
+  readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "src", "agent-file.ts"), "utf8"),
+  ts.ScriptTarget.Latest,
+);
+const DOOR = DOOR_AST.statements.find(
+  (s): s is ts.FunctionDeclaration => ts.isFunctionDeclaration(s) && s.name?.text === "spawnNameError",
+);
+const TRAVERSAL_GUARD = "/^[A-Za-z0-9_-]+$/";
+let validatorCalls = 0;
+const doorRegexes: string[] = [];
+const walkDoor = (node: ts.Node): void => {
+  if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "assertBoundedOwner")
+    validatorCalls++;
+  if (ts.isRegularExpressionLiteral(node)) doorRegexes.push(node.text);
+  ts.forEachChild(node, walkDoor);
+};
+if (DOOR?.body) walkDoor(DOOR.body);
 
-check("instrument control: the predicate's source was located, comments stripped",
-  fnBody.includes("export function spawnNameError") && fnBody.length > 100 && !fnBody.includes("DELEGATES"),
-  { len: fnBody.length });
+check("instrument control: the predicate was parsed and its regex literals are visible (the traversal guard)",
+  DOOR?.body !== undefined && doorRegexes.includes(TRAVERSAL_GUARD),
+  { doorRegexes });
 check("the narrow half CALLS the shipped validator (delegation, not a restatement)",
-  fnBody.includes("assertValidOwnerToken("));
+  validatorCalls >= 1,
+  { validatorCalls });
 check("…and carries no second copy of the token alphabet",
-  !/\[A-Za-z0-9_\]\+/.test(fnBody),
-  { fnBody: fnBody.slice(0, 400) });
+  doorRegexes.every((r) => r === TRAVERSAL_GUARD),
+  { doorRegexes });
 
 // A good name is accepted in both modes — so the guard above is not just always-refusing.
 check("a plain name is accepted in BOTH modes",
@@ -148,8 +208,8 @@ const CLI_REFUSAL_USER = spawnNameError("default_agent-3", { userMode: true });
 check("a hyphenated --name on a USER-mode target is refused by the same predicate the manager uses",
   CLI_REFUSAL_USER !== undefined && /actor token/.test(CLI_REFUSAL_USER),
   { msg: CLI_REFUSAL_USER });
-check("…the CLI's message is core's own, not a copy (names the separator reservation)",
-  typeof CLI_REFUSAL_USER === "string" && CLI_REFUSAL_USER.includes("reserved as the principal name-form separator"),
+check("…the CLI's message is core's own, not a copy (names the exchange's refusal)",
+  typeof CLI_REFUSAL_USER === "string" && CLI_REFUSAL_USER.includes("the exchange refuses it"),
   { msg: CLI_REFUSAL_USER });
 check("the same hyphenated --name on a STATIC-mode target is accepted",
   spawnNameError("default_agent-3", { userMode: false }) === undefined);
@@ -164,7 +224,7 @@ const CLI_RAW = readFileSync(
   "utf8",
 );
 check("instrument control: the CLI's spawn source was located",
-  CLI_RAW.includes("async function spawnDetached") && CLI_RAW.includes("export async function spawn"),
+  CLI_RAW.includes("async function launchManagedPersona") && CLI_RAW.includes("export async function spawn"),
   { len: CLI_RAW.length });
 const CLI_AST = ts.createSourceFile("spawn.ts", CLI_RAW, ts.ScriptTarget.Latest);
 // Parsed, so only a real value import binding the export to its own name counts, wherever it sits in the list.
@@ -189,11 +249,17 @@ collectDoorCalls(CLI_AST);
 check("the CLI calls the shared name door (call sites: detached + foreground)",
   DOOR_CALLS.length === 2,
   { sites: DOOR_CALLS.length });
+// Parentheses change no behaviour, so they must not change the verdict.
+const unparen = (node: ts.Expression): ts.Expression =>
+  ts.isParenthesizedExpression(node) ? unparen(node.expression) : node;
 check("the CLI keys the door on the target mesh's auth mode, not on a restated grammar",
-  DOOR_CALLS.length > 0 && DOOR_CALLS.every(({ arguments: [, mode] }) =>
-    mode !== undefined && ts.isBinaryExpression(mode) && mode.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken &&
-    ts.isPropertyAccessExpression(mode.left) && mode.left.name.text === "mode" &&
-    ts.isStringLiteralLike(mode.right) && mode.right.text === "user"));
+  DOOR_CALLS.length > 0 && DOOR_CALLS.every(({ arguments: [, arg] }) => {
+    const mode = arg && unparen(arg);
+    if (mode === undefined || !ts.isBinaryExpression(mode) || mode.operatorToken.kind !== ts.SyntaxKind.EqualsEqualsEqualsToken)
+      return false;
+    const [left, right] = [unparen(mode.left), unparen(mode.right)];
+    return ts.isPropertyAccessExpression(left) && left.name.text === "mode" && ts.isStringLiteralLike(right) && right.text === "user";
+  }));
 
 console.log(
   failed === 0

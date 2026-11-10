@@ -5,9 +5,12 @@
  * returned `bash <path>` command. Exercises paneCommand directly, so it needs no cmux CLI and runs in
  * CI. Run: pnpm smoke:cmux
  */
-import { existsSync, mkdtempSync, rmSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { registry } from "@cotal-ai/core";
+import * as cmuxPkg from "./src/index.js";
 import { CmuxRuntime, paneCommand } from "./src/runtime.js";
 import { waitForWorkspaceExit } from "./src/driver.js";
 
@@ -43,14 +46,42 @@ async function rejects(label: string, fn: () => Promise<unknown>, pattern?: RegE
 }
 
 const SECRET = "leak-canary-cmux-DO-NOT-LEAK";
-const cmd = paneCommand(
-  { command: "/bin/echo", args: ["hi"], env: { COTAL_CONTROL_TOKEN: SECRET }, cwd: "/tmp" },
-  false,
-  true, // isolate (P3): the agent gets ONLY the connector-declared env
-).command;
+const envRoot = mkdtempSync(join(tmpdir(), "cotal-cmux-env-"));
+const previousEnvTmp = process.env.TMPDIR;
+try {
+  process.env.TMPDIR = envRoot;
+  for (const name of ["$(touch MARKER)X", "`touch MARKER`X", "A;true", "A=B", "A B", "A\n", "1NAME", ""]) {
+    let message = "";
+    let launch: ReturnType<typeof paneCommand> | undefined;
+    try { launch = paneCommand({ command: "/bin/true", env: { [name]: "1" } }); }
+    catch (error) { message = (error as Error).message; }
+    if (launch) rmSync(launch.dir, { recursive: true, force: true });
+    ok(`unsafe env name is refused (${JSON.stringify(name)})`,
+      message === `cmux: refusing to render unsafe env var name ${JSON.stringify(name)}`);
+    ok("unsafe env name creates no launcher files", readdirSync(envRoot).length === 0);
+  }
+  const literal = "$(touch MARKER) 'quoted' `touch OTHER_MARKER`\nnext line";
+  const launch = paneCommand({
+    command: process.execPath,
+    args: ["-e", "process.stdout.write(JSON.stringify([process.env.NAME,process.env._name2]))"],
+    env: { NAME: literal, _name2: "valid" },
+    cwd: envRoot,
+  });
+  const output = execFileSync("bash", ["-c", launch.command], { cwd: envRoot, encoding: "utf8", timeout: 5_000 });
+  ok("valid env names preserve literal values",
+    output === JSON.stringify([literal, "valid"]));
+  ok("shell syntax in an env value does not execute", !existsSync(join(envRoot, "MARKER")) && !existsSync(join(envRoot, "OTHER_MARKER")));
+  ok("executed launcher removes its directory", !existsSync(launch.dir));
+} finally {
+  if (previousEnvTmp === undefined) delete process.env.TMPDIR;
+  else process.env.TMPDIR = previousEnvTmp;
+  rmSync(envRoot, { recursive: true, force: true });
+}
+
+const cmd = paneCommand({ command: "/bin/echo", args: ["hi"], env: { COTAL_CONTROL_TOKEN: SECRET }, cwd: "/tmp" }).command;
 
 ok("paneCommand returns a `bash <path>` invocation", /^bash '\/.*\/launch\.sh'$/.test(cmd));
-const scriptPath = cmd.replace(/^bash\s+(?:-l\s+)?'|'$/g, "");
+const scriptPath = cmd.replace(/^bash\s+'|'$/g, "");
 ok("launcher script is 0o600 (owner-only, never world-readable)", (statSync(scriptPath).mode & 0o777) === 0o600);
 ok("launcher dir is 0o700 (owner-only)", (statSync(dirname(scriptPath)).mode & 0o777) === 0o700);
 ok("returned command does NOT contain the secret (no argv leak)", !cmd.includes(SECRET));
@@ -60,6 +91,14 @@ try {
   rmSync(dirname(scriptPath), { recursive: true, force: true });
 } catch {
   /* best-effort cleanup */
+}
+
+ok("package exports CmuxRuntime and cmuxRuntimeProvider, not cmuxTerminalProvider", "CmuxRuntime" in cmuxPkg && "cmuxRuntimeProvider" in cmuxPkg && !("cmuxTerminalProvider" in cmuxPkg));
+ok("importing @cotal-ai/cmux registers runtime/cmux and no terminal provider", registry.has("runtime", "cmux") && !registry.has("terminal", "cmux") && registry.all("terminal").length === 0);
+{
+  let refusal = "";
+  try { registry.resolve("terminal", "cmux"); } catch (e) { refusal = (e as Error).message; }
+  ok("resolving 'terminal/cmux' throws", refusal === 'no terminal registered for "cmux"');
 }
 
 if ((process.platform as NodeJS.Platform) !== "win32") {
@@ -125,6 +164,10 @@ process.stdout.write("OK");
       "/tmp",
     );
     ok("cmux runtime handle implements waitForExit", typeof handle.waitForExit === "function");
+    // Declared, not discovered by catching the throw from attach(): a caller reads this to decide
+    // whether to ask for an attach at all, so a foreground `cotal spawn` on this runtime launches
+    // the seat and stops there instead of failing on an attach that cannot open.
+    ok("the runtime declares that it streams no terminal", new CmuxRuntime().streamsTerminal === false);
     ok("cmux handle reports running from exact workspace inventory", handle.status() === "running");
     handle.stop({ graceful: false });
     await handle.waitForExit!();
@@ -140,4 +183,5 @@ process.stdout.write("OK");
 }
 
 console.log(`\n${passed} passed, ${failed} failed\n`);
+console.log("CMUX SMOKE COMPLETE");
 if (failed > 0) process.exit(1);

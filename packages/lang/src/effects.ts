@@ -11,6 +11,7 @@
  */
 
 import type { StepKey } from "./keys.js";
+import { deepFreeze } from "./values.js";
 
 // ---- values that cross the boundary ---------------------------------------------------------
 
@@ -21,6 +22,8 @@ import type { StepKey } from "./keys.js";
  * and a host-local pointer in journalled state is exactly how that stops being true.
  */
 export interface AgentHandleValue {
+  /** `undefined` is a legacy journalled spawn handle. New handles always name their origin. */
+  readonly kind?: "spawned" | "participant";
   readonly agent: string;
   readonly persona: string;
   readonly worktree?: string;
@@ -97,8 +100,27 @@ export interface NotifyFact {
 
 // ---- requests --------------------------------------------------------------------------------
 
+/** An inline persona: the helper's whole definition, written in the program instead of read from
+ *  the manager's catalog (§6.1). Closed, and holding only the keys the program wrote. */
+export interface InlineSpawnDefinition {
+  readonly name: string;
+  readonly prompt: string;
+  readonly role?: string;
+  readonly model?: string;
+  readonly variant?: string;
+  readonly description?: string;
+  readonly subscribe?: readonly string[];
+  readonly allowSubscribe?: readonly string[];
+  readonly allowPublish?: readonly string[];
+  readonly capabilities?: readonly string[];
+  readonly save?: boolean;
+}
+
 export interface SpawnRequest {
+  /** The catalog persona, or an inline persona's `name`. */
   readonly persona: string;
+  /** Present for an inline spawn. `model` and `variant` are then the definition's own. */
+  readonly inline?: InlineSpawnDefinition;
   readonly model?: string;
   readonly variant?: string;
   /** Existing absolute directory on the serving manager's host. Separate from logical worktree identity. */
@@ -122,6 +144,13 @@ export interface SpawnRequest {
   /** `false` starts the agent without its event plane, for a connector that publishes none.
    *  Omitted, the host's default applies. */
   readonly events?: boolean;
+  /** The terminal runtime this one seat launches on. Omitted, the serving manager uses its own. */
+  readonly runtime?: string;
+}
+
+/** Resolve a participant already supplied by the host. This never spawns or adopts a seat. */
+export interface ParticipantRequest {
+  readonly name?: string;
 }
 
 export interface TurnRequest {
@@ -371,31 +400,73 @@ export class RunHeld extends Error {
  *
  * `escalate` never arrives here. It mints an effect rather than choosing a disposition, so it is
  * hashed (design 5.12) and an edit to it diverges before any of this runs.
+ *
+ * `timeout` is the checkpoint's own option when it set one, so L4007 can say whether the deadline
+ * came from it or from the run's default.
+ *
+ * The record this returns is the value the program receives, and it is built here, after the journal
+ * froze the raw outcome. Freezing it is what makes the result the program holds the same frozen
+ * value the journal recorded, on the live path and on replay. The nested `value` is already frozen
+ * by the share; the record around it was the one left writable.
  */
 export function applyCheckpointPolicy(
   raw: CheckpointRaw,
   onExpiry: "fail" | "proceed" | "escalate" | undefined,
+  timeout?: string,
 ): CheckpointResultValue {
   if (raw.outcome === "resolved") {
-    return {
+    return deepFreeze({
       status: "resolved",
       ...(raw.value !== undefined ? { value: raw.value } : {}),
       ...(raw.by !== undefined ? { by: raw.by } : {}),
       ...(raw.artifact !== undefined ? { artifact: raw.artifact } : {}),
       at: raw.at,
-    };
+    });
   }
   // `escalate` reaching here means the chain is FINISHED: the interpreter already performed the
   // one hop, and a second expiry settles exactly as `proceed` would (design 5.5, one hop). Only
   // `fail` throws. Treating escalate as a throw made a completed escalation raise L4007, which is
   // the opposite of what the stop rule says happens.
   const disposition = onExpiry ?? "fail";
-  if (disposition === "proceed" || disposition === "escalate") return { status: "expired", at: raw.at };
+  if (disposition === "proceed" || disposition === "escalate") return deepFreeze({ status: "expired", at: raw.at });
+  // Say where the deadline came from: the same expiry reads the same under the checkpoint's own
+  // `timeout` and under the run's default, and the fix differs between the two.
+  const source = timeout !== undefined
+    ? `The deadline came from its own timeout of ${JSON.stringify(timeout)}.`
+    : "It sets no timeout of its own, so the deadline came from the run's default.";
+  const raise = timeout !== undefined ? "raise its timeout" : "give it a timeout of its own, or start the run with a longer default";
   throw new EffectError(
     "L4007",
     "checkpoint-expired",
-    `L4007 Checkpoint expired\n\nNobody answered in time and this checkpoint's onExpiry is "fail".\n\nOptions\n  onExpiry: "proceed"    return { status: "expired" } and let the program decide\n  onExpiry: "escalate"   mint a second checkpoint addressed to someone else\n  raise the timeout`,
+    `L4007 Checkpoint expired\n\nNobody answered in time and this checkpoint's onExpiry is "fail". ${source}\n\nOptions\n  onExpiry: "proceed"    return { status: "expired" } and let the program decide\n  onExpiry: "escalate"   mint a second checkpoint addressed to someone else\n  ${raise}`,
   );
+}
+
+/** A host's latched root cancellation. Subscriptions replay a latched reason and return a remover. */
+export interface RootCancellationSource {
+  readonly reason: string | undefined;
+  subscribe(fn: (reason: string) => void): () => void;
+}
+
+/** Process-local cancellation only. It carries no admission or permission. */
+export class RootCancellation implements RootCancellationSource {
+  private why: string | undefined;
+  private readonly listeners = new Set<(reason: string) => void>();
+
+  get reason(): string | undefined { return this.why; }
+
+  cancel(reason: string): void {
+    if (this.why !== undefined) return;
+    this.why = reason;
+    for (const listener of this.listeners) listener(reason);
+    this.listeners.clear();
+  }
+
+  subscribe(fn: (reason: string) => void): () => void {
+    if (this.why !== undefined) fn(this.why);
+    else this.listeners.add(fn);
+    return () => { this.listeners.delete(fn); };
+  }
 }
 
 export interface CancelSignal {
@@ -468,6 +539,7 @@ export interface EffectHandler {
   now(): number;
 
   spawn(req: SpawnRequest, ctx: EffectContext): Promise<AgentHandleValue>;
+  participant(req: ParticipantRequest, ctx: EffectContext): Promise<AgentHandleValue>;
   turn(req: TurnRequest, ctx: EffectContext): Promise<TurnResultValue>;
   ask(req: AskRequest, ctx: EffectContext): Promise<unknown>;
   checkpoint(req: CheckpointRequest, ctx: EffectContext): Promise<CheckpointRaw>;

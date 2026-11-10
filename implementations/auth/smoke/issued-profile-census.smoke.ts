@@ -8,12 +8,12 @@ import { join, dirname } from "node:path";
 import { connect, credsAuthenticator, type NatsConnection } from "@nats-io/transport-node";
 import { encodeUser, fmtCreds, type User } from "@nats-io/jwt";
 import { createUser, fromPublic, fromSeed } from "@nats-io/nkeys";
-import { createSpaceAuth, serverConfig, isReachable } from "@cotal-ai/core";
+import { createSpaceAuth, serverConfig, isReachable, patternCovers } from "@cotal-ai/core";
 import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
 import { importNativeSubjectPermissions } from "../../../packages/core/smoke/prototypes/issued-subject-permissions.js";
 import { acceptedReadGrant } from "../../../packages/core/smoke/prototypes/issued-accepted-row.js";
-import { profileFixtures, namespaceGrants, namespaceOverlap, writeAndRawReadStreams, shippedSources, holdsServerView, ledgerCitations, suiteCellNames, clientApiVerbs, DELIVERY_CONFIGURING_VERBS, singleSampledHoldAssertions, peerOptionSweep, TRUSTED_PROFILES, deliveryPaths, deliveryClassOf, PEER_HELD_PROFILES, type ProfileFixture } from "./prototypes/issued-profile-census.js";
+import { profileFixtures, namespaceGrants, namespaceOverlap, writeAndRawReadStreams, shippedSources, issuedRailSourceCensus, holdsServerView, ledgerCitations, suiteCellNames, clientApiVerbs, DELIVERY_CONFIGURING_VERBS, singleSampledHoldAssertions, peerOptionSweep, TRUSTED_PROFILES, deliveryPaths, deliveryClassOf, PEER_HELD_PROFILES, type ProfileFixture } from "./prototypes/issued-profile-census.js";
 
 let passed = 0;
 async function check(name: string, fn: () => Promise<void>) {
@@ -226,30 +226,28 @@ try {
     assert.deepEqual(importers.map((f) => f.slice(root.length)), []);
   });
 
-  await check("no current profile can request its own server view", async () => {
-    // Discovery needs `$SYS.REQ.USER.INFO`. If some profile already had it, adding it would not be
-    // part of the issuance change; this pins that it is.
-    // Positive control first: an emptiness result from a detector that finds nothing is worthless.
+  await check("only provisioner and teardown hold the server-view grant", async () => {
+    // These trusted profiles query their connection's account before native impact reads.
+    // Keep the holder set closed without granting discovery to peer-held profiles.
     assert.equal(holdsServerView({ pub: { allow: ["$SYS.REQ.USER.INFO"] } }), true);
     assert.equal(holdsServerView({ pub: { allow: [">"] } }), true);
     assert.equal(holdsServerView({ pub: { allow: ["cotal.x.>"] } }), false);
-    assert.deepEqual(fixtures.filter((f) => holdsServerView(f.permissions)).map((f) => `${f.profile}/${f.variant}`), []);
+    const holders = fixtures.filter((f) => holdsServerView(f.permissions));
+    assert.deepEqual(holders.map((f) => `${f.profile}/${f.variant}`).sort(), ["provisioner/default", "teardown/default"]);
+    for (const holder of holders) {
+      assert.ok(TRUSTED_PROFILES.includes(holder.profile));
+      assert.equal(PEER_HELD_PROFILES.includes(holder.profile), false);
+      const allow = (holder.permissions.pub as { allow: string[] }).allow;
+      assert.deepEqual(allow.filter((row) => patternCovers(row, "$SYS.REQ.USER.INFO")), ["$SYS.REQ.USER.INFO"]);
+    }
   });
 
   await check("the issued rail is spelled only by core's endpoint subject and grant builders", async () => {
-    // The versioned rail (SPEC 13.15) is reachable only through the builders that pin the
-    // generation token beside the caller triple. Any other shipped file spelling `ep.v1` is a
-    // second, unpinned way onto the rail, so the scan closes over every shipped source and
-    // names the four files that may.
+    // Literal subject construction belongs to core's builders; prose does not construct a rail.
+    // The focused gate exercises this same parser-backed inventory without the other census cells.
     const root = fileURLToPath(new URL("../../..", import.meta.url));
-    const files = shippedSources(root);
-    const builders = ["packages/core/src/endpoint-subjects.ts", "packages/core/src/endpoint-grants.ts",
-      "packages/core/src/endpoint-serve.ts", "packages/core/src/issued-authority.ts"];
-    // The generated docs bundle mirrors the published pages, which describe the rail in prose;
-    // it builds no subject. It is the one shipped file allowed to spell the rail outside core.
-    const prose = "extensions/connector-core/src/docs-bundle.generated.ts";
-    const spelled = files.filter((file) => /ep\.v1/.test(readFileSync(file, "utf8"))).map((f) => f.slice(root.length)).filter((f) => f !== prose).sort();
-    assert.deepEqual(spelled, [...builders].sort());
+    const { files, unexpected } = issuedRailSourceCensus(root);
+    assert.deepEqual(unexpected, []);
     // Positive control: the corpus really contains the endpoint subject builders it must cover.
     assert.ok(files.some((file) => /function epRequestSubject/.test(readFileSync(file, "utf8"))), `scanned ${files.length} files without reaching the subject builders`);
     // The published composition root is shipped code. A negative claim about shipped code that

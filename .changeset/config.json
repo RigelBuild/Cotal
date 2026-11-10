@@ -28,7 +28,8 @@
       "@cotal-ai/pi",
       "@cotal-ai/omp",
       "@cotal-ai/zellij",
-      "@cotal-ai/auth"
+      "@cotal-ai/auth",
+      "@cotal-ai/registry"
     ]
   ],
   "linked": [],

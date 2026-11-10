@@ -87,6 +87,7 @@ function parseReference(reference: RuntimeReference): { name: string; holder: Pr
 
 export class HolderRuntime implements Runtime {
   readonly kind = "holder" as const;
+  readonly streamsTerminal = false;
   private readonly command: () => string | undefined;
   private readonly prefix: () => string;
   private readonly exec: HolderExec;

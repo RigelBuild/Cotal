@@ -344,11 +344,12 @@ try {
   const brokerRoot = process.env.PI_EVENTS_TEST_SERVER ? undefined : mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
   const port = brokerRoot ? await pickFreePort() : undefined;
   const server = process.env.PI_EVENTS_TEST_SERVER ?? `nats://127.0.0.1:${port}`;
-  const brokerPath = brokerRoot ? (await resolveNatsServer()).bin : undefined;
+  const brokerPath = brokerRoot ? (await resolveNatsServer()).path : undefined;
   let broker: ReturnType<typeof spawn> | undefined;
   if (brokerRoot && port && brokerPath) broker = spawn(brokerPath, ["-js", "-p", String(port), "-sd", brokerRoot], { stdio: "ignore" });
   const releaseBroker = broker && brokerRoot ? teardownOnSignal(broker, brokerRoot) : undefined;
   const root = mkdtempSync(join(tmpdir(), "cotal-pi-events-sdk-"));
+  // Inherit only the ambient launch settings this smoke does not overwrite; restore them below.
   const savedCotalEnv = Object.entries(process.env).filter(([key]) => key.startsWith("COTAL_"));
   for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_")) delete process.env[key];
   const space = process.env.PI_EVENTS_TEST_SPACE ?? `pi_events_${randomUUID().replace(/-/g, "")}`;

@@ -589,6 +589,27 @@ if (c.status === "expired") { await sleep("1s", { name: "continued" }); }
   ok("editing onExpiry to fail makes the resume throw", (threw as { code?: string })?.code === "L4007", String(threw).slice(0, 60));
 }
 
+// ---- 14a) L4007 says where the expired deadline came from --------------------------------------
+//
+// The same expiry under the checkpoint's own `timeout` and under the run's default printed the same
+// sentence, so a reader could not tell which deadline to raise.
+{
+  const expire = async (opts: string) => {
+    try {
+      await run(`await checkpoint("gate", "ok?"${opts});`, { runId: "r-14a", handler: new SimHandler({ checkpoints: { gate: { status: "expired" } } }) });
+    } catch (e) { return e as { code?: string; message?: string }; }
+    return undefined;
+  };
+  const own = await expire(', { timeout: "3s" }');
+  ok("an expiry under the checkpoint's own timeout names that timeout in L4007",
+    own?.code === "L4007" && (own.message ?? "").includes('The deadline came from its own timeout of "3s".') && (own.message ?? "").includes("raise its timeout")
+      && !(own.message ?? "").includes("run's default"), own?.message);
+  const dflt = await expire("");
+  ok("an expiry with no timeout of its own names the run's default in L4007",
+    dflt?.code === "L4007" && (dflt.message ?? "").includes("It sets no timeout of its own, so the deadline came from the run's default.")
+      && (dflt.message ?? "").includes("give it a timeout of its own, or start the run with a longer default"), dflt?.message);
+}
+
 // ---- 14b) the record EVERY non-escalating checkpoint writes ------------------------------------
 //
 // Three sites write an `attempts` array: the live escalation, the recovery of an open hop, and this
@@ -1381,6 +1402,20 @@ sch.deep.x = 2;`;
   }
   ok("the options bag crosses like any input: a checkpoint's schema is frozen at the share (L2031)",
     String((bagCaught as Error)?.message).startsWith("L2031"), String(bagCaught).slice(0, 60));
+
+  // The policy builds the record the program receives AFTER the journal froze the raw outcome, so
+  // the record itself is a second value that crosses. A write to one of its own fields is L2031,
+  // the same as a write into the nested value the share already froze.
+  const statusWrite = `const r = await checkpoint("q", "ok?", { timeout: "1h" });
+r.status = "changed";`;
+  let statusCaught: unknown;
+  try {
+    await run(statusWrite, { runId: "r-frz-status", handler: new SimHandler({ checkpoints: { q: { status: "resolved", value: { inner: "kept" }, by: "sim" } } }) });
+  } catch (e) {
+    statusCaught = e;
+  }
+  ok("a checkpoint result's own field is frozen with the result: assigning status is L2031",
+    String((statusCaught as Error)?.message).startsWith("L2031"), String(statusCaught).slice(0, 60));
 
   const SRC = `const a = await spawn("w", { name: "a" });
 a.agent = "changed";`;

@@ -1,5 +1,5 @@
 /**
- * D5 slice 4 — BROKER-BACKED LIVE CONNECTION EVICTION.
+ * BROKER-BACKED LIVE CONNECTION EVICTION.
  *
  * Revocation has two halves. DENY-NEW (ledger revoke, cred expiry, stripped signer, ACL removal)
  * stops the next exchange/connect — but a client that is ALREADY connected with a still-valid JWT
@@ -17,8 +17,8 @@
  * Two credentials by design (never one broad sys user that both enumerates and kills):
  *  - the existing `membership-observer` (CONNZ-read only) does discovery;
  *  - a NEW kick-only evictor (`$SYS.REQ.SERVER.*.KICK` and nothing else) does the kill.
- * Both are system-account users mintable ONLY at the `up` that provisions the account (the $SYS
- * signing seed is never persisted) — so the evictor is a standing, high-power, renewable credential,
+ * Both are system-account users mintable ONLY at the `up` that provisions the account (the trust
+ * record carries no $SYS signing seed) — so the evictor is a standing, high-power, renewable credential,
  * classified with the observer, surfaced by the stale-auth diagnostics when absent.
  *
  * SEMANTICS, stated in the result (never inferred):
@@ -31,9 +31,11 @@
  *    a fresh cid until its cred dies, so an evict-only loop would chase churn. The name says so.
  */
 import { randomUUID } from "node:crypto";
-import { connect, credsAuthenticator, type NatsConnection } from "@nats-io/transport-node";
-import { isAccountNkey, isUserNkey } from "./identity.js";
-import { connzRequestSubject, isPrincipalOwnerToken, parsePrincipalKey, principalFromConnz, serverKickSubject, MEMBERSHIP_INBOX_PREFIX } from "./subjects.js";
+import { fromPublic } from "@nats-io/nkeys";
+import { credsAuthenticator, type NatsConnection } from "@nats-io/transport-node";
+import { dialerFor } from "./endpoint.js";
+import { credsClaims, isAccountNkey, isUserNkey } from "./identity.js";
+import { accountCensusInboxPrefix, connzRequestSubject, isPrincipalOwnerToken, parsePrincipalKey, principalFromConnz, serverKickSubject, MEMBERSHIP_INBOX_PREFIX } from "./subjects.js";
 
 const enc = (s: string) => new TextEncoder().encode(s);
 const MAX_PAGES = 64; // fan-out pagination guard (mirrors the membership feed's under-report ceiling)
@@ -59,7 +61,7 @@ interface ConnzReply {
    *  clustering is configured, absent only for a standalone process — the plane-reclaim
    *  discriminator (SPEC 13.13) reads it, never inferring topology from who happened to reply. */
   server?: { id?: string; cluster?: string };
-  data?: { server_id?: string; total?: number; offset?: number; connections?: ConnzConn[] };
+  data?: { server_id?: string; total?: number; offset?: number; num_connections?: number; connections?: ConnzConn[] };
   /** `ServerAPIResponse.error` — a reply carrying it is a FAILED request, never an empty page. */
   error?: unknown;
 }
@@ -173,15 +175,16 @@ function connzRound(
   opts: Required<Pick<EvictOptions, "settleMs" | "maxWaitMs" | "pageLimit">>,
   sweep: string,
   seq: number,
+  replyPrefix = MEMBERSHIP_INBOX_PREFIX,
+  invalidReply?: () => void,
 ): Promise<ConnzReply[]> {
   return new Promise((resolve) => {
-    // The reply inbox MUST sit under the prefix the observer cred (`membership-observer`) grants sub
-    // on — its ACL allows only `${MEMBERSHIP_INBOX_PREFIX}.>`, so a distinct `_INBOX.cotal-evict.*`
-    // subject is broker-denied and the scan gets ZERO replies (a fail-closed under-report).
+    // The reply inbox must sit under the observer credential's allowed subscription prefix.
+    // Legacy callers use the membership prefix; the census reader supplies its account prefix.
     // `sweep` is a per-call collision-resistant nonce: concurrent sweeps (a plane reclaim next to an
     // eviction verify) subscribe to DISJOINT inboxes, so one sweep's page reply can never satisfy —
     // or falsely complete — another's round.
-    const inbox = `${MEMBERSHIP_INBOX_PREFIX}.evict.${sweep}.${seq}`;
+    const inbox = `${replyPrefix}.evict.${sweep}.${seq}`;
     const out: ConnzReply[] = [];
     let settle: ReturnType<typeof setTimeout> | undefined;
     let done = false;
@@ -195,8 +198,8 @@ function connzRound(
     };
     const sub = observerConn.subscribe(inbox, {
       callback: (err, msg) => {
-        if (err) return;
-        try { out.push(msg.json<ConnzReply>()); } catch { /* skip undecodable */ }
+        if (err) { invalidReply?.(); return; }
+        try { out.push(msg.json<ConnzReply>()); } catch { invalidReply?.(); }
         if (settle) clearTimeout(settle);
         settle = setTimeout(finish, opts.settleMs);
       },
@@ -210,10 +213,17 @@ function connzRound(
   });
 }
 
+/** One live connection named the way KICK names it: the server that holds it and its connection id
+ *  there. What a sweep hands a kicker, and what a kick authority checks against an account's census. */
+export interface KickTarget {
+  serverId: string;
+  cid: number;
+}
+
 /** KICK one connection by cid on the server that reported it. No per-cid ack from the broker; the
  *  caller's re-scan is the verification. A publish/permission failure is surfaced (thrown up), so a
  *  mis-scoped evictor cred fails loud rather than silently not-kicking. */
-async function kick(evictorConn: NatsConnection, conn: LiveConn): Promise<void> {
+export async function kickConnection(evictorConn: NatsConnection, conn: KickTarget): Promise<void> {
   // Request/reply so a broker-side error (bad permissions, unknown server) surfaces rather than a
   // fire-and-forget publish that a mis-scoped cred would swallow. The ServerAPIResponse `data` is
   // empty on success; we don't parse it (re-scan verifies) but DO honor an `error` field.
@@ -221,6 +231,32 @@ async function kick(evictorConn: NatsConnection, conn: LiveConn): Promise<void> 
   const body = res.json<{ error?: { description?: string } }>();
   if (body?.error) throw new Error(`KICK cid ${conn.cid} on ${conn.serverId} refused: ${body.error.description ?? "unknown"}`);
 }
+
+/** What one COMPLETE account-scoped CONNZ page says about a connection: it is in the account, it is
+ *  not, or the page did not answer whole. KICK takes a connection id and checks no account, so a
+ *  process that holds the broker-wide kick credential on behalf of several spaces decides here, on
+ *  a scan it completed itself, before the request leaves. `absent` and `unreadable` both refuse: a
+ *  page that did not answer is not proof the connection is gone, and a connection this account cannot
+ *  see is not this account's to drop. */
+export async function accountHoldsConnection(
+  observerConn: NatsConnection,
+  accountId: string,
+  target: KickTarget,
+  options: EvictOptions = {},
+): Promise<"present" | "absent" | "unreadable"> {
+  const page = await scanLive(observerConn, accountId, {
+    settleMs: options.settleMs ?? 250,
+    maxWaitMs: options.maxWaitMs ?? 2000,
+    pageLimit: options.pageLimit ?? 1024,
+  });
+  if (!page.complete) return "unreadable";
+  return page.conns.some((c) => c.serverId === target.serverId && c.cid === target.cid) ? "present" : "absent";
+}
+
+/** What a sweep kicks with: the kick-only evictor connection, a supplier that opens it once a live
+ *  match exists, or a kick function another process answers for, such as the one kick authority of a
+ *  multi-space delivery host. With a function, this process opens no kick credential. */
+export type Kicker = NatsConnection | (() => Promise<NatsConnection>) | { readonly kick: (target: KickTarget) => Promise<void> };
 
 /**
  * Evict every live connection of one principal — the kill-live half of revocation, to be called
@@ -234,7 +270,7 @@ async function kick(evictorConn: NatsConnection, conn: LiveConn): Promise<void> 
  */
 export async function evictDeniedPrincipal(
   observerConn: NatsConnection,
-  evictorConn: NatsConnection | (() => Promise<NatsConnection>),
+  evictorConn: Kicker,
   accountId: string,
   principal: string,
   options: EvictOptions = {},
@@ -260,7 +296,7 @@ export const KICK_CONCURRENCY = 16;
  */
 export async function evictDeniedPrincipals(
   observerConn: NatsConnection,
-  evictorConn: NatsConnection | (() => Promise<NatsConnection>),
+  evictorConn: Kicker,
   accountId: string,
   principals: readonly string[],
   options: EvictOptions = {},
@@ -297,7 +333,12 @@ export async function evictDeniedPrincipals(
     else pending.set(p, { kicked: 0 });
   }
   if (pending.size === 0) return answer();
-  const kicker = typeof evictorConn === "function" ? await evictorConn() : evictorConn;
+  const kickOne: (target: KickTarget) => Promise<void> = "kick" in evictorConn
+    ? evictorConn.kick
+    : await (async () => {
+      const conn = typeof evictorConn === "function" ? await evictorConn() : evictorConn;
+      return (target: KickTarget) => kickConnection(conn, target);
+    })();
   // KICKs are independent per connection, so they run KICK_CONCURRENCY at a time; every one of them
   // settles before the verify re-scan reads the result.
   const kickAll = async (live: Map<string, LiveConn[]>) => {
@@ -305,7 +346,7 @@ export async function evictDeniedPrincipals(
     const worker = async () => {
       for (let next = queue.shift(); next; next = queue.shift()) {
         try {
-          await kick(kicker, next.t);
+          await kickOne(next.t);
           next.st.kicked++;
         } catch (e) {
           next.st.note = e instanceof Error ? e.message : String(e);
@@ -643,7 +684,7 @@ export async function observeAccountLivenessWithCreds(opts: {
 }): Promise<LivenessSweep> {
   if (!isAccountNkey(opts.accountId))
     throw new Error("account liveness requires one account public key");
-  const observer = await connect({
+  const observer = await dialerFor(opts.servers)({
     servers: opts.servers,
     authenticator: credsAuthenticator(enc(opts.observerCreds)),
     inboxPrefix: MEMBERSHIP_INBOX_PREFIX,
@@ -651,6 +692,72 @@ export async function observeAccountLivenessWithCreds(opts: {
   });
   try {
     return await livenessSweep(observer, opts.accountId, opts.options ?? {});
+  } finally {
+    await observer.drain().catch(() => observer.close());
+  }
+}
+
+export type AccountCensusResult = {
+  accountId: string; expectedServerId: string; observedAt: number;
+} & (
+  | { state: "complete"; connections: SweptConn[] }
+  | { state: "unknown"; reason: "no-reply" | "invalid-reply" | "unsupported-topology" | "incomplete-page" }
+);
+
+/** One complete account page from a pinned standalone server, using census-only credentials.
+ * No pagination, event subscriptions or KICK. The host must independently establish that its
+ * deployment has no leaf/gateway or foreign-restore predecessor. This observation is neither
+ * that deployment proof nor a terminal retirement verdict; cutoff/readiness checks stay outside.
+ */
+export async function observeAccountCensusWithCreds(opts: {
+  servers: string; observerCreds: string; accountId: string; expectedServerId: string;
+  options?: { settleMs?: number; maxWaitMs?: number; pageLimit?: number };
+}): Promise<AccountCensusResult> {
+  const { servers, observerCreds, accountId, expectedServerId } = opts;
+  const prefix = accountCensusInboxPrefix(accountId);
+  if (!/^N[A-Z2-7]{55}$/.test(expectedServerId)) throw new Error("account census requires a pinned server public key");
+  fromPublic(expectedServerId);
+  const bounds = { settleMs: opts.options?.settleMs ?? 250, maxWaitMs: opts.options?.maxWaitMs ?? 2000, pageLimit: opts.options?.pageLimit ?? 1024 };
+  if (!Object.values(bounds).every((v) => Number.isSafeInteger(v) && v > 0) || bounds.settleMs > bounds.maxWaitMs
+    || bounds.maxWaitMs > 2000 || bounds.pageLimit > 1024) throw new Error("account census bounds are unsupported");
+  // This is a local scope preflight, not signature verification. The broker authenticates the
+  // credential on connect. A legacy/shared-inbox or broader credential is not a substitute.
+  const claims = credsClaims(observerCreds), nats = claims.nats;
+  const exactly = (raw: unknown, expected: string) => Array.isArray(raw) && raw.length === 1 && raw[0] === expected;
+  if (!nats || typeof nats !== "object" || !exactly(nats.pub?.allow, connzRequestSubject(accountId))
+    || !exactly(nats.sub?.allow, `${prefix}.>`) || Object.hasOwn(nats, "resp")
+    || typeof claims.exp !== "number" || !Number.isSafeInteger(claims.exp) || claims.exp <= Math.floor(Date.now() / 1000))
+    throw new Error("account census requires its account-scoped request and reply credential");
+  const observer = await dialerFor(servers)({ servers, authenticator: credsAuthenticator(enc(observerCreds)),
+    inboxPrefix: prefix, reconnect: false, timeout: bounds.maxWaitMs });
+  try {
+    let invalid = false;
+    const replies = await connzRound(observer, accountId, 0, bounds, randomUUID(), 0, prefix, () => { invalid = true; });
+    const base = { accountId, expectedServerId, observedAt: Date.now() };
+    const unknown = (reason: Extract<AccountCensusResult, { state: "unknown" }>["reason"]): AccountCensusResult => ({ ...base, state: "unknown", reason });
+    if (invalid) return unknown("invalid-reply");
+    if (replies.length === 0) return unknown("no-reply");
+    if (replies.length !== 1) return unknown("unsupported-topology");
+    const reply = replies[0];
+    if (!reply || typeof reply !== "object" || Array.isArray(reply) || reply.error !== undefined || !reply.server || !reply.data)
+      return unknown("invalid-reply");
+    if (reply.server.id !== expectedServerId || reply.server.cluster !== undefined) return unknown("unsupported-topology");
+    const data = reply.data;
+    if (data.server_id !== expectedServerId || data.offset !== 0 || !Array.isArray(data.connections)
+      || !Number.isSafeInteger(data.total) || data.total! < 0 || !Number.isSafeInteger(data.num_connections)) return unknown("invalid-reply");
+    if (data.total !== data.connections.length || data.num_connections !== data.connections.length || data.connections.length > bounds.pageLimit)
+      return unknown("incomplete-page");
+    const ids = new Set<number>(), connections: SweptConn[] = [];
+    for (const row of data.connections) {
+      if (!row || typeof row !== "object" || !Number.isSafeInteger(row.cid) || row.cid! <= 0 || ids.has(row.cid!)) return unknown("invalid-reply");
+      if ((row.tags !== undefined && (!Array.isArray(row.tags) || row.tags.some((tag) => typeof tag !== "string")))
+        || (row.authorized_user !== undefined && typeof row.authorized_user !== "string")) return unknown("invalid-reply");
+      ids.add(row.cid!);
+      const principal = principalFromConnz(row, { allowPlatform: true });
+      connections.push({ serverId: expectedServerId, cid: row.cid!, ...(principal === null ? {} : { principal }),
+        ...(isUserNkey(row.authorized_user) ? { userNkey: row.authorized_user } : {}) });
+    }
+    return { ...base, state: "complete", connections };
   } finally {
     await observer.drain().catch(() => observer.close());
   }
@@ -666,7 +773,7 @@ export async function observePlaneLivenessWithCreds(opts: {
   query: PlaneLivenessQuery;
   options?: EvictOptions;
 }): Promise<PlaneLivenessResult> {
-  const observer = await connect({
+  const observer = await dialerFor(opts.servers)({
     servers: opts.servers,
     authenticator: credsAuthenticator(enc(opts.observerCreds)),
     inboxPrefix: MEMBERSHIP_INBOX_PREFIX,
@@ -769,7 +876,7 @@ export async function observePrincipalLivenessWithCreds(opts: {
   principal: string;
   options?: EvictOptions;
 }): Promise<PrincipalLivenessResult> {
-  const observer = await connect({
+  const observer = await dialerFor(opts.servers)({
     servers: opts.servers,
     authenticator: credsAuthenticator(enc(opts.observerCreds)),
     inboxPrefix: MEMBERSHIP_INBOX_PREFIX,
@@ -811,12 +918,16 @@ export async function evictDeniedPrincipalsWithCreds(opts: {
   evictorCreds?: string;
   /** Loaded only after a complete scan finds a live match. Wins over `evictorCreds` when both are set. */
   openEvictor?: () => Promise<string>;
+  /** Kicks one scanned connection on this sweep's behalf, in place of a kick credential this process
+   *  would open: the one kick authority of a multi-space host. When set, no evictor credential is
+   *  read or dialled here and `openEvictor` is never called. */
+  kick?: (target: KickTarget) => Promise<void>;
   accountId: string;
   principals: readonly string[];
   options?: EvictOptions;
 }): Promise<EvictionResult[]> {
   const enc = (s: string) => new TextEncoder().encode(s);
-  const observer = await connect({
+  const observer = await dialerFor(opts.servers)({
     servers: opts.servers,
     authenticator: credsAuthenticator(enc(opts.observerCreds)),
     inboxPrefix: MEMBERSHIP_INBOX_PREFIX,
@@ -824,11 +935,11 @@ export async function evictDeniedPrincipalsWithCreds(opts: {
   });
   let evictor: NatsConnection | undefined;
   try {
-    return await evictDeniedPrincipals(observer, async () => {
+    return await evictDeniedPrincipals(observer, opts.kick !== undefined ? { kick: opts.kick } : async () => {
       const creds = opts.openEvictor ? await opts.openEvictor() : opts.evictorCreds;
       if (creds === undefined)
         throw new Error("evictDeniedPrincipal: a live match requires the kick-only evictor credential");
-      evictor = await connect({
+      evictor = await dialerFor(opts.servers)({
         servers: opts.servers,
         authenticator: credsAuthenticator(enc(creds)),
         maxReconnectAttempts: 0,

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { discardSeatArtifacts } from "./artifacts.js";
-import { assertSeatId, capabilityToken, fencePath, readSeatFileNoFollow, recordPath, seatId, socketPath, type SeatRecord, readRecord } from "./record.js";
+import { assertSeatId, capabilityToken, exitPath, processStartToken, fencePath, processStatFields, readSeatFileNoFollow, recordPath, seatId, socketPath, type SeatRecord, readRecord } from "./record.js";
 import { CONFIRM_TIMEOUT_MS, unattendedMs, assertSocketPathFits, unsupportedTransport } from "./protocol.js";
 import { tryLockFd } from "./peercred.js";
 import type { CustodianTestSeam } from "./custodian.js";
@@ -16,6 +16,8 @@ export interface SeatLaunchSpec {
   env?: Record<string, string>;
   confirm?: string;
   confirmBefore?: readonly import("./startup-confirm.js").StartupReply[];
+  confirmReady?: readonly string[];
+  confirmBlockers?: readonly import("./startup-confirm.js").StartupBlocker[];
   /** The launch's private temporary directories, recorded on the seat record (see SeatRecord). */
   artifacts?: string[];
 }
@@ -64,13 +66,8 @@ export const RUN_MARKER_FLAG = "--cotal-run";
 
 /** This process's parent, from `/proc/<pid>/stat` field 4. Undefined when the pid is gone. */
 function parentOf(pid: number): number | undefined {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const ppid = Number(stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[1]);
-    return Number.isInteger(ppid) && ppid > 1 ? ppid : undefined;
-  } catch {
-    return undefined;
-  }
+  const ppid = Number(processStatFields(pid)?.[1]);
+  return Number.isSafeInteger(ppid) && ppid > 1 ? ppid : undefined;
 }
 
 /**
@@ -129,13 +126,8 @@ export function runMarkerOf(pid: number): string | undefined {
 
 function pidLive(pid: number | undefined): boolean {
   if (typeof pid !== "number" || pid <= 0) return false;
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const state = stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[0];
-    return state !== "Z";
-  } catch {
-    return false;
-  }
+  const state = processStatFields(pid)?.[0];
+  return state !== undefined && state !== "Z";
 }
 
 // Test seams: index.ts does not re-export these and the package `exports` map names only ".", so an
@@ -237,9 +229,7 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup; spawne
     }
     if (readFileSync(fenceFd, "utf8").trim() === "sealed") throw new Error(`seat ${id} launch fence ${fence} is sealed; the seat was released`);
     if (launcherSeam?.failMkdir) throw new Error("test seam: seat mkdir failed");
-    // Under the fence lock, so a release that sealed first leaves no cgroup to create.
     if (opts.cgroupBase !== undefined) {
-      // A reap or release derives the path from its own base, so a seat under any other base is unreapable.
       if (opts.cgroupBase !== ownCgroup()) throw new Error(`cgroup base ${opts.cgroupBase} is not this process's cgroup ${String(ownCgroup())}`);
       cgroup = created.cgroup = createSeatCgroup(opts.cgroupBase, id, agentUid);
     }
@@ -258,24 +248,15 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup; spawne
       logPath,
       confirm: opts.spec.confirm,
       confirmBefore: opts.spec.confirmBefore,
+      confirmReady: opts.spec.confirmReady,
+      confirmBlockers: opts.spec.confirmBlockers,
       ...(opts.spec.artifacts?.length ? { artifacts: opts.spec.artifacts, artifactRoot } : {}),
       run,
-      // Resolved HERE, not in the custodian: the custodian's environment is scrubbed to `PATH` plus the
-      // run marker, so it cannot read an override the caller set.
       unattendedMs: unattendedMs(),
       ...(cgroup ? { cgroup: cgroup.path } : {}),
       adopterUid: euid,
       ...(testSeam ? { testSeam } : {}),
     });
-    // Payload carries spec.env (provider keys) and the capability token.
-    // argv is world-readable via /proc/<pid>/cmdline (0444). Inherit a 0600
-    // file as stdin so the JSON never appears on argv.
-    //
-    // The run marker is the one thing deliberately ON argv, because that is the point of it: a census
-    // must be able to attribute an orphan without the uid needed to read `/proc/<pid>/cwd`. It names a
-    // run, never a credential.
-    // Written, opened and unlinked while the seat directory is still ours: after the chown below the
-    // agent owns it and could plant a link here. Exclusive and no-follow regardless.
     const launchPath = join(dirname(recPath), "launch.json");
     const writeFd = openSync(launchPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     try {
@@ -299,8 +280,6 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup; spawne
   const child = spawn(argv[0] ?? "", argv.slice(1), {
     detached: true,
     stdio: [launchFd, "ignore", "ignore"],
-    // COTAL_RUN is re-exported so a custodian's own descendants stay attributable to the same run,
-    // and so `/proc/<pid>/environ` answers the same question argv does for a reader who can read it.
     env: { PATH: process.env.PATH ?? "", COTAL_RUN: run },
   });
   created.spawned = true;
@@ -340,11 +319,15 @@ function launchInto(opts: LaunchSeatOpts, created: { cgroup?: SeatCgroup; spawne
   throw new Error(`custodian did not write a seat record at ${recPath}`);
 }
 
-/** The record of seat `id`, with its socket derived from the root and id. The seat directory may be
- *  owned by the agent uid, so a record naming another seat, or another socket, is not trusted. */
+/** The record of a seat about to be adopted. Refuses records naming another seat, and seats whose
+ *  custodian recorded the child's exit or is gone, because they cannot be safely adopted. */
 export function loadSeat(root: string, id: string): SeatRecord {
-  const rec = readRecord(recordPath(root, id));
-  if (rec.id !== id) throw new Error(`seat record at ${recordPath(root, id)} names seat ${rec.id}, not ${id}; refusing to adopt it`);
+  const path = recordPath(root, id);
+  const rec = readRecord(path);
+  if (rec.id !== id) throw new Error(`seat record at ${path} names seat ${rec.id}, not ${id}; refusing to adopt it`);
+  if (existsSync(exitPath(path))) throw new Error(`seat ${id} has exited (its custodian recorded the exit); reap it instead of adopting it`);
+  if (rec.custodianStart !== undefined && processStartToken(rec.custodianPid) !== rec.custodianStart)
+    throw new Error(`seat ${id} cannot be adopted: its custodian (pid ${rec.custodianPid}) is gone; reap it instead`);
   return { ...rec, socket: socketPath(root, id) };
 }
 

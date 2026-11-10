@@ -4,7 +4,7 @@
  * Uses a real tmux session; cleans up on pass or fail.
  */
 import * as tmux from "./src/driver.js";
-import { TmuxRuntime, tmuxRuntimeProvider, tmuxTerminalProvider } from "./src/runtime.js";
+import { TmuxRuntime, tmuxRuntimeProvider } from "./src/runtime.js";
 import { registry } from "@cotal-ai/core";
 import { execFileSync } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
@@ -86,6 +86,19 @@ ok("listWindows includes test-win", wins.includes("test-win"));
 const refs = tmux.windowRefs(SESSION, "test-win");
 ok("windowRefs returns one entry", refs.length >= 1);
 ok("windowRefs entry starts with @", refs[0]!.startsWith("@"));
+
+// Without a UTF-8 locale the tmux client writes a tab in its output as `_`. The name lookups parse
+// tab-separated listings, so they must still find the window with every locale variable unset.
+{
+  const locale = ["LC_ALL", "LC_CTYPE", "LANG"].map((name) => [name, process.env[name]] as const);
+  for (const [name] of locale) delete process.env[name];
+  try {
+    ok("with no locale set, windowAlive still finds test-win", tmux.windowAlive(SESSION, "test-win"));
+    ok("with no locale set, windowRefs still returns test-win's window ID", tmux.windowRefs(SESSION, "test-win").includes(windowId));
+  } finally {
+    for (const [name, value] of locale) if (value !== undefined) process.env[name] = value;
+  }
+}
 
 // send / sendKey
 tmux.send("echo hello", `${SESSION}:test-win`);
@@ -237,13 +250,12 @@ console.log("\n── registry registration ────────────
 const resolvedRuntime = registry.resolve("runtime", "tmux");
 ok("tmuxRuntimeProvider registered as 'runtime/tmux'", resolvedRuntime != null);
 ok("tmuxRuntimeProvider.available() returns true", tmuxRuntimeProvider.available());
-
-const resolvedTerminal = registry.resolve("terminal", "tmux");
-ok("tmuxTerminalProvider registered as 'terminal/tmux'", resolvedTerminal != null);
-ok("tmuxTerminalProvider.available() returns true", tmuxTerminalProvider.available());
-
-// refs() throws when not in tmux (no $TMUX env)
-throws("refs() throws when not in tmux", () => tmuxTerminalProvider.refs("anything"));
+// Declared, not discovered by catching the throw below: a caller reads this to decide whether to
+// ask for an attach at all, so a foreground `cotal spawn` on this runtime launches the seat and
+// stops there instead of failing on an attach that cannot open.
+ok("the runtime declares that it streams no terminal", new TmuxRuntime(SESSION).streamsTerminal === false);
+ok("importing @cotal-ai/tmux registers no terminal provider", registry.all("terminal").length === 0 && !registry.has("terminal", "tmux"));
+throws("resolving 'terminal/tmux' throws", () => registry.resolve("terminal", "tmux"));
 
 console.log("\n── command builders ─────────────────────────────");
 

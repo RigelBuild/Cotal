@@ -32,6 +32,7 @@ function envAgentUid(): number | undefined {
  */
 export class CustodialPtyRuntime implements ReleasableRuntime {
   readonly kind = "pty" as const;
+  readonly streamsTerminal = true;
   readonly supportsRelease = true;
   readonly root: string;
   /** Undefined: layer 3 is off on this host, so every reap of a live seat stays retained. */
@@ -93,7 +94,7 @@ export class CustodialPtyRuntime implements ReleasableRuntime {
     const rec = launchSeat({
       root: this.root,
       name,
-      spec: { command: spec.command, args: spec.args, env: spec.env ?? {}, confirm: spec.confirm, confirmBefore: spec.confirmBefore, artifacts: spec.artifacts },
+      spec: { command: spec.command, args: spec.args, env: spec.env ?? {}, confirm: spec.confirm, confirmBefore: spec.confirmBefore, confirmReady: spec.confirmReady, confirmBlockers: spec.confirmBlockers, artifacts: spec.artifacts },
       cwd,
       ...(reference ? { id: reference.id } : {}),
       ...(this.cgroupBase === undefined ? {} : { cgroupBase: this.cgroupBase }),

@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { EpEnvelopeError } from "@cotal-ai/core";
+import { EpEnvelopeError, rejectionText } from "@cotal-ai/core";
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -316,7 +316,7 @@ export class AttachEndpoint {
         const code = e instanceof EpEnvelopeError ? e.code : undefined;
         const status = code === "resource-exhausted" ? 429 : 500;
         if (!res.headersSent) res.writeHead(status, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: (e as Error).message, ...(code ? { code } : {}) }));
+        res.end(JSON.stringify({ error: rejectionText(e), ...(code ? { code } : {}) }));
       });
   }
 
