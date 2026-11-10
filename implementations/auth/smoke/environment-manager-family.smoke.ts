@@ -1,9 +1,11 @@
 /** Existing supervisor issuance cannot cross an environment-manager gate. */
 import assert from "node:assert/strict";
 import { Kvm } from "@nats-io/kv";
+import { connect } from "@nats-io/transport-node";
 import {
-  EpEnvelopeError, epAuthBucket, epgateKey, mintCreds, mintLifecycleUid, newIdentity, parseEndpointGate,
-  provisionEndpointGateOpen, remoteManagerActors, REMOTE_MANAGER_IDENTITY_NAMES, setupSpaceStreams,
+  EpEnvelopeError, credsFromJwt, epAuthBucket, epgateKey, mintCreds, mintLifecycleUid, newIdentity, parseEndpointGate,
+  provisionEndpointGateOpen, remoteManagerActors, REMOTE_MANAGER_IDENTITY_NAMES, setupSpaceStreams, standaloneConnectOpts,
+  requestManagerRegistrationRead,
   type RemoteManagerAuthorityRequest,
 } from "@cotal-ai/core";
 import { openAuthAuthorityPlane, startAuthService, type AuthServiceHandle } from "../src/index.js";
@@ -54,15 +56,16 @@ async function exerciseAuthorityPaths() {
     await cell("unregistered environment gates do not disable ordinary caller selection", async () => {
       await assert.rejects(() => plane.selectManagerInstance(owner), /found no manager candidate/);
     });
-    // Registration fixture, not environment admission: generated authority registers both families
-    // through the stock ceremony. No bootstrap or hosted execution is certified by this setup.
-    const register = async (instanceId: string) => registerRemoteManagerAuthority({ space, server: fx.servers,
+    // Registration fixture, not environment admission: environment registration uses its existing
+    // gate; ordinary registration uses the stock auth prepare ceremony. No bootstrap or hosted
+    // execution is certified by this setup.
+    const register = (instanceId: string, prepareCreds: string) => registerRemoteManagerAuthority({ space, server: fx.servers,
       owner, instanceId, serveActor: remoteManagerActors(instanceId).serve, tlsRequired: false,
-      prepareCreds: await mintCreds(account.auth, newIdentity(), "remote-manager", {
-        principal: { owner, actor: remoteManagerActors(instanceId).executor },
-        remoteManager: { instanceId, owner, actor: remoteManagerActors(instanceId).executor } }),
-      evict: async principals => principals.map(() => true) });
-    const registered = await register(envInstance);
+      prepareCreds, evict: async principals => principals.map(() => true) });
+    const envCreds = await mintCreds(account.auth, newIdentity(), "remote-manager", {
+      principal: { owner, actor: remoteManagerActors(envInstance).executor },
+      remoteManager: { instanceId: envInstance, owner, actor: remoteManagerActors(envInstance).executor } });
+    const registered = await register(envInstance, envCreds);
     const before = (await kv.get(envKey))!;
     const envelope = (instanceId = envInstance) => ({ v: 1 as const, space, actor: "cli", instanceId,
       managerLifecycleUid, requestId: mintLifecycleUid(), identities });
@@ -93,7 +96,29 @@ async function exerciseAuthorityPaths() {
     await deny("own maintenance refuses before scanning an environment credential family", () => plane.maintainRemoteManager({ owner, scope: ["supervise"],
       request: { ...base, kind: "manager-service-maintenance", operation: "evict-family-principal", targetInstanceId: envInstance,
         principals: [`${owner}.${remoteManagerActors(envInstance).serve}`] } }));
-    const ordinary = await register(plainInstance);
+    const probeIdentity = newIdentity();
+    const unpreparedCreds = await mintCreds(account.auth, probeIdentity, "remote-manager", {
+      principal: { owner, actor: remoteManagerActors(plainInstance).executor },
+      remoteManager: { instanceId: plainInstance, owner, actor: remoteManagerActors(plainInstance).executor } });
+    const probeClient = await connect({ servers: fx.servers,
+      ...standaloneConnectOpts({ creds: unpreparedCreds, tls: false }), reconnect: false });
+    try {
+      const absent = await requestManagerRegistrationRead(probeClient, space, owner, plainInstance,
+        { kind: "read", key: epgateKey("manager", plainInstance) });
+      assert.equal(absent, null, "the family reader returns the exact absent gate for a manager request");
+      passed++;
+      const managerKv = await new Kvm(probeClient).open(epAuthBucket(space));
+      await assert.rejects(() => managerKv.get(epgateKey("manager", plainInstance)), /permissions violation/i,
+        "the manager cannot read the gate directly from auth KV");
+      await assert.rejects(() => register(plainInstance, unpreparedCreds), /manager registration requires an auth-prepared gate/);
+    } finally { await probeClient.close(); }
+    const preparedIdentity = { supervisor: newIdentity(), executor: newIdentity(), serve: newIdentity(), goalWriter: newIdentity(), sessionLedger: newIdentity() };
+    const prepared = await plane.issueManagerServiceAuthority({ owner, scope: ["supervise"], request: {
+      v: 1, kind: "manager-service-authority", operation: "prepare", space, actor: "cli",
+      instanceId: plainInstance, managerLifecycleUid, requestId: mintLifecycleUid(),
+      identities: Object.fromEntries(Object.entries(preparedIdentity).map(([name, identity]) => [name, { id: identity.id }])) as RemoteManagerAuthorityRequest["identities"],
+    } });
+    const ordinary = await register(plainInstance, credsFromJwt(prepared.credentials.executor!.jwt, preparedIdentity.executor));
     await deny("ordinary maintenance refuses a foreign environment target", () => plane.maintainRemoteManager({ owner, scope: ["supervise"],
       request: { ...envelope(plainInstance), kind: "manager-service-maintenance", operation: "reconcile-registration", targetInstanceId: envInstance } }));
     await deny("run admission refuses an environment registration", () => plane.admitManagerRun({ owner, scope: ["supervise"],

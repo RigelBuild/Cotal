@@ -18,6 +18,7 @@ export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts,
     let requestKey: string | undefined;
     let claimed = false;
     let reply: string | undefined;
+    let requestNonce: string | undefined;
     let scanTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       const parts = msg.subject.split(".");
@@ -25,7 +26,8 @@ export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts,
       if (msg.subject !== managerRegistrationFamilySubject(opts.space, owner, iid)) throw new Error("invalid scan subject");
       const body: unknown = JSON.parse(new TextDecoder().decode(msg.data));
       if (!body || typeof body !== "object" || Array.isArray(body) || !("nonce" in body) || typeof body.nonce !== "string") throw new Error("invalid scan request");
-      reply = `${msg.subject}.reply.${assertNonce(body.nonce)}`;
+      const nonce = requestNonce = assertNonce(body.nonce);
+      reply = `${msg.subject}.reply.${nonce}`;
       const pointRead = "kind" in body;
       let controller: AbortController | undefined;
       let deadline = 0;
@@ -35,6 +37,10 @@ export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts,
         if (Object.keys(body).length !== 2 || !("deadline" in body) || typeof body.deadline !== "number" || !Number.isSafeInteger(body.deadline) || body.deadline <= Date.now()) throw new Error("invalid scan request");
       }
       const gate = await serveIssuanceGateKv(opts.authKv, opts.space, { endpoint: "manager", instanceId: iid }).observe();
+      if (!gate && pointRead && body.kind === "read" && Object.keys(body).length === 3 && "key" in body && body.key === epgateKey("manager", iid)) {
+        client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce, absent: true })));
+        return;
+      }
       if (!gate || gate.state === "retired" || gate.principal !== remoteManagerServePrincipal(owner, iid)) throw new Error("manager gate does not match requester");
       if (pointRead) {
         const key = `${owner}.${iid}`, count = pointReadsByInstance.get(key) ?? 0;
@@ -110,7 +116,7 @@ export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts,
       }
     } catch (error) {
       opts.log(`registration family scan refused: ${error instanceof Error ? error.message : String(error)}`);
-      if (reply) client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ error: "registration family scan failed" })));
+      if (reply && requestNonce) client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ nonce: requestNonce, error: "refused" })));
     } finally {
       if (scanTimer !== undefined) clearTimeout(scanTimer);
       if (claimed && requestKey?.startsWith("read:")) {

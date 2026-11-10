@@ -3,7 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { NatsConnection } from "@nats-io/transport-node";
 import type { EpServeLedgerRow } from "./endpoint-service.js";
 import { managerRegistrationFamilySubject } from "./endpoint-subjects.js";
-import { RegistrationFamilyBusyError } from "./registration-read-client.js";
+import { RegistrationFamilyBusyError, RegistrationFamilyRefusedError } from "./registration-read-client.js";
 import { parseManagerRegistrationFamilyRows } from "./registration-family.js";
 
 export async function requestManagerRegistrationFamily(nc: NatsConnection, space: string, owner: string, instanceId: string, timeoutMs = 5 * 60_000): Promise<EpServeLedgerRow[]> {
@@ -24,6 +24,7 @@ export async function requestManagerRegistrationFamily(nc: NatsConnection, space
       if (msg.done) throw new Error("registration family reply subscription closed");
       const chunk: unknown = JSON.parse(new TextDecoder().decode(msg.value.data));
       if (chunk && typeof chunk === "object" && "nonce" in chunk && chunk.nonce === nonce && "error" in chunk && chunk.error === "busy" && Object.keys(chunk).length === 2) throw new RegistrationFamilyBusyError();
+      if (chunk && typeof chunk === "object" && "nonce" in chunk && chunk.nonce === nonce && "error" in chunk && chunk.error === "refused" && Object.keys(chunk).length === 2) throw new RegistrationFamilyRefusedError();
       if (!chunk || typeof chunk !== "object" || Array.isArray(chunk) || Object.keys(chunk).some(k => !["nonce", "scanId", "seq", "total", "rows", "rowCount", "complete"].includes(k)) ||
         !("nonce" in chunk) || chunk.nonce !== nonce || !("scanId" in chunk) || typeof chunk.scanId !== "string" || !/^[A-Za-z0-9_-]{22,64}$/.test(chunk.scanId) ||
         !("seq" in chunk) || chunk.seq !== seq || !("total" in chunk) || typeof chunk.total !== "number" || !Number.isSafeInteger(chunk.total) || chunk.total < 1 || chunk.total > 100000 ||
