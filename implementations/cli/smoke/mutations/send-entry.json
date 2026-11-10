@@ -25,8 +25,8 @@
       "file": "implementations/cli/smoke/send.smoke.ts",
       "find": "    setCurrent(space);",
       "replace": "    setCurrent(\"decoy\");",
-      "expectRed": "`cotal send dm` outside a seat exits 0",
-      "cell": "`cotal send dm` outside a seat exits 0"
+      "expectRed": "`cotal send -t` outside a seat exits 0",
+      "cell": "`cotal send -t` outside a seat exits 0"
     },
     {
       "name": "restore the obsolete managed-seat environment gate",

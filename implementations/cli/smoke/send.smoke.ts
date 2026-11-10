@@ -195,7 +195,7 @@ try {
   await wait(400);
   const refusedManager = await run(["send", "dm", "manager-target", "please review"]);
   check(
-    "`cotal send dm` refuses the manager endpoint with a CLI roster hint",
+    "`cotal send --to` refuses the manager endpoint with a CLI roster hint",
     refusedManager.code !== 0 &&
       refusedManager.stderr.includes('Cannot DM "manager-target"') &&
       refusedManager.stderr.includes("cotal endpoints") &&
@@ -204,7 +204,7 @@ try {
   );
   const refusedManagerId = await run(["send", "dm", manager.card.id, "please review"]);
   check(
-    "`cotal send dm` refuses the manager by exact instance id",
+    "`cotal send --to` refuses the manager by exact instance id",
     refusedManagerId.code !== 0 && refusedManagerId.stderr.includes('Cannot DM "manager-target"'),
     refusedManagerId,
   );
