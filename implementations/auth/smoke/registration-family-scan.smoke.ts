@@ -25,7 +25,7 @@ import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
 import { makeLedgerScannerOverConnection, authorityScannerGrants } from "../src/ledger-scanner.js";
 import { openAuthorityClient } from "../src/authority-client.js";
 import { openRegistrationFamilyScan } from "../src/registration-family-scan.js";
-import { requestManagerRegistrationFamily, requestManagerRegistrationRead, remoteManagerServePrincipal, RegistrationFamilyBusyError } from "@cotal-ai/core";
+import { requestManagerRegistrationFamily, requestManagerRegistrationRead, remoteManagerServePrincipal, RegistrationFamilyBusyError, RegistrationFamilyRefusedError } from "@cotal-ai/core";
 
 const evidence = process.env.FAMILY_SCAN_EVIDENCE_DIR;
 const dir = mkdtempSync(join(evidence ?? tmpdir(), SMOKE_BROKER_TOKEN));
@@ -54,6 +54,7 @@ try {
   const provisioner = await open(await mintCreds(auth, newIdentity(), "provisioner"));
   const owner = `u_${"a".repeat(26)}`;
   const scanClient = await openAuthorityClient({ server: servers, space, dataAccount: { pub: auth.account.pub, signingSeed: auth.account.signingSeed }, label: "family-scan-smoke", grants: id => authorityScannerGrants(space, id), log: console.error });
+  let failAfterFirstChunk = false;
   let stallNextFamilyScan = false;
   let deadlineScanStarted: (() => void) | undefined;
   let deadlineScanAborted: (() => void) | undefined;
@@ -79,6 +80,10 @@ try {
       await blockedReadGate;
     }
   }, probeChunks: chunks => {
+    if (failAfterFirstChunk) return (function* () {
+      yield chunks[0]!;
+      throw new Error("probe failed after first chunk");
+    })();
     if (chunks.length < 2 || !corruption) return chunks;
     if (corruption === "drop") return chunks.slice(1);
     if (corruption === "duplicate") return [chunks[0]!, chunks[0]!, ...chunks.slice(1)];
@@ -220,6 +225,11 @@ try {
         try { await scanRemote(remote.nc, instanceId); } catch (error) { failure = error; } finally { corruption = ""; }
         check(`${mode} family chunk fails closed`, failure instanceof Error && message.test(failure.message));
       }
+      failAfterFirstChunk = true;
+      let failedScan: unknown;
+      try { await scanRemote(remote.nc, instanceId); } catch (error) { failedScan = error; } finally { failAfterFirstChunk = false; }
+      check("failure after first family chunk returns a plain scan failure", failedScan instanceof Error &&
+        !(failedScan instanceof RegistrationFamilyRefusedError) && /registration family scan failed/.test(failedScan.message));
     }
     check(`${count}: remote executor deletes its scan consumer`, (await jsm.streams.info(`KV_${epAuthBucket(space)}`)).state.consumer_count === consumersBefore);
     let remoteDenied: unknown;
@@ -286,5 +296,5 @@ try {
   if (evidence) writeFileSync(join(dir, "OUTCOME.json"), JSON.stringify({ passed, port, brokerExited: true }) + "\n", { mode: 0o600 });
   else rmSync(dir, { recursive: true, force: true });
 }
-assert.equal(passed, 58, "all family scan cells ran");
+assert.equal(passed, 59, "all family scan cells ran");
 console.log(`ENDPOINT FAMILY SCAN: ${passed} passed`);

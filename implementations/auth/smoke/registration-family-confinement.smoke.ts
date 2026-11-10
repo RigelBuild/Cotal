@@ -162,6 +162,10 @@ try {
     await assert.rejects(requestManagerRegistrationRead(nc, space, owner, instanceId, { kind: "read", key: epgateKey("manager", mintLifecycleUid()) }),
       error => error instanceof RegistrationFamilyRefusedError);
     console.log("  ✓ closed read refuses another instance gate");
+    await assert.rejects(
+      requestManagerRegistrationRead(nc, space, owner, instanceId, { kind: "generation", targetInstanceId: "not-a-token" }),
+      error => error instanceof Error && !(error instanceof RegistrationFamilyRefusedError) && /registration read failed/.test(error.message));
+    console.log("  ✓ invalid generation target is a plain registration read failure");
     await setManagerGate("retired");
     await assert.rejects(requestManagerRegistrationFamily(nc, space, owner, instanceId, 1000),
       error => error instanceof RegistrationFamilyRefusedError);

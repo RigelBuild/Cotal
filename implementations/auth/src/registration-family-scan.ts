@@ -6,7 +6,7 @@ import { openAuthorityClient, type AuthorityClientOpts } from "./authority-clien
 import type { AuthLedgerScanner } from "./ledger-scanner.js";
 
 class RegistrationFamilyAuthorizationError extends Error {}
-export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts, "server" | "space" | "dataAccount" | "log" | "onConnection"> & { scanner: AuthLedgerScanner; authKv: KV; recordsKv: KV; probeScanStarted?: () => void; probePointRead?: (instanceId: string) => void | Promise<void>; probeChunks?: (chunks: Record<string, unknown>[]) => Record<string, unknown>[] }) {
+export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts, "server" | "space" | "dataAccount" | "log" | "onConnection"> & { scanner: AuthLedgerScanner; authKv: KV; recordsKv: KV; probeScanStarted?: () => void; probePointRead?: (instanceId: string) => void | Promise<void>; probeChunks?: (chunks: Record<string, unknown>[]) => Iterable<Record<string, unknown>> }) {
   const client = await openAuthorityClient({ ...opts, label: `cotal:registration-family:${opts.space}`,
     grants: () => ({ publish: [managerRegistrationFamilyReplyFilter(opts.space)], subscribe: [managerRegistrationFamilyFilter(opts.space)] }) });
   const sub = client.nc.subscribe(managerRegistrationFamilyFilter(opts.space));
@@ -18,7 +18,6 @@ export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts,
   const handle = async (msg: { subject: string; data: Uint8Array }) => {
     let requestKey: string | undefined;
     let claimed = false;
-    let reply: string | undefined;
     let requestNonce: string | undefined;
     let scanTimer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -28,7 +27,7 @@ export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts,
       const body: unknown = JSON.parse(new TextDecoder().decode(msg.data));
       if (!body || typeof body !== "object" || Array.isArray(body) || !("nonce" in body) || typeof body.nonce !== "string") throw new Error("invalid scan request");
       const nonce = requestNonce = assertNonce(body.nonce);
-      reply = `${msg.subject}.reply.${nonce}`;
+      const reply = `${msg.subject}.reply.${nonce}`;
       const pointRead = "kind" in body;
       let controller: AbortController | undefined;
       let deadline = 0;
@@ -120,8 +119,10 @@ export async function openRegistrationFamilyScan(opts: Pick<AuthorityClientOpts,
         client.nc.publish(reply, new TextEncoder().encode(JSON.stringify({ ...chunk, nonce })));
       }
     } catch (error) {
-      opts.log(`registration family scan refused: ${error instanceof Error ? error.message : String(error)}`);
-      if (requestNonce) client.nc.publish(`${msg.subject}.reply.${requestNonce}`, new TextEncoder().encode(JSON.stringify({ nonce: requestNonce, error: error instanceof RegistrationFamilyAuthorizationError ? "refused" : "failed" })));
+      const kind = error instanceof RegistrationFamilyAuthorizationError ? "refused" : "failed";
+      const message = error instanceof Error ? error.message : String(error);
+      opts.log(`registration family request ${kind}: ${message}`);
+      if (requestNonce) client.nc.publish(`${msg.subject}.reply.${requestNonce}`, new TextEncoder().encode(JSON.stringify({ nonce: requestNonce, error: kind })));
     } finally {
       if (scanTimer !== undefined) clearTimeout(scanTimer);
       if (claimed && requestKey?.startsWith("read:")) {
