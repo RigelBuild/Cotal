@@ -15,7 +15,7 @@ export interface Harness {
   svg: string;
 }
 
-export const HARNESS: Record<"claude" | "opencode" | "codex" | "hermes" | "jcode" | "pi" | "omp", Harness> = {
+export const HARNESS: Record<"claude" | "opencode" | "codex" | "hermes" | "jcode" | "pi" | "omp" | "zellij", Harness> = {
   claude: {
     label: "Claude Code",
     color: "#d97757", // official Claude clay
@@ -57,5 +57,11 @@ export const HARNESS: Record<"claude" | "opencode" | "codex" | "hermes" | "jcode
     color: "#c4b5fd", // oh-my-pi, no official mark: the π glyph in violet
     glyph: "π",
     svg: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M9 7v12"/><path d="M15 7v12c0 1.5 1.5 2 3 1"/></svg>`,
+  },
+  zellij: {
+    label: "Zellij",
+    color: "#A6E22E",
+    glyph: "▤",
+    svg: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M10 4v16M6 9l2 2-2 2"/></svg>`,
   },
 };
