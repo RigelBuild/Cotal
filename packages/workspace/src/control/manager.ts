@@ -77,7 +77,7 @@ export const START_TIMEOUT_MS = 40_000;
  *  `{name}` argument becomes a §13.2 target block (resolved to the agent's principal triple via
  *  the name-keyed `inspect` read — it rides the spawn capability arm, so resolution reach equals
  *  despawn/attach reach; the wire target is (owner, actor, lifecycleUid), never an alias). */
-const EP_COMMANDS: Record<string, { command: string; targeted?: boolean; self?: boolean }> = {
+export const EP_COMMANDS: Record<string, { command: string; targeted?: boolean; self?: boolean }> = {
   managerStatus: { command: "status" },
   start: { command: "spawn" },
   resolveAgent: { command: "resolve-agent" },
@@ -100,6 +100,8 @@ const EP_COMMANDS: Record<string, { command: string; targeted?: boolean; self?: 
   commitPreservation: { command: "commit-preservation" },
   abortPreservation: { command: "abort-preservation" },
   transcriptReceive: { command: "transcript-receive" },
+  attestGone: { command: "attest-gone" },
+  allowlistSet: { command: "allowlist-set" },
   chatSessionOpen: { command: "chat-session-open" },
   chatSessionRetire: { command: "chat-session-retire" },
   runPs: { command: "run-ps" },
