@@ -74,7 +74,6 @@ export const QUARANTINED = {
   "smoke:signal-exits:live": { reason: "RIG-9150 CI-env: CI cannot signal nats-server pid 1 (EPERM), leaving manager stop unknown; 16/18 cells pass", recheckBy: "2026-12-31" },
   "smoke:setup-destination": { reason: "RIG-9150 upstream: 19/82 cells fail on pristine 82a97c1f (local run); runtime host-tool fixture cells", recheckBy: "2026-12-31" },
   "smoke:reap-absent-refusal": { reason: "RIG-9150 upstream: the manager.ts reap census flags Manager.adoptReleasedSeat as a bypass of requireRuntimeReap, 1/62 fails on pristine fdd4d022 (local run, bypass at line 3706). The fork's extra REVIEWED_SITES control (Manager.provePredecessor) passes; the quarantine covers only the upstream bypass", recheckBy: "2026-12-31" },
-  "smoke:manager-stop-reap": { reason: "fork custody contract (#72/#73): reapSeat reaps only through a contained seat cgroup and returns unprovable otherwise; #4005 expects the upstream pid/token reap, so the released seat's credential is never deprovisioned (local run: fork 21/22, #4005 red; pristine fdd4d022 22/22 with nats-server 2.14.6 on PATH); quarantined on sync per RIG-9150", recheckBy: "2026-12-31" },
   "smoke:stack-settle:live": { reason: "RIG-9068 upstream: 8/368 cells fail identically on pristine 82a97c1f and on the fork tip (VM run, Node 22.23.4, nats-server v2.12.12): the latched-JetStream cells (a write the store refused, JetStream disabled) and the fewfiles ulimit -n 32 cell; the fork adds no failure; quarantined on sync", recheckBy: "2026-12-31" },
 };
 
