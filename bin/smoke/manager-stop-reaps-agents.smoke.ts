@@ -397,11 +397,11 @@ try {
   ok("#4005: a next manager starts on the root that released the seat", startError === undefined, { startError });
   // The fork's contract: a released seat no runtime can prove gone is NOT retired, and its credential
   // and runtime reference stay on disk for a later adoption (RIG-4320). The next manager's start runs
-  // reconcileStaticLifecycles, but that sweep only plans durable static slot rows. A released seat is
-  // not one, so the sweep never attempts it. The seat's guard is releasedSeatPending in the drop path
-  // (manager.ts). The sweep is fire-and-forget from start(), so wait for it to finish first (it sets
-  // lastSweep.completedAt on both its normal and its error exit). The asserts then read the files the
-  // refusal leaves behind.
+  // reconcileStaticLifecycles, which plans the seat as a restart row and calls adoptSeat. adoptSeat
+  // refuses the unprovable seat. The record drop that follows is guarded by releasedSeatPending
+  // (manager.ts, restart-reconcile loop). Without that guard the reference is removed, and the cell
+  // below goes red (mutation-checked). Start() does not await the sweep, so wait for it first; it sets
+  // lastSweep.completedAt on both its normal and its error exit.
   const sweepDone = await until(() => statusOf().staticReconciliation.lastSweep?.completedAt !== undefined, 15_000);
   ok("#4005: the next manager's static reconcile sweep finishes", sweepDone, { lastSweep: statusOf().staticReconciliation.lastSweep });
   ok("#4005: the next manager keeps the unprovable released seat's minted credential (no retirement without proof)", credsA !== undefined && existsSync(credsA), { credsA });
