@@ -4276,6 +4276,7 @@ export async function startMeshDetached(
   closeSync(fd);
   await recordSpawnedListener(child, listenerStartedAt, opts.boundListener);
   child.unref();
+  if (!opts.quietBoot) console.log(c.dim(`• started nats-server (pid ${child.pid})`));
 
   await awaitSpawnedListener({ child, executable: { path: bin, source, version }, server, space, creds: setup?.creds, tls: transport.kind === "tls-required", log: logPath, boundListener: opts.boundListener });
   const { authService, controlPlane } = await serveReadyListener({
