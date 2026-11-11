@@ -979,8 +979,12 @@ try {
       if (pid === absentLeader || pid === -absentLeader) signalled = true;
       return origKill.call(this, pid, sig);
     };
-    const reaped = await seat.reapSeat(reapRoot, reapId, { graceMs: 200 });
-    process.kill = origKill;
+    let reaped;
+    try {
+      reaped = await seat.reapSeat(reapRoot, reapId, { graceMs: 200 });
+    } finally {
+      process.kill = origKill;
+    }
     assert.equal(reaped.outcome, "retained", "no cgroup proof: the fork retains, it never reaps unproven");
     assert.equal(reaped.reason, "unprovable");
     assert.match(reaped.detail, /has no contained cgroup proof/);
