@@ -80,12 +80,28 @@ let
       crypto.createHash("sha256").update("ok").digest("hex");
     '
   '';
-  # Checks the whole image closure, not only node: a -dev output or bash fails the image build even
-  # if a disallowedRequisites list missed it. The pattern is -bash- because store paths start with a hash.
-  imageClosure = pkgs.closureInfo { rootPaths = [ nodeTrimmed runtime etcFiles ]; };
+  # The single source for every store path the image ships: the streamed contents, the entrypoint,
+  # and the etc files. The closure guard reads this same list, so extending the image extends it.
+  # etcFiles is copied into the root filesystem, not streamed as contents (a store link there would
+  # be an /etc symlink into the store, which containerd refuses), so contents filters it out.
+  imageRoots = [
+    nodeTrimmed
+    runtime
+    etcFiles
+  ];
+  # Fails the image build if the closure of imageRoots holds a -dev output or bash. The grep
+  # status is checked: 0 means a hit, 1 means none, and anything else is an error that fails too.
+  imageClosure = pkgs.closureInfo { rootPaths = imageRoots; };
   imageContents = pkgs.runCommand "seat-image-contents" { } ''
-    if grep -E -- '-dev($|-)|-bash-' ${imageClosure}/store-paths; then
+    test -s ${imageClosure}/store-paths || { echo "error: empty closure list" >&2; exit 1; }
+    status=0
+    grep -E -- '-dev($|-)|-bash-' ${imageClosure}/store-paths || status=$?
+    if [ "$status" -eq 0 ]; then
       echo "error: the seat image closure holds a -dev output or bash" >&2
+      exit 1
+    fi
+    if [ "$status" -gt 1 ]; then
+      echo "error: grep failed with status $status" >&2
       exit 1
     fi
     touch $out
@@ -107,9 +123,7 @@ in
   seatImage = pkgs.dockerTools.streamLayeredImage {
     name = "cotal-seat";
     tag = "seat";
-    contents = [
-      nodeTrimmed
-    ];
+    contents = builtins.filter (p: p != etcFiles) imageRoots;
     extraCommands = ''
       # Build-time guard: realise the contents check, so a regression fails this image build.
       : ${imageContents}
