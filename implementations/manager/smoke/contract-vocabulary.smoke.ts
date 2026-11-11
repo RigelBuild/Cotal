@@ -84,37 +84,29 @@ console.log(`\n${checked} documents checked, ${refused} refused by the admitted 
 if (!enough) console.log(`  FAIL  only ${checked} documents reached the check (floor ${FLOOR}) - the input set collapsed`);
 
 // THE IMPORT-COST CELL (#1323): importing the contract module must not compile the schemas. The
-// compile used to run at module scope, so EVERY CLI invocation paid ~1.8 CPU-seconds of Ajv work
-// before its verb was read (`cotal --version` included). Two fresh children measure what the
-// module adds on top of its own dependency floor (`@cotal-ai/core`: the NATS graph, Ajv itself,
-// the digest code — plus, under tsx, the loader's per-module tax, which lands on both sides):
-// one imports the floor, the other imports the contract module and reads one cluster-document
-// digest (the describe-only path a `describe` reader takes — digests, never validators). The
-// DELTA between the two children is the module's own cost; the compile alone accounts for
-// ~500 ms of it, so a lazy module sits far below the bound and a module-scope compile trips it
-// by an order of magnitude. CPU, not wall: wall counts the machine (SCHEMA_PROFILE's own record
-// of the 101-158 ms trivial-compile refusal), and the bound carries margin for a loaded runner.
-const TSX = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "node_modules", ".bin", "tsx");
+// probe wraps the Ajv constructor used by the core package, imports the dependency floor, then
+// counts actual compile calls while loading the manager contract module and reading one digest.
+// This measures compiler work directly, without a runner-speed threshold or process-wide CPU sample.
 const PROBE = join(dirname(fileURLToPath(import.meta.url)), "_probe-1323-contract-import.ts");
-const probeCpu = (mode: "--control" | "--contract"): Promise<number> =>
-  new Promise((resolve, reject) => {
-    const child = spawn(TSX, [PROBE, mode], { stdio: ["ignore", "pipe", "pipe"] });
-    let out = "";
-    child.stdout.on("data", (b) => (out += b.toString()));
-    child.on("error", reject);
-    child.on("exit", (rc) => {
-      const m = /PROBE (?:control|contract) (\d+) \d+/.exec(out);
-      if (rc !== 0 || !m) return reject(new Error(`probe ${mode} exited ${rc}: ${out.trim().slice(0, 200)}`));
-      resolve(Number(m[1]));
-    });
+const probeCompileCalls = (): Promise<number> => {
+  const { promise, resolve, reject } = Promise.withResolvers<number>();
+  const child = spawn(TSX, [PROBE], { stdio: ["ignore", "pipe", "pipe"] });
+  let out = "";
+  child.stdout.on("data", (b) => (out += b.toString()));
+  child.on("error", reject);
+  child.on("exit", (rc) => {
+    const m = /PROBE contract (\d+)/.exec(out);
+    if (rc !== 0 || !m) return reject(new Error(`compile probe exited ${rc}: ${out.trim().slice(0, 200)}`));
+    resolve(Number(m[1]));
   });
+  return promise;
+}
 let lazyOk = false;
 let lazyDetail = "";
 try {
-  const [control, contract] = [await probeCpu("--control"), await probeCpu("--contract")];
-  const overhead = contract - control;
-  lazyOk = overhead <= 150;
-  lazyDetail = `module adds ${overhead} ms CPU over its dependency floor (bound 150; compile at import measured ~500+)`;
+  const compileCalls = await probeCompileCalls();
+  lazyOk = compileCalls === 0;
+  lazyDetail = `module import invoked Ajv.compile ${compileCalls} times (expected 0)`;
 } catch (e) {
   lazyDetail = `probe failed: ${(e as Error).message}`;
 }
