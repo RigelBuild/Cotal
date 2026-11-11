@@ -1,0 +1,186 @@
+# Scratch, not for merge: run listed smoke suites one by one without stopping at a failure.
+name: smoke keep-going (scratch)
+on:
+  pull_request:
+    paths: [.github/kg-suites.txt]
+permissions:
+  contents: read
+jobs:
+  workspace-native:
+    uses: ./.github/workflows/workspace-native.yml
+    with:
+      darwin: true
+
+  seat-native-linux-x64:
+    name: seat native (linux-x64)
+    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6.0.8
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build host native
+        run: pnpm --filter @cotal-ai/seat build
+      - name: Native symbol-version ceiling
+        run: node packages/seat/scripts/assert-native-ceiling.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seat-native-linux-x64
+          path: packages/seat/build/Release/linux-x64/
+          if-no-files-found: error
+          retention-days: 7
+
+  seat-native-linux-arm64:
+    name: seat native (linux-arm64)
+    timeout-minutes: 15
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6.0.8
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build host native
+        run: pnpm --filter @cotal-ai/seat build
+      - name: Native symbol-version ceiling
+        run: node packages/seat/scripts/assert-native-ceiling.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seat-native-linux-arm64
+          path: packages/seat/build/Release/linux-arm64/
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    needs: [workspace-native, seat-native-linux-x64, seat-native-linux-arm64]
+    name: smoke keep-going
+    # Shard 2/4 runs ~39-40 min, so the previous 40 left a median margin of 15 seconds and
+    # cancelled healthy runs (#1220 died at 40m18s). Sized at ~1.5x the slowest observed
+    # success, which absorbs runner variance and lets the corpus grow before this binds again.
+    timeout-minutes: 300
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # egress-guard-differential resolves the predecessor commit of the egress classifier and
+          # diffs HEAD's verdicts against it. A depth-1 clone reaches no role-carrying ancestor of
+          # agui.ts, so the resolver cell fails with "deepen the checkout" and takes shard 0 with
+          # it. Same reason the unit job pins this.
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v6.0.8
+        with:
+          standalone: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Capture smoke toolchain
+        id: smoke-tools
+        shell: /usr/bin/env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+        run: |
+          node_path="$(command -v node)"
+          pnpm_path="$(command -v pnpm)"
+          node_target="$(/usr/bin/readlink -f "$node_path")"
+          pnpm_target="$(/usr/bin/readlink -f "$pnpm_path")"
+          echo "node_path=$node_path" >> "$GITHUB_OUTPUT"
+          echo "node_target=$node_target" >> "$GITHUB_OUTPUT"
+          echo "node_sha=$(/usr/bin/sha256sum "$node_target" | /usr/bin/cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "pnpm_path=$pnpm_path" >> "$GITHUB_OUTPUT"
+          echo "pnpm_target=$pnpm_target" >> "$GITHUB_OUTPUT"
+          echo "pnpm_sha=$(/usr/bin/sha256sum "$pnpm_target" | /usr/bin/cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - run: pnpm install --frozen-lockfile
+      # Ubuntu 24.04 runners block unprivileged user namespaces via AppArmor; the seat's
+      # reused-pid cell needs one to own ns_last_pid.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Cache nats-server
+        id: nats
+        uses: actions/cache@v4
+        with:
+          path: ~/nats-bin
+          key: nats-server-v2.12.12-${{ runner.os }}
+      - name: Install nats-server
+        if: steps.nats.outputs.cache-hit != 'true'
+        run: |
+          NATS_VERSION=v2.12.12
+          curl -fsSL "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-amd64.tar.gz" -o /tmp/nats-server.tar.gz
+          tar -xzf /tmp/nats-server.tar.gz -C /tmp
+          mkdir -p ~/nats-bin
+          install "/tmp/nats-server-${NATS_VERSION}-linux-amd64/nats-server" ~/nats-bin/nats-server
+      - name: nats-server on PATH
+        run: echo "$HOME/nats-bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: pnpm build
+      - uses: actions/download-artifact@v4
+        with:
+          name: workspace-native-x64
+          path: ${{ runner.temp }}/workspace-native-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: workspace-native-arm64
+          path: ${{ runner.temp }}/workspace-native-arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: workspace-native-darwin-x64
+          path: ${{ runner.temp }}/workspace-native-darwin-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: workspace-native-darwin-arm64
+          path: ${{ runner.temp }}/workspace-native-darwin-arm64
+      - name: Assemble source-matched Windows and macOS process identity bindings
+        run: node scripts/workspace-assemble-natives.mjs
+        env:
+          WORKSPACE_NATIVE_X64: ${{ runner.temp }}/workspace-native-x64
+          WORKSPACE_NATIVE_ARM64: ${{ runner.temp }}/workspace-native-arm64
+          WORKSPACE_NATIVE_DARWIN_X64: ${{ runner.temp }}/workspace-native-darwin-x64
+          WORKSPACE_NATIVE_DARWIN_ARM64: ${{ runner.temp }}/workspace-native-darwin-arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: seat-native-linux-x64
+          path: ${{ runner.temp }}/seat-native-linux-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: seat-native-linux-arm64
+          path: ${{ runner.temp }}/seat-native-linux-arm64
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: seat-native-darwin-*
+          path: ${{ runner.temp }}/seat-host-native
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: seat-native-win32-*
+          path: ${{ runner.temp }}/seat-host-native
+      - name: Assemble the seat SO_PEERCRED helpers
+        run: node scripts/seat-assemble-natives.mjs
+        env:
+          SEAT_NATIVE_X64: ${{ runner.temp }}/seat-native-linux-x64
+          SEAT_NATIVE_ARM64: ${{ runner.temp }}/seat-native-linux-arm64
+          SEAT_NATIVE_DARWIN_X64: ${{ runner.temp }}/seat-host-native/seat-native-darwin-x64/peercred.node
+          SEAT_NATIVE_DARWIN_ARM64: ${{ runner.temp }}/seat-host-native/seat-native-darwin-arm64/peercred.node
+          SEAT_NATIVE_WIN32_X64: ${{ runner.temp }}/seat-host-native/seat-native-win32-x64/peercred.node
+          SEAT_NATIVE_WIN32_ARM64: ${{ runner.temp }}/seat-host-native/seat-native-win32-arm64/peercred.node
+      - name: Keep-going suites
+        run: |
+          set +e
+          : > results.tsv
+          for s in $(cat .github/kg-suites.txt); do
+            echo "::group::$s"
+            export SMOKE_BROKER_SCOPE=$(cat /proc/sys/kernel/random/uuid) COTAL_RUN=kg-$s DO_NOT_TRACK=1
+            timeout 900 pnpm --silent "$s" > "kg-$s.log" 2>&1; rc=$?
+            tail -60 "kg-$s.log"; echo "::endgroup::"
+            printf '%s\t%s\n' "$s" "$rc" >> results.tsv
+          done
+          cat results.tsv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kg-logs
+          path: |
+            results.tsv
+            kg-*.log
