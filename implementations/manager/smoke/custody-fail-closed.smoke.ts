@@ -169,7 +169,7 @@ const M = mgr as unknown as {
   agents: Map<string, Managed>;
   retiring: Map<string, { target: { lifecycleUid: string } }>;
   staticReconcileItems: Map<string, { alias: string; attempts: number; maxAttempts: number }>;
-  staticReleasePending: Set<string>;
+  deprovisioningFlight: Map<string, Promise<void>>;
   staticReconcileSweepsInFlight: number;
   releaseStaticReconcileSweep: () => void;
   driveStaticRetirement: (a: { id: string; name: string; lifecycleUid: string }) => Promise<void>;
@@ -592,12 +592,12 @@ try {
     M.staticReleasePending.add(flightKey);
     failSlotCasFor = "retryrelease";
     M.despawnAuthorized(a, false, false, "smoke");
-    const cas = await until(() => failSlotCasFor === undefined, 10_000);
     const despawned = await until(() => M.agents.get("retryrelease") === undefined, 10_000);
+    const settled = await until(() => !M.deprovisioningFlight.has(flightKey), 10_000);
     M.staticReleasePending.delete(flightKey);
-    failSlotCasFor = undefined;
     check("live retirement failing under a pending operator release creates no retry item and keeps the alias held",
-      cas && despawned && item("retryrelease") === undefined && M.retiring.has("retryrelease"), { cas, despawned, item: item("retryrelease") });
+      failSlotCasFor === "retryrelease" && despawned && settled && item("retryrelease") === undefined && M.retiring.has("retryrelease"), { casStillArmed: failSlotCasFor === "retryrelease", despawned, settled, item: item("retryrelease") });
+    failSlotCasFor = undefined;
   }
 
   // ── A changed durable lifecycle is never reached by a retry ────────────────
