@@ -113,7 +113,7 @@ jobs:
           # Log in with the pinned crane, so no third-party login action is needed.
           crane="$(nix build --file nix/crane.nix --no-link --print-out-paths)/bin/crane"
           echo "CRANE=$crane" >> "$GITHUB_ENV"
-          printf '%s' "$GH_TOKEN_VALUE" | "$CRANE" auth login ghcr.io --username "$ACTOR" --password-stdin
+          printf '%s' "$GH_TOKEN_VALUE" | "$crane" auth login ghcr.io --username "$ACTOR" --password-stdin
 
       - name: Push seat image by digest
         id: push
@@ -155,7 +155,7 @@ jobs:
           # Resolve crane once for this job; later steps read it from GITHUB_ENV.
           crane="$(nix build --file nix/crane.nix --no-link --print-out-paths)/bin/crane"
           echo "CRANE=$crane" >> "$GITHUB_ENV"
-          printf '%s' "$GH_TOKEN_VALUE" | "$CRANE" auth login ghcr.io --username "$ACTOR" --password-stdin
+          printf '%s' "$GH_TOKEN_VALUE" | "$crane" auth login ghcr.io --username "$ACTOR" --password-stdin
 
 
       - name: Apply release tags and verify digests
