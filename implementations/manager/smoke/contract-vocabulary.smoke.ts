@@ -36,6 +36,7 @@ import {
   CANCEL_INPUT_SCHEMA, TURN_YIELD_OUTPUT_SCHEMA,
 } from "@cotal-ai/core";
 import { managerClusterDocument, managerContractArtifactValues } from "../src/manager-service-contract.js";
+const TSX = join(import.meta.dirname, "..", "..", "..", "node_modules", ".bin", "tsx");
 
 let checked = 0;
 let refused = 0;

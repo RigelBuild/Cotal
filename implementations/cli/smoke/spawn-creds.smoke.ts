@@ -94,8 +94,9 @@ async function run(argv: string[]): Promise<{ exited?: number; stderr: string }>
   process.stderr.write = ((chunk: unknown) => { stderr += String(chunk); return true; }) as typeof process.stderr.write;
   console.error = (...a: unknown[]) => { stderr += a.map(String).join(" ") + "\n"; };
   // A refusal ends the process; turning it into a throw makes "it refused" observable (as the sibling suites do).
+  // runCli catches that throw and exits again with OPERATION_UNKNOWN, so only the first exit is the refusal's.
   (process as unknown as { exit: (c?: number) => never }).exit = ((code?: number) => {
-    exited = code ?? 0;
+    exited ??= code ?? 0;
     throw new Error(`__exit__${exited}`);
   }) as never;
   try {
