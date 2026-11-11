@@ -49,7 +49,7 @@ import { controlCaller, type ControlAuth } from "../control-target.js";
 import { staleStoreHint } from "../maintenance.js";
 import { CommandFailure, nativeEndpointRefusal, type RefusalCode } from "../output.js";
 import { DIAL_TIMEOUT_MS, DialNotAdmitted, dialWithRetry, notAdmittedRefusal } from "./dial-retry.js";
-import { EP_COMMANDS } from "./ep-commands.js";
+import { EP_COMMANDS, type EpCommandMapping } from "./ep-commands.js";
 
 
 /** What the surface making control calls supplies, because only it knows. */
@@ -107,7 +107,7 @@ async function askManagerEp(
   if (pin?.instanceId !== undefined && auth.managerInstanceId !== undefined && pin.instanceId !== auth.managerInstanceId)
     return { ok: false, error: "the manager pin differs from this credential's instance authority", code: "permission-denied" };
   const instanceId = pin?.instanceId ?? auth.managerInstanceId;
-  const mapped = EP_COMMANDS[op];
+  const mapped: EpCommandMapping = EP_COMMANDS[op];
   // Each attempt is a new connection, so a user bearer's connection nonce is minted afresh with it.
   let connectOpts: Record<string, unknown> = {};
   const nc = await dialWithRetry(() => {
@@ -711,7 +711,7 @@ async function askManagerScatterEp(
   timeoutMs?: number,
   reportHosts = false,
 ): Promise<ScatterReply> {
-  const mapped = EP_COMMANDS[op];
+  const mapped: EpCommandMapping = EP_COMMANDS[op];
   if (mapped.targeted) return { ok: false, error: `${op} is targeted and cannot be scattered across instances` };
 
   // ---- connection 0: freeze the class. A registry read that fails here fails the command with the
