@@ -22,7 +22,8 @@
  * Run: pnpm smoke:spawn-creds
  */
 import { spawn as spawnProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -89,10 +90,32 @@ async function run(argv: string[]): Promise<{ exited?: number; stderr: string }>
   const realExit = process.exit;
   const realErr = console.error;
   const realWrite = process.stderr.write.bind(process.stderr);
+  // The rich refusal renderer writes directly to fd 2 with node:fs writeSync, so synchronize that ESM export into the CLI import while capturing.
+  const realWriteSync = fs.writeSync;
   let exited: number | undefined;
   let stderr = "";
   process.stderr.write = ((chunk: unknown) => { stderr += String(chunk); return true; }) as typeof process.stderr.write;
   console.error = (...a: unknown[]) => { stderr += a.map(String).join(" ") + "\n"; };
+  fs.writeSync = ((fd: number, data: string | NodeJS.ArrayBufferView, offsetOrPosition?: number, lengthOrEncoding?: number | BufferEncoding, position?: number): number => {
+    if (fd === 2) {
+      if (typeof data === "string") {
+        stderr += data;
+        return Buffer.byteLength(data, typeof lengthOrEncoding === "string" ? lengthOrEncoding : undefined);
+      }
+      const bytes = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+      const start = offsetOrPosition ?? 0;
+      const selected = bytes.subarray(start, typeof lengthOrEncoding === "number" ? start + lengthOrEncoding : undefined);
+      stderr += selected.toString();
+      return selected.byteLength;
+    }
+    if (typeof data === "string") {
+      return typeof lengthOrEncoding === "string"
+        ? realWriteSync(fd, data, offsetOrPosition, lengthOrEncoding)
+        : realWriteSync(fd, data, offsetOrPosition);
+    }
+    return realWriteSync(fd, data, offsetOrPosition, typeof lengthOrEncoding === "number" ? lengthOrEncoding : undefined, position);
+  }) as typeof fs.writeSync;
+  syncBuiltinESMExports();
   // A refusal ends the process; turning it into a throw makes "it refused" observable (as the sibling suites do).
   // runCli catches that throw and exits again with OPERATION_UNKNOWN, so only the first exit is the refusal's.
   (process as unknown as { exit: (c?: number) => never }).exit = ((code?: number) => {
@@ -108,6 +131,8 @@ async function run(argv: string[]): Promise<{ exited?: number; stderr: string }>
     (process as unknown as { exit: typeof realExit }).exit = realExit;
     console.error = realErr;
     process.stderr.write = realWrite;
+    fs.writeSync = realWriteSync;
+    syncBuiltinESMExports();
   }
   return { exited, stderr };
 }
@@ -198,7 +223,7 @@ try {
   {
     const r = await run([...base, "--creds", credsPath, "--detach", "--server", "nats://127.0.0.1:1"]);
     check("--creds --detach keeps the control path (no pairing refusal, fails at the unreachable broker)",
-      r.exited === 1 && !/lifecycle-paired/.test(r.stderr) && /127\.0\.0\.1:1/.test(r.stderr), r);
+      r.exited === 2 && !/lifecycle-paired/.test(r.stderr) && /127\.0\.0\.1:1/.test(r.stderr), r);
   }
   {
     const r = await run([...base, "--creds", bareCredsPath, "--lifecycle-uid", bareUid]);
