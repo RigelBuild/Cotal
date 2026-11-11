@@ -18,7 +18,7 @@
     }
   },
   "scripts": {
-    "test": "pnpm run build && tsx package.smoke.ts && tsx holder.smoke.ts && node --input-type=module -e \"await import('./dist/index.js'); console.log('zellij dist smoke: import passed')\"",
+    "test": "pnpm run build && tsx package.smoke.ts && tsx holder.smoke.ts && tsx holder-darwin.smoke.ts && node --input-type=module -e \"await import('./dist/index.js'); console.log('zellij dist smoke: import passed')\"",
     "test:live": "tsx smoke.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.smoke.json",
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json --emitDeclarationOnly && pnpm run bundle",

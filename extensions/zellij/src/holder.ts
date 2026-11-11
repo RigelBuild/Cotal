@@ -33,6 +33,10 @@ type HolderRuntimeOptions = {
   readonly sleep?: (ms: number) => Promise<void>;
   readonly now?: () => number;
   readonly kill?: (pid: number, signal: NodeJS.Signals) => void;
+  /** "darwin" selects wave-host identity and stop; any other value keeps /proc and systemctl. */
+  readonly platform?: NodeJS.Platform;
+  /** The Darwin wave-host executable. Required on darwin; the seat cannot start without it. */
+  readonly waveHostCommand?: () => string | undefined;
 };
 
 const defaultExec: HolderExec = (file, args, options) => execFileSync(file, args, options);
@@ -95,6 +99,8 @@ export class HolderRuntime implements Runtime {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
   private readonly kill: (pid: number, signal: NodeJS.Signals) => void;
+  private readonly platform: NodeJS.Platform;
+  private readonly waveHost: () => string | undefined;
 
   constructor(options: HolderRuntimeOptions = {}) {
     this.command = options.holderCommand ?? (() => process.env.COTAL_HOLDER_COMMAND);
@@ -103,6 +109,8 @@ export class HolderRuntime implements Runtime {
     this.fs = options.fs ?? defaultFs;
     this.sleep = options.sleep ?? defaultSleep;
     this.now = options.now ?? Date.now;
+    this.platform = options.platform ?? process.platform;
+    this.waveHost = options.waveHostCommand ?? (() => process.env.WAVE_HOST_COMMAND);
     this.kill = options.kill ?? defaultKill;
   }
 
@@ -183,7 +191,7 @@ export class HolderRuntime implements Runtime {
       };
     } catch (error) {
       if (holderAcceptedStart) {
-        try { this.exec("systemctl", ["--user", "stop", "--no-block", `${this.prefix()}${name}`], { encoding: "utf8" }); } catch { /* the original start failure is primary */ }
+        try { this.stopSeatJob(name); } catch { /* the original start failure is primary */ }
         try { cleanupLauncher(); } catch { /* best effort after stopping the unit */ }
       }
       throw error;
@@ -227,6 +235,10 @@ export class HolderRuntime implements Runtime {
   }
 
   private readProcess(pid: number): ProcessRecord | undefined {
+    if (this.platform === "darwin") {
+      const token = this.darwinStartToken(pid);
+      return token === undefined ? undefined : { pid, state: "S", startTime: token };
+    }
     try {
       return parseProcessStat(this.fs.readFileSync(`/proc/${pid}/stat`, "utf8"), pid);
     } catch {
@@ -234,7 +246,33 @@ export class HolderRuntime implements Runtime {
     }
   }
 
+  /** The start token wave-host reports for a live pid; undefined when absent or unreadable. */
+  private darwinStartToken(pid: number): string | undefined {
+    try {
+      const out = this.exec(this.requireWaveHost(), ["process-identity", "--pid", String(pid)], { encoding: "utf8", timeout: START_TIMEOUT_MS });
+      return /^\d+\s*$/u.test(out) ? out.trim() : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private requireWaveHost(): string {
+    const command = this.waveHost();
+    if (command === undefined) throw new SpawnRefused("holder runtime: WAVE_HOST_COMMAND is not set");
+    return command;
+  }
+
   private processState(identity: ProcessIdentity): ProcessState {
+    if (this.platform === "darwin") {
+      let token: string;
+      try {
+        token = this.exec(this.requireWaveHost(), ["process-identity", "--pid", String(identity.pid)], { encoding: "utf8", timeout: START_TIMEOUT_MS }).trim();
+      } catch (error) {
+        return exitStatus(error) === 3 ? "gone" : "unknown";
+      }
+      if (!/^\d+$/u.test(token)) return "unknown";
+      return token === identity.startTime ? "alive" : "gone";
+    }
     let raw: string;
     try {
       raw = this.fs.readFileSync(`/proc/${identity.pid}/stat`, "utf8");
@@ -258,10 +296,19 @@ export class HolderRuntime implements Runtime {
   private stopUnit(name: string, identities: { holder: ProcessIdentity; agent: ProcessIdentity }): void {
     if (this.areGone(identities)) return;
     try {
-      this.exec("systemctl", ["--user", "stop", "--no-block", `${this.prefix()}${name}`], { encoding: "utf8" });
+      this.stopSeatJob(name);
     } catch (error) {
       if (!this.areGone(identities)) throw error;
     }
+  }
+
+  /** The graceful, platform-correct stop of a seat's job. Darwin removes its launchd job; Linux stops the unit. */
+  private stopSeatJob(name: string): void {
+    if (this.platform === "darwin") {
+      this.exec(this.requireWaveHost(), ["seat-stop", "--name", name], { encoding: "utf8", timeout: START_TIMEOUT_MS });
+      return;
+    }
+    this.exec("systemctl", ["--user", "stop", "--no-block", `${this.prefix()}${name}`], { encoding: "utf8" });
   }
 
   private forceStop(name: string, identities: { holder: ProcessIdentity; agent: ProcessIdentity }): void {
@@ -272,7 +319,8 @@ export class HolderRuntime implements Runtime {
       if (!isMissingProcess(error) && !this.areGone(identities)) throw error;
     }
     try {
-      this.exec("systemctl", ["--user", "kill", "-s", "SIGKILL", `${this.prefix()}${name}`], { encoding: "utf8" });
+      if (this.platform === "darwin") this.stopSeatJob(name);
+      else this.exec("systemctl", ["--user", "kill", "-s", "SIGKILL", `${this.prefix()}${name}`], { encoding: "utf8" });
     } catch (error) {
       if (!this.areGone(identities)) throw error;
     }
