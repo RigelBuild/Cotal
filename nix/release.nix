@@ -6,7 +6,9 @@ let
   inherit (pkgs) lib;
   release = lib.importJSON ./release.json;
   system = pkgs.stdenv.hostPlatform.system;
-  asset = release.assets.${system};
+  asset =
+    release.assets.${system}
+      or (throw "cotal: no published runtime asset for ${system} in nix/release.json");
   assetName = "cotal-runtime-${asset.platform}.tar.gz";
 in
 assert lib.assertMsg (lib.hasPrefix "rigel-v${release.version}-" release.tag)
@@ -34,6 +36,13 @@ pkgs.stdenvNoCC.mkDerivation {
     mkdir -p "$out/lib" "$out/bin"
     cp -a . "$out/lib/cotal"
 
+    # The release assembler copies only bin, extensions, implementations, packages and examples
+    # (.github/workflows/rigel-release.yml). The pnpm workspace links that point at the other
+    # members (desktop, tools/docs-content) therefore dangle in the tarball. nixpkgs' noBrokenSymlinks
+    # fixup fails the build on them, and they are unused at runtime, so drop them. Do not disable
+    # the fixup: it still guards every other link.
+    find "$out/lib/cotal" -xtype l -delete
+
     makeWrapper ${pkgs.nodejs_24}/bin/node "$out/bin/cotal" \
       --add-flags "$out/lib/cotal/cotal-ai/dist/cotal.js"
 
@@ -45,7 +54,7 @@ pkgs.stdenvNoCC.mkDerivation {
     homepage = "https://github.com/${release.repo}";
     license = lib.licenses.asl20;
     mainProgram = "cotal";
-    platforms = [ system ];
+    platforms = builtins.attrNames release.assets;
     sourceProvenance = [ lib.sourceTypes.binaryNativeCode ];
   };
 }
