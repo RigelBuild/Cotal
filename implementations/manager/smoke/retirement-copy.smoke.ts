@@ -92,7 +92,13 @@ try {
     beforeAnswer?.();
     if (answer !== "ok") throw new EpEnvelopeError(answer === "expired" ? "expired" : "permission-denied", answer === "expired" ? expired : denied);
     return { retired: true, lifecycleUid: uid, opId: args.opId, evictedPrincipals: [] };
-  } }), { public: true }, { resolveTarget: (target) => {
+  },
+  // This fixture serves only `retire-lifecycle`; a placement call here is a test bug, so refuse loudly.
+  verifyPlacementEnrollment: () => { throw new EpEnvelopeError("unimplemented", "placement not served by this fixture"); },
+  enrollmentEffectStatus: () => { throw new EpEnvelopeError("unimplemented", "placement not served by this fixture"); },
+  closeEnrollmentEffect: () => { throw new EpEnvelopeError("unimplemented", "placement not served by this fixture"); },
+  retirePlacementEnrollment: () => { throw new EpEnvelopeError("unimplemented", "placement not served by this fixture"); },
+ }), { public: true }, { resolveTarget: (target) => {
     const lifecycleUid = mappings.get(`${target.owner}.${target.actor}`);
     return lifecycleUid === undefined ? undefined : { lifecycleUid, mappingRevision: 1 };
   } });
