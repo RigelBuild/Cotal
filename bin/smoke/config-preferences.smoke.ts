@@ -53,9 +53,9 @@ type Envelope = {
   error?: { code: string; message: string; remedy?: string };
 };
 const PATH = process.env.PATH ?? "";
-const sandboxEnv = (extra: NodeJS.ProcessEnv) => ({ ...HOST_ENV, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: xdg, COTAL_HOME: cotalHome, COTAL_SKIP_CONNECTOR_SEED: "1", ...extra });
+const sandboxEnv = (extra: NodeJS.ProcessEnv) => ({ ...HOST_ENV, PATH, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: xdg, COTAL_HOME: cotalHome, COTAL_SKIP_CONNECTOR_SEED: "1", ...extra });
 function run(args: string[], extra: NodeJS.ProcessEnv = {}, cwd = home) {
-  const r = spawnSync(process.execPath, [BIN, ...args], { cwd, env: { ...sandboxEnv(extra), PATH: extra.PATH ?? PATH }, encoding: "utf8", timeout: 60_000 });
+  const r = spawnSync(process.execPath, [BIN, ...args], { cwd, env: sandboxEnv(extra), encoding: "utf8", timeout: 60_000 });
   const stdout = r.stdout ?? "";
   const lines = stdout.split("\n").filter(Boolean);
   const envelope = lines.length === 1 && lines[0]!.startsWith("{") ? (JSON.parse(lines[0]!) as Envelope) : undefined;
@@ -549,7 +549,7 @@ if (process.platform !== "win32") {
   check("a write does not replace an invalid file", write.status === 1 && /is invalid/.test(write.stderr) && fileText()?.includes("spaces") === true, shown(write));
   const help = run(["config", "--help"]);
   check("help still works", help.status === 0 && /cotal config/.test(help.stdout), shown(help));
-  // Bare completion probes PowerShell when pwsh is on PATH. Keep this preference-boundary check independent of runner-owned shell profiles.
+  // Bare completion probes pwsh when it is on PATH and exits 4 if that probe fails. Hide pwsh so this checks preferences only.
   for (const args of [["help"], ["--help"], ["help", "config"], ["completion"], ["completion", "script", "bash"]]) {
     const r = run(args, args.length === 1 && args[0] === "completion" ? { PATH: join(home, "empty-bin") } : {});
     check(`cotal ${args.join(" ")} still works`, r.status === 0 && r.stdout !== "" && !/is invalid/.test(r.stderr), shown(r));
