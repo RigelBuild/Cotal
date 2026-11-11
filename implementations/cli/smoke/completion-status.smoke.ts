@@ -55,6 +55,12 @@ function sandbox(shell = "/bin/bash") {
   const shellOf = (env: { result: { shells: { shell: string }[] } | null } | undefined, name: string) => env?.result?.shells.find((s) => s.shell === name) as Record<string, unknown> | undefined;
   return { home, xdg, run, json, shellOf };
 }
+/** A pwsh on PATH whose current-user profile probe fails. */
+function failingPwsh(bin: string): string {
+  mkdirSync(bin, { mode: 0o700 });
+  writeFileSync(join(bin, "pwsh"), "#!/bin/sh\nexit 1\n", { mode: 0o700 });
+  return `${bin}:${process.env.PATH ?? ""}`;
+}
 const shown = (r: { status: number | null; stdout: string; stderr: string }) => ({ status: r.status, stdout: r.stdout.slice(0, 400), stderr: r.stderr.slice(0, 400) });
 /** The error code of the envelope on stdout, or undefined when stdout is not one. */
 const codeOf = (stdout: string): unknown => {
@@ -136,6 +142,26 @@ const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
   const tcshPlain = tcsh.run(["completion", "--plain"]);
   check("with an unknown $SHELL the report offers no line for this shell", tcshPlain.status === 0 && !/this shell only/.test(tcshPlain.stdout) && /cotal completion install/.test(tcshPlain.stdout), shown(tcshPlain));
 }
+// ── A profile probe failure matters to completeness only for the selected shell ────────────────────
+{
+  const s = sandbox("/bin/bash");
+  const r = s.run(["completion", "--json"], { PATH: failingPwsh(join(s.home, "bin")) });
+  const env = r.stdout.startsWith("{") ? JSON.parse(r.stdout) : undefined;
+  const powershell = s.shellOf(env, "powershell");
+  check("a failed pwsh profile probe for another shell warns without making bash status partial",
+    r.status === 0 && env?.outcome === "ok" && env.completeness === "complete" && env.error === undefined && powershell?.state === "unreadable"
+      && env.warnings.some((w: { code: string; target: { shell?: string }; message: string }) => w.code === "COMPLETION_PROFILE_UNAVAILABLE" && w.target.shell === "powershell" && /pwsh/.test(w.message) && /current-user profile probe failed, timed out, or returned no usable profile path/.test(w.message)), shown(r));
+}
+{
+  const s = sandbox("/bin/pwsh");
+  const r = s.run(["completion", "--json"], { PATH: failingPwsh(join(s.home, "bin")) });
+  const env = r.stdout.startsWith("{") ? JSON.parse(r.stdout) : undefined;
+  const powershell = s.shellOf(env, "powershell");
+  check("a failed pwsh profile probe for the selected shell keeps completion status partial",
+    r.status === 4 && env?.outcome === "partial" && env.completeness === "partial" && powershell?.state === "unreadable"
+      && env.warnings.some((w: { code: string; target: { shell?: string } }) => w.code === "COMPLETION_PROFILE_UNAVAILABLE" && w.target.shell === "powershell"), shown(r));
+}
+
 
 // ── Status after install, after an edit, after the rc line goes ─────────────────────────────────────
 {
