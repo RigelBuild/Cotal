@@ -94,10 +94,11 @@ const must = (name: string, cond: boolean, extra?: unknown) => {
   pass++;
   console.log(`  ✓ ${name}`);
 };
-/** Twenty-four scenario cells (18 `ok` and 6 `must`) run before the final count cell, which is the
- * 25th call. EXPECTED_CELLS counts all 25, and the count cell checks `pass + fail === EXPECTED_CELLS - 1`.
- * A throw lands in the catch as a counted failure, so a partial run can never print the OK banner. */
-const EXPECTED_CELLS = 25;
+/** Twenty-three scenario cells run before the final count cell, which is the 24th call. EXPECTED_CELLS
+ * counts all 24, and the count cell checks `pass + fail === EXPECTED_CELLS - 1`. The number is the run's
+ * own count (`pass` before the count), not a static tally of the source. A throw lands in the catch as
+ * a counted failure, so a partial run can never print the OK banner. */
+const EXPECTED_CELLS = 24;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const until = async (cond: () => boolean, ms: number): Promise<boolean> => {
   const end = Date.now() + ms;
