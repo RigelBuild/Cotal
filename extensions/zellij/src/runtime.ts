@@ -171,6 +171,9 @@ export class ZellijRuntime implements Runtime {
     }
 
     const startedPane = paneId;
+    // The watch reports how it ended through `settled`. The handle exposes that outcome, so a caller
+    // waits on the event itself rather than on a timer.
+    let settledOutcome: string | undefined;
     watch?.({
       read: () => zellij.dumpScreen(this.session, startedPane, Date.now() + CONFIRM_BUDGET_MS),
       enter: () => zellij.writePane(this.session, startedPane, "13", Date.now() + CONFIRM_BUDGET_MS),
@@ -184,6 +187,7 @@ export class ZellijRuntime implements Runtime {
         }
         cleanupLauncher(launcher);
       },
+      settled: (outcome) => { settledOutcome = outcome; },
     });
 
     return {
@@ -198,6 +202,7 @@ export class ZellijRuntime implements Runtime {
         }
       },
       interrupt: () => zellij.interruptPane(this.session, startedPane),
+      confirmOutcome: () => settledOutcome,
       waitForExit: () => waitForLauncherExit(launcher.dir),
       attach: () => {
         throw new Error(`zellij runtime: attach natively with zellij attach ${this.session}`);

@@ -33,15 +33,16 @@ function readCalls(logPath: string): string[][] {
     .map((line) => JSON.parse(line) as string[]);
 }
 
-// Waits until the fake's call log satisfies `done`, or the deadline passes. The confirm watch polls
-// the pane on a fixed interval, and each read is a real zellij spawn, so a fixed sleep races a slow
-// host. The assertions still decide pass or fail once this returns.
+// Waits until the fake's call log satisfies `done`. Throws on timeout: a wait that never sees its
+// event must fail visibly, not return and let the assertions read a state the wait never reached.
+// Each read is a real zellij spawn, so the call log is the only ordering the test can observe.
 async function waitForCalls(logPath: string, done: (calls: string[][]) => boolean, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (done(readCalls(logPath))) return;
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
   }
+  throw new Error(`waitForCalls: condition not met within ${timeoutMs} ms`);
 }
 
 async function withFakeZellij(
@@ -368,21 +369,18 @@ await withFakeZellij("confirm", async (logPath, session) => {
     { command: "sleep", args: ["600"], confirm: "Continue?" },
     process.cwd(),
   );
-  await waitForCalls(logPath, (calls) => calls.some((args) => args[3] === "write" && args.includes("13")), 10_000);
-  // Event-bounded, not timed. Each dump-screen is one watch poll, and the fake logs it. After the
-  // first Enter, wait for one further poll to read the pane: a duplicate Enter is written by the
-  // poll that follows the first, so it is in the log once that poll has run. The wait ends on that
-  // read, never on a deadline. The watch then stops, and the count reads the log, which the stopped
-  // watch can no longer extend.
-  const screenCount = (): number => Number(readFileSync(`${logPath}.screen-count`, "utf8") || "0");
-  const enterCount = (calls: string[][]): number => calls.filter((args) => args[3] === "write" && args.includes("13")).length;
-  const readsAtFirstEnter = screenCount();
-  await waitForCalls(logPath, () => screenCount() > readsAtFirstEnter, 10_000);
+  const started = Date.now();
+  // The end event: the watch reports `settled` once it has sent its final Enter. Correct code reaches
+  // it right after the first Enter and makes no later poll. A duplicate Enter from a poll that runs
+  // before `settled` is in the log by the time the wait ends, so the count below sees it.
+  await waitForCalls(logPath, () => handle.confirmOutcome?.() !== undefined, 10_000);
   const calls = readCalls(logPath);
+  const enters = calls.filter((args) => args[3] === "write" && args.includes("13")).length;
   handle.stop({ graceful: false });
+  console.log(`  · confirm one-Enter cell waited ${Date.now() - started} ms for the settled event`);
   check(
     "confirm sends one Enter only after the pane displays the prompt",
-    enterCount(calls) === 1 && calls.some((args) => args[3] === "dump-screen"),
+    enters === 1 && calls.some((args) => args[3] === "dump-screen") && handle.confirmOutcome?.() === "confirmed",
   );
 });
 await withFakeZellij("confirm", async (logPath, session) => {
