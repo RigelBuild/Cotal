@@ -13,7 +13,7 @@ import { releaseManifests, stageReleasePlan, STAGING_TAG } from "./stage-release
 const root = join(import.meta.dirname, "..");
 
 test("direct install verification stays outside publisher concurrency while staged verification stays inside", () => {
-  const workflow = YAML.parse(readFileSync(join(root, ".github/workflows/changesets.yml"), "utf8"));
+  const workflow = YAML.parse(readFileSync(join(root, ".github/workflows/changesets.yml.disabled"), "utf8"));
   const inside = workflow.jobs.publish.steps.find((step) => step.run?.includes("verify-release-installable.mjs"));
   const outside = workflow.jobs["verify-install"].steps.find((step) => step.run?.includes("verify-release-installable.mjs"));
   assert.equal(inside.if, "steps.publish.outputs.published == 'true' && needs.release.outputs.staged == 'true'", "direct installs must not hold the publish queue");
@@ -26,7 +26,7 @@ test("direct install verification stays outside publisher concurrency while stag
 });
 
 test("one frozen select output governs artifact selection, verification and promotion despite later variable changes", () => {
-  const text = readFileSync(join(root, ".github/workflows/changesets.yml"), "utf8");
+  const text = readFileSync(join(root, ".github/workflows/changesets.yml.disabled"), "utf8");
   const workflow = YAML.parse(text);
   assert.equal((text.match(/vars\.COTAL_STAGED_RELEASE/g) ?? []).length, 1, "mutable repo variable must only be read once");
   const freeze = workflow.jobs.select.steps.find((step) => step.id === "release-mode");
@@ -71,7 +71,7 @@ test("one frozen select output governs artifact selection, verification and prom
 });
 
 test("unset, false and unrelated variables preserve the original plan and skip every staged step", () => {
-  const workflow = YAML.parse(readFileSync(join(root, ".github/workflows/changesets.yml"), "utf8"));
+  const workflow = YAML.parse(readFileSync(join(root, ".github/workflows/changesets.yml.disabled"), "utf8"));
   const pack = workflow.jobs.pack.steps.find((step) => step.id === "pack");
   assert.equal(pack.with["publish-plan-artifact-id"], "${{ steps.staged-plan.outputs.artifact-id || steps.plan.outputs.publish-plan-artifact-id }}");
   const optional = [
@@ -94,7 +94,7 @@ test("unset, false and unrelated variables preserve the original plan and skip e
 });
 
 test("workflow parses and every ID download flattens the artifact into its declared plan path", () => {
-  const workflow = YAML.parse(readFileSync(join(root, ".github/workflows/changesets.yml"), "utf8"));
+  const workflow = YAML.parse(readFileSync(join(root, ".github/workflows/changesets.yml.disabled"), "utf8"));
   for (const name of ["pack", "publish"]) {
     const downloads = workflow.jobs[name].steps.filter((step) => step.with?.["artifact-ids"]);
     assert.equal(downloads.length, 1);
@@ -185,7 +185,7 @@ test("real repository closure produces complete dependency-ordered promotion spe
 });
 
 test("actual workflow promotion shell uses ordinary npm, stops on error and does not promote after failed verification", () => {
-  const workflow = YAML.parse(readFileSync(join(root, ".github/workflows/changesets.yml"), "utf8"));
+  const workflow = YAML.parse(readFileSync(join(root, ".github/workflows/changesets.yml.disabled"), "utf8"));
   const script = workflow.jobs.publish.steps.find((step) => step.name === "Promote verified packages to latest")?.run;
   assert(script, "ordinary promotion block must exist");
   const scratch = mkdtempSync(join(tmpdir(), "release-promotion-shell-"));

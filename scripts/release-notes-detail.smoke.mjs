@@ -32,7 +32,7 @@ function detail(dir, ...args) {
 // Execute the workflow's actual shell body, replacing only the external GitHub client. The stub
 // captures its notes-file input instead of publishing anything. No credentials enter this fixture.
 function workflowBody() {
-  const text = readFileSync(join(root, '.github/workflows/changesets.yml'), 'utf8');
+  const text = readFileSync(join(root, '.github/workflows/changesets.yml.disabled'), 'utf8');
   const step = text.indexOf('      - name: Cut the GitHub Release\n');
   if (step < 0) throw new Error('release step missing');
   const marker = '        run: |\n';
@@ -174,7 +174,7 @@ try {
   const range = fixture(`## ${version}\n\n- Current change.\n\n## 9.8.6\n\n- Previously unannounced change.\n\n## 9.8.5\n\n- Already announced change.\n`);
   const ranged = workflow(range, 'v9.8.5');
   suite.check('the actual workflow includes skipped versions and excludes the previous release', ranged.status === 0 && ranged.notes?.includes('Previously unannounced change.') && !ranged.notes?.includes('Already announced change.'));
-  const release = parse(readFileSync(join(root, '.github/workflows/changesets.yml'), 'utf8'));
+  const release = parse(readFileSync(join(root, '.github/workflows/changesets.yml.disabled'), 'utf8'));
   const steps = release.jobs['verify-install'].steps;
   const setup = steps.findIndex(step => step.uses?.startsWith('pnpm/action-setup@'));
   const install = steps.findIndex(step => step.name === 'Install release-note dependencies');

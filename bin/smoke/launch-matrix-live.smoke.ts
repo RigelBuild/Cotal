@@ -41,6 +41,9 @@ const xdg = join(home, "xdg");
 const samePath = (a: string, b: string) => existsSync(a) && realpathSync(a) === realpathSync(b);
 const stubBin = join(home, "stub-bin");
 for (const dir of [join(root, ".cotal"), join(fgRoot, ".cotal"), xdg, stubBin]) mkdirSync(dir, { recursive: true });
+const priorUmask = process.umask(0o077);
+try { mkdirSync(join(xdg, "powershell"), { recursive: true }); }
+finally { process.umask(priorUmask); }
 const anchors = new Map([
   [root, recordSmokeSandbox({ root, cotalHome: join(home, ".cotal"), xdgConfigHome: xdg })],
   [fgRoot, recordSmokeSandbox({ root: fgRoot, cotalHome: join(home, ".cotal"), xdgConfigHome: xdg })],

@@ -12,7 +12,7 @@ const scratch = mkdtempSync(join(tmpdir(), "gate-invocations-"));
 const original = JSON.parse(readFileSync(join(repo, "package.json"), "utf8"));
 const copy = (file) => { mkdirSync(dirname(join(scratch, file)), { recursive: true }); cpSync(join(repo, file), join(scratch, file), { recursive: true }); };
 try {
-  for (const file of ["bin/smoke/gate-inventory.smoke.ts", "bin/smoke/ci-suites.mjs", "bin/smoke/ci-suites.txt", "bin/smoke/ci-suites.d", "bin/smoke/ci-suite-costs.json", "bin/smoke/platform-suites.txt", ".github/workflows"]) copy(file);
+  for (const file of ["bin/smoke/gate-inventory.smoke.ts", "bin/smoke/ci-suites.mjs", "bin/smoke/ci-quarantine.mjs", "bin/smoke/ci-suites.txt", "bin/smoke/ci-suites.d", "bin/smoke/ci-suite-costs.json", "bin/smoke/platform-suites.txt", ".github/workflows"]) copy(file);
   for (const file of execFileSync("git", ["ls-files", "*package.json"], { cwd: repo, encoding: "utf8" }).trim().split("\n")) {
     if (file !== "package.json") copy(file);
   }
