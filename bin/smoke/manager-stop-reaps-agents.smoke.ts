@@ -94,11 +94,11 @@ const must = (name: string, cond: boolean, extra?: unknown) => {
   pass++;
   console.log(`  ✓ ${name}`);
 };
-/** Twenty-three scenario cells run before the final count cell, which is the 24th call. EXPECTED_CELLS
- * counts all 24, and the count cell checks `pass + fail === EXPECTED_CELLS - 1`. The number is the run's
- * own count (`pass` before the count), not a static tally of the source. A throw lands in the catch as
- * a counted failure, so a partial run can never print the OK banner. */
-const EXPECTED_CELLS = 24;
+/** Twenty-four scenario cells run before the final count cell, which is the 25th call. EXPECTED_CELLS
+ * counts all 25, and the count cell checks `pass + fail === EXPECTED_CELLS - 1`. The number is measured
+ * from the body (ok and must calls), not a static guess. A throw lands in the catch as a counted failure,
+ * so a partial run can never print the OK banner. */
+const EXPECTED_CELLS = 25;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const until = async (cond: () => boolean, ms: number): Promise<boolean> => {
   const end = Date.now() + ms;
@@ -404,6 +404,10 @@ try {
   // lastSweep.completedAt on both its normal and its error exit.
   const sweepDone = await until(() => statusOf().staticReconciliation.lastSweep?.completedAt !== undefined, 15_000);
   ok("#4005: the next manager's static reconcile sweep finishes", sweepDone, { lastSweep: statusOf().staticReconciliation.lastSweep });
+  const sweepStatus = statusOf().staticReconciliation;
+  const seatAItem = sweepStatus.failures.find((f) => f.alias === "seatA");
+  console.log(`  · #4005 baseline: lastSweep.attempted=${sweepStatus.lastSweep?.attempted} seatA disposition=${seatAItem?.disposition} retainedReason=${seatAItem?.retainedReason}`);
+  ok("#4005: the sweep refuses the released seat as unprovable (disposition refused, retainedReason unprovable)", seatAItem?.disposition === "refused" && seatAItem?.retainedReason === "unprovable", { item: seatAItem });
   ok("#4005: the next manager keeps the unprovable released seat's minted credential (no retirement without proof)", credsA !== undefined && existsSync(credsA), { credsA });
   ok("#4005: the next manager keeps the released seat's runtime reference for a later adoption", existsSync(releasedRef), { releasedRef });
 
