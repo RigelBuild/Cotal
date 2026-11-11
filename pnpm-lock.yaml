@@ -6,7 +6,7 @@ settings:
 
 overrides:
   effect>toml: ^5.0.1
-  '@earendil-works/pi-coding-agent>undici': 8.12.3
+  '@earendil-works/pi-coding-agent>undici': 8.12.4
 
 patchedDependencies:
   '@changesets/cli@3.0.3': d4f20e400d1aedf5bf63f73fa94a783e2bd1db7d21cd9a4ffe239c7b66d74f3c
@@ -347,12 +347,12 @@ importers:
       '@nats-io/transport-node':
         specifier: ^3.4.0
         version: 3.4.0
-      esbuild:
-        specifier: ^0.28.0
-        version: 0.28.0
       tsx:
         specifier: ^4.22.4
         version: 4.22.4
+      zod:
+        specifier: ^4.6.7
+        version: 4.6.7
 
   extensions/connector-codex:
     devDependencies:
@@ -367,7 +367,7 @@ importers:
         version: link:../../packages/smoke-kit
       '@modelcontextprotocol/sdk':
         specifier: ^1.32.2
-        version: 1.32.2(zod@4.4.3)
+        version: 1.32.2(zod@4.6.7)
       '@nats-io/transport-node':
         specifier: ^3.4.0
         version: 3.4.0
@@ -384,17 +384,17 @@ importers:
         specifier: ^8.21.0
         version: 8.21.0
       zod:
-        specifier: ^4.4.3
-        version: 4.4.3
+        specifier: ^4.6.7
+        version: 4.6.7
 
   extensions/connector-core:
     dependencies:
       '@modelcontextprotocol/sdk':
         specifier: ^1.32.2
-        version: 1.32.2(zod@4.4.3)
+        version: 1.32.2(zod@4.6.7)
       zod:
-        specifier: ^4.4.3
-        version: 4.4.3
+        specifier: ^4.6.7
+        version: 4.6.7
     devDependencies:
       '@ag-ui/core':
         specifier: 0.0.57
@@ -436,8 +436,8 @@ importers:
         specifier: ^4.22.4
         version: 4.22.4
       zod:
-        specifier: ^4.4.3
-        version: 4.4.3
+        specifier: ^4.6.7
+        version: 4.6.7
 
   extensions/connector-jcode:
     dependencies:
@@ -446,7 +446,7 @@ importers:
         version: 1.1.0
       '@modelcontextprotocol/sdk':
         specifier: ^1.32.2
-        version: 1.32.2(zod@4.4.3)
+        version: 1.32.2(zod@4.6.7)
       smol-toml:
         specifier: ^1.8.0
         version: 1.8.0
@@ -473,8 +473,8 @@ importers:
         specifier: ^4.22.4
         version: 4.23.0
       zod:
-        specifier: ^4.4.3
-        version: 4.4.3
+        specifier: ^4.6.7
+        version: 4.6.7
 
   extensions/connector-opencode:
     devDependencies:
@@ -534,10 +534,10 @@ importers:
         version: link:../../packages/smoke-kit
       '@earendil-works/pi-ai':
         specifier: 0.79.10
-        version: 0.79.10(@modelcontextprotocol/sdk@1.32.2(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)
+        version: 0.79.10(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))(ws@8.21.0)(zod@4.6.7)
       '@earendil-works/pi-coding-agent':
         specifier: 0.79.10
-        version: 0.79.10(@modelcontextprotocol/sdk@1.32.2(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)
+        version: 0.79.10(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))(ws@8.21.0)(zod@4.6.7)
       '@earendil-works/pi-tui':
         specifier: 0.79.10
         version: 0.79.10
@@ -554,8 +554,8 @@ importers:
         specifier: ^1.1.0
         version: 1.3.6
       zod:
-        specifier: ^4.4.3
-        version: 4.4.3
+        specifier: ^4.6.7
+        version: 4.6.7
 
   extensions/tmux:
     devDependencies:
@@ -645,8 +645,8 @@ importers:
         specifier: ^2.9.0
         version: 2.9.0
       zod:
-        specifier: ^4.4.3
-        version: 4.4.3
+        specifier: ^4.6.7
+        version: 4.6.7
     devDependencies:
       '@cotal-ai/auth':
         specifier: workspace:*
@@ -713,6 +713,9 @@ importers:
       '@nats-io/transport-node':
         specifier: ^3.4.0
         version: 3.4.0
+      zod:
+        specifier: ^4.6.7
+        version: 4.6.7
     devDependencies:
       '@cotal-ai/auth':
         specifier: workspace:*
@@ -775,8 +778,8 @@ importers:
         specifier: ^2.9.0
         version: 2.9.0
       zod:
-        specifier: ^4.4.3
-        version: 4.4.3
+        specifier: ^4.6.7
+        version: 4.6.7
     devDependencies:
       '@cotal-ai/auth':
         specifier: workspace:*
@@ -807,7 +810,7 @@ importers:
         version: link:../../packages/smoke-kit
       '@modelcontextprotocol/sdk':
         specifier: 1.32.2
-        version: 1.32.2(zod@4.4.3)
+        version: 1.32.2(zod@4.6.7)
       '@nats-io/nats-core':
         specifier: ^3.4.0
         version: 3.4.0
@@ -1102,8 +1105,8 @@ importers:
         specifier: ^2.9.0
         version: 2.9.0
       zod:
-        specifier: ^4.4.3
-        version: 4.4.3
+        specifier: ^4.6.7
+        version: 4.6.7
     devDependencies:
       '@cotal-ai/smoke-kit':
         specifier: workspace:*
@@ -1113,7 +1116,7 @@ importers:
     dependencies:
       fumadocs-core:
         specifier: 16.17.9
-        version: 16.17.9(@modelcontextprotocol/server@2.4.0)(@types/estree-jsx@1.0.5)(@types/hast@3.0.5)(@types/mdast@4.0.4)(@types/react@19.2.17)(react-dom@19.3.1(react@19.3.1))(react@19.2.7)(zod@4.4.3)
+        version: 16.17.9(@modelcontextprotocol/server@2.4.0)(@types/estree-jsx@1.0.5)(@types/hast@3.0.5)(@types/mdast@4.0.4)(@types/react@19.2.17)(react-dom@19.3.1(react@19.3.1))(react@19.2.7)(zod@4.6.7)
       remark-gfm:
         specifier: ^4.0.1
         version: 4.0.1
@@ -6093,8 +6096,8 @@ packages:
     resolution: {integrity: sha512-mLyPQnHwUxaM/rideoK/+KL8DaAJLRl4aBCfmX444aCSLnIaomqPLtNRe2jdCYcsk5wZzXrDIQC8ZeYNRAYyIA==}
     engines: {node: '>=20.18.1'}
 
-  undici@8.12.3:
-    resolution: {integrity: sha512-+fdndUTwBP86cVjihTp21hZHo7d6oj1c/47XPA3lL8mM0XHs+C4EkcjmgRsFnFk2f/UONGDy9ItBItmXsLOQHw==}
+  undici@8.12.4:
+    resolution: {integrity: sha512-8Mx+uNKKER2bA4AdtedkqRbwUCIJFr2nJckXRe5yrDqzePqwLP7VNcctN8/XdmDSbF7mS+jJKIszlL+vbam1VA==}
     engines: {node: '>=22.19.0'}
 
   unicorn-magic@0.3.0:
@@ -6395,11 +6398,11 @@ snapshots:
       ansi-styles: 6.2.3
       is-fullwidth-code-point: 5.1.0
 
-  '@anthropic-ai/sdk@0.91.1(zod@4.4.3)':
+  '@anthropic-ai/sdk@0.91.1(zod@4.6.7)':
     dependencies:
       json-schema-to-ts: 3.1.1
     optionalDependencies:
-      zod: 4.4.3
+      zod: 4.6.7
 
   '@asamuzakjp/css-color@5.1.11':
     dependencies:
@@ -7058,9 +7061,9 @@ snapshots:
 
   '@dotenvx/primitives@0.8.0': {}
 
-  '@earendil-works/pi-agent-core@0.79.10(@modelcontextprotocol/sdk@1.32.2(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)':
+  '@earendil-works/pi-agent-core@0.79.10(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))(ws@8.21.0)(zod@4.6.7)':
     dependencies:
-      '@earendil-works/pi-ai': 0.79.10(@modelcontextprotocol/sdk@1.32.2(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)
+      '@earendil-works/pi-ai': 0.79.10(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))(ws@8.21.0)(zod@4.6.7)
       ignore: 7.0.5
       typebox: 1.1.38
       yaml: 2.9.0
@@ -7072,17 +7075,17 @@ snapshots:
       - ws
       - zod
 
-  '@earendil-works/pi-ai@0.79.10(@modelcontextprotocol/sdk@1.32.2(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)':
+  '@earendil-works/pi-ai@0.79.10(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))(ws@8.21.0)(zod@4.6.7)':
     dependencies:
-      '@anthropic-ai/sdk': 0.91.1(zod@4.4.3)
+      '@anthropic-ai/sdk': 0.91.1(zod@4.6.7)
       '@aws-sdk/client-bedrock-runtime': 3.1048.0
-      '@google/genai': 1.52.0(@modelcontextprotocol/sdk@1.32.2(zod@4.4.3))
+      '@google/genai': 1.52.0(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))
       '@mistralai/mistralai': 2.2.6(@opentelemetry/api@1.9.0)
       '@opentelemetry/api': 1.9.0
       '@smithy/node-http-handler': 4.7.3
       http-proxy-agent: 7.0.2
       https-proxy-agent: 7.0.6
-      openai: 6.26.0(ws@8.21.0)(zod@4.4.3)
+      openai: 6.26.0(ws@8.21.0)(zod@4.6.7)
       partial-json: 0.1.7
       typebox: 1.1.38
     transitivePeerDependencies:
@@ -7093,10 +7096,10 @@ snapshots:
       - ws
       - zod
 
-  '@earendil-works/pi-coding-agent@0.79.10(@modelcontextprotocol/sdk@1.32.2(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)':
+  '@earendil-works/pi-coding-agent@0.79.10(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))(ws@8.21.0)(zod@4.6.7)':
     dependencies:
-      '@earendil-works/pi-agent-core': 0.79.10(@modelcontextprotocol/sdk@1.32.2(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)
-      '@earendil-works/pi-ai': 0.79.10(@modelcontextprotocol/sdk@1.32.2(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)
+      '@earendil-works/pi-agent-core': 0.79.10(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))(ws@8.21.0)(zod@4.6.7)
+      '@earendil-works/pi-ai': 0.79.10(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))(ws@8.21.0)(zod@4.6.7)
       '@earendil-works/pi-tui': 0.79.10
       '@silvia-odwyer/photon-node': 0.3.4
       chalk: 5.6.2
@@ -7111,7 +7114,7 @@ snapshots:
       proper-lockfile: 4.1.2
       semver: 7.8.0
       typebox: 1.1.38
-      undici: 8.12.3
+      undici: 8.12.4
       yaml: 2.9.0
     optionalDependencies:
       '@mariozechner/clipboard': 0.3.9
@@ -7349,14 +7352,14 @@ snapshots:
       '@shikijs/types': 3.23.0
       '@shikijs/vscode-textmate': 10.1.0
 
-  '@google/genai@1.52.0(@modelcontextprotocol/sdk@1.32.2(zod@4.4.3))':
+  '@google/genai@1.52.0(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))':
     dependencies:
       google-auth-library: 10.9.0
       p-retry: 4.6.2
       protobufjs: 7.6.5
       ws: 8.21.0
     optionalDependencies:
-      '@modelcontextprotocol/sdk': 1.32.2(zod@4.4.3)
+      '@modelcontextprotocol/sdk': 1.32.2(zod@4.6.7)
     transitivePeerDependencies:
       - bufferutil
       - supports-color
@@ -7485,8 +7488,8 @@ snapshots:
     dependencies:
       '@opentelemetry/semantic-conventions': 1.41.1
       ws: 8.21.0
-      zod: 4.4.3
-      zod-to-json-schema: 3.25.2(zod@4.4.3)
+      zod: 4.6.7
+      zod-to-json-schema: 3.25.2(zod@4.6.7)
     optionalDependencies:
       '@opentelemetry/api': 1.9.0
     transitivePeerDependencies:
@@ -7496,28 +7499,6 @@ snapshots:
   '@modelcontextprotocol/core@2.4.0':
     dependencies:
       zod: 4.4.3
-
-  '@modelcontextprotocol/sdk@1.32.2(zod@4.4.3)':
-    dependencies:
-      '@hono/node-server': 1.19.14(hono@4.13.17)
-      ajv: 8.20.0
-      ajv-formats: 3.0.1
-      content-type: 1.0.5
-      cors: 2.8.6
-      cross-spawn: 7.0.6
-      eventsource: 3.0.7
-      eventsource-parser: 3.1.0
-      express: 5.2.1
-      express-rate-limit: 8.5.2(express@5.2.1)
-      hono: 4.13.17
-      jose: 6.2.3
-      json-schema-typed: 8.0.2
-      pkce-challenge: 5.0.1
-      raw-body: 3.0.2
-      zod: 4.4.3
-      zod-to-json-schema: 3.25.2(zod@4.4.3)
-    transitivePeerDependencies:
-      - supports-color
 
   '@modelcontextprotocol/sdk@1.32.2(zod@4.6.7)':
     dependencies:
@@ -8573,7 +8554,7 @@ snapshots:
       tsconfig-paths: 4.2.0
       type-fest: 4.41.0
       undici: 7.30.2
-      zod: 4.4.3
+      zod: 4.6.7
     transitivePeerDependencies:
       - supports-color
 
@@ -9635,7 +9616,7 @@ snapshots:
   fsevents@2.3.3:
     optional: true
 
-  fumadocs-core@16.17.9(@modelcontextprotocol/server@2.4.0)(@types/estree-jsx@1.0.5)(@types/hast@3.0.5)(@types/mdast@4.0.4)(@types/react@19.2.17)(react-dom@19.3.1(react@19.3.1))(react@19.2.7)(zod@4.4.3):
+  fumadocs-core@16.17.9(@modelcontextprotocol/server@2.4.0)(@types/estree-jsx@1.0.5)(@types/hast@3.0.5)(@types/mdast@4.0.4)(@types/react@19.2.17)(react-dom@19.3.1(react@19.3.1))(react@19.2.7)(zod@4.6.7):
     dependencies:
       '@fumari/image-size': 0.1.1
       estree-util-value-to-estree: 3.5.0
@@ -9664,7 +9645,7 @@ snapshots:
       '@types/react': 19.2.17
       react: 19.2.7
       react-dom: 19.3.1(react@19.3.1)
-      zod: 4.4.3
+      zod: 4.6.7
     transitivePeerDependencies:
       - supports-color
 
@@ -10821,10 +10802,10 @@ snapshots:
       is-docker: 2.2.1
       is-wsl: 2.2.0
 
-  openai@6.26.0(ws@8.21.0)(zod@4.4.3):
+  openai@6.26.0(ws@8.21.0)(zod@4.6.7):
     optionalDependencies:
       ws: 8.21.0
-      zod: 4.4.3
+      zod: 4.6.7
 
   ora@8.2.0:
     dependencies:
@@ -11345,7 +11326,7 @@ snapshots:
       tsconfig-paths: 4.2.0
       undici: 7.30.2
       validate-npm-package-name: 7.0.2
-      zod: 4.4.3
+      zod: 4.6.7
     transitivePeerDependencies:
       - babel-plugin-macros
       - supports-color
@@ -11634,7 +11615,7 @@ snapshots:
 
   undici@7.30.2: {}
 
-  undici@8.12.3: {}
+  undici@8.12.4: {}
 
   unicorn-magic@0.3.0: {}
 
@@ -11810,10 +11791,6 @@ snapshots:
   yoga-layout@3.2.1: {}
 
   zbsearch@4.0.1: {}
-
-  zod-to-json-schema@3.25.2(zod@4.4.3):
-    dependencies:
-      zod: 4.4.3
 
   zod-to-json-schema@3.25.2(zod@4.6.7):
     dependencies:

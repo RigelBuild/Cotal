@@ -16,4 +16,4 @@ patchedDependencies:
   '@changesets/cli@3.0.3': patches/@changesets__cli@3.0.3.patch
 overrides:
   effect>toml: ^5.0.1
-  "@earendil-works/pi-coding-agent>undici": "8.12.3"
+  "@earendil-works/pi-coding-agent>undici": "8.12.4"
