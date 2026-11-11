@@ -80,8 +80,8 @@ let
       crypto.createHash("sha256").update("ok").digest("hex");
     '
   '';
-  # The single source for every store path the image ships: the streamed contents, the entrypoint,
-  # and the etc files. The closure guard reads this same list, so extending the image extends it.
+  # The roots the closure guard scans; contents is derived from them. Anything config interpolates
+  # (Entrypoint, Env, Cmd) must also be listed here, or it ships unguarded.
   # etcFiles is copied into the root filesystem, not streamed as contents (a store link there would
   # be an /etc symlink into the store, which containerd refuses), so contents filters it out.
   imageRoots = [
