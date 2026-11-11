@@ -24,7 +24,8 @@
  */
 import { deferredSeatIn, deferredSeatLookupFailureMessage, deferredSeatLookupIn, deferredSeatMessage } from "../src/commands/agents.js";
 import { allowlistSetOptions, allowlistSetPreflight, allowlistStatusAmbiguity } from "../src/commands/allowlist.js";
-import { locateSeatIn, seatMissRefusal, type SeatLocation, type ScatterInstanceReply, managersByInstance } from "@cotal-ai/workspace/control";
+import { EP_COMMANDS, locateSeatIn, seatMissRefusal, type SeatLocation, type ScatterInstanceReply, managersByInstance } from "@cotal-ai/workspace/control";
+import { managerClusterDocument } from "../../manager/src/manager-service-contract.js";
 import { AgentManagerUnsettled, managerChoiceFailure } from "../src/lib/manager-choice.js";
 
 let pass = 0, fail = 0;
@@ -91,6 +92,13 @@ console.log("\n5. allowlist-set's multi-manager target and settle deadline");
   const unpinned = allowlistSetOptions(undefined);
   check("allowlist-set waits 120 seconds and retains an explicit instance pin", pinned.timeoutMs === 120_000 && pinned.pin?.instanceId === A);
   check("the single-manager path stays unpinned with the same settle window", unpinned.timeoutMs === 120_000 && unpinned.pin === undefined);
+  const commands = managerClusterDocument().commands;
+  const missingContracts = Object.entries(EP_COMMANDS).flatMap(([op, mapping]) => {
+    const contract = commands.find((row) => row.name === mapping.command);
+    return contract === undefined || contract.targeted !== (mapping.targeted === true || mapping.self === true) ? [{ op, mapping, contract: contract?.name, targeted: contract?.targeted }] : [];
+  });
+  check("every manager op maps to a contract command with matching targeting", missingContracts.length === 0, missingContracts);
+  check("CLI allowlistSet and attestGone ops have mappings", EP_COMMANDS.allowlistSet?.command === "allowlist-set" && EP_COMMANDS.attestGone?.command === "attest-gone", { allowlistSet: EP_COMMANDS.allowlistSet, attestGone: EP_COMMANDS.attestGone });
 }
 
 
@@ -177,7 +185,7 @@ console.log("5. a plain stop on a deferred seat names the seat's remedy, not abs
 }
 // DECLARED, not implied: a suite that ends early reddens no line, and `fail === 0` with a zero exit
 // reads as a pass in every one of those ways out. The count is checked however the process leaves.
-const EXPECTED_CELLS = 35;
+const EXPECTED_CELLS = 37;
 process.on("exit", () => {
   const ran = pass + fail;
   if (ran !== EXPECTED_CELLS) {
