@@ -57,7 +57,7 @@
     "@nats-io/transport-node": "^3.4.0",
     "esbuild": "^0.28.0",
     "typebox": "^1.1.0",
-    "zod": "^4.4.3"
+    "zod": "^4.6.7"
   },
   "files": [
     "dist"
