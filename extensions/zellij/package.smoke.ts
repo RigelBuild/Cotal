@@ -369,17 +369,20 @@ await withFakeZellij("confirm", async (logPath, session) => {
     process.cwd(),
   );
   await waitForCalls(logPath, (calls) => calls.some((args) => args[3] === "write" && args.includes("13")), 10_000);
-  // The watch polls every 250 ms (startup-confirm.ts POLL_MS). Wait for two further poll cycles after
-  // the first Enter, so a duplicate Enter on a later poll is logged before the count. Event-bounded:
-  // the wait ends when the call log shows a second Enter, or when two polls have passed without one.
-  const firstEnter = readCalls(logPath).filter((args) => args[3] === "write" && args.includes("13")).length;
-  await waitForCalls(logPath, (calls) => calls.filter((args) => args[3] === "write" && args.includes("13")).length > firstEnter, 2 * 250 + 250);
+  // Event-bounded, not timed. Each dump-screen is one watch poll, and the fake logs it. After the
+  // first Enter, wait for one further poll to read the pane: a duplicate Enter is written by the
+  // poll that follows the first, so it is in the log once that poll has run. The wait ends on that
+  // read, never on a deadline. The watch then stops, and the count reads the log, which the stopped
+  // watch can no longer extend.
+  const screenCount = (): number => Number(readFileSync(`${logPath}.screen-count`, "utf8") || "0");
+  const enterCount = (calls: string[][]): number => calls.filter((args) => args[3] === "write" && args.includes("13")).length;
+  const readsAtFirstEnter = screenCount();
+  await waitForCalls(logPath, () => screenCount() > readsAtFirstEnter, 10_000);
   const calls = readCalls(logPath);
   handle.stop({ graceful: false });
   check(
     "confirm sends one Enter only after the pane displays the prompt",
-    calls.filter((args) => args[3] === "write" && args.includes("13")).length === 1 &&
-      calls.some((args) => args[3] === "dump-screen"),
+    enterCount(calls) === 1 && calls.some((args) => args[3] === "dump-screen"),
   );
 });
 await withFakeZellij("confirm", async (logPath, session) => {
