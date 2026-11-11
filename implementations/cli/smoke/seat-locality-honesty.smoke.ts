@@ -92,11 +92,13 @@ console.log("\n5. allowlist-set's multi-manager target and settle deadline");
   const unpinned = allowlistSetOptions(undefined);
   check("allowlist-set waits 120 seconds and retains an explicit instance pin", pinned.timeoutMs === 120_000 && pinned.pin?.instanceId === A);
   check("the single-manager path stays unpinned with the same settle window", unpinned.timeoutMs === 120_000 && unpinned.pin === undefined);
-  const allowlistMapping = EP_COMMANDS.allowlistSet;
-  const allowlistContract = managerClusterDocument().commands.find((command) => command.name === "allowlist-set");
-  check("allowlistSet maps to the untargeted allowlist-set manager contract",
-    allowlistMapping?.command === "allowlist-set" && allowlistMapping.targeted !== true && allowlistContract?.targeted === false,
-    { mapping: allowlistMapping, contract: allowlistContract?.name });
+  const commands = managerClusterDocument().commands;
+  const missingContracts = Object.entries(EP_COMMANDS).flatMap(([op, mapping]) => {
+    const contract = commands.find((row) => row.name === mapping.command);
+    return contract === undefined || contract.targeted !== (mapping.targeted === true) ? [{ op, mapping, contract: contract?.name, targeted: contract?.targeted }] : [];
+  });
+  check("every manager op maps to a contract command with matching targeting", missingContracts.length === 0, missingContracts);
+  check("CLI allowlistSet and attestGone ops have mappings", EP_COMMANDS.allowlistSet?.command === "allowlist-set" && EP_COMMANDS.attestGone?.command === "attest-gone", { allowlistSet: EP_COMMANDS.allowlistSet, attestGone: EP_COMMANDS.attestGone });
 }
 
 
@@ -183,7 +185,7 @@ console.log("5. a plain stop on a deferred seat names the seat's remedy, not abs
 }
 // DECLARED, not implied: a suite that ends early reddens no line, and `fail === 0` with a zero exit
 // reads as a pass in every one of those ways out. The count is checked however the process leaves.
-const EXPECTED_CELLS = 36;
+const EXPECTED_CELLS = 37;
 process.on("exit", () => {
   const ran = pass + fail;
   if (ran !== EXPECTED_CELLS) {
