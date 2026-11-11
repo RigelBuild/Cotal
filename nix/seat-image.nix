@@ -37,24 +37,11 @@ let
     find $out/lib/cotal -xtype l -delete
   '';
 
-  # nodejs-slim_24 bakes build-time store paths into bin/node and config.gypi: its own path, twelve
-  # -dev outputs and bash (reached through icu4c-dev and zstd-bin). Nothing loads them at runtime,
-  # so strip them from a copy. The checks below fail the build if any of them comes back.
-  unwantedRefs = [
-    pkgs.bashNonInteractive
-    pkgs.brotli.dev
-    pkgs.c-ares.dev
-    pkgs.icu78.dev
-    pkgs.libuv.dev
-    pkgs.llhttp.dev
-    pkgs.ngtcp2.dev
-    pkgs.nghttp2.dev
-    pkgs.nghttp3.dev
-    pkgs.openssl.dev
-    pkgs.sqlite.dev
-    pkgs.zlib.dev
-    pkgs.zstd.dev
-  ];
+  # Every -dev output among nodejs-slim_24's build inputs, plus bash. Derived rather than kept by
+  # hand, so a nixpkgs bump that adds a -dev input reaches the closure check below.
+  unwantedRefs =
+    map (p: p.dev) (builtins.filter (p: p ? dev) pkgs.nodejs-slim_24.buildInputs)
+    ++ [ pkgs.bashNonInteractive ];
   stripArgs = pkgs.lib.concatMapStringsSep " " (p: "-t ${p}") (unwantedRefs ++ [ pkgs.nodejs-slim_24 pkgs.uvwasi ]);
   # uvwasi's propagated-build-inputs names libuv-dev. bin/node loads uvwasi's lib through RUNPATH,
   # so point RUNPATH at a copy without that file. The copy keeps the store name, so the RUNPATH
@@ -64,22 +51,44 @@ let
     chmod -R u+w $out
     find $out -type f -exec ${pkgs.removeReferencesTo}/bin/remove-references-to -t ${pkgs.uvwasi} -t ${pkgs.libuv.dev} {} +
   '';
+  # Strips node's own store path too: bin/node and config.gypi embed it, and it pulls the unwanted
+  # outputs back in. Fails closed: refuses to continue if uvwasi is not in RUNPATH, and smoke-runs
+  # the result so a broken RUNPATH or missing Intl data fails the build.
   nodeTrimmed = pkgs.runCommand "nodejs-slim-24-trimmed" {
     nativeBuildInputs = [ pkgs.patchelf ];
-    disallowedRequisites = unwantedRefs;
+    disallowedRequisites = unwantedRefs ++ [ pkgs.nodejs-slim_24 pkgs.uvwasi ];
   } ''
     cp -R ${pkgs.nodejs-slim_24} $out
     chmod -R u+w $out
     old="${pkgs.uvwasi}"
     new="${uvwasiTrimmed}"
     rpath="$(patchelf --print-rpath $out/bin/node)"
+    case ":$rpath:" in
+      *":$old/lib:"*) ;;
+      *)
+        echo "error: $old/lib is not in the node RUNPATH; the uvwasi swap would do nothing" >&2
+        exit 1
+        ;;
+    esac
     patchelf --set-rpath "''${rpath//"$old"/"$new"}" $out/bin/node
     find $out -type f -exec ${pkgs.removeReferencesTo}/bin/remove-references-to ${stripArgs} {} +
+    $out/bin/node -e '
+      const zlib = require("zlib");
+      const crypto = require("crypto");
+      if (new Intl.NumberFormat("de-DE").format(1234.5) !== "1.234,5") throw new Error("Intl de-DE");
+      if (zlib.gunzipSync(zlib.gzipSync("ok")).toString() !== "ok") throw new Error("zlib");
+      crypto.createHash("sha256").update("ok").digest("hex");
+    '
   '';
-  # Guards the whole image contents, not only node: a new dependency that brings bash or a -dev
-  # output fails the build here.
-  imageContents = pkgs.runCommand "seat-image-contents" { disallowedRequisites = unwantedRefs; } ''
-    echo ${nodeTrimmed} ${runtime} ${etcFiles} > $out
+  # Checks the whole image closure, not only node: a -dev output or bash fails the image build even
+  # if a disallowedRequisites list missed it. The pattern is -bash- because store paths start with a hash.
+  imageClosure = pkgs.closureInfo { rootPaths = [ nodeTrimmed runtime etcFiles ]; };
+  imageContents = pkgs.runCommand "seat-image-contents" { } ''
+    if grep -E -- '-dev($|-)|-bash-' ${imageClosure}/store-paths; then
+      echo "error: the seat image closure holds a -dev output or bash" >&2
+      exit 1
+    fi
+    touch $out
   '';
 
   # The entrypoint is node running the runtime's cotal.js directly. No shell wrapper, so no bash
