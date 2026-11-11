@@ -24,7 +24,8 @@
  */
 import { deferredSeatIn, deferredSeatLookupFailureMessage, deferredSeatLookupIn, deferredSeatMessage } from "../src/commands/agents.js";
 import { allowlistSetOptions, allowlistSetPreflight, allowlistStatusAmbiguity } from "../src/commands/allowlist.js";
-import { locateSeatIn, seatMissRefusal, type SeatLocation, type ScatterInstanceReply, managersByInstance } from "@cotal-ai/workspace/control";
+import { EP_COMMANDS, locateSeatIn, seatMissRefusal, type SeatLocation, type ScatterInstanceReply, managersByInstance } from "@cotal-ai/workspace/control";
+import { managerClusterDocument } from "../../manager/src/manager-service-contract.js";
 import { AgentManagerUnsettled, managerChoiceFailure } from "../src/lib/manager-choice.js";
 
 let pass = 0, fail = 0;
@@ -91,6 +92,11 @@ console.log("\n5. allowlist-set's multi-manager target and settle deadline");
   const unpinned = allowlistSetOptions(undefined);
   check("allowlist-set waits 120 seconds and retains an explicit instance pin", pinned.timeoutMs === 120_000 && pinned.pin?.instanceId === A);
   check("the single-manager path stays unpinned with the same settle window", unpinned.timeoutMs === 120_000 && unpinned.pin === undefined);
+  const allowlistMapping = EP_COMMANDS.allowlistSet;
+  const allowlistContract = managerClusterDocument().commands.find((command) => command.name === "allowlist-set");
+  check("allowlistSet maps to the untargeted allowlist-set manager contract",
+    allowlistMapping?.command === "allowlist-set" && allowlistMapping.targeted !== true && allowlistContract?.targeted === false,
+    { mapping: allowlistMapping, contract: allowlistContract?.name });
 }
 
 
@@ -177,7 +183,7 @@ console.log("5. a plain stop on a deferred seat names the seat's remedy, not abs
 }
 // DECLARED, not implied: a suite that ends early reddens no line, and `fail === 0` with a zero exit
 // reads as a pass in every one of those ways out. The count is checked however the process leaves.
-const EXPECTED_CELLS = 35;
+const EXPECTED_CELLS = 36;
 process.on("exit", () => {
   const ran = pass + fail;
   if (ran !== EXPECTED_CELLS) {
