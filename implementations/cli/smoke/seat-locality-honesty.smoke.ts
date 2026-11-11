@@ -95,7 +95,7 @@ console.log("\n5. allowlist-set's multi-manager target and settle deadline");
   const commands = managerClusterDocument().commands;
   const missingContracts = Object.entries(EP_COMMANDS).flatMap(([op, mapping]) => {
     const contract = commands.find((row) => row.name === mapping.command);
-    return contract === undefined || contract.targeted !== (mapping.targeted === true) ? [{ op, mapping, contract: contract?.name, targeted: contract?.targeted }] : [];
+    return contract === undefined || contract.targeted !== (mapping.targeted === true || mapping.self === true) ? [{ op, mapping, contract: contract?.name, targeted: contract?.targeted }] : [];
   });
   check("every manager op maps to a contract command with matching targeting", missingContracts.length === 0, missingContracts);
   check("CLI allowlistSet and attestGone ops have mappings", EP_COMMANDS.allowlistSet?.command === "allowlist-set" && EP_COMMANDS.attestGone?.command === "attest-gone", { allowlistSet: EP_COMMANDS.allowlistSet, attestGone: EP_COMMANDS.attestGone });
