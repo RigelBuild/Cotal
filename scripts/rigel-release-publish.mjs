@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { isMainEntry } from './main-entry.mjs';
 
-const assets = ['cotal-runtime-linux-x64.tar.gz', 'cotal-runtime-darwin-arm64.tar.gz', 'SHA256SUMS'];
+const assets = ['cotal-runtime-linux-x64.tar.gz', 'cotal-runtime-linux-arm64.tar.gz', 'cotal-runtime-darwin-arm64.tar.gz', 'SHA256SUMS'];
 
 function runGh(args) {
   const result = spawnSync('gh', args, { encoding: 'utf8' });
