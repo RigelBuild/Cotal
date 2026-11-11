@@ -33,6 +33,17 @@ function readCalls(logPath: string): string[][] {
     .map((line) => JSON.parse(line) as string[]);
 }
 
+// Waits until the fake's call log satisfies `done`, or the deadline passes. The confirm watch polls
+// the pane on a fixed interval, and each read is a real zellij spawn, so a fixed sleep races a slow
+// host. The assertions still decide pass or fail once this returns.
+async function waitForCalls(logPath: string, done: (calls: string[][]) => boolean, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (done(readCalls(logPath))) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  }
+}
+
 async function withFakeZellij(
   mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable" | "slow-probe" | "no-client" | "slow-client" | "clients-error" | "clients-flaky" | "handoff",
   run: (logPath: string, session: string) => void | Promise<void>,
@@ -357,7 +368,7 @@ await withFakeZellij("confirm", async (logPath, session) => {
     { command: "sleep", args: ["600"], confirm: "Continue?" },
     process.cwd(),
   );
-  await new Promise<void>((resolve) => setTimeout(resolve, 850));
+  await waitForCalls(logPath, (calls) => calls.some((args) => args[3] === "write" && args.includes("13")), 10_000);
   const calls = readCalls(logPath);
   handle.stop({ graceful: false });
   check(
@@ -380,7 +391,7 @@ await withFakeZellij("confirm", async (logPath, session) => {
   );
   await new Promise<void>((resolve) => setTimeout(resolve, 1_400));
   process.env.COTAL_ZELLIJ_TEST_SCREEN = "Continue?";
-  await new Promise<void>((resolve) => setTimeout(resolve, 900));
+  await waitForCalls(logPath, (calls) => calls.some((args) => args[3] === "write" && args.includes("13")), 10_000);
   const calls = readCalls(logPath);
   handle.stop({ graceful: false });
   check(
