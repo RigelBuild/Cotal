@@ -895,19 +895,27 @@ assert.equal(typeof seat.processStatFields, "function");
 assert.equal(process.env.COTAL_RUN, "probe-3152-real");
 delete process.env.COTAL_RUN;
 
-const sleepBin = cp.execFileSync("sh", ["-c", "command -v sleep"], { encoding: "utf8" }).trim();
-const commBin = path.join(${JSON.stringify(probeDir)}, "x) y (z");
-fs.copyFileSync(sleepBin, commBin);
-fs.chmodSync(commBin, 0o755);
-
-const decoy = cp.spawn(sleepBin, ["300"], { stdio: "ignore", env: { PATH: process.env.PATH ?? "", COTAL_RUN: "probe-3152-decoy" } });
-const real = cp.spawn(commBin, ["300"], { stdio: "ignore", env: { PATH: process.env.PATH ?? "" } });
+const heldScript = "process.title = process.argv[1]; process.stdin.resume(); process.stdout.write('READY'); process.stdin.on('end', () => process.exit(0));";
+const spawnHeld = (title, env) => {
+  const child = cp.spawn(process.execPath, ["-e", heldScript, title], { stdio: ["pipe", "pipe", "ignore"], env });
+  const readyGate = Promise.withResolvers();
+  const exitGate = Promise.withResolvers();
+  child.stdout.once("data", (data) => data.toString() === "READY" ? readyGate.resolve() : readyGate.reject(new Error("unexpected probe readiness output")));
+  child.once("error", (error) => { readyGate.reject(error); exitGate.resolve(); });
+  child.once("exit", (code, signal) => {
+    exitGate.resolve();
+    readyGate.reject(new Error("probe " + title + " exited before ready: " + code + " " + signal));
+  });
+  return { child, ready: readyGate.promise, exited: exitGate.promise };
+};
+const { child: decoy, ready: decoyReady, exited: decoyExited } = spawnHeld("stat-decoy", { PATH: process.env.PATH ?? "", COTAL_RUN: "probe-3152-decoy" });
+const { child: real, ready: realReady, exited: realExited } = spawnHeld("x) y (z", { PATH: process.env.PATH ?? "" });
 const P = real.pid;
 const Q = decoy.pid;
-assert.ok(P && Q);
 
 try {
-  await new Promise((r) => setTimeout(r, 200));
+  await Promise.all([decoyReady, realReady]);
+  assert.ok(P && Q);
   const rawStat = fs.readFileSync(\`/proc/\${P}/stat\`, "utf8");
   assert.ok(rawStat.includes("(x) y (z)"), rawStat);
   const expectedToken = rawStat.slice(rawStat.lastIndexOf(") ") + 2).trim().split(/\\s+/)[19];
@@ -1048,8 +1056,9 @@ try {
   assert.equal(after.verdict, "live");
   assert.equal(after.runMarker, "probe-3152-real");
 } finally {
-  try { real.kill("SIGKILL"); } catch {}
-  try { decoy.kill("SIGKILL"); } catch {}
+  real.stdin.end();
+  decoy.stdin.end();
+  await Promise.all([realExited, decoyExited]);
 }
 `,
     );
