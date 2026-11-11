@@ -184,6 +184,13 @@ class FakeMesh {
     return undefined;
   }
 
+  // The lost-steer driver claims a surfaced run turn before dispatch. This fake grants every claim.
+  claimTurns(_goalIds: readonly string[]): boolean {
+    return true;
+  }
+
+  releaseTurns(_goalIds: readonly string[]): void {}
+
   commitSurfacedTurns(goalIds: readonly string[]): void {
     throw new Error(`FakeMesh: no turn was surfaced, so nothing can be committed: ${goalIds.join(",")}`);
   }
