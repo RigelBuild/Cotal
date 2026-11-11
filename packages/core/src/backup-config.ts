@@ -190,8 +190,6 @@ export type CanonicalBackupStreamConfig = Pick<
   compression: typeof StoreCompression.None;
 };
 
-/** JetStream client default publish timeout (DM and anycast). The duplicate window must cover it. */
-export const JETSTREAM_PUBLISH_TIMEOUT_MS = 5_000;
 const DEFAULT_DUPLICATE_WINDOW_MS = 2 * 60 * 1000;
 const DEFAULT_DUPLICATE_WINDOW = nanos(DEFAULT_DUPLICATE_WINDOW_MS);
 /** The count a new space's INBOX and DLV streams keep per subject, where a subject is one agent

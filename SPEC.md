@@ -836,7 +836,7 @@ credential diverge (§2): the principal keys subjects/durables/presence; the con
 | `admin` | none | whole space live tap plus DM history | plaintext god-view, opt-in |
 | `transfer-writer` | one carried transcript's chunk and meta subjects in one manager instance's transfer bucket (§8) | a last-message Direct Get on those two subjects | one-shot per CLI call, minted after the transcript is hashed; no consumer and no other object |
 | `dm-reader` | `CONSUMER.INFO` and `CONSUMER.MSG.NEXT` on its own lifecycle-scoped `dm_…`, and its `$JS.ACK` subtree | own `_INBOX_<connId>.>` | no message publish, presence, channel, CHAT, `dlv_`, `$JS.API.INFO` or stream INFO row; bound to the bearer's expiry |
-| `webhook-publisher` | `inst.*.*.<owner>.<actor>` and `svc.*.<role>.<owner>.<actor>` | live presence roster; own `_INBOX_<connId>.>` replies | dedicated integration publisher; no chat, channel registry, control or presence writes |
+| `webhook-publisher` | `inst.*.*.<owner>.<actor>` and `svc.*.<owner>.<actor>` | live presence roster; own `_INBOX_<connId>.>` replies | dedicated integration publisher; no chat, channel registry, control or presence writes |
 | `transfer-reader` | the stock delete marker on its own transfer bucket's meta subjects | its own `OBJ_cotal_xfer_<space>_<instanceId>` stream: info, message get, its push consumer, purge | one-shot per `transcript-receive` or sweep; no other instance's bucket |
 | scoped host profiles | least-privilege per function | least-privilege per function | The former allow-all `manager` is **deleted**; its host duties split into scoped, single-function creds (`supervisor`, `provisioner`, `delivery`, `membership-rw`, `operator`, `purger`, `teardown`, `channel-writer`, …). No allow-all credential exists. Appendix B summarizes them; the concrete grant lists are **generated from the §13.9 ownership matrix** into `provision.ts` (the matrix is the single oracle; `provision.ts` is its artifact, Appendix B its summary). |
 
@@ -6900,7 +6900,7 @@ Admin still has no application publish grants.
 `pub.allow` permits self-attributed DM and anycast publication, plus a batched Direct Get of live presence:
 
 - `P.inst.*.*.<owner>.<actor>`
-- `P.svc.*.<role>.<owner>.<actor>`
+- `P.svc.*.<owner>.<actor>`
 - `$JS.API.INFO`
 - `$JS.API.STREAM.INFO.<KV>`
 - `$JS.API.DIRECT.GET.<KV>`

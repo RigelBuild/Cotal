@@ -11,7 +11,6 @@ import { connect, credsAuthenticator } from "@nats-io/transport-node";
 import { jetstream, jetstreamManager } from "@nats-io/jetstream";
 import { Kvm } from "@nats-io/kv";
 import {
-  JETSTREAM_PUBLISH_TIMEOUT_MS,
   anycastSubject,
   canonicalBackupStreamConfig,
   channelBucket,
@@ -49,8 +48,9 @@ writeFileSync(join(dir, "server.conf"), serverConfig(auth, [auth], { transport: 
 const broker = spawn("nats-server", ["-c", join(dir, "server.conf")], { stdio: "ignore" });
 const releaseBroker = teardownOnSignal(broker, dir);
 
-/** DM and anycast publishes take the JetStream client's default timeout, the value this suite pins. */
-const PUBLISH_TIMEOUT_MS = JETSTREAM_PUBLISH_TIMEOUT_MS;
+/** DM and anycast publishes use `jetstream(nc)` with no override (endpoint.ts), so they take the
+ *  JetStream client's default request timeout, 5000 ms (`jsbaseclient_api.js`). */
+const PUBLISH_TIMEOUT_MS = 5_000;
 
 /** Resolve after `ms`. */
 function wait(ms: number): Promise<void> {
@@ -151,9 +151,12 @@ try {
   check("ack on the DM durable is refused", await request(profileCreds, `$JS.ACK.${dmTarget}.${dmDurableName}.1.1.1.0.0`, publisher.id) === "denied");
   check("chat publish is refused", await request(profileCreds, chatSubject(space, DEV_OWNER, publisher.id, "general"), publisher.id) === "denied");
   check("chat subscribe is refused", await subscribeVerdict(profileCreds, publisher.id, `${spacePrefix(space)}.chat.>`) === "denied");
+  check("DM subscribe (inst.>) is refused", await subscribeVerdict(profileCreds, publisher.id, `${spacePrefix(space)}.inst.>`) === "denied");
+  check("anycast subscribe (svc.>) is refused", await subscribeVerdict(profileCreds, publisher.id, `${spacePrefix(space)}.svc.>`) === "denied");
   check("control service request is refused", await request(profileCreds, control, publisher.id) === "denied");
   check("channel-registry Direct Get is refused", await request(profileCreds, `$JS.API.DIRECT.GET.KV_${channelBucket(space)}`, publisher.id) === "denied");
   check("KV presence write is refused", await request(profileCreds, `$KV.${presenceBucket(space)}.${principalKey(DEV_OWNER, publisher.id).key}`, publisher.id) === "denied");
+  check("KV channel-registry write is refused", await request(profileCreds, `$KV.${channelBucket(space)}.${principalKey(DEV_OWNER, publisher.id).key}`, publisher.id) === "denied");
   check("DM stream delete is refused", await request(profileCreds, `$JS.API.STREAM.DELETE.${dmTarget}`, publisher.id) === "denied");
   check("TASK stream delete is refused", await request(profileCreds, `$JS.API.STREAM.DELETE.${taskTarget}`, publisher.id) === "denied");
 

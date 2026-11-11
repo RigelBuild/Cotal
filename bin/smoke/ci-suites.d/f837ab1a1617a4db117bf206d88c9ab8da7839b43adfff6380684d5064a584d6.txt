@@ -1,0 +1,2 @@
+# A send-only Cotal identity can read presence, DM and anycast without channel or control grants.
+smoke:webhook-publisher

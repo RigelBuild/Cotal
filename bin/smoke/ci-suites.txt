@@ -798,7 +798,3 @@ smoke:signal-exits:live
 # handoff. The first possible context frame and first inbox read both preserve unknown handling when
 # no separate handoff evidence exists. Appended so existing shard assignments remain unchanged.
 smoke:broker-redelivery-framing
- # A send-only Cotal identity can read presence, DM and anycast without channel or control grants.
- # Appended so existing shard assignments remain unchanged.
-smoke:webhook-publisher
-smoke:webhook-publisher-stream-config
