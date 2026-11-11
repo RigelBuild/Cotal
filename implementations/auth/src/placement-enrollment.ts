@@ -68,6 +68,10 @@ export interface ReconcilerPort {
   acceptedIntent(request: { acceptanceId: string; authority: PlacementAuthorityView; actorTokenHash: string }): Promise<{ accepted: AcceptedIntentView; effect: EnrollEffectView }>;
 }
 
+/** Maps the broker-authenticated caller to a service principal. `transportPrincipal` is the caller's
+ *  broker-authenticated `owner.actor` key (`principalKey(owner, actor).key`), never a body field. An
+ *  implementation MUST compare it exactly against the configured reconciler identity: never by actor
+ *  name alone, never by suffix, since a match on the actor name would admit any owner's `reconciler`. */
 export interface ServiceAuthenticator {
   authenticateService(request: { transportPrincipal: string; operation: string; requestDigest: string }): Promise<{ principal: string }>;
 }
@@ -101,12 +105,30 @@ export interface PlacementEnrollmentAuthorityOptions {
   log(line: string): void;
 }
 
+/** The verify result: the committed identity, active once it verifies. */
+export interface VerifyPlacementResult { identity: EnrollmentIdentity; active: true }
+
+/** The effect lifecycle state a status or close reports. */
+export type PlacementEffectState = "effective" | "unknown" | "cancelled" | "pending";
+
+/** The status and close result: the effect state plus its fence and custody facts. */
+export interface PlacementEffectStatusResult {
+  effectId: string;
+  state: PlacementEffectState;
+  enrollment?: EnrollmentIdentity;
+  noLateEffects: boolean;
+  privateCustody: "none";
+}
+
+/** The retire result: retired, pending, or unknown, with the denial proof once retired. */
+export interface PlacementRetireResult { state: "retired" | "pending" | "unknown"; denialProofId?: string }
+
 export interface PlacementEnrollmentAuthority {
   enrollPlacement(args: { owner: string; scope: string[]; request: unknown; sentinelCreds: string; agentBearerExchangeUrl: string; onDelivered: (release: () => void) => void }): Promise<PlacementEnrollmentResult>;
-  verifyPlacementEnrollment(args: { caller: string; request: unknown }): Promise<{ identity: EnrollmentIdentity; active: true }>;
-  enrollmentEffectStatus(args: { caller: string; effectId: string }): Promise<{ effectId: string; state: "effective" | "unknown" | "cancelled" | "pending"; enrollment?: EnrollmentIdentity; noLateEffects: boolean; privateCustody: "none" }>;
-  closeEnrollmentEffect(args: { caller: string; effectId: string; fenceId: string }): Promise<{ effectId: string; state: "effective" | "unknown" | "cancelled" | "pending"; enrollment?: EnrollmentIdentity; noLateEffects: boolean; privateCustody: "none" }>;
-  retirePlacementEnrollment(args: { caller: string; operationId: string; identity: EnrollmentIdentity; fenceId: string }): Promise<{ state: "retired" | "pending" | "unknown"; denialProofId?: string }>;
+  verifyPlacementEnrollment(args: { caller: string; request: unknown }): Promise<VerifyPlacementResult>;
+  enrollmentEffectStatus(args: { caller: string; effectId: string }): Promise<PlacementEffectStatusResult>;
+  closeEnrollmentEffect(args: { caller: string; effectId: string; fenceId: string }): Promise<PlacementEffectStatusResult>;
+  retirePlacementEnrollment(args: { caller: string; operationId: string; identity: EnrollmentIdentity; fenceId: string }): Promise<PlacementRetireResult>;
 }
 
 interface PendingRecord {

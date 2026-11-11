@@ -774,7 +774,12 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
   // stays with the plane's own registry + retirement deps (the drain rides the ONE sealed records
   // scanner exactly like the boot resume); the listener only authorizes (subject attribution +
   // the FRESH space-manager-lease holder check) and dispatches.
-  const authAdmin = await openAuthAdminListener({ onConnection, server, space, dataAccount, reg: barrierReg, retirement, barrierFlight: retirementFlights, instanceId: authServeInstanceId, epoch: authServeGrant.epoch, grant: authServeGrant, log });
+  // The placement authority is built after this listener opens (its helpers are defined below), so
+  // the listener reads it through this getter. `placementConfigured` is the boot-time fact, known now:
+  // a configured plane whose port is not yet built answers `unavailable` (starting), not permanent misconfig.
+  let placementAuthority: PlacementEnrollmentAuthority | undefined;
+  const placementConfigured = Boolean(opts.placementReconciler && opts.placementAuthenticator && opts.placementRolePolicy);
+  const authAdmin = await openAuthAdminListener({ onConnection, server, space, dataAccount, reg: barrierReg, retirement, barrierFlight: retirementFlights, instanceId: authServeInstanceId, epoch: authServeGrant.epoch, grant: authServeGrant, log, placement: { configured: placementConfigured, port: () => placementAuthority } });
   unwind.push(() => authAdmin.close());
   if (opts.registry !== undefined) {
     unwind.push(async () => { await registryHost?.close(); });
@@ -1322,16 +1327,17 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
         },
       };
   };
-  const placementEnrollment = opts.placementReconciler && opts.placementAuthenticator && opts.placementRolePolicy ? createPlacementEnrollmentAuthority({
+  const placementEnrollment = placementConfigured ? createPlacementEnrollmentAuthority({
     dir: opts.dir, space, accountPublicKey: dataAccount.pub, proofSecret: dataAccount.signingSeed,
-    observeManagerGate: observeLegacyManagerGate, reconciler: opts.placementReconciler,
-    authenticator: opts.placementAuthenticator, assertOpen: refuseIfFenced,
-    rolePolicy: opts.placementRolePolicy,
+    observeManagerGate: observeLegacyManagerGate, reconciler: opts.placementReconciler!,
+    authenticator: opts.placementAuthenticator!, assertOpen: refuseIfFenced,
+    rolePolicy: opts.placementRolePolicy!,
     serializedForAlias: (owner, actor, action) => serializedForAlias(opts.dir, owner, actor, action),
     deprovisionFootprint: (owner, actor, lifecycleUid, channels) => deprovisionManagedFootprint(owner, actor, lifecycleUid, channels.filter(isConcreteChannel)),
     enrollManagedAgent,
     log,
   }) : undefined;
+  placementAuthority = placementEnrollment;
   return {
     ...callout,
     placementEnrollment,
