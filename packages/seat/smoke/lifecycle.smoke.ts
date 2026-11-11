@@ -973,8 +973,19 @@ try {
       return origRead.call(this, file, ...args);
     };
     syncBuiltinESMExports();
+    let signalled = false;
+    const origKill = process.kill;
+    process.kill = function (pid, sig) {
+      if (pid === absentLeader || pid === -absentLeader) signalled = true;
+      return origKill.call(this, pid, sig);
+    };
     const reaped = await seat.reapSeat(reapRoot, reapId, { graceMs: 200 });
-    assert.equal(reaped.outcome, "reaped");
+    process.kill = origKill;
+    assert.equal(reaped.outcome, "retained", "no cgroup proof: the fork retains, it never reaps unproven");
+    assert.equal(reaped.reason, "unprovable");
+    assert.match(reaped.detail, /has no contained cgroup proof/);
+    assert.equal(fs.existsSync(reapRecPath), true, "the record is kept for a later attempt");
+    assert.equal(signalled, false, "no signal is sent on the unprovable path");
 
     const launchRoot = ${JSON.stringify(root)};
     const launchId = "c".repeat(32);
