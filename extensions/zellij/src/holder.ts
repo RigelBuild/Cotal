@@ -110,7 +110,7 @@ export class HolderRuntime implements Runtime {
     this.sleep = options.sleep ?? defaultSleep;
     this.now = options.now ?? Date.now;
     this.platform = options.platform ?? process.platform;
-    this.waveHost = options.waveHostCommand ?? (() => process.env.WAVE_HOST_COMMAND);
+    this.waveHost = options.waveHostCommand ?? (() => process.env.WAVE_HOST_COMMAND ?? "wave-host");
     this.kill = options.kill ?? defaultKill;
   }
 
@@ -120,6 +120,9 @@ export class HolderRuntime implements Runtime {
     const holder = this.command();
     if (holder === undefined)
       throw new SpawnRefused("holder runtime: COTAL_HOLDER_COMMAND is not set");
+    // Resolve wave-host before the holder starts a seat: without it the seat would
+    // run with no reference and no stop path.
+    if (this.platform === "darwin") this.requireWaveHost();
 
     const launcher = privateLauncher(spec, cwd, name);
     let launcherCleaned = false;

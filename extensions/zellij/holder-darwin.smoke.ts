@@ -142,6 +142,19 @@ await check("darwin forced stop kills the verified agent pid, then seat-stops", 
   }
 });
 
+await check("darwin never SIGKILLs a reused agent pid whose token changed", () => {
+  const f = fixture();
+  try {
+    const handle = f.spawn();
+    // The holder stays alive, but pid 202 now belongs to another process.
+    f.tokens.set(202, "1700000000000099");
+    handle.stop({ graceful: false });
+    assert.deepEqual(f.kills, []);
+  } finally {
+    f.cleanup();
+  }
+});
+
 await check("darwin stop on an exited seat does not call seat-stop", () => {
   const f = fixture();
   try {
@@ -194,9 +207,21 @@ await check("darwin reap reaps when both identities are absent", async () => {
   }
 });
 
-await check("darwin spawn refuses when wave-host is not configured", () => {
-  const runtime = new HolderRuntime({ platform: "darwin", holderCommand: () => holder, waveHostCommand: () => undefined });
-  assert.throws(() => runtime.spawn(seatName, launchSpec, process.cwd()), /wave-host/);
+await check("darwin spawn refuses before holder start when wave-host is unavailable", () => {
+  const calls: string[] = [];
+  const runtime = new HolderRuntime({
+    platform: "darwin",
+    holderCommand: () => holder,
+    waveHostCommand: () => undefined,
+    execFileSync: (file: string) => {
+      calls.push(file);
+      return "101 202\n";
+    },
+  });
+  assert.throws(() => runtime.spawn(seatName, launchSpec, process.cwd()), (error: unknown) =>
+    error instanceof Error && error.name === "SpawnRefused" && /wave-host/.test(error.message),
+  );
+  assert.deepEqual(calls, [], "holder start must not run when wave-host is unresolved");
 });
 
 console.log(`HOLDER DARWIN PACKAGE TESTS: ${checks} tests executed`);
