@@ -17,9 +17,11 @@ patchedDependencies:
 overrides:
   effect>toml: ^5.0.1
   '@earendil-works/pi-coding-agent>undici': 8.12.4
-  body-parser: 2.4.0
-  brace-expansion@5: 5.0.12
-  fast-uri: 3.1.9
-  hono: 4.13.17
-  ip-address: 10.7.6
-  proxy-addr: 2.0.8
+  # CVE floors for the Cotal image gate (RIG-9578).
+  body-parser: ^2.4.0
+  brace-expansion@5: ^5.0.12
+  fast-uri: ^3.1.9
+  hono: ^4.13.17
+  ip-address: ^10.7.6
+  proxy-addr: ^2.0.8
+  undici@7: ^7.30.2
