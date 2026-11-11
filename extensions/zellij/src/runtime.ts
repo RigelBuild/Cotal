@@ -112,13 +112,19 @@ function paneForTab(session: string, tabId: number): string {
   return pane.id;
 }
 
+/** The zellij handle: the shared AgentHandle, plus the startup confirm's outcome. The outcome is
+ * undefined until the watch settles, so a caller waits on that event rather than on a timer. */
+export interface ZellijAgentHandle extends AgentHandle {
+  confirmOutcome(): string | undefined;
+}
+
 export class ZellijRuntime implements Runtime {
   readonly kind = "zellij" as const;
   readonly streamsTerminal = false;
 
   constructor(private readonly session: string) {}
 
-  spawn(name: string, spec: LaunchSpec, cwd: string): AgentHandle {
+  spawn(name: string, spec: LaunchSpec, cwd: string): ZellijAgentHandle {
     if (!/^[A-Za-z0-9_.-]+$/.test(name))
       throw new SpawnRefused(`zellij runtime: unsafe agent name ${JSON.stringify(name)} (allowed: letters, digits, _ . -)`);
     if (!zellij.available()) throw new SpawnRefused("zellij runtime: zellij is not available — is it installed and on PATH?");
