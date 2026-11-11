@@ -1,4 +1,4 @@
-export interface EpCommandMapping {
+interface EpCommandMapping {
   command: string;
   targeted?: boolean;
   self?: boolean;
