@@ -37,6 +37,51 @@ let
     find $out/lib/cotal -xtype l -delete
   '';
 
+  # nodejs-slim_24 bakes build-time store paths into bin/node and config.gypi: its own path, twelve
+  # -dev outputs and bash (reached through icu4c-dev and zstd-bin). Nothing loads them at runtime,
+  # so strip them from a copy. The checks below fail the build if any of them comes back.
+  unwantedRefs = [
+    pkgs.bashNonInteractive
+    pkgs.brotli.dev
+    pkgs.c-ares.dev
+    pkgs.icu78.dev
+    pkgs.libuv.dev
+    pkgs.llhttp.dev
+    pkgs.ngtcp2.dev
+    pkgs.nghttp2.dev
+    pkgs.nghttp3.dev
+    pkgs.openssl.dev
+    pkgs.sqlite.dev
+    pkgs.zlib.dev
+    pkgs.zstd.dev
+  ];
+  stripArgs = pkgs.lib.concatMapStringsSep " " (p: "-t ${p}") (unwantedRefs ++ [ pkgs.nodejs-slim_24 pkgs.uvwasi ]);
+  # uvwasi's propagated-build-inputs names libuv-dev. bin/node loads uvwasi's lib through RUNPATH,
+  # so point RUNPATH at a copy without that file. The copy keeps the store name, so the RUNPATH
+  # length is unchanged and patchelf rewrites it in place.
+  uvwasiTrimmed = pkgs.runCommand pkgs.uvwasi.name { disallowedRequisites = [ pkgs.libuv.dev ]; } ''
+    cp -R ${pkgs.uvwasi} $out
+    chmod -R u+w $out
+    find $out -type f -exec ${pkgs.removeReferencesTo}/bin/remove-references-to -t ${pkgs.uvwasi} -t ${pkgs.libuv.dev} {} +
+  '';
+  nodeTrimmed = pkgs.runCommand "nodejs-slim-24-trimmed" {
+    nativeBuildInputs = [ pkgs.patchelf ];
+    disallowedRequisites = unwantedRefs;
+  } ''
+    cp -R ${pkgs.nodejs-slim_24} $out
+    chmod -R u+w $out
+    old="${pkgs.uvwasi}"
+    new="${uvwasiTrimmed}"
+    rpath="$(patchelf --print-rpath $out/bin/node)"
+    patchelf --set-rpath "''${rpath//"$old"/"$new"}" $out/bin/node
+    find $out -type f -exec ${pkgs.removeReferencesTo}/bin/remove-references-to ${stripArgs} {} +
+  '';
+  # Guards the whole image contents, not only node: a new dependency that brings bash or a -dev
+  # output fails the build here.
+  imageContents = pkgs.runCommand "seat-image-contents" { disallowedRequisites = unwantedRefs; } ''
+    echo ${nodeTrimmed} ${runtime} ${etcFiles} > $out
+  '';
+
   # The entrypoint is node running the runtime's cotal.js directly. No shell wrapper, so no bash
   # is in the image.
   cotalEntry = "${runtime}/lib/cotal/cotal-ai/dist/cotal.js";
@@ -54,9 +99,11 @@ in
     name = "cotal-seat";
     tag = "seat";
     contents = [
-      pkgs.nodejs-slim_24
+      nodeTrimmed
     ];
     extraCommands = ''
+      # Build-time guard: realise the contents check, so a regression fails this image build.
+      : ${imageContents}
       mkdir -p tmp
       chmod 1777 tmp
     '';
@@ -75,7 +122,7 @@ in
         "SSL_CERT_FILE=/etc/ca-bundle.crt"
       ];
       Entrypoint = [
-        "${pkgs.nodejs-slim_24}/bin/node"
+        "${nodeTrimmed}/bin/node"
         cotalEntry
       ];
       Cmd = [ "--version" ];
