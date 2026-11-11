@@ -369,6 +369,11 @@ await withFakeZellij("confirm", async (logPath, session) => {
     process.cwd(),
   );
   await waitForCalls(logPath, (calls) => calls.some((args) => args[3] === "write" && args.includes("13")), 10_000);
+  // The watch polls every 250 ms (startup-confirm.ts POLL_MS). Wait for two further poll cycles after
+  // the first Enter, so a duplicate Enter on a later poll is logged before the count. Event-bounded:
+  // the wait ends when the call log shows a second Enter, or when two polls have passed without one.
+  const firstEnter = readCalls(logPath).filter((args) => args[3] === "write" && args.includes("13")).length;
+  await waitForCalls(logPath, (calls) => calls.filter((args) => args[3] === "write" && args.includes("13")).length > firstEnter, 2 * 250 + 250);
   const calls = readCalls(logPath);
   handle.stop({ graceful: false });
   check(
@@ -389,7 +394,7 @@ await withFakeZellij("confirm", async (logPath, session) => {
     },
     process.cwd(),
   );
-  await new Promise<void>((resolve) => setTimeout(resolve, 1_400));
+  await waitForCalls(logPath, (calls) => calls.some((args) => args[3] === "write" && args.includes("27") && args.includes("91") && args.includes("66")), 10_000);
   process.env.COTAL_ZELLIJ_TEST_SCREEN = "Continue?";
   await waitForCalls(logPath, (calls) => calls.some((args) => args[3] === "write" && args.includes("13")), 10_000);
   const calls = readCalls(logPath);

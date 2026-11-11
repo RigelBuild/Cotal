@@ -393,7 +393,15 @@ try {
     startError = (e as Error).message;
   }
   ok("#4005: a next manager starts on the root that released the seat", startError === undefined, { startError });
-  ok("#4005: the next manager retires the gone released seat (its minted credential is deprovisioned)", credsA !== undefined && (await until(() => !existsSync(credsA), 30_000)), { credsA, releasedRef: existsSync(releasedRef) });
+  // The fork's contract: a released seat no runtime can prove gone is NOT retired. adoptReleasedSeat
+  // refuses the unprovable reap and leaves the record in place (manager.ts), so the minted credential
+  // stays on disk and the next manager's adoption keeps the reference for a later retry. Upstream
+  // deprovisions here; the fork does not, on purpose (#72/#73, RIG-4320). Both facts are asserted.
+  // Adoption is fire-and-forget from start() (`void this.adoptReleasedSeats()`). Its unprovable path
+  // returns before any credential or record write, and logs nothing, so these asserts read the state
+  // the refusal leaves. Neither is gated on a timer.
+  ok("#4005: the next manager keeps the unprovable released seat's minted credential (no retirement without proof)", credsA !== undefined && existsSync(credsA), { credsA });
+  ok("#4005: the next manager keeps the released seat's runtime reference for a later adoption", existsSync(releasedRef), { releasedRef });
 
   ok("every cell ran (silently skipped cells must not read as green)", pass + fail === EXPECTED_CELLS - 1, { pass, fail, expected: EXPECTED_CELLS - 1 });
 } catch (e) {
