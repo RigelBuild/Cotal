@@ -30,6 +30,8 @@ export interface CotalBatchDetails {
   batchId: string;
   ids: string[];
   items?: InboxItem[];
+  /** Goal ids of the run turns this batch carries; the dedupe keys on these, not on rendered text. */
+  turnIds?: string[];
   suffix?: string;
 }
 
@@ -48,6 +50,9 @@ export interface PiHost {
     options: { triggerTurn: true; deliverAs: "steer" },
   ): void;
 }
+
+/** Stands in for a kept later copy that carries nothing new and sits after an assistant message. */
+const ALREADY_DELIVERED_STUB = "Cotal batch already delivered above; no new items.";
 
 interface Batch {
   id: string;
@@ -413,7 +418,7 @@ export class PiDriver {
           customType: CUSTOM_TYPE,
           content: batch.content,
           display: true,
-          details: { version: 1, batchId: batch.id, ids: [...batch.ids], items: batch.items ?? [], ...(batch.suffix !== undefined ? { suffix: batch.suffix } : {}) },
+          details: { version: 1, batchId: batch.id, ids: [...batch.ids], items: batch.items ?? [], ...(batch.turnIds ? { turnIds: [...batch.turnIds] } : {}), ...(batch.suffix !== undefined ? { suffix: batch.suffix } : {}) },
         },
         { triggerTurn: true, deliverAs: "steer" },
       );
@@ -451,40 +456,56 @@ export class PiDriver {
   }
 
   /** The messages a provider request carries. A lost steer re-dispatched after its settle window can
-   *  still drain into Pi beside its replacement, so a delivery can sit in the request twice. The first
-   *  copy of each receive key and run-turn text is kept. A later copy is dropped when it carries
-   *  nothing new, and rebuilt from its new items otherwise. Returns undefined when nothing changed. */
+   *  still drain into Pi beside its replacement, so a delivery can sit in the request twice. A later
+   *  copy is dropped only when no assistant message sits between it and the first copy it repeats;
+   *  otherwise the request would end on an assistant turn. A kept copy is rebuilt from its new items
+   *  or run turn, or becomes a short stub when it carries nothing new. Run turns dedupe by goal id.
+   *  Returns undefined when nothing changed. */
   private withoutSupersededBatches<T>(messages: readonly T[]): T[] | undefined {
     const seenIds = new Set<string>();
-    const seenTurns = new Set<string>();
+    const seenTurnIds = new Set<string>();
     const kept: T[] = [];
     let changed = false;
+    let assistantSinceLastCopy = false;
     for (const message of messages) {
+      if (message && typeof message === "object" && "role" in message && message.role === "assistant") {
+        assistantSinceLastCopy = true;
+        kept.push(message);
+        continue;
+      }
       const details = detailsOf(message);
       if (!details) {
         kept.push(message);
         continue;
       }
       const newIds = details.ids.filter((id) => !seenIds.has(id));
-      const turnNew = details.suffix !== undefined && !seenTurns.has(details.suffix);
+      const turnIds = details.turnIds ?? [];
+      const newTurnIds = turnIds.filter((id) => !seenTurnIds.has(id));
       for (const id of details.ids) seenIds.add(id);
-      if (details.suffix !== undefined) seenTurns.add(details.suffix);
-      if (newIds.length === details.ids.length && (details.suffix === undefined || turnNew)) {
+      for (const id of turnIds) seenTurnIds.add(id);
+      const repeats = newIds.length < details.ids.length || newTurnIds.length < turnIds.length;
+      if (!repeats) {
         kept.push(message);
         continue;
       }
       changed = true;
-      if (newIds.length === 0 && !turnNew) continue;
+      const dropped = newIds.length === 0 && newTurnIds.length === 0;
+      if (dropped && !assistantSinceLastCopy) continue;
       const items = (details.items ?? []).filter((item) => newIds.includes(item.recvKey));
-      const parts = [items.length > 0 ? formatInjection(items) : undefined, turnNew ? details.suffix : undefined];
+      const suffix = newTurnIds.length > 0 ? details.suffix : undefined;
+      const body = [items.length > 0 ? formatInjection(items) : undefined, suffix]
+        .filter((part): part is string => part !== undefined)
+        .join("\n\n");
       const rebuilt: CotalBatchDetails = {
         version: 1,
         batchId: details.batchId,
         ids: newIds,
         items,
-        ...(turnNew && details.suffix !== undefined ? { suffix: details.suffix } : {}),
+        ...(newTurnIds.length > 0 ? { turnIds: newTurnIds } : {}),
+        ...(suffix !== undefined ? { suffix } : {}),
       };
-      kept.push({ ...(message as object), content: parts.filter((p): p is string => p !== undefined).join("\n\n"), details: rebuilt } as T);
+      kept.push({ ...(message as object), content: body.length > 0 ? body : ALREADY_DELIVERED_STUB, details: rebuilt } as T);
+      assistantSinceLastCopy = false;
     }
     return changed ? kept : undefined;
   }

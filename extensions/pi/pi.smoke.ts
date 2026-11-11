@@ -971,7 +971,8 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
 }
 
 // A lost steer that drains after its re-dispatch sits in the same request twice. The first copy of
-// each receive key is kept; a later copy that carries nothing new is dropped. Pass-through is undefined.
+// each receive key is kept. A later copy is dropped only when no assistant message sits between it
+// and the copy it repeats, so the request never ends on an assistant turn. Run turns dedupe by goal id.
 {
   const mesh = new FakeMesh();
   mesh.items = [item("m1")];
@@ -992,19 +993,32 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const fresh = { role: "custom", customType: "cotal-inbox", content: "new", details: live };
   const other = { role: "user", content: "hello" };
   const reply = { role: "assistant", content: "answered" };
-  const interleaved = driver.onContext([old, reply, fresh]);
-  ok(interleaved?.length === 2 && interleaved[0] === old && interleaved[1] === reply,
-    "the first copy is kept, a later copy with nothing new is dropped, and an assistant reply between them stays in order");
+
+  const afterReply = driver.onContext([old, reply, fresh]);
+  ok(afterReply !== undefined && afterReply.length === 3 && afterReply[0] === old && afterReply[1] === reply,
+    "a later copy after an assistant reply is kept, so the first copy and reply stay in order");
+  ok(afterReply?.at(-1)?.role !== "assistant", "a request that kept a later copy after a reply does not end on an assistant message");
+
+  const trailingCopy = driver.onContext([old, fresh]);
+  ok(trailingCopy?.length === 1 && trailingCopy[0] === old,
+    "a later copy with nothing new and no assistant between copies is dropped");
+
   ok(driver.onContext([other, fresh]) === undefined, "a request without a repeated delivery passes through unchanged");
+
   const extra = { role: "custom", customType: "cotal-inbox", content: "wide", details: { version: 1, batchId: "wide", ids: ["m1", "m2"], items: [item("m1"), item("m2")] } };
   const widened = driver.onContext([old, extra]);
   ok(widened?.length === 2 && widened[0] === old && widened[1]?.details?.ids.join() === "m2" &&
     widened[1]?.details?.items?.map((value) => value.id).join() === "m2",
     "a re-dispatch with an extra item keeps only the item no earlier copy carried");
-  const turnA = { role: "custom", customType: "cotal-inbox", content: "turn", details: { version: 1, batchId: "t1", ids: [], suffix: "Run turn: yield when done" } };
-  const turnB = { role: "custom", customType: "cotal-inbox", content: "turn", details: { version: 1, batchId: "t2", ids: [], suffix: "Run turn: yield when done" } };
+
+  const turnA = { role: "custom", customType: "cotal-inbox", content: "turn", details: { version: 1, batchId: "t1", ids: [], turnIds: ["g1"], suffix: "Run turn: yield when done" } };
+  const turnB = { role: "custom", customType: "cotal-inbox", content: "turn", details: { version: 1, batchId: "t2", ids: [], turnIds: ["g1"], suffix: "Run turn: yield when done (reworded)" } };
   const turned = driver.onContext([turnA, turnB]);
-  ok(turned?.length === 1 && turned[0] === turnA, "a run-turn repeated across copies is kept once, as its first copy");
+  ok(turned?.length === 1 && turned[0] === turnA, "a run turn repeated by goal id is kept once, as its first copy, even when its text differs");
+  const twoTurns = { role: "custom", customType: "cotal-inbox", content: "turn2", details: { version: 1, batchId: "t3", ids: [], turnIds: ["g1", "g2"], suffix: "Run turn: second" } };
+  const newTurn = driver.onContext([turnA, twoTurns]);
+  ok(newTurn?.length === 1 && newTurn[0]?.details?.turnIds?.join() === "g2" && newTurn[0]?.details?.suffix === "Run turn: second",
+    "a re-dispatch that adds a second goal id keeps only that goal's text");
 }
 
 // A turn that starts while the lost-steer check waits owns the hold again; a stale check never fires.
