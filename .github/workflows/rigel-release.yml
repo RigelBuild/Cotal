@@ -57,6 +57,8 @@ jobs:
             echo "tag=rigel-v${version}-${short_sha}"
             echo "commit_time=$commit_time"
           } >> "$GITHUB_OUTPUT"
+      # Keep this assembly block in step with the one in seat-image.yml: both must produce the
+      # same runtime tree, so a change here needs the matching change there.
       - name: Assemble runtime archive
         env:
           COMMIT_TIME: ${{ steps.metadata.outputs.commit_time }}
