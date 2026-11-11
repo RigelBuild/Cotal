@@ -13094,7 +13094,9 @@ export class Manager {
           console.error(record.supervise
             ? `! ${row.alias}: the supervised seat its previous manager left was not restarted (${refusal}); retiring the lifecycle`
             : `! ${row.alias}: the seat its previous manager left was not adopted (${refusal}); retiring the lifecycle`);
-          this.dropSeatRecord({ name: row.alias, lifecycleUid: row.lifecycleUid });
+          // A released seat keeps its record while its reference is pending: the next manager adopts it from there.
+          const seat = { name: row.alias, lifecycleUid: row.lifecycleUid };
+          if (!this.releasedSeatPending(seat)) this.dropSeatRecord(seat);
           terminalRows.push(row);
         }
         const sweepDeprovision: DeprovisionResourceAccounting = {
