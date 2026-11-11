@@ -291,6 +291,20 @@ await withFakeZellij("missing-session", (logPath, session) => {
   );
 });
 
+await withFakeZellij("missing-session", (logPath, session) => {
+  let refused = false;
+  try {
+    new ZellijRuntime(session, false).spawn("worker", { command: "sleep", args: ["600"] }, process.cwd());
+  } catch (error) {
+    refused = error instanceof Error && error.name === "SpawnRefused" && error.message.includes("COTAL_ZELLIJ_NO_CREATE_SESSION");
+  }
+  const calls = readCalls(logPath);
+  check(
+    "no-create runtime refuses a missing session without attaching, creating a tab, or creating a pane",
+    refused && !calls.some((args) => args.includes("--create-background") || args[3] === "new-tab" || args[3] === "new-pane"),
+  );
+});
+
 await withFakeZellij("no-server", (_logPath, session) => {
   check("zellij's no-sessions answer reads as exited", zellij.paneState(session, "terminal_99") === "exited");
 });
