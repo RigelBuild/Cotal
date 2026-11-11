@@ -76,6 +76,13 @@ function detailsOf(message: unknown): CotalBatchDetails | undefined {
   return details as CotalBatchDetails;
 }
 
+/** One key per delivery a batch carries: its receive keys, or its run-turn text when it has none.
+ *  Nudges carry neither, so they never collapse with each other. */
+function deliveryKey(details: CotalBatchDetails): string | undefined {
+  if (details.ids.length > 0) return `ids:${JSON.stringify(details.ids)}`;
+  return details.suffix === undefined ? undefined : `turn:${details.suffix}`;
+}
+
 function ownChannelEcho(mesh: MeshAgent, item: InboxItem): boolean {
   return item.kind === "channel" && item.fromId === mesh.id;
 }
@@ -219,13 +226,14 @@ export class PiDriver {
     }
   }
 
-  onContext(messages: readonly unknown[]): void {
-    if (this._state === "shuttingDown") return;
+  onContext<T>(messages: readonly T[]): T[] | undefined {
+    if (this._state === "shuttingDown") return undefined;
     const visible = new Set(messages.map(detailsOf).filter((details): details is CotalBatchDetails => Boolean(details)).map((d) => d.batchId));
     const candidates = this.batches.filter((batch) => !batch.confirmed && visible.has(batch.id));
     this.contextBatchIds = new Set(candidates.map((batch) => batch.id));
     this.requestBatchIds = new Set(candidates.filter((batch) => batch.started).map((batch) => batch.id));
     for (const id of this.requestBatchIds) this.terminalEvidenceBatchIds.add(id);
+    return this.withoutSupersededBatches(messages);
   }
 
   onProviderResponse(status: number): void {
@@ -447,6 +455,29 @@ export class PiDriver {
     this.heldReason = undefined;
     this._state = "idle";
     this.pump();
+  }
+
+  /** The messages a provider request carries. A lost steer re-dispatched after its settle window can
+   *  still drain into Pi beside its replacement, so one delivery sits in the request twice. Keep one
+   *  copy per delivery: the live batch's when it is visible, else the latest. A request with no
+   *  repeated delivery passes through unchanged (undefined). */
+  private withoutSupersededBatches<T>(messages: readonly T[]): T[] | undefined {
+    const live = new Set(this.batches.filter((batch) => !batch.confirmed).map((batch) => batch.id));
+    const parts = messages.map((message) => {
+      const details = detailsOf(message);
+      return { key: details && deliveryKey(details), batchId: details?.batchId ?? "" };
+    });
+    const keeper = new Map<string, number>();
+    parts.forEach(({ key, batchId }, index) => {
+      if (key === undefined) return;
+      const kept = keeper.get(key);
+      if (kept === undefined || live.has(batchId) || !live.has(parts[kept]?.batchId ?? "")) keeper.set(key, index);
+    });
+    const kept = messages.filter((_, index) => {
+      const key = parts[index]?.key;
+      return key === undefined || keeper.get(key) === index;
+    });
+    return kept.length === messages.length ? undefined : kept;
   }
 
   /** Surfacing at confirmation, not at agent end: a confirmation lets `pump` run mid-turn, which

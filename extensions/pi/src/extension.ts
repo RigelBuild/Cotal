@@ -241,7 +241,10 @@ export default async function cotalMesh(pi: ExtensionAPI): Promise<void> {
     await nameSession();
   });
   pi.on("message_start", (event) => runtime.driver.onMessageStart(event.message));
-  pi.on("context", (event) => runtime.driver.onContext(event.messages));
+  pi.on("context", (event) => {
+    const messages = runtime.driver.onContext(event.messages);
+    return messages ? { messages } : undefined;
+  });
   pi.on("after_provider_response", (event) => runtime.driver.onProviderResponse(event.status));
   pi.on("tool_execution_start", (event) => runtime.driver.onToolStart(event.toolName));
   pi.on("tool_execution_end", () => runtime.driver.onToolEnd());

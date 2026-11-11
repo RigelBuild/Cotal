@@ -963,6 +963,33 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
     "the recovered batch commits once and the backlog flows");
 }
 
+// A lost steer that drains after its re-dispatch sits in the same request twice. The provider sees
+// one copy: the live batch's. A request with no repeat passes through untouched.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200, 50);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], context());
+  ctx.idle = true;
+  ctx.pending = false;
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const stale = host.sent[0]?.details;
+  const live = host.sent[1]?.details;
+  ok(stale && live && stale.batchId !== live.batchId, "the recovery re-dispatched the lost steer under a new batch id");
+  const old = { role: "custom", customType: "cotal-inbox", content: "old", details: stale };
+  const fresh = { role: "custom", customType: "cotal-inbox", content: "new", details: live };
+  const other = { role: "user", content: "hello" };
+  const deduped = driver.onContext([old, other, fresh]);
+  ok(deduped?.length === 2 && deduped.includes(fresh) && !deduped.includes(old) && deduped.includes(other),
+    "a superseded lost-steer copy is hidden from the provider request");
+  ok(driver.onContext([other, fresh]) === undefined, "a request without a repeated delivery passes through unchanged");
+}
+
 // A turn that starts while the lost-steer check waits owns the hold again; a stale check never fires.
 {
   const mesh = new FakeMesh();
