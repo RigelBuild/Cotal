@@ -400,9 +400,13 @@ try {
   // reconcileStaticLifecycles, which plans the seat as a restart row and calls adoptSeat. adoptSeat
   // refuses the unprovable seat. The record drop that follows is guarded by releasedSeatPending
   // (manager.ts, restart-reconcile loop). Without that guard the reference is removed, and the cell
-  // below goes red (mutation-checked). Start() does not await the sweep, so wait for it first; it sets
-  // lastSweep.completedAt on both its normal and its error exit.
-  const sweepDone = await until(() => statusOf().staticReconciliation.lastSweep?.completedAt !== undefined, 15_000);
+  // below goes red (mutation-checked). Start() does not await the sweep, and the startup sweeps finish
+  // before the one that plans seatA. Wait for the sweep that attempted a row: completedAt set and
+  // attempted at least 1. A sweep that planned nothing (attempted 0) can never satisfy this.
+  const sweepDone = await until(() => {
+    const last = statusOf().staticReconciliation.lastSweep;
+    return last?.completedAt !== undefined && (last?.attempted ?? 0) >= 1;
+  }, 15_000);
   ok("#4005: the next manager's static reconcile sweep finishes", sweepDone, { lastSweep: statusOf().staticReconciliation.lastSweep });
   const sweepStatus = statusOf().staticReconciliation;
   const seatAItem = sweepStatus.failures.find((f) => f.alias === "seatA");
