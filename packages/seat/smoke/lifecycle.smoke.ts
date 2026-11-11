@@ -715,7 +715,7 @@ await h.waitForExit();
     try {
       const childReady = await until(() => existsSync(childPidPath), 2_000);
       const grandchildReady = await until(() => existsSync(grandchildPidPath), 2_000);
-      const grandchildPid = Number(readFileSync(grandchildPidPath, "utf8"));
+      const grandchildPid = grandchildReady ? Number(readFileSync(grandchildPidPath, "utf8")) : Number.NaN;
       const grandchildStart = processStartToken(grandchildPid);
       check("setsid escapee fixture: grandchild starts in a new session", childReady && grandchildReady && state(grandchildPid) !== "gone", { childPid, grandchildPid });
       const id = seatId();
