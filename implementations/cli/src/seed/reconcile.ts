@@ -152,7 +152,12 @@ async function reconcile(mode: Mode): Promise<ReconcileResult> {
           await reconcile("repair");
           return NOOP;
         }
-        if (cursor?.failed) throw failedSeed(cursor);
+        // The run that wrote this cursor failed and released the lock. Retry its seed as repair under the
+        // locks, as an interrupted upgrade is resumed above, instead of refusing until `--repair` is run.
+        if (cursor?.failed) {
+          await reconcile("repair");
+          return NOOP;
+        }
         if (cursor) {
           const storeGeneration = readStamp()?.generation ?? "absent";
           throw new Error(
@@ -196,9 +201,9 @@ async function reconcile(mode: Mode): Promise<ReconcileResult> {
           throw new Error("installed extensions changed during connector refresh; retry the upgrade before committing its generation");
       });
     } catch (e) {
-      // This process is alive to see the failure, so the cursor it leaves says so: the next run
-      // reports why the seed failed, not an interruption. Failing to note it leaves that cursor as an
-      // interruption, and the seed's own error is still the one reported.
+      // This process is alive to see the failure, so the cursor it leaves says so: the next command retries
+      // the seed under the locks instead of reporting an interruption. Failing to note it leaves that cursor
+      // as an interruption, and the seed's own error is still the one reported.
       try { markCursorFailed(lock.nonce, e instanceof Error ? e.message : String(e)); } catch { /* reported below */ }
       throw e;
     } finally {
@@ -259,7 +264,7 @@ function builtinsMetadataCurrent(): boolean {
   return true;
 }
 
-async function runUnderLocks(mode: Mode, generation: string, nonce: string, refreshInstalls: () => Promise<void>): Promise<ReconcileResult> {
+async function runUnderLocks(requested: Mode, generation: string, nonce: string, refreshInstalls: () => Promise<void>): Promise<ReconcileResult> {
   // Refuse to touch the prefix while an orphaned seed child (a crashed parent's still-running
   // installer) is mutating it — reclaiming the lock does not stop that process. A pending marker whose
   // parent died is cleared: this lock is now live, so that parent's children refuse before installing.
@@ -287,6 +292,10 @@ async function runUnderLocks(mode: Mode, generation: string, nonce: string, refr
   const downgrade = seedDowngradeRefusal(generation);
   if (downgrade) throw downgrade;
 
+  // An auto run that waited on a live reconcile can reach the lock just after that run failed. Retry the
+  // failed seed as repair here: this lock is already held, so the retry cannot call reconcile() again.
+  const mode: Mode = requested === "auto" && readCursor()?.failed ? "repair" : requested;
+
   // Maintenance modes must survive a corrupt manifest / corrupt seed state: quarantine the unreadable
   // file(s) aside so the reads below (and the commit) can't wedge on them. `manifestRebuilt` ⇒ reconcile
   // against ON-DISK truth (a quarantined manifest has no reliable "removed" record); `repairAllSeeded`
@@ -303,7 +312,6 @@ async function runUnderLocks(mode: Mode, generation: string, nonce: string, refr
   // seed/repair was interrupted. In maintenance mode they are kept and cleared only at the final commit.
   const cursor = readCursor();
   if (cursor) {
-    if (mode === "auto" && cursor.failed) throw failedSeed(cursor);
     if (mode === "auto")
       throw new Error(
         `a previous connector seed was interrupted (package "${cursor.package}", phase ${cursor.phase}) - run \`cotal ext seed --repair\``,
@@ -668,11 +676,6 @@ function childFailure(r: SpawnSyncReturns<string>): string {
   }
   if (at > 0) process.stderr.write(`${lines.slice(0, at).join("\n")}\n`);
   return plain(lines.slice(at).join("\n")).slice(2);
-}
-
-/** The refusal after a seed that failed: what failed, and that `--repair` finishes it. */
-function failedSeed(cursor: ReconcileCursor): Error {
-  return new Error(`a previous connector seed failed (package "${cursor.package}", phase ${cursor.phase}): ${cursor.failed} - fix that, then run \`cotal ext seed --repair\``);
 }
 
 /** Confirm a connector the reconcile claims to have (re)installed is recorded AND on disk at the

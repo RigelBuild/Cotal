@@ -5,7 +5,7 @@
  *
  *  - first-run auto-seed of the first-party extensions + idempotent no-op + removability (removed stays removed)
  *  - crash cursor → auto fails loud → `--repair` re-installs the interrupted connector
- *  - a seed that fails reports its reason; the next boot says it failed, not that it was interrupted
+ *  - a seed that fails reports its reason; the next boot retries it under the locks, and seeds once npm is back
  *  - a recorded third-party package whose directory is gone (never there, or pruned by npm) is
  *    reported by reset and repair, which still succeed, and `ext remove` then drops its entry
  *  - corrupt manifest → `--reset` quarantines + rebuilds; connectors still on disk → `--repair` rebuilds
