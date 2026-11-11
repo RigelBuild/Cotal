@@ -49,6 +49,8 @@ import { controlCaller, type ControlAuth } from "../control-target.js";
 import { staleStoreHint } from "../maintenance.js";
 import { CommandFailure, nativeEndpointRefusal, type RefusalCode } from "../output.js";
 import { DIAL_TIMEOUT_MS, DialNotAdmitted, dialWithRetry, notAdmittedRefusal } from "./dial-retry.js";
+import { EP_COMMANDS } from "./ep-commands.js";
+
 
 /** What the surface making control calls supplies, because only it knows. */
 export interface ControlClient {
@@ -70,43 +72,9 @@ export interface ControlClient {
  *  relation by test. */
 export const START_TIMEOUT_MS = 40_000;
 
-/** v0.3 ctl op → v0.4 typed command (P2 item 1, 1c.2b): the wire names the manager REGISTERS
- *  (manager-service-contract ROWS). `start` is creation (`spawn`), a NAMED `stop` is the one
- *  owner/any-mode terminal (`despawn`), the per-agent `status` read is `inspect`; the camelCase
- *  admin family maps to its kebab-case wire names. `targeted` marks the three commands whose
- *  `{name}` argument becomes a §13.2 target block (resolved to the agent's principal triple via
- *  the name-keyed `inspect` read — it rides the spawn capability arm, so resolution reach equals
- *  despawn/attach reach; the wire target is (owner, actor, lifecycleUid), never an alias). */
-export const EP_COMMANDS: Record<string, { command: string; targeted?: boolean; self?: boolean }> = {
-  managerStatus: { command: "status" },
-  start: { command: "spawn" },
-  resolveAgent: { command: "resolve-agent" },
-  resolveCwd: { command: "resolve-cwd" },
-  stop: { command: "despawn", targeted: true },
-  stopSelf: { command: "stop", self: true },
-  attach: { command: "attach", targeted: true },
-  input: { command: "input", targeted: true },
-  status: { command: "inspect" },
-  ps: { command: "ps" },
-  slots: { command: "slots" },
-  models: { command: "models" },
-  listPersonas: { command: "list-personas" },
-  launch: { command: "launch" },
-  purge: { command: "purge" },
-  resumePreserved: { command: "resume-preserved" },
-  commitResume: { command: "commit-resume" },
-  finalizeResume: { command: "finalize-resume" },
-  preparePreservation: { command: "prepare-preservation" },
-  commitPreservation: { command: "commit-preservation" },
-  abortPreservation: { command: "abort-preservation" },
-  transcriptReceive: { command: "transcript-receive" },
-  attestGone: { command: "attest-gone" },
-  allowlistSet: { command: "allowlist-set" },
-  chatSessionOpen: { command: "chat-session-open" },
-  chatSessionRetire: { command: "chat-session-retire" },
-  runPs: { command: "run-ps" },
-  runStatus: { command: "run-status" },
-};
+/** The v0.3 manager operation names with registered v0.4 command mappings. */
+export type ManagerOp = keyof typeof EP_COMMANDS;
+
 
 /** Operator reach for one targeted control call: `owner` rides the caller's own-domain verb rows
  *  (the spawn capability's standing mint), `any` the admin instrument's cross-agent rows (§13.2
@@ -129,7 +97,7 @@ async function askManagerEp(
   client: ControlClient,
   space: string,
   server: string,
-  op: string,
+  op: ManagerOp,
   args: Record<string, unknown> | undefined,
   auth: ControlAuth,
   reach: ControlReach,
@@ -140,7 +108,6 @@ async function askManagerEp(
     return { ok: false, error: "the manager pin differs from this credential's instance authority", code: "permission-denied" };
   const instanceId = pin?.instanceId ?? auth.managerInstanceId;
   const mapped = EP_COMMANDS[op];
-  if (!mapped) return { ok: false, error: `unknown manager op "${op}" (no v0.4 command mapping)` };
   // Each attempt is a new connection, so a user bearer's connection nonce is minted afresh with it.
   let connectOpts: Record<string, unknown> = {};
   const nc = await dialWithRetry(() => {
@@ -422,7 +389,7 @@ export async function askManager(
   client: ControlClient,
   space: string,
   server: string,
-  op: string,
+  op: ManagerOp,
   args?: Record<string, unknown>,
   auth: ControlAuth = {},
   reach: ControlReach = "owner",
@@ -738,14 +705,13 @@ async function askManagerScatterEp(
   client: ControlClient,
   space: string,
   server: string,
-  op: string,
+  op: ManagerOp,
   auth: ControlAuth,
   spaceAuth: SpaceAuth | undefined,
   timeoutMs?: number,
   reportHosts = false,
 ): Promise<ScatterReply> {
   const mapped = EP_COMMANDS[op];
-  if (!mapped) return { ok: false, error: `unknown manager op "${op}" (no v0.4 command mapping)` };
   if (mapped.targeted) return { ok: false, error: `${op} is targeted and cannot be scattered across instances` };
 
   // ---- connection 0: freeze the class. A registry read that fails here fails the command with the
@@ -830,7 +796,7 @@ export async function scatterManager(
   client: ControlClient,
   space: string,
   server: string,
-  op: string,
+  op: ManagerOp,
   auth: ControlAuth = {},
   spaceAuth?: SpaceAuth,
   timeoutMs?: number,

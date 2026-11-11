@@ -11,7 +11,7 @@
 import { assertValidChannel, clearChannel, isConcreteChannel } from "@cotal-ai/core";
 import { connectOrThrow, userViewAuth, type ConnectFlags } from "../connect.js";
 import { resolveControlTarget } from "../control-target.js";
-import { askManager, scatterManager, START_TIMEOUT_MS, type ControlClient, type ManagerPin, type ManagerReply } from "./manager.js";
+import { askManager, scatterManager, START_TIMEOUT_MS, type ControlClient, type ManagerOp, type ManagerPin, type ManagerReply } from "./manager.js";
 import { locateSeat, seatMissRefusal, seatNotFoundMessage } from "./seat.js";
 
 /** The console's control coordinates: the same `ConnectFlags` triple the CLI's control commands
@@ -29,7 +29,7 @@ const OPS = {
   start: { profile: "control-caller-privileged", targeted: false, timeoutMs: START_TIMEOUT_MS },
   purge: { profile: "control-caller-admin", targeted: false },
   stop: { profile: "control-caller-admin", targeted: true },
-} as const;
+} as const satisfies Partial<Record<ManagerOp, { profile: string; targeted: boolean; timeoutMs?: number }>>;
 export type ControlOp = keyof typeof OPS;
 
 /** Delete one channel: its retained history (a filtered purge) and its registry entry, through

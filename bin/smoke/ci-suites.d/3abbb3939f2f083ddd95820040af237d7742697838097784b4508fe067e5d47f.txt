@@ -1,0 +1,2 @@
+# Keep manager operation mappings aligned with registered manager commands.
+smoke:manager-op-mapping

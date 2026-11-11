@@ -3,7 +3,7 @@ import { isConnectRefusal, type ConnectFlags } from "../connect.js";
 import { resolveControlTarget } from "../control-target.js";
 import { DEFAULT_MANAGER_NAME } from "../manager-name.js";
 import { CommandFailure, isCommandFailure } from "../output.js";
-import { askManager, readFailure, scatterManager, type ControlClient, type ManagerReply, type ScatterInstanceReply } from "./manager.js";
+import { askManager, readFailure, scatterManager, type ControlClient, type ManagerOp, type ManagerReply, type ScatterInstanceReply } from "./manager.js";
 
 /** The exchange's refusal of an unpinned manager-caller selection while several of the caller's own
  *  managers are live: their count, the owner and the instance ids. */

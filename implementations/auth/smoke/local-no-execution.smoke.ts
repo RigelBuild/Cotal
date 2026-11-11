@@ -25,7 +25,7 @@ import { formatSentinel, killAndAwaitExit, SMOKE_BROKER_TOKEN, teardownOnSignal 
 import { writeStamp } from "../../cli/src/seed/authority.js";
 import { pickFreePort } from "./_free-port.js";
 import { bootDeliveryDaemon } from "../../manager/smoke/_boot-delivery.js";
-import { askManager } from "@cotal-ai/workspace/control";
+import { askManager, type ManagerOp } from "@cotal-ai/workspace/control";
 import { cliControl } from "../../cli/src/lib/control.js";
 
 if (process.argv[2] === "auth-service") {
@@ -158,7 +158,7 @@ try {
   check("absent option preserves dead-remote refusal", legacy.status === 401 && /none live/.test(legacy.body.error ?? ""));
   const pinned = await exchange(local.instanceId);
   check("explicit genuine local pin still succeeds", pinned.status === 200 && pinned.instance === local.instanceId);
-  const nativePs = async (bearer: string, op = "ps") => {
+  const nativePs = async (bearer: string, op: ManagerOp = "ps") => {
     const claims = decodeJwt(bearer) as { sub: string; act: { actor: string; lifecycleUid: string; managerInstanceId: string } };
     const callout = await import("@cotal-ai/auth").then(m => m.loadCalloutAuth(store, space));
     return askManager(cliControl, space, server, op, undefined, { bearer, sentinelCreds: callout!.sentinelCreds,
