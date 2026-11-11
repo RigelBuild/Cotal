@@ -18,4 +18,4 @@ Zellij tabs keep their assigned names. Zellij ignores OSC titles from panes it s
 
 Set `COTAL_ZELLIJ_SESSION` to target a shared Zellij session instead of the session passed by Cotal. The runtime creates the selected session detached if it does not exist. Attach with `zellij attach <session>`.
 
-Set `COTAL_ZELLIJ_NO_CREATE_SESSION=1` when another process owns the session, such as a server started outside Cotal. Cotal then never creates it: `cotal up` leaves it alone, and a spawn into a missing session is refused with a `SpawnRefused` error that names the variable.
+Set `COTAL_ZELLIJ_NO_CREATE_SESSION=1` (or `true`) when another process owns the session, such as a server started outside Cotal. Any value except empty, `0`, or `false` turns this on. Cotal then never creates it: `cotal up` leaves it alone, and a spawn into a missing session is refused with a `SpawnRefused` error that names the variable.

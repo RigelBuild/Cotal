@@ -218,8 +218,10 @@ export const zellijRuntimeProvider: RuntimeProvider = {
   available: () => zellij.available(),
   create: ({ session }) => {
     const target = process.env.COTAL_ZELLIJ_SESSION ?? session;
+    // Fails closed: any value except empty, "0", or "false" turns the mode on, so a typo never re-enables creation.
+    const noCreateRaw = process.env.COTAL_ZELLIJ_NO_CREATE_SESSION?.trim().toLowerCase() ?? "";
     // Cotal must not create the session in this mode: the server that owns it is started by someone else.
-    if (process.env.COTAL_ZELLIJ_NO_CREATE_SESSION === "1") return new ZellijRuntime(target, false);
+    if (noCreateRaw !== "" && noCreateRaw !== "0" && noCreateRaw !== "false") return new ZellijRuntime(target, false);
     zellij.ensureSession(target);
     return new ZellijRuntime(target);
   },
