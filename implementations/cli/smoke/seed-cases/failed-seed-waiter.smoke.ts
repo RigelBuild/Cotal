@@ -18,13 +18,21 @@ console.log("ready");
 setTimeout(() => { lock.release(); process.exit(0); }, Number(process.env.HOLDER_HOLD_MS));
 `;
 
+// `Promise.withResolvers` needs lib es2024; this tsconfig targets older, so keep the same shape locally.
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void; reject: (reason?: unknown) => void } {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
 interface BootResult {
   readonly status: number;
   readonly stderr: string;
 }
 
 function bootAsync(cfg: string, extraEnv: Record<string, string>): Promise<BootResult> {
-  const { promise, resolve, reject } = Promise.withResolvers<BootResult>();
+  const { promise, resolve, reject } = deferred<BootResult>();
   const child = spawn("node", [BIN, "sync"], {
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...HOST_ENV, XDG_CONFIG_HOME: cfg, COTAL_ALLOW_CHECKOUT_SEED: "1", ...extraEnv },
@@ -45,8 +53,8 @@ async function run(): Promise<void> {
   const bin = track(mkdtempSync(join(tmpdir(), "cotal-seed-waiter-no-npm-")));
   symlinkSync(process.execPath, join(bin, "node"));
 
-  const ready = Promise.withResolvers<void>();
-  const exited = Promise.withResolvers<void>();
+  const ready = deferred<void>();
+  const exited = deferred<void>();
   const holder = spawn(process.execPath, ["--input-type=module", "-e", HOLDER], {
     cwd: import.meta.dirname,
     stdio: ["ignore", "pipe", "inherit"],
