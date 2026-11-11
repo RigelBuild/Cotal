@@ -25,6 +25,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import assert from "node:assert/strict";
 import { marked } from "marked";
+import { isMainEntry } from "./main-entry.mjs";
 
 const parseVersion = (text) => {
   const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(text.trim());
@@ -359,4 +360,4 @@ const main = (argv) => {
   process.stdout.write(render(collectSummaries(process.cwd(), version, since), maxBytes));
 };
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) main(process.argv.slice(2));
+if (isMainEntry(import.meta.url)) main(process.argv.slice(2));

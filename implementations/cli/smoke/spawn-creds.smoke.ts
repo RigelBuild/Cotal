@@ -1,5 +1,5 @@
 /**
- * `cotal spawn --creds <file> --lifecycle-uid <uid>` in the foreground: a seedless launch.
+ * `cotal spawn <persona-file> --creds <file>` with a lifecycle uid in the foreground: a seedless launch.
  *
  * The launch runs from a directory with no `.cotal` at all, against a mesh whose record names a
  * root with no trust material, so nothing on this host can mint or provision. The credential is
@@ -164,12 +164,12 @@ try {
   const foreignCredsPath = write("foreign.creds", foreignCreds);
 
   // The launch host: an `up` record (the prunable kind) whose root holds nothing, and a persona
-  // outside any catalog that declares more than some credentials grant.
+  // file path outside any catalog that declares more than some credentials grant.
   recordMesh({ space: SPACE, server, root: launchDir, mode: "auth", origin: "up", ts: new Date().toISOString() });
   const persona = join(temp, "seedless.md");
   writeFileSync(persona, "---\nname: seedless\nrole: worker\nsubscribe: []\nallowSubscribe: []\ncapabilities: [spawn]\n---\nseedless spawn acceptance\n");
   process.chdir(launchDir);
-  const base = ["spawn", "--config", persona, "--space", SPACE, "--agent", "creds-probe"];
+  const base = ["spawn", persona, "--space", SPACE, "--agent", "creds-probe"];
 
   console.log("refusals");
   {

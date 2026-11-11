@@ -33,7 +33,7 @@ const positive = fixture.cases.find((c: { pr: number }) => c.pr === 1087);
 if (!positive) throw new Error("positive PR-head fixture case is missing");
 // Windows and Changesets are retired on this fork. Docs, Installer, and Remotion remain path-filtered.
 const expectedNames = positive.expectedNames;
-const packageExpectedNames = ["CI", "Mutation reproof", "Remotion typecheck"];
+const packageExpectedNames = ["CI", "Docs", "Mutation reproof", "Remotion typecheck"];
 check(
   "path-filtered workflows are included only when changed paths match declarations",
   JSON.stringify(expectedPullRequestWorkflows(workflows, ["package.json"])) === JSON.stringify(packageExpectedNames) &&
