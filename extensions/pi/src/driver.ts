@@ -459,7 +459,7 @@ export class PiDriver {
    *  still drain into Pi beside its replacement, so a delivery can sit in the request twice. A later
    *  copy is dropped only when no assistant message sits between it and the first copy it repeats;
    *  otherwise the request would end on an assistant turn. A kept copy is rebuilt from its new items
-   *  or run turn, or becomes a short stub when it carries nothing new. Run turns dedupe by goal id.
+   *  or run turn, or becomes a short stub when it carries nothing new. Run turns dedupe by goal id; a multi-goal run-turn suffix is kept whole, so its earlier goals' text can repeat.
    *  Returns undefined when nothing changed. */
   private withoutSupersededBatches<T>(messages: readonly T[]): T[] | undefined {
     const seenIds = new Set<string>();
@@ -486,6 +486,7 @@ export class PiDriver {
       const repeats = newIds.length < details.ids.length || newTurnIds.length < turnIds.length;
       if (!repeats) {
         kept.push(message);
+        assistantSinceLastCopy = false;
         continue;
       }
       changed = true;

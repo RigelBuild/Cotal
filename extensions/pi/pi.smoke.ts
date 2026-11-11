@@ -997,8 +997,12 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const afterReply = driver.onContext([old, reply, fresh]);
   ok(afterReply !== undefined && afterReply.length === 3 && afterReply[0] === old && afterReply[1] === reply,
     "a later copy after an assistant reply is kept, so the first copy and reply stay in order");
+  ok(afterReply?.[2]?.content === "Cotal batch already delivered above; no new items.", "a later copy with nothing new after an assistant reply becomes the already-delivered stub");
   ok(afterReply?.at(-1)?.role !== "assistant", "a request that kept a later copy after a reply does not end on an assistant message");
-
+  const earlierReply = { role: "assistant", content: "earlier" };
+  const earlierThenRepeat = driver.onContext([earlierReply, old, fresh]);
+  ok(earlierThenRepeat?.length === 2 && earlierThenRepeat[0] === earlierReply && earlierThenRepeat[1] === old,
+    "an assistant message before the first copy does not stop a trailing repeat from being dropped");
   const trailingCopy = driver.onContext([old, fresh]);
   ok(trailingCopy?.length === 1 && trailingCopy[0] === old,
     "a later copy with nothing new and no assistant between copies is dropped");
