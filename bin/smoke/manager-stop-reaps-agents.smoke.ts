@@ -395,6 +395,13 @@ try {
     startError = (e as Error).message;
   }
   ok("#4005: a next manager starts on the root that released the seat", startError === undefined, { startError });
+  // The next manager (mgr3) is the one that runs the sweep over the released seat. statusOf reads
+  // `reaper` (mgr2, the seatB manager), which never attempts seatA, so the #4005 reads use mgr3.
+  type NextView = { staticReconciliation: { lastSweep?: { completedAt?: string; attempted: number }; failures: Array<{ alias: string; disposition: string; retainedReason?: string }> } };
+  // managerStatusData is private to Manager, so the test reaches it through one named, unchecked view
+  // of mgr3 (the next manager). It is read once here, not at each use, so the cast is visible in one place.
+  const nextManagerView = mgr3 as unknown as { managerStatusData: (owner: undefined) => NextView };
+  const nextStatus = (): NextView => nextManagerView.managerStatusData(undefined);
   // The fork's contract: a released seat no runtime can prove gone is NOT retired, and its credential
   // and runtime reference stay on disk for a later adoption (RIG-4320). The next manager's start runs
   // reconcileStaticLifecycles, which plans the seat as a restart row and calls adoptSeat. adoptSeat
@@ -404,11 +411,11 @@ try {
   // before the one that plans seatA. Wait for the sweep that attempted a row: completedAt set and
   // attempted at least 1. A sweep that planned nothing (attempted 0) can never satisfy this.
   const sweepDone = await until(() => {
-    const last = statusOf().staticReconciliation.lastSweep;
+    const last = nextStatus().staticReconciliation.lastSweep;
     return last?.completedAt !== undefined && (last?.attempted ?? 0) >= 1;
   }, 15_000);
-  ok("#4005: the next manager's static reconcile sweep finishes", sweepDone, { lastSweep: statusOf().staticReconciliation.lastSweep });
-  const sweepStatus = statusOf().staticReconciliation;
+  ok("#4005: the next manager's static reconcile sweep finishes", sweepDone, { lastSweep: nextStatus().staticReconciliation.lastSweep });
+  const sweepStatus = nextStatus().staticReconciliation;
   const seatAItem = sweepStatus.failures.find((f) => f.alias === "seatA");
   console.log(`  · #4005 baseline: lastSweep.attempted=${sweepStatus.lastSweep?.attempted} seatA disposition=${seatAItem?.disposition} retainedReason=${seatAItem?.retainedReason}`);
   ok("#4005: the sweep refuses the released seat as unprovable (disposition refused, retainedReason unprovable)", seatAItem?.disposition === "refused" && seatAItem?.retainedReason === "unprovable", { item: seatAItem });
