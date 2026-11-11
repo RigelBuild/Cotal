@@ -347,6 +347,9 @@ importers:
       '@nats-io/transport-node':
         specifier: ^3.4.0
         version: 3.4.0
+      esbuild:
+        specifier: ^0.28.0
+        version: 0.28.1
       tsx:
         specifier: ^4.22.4
         version: 4.22.4
