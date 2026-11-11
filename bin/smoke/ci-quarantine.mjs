@@ -39,6 +39,7 @@ export const QUARANTINED = {
   "smoke:orphan-seat-rollback": { reason: "upstream: finds no seat record under the custody root on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:runtime-mesh-turn": { reason: "upstream: cancel is not in the manager surface, so the Cancelled cell fails on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:manager-stop-spare-guard": { reason: "upstream: 1/26 cells fail on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
+  "smoke:manager-stop-reap": { reason: "RIG-9723: GHA runners refuse to signal nats-server as pid 1 (EPERM) and lose the manager .pid; passes 25/25 on a full VM", recheckBy: "2026-12-31" },
   "smoke:delivery-explicit-space": { reason: "upstream: ensureControlPlane explicit-space cell fails on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:claude-hosted-session": { reason: "upstream: spawnSync git ENOENT on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:cli-on-instance": { reason: "upstream: red on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
