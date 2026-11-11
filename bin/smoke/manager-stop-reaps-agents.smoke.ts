@@ -94,10 +94,10 @@ const must = (name: string, cond: boolean, extra?: unknown) => {
   pass++;
   console.log(`  ✓ ${name}`);
 };
-/** Twenty-two scenario cells (16 `ok` and 6 `must`) run before the final count cell, which is the
- * 23rd call. EXPECTED_CELLS counts all 23, and the count cell checks `pass + fail === EXPECTED_CELLS - 1`.
+/** Twenty-five scenario cells (19 `ok` and 6 `must`) run before the final count cell, which is the
+ * 26th call. EXPECTED_CELLS counts all 26, and the count cell checks `pass + fail === EXPECTED_CELLS - 1`.
  * A throw lands in the catch as a counted failure, so a partial run can never print the OK banner. */
-const EXPECTED_CELLS = 23;
+const EXPECTED_CELLS = 26;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const until = async (cond: () => boolean, ms: number): Promise<boolean> => {
   const end = Date.now() + ms;
@@ -394,13 +394,16 @@ try {
     startError = (e as Error).message;
   }
   ok("#4005: a next manager starts on the root that released the seat", startError === undefined, { startError });
-  // The fork's contract: a released seat no runtime can prove gone is NOT retired. adoptReleasedSeat
-  // refuses the unprovable reap and leaves the record in place (manager.ts), so the minted credential
-  // stays on disk and the next manager's adoption keeps the reference for a later retry. Upstream
-  // deprovisions here; the fork does not, on purpose (#72/#73, RIG-4320). Both facts are asserted.
-  // Adoption is fire-and-forget from start() (`void this.adoptReleasedSeats()`). Its unprovable path
-  // returns before any credential or record write, and logs nothing, so these asserts read the state
-  // the refusal leaves. Neither is gated on a timer.
+  // The released seat is retired by the static reconcile that the next manager starts, not by
+  // adoptReleasedSeats (that path is user-mode only; this smoke runs static auth). The path is
+  // reconcileStaticLifecycles, which calls adoptSeat, which refuses an unprovable seat and leaves the
+  // record in place; the drop it would make is gated on releasedSeatPending (manager.ts). Start() does
+  // not await that sweep, so wait for it to finish before reading the state it leaves. The sweep sets
+  // lastSweep.completedAt on both its normal and its error exit.
+  const sweepDone = await until(() => statusOf().staticReconciliation.lastSweep?.completedAt !== undefined, 15_000);
+  ok("#4005: the next manager's static reconcile sweep finishes", sweepDone, { lastSweep: statusOf().staticReconciliation.lastSweep });
+  const releasedItem = statusOf().staticReconciliation.failures.find((f) => f.alias === "seatA");
+  ok("#4005: the released seat is refused as unprovable, not retired", releasedItem?.disposition === "refused" && releasedItem?.retainedReason === "unprovable", { item: releasedItem });
   ok("#4005: the next manager keeps the unprovable released seat's minted credential (no retirement without proof)", credsA !== undefined && existsSync(credsA), { credsA });
   ok("#4005: the next manager keeps the released seat's runtime reference for a later adoption", existsSync(releasedRef), { releasedRef });
 
