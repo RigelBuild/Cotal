@@ -1,0 +1,199 @@
+name: seat-image
+
+# Publishes the Cotal seat image from a reviewed rigel-release commit.
+# Nix builds the image from the runtime tree rigel-release.yml assembles.
+on:
+  push:
+    branches:
+      - rigel-release
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Queue every push so each commit gets its image; never cancel a publish in flight.
+concurrency:
+  group: seat-image-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
+
+env:
+  IMAGE: ghcr.io/rigelbuild/cotal-seat
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+      version_tag: ${{ steps.meta.outputs.version_tag }}
+      sha_tag: ${{ steps.meta.outputs.sha_tag }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+    steps:
+      - name: Require release-branch dispatch
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/rigel-release'
+        run: |
+          echo '::error::workflow_dispatch is only allowed from rigel-release' >&2
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Prepare image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          short_sha="${sha:0:10}"
+          version="$(jq -r .version bin/package.json)"
+          {
+            echo "sha=$sha"
+            echo "version_tag=rigel-v${version}-${short_sha}"
+            echo "sha_tag=sha-${sha}"
+            echo "release_tag=seat-image-rigel-v${version}-${short_sha}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          # Match the Node the runtime is built and tested against.
+          node-version: 24
+          cache: pnpm
+
+      - name: Build runtime
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Assemble runtime tree
+        run: |
+          set -euo pipefail
+          runtime_root="$RUNNER_TEMP/cotal-runtime-asset"
+          mkdir -p "$runtime_root/cotal"
+          cp -R bin extensions implementations packages examples node_modules package.json pnpm-workspace.yaml "$runtime_root/cotal/"
+          cp -R bin "$runtime_root/cotal/cotal-ai"
+          ln -sfn ../../../cotal-ai "$runtime_root/cotal/node_modules/.pnpm/node_modules/cotal-ai"
+          echo "RUNTIME_DIR=$runtime_root/cotal" >> "$GITHUB_ENV"
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@91f6a0f59e94dfb2cfed0f4000f36a68ead1d20c # v31.11.4
+
+      - name: Build seat image
+        run: nix build --file nix/seat-image.nix --argstr runtimeDir "$RUNTIME_DIR" --out-link result --print-build-logs
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Load seat image
+        run: ./result | docker load
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push seat image and record digest
+        id: push
+        env:
+          SHA_TAG: ${{ needs.resolve.outputs.sha_tag }}
+        run: |
+          set -euo pipefail
+          ref="$IMAGE:$SHA_TAG"
+          # A rerun reuses the digest already published for this commit and pushes nothing.
+          if existing="$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}' 2>/dev/null)"; then
+            echo "$ref already published as $existing; reusing it"
+            echo "digest=$existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          docker tag cotal-seat:seat "$ref"
+          docker push "$ref" | tee push.log
+          digest="$(sed -n 's/.*digest: \(sha256:[a-f0-9]\{64\}\).*/\1/p' push.log | tail -n 1)"
+          if [ -z "$digest" ]; then
+            echo "::error::no digest in docker push output" >&2
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  finalize:
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Apply release tags and verify digests
+        env:
+          DIGEST: ${{ needs.build.outputs.digest }}
+          VERSION_TAG: ${{ needs.resolve.outputs.version_tag }}
+          SHA_TAG: ${{ needs.resolve.outputs.sha_tag }}
+        run: |
+          set -euo pipefail
+          # imagetools create is idempotent: rerunning finalize alone never rebuilds the image.
+          for tag in "$VERSION_TAG" "$SHA_TAG"; do
+            docker buildx imagetools create --tag "$IMAGE:$tag" "$IMAGE@$DIGEST"
+            resolved="$(docker buildx imagetools inspect "$IMAGE:$tag" --format '{{.Manifest.Digest}}')"
+            if [ "$resolved" != "$DIGEST" ]; then
+              echo "::error::$IMAGE:$tag resolves to $resolved, expected $DIGEST" >&2
+              exit 1
+            fi
+            echo "$IMAGE:$tag@$resolved" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+  release:
+    # Last: a Release marks the image as complete and tagged.
+    needs: [resolve, build, finalize]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          VERSION_TAG: ${{ needs.resolve.outputs.version_tag }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub Release $RELEASE_TAG already exists"
+            exit 0
+          fi
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "$RELEASE_TAG" \
+            --notes "Cotal seat image ${IMAGE}:${VERSION_TAG}@${DIGEST}"
