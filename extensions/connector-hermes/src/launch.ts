@@ -76,24 +76,16 @@ function processTree(pid: number): number[] {
  *  launch's own control token alongside space/name/pid, so a same-uid process cannot compute the
  *  path from public identity the way the old `space`+`name` name let it. The token is what
  *  authenticates the socket (see bridge.ts); the path merely stops it being guessed at a glance. */
-function bridgeSocketPath(space: string, name: string, token: string): string {
+export function bridgeSocketPath(space: string, name: string, token: string): string {
   const id = createHash("sha256")
     .update(`${space}\0${name}\0${process.pid}\0${token}\0bridge`)
     .digest("base64url")
     .slice(0, 32);
-  const path = join(tmpdir(), `cotal-hermes-bridge-${id}.sock`);
-  const bytes = Buffer.byteLength(path);
-  if (bytes > SUN_PATH_MAX_BYTES) {
-    const tail = `/cotal-hermes-bridge-${id}.sock`.length;
-    throw new Error(
-      `bridge socket path is ${bytes} bytes, over the ${SUN_PATH_MAX_BYTES}-byte sun_path limit on ` +
-        `${process.platform}, so it cannot be bound and the kernel would report only EINVAL: ${path}. ` +
-        `The socket name is a fixed ${tail} bytes, so the temp root must be at most ` +
-        `${SUN_PATH_MAX_BYTES - tail} bytes — TMPDIR is ${Buffer.byteLength(tmpdir())} bytes ` +
-        `(${tmpdir()}). Point TMPDIR at a shorter directory.`,
-    );
-  }
-  return path;
+  // macOS's per-user TMPDIR (`/var/folders/…/T/`) alone overruns darwin's 104-byte sun_path, so a
+  // fixed-length name there cannot bind. `/tmp` is short everywhere, and the id carries the control
+  // token, so the name stays unguessable even in a shared directory. The `/tmp` form is 62 bytes.
+  const inTmp = join(tmpdir(), `cotal-hermes-bridge-${id}.sock`);
+  return Buffer.byteLength(inTmp) <= SUN_PATH_MAX_BYTES ? inTmp : `/tmp/cotal-hermes-bridge-${id}.sock`;
 }
 
 function log(msg: string): void {
