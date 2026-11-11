@@ -74,6 +74,7 @@ export const QUARANTINED = {
   "smoke:membership-rw-renewal": { reason: "RIG-9150 flaky: reconnect sweep cell failed once on CI (3f4f77b1 shard 3); 52/52 locally on fork and 82a97c1f", recheckBy: "2026-12-31" },
   "smoke:signal-exits:live": { reason: "RIG-9150 CI-env: CI cannot signal nats-server pid 1 (EPERM), leaving manager stop unknown; 16/18 cells pass", recheckBy: "2026-12-31" },
   "smoke:setup-destination": { reason: "RIG-9150 upstream: 19/82 cells fail on pristine 82a97c1f (local run); runtime host-tool fixture cells", recheckBy: "2026-12-31" },
+  "smoke:reap-absent-refusal": { reason: "RIG-9150 upstream: the manager.ts reap census flags Manager.adoptReleasedSeat as a bypass of requireRuntimeReap, 1/62 fails on pristine fdd4d022 (local run, bypass at line 3706); the fork adds a second REVIEWED_SITES control, 2/66 fail", recheckBy: "2026-12-31" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */
