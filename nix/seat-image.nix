@@ -1,7 +1,7 @@
 # The Cotal seat image: one OCI image carrying the Cotal runtime and its Node runtime.
 #
 # Build: nix build --file nix/seat-image.nix --argstr runtimeDir <dir> --out-link result
-# Load:  ./result | docker load
+# Load:  ./result > seat-image.tar && docker load -i seat-image.tar   (CI pushes it with crane)
 #
 # `runtimeDir` is the runtime tree that rigel-release.yml assembles: a `cotal/` directory
 # holding bin, extensions, implementations, packages, examples, node_modules, package.json.
@@ -31,19 +31,22 @@ let
   runtime = pkgs.runCommand "cotal-runtime" { } ''
     mkdir -p $out/lib
     cp -a ${runtimeSrc} $out/lib/cotal
-    # Same dangling-link cleanup as nix/release.nix: the assembler leaves workspace links to
-    # members it does not copy. The fixup still guards every other link.
+    chmod -R u+w $out/lib/cotal
+    # The assembler leaves workspace links to members it does not copy. Delete those so the
+    # fixup only sees real links; every other dangling link still fails the build.
     find $out/lib/cotal -xtype l -delete
   '';
 
-  cotal = pkgs.writeShellScriptBin "cotal" ''
-    exec ${pkgs.nodejs_24}/bin/node ${runtime}/lib/cotal/cotal-ai/dist/cotal.js "$@"
-  '';
-
-  passwd = pkgs.runCommand "passwd" { } ''
-    mkdir -p $out/etc
-    printf '%s\n' 'root:x:0:0:root:/root:/bin/false' '${user}:x:${toString uid}:${toString uid}::${home}:/bin/false' > $out/etc/passwd
-    printf '%s\n' 'root:x:0:' '${user}:x:${toString uid}:' > $out/etc/group
+  # The entrypoint is node running the runtime's cotal.js directly. No shell wrapper, so no bash
+  # is in the image.
+  cotalEntry = "${runtime}/lib/cotal/cotal-ai/dist/cotal.js";
+  # passwd, group and the CA bundle are written as real files in the image root. A store-path
+  # entry in `contents` makes /etc a link into /nix/store, which containerd refuses to mount.
+  etcFiles = pkgs.runCommand "etc-files" { } ''
+    mkdir -p $out
+    printf '%s\n' 'root:x:0:0:root:/root:/bin/false' '${user}:x:${toString uid}:${toString uid}::${home}:/bin/false' > $out/passwd
+    printf '%s\n' 'root:x:0:' '${user}:x:${toString uid}:' > $out/group
+    cp ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt $out/ca-bundle.crt
   '';
 in
 {
@@ -51,26 +54,30 @@ in
     name = "cotal-seat";
     tag = "seat";
     contents = [
-      cotal
-      pkgs.nodejs_24
-      pkgs.cacert
-      passwd
+      pkgs.nodejs-slim_24
     ];
     extraCommands = ''
       mkdir -p tmp
       chmod 1777 tmp
     '';
     fakeRootCommands = ''
-      mkdir -p .${home}
+      mkdir -p .${home} etc
+      cp ${etcFiles}/passwd etc/passwd
+      cp ${etcFiles}/group etc/group
+      cp ${etcFiles}/ca-bundle.crt etc/ca-bundle.crt
+      chmod 0644 etc/passwd etc/group etc/ca-bundle.crt
       chown ${toString uid}:${toString uid} .${home}
     '';
     config = {
       User = "${toString uid}:${toString uid}";
       Env = [
         "HOME=${home}"
-        "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+        "SSL_CERT_FILE=/etc/ca-bundle.crt"
       ];
-      Entrypoint = [ "${cotal}/bin/cotal" ];
+      Entrypoint = [
+        "${pkgs.nodejs-slim_24}/bin/node"
+        cotalEntry
+      ];
       Cmd = [ "--version" ];
     };
   };

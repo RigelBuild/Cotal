@@ -36,4 +36,5 @@ jobs:
           image-names: cotal-seat
           tag-selection: untagged
           cut-off: 30d
-          dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run || 'false' }}
+          # Scheduled runs are always dry-run. Deletion needs an explicit dispatch with dry-run false.
+          dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run || 'true' }}
