@@ -1,4 +1,4 @@
-interface EpCommandMapping {
+export interface EpCommandMapping {
   command: string;
   targeted?: boolean;
   self?: boolean;
@@ -37,4 +37,5 @@ export const EP_COMMANDS = Object.freeze({
   chatSessionOpen: freezeCommand({ command: "chat-session-open" }),
   chatSessionRetire: freezeCommand({ command: "chat-session-retire" }),
   runPs: freezeCommand({ command: "run-ps" }),
+  runStatus: freezeCommand({ command: "run-status" }),
 } as const satisfies Record<string, EpCommandMapping>);
