@@ -76,13 +76,6 @@ function detailsOf(message: unknown): CotalBatchDetails | undefined {
   return details as CotalBatchDetails;
 }
 
-/** One key per delivery a batch carries: its receive keys, or its run-turn text when it has none.
- *  Nudges carry neither, so they never collapse with each other. */
-function deliveryKey(details: CotalBatchDetails): string | undefined {
-  if (details.ids.length > 0) return `ids:${JSON.stringify(details.ids)}`;
-  return details.suffix === undefined ? undefined : `turn:${details.suffix}`;
-}
-
 function ownChannelEcho(mesh: MeshAgent, item: InboxItem): boolean {
   return item.kind === "channel" && item.fromId === mesh.id;
 }
@@ -458,26 +451,42 @@ export class PiDriver {
   }
 
   /** The messages a provider request carries. A lost steer re-dispatched after its settle window can
-   *  still drain into Pi beside its replacement, so one delivery sits in the request twice. Keep one
-   *  copy per delivery: the live batch's when it is visible, else the latest. A request with no
-   *  repeated delivery passes through unchanged (undefined). */
+   *  still drain into Pi beside its replacement, so a delivery can sit in the request twice. The first
+   *  copy of each receive key and run-turn text is kept. A later copy is dropped when it carries
+   *  nothing new, and rebuilt from its new items otherwise. Returns undefined when nothing changed. */
   private withoutSupersededBatches<T>(messages: readonly T[]): T[] | undefined {
-    const live = new Set(this.batches.filter((batch) => !batch.confirmed).map((batch) => batch.id));
-    const parts = messages.map((message) => {
+    const seenIds = new Set<string>();
+    const seenTurns = new Set<string>();
+    const kept: T[] = [];
+    let changed = false;
+    for (const message of messages) {
       const details = detailsOf(message);
-      return { key: details && deliveryKey(details), batchId: details?.batchId ?? "" };
-    });
-    const keeper = new Map<string, number>();
-    parts.forEach(({ key, batchId }, index) => {
-      if (key === undefined) return;
-      const kept = keeper.get(key);
-      if (kept === undefined || live.has(batchId) || !live.has(parts[kept]?.batchId ?? "")) keeper.set(key, index);
-    });
-    const kept = messages.filter((_, index) => {
-      const key = parts[index]?.key;
-      return key === undefined || keeper.get(key) === index;
-    });
-    return kept.length === messages.length ? undefined : kept;
+      if (!details) {
+        kept.push(message);
+        continue;
+      }
+      const newIds = details.ids.filter((id) => !seenIds.has(id));
+      const turnNew = details.suffix !== undefined && !seenTurns.has(details.suffix);
+      for (const id of details.ids) seenIds.add(id);
+      if (details.suffix !== undefined) seenTurns.add(details.suffix);
+      if (newIds.length === details.ids.length && (details.suffix === undefined || turnNew)) {
+        kept.push(message);
+        continue;
+      }
+      changed = true;
+      if (newIds.length === 0 && !turnNew) continue;
+      const items = (details.items ?? []).filter((item) => newIds.includes(item.recvKey));
+      const parts = [items.length > 0 ? formatInjection(items) : undefined, turnNew ? details.suffix : undefined];
+      const rebuilt: CotalBatchDetails = {
+        version: 1,
+        batchId: details.batchId,
+        ids: newIds,
+        items,
+        ...(turnNew && details.suffix !== undefined ? { suffix: details.suffix } : {}),
+      };
+      kept.push({ ...(message as object), content: parts.filter((p): p is string => p !== undefined).join("\n\n"), details: rebuilt } as T);
+    }
+    return changed ? kept : undefined;
   }
 
   /** Surfacing at confirmation, not at agent end: a confirmation lets `pump` run mid-turn, which
