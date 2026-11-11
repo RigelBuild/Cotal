@@ -1,0 +1,39 @@
+name: seat-image-retention
+
+# Prunes untagged cotal-seat versions older than the cut-off. Tagged versions are never
+# selected, so every published release and sha tag stays.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Print what would be deleted without deleting it
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: seat-image-retention
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      packages: write
+    steps:
+      - name: Prune untagged cotal-seat versions
+        uses: snok/container-retention-policy@d3bdcf5ce9b05f685154e4a16c39233b245e3d53 # v3.1.0
+        with:
+          account: RigelBuild
+          token: ${{ secrets.GITHUB_TOKEN }}
+          image-names: cotal-seat
+          tag-selection: untagged
+          cut-off: 30d
+          dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run || 'false' }}
