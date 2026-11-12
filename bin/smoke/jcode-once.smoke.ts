@@ -13,10 +13,10 @@
  * Run: pnpm smoke:jcode-once   (needs nats-server + node on PATH; Linux)
  */
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { custodySeatRoot, scrubAmbientCotalEnv } from "@cotal-ai/smoke-kit";
 
 if (process.platform !== "linux") throw new Error("jcode-once proves process identity through /proc and runs on Linux only");
 const repoRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
@@ -25,8 +25,8 @@ const scratch = mkdtempSync(join(tmpdir(), "cotal-jcode-once-"));
 process.env.HOME = join(scratch, "home");
 process.env.XDG_CONFIG_HOME = join(scratch, "home", ".config");
 mkdirSync(process.env.XDG_CONFIG_HOME, { recursive: true });
-for (const key of Object.keys(process.env)) if (key.startsWith("COTAL_") || key.startsWith("FAKE_JCODE_")) delete process.env[key];
-// `jcode` on PATH is the fake harness.
+scrubAmbientCotalEnv(process.env);
+for (const key of Object.keys(process.env)) if (key.startsWith("FAKE_JCODE_")) delete process.env[key];
 const bin = join(scratch, "bin");
 mkdirSync(bin);
 const fake = join(repoRoot, "extensions/connector-jcode/smoke/fake-jcode.mjs");
@@ -77,6 +77,7 @@ const carriers = (identities: readonly string[]): number[] => {
 
 const space = `jonce-${randomUUID().slice(0, 8)}`;
 const auth = await createSpaceAuth(space);
+const { cleanup: cleanupSeatRoot } = custodySeatRoot("cotal-jcode-seats-");
 const broker = await bootBroker(auth);
 const workspaceRoot = join(scratch, "ws");
 mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
@@ -241,6 +242,7 @@ try {
   await broker.stop().catch(() => {});
   // Anything still carrying an identity this run recorded is this run's own process.
   for (const pid of carriers([...leftovers])) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
+  cleanupSeatRoot();
   rmSync(scratch, { recursive: true, force: true });
 }
 

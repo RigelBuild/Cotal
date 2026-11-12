@@ -14,11 +14,11 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { custodySeatRoot, SMOKE_BROKER_TOKEN, freePort, scrubAmbientCotalEnv, teardownOnSignal } from "@cotal-ai/smoke-kit";
 
 const home = mkdtempSync(join(tmpdir(), "cotal-langsupervise-home-"));
-for (const k of Object.keys(process.env)) if (k.startsWith("COTAL_")) delete process.env[k];
-process.env.COTAL_HOME = home;
+const custodyEnv = scrubAmbientCotalEnv(process.env);
+const { root: seatRoot, cleanup: cleanupSeatRoot } = custodySeatRoot("cotal-langsupervise-seats-");
 
 const { connect } = await import("@nats-io/transport-node");
 const { jetstream, jetstreamManager } = await import("@nats-io/jetstream");
@@ -68,10 +68,10 @@ writeFileSync(turnLog, "");
 
 let yieldOnPull = false;
 const envJoin = (o: LaunchOptsT): Record<string, string> => ({
-  ...launchEnv(), CORE_DIST: coreDist,
+  ...launchEnv(), ...custodyEnv, CORE_DIST: coreDist,
+  COTAL_SEAT_ROOT: seatRoot,
   COTAL_SPACE: o.space, COTAL_SERVERS: String(o.servers ?? SERVER),
   COTAL_ID: o.id ?? "", COTAL_LIFECYCLE_UID: o.lifecycleUid ?? "", COTAL_NAME: o.name,
-  COTAL_TURN_LOG: turnLog,
   COTAL_AUTO_YIELD: yieldOnPull ? "1" : "0",
 });
 const joinCon: ConnectorT = {
@@ -266,7 +266,7 @@ try {
   try { await mgr?.stop({ withAgents: true }); } catch { /* teardown */ }
   for (const k of kids) { try { k.kill("SIGKILL"); } catch { /* gone */ } }
   rmSync(home, { recursive: true, force: true });
-  rmSync(workspaceRoot, { recursive: true, force: true });
+  cleanupSeatRoot();
 }
 console.log(`lang-supervise-live.smoke: ${pass} passed, ${fail} failed`);
 process.exit(rc);

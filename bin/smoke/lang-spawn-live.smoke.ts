@@ -33,12 +33,13 @@ import { spawn as spawnProc, type ChildProcess } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { custodySeatRoot, SMOKE_BROKER_TOKEN, freePort, scrubAmbientCotalEnv, teardownOnSignal } from "@cotal-ai/smoke-kit";
 
 // Seat-env hygiene BEFORE any cotal import: whatever runs this suite may itself be a managed
 // session whose COTAL_* names a live mesh; nothing may leak into the rig or its children.
 const home = mkdtempSync(join(tmpdir(), "cotal-langspawn-home-"));
-for (const k of Object.keys(process.env)) if (k.startsWith("COTAL_")) delete process.env[k];
+const custodyEnv = scrubAmbientCotalEnv(process.env);
+const { root: seatRoot, cleanup: cleanupSeatRoot } = custodySeatRoot("cotal-langspawn-seats-");
 process.env.COTAL_HOME = home;
 
 const { connect } = await import("@nats-io/transport-node");
@@ -93,10 +94,10 @@ const JOIN_CHILD = [
   "ep.on('error',()=>{});await ep.start();setInterval(()=>{},1<<30);});",
 ].join("");
 const envJoin = (o: LaunchOptsT): Record<string, string> => ({
-  ...launchEnv(), CORE_DIST: coreDist,
+  ...launchEnv(), ...custodyEnv, CORE_DIST: coreDist,
+  COTAL_SEAT_ROOT: seatRoot,
   COTAL_SPACE: o.space, COTAL_SERVERS: String(o.servers ?? SERVER),
   COTAL_ID: o.id ?? "", COTAL_LIFECYCLE_UID: o.lifecycleUid ?? "", COTAL_NAME: o.name,
-  ...(o.creds !== undefined ? { COTAL_CREDS: o.creds } : {}),
 });
 const joinCon: ConnectorT = { kind: "connector", name: "join", requires: ["node"], eventChannel, buildLaunch: (o): LaunchSpecT => ({ command: process.execPath, args: ["-e", JOIN_CHILD], env: envJoin(o) }) };
 registry.register(joinCon);
@@ -510,7 +511,7 @@ log("got", v.estimate);`,
   try { await mgr?.stop({ withAgents: true }); } catch { /* teardown */ }
   for (const k of kids) { try { k.kill("SIGKILL"); } catch { /* gone */ } }
   rmSync(home, { recursive: true, force: true });
-  rmSync(workspaceRoot, { recursive: true, force: true });
+  cleanupSeatRoot();
 }
 console.log(`lang-spawn-live.smoke: ${pass} passed, ${fail} failed`);
 process.exit(rc);

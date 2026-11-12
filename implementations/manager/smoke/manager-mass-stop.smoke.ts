@@ -34,7 +34,7 @@ import {
 } from "@cotal-ai/core";
 import { MeshAgent, configFromEnv } from "@cotal-ai/connector-core";
 import { authDir, saveSpaceAuth, workspaceSecretStore } from "@cotal-ai/workspace";
-import { createSuite } from "@cotal-ai/smoke-kit";
+import { createSuite, custodySeatRoot, scrubAmbientCotalEnv } from "@cotal-ai/smoke-kit";
 import { connect, credsAuthenticator } from "@nats-io/transport-node";
 import type { KV } from "@nats-io/kv";
 import { Manager } from "../src/manager.js";
@@ -47,14 +47,14 @@ const SEATS = 20;
 const BOUND = 8;
 const CONNECTOR = "mass-stop-stub";
 
-for (const k of Object.keys(process.env)) if (k.startsWith("COTAL_")) delete process.env[k];
+scrubAmbientCotalEnv(process.env);
 const token = String(Date.now() % 1_000_000).padStart(6, "0");
 const space = `massstop-${Math.random().toString(36).slice(2, 8)}`;
 const dir = mkdtempSync(join(tmpdir(), "mass-stop-"));
 const workspaceRoot = join(dir, "ws"), seatDir = join(dir, "seats");
 for (const d of [join(workspaceRoot, ".cotal", "agents"), seatDir, join(dir, "home")]) mkdirSync(d, { recursive: true });
 process.env.COTAL_HOME = join(dir, "home");
-process.env.COTAL_SEAT_ROOT = mkdtempSync(join(tmpdir(), "s"));
+const { root: seatRoot, cleanup: cleanupSeatRoot } = custodySeatRoot("mass-stop-seats-");
 process.env.DO_NOT_TRACK = "1";
 // Each seat reads `general` (a concrete launch channel) and `lane.a` under `lane.>`: the `lane.a` row is
 // outside the launch's concrete channels, so only the inventory names it to the teardown.
@@ -131,7 +131,9 @@ try {
       args: ["-c", `umask 077; f="$SEAT_HOST_DIR/$COTAL_ID"; { env | grep '^COTAL_'; echo "SEAT_PID=$$"; } > "$f.tmp" && mv "$f.tmp" "$f.seat"; exec sleep 99999.${token}`],
       env: {
         PATH: process.env.PATH ?? "", SEAT_HOST_DIR: seatDir, HOME: process.env.HOME ?? "",
-        COTAL_SPACE: o.space, COTAL_SERVERS: String(o.servers), COTAL_NAME: o.name,
+        ...(process.env.COTAL_SEAT_CGROUP_DELEGATED !== undefined ? { COTAL_SEAT_CGROUP_DELEGATED: process.env.COTAL_SEAT_CGROUP_DELEGATED } : {}),
+        COTAL_SEAT_ROOT: seatRoot,
+        ...(process.env.COTAL_SEAT_AGENT_UID !== undefined ? { COTAL_SEAT_AGENT_UID: process.env.COTAL_SEAT_AGENT_UID } : {}),
         ...(o.id ? { COTAL_ID: o.id } : {}), ...(o.role ? { COTAL_ROLE: o.role } : {}),
         ...(o.creds ? { COTAL_CREDS: o.creds } : {}), ...(o.lifecycleUid ? { COTAL_LIFECYCLE_UID: o.lifecycleUid } : {}),
         ...(o.acceptedToken ? { COTAL_ACCEPTED_TOKEN: o.acceptedToken } : {}),
@@ -231,8 +233,7 @@ try {
   await observer?.close().catch(() => {});
   await daemon?.stop().catch(() => {});
   await broker.stop();
-  rmSync(dir, { recursive: true, force: true });
-  rmSync(process.env.COTAL_SEAT_ROOT!, { recursive: true, force: true });
+  cleanupSeatRoot();
 }
 finish();
 process.exit(process.exitCode ?? 0);

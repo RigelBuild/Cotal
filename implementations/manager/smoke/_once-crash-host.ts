@@ -12,7 +12,7 @@ const space = process.env.REPRO_SPACE!;
 const servers = process.env.REPRO_SERVERS!;
 const here = dirname(fileURLToPath(import.meta.url));
 const stub = join(here, "e2e-stub.mjs");
-const envFor = (o: LaunchOpts): Record<string, string> => ({ COTAL_SPACE: o.space, COTAL_SERVERS: String(o.servers ?? servers), COTAL_CREDS: String(o.creds), COTAL_ID: String(o.id), COTAL_NAME: o.name, COTAL_LIFECYCLE_UID: String(o.lifecycleUid), PATH: process.env.PATH ?? "" });
+const envFor = (o: LaunchOpts): Record<string, string> => ({ COTAL_SEAT_ROOT: process.env.COTAL_SEAT_ROOT ?? "", COTAL_SPACE: o.space, COTAL_SERVERS: String(o.servers ?? servers), COTAL_CREDS: String(o.creds), COTAL_ID: String(o.id), COTAL_NAME: o.name, COTAL_LIFECYCLE_UID: String(o.lifecycleUid), PATH: process.env.PATH ?? "" });
 // The space and the seat name ride argv so the suite can find each seat by its command line.
 // Its retireAfterExit stands in for a connector whose seat launches processes of its own: each call
 // and each discard is logged with the manager process that made it, which the suite reads back.

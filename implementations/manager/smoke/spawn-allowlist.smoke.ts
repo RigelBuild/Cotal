@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createSuite } from "@cotal-ai/smoke-kit";
+import { createSuite, custodySeatRoot } from "@cotal-ai/smoke-kit";
 import { DEV_OWNER, mintLifecycleUid, newIdentity, principalKey, registry, type AgentHandle, type AttachSession, type Connector, type ControlReply, type LaunchSpec, type RuntimeReference } from "@cotal-ai/core";
 import { Manager, type ManagerResumeAgent } from "../src/manager.js";
 
@@ -100,6 +100,7 @@ function watch(p: Promise<unknown>): () => boolean {
 }
 
 const workspaceRoot = mkdtempSync(join(tmpdir(), "cotal-spawn-allowlist-"));
+const { root: seatRoot, cleanup: cleanupSeatRoot } = custodySeatRoot("cotal-spawn-allowlist-seats-");
 const agentsDir = join(workspaceRoot, ".cotal", "agents");
 mkdirSync(agentsDir, { recursive: true });
 for (const n of ["listed", "stranger", "reviewer", "reviewer_2", "early", "paused", "failing", "rollback1", "rollback2", "medic", "medic2", "rescue", "refused", "mismatch", "deleg1", "deleg2"])
@@ -475,4 +476,5 @@ const resumeEntry = (name: string): ManagerResumeAgent => {
 
 console.log("SPAWN-ALLOWLIST SMOKE COMPLETE");
 finish();
+cleanupSeatRoot();
 process.exit(process.exitCode ?? 0);

@@ -1,0 +1,13 @@
+# Cgroup custody suites run once in the delegated CI scope.
+smoke:custody-fail-closed
+smoke:lang-spawn-live
+smoke:lang-supervise-live
+smoke:manager-supervise-crash
+smoke:manager-supervise-restart
+smoke:spawn-allowlist
+smoke:spawn-inline-persona
+smoke:spawn-once-restart
+smoke:supervise-crash-late-join
+smoke:jcode-once
+smoke:turn-intake
+smoke:manager-mass-stop

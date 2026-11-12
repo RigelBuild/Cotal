@@ -24,7 +24,7 @@ import {
   type EpCaller, type IssuedCaller,
 } from "@cotal-ai/core";
 import { agentLifecycleSecretFilePaths, authDir, saveSpaceAuth, workspaceSecretStore } from "@cotal-ai/workspace";
-import { SMOKE_BROKER_TOKEN, emitSentinel, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { custodySeatRoot, SMOKE_BROKER_TOKEN, emitSentinel, freePort, scrubAmbientCotalEnv, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import { MANAGER_CONTRACTS, MANAGER_ENDPOINT } from "../src/manager-service-contract.js";
 import { readSeatRecord } from "../src/resume.js";
 import { bootDeliveryDaemon, type DeliveryDaemon } from "./_boot-delivery.js";
@@ -62,9 +62,9 @@ const until = async (read: () => boolean | Promise<boolean>, timeoutMs: number):
 const asValue = (e: unknown) => ({ code: (e as { code?: string }).code, message: String((e as Error).message).slice(0, 240) });
 const stopGroup = (pid?: number) => { if (!pid) return; try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch {} } };
 const here = dirname(fileURLToPath(import.meta.url)); const repo = resolve(here, "../../.."); const host = join(here, "_supervise-crash-host.ts"); const tsx = join(repo, "node_modules", ".bin", "tsx");
-const ambientEnv: NodeJS.ProcessEnv = { ...process.env };
-for (const key of Object.keys(ambientEnv)) if (key.startsWith("COTAL_")) delete ambientEnv[key];
-
+const custodyEnv = scrubAmbientCotalEnv(process.env);
+const ambientEnv: NodeJS.ProcessEnv = { ...process.env, ...custodyEnv };
+const { root: seatRoot, cleanup: cleanupSeatRoot } = custodySeatRoot("cotal-supervise-crash-seats-");
 const port = await freePort(); const servers = `nats://127.0.0.1:${port}`; const space = `supcrash-${randomUUID().slice(0, 8)}`;
 const auth = await createSpaceAuth(space); const observerCreds = await mintMembershipObserverCreds(auth, newIdentity()); const evictorCreds = await mintConnectionEvictorCreds(auth, newIdentity());
 const seatPids = () => {
@@ -88,7 +88,7 @@ type Host = { child: ChildProcess; manager: { managerPid: number; managerInstanc
 async function startHost(): Promise<Host> {
   const deadline = Date.now() + 120_000;
   for (;;) {
-    const child = spawn(tsx, [host], { cwd: repo, env: { ...ambientEnv, REPRO_ROOT: root, REPRO_SPACE: space, REPRO_SERVERS: servers, REPRO_OBSERVER_CREDS: observerCreds, REPRO_EVICTOR_CREDS: evictorCreds, REPRO_ACCOUNT_ID: auth.account.pub, COTAL_SERVER: "", COTAL_SERVERS: "", COTAL_CREDS: "", NATS_URL: "" }, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(tsx, [host], { cwd: repo, env: { ...ambientEnv, COTAL_SEAT_ROOT: seatRoot, REPRO_ROOT: root, REPRO_SPACE: space, REPRO_SERVERS: servers, REPRO_OBSERVER_CREDS: observerCreds, REPRO_EVICTOR_CREDS: evictorCreds, REPRO_ACCOUNT_ID: auth.account.pub, COTAL_SERVER: "", COTAL_SERVERS: "", COTAL_CREDS: "", NATS_URL: "" }, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     managers.push(child);
     let out = "", err = "";
     child.stdout?.on("data", (b) => out += String(b)); child.stderr?.on("data", (b) => err += String(b));
@@ -215,6 +215,7 @@ try {
   await wait(300);
   rmSync(dir, { recursive: true, force: true });
   releaseBroker();
+  cleanupSeatRoot();
 }
 
 if (pass + fail !== CELLS.length) throw new Error(`expected ${CELLS.length} cells, ran ${pass + fail}; a cell was graded twice or skipped`);

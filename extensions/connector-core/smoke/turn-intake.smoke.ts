@@ -39,7 +39,7 @@ import {
   setupSpaceStreams,
   type DelegatedSeatLaunch,
 } from "@cotal-ai/core";
-import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { custodySeatRoot, SMOKE_BROKER_TOKEN, scrubAmbientCotalEnv, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import { pickFreePort } from "./_free-port.js";
 import { assertEphemeralBroker, scrubAmbientBrokerEnv } from "../../../packages/core/smoke/_ephemeral-only.js";
 import * as connectorCoreRoot from "../src/index.js";
@@ -48,7 +48,8 @@ import { TURN_PULL_RETRY_MS } from "../src/turn-poll.js";
 import { cotalToolSpecs } from "../src/tool-specs.js";
 import { configFromEnv, type AgentConfig } from "../src/config.js";
 import { launchEnv } from "../src/launch.js";
-
+const custodyEnv = scrubAmbientCotalEnv(process.env);
+const { root: seatRoot, cleanup: cleanupSeatRoot } = custodySeatRoot("cotal-turn-intake-seats-");
 scrubAmbientBrokerEnv();
 
 let pass = 0, fail = 0;
@@ -1055,6 +1056,8 @@ process.exit(0);
         cwd: managerDir,
         env: {
           ...launchEnv(),
+          ...custodyEnv,
+          COTAL_SEAT_ROOT: seatRoot,
           PATH: process.env.PATH ?? "",
           TMPDIR: dir,
           COTAL_SKIP_CONNECTOR_SEED: "1",
@@ -1151,7 +1154,8 @@ process.exit(0);
 
     const baseSeatEnv: Record<string, string | undefined> = {
       ...launchEnv(),
-      COTAL_SPACE: space,
+      ...custodyEnv,
+      COTAL_SEAT_ROOT: seatRoot,
       COTAL_NAME: delegatedActor,
       COTAL_SERVERS: servers,
       COTAL_LIFECYCLE_UID: delegatedUid,
@@ -1168,9 +1172,10 @@ process.exit(0);
     const directChildEnvPath = join(dir, "direct-child-env.json");
     const spawnHopEnv: Record<string, string | undefined> = {
       ...launchEnv(),
+      ...custodyEnv,
       PATH: process.env.PATH ?? "",
       TMPDIR: dir,
-      COTAL_SKIP_CONNECTOR_SEED: "1",
+      COTAL_SEAT_ROOT: seatRoot,
       COTAL_MANAGED_HANDOFF_FILE: delegated?.env.COTAL_MANAGED_HANDOFF_FILE ?? handoffFilePath,
       PROBE_SPACE: space,
       PROBE_SERVERS: servers,
@@ -1275,8 +1280,9 @@ registry.register({
       args: ["-e", "import('node:fs').then(fs => fs.writeFileSync(" + JSON.stringify(outPath) + ", JSON.stringify(process.env)))"],
       env: {
         ...launchEnv(),
+        ...custodyEnv,
         ...aclEnv(opts),
-        COTAL_SPACE: opts.space,
+        COTAL_SEAT_ROOT: seatRoot,
         COTAL_NAME: opts.name,
         COTAL_SERVERS: String(opts.servers),
         ...(opts.lifecycleUid ? { COTAL_LIFECYCLE_UID: opts.lifecycleUid } : {}),
@@ -1442,6 +1448,7 @@ process.exit(0);
     writeFileSync(personaNoInstPath, "---\nname: " + delegatedActor + "\n---\n");
     const n2Env: Record<string, string | undefined> = {
       ...launchEnv(),
+      ...custodyEnv,
       PATH: process.env.PATH ?? "",
       TMPDIR: n2Tmp,
       TSX_DISABLE_CACHE: "1",
@@ -1526,6 +1533,7 @@ await spawn(
     await awaitBrokerExit(broker);
     releaseBroker();
     rmSync(dir, { recursive: true, force: true });
+    cleanupSeatRoot();
   }
 }
 

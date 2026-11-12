@@ -55,9 +55,12 @@ if (!Number.isInteger(shard) || !Number.isInteger(count) || count < 1 || shard <
 const listPath = process.env.COTAL_CI_SUITES || CI_SUITES_PATH;
 const legacy = parseCiSuites(readFileSync(listPath, "utf8"), listPath);
 const fragments = listPath === CI_SUITES_PATH ? readCiSuiteFragments() : [];
-const all = [...legacy, ...fragments].map((s) => `pnpm ${s}`);
+const custodySuites = listPath === CI_SUITES_PATH
+  ? new Set(parseCiSuites(readFileSync(new URL("./ci-custody-suites.txt", import.meta.url), "utf8"), "ci-custody-suites.txt"))
+  : new Set();
+const all = [...legacy, ...fragments].filter((suite) => !custodySuites.has(suite)).map((s) => `pnpm ${s}`);
 if (all.length === 0) { console.error(`no suites in ${listPath}`); process.exit(2); }
-const mine = suitesForShard(legacy, fragments, shard, count).map((s) => `pnpm ${s}`);
+const mine = suitesForShard(legacy, fragments, shard, count).filter((suite) => !custodySuites.has(suite)).map((s) => `pnpm ${s}`);
 // Keep inventory and shard assignments stable while honoring the repository's no-mutation policy.
 // These infrastructure suites can invoke mutation-proof transitively, even without its workflow.
 const mutationExcluded = mine.filter((cmd) => /^pnpm smoke:mutation(?:-|$)/.test(cmd));

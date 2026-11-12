@@ -2,10 +2,9 @@
  * Stock PTY refuses supervise; a childless fixture exercises the restart budget and turn relay.
  * Live broker and manager coverage verifies the retained custodial predecessor path.
  */
-import { randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { connect } from "@nats-io/transport-node";
 import {
@@ -17,7 +16,7 @@ import {
   authDir, saveSpaceAuth, agentLifecycleSecretFilePaths, recordMesh, removeMesh, userAuthStateDir, workspaceSecretStore,
 } from "@cotal-ai/workspace";
 import { readRecord, recordPath } from "@cotal-ai/seat";
-import { makeSeatRoot } from "@cotal-ai/smoke-kit";
+import { custodySeatRoot, scrubAmbientCotalEnv } from "@cotal-ai/smoke-kit";
 import { Manager } from "../src/manager.js";
 import type { ManagerStatus } from "../src/manager-service-contract.js";
 import { LegacyPtyRuntime } from "../src/runtime/pty.js";
@@ -73,11 +72,14 @@ writeFileSync(join(workspaceRoot, ".cotal", "agents", "seat.md"), "---\nname: se
 writeFileSync(join(workspaceRoot, ".cotal", "agents", "user.md"), "---\nname: user\n---\n");
 writeFileSync(join(workspaceRoot, ".cotal", "agents", "ext.md"), "---\nname: ext\n---\n");
 writeFileSync(join(workspaceRoot, ".cotal", "agents", "custody.md"), "---\nname: custody\nrole: worker\n---\n");
-const seatRoot = makeSeatRoot("seats-");
+const custodyEnv = scrubAmbientCotalEnv(process.env);
+const { root: seatRoot, cleanup: cleanupSeatRoot } = custodySeatRoot("cotal-supervise-seats-");
 const seatProcs: Array<Owned | undefined> = [];
 
 const spawnedOpts: LaunchOpts[] = [];
 const envFor = (o: LaunchOpts): Record<string, string> => ({
+  ...custodyEnv,
+  COTAL_SEAT_ROOT: seatRoot,
   COTAL_SPACE: o.space, COTAL_SERVERS: String(o.servers ?? broker.servers), COTAL_CREDS: String(o.creds),
   COTAL_ID: String(o.id), COTAL_NAME: o.name, PATH: process.env.PATH ?? "",
   ...(o.lifecycleUid ? { COTAL_LIFECYCLE_UID: o.lifecycleUid } : {}),
@@ -363,6 +365,7 @@ try {
   await broker.stop().catch(() => {});
   if (prevHome === undefined) delete process.env.COTAL_HOME;
   else process.env.COTAL_HOME = prevHome;
+  cleanupSeatRoot();
 }
 
 const EXPECTED = 32;

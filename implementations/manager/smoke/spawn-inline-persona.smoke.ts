@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { Manager, type FreeSlotCause, type ManagerResumeAgent, type ManagerResumeInventory } from "../src/manager.js";
 import { inlinePersonaDir, inlineSnapshotPath } from "../src/launch.js";
 import { readSeatRecord } from "../src/resume.js";
+import { custodySeatRoot } from "@cotal-ai/smoke-kit";
 import {
   createSpaceAuth,
   eventChannel,
@@ -60,6 +61,7 @@ const auth = await createSpaceAuth(space);
 const { servers: SERVERS, stop: stopBroker } = await bootBroker(auth);
 
 const scratch = mkdtempSync(join(tmpdir(), "cotal-inline-persona-"));
+const { root: seatRoot, cleanup: cleanupSeatRoot } = custodySeatRoot("cotal-inline-persona-seats-");
 const workspaceRoot = join(scratch, "static");
 const agentsDir = join(workspaceRoot, ".cotal", "agents");
 mkdirSync(agentsDir, { recursive: true });
@@ -755,6 +757,7 @@ try {
 } finally {
   await stopBroker();
   rmSync(scratch, { recursive: true, force: true });
+  cleanupSeatRoot();
 }
 
 console.log(`\nSPAWN-INLINE-PERSONA SMOKE ${pass} passed, ${fail} failed`);

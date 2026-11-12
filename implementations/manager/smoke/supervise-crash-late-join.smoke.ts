@@ -31,7 +31,7 @@ import {
   mintMembershipObserverCreds, newIdentity, principalKey, serverConfig, setupSpaceStreams, standaloneConnectOpts,
 } from "@cotal-ai/core";
 import { authDir, mintControlInstrument, saveSpaceAuth, workspaceSecretStore } from "@cotal-ai/workspace";
-import { SMOKE_BROKER_TOKEN, emitSentinel, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { custodySeatRoot, SMOKE_BROKER_TOKEN, emitSentinel, freePort, scrubAmbientCotalEnv, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import { MANAGER_CONTRACTS, MANAGER_ENDPOINT } from "../src/manager-service-contract.js";
 import { readSeatRecord } from "../src/resume.js";
 import { bootDeliveryDaemon } from "./_boot-delivery.js";
@@ -67,8 +67,8 @@ const until = async (read: () => boolean | Promise<boolean>, timeoutMs: number):
 const asValue = (e: unknown) => ({ code: (e as { code?: string }).code, message: String((e as Error).message).slice(0, 240) });
 const stopGroup = (pid?: number) => { if (!pid) return; try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch {} } };
 const here = dirname(fileURLToPath(import.meta.url)); const repo = resolve(here, "../../.."); const host = join(here, "_supervise-crash-host.ts"); const tsx = join(repo, "node_modules", ".bin", "tsx");
-const ambientEnv: NodeJS.ProcessEnv = { ...process.env };
-for (const key of Object.keys(ambientEnv)) if (key.startsWith("COTAL_")) delete ambientEnv[key];
+const custodyEnv = scrubAmbientCotalEnv(process.env);
+const ambientEnv: NodeJS.ProcessEnv = { ...process.env, ...custodyEnv };
 
 type Host = { child: ChildProcess; manager: { managerPid: number; managerInstanceId: string }; stderr: () => string };
 
@@ -86,7 +86,7 @@ async function runCase(tag: "control" | "late" | "early exit"): Promise<void> {
   mkdirSync(join(root, ".cotal", "agents"), { recursive: true }); saveSpaceAuth(authDir(root), auth);
   writeFileSync(join(root, ".cotal", "agents", "worker.md"), "---\nname: worker\nrole: worker\nsubscribe: []\nallowSubscribe: []\nallowPublish: []\n---\n");
   writeFileSync(join(dir, "server.conf"), serverConfig(auth, [auth], { transport: { kind: "plaintext" }, port, storeDir: join(dir, "js") }));
-  const broker = spawn("nats-server", ["-c", join(dir, "server.conf")], { stdio: "ignore" }); const releaseBroker = teardownOnSignal(broker, dir);
+  const { root: seatRoot, cleanup: cleanupSeatRoot } = custodySeatRoot("cotal-supervise-late-seats-");
   const managers: ChildProcess[] = [];
   let daemon: Awaited<ReturnType<typeof bootDeliveryDaemon>> | undefined;
   let runnerNc: Awaited<ReturnType<typeof connect>> | undefined;
@@ -97,7 +97,7 @@ async function runCase(tag: "control" | "late" | "early exit"): Promise<void> {
   const startHost = async (extraEnv: Record<string, string> = {}): Promise<Host> => {
     const deadline = Date.now() + 120_000;
     for (;;) {
-      const child = spawn(tsx, [host], { cwd: repo, env: { ...ambientEnv, REPRO_ROOT: root, REPRO_SPACE: space, REPRO_SERVERS: servers, REPRO_OBSERVER_CREDS: observerCreds, REPRO_EVICTOR_CREDS: evictorCreds, REPRO_ACCOUNT_ID: auth.account.pub, REPRO_READINESS_MS: String(READINESS_MS), ...extraEnv, COTAL_SERVER: "", COTAL_SERVERS: "", COTAL_CREDS: "", NATS_URL: "" }, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawn(tsx, [host], { cwd: repo, env: { ...ambientEnv, COTAL_SEAT_ROOT: seatRoot, REPRO_ROOT: root, REPRO_SPACE: space, REPRO_SERVERS: servers, REPRO_OBSERVER_CREDS: observerCreds, REPRO_EVICTOR_CREDS: evictorCreds, REPRO_ACCOUNT_ID: auth.account.pub, REPRO_READINESS_MS: String(READINESS_MS), ...extraEnv, COTAL_SERVER: "", COTAL_SERVERS: "", COTAL_CREDS: "", NATS_URL: "" }, detached: true, stdio: ["ignore", "pipe", "pipe"] });
       managers.push(child);
       let out = "", err = "";
       child.stdout?.on("data", (b) => out += String(b)); child.stderr?.on("data", (b) => err += String(b));
@@ -207,6 +207,7 @@ async function runCase(tag: "control" | "late" | "early exit"): Promise<void> {
     await wait(300);
     rmSync(dir, { recursive: true, force: true });
     releaseBroker();
+    cleanupSeatRoot();
   }
 }
 
