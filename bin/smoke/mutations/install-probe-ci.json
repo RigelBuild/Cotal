@@ -33,16 +33,8 @@
       "file": ".github/workflows/cold-setup.yml",
       "find": "        run: node scripts/post-publish-install-probe.mjs",
       "replace": "        run: echo 'probe disabled'",
-      "expectRed": "install-probe runs the post-publish-install-probe script",
-      "cell": "install-probe runs the post-publish-install-probe script"
-    },
-    {
-      "name": "the closure gate is removed from the version job",
-      "file": ".github/workflows/changesets.yml.disabled",
-      "find": "          node scripts/verify-publish-closure.mjs \"$version\"",
-      "replace": "          echo 'closure gate disabled'",
-      "expectRed": "the version job verifies publish closure before the Release",
-      "cell": "the version job verifies publish closure before the Release"
+      "expectRed": "cold candidate runs the post-publish-install-probe script",
+      "cell": "cold candidate runs the post-publish-install-probe script"
     }
   ]
 }

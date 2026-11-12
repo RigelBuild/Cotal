@@ -91,12 +91,13 @@ const PROBE = join(import.meta.dirname, "_probe-1323-contract-import.ts");
 const probeCompileCalls = (): Promise<{ importCalls: number; controlCalls: number }> => {
   const { promise, resolve, reject } = Promise.withResolvers<{ importCalls: number; controlCalls: number }>();
   const child = spawn(TSX, [PROBE], { stdio: ["ignore", "pipe", "pipe"] });
-  let out = "";
+  let out = "", err = "";
   child.stdout.on("data", (b) => (out += b.toString()));
+  child.stderr.on("data", (b) => (err += b.toString()));
   child.on("error", reject);
   child.on("exit", (rc) => {
     const m = /PROBE (\d+) (\d+)/.exec(out);
-    if (rc !== 0 || !m) return reject(new Error(`compile probe exited ${rc}: ${out.trim().slice(0, 200)}`));
+    if (rc !== 0 || !m) return reject(new Error(`compile probe exited ${rc}: ${out.trim().slice(0, 200)} ${err.trim().slice(-300)}`));
     resolve({ importCalls: Number(m[1]), controlCalls: Number(m[2]) });
   });
   return promise;
