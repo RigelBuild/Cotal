@@ -28,8 +28,7 @@
  * Run: pnpm smoke:contract-vocabulary
  */
 import { spawn } from "node:child_process";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import {
   compileContract, VOID_SCHEMA, SPAWN_INPUT_SCHEMA, SPAWN_OUTPUT_SCHEMA,
   GRACEFUL_INPUT_SCHEMA, STOP_OUTPUT_SCHEMA, INSPECT_INPUT_SCHEMA, AGENT_ROW_SCHEMA,
@@ -88,26 +87,26 @@ if (!enough) console.log(`  FAIL  only ${checked} documents reached the check (f
 // probe wraps the Ajv constructor used by the core package, imports the dependency floor, then
 // counts actual compile calls while loading the manager contract module and reading one digest.
 // This measures compiler work directly, without a runner-speed threshold or process-wide CPU sample.
-const PROBE = join(dirname(fileURLToPath(import.meta.url)), "_probe-1323-contract-import.ts");
-const probeCompileCalls = (): Promise<number> => {
-  const { promise, resolve, reject } = Promise.withResolvers<number>();
+const PROBE = join(import.meta.dirname, "_probe-1323-contract-import.ts");
+const probeCompileCalls = (): Promise<{ importCalls: number; controlCalls: number }> => {
+  const { promise, resolve, reject } = Promise.withResolvers<{ importCalls: number; controlCalls: number }>();
   const child = spawn(TSX, [PROBE], { stdio: ["ignore", "pipe", "pipe"] });
   let out = "";
   child.stdout.on("data", (b) => (out += b.toString()));
   child.on("error", reject);
   child.on("exit", (rc) => {
-    const m = /PROBE contract (\d+)/.exec(out);
+    const m = /PROBE (\d+) (\d+)/.exec(out);
     if (rc !== 0 || !m) return reject(new Error(`compile probe exited ${rc}: ${out.trim().slice(0, 200)}`));
-    resolve(Number(m[1]));
+    resolve({ importCalls: Number(m[1]), controlCalls: Number(m[2]) });
   });
   return promise;
-}
+};
 let lazyOk = false;
 let lazyDetail = "";
 try {
-  const compileCalls = await probeCompileCalls();
-  lazyOk = compileCalls === 0;
-  lazyDetail = `module import invoked Ajv.compile ${compileCalls} times (expected 0)`;
+  const { importCalls, controlCalls } = await probeCompileCalls();
+  lazyOk = importCalls === 0 && controlCalls > 0;
+  lazyDetail = `module import invoked Ajv.compile ${importCalls} times (expected 0); positive control invoked it ${controlCalls} times (expected >0)`;
 } catch (e) {
   lazyDetail = `probe failed: ${(e as Error).message}`;
 }

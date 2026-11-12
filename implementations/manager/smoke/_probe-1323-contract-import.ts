@@ -42,12 +42,16 @@ compileCalls = 0;
 probe.compile({ type: "string" });
 if (compileCalls !== 1) throw new Error(`Ajv.compile instrumentation observed ${compileCalls} calls for one schema`);
 
+const core = await import("@cotal-ai/core");
 compileCalls = 0;
-// Import the dependency floor first, as the prior control probe did, then count only work caused
-// by importing the manager contract module itself.
-await import("@cotal-ai/core");
-compileCalls = 0;
-// Dynamic import is required: install the counter before loading the dependency floor and target.
+// Import the dependency floor first, then count only work caused by importing the manager contract module.
 const manager = await import("../src/manager-service-contract.js");
 void manager.managerClusterDocument().commands[0]?.inputDigest;
-console.log(`PROBE contract ${compileCalls}`);
+
+const importCalls = compileCalls;
+// Compile through the public core entry to prove the counter observes core's Ajv instance.
+compileCalls = 0;
+core.compileContract({ root: { type: "string" } });
+const controlCalls = compileCalls;
+if (controlCalls === 0) throw new Error("Ajv.compile instrumentation missed the core positive control");
+console.log(`PROBE ${importCalls} ${controlCalls}`);
