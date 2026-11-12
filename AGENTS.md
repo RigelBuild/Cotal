@@ -15,8 +15,7 @@ and do not file a question about it. This is a standing owner ruling.
   that names the evidence and a `recheckBy` date. Keep its line in `bin/smoke/ci-suites.txt`,
   because removing a line re-shards every suite below it.
   - A `ci.yml` smoke step: add `continue-on-error: true` and a matching `LIVE_QUARANTINED` entry.
-  - Mutation reproof does not run on upstream sync PRs; the daily `--all` sweep grades them
-  after the merge.
+- The mutation reproof workflow is disabled on this fork.
 - **A test for code we wrote is fixed.** Fix a race by waiting for the event, not with a retry
 or a quarantine.
 

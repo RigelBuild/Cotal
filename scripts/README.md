@@ -156,11 +156,12 @@ A fatal verdict or a pre-red command that the diff caused fails it. A command th
 at the base, or a fixture whose run was inconclusive, is reported without failing, as long as at
 least one selected fixture produced a kill.
 
-`node scripts/mutation-reproof.mjs --all` is the scheduled full sweep, run in shards. It grades the
-health of the whole tree, so every proven fixture in the shard must produce a kill. A fixture that
-is pre-red, inconclusive, or graded nothing fails the sweep and is named on the
-`MUTATION REPROOF FLOOR ERODED` line, or on the `ZERO DISCRIMINATED, COULD NOT` line when no fixture
-killed. That failure opens or comments on the `ci:mutation-reproof` tracking issue.
+`node scripts/mutation-reproof.mjs --all` selects every fixture in the tree. The full sweep requires a
+kill from every proven fixture. A fixture that is pre-red, inconclusive, or graded nothing fails
+the sweep and is named on the `MUTATION REPROOF FLOOR ERODED` line, or on the `ZERO DISCRIMINATED,
+COULD NOT` line when no fixture killed. That failure opens or comments on the
+`ci:mutation-reproof` tracking issue.
+The mutation reproof workflow is disabled on this fork.
 
 ## Mutation reproof budget
 
