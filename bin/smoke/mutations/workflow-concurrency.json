@@ -77,7 +77,7 @@
       "file": ".github/workflows/rigel-release.yml",
       "find": "concurrency:\n  group: rigel-release-${{ github.ref }}\n  cancel-in-progress: false\n  queue: max\n",
       "replace": "",
-      "expectRed": "exactly 5 of those declare a concurrency group",
+      "expectRed": "exactly 4 of those declare a concurrency group",
       "cell": "declare a concurrency group"
     }
   ]

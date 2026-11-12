@@ -159,13 +159,13 @@ least one selected fixture produced a kill.
 `node scripts/mutation-reproof.mjs --all` selects every fixture in the tree. The full sweep requires a
 kill from every proven fixture. A fixture that is pre-red, inconclusive, or graded nothing fails
 the sweep and is named on the `MUTATION REPROOF FLOOR ERODED` line, or on the `ZERO DISCRIMINATED,
-COULD NOT` line when no fixture killed. That failure opens or comments on the
-`ci:mutation-reproof` tracking issue.
+COULD NOT` line when no fixture killed. That failure would open or comment on the
+`ci:mutation-reproof` tracking issue through the disabled workflow's alarm job.
 The mutation reproof workflow is disabled on this fork.
 
 ## Mutation reproof budget
 
-`mutation-reproof` takes `--budget-minutes <n>`, and the workflow passes one below each shard's step
+`mutation-reproof` takes `--budget-minutes <n>`, and the disabled workflow passed one below each shard's step
 timeout. Selection does not estimate fixture cost, so one shard can draw more proof work than its
 step can finish. Without a budget the step was killed from outside: no tally, no word about the
 fixtures that never ran, and a mutant left in the tree. With one, each `mutation-proof` child gets

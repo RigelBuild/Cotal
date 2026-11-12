@@ -22,7 +22,7 @@ or a quarantine.
 ## Syncing upstream into `rigel-release`
 
 1. Branch `harness/rig-5440-upstream-sync` from `rigel-release` and merge `main` into it. Keep the
-merge commit; this PR must not be squashed or rebased. Mutation reproof skips this exact branch name.
+merge commit; this PR must not be squashed or rebased.
 2. Resolve conflicts in favor of our custody guarantees (custodian-run Linux pty seats, no
 numeric or process-group signals, retain or refuse an unproven reap). If an upstream test asserts
 the opposite, quarantine it unchanged.
