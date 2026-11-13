@@ -5731,7 +5731,8 @@ export class Manager {
       try {
         await this.driveStaticRetirement(a, true);
       } catch (error) {
-        this.holdFailedStaticRetirement(a, "terminalizing", error, true);
+        const row = await this.readStaticReconcileSlot(a.name).catch(() => undefined);
+        this.holdFailedStaticRetirement(a, row?.lifecycleUid === a.lifecycleUid && row.actor === a.id ? row.phase : "terminalizing", error, true);
       }
       return;
     }
@@ -12231,7 +12232,11 @@ export class Manager {
     const opId = managedRetirementOpId(a.lifecycleUid);
     held.lastError = `the static retirement did not complete (${rejectionText(error)}); the name stays held - a same-name spawn retries the same terminal (op ${opId})`;
     const blocked = lifecycleBlockedFrom(error);
-    if (!queueRetry || this.staticReconcileStopping || error instanceof RuntimeReapUnproven || this.staticReleasePending.has(JSON.stringify([a.name, a.lifecycleUid])) || (blocked !== undefined && (blocked.blockedOp !== "retirement" || blocked.opId !== opId))) return;
+    if (queueRetry && this.staticReconcileStopping) {
+      console.error(`! static retirement of "${a.name}" at uid ${a.lifecycleUid} failed during shutdown; the alias stays held for the next manager start`);
+      return;
+    }
+    if (!queueRetry || error instanceof RuntimeReapUnproven || this.staticReleasePending.has(JSON.stringify([a.name, a.lifecycleUid])) || (blocked !== undefined && (blocked.blockedOp !== "retirement" || blocked.opId !== opId))) return;
     const row = { owner: DEV_OWNER, alias: a.name, actor: a.id, lifecycleUid: a.lifecycleUid };
     const key = this.staticReconcileKey(row);
     let item = this.staticReconcileItems.get(key);
@@ -12239,7 +12244,8 @@ export class Manager {
       item = { ...row, phase, attempts: 1, maxAttempts: STATIC_RECONCILE_MAX_ATTEMPTS, disposition: "retrying", lastError: rejectionText(error), liveOrigin: true };
       this.staticReconcileItems.set(key, item);
     } else {
-      if (item.attempts >= item.maxAttempts && item.disposition === "retry-exhausted") {
+      if (item.attempts >= item.maxAttempts) {
+        if (item.disposition !== "retry-exhausted") return;
         item.attempts = 1;
         item.remedy = undefined;
       }
@@ -12347,9 +12353,9 @@ export class Manager {
         }
       }
       const cur = this.retiring.get(a.name);
-      if (retired && cur && cur.target.lifecycleUid === a.lifecycleUid) {
+      if (cur && cur.target.lifecycleUid === a.lifecycleUid) {
         this.retiring.delete(a.name);
-        this.confirmedRetiredPredecessors.set(a.name, { principal, lifecycleUid: a.lifecycleUid });
+        if (retired) this.confirmedRetiredPredecessors.set(a.name, { principal, lifecycleUid: a.lifecycleUid });
       }
     } catch (e) {
       const now = e instanceof RuntimeReapUnproven ? await this.readStaticReconcileSlot(a.name).catch(() => undefined) : undefined;

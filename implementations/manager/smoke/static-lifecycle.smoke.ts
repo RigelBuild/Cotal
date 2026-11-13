@@ -104,7 +104,7 @@ let ran = 0;
  * when a `check` is deliberately added or removed, because completeness is something only this
  * suite knows, so it has to be the thing that says it.
  */
-const EXPECTED_CHECKS = 71;
+const EXPECTED_CHECKS = 72;
 function check(label: string, cond: boolean, extra?: unknown): void {
   console.log(`${cond ? "✓" : "✗"} ${label}${cond ? "" : ` — ${JSON.stringify(extra) ?? ""}`}`);
   ran++;
@@ -461,6 +461,9 @@ try {
   check("slot CASed over the retired row: ACTIVE at B's uid/actor", s5.slot?.phase === "active" && s5.slot?.lifecycleUid === uidB && s5.slot?.actor === idB, s5.slot);
   const s5a = await readState("worker", idA, uidA);
   check("predecessor's head/gate stay terminally retired (uid never reused)", s5a.head?.state === "retired" && s5a.gate?.state === "retired");
+  M.retiring.set("worker", { target: { lifecycleUid: uidA } });
+  await M.deprovision({ id: idA, name: "worker", lifecycleUid: uidA });
+  check("a stale hold clears when the slot belongs to a successor", !M.retiring.has("worker") && (await readSlotOnly("worker"))?.lifecycleUid === uidB);
 
   // ── 6. Failed static retirement: bounded retries and same-name re-drive ──
   M.staticReconcileRetryDelaysMs = [60_000, 60_000, 60_000];
