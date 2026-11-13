@@ -388,7 +388,7 @@ const STATIC_RECONCILE_MAX_ATTEMPTS = STATIC_RECONCILE_RETRY_DELAYS_MS.length + 
  *  it is never offered here. */
 const RETAINED_CUSTODY_REMEDY =
   "the seat is not proved gone; confirm its processes are gone, then call release-seat with this alias and lifecycleUid";
-const RESTART_RETRY_REMEDY = "restart this manager for a fresh per-process retry budget";
+const RESTART_RETRY_REMEDY = "retry with a same-name spawn, or restart this manager for a fresh per-process retry budget";
 /** The remedy a deferred seat carries: an unreachable seat waits out its credential, or an operator attests it gone. */
 const DEFERRED_SEAT_REMEDY =
   "the seat is unreachable and its credential has not expired; it terminalizes after deferUntil, or confirm its processes are gone and run cotal stop --name <alias> --attest-gone <reason>";
@@ -5659,6 +5659,8 @@ export class Manager {
     const key = JSON.stringify([a.name, a.lifecycleUid]); // ASCII-safe, delimiter-collision-free
     const inflight = this.deprovisioningFlight.get(key);
     if (inflight) return inflight;
+    const reconcile = this.staticReconcileItems.get(this.staticReconcileKey({ owner: DEV_OWNER, alias: a.name, lifecycleUid: a.lifecycleUid }))?.flight;
+    if (reconcile) { await reconcile; return; }
     const flight = this.withRetirementSlot(() => this.driveDeprovision(a)).finally(() => {
       if (this.deprovisioningFlight.get(key) === flight) this.deprovisioningFlight.delete(key);
     });
@@ -5729,29 +5731,7 @@ export class Manager {
       try {
         await this.driveStaticRetirement(a, true);
       } catch (error) {
-        // Deprovision callers are detached and fire-and-forget, so a static failure never rejects here.
-        // A retained terminal is already recorded by recordRetainedTerminal; an operator release owns its lifecycle.
-        if (error instanceof RuntimeReapUnproven) return;
-        if (this.staticReleasePending.has(JSON.stringify([a.name, a.lifecycleUid]))) return;
-        const row = { owner: DEV_OWNER, alias: a.name, actor: a.id, lifecycleUid: a.lifecycleUid };
-        const key = this.staticReconcileKey(row);
-        if (this.staticReconcileStopping) {
-          console.error(`! static retirement of "${a.name}" at uid ${a.lifecycleUid} failed during shutdown; the alias stays held for the next manager start`);
-          return;
-        }
-        console.error(`! static retirement of "${a.name}" at uid ${a.lifecycleUid} failed; retrying: ${rejectionText(error)}`);
-        if (this.staticReconcileItems.has(key)) return;
-        const item: StaticReconcileItem = {
-          ...row,
-          phase: "terminalizing",
-          attempts: 1,
-          maxAttempts: STATIC_RECONCILE_MAX_ATTEMPTS,
-          disposition: "retrying",
-          lastError: rejectionText(error),
-          liveOrigin: true,
-        };
-        this.staticReconcileItems.set(key, item);
-        this.scheduleStaticReconcileRetry(key, item);
+        this.holdFailedStaticRetirement(a, "terminalizing", error, true);
       }
       return;
     }
@@ -8325,6 +8305,8 @@ export class Manager {
         // retires it, and its name stays held for retireDelegatedAgent.
         const p = orphan.delegated ? parsePrincipalKey(orphan.id) : null;
         if (p) this.retiring.set(orphan.name, { opId: managedRetirementOpId(orphan.lifecycleUid), owner: p.owner, actor: p.actor, target: orphan, startedAt: Date.now() });
+        else if (this.auth && !this.userMode && !isChatAlias(orphan.name))
+          this.retiring.set(orphan.name, { opId: managedRetirementOpId(orphan.lifecycleUid), owner: DEV_OWNER, actor: orphan.id, target: orphan, startedAt: Date.now() });
         this.trackDeprovision(orphan, "(orphaned spawn)", launchToken);
       } else {
         this.finishLaunch(launchToken);
@@ -12242,6 +12224,33 @@ export class Manager {
     console.error(`! static retirement retained alias=${item.alias} uid=${item.lifecycleUid} reason=${e.reason} disposition=${item.disposition}: ${item.lastError}; NEXT: ${RETAINED_CUSTODY_REMEDY}`);
   }
 
+  /** Keep only the existing exact-incarnation hold; a late failure must not recreate it. */
+  private holdFailedStaticRetirement(a: TeardownTarget, phase: ManagerStaticReconciliationFailure["phase"], error: unknown, queueRetry: boolean): void {
+    const held = this.retiring.get(a.name);
+    if (!held || held.target.lifecycleUid !== a.lifecycleUid || !this.auth || this.userMode || isChatAlias(a.name)) return;
+    const opId = managedRetirementOpId(a.lifecycleUid);
+    held.lastError = `the static retirement did not complete (${rejectionText(error)}); the name stays held - a same-name spawn retries the same terminal (op ${opId})`;
+    const blocked = lifecycleBlockedFrom(error);
+    if (!queueRetry || this.staticReconcileStopping || error instanceof RuntimeReapUnproven || this.staticReleasePending.has(JSON.stringify([a.name, a.lifecycleUid])) || (blocked !== undefined && (blocked.blockedOp !== "retirement" || blocked.opId !== opId))) return;
+    const row = { owner: DEV_OWNER, alias: a.name, actor: a.id, lifecycleUid: a.lifecycleUid };
+    const key = this.staticReconcileKey(row);
+    let item = this.staticReconcileItems.get(key);
+    if (!item || item.disposition === "recovered") {
+      item = { ...row, phase, attempts: 1, maxAttempts: STATIC_RECONCILE_MAX_ATTEMPTS, disposition: "retrying", lastError: rejectionText(error), liveOrigin: true };
+      this.staticReconcileItems.set(key, item);
+    } else {
+      if (item.attempts >= item.maxAttempts && item.disposition === "retry-exhausted") {
+        item.attempts = 1;
+        item.remedy = undefined;
+      }
+      item.phase = phase;
+      item.lastError = rejectionText(error);
+    }
+    if (item.attempts >= item.maxAttempts) this.failStaticReconcileItem(item, "retry-exhausted", RESTART_RETRY_REMEDY, rejectionText(error));
+    else if (this.staticReconcileSweepsInFlight > 0) item.disposition = "retry-scheduled";
+    else this.scheduleStaticReconcileRetry(key, item);
+  }
+
   private async driveStaticRetirement(a: TeardownTarget, surfaceFailure = false, release = false, onDeprovision?: (accounting: DeprovisionResourceAccounting) => void): Promise<void> {
     const key = JSON.stringify([a.name, a.lifecycleUid]);
     if (!release && this.staticReleasePending.has(key)) {
@@ -12338,7 +12347,7 @@ export class Manager {
         }
       }
       const cur = this.retiring.get(a.name);
-      if (cur && cur.target.lifecycleUid === a.lifecycleUid) {
+      if (retired && cur && cur.target.lifecycleUid === a.lifecycleUid) {
         this.retiring.delete(a.name);
         this.confirmedRetiredPredecessors.set(a.name, { principal, lifecycleUid: a.lifecycleUid });
       }
@@ -12819,18 +12828,16 @@ export class Manager {
 
   private async driveStaticReconcileRetry(key: string, item: StaticReconcileItem): Promise<void> {
     if (item.flight) await item.flight;
-    if (this.staticReconcileStopping || item.disposition === "recovered") return;
-    // A retry trigger consumes one finite budget entry even if the authoritative re-read itself
-    // fails. Otherwise a broker outage before the planner could reschedule forever without ever
-    // incrementing `attempts`, violating the bounded-retry guarantee.
-    item.attempts++;
-    item.disposition = "retrying";
-    item.remedy = undefined;
-    console.error(`static reconcile retrying alias=${item.alias} phase=${item.phase} uid=${item.lifecycleUid} attempt=${item.attempts}/${item.maxAttempts}`);
+    const deprovision = this.deprovisioningFlight.get(JSON.stringify([item.alias, item.lifecycleUid]));
+    if (deprovision) await deprovision;
+    if (this.staticReconcileStopping || item.disposition === "recovered" || item.timer || item.attempts >= item.maxAttempts) return;
     let row: StaticManagedSlotRow | undefined;
     try {
       row = await this.readStaticReconcileSlot(item.alias);
     } catch (error) {
+      if (item.timer || this.deprovisioningFlight.has(JSON.stringify([item.alias, item.lifecycleUid]))) return;
+      item.attempts++;
+      item.remedy = undefined;
       const lastError = `durable slot re-read failed: ${rejectionText(error)}`;
       if (item.attempts >= item.maxAttempts) {
         this.failStaticReconcileItem(item, "retry-exhausted", RESTART_RETRY_REMEDY, lastError);
@@ -12852,6 +12859,8 @@ export class Manager {
     }
     item.phase = row.phase;
     if (row.phase === "retired") {
+      const held = this.retiring.get(item.alias);
+      if (held?.target.lifecycleUid === item.lifecycleUid) this.retiring.delete(item.alias);
       item.disposition = "recovered";
       item.recoveredAt = new Date().toISOString();
       item.lastError = undefined;
@@ -12878,21 +12887,21 @@ export class Manager {
       console.error(`! static reconcile refused alias=${item.alias} phase=${item.phase} uid=${item.lifecycleUid}: ${item.lastError}`);
       return;
     }
-    await this.attemptStaticReconcile(key, item, row, false);
+    await this.attemptStaticReconcile(key, item, row);
   }
 
   /** Enter one exact terminal at most once per coordinate. Sweep and timer triggers join the same
    *  promise. A settled failed item keeps its original per-process budget; a restart builds a fresh
    *  map from the still-authoritative durable row. */
-  private attemptStaticReconcile(key: string, item: StaticReconcileItem, row: StaticManagedSlotRow, countAttempt = true): Promise<StaticReconcileAttempt> {
+  private attemptStaticReconcile(key: string, item: StaticReconcileItem, row: StaticManagedSlotRow): Promise<StaticReconcileAttempt> {
     if (item.flight) return item.flight;
-    if (this.staticReleasePending.has(JSON.stringify([row.alias, row.lifecycleUid])) || item.timer) return Promise.resolve({ succeeded: false });
-    // A timer/retry driver increments before its mandatory durable re-read, then calls with
-    // countAttempt=false. Let that already-consumed budget entry enter the terminal. Only a fresh
-    // sweep entry (countAttempt=true) is refused once the per-process budget is exhausted.
-    if (countAttempt && item.attempts >= item.maxAttempts) return Promise.resolve({ succeeded: false });
+    if (this.staticReleasePending.has(JSON.stringify([row.alias, row.lifecycleUid])) || item.timer || item.attempts >= item.maxAttempts) return Promise.resolve({ succeeded: false });
+    const existing = this.deprovisioningFlight.get(JSON.stringify([row.alias, row.lifecycleUid]));
+    if (existing) return existing.then(() => ({ succeeded: item.disposition === "recovered" }));
+    const terminal = this.staticRetirementFlight.get(JSON.stringify([row.alias, row.lifecycleUid]));
+    if (terminal) return terminal.then(() => ({ succeeded: true }), () => ({ succeeded: false }));
     const flight = (async (): Promise<StaticReconcileAttempt> => {
-      if (countAttempt) item.attempts++;
+      item.attempts++;
       item.phase = row.phase;
       item.disposition = "retrying";
       item.nextRetryAt = undefined;

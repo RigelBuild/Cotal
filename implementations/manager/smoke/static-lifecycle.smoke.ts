@@ -20,9 +20,12 @@
  *     slot retired -> alias free; the retiring hold gates same-name reuse meanwhile.
  *  5. Same-name respawn after the terminal: a FRESH uid, the slot CASed over the retired row,
  *     the predecessor's gate/head stay terminally retired (never reused).
- *  6. F3 rollback: a spawn that throws AFTER activation (buildLaunch) drives the exact-op static
+ *  6. FAILED STATIC RETIREMENT: a non-reap authentication timeout keeps the provisioning slot held,
+ *     schedules bounded in-process retries, recovers after a transient failure, and permits a
+ *     same-name spawn to re-drive retirement after retry exhaustion.
+ *  7. F3 rollback: a spawn that throws AFTER activation (buildLaunch) drives the exact-op static
  *     terminal — no active orphan survives.
- *  7. RECONCILE (boot sweep): an active slot with no live process is terminalized by
+ *  8. RECONCILE (boot sweep): an active slot with no live process is terminalized by
  *     reconcileStaticLifecycles (no active orphan across manager restarts). A ledgerless
  *     orphan (never minted) retires without a broker eviction. A ledgered orphan whose
  *     eviction is unverified stays terminalizing so the alias cannot land in two owners.
@@ -68,6 +71,8 @@ import {
   type EpGateRow,
   type StaticManagedSlotRow,
   type EvictionResult,
+  type LifecycleStateTransport,
+  type DeprovisionResourceAccounting,
 } from "@cotal-ai/core";
 import { workspaceSecretStore } from "@cotal-ai/workspace";
 import {
@@ -99,13 +104,12 @@ let ran = 0;
  * when a `check` is deliberately added or removed, because completeness is something only this
  * suite knows, so it has to be the thing that says it.
  */
-const EXPECTED_CHECKS = 45;
+const EXPECTED_CHECKS = 71;
 function check(label: string, cond: boolean, extra?: unknown): void {
   console.log(`${cond ? "✓" : "✗"} ${label}${cond ? "" : ` — ${JSON.stringify(extra) ?? ""}`}`);
   ran++;
   if (!cond) failures++;
 }
-const enc = new TextEncoder();
 const retireOpId = (uid: string): string => createHash("sha256").update(`retire:${uid}`).digest("hex").slice(0, 26);
 async function until(cond: () => Promise<boolean> | boolean, ms: number, what: string): Promise<boolean> {
   const deadline = Date.now() + ms;
@@ -125,7 +129,7 @@ const { servers: SERVERS, stop: stopBroker } = await bootBroker(auth);
 
 const workspaceRoot = mkdtempSync(join(tmpdir(), "cotal-static-lifecycle-ws-"));
 mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
-for (const alias of ["worker", "crashy"])
+for (const alias of ["worker", "crashy", "retryable", "retry-exhausted"])
   writeFileSync(
     join(workspaceRoot, ".cotal", "agents", `${alias}.md`),
     `---\nname: ${alias}\nrole: worker\nsubscribe: [general]\nallowSubscribe: [general]\nallowPublish: [general]\n---\nbody\n`,
@@ -152,29 +156,70 @@ const fakeHandle = (name: string): AgentHandle => {
 };
 
 let crashLaunch = false;
+let failRetirementExecutor = false;
+let retirementFailsRemaining = 0;
+let failedRetirementAlias: string | undefined;
 const con: Connector = {
   kind: "connector",
   name: "smoke-sl",
   requires: ["node"],
-  buildLaunch: () => {
-    if (crashLaunch) throw new Error("smoke: injected buildLaunch crash");
+  buildLaunch: (opts) => {
+    if (crashLaunch) {
+      if (opts.name === "retryable" || opts.name === "retry-exhausted") {
+        failRetirementExecutor = true;
+        failedRetirementAlias = opts.name;
+        retirementFailsRemaining = opts.name === "retryable" ? 2 : 5;
+      }
+      throw new Error("smoke: injected buildLaunch crash");
+    }
     return { command: "true", args: [], env: {} };
   },
 };
 registry.register(con);
 
+type LifecycleExecutorPin = { owner: string; actor: string; lifecycleUid: string; alias: string };
+type StaticLifecycleItem = { alias: string; lifecycleUid: string; attempts: number; maxAttempts: number; disposition: string; nextRetryAt?: string; lastError?: string; remedy?: string; timer?: NodeJS.Timeout };
+
 const M = mgr as unknown as {
   managerInstanceId: string;
   agents: Map<string, { id: string; name: string; lifecycleUid: string; terminalizing?: boolean; secretPaths?: { creds?: string }; seed?: string }>;
-  retiring: Map<string, { target: { lifecycleUid: string } }>;
+  retiring: Map<string, { target: { lifecycleUid: string }; lastError?: string }>;
   retiredPrincipals: Set<string>;
   freeSlot: (a: unknown, floor: boolean, cause: FreeSlotCause) => void;
+  holdFailedStaticRetirement: (target: { id: string; name: string; lifecycleUid: string }, phase: StaticManagedSlotRow["phase"], error: unknown, queueRetry: boolean) => void;
   deprovision: (a: { id: string; name: string; lifecycleUid: string; secretPaths?: { creds?: string } }) => Promise<void>;
   lifecycleMembershipRefusal: (caller: string) => string | undefined;
   renewManagedStaticCred: (a: unknown) => Promise<void>;
-  reconcileStaticLifecycles: () => Promise<void>;
+  retryStaticReconcile: (key: string) => Promise<void>;
+  scheduleStaticReconcileRetry: (key: string, item: StaticLifecycleItem) => void;
+  reconcileStaticLifecycles: (postAdoption?: boolean) => Promise<void>;
+  staticReconcileRetryDelaysMs: readonly number[];
+  staticReconcileItems: Map<string, StaticLifecycleItem>;
+  deprovisionBroker: (target: { id: string; name: string; lifecycleUid: string; launch?: { allowSubscribe: readonly string[] } }) => Promise<DeprovisionResourceAccounting>;
+  withLifecycleExecutor: <T>(pin: LifecycleExecutorPin, fn: (transport: LifecycleStateTransport) => Promise<T>) => Promise<T>;
 };
 M.managerInstanceId = "smoke-manager-instance";
+const withLifecycleExecutor = M.withLifecycleExecutor.bind(mgr);
+M.withLifecycleExecutor = async (pin, fn) => {
+  if (failRetirementExecutor && pin.alias === failedRetirementAlias && retirementFailsRemaining > 0) {
+    retirementFailsRemaining--;
+    throw new Error("authentication timeout");
+  }
+  return withLifecycleExecutor(pin, fn);
+};
+let blockCleanup = false;
+let cleanupCalls = 0;
+let failCleanup = false;
+let releaseCleanup: (() => void) | undefined;
+const deprovisionBroker = M.deprovisionBroker.bind(mgr);
+M.deprovisionBroker = async (target) => {
+  if (target.name === "retryable") {
+    cleanupCalls++;
+    if (blockCleanup) await new Promise<void>((resolve) => { releaseCleanup = resolve; });
+    if (failCleanup) throw new Error("injected cleanup failure");
+  }
+  return deprovisionBroker(target);
+};
 
 // The real delivery-admin executor is covered by the restart/eviction suites. This lifecycle suite
 // grades the terminal's use of the seam and its ordering. Default verified-gone keeps existing cells
@@ -264,6 +309,21 @@ async function plantActiveOrphan(alias: string, actor: string, uid: string, ledg
   }
 }
 
+async function failedStaticSpawn(alias: "retryable" | "retry-exhausted"): Promise<{ actor: string; uid: string; key: string }> {
+  crashLaunch = true;
+  const spawn = await mgr.startAgent({ name: alias, agent: "smoke-sl", events: false });
+  crashLaunch = false;
+  const row = await until(async () => (await readSlotOnly(alias)) !== undefined, 5_000, `${alias} activation intent`);
+  const slot = await readSlotOnly(alias);
+  check(`${alias} spawn fails after activation`, spawn.ok === false && /injected buildLaunch crash/.test(spawn.error ?? "") && row && slot?.phase === "provisioning", { spawn, slot });
+  if (!slot) throw new Error(`${alias}: expected a durable provisioning row`);
+  const key = JSON.stringify([DEV_OWNER, alias, slot.lifecycleUid]);
+  check(`${alias} failed rollback retains a same-name retirement hold`, M.retiring.get(alias)?.target.lifecycleUid === slot.lifecycleUid, M.retiring.get(alias));
+  const queued = await until(() => M.staticReconcileItems.get(key)?.disposition === "retry-scheduled", 5_000, `${alias} bounded retry scheduling`);
+  const item = M.staticReconcileItems.get(key);
+  check(`${alias} authentication timeout schedules a bounded retry`, queued && typeof item?.nextRetryAt === "string" && /authentication timeout/.test(item.lastError ?? ""), item);
+  return { actor: slot.actor, uid: slot.lifecycleUid, key };
+}
 /** Plant a live static incarnation, latch it to `terminalizing` (optionally with the durable
  *  `cleanupComplete` marker already set, modelling a crash AFTER cleanup finished but BEFORE the
  *  `retired` CAS), then drive `runStaticTerminal` as a resume would — counting how many times the
@@ -304,6 +364,8 @@ async function driveTerminalDirect(
 
 try {
   await setupSpaceStreams({ servers: SERVERS, space, creds: await mintCreds(auth, newIdentity(), "provisioner") });
+  const originalRetryDelays = M.staticReconcileRetryDelaysMs;
+  M.staticReconcileRetryDelaysMs = [80, 80, 80];
 
   // ── 1. Activation: durable identity + bounded ledgered credential ─────────
   const spawnA = await mgr.startAgent({ name: "worker", agent: "smoke-sl", events: false });
@@ -400,7 +462,90 @@ try {
   const s5a = await readState("worker", idA, uidA);
   check("predecessor's head/gate stay terminally retired (uid never reused)", s5a.head?.state === "retired" && s5a.gate?.state === "retired");
 
-  // ── 6. F3 rollback: a crash AFTER activation drives the exact-op terminal ──
+  // ── 6. Failed static retirement: bounded retries and same-name re-drive ──
+  M.staticReconcileRetryDelaysMs = [60_000, 60_000, 60_000];
+  const retryable = await failedStaticSpawn("retryable");
+  const retryableItem = M.staticReconcileItems.get(retryable.key)!;
+  if (retryableItem.timer) clearTimeout(retryableItem.timer);
+  retryableItem.timer = undefined;
+  retryableItem.nextRetryAt = undefined;
+  await M.retryStaticReconcile(retryable.key);
+  check("an authentication timeout during retry schedules the next bounded attempt", retryableItem.attempts === 2 && retryableItem.disposition === "retry-scheduled", retryableItem);
+  check("failed retirement keeps its provisioning slot held", (await readSlotOnly("retryable"))?.phase === "provisioning");
+  check("failed retry retains the same lifecycle hold", M.retiring.get("retryable")?.target.lifecycleUid === retryable.uid);
+  clearTimeout(retryableItem.timer);
+  retryableItem.timer = undefined;
+  retryableItem.nextRetryAt = undefined;
+  M.staticReconcileRetryDelaysMs = [80, 80, 80];
+  M.scheduleStaticReconcileRetry(retryable.key, retryableItem);
+  blockCleanup = true;
+  const blockedRetrySpawn = await mgr.startAgent({ name: "retryable", agent: "smoke-sl", events: false });
+  const entered = await until(() => cleanupCalls > 0, 5_000, "spawn retirement cleanup");
+  const timerFired = await until(() => retryableItem.timer === undefined, 5_000, "overlapping retry timer");
+  check("spawn retirement remains held while retry timer fires", !blockedRetrySpawn.ok && entered && timerFired && M.retiring.get("retryable")?.target.lifecycleUid === retryable.uid);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  check("spawn and timer share one retirement cleanup", cleanupCalls === 1 && retryableItem.attempts === 2, { cleanupCalls, attempts: retryableItem.attempts });
+  blockCleanup = false;
+  releaseCleanup?.();
+  const recoveredRetry = await until(async () => (await readSlotOnly("retryable"))?.phase === "retired" && !M.retiring.has("retryable"), 5_000, "retryable rollback retry");
+  check("the same manager retries and retires the failed static spawn", recoveredRetry, { slot: await readSlotOnly("retryable"), hold: M.retiring.get("retryable") });
+  const retryItem = M.staticReconcileItems.get(retryable.key);
+  check("successful retry records recovery under the original lifecycle", retryItem?.disposition === "recovered" && retryItem.lifecycleUid === retryable.uid, retryItem);
+  M.holdFailedStaticRetirement({ id: retryable.actor, name: "retryable", lifecycleUid: retryable.uid }, "terminalizing", new Error("late failure"), true);
+  check("a late failure cannot recreate a cleared hold", !M.retiring.has("retryable"));
+  M.staticReconcileRetryDelaysMs = [60_000, 60_000, 60_000];
+  const joined = await failedStaticSpawn("retryable");
+  const joinedItem = M.staticReconcileItems.get(joined.key)!;
+  retirementFailsRemaining = 0;
+  clearTimeout(joinedItem.timer);
+  joinedItem.timer = undefined;
+  joinedItem.nextRetryAt = undefined;
+  M.staticReconcileRetryDelaysMs = [80, 60_000, 60_000];
+  M.scheduleStaticReconcileRetry(joined.key, joinedItem);
+  blockCleanup = true;
+  failCleanup = true;
+  const beforeJoinedCleanup = cleanupCalls;
+  await mgr.startAgent({ name: "retryable", agent: "smoke-sl", events: false });
+  await until(() => cleanupCalls > beforeJoinedCleanup, 5_000, "failed joined cleanup");
+  await until(() => joinedItem.timer === undefined, 5_000, "failed joined timer");
+  M.staticReconcileRetryDelaysMs = [60_000, 60_000, 60_000];
+  blockCleanup = false;
+  releaseCleanup?.();
+  const joinedScheduled = await until(() => joinedItem.disposition === "retry-scheduled" && joinedItem.timer !== undefined, 5_000, "failed joined retry scheduled");
+  check("failed joined cleanup preserves budget and schedules one retry", joinedScheduled && joinedItem.attempts === 1 && joinedItem.attempts <= joinedItem.maxAttempts && cleanupCalls === beforeJoinedCleanup + 1, joinedItem);
+  for (let attempt = 0; attempt < joinedItem.maxAttempts && joinedItem.attempts < joinedItem.maxAttempts; attempt++) {
+    clearTimeout(joinedItem.timer);
+    joinedItem.timer = undefined;
+    joinedItem.nextRetryAt = undefined;
+    await M.retryStaticReconcile(joined.key);
+  }
+  check("failed joined cleanup exhausts at the budget with a remedy", joinedItem.attempts === joinedItem.maxAttempts && joinedItem.disposition === "retry-exhausted" && joinedItem.timer === undefined && /same-name spawn/.test(joinedItem.remedy ?? ""), joinedItem);
+  failCleanup = false;
+  await mgr.startAgent({ name: "retryable", agent: "smoke-sl", events: false });
+  const joinedRecovered = await until(() => !M.retiring.has("retryable"), 10_000, "failed joined cleanup recovery");
+  check("failed joined cleanup recovers on a same-name spawn", joinedRecovered && !M.retiring.has("retryable"));
+
+  const exhausted = await failedStaticSpawn("retry-exhausted");
+  for (let attempt = 0; attempt < M.staticReconcileRetryDelaysMs.length; attempt++) {
+    const item = M.staticReconcileItems.get(exhausted.key)!;
+    if (item.timer) clearTimeout(item.timer);
+    item.timer = undefined;
+    item.nextRetryAt = undefined;
+    await M.retryStaticReconcile(exhausted.key);
+  }
+  const exhaustedStatus = M.staticReconcileItems.get(exhausted.key);
+  check("persistent retirement failure exhausts its bounded retry budget", exhaustedStatus?.attempts === 4 && exhaustedStatus.disposition === "retry-exhausted", exhaustedStatus);
+  check("retry exhaustion names same-name spawn as a recovery action", /same-name spawn/.test(exhaustedStatus?.remedy ?? ""), exhaustedStatus?.remedy);
+  check("retry exhaustion keeps a same-name hold", M.retiring.get("retry-exhausted")?.target.lifecycleUid === exhausted.uid);
+  M.staticReconcileRetryDelaysMs = [1_000, 1_000, 1_000];
+  const blockedExhaustedSpawn = await mgr.startAgent({ name: "retry-exhausted", agent: "smoke-sl", events: false });
+  check("same-name spawn after exhaustion refuses and re-drives retirement", blockedExhaustedSpawn.ok === false && /reserved pending retirement/.test(blockedExhaustedSpawn.error ?? ""), blockedExhaustedSpawn);
+  const reset = await until(() => exhaustedStatus?.disposition === "retry-scheduled" && exhaustedStatus.attempts === 1, 5_000, "fresh retry budget");
+  check("failed same-name re-drive resets the budget and clears its stale remedy", reset && exhaustedStatus?.remedy === undefined && M.retiring.get("retry-exhausted")?.target.lifecycleUid === exhausted.uid, exhaustedStatus);
+  const recoveredExhausted = await until(async () => (await readSlotOnly("retry-exhausted"))?.phase === "retired", 10_000, "exhausted rollback timer retry");
+  check("real retry timer retires the lifecycle without a manager restart", recoveredExhausted && !M.retiring.has("retry-exhausted"), { slot: await readSlotOnly("retry-exhausted"), hold: M.retiring.get("retry-exhausted") });
+  M.staticReconcileRetryDelaysMs = originalRetryDelays;
+  // ── 7. F3 rollback: a crash AFTER activation drives the exact-op terminal ──
   crashLaunch = true;
   const spawnC = await mgr.startAgent({ name: "crashy", agent: "smoke-sl", events: false });
   crashLaunch = false;
@@ -412,8 +557,7 @@ try {
     const sc = await readState("crashy", cSlot.actor, cSlot.lifecycleUid);
     check("the crashed spawn's head is RETIRED and its gate terminally retired", sc.head?.state === "retired" && sc.gate?.state === "retired", { head: sc.head?.state, gate: sc.gate?.state });
   }
-
-  // ── 7. Reconcile: ledgerless-vacuous vs fail-closed holder ─────────────────
+  // ── 8. Reconcile: ledgerless-vacuous vs fail-closed holder ─────────────────
   const orphanId = newIdentity();
   const orphanUid = mintLifecycleUid();
   await plantActiveOrphan("orphan", orphanId.id, orphanUid, false);
