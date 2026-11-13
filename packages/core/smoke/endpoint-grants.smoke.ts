@@ -24,11 +24,11 @@ import { AUTH_ENDPOINT, EP_CMD_VERIFY_PLACEMENT_ENROLLMENT, EP_CMD_ENROLLMENT_EF
   epCallerReplyFilter } from "../src/endpoint-subjects.js";
 
 let ok = 0, fail = 0;
-const UID = "u".repeat(26);
-const IID = "i".repeat(26);
 const c = (n: string, v: boolean, extra?: unknown) => { if (v) { ok++; } else { fail++; console.log("  ✗ FAIL:", n, extra ?? ""); } };
 const throws = (n: string, fn: () => unknown) => { try { fn(); c(n, false); } catch { c(n, true); } };
 
+const UID = "u".repeat(26);
+const IID = "i".repeat(26);
 const caller: EpCaller = { owner: "u_abc", actor: "cli", uid: UID };
 // ── caller rows against the §13.9 matrix forms ──
 const spawnCap: EpCapability = { endpoint: "manager", command: "spawn", target: { mode: "owner", tOwner: "u_abc" }, journal: true };
@@ -127,6 +127,10 @@ for (const field of ["owner", "actor", "uid"] as const) {
   throws(`reconciler profile rejects an empty caller ${field}`, () => permissionsFor("reconciler", "demo",
     { ...reconcilerCaller, connId: "conn1234567890" }, { reconciler: { ...reconcilerCaller, [field]: "" } }));
 }
+throws("reconciler profile rejects a mismatched principal owner", () => permissionsFor("reconciler", "demo",
+  { ...reconcilerCaller, owner: "u_other", connId: "conn1234567890" }, { reconciler: reconcilerCaller }));
+throws("reconciler profile rejects a mismatched principal actor", () => permissionsFor("reconciler", "demo",
+  { ...reconcilerCaller, actor: "other", connId: "conn1234567890" }, { reconciler: reconcilerCaller }));
 
 // ── an ISSUED caller (SPEC 13.15): the generation rides the request and reply rails and NOTHING else ──
 // The endpoint publishes a goal's progress under the goal's caller TRIPLE and a client submits journal

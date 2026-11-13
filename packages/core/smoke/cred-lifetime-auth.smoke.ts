@@ -206,7 +206,9 @@ try {
   check("membership-rw is bounded now that the manager-remint reload seam exists (slice 5 class 2)", credentialLifetime("membership-rw").defaultTtlSeconds === STANDING_RENEWABLE_TTL_SEC && typeof mrw.uc.exp === "number", mrw.uc.exp);
 
   const reconcilerCaller = { owner: DEV_OWNER, actor: "reconciler", uid: mintLifecycleUid() };
-  const reconcilerCreds = await mintCreds(auth, newIdentity(), "reconciler", { reconciler: reconcilerCaller });
+  const reconcilerCreds = await mintCreds(auth, newIdentity(), "reconciler", {
+    principal: { owner: DEV_OWNER, actor: reconcilerCaller.actor }, reconciler: reconcilerCaller,
+  });
   const reconcilerClaims = await parseCreds(enc(reconcilerCreds));
   const reconcilerLifetime = credentialLifetime("reconciler");
   check("reconciler has a bounded standing-renewable lifetime and its minted credential carries the 24-hour exp",

@@ -51,7 +51,7 @@ export async function profileFixtures(space: string): Promise<ProfileFixture[]> 
     },
     provisioner: () => one("provisioner"),
     deprovisioner: () => one("deprovisioner", { deprovisionTarget: { principal: "local.worker", lifecycleUid: uid } }),
-    reconciler: () => one("reconciler", { reconciler: { owner: "local", actor: "census", uid } }),
+    reconciler: () => one("reconciler", { reconciler: { owner: "local", actor: "reconciler", uid } }, "default", { ...principal, actor: "reconciler" }),
     "retirement-requester": () => one("retirement-requester", { retirementRequester: { owner: "local", actor: "census", uid, target: { owner: "local", actor: "worker", lifecycleUid: uid } } }),
     "lifecycle-executor": () => one("lifecycle-executor", { lifecycleExecutor: { owner: "local", actor: "worker", lifecycleUid: uid, alias: "worker" } }),
     "endpoint-serve-executor": () => one("endpoint-serve-executor", { endpointServeExecutor: { endpoint: "manager", instanceId: instance } }),

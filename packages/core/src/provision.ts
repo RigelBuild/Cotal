@@ -314,7 +314,7 @@ export const CREDENTIAL_LIFETIMES: Record<CredentialKind, CredentialLifetimePoli
   provisioner: { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "setup/spawn provisioning window only" },
   deprovisioner: { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "target-pinned teardown window only" },
   // Standing because the reconciler must resume durable placement work across process restarts.
-  reconciler: { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "reconciler service", note: "auth placement request caller; request+reply only" },
+  reconciler: { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "reconciler service", note: "the reconciler service runs outside Cotal, holds the signer path, and re-mints the credential before expiry; Cotal does not renew it" },
   "retirement-requester": { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "one despawn's retirement request window; request+reply only" },
   "lifecycle-executor": { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "one static lifecycle operation's 13.1 state-write window (activation / terminal / renewal ledger append)" },
   "endpoint-serve-executor": { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "one endpoint registration/serve-mint window (13.1 epgate CAS + epcred stage/revoke + eprepair cursor for one (endpoint, instanceId))" },
@@ -1205,7 +1205,7 @@ export async function mintPublicUserJwt(
   opts: MintOpts,
 ): Promise<{ jwt: string; exp: number }> {
   if (!isUserNkey(publicId)) throw new Error("mintPublicUserJwt: publicId must be a user nkey");
-  if (!isEnvironmentManagerProfile(profile) && !["remote-manager", "endpoint-serve", "goal-writer", "session-ledger", "session-serving", "retirement-requester", "reconciler", "run-driver", "run-mediator", "run-operator", "transfer-reader"].includes(profile))
+  if (!isEnvironmentManagerProfile(profile) && !["remote-manager", "endpoint-serve", "goal-writer", "session-ledger", "session-serving", "retirement-requester", "run-driver", "run-mediator", "run-operator", "transfer-reader"].includes(profile))
     throw new Error(`mintPublicUserJwt: profile "${profile}" is not part of the closed remote manager protocol`);
   const pr: MintPrincipal = {
     owner: opts.principal?.owner ?? DEV_OWNER,
@@ -1350,6 +1350,10 @@ export function permissionsFor(
     for (const [field, value] of [["owner", reconciler.owner], ["actor", reconciler.actor], ["uid", reconciler.uid]] as const)
       if (typeof value !== "string" || value.length === 0)
         throw new Error(`permissionsFor: reconciler requires opts.reconciler.${field} (the caller triple is <owner>.<actor>.<uid>)`);
+    if (reconciler.owner !== pr.owner)
+      throw new Error(`permissionsFor: reconciler owner mismatch: opts.reconciler.owner "${reconciler.owner}" does not match principal owner "${pr.owner}"`);
+    if (reconciler.actor !== pr.actor)
+      throw new Error(`permissionsFor: reconciler actor mismatch: opts.reconciler.actor "${reconciler.actor}" does not match principal actor "${pr.actor}"`);
     const caller = { owner: reconciler.owner, actor: reconciler.actor, uid: reconciler.uid };
     const rows = [
       EP_CMD_VERIFY_PLACEMENT_ENROLLMENT,
