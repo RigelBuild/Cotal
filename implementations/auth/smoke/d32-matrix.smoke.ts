@@ -857,8 +857,8 @@ console.log("4. the auth endpoint rail profiles (piece 3)");
       route: { mode: "one" }, endpoint: AUTH_ENDPOINT, command, caller: CALLER, nonce: "n".repeat(22),
     });
     const foreignCallers = [
-      { ...CALLER, owner: "other-owner" },
-      { ...CALLER, actor: "other-manager" },
+      { ...CALLER, owner: "other_owner" },
+      { ...CALLER, actor: "other_manager" },
       { ...CALLER, uid: mintLifecycleUid() },
     ];
     return reconciler.pub.allow.some((row) => subjectMatches(row, subject))
