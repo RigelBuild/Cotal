@@ -10,7 +10,7 @@
  * Run: pnpm smoke:ep-grants   (no broker; part of smoke:ci)
  */
 import {
-  createSpaceAuth, mintCreds, newIdentity, mintLifecycleUid,
+  createSpaceAuth, mintCreds, mintPublicUserJwt, newIdentity, mintLifecycleUid,
   epRequestGrantRows, epJournalGrantRow, epCallerReplyGrantRow, epGoalProgressGrantRow,
   epCallerGrantRows, epServeSubscribeRows, epServePublishRows, epServeGrantRows,
   epBaselineGrantRows, spawnCallerCapabilities, runCallerCapabilities, operatorInstrumentCapabilities, instancePinnedInstrumentCapabilities, baselineCallerCapabilities, permissionsFor,
@@ -285,6 +285,18 @@ c("no serve rail row crosses commands (no bare cross-command tail)",
 
 // ── the minted credential carries exactly these rows (permissionsFor wiring) ──
 const auth = await createSpaceAuth("epg");
+let reconcilerMintError: string | undefined;
+try {
+  await mintPublicUserJwt(auth, newIdentity().id, "reconciler", {
+    principal: { owner: reconcilerCaller.owner, actor: reconcilerCaller.actor },
+    reconciler: reconcilerCaller,
+    expiresAt: Math.floor(Date.now() / 1000) + 300,
+  });
+} catch (error) {
+  reconcilerMintError = error instanceof Error ? error.message : String(error);
+}
+c("public reconciler JWT mint rejects the closed remote manager protocol",
+  reconcilerMintError?.includes("closed remote manager protocol") === true, reconcilerMintError);
 const decode = (creds: string): { pub: { allow: string[] }; sub: { allow: string[] } } => {
   const jwt = /BEGIN NATS USER JWT-+\s+(\S+)/.exec(creds)![1];
   const payload = jwt.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
