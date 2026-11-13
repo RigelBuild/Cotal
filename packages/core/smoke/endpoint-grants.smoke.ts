@@ -16,17 +16,20 @@ import {
   epBaselineGrantRows, spawnCallerCapabilities, runCallerCapabilities, operatorInstrumentCapabilities, instancePinnedInstrumentCapabilities, baselineCallerCapabilities, permissionsFor,
   SPAWN_CREATE_COMMANDS,
   MAX_CONTROL_LINE_BYTES, CONNECT_ENVELOPE_OVERHEAD_BYTES, MAX_MINTED_JWT_BYTES,
+  subjectMatches,
   type EpCapability, type EpCaller,
 } from "../src/index.js";
+import { AUTH_ENDPOINT, EP_CMD_VERIFY_PLACEMENT_ENROLLMENT, EP_CMD_ENROLLMENT_EFFECT_STATUS,
+  EP_CMD_CLOSE_ENROLLMENT_EFFECT, EP_CMD_RETIRE_PLACEMENT_ENROLLMENT, epRequestSubject,
+  epCallerReplyFilter } from "../src/endpoint-subjects.js";
 
 let ok = 0, fail = 0;
+const UID = "u".repeat(26);
+const IID = "i".repeat(26);
 const c = (n: string, v: boolean, extra?: unknown) => { if (v) { ok++; } else { fail++; console.log("  ✗ FAIL:", n, extra ?? ""); } };
 const throws = (n: string, fn: () => unknown) => { try { fn(); c(n, false); } catch { c(n, true); } };
 
-const UID = "u".repeat(26);
-const IID = "i".repeat(26);
 const caller: EpCaller = { owner: "u_abc", actor: "cli", uid: UID };
-
 // ── caller rows against the §13.9 matrix forms ──
 const spawnCap: EpCapability = { endpoint: "manager", command: "spawn", target: { mode: "owner", tOwner: "u_abc" }, journal: true };
 c("request row: class one, owner mode, caller-pinned, nonce-only wildcard",
@@ -77,6 +80,53 @@ c("caller bundle: request + journal pub, reply-rail + own-goal-progress sub (spa
   && bundle.sub[0] === epCallerReplyGrantRow("demo", caller)
   && bundle.sub[1] === epGoalProgressGrantRow("demo", "manager", caller));
 c("empty capability set mints nothing", JSON.stringify(epCallerGrantRows("demo", [], caller)) === '{"pub":[],"sub":[]}');
+
+// ── standing reconciler profile: exact untargeted placement requests and caller pinning ──
+const reconcilerCaller: EpCaller = { owner: "u_reconciler", actor: "reconciler", uid: UID };
+const reconciler = permissionsFor("reconciler", "demo", { ...reconcilerCaller, connId: "conn1234567890" }, {
+  reconciler: reconcilerCaller,
+}) as { pub: { allow: string[] }; sub: { allow: string[] } };
+const placementCommands = [
+  EP_CMD_VERIFY_PLACEMENT_ENROLLMENT,
+  EP_CMD_ENROLLMENT_EFFECT_STATUS,
+  EP_CMD_CLOSE_ENROLLMENT_EFFECT,
+  EP_CMD_RETIRE_PLACEMENT_ENROLLMENT,
+];
+const reconcilerPublishRows = [
+  ...placementCommands.map((command) => `cotal.demo.ep.one.auth.${command}.u_reconciler.reconciler.${UID}.*`),
+  `cotal.demo.ep.one.*.describe.u_reconciler.reconciler.${UID}.*`,
+  "$JS.API.DIRECT.GET.EPC_demo.cotal.demo.epc.>",
+];
+c("reconciler publishes exactly four placement requests, describe and EPC fetch",
+  JSON.stringify(reconciler.pub.allow) === JSON.stringify(reconcilerPublishRows), reconciler.pub.allow);
+c("reconciler subscribes only to its caller reply rail and own inbox",
+  JSON.stringify(reconciler.sub.allow) === JSON.stringify([
+    epCallerReplyFilter("demo", reconcilerCaller), "_INBOX_conn1234567890.>",
+  ]), reconciler.sub.allow);
+const reconcilerCallerVariants: EpCaller[] = [
+  { ...reconcilerCaller, owner: "u_other" },
+  { ...reconcilerCaller, actor: "other" },
+  { ...reconcilerCaller, uid: "v".repeat(26) },
+];
+c("reconciler request grants match only the pinned caller triple",
+  placementCommands.every((command) => {
+    const request = epRequestSubject("demo", {
+      route: { mode: "one" }, endpoint: AUTH_ENDPOINT, command, caller: reconcilerCaller, nonce: "n".repeat(22),
+    });
+    return reconciler.pub.allow.some((row) => subjectMatches(row, request))
+      && reconcilerCallerVariants.every((caller) => {
+        const foreign = epRequestSubject("demo", {
+          route: { mode: "one" }, endpoint: AUTH_ENDPOINT, command, caller, nonce: "n".repeat(22),
+        });
+        return !reconciler.pub.allow.some((row) => subjectMatches(row, foreign));
+      });
+  }));
+throws("reconciler profile requires the reconciler caller triple", () =>
+  permissionsFor("reconciler", "demo", { ...reconcilerCaller, connId: "conn1234567890" }, {}));
+for (const field of ["owner", "actor", "uid"] as const) {
+  throws(`reconciler profile rejects an empty caller ${field}`, () => permissionsFor("reconciler", "demo",
+    { ...reconcilerCaller, connId: "conn1234567890" }, { reconciler: { ...reconcilerCaller, [field]: "" } }));
+}
 
 // ── an ISSUED caller (SPEC 13.15): the generation rides the request and reply rails and NOTHING else ──
 // The endpoint publishes a goal's progress under the goal's caller TRIPLE and a client submits journal

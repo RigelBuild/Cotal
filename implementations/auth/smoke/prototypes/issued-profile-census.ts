@@ -51,6 +51,7 @@ export async function profileFixtures(space: string): Promise<ProfileFixture[]> 
     },
     provisioner: () => one("provisioner"),
     deprovisioner: () => one("deprovisioner", { deprovisionTarget: { principal: "local.worker", lifecycleUid: uid } }),
+    reconciler: () => one("reconciler", { reconciler: { owner: "local", actor: "census", uid } }),
     "retirement-requester": () => one("retirement-requester", { retirementRequester: { owner: "local", actor: "census", uid, target: { owner: "local", actor: "worker", lifecycleUid: uid } } }),
     "lifecycle-executor": () => one("lifecycle-executor", { lifecycleExecutor: { owner: "local", actor: "worker", lifecycleUid: uid, alias: "worker" } }),
     "endpoint-serve-executor": () => one("endpoint-serve-executor", { endpointServeExecutor: { endpoint: "manager", instanceId: instance } }),
@@ -259,7 +260,7 @@ export const TRUSTED_PROFILES: readonly Profile[] = Object.freeze([
   "session-ledger", "session-serving", "run-mediator", "run-operator", "remote-manager",
   "lifecycle-executor", "endpoint-serve-executor", "endpoint-serve", "control-caller-privileged",
   "control-caller-admin", "backup", "restore", "endpoint-evictor", "retirement-requester",
-  "issuer", "run-admitter", "transfer-writer", "transfer-reader",
+  "issuer", "run-admitter", "transfer-writer", "transfer-reader", "reconciler",
   // The registry's reads: the evidence store stream-wide, so never a peer's.
   "registry-reader",
   // Manager-only infrastructure duties, like remote-manager. This classification is not

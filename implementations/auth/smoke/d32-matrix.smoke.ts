@@ -48,9 +48,13 @@ import {
   recordReaderConfig, recordsKvStreamName, readerBindGrants,
   AUTHORITY_KIND_DEFS, callerReadableRecordKind,
   createSpaceAuth, mintCreds, newIdentity, permissionsFor, DEV_OWNER, mintLifecycleUid,
+  epRequestSubject, subjectMatches, AUTH_ENDPOINT,
+  EP_CMD_VERIFY_PLACEMENT_ENROLLMENT, EP_CMD_ENROLLMENT_EFFECT_STATUS,
+  EP_CMD_CLOSE_ENROLLMENT_EFFECT, EP_CMD_RETIRE_PLACEMENT_ENROLLMENT,
   runDriverGrants, runMediatorGrants, runDriverCaller, runOperatorGrants,
   type EpCapability,
 } from "@cotal-ai/core";
+import { AUTH_PLACEMENT_COMMANDS } from "../src/auth-service-contract.js";
 import { authorityWriterGrants, authorityBarrierGrants, barrierExecutorSettlementGrants, environmentManagerAdmissionIndexGrants, environmentManagerAdmissionWriterGrants, remoteManagerIssuerGrants } from "../src/authority-client.js";
 import { retirementExecutorClientGrants } from "../src/retirement-cleaner.js";
 import { drainApplierGrants, drainCancellerGrants, drainReconcilerGrants } from "../src/drain-repair.js";
@@ -823,6 +827,64 @@ console.log("4. the auth endpoint rail profiles (piece 3)");
 {
   const T = { owner: "local", actor: "w1", lifecycleUid: mintLifecycleUid() };
   const CALLER = { owner: "local", actor: "mgr0", uid: mintLifecycleUid() };
+  const reconciler = permissionsFor("reconciler", S, { ...CALLER, connId: CONN }, { reconciler: CALLER }) as {
+    pub: { allow: string[] }; sub: { allow: string[] };
+  };
+  const placementRows = [
+    `cotal.${S}.ep.one.auth.${EP_CMD_VERIFY_PLACEMENT_ENROLLMENT}.${CALLER.owner}.${CALLER.actor}.${CALLER.uid}.*`,
+    `cotal.${S}.ep.one.auth.${EP_CMD_ENROLLMENT_EFFECT_STATUS}.${CALLER.owner}.${CALLER.actor}.${CALLER.uid}.*`,
+    `cotal.${S}.ep.one.auth.${EP_CMD_CLOSE_ENROLLMENT_EFFECT}.${CALLER.owner}.${CALLER.actor}.${CALLER.uid}.*`,
+    `cotal.${S}.ep.one.auth.${EP_CMD_RETIRE_PLACEMENT_ENROLLMENT}.${CALLER.owner}.${CALLER.actor}.${CALLER.uid}.*`,
+    `cotal.${S}.ep.one.*.describe.${CALLER.owner}.${CALLER.actor}.${CALLER.uid}.*`,
+    `$JS.API.DIRECT.GET.EPC_${S}.cotal.${S}.epc.>`,
+  ];
+  c("core placement command constants match the auth service registry",
+    JSON.stringify(AUTH_PLACEMENT_COMMANDS) === JSON.stringify([
+      EP_CMD_VERIFY_PLACEMENT_ENROLLMENT,
+      EP_CMD_ENROLLMENT_EFFECT_STATUS,
+      EP_CMD_CLOSE_ENROLLMENT_EFFECT,
+      EP_CMD_RETIRE_PLACEMENT_ENROLLMENT,
+    ]));
+  c("the reconciler grants exactly its four placement requests, describe, and EPC fetch; nothing else",
+    JSON.stringify(reconciler.pub.allow) === JSON.stringify(placementRows)
+      && JSON.stringify(reconciler.sub.allow) === JSON.stringify([
+        `cotal.${S}.ep.reply.*.*.*.${CALLER.owner}.${CALLER.actor}.${CALLER.uid}.*`,
+        `_INBOX_${CONN}.>`,
+      ]), reconciler);
+  const placementCommands = AUTH_PLACEMENT_COMMANDS;
+  const placementSubjectsMatch = placementCommands.every((command) => {
+    const subject = epRequestSubject(S, {
+      route: { mode: "one" }, endpoint: AUTH_ENDPOINT, command, caller: CALLER, nonce: "n".repeat(22),
+    });
+    const foreignCallers = [
+      { ...CALLER, owner: "other-owner" },
+      { ...CALLER, actor: "other-manager" },
+      { ...CALLER, uid: mintLifecycleUid() },
+    ];
+    return reconciler.pub.allow.some((row) => subjectMatches(row, subject))
+      && foreignCallers.every((caller) => {
+        const foreign = epRequestSubject(S, {
+          route: { mode: "one" }, endpoint: AUTH_ENDPOINT, command, caller, nonce: "n".repeat(22),
+        });
+        return !reconciler.pub.allow.some((row) => subjectMatches(row, foreign));
+      });
+  });
+  c("reconciler rows match each served placement subject and reject owner, actor, or uid changes", placementSubjectsMatch);
+  const reconcilerError = (opts: { reconciler?: { owner: string; actor: string; uid: string } }): string => {
+    try {
+      permissionsFor("reconciler", S, { ...CALLER, connId: CONN }, opts);
+      return "";
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  };
+  c("missing reconciler triple names opts.reconciler", reconcilerError({}).includes("opts.reconciler"));
+  for (const field of ["owner", "actor", "uid"] as const) {
+    const empty = { ...CALLER, [field]: "" };
+    c(`empty reconciler ${field} names opts.reconciler.${field}`,
+      reconcilerError({ reconciler: empty }).includes(`opts.reconciler.${field}`));
+  }
+
   const req = decode(await mintCreds(auth, newIdentity(), "retirement-requester", {
     retirementRequester: { ...CALLER, target: T },
   }));
