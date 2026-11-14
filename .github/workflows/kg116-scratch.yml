@@ -1,8 +1,8 @@
 # Scratch, not for merge: run listed smoke suites one by one without stopping at a failure.
-name: smoke keep-going (scratch)
+name: smoke keep-going 116 (scratch)
 on:
   pull_request:
-    paths: [.github/workflows/kg-scratch.yml]
+    paths: [.github/workflows/kg116-scratch.yml]
 permissions:
   contents: read
 env:
