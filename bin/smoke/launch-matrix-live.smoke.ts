@@ -333,7 +333,7 @@ try {
   } else {
     check("completion install powershell refuses when pwsh is unavailable",
       pwsh.status === 2 && pwsh.stdout === "" && pwsh.stderr.includes("owned PowerShell profile installation is unavailable"), out(pwsh));
-    skip("live PowerShell profile installation", "pwsh is unavailable; missing-profile behavior is covered by completion-status fixture tests");
+    skip("live PowerShell profile installation", "pwsh is unavailable; completion-status covers missing-profile behavior (quarantined, RIG-10098)");
   }
   const completed = cotal(["__complete", "sp"]);
   check("__complete answers the stubs' protocol", completed.status === 0 && /^spawn\t/m.test(completed.stdout), out(completed));

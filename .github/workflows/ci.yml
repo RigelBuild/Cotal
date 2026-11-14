@@ -372,7 +372,7 @@ jobs:
         continue-on-error: true
         run: pnpm smoke:lifecycle-e2e
       # T6 delegated proof: root manager in a Delegate=yes scope, seats under a created agent uid.
-      # Its own step and not quarantined: the legacy step above keeps RIG-4872's continue-on-error.
+      # Its own step and not quarantined: the legacy step above keeps continue-on-error (quarantined, RIG-10098).
       # The agent uid loads the custodian and the stub from the checkout, so every ancestor gets o+x.
       - name: Manager lifecycle e2e, delegated (custodial pty, cgroups, distinct agent uid)
         run: |
@@ -394,7 +394,7 @@ jobs:
       - name: herdr endurance soak (spawn/stop churn, leak deltas)
         run: pnpm smoke:herdr:soak
       # The integration the unit suite cannot reach: real broker + real Manager + a real agent in
-      # presence, then SIGKILL the manager to prove the agent outlives it. Quarantined (RIG-4872):
+      # presence, then SIGKILL the manager to prove the agent outlives it. Quarantined (RIG-10098):
       # the herdr server is not running when the manager starts; remove continue-on-error once fixed.
       - name: herdr e2e (real broker + manager + agent, manager-kill survival)
         continue-on-error: true
