@@ -216,6 +216,11 @@ try {
   // 1) the full stack comes up from ONE command, JWT-authed by default.
   const up = cli("up", "--detach", "--server", SERVER);
   ok("up --detach exits 0", up.status === 0, up.stdout + up.stderr);
+  // The pre-step stops only the broker whose pid this line names, so it must print before readiness and
+  // name the pid nats.pid holds.
+  const startedLine = plain(up.stdout).match(/^• started nats-server \(pid (\d+)\)$/m);
+  ok("up --detach prints the spawned nats pid before the summary", startedLine !== null && plain(up.stdout).indexOf(startedLine[0]) < plain(up.stdout).indexOf("✓ running in the background"), up.stdout);
+  ok("the spawned pid line names the pid nats.pid holds", startedLine !== null && Number(startedLine[1]) === pidOf("nats.pid"), { line: startedLine?.[0], pidfile: pidOf("nats.pid") });
   ok(
     "auth up reports the exact running component set",
     /^✓ running in the background: nats-server \(pid \d+\), delivery daemon, manager - stop with: `cotal down`$/m.test(plain(up.stdout)),
