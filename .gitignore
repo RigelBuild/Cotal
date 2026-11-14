@@ -48,3 +48,6 @@ desktop/src-tauri/binaries/
 desktop/src-tauri/runtime/
 desktop/src-tauri/gen/
 desktop/src-tauri/.runtime-stage-*/
+
+# nix build output symlink at the repo root.
+/result

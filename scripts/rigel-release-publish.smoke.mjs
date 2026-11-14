@@ -3,7 +3,7 @@ import { publish } from './rigel-release-publish.mjs';
 
 const sha = 'a'.repeat(40);
 const tag = 'rigel-v1.0.0-aaaaaaaaaa';
-const assets = ['cotal-runtime-linux-x64.tar.gz', 'cotal-runtime-darwin-arm64.tar.gz', 'SHA256SUMS'];
+const assets = ['cotal-runtime-linux-x64.tar.gz', 'cotal-runtime-linux-arm64.tar.gz', 'cotal-runtime-darwin-arm64.tar.gz', 'SHA256SUMS'];
 const paths = assets.map((name) => `dist/${name}`);
 const ok = (data = '') => ({ status: 0, stdout: data, stderr: '' });
 const ref = (object) => ok(`HTTP/2 200 OK\r\n\r\n${JSON.stringify({ object })}`);
