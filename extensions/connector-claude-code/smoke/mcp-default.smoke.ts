@@ -54,7 +54,7 @@ try {
   const declaring = join(root, "declaring"); mkdirSync(declaring);
   writeFileSync(join(declaring, ".mcp.json"), JSON.stringify({ mcpServers: { cotal: { command: "node", args: ["elsewhere.cjs"] } } }));
   check("a project .mcp.json declaring cotal satisfies the launch", Object.keys(config(build({ cwd: declaring })).mcpServers).join() === "cotal");
-  const native = { mcpServers: { personal, cotal: { command: "node", args: ["registered-elsewhere.cjs"] } } };
+  const native = { mcpServers: { personal, cotal: { command: "node", args: ["seat.cjs"] } } };
   const original = JSON.stringify(native);
   writeFileSync(profileFile, original);
   const ordinary = build();

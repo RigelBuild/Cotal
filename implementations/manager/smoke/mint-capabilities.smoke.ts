@@ -53,7 +53,7 @@ async function runMint(argv: string[]): Promise<{ out: string; code: number }> {
   console.error = (...args: unknown[]) => { lines.push(args.join(" ")); };
   process.exit = ((next?: number) => { code ??= next ?? 0; throw new ExitSignal(); }) as never;
   try {
-    await runCli(registry, ["mint", ...argv]);
+    await runCli(registry, ["auth", "mint", ...argv]);
   } catch (error) {
     if (!(error instanceof ExitSignal)) throw error;
   } finally {

@@ -13,6 +13,7 @@
  *
  * Run: pnpm smoke:gate-reconcile-resume
  */
+import { Bucket } from "@nats-io/kv/internal";
 import type { KV } from "@nats-io/kv";
 import {
   DEV_OWNER,
@@ -44,7 +45,7 @@ function memKv(): KV & {
   const store = new Map<string, Stored>();
   const writes: Array<{ key: string; value: string; revision: number }> = [];
   let sequence = 0;
-  const self = {
+  const self = Object.assign(Object.create(Bucket.prototype), {
     failDelete: 0,
     get: async (key: string) => store.get(key),
     create: async (key: string, value: Uint8Array) => {
@@ -91,7 +92,7 @@ function memKv(): KV & {
     },
     dump: (key: string) => store.get(key),
     writes,
-  };
+  });
   return self as unknown as ReturnType<typeof memKv>;
 }
 
