@@ -4,34 +4,51 @@
  * verdict this machine did not observe.
  * Run: pnpm smoke:update-remote-custody
  */
-import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
+import rawAssert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
+import { createServer as createTcpServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { cotalAuthProvider } from "@cotal-ai/auth";
+import { saveIdpSession } from "../../auth/src/login.js";
+import { countedAssert, emitSentinel } from "@cotal-ai/smoke-kit";
 
+const counted = countedAssert(rawAssert);
+const assert: typeof rawAssert = counted.assert;
+const cells = counted.cells;
 const root = mkdtempSync(join(tmpdir(), "cotal-update-remote-custody-"));
 const home = join(root, "home"), config = join(root, "config"), project = join(root, "project");
 for (const path of [home, config, project, join(project, ".cotal")]) mkdirSync(path, { recursive: true, mode: 0o700 });
 process.env.COTAL_HOME = join(home, ".cotal");
 process.env.XDG_CONFIG_HOME = config;
 process.env.DO_NOT_TRACK = "1";
+// These imports follow the isolated home setup because workspace paths are captured at module load.
 const { recordMesh, setCurrent, userAuthStateDir } = await import("@cotal-ai/workspace");
 const { readManagerContinuity } = await import("../src/commands/update.js");
+void cotalAuthProvider;
 const { supervisorMayServe } = await import("../src/lib/manager-proc.js");
 
 const space = `update-remote-${process.pid}`;
 // Hold both addresses for the whole run so no foreign listener answers a probe; neither accepts.
-const broker = createServer((socket) => socket.destroy());
-const exchange = createServer((socket) => socket.destroy());
+const broker = createTcpServer((socket) => socket.destroy());
+let exchangeRequests = 0;
+const exchange = createTcpServer((socket) => { exchangeRequests++; socket.destroy(); });
+const idpServer = createHttpServer((_request, response) => {
+  response.setHeader("content-type", "application/json");
+  response.end(JSON.stringify({ token: "e30.eyJzdWIiOiJmaXh0dXJlLWh1bWFuIn0.fixture" }));
+});
 let decoy: ChildProcess | undefined;
 let other: ChildProcess | undefined;
 try {
+  await new Promise<void>((resolve) => idpServer.listen(0, "127.0.0.1", resolve));
   await new Promise<void>((resolve) => broker.listen(0, "127.0.0.1", resolve));
   await new Promise<void>((resolve) => exchange.listen(0, "127.0.0.1", resolve));
-  const base = `http://127.0.0.1:${(exchange.address() as { port: number }).port}`, idp = `${base}/api/auth`;
+  const base = `http://127.0.0.1:${(exchange.address() as { port: number }).port}`;
+  const idp = `http://127.0.0.1:${(idpServer.address() as { port: number }).port}/api/auth`;
   const state = userAuthStateDir(project, space);
   mkdirSync(state, { recursive: true, mode: 0o700 });
   const sentinel = join(state, "sentinel.creds");
@@ -42,6 +59,7 @@ try {
     userAuth: { provider: "cotal", remote: true, idp: { url: idp, issuer: idp, audience: idp }, endpoints: { url: base }, sentinelCredsPath: sentinel },
   });
   setCurrent(space);
+  saveIdpSession(join(home, ".cotal"), idp, { token: "isolated-fixture-session", expiresAt: Math.floor(Date.now() / 1000) + 600, sub: "fixture-human" });
 
   // `--on` is read before any mesh is dialed, with the grammar every other manager command uses: an
   // empty value and a roster principal id are refused naming the instance id the flag wants, so a
@@ -78,6 +96,8 @@ try {
   }
   assert.notEqual(outcome, "none", "a remote mesh served from this machine is read, not reported as running elsewhere");
   assert.ok(outcome.startsWith("refused: "), `an exchange that answers nothing ends the read in a refusal: ${outcome}`);
+  assert.match(outcome, /did not answer at http:\/\/127\.0\.0\.1:/, `the registered auth provider must reach the refused fixture exchange, not fail provider lookup or login: ${outcome}`);
+  assert.ok(exchangeRequests > 0, "the registered provider reaches the refusing fixture exchange");
   decoy.kill("SIGKILL");
   await once(decoy, "exit");
   decoy = undefined;
@@ -117,10 +137,12 @@ try {
     decoy = undefined;
   }
   console.log(`update-remote-custody: ok (${outcome.slice(0, 160)})`);
+  emitSentinel({ passed: cells(), failed: 0 });
 } finally {
   decoy?.kill("SIGKILL");
   other?.kill("SIGKILL");
   broker.close();
   exchange.close();
+  idpServer.close();
   rmSync(root, { recursive: true, force: true });
 }

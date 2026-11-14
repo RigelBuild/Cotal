@@ -177,7 +177,7 @@ const M = mgr as unknown as {
   retryStaticReconcile: (key: string) => Promise<void>;
   userMode: boolean;
   unrecordedCustody: Map<string, RuntimeReference>;
-  spawnCustodied: (name: string, spec: unknown, cwd: string, reserved: RuntimeReference, slot: { id: string; lifecycleUid: string }) => Promise<AgentHandle>;
+  spawnCustodied: (runtime: CustodialRuntime, name: string, spec: unknown, cwd: string, reserved: RuntimeReference, slot: { id: string; lifecycleUid: string }) => Promise<AgentHandle>;
   staticReconcileRetryDelaysMs: readonly number[];
   staticLifecycleEvict?: (principal: string) => Promise<EvictionResult>;
   withLifecycleExecutor: Executor;
@@ -531,8 +531,13 @@ try {
     const mark = reaps.length;
     spawnAs = got;
     M.userMode = true;
-    const outcome = await M.spawnCustodied("nostatic", {}, workspaceRoot, reserved, { id: newIdentity().id, lifecycleUid: uid }).then(() => "spawned", (e: unknown) => String(e));
-    M.userMode = false;
+    let outcome: string;
+    try {
+      outcome = await M.spawnCustodied(fakeRuntime, "nostatic", {}, workspaceRoot, reserved, { id: newIdentity().id, lifecycleUid: uid }).then(() => "spawned", (e: unknown) => String(e));
+    } finally {
+      M.userMode = false;
+      spawnAs = undefined;
+    }
     check("no static row: a mismatched spawn reaps got inline before failing, and unrecordedCustody stays untouched",
       /spawned seat was reaped/.test(outcome) && reaps.slice(mark).join() === got.id && !M.unrecordedCustody.has(uid), { outcome, reaps: reaps.slice(mark) });
   }
