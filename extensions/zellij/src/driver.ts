@@ -84,7 +84,7 @@ function isNoSessionsError(error: unknown): boolean {
 
 // Only zellij's own "no sessions" answer means absent; any other probe failure throws, so a
 // failed probe can never read as a confirmed exit.
-function sessionExists(session: string, deadline?: number): boolean {
+export function sessionExists(session: string, deadline?: number): boolean {
   let listing: string;
   try {
     listing = execFileSync("zellij", ["list-sessions", "--no-formatting"], {

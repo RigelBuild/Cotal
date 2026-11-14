@@ -116,7 +116,11 @@ export class ZellijRuntime implements Runtime {
   readonly kind = "zellij" as const;
   readonly streamsTerminal = false;
 
-  constructor(private readonly session: string) {}
+  constructor(
+    private readonly session: string,
+    // False when the server that owns the session must not gain one from Cotal; spawn then refuses instead.
+    private readonly createSession: boolean = true,
+  ) {}
 
   spawn(name: string, spec: LaunchSpec, cwd: string): AgentHandle {
     if (!/^[A-Za-z0-9_.-]+$/.test(name))
@@ -131,7 +135,9 @@ export class ZellijRuntime implements Runtime {
     }
 
     const placement = readZellijPlacement(spec.env?.COTAL_AGENT_FILE);
-    zellij.ensureSession(this.session);
+    if (this.createSession) zellij.ensureSession(this.session);
+    else if (!zellij.sessionExists(this.session))
+      throw new SpawnRefused(`zellij runtime: session ${JSON.stringify(this.session)} is not running and COTAL_ZELLIJ_NO_CREATE_SESSION=1 forbids creating it`);
     let paneId: string | undefined;
     let createdTabId: string | undefined;
     const targetTabName = placement?.tab ?? name;
@@ -212,6 +218,10 @@ export const zellijRuntimeProvider: RuntimeProvider = {
   available: () => zellij.available(),
   create: ({ session }) => {
     const target = process.env.COTAL_ZELLIJ_SESSION ?? session;
+    // Fails closed: any value except empty, "0", or "false" turns the mode on, so a typo never re-enables creation.
+    const noCreateRaw = process.env.COTAL_ZELLIJ_NO_CREATE_SESSION?.trim().toLowerCase() ?? "";
+    // Cotal must not create the session in this mode: the server that owns it is started by someone else.
+    if (noCreateRaw !== "" && noCreateRaw !== "0" && noCreateRaw !== "false") return new ZellijRuntime(target, false);
     zellij.ensureSession(target);
     return new ZellijRuntime(target);
   },

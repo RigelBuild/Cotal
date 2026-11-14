@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import type { LaunchSpec } from "@cotal-ai/core";
 import { buildNewPaneArgs, buildNewTabArgs } from "./src/driver.js";
 import { parseZellijPlacement } from "./src/placement.js";
-import { launcherState, privateLauncher, waitForLauncherExit, ZellijRuntime } from "./src/runtime.js";
+import { launcherState, privateLauncher, waitForLauncherExit, ZellijRuntime, zellijRuntimeProvider } from "./src/runtime.js";
 import * as zellij from "./src/driver.js";
 
 let checks = 0;
@@ -288,6 +288,53 @@ await withFakeZellij("missing-session", (logPath, session) => {
   check(
     "missing session reads as exited and close is a no-op without attaching a client",
     state === "exited" && closeSucceeded && calls.every((args) => args[3] !== "list-clients"),
+  );
+});
+
+await withFakeZellij("missing-session", (logPath, session) => {
+  let refused = false;
+  try {
+    new ZellijRuntime(session, false).spawn("worker", { command: "sleep", args: ["600"] }, process.cwd());
+  } catch (error) {
+    refused = error instanceof Error && error.name === "SpawnRefused" && error.message.includes("COTAL_ZELLIJ_NO_CREATE_SESSION");
+  }
+  const calls = readCalls(logPath);
+  check(
+    "no-create runtime refuses a missing session without attaching, creating a tab, or creating a pane",
+    refused && !calls.some((args) => args.includes("--create-background") || args[3] === "new-tab" || args[3] === "new-pane"),
+  );
+});
+
+await withFakeZellij("missing-session", (logPath, session) => {
+  const saved = process.env.COTAL_ZELLIJ_NO_CREATE_SESSION;
+  process.env.COTAL_ZELLIJ_NO_CREATE_SESSION = "true";
+  process.env.COTAL_ZELLIJ_SESSION = session;
+  try {
+    const runtime = zellijRuntimeProvider.create({ session: "unused-default" });
+    let refused = false;
+    try {
+      runtime.spawn("worker", { command: "sleep", args: ["600"] }, process.cwd());
+    } catch (error) {
+      refused = error instanceof Error && error.name === "SpawnRefused";
+    }
+    check(
+      "provider create honours COTAL_ZELLIJ_NO_CREATE_SESSION=true: no attach --create-background and spawn refuses",
+      refused && !readCalls(logPath).some((args) => args.includes("--create-background")),
+    );
+  } finally {
+    if (saved === undefined) delete process.env.COTAL_ZELLIJ_NO_CREATE_SESSION;
+    else process.env.COTAL_ZELLIJ_NO_CREATE_SESSION = saved;
+    delete process.env.COTAL_ZELLIJ_SESSION;
+  }
+});
+
+await withFakeZellij("confirm", (logPath, session) => {
+  const handle = new ZellijRuntime(session, false).spawn("worker", { command: "sleep", args: ["600"] }, process.cwd());
+  handle.stop({ graceful: false });
+  const calls = readCalls(logPath);
+  check(
+    "no-create runtime spawns into an existing session without creating it",
+    calls.some((args) => args[3] === "new-tab" || args[3] === "new-pane") && !calls.some((args) => args.includes("--create-background")),
   );
 });
 
