@@ -75,7 +75,8 @@ export const QUARANTINED = {
   "smoke:signal-exits:live": { reason: "RIG-9150 CI-env: CI cannot signal nats-server pid 1 (EPERM), leaving manager stop unknown; 16/18 cells pass", recheckBy: "2026-12-31" },
   "smoke:setup-destination": { reason: "RIG-9150 upstream: 19/82 cells fail on pristine 82a97c1f (local run); runtime host-tool fixture cells", recheckBy: "2026-12-31" },
   "smoke:reap-absent-refusal": { reason: "RIG-9150 upstream: the manager.ts reap census flags Manager.adoptReleasedSeat as a bypass of requireRuntimeReap, 1/62 fails on pristine fdd4d022 (local run, bypass at line 3706). The fork's extra REVIEWED_SITES control (Manager.provePredecessor) passes; the quarantine covers only the upstream bypass", recheckBy: "2026-12-31" },
-  "smoke:delivery-timer-writer": { reason: "upstream: missed 1 of 11 fires across credential renewals (firedN=10, tokens=11) on GHA run 43137554293, shard 0/4; no fork delta in delivery sources", recheckBy: "2026-12-31" },
+  "smoke:stack-settle:live": { reason: "RIG-9068 upstream: 8/368 cells fail identically on pristine 82a97c1f and on the fork tip (VM run, Node 22.23.4, nats-server v2.12.12): the latched-JetStream cells (a write the store refused, JetStream disabled) and the fewfiles ulimit -n 32 cell; the fork adds no failure; quarantined on sync", recheckBy: "2026-12-31" },
+  "smoke:delivery-timer-writer": { reason: "RIG-9150 upstream: missed 1 of 11 fires across credential renewals (firedN=10, tokens=11) on GHA run 43137554293, shard 0/4; no fork delta in delivery sources", recheckBy: "2026-12-31" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */
