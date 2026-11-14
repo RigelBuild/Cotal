@@ -24,7 +24,7 @@ const recordPath = (paths: Paths) => `${paths.stub}.ownership.json`;
 /** Ask the installed shell for its current-user all-hosts profile; profile directories vary by host. */
 function powershellProfile(): string | undefined {
   if (process.platform === "win32") return undefined;
-  const read = spawnSync("pwsh", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write($PROFILE.CurrentUserAllHosts)"], { encoding: "utf8", timeout: 3000, maxBuffer: 4096, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  const read = spawnSync("pwsh", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write($PROFILE.CurrentUserAllHosts)"], { encoding: "utf8", timeout: 15_000, maxBuffer: 4096, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
   if ((read.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return undefined;
   const path = read.stdout;
   if (read.error || read.signal || read.status !== 0 || !path || path.length > 4096 || !isAbsolute(path) || /[\u0000-\u001f\u007f]/u.test(path) || path.split(/[\\/]/u).at(-1)?.toLowerCase() !== "profile.ps1") throw new CommandFailure("refused", "TARGET_UNAVAILABLE", "the installed PowerShell did not identify one bounded current-user all-hosts profile; no profile path was guessed");

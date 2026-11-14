@@ -314,7 +314,7 @@ try {
   const fishFile = join(xdg, "fish", "completions", "cotal.fish");
   check("completion install fish writes a completions file that calls `cotal __complete`",
     fish.status === 0 && existsSync(fishFile) && readFileSync(fishFile, "utf8").includes("cotal __complete"), out(fish));
-  const pwshAvailable = process.platform !== "win32" && (process.env.PATH ?? "").split(delimiter).some((dir) => {
+  const pwshOnPath = process.platform !== "win32" && (process.env.PATH ?? "").split(delimiter).some((dir) => {
     try {
       const path = join(dir, "pwsh");
       if (!statSync(path).isFile()) return false;
@@ -327,7 +327,7 @@ try {
   const pwsh = cotal(["completion", "install", "powershell"]);
   const profile = join(xdg, "powershell", "profile.ps1");
   const profileText = existsSync(profile) ? readFileSync(profile, "utf8") : "";
-  if (pwshAvailable) {
+  if (pwshOnPath) {
     check("completion install powershell writes the owned $PROFILE block",
       pwsh.status === 0 && profileText.includes(`# >>> cotal completion >>>\n. '${join(xdg, "cotal", "completion.ps1")}'\n# <<< cotal completion <<<\n`), { output: out(pwsh), profileText });
   } else {
