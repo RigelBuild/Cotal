@@ -259,27 +259,52 @@ try {
   {
     const until = Math.max(firstCredExpMs + DLV_TTL_S * 1000 + 2_000, Date.now() + 20_000);
     const tokens: string[] = [];
+    const fireSubjects: Record<string, string> = {};
+    const observedFires = new Set<string>();
+    let resolveAllFires: () => void = () => {};
+    const allFires = new Promise<void>((resolve) => { resolveAllFires = resolve; });
+    let expectedFireCount: number | undefined;
+    const fireSub = serveNc.subscribe(`cotal.${space}.ept.${EP}.${IID}.${EPOCH}.*.fire`, {
+      callback: (_error, msg) => {
+        const armedSubject = fireSubjects[msg.subject];
+        if (armedSubject === undefined || msg.headers?.get("Nats-Scheduler") !== armedSubject) return;
+        observedFires.add(msg.subject);
+        if (expectedFireCount === observedFires.size) resolveAllFires();
+      },
+    });
+    await serveNc.flush();
+    let lastDeadline = 0;
     while (Date.now() < until) {
       const token = `cp_timerw_swap_${tokens.length + 1}`;
       const now = Date.now();
-      await mintCheckpoint(kv, jetstream(serveNc), space, { ref: { endpoint: EP, token }, instanceId: IID, epoch: EPOCH, holder, deadline: now + 3_000, now });
+      lastDeadline = now + 3_000;
+      const fireSubject = eptSubject(space, EP, IID, EPOCH, token, "fire");
+      fireSubjects[fireSubject] = eptSubject(space, EP, IID, EPOCH, token, "armed");
+      await mintCheckpoint(kv, jetstream(serveNc), space, { ref: { endpoint: EP, token }, instanceId: IID, epoch: EPOCH, holder, deadline: lastDeadline, now });
       tokens.push(token);
       await wait(2_000);
     }
-    await wait(8_000);
-    // The broker removes a one-shot schedule's `.armed` message once it fires, so the lasting record
-    // of an arm is the `.fire` the broker published from it.
+    expectedFireCount = tokens.length;
+    if (observedFires.size === tokens.length) resolveAllFires();
+    const fireDeadlineMs = Math.max(0, lastDeadline - Date.now()) + 20_000;
+    const allFiresObserved = await Promise.race([
+      allFires.then(() => true),
+      wait(fireDeadlineMs).then(() => false),
+    ]);
+    // The broker's one-shot removes `.armed`; its subscribed `.fire` event gates these durable
+    // reads, so a slow scheduled publish cannot turn into a false missing-fire assertion.
     let firedN = 0;
     for (const token of tokens) {
       const f = await jsm.streams.getMessage(eptStreamName(space), { last_by_subj: eptSubject(space, EP, IID, EPOCH, token, "fire") }).catch(() => null);
       if (f?.header?.get("Nats-Scheduler") === eptSubject(space, EP, IID, EPOCH, token, "armed")) firedN++;
     }
     check(`every .schedule published across the daemon's credential renewals was armed and fired (${firedN}/${tokens.length})`,
-      tokens.length >= 5 && firedN === tokens.length, { firedN, tokens: tokens.length });
+      tokens.length >= 5 && allFiresObserved && firedN === tokens.length, { firedN, tokens: tokens.length, observedFires: observedFires.size });
+    fireSub.unsubscribe();
     check("the writer never went down across two credential expiries: its connection follows each adopted credential",
       !daemonOut.includes("timer writer: down"), daemonOut.split("\n").filter((l) => l.includes("timer writer: down")));
   }
-
+  
   // 5. The daemon still exits promptly on SIGTERM with the writer running (shutdown wiring).
   daemon.kill("SIGTERM");
   let exited = false;
