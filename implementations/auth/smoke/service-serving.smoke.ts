@@ -385,8 +385,6 @@ try {
   const gd = await gate(ordersEp, d.sr.instanceId);
   c.check("E(d) the resumed registration completes the same operation", gd.row.serviceAuthority.registration?.operationId === engineId(ownerA, d.run.r), gd.row);
   let eStop = "", eOperationId = "", eSpecCommitted = false, eSpecRevision = 0;
-  type GateRow = { state: string; generation: number; processEpoch: number; registrationRevision: number;
-    serviceAuthority: { activationIssued: boolean; registration?: { requestId: string; operationId: string }; pendingRegistration?: { operationId: string; requestId: string } } };
   let eGateAtStop: GateRow | undefined;
   await point("(e) spec written, no reopen", "org.example.stop-e", async (s) => {
     const id = await simIntent(ownerA, s.proposal); eOperationId = id; eStop = await simSpec(s, s.proposal, id);
