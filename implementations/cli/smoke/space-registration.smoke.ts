@@ -889,7 +889,7 @@ if (process.platform === "linux") {
   // A folder whose path holds a control character could be prepared but never started, and a
   // bidirectional formatting mark can show one path as another, so create and up refuse both before
   // anything is written.
-  // Outside the home folder, whose .cotal up would otherwise refuse to inherit first.
+  // Each unusual folder gets its own empty .cotal, so the root walk stops there and up checks that path.
   const { oneLine } = await import("@cotal-ai/core");
   const outside = realpathSync(mkdtempSync(join(tmpdir(), "cotal-space-registration-odd-")));
   for (const [label, name] of [["a tab", "tab\tfolder"], ["a newline", "line\nfolder"], ["an escape character", "esc\u001bfolder"], ["a delete character", "del\u007ffolder"], ["the bidirectional formatting mark U+202E", "rlo\u202efolder"]]) {
@@ -898,9 +898,10 @@ if (process.platform === "linux") {
     const created = await json(["space", "create", "oddpath", "--root", odd]);
     check(`a --root whose path holds ${label} is USAGE_INVALID, exit 1, naming it, with nothing written`,
       refused(created, 1, "USAGE_INVALID") && (created.env?.error?.message ?? "") === `the folder path ${oneLine(odd)} contains ${label}, and a project path may hold neither control characters nor bidirectional formatting marks; nothing was written` && !existsSync(join(odd, ".cotal")) && findPreparedSpace("oddpath") === undefined, shown(created));
+    mkdirSync(join(odd, ".cotal"), { mode: 0o700 });
     const up = await json(["up", "--server", DEAD], odd);
     check(`up in that folder is USAGE_INVALID, exit 1, and writes no stack journal`,
-      refused(up, 1, "USAGE_INVALID") && (up.env?.error?.message ?? "").startsWith(`the folder path ${oneLine(odd)} contains ${label}`) && !existsSync(join(odd, ".cotal")), shown(up));
+      refused(up, 1, "USAGE_INVALID") && (up.env?.error?.message ?? "").startsWith(`the folder path ${oneLine(odd)} contains ${label}`) && readdirSync(join(odd, ".cotal")).length === 0 && !existsSync(stackJournalPath(odd)), shown(up));
     rmSync(odd, { recursive: true, force: true });
   }
   rmSync(outside, { recursive: true, force: true });
