@@ -25,7 +25,7 @@
     },
     {
       "name": "the workflow omits the runner shard argument",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "          node scripts/mutation-reproof.mjs --base \"$base\" --head \"$(git rev-parse HEAD)\" --shard \"${{ matrix.shard }}/12\"",
       "replace": "          node scripts/mutation-reproof.mjs --base \"$base\" --head \"$(git rev-parse HEAD)\"",
       "expectRed": "the changed workload fans exactly the planned shards without fail-fast cancellation",
@@ -33,7 +33,7 @@
     },
     {
       "name": "the matrix is hardcoded instead of read from the plan",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "        shard: ${{ fromJSON(needs.plan.outputs.shards) }}",
       "replace": "        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]",
       "expectRed": "the changed workload fans exactly the planned shards without fail-fast cancellation",
@@ -41,7 +41,7 @@
     },
     {
       "name": "a failed shard cancels its sibling work",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "  changed_shard:\n    # At dfbb4550f, PR #1350 selected 32 fixtures and exhausted the 145-minute serial step.\n    # Each path is assigned to one shard by the runner's existing hash. Shards use separate\n    # checkouts because mutation-proof temporarily changes source and compiled artifacts.\n    # Only the shards the plan named are fanned; the shard run re-selects for itself, so a shard\n    # that disagrees with the plan prints its own selection rather than trusting the plan's.\n    if: github.event_name != 'schedule' && needs.plan.outputs.shards != '[]'\n    needs: [plan]\n    timeout-minutes: 150\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false",
       "replace": "  changed_shard:\n    # At dfbb4550f, PR #1350 selected 32 fixtures and exhausted the 145-minute serial step.\n    # Each path is assigned to one shard by the runner's existing hash. Shards use separate\n    # checkouts because mutation-proof temporarily changes source and compiled artifacts.\n    # Only the shards the plan named are fanned; the shard run re-selects for itself, so a shard\n    # that disagrees with the plan prints its own selection rather than trusting the plan's.\n    if: github.event_name != 'schedule' && needs.plan.outputs.shards != '[]'\n    needs: [plan]\n    timeout-minutes: 150\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: true",
       "expectRed": "the changed workload fans exactly the planned shards without fail-fast cancellation",
@@ -49,7 +49,7 @@
     },
     {
       "name": "the aggregate is skipped after a shard fails",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "    if: github.event_name != 'schedule' && always()",
       "replace": "    if: github.event_name != 'schedule'",
       "expectRed": "the aggregate changed check waits for the plan and every shard even after a failed or cancelled shard",
@@ -57,7 +57,7 @@
     },
     {
       "name": "the aggregate no longer waits on the matrix",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "    needs: [plan, changed_shard]",
       "replace": "    needs: [plan]",
       "expectRed": "the aggregate changed check waits for the plan and every shard even after a failed or cancelled shard",
@@ -65,7 +65,7 @@
     },
     {
       "name": "the aggregate accepts failed shards",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "          if [ \"$PLAN_SHARDS\" = \"[]\" ]; then test \"$SHARD_RESULT\" = skipped; else test \"$SHARD_RESULT\" = success; fi",
       "replace": "          true",
       "expectRed": "the aggregate shell rejects plan=success shards=[0,3] matrix=failure",
@@ -73,7 +73,7 @@
     },
     {
       "name": "the aggregate accepts cancellation",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "          if [ \"$PLAN_SHARDS\" = \"[]\" ]; then test \"$SHARD_RESULT\" = skipped; else test \"$SHARD_RESULT\" = success; fi",
       "replace": "          if [ \"$PLAN_SHARDS\" = \"[]\" ]; then test \"$SHARD_RESULT\" = skipped; else test \"$SHARD_RESULT\" != failure; fi",
       "expectRed": "the aggregate shell rejects plan=success shards=[0,3] matrix=cancelled",
@@ -81,7 +81,7 @@
     },
     {
       "name": "the aggregate accepts a skipped shard set",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "          if [ \"$PLAN_SHARDS\" = \"[]\" ]; then test \"$SHARD_RESULT\" = skipped; else test \"$SHARD_RESULT\" = success; fi",
       "replace": "          test \"$SHARD_RESULT\" = success || test \"$SHARD_RESULT\" = skipped",
       "expectRed": "the aggregate shell rejects plan=success shards=[0,3] matrix=skipped",
@@ -129,7 +129,7 @@
     },
     {
       "name": "the aggregate accepts a failed plan",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "          test \"$PLAN_RESULT\" = success\n",
       "replace": "",
       "cell": "the aggregate shell rejects plan=failure shards=[0,3] matrix=success",
@@ -137,7 +137,7 @@
     },
     {
       "name": "the aggregate accepts a successful fan-out behind an empty plan",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "          if [ \"$PLAN_SHARDS\" = \"[]\" ]; then test \"$SHARD_RESULT\" = skipped; else test \"$SHARD_RESULT\" = success; fi",
       "replace": "          if [ \"$PLAN_SHARDS\" = \"[]\" ]; then true; else test \"$SHARD_RESULT\" = success; fi",
       "cell": "the aggregate shell rejects plan=success shards=[] matrix=success",
@@ -145,7 +145,7 @@
     },
     {
       "name": "the fan-out no longer waits on the plan",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "    if: github.event_name != 'schedule' && needs.plan.outputs.shards != '[]'\n    needs: [plan]\n",
       "replace": "    if: github.event_name != 'schedule'\n",
       "cell": "the changed workload fans exactly the planned shards without fail-fast cancellation",
@@ -153,7 +153,7 @@
     },
     {
       "name": "the plan installs before selecting",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "          out=\"$(node scripts/mutation-reproof.mjs --base \"$base\" --head \"$(git rev-parse HEAD)\" --list-shards 12)\"",
       "replace": "          pnpm install --frozen-lockfile\n          out=\"$(node scripts/mutation-reproof.mjs --base \"$base\" --head \"$(git rev-parse HEAD)\" --list-shards 12)\"",
       "cell": "the plan job runs the selector over the same shard count and publishes the fan-out",
@@ -161,7 +161,7 @@
     },
     {
       "name": "the plan asks for a different shard count than the fan-out uses",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "--list-shards 12)",
       "replace": "--list-shards 6)",
       "cell": "the plan job runs the selector over the same shard count and publishes the fan-out",
@@ -169,7 +169,7 @@
     },
     {
       "name": "the gate no longer stops at the first failed test",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "          set -euo pipefail\n          echo \"plan=$PLAN_RESULT",
       "replace": "          echo \"plan=$PLAN_RESULT",
       "cell": "the aggregate shell rejects plan=failure shards=[0,3] matrix=success",

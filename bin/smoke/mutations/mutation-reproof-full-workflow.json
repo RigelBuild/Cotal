@@ -9,7 +9,7 @@
   "mutations": [
     {
       "name": "the full matrix cancels siblings after one shard fails",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "  full_shard:\n    # A daily sweep keeps the remaining ambient-drift window bounded without making every pull\n    # request pay for the full corpus. The corpus takes roughly 20 hours as one serial process, so\n    # the runner's deterministic path hash partitions it across 12 independent mutation trees.\n    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'\n    timeout-minutes: 240\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false",
       "replace": "  full_shard:\n    # A daily sweep keeps the remaining ambient-drift window bounded without making every pull\n    # request pay for the full corpus. The corpus takes roughly 20 hours as one serial process, so\n    # the runner's deterministic path hash partitions it across 12 independent mutation trees.\n    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'\n    timeout-minutes: 240\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: true",
       "expectRed": "full_shard is a 12-way fail-fast-disabled GitHub-hosted matrix",
@@ -17,7 +17,7 @@
     },
     {
       "name": "the full aggregate accepts a failed matrix",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "          test \"$SHARD_RESULT\" = success",
       "replace": "          test \"$SHARD_RESULT\" != cancelled",
       "expectRed": "the full aggregate rejects matrix=failure",
@@ -25,7 +25,7 @@
     },
     {
       "name": "the full aggregate accepts a cancelled matrix",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "          test \"$SHARD_RESULT\" = success",
       "replace": "          test \"$SHARD_RESULT\" != failure",
       "expectRed": "the full aggregate rejects matrix=cancelled",
@@ -41,7 +41,7 @@
     },
     {
       "name": "the full alarm watches shards instead of the aggregate gate",
-      "file": ".github/workflows/mutation-reproof.yml",
+      "file": ".github/workflows/mutation-reproof.yml.disabled",
       "find": "    needs: full\n    if: always() && (needs.full.result == 'failure' || needs.full.result == 'cancelled')",
       "replace": "    needs: full_shard\n    if: always() && (needs.full_shard.result == 'failure' || needs.full_shard.result == 'cancelled')",
       "expectRed": "full-alarm remains pointed at the full aggregate gate",
