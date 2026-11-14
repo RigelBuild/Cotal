@@ -190,7 +190,7 @@ if (process.platform !== "win32") {
   writeFileSync(config, "", { mode: 0o600 });
   const rejected = await json(["service", "add", "unsafe-binary", "--preset", "broker", "--space", "unsafe-binary-space", "--config", config, "--binary", worldWritableNode, "--server", DEAD]);
   check("a broker binary writable by every local account is refused PERMISSION_DENIED, naming the binary and chmod",
-    prepared.status === 0 && refused(rejected, 2, "PERMISSION_DENIED") && rejected.env?.error?.message === `the declared adapter path binary is not protected against other local writers: ${worldWritableNode} is writable by every local account` && rejected.env?.error?.remedy === `chmod o-w ${worldWritableNode}`, shown(rejected));
+    prepared.status === 0 && refused(rejected, 2, "PERMISSION_DENIED") && rejected.env?.error?.message === `the declared adapter path --binary is not protected against other local writers: ${worldWritableNode} is writable by every local account` && rejected.env?.error?.remedy === `chmod go-w ${worldWritableNode}`, shown(rejected));
   check("the refused broker definition is not saved", serviceDefinitionStore("unsafe-binary-space").read("unsafe-binary") === undefined);
 }
 
