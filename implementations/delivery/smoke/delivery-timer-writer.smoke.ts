@@ -283,10 +283,7 @@ try {
       tokens.length >= 5 && firedTokens.size === tokens.length, { firedN: firedTokens.size, tokens: tokens.length });
     check("the writer never went down across two credential expiries: its connection follows each adopted credential",
       !daemonOut.includes("timer writer: down"), daemonOut.split("\n").filter((l) => l.includes("timer writer: down")));
-
-
   }
-  
   // 5. The daemon still exits promptly on SIGTERM with the writer running (shutdown wiring).
   daemon.kill("SIGTERM");
   let exited = false;
