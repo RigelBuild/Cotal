@@ -91,13 +91,12 @@ total as `static reconcile completed: <n> attempted, <n> succeeded, <n> failed`.
 available before a slow sweep completes. The no-race boundary is per alias: `spawn` for an alias
 still reconciling refuses until that exact lifecycle terminal attempt returns; unrelated aliases and
 read-only control remain available. A terminal error releases that alias fence so the sweep can
-continue. The same process retries the alias after 1, 5 and 30 seconds; after the fourth failed
-attempt it logs `retry-exhausted` and the slot stays held until the next manager start re-drives
-it. An active orphan retires only after delivery-admin has verified its broker
-principal gone. The broker result is persisted in the lifecycle's per-UID audit record before
-cleanup and alias reuse. The orphan OS process is not reaped by this reconciliation path.
-A live static retirement also retries ordinary terminal errors on the same 1s, 5s and 30s schedule.
-The alias stays held when those retries are exhausted.
+continue. Failed static retirements, including spawn rollback, retry after 1, 5 and 30 seconds.
+An unproven runtime reap or a foreign operation remains held for its own remedy. After four failed
+attempts, the alias stays held. A same-name spawn is refused and re-drives its retirement with a
+fresh retry budget if it fails again; spawn again after retirement completes. An active orphan
+retires only after delivery-admin has verified its broker principal gone. The broker result is
+persisted in the lifecycle's per-UID audit record before cleanup and alias reuse.
 
 ## Maintenance API
 
