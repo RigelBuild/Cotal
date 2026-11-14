@@ -159,9 +159,9 @@ export async function completion(args: ParsedArgs): Promise<void> {
   const values = args.values as FlagValues<typeof completionFlags>;
   const presentation = presentationOf(values);
   if (sub === undefined) {
-    const { status, unread, unsafe, repairs } = completionStatus();
+    const { status, unread, unsafe, repairs, warnings: nonPartialWarnings } = completionStatus();
     const count = unread.length + unsafe.reduce((sum, folder) => sum + folder.unopened, 0);
-    const warnings = [...unsafe.map(folderWarning), ...unread];
+    const warnings = [...unsafe.map(folderWarning), ...unread, ...nonPartialWarnings];
     const partial = count ? { completeness: "partial" as const, warnings, partial: { message: `completion could not read ${count === 1 ? "one file" : `${count} files`}`, remedy: unread.length ? "review each named file without overwriting custom startup content" : "fix the folder the warning names, then run `cotal completion` again" } } : warnings.length ? { warnings } : {};
     return writeResult(presentation, { command: "completion", target: null, result: status, ...partial }, (result) => statusView(result, unsafe, repairs));
   }
@@ -246,8 +246,10 @@ function readText(path: string): string | undefined | NodeJS.ErrnoException {
 
 /** Each shell's stub against the script this binary prints, a warning for each file it could not
  *  read, and each unsafe folder above them. Reads local files only. */
-export function completionStatus(): { status: CompletionStatus; unread: OutputWarning[]; unsafe: UnsafeFolder[]; repairs: FileRepair[] } {
+export function completionStatus(): { status: CompletionStatus; unread: OutputWarning[]; warnings: OutputWarning[]; unsafe: UnsafeFolder[]; repairs: FileRepair[] } {
   const unread: OutputWarning[] = [];
+  const warnings: OutputWarning[] = [];
+  const detected = currentShell();
   const unsafe = new Map<string, UnsafeFolder>();
   const repairs: FileRepair[] = [];
   /** The unsafe folders above `path`, noted once for every shell under them. A check that cannot run
@@ -277,7 +279,10 @@ export function completionStatus(): { status: CompletionStatus; unread: OutputWa
   const shells = Object.keys(SCRIPTS).map((shell): ShellCompletion => {
     let paths: ReturnType<typeof stubPaths>;
     try { paths = stubPaths(shell); }
-    catch { unread.push({ code: "COMPLETION_PROFILE_UNAVAILABLE", target: { shell }, message: "the shell did not return a usable current-user profile; no alternate profile was guessed" }); return { shell, stub: null, state: "unreadable", wiredIn: null, ownership: "unreadable", legacyWiring: false }; }
+    catch {
+      (shell === detected ? unread : warnings).push({ code: "COMPLETION_PROFILE_UNAVAILABLE", target: { shell }, message: "the pwsh current-user profile probe failed, timed out, or returned no usable profile path; no alternate profile was guessed" });
+      return { shell, stub: null, state: "unreadable", wiredIn: null, ownership: "unreadable", legacyWiring: false };
+    }
     if (!paths) return { shell, stub: null, state: "not-installed-by-cotal", wiredIn: null, ownership: "manual", legacyWiring: false };
     const content = read(shell, paths.stub);
     const state: StubState = content === null ? "unreadable" : content === undefined ? "missing" : content === SCRIPTS[shell] ? "current" : "differs";
@@ -299,8 +304,7 @@ export function completionStatus(): { status: CompletionStatus; unread: OutputWa
     const legacyWiring = typeof rc === "string" && new RegExp(`cotal[ \t]+completion[ \t]+${shell}(?:[ \t;|)]|$)`, "m").test(rc);
     return { shell, stub: paths.stub, state, wiredIn: rc && holdsSourceLine(rc, paths.stub, shell) ? paths.rc : null, ownership, legacyWiring };
   });
-  const detected = currentShell();
-  return { status: { shell: Object.hasOwn(SCRIPTS, detected) ? detected : null, shells }, unread, unsafe: [...unsafe.values()], repairs };
+  return { status: { shell: Object.hasOwn(SCRIPTS, detected) ? detected : null, shells }, unread, warnings, unsafe: [...unsafe.values()], repairs };
 }
 
 const STATE: Record<ShellCompletion["state"], Styled> = {
