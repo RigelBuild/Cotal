@@ -42,7 +42,7 @@
     "@xterm/xterm": "^5.5.0",
     "ws": "^8.21.0",
     "yaml": "^2.9.0",
-    "zod": "^4.4.3"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@cotal-ai/auth": "workspace:*",
@@ -54,7 +54,7 @@
     "@cotal-ai/delivery": "workspace:*",
     "@cotal-ai/runtime": "workspace:*",
     "@cotal-ai/smoke-kit": "workspace:*",
-    "@modelcontextprotocol/sdk": "1.29.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "@nats-io/nats-core": "^3.4.0",
     "@types/ws": "^8.18.1",
     "esbuild": "^0.28.1"

@@ -25,9 +25,10 @@
     "prepublishOnly": "pnpm run build"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@nats-io/kv": "^3.4.0",
-    "@nats-io/transport-node": "^3.4.0"
+    "@nats-io/transport-node": "^3.4.0",
+    "zod": "^4.6.7"
   },
   "peerDependencies": {
     "@cotal-ai/core": "*",
