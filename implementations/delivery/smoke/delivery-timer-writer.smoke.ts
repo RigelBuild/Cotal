@@ -258,21 +258,21 @@ try {
   //    while the daemon adopts each new generation are all armed and fired.
   {
     const until = Math.max(firstCredExpMs + DLV_TTL_S * 1000 + 2_000, Date.now() + 20_000);
-    const tokens: string[] = [];
+    const tokens: { token: string; deadline: number }[] = [];
     const firedTokens = new Set<string>();
-    let lastDeadline = 0;
     while (Date.now() < until) {
       const token = `cp_timerw_swap_${tokens.length + 1}`;
       const now = Date.now();
-      lastDeadline = now + 3_000;
-      await mintCheckpoint(kv, jetstream(serveNc), space, { ref: { endpoint: EP, token }, instanceId: IID, epoch: EPOCH, holder, deadline: lastDeadline, now });
-      tokens.push(token);
+      const deadline = now + 3_000;
+      await mintCheckpoint(kv, jetstream(serveNc), space, { ref: { endpoint: EP, token }, instanceId: IID, epoch: EPOCH, holder, deadline, now });
+      tokens.push({ token, deadline });
       await wait(2_000);
     }
-    // JetStream fires are stored records, not core-NATS publications; poll the durable subject records until all broker fires arrive.
-    const fireDeadline = lastDeadline + 20_000;
+    // The broker removes .armed on fire, so .fire is the lasting record; poll until every fire arrives.
+    const lastDeadline = tokens.at(-1)?.deadline ?? 0;
+    const fireDeadline = lastDeadline + 5_000;
     while (firedTokens.size < tokens.length && Date.now() < fireDeadline) {
-      const newlyFired = await Promise.all(tokens.filter((token) => !firedTokens.has(token)).map(async (token) => {
+      const newlyFired = await Promise.all(tokens.filter(({ token }) => !firedTokens.has(token)).map(async ({ token }) => {
         const f = await jsm.streams.getMessage(eptStreamName(space), { last_by_subj: eptSubject(space, EP, IID, EPOCH, token, "fire") }).catch(() => null);
         return f?.header?.get("Nats-Scheduler") === eptSubject(space, EP, IID, EPOCH, token, "armed") ? token : undefined;
       }));

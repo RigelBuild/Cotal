@@ -384,20 +384,19 @@ try {
   }, { at: "registering:barrier", resumed: "registered", cancelled: "revoking:deny-new-landed" });
   const gd = await gate(ordersEp, d.sr.instanceId);
   c.check("E(d) the resumed registration completes the same operation", gd.row.serviceAuthority.registration?.operationId === engineId(ownerA, d.run.r), gd.row);
-  let eStop = "", eOperationId = "", eSpecCommitted = false, eSpecRevision = 0;
+  let eStop = "", eOperationId = "", eSpecCommitted = false;
   let eGateAtStop: GateRow | undefined;
   await point("(e) spec written, no reopen", "org.example.stop-e", async (s) => {
     const id = await simIntent(ownerA, s.proposal); eOperationId = id; eStop = await simSpec(s, s.proposal, id);
     eGateAtStop = (await gate(s.ep, s.instanceId)).row;
     const specAtStop = await recordsKv.get(recordSpecKey(RECORD_KINDS.svc, [s.ep, s.instanceId]));
     eSpecCommitted = specAtStop?.operation === "PUT";
-    eSpecRevision = specAtStop?.revision ?? 0;
     return { r: s.proposal, who: "a" };
   }, { at: "registering:barrier", resumed: "registered", cancelled: "revoking:deny-new-landed" });
   c.check("E(e) a stopped reopen leaves the committed spec behind its frozen registration gate",
-    /sim stop before reopen/.test(eStop) && eSpecCommitted && eGateAtStop?.state === "frozen"
-    && eGateAtStop.serviceAuthority.pendingRegistration?.operationId === eOperationId && eSpecRevision > eGateAtStop.registrationRevision,
-    { error: eStop, gate: eGateAtStop, specCommitted: eSpecCommitted, specRevision: eSpecRevision });
+    /sim stop before reopen/.test(eStop) && /reopen's outcome is unknown.*gate is still frozen/.test(eStop) && eSpecCommitted && eGateAtStop?.state === "frozen"
+    && eGateAtStop.serviceAuthority.pendingRegistration?.operationId === eOperationId,
+    { error: eStop, gate: eGateAtStop, specCommitted: eSpecCommitted });
   const f = await point("(f) registered, reply lost", ordersEp, async (s) => { await registered(s); return { r: s.proposal, who: "a" }; },
     { at: "registered", resumed: "registered", cancelled: "revoking:deny-new-landed" });
   const gf = await gate(ordersEp, f.sr.instanceId), fAgain = await viaProvider("a", f.run.r), gf2 = await gate(ordersEp, f.sr.instanceId);

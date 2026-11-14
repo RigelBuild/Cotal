@@ -192,6 +192,7 @@ if (process.platform !== "win32") {
   check("a broker binary writable by every local account is refused PERMISSION_DENIED, naming the binary and chmod",
     prepared.status === 0 && refused(rejected, 2, "PERMISSION_DENIED") && rejected.env?.error?.message === `the declared adapter path --binary is not protected against other local writers: ${worldWritableNode} is writable by every local account` && rejected.env?.error?.remedy === `chmod go-w ${worldWritableNode}`, shown(rejected));
   check("the refused broker definition is not saved", serviceDefinitionStore("unsafe-binary-space").read("unsafe-binary") === undefined);
+  removePreparedSpace("unsafe-binary-space");
 }
 
 // ── Usage refusals, before anything is read or dialed ─────────────────────────────────────────────────

@@ -314,7 +314,7 @@ try {
   const fishFile = join(xdg, "fish", "completions", "cotal.fish");
   check("completion install fish writes a completions file that calls `cotal __complete`",
     fish.status === 0 && existsSync(fishFile) && readFileSync(fishFile, "utf8").includes("cotal __complete"), out(fish));
-  const pwshAvailable = spawnSync("pwsh", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"], { encoding: "utf8", timeout: 3000 }).status === 0;
+  const pwshAvailable = process.platform !== "win32" && (process.env.PATH ?? "").split(delimiter).some((dir) => existsSync(join(dir, "pwsh")));
   const pwsh = cotal(["completion", "install", "powershell"]);
   const profile = join(xdg, "powershell", "profile.ps1");
   const profileText = existsSync(profile) ? readFileSync(profile, "utf8") : "";

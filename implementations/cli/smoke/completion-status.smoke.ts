@@ -521,7 +521,8 @@ if (process.platform !== "win32" && process.getuid?.() !== 0) {
   const profileTool = mkdtempSync(join(tmpdir(), "cotal-pwsh-fixture-bin-"));
   roots.push(profileTool);
   const fakePwsh = join(profileTool, "pwsh");
-  symlinkSync(join(import.meta.dirname, "fixtures", "pwsh-profile-path.sh"), fakePwsh);
+  writeFileSync(fakePwsh, `#!/bin/sh\nprintf '%s' "$PROFILE_DIR/profile.ps1"\n`);
+  chmodSync(fakePwsh, 0o755);
   const missingProfile = s.run(["completion", "install", "powershell"], { PATH: `${profileTool}:${process.env.PATH ?? ""}`, PROFILE_DIR: profileFolder });
   check("PowerShell completion install refuses a missing profile directory without creating it", missingProfile.status === 2 && missingProfile.stdout === "" && missingProfile.stderr.includes(`the shell startup folder ${profileFolder} does not exist; nothing was changed`) && !existsSync(profileFolder) && !existsSync(join(s.xdg, "cotal", "completion.ps1")) && !existsSync(join(s.xdg, "cotal", "completion.ps1.ownership.json")), shown(missingProfile));
   const fromShell = s.run(["completion", "install"], { SHELL: "/bin/tcsh" });
