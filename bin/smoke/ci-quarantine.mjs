@@ -7,14 +7,14 @@
 
 /** @type {Record<string, { reason: string; recheckBy: string }>} */
 export const QUARANTINED = {
-  "smoke:delivery-starvation": { reason: "RIG-4872: F3/F5 shard-takeover cells fail", recheckBy: "2026-11-15" },
-  "smoke:upgrade-section": { reason: "RIG-4872: flaky ACCEPT CONTROL exit-reader cells", recheckBy: "2026-11-15" },
-  "smoke:backup-perms:live": { reason: "RIG-4872/#643: zero-delivery consumer frontier 1 !== 2 on CI (shard 3)", recheckBy: "2026-11-15" },
-  "smoke:console-control": { reason: "RIG-4922: graceful-stop cells (y, seat3 leaves) failed in mutation-reproof run 38051239634; custodian leak fixed", recheckBy: "2026-11-15" },
-  "smoke:attach-reconnect": { reason: "RIG-4922: cell B (detach key mid-reconnect) failed on main CI run 38022761542 at 88546942; first failure in 25 runs", recheckBy: "2026-11-15" },
+  "smoke:delivery-starvation": { reason: "RIG-10098 (was RIG-4872, closed): F3/F5 shard-takeover cells fail", recheckBy: "2026-12-31" },
+  "smoke:upgrade-section": { reason: "RIG-10098 (was RIG-4872, closed): flaky ACCEPT CONTROL exit-reader cells", recheckBy: "2026-12-31" },
+  "smoke:backup-perms:live": { reason: "RIG-10098 (was RIG-4872/#643, closed): zero-delivery consumer frontier 1 !== 2 on CI (shard 3)", recheckBy: "2026-12-31" },
+  "smoke:console-control": { reason: "RIG-10098 (was RIG-4922, canceled): graceful-stop cells (y, seat3 leaves) failed in mutation-reproof run 38051239634; custodian leak fixed", recheckBy: "2026-12-31" },
+  "smoke:attach-reconnect": { reason: "RIG-10098 (was RIG-4922, canceled): cell B (detach key mid-reconnect) failed on main CI run 38022761542 at 88546942; first failure in 25 runs", recheckBy: "2026-12-31" },
   "smoke:turn-relay-auth": { reason: "flaky: JetStream heartbeats missed on CI run 38171320196; Cotal is unmaintained, off per Matt", recheckBy: "2026-11-30" },
   "smoke:delivery-renewal": { reason: "flaky: reloadCreds no responders on CI run 38171167895; Cotal is unmaintained, off per Matt", recheckBy: "2026-11-30" },
-  "smoke:codex-host": { reason: "RIG-4872: flaky; approval presence wait timed out on CI run 37970832138, passed on 37964440191", recheckBy: "2026-11-15" },
+  "smoke:codex-host": { reason: "RIG-10098 (was RIG-4872, closed): flaky; approval presence wait timed out on CI run 37970832138, passed on 37964440191", recheckBy: "2026-12-31" },
   "smoke:mutation-fixtures": { reason: "upstream: 91 dead mutation anchors on pristine main; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:required-arg-seam": { reason: "upstream: call-site pins 229/179 vs 247/193 and an unverifiable tls site in control-target.ts on pristine main; quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:instrument-instance-pin": { reason: "upstream: red on main CI runs 38756147210 and 38753177566; 2/61 fail locally on the merge; quarantined on sync per Matt", recheckBy: "2026-12-31" },
@@ -98,14 +98,16 @@ export const QUARANTINED = {
   "smoke:lang-supervise-live": { reason: "RIG-10098 upstream: stock pty gives no work closure, so supervised spawn is refused; suite unchanged from sync 82a97c1f, fixed upstream later; runs 43570538335 and 43575622507", recheckBy: "2026-12-31" },
   "smoke:linear-hosted-renewal:live": { reason: "RIG-10098 upstream: serveLinearUserAuth ignores transport reconnect after bearer renewal, so ready never follows; suite and source unchanged from sync 82a97c1f, fixed upstream in 093e70d5; runs 43570538335 and 43575622507", recheckBy: "2026-12-31" },
   "smoke:web-openapi": { reason: "RIG-10098 upstream: sync-docs needs website deps and generated TypeDoc that the smoke shard lacks; upstream later made the TypeDoc copy optional; runs 43570538335 and 43575622507", recheckBy: "2026-12-31" },
+  "smoke:completion-status": { reason: "RIG-10098 upstream: the GHA runner has pwsh on PATH, so the no-pwsh status cells see a PowerShell profile; completion.ts unchanged from sync 82a97c1f; runs 43570538335 and 43575622507", recheckBy: "2026-12-31" },
+  "smoke:auth-revoke-credential:live": { reason: "RIG-10099 fork: mint stamps the holder label into JWT name, and doctor/connect/send detect agent creds by name === agent; interim ruling I2 quarantines it until the signed profile marker (ruling A) lands", recheckBy: "2026-12-31" },
 };
 
 /** ci.yml smoke steps marked `continue-on-error`; gate-inventory requires the two sets to match. */
 /** @type {Record<string, { reason: string; recheckBy: string }>} */
 export const LIVE_QUARANTINED = {
-  "smoke:lifecycle-e2e": { reason: "RIG-4872: despawn cannot prove a pty seat gone until RIG-4320 lands", recheckBy: "2026-11-15" },
+  "smoke:lifecycle-e2e": { reason: "RIG-10098 (was RIG-4872, closed): despawn cannot prove a pty seat gone; RIG-4320 ruled, fix not landed", recheckBy: "2026-12-31" },
   "smoke:schema-remaining15-diagnostic": { reason: "upstream: dynamicRef cases fail on pristine main 8ca93e96 (local run); quarantined on sync per Matt", recheckBy: "2026-12-31" },
-  "smoke:herdr-e2e:live": { reason: "RIG-4872: herdr server not running when the manager starts", recheckBy: "2026-11-15" },
+  "smoke:herdr-e2e:live": { reason: "RIG-10098 (was RIG-4872, closed): herdr server not running when the manager starts", recheckBy: "2026-12-31" },
   "smoke:up-stack:live": { reason: "upstream expects an in-process pty seat to die with the manager on Ctrl-C; fork pty seats run under a custodian (#72/#73); quarantined on sync per Matt", recheckBy: "2026-12-31" },
   "smoke:setup-pure:live": { reason: "RIG-9150 upstream: setup first run exits 4 when the Codex plugin install fails; red on fork main at upstream bdc8d54f (run 42746431506)", recheckBy: "2026-12-31" },
 };

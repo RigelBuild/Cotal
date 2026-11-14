@@ -115,14 +115,12 @@ function pathWithout(command: string): string | undefined {
   symlinkSync(getent, join(bin, "getent"));
   return bin;
 }
-const noPwshPath = pathWithout("pwsh");
-const noPwshEnv: Record<string, string> = noPwshPath ? { PATH: noPwshPath } : {};
 const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
 
 // ── Status on a fresh machine ─────────────────────────────────────────────────────────────────────
 {
   const s = sandbox();
-  const fresh = s.json(noPwshEnv);
+  const fresh = s.json();
   check("completion --json on a fresh machine is one ok envelope with no target", fresh.status === 0 && fresh.env?.outcome === "ok" && fresh.env.target === null && fresh.env.command === "completion", shown(fresh));
   check("it names the shell $SHELL is", fresh.env?.result.shell === "bash", fresh.env?.result);
   for (const shell of ["bash", "zsh", "fish"])
@@ -130,8 +128,8 @@ const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
   check("PowerShell is not installed by cotal and has no stub file", s.shellOf(fresh.env, "powershell")?.state === "not-installed-by-cotal" && s.shellOf(fresh.env, "powershell")?.stub === null, s.shellOf(fresh.env, "powershell"));
   const files = () => (readdirSync(s.home, { recursive: true }) as string[]).sort();
   const before = files();
-  s.run(["completion"], noPwshEnv);
-  s.run(["completion", "--plain"], noPwshEnv);
+  s.run(["completion"]);
+  s.run(["completion", "--plain"]);
   check("the status writes nothing", JSON.stringify(files()) === JSON.stringify(before), { before, after: files() });
   const tcsh = sandbox("/usr/bin/tcsh");
   check("an unknown $SHELL names no shell", tcsh.json().env?.result.shell === null);
@@ -162,8 +160,8 @@ const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
 
   // The zsh record names $ZDOTDIR's rc, so the report reads it with the same ZDOTDIR. The edited
   // bash stub no longer matches its ownership record, which the report puts before its version.
-  const rich = s.run(["completion"], { FORCE_COLOR: "1", ZDOTDIR: zdot, ...noPwshEnv });
-  const plain = s.run(["completion", "--plain"], { FORCE_COLOR: "1", ZDOTDIR: zdot, ...noPwshEnv });
+  const rich = s.run(["completion"], { FORCE_COLOR: "1", ZDOTDIR: zdot });
+  const plain = s.run(["completion", "--plain"], { FORCE_COLOR: "1", ZDOTDIR: zdot });
   const richText = strip(rich.stdout);
   check(
     "the status report names each shell and its state",
@@ -177,7 +175,7 @@ const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
 
 // ── A machine with no completion installed: every cell says something ──────────────────────────────
 {
-  const fresh = sandbox().run(["completion", "--plain"], noPwshEnv);
+  const fresh = sandbox().run(["completion", "--plain"]);
   check(
     "a shell with nothing installed says not installed, and PowerShell says not installed by cotal",
     fresh.status === 0 && ["bash", "zsh", "fish"].every((shell) => new RegExp(`^ {2}${shell} +not installed$`, "m").test(fresh.stdout)) && /^ {2}powershell +not installed by cotal$/m.test(fresh.stdout),
@@ -390,14 +388,14 @@ if (process.platform !== "win32" && process.getuid?.() !== 0) {
   const assigned = shared !== undefined && assignedGroup(shared, [s.xdg]);
   check("a shared-group folder warning runs only after chgrp puts it in a supplementary group", shared === undefined || assigned, { shared, assigned });
   if (assigned) {
-    const report = s.run(["completion", "--json"], noPwshEnv);
+    const report = s.run(["completion", "--json"]);
     const env = report.stdout.startsWith("{") ? JSON.parse(report.stdout) as { outcome: string; warnings: { code: string; message: string }[]; result: { shells: { shell: string; state: string; ownership: string }[] } } : undefined;
     const fix = `chmod g-w ${s.xdg}`;
     check("absent files under a group-writable config folder are missing and the report is complete, exit 0",
       report.status === 0 && env?.outcome === "ok" && ["bash", "zsh", "fish"].every((shell) => env.result.shells.some((row) => row.shell === shell && row.state === "missing" && row.ownership === "unrecorded")), shown(report));
     check("the folder is one warning naming it, its mode and the chmod that fixes it",
       env?.warnings.length === 1 && env.warnings[0]!.code === "COMPLETION_FOLDER_UNSAFE" && env.warnings[0]!.message === `${s.xdg} is group-writable and its group is not your primary group (mode 0775); completion does not open the bash, zsh and fish completion files under it, and install and uninstall refuse there; chmod g-w ${s.xdg} fixes it`, env?.warnings);
-    const text = s.run(["completion"], noPwshEnv);
+    const text = s.run(["completion"]);
     const next = text.stdout.slice(text.stdout.indexOf("Next"));
     check("Next offers the chmod first, then install, and no uninstall with nothing installed",
       text.status === 0 && next.trimStart().startsWith(`Next\n  ${fix} `) && /cotal completion install bash/.test(next) && !/cotal completion uninstall/.test(next) && text.stderr.split("\n").filter((line) => line.startsWith("!")).length === 1, shown(text));
@@ -406,7 +404,7 @@ if (process.platform !== "win32" && process.getuid?.() !== 0) {
   check("the install Next offers then works", s.run(["completion", "install", "bash"]).status === 0);
   if (assigned && assignedGroup(shared!, [s.xdg])) {
     chmodSync(s.xdg, 0o770);
-    const installed = s.run(["completion"], noPwshEnv);
+    const installed = s.run(["completion"]);
     const installedNext = installed.stdout.slice(installed.stdout.indexOf("Next"));
     const fix = `chmod g-w ${s.xdg}`;
     check("with files under the folder the report is partial, and Next offers the chmod and no install or uninstall that would refuse",
@@ -516,7 +514,8 @@ if (process.platform !== "win32" && process.getuid?.() !== 0) {
   const bashrc = join(s.home, ".bashrc");
   check("completion install --json is one ok envelope and writes the managed block", installJson.status === 0 && outcomeOf(installJson.stdout) === "ok" && existsSync(bashrc) && readFileSync(bashrc, "utf8").includes(`# >>> cotal completion >>>\nsource '${join(s.xdg, "cotal", "completion.bash")}'\n# <<< cotal completion <<<\n`), shown(installJson));
   // Without pwsh there is no profile to wire, so install refuses without guessing one.
-  const pwsh = s.run(["completion", "install", "powershell"], noPwshEnv);
+  const noPwshPath = pathWithout("pwsh");
+  const pwsh = s.run(["completion", "install", "powershell"], noPwshPath ? { PATH: noPwshPath } : {});
   check("completion install powershell is refused when pwsh is missing, naming the supported loading command", pwsh.status === 2 && pwsh.stdout === "" && pwsh.stderr.includes("the supported loading command is: `cotal completion script powershell | Out-String | Invoke-Expression`"), shown(pwsh));
   const profileFolder = join(s.xdg, "powershell");
   const profileTool = mkdtempSync(join(tmpdir(), "cotal-pwsh-fixture-bin-"));
