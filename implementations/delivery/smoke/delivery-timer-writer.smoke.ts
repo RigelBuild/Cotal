@@ -260,12 +260,19 @@ try {
     const until = Math.max(firstCredExpMs + DLV_TTL_S * 1000 + 2_000, Date.now() + 20_000);
     const tokens: string[] = [];
     const fireSubjects: Record<string, string> = {};
+    let fireCallbacks = 0;
+    let fireSubscriptionError: string | undefined;
+    let firstFireCallback: { subject: string; scheduler?: string } | undefined;
     const observedFires = new Set<string>();
     let resolveAllFires: () => void = () => {};
     const allFires = new Promise<void>((resolve) => { resolveAllFires = resolve; });
     let expectedFireCount: number | undefined;
     const fireSub = serveNc.subscribe(`cotal.${space}.ept.${EP}.${IID}.${EPOCH}.*.fire`, {
-      callback: (_error, msg) => {
+      callback: (error, msg) => {
+        if (error) { fireSubscriptionError = error.message; return; }
+        if (!msg) return;
+        fireCallbacks++;
+        firstFireCallback ??= { subject: msg.subject, scheduler: msg.headers?.get("Nats-Scheduler") };
         const armedSubject = fireSubjects[msg.subject];
         if (armedSubject === undefined || msg.headers?.get("Nats-Scheduler") !== armedSubject) return;
         observedFires.add(msg.subject);
@@ -300,7 +307,7 @@ try {
       if (f?.header?.get("Nats-Scheduler") === eptSubject(space, EP, IID, EPOCH, token, "armed")) firedN++;
     }
     check(`every .schedule published across the daemon's credential renewals was armed and fired (${firedN}/${tokens.length})`,
-      tokens.length >= 5 && allFiresObserved && firedN === tokens.length, { firedN, tokens: tokens.length, observedFires: observedFires.size });
+      tokens.length >= 5 && allFiresObserved && firedN === tokens.length, { firedN, tokens: tokens.length, observedFires: observedFires.size, fireCallbacks, fireSubscriptionError, firstFireCallback });
     fireSub.unsubscribe();
     check("the writer never went down across two credential expiries: its connection follows each adopted credential",
       !daemonOut.includes("timer writer: down"), daemonOut.split("\n").filter((l) => l.includes("timer writer: down")));
