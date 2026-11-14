@@ -17,7 +17,7 @@ const childEnv = (): NodeJS.ProcessEnv => {
   for (const key of Object.keys(env)) if (key.startsWith("COTAL_")) delete env[key];
   return env;
 };
-const workflow = parse(readFileSync(join(ROOT, ".github/workflows/mutation-reproof.yml"), "utf8"));
+const workflow = parse(readFileSync(join(ROOT, ".github/workflows/mutation-reproof.yml.disabled"), "utf8"));
 const jobs = workflow?.jobs ?? {};
 const shardJob = jobs.full_shard;
 const aggregate = jobs.full;

@@ -33,6 +33,18 @@ function readCalls(logPath: string): string[][] {
     .map((line) => JSON.parse(line) as string[]);
 }
 
+// Waits until the fake's call log satisfies `done`. Throws on timeout: a wait that never sees its
+// event must fail visibly, not return and let the assertions read a state the wait never reached.
+// Each read is a real zellij spawn, so the call log is the only ordering the test can observe.
+async function waitForCalls(logPath: string, done: (calls: string[][]) => boolean, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (done(readCalls(logPath))) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`waitForCalls: condition not met within ${timeoutMs} ms`);
+}
+
 async function withFakeZellij(
   mode: "missing-session" | "partial-tab" | "confirm" | "no-server" | "probe-error" | "bad-tabs" | "dropped-pane" | "unavailable" | "slow-probe" | "no-client" | "slow-client" | "clients-error" | "clients-flaky" | "handoff",
   run: (logPath: string, session: string) => void | Promise<void>,
@@ -357,13 +369,18 @@ await withFakeZellij("confirm", async (logPath, session) => {
     { command: "sleep", args: ["600"], confirm: "Continue?" },
     process.cwd(),
   );
-  await new Promise<void>((resolve) => setTimeout(resolve, 850));
+  const started = Date.now();
+  // The end event: the watch reports `settled` once it has sent its final Enter. Correct code reaches
+  // it right after the first Enter and makes no later poll. A duplicate Enter from a poll that runs
+  // before `settled` is in the log by the time the wait ends, so the count below sees it.
+  await waitForCalls(logPath, () => handle.confirmOutcome?.() !== undefined, 10_000);
   const calls = readCalls(logPath);
+  const enters = calls.filter((args) => args[3] === "write" && args.includes("13")).length;
   handle.stop({ graceful: false });
+  console.log(`  · confirm one-Enter cell waited ${Date.now() - started} ms for the settled event`);
   check(
     "confirm sends one Enter only after the pane displays the prompt",
-    calls.filter((args) => args[3] === "write" && args.includes("13")).length === 1 &&
-      calls.some((args) => args[3] === "dump-screen"),
+    enters === 1 && calls.some((args) => args[3] === "dump-screen") && handle.confirmOutcome?.() === "confirmed",
   );
 });
 await withFakeZellij("confirm", async (logPath, session) => {
@@ -378,9 +395,9 @@ await withFakeZellij("confirm", async (logPath, session) => {
     },
     process.cwd(),
   );
-  await new Promise<void>((resolve) => setTimeout(resolve, 1_400));
+  await waitForCalls(logPath, (calls) => calls.some((args) => args[3] === "write" && args.includes("27") && args.includes("91") && args.includes("66")), 10_000);
   process.env.COTAL_ZELLIJ_TEST_SCREEN = "Continue?";
-  await new Promise<void>((resolve) => setTimeout(resolve, 900));
+  await waitForCalls(logPath, (calls) => calls.some((args) => args[3] === "write" && args.includes("13")), 10_000);
   const calls = readCalls(logPath);
   handle.stop({ graceful: false });
   check(

@@ -22,12 +22,12 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   }
 }
 
-/** Pin the active parser population and push-policy coverage. */
-const EXPECTED_WORKFLOWS = 10;
-const EXPECTED_PUSH_TO_MAIN = 5;
+/** Pin the active workflow population and push-policy coverage. */
+const EXPECTED_WORKFLOWS = 9;
+const EXPECTED_PUSH_TO_MAIN = 4;
 // Rigel merges land on rigel-release; upstream main remains a mirrored branch.
 const RELEASE_BRANCH = "rigel-release";
-const EXPECTED_GROUPED = 5;
+const EXPECTED_GROUPED = 4;
 
 /** What a concurrency key can be: absent, a literal, or one of the expressions this repo uses.
  *  `unknown` is deliberately terminal. */

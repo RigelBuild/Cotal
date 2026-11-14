@@ -4,6 +4,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { createSuite } from "../bin/smoke/sentinel.mjs";
 
 const { check, finish } = createSuite();
@@ -12,7 +13,12 @@ const scratch = mkdtempSync(join(tmpdir(), "gate-invocations-"));
 const original = JSON.parse(readFileSync(join(repo, "package.json"), "utf8"));
 const copy = (file) => { mkdirSync(dirname(join(scratch, file)), { recursive: true }); cpSync(join(repo, file), join(scratch, file), { recursive: true }); };
 try {
-  for (const file of ["bin/smoke/gate-inventory.smoke.ts", "bin/smoke/ci-suites.mjs", "bin/smoke/ci-suites.txt", "bin/smoke/ci-suites.d", "bin/smoke/ci-suite-costs.json", "bin/smoke/platform-suites.txt", ".github/workflows"]) copy(file);
+  for (const file of ["bin/smoke/gate-inventory.smoke.ts", "bin/smoke/ci-suites.mjs", "bin/smoke/ci-quarantine.mjs", "bin/smoke/ci-suites.txt", "bin/smoke/ci-suites.d", "bin/smoke/ci-suite-costs.json", "bin/smoke/platform-suites.txt", ".github/workflows"]) copy(file);
+  copy("bin/smoke/json-duplicate-keys.ts");
+  const duplicateKeys = ts.transpileModule(readFileSync(join(scratch, "bin/smoke/json-duplicate-keys.ts"), "utf8"), {
+    compilerOptions: { module: ts.ModuleKind.ESNext },
+  }).outputText;
+  writeFileSync(join(scratch, "bin/smoke/json-duplicate-keys.js"), duplicateKeys);
   for (const file of execFileSync("git", ["ls-files", "*package.json"], { cwd: repo, encoding: "utf8" }).trim().split("\n")) {
     if (file !== "package.json") copy(file);
   }

@@ -287,8 +287,12 @@ const shardCountFromWorkflow = (yml: string, requireCommittedInputs = true, requ
     .map((line) => legacyInvocationPattern.exec(line))
     .filter((match): match is RegExpExecArray => match !== null);
   const named = /^      - name:\s*\S/.test(activeShardStep[0]);
-  const guarded = activeShardStep.length === 3 && named &&
-    activeShardStep[1] === guardedShell && guardedInvocations.length === 1;
+  const guardedRevisionEnv = activeShardStep.length === 6 &&
+    activeShardStep[2] === "        env:" &&
+    activeShardStep[3] === "          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}" &&
+    activeShardStep[4] === "          HEAD: ${{ github.sha }}";
+  const guarded = named && activeShardStep[1] === guardedShell && guardedInvocations.length === 1 &&
+    (activeShardStep.length === 3 || guardedRevisionEnv);
   const legacy = activeShardStep.length === 2 && named && legacyInvocations.length === 1;
   if (requireCommittedInputs ? !guarded : !guarded && !legacy) return null;
   const invocation = guarded ? guardedInvocations[0] : legacyInvocations[0];

@@ -98,11 +98,12 @@ assert.throws(() => loopStallWatch(() => {}, 300, -1)); checks++;
   const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
   const calls: string[] = [];
   const rows: Array<{ epochMs: number; ms: number; failed?: string }> = [];
+  let clock = 0;
   const probe = putLatencyProbe([
-    async () => { calls.push("fast"); await sleep(2); },
-    async () => { calls.push("slow"); await sleep(60); },
-    async () => { calls.push("bad"); await sleep(1); throw Object.assign(new Error("private detail"), { name: "TimeoutError" }); },
-  ], (row) => rows.push(row), 40, 2, 10);
+    async () => { calls.push("fast"); clock += 2; },
+    async () => { calls.push("slow"); clock += 60; },
+    async () => { calls.push("bad"); clock += 1; throw Object.assign(new Error("private detail"), { name: "TimeoutError" }); },
+  ], (row) => rows.push(row), 40, 2, 10, () => clock);
   await sleep(260);
   probe.stop();
   const stats = probe.take();
@@ -110,9 +111,11 @@ assert.throws(() => loopStallWatch(() => {}, 300, -1)); checks++;
   assert.deepEqual(calls.slice(0, 3), ["fast", "slow", "bad"]); checks++;
   assert.equal(stats.n, calls.length); checks++;
   assert.equal(stats.failed, calls.filter((c) => c === "bad").length); checks++;
-  assert.ok(stats.maxMs >= 60 && stats.p50Ms <= stats.p99Ms && stats.p99Ms <= stats.maxMs, JSON.stringify(stats)); checks++;
+  assert.equal(stats.maxMs, 60); checks++;
+  assert.ok(stats.p50Ms <= stats.p99Ms && stats.p99Ms <= stats.maxMs, JSON.stringify(stats)); checks++;
   assert.equal(rows.length, 2, "row limit"); checks++;
-  assert.ok(rows[0].ms >= 60 && rows[0].failed === undefined, JSON.stringify(rows[0])); checks++;
+  assert.equal(rows[0].ms, 60); checks++;
+  assert.equal(rows[0].failed, undefined); checks++;
   assert.equal(rows[1].failed, "TimeoutError"); checks++;
   assert.ok(!JSON.stringify(rows).includes("private detail")); checks++;
   const after = probe.take();

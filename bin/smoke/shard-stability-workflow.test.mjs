@@ -14,6 +14,8 @@ const verifier = readFileSync(new URL('./verify-shard-inputs.sh', import.meta.ur
 const exclusion = "    if: ${{ github.event_name != 'workflow_dispatch' }}";
 const header = `  smoke:\n${exclusion}\n`;
 assert.equal(workflow.split(header).length, 2, 'Regression requires the actual unique smoke job');
+const guardedStepStart = workflow.indexOf('      - name: Protocol & security smoke tests');
+const guardedStep = workflow.slice(guardedStepStart, workflow.indexOf('\n  live:', guardedStepStart));
 const env = { ...process.env };
 for (const key of Object.keys(env)) if (key.startsWith('GIT_') || key.startsWith('COTAL_')) delete env[key];
 for (const key of ['BASH_ENV', 'ENV', 'SHELLOPTS', 'BASHOPTS']) delete env[key];
@@ -61,11 +63,30 @@ const expect = (result, status, token) => {
   assert.equal(result.status, status, result.output);
   assert.equal(result.token, token, result.output);
 };
-test('the shipped detector accepts only the fixed manual exclusion on an unchanged ordinary topology', () => {
+const baseEnv = "          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}";
+const headEnv = "          HEAD: ${{ github.sha }}";
+const expectedEnv = `${baseEnv}\n${headEnv}`;
+assert.equal(workflow.split(expectedEnv).length, 2, 'Regression requires the exact guarded shard env');
+test('the shipped detector accepts shard BASE/HEAD env with unchanged topology', () => {
+  assert.equal(guardedStepStart >= 0, true, 'Regression requires the named smoke shard step');
+  assert.equal(guardedStep.split(baseEnv).length, 2, 'Regression requires BASE on the smoke shard step');
+  assert.equal(guardedStep.split(headEnv).length, 2, 'Regression requires HEAD on the smoke shard step');
   expect(run(withCondition(null), workflow), 0, 'STABLE');
   expect(run(workflow, workflow), 0, 'STABLE');
   expect(run(withCondition(null), withCondition(null)), 0, 'STABLE');
 });
+test('the shipped detector refuses an extra env key on the guarded shard step', () => {
+  expect(run(workflow, workflow.replace(expectedEnv,
+    `${expectedEnv}\n          EXTRA: \${{ github.sha }}`)), 2, 'ABORT');
+});
+test('the shipped detector refuses swapped BASE and HEAD env on the guarded shard step', () => {
+  expect(run(workflow, workflow.replace(expectedEnv, `${headEnv}\n${baseEnv}`)), 2, 'ABORT');
+});
+test('the shipped detector refuses a changed BASE expression on the guarded shard step', () => {
+  expect(run(workflow, workflow.replace(expectedEnv,
+    `          BASE: \${{ github.sha }}\n${headEnv}`)), 2, 'ABORT');
+});
+
 test('the shipped detector still detects a real index move with the manual exclusion', () => {
   const names = registry.trim().split('\n');
   const changed = [names[1], names[0], ...names.slice(2)].join('\n') + '\n';

@@ -49,7 +49,7 @@ async function run(extra: string[]): Promise<string> {
   console.error = (...args: unknown[]) => { stderr += `${args.map(String).join(" ")}\n`; };
   process.stderr.write = ((chunk: unknown) => { stderr += String(chunk); return true; }) as typeof process.stderr.write;
   (process as unknown as { exit: (code?: number) => never }).exit = ((code?: number) => { throw new Error(`__exit__${code}`); }) as never;
-  try { await runCli(registry, ["spawn", "--no-events", "--config", persona, "--server", server, "--space", "continue", ...extra]); }
+  try { await runCli(registry, ["spawn", "--no-events", "--file", persona, "--foreground", "--server", server, "--space", "continue", ...extra]); }
   catch { /* expected command completion or refusal */ }
   finally { console.error = oldError; process.stderr.write = oldWrite; process.exit = oldExit; }
   return stderr;

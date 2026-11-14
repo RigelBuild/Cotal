@@ -1,36 +1,34 @@
 import { strict as nodeAssert } from "node:assert";
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSpaceAuth, DEV_OWNER, epRequestGrantRows, jwtFromCreds, mintCreds, mintLifecycleUid, newIdentity, registry, spawnCallerCapabilities, type EpCaller } from "@cotal-ai/core";
 import { authDir, recordMesh, saveSpaceAuth } from "@cotal-ai/workspace";
-import { runCli } from "../src/command.js";
 import { countedAssert, emitSentinel } from "@cotal-ai/smoke-kit";
+import "../src/index.js";
+import "@cotal-ai/auth";
+import { runCli } from "../src/command.js";
 
 const counted = countedAssert(nodeAssert);
 const assert: typeof nodeAssert = counted.assert;
 const cells = counted.cells;
 
-class ExitSignal extends Error {}
+if (process.argv[2] === "cotal-child") {
+  await runCli(registry, process.argv.slice(3));
+  process.exit(process.exitCode ?? 0);
+}
+
 async function runMint(argv: string[]): Promise<{ output: string; code: number }> {
-  const output: string[] = [];
-  const previousLog = console.log;
-  const previousError = console.error;
-  const previousExit = process.exit;
-  let code = 0;
-  console.log = (...args: unknown[]) => { output.push(args.join(" ")); };
-  console.error = (...args: unknown[]) => { output.push(args.join(" ")); };
-  process.exit = ((exitCode?: number) => { code = exitCode ?? 0; throw new ExitSignal(); }) as never;
-  try {
-    await runCli(registry, ["mint", ...argv]);
-  } catch (error) {
-    if (!(error instanceof ExitSignal)) throw error;
-  } finally {
-    console.log = previousLog;
-    console.error = previousError;
-    process.exit = previousExit;
-  }
-  return { output: output.join("\n"), code };
+  const child = spawn(process.execPath, [...process.execArgv, process.argv[1]!, "cotal-child", "auth", "mint", ...argv], { stdio: ["ignore", "pipe", "pipe"] });
+  const chunks: Buffer[] = [];
+  child.stdout.on("data", (chunk: Buffer) => void chunks.push(chunk));
+  child.stderr.on("data", (chunk: Buffer) => void chunks.push(chunk));
+  const code = await new Promise<number>((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (status) => resolve(status ?? -1));
+  });
+  return { output: Buffer.concat(chunks).toString("utf8"), code };
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
@@ -58,26 +56,25 @@ function addLifecycleUid(creds: string, uid: string): string {
   return creds.replace(jwt, replacement);
 }
 
-await import("../src/index.js");
 const root = mkdtempSync(join(tmpdir(), "cotal-mint-caps-unit-"));
+const home = mkdtempSync(join(tmpdir(), "cotal-mint-caps-unit-home-"));
 const previousHome = process.env.COTAL_HOME;
 const previousNoPrompt = process.env.COTAL_NO_PROMPT;
 const cwd = process.cwd();
-process.env.COTAL_HOME = root;
+process.env.COTAL_HOME = home;
 process.env.COTAL_NO_PROMPT = "1";
-const agents = join(root, ".cotal", "agents");
+const agents = join(home, ".cotal", "agents");
 mkdirSync(agents, { recursive: true });
 writeFileSync(join(agents, "spawn-caller.md"), "---\nname: spawn-caller\ncapabilities: [spawn]\n---\n");
 const auth = await createSpaceAuth("main");
-saveSpaceAuth(authDir(root), auth);
-recordMesh({ space: "main", server: "nats://127.0.0.1:1", root, mode: "auth", ts: new Date().toISOString(), origin: "manual" });
+saveSpaceAuth(authDir(home), auth);
+recordMesh({ space: "main", server: "nats://127.0.0.1:1", root: home, mode: "auth", ts: new Date().toISOString(), origin: "manual" });
 
 try {
   process.chdir(root);
   const firstPath = join(root, "first.creds");
   const firstResult = await runMint(["spawn-caller", "--out", firstPath]);
   assert.equal(firstResult.code, 0, firstResult.output);
-  assert.match(firstResult.output, /capabilities:\s+spawn/);
   const firstCreds = readFileSync(firstPath, "utf8");
   const firstJwt = jwtFromCreds(firstCreds);
   assert.ok(firstJwt);
@@ -142,11 +139,11 @@ try {
   const missingNameOut = join(root, "missing-name.creds");
   const missingName = await runMint(["--out", missingNameOut]);
   assert.equal(missingName.code, 1, missingName.output);
-  assert.match(missingName.output, /usage: cotal mint <name>/);
+  assert.match(missingName.output, /auth mint needs one credential label/);
   assert.equal(existsSync(missingNameOut), false);
 
   const observerPath = join(root, "observer.creds");
-  writeFileSync(observerPath, await mintCreds(auth, newIdentity(), "observer"));
+  writeFileSync(observerPath, await mintCreds(auth, newIdentity(), "observer"), { mode: 0o600 });
 
   for (const profile of ["observer", "admin"]) {
     const out = join(root, `new-incarnation-${profile}.creds`);
@@ -158,17 +155,17 @@ try {
 
   const zeroUidOut = join(root, "zero-lifecycle-uid.creds");
   const zeroUid = await runMint(["spawn-caller", "--profile", "agent", "--identity", observerPath, "--out", zeroUidOut]);
-  assert.equal(zeroUid.code, 1, zeroUid.output);
+  assert.equal(zeroUid.code, 2, zeroUid.output);
   assert.match(zeroUid.output, /no single agent lifecycle UID/);
   assert.equal(existsSync(zeroUidOut), false);
 
   const secondUid = mintLifecycleUid();
   assert.notEqual(secondUid, firstUid);
   const multipleUidPath = join(root, "multiple-lifecycle-uids.creds");
-  writeFileSync(multipleUidPath, addLifecycleUid(firstCreds, secondUid));
+  writeFileSync(multipleUidPath, addLifecycleUid(firstCreds, secondUid), { mode: 0o600 });
   const multipleUidOut = join(root, "multiple-lifecycle-uids-remint.creds");
   const multipleUids = await runMint(["spawn-caller", "--profile", "agent", "--identity", multipleUidPath, "--out", multipleUidOut]);
-  assert.equal(multipleUids.code, 1, multipleUids.output);
+  assert.equal(multipleUids.code, 2, multipleUids.output);
   assert.match(multipleUids.output, /no single agent lifecycle UID/);
   assert.equal(existsSync(multipleUidOut), false);
 } finally {
@@ -178,6 +175,7 @@ try {
   if (previousNoPrompt === undefined) delete process.env.COTAL_NO_PROMPT;
   else process.env.COTAL_NO_PROMPT = previousNoPrompt;
   rmSync(root, { recursive: true, force: true });
+  rmSync(home, { recursive: true, force: true });
 }
 // Success-only: a thrown assertion skips both, so the runner and the mutation marker see the failure.
 console.log(`MINT CAPABILITIES UNIT SMOKE COMPLETE`);

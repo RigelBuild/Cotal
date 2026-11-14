@@ -513,9 +513,18 @@ if (process.platform !== "win32" && process.getuid?.() !== 0) {
   const installJson = s.run(["completion", "install", "bash", "--json"]);
   const bashrc = join(s.home, ".bashrc");
   check("completion install --json is one ok envelope and writes the managed block", installJson.status === 0 && outcomeOf(installJson.stdout) === "ok" && existsSync(bashrc) && readFileSync(bashrc, "utf8").includes(`# >>> cotal completion >>>\nsource '${join(s.xdg, "cotal", "completion.bash")}'\n# <<< cotal completion <<<\n`), shown(installJson));
-  // With no pwsh on PATH there is no profile to wire, so install refuses without guessing one.
-  const pwsh = s.run(["completion", "install", "powershell"]);
-  check("completion install powershell is refused, naming the supported loading command", pwsh.status === 2 && pwsh.stdout === "" && pwsh.stderr.includes("the supported loading command is: `cotal completion script powershell | Out-String | Invoke-Expression`"), shown(pwsh));
+  // Without pwsh there is no profile to wire, so install refuses without guessing one.
+  const noPwshPath = pathWithout("pwsh");
+  const pwsh = s.run(["completion", "install", "powershell"], noPwshPath ? { PATH: noPwshPath } : {});
+  check("completion install powershell is refused when pwsh is missing, naming the supported loading command", pwsh.status === 2 && pwsh.stdout === "" && pwsh.stderr.includes("the supported loading command is: `cotal completion script powershell | Out-String | Invoke-Expression`"), shown(pwsh));
+  const profileFolder = join(s.xdg, "powershell");
+  const profileTool = mkdtempSync(join(tmpdir(), "cotal-pwsh-fixture-bin-"));
+  roots.push(profileTool);
+  const fakePwsh = join(profileTool, "pwsh");
+  writeFileSync(fakePwsh, `#!/bin/sh\nprintf '%s' "$PROFILE_DIR/profile.ps1"\n`);
+  chmodSync(fakePwsh, 0o755);
+  const missingProfile = s.run(["completion", "install", "powershell"], { PATH: `${profileTool}:${process.env.PATH ?? ""}`, PROFILE_DIR: profileFolder });
+  check("PowerShell completion install refuses a missing profile directory without creating it", missingProfile.status === 2 && missingProfile.stdout === "" && missingProfile.stderr.includes(`the shell startup folder ${profileFolder} does not exist; nothing was changed`) && !existsSync(profileFolder) && !existsSync(join(s.xdg, "cotal", "completion.ps1")) && !existsSync(join(s.xdg, "cotal", "completion.ps1.ownership.json")), shown(missingProfile));
   const fromShell = s.run(["completion", "install"], { SHELL: "/bin/tcsh" });
   check("a SHELL that names an unsupported shell is refused UNSUPPORTED, exit 2, naming it without the whole help",
     fromShell.status === 2 && /completion does not support tcsh, the shell SHELL names/.test(fromShell.stderr) && /UNSUPPORTED/.test(fromShell.stderr) && !/^Usage$/m.test(fromShell.stderr), shown(fromShell));

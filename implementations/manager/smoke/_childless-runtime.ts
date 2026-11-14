@@ -1,18 +1,19 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { LaunchSpec, Runtime, RuntimeReference } from "@cotal-ai/core";
+import { processStartToken } from "@cotal-ai/seat";
+import { pidfdExited, pidfdOpen } from "../../../packages/seat/dist/peercred.js";
 
 /** Fixture-only closure for an allowlisted program that never launches child processes. This
  * proves nothing about arbitrary connectors or detached tools. It never sends a signal. */
 export function childlessRuntime(runtime: Runtime, root: string, accepts: (spec: LaunchSpec) => boolean): Runtime {
   assert.equal(process.platform, "linux", "the fixture's birth reader requires Linux");
   mkdirSync(root, { recursive: true, mode: 0o700 });
-  const birth = (pid: number): string | undefined => {
-    try { return readFileSync(`/proc/${pid}/stat`, "utf8").split(") ").at(-1)!.split(" ")[19]; }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
-  };
+  // Match custody's start-token parser, including `/proc/<pid>/stat` command names with spaces or `) `.
+  const birth = processStartToken;
   const path = (ref: RuntimeReference) => {
     assert.equal(ref.kind, runtime.kind);
     assert.match(ref.id, /^[a-f0-9-]{36}$/);
@@ -21,10 +22,23 @@ export function childlessRuntime(runtime: Runtime, root: string, accepts: (spec:
   const reapWork = async (ref: RuntimeReference): Promise<void> => {
     const record = JSON.parse(readFileSync(path(ref), "utf8")) as { pid: number; birth: string };
     assert.ok(Number.isSafeInteger(record.pid) && record.pid > 0 && /^\d+$/.test(record.birth));
+    const exited = (): boolean => {
+      const currentBirth = birth(record.pid);
+      if (currentBirth === undefined || currentBirth !== record.birth) return true;
+      const pidfd = pidfdOpen(record.pid);
+      if (pidfd === undefined) return true;
+      try {
+        if (birth(record.pid) !== record.birth) return true;
+        // Match custody's native proof: pidfd poll accepts an exited, unreaped child as gone.
+        return pidfdExited(pidfd);
+      } finally {
+        closeSync(pidfd);
+      }
+    };
     const deadline = Date.now() + 5_000;
-    while (birth(record.pid) === record.birth) {
+    while (!exited()) {
       if (Date.now() >= deadline) throw new Error("childless fixture process remains alive");
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await sleep(20);
     }
   };
   const spawn = runtime.spawn.bind(runtime);

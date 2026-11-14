@@ -48,7 +48,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -61,6 +61,11 @@ if (!existsSync(BIN)) {
 }
 
 const home = mkdtempSync(join(tmpdir(), "cotal-space-registration-"));
+const protectedNodeDir = join(home, "node");
+mkdirSync(protectedNodeDir, { mode: 0o700 });
+const protectedNode = join(protectedNodeDir, basename(process.execPath));
+copyFileSync(process.execPath, protectedNode);
+chmodSync(protectedNode, 0o700);
 // Set before the workspace is imported: it reads COTAL_HOME on each call.
 process.env.COTAL_HOME = join(home, ".cotal");
 const { MANAGER_PIDFILE, cacheLocalProcess, canonicalLocalProcessPath, clearCurrent, extensionsManifestPath, findMesh, findPreparedSpace, getCurrent, meshesDir, preparedSpacesDir, recordMesh, recordPreparedSpace, removeMesh, removePreparedSpace, saveExtensionsManifest, setCurrent, spaceSegment } = await import("@cotal-ai/workspace");
@@ -112,7 +117,7 @@ process.on("exit", () => {
 const runEnv = { ...HOST_ENV, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: join(home, ".config"), COTAL_HOME: process.env.COTAL_HOME!, COTAL_SKIP_CONNECTOR_SEED: "1" };
 const run = (args: string[], extraEnv: Record<string, string> = {}, cwd = home) =>
   new Promise<{ status: number | null; stdout: string; stderr: string }>((done) => {
-    const child = spawn(process.execPath, [BIN, ...args], {
+    const child = spawn(protectedNode, [BIN, ...args], {
       cwd,
       env: { ...runEnv, ...extraEnv },
       stdio: ["ignore", "pipe", "pipe"],
@@ -174,6 +179,21 @@ writeFileSync(file, JSON.stringify(bundle()));
 const userRoot = projectRoot("hosted-root");
 recordMesh({ space: "keep", server: DEAD, root, mode: "open", origin: "manual", ts: new Date(0).toISOString() });
 setCurrent("keep");
+// Keep the safety check exercised while the hosted runner's Node path remains untrusted.
+if (process.platform !== "win32") {
+  const worldWritableNode = join(home, "world-writable-node");
+  copyFileSync(process.execPath, worldWritableNode);
+  chmodSync(worldWritableNode, 0o777);
+  const unsafeRoot = projectRoot("unsafe-binary");
+  const prepared = await json(["space", "create", "unsafe-binary-space", "--root", unsafeRoot]);
+  const config = join(unsafeRoot, ".cotal", "world-writable-node.conf");
+  writeFileSync(config, "", { mode: 0o600 });
+  const rejected = await json(["service", "add", "unsafe-binary", "--preset", "broker", "--space", "unsafe-binary-space", "--config", config, "--binary", worldWritableNode, "--server", DEAD]);
+  check("a broker binary writable by every local account is refused PERMISSION_DENIED, naming the binary and chmod",
+    prepared.status === 0 && refused(rejected, 2, "PERMISSION_DENIED") && rejected.env?.error?.message === `the declared adapter path --binary is not protected against other local writers: ${worldWritableNode} is writable by every local account` && rejected.env?.error?.remedy === `chmod go-w ${worldWritableNode}`, shown(rejected));
+  check("the refused broker definition is not saved", serviceDefinitionStore("unsafe-binary-space").read("unsafe-binary") === undefined);
+  removePreparedSpace("unsafe-binary-space");
+}
 
 // ── Usage refusals, before anything is read or dialed ─────────────────────────────────────────────────
 {
@@ -240,8 +260,8 @@ setCurrent("keep");
   check("a port that takes no connection says so, with the port check as its remedy",
     (dead.env?.error?.message ?? "").endsWith(`nothing accepted a connection at 127.0.0.1:${deadPort}`) && dead.env?.error?.remedy === `check that the mesh is up and listening on port ${deadPort} of 127.0.0.1, or pass --server with the port it listens on; pass --force to add "dead1" unchecked, as for a space that is down right now`, shown(dead));
   const otherScheme = await json(["space", "add", "open", "--server", `tls://127.0.0.1:${brokerPort}`, "--mode", "open", "--root", root]);
-  check("a broker that answers under another scheme is named, with that address as the Next",
-    refused(otherScheme, 2, "TARGET_UNAVAILABLE") && otherScheme.env?.error?.message === `no broker answered at tls://127.0.0.1:${brokerPort}, but one answers at ${LIVE}, without TLS` && otherScheme.env.error.remedy === `run it again with --server ${LIVE}; pass --force to add "open" unchecked, as for a space that is down right now`, shown(otherScheme));
+  check("a TLS-required address refuses a plaintext listener without downgrading",
+    refused(otherScheme, 2, "DEPENDENCY_UNAVAILABLE") && otherScheme.env?.error?.message === `the listener at tls://127.0.0.1:${brokerPort} does not offer the required TLS - check the address and configure TLS on the broker`, shown(otherScheme));
   const unserved = await json(["space", "add", "open", "--server", LIVE, "--mode", "open", "--root", root]);
   check("an open name the broker does not serve is TARGET_NOT_FOUND, exit 2, naming the spaces it serves",
     refused(unserved, 2, "TARGET_NOT_FOUND") && unserved.env?.error?.message === `the broker at ${LIVE} serves no space named "open"; it serves ${SERVED.map((space) => `"${space}"`).join(", ")}` && /--force/.test(unserved.env?.error?.remedy ?? ""), shown(unserved));
@@ -411,7 +431,7 @@ setCurrent("keep");
     const brokerDefinition = (space: string, stackRoot: string) => {
       const config = join(stackRoot, ".cotal", "server.conf");
       writeFileSync(config, "", { mode: 0o600 });
-      serviceDefinitionStore(space).commit("stack-broker", undefined, { schemaVersion: 1, space, launch: { type: "adapter", adapter: "nats-broker", options: { root: stackRoot, config, binary: process.execPath, server: LIVE } }, readiness: { type: "adapter", timeoutMs: 30_000 } });
+      serviceDefinitionStore(space).commit("stack-broker", undefined, { schemaVersion: 1, space, launch: { type: "adapter", adapter: "nats-broker", options: { root: stackRoot, config, binary: protectedNode, server: LIVE } }, readiness: { type: "adapter", timeoutMs: 30_000 } });
     };
 
     const runningRoot = stack("stackrun", "open", { broker: member("stackrun", "stack-broker", requireProcessIdentity(process.pid), false) }, "started");
@@ -869,7 +889,7 @@ if (process.platform === "linux") {
   // A folder whose path holds a control character could be prepared but never started, and a
   // bidirectional formatting mark can show one path as another, so create and up refuse both before
   // anything is written.
-  // Outside the home folder, whose .cotal up would otherwise refuse to inherit first.
+  // Each unusual folder gets its own empty .cotal, so the root walk stops there and up checks that path.
   const { oneLine } = await import("@cotal-ai/core");
   const outside = realpathSync(mkdtempSync(join(tmpdir(), "cotal-space-registration-odd-")));
   for (const [label, name] of [["a tab", "tab\tfolder"], ["a newline", "line\nfolder"], ["an escape character", "esc\u001bfolder"], ["a delete character", "del\u007ffolder"], ["the bidirectional formatting mark U+202E", "rlo\u202efolder"]]) {
@@ -878,9 +898,10 @@ if (process.platform === "linux") {
     const created = await json(["space", "create", "oddpath", "--root", odd]);
     check(`a --root whose path holds ${label} is USAGE_INVALID, exit 1, naming it, with nothing written`,
       refused(created, 1, "USAGE_INVALID") && (created.env?.error?.message ?? "") === `the folder path ${oneLine(odd)} contains ${label}, and a project path may hold neither control characters nor bidirectional formatting marks; nothing was written` && !existsSync(join(odd, ".cotal")) && findPreparedSpace("oddpath") === undefined, shown(created));
+    mkdirSync(join(odd, ".cotal"), { mode: 0o700 });
     const up = await json(["up", "--server", DEAD], odd);
     check(`up in that folder is USAGE_INVALID, exit 1, and writes no stack journal`,
-      refused(up, 1, "USAGE_INVALID") && (up.env?.error?.message ?? "").startsWith(`the folder path ${oneLine(odd)} contains ${label}`) && !existsSync(join(odd, ".cotal")), shown(up));
+      refused(up, 1, "USAGE_INVALID") && (up.env?.error?.message ?? "").startsWith(`the folder path ${oneLine(odd)} contains ${label}`) && readdirSync(join(odd, ".cotal")).length === 0 && !existsSync(stackJournalPath(odd)), shown(up));
     rmSync(odd, { recursive: true, force: true });
   }
   rmSync(outside, { recursive: true, force: true });

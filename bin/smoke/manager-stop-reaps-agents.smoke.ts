@@ -94,9 +94,11 @@ const must = (name: string, cond: boolean, extra?: unknown) => {
   pass++;
   console.log(`  ✓ ${name}`);
 };
-/** Seventeen scenario cells run before the final count cell. A throw lands in the catch as a
- * counted failure, so a partial run can never print the OK banner. */
-const EXPECTED_CELLS = 22;
+/** Twenty-four scenario cells run before the final count cell, which is the 25th call. EXPECTED_CELLS
+ * counts all 25, and the count cell checks `pass + fail === EXPECTED_CELLS - 1`. The number is measured
+ * from the body (ok and must calls), not a static guess. A throw lands in the catch as a counted failure,
+ * so a partial run can never print the OK banner. */
+const EXPECTED_CELLS = 25;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const until = async (cond: () => boolean, ms: number): Promise<boolean> => {
   const end = Date.now() + ms;
@@ -393,7 +395,32 @@ try {
     startError = (e as Error).message;
   }
   ok("#4005: a next manager starts on the root that released the seat", startError === undefined, { startError });
-  ok("#4005: the next manager retires the gone released seat (its minted credential is deprovisioned)", credsA !== undefined && (await until(() => !existsSync(credsA), 30_000)), { credsA, releasedRef: existsSync(releasedRef) });
+  // The next manager (mgr3) is the one that runs the sweep over the released seat. statusOf reads
+  // `reaper` (mgr2, the seatB manager), which never attempts seatA, so the #4005 reads use mgr3.
+  type NextView = { staticReconciliation: { lastSweep?: { completedAt?: string; attempted: number }; failures: Array<{ alias: string; disposition: string; retainedReason?: string }> } };
+  // managerStatusData is private to Manager, so the test reaches it through one named, unchecked view
+  // of mgr3 (the next manager). It is read once here, not at each use, so the cast is visible in one place.
+  const nextManagerView = mgr3 as unknown as { managerStatusData: (owner: undefined) => NextView };
+  const nextStatus = (): NextView => nextManagerView.managerStatusData(undefined);
+  // The fork's contract: a released seat no runtime can prove gone is NOT retired, and its credential
+  // and runtime reference stay on disk for a later adoption (RIG-4320). The next manager's start runs
+  // reconcileStaticLifecycles, which plans the seat as a restart row and calls adoptSeat. adoptSeat
+  // refuses the unprovable seat. The record drop that follows is guarded by releasedSeatPending
+  // (manager.ts, restart-reconcile loop). Without that guard the reference is removed, and the cell
+  // below goes red (mutation-checked). Start() does not await the sweep, and the startup sweeps finish
+  // before the one that plans seatA. Wait for the sweep that attempted a row: completedAt set and
+  // attempted at least 1. A sweep that planned nothing (attempted 0) can never satisfy this.
+  const sweepDone = await until(() => {
+    const last = nextStatus().staticReconciliation.lastSweep;
+    return last?.completedAt !== undefined && (last?.attempted ?? 0) >= 1;
+  }, 15_000);
+  ok("#4005: the next manager's static reconcile sweep finishes", sweepDone, { lastSweep: nextStatus().staticReconciliation.lastSweep });
+  const sweepStatus = nextStatus().staticReconciliation;
+  const seatAItem = sweepStatus.failures.find((f) => f.alias === "seatA");
+  console.log(`  · #4005 baseline: lastSweep.attempted=${sweepStatus.lastSweep?.attempted} seatA disposition=${seatAItem?.disposition} retainedReason=${seatAItem?.retainedReason}`);
+  ok("#4005: the sweep refuses the released seat as unprovable (disposition refused, retainedReason unprovable)", seatAItem?.disposition === "refused" && seatAItem?.retainedReason === "unprovable", { item: seatAItem });
+  ok("#4005: the next manager keeps the unprovable released seat's minted credential (no retirement without proof)", credsA !== undefined && existsSync(credsA), { credsA });
+  ok("#4005: the next manager keeps the released seat's runtime reference for a later adoption", existsSync(releasedRef), { releasedRef });
 
   ok("every cell ran (silently skipped cells must not read as green)", pass + fail === EXPECTED_CELLS - 1, { pass, fail, expected: EXPECTED_CELLS - 1 });
 } catch (e) {

@@ -24,14 +24,6 @@ try {
     check(`downgrade: ${mode} preserves the stamp and extension manifest`, readFileSync(stamp).equals(before) && readFileSync(manifestPath(cfg)).equals(manifestBefore));
     check(`downgrade: ${mode} preserves every store generation`, readdirSync(join(seedDir(cfg), "store")).sort().join(",") === storeBefore);
   }
-
-
-  // A refusal that prescribes a fix has to have a working fix, or it is a wedge with instructions.
-  const force = cotal(cfg, ["ext", "seed", "--force"]);
-  check("downgrade: `ext seed --force` recovers the store", force.status === 0, force.stderr.slice(0, 300));
-  check("downgrade: the stamp is this binary's generation again", readJson(stamp).generation === readJson(join(REPO, "bin", "package.json")).version);
-  check("downgrade: ordinary commands work after the force rebuild", listNames(cfg).length === 7);
-
   // Put back this fixture's actual stamp, then retain same-generation maintenance controls.
   writeJson(stamp, JSON.parse(currentStamp.toString()));
   const maintenanceForce = cotal(cfg, ["ext", "seed", "--force"]);

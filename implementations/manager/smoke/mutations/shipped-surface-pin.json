@@ -12,11 +12,9 @@
     "",
     "M2 keeps revision 51 after the fork's retained-seat, deferred-seat, allowlist and spawn-input validation changes advance the upstream revision 46 surface.",
     "The named revision cell runs after resolving the actual shipped document over the wire.",
-    "M3 re-introduces the module-scope compile (#1323): every CLI invocation paid ~1.8 CPU-seconds",
-    "of Ajv work before its verb was read. The mutant reads every pair from the shared lazy table",
-    "at import, which compiles them all as the removed eager map did. The contract-vocabulary",
-    "import-cost cell measures the module's CPU cost over its dependency floor in fresh children,",
-    "so the eager compile trips it by ~7x the bound while the lazy module sits 3-6x under it."
+    "M3 re-introduces module-scope compilation (#1323): the mutant reads every pair from the lazy table",
+    "at import and compiles them all, as the removed eager map did. The contract-vocabulary import-cost",
+    "cell counts Ajv.compile calls during import and expects zero; the eager mutant produces a nonzero count."
   ],
   "mutations": [
     {

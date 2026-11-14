@@ -186,13 +186,14 @@ c("the run capability set: run-start/run-resume/run-start-keyed/run-submission-s
   && JSON.stringify(runCallerCapabilities("u_abc").slice(8)) === JSON.stringify(spawnCallerCapabilities("u_abc"))
   && !spawnCallerCapabilities("u_abc").some((cap) => cap.command.startsWith("run-")));
 const adminCaps = operatorInstrumentCapabilities("admin", "u_abc");
+// Upstream's 38 plus the fork's release-seat, attest-gone and allowlist-set.
 c("the admin instrument set adds any-mode despawn/attach + BOTH modes of input and turn + the manager.admin family",
-  adminCaps.length === 38
+  adminCaps.length === 41
   && adminCaps.filter((cap) => cap.target?.mode === "any").map((cap) => cap.command).join(",") === "despawn,attach,input,turn"
   && adminCaps.filter((cap) => cap.target?.mode === "owner").map((cap) => cap.command).join(",") === "input,turn"
   && adminCaps.filter((cap) => cap.target?.mode === "owner").every((cap) => (cap.target as { tOwner?: string }).tOwner === "u_abc")
   && adminCaps.filter((cap) => cap.target?.mode === "any").every((cap) => (cap.target as { tOwner?: string }).tOwner === "*")
-  && ["purge", "launch", "resume-preserved", "commit-resume", "finalize-resume", "prepare-preservation", "commit-preservation", "abort-preservation", "transcript-receive"].every((cmd) => adminCaps.some((cap) => cap.command === cmd && cap.target === undefined)));
+  && ["purge", "launch", "resume-preserved", "commit-resume", "finalize-resume", "prepare-preservation", "commit-preservation", "abort-preservation", "transcript-receive", "release-seat", "attest-gone", "allowlist-set"].every((cmd) => adminCaps.some((cap) => cap.command === cmd && cap.target === undefined)));
 // The owner-mode `input` row is minted ONLY where the mint site can name the caller's own owner.
 // Without it the capability is omitted rather than emitted with a wildcard owner, because §13.2
 // forbids an owner-mode standing mint naming a foreign owner and a `*` there would be exactly that.

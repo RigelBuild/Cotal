@@ -31,14 +31,14 @@ function check(name: string, condition: unknown, detail?: unknown): void {
 
 const positive = fixture.cases.find((c: { pr: number }) => c.pr === 1087);
 if (!positive) throw new Error("positive PR-head fixture case is missing");
-// Windows and Changesets are retired on this fork. Docs, Installer, and Remotion remain path-filtered.
+// Windows, Changesets and Mutation reproof are retired on this fork; the other workflow readers stay active.
 const expectedNames = positive.expectedNames;
-const packageExpectedNames = ["CI", "Mutation reproof", "Remotion typecheck"];
+const packageExpectedNames = ["CI", "Docs", "Remotion typecheck"];
 check(
   "path-filtered workflows are included only when changed paths match declarations",
   JSON.stringify(expectedPullRequestWorkflows(workflows, ["package.json"])) === JSON.stringify(packageExpectedNames) &&
-    JSON.stringify(expectedPullRequestWorkflows(workflows, ["package.json", "docs/cli.md"])) === JSON.stringify(["CI", "Docs", "Mutation reproof", "Remotion typecheck"]) &&
-    JSON.stringify(expectedPullRequestWorkflows(workflows, ["install.sh"])) === JSON.stringify(["CI", "Installer", "Mutation reproof"]),
+    JSON.stringify(expectedPullRequestWorkflows(workflows, ["package.json", "docs/cli.md"])) === JSON.stringify(["CI", "Docs", "Remotion typecheck"]) &&
+    JSON.stringify(expectedPullRequestWorkflows(workflows, ["install.sh"])) === JSON.stringify(["CI", "Installer"]),
 );
 let repositoryWorkflowsParsed = false;
 try {

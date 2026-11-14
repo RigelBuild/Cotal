@@ -188,6 +188,21 @@ class FakeMesh {
     throw new Error(`FakeMesh: no turn was surfaced, so nothing can be committed: ${goalIds.join(",")}`);
   }
 
+  // Run turns need no permit on the real agent, so the fake grants it, and the release and the
+  // dispatch note are no-ops for them. A once task is never surfaced here.
+  claimTurns(goalIds: readonly string[]): boolean {
+    void goalIds;
+    return true;
+  }
+
+  releaseTurns(goalIds: readonly string[]): void {
+    void goalIds;
+  }
+
+  noteTurnsDispatched(goalIds: readonly string[]): void {
+    void goalIds;
+  }
+
   async setStatus(status: string, activity?: string): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, status === "working" && activity === "thinking" ? 3 : 0));
     this.statuses.push({ status, activity });

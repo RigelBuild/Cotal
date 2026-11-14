@@ -1,33 +1,57 @@
-/**
- * ST1 probe (#1323): measure, in a FRESH child process, what importing the manager's service
- * contract module costs on top of its dependency floor (`@cotal-ai/core`, the module's own
- * baseline import). Run by `contract-vocabulary.smoke.ts` (see the import-cost cell there).
- *
- * The child imports one of two targets and reports `process.cpuUsage` delta plus wall time:
- *   --control  imports `@cotal-ai/core` (the floor: NATS client graph, Ajv itself, digest code)
- *   --contract imports `../src/manager-service-contract.js` (the floor + the contract module)
- *
- * The measured quantity is the DELTA between the two: what the contract module itself adds. At
- * module-scope compile that delta is ~500+ ms of CPU (Ajv codegen for 41 schema roots); with the
- * lazy compile it is single-digit ms. A plain wall-or-CPU ceiling on the contract run alone would
- * be the instrument error `SCHEMA_PROFILE` records: the tsx loader and the core graph dominate
- * both sides, so only the difference isolates the compile. Not a shipped module; smoke-only.
+/** Count actual Ajv compilation work in a fresh process while importing the manager contract module.
+ * Run by contract-vocabulary.smoke.ts. The wrapper is installed on the Ajv 2020-12 constructor
+ * resolved from the core package itself, so it observes the same class the module under test uses.
  */
-import { performance } from "node:perf_hooks";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 
-const mode = process.argv[2] ?? "";
-const c0 = process.cpuUsage();
-const t0 = performance.now();
-if (mode === "--control") {
-  await import("@cotal-ai/core");
-} else if (mode === "--contract") {
-  const m = await import("../src/manager-service-contract.js");
-  // Read one digest: proves the lazy path is one property away, and pins the value the smoke
-  // compares against the compiled closure digest (see the cell). Costs microseconds.
-  void m.managerClusterDocument().commands[0]?.inputDigest;
-} else {
-  console.error("usage: probe --control | --contract");
-  process.exit(2);
+interface AjvInstance { compile(...args: unknown[]): unknown }
+interface AjvConstructor {
+  new(options: { strict: false }): AjvInstance;
+  prototype: AjvInstance;
 }
-const c = process.cpuUsage(c0);
-console.log(`PROBE ${mode === "--control" ? "control" : "contract"} ${Math.round((c.user + c.system) / 1000)} ${Math.round(performance.now() - t0)}`);
+
+function isAjvConstructor(value: unknown): value is AjvConstructor {
+  if (typeof value !== "function" || !("prototype" in value)) return false;
+  const prototype: unknown = value.prototype;
+  return typeof prototype === "object" && prototype !== null
+    && "compile" in prototype && typeof prototype.compile === "function";
+}
+
+function isAjvModule(value: unknown): value is { Ajv2020: AjvConstructor } {
+  return typeof value === "object" && value !== null && "Ajv2020" in value
+    && isAjvConstructor(value.Ajv2020);
+}
+
+// Resolve through core's package boundary so the counter wraps the exact Ajv module instance used
+// by schema-profile; the manager package cannot statically resolve core's private dependency.
+const coreRequire = createRequire(new URL("../../../packages/core/package.json", import.meta.url));
+const ajvUrl = pathToFileURL(coreRequire.resolve("ajv/dist/2020.js")).href;
+const ajvModule: unknown = await import(ajvUrl);
+if (!isAjvModule(ajvModule)) throw new Error("the core package did not resolve Ajv2020");
+const Ajv2020 = ajvModule.Ajv2020;
+const originalCompile = Ajv2020.prototype.compile;
+let compileCalls = 0;
+Ajv2020.prototype.compile = function (this: AjvInstance, ...args: unknown[]): unknown {
+  compileCalls++;
+  return Reflect.apply(originalCompile, this, args);
+};
+
+const probe = new Ajv2020({ strict: false });
+compileCalls = 0;
+probe.compile({ type: "string" });
+if (compileCalls !== 1) throw new Error(`Ajv.compile instrumentation observed ${compileCalls} calls for one schema`);
+
+const core = await import("@cotal-ai/core");
+compileCalls = 0;
+// Import the dependency floor first, then count only work caused by importing the manager contract module.
+const manager = await import("../src/manager-service-contract.js");
+void manager.managerClusterDocument().commands[0]?.inputDigest;
+
+const importCalls = compileCalls;
+// Compile through the public core entry to prove the counter observes core's Ajv instance.
+compileCalls = 0;
+core.compileContract({ root: { type: "string" } });
+const controlCalls = compileCalls;
+if (controlCalls === 0) throw new Error("Ajv.compile instrumentation missed the core positive control");
+console.log(`PROBE ${importCalls} ${controlCalls}`);
