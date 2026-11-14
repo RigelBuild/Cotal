@@ -85,7 +85,7 @@ try {
     barrier: endpointRegistrationBarrier(authKv, space, { endpoint: AUTH_ENDPOINT, instanceId, opId: mintLifecycleUid() }),
     readClusterArtifact: (digest) => byDigest.get(digest),
   });
-  serving = serveEndpoint(nc, space, grant, authCommandDefs({ retireLifecycle: (ctx) => {
+  serving = serveEndpoint(nc, space, grant, authCommandDefs({ roster: async () => ({ rows: [] }), retireLifecycle: (ctx) => {
     const uid = ctx.request.target!.lifecycleUid;
     const args = ctx.request.args as { opId: string };
     invoked.push({ uid, opId: args.opId });

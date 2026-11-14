@@ -949,6 +949,15 @@ export function isPresenceRow(value: unknown, key: string): value is Presence {
   return presenceRowProblem(value, key) === undefined;
 }
 
+/** Parse and validate one serialized presence row, shared by watches and direct readers. */
+export function parsePresenceRow(value: unknown, key: string): Presence | undefined {
+  if (typeof value !== "string") return undefined;
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); }
+  catch { return undefined; }
+  return isPresenceRow(parsed, key) ? parsed : undefined;
+}
+
 function presenceRowProblem(value: unknown, key: string): string | undefined {
   if (!presenceRecord(value)) return "row";
   if (!presenceRecord(value.card)) return "card";

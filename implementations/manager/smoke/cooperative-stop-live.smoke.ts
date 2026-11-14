@@ -70,6 +70,7 @@ const releaseBroker = teardownOnSignal(srv, dir);
 let alice: CotalEndpoint | undefined;
 let bob: CotalEndpoint | undefined;
 let mgr: CotalEndpoint | undefined;
+let observer: CotalEndpoint | undefined;
 let server: ReturnType<typeof startControlServer> | undefined;
 
 try {
@@ -98,6 +99,9 @@ try {
     ttlMs: 1500,
   });
   await mgr.start();
+  observer = new CotalEndpoint({ space, servers: SERVERS, creds: await mintCreds(auth, newIdentity(), "observer"), card: { name: "presence-observer", kind: "endpoint" }, channels: [], consume: false, registerPresence: false });
+  observer.on("error", () => {});
+  await observer.start();
 
   const aliceId = newIdentity();
   const bobId = newIdentity();
@@ -137,7 +141,7 @@ try {
   await wait(800);
 
   // bob sees alice as a live peer (not offline) before the stop — the baseline.
-  const aliceLive = bob.getRoster().find((p) => p.card.name === "alice");
+  const aliceLive = observer.getRoster().find((p) => p.card.name === "alice");
   check("baseline: bob sees alice live", aliceLive !== undefined && aliceLive.status !== "offline", aliceLive?.status);
 
   // Stand up alice's REAL control server. onShutdown does what the Claude Code connector's shutdown
@@ -165,11 +169,11 @@ try {
   let aliceOffline = false;
   for (let i = 0; i < 30 && !aliceOffline; i++) {
     await wait(50);
-    aliceOffline = bob.getRoster().find((p) => p.card.name === "alice")?.status === "offline";
+    aliceOffline = observer.getRoster().find((p) => p.card.name === "alice")?.status === "offline";
   }
 
   check("controlShutdown reached the control server's onShutdown", onShutdownFired);
-  check("cooperative stop publishes OFFLINE presence (bob sees alice offline, ≪ TTL)", aliceOffline, bob.getRoster().find((p) => p.card.name === "alice")?.status);
+  check("cooperative stop publishes OFFLINE presence (observer sees alice offline, ≪ TTL)", aliceOffline, observer.getRoster().find((p) => p.card.name === "alice")?.status);
 } catch (e) {
   fail++;
   console.error("  ✗ scenario threw:", (e as Error).message);
@@ -179,7 +183,7 @@ try {
   } catch {
     /* ignore */
   }
-  for (const ep of [alice, bob, mgr]) {
+  for (const ep of [alice, bob, mgr, observer]) {
     try {
       await ep?.stop();
     } catch {

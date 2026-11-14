@@ -38,6 +38,7 @@ import {
 import { createSuite, killAndAwaitExit, SMOKE_BROKER_TOKEN, teardownOnSignal, teardownPathOnSignal } from "@cotal-ai/smoke-kit";
 import { authDir, recordMesh, recordPreparedSpace, saveSpaceAuth, setCurrent, userAuthStateDir } from "@cotal-ai/workspace";
 import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
+import { startRosterFixture } from "../../../packages/core/smoke/_roster-service.js";
 
 const BIN = join(import.meta.dirname, "..", "..", "..", "bin", "dist", "cotal.js");
 if (!existsSync(BIN)) {
@@ -147,6 +148,7 @@ function probeTraceLine(value: ReturnType<typeof probeTraceResult> & { format?: 
 }
 
 const endpoints: CotalEndpoint[] = [];
+let stopRoster: (() => Promise<void>) | undefined;
 let provisioner: CotalEndpoint | undefined;
 try {
   let ready = false;
@@ -305,11 +307,16 @@ try {
   // ── a --creds credential that may read the roster, with the manager still on it ──────────────────
   const reader = join(home, "reader.creds");
   writeFileSync(reader, await mintCreds(auth, newIdentity(), "agent", { lifecycleUid: mintLifecycleUid() }), { mode: 0o600 });
+  const missingManager = await run(["who", "--json", "--creds", reader, "--space", space, "--server", servers]);
+  check("an agent roster read without manager fails closed and names manager.roster", missingManager.status === 2 && missingManager.envelope?.error?.code === "TARGET_UNAVAILABLE" && missingManager.envelope.error.message.includes("manager.roster"), shown(missingManager));
+  stopRoster = await startRosterFixture(space, servers, auth);
   const credsRead = await run(["who", "--json", "--creds", reader, "--space", space, "--server", servers]);
   check("a --creds credential is a complete read, exit 0, with the managers labelled denied and not left unread",
     credsRead.status === 0 && credsRead.envelope?.outcome === "ok" && credsRead.envelope.completeness === "complete" && credsRead.envelope.result?.managers === "denied" &&
     credsRead.envelope.warnings.some((w) => w.code === "MANAGERS_DENIED") && !credsRead.envelope.warnings.some((w) => w.code === "MANAGERS_UNREAD") &&
     rowsOf(credsRead).alice?.managed === null, shown(credsRead));
+  await stopRoster();
+  stopRoster = undefined;
 
   // ── whoami ──────────────────────────────────────────────────────────────────────────────────────
   const me = await run(["whoami", "--json"]);
@@ -465,6 +472,7 @@ try {
   const both = await run(["who", "--json", "--plain"]);
   check("who --json --plain is one USAGE_INVALID envelope", both.status === 1 && both.envelope?.error?.code === "USAGE_INVALID", shown(both));
 } finally {
+  await stopRoster?.().catch(() => {});
   for (const ep of endpoints) await ep.stop().catch(() => {});
   await provisioner?.stop().catch(() => {});
   await killAndAwaitExit(recoveryBroker);

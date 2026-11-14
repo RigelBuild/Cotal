@@ -687,6 +687,7 @@ export class MeshAgent extends EventEmitter {
       // A seat reads the roster when it acts (readRoster) instead of watching it: a watch delivers
       // every member's heartbeat to every member, K² per heartbeat in a space of K (SPEC §6).
       watchPresence: false,
+      managerRoster: config.creds !== undefined,
       card: {
         id: config.id,
         name: config.name,

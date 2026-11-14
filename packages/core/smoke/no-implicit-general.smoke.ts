@@ -51,6 +51,7 @@ import { join } from "node:path";
 import { connect, credsAuthenticator } from "@nats-io/transport-node";
 import { SMOKE_BROKER_TOKEN, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import { pickFreePort } from "./_free-port.js";
+import { startRosterFixture } from "./_roster-service.js";
 import {
   chatSubject,
   createSpaceAuth,
@@ -153,6 +154,7 @@ for (let i = 0; i < 50; i++) {
 if (!up) throw new Error(`server not up (exit ${child.exitCode}):\n${readFileSync(log, "utf8")}`);
 
 await setupSpaceStreams({ servers: server, space, creds: provCreds });
+const stopRoster = await startRosterFixture(space, server, auth);
 await seedChannelRegistry({
   servers: server,
   space,
@@ -232,6 +234,7 @@ const quietGot: string[] = [];
 const quietAgent = new CotalEndpoint({
   space, servers: server, creds: quietCreds, lifecycleUid: quietUid,
   card: { id: quietId.id, name: "quiet", role: "reviewer", kind: "agent" },
+  watchPresence: false,
   heartbeatMs: 500, ttlMs: 2000,
 });
 const quietErrors: string[] = [];
@@ -243,6 +246,7 @@ const talkerGot: string[] = [];
 const talker = new CotalEndpoint({
   space, servers: server, creds: talkerCreds, lifecycleUid: talkerUid,
   card: { id: talkerId.id, name: "talker", role: "planner", kind: "agent" },
+  watchPresence: false,
   channels: ["general"], heartbeatMs: 500, ttlMs: 2000,
 });
 talker.on("error", (e: Error) => console.log("talker err:", e.message));
@@ -271,6 +275,7 @@ const dmOut = await refusal(async () => quietAgent.unicast(talkerPrincipal, "on 
 await wait(400);
 check("an agent minted with allowPublish: [] can still SEND a DM (empty means no channels, not no publishing)", dmOut === "", dmOut);
 check("and the DM arrives", talkerGot.includes("DM:on it"), talkerGot);
+await talker.readPresence();
 check("a channel-less agent is on the roster", talker.getRoster().some((p) => p.card.name === "quiet"));
 
 // ---- 4. no default send channel ----------------------------------------------------------------
@@ -292,6 +297,7 @@ const soloCreds = await provisionAgent(prov, auth, soloId, { ...soloAcl, role: "
 const solo = new CotalEndpoint({
   space, servers: server, creds: soloCreds, lifecycleUid: soloUid,
   card: { id: soloId.id, name: "solo", role: "builder", kind: "agent" },
+  watchPresence: false,
   channels: ["ops"], heartbeatMs: 500, ttlMs: 2000,
 });
 solo.on("error", (e: Error) => console.log("solo err:", e.message));
@@ -322,6 +328,7 @@ await solo.stop();
 await talker.stop();
 await quietAgent.stop();
 await poster.stop();
+await stopRoster();
 await prov.stop();
 await killAndAwaitExit(child, "SIGTERM");
 rmSync(dir, { recursive: true, force: true });

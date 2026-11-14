@@ -2,6 +2,7 @@ import { userInfo } from "node:os";
 import * as readline from "node:readline";
 import {
   CotalEndpoint,
+  DEFAULT_HEARTBEAT_MS,
   parseJoinLink,
   resolvePeer,
   AmbiguousPeerError,
@@ -21,6 +22,7 @@ import {
   type SpaceAuth,
 } from "@cotal-ai/core";
 import { CommandFailure, activateTerminalSeat, issueTerminalSeat, retireTerminalSeat, seatExpiryAt, credsSpace, findMesh, inputDisabledByFlag, isConnectRefusal, preflightOrThrow, reachableOrThrow, readCredsFile, refreshRegistrationPolicy, refuseStaticCredsForKnownUserAuth, resolveTargetOrThrow, connectUserControlOrThrow, endpointAuth, type Connection, type MeshEntry, offlineRecipientNotice } from "@cotal-ai/workspace";
+import { createPresencePoller } from "@cotal-ai/workspace";
 import { credentialEnded } from "../lib/connect.js";
 import { withProvisioner } from "../lib/provisioner.js";
 import { resolveSpace } from "../lib/status.js";
@@ -268,6 +270,7 @@ async function joinSpace(args: ParsedArgs): Promise<void> {
     return fresh.bearer;
   } : undefined;
 
+  const mediatedRoster = Boolean(userConnection || auth.creds);
   const ep = new CotalEndpoint({
     space,
     servers: server,
@@ -277,6 +280,7 @@ async function joinSpace(args: ParsedArgs): Promise<void> {
     lifecycleUid,
     ...(acceptedToken !== undefined ? { acceptedToken } : {}),
     channels: [channel],
+    ...(mediatedRoster ? { watchPresence: false, managerRoster: !userConnection } : {}),
     card: {
       ...(userConnection ? { owner: userConnection.epCaller!.owner, actor: userConnection.epCaller!.actor } : {}),
       name,
@@ -356,6 +360,7 @@ async function joinSpace(args: ParsedArgs): Promise<void> {
         `${c.dim("•")} ${who(ev.presence.card)} ${statusBadge(ev.presence.status)}${presenceDetail(ev.presence)}${activityDetail(ev.presence)}`,
       );
   });
+  const rosterPoller = mediatedRoster ? createPresencePoller(ep, DEFAULT_HEARTBEAT_MS, (event) => ep.emit("presence", event), (error) => print(c.yellow(`! roster read failed: ${error instanceof Error ? error.message : String(error)}`))) : undefined;
 
   // A session that cannot come back ends with the reason and what to run, rather than retrying for
   // good. A reconnect that finds its inbox gone from the broker cannot bind it again. A credential
@@ -396,6 +401,7 @@ async function joinSpace(args: ParsedArgs): Promise<void> {
   /** Leave once the session is lost: stop the endpoint and end with its refusal. */
   const whenLost = async (): Promise<never> => {
     const failure = await lost;
+    rosterPoller?.stop();
     rl?.close();
     try { await ep.stop(); } catch { /* it ends either way */ }
     await leaveSeat();
@@ -404,6 +410,7 @@ async function joinSpace(args: ParsedArgs): Promise<void> {
 
   try {
     await ep.start();
+    await rosterPoller?.start();
   } catch (e) {
     await leaveSeat();
     // A bare `cotal join` binds a durable DM inbox nobody pre-created on an unprovisioned space;
@@ -416,6 +423,7 @@ async function joinSpace(args: ParsedArgs): Promise<void> {
   const shutdown = async (code = 0) => {
     print(c.dim("leaving…"));
     rl?.close();
+    rosterPoller?.stop();
     await ep.stop();
     await leaveSeat();
     process.exit(code);
@@ -490,6 +498,7 @@ async function joinSpace(args: ParsedArgs): Promise<void> {
           const target = rest.slice(0, sp);
           const text = rest.slice(sp + 1);
           try {
+            await rosterPoller?.read();
             const peer = resolvePeer(ep.getRoster(), target, { selfId: me });
             if (!peer) print(c.red(`no peer named "${target}" present`));
             else if (!readsDirectMessages(peer)) print(c.red(dmEndpointRefusal(peer.card.name)));

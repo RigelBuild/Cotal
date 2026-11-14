@@ -117,6 +117,7 @@ try {
     space,
     servers,
     creds: pubbyCreds,
+    watchPresence: false,
     card: { name: "Pubby", kind: "agent", id: pubbyId.id },
     channels: ["open-ch", "quiet-ch"],
     lifecycleUid: pubbyUid,

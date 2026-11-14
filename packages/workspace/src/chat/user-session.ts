@@ -175,6 +175,7 @@ export async function openUserChatSession(target: MeshTarget, options: {
     card: { owner, actor, name: options.label, kind: "endpoint", meta: { sessionKind: "chat" } },
     lifecycleUid,
     channels: [...options.channels],
+    watchPresence: false,
     bearer: bearerSource,
     sentinelCreds: first.sentinelCreds,
   });
@@ -186,6 +187,7 @@ export async function openUserChatSession(target: MeshTarget, options: {
   const session = new NativeChatSession({ endpoint, identity, retire, words: options.words });
   try {
     await endpoint.start();
+    await session.startUserRoster();
   } catch (e) {
     const close = await session.close();
     throw new CommandFailure("unknown", "OPERATION_UNKNOWN", `the user-mode chat session was admitted but did not connect (${e instanceof Error ? e.message : String(e)}); no automatic retry was made`, {

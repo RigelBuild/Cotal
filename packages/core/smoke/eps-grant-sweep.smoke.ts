@@ -138,6 +138,7 @@ const PRODUCERS: Record<Profile, () => string[]> = {
   issuer: via("issuer"),
   "webhook-publisher": via("webhook-publisher"),
   "registry-reader": via("registry-reader"),
+  "auth-roster-reader": via("auth-roster-reader"),
   "run-admitter": via("run-admitter", { runAdmitter: { endpoint: EP, runId: "run-sweep" } }),
   "transfer-writer": via("transfer-writer", { transferWriter: { instanceId: IID, hex: "0".repeat(64) } }),
   "transfer-reader": via("transfer-reader", { transferReader: { instanceId: IID } }),
@@ -156,6 +157,8 @@ console.log("A. exhaustiveness: every mint profile is swept, none skipped");
     missing.length === 0 && extra.length === 0, { missing, extra });
   c("every non-profile CredentialKind is accounted for explicitly (never silently dropped)",
     NON_PROFILE_KINDS.every((k) => k in CREDENTIAL_LIFETIMES), NON_PROFILE_KINDS);
+  const rosterRows = PRODUCERS["auth-roster-reader"]();
+  c("both auth and manager roster readers use the swept read-only profile", rosterRows.length > 0 && !rosterRows.some((row) => row.startsWith("$KV.")), rosterRows);
 }
 
 // ── the sweep ──────────────────────────────────────────────────────────────────────────────────

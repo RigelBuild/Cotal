@@ -16,6 +16,15 @@
   "progressPattern": "^  ok ",
   "mutations": [
     {
+      "name": "roster reader gains presence write",
+      "file": "packages/core/src/provision.ts",
+      "find": "pub: { allow: [`$JS.API.STREAM.INFO.${KV}`, `$JS.API.DIRECT.GET.${KV}`] },",
+      "replace": "pub: { allow: [`$JS.API.STREAM.INFO.${KV}`, `$JS.API.DIRECT.GET.${KV}`, `$KV.${presenceBucket(space)}.>`] },",
+      "afterRestore": "pnpm --filter @cotal-ai/core build",
+      "expectRed": "roster readers have only presence read and inbox grants",
+      "cell": "roster readers have only presence read and inbox grants"
+    },
+    {
       "name": "one declared profile is omitted",
       "file": "implementations/auth/smoke/prototypes/issued-profile-census.ts",
       "find": "supervisor: () => one(\"supervisor\"),",

@@ -98,11 +98,13 @@ c("issued per-goal progress row is the plain triple: the subject the endpoint pu
 const baseline = epBaselineGrantRows("demo", caller);
 c("baseline: the ONE wildcard-endpoint form is describe-only, caller pinned, nonce-tailed",
   baseline.pub[0] === `cotal.demo.ep.one.*.describe.u_abc.cli.${UID}.*`);
-c("baseline: delivery join/leave/list untargeted + manager stop/turn-participate/turn-pending/turn-yield/turn-unconfirmed/run-answer self-mode + the ONE epc-subject-scoped store fetch, nothing else",
-  baseline.pub.length === 11
+c("baseline: delivery commands, manager self commands, both roster commands and the epc store fetch",
+  baseline.pub.length === 13
   && baseline.pub.includes(`cotal.demo.ep.one.delivery.join.u_abc.cli.${UID}.*`)
   && baseline.pub.includes(`cotal.demo.ep.one.delivery.leave.u_abc.cli.${UID}.*`)
   && baseline.pub.includes(`cotal.demo.ep.one.delivery.list.u_abc.cli.${UID}.*`)
+  && baseline.pub.includes(`cotal.demo.ep.one.auth.roster.u_abc.cli.${UID}.*`)
+  && baseline.pub.includes(`cotal.demo.ep.one.manager.roster.u_abc.cli.${UID}.*`)
   && baseline.pub.includes(`cotal.demo.ep.one.manager.stop.self.u_abc.cli.${UID}.*`)
   && baseline.pub.includes(`cotal.demo.ep.one.manager.turn-participate.self.u_abc.cli.${UID}.*`)
   // The turn relay's seat half rides self mode too: a seat that cannot pull its own turns has no

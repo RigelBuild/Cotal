@@ -37,6 +37,7 @@ import type { AgentConfig } from "../src/config.js";
 import type { InboxItem } from "../src/agent.js";
 import { pickFreePort } from "./_free-port.js";
 import { SMOKE_BROKER_TOKEN, awaitBrokerReady, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { startRosterFixture } from "../../../packages/core/smoke/_roster-service.js";
 
 const PORT = await pickFreePort();
 const servers = `nats://127.0.0.1:${PORT}`;
@@ -71,6 +72,7 @@ const check = (name: string, cond: boolean, extra?: unknown) => {
 };
 
 const channels = ["normal-ch", "quiet-ch", "muted-ch"];
+let stopRoster: (() => Promise<void>) | undefined;
 
 try {
   await awaitBrokerReady(() => isReachable(servers), { servers, attempts: 50, delayMs: 200 });
@@ -79,6 +81,7 @@ try {
   // and the two peers' bind-only durables + scoped "agent" creds.
   const mgrCreds = await mintCreds(auth, newIdentity(), "provisioner");
   await setupSpaceStreams({ servers, space, creds: mgrCreds });
+  stopRoster = await startRosterFixture(space, servers, auth);
   await seedChannelRegistry({ servers, space, creds: mgrCreds, file: { defaults: { replay: true }, channels: { "fx51-durable": { deliveryClass: "durable" }, "fx51fam.dur": { deliveryClass: "durable" }, "fx51star.dur": { deliveryClass: "durable" }, "fx51left.dur": { deliveryClass: "durable" }, "fx51left.sub.dur": { deliveryClass: "durable" } } } });
   const mgr = new CotalEndpoint({ space, servers, creds: mgrCreds, card: { name: "mgr", kind: "endpoint" }, consume: false, registerPresence: false, watchPresence: false });
   mgr.on("error", () => {});
@@ -309,7 +312,7 @@ try {
   agent.on("incoming", (i: InboxItem) => incoming.push(i));
   agent.on("mention-wake", (i: InboxItem) => mentionWake.push(i));
 
-  const pub = new CotalEndpoint({ space, servers, creds: pubbyCreds, card: { name: "Pubby", kind: "agent", id: pubbyId.id }, channels, lifecycleUid: pubbyUid });
+  const pub = new CotalEndpoint({ space, servers, creds: pubbyCreds, card: { name: "Pubby", kind: "agent", id: pubbyId.id }, channels, lifecycleUid: pubbyUid, watchPresence: false });
   pub.on("error", () => {});
 
   await pub.start();
@@ -319,6 +322,7 @@ try {
   await sleep(300);
 
   // ---- file-default modes are visible in presence at BOOT over the auth wire, before any toggle ----
+  await pub.readPresence();
   const bootSeen = pub.getRoster().find((p) => p.card.id === ottoPrincipal);
   check("file-default channelModes visible in presence at boot under auth (no toggle yet)",
     bootSeen?.channelModes?.["quiet-ch"] === "quiet" && bootSeen?.channelModes?.["muted-ch"] === "muted");
@@ -362,14 +366,17 @@ try {
   // ---- presence mirror over the wire: a SEPARATE peer sees attention + channelModes ----
   await agent.setAttention("dnd");
   await agent.setChannelMode("normal-ch", "muted"); // runtime override on top of file defaults
-  await sleep(500);
+  await sleep(1_100);
+  await pub.readPresence();
   const seen = pub.getRoster().find((p) => p.card.id === ottoPrincipal);
   check("peer reads Otto's global attention from presence (auth wire)", seen?.attention === "dnd");
   check("peer reads Otto's channelModes from presence (auth wire)",
     seen?.channelModes?.["normal-ch"] === "muted" && seen?.channelModes?.["quiet-ch"] === "quiet" && seen?.channelModes?.["muted-ch"] === "muted");
   await agent.setChannelMode("normal-ch", "normal");
-  await sleep(400);
-  check("clearing a mode removes the key for the peer", pub.getRoster().find((p) => p.card.id === ottoPrincipal)?.channelModes?.["normal-ch"] === undefined);
+  await sleep(1_100);
+  await pub.readPresence();
+  const cleared = pub.getRoster().find((p) => p.card.id === ottoPrincipal);
+  check("clearing a mode removes the key for the peer", cleared !== undefined && cleared.channelModes?.["normal-ch"] === undefined);
 
   // ---- reset on restart ----
   const fresh = new MeshAgent(cfg);
@@ -380,6 +387,7 @@ try {
   await pub.stop();
   await mgr.stop();
 } finally {
+  await stopRoster?.().catch(() => {});
   srv.kill("SIGKILL");
   await awaitExit(srv);
   rmSync(dir, { recursive: true, force: true });

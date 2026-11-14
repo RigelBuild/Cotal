@@ -201,6 +201,8 @@ export type Profile =
   // The REGISTRY READER (SPEC 13.20): the registry's reads and nothing else. The evidence store's
   // leader read, the records key list and `svc` spec/status rows, and contract artifacts by subject.
   | "registry-reader"
+  // The auth plane's independent world-readable presence-roster reader. No auth-store credential grants.
+  | "auth-roster-reader"
   // The RUN ADMITTER (SPEC 14.8): the one-shot connection a hosting manager admits a workflow run
   // over. Creates that ONE run's admission record and, later, its revocation marker. The driver
   // holds nothing on this store; the mediator reads it.
@@ -232,6 +234,7 @@ export const PROFILES = Object.freeze([
   "environment-manager-executor", "environment-manager-goal-writer", "dm-reader", "issued-store-recreate",
   "registry-reader",
   "webhook-publisher",
+  "auth-roster-reader",
 ] as const satisfies readonly Profile[]);
 
 type _AllProfiles = Exclude<Profile, (typeof PROFILES)[number]> extends never ? true : never;
@@ -337,6 +340,7 @@ export const CREDENTIAL_LIFETIMES: Record<CredentialKind, CredentialLifetimePoli
   "run-mediator": { class: "standing-renewable", defaultTtlSeconds: STANDING_RENEWABLE_TTL_SEC, renewalOwner: "manager", note: "trusted workflow host operations, bound to one run and attempt; kept on the hosting process's connection" },
   "run-operator": { class: "one-shot", defaultTtlSeconds: 60, note: "one served run-status / run-ps / run-answer call (SPEC 14.3): the hosting manager mints it per call on its own connection, never the serve rails; 60s bounds a copied cred to a minute" },
   "registry-reader": { class: "standing-renewable", defaultTtlSeconds: 60 * 60, renewalOwner: "registry host", note: "the registry's reads (SPEC 13.20), no write of any shape; the evidence-store read is stream-scoped, so it can read every recorded ceiling in the space (a NAMED RESIDUAL), and one hour bounds a copied credential; the process hosting the registry re-mints it" },
+  "auth-roster-reader": { class: "standing-renewable", defaultTtlSeconds: 60 * 60, renewalOwner: "roster host", note: "independent presence roster reader; no writes and no auth-store grants" },
   issuer: { class: "mixed", defaultTtlSeconds: FIVE_MINUTES, renewalOwner: "auth-service", note: "renewed as the auth plane's held session for connect-time issuance (re-minted before exp, closed with the plane); one-shot for every other issuance window and for a lifecycle terminal's issuance retirement (SPEC 13.15)" },
   "run-admitter": { class: "one-shot", defaultTtlSeconds: 60, note: "one hosted run's admission record create, or its revocation marker (SPEC 14.8); 60s bounds a copied cred to a minute" },
   "transfer-writer": { class: "one-shot", defaultTtlSeconds: FIVE_MINUTES, note: "one carried resume per CLI call: one object's chunk and meta subjects in one instance's transfer bucket" },
@@ -1390,6 +1394,7 @@ export function permissionsFor(
   }
   if (profile === "issuer") return issuerPermissions(space, pr);
   if (profile === "registry-reader") return registryReaderPermissions(space, pr);
+  if (profile === "auth-roster-reader") return authRosterReaderPermissions(space, pr);
   if (profile === "run-admitter") {
     if (!opts.runAdmitter) throw new Error("permissionsFor: run-admitter requires opts.runAdmitter ({endpoint, runId} of the ONE run it admits)");
     return runAdmitterPermissions(space, pr, opts.runAdmitter);
@@ -1657,18 +1662,7 @@ export function permissionsFor(
     `$JS.API.CONSUMER.INFO.${DLV}.${dlvD}`,
     `$JS.API.CONSUMER.MSG.NEXT.${DLV}.${dlvD}`,
     `$JS.ACK.${DLV}.${dlvD}.>`,
-    // Presence: on-demand read + watch (read, public roster) + flow control + PUT OWN KEY ONLY.
-    // The read is a batched Direct Get of the bucket (SPEC §6): a seat reads the roster when it acts
-    // instead of receiving every member's heartbeat. Its reply subject is caller-chosen, the same
-    // vector the consumer create below already grants on the same world-readable bucket, so it
-    // reaches no byte the watch could not. The watch rows stay for seats built before the read.
-    `$JS.API.DIRECT.GET.${KV}`,
-    `$JS.API.CONSUMER.CREATE.${KV}.>`,
-    `$JS.API.CONSUMER.INFO.${KV}.>`,
-    // No CONSUMER.DELETE here or on the registry below: the watch's `oc_<nuid>_<serial>` name
-    // cannot be pinned, and a stream-wide delete reaches every peer's watch cursor (#691). A
-    // rebuild's predecessor delete is not published under these claims (#4123), and the consumer
-    // stays until the broker's inactive threshold.
+    // Presence writes only the holder's own key; roster reads use a service command.
     "$JS.FC.>",
     presenceKeySubject(space, pr.owner, pr.actor), // own presence key (owner+actor) only — can't spoof peers
     // Channel registry: read-only (watch + direct kv.get for the join-time replay decision).
@@ -2080,9 +2074,7 @@ function operatorPermissions(space: string, pr: MintPrincipal): Record<string, u
         anycastSubject(space, "*", pr.owner, pr.actor), // svc.*.<o>.<a>   — anycast any role as me
         `$KV.${presenceBucket(space)}.${principalKey(pr.owner, pr.actor).key}`, // own presence key only
         "$JS.API.INFO",
-        // Presence read (name→id resolution + the roster). The transient endpoint reads the bucket once
-        // with a batched Direct Get, whose request subject is the bare stream (#4091); the consumer rows
-        // serve a watch. No STREAM.MSG.GET.
+        // Trusted operator credentials retain their existing presence read path.
         `$JS.API.STREAM.INFO.${PKV}`,
         `$JS.API.DIRECT.GET.${PKV}`,
         `$JS.API.CONSUMER.CREATE.${PKV}.>`,
@@ -2717,6 +2709,13 @@ function registryReaderPermissions(space: string, pr: MintPrincipal): Record<str
         `$JS.API.DIRECT.GET.${epcStreamName(space)}.${spacePrefix(space)}.epc.>`,
       ],
     },
+    sub: { allow: [`_INBOX_${pr.connId}.>`] },
+  };
+}
+function authRosterReaderPermissions(space: string, pr: MintPrincipal): Record<string, unknown> {
+  const KV = `KV_${presenceBucket(space)}`;
+  return {
+    pub: { allow: [`$JS.API.STREAM.INFO.${KV}`, `$JS.API.DIRECT.GET.${KV}`] },
     sub: { allow: [`_INBOX_${pr.connId}.>`] },
   };
 }

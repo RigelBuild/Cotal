@@ -7,6 +7,20 @@ do when a deployment already exists, holds credentials, and cannot be torn down 
 release that breaks a running deployment gets a section here. Each section names what migrates on
 its own, what does not, and the order of the steps.
 
+## Roster reads
+
+Upgrade the manager before static agents and the auth service before user-auth agents. These services
+must serve the paged `roster` command before agents rely on it. A refused or unavailable command fails
+the read without a raw fallback. Agent credentials no longer grant raw presence reads or watches.
+One-shot CLI reads with a static agent credential require a running manager in that space.
+If it is unavailable, start the manager or use an operator credential.
+
+An issued agent credential cannot read the roster from a one-shot CLI call. Run the call inside the
+agent session or use an operator credential.
+
+Static agent endpoints now default to no presence watch. Embedders that consume presence events
+must poll `readPresence()` and diff the results. An explicit `watchPresence: true` is refused.
+
 ## Migration commits need pause cleanup custody
 
 Library callers of `commitMigration` that supply journal entries and a handler must provide the

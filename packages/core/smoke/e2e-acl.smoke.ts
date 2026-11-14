@@ -153,7 +153,7 @@ try {
   const mkEp = (a: { name: string; ident: { id: string }; creds: string; uid: string }) => {
     const errors: string[] = [];
     const got: Got[] = [];
-    const ep = new CotalEndpoint({ space, servers: SERVERS, creds: a.creds, card: { name: a.name, kind: "agent", id: a.ident.id }, channels: ["general"], lifecycleUid: a.uid });
+    const ep = new CotalEndpoint({ space, servers: SERVERS, creds: a.creds, card: { name: a.name, kind: "agent", id: a.ident.id }, channels: ["general"], lifecycleUid: a.uid, watchPresence: false });
     ep.on("error", (e: Error) => errors.push(e.message));
     ep.on("message", (m: CotalMessage, d: Delivery, meta?: MessageMeta) => { got.push({ channel: m.channel, text: textOf(m), historical: meta?.historical ?? false }); d.ack(); });
     return { ep, errors, got };

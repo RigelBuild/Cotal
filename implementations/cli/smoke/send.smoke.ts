@@ -53,6 +53,7 @@ import {
 import { killAndAwaitExit, SMOKE_BROKER_TOKEN, teardownOnSignal, teardownPathOnSignal } from "@cotal-ai/smoke-kit";
 import { authDir, recordMesh, saveSpaceAuth, setCurrent } from "@cotal-ai/workspace";
 import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
+import { startRosterFixture } from "../../../packages/core/smoke/_roster-service.js";
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const EXPECTED = 85;
@@ -133,6 +134,7 @@ const expectedSender = `${userInfo().username}@${hostname()}`;
 const got: Array<{ route: string; text: string; fromId: string; fromName: string }> = [];
 // Bob's endpoint options and message handler, kept so the same lifecycle can come back later.
 let bobOptions: ConstructorParameters<typeof CotalEndpoint>[0];
+let stopRoster: (() => Promise<void>) | undefined;
 const onBobMessage = (message: CotalMessage, delivery: Delivery) => {
   const text = message.parts.map((part) => (part.kind === "text" ? part.text : "")).join("");
   const route = message.to ? "DM" : message.toService ? `ANY:${message.toService}` : `#${message.channel ?? ""}`;
@@ -152,6 +154,7 @@ try {
 
   const provisionerCreds = await mintCreds(auth, newIdentity(), "provisioner");
   await setupSpaceStreams({ servers, space, creds: provisionerCreds });
+  stopRoster = await startRosterFixture(space, servers, auth);
   await seedChannelRegistry({ servers, space, creds: provisionerCreds, file: { channels: { general: {} } } });
   saveSpaceAuth(authDir(meshRoot), auth);
   const priorCotalHome = process.env.COTAL_HOME;
@@ -272,8 +275,7 @@ try {
   const consumersAfter = await watchConsumers();
   const listed = await run(["channel"]);
   const consumersAfterList = await watchConsumers();
-  // A --creds credential reads once when its own grant holds the Direct Get rows, as the operator
-  // credential does. An agent credential from `cotal auth mint` holds none, so it watches instead.
+  // Operator credentials use Direct Get. Agent credentials read through manager.roster.
   const operatorRead = join(tmp, "operator-read.creds");
   writeFileSync(operatorRead, await mintCreds(auth, newIdentity(), "operator"), { mode: 0o600 });
   const agentRead = join(tmp, "agent-read.creds");
@@ -321,11 +323,13 @@ try {
     { operatorSend, before: consumersAfterList, after: consumersAfterOperator },
   );
   check(
-    "an agent credential passed with --creds holds both batched reads, so it reads once, leaves no consumer, and its channel send is stored (#4091)",
+    "an agent credential reads presence through manager without a watch and its channel send is stored",
     agentSend.code === 0 && got.some((m) => m.route === "#general" && m.text === agentReadText) &&
       consumersAfterAgent.presence === consumersAfterOperator.presence && consumersAfterAgent.channels === consumersAfterOperator.channels,
     { agentSend, before: consumersAfterOperator, after: consumersAfterAgent },
   );
+  await stopRoster();
+  stopRoster = undefined;
   check(
     "a credential passed with --creds that may not read presence refuses PERMISSION_DENIED, exit 2, before anything is sent",
     noReadSend.code === 2 && noReadSend.stdout.includes('"code":"PERMISSION_DENIED"') && !got.some((m) => m.text === "never stored"),
@@ -860,6 +864,7 @@ try {
     got.filter((g) => g.route === "DM").map((g) => g.text),
   );
 } finally {
+  await stopRoster?.().catch(() => {});
   await bob?.stop().catch(() => {});
   await carol?.stop().catch(() => {});
   await dave?.stop().catch(() => {});

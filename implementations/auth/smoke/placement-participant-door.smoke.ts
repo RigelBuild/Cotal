@@ -150,7 +150,7 @@ function recordingPort(): { port: PlacementEnrollmentAuthority; calls: { op: str
 
   // The four commands are served on the auth endpoint.
   const stub = (): unknown => { throw new EpEnvelopeError("unimplemented", "stub"); };
-  const handlers: AuthServiceHandlers = { retireLifecycle: stub, verifyPlacementEnrollment: stub, enrollmentEffectStatus: stub, closeEnrollmentEffect: stub, retirePlacementEnrollment: stub };
+  const handlers: AuthServiceHandlers = { roster: async () => { throw new EpEnvelopeError("unimplemented", "stub"); }, retireLifecycle: stub, verifyPlacementEnrollment: stub, enrollmentEffectStatus: stub, closeEnrollmentEffect: stub, retirePlacementEnrollment: stub };
   const defs = authCommandDefs(handlers);
   for (const name of AUTH_PLACEMENT_COMMANDS) assert.ok(defs.some((d) => d.command === name), `${name} must be served`);
   console.log("  ✓ the four placement commands are served on the auth endpoint");

@@ -114,7 +114,7 @@ const agentPrincipal = principalKey(DEV_OWNER, ident.id).key;
 await dlv.startPlane3((owner) => (owner === agentPrincipal ? allowSub : undefined));
 const errors: string[] = [];
 const got: { channel?: string; text: string; historical: boolean }[] = [];
-const agent = new CotalEndpoint({ space, servers: server, creds: agentCreds, card: { name: "ag1", kind: "agent", id: ident.id }, channels: ["log", "general"], lifecycleUid: UID });
+const agent = new CotalEndpoint({ space, servers: server, creds: agentCreds, card: { name: "ag1", kind: "agent", id: ident.id }, channels: ["log", "general"], lifecycleUid: UID, watchPresence: false });
 agent.on("error", (e: Error) => errors.push(e.message));
 agent.on("message", (m: CotalMessage, d: Delivery, meta?: MessageMeta) => { got.push({ channel: m.channel, text: textOf(m), historical: meta?.historical ?? false }); d.ack(); });
 await agent.start();

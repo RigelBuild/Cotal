@@ -12,11 +12,16 @@ import {
   buildClusterArtifacts,
   buildClusterDocument,
   serviceContractTable,
+  AUTH_ROSTER_INPUT_SCHEMA,
+  AUTH_ROSTER_OUTPUT_SCHEMA,
+  AUTH_ROSTER_COMMAND,
   type ClusterDocument,
   type ContractClosureManifest,
   type EpAuthzMode,
   type EpCommandDef,
   type EpServeContext,
+  type AuthRosterInput,
+  type AuthRosterOutput,
 } from "@cotal-ai/core";
 
 /** The auth plane's endpoint NAME (matches `AUTH_ENDPOINT` in `@cotal-ai/core`). */
@@ -189,23 +194,23 @@ const RETIRE_PLACEMENT_OUTPUT_SCHEMA = {
 } as const;
 
 interface CommandRow {
-  name: string;
+  name: "retire-lifecycle" | typeof AUTH_ROSTER_COMMAND | "verify-placement-enrollment" | "enrollment-effect-status" | "close-enrollment-effect" | "retire-placement-enrollment";
   capability: string;
   input: unknown;
   output: unknown;
   targeted: boolean;
   modes?: EpAuthzMode[];
-  handler: keyof AuthServiceHandlers;
 }
 
 const PLACEMENT_CAPABILITY = "auth.placement";
 
 const ROWS: CommandRow[] = [
-  { name: "retire-lifecycle", capability: "auth.admin", input: RETIRE_LIFECYCLE_INPUT_SCHEMA, output: RETIRE_LIFECYCLE_OUTPUT_SCHEMA, targeted: true, modes: ["exact"], handler: "retireLifecycle" },
-  { name: "verify-placement-enrollment", capability: PLACEMENT_CAPABILITY, input: VERIFY_PLACEMENT_INPUT_SCHEMA, output: VERIFY_PLACEMENT_OUTPUT_SCHEMA, targeted: false, handler: "verifyPlacementEnrollment" },
-  { name: "enrollment-effect-status", capability: PLACEMENT_CAPABILITY, input: EFFECT_STATUS_INPUT_SCHEMA, output: PLACEMENT_STATUS_SCHEMA, targeted: false, handler: "enrollmentEffectStatus" },
-  { name: "close-enrollment-effect", capability: PLACEMENT_CAPABILITY, input: CLOSE_EFFECT_INPUT_SCHEMA, output: PLACEMENT_STATUS_SCHEMA, targeted: false, handler: "closeEnrollmentEffect" },
-  { name: "retire-placement-enrollment", capability: PLACEMENT_CAPABILITY, input: RETIRE_PLACEMENT_INPUT_SCHEMA, output: RETIRE_PLACEMENT_OUTPUT_SCHEMA, targeted: false, handler: "retirePlacementEnrollment" },
+  { name: "retire-lifecycle", capability: "auth.admin", input: RETIRE_LIFECYCLE_INPUT_SCHEMA, output: RETIRE_LIFECYCLE_OUTPUT_SCHEMA, targeted: true, modes: ["exact"] },
+  { name: "verify-placement-enrollment", capability: PLACEMENT_CAPABILITY, input: VERIFY_PLACEMENT_INPUT_SCHEMA, output: VERIFY_PLACEMENT_OUTPUT_SCHEMA, targeted: false },
+  { name: "enrollment-effect-status", capability: PLACEMENT_CAPABILITY, input: EFFECT_STATUS_INPUT_SCHEMA, output: PLACEMENT_STATUS_SCHEMA, targeted: false },
+  { name: "close-enrollment-effect", capability: PLACEMENT_CAPABILITY, input: CLOSE_EFFECT_INPUT_SCHEMA, output: PLACEMENT_STATUS_SCHEMA, targeted: false },
+  { name: "retire-placement-enrollment", capability: PLACEMENT_CAPABILITY, input: RETIRE_PLACEMENT_INPUT_SCHEMA, output: RETIRE_PLACEMENT_OUTPUT_SCHEMA, targeted: false },
+  { name: AUTH_ROSTER_COMMAND, capability: "auth.roster", input: AUTH_ROSTER_INPUT_SCHEMA, output: AUTH_ROSTER_OUTPUT_SCHEMA, targeted: false },
 ];
 
 /** The placement participant commands, served by the auth endpoint and admitted only from the
@@ -222,10 +227,9 @@ export const AUTH_CONTRACTS = TABLE.contracts;
  *  DISTINCT schema root plus its single-member closure manifest. */
 export const authContractArtifactValues = TABLE.artifactValues;
 
-/** The §13.7 cluster DOCUMENT: the content-addressed authority for the auth plane's served
- *  command surface. Revision 2: `retire-lifecycle` plus the four placement participant commands. */
+/** Revision 3 adds roster to the placement and retirement commands. */
 export function authClusterDocument(): ClusterDocument {
-  return buildClusterDocument(AUTH_CLUSTER_URN, 2, ROWS);
+  return buildClusterDocument(AUTH_CLUSTER_URN, 3, ROWS);
 }
 
 /** The two-digest §13.7 content addressing for the auth document: both artifacts publish to the
@@ -245,6 +249,7 @@ export function authClusterArtifacts(): {
  *  value (the compiled output contract validates it at the serve boundary). Kept as a narrow
  *  interface so the contract module stays broker-free. */
 export interface AuthServiceHandlers {
+  roster(ctx: EpServeContext, input: AuthRosterInput): Promise<AuthRosterOutput>;
   retireLifecycle(ctx: EpServeContext): unknown | Promise<unknown>;
   verifyPlacementEnrollment(ctx: EpServeContext): unknown | Promise<unknown>;
   enrollmentEffectStatus(ctx: EpServeContext): unknown | Promise<unknown>;
@@ -256,9 +261,17 @@ export interface AuthServiceHandlers {
 export function authCommandDefs(handlers: AuthServiceHandlers): EpCommandDef[] {
   // Reading a pair compiles it (the table is lazy), so a compile failure surfaces here, at
   // registration, where serve needs the validators.
-  return ROWS.map((r) => ({
-    command: r.name,
-    contract: AUTH_CONTRACTS[r.name],
-    handler: (ctx: EpServeContext) => handlers[r.handler](ctx),
-  }));
+  const dispatch: Record<CommandRow["name"], EpCommandDef["handler"]> = {
+    "retire-lifecycle": (ctx) => handlers.retireLifecycle(ctx),
+    "verify-placement-enrollment": (ctx) => handlers.verifyPlacementEnrollment(ctx),
+    "enrollment-effect-status": (ctx) => handlers.enrollmentEffectStatus(ctx),
+    "close-enrollment-effect": (ctx) => handlers.closeEnrollmentEffect(ctx),
+    "retire-placement-enrollment": (ctx) => handlers.retirePlacementEnrollment(ctx),
+    [AUTH_ROSTER_COMMAND]: (ctx) => {
+      const args = ctx.request.args;
+      const limit = args?.limit, after = args?.after;
+      return handlers.roster(ctx, { ...(typeof limit === "number" ? { limit } : {}), ...(typeof after === "string" ? { after } : {}) });
+    },
+  };
+  return ROWS.map((row) => ({ command: row.name, contract: AUTH_CONTRACTS[row.name], handler: dispatch[row.name] }));
 }

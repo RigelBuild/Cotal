@@ -141,6 +141,7 @@ try {
     card: { id: aId.id, name: "alice", kind: "agent" },
     channels: ["general", "ops"],
     lifecycleUid: uidA,
+    watchPresence: false,
     heartbeatMs: 500,
     ttlMs: 2000,
   });
@@ -341,6 +342,7 @@ try {
   const b = new CotalEndpoint({
     space, servers: SERVERS, creds: bCreds,
     card: { id: bId.id, name: "bob", kind: "agent" },
+    watchPresence: false,
     channels: ["ops"], lifecycleUid: uidB, heartbeatMs: 500, ttlMs: 2000,
   });
   const gotB: string[] = [];

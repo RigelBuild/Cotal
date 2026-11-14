@@ -122,6 +122,7 @@ import { RunCancelObservations, type RunCancelLimits } from "./run-cancel-observ
 import { jitteredBackoffMs, readCancellationAdmission, resolveReadAcl, type RunDelegation } from "@cotal-ai/core";
 import type { DelegatedUserIntentIncarnation } from "./delegated-user-intent.js";
 import { joinOrStartRetirement, openAuthAdminListener, type RetirementFlights } from "./auth-admin.js";
+import { openAuthRosterReader } from "@cotal-ai/core";
 import { registerSelfAuthorizedInstance } from "./service-registration.js";
 import { openAuthRegistry } from "./registry-host.js";
 import { registry as extensionRegistry, type RegistryService } from "@cotal-ai/core";
@@ -774,12 +775,12 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
   // stays with the plane's own registry + retirement deps (the drain rides the ONE sealed records
   // scanner exactly like the boot resume); the listener only authorizes (subject attribution +
   // the FRESH space-manager-lease holder check) and dispatches.
-  // The placement authority is built after this listener opens (its helpers are defined below), so
-  // the listener reads it through this getter. `placementConfigured` is the boot-time fact, known now:
-  // a configured plane whose port is not yet built answers `unavailable` (starting), not permanent misconfig.
+  // The placement authority is built after this listener opens; the getter follows its readiness.
   let placementAuthority: PlacementEnrollmentAuthority | undefined;
   const placementConfigured = Boolean(opts.placementReconciler && opts.placementAuthenticator && opts.placementRolePolicy);
-  const authAdmin = await openAuthAdminListener({ onConnection, server, space, dataAccount, reg: barrierReg, retirement, barrierFlight: retirementFlights, instanceId: authServeInstanceId, epoch: authServeGrant.epoch, grant: authServeGrant, log, placement: { configured: placementConfigured, port: () => placementAuthority } });
+  const rosterReader = await openAuthRosterReader({ server, space, auth: dataAccountAuth(space, dataAccount), onConnection, log });
+  unwind.push(() => rosterReader.close());
+  const authAdmin = await openAuthAdminListener({ onConnection, server, space, dataAccount, reg: barrierReg, retirement, rosterReader, barrierFlight: retirementFlights, instanceId: authServeInstanceId, epoch: authServeGrant.epoch, grant: authServeGrant, log, placement: { configured: placementConfigured, port: () => placementAuthority } });
   unwind.push(() => authAdmin.close());
   if (opts.registry !== undefined) {
     unwind.push(async () => { await registryHost?.close(); });
@@ -2220,6 +2221,7 @@ async function buildAuthAuthorityPlane(opts: OpenAuthAuthorityPlaneOptions, unwi
       const scannerFlight = closeScanners ??= (async () => {
         await registrationFamilyScan.close();
         await authAdmin?.close();
+        await rosterReader.close();
         const results = await Promise.allSettled([reader.close(), recordsScanner.close(), scanner.close()]);
         const errors = results.filter((r): r is PromiseRejectedResult => r.status === "rejected").map((r) => r.reason);
         if (errors.length) throw new AggregateError(errors, "auth scan-capable clients failed to close");
