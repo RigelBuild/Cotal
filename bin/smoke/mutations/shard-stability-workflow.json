@@ -31,6 +31,15 @@
       "expectRed": "the shipped detector refuses unsupported smoke job conditions instead of inventing topology",
       "cell": "the shipped detector refuses unsupported smoke job conditions instead of inventing topology",
       "afterRestore": "pnpm smoke:shard-stability"
+    },
+    {
+      "name": "topology reader refuses an extra guarded shard-step env key",
+      "file": "bin/smoke/shard-stability.ts",
+      "find": "  const guardedRevisionEnv = activeShardStep.length === 6 &&",
+      "replace": "  const guardedRevisionEnv = activeShardStep.length >= 6 &&",
+      "expectRed": "the shipped detector refuses an extra env key on the guarded shard step",
+      "cell": "the shipped detector refuses an extra env key on the guarded shard step",
+      "afterRestore": "pnpm smoke:shard-stability"
     }
   ]
 }

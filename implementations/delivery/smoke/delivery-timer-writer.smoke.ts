@@ -258,32 +258,28 @@ try {
   //    while the daemon adopts each new generation are all armed and fired.
   {
     const until = Math.max(firstCredExpMs + DLV_TTL_S * 1000 + 2_000, Date.now() + 20_000);
-    const tokens: { token: string; deadline: number }[] = [];
-    const firedTokens = new Set<string>();
+    const tokens: string[] = [];
     while (Date.now() < until) {
       const token = `cp_timerw_swap_${tokens.length + 1}`;
       const now = Date.now();
-      const deadline = now + 3_000;
-      await mintCheckpoint(kv, jetstream(serveNc), space, { ref: { endpoint: EP, token }, instanceId: IID, epoch: EPOCH, holder, deadline, now });
-      tokens.push({ token, deadline });
+      await mintCheckpoint(kv, jetstream(serveNc), space, { ref: { endpoint: EP, token }, instanceId: IID, epoch: EPOCH, holder, deadline: now + 3_000, now });
+      tokens.push(token);
       await wait(2_000);
     }
-    // The broker removes .armed on fire, so .fire is the lasting record; poll until every fire arrives.
-    const lastDeadline = tokens.at(-1)?.deadline ?? 0;
-    const fireDeadline = lastDeadline + 5_000;
-    while (firedTokens.size < tokens.length && Date.now() < fireDeadline) {
-      const newlyFired = await Promise.all(tokens.filter(({ token }) => !firedTokens.has(token)).map(async ({ token }) => {
-        const f = await jsm.streams.getMessage(eptStreamName(space), { last_by_subj: eptSubject(space, EP, IID, EPOCH, token, "fire") }).catch(() => null);
-        return f?.header?.get("Nats-Scheduler") === eptSubject(space, EP, IID, EPOCH, token, "armed") ? token : undefined;
-      }));
-      for (const token of newlyFired) if (token !== undefined) firedTokens.add(token);
-      if (firedTokens.size < tokens.length) await wait(Math.min(100, Math.max(0, fireDeadline - Date.now())));
+    await wait(8_000);
+    // The broker removes a one-shot schedule's `.armed` message once it fires, so the lasting record
+    // of an arm is the `.fire` the broker published from it.
+    let firedN = 0;
+    for (const token of tokens) {
+      const f = await jsm.streams.getMessage(eptStreamName(space), { last_by_subj: eptSubject(space, EP, IID, EPOCH, token, "fire") }).catch(() => null);
+      if (f?.header?.get("Nats-Scheduler") === eptSubject(space, EP, IID, EPOCH, token, "armed")) firedN++;
     }
-    check(`every .schedule published across the daemon's credential renewals was armed and fired (${firedTokens.size}/${tokens.length})`,
-      tokens.length >= 5 && firedTokens.size === tokens.length, { firedN: firedTokens.size, tokens: tokens.length });
+    check(`every .schedule published across the daemon's credential renewals was armed and fired (${firedN}/${tokens.length})`,
+      tokens.length >= 5 && firedN === tokens.length, { firedN, tokens: tokens.length });
     check("the writer never went down across two credential expiries: its connection follows each adopted credential",
       !daemonOut.includes("timer writer: down"), daemonOut.split("\n").filter((l) => l.includes("timer writer: down")));
   }
+
   // 5. The daemon still exits promptly on SIGTERM with the writer running (shutdown wiring).
   daemon.kill("SIGTERM");
   let exited = false;

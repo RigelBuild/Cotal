@@ -22,7 +22,7 @@
  * Run: pnpm smoke:launch-matrix:live
  */
 import { spawn as spawnProc, spawnSync, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -314,7 +314,16 @@ try {
   const fishFile = join(xdg, "fish", "completions", "cotal.fish");
   check("completion install fish writes a completions file that calls `cotal __complete`",
     fish.status === 0 && existsSync(fishFile) && readFileSync(fishFile, "utf8").includes("cotal __complete"), out(fish));
-  const pwshAvailable = process.platform !== "win32" && (process.env.PATH ?? "").split(delimiter).some((dir) => existsSync(join(dir, "pwsh")));
+  const pwshAvailable = process.platform !== "win32" && (process.env.PATH ?? "").split(delimiter).some((dir) => {
+    try {
+      const path = join(dir, "pwsh");
+      if (!statSync(path).isFile()) return false;
+      accessSync(path, constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  });
   const pwsh = cotal(["completion", "install", "powershell"]);
   const profile = join(xdg, "powershell", "profile.ps1");
   const profileText = existsSync(profile) ? readFileSync(profile, "utf8") : "";
