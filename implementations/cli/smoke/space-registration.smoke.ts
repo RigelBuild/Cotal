@@ -48,7 +48,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -61,6 +61,11 @@ if (!existsSync(BIN)) {
 }
 
 const home = mkdtempSync(join(tmpdir(), "cotal-space-registration-"));
+const protectedNodeDir = join(home, "node");
+mkdirSync(protectedNodeDir, { mode: 0o700 });
+const protectedNode = join(protectedNodeDir, basename(process.execPath));
+copyFileSync(process.execPath, protectedNode);
+chmodSync(protectedNode, 0o700);
 // Set before the workspace is imported: it reads COTAL_HOME on each call.
 process.env.COTAL_HOME = join(home, ".cotal");
 const { MANAGER_PIDFILE, cacheLocalProcess, canonicalLocalProcessPath, clearCurrent, extensionsManifestPath, findMesh, findPreparedSpace, getCurrent, meshesDir, preparedSpacesDir, recordMesh, recordPreparedSpace, removeMesh, removePreparedSpace, saveExtensionsManifest, setCurrent, spaceSegment } = await import("@cotal-ai/workspace");
@@ -174,6 +179,20 @@ writeFileSync(file, JSON.stringify(bundle()));
 const userRoot = projectRoot("hosted-root");
 recordMesh({ space: "keep", server: DEAD, root, mode: "open", origin: "manual", ts: new Date(0).toISOString() });
 setCurrent("keep");
+// Keep the safety check exercised while the hosted runner's Node path remains untrusted.
+if (process.platform !== "win32") {
+  const worldWritableNode = join(home, "world-writable-node");
+  copyFileSync(process.execPath, worldWritableNode);
+  chmodSync(worldWritableNode, 0o777);
+  const unsafeRoot = projectRoot("unsafe-binary");
+  const prepared = await json(["space", "create", "unsafe-binary-space", "--root", unsafeRoot]);
+  const config = join(unsafeRoot, ".cotal", "world-writable-node.conf");
+  writeFileSync(config, "", { mode: 0o600 });
+  const rejected = await json(["service", "add", "unsafe-binary", "--preset", "broker", "--space", "unsafe-binary-space", "--config", config, "--binary", worldWritableNode, "--server", DEAD]);
+  check("a broker binary writable by every local account is refused PERMISSION_DENIED, naming the binary and chmod",
+    prepared.status === 0 && refused(rejected, 2, "PERMISSION_DENIED") && rejected.env?.error?.message === `the declared adapter path binary is not protected against other local writers: ${worldWritableNode} is writable by every local account` && rejected.env?.error?.remedy === `chmod o-w ${worldWritableNode}`, shown(rejected));
+  check("the refused broker definition is not saved", serviceDefinitionStore("unsafe-binary-space").read("unsafe-binary") === undefined);
+}
 
 // ── Usage refusals, before anything is read or dialed ─────────────────────────────────────────────────
 {
@@ -411,7 +430,7 @@ setCurrent("keep");
     const brokerDefinition = (space: string, stackRoot: string) => {
       const config = join(stackRoot, ".cotal", "server.conf");
       writeFileSync(config, "", { mode: 0o600 });
-      serviceDefinitionStore(space).commit("stack-broker", undefined, { schemaVersion: 1, space, launch: { type: "adapter", adapter: "nats-broker", options: { root: stackRoot, config, binary: process.execPath, server: LIVE } }, readiness: { type: "adapter", timeoutMs: 30_000 } });
+      serviceDefinitionStore(space).commit("stack-broker", undefined, { schemaVersion: 1, space, launch: { type: "adapter", adapter: "nats-broker", options: { root: stackRoot, config, binary: protectedNode, server: LIVE } }, readiness: { type: "adapter", timeoutMs: 30_000 } });
     };
 
     const runningRoot = stack("stackrun", "open", { broker: member("stackrun", "stack-broker", requireProcessIdentity(process.pid), false) }, "started");
