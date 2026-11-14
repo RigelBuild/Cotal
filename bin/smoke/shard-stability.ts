@@ -61,9 +61,6 @@
  *   - "Appended" claims on PRE-EXISTING entries must be ignored (history is not re-graded)
  *   - a tail append of a new suite name must report that name
  *   - a comment-only edit of the frozen list must report nothing
- *   - a deletion from the frozen list must report nothing
- *   - a cost-table pin must move its suite
- *   - a pin recorded for another shard count must move nothing
  * Any failed control ABORTS with exit 2 rather than emitting a verdict.
  *
  * A third line once sat here claiming "the known production re-shard 7837b64c->d1aeafc3
@@ -287,10 +284,14 @@ const shardCountFromWorkflow = (yml: string, requireCommittedInputs = true, requ
     .map((line) => legacyInvocationPattern.exec(line))
     .filter((match): match is RegExpExecArray => match !== null);
   const named = /^      - name:\s*\S/.test(activeShardStep[0]);
-  const guarded = activeShardStep.length === 3 && named &&
-    activeShardStep[1] === guardedShell && guardedInvocations.length === 1;
+  const guardedRevisionEnv = activeShardStep.length === 5 &&
+    activeShardStep[2] === "        env:" &&
+    activeShardStep[3] === "          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}" &&
+    activeShardStep[4] === "          HEAD: ${{ github.sha }}";
+  const guarded = named && activeShardStep[1] === guardedShell && guardedInvocations.length === 1 &&
+    (activeShardStep.length === 3 || guardedRevisionEnv);
   const legacy = activeShardStep.length === 2 && named && legacyInvocations.length === 1;
-  if (requireCommittedInputs ? !guarded : !guarded && !legacy) return null;
+  if ((requireCommittedInputs ? !guarded : !guarded && !legacy) || (requireToolPrelude && !guardedRevisionEnv)) return null;
   const invocation = guarded ? guardedInvocations[0] : legacyInvocations[0];
   const commandCount = Number(invocation[1]);
   return commandCount === indices.length ? commandCount : null;
@@ -494,9 +495,9 @@ const replaceRefRuntimeControl = (): boolean => {
     const replacement = git(["commit-tree", tree, "-p", original, "-m", "control: replacement tree"]);
     git(["replace", original, replacement]);
     if (
-      git(["show", `${original}:bin/smoke/ci-suites.txt`]) !== "smoke:first" ||
       git(["--no-replace-objects", "show", `${original}:bin/smoke/ci-suites.txt`]) !==
-        "smoke:first\nsmoke:second"
+        "smoke:first\nsmoke:second" ||
+      git(["show", `${original}:bin/smoke/ci-suites.txt`]) !== "smoke:first"
     ) return false;
 
     const result = spawnSync(
