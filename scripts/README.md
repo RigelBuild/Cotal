@@ -150,30 +150,30 @@ change: mutation-reproof names it as a metadata-only exclusion instead of re-pro
 kill set.
 
 ## Mutation reproof
+> **Mutation reproof is disabled on this fork.** The workflow is renamed
+> `.github/workflows/mutation-reproof.yml.disabled`, so GitHub never runs it.
+> Its fixtures and script remain for local runs.
 
 `node scripts/mutation-reproof.mjs --base <commit>` re-proves the mutation fixtures a diff selects.
 A fatal verdict or a pre-red command that the diff caused fails it. A command that was already red
 at the base, or a fixture whose run was inconclusive, is reported without failing, as long as at
 least one selected fixture produced a kill.
 
-`node scripts/mutation-reproof.mjs --all` is the scheduled full sweep, run in shards. It grades the
-health of the whole tree, so every proven fixture in the shard must produce a kill. A fixture that
-is pre-red, inconclusive, or graded nothing fails the sweep and is named on the
-`MUTATION REPROOF FLOOR ERODED` line, or on the `ZERO DISCRIMINATED, COULD NOT` line when no fixture
-killed. That failure opens or comments on the `ci:mutation-reproof` tracking issue.
+The `node scripts/mutation-reproof.mjs --all` option grades the whole tree. Every proven fixture
+in the selection must produce a kill. A fixture that is pre-red, inconclusive, or graded nothing
+fails the local run and is named in its summary.
 
 ## Mutation reproof budget
 
-`mutation-reproof` takes `--budget-minutes <n>`, and the workflow passes one below each shard's step
-timeout. Selection does not estimate fixture cost, so one shard can draw more proof work than its
-step can finish. Without a budget the step was killed from outside: no tally, no word about the
-fixtures that never ran, and a mutant left in the tree. With one, each `mutation-proof` child gets
-the deadline as `--deadline <epoch-ms>`. At the deadline it cuts the running suite, kills that
-suite's process group, puts the mutant back, names the mutations it did not reach and exits 5. The
-reproof then prints `MUTATION REPROOF BUDGET EXHAUSTED`, names each selected fixture as cut short or
-not run, and exits 1. That result is UNMEASURED. It is never a pass. A fatal verdict whose base
-comparison cannot finish in the budget is reported as an unmeasured transition with the budget as
-its reason.
+`mutation-reproof` takes `--budget-minutes <n>` to bound a local run. Selection does not estimate
+fixture cost, so one run can draw more proof work than its deadline permits. Without a budget, an
+external timeout leaves no tally, no word about the fixtures that never ran, and a mutant left in
+the tree. With one, each `mutation-proof` child gets the deadline as `--deadline <epoch-ms>`. At
+the deadline it cuts the running suite, kills that suite's process group, puts the mutant back,
+names the mutations it did not reach and exits 5. The reproof then prints
+`MUTATION REPROOF BUDGET EXHAUSTED`, names each selected fixture as cut short or not run, and
+exits 1. That result is UNMEASURED. It is never a pass. A fatal verdict whose base comparison
+cannot finish in the budget is reported as an unmeasured transition with the budget as its reason.
 
 A process that left the suite's group survives a group kill, and anything spawned `detached` does.
 Every process a proof starts carries the proof's mark in `MUTATION_PROOF_RUN`. After any timed-out

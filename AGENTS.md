@@ -15,15 +15,15 @@ and do not file a question about it. This is a standing owner ruling.
   that names the evidence and a `recheckBy` date. Keep its line in `bin/smoke/ci-suites.txt`,
   because removing a line re-shards every suite below it.
   - A `ci.yml` smoke step: add `continue-on-error: true` and a matching `LIVE_QUARANTINED` entry.
-  - Mutation reproof does not run on upstream sync PRs; the daily `--all` sweep grades them
-  after the merge.
 - **A test for code we wrote is fixed.** Fix a race by waiting for the event, not with a retry
 or a quarantine.
 
 ## Syncing upstream into `rigel-release`
 
 1. Branch `harness/rig-5440-upstream-sync` from `rigel-release` and merge `main` into it. Keep the
-merge commit; this PR must not be squashed or rebased. Mutation reproof skips this exact branch name.
+merge commit; this PR must not be squashed or rebased. Mutation reproof is disabled on this fork:
+the workflow is renamed `.github/workflows/mutation-reproof.yml.disabled`, so GitHub never runs it.
+Its fixtures and script remain for local runs.
 2. Resolve conflicts in favor of our custody guarantees (custodian-run Linux pty seats, no
 numeric or process-group signals, retain or refuse an unproven reap). If an upstream test asserts
 the opposite, quarantine it unchanged.
