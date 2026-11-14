@@ -68,6 +68,7 @@ const headEnv = "          HEAD: ${{ github.sha }}";
 const expectedEnv = `${baseEnv}\n${headEnv}`;
 assert.equal(workflow.split(expectedEnv).length, 2, 'Regression requires the exact guarded shard env');
 test('the shipped detector accepts shard BASE/HEAD env with unchanged topology', () => {
+  assert.equal(guardedStepStart >= 0, true, 'Regression requires the named smoke shard step');
   assert.equal(guardedStep.split(baseEnv).length, 2, 'Regression requires BASE on the smoke shard step');
   assert.equal(guardedStep.split(headEnv).length, 2, 'Regression requires HEAD on the smoke shard step');
   expect(run(withCondition(null), workflow), 0, 'STABLE');
