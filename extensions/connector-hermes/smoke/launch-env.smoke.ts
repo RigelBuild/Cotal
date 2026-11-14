@@ -15,8 +15,8 @@ import { join } from "node:path";
 import { skipSuite } from "@cotal-ai/smoke-kit";
 import { HERMES_BIN_ENV, hermesUvCommand, spawnHermesGateway } from "../src/binary.js";
 import { hermesConnector } from "../src/extension.js";
-import { ADOPT_HOME_ENV, LaunchRefused, adoptedHome, assertHermesVersion, setupAdoptedProfile, setupProfile } from "../src/launch.js";
-import { briefing } from "@cotal-ai/connector-core";
+import { ADOPT_HOME_ENV, LaunchRefused, adoptedHome, assertHermesVersion, bridgeSocketPath, setupAdoptedProfile, setupProfile } from "../src/launch.js";
+import { SUN_PATH_MAX_BYTES, briefing } from "@cotal-ai/connector-core";
 
 /**
  * Count every assertion, so the terminal tally is derived from what actually ran.
@@ -48,7 +48,7 @@ const assert: typeof nodeAssert = new Proxy(nodeAssert, {
  * guarantee is the false-green shape this package keeps being bitten by. Pinning the floor turns a
  * smaller green into a red. Raise it deliberately when you add a cell; a drop means one vanished.
  */
-const EXPECTED_CELLS = 176;
+const EXPECTED_CELLS = 181;
 
 if (process.platform === "win32") skipSuite("the Hermes connector is Unix-only; buildLaunch throws");
 
@@ -405,6 +405,23 @@ assert.equal(adoptEnv.COTAL_HERMES_ADOPT_HOME, "/srv/op/.hermes", "the adopt-hom
 delete process.env.COTAL_HERMES_ADOPT_HOME;
 const plainEnv = hermesConnector.buildLaunch({ space: "smoke", name: "hermes-plain" }).env ?? {};
 assert.ok(!("COTAL_HERMES_ADOPT_HOME" in plainEnv), "without the opt-in the child gets the managed default");
+
+// The bridge socket. A long per-user TMPDIR (macOS `/var/folders/…/T/`) overruns darwin's 104-byte
+// sun_path, so the socket falls back to /tmp; a short TMPDIR keeps it there; either way the path
+// fits the limit and its name carries the control token.
+{
+  const savedTmp = process.env.TMPDIR;
+  process.env.TMPDIR = `/var/folders/75/${"x".repeat(40)}/T/`;
+  const fellBack = bridgeSocketPath("smoke", "hermes-bridge", "tok-a");
+  assert.ok(fellBack.startsWith("/tmp/cotal-hermes-bridge-"), `a long TMPDIR falls back to /tmp, got ${fellBack}`);
+  assert.ok(Buffer.byteLength(fellBack) <= SUN_PATH_MAX_BYTES, "the fallback fits sun_path");
+  process.env.TMPDIR = "/tmp/";
+  const shortTmp = bridgeSocketPath("smoke", "hermes-bridge", "tok-a");
+  assert.ok(shortTmp.startsWith("/tmp/cotal-hermes-bridge-") && Buffer.byteLength(shortTmp) <= SUN_PATH_MAX_BYTES, "a short TMPDIR is used");
+  assert.notEqual(bridgeSocketPath("smoke", "hermes-bridge", "tok-b"), shortTmp, "the id folds in the control token");
+  if (savedTmp === undefined) delete process.env.TMPDIR;
+  else process.env.TMPDIR = savedTmp;
+}
 
 rmSync(opAdopt, { recursive: true, force: true });
 rmSync(opBare, { recursive: true, force: true });
