@@ -41,6 +41,7 @@ const xdg = join(home, "xdg");
 const samePath = (a: string, b: string) => existsSync(a) && realpathSync(a) === realpathSync(b);
 const stubBin = join(home, "stub-bin");
 for (const dir of [join(root, ".cotal"), join(fgRoot, ".cotal"), xdg, stubBin]) mkdirSync(dir, { recursive: true });
+// The installer does not create PowerShell's profile folder; provide the profile path as a user would.
 const priorUmask = process.umask(0o077);
 try { mkdirSync(join(xdg, "powershell"), { recursive: true }); }
 finally { process.umask(priorUmask); }
@@ -313,9 +314,18 @@ try {
   const fishFile = join(xdg, "fish", "completions", "cotal.fish");
   check("completion install fish writes a completions file that calls `cotal __complete`",
     fish.status === 0 && existsSync(fishFile) && readFileSync(fishFile, "utf8").includes("cotal __complete"), out(fish));
+  const pwshAvailable = spawnSync("pwsh", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"], { encoding: "utf8", timeout: 3000 }).status === 0;
   const pwsh = cotal(["completion", "install", "powershell"]);
-  check("completion install powershell prints the $PROFILE line instead of writing one",
-    out(pwsh).includes("cotal completion script powershell | Out-String | Invoke-Expression"), out(pwsh));
+  const profile = join(xdg, "powershell", "profile.ps1");
+  const profileText = existsSync(profile) ? readFileSync(profile, "utf8") : "";
+  if (pwshAvailable) {
+    check("completion install powershell writes the owned $PROFILE block",
+      pwsh.status === 0 && profileText.includes(`# >>> cotal completion >>>\n. '${join(xdg, "cotal", "completion.ps1")}'\n# <<< cotal completion <<<\n`), { output: out(pwsh), profileText });
+  } else {
+    check("completion install powershell refuses when pwsh is unavailable",
+      pwsh.status === 2 && pwsh.stdout === "" && pwsh.stderr.includes("owned PowerShell profile installation is unavailable"), out(pwsh));
+    skip("live PowerShell profile installation", "pwsh is unavailable; missing-profile behavior is covered by completion-status fixture tests");
+  }
   const completed = cotal(["__complete", "sp"]);
   check("__complete answers the stubs' protocol", completed.status === 0 && /^spawn\t/m.test(completed.stdout), out(completed));
   for (const shell of ["bash", "zsh", "fish", "powershell"]) {
