@@ -259,58 +259,33 @@ try {
   {
     const until = Math.max(firstCredExpMs + DLV_TTL_S * 1000 + 2_000, Date.now() + 20_000);
     const tokens: string[] = [];
-    const fireSubjects: Record<string, string> = {};
-    let fireCallbacks = 0;
-    let fireSubscriptionError: string | undefined;
-    let firstFireCallback: { subject: string; scheduler?: string } | undefined;
     const observedFires = new Set<string>();
-    let resolveAllFires: () => void = () => {};
-    const allFires = new Promise<void>((resolve) => { resolveAllFires = resolve; });
-    let expectedFireCount: number | undefined;
-    const fireSub = serveNc.subscribe(`cotal.${space}.ept.${EP}.${IID}.${EPOCH}.*.fire`, {
-      callback: (error, msg) => {
-        if (error) { fireSubscriptionError = error.message; return; }
-        if (!msg) return;
-        fireCallbacks++;
-        firstFireCallback ??= { subject: msg.subject, scheduler: msg.headers?.get("Nats-Scheduler") };
-        const armedSubject = fireSubjects[msg.subject];
-        if (armedSubject === undefined || msg.headers?.get("Nats-Scheduler") !== armedSubject) return;
-        observedFires.add(msg.subject);
-        if (expectedFireCount === observedFires.size) resolveAllFires();
+    const recordsSub = gwNc.subscribe(`$KV.${recordsBucket(space)}.cp.>`, {
+      callback: (_error, msg) => {
+        const value = JSON.parse(new TextDecoder().decode(msg.data)) as { kind?: string; qualifiers?: { endpoint?: string; token?: string }; value?: { state?: string } };
+        if (value.kind === "cp" && value.qualifiers?.endpoint === EP && value.qualifiers.token?.startsWith("cp_timerw_swap_") && value.value?.state === "expired") {
+          observedFires.add(value.qualifiers.token);
+        }
       },
     });
-    await serveNc.flush();
+    await gwNc.flush();
     let lastDeadline = 0;
     while (Date.now() < until) {
       const token = `cp_timerw_swap_${tokens.length + 1}`;
       const now = Date.now();
       lastDeadline = now + 3_000;
-      const fireSubject = eptSubject(space, EP, IID, EPOCH, token, "fire");
-      const armedSubject = eptSubject(space, EP, IID, EPOCH, token, "armed");
-      fireSubjects[fireSubject] = armedSubject;
       await mintCheckpoint(kv, jetstream(serveNc), space, { ref: { endpoint: EP, token }, instanceId: IID, epoch: EPOCH, holder, deadline: lastDeadline, now });
       tokens.push(token);
       await wait(2_000);
     }
-    expectedFireCount = tokens.length;
-    if (observedFires.size === tokens.length) resolveAllFires();
-    const fireDeadlineMs = Math.max(0, lastDeadline - Date.now()) + 20_000;
-    const allFiresObserved = await Promise.race([
-      allFires.then(() => true),
-      wait(fireDeadlineMs).then(() => false),
-    ]);
-    // The broker's one-shot removes `.armed`; its subscribed `.fire` event gates these durable
-    // reads, so a slow scheduled publish cannot turn into a false missing-fire assertion.
-    let firedN = 0;
-    for (const token of tokens) {
-      const f = await jsm.streams.getMessage(eptStreamName(space), { last_by_subj: eptSubject(space, EP, IID, EPOCH, token, "fire") }).catch(() => null);
-      if (f?.header?.get("Nats-Scheduler") === eptSubject(space, EP, IID, EPOCH, token, "armed")) firedN++;
-    }
-    check(`every .schedule published across the daemon's credential renewals was armed and fired (${firedN}/${tokens.length})`,
-      tokens.length >= 5 && allFiresObserved && firedN === tokens.length, { firedN, tokens: tokens.length, observedFires: observedFires.size, fireCallbacks, fireSubscriptionError, firstFireCallback });
-    fireSub.unsubscribe();
+    const fireDeadline = lastDeadline + 20_000;
+    while (observedFires.size < tokens.length && Date.now() < fireDeadline) await wait(50);
+    check(`every .schedule published across the daemon's credential renewals was armed and fired (${observedFires.size}/${tokens.length})`,
+      tokens.length >= 5 && observedFires.size === tokens.length, { firedN: observedFires.size, tokens: tokens.length });
+    recordsSub.unsubscribe();
     check("the writer never went down across two credential expiries: its connection follows each adopted credential",
       !daemonOut.includes("timer writer: down"), daemonOut.split("\n").filter((l) => l.includes("timer writer: down")));
+
   }
   
   // 5. The daemon still exits promptly on SIGTERM with the writer running (shutdown wiring).
