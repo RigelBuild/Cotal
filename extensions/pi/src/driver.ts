@@ -30,6 +30,8 @@ export interface CotalBatchDetails {
   batchId: string;
   ids: string[];
   items?: InboxItem[];
+  /** Goal ids of the run turns this batch carries; the dedupe keys on these, not on rendered text. */
+  turnIds?: string[];
   suffix?: string;
 }
 
@@ -48,6 +50,9 @@ export interface PiHost {
     options: { triggerTurn: true; deliverAs: "steer" },
   ): void;
 }
+
+/** Stands in for a kept later copy that carries nothing new and sits after an assistant message. */
+const ALREADY_DELIVERED_STUB = "Cotal batch already delivered above; no new items.";
 
 interface Batch {
   id: string;
@@ -219,13 +224,14 @@ export class PiDriver {
     }
   }
 
-  onContext(messages: readonly unknown[]): void {
-    if (this._state === "shuttingDown") return;
+  onContext<T>(messages: readonly T[]): T[] | undefined {
+    if (this._state === "shuttingDown") return undefined;
     const visible = new Set(messages.map(detailsOf).filter((details): details is CotalBatchDetails => Boolean(details)).map((d) => d.batchId));
     const candidates = this.batches.filter((batch) => !batch.confirmed && visible.has(batch.id));
     this.contextBatchIds = new Set(candidates.map((batch) => batch.id));
     this.requestBatchIds = new Set(candidates.filter((batch) => batch.started).map((batch) => batch.id));
     for (const id of this.requestBatchIds) this.terminalEvidenceBatchIds.add(id);
+    return this.withoutSupersededBatches(messages);
   }
 
   onProviderResponse(status: number): void {
@@ -412,7 +418,7 @@ export class PiDriver {
           customType: CUSTOM_TYPE,
           content: batch.content,
           display: true,
-          details: { version: 1, batchId: batch.id, ids: [...batch.ids], items: batch.items ?? [], ...(batch.suffix !== undefined ? { suffix: batch.suffix } : {}) },
+          details: { version: 1, batchId: batch.id, ids: [...batch.ids], items: batch.items ?? [], ...(batch.turnIds ? { turnIds: [...batch.turnIds] } : {}), ...(batch.suffix !== undefined ? { suffix: batch.suffix } : {}) },
         },
         { triggerTurn: true, deliverAs: "steer" },
       );
@@ -447,6 +453,62 @@ export class PiDriver {
     this.heldReason = undefined;
     this._state = "idle";
     this.pump();
+  }
+
+  /** The messages a provider request carries. A lost steer re-dispatched after its settle window can
+   *  still drain into Pi beside its replacement, so a delivery can sit in the request twice. A later
+   *  copy is dropped only when no assistant message sits between it and the first copy it repeats;
+   *  otherwise the request would end on an assistant turn. A kept copy is rebuilt from its new items
+   *  or run turn, or becomes a short stub when it carries nothing new. Run turns dedupe by goal id; a multi-goal run-turn suffix is kept whole, so its earlier goals' text can repeat.
+   *  Returns undefined when nothing changed. */
+  private withoutSupersededBatches<T>(messages: readonly T[]): T[] | undefined {
+    const seenIds = new Set<string>();
+    const seenTurnIds = new Set<string>();
+    const kept: T[] = [];
+    let changed = false;
+    let assistantSinceLastCopy = false;
+    for (const message of messages) {
+      if (message && typeof message === "object" && "role" in message && message.role === "assistant") {
+        assistantSinceLastCopy = true;
+        kept.push(message);
+        continue;
+      }
+      const details = detailsOf(message);
+      if (!details) {
+        kept.push(message);
+        continue;
+      }
+      const newIds = details.ids.filter((id) => !seenIds.has(id));
+      const turnIds = details.turnIds ?? [];
+      const newTurnIds = turnIds.filter((id) => !seenTurnIds.has(id));
+      for (const id of details.ids) seenIds.add(id);
+      for (const id of turnIds) seenTurnIds.add(id);
+      const repeats = newIds.length < details.ids.length || newTurnIds.length < turnIds.length;
+      if (!repeats) {
+        kept.push(message);
+        assistantSinceLastCopy = false;
+        continue;
+      }
+      changed = true;
+      const dropped = newIds.length === 0 && newTurnIds.length === 0;
+      if (dropped && !assistantSinceLastCopy) continue;
+      const items = (details.items ?? []).filter((item) => newIds.includes(item.recvKey));
+      const suffix = newTurnIds.length > 0 ? details.suffix : undefined;
+      const body = [items.length > 0 ? formatInjection(items) : undefined, suffix]
+        .filter((part): part is string => part !== undefined)
+        .join("\n\n");
+      const rebuilt: CotalBatchDetails = {
+        version: 1,
+        batchId: details.batchId,
+        ids: newIds,
+        items,
+        ...(newTurnIds.length > 0 ? { turnIds: newTurnIds } : {}),
+        ...(suffix !== undefined ? { suffix } : {}),
+      };
+      kept.push({ ...(message as object), content: body.length > 0 ? body : ALREADY_DELIVERED_STUB, details: rebuilt } as T);
+      assistantSinceLastCopy = false;
+    }
+    return changed ? kept : undefined;
   }
 
   /** Surfacing at confirmation, not at agent end: a confirmation lets `pump` run mid-turn, which
