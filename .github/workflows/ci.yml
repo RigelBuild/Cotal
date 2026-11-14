@@ -39,7 +39,7 @@ concurrency:
 # still accepts both runner homes, so a later move back is a label change only.
 # Same coverage as before, fanned across parallel jobs so wall-clock is the slowest job, not the sum:
 #   • unit  — typecheck + build + unit tests + the view/pack checks (fast).
-#   • smoke — build + web-doc prep + protocol/security suite (smoke:ci), round-robin sharded across runners by
+#   • smoke — the protocol/security suite (smoke:ci), round-robin sharded across runners by
 #             bin/smoke/shard.mjs (each smoke still runs in its own broker; shards are on separate
 #             runners, so no cross-smoke port contention).
 #   • live  — the Linux-only live/lifecycle e2es (real broker + real agents, tmux/cmux/opencode).
@@ -236,12 +236,6 @@ jobs:
         run: echo "$HOME/nats-bin" >> "$GITHUB_PATH"
       - name: Build
         run: pnpm build
-      # web-openapi syncs the site, so prepare its website dependencies and generated TypeDoc first.
-      - name: Install website deps
-        working-directory: website
-        run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Generate TypeDoc
-        run: pnpm exec typedoc
       - uses: actions/download-artifact@v4
         with:
           name: workspace-native-x64

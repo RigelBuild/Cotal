@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { closeSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { LaunchSpec, Runtime, RuntimeReference } from "@cotal-ai/core";
 import { processStartToken } from "@cotal-ai/seat";
 import { pidfdExited, pidfdOpen } from "../../../packages/seat/dist/peercred.js";
@@ -37,9 +38,7 @@ export function childlessRuntime(runtime: Runtime, root: string, accepts: (spec:
     const deadline = Date.now() + 5_000;
     while (!exited()) {
       if (Date.now() >= deadline) throw new Error("childless fixture process remains alive");
-      const { promise, resolve } = Promise.withResolvers<void>();
-      setTimeout(resolve, 20);
-      await promise;
+      await sleep(20);
     }
   };
   const spawn = runtime.spawn.bind(runtime);

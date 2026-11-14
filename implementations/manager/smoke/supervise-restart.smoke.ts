@@ -248,8 +248,8 @@ try {
     (failSpawned as { ok?: boolean }).ok === true && failReady?.state === "succeeded" && failRow !== undefined, { failSpawned, failReady });
   const failPid = failRow?.handle.pid;
   // The next recoverManagedSession calls the same connector.buildLaunch. Point it at a
-  // command that is not on PATH so the live PtyRuntime.spawn throws; that is the
-  // supervise-recovery-failed catch, without wrapping Manager.runtime.
+  // command that is not on PATH: the replacement exits at exec and readiness fails, which is
+  // the supervise-recovery-failed catch, without wrapping Manager.runtime.
   const previousBuild = stubCon.buildLaunch;
   const origErr = console.error;
   const logs: string[] = [];
