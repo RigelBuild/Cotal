@@ -897,7 +897,7 @@ if (process.platform === "linux") {
     const created = await json(["space", "create", "oddpath", "--root", odd]);
     check(`a --root whose path holds ${label} is USAGE_INVALID, exit 1, naming it, with nothing written`,
       refused(created, 1, "USAGE_INVALID") && (created.env?.error?.message ?? "") === `the folder path ${oneLine(odd)} contains ${label}, and a project path may hold neither control characters nor bidirectional formatting marks; nothing was written` && !existsSync(join(odd, ".cotal")) && findPreparedSpace("oddpath") === undefined, shown(created));
-    const up = await json(["up", "--server", DEAD], odd);
+    const up = await json(["up", "--open", "--no-manager", "--server", DEAD, "--json"], odd);
     check(`up in that folder is USAGE_INVALID, exit 1, and writes no stack journal`,
       refused(up, 1, "USAGE_INVALID") && (up.env?.error?.message ?? "").startsWith(`the folder path ${oneLine(odd)} contains ${label}`) && !existsSync(join(odd, ".cotal")), shown(up));
     rmSync(odd, { recursive: true, force: true });
