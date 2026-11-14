@@ -97,7 +97,7 @@ let spawnAs: RuntimeReference | undefined;
 const fakeSession = { cols: 80, rows: 24, backlog: () => Buffer.alloc(0), onData: () => () => {}, onExit: () => () => {}, write: () => {}, resize: () => {} };
 const fakeHandle = (name: string, reference: RuntimeReference | undefined): AgentHandle => {
   let running = true;
-  return { name, kind: "pty", reference, status: () => running ? "running" : "exited", stop: () => { running = false; }, waitForExit: async () => { running = false; }, interrupt: () => {}, attach: () => fakeSession };
+  return { name, kind: "pty", reference, status: () => running ? "running" : "exited", stop: () => { running = false; }, waitForExit: async () => { running = false; }, waitForWorkExit: async () => {}, interrupt: () => {}, attach: () => fakeSession };
 };
 /** A seat whose stop is only a request: its exit is proved when the smoke calls `exit()`, and never
  *  once `refuse()` makes every exit wait reject. */
@@ -135,10 +135,11 @@ function gatedHandle(name: string): { handle: AgentHandle; stopped: () => boolea
     refuse: () => { refused = true; },
   };
 }
-const fakeRuntime: CustodialRuntime = {
+const fakeRuntime: CustodialRuntime & { supportsWorkClosure: true; reapWork: (reference: RuntimeReference) => Promise<void> } = {
   kind: "pty",
   streamsTerminal: false,
-  reserve: () => ({ kind: "pty", id: randomUUID().replaceAll("-", "") }),
+  supportsWorkClosure: true,
+  reapWork: async () => {},
   spawn: (name, _spec, _cwd, reference) => {
     spawnCalls++;
     if (failNextSpawn) {
