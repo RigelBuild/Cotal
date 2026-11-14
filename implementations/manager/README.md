@@ -96,6 +96,8 @@ attempt it logs `retry-exhausted` and the slot stays held until the next manager
 it. An active orphan retires only after delivery-admin has verified its broker
 principal gone. The broker result is persisted in the lifecycle's per-UID audit record before
 cleanup and alias reuse. The orphan OS process is not reaped by this reconciliation path.
+A live static retirement also retries ordinary terminal errors on the same 1s, 5s and 30s schedule.
+The alias stays held when those retries are exhausted.
 
 ## Maintenance API
 
