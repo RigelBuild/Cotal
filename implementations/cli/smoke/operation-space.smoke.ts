@@ -181,8 +181,7 @@ const removedDefault = cotal("persona", "remove", "default", "--yes", "--plain")
 check("removing the seeded default says so and names what writes a fresh copy",
   removedDefault.status === 0 && removedDefault.stdout.includes("This was the seeded default persona, which a bare `cotal spawn` launches") && !existsSync(agentFilePath(root, "default")), shown(removedDefault));
 
-// A launch preview refuses a missing persona as the launch does, naming where it looked: the catalog
-// for a name, the file for a path, and for the default also the command that writes one.
+// A launch preview refuses a missing named persona or file, and previews a missing default without writing it.
 const catalog = dirname(agentFilePath(root, "default"));
 const noName = cotal("spawn", "nosuch", "--dry-run", "--json");
 check("spawn --dry-run of a missing name is TARGET_NOT_FOUND, naming the catalog and --file",
@@ -192,8 +191,8 @@ const noFile = cotal("spawn", "--file", "missing.md", "--dry-run", "--json");
 check("spawn --dry-run of a missing --file names the file it checked",
   noFile.status === 2 && noFile.envelope?.error?.code === "TARGET_NOT_FOUND" && noFile.envelope.error.message === `no persona "missing.md": ${join(root, "missing.md")} was not found`, shown(noFile));
 const noDefault = cotal("spawn", "--dry-run", "--plain");
-check("spawn --dry-run with no default persona names cotal up in the space's root",
-  noDefault.status === 2 && noDefault.stderr.includes(`no default persona in ${catalog} (mesh "opsp")`) && noDefault.stderr.includes(`run \`cotal up\` in ${root} to write one`) && !noDefault.stderr.includes("team deploy"), shown(noDefault));
+check("spawn --dry-run with no default persona previews the shipped default without writing it",
+  noDefault.status === 0 && noDefault.stdout.includes("the launch writes the shipped default persona here; the preview wrote nothing") && !existsSync(agentFilePath(root, "default")), shown(noDefault));
 
 // A managed preview shows the request and exits 0. Both previews say where the persona came from in
 // words, and warn about a harness no connector here provides.
