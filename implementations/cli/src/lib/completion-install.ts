@@ -24,6 +24,7 @@ const recordPath = (paths: Paths) => `${paths.stub}.ownership.json`;
 /** Ask the installed shell for its current-user all-hosts profile; profile directories vary by host. */
 function powershellProfile(): string | undefined {
   if (process.platform === "win32") return undefined;
+  // pwsh cold start on CI runners takes over 4 s; 15 s still bounds a wedged shell.
   const read = spawnSync("pwsh", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write($PROFILE.CurrentUserAllHosts)"], { encoding: "utf8", timeout: 15_000, maxBuffer: 4096, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
   if ((read.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return undefined;
   const path = read.stdout;

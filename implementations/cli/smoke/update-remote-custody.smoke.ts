@@ -13,8 +13,6 @@ import { createServer as createTcpServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { cotalAuthProvider } from "@cotal-ai/auth";
-import { saveIdpSession } from "../../auth/src/login.js";
 import { countedAssert, emitSentinel } from "@cotal-ai/smoke-kit";
 
 const counted = countedAssert(rawAssert);
@@ -29,7 +27,9 @@ process.env.DO_NOT_TRACK = "1";
 // These imports follow the isolated home setup because workspace paths are captured at module load.
 const { recordMesh, setCurrent, userAuthStateDir } = await import("@cotal-ai/workspace");
 const { readManagerContinuity } = await import("../src/commands/update.js");
-void cotalAuthProvider;
+// Loading @cotal-ai/auth registers the "cotal" provider the remote read needs.
+await import("@cotal-ai/auth");
+const { saveIdpSession } = await import("../../auth/src/login.js");
 const { supervisorMayServe } = await import("../src/lib/manager-proc.js");
 
 const space = `update-remote-${process.pid}`;
