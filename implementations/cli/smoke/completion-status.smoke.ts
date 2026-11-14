@@ -514,7 +514,8 @@ if (process.platform !== "win32" && process.getuid?.() !== 0) {
   const bashrc = join(s.home, ".bashrc");
   check("completion install --json is one ok envelope and writes the managed block", installJson.status === 0 && outcomeOf(installJson.stdout) === "ok" && existsSync(bashrc) && readFileSync(bashrc, "utf8").includes(`# >>> cotal completion >>>\nsource '${join(s.xdg, "cotal", "completion.bash")}'\n# <<< cotal completion <<<\n`), shown(installJson));
   // Without pwsh there is no profile to wire, so install refuses without guessing one.
-  const pwsh = s.run(["completion", "install", "powershell"]);
+  const noPwshPath = pathWithout("pwsh");
+  const pwsh = s.run(["completion", "install", "powershell"], noPwshPath ? { PATH: noPwshPath } : {});
   check("completion install powershell is refused when pwsh is missing, naming the supported loading command", pwsh.status === 2 && pwsh.stdout === "" && pwsh.stderr.includes("the supported loading command is: `cotal completion script powershell | Out-String | Invoke-Expression`"), shown(pwsh));
   const profileFolder = join(s.xdg, "powershell");
   const profileTool = mkdtempSync(join(tmpdir(), "cotal-pwsh-fixture-bin-"));
