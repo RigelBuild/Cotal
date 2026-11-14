@@ -259,8 +259,8 @@ if (process.platform !== "win32") {
   check("a port that takes no connection says so, with the port check as its remedy",
     (dead.env?.error?.message ?? "").endsWith(`nothing accepted a connection at 127.0.0.1:${deadPort}`) && dead.env?.error?.remedy === `check that the mesh is up and listening on port ${deadPort} of 127.0.0.1, or pass --server with the port it listens on; pass --force to add "dead1" unchecked, as for a space that is down right now`, shown(dead));
   const otherScheme = await json(["space", "add", "open", "--server", `tls://127.0.0.1:${brokerPort}`, "--mode", "open", "--root", root]);
-  check("a tls:// address refuses a plaintext broker instead of registering it",
-    refused(otherScheme, 2, "DEPENDENCY_UNAVAILABLE") && otherScheme.env?.error?.message === `the listener at tls://127.0.0.1:${brokerPort} does not offer the required TLS - check the address and configure TLS on the broker` && findMesh("open") === undefined, shown(otherScheme));
+  check("a broker that answers under another scheme is named, with that address as the Next",
+    refused(otherScheme, 2, "TARGET_UNAVAILABLE") && otherScheme.env?.error?.message === `no broker answered at tls://127.0.0.1:${brokerPort}, but one answers at ${LIVE}, without TLS` && otherScheme.env.error.remedy === `run it again with --server ${LIVE}; pass --force to add "open" unchecked, as for a space that is down right now`, shown(otherScheme));
   const unserved = await json(["space", "add", "open", "--server", LIVE, "--mode", "open", "--root", root]);
   check("an open name the broker does not serve is TARGET_NOT_FOUND, exit 2, naming the spaces it serves",
     refused(unserved, 2, "TARGET_NOT_FOUND") && unserved.env?.error?.message === `the broker at ${LIVE} serves no space named "open"; it serves ${SERVED.map((space) => `"${space}"`).join(", ")}` && /--force/.test(unserved.env?.error?.remedy ?? ""), shown(unserved));
@@ -897,7 +897,7 @@ if (process.platform === "linux") {
     const created = await json(["space", "create", "oddpath", "--root", odd]);
     check(`a --root whose path holds ${label} is USAGE_INVALID, exit 1, naming it, with nothing written`,
       refused(created, 1, "USAGE_INVALID") && (created.env?.error?.message ?? "") === `the folder path ${oneLine(odd)} contains ${label}, and a project path may hold neither control characters nor bidirectional formatting marks; nothing was written` && !existsSync(join(odd, ".cotal")) && findPreparedSpace("oddpath") === undefined, shown(created));
-    const up = await json(["up", "--open", "--no-manager", "--server", DEAD, "--json"], odd);
+    const up = await json(["up", "--server", DEAD], odd);
     check(`up in that folder is USAGE_INVALID, exit 1, and writes no stack journal`,
       refused(up, 1, "USAGE_INVALID") && (up.env?.error?.message ?? "").startsWith(`the folder path ${oneLine(odd)} contains ${label}`) && !existsSync(join(odd, ".cotal")), shown(up));
     rmSync(odd, { recursive: true, force: true });
