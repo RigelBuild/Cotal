@@ -139,6 +139,7 @@ const fakeRuntime: CustodialRuntime & { supportsWorkClosure: true; reapWork: (re
   kind: "pty",
   streamsTerminal: false,
   supportsWorkClosure: true,
+  reserve: () => ({ kind: "pty", id: randomUUID().replaceAll("-", "") }),
   reapWork: async () => {},
   spawn: (name, _spec, _cwd, reference) => {
     spawnCalls++;

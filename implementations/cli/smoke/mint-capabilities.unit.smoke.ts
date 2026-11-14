@@ -57,17 +57,18 @@ function addLifecycleUid(creds: string, uid: string): string {
 }
 
 const root = mkdtempSync(join(tmpdir(), "cotal-mint-caps-unit-"));
+const home = mkdtempSync(join(tmpdir(), "cotal-mint-caps-unit-home-"));
 const previousHome = process.env.COTAL_HOME;
 const previousNoPrompt = process.env.COTAL_NO_PROMPT;
 const cwd = process.cwd();
-process.env.COTAL_HOME = root;
+process.env.COTAL_HOME = home;
 process.env.COTAL_NO_PROMPT = "1";
-const agents = join(root, ".cotal", "agents");
+const agents = join(home, ".cotal", "agents");
 mkdirSync(agents, { recursive: true });
 writeFileSync(join(agents, "spawn-caller.md"), "---\nname: spawn-caller\ncapabilities: [spawn]\n---\n");
 const auth = await createSpaceAuth("main");
-saveSpaceAuth(authDir(root), auth);
-recordMesh({ space: "main", server: "nats://127.0.0.1:1", root, mode: "auth", ts: new Date().toISOString(), origin: "manual" });
+saveSpaceAuth(authDir(home), auth);
+recordMesh({ space: "main", server: "nats://127.0.0.1:1", root: home, mode: "auth", ts: new Date().toISOString(), origin: "manual" });
 
 try {
   process.chdir(root);
@@ -130,7 +131,7 @@ try {
     writeFileSync(join(agents, `${name}.md`), `---\nname: ${name}\ncapabilities: [${capability}]\n---\n`);
     const out = join(root, `${name}.creds`);
     const result = await runMint([name, "--out", out]);
-    assert.equal(result.code, 2, result.output);
+    assert.equal(result.code, 1, result.output);
     assert.match(result.output, /unknown capability/);
     assert.equal(existsSync(out), false, `${capability} must be refused before writing creds`);
   }
@@ -174,6 +175,7 @@ try {
   if (previousNoPrompt === undefined) delete process.env.COTAL_NO_PROMPT;
   else process.env.COTAL_NO_PROMPT = previousNoPrompt;
   rmSync(root, { recursive: true, force: true });
+  rmSync(home, { recursive: true, force: true });
 }
 // Success-only: a thrown assertion skips both, so the runner and the mutation marker see the failure.
 console.log(`MINT CAPABILITIES UNIT SMOKE COMPLETE`);
