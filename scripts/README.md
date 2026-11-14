@@ -150,6 +150,7 @@ change: mutation-reproof names it as a metadata-only exclusion instead of re-pro
 kill set.
 
 ## Mutation reproof
+
 > **Mutation reproof is disabled on this fork.** The workflow is renamed
 > `.github/workflows/mutation-reproof.yml.disabled`, so GitHub never runs it.
 > Its fixtures and script remain for local runs.
