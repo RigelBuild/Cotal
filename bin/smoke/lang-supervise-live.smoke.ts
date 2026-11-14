@@ -15,6 +15,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import type { Runtime as RuntimeT } from "@cotal-ai/core";
+import { childlessRuntime } from "../../implementations/manager/smoke/_childless-runtime.js";
 
 const home = mkdtempSync(join(tmpdir(), "cotal-langsupervise-home-"));
 for (const k of Object.keys(process.env)) if (k.startsWith("COTAL_")) delete process.env[k];
@@ -102,6 +104,10 @@ try {
   recordMesh({ space: SPACE, server: SERVER, root: workspaceRoot, mode: "open", ts: new Date().toISOString() });
 
   mgr = new Manager({ space: SPACE, servers: SERVER, runtime: "pty", workspaceRoot });
+  // This exact child starts no child processes; its recorded process exit is the closure proof.
+  const runtime = (mgr as unknown as { runtime: RuntimeT }).runtime;
+  childlessRuntime(runtime, join(workspaceRoot, "childless-runtime"),
+    (spec) => spec.command === process.execPath && spec.args.length === 1 && spec.args[0] === SEAT);
   await mgr.start();
 
   const nc = await connect({ servers: SERVER, maxReconnectAttempts: 0 });

@@ -160,7 +160,8 @@ try {
   // closure. This is not a containment implementation or a claim about real connector tools.
   const runtime = (manager as unknown as { runtime: import("@cotal-ai/core").Runtime }).runtime;
   childlessRuntime(runtime, join(workspaceRoot, "childless-runtime"),
-    (spec) => spec.command === "node" && spec.args.length === 1 && spec.args[0] === STUB);
+    (spec) => (spec.command === "node" && spec.args.length === 1 && spec.args[0] === STUB)
+      || (spec.command === "cotal-supervise-missing-binary" && spec.args.length === 0));
 
   const spawnGoal = "spawn-seat".padEnd(43, "s");
   const spawned = await call("spawn", {
