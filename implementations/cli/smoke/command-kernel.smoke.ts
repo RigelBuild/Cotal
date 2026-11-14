@@ -1554,6 +1554,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   const row = (name: string, meta: Record<string, string>, activity?: string) => ({ card: { id: "u_own.manager_x", name, kind: "endpoint", role: "manager", meta }, status: "idle", ...(activity ? { activity } : {}), ts: 0 }) as unknown as import("@cotal-ai/core").Presence;
   assert.equal(managerLabel(row("factory", { host: "pc" }, "supervisor (tmux)")), "factory", "a named manager shows by its name");
   assert.equal(managerLabel(row("manager", { host: "pc" }, "supervisor (tmux)")), "pc/tmux", "an unnamed one shows by <host>/<runtime>");
+  assert.equal(managerLabel(row("manager", { host: "pc" }, "agent host (pty)")), "pc/pty", "the current manager activity also reports its runtime");
   assert.equal(managerLabel(row("manager", { host: "pc" }, "busy")), "pc", "without a runtime in its activity, by its host");
   assert.equal(managerLabel(row("manager", {}, "supervisor (orca)")), "orca", "without a host, as a manager started by a cotal before 0.100.0, by its runtime");
   const { CommandFailure, commandFailureReport, renderReport } = await import("@cotal-ai/workspace");
