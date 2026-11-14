@@ -117,7 +117,7 @@ process.on("exit", () => {
 const runEnv = { ...HOST_ENV, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: join(home, ".config"), COTAL_HOME: process.env.COTAL_HOME!, COTAL_SKIP_CONNECTOR_SEED: "1" };
 const run = (args: string[], extraEnv: Record<string, string> = {}, cwd = home) =>
   new Promise<{ status: number | null; stdout: string; stderr: string }>((done) => {
-    const child = spawn(process.execPath, [BIN, ...args], {
+    const child = spawn(protectedNode, [BIN, ...args], {
       cwd,
       env: { ...runEnv, ...extraEnv },
       stdio: ["ignore", "pipe", "pipe"],
