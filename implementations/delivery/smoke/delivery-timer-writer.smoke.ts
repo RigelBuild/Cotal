@@ -279,7 +279,8 @@ try {
       const now = Date.now();
       lastDeadline = now + 3_000;
       const fireSubject = eptSubject(space, EP, IID, EPOCH, token, "fire");
-      fireSubjects[fireSubject] = eptSubject(space, EP, IID, EPOCH, token, "armed");
+      const armedSubject = eptSubject(space, EP, IID, EPOCH, token, "armed");
+      fireSubjects[fireSubject] = armedSubject;
       await mintCheckpoint(kv, jetstream(serveNc), space, { ref: { endpoint: EP, token }, instanceId: IID, epoch: EPOCH, holder, deadline: lastDeadline, now });
       tokens.push(token);
       await wait(2_000);
