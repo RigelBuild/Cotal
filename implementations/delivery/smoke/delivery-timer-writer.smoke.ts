@@ -269,6 +269,7 @@ try {
       tokens.push(token);
       await wait(2_000);
     }
+    // JetStream fires are stored records, not core-NATS publications; poll the durable subject records until all broker fires arrive.
     const fireDeadline = lastDeadline + 20_000;
     while (firedTokens.size < tokens.length && Date.now() < fireDeadline) {
       const newlyFired = await Promise.all(tokens.filter((token) => !firedTokens.has(token)).map(async (token) => {
