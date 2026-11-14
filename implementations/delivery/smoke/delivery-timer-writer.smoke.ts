@@ -259,16 +259,7 @@ try {
   {
     const until = Math.max(firstCredExpMs + DLV_TTL_S * 1000 + 2_000, Date.now() + 20_000);
     const tokens: string[] = [];
-    const observedFires = new Set<string>();
-    const recordsSub = gwNc.subscribe(`$KV.${recordsBucket(space)}.cp.>`, {
-      callback: (_error, msg) => {
-        const value = JSON.parse(new TextDecoder().decode(msg.data)) as { kind?: string; qualifiers?: { endpoint?: string; token?: string }; value?: { state?: string } };
-        if (value.kind === "cp" && value.qualifiers?.endpoint === EP && value.qualifiers.token?.startsWith("cp_timerw_swap_") && value.value?.state === "expired") {
-          observedFires.add(value.qualifiers.token);
-        }
-      },
-    });
-    await gwNc.flush();
+    const firedTokens = new Set<string>();
     let lastDeadline = 0;
     while (Date.now() < until) {
       const token = `cp_timerw_swap_${tokens.length + 1}`;
@@ -279,12 +270,19 @@ try {
       await wait(2_000);
     }
     const fireDeadline = lastDeadline + 20_000;
-    while (observedFires.size < tokens.length && Date.now() < fireDeadline) await wait(50);
-    check(`every .schedule published across the daemon's credential renewals was armed and fired (${observedFires.size}/${tokens.length})`,
-      tokens.length >= 5 && observedFires.size === tokens.length, { firedN: observedFires.size, tokens: tokens.length });
-    recordsSub.unsubscribe();
+    while (firedTokens.size < tokens.length && Date.now() < fireDeadline) {
+      const newlyFired = await Promise.all(tokens.filter((token) => !firedTokens.has(token)).map(async (token) => {
+        const f = await jsm.streams.getMessage(eptStreamName(space), { last_by_subj: eptSubject(space, EP, IID, EPOCH, token, "fire") }).catch(() => null);
+        return f?.header?.get("Nats-Scheduler") === eptSubject(space, EP, IID, EPOCH, token, "armed") ? token : undefined;
+      }));
+      for (const token of newlyFired) if (token !== undefined) firedTokens.add(token);
+      if (firedTokens.size < tokens.length) await wait(Math.min(100, Math.max(0, fireDeadline - Date.now())));
+    }
+    check(`every .schedule published across the daemon's credential renewals was armed and fired (${firedTokens.size}/${tokens.length})`,
+      tokens.length >= 5 && firedTokens.size === tokens.length, { firedN: firedTokens.size, tokens: tokens.length });
     check("the writer never went down across two credential expiries: its connection follows each adopted credential",
       !daemonOut.includes("timer writer: down"), daemonOut.split("\n").filter((l) => l.includes("timer writer: down")));
+
 
   }
   
