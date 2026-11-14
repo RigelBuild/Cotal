@@ -169,7 +169,7 @@ jobs:
         run: |
           set +e
           : > results.tsv
-          mapfile -t suites < <(grep -vE '^[[:space:]]*(#|$)' bin/smoke/ci-suites.txt)
+          mapfile -t suites < <(node -e 'import("./bin/smoke/ci-suites.mjs").then(({ readCiSuiteFragments }) => console.log(readCiSuiteFragments().join("\n")))')
           mapfile -t quarantined < <(node -e 'import("./bin/smoke/ci-quarantine.mjs").then(({ QUARANTINED }) => console.log(Object.keys(QUARANTINED).join("\n")))')
           for i in "${!suites[@]}"; do
             s="${suites[$i]}"
