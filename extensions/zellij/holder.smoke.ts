@@ -38,6 +38,7 @@ function fixture(options: FixtureOptions = {}) {
   const launcherDirs: string[] = [];
   let clock = 0;
   const runtime = new HolderRuntime({
+    platform: "linux",
     holderCommand: () => holder,
     unitPrefix: () => "wave-seat-",
     execFileSync: (file: string, args: string[], execOptions: ExecOptions) => {
@@ -234,6 +235,19 @@ await check("graceful and forced stop use the seat unit and verified agent pid",
       file: "systemctl",
       args: ["--user", "kill", "-s", "SIGKILL", `wave-seat-${seatName}`],
     });
+  } finally {
+    f.cleanup();
+  }
+});
+
+await check("forced stop never SIGKILLs a reused agent pid whose starttime changed", () => {
+  const f = fixture();
+  try {
+    const handle = f.spawn();
+    // The holder stays alive, but pid 202 now belongs to another process.
+    f.proc.set(202, stat(202, 23));
+    handle.stop({ graceful: false });
+    assert.deepEqual(f.kills, []);
   } finally {
     f.cleanup();
   }
