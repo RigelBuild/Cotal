@@ -63,9 +63,11 @@ import {
   type EpServeGrant,
   type EpServeHandle,
 } from "@cotal-ai/core";
-import { authCommandDefs, type AuthServiceHandlers } from "./auth-service-contract.js";
+import { authCommandDefs, AUTH_PLACEMENT_COMMANDS, type AuthServiceHandlers } from "./auth-service-contract.js";
 import { openAuthorityClient, type AuthorityClient } from "./authority-client.js";
 import { runAgentRetirementBarrier, type RetirementDeps } from "./retirement-barrier.js";
+import type { PlacementEnrollmentAuthority } from "./placement-enrollment.js";
+import { createPlacementDoorHandlers } from "./placement-participant-door.js";
 import { observeGate, readLifecycleHeadForOperation, type LifecycleRegistry } from "./lifecycle-registry.js";
 import type { ServiceKeys } from "./store.js";
 
@@ -85,7 +87,7 @@ export function authAdminListenerGrants(
     endpoint: AUTH_ENDPOINT,
     instanceId: responder.instanceId,
     epoch: responder.epoch,
-    ephemeralCommands: [EP_CMD_RETIRE_LIFECYCLE],
+    ephemeralCommands: [EP_CMD_RETIRE_LIFECYCLE, ...AUTH_PLACEMENT_COMMANDS],
   });
   return {
     publish: [
@@ -168,6 +170,10 @@ export async function openAuthAdminListener(opts: {
    *  — `serveEndpoint` consumes it directly; it is the ONE authority source for what this
    *  credential may serve (SPEC 13.9). */
   grant: EpServeGrant;
+  /** Placement enrollment. `configured` is the boot-time fact (the composition supplies the reconciler,
+   *  authenticator and role policy); `port` reads the built authority per request, undefined until the
+   *  plane finishes building it. Configured-but-not-ready answers `unavailable`; unconfigured `unimplemented`. */
+  placement: { configured: boolean; port: () => PlacementEnrollmentAuthority | undefined };
   onConnection?: import("./authority-client.js").AuthorityClientOpts["onConnection"];
   log: (line: string) => void;
 }): Promise<AuthAdminListener> {
@@ -213,6 +219,7 @@ export async function openAuthAdminListener(opts: {
   };
 
   const handlers: AuthServiceHandlers = {
+    ...createPlacementDoorHandlers(opts.placement),
     retireLifecycle: async (ctx: EpServeContext) => {
       // The TARGET comes from the subject (`exact` mode, arity 3) — broker-enforced and
       // grant-pinned, not a claim the caller can vary independently of what it may publish.

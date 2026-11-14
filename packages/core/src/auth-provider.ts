@@ -26,6 +26,7 @@ import type {
   RemoteRunAttemptRequest,
   RemoteRunAttemptResult,
 } from "./remote-manager-authority.js";
+import type { PlacementEnrollmentRequest, PlacementEnrollmentResult } from "./placement-enrollment.js";
 import type { ConversationSelection } from "./conversation-selection.js";
 import { assertLifecycleToken } from "./subjects.js";
 
@@ -350,6 +351,8 @@ export interface AuthProvider extends Extension {
     dir: string;
     request: RemoteManagedAgentEnrollmentRequest;
   }): Promise<RemoteManagedAgentEnrollmentResult>;
+  /** Request first-effect placement enrollment through the host's reconciler-backed admission. */
+  enrollPlacement?(opts: { store: SecretStore; dir: string; request: PlacementEnrollmentRequest }): Promise<PlacementEnrollmentResult>;
   /**
    * Ask the host to PREPARE one managed agent's terminal retirement (#1972 phase P0/P1): revoke the
    * managed grant UID-exactly and commit the resumable release while preserving the UID. Success

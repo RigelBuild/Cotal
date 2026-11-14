@@ -27,7 +27,7 @@ export interface ManagerCandidate {
 }
 
 /** How a manager is shown: the name it was started with, or `<host>/<runtime>` for one left at the
- *  default name, with the runtime read from its `supervisor (<runtime>)` activity. A manager whose
+ *  default name, with the runtime read from its `agent host (<runtime>)` activity. A manager whose
  *  presence names no host, as one started by a cotal before 0.100.0, is shown by its runtime. */
 export function managerLabel(p: Presence): string {
   if (p.card.name !== DEFAULT_MANAGER_NAME) return p.card.name;
@@ -38,8 +38,8 @@ export function managerLabel(p: Presence): string {
 
 const presenceHost = (p: Presence): string | null => typeof p.card.meta?.host === "string" && p.card.meta.host ? p.card.meta.host : null;
 
-/** The runtime a manager reports, read from its `supervisor (<runtime>)` activity. */
-const presenceRuntime = (p: Presence): string | null => /^supervisor \((.+)\)$/.exec(p.activity ?? "")?.[1] ?? null;
+/** The runtime from current and earlier manager activity. */
+const presenceRuntime = (p: Presence): string | null => /^(?:agent host|supervisor) \((.+)\)$/.exec(p.activity ?? "")?.[1] ?? null;
 
 /** What a manager reports about attaching to its seats' terminals. Only the two values it writes
  *  are taken; anything else, an absent key included, is "it did not say". */

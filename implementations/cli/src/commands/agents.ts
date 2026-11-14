@@ -158,9 +158,8 @@ export async function stop(args: ParsedArgs): Promise<void> {
   if (!data.stopped) throw new CommandFailure("failed", "OPERATION_FAILED", "the manager reported that it did not stop the selected agent", { target });
   const result = { kind: "agent-stop", name: data.name, stopped: data.stopped, graceful: data.graceful, request: reply.request ?? null, grantRevocation: t.auth.bearer ? "native user-mode stop policy" : "not asserted" };
   writeResult(presentationOf(v), { command: "stop", target, result }, (row): Report => ({ sections: [
-    { title: "Agent stop acknowledged", blocks: [{ kind: "fields", rows: [["Agent", row.name], ["Space", t.space], ["Manager", reply.managerInstanceId ?? "not attributed"], ["Native mode", row.graceful ? "graceful" : "hard despawn"], ["Selection", v.self ? "this verified seat only" : "named agent's resolved incarnation"]] }, { kind: "lines", lines: [{ text: "This is the manager's stop result, not an independent process-exit measurement. No other agent was selected and no replacement was launched.", tone: "hint" }] }] },
+    { title: "Agent stop acknowledged", blocks: [{ kind: "fields", rows: [["Agent", row.name], ["Space", t.space], ["Manager", reply.managerInstanceId ?? "not attributed"], ["Native mode", row.graceful ? "graceful" : "hard despawn"], ["Selection", v.self ? "this verified seat only" : "named agent's resolved incarnation"]] }, { kind: "lines", lines: [{ text: "This is the manager's stop result, not an independent process-exit measurement. No other agent was selected and no replacement was launched.", tone: "hint" }, ...(t.auth.bearer ? [{ text: `✓ stopped ${data.name} - its actor grant is revoked; a respawn re-grants automatically`, tone: "hint" as const }] : [])] }] },
   ] }));
-  if (t.auth.bearer) console.log(c.dim(`✓ stopped ${data.name} - its actor grant is revoked; a respawn re-grants automatically`));
 }
 
 type AgentRow = {

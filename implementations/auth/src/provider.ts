@@ -1,4 +1,5 @@
 import { exchangeRateLimit, readAuthResponseJson, type ExchangeRateLimit } from "./response-json.js";
+import type { PlacementEnrollmentRequest, PlacementEnrollmentResult } from "@cotal-ai/core";
 /**
  * The core `auth-provider` extension — how a composition root gets user-mode auth WITHOUT importing
  * this package from the CLI (`bin/cotal.ts` imports `@cotal-ai/auth`; `@cotal-ai/cli` resolves the
@@ -409,6 +410,11 @@ export const cotalAuthProvider: AuthProvider = {
         throw new EpEnvelopeError("permission-denied", error.message, undefined, "not-executed");
       throw error;
     }
+  },
+
+  async enrollPlacement({ store, dir, request }: { store: SecretStore; dir: string; request: PlacementEnrollmentRequest }): Promise<PlacementEnrollmentResult> {
+    const { endpoint, idpUrl, authorization } = await managerAuthorityEndpoint(store, dir, request.enrollment.space, "enrolling a placement");
+    return postManagerAuthority(endpoint, idpUrl, authorization, request, "placement enrollment") as Promise<PlacementEnrollmentResult>;
   },
 
   /** Client half of host-owned terminal release preparation (#1972 phase P0/P1). The opId is derived

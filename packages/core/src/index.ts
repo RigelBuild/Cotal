@@ -15,6 +15,9 @@ export type { RegistryService, RegistryServiceHandle, RegistryServiceInputs } fr
 export * from "./endpoint-envelope.js";
 export * from "./endpoint-records.js";
 export * from "./lifecycle-state.js";
+export * from "./registration-family.js";
+export * from "./registration-family-client.js";
+export * from "./registration-read-client.js";
 export * from "./environment-manager-grants.js";
 export * from "./lifecycle-saga.js";
 export * from "./native-uid-custody.js";
@@ -117,6 +120,7 @@ export * from "./conversation-selection.js";
 export * from "./conversation-approval.js";
 export * from "./manager-caller.js";
 export * from "./remote-manager-authority.js";
+export { parsePlacementEnrollmentRequest, type PlacementEnrollmentRequest, type PlacementEnrollmentResult } from "./placement-enrollment.js";
 export * from "./remote-service-authority.js";
 export * from "./endpoint-capability-policy.js";
 export * from "./delegated-recovery.js";
