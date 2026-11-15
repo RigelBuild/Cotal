@@ -57,6 +57,7 @@ import {
   type CotalConfig,
   modelPolicyRefusal,
   mintCreds,
+  mintPublicSeatUserJwt,
   mintGeneration,
   mintAcceptedToken,
   type IssuedBinding,
@@ -2002,6 +2003,7 @@ export class Manager {
   private auth?: SpaceAuth;
   /** Durable reservation and issuance state for identities this static manager mints. */
   private identityStore?: IdentityStore;
+  private readonly identityMintFlights = new Map<string, Promise<{ name: string; jwt: string; lifecycleUid: string; exp: number; acceptedToken: string }>>();
   /** Readiness-race backstop (#159 B1) — the {@link READINESS_TIMEOUT_MS} constant, held as an instance
    *  field so a test can shorten it (the join/exit signals are event-driven; only the backstop is timed).
    *  Production leaves it at the constant. */
@@ -12508,9 +12510,54 @@ export class Manager {
     return {};
   }
 
-  private identityMint(_ctx: EpServeContext): never {
-    this.identityStoreForCommand();
-    throw new EpEnvelopeError("unavailable", "public-seat JWT issuance is unavailable until the core mintPublicSeatUserJwt API is integrated", undefined, "not-executed");
+  private async identityMint(ctx: EpServeContext): Promise<{ name: string; jwt: string; lifecycleUid: string; exp: number; acceptedToken: string }> {
+    const store = this.identityStoreForCommand();
+    const input = ctx.request.args;
+    if (typeof input !== "object" || input === null || Array.isArray(input) || !("name" in input) || !("lifecycleUid" in input) || !("publicKey" in input) || typeof input.lifecycleUid !== "string" || typeof input.publicKey !== "string")
+      throw new EpEnvelopeError("bad-request", "identity mint requires a name, lifecycle UID and public key", undefined, "not-executed");
+    const publicKey = input.publicKey;
+    const name = this.identityAlias(input.name);
+    const minter = principalKey(ctx.subject.caller.owner, ctx.subject.caller.actor).key;
+    const record = store.get(name);
+    if (!record) throw new EpEnvelopeError("not-found", `identity ${name} has no reservation`, undefined, "not-executed");
+    if (record.minter !== minter) throw new EpEnvelopeError("permission-denied", `identity ${name} is owned by another minter`, undefined, "not-executed");
+    if (record.lifecycleUid !== input.lifecycleUid) throw new EpEnvelopeError("failed-precondition", "identity lifecycle UID does not match its reservation", undefined, "not-executed");
+    const bound = store.bindPublicKey(name, minter, record.lifecycleUid, input.publicKey);
+    const existing = this.identityMintFlights.get(record.lifecycleUid);
+    if (existing) return existing;
+    const flight = (async () => {
+      const now = Math.floor(Date.now() / 1000);
+      let issuance = bound.issuance;
+      if (!issuance) {
+        issuance = { generation: mintGeneration(now + STATIC_GENERATION_HORIZON_SEC), acceptedToken: mintAcceptedToken(), issuanceId: mintLifecycleUid(), iat: now, exp: now + MANAGED_STATIC_TTL_SEC, state: "pending" };
+        store.transition(name, minter, record.lifecycleUid, undefined, issuance);
+        await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: publicKey, lifecycleUid: record.lifecycleUid, alias: name }, (t) =>
+          activateStaticLifecycle(t, { owner: DEV_OWNER, alias: name, actor: publicKey, lifecycleUid: record.lifecycleUid, managerInstance: this.managerLifecycleUid, ownerInstanceId: this.managerInstanceId }));
+      }
+      if (issuance.state !== "pending" && issuance.state !== "issued")
+        throw new EpEnvelopeError("failed-precondition", "identity issuance is terminalizing", undefined, "not-executed");
+      const current = issuance;
+      const minted = await this.withIssuer((i) => mintPublicSeatUserJwt(this.auth!, publicKey, {
+        name, principal: { owner: DEV_OWNER, actor: publicKey }, lifecycleUid: record.lifecycleUid,
+        issuedAt: current.iat, expiresAt: current.exp,
+        issued: { generation: current.generation, acceptedToken: current.acceptedToken },
+        issuance: this.issuanceSeam(i, "issue", { name, id: publicKey, lifecycleUid: record.lifecycleUid }, current.exp),
+      }));
+      if (current.state === "pending") {
+        await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: publicKey, lifecycleUid: record.lifecycleUid, alias: name }, async (t) => {
+          const slot = await readStaticSlot(t, DEV_OWNER, name);
+          if (!slot || slot.row.lifecycleUid !== record.lifecycleUid || slot.row.actor !== publicKey || slot.row.phase !== "provisioning")
+            throw new EpEnvelopeError("failed-precondition", "identity static slot does not match its issuance", undefined, "not-executed");
+          await casStaticSlot(t, { ...slot.row, phase: "active" }, slot.revision);
+        });
+        store.transition(name, minter, record.lifecycleUid, current.generation, { ...current, credentialId: credentialIdOf(minted.jwt), state: "issued" });
+      }
+      if (current.credentialId !== undefined && current.credentialId !== credentialIdOf(minted.jwt))
+        throw new EpEnvelopeError("failed-precondition", "identity credential does not match its persisted reference", undefined, "not-executed");
+      return { name, lifecycleUid: record.lifecycleUid, ...minted };
+    })();
+    this.identityMintFlights.set(record.lifecycleUid, flight);
+    try { return await flight; } finally { if (this.identityMintFlights.get(record.lifecycleUid) === flight) this.identityMintFlights.delete(record.lifecycleUid); }
   }
 
   private identityRenew(_ctx: EpServeContext): never {

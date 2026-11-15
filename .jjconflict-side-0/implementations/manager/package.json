@@ -25,6 +25,7 @@
     "build:console-bundle": "esbuild src/console-session-entry.ts --bundle --format=iife --platform=browser --target=es2020 --alias:node:crypto=./src/console-crypto-shim.ts --outfile=dist/console/session-bundle.js && node scripts/console-bundle-loadtest.mjs",
     "prepublishOnly": "pnpm run build",
     "smoke:identity-store": "tsx smoke/identity-store.smoke.ts",
+    "smoke:identity-mint": "tsx smoke/identity-mint.smoke.ts",
     "smoke:shutdown-custody": "tsx smoke/shutdown-custody.smoke.ts"
   },
   "dependencies": {

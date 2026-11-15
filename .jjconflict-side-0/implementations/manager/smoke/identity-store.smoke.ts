@@ -68,7 +68,7 @@ try {
   assert.throws(
     () => reopened.reserve("over-cap", "next-minter", 12, 1),
     (error: unknown) => error instanceof EpEnvelopeError && error.code === "resource-exhausted" &&
-      error.details?.some((detail) => detail.kind === "EP_SEAT_MINT_CAP" && detail.seats === 1 && detail.cap === 1) === true,
+      error.details?.some((detail) => detail.kind === "ai.cotal.ep.seat-mint-cap" && detail.seats === 1 && detail.cap === 1) === true,
     "cap checking and reservation share the same transaction",
   );
 

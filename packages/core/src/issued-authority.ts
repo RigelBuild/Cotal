@@ -790,7 +790,7 @@ export function assertIssuedStoreConfig(cfg: StreamConfig, space: string, bucket
 export async function bindIssuedStores(kvm: Kvm, jsm: JetStreamManager, space: string): Promise<{ store: IssuedStore; accepted: KV }> {
   for (const { bucket } of issuedStoreDefinitions(space))
     assertIssuedStoreConfig((await jsm.streams.info(`KV_${bucket}`)).config, space, bucket);
-  return { store: openIssuedStore(await kvm.open(issuedBucket(space)), jsm, space), accepted: await kvm.open(acceptedBucket(space)) };
+  return { store: openIssuedStore(await kvm.open(issuedBucket(space)), jsm, space), accepted: await kvm.open(acceptedBucket(space), { allow_direct: true }) };
 }
 
 // ---- the accepted row ----------------------------------------------------------------------------

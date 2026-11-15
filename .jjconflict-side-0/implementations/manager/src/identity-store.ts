@@ -13,6 +13,7 @@ export type IdentityIssuance = {
   exp: number;
   acceptedToken: string;
   issuanceId: string;
+  credentialId?: string;
   state: "pending" | "issued" | "retiring" | "retired";
 };
 
@@ -29,7 +30,7 @@ export type IdentityRecord = {
 };
 
 const KEYS = new Set(["version", "name", "lifecycleUid", "minter", "reservedAt", "touchedAt", "retiredAt", "publicKey", "issuance"]);
-const ISSUANCE_KEYS = new Set(["generation", "iat", "exp", "acceptedToken", "issuanceId", "state"]);
+const ISSUANCE_KEYS = new Set(["generation", "iat", "exp", "acceptedToken", "issuanceId", "credentialId", "state"]);
 const UID = /^[a-z0-9]{26,32}$/;
 const USER_NKEY = /^U[A-Z2-7]{55}$/;
 const HEX32 = /^[0-9a-f]{32}$/;
@@ -45,6 +46,7 @@ function parseIssuance(raw: unknown): IdentityIssuance | undefined {
       !Number.isSafeInteger(raw.iat) || !Number.isSafeInteger(raw.exp) ||
       typeof raw.acceptedToken !== "string" || !HEX32.test(raw.acceptedToken) ||
       typeof raw.issuanceId !== "string" || !UID.test(raw.issuanceId) ||
+      (raw.credentialId !== undefined && (typeof raw.credentialId !== "string" || !/^sha256-[0-9a-f]{64}$/.test(raw.credentialId))) ||
       !["pending", "issued", "retiring", "retired"].includes(String(raw.state)))
     throw new Error("invalid identity issuance record");
   return {
@@ -53,6 +55,7 @@ function parseIssuance(raw: unknown): IdentityIssuance | undefined {
     exp: raw.exp as number,
     acceptedToken: raw.acceptedToken,
     issuanceId: raw.issuanceId,
+    ...(raw.credentialId === undefined ? {} : { credentialId: raw.credentialId as string }),
     state: raw.state as IdentityIssuance["state"],
   };
 }
@@ -83,7 +86,7 @@ export function parseIdentityRecord(raw: unknown): IdentityRecord {
 function sameIssuance(a: IdentityIssuance | undefined, b: IdentityIssuance | undefined): boolean {
   return a === undefined ? b === undefined : b !== undefined &&
     a.generation === b.generation && a.iat === b.iat && a.exp === b.exp &&
-    a.acceptedToken === b.acceptedToken && a.issuanceId === b.issuanceId && a.state === b.state;
+    a.acceptedToken === b.acceptedToken && a.issuanceId === b.issuanceId && a.credentialId === b.credentialId && a.state === b.state;
 }
 
 function cloneRecord(record: IdentityRecord): IdentityRecord {
@@ -251,7 +254,7 @@ export class IdentityStore {
       const seats = [...currentByName.values()].filter((row) => row.minter === minter && row.retiredAt === undefined && row.issuance?.state !== "retired").length;
       if (seats >= cap)
         throw new EpEnvelopeError("resource-exhausted", `minter ${minter} has reached its seat mint cap`,
-          [{ kind: "EP_SEAT_MINT_CAP", minter, seats, cap }], "not-executed");
+          [{ kind: "ai.cotal.ep.seat-mint-cap", minter, seats, cap }], "not-executed");
 
       let lifecycleUid = mintLifecycleUid();
       while (this.#indexByUid(lifecycleUid) >= 0) lifecycleUid = mintLifecycleUid();
@@ -311,7 +314,8 @@ export class IdentityStore {
           throw identityError("failed-precondition", "initial identity issuance must be pending or issued");
       } else if (next.generation === previous.generation) {
         const sameAuthority = next.iat === previous.iat && next.exp === previous.exp &&
-          next.acceptedToken === previous.acceptedToken && next.issuanceId === previous.issuanceId;
+          next.acceptedToken === previous.acceptedToken && next.issuanceId === previous.issuanceId &&
+          (previous.credentialId === next.credentialId || (previous.state === "pending" && next.state === "issued" && previous.credentialId === undefined && next.credentialId !== undefined));
         const allowed = next.state === previous.state ||
           (previous.state === "pending" && next.state === "issued") ||
           (previous.state === "issued" && next.state === "retiring") ||
