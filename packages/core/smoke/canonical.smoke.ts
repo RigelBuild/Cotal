@@ -109,6 +109,13 @@ ok("digest has sha256:<hex> form", isContractDigest(d1), d1);
 ok("digest independent of key order", d1 === d2);
 ok("digest changes with content", contractDigest({ x: 2, y: [true, "z"] }) !== d1);
 
+// Shared launch-intent digest vector after removing only the top-level digest (orion-docs launch protocol).
+const launchIntent = { z: 1, nested: { digest: "kept" }, a: "é" };
+const launchIntentDigest = contractDigest(launchIntent);
+ok("shared launch-intent digest vector", launchIntentDigest === "sha256:dae8b1efd904f86fed1ebec22c7d3e2bdeeab900aa162c2553f89e9e12f6ff75", launchIntentDigest);
+ok("shared launch-intent digest ignores key insertion order",
+  contractDigest({ a: "é", nested: { digest: "kept" }, z: 1 }) === launchIntentDigest);
+
 // 7) verify-on-read: matching bytes parse; tampered bytes and wrong digests refuse loudly.
 const artifact = { urn: "ai.cotal.lifecycle", revision: 1 };
 const bytes = new TextEncoder().encode(JSON.stringify(artifact));
