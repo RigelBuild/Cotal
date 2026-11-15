@@ -60,15 +60,6 @@ export async function authorizeNamedControl(opts: {
   return `not authorized: ${target.name} was not spawned by ${caller} (admin tier required)`;
 }
 
-/** Identity control belongs to its recorded minter, except on the separately granted admin route. */
-export function authorizeIdentityControl(
-  seat: { name: string; minter: string },
-  caller: string,
-  adminGrant: boolean,
-): string | undefined {
-  if (adminGrant || seat.minter === caller) return undefined;
-  return `not authorized: ${seat.name} was not reserved by ${caller}`;
-}
 
 /**
  * The manifest-launch authorization decision — pure, same contract style as
