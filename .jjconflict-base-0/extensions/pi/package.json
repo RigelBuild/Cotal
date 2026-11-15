@@ -1,0 +1,68 @@
+{
+  "name": "@cotal-ai/pi",
+  "version": "0.151.2",
+  "license": "Apache-2.0",
+  "keywords": [
+    "cotal",
+    "pi-coding-agent",
+    "multi-agent",
+    "agent-coordination"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Cotal-AI/Cotal.git",
+    "directory": "extensions/pi"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./extension": {
+      "types": "./dist/extension.d.ts",
+      "import": "./dist/standalone.js"
+    }
+  },
+  "engines": {
+    "node": ">=22.10"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.smoke.json",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json --emitDeclarationOnly && pnpm run bundle",
+    "bundle": "esbuild src/index.ts --bundle --minify-whitespace --platform=node --format=esm --target=node20 --outfile=dist/index.js --external:@cotal-ai/core --external:@earendil-works/pi-coding-agent && esbuild src/standalone.ts --bundle --minify-whitespace --platform=node --format=esm --target=node20 --outfile=dist/standalone.js --external:@earendil-works/pi-coding-agent --external:@earendil-works/pi-tui --banner:js=\"import { createRequire as __cotalCreateRequire } from 'node:module'; const require = __cotalCreateRequire(import.meta.url);\" && node -e \"require('node:fs').copyFileSync('../connector-core/src/docs-index.bin','dist/docs-index.bin')\" && node -e \"require('node:fs').copyFileSync('../connector-core/src/docs-bundle.bin','dist/docs-bundle.bin')\"",
+    "test": "pnpm run build && tsx pi.smoke.ts && node --input-type=module -e \"await import('./dist/standalone.js'); console.log('pi standalone smoke: import passed')\"",
+    "prepublishOnly": "pnpm run build"
+  },
+  "peerDependencies": {
+    "@cotal-ai/core": ">=0.1.0",
+    "@earendil-works/pi-coding-agent": ">=0.79.10",
+    "@earendil-works/pi-tui": ">=0.79.10"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@cotal-ai/core": "workspace:*",
+    "@cotal-ai/connector-core": "workspace:*",
+    "@cotal-ai/smoke-kit": "workspace:*",
+    "@earendil-works/pi-ai": "0.79.10",
+    "@earendil-works/pi-coding-agent": "0.79.10",
+    "@earendil-works/pi-tui": "0.79.10",
+    "@nats-io/jetstream": "^3.4.0",
+    "@nats-io/transport-node": "^3.4.0",
+    "esbuild": "^0.28.0",
+    "typebox": "^1.1.0",
+    "zod": "^4.6.7"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

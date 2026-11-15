@@ -1,0 +1,648 @@
+/**
+ * Agent definition files — the persisted form of an agent's identity + persona.
+ *
+ *   .cotal/agents/<name>.md
+ *   ---
+ *   name: builder              # AgentCard-shaped identity in the frontmatter
+ *   role: builder
+ *   description: …
+ *   tags: [edit, test]
+ *   subscribe: [general]       # channels this agent actively reads at boot (the live set);
+ *                              #   omit ⇒ NO channels (reachable by DM only)
+ *   allowSubscribe: [general]  # read ACL — channels it MAY read; omit ⇒ same as `subscribe`
+ *   allowPublish: [general]    # post ACL — channels it may publish to; omit ⇒ DENY (default-deny)
+ *   model: opus                # optional CLI/model override
+ *   variant: high              # optional connector-defined model variant
+ *   capabilities: [spawn]  # control-plane capabilities (spawn → may start/despawn others)
+ *   agent: jcode           # optional connector/harness pin (flag > file > COTAL_DEFAULT_AGENT > default)
+ *   theme: dark            # any unmodelled key is kept verbatim in AgentDef.meta, so a
+ *                          #   connector can read its own launcher hints without core knowing them
+ *   ---
+ *   <the Markdown body is the persona — an appended system prompt>
+ *
+ * A launcher resolves a name (or path) to one of these, hands the persona/model/variant
+ * to the agent process at spawn, and passes the file through so the joined
+ * session reads its own card from it. Part of the wire contract's onboarding
+ * half, alongside the join link.
+ */
+import { accessSync, constants, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import type { EndpointKind } from "./types.js";
+import { assertValidName } from "./resolve.js";
+import { createPrivateRecord, writePrivateRecord } from "./secret-fs.js";
+import { utf16Problem } from "./text-encoding.js";
+import { assertValidChannel, channelInAllow, isConcreteChannel, resolveReadAcl } from "./subjects.js";
+import { assertBoundedOwner } from "./endpoint-subjects.js";
+
+/** Agent-file capabilities that grant authority in v1. Shared with boundaries that validate
+ *  hand-editable policies before they reach credential signing or provisioning. */
+export function assertKnownAgentCapabilities(capabilities: readonly string[], where = "agent"): void {
+  for (const capability of capabilities) {
+    if (capability !== "spawn" && capability !== "run" && !/^role:[A-Za-z0-9_-]+$/.test(capability))
+      throw new Error(`${where}: unknown capability "${capability}" (known: spawn, run, role:<r>)`);
+  }
+}
+
+export interface AgentDef {
+  name: string;
+  role?: string;
+  kind?: EndpointKind;
+  description?: string;
+  tags?: string[];
+  /** The connector/harness this persona pins (e.g. `claude`, `jcode`). Honored with the same
+   *  precedence as {@link model}/{@link variant}: an explicit `--agent` flag wins over the file,
+   *  the file wins over `COTAL_DEFAULT_AGENT`, which wins over the product default. A value
+   *  naming an unregistered connector fails loud at spawn (registry resolve, no fallback). */
+  agent?: string;
+  /** The *active* read set: channels this agent subscribes to at boot (the live chat-durable
+   *  filter; mutable at runtime via join/leave). Must be ⊆ {@link allowSubscribe}. Omitted or
+   *  empty ⇒ NO channels: an agent reads exactly the channels it lists, and a file that names
+   *  none joins none (it stays reachable by DM, presence and anycast). List `general` to get it. */
+  subscribe?: string[];
+  /** The read **ACL**: channels this agent *may* read (auth mode → minted as per-channel
+   *  history-consumer create grants; the live durable's filter is also held within it). Entries
+   *  may be wildcard subtrees (`team.>`). Omitted ⇒ defaults to {@link subscribe} — it can read
+   *  exactly what it subscribes to. */
+  allowSubscribe?: string[];
+  /** The post **ACL**: channels this agent may publish to (auth mode → minted into pub-allow
+   *  ACLs). Entries may be wildcard subtrees (`team.>`). Omitted ⇒ **deny** (default-deny):
+   *  publishing is the dangerous capability, so it must be declared explicitly. */
+  allowPublish?: string[];
+  /** Per-channel attention DEFAULT: channels delivered but never waking this agent — per-channel
+   *  `dnd`. Concrete channels within the read ACL (`allowSubscribe`). One-way operator default; the runtime toggle is
+   *  connector state, never written back here (the file is a shared template). */
+  quiet?: string[];
+  /** Per-channel attention DEFAULT: channels dropped on receive (incl. `@`-mentions) — "don't receive
+   *  this channel". Same one-way default semantics as {@link quiet}. */
+  muted?: string[];
+  /** Model override handed to the agent CLI (e.g. `claude --model`). */
+  model?: string;
+  /** Connector-defined model variant handed to the launcher (e.g. OpenCode reasoning effort). */
+  variant?: string;
+  /** Opaque, connector-specific launch options — an arbitrary key→value map that core never
+   *  interprets. Connectors forward well-shaped keys raw into their host form (`claude` flags,
+   *  OpenCode config); a connector with no option surface fails loud. `--opt k=v` on the CLI, a
+   *  manifest `launchOptions:`, or a nested `launchOptions:` block here all feed the same bag. */
+  launchOptions?: Record<string, unknown>;
+  /** Capabilities this agent may exercise on the control plane (auth mode → minted into the
+   *  cred's publish allow-list). `spawn` grants the manager's `spawnCallerCapabilities` ep rows
+   *  and `run` the `runCallerCapabilities` rows (the run commands plus the spawn set). Default-deny
+   *  when absent — nats-server, not a handler, is the boundary. Granting authority is operator-level
+   *  (`definePersona` is itself privileged), so no peer can self-grant via its own agent file.
+   *  NOTE: because launchOptions is a raw passthrough, `spawn` is HOST-LAUNCH AUTHORITY — its holder
+   *  can drive the connector's full launch surface on the manager host (Claude `--mcp-config` /
+   *  `--add-dir` / permission flags, OpenCode agent-config keys). Grant it as host-launch authority,
+   *  not as a narrow "add a teammate" permission. */
+  capabilities?: string[];
+  /** Authenticated id of the agent that first defined this persona via `definePersona` (P6). A
+   *  POLICY field, not content: the privileged tier may *redefine* an existing file only if its
+   *  `owner` equals the caller; everyone else needs the admin tier. Fail-closed — an ownerless
+   *  file (legacy / operator-written) is admin-only, and a caller can never claim ownership of an
+   *  existing file. Set once at creation (owner = creator), preserved on every later redefine. */
+  owner?: string;
+  /** Frontmatter keys not modelled above, kept verbatim so a connector can read its own launcher
+   *  hints without core knowing about each one. */
+  meta?: Record<string, string>;
+  /** Markdown body — the agent's persona / appended system prompt. */
+  persona?: string;
+}
+
+/** Parse the frontmatter block as YAML (the `yaml` library — spec-compliant quoting/escaping and
+ *  safe scalar typing, so a value with a `:`/`#`/quote can't be misread). Must be a mapping; a
+ *  sequence, scalar, or malformed block fails loud. Values keep their YAML types (string, number,
+ *  boolean, nested map/list); {@link loadAgentFile} coerces the modelled scalar fields. */
+function parseFrontmatter(src: string, path: string): Record<string, unknown> {
+  let doc: unknown;
+  try {
+    doc = parseYaml(src);
+  } catch (e) {
+    throw new Error(`agent file ${path}: invalid YAML frontmatter; ${(e as Error).message}`);
+  }
+  if (doc === null || doc === undefined) return {};
+  if (typeof doc !== "object" || Array.isArray(doc))
+    throw new Error(`agent file ${path}: frontmatter must be a YAML mapping (key: value pairs)`);
+  return doc as Record<string, unknown>;
+}
+
+/** The frontmatter fence {@link loadAgentFile} and a frontmattered `cotal_persona` prompt share. */
+const AGENT_FILE_FENCE = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/;
+
+/** Named error prefix when a persona prompt starts with `---` but is not a closed, valid agent file. */
+export const PROMPT_FRONTMATTER = "prompt-frontmatter";
+
+/** Frontmatter keys {@link AgentDef} models. The parser keeps them out of `meta`, and the writer
+ *  refuses a `meta` entry that names one, so a hint can never overwrite a field the file models. */
+const MODELED_KEYS = new Set(["name", "role", "kind", "description", "tags", "subscribe", "allowSubscribe", "allowPublish", "quiet", "muted", "agent", "model", "variant", "launchOptions", "capabilities", "owner"]);
+
+/** Pre-ACL field names the parser refuses outright, so the writer must never emit them from `meta`. */
+const RENAMED_KEYS = ["channels", "publish"];
+
+/** Refuse a whitespace-only `model` or `variant`. Launchers and connectors read these as set or
+ *  absent, and a blank value is neither, so letting one through leaves each of them to drop, render
+ *  or refuse it on its own. */
+function assertLaunchSelectors(def: Pick<AgentDef, "model" | "variant">, where: string): void {
+  for (const k of ["model", "variant"] as const) {
+    const v = def[k];
+    if (v !== undefined && !v.trim()) throw new Error(`${where}: "${k}" must not be empty`);
+  }
+}
+
+/** Validate an endpoint **kind** (`card.kind`, `COTAL_KIND`, or an agent file's `kind:`): the
+ *  closed `"agent" | "endpoint"` set ({@link EndpointKind}). The endpoint branches on
+ *  `card.kind === "agent"` for the authed agent's `dm_` incarnation proof before presence
+ *  publishes, so an unvalidated string would skip that proof. */
+export function assertValidKind(kind: unknown, where?: string): EndpointKind {
+  if (kind === "agent" || kind === "endpoint") return kind;
+  throw new Error(
+    `${where ? `${where}: ` : `invalid kind ${JSON.stringify(kind)}: `}"kind" must be "agent" or "endpoint"`,
+  );
+}
+
+/** Load and parse an agent definition file (Markdown + `---` frontmatter). */
+export function loadAgentFile(path: string): AgentDef {
+  return parseAgentFileSource(readFileSync(path, "utf8"), path);
+}
+
+/** Parse an agent-file document already in memory. `path` is only for error text. A leading UTF-8
+ *  BOM and CRLF line endings, as Windows editors and git's `core.autocrlf` write them, read as LF. A
+ *  file saved as UTF-16 is refused by its encoding (see {@link utf16Problem}). */
+export function parseAgentFileSource(src: string, path: string): AgentDef {
+  const encoding = utf16Problem(src);
+  if (encoding) throw new Error(`agent file ${path}: ${encoding}; save it as UTF-8`);
+  const m = AGENT_FILE_FENCE.exec(src.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n"));
+  if (!m) throw new Error(`agent file ${path}: missing "---" frontmatter block`);
+  const fm = parseFrontmatter(m[1], path);
+  const persona = m[2].trim();
+
+  const str = (k: string): string | undefined => {
+    const v = fm[k];
+    if (v === undefined || v === null) return undefined;
+    if (typeof v === "object") throw new Error(`agent file ${path}: "${k}" must be a scalar`);
+    return String(v);
+  };
+  const list = (k: string): string[] | undefined => {
+    const v = fm[k];
+    if (v === undefined || v === null) return undefined;
+    return (Array.isArray(v) ? v : [v]).map((x) => {
+      if (x === null || typeof x === "object") throw new Error(`agent file ${path}: "${k}" list items must be scalars`);
+      return String(x);
+    });
+  };
+
+  const name = str("name");
+  if (!name) throw new Error(`agent file ${path}: "name" is required`);
+  assertValidName(name);
+  const model = str("model");
+  const variant = str("variant");
+  assertLaunchSelectors({ model, variant }, `agent file ${path}`);
+  const rawKind = str("kind");
+  const kind = rawKind !== undefined ? assertValidKind(rawKind, `agent file ${path}`) : undefined;
+
+  // The pre-ACL field names were renamed (channels→subscribe, publish→allowPublish, +allowSubscribe).
+  // Fail loud on the old names rather than silently sweeping them into meta and ignoring them —
+  // an unmigrated file would otherwise lose its read/post scope without warning (no silent degrade).
+  for (const old of RENAMED_KEYS)
+    if (old in fm)
+      throw new Error(
+        `agent file ${path}: "${old}" was renamed - use "subscribe"/"allowSubscribe" (read) and "allowPublish" (post)`,
+      );
+
+  const subscribe = list("subscribe");
+  const allowSubscribe = list("allowSubscribe");
+  const allowPublish = list("allowPublish");
+  const quiet = list("quiet");
+  const muted = list("muted");
+  // Reject channel names the wire layer would silently rewrite — a policy name must equal its wire
+  // token, or the ACL aliases (see assertValidChannel). Covers all three scope fields.
+  for (const ch of [...(subscribe ?? []), ...(allowSubscribe ?? []), ...(allowPublish ?? [])])
+    try {
+      assertValidChannel(ch);
+    } catch (e) {
+      throw new Error(`agent file ${path}: ${(e as Error).message}`);
+    }
+  // Invariant (fail-loud at load): the active read set must be within the read ACL. Defaults:
+  // subscribe ⇒ NOTHING; allowSubscribe ⇒ subscribe (read exactly what you subscribe to).
+  // An omitted or empty read set means NO channels, not `general`: a file that names no channel
+  // gets none, and the agent is reachable by DM/presence/anycast only. The old default put every
+  // persona that forgot the field onto `general`, including DM-only reviewers and probes, and
+  // minted the matching channel read row into its credential — a channel nobody chose.
+  let effAllow: string[];
+  try {
+    effAllow = resolveReadAcl(subscribe ?? [], allowSubscribe);
+  } catch (e) {
+    throw new Error(`agent file ${path}: ${(e as Error).message}`);
+  }
+
+  // Per-channel attention defaults (quiet/muted): concrete channels within the read ACL (allowSubscribe)
+  // — silencing a channel you can't read, or with a wildcard the ingest match would never hit, is a config error. A
+  // channel can't be both at once. Fail loud (no silent no-op), matching the checks above.
+  const both = (quiet ?? []).filter((c) => (muted ?? []).includes(c));
+  if (both.length)
+    throw new Error(`agent file ${path}: channel(s) [${both.join(", ")}] are in both quiet and muted - pick one`);
+  for (const [field, chans] of [["quiet", quiet], ["muted", muted]] as const)
+    for (const ch of chans ?? []) {
+      try {
+        assertValidChannel(ch);
+      } catch (e) {
+        throw new Error(`agent file ${path}: ${(e as Error).message}`);
+      }
+      if (!isConcreteChannel(ch))
+        throw new Error(`agent file ${path}: ${field} channel "${ch}" must be a concrete channel (no wildcard)`);
+      if (!channelInAllow(effAllow, ch))
+        throw new Error(`agent file ${path}: ${field} channel "${ch}" is not within your read ACL / allowSubscribe [${effAllow.join(", ")}]`);
+    }
+
+  // Opaque connector-specific launch options — a mapping core never interprets (each connector
+  // reads its own keys). A scalar/sequence here is a config error (it must be `key: value` pairs).
+  const launchOptionsRaw = fm["launchOptions"];
+  let launchOptions: Record<string, unknown> | undefined;
+  if (launchOptionsRaw !== undefined && launchOptionsRaw !== null) {
+    if (typeof launchOptionsRaw !== "object" || Array.isArray(launchOptionsRaw))
+      throw new Error(`agent file ${path}: "launchOptions" must be a mapping of key: value pairs`);
+    launchOptions = launchOptionsRaw as Record<string, unknown>;
+  }
+
+  // Sweep every scalar frontmatter key we don't model into meta, verbatim — connector launcher
+  // hints ride here so core stays ignorant of surface-specific keys.
+  const meta: Record<string, string> = {};
+  for (const [k, v] of Object.entries(fm)) if (!MODELED_KEYS.has(k) && v !== null && typeof v !== "object") meta[k] = String(v);
+
+  return {
+    name,
+    role: str("role"),
+    kind,
+    description: str("description"),
+    tags: list("tags"),
+    agent: str("agent"),
+    subscribe,
+    allowSubscribe,
+    allowPublish,
+    quiet,
+    muted,
+    model,
+    variant,
+    launchOptions,
+    capabilities: list("capabilities"),
+    owner: str("owner"),
+    meta: Object.keys(meta).length ? meta : undefined,
+    persona: persona || undefined,
+  };
+}
+
+/** Write an agent definition back to disk in the form {@link loadAgentFile} reads:
+ *  the set frontmatter fields followed by the persona body. Round-trips through the
+ *  parser and refuses, writing nothing, a file it would not load; creates parent dirs. The runtime persona-definition path uses this to
+ *  persist a peer-defined agent as config. The file is written 0o600 and never through a
+ *  symlink ({@link writePrivateRecord}). `createOnly` refuses a name that already exists, a symlink
+ *  included, and leaves it as it was ({@link createPrivateRecord}). */
+export function saveAgentFile(path: string, def: AgentDef, opts: { createOnly?: boolean } = {}): void {
+  if (!def.name) throw new Error('saveAgentFile: "name" is required');
+  assertValidName(def.name);
+  if (def.kind !== undefined) assertValidKind(def.kind, "saveAgentFile");
+  assertLaunchSelectors(def, "saveAgentFile");
+  for (const k of Object.keys(def.meta ?? {}))
+    if (MODELED_KEYS.has(k) || RENAMED_KEYS.includes(k))
+      throw new Error(`saveAgentFile: meta key "${k}" collides with a modeled frontmatter field`);
+  // The read set must be SAID, not inferred. A persona saved without one used to inherit a channel
+  // nobody chose, and the file gave a later reader no way to tell a deliberate silence from a
+  // forgotten field. Refusing here rather than filling in an empty list keeps that distinction:
+  // auto-filling would turn every omission into a declaration and destroy the difference for good.
+  //
+  // This is the writer, so it binds every caller that builds a definition and saves it, including
+  // ones added later. It cannot see a file written as literal text, which is why the shipped
+  // templates are asserted separately.
+  if (!def.subscribe)
+    throw new Error(
+      `saveAgentFile: "subscribe" is required for "${def.name}" - list the channels it reads, ` +
+        `or [] for none (an agent with no channels is still reachable by direct message and anycast)`,
+    );
+  // Build the frontmatter mapping in read order, then serialize with the `yaml` library — it owns
+  // all quoting/escaping (a value with a `:`/`#`/`[`/quote round-trips safely, which the old
+  // hand-rolled writer had to special-case). `lineWidth: 0` keeps scalars on one line (no folding).
+  const fm: Record<string, unknown> = { name: def.name };
+  if (def.role) fm.role = def.role;
+  if (def.kind) fm.kind = def.kind;
+  if (def.description) fm.description = def.description;
+  if (def.tags?.length) fm.tags = def.tags;
+  // The three channel-policy fields emit whenever they are SET, empty included: an empty list is a
+  // declaration ("no channels"), not an absent one, and the two are different states a reader and a
+  // future default can tell apart. Gating these on `.length` made a load-then-save silently rewrite
+  // an explicit `subscribe: []` into an omitted field, so a persona that declined every channel came
+  // back from a redefine indistinguishable from one that never named the field at all.
+  if (def.subscribe) fm.subscribe = def.subscribe;
+  if (def.allowSubscribe) fm.allowSubscribe = def.allowSubscribe;
+  if (def.allowPublish) fm.allowPublish = def.allowPublish;
+  if (def.quiet?.length) fm.quiet = def.quiet;
+  if (def.muted?.length) fm.muted = def.muted;
+  if (def.agent) fm.agent = def.agent;
+  if (def.model) fm.model = def.model;
+  if (def.variant) fm.variant = def.variant;
+  if (def.launchOptions && Object.keys(def.launchOptions).length) fm.launchOptions = def.launchOptions;
+  if (def.capabilities?.length) fm.capabilities = def.capabilities;
+  if (def.owner) fm.owner = def.owner;
+  if (def.meta) for (const [k, v] of Object.entries(def.meta)) fm[k] = v;
+  const frontmatter = stringifyYaml(fm, { lineWidth: 0 }).trimEnd();
+  const body = def.persona ? `${def.persona.trim()}\n` : "";
+  const text = `---\n${frontmatter}\n---\n\n${body}`;
+  // A persona that saves must load. A file the reader refuses, such as one whose subscribe entry no
+  // allowSubscribe entry contains, made every later load, spawn and redefine of that name fail.
+  // The message reaches an agent as the reason its definition was refused, so it names the rule the
+  // file broke and not this function or the path of a file that was never written.
+  try {
+    parseAgentFileSource(text, path);
+  } catch (e) {
+    const reason = (e as Error).message;
+    const prefix = `agent file ${path}: `;
+    throw new Error(`it would not load: ${reason.startsWith(prefix) ? reason.slice(prefix.length) : reason}`);
+  }
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  if (opts.createOnly) createPrivateRecord(path, text);
+  else writePrivateRecord(path, text);
+}
+
+/** An inline persona (SPEC 13.7): the helper's definition, carried on the spawn instead of read
+ *  from the catalog. `prompt` is the persona body, never the first-turn kickoff. A channel field
+ *  that is omitted and one that is `[]` stay apart, as in a file. `save` also writes a create-only
+ *  catalog copy under the requested name. */
+export interface InlinePersona {
+  prompt: string;
+  role?: string;
+  model?: string;
+  variant?: string;
+  description?: string;
+  subscribe?: string[];
+  allowSubscribe?: string[];
+  allowPublish?: string[];
+  capabilities?: string[];
+  save?: boolean;
+}
+
+/** What a peer may name on `define-persona`: content, plus `capabilities`, which the manager bounds
+ *  against the definer before it writes. `owner` has no slot. */
+export type WirePersonaArgs = {
+  name: string;
+  /** The principal a fresh file records as its owner; absent, the file is operator-owned. */
+  owner?: string;
+  prompt: string;
+  model?: string;
+  role?: string;
+  agent?: string;
+  subscribe?: string[];
+  allowSubscribe?: string[];
+  allowPublish?: string[];
+  capabilities?: string[];
+};
+
+/**
+ * Split a `cotal_persona` prompt that is already a complete agent file into one frontmatter
+ * block plus body. A prompt that does not start with `---` is prose. A prompt that starts with
+ * `---` but is not a closed, valid block fails with {@link PROMPT_FRONTMATTER} rather than being
+ * wrapped. The tool `name` wins over any `name:` inside the prompt.
+ */
+export function parseLeadingPromptFrontmatter(prompt: string, fallbackName: string): { body: string; def?: AgentDef } {
+  if (!prompt.startsWith("---")) return { body: prompt };
+  const m = AGENT_FILE_FENCE.exec(prompt);
+  if (!m) throw new Error(`${PROMPT_FRONTMATTER}: prompt starts with --- but is not a closed YAML frontmatter block`);
+  let fm = m[1] ?? "";
+  const rest = m[2] ?? "";
+  if (!/^\s*name\s*:/m.test(fm)) fm = `name: ${fallbackName}\n${fm}`;
+  try {
+    const def = parseAgentFileSource(`---\n${fm}\n---\n${rest}`, "<prompt>");
+    def.name = fallbackName;
+    return { body: rest.trim(), def };
+  } catch (e) {
+    const detail = (e as Error).message;
+    if (detail.startsWith(`${PROMPT_FRONTMATTER}:`)) throw e;
+    throw new Error(`${PROMPT_FRONTMATTER}: ${detail}`);
+  }
+}
+
+function dropWireDefaultIfScoped(def: AgentDef): void {
+  if (def.meta?.scope_source === "wire-default" && def.subscribe?.length) {
+    const { scope_source: _dropped, ...rest } = def.meta;
+    def.meta = Object.keys(rest).length ? rest : undefined;
+  }
+}
+
+/**
+ * Build the AgentDef `definePersona` writes. A leading frontmatter block in `prompt` is parsed
+ * and merged: explicit tool arguments win; grants, role, and agent from the prompt survive;
+ * `capabilities` and `owner` from the prompt never do, and only an explicit `capabilities`
+ * argument sets capabilities. The result is always one frontmatter block
+ * once {@link saveAgentFile} writes it. On redefine, prompt grants are not applied (the stored
+ * file's policy is preserved) except where an explicit tool argument names a field.
+ */
+export function composeWirePersona(args: WirePersonaArgs, existing?: AgentDef): AgentDef {
+  const parsed = parseLeadingPromptFrontmatter(args.prompt, args.name);
+  const fromPrompt = parsed.def;
+  if (existing) {
+    const def: AgentDef = { ...existing };
+    if (args.model !== undefined) def.model = args.model;
+    if (args.role !== undefined) def.role = args.role;
+    if (args.agent !== undefined) def.agent = args.agent;
+    if (args.subscribe !== undefined) def.subscribe = args.subscribe;
+    if (args.allowSubscribe !== undefined) def.allowSubscribe = args.allowSubscribe;
+    if (args.allowPublish !== undefined) def.allowPublish = args.allowPublish;
+    if (args.capabilities !== undefined) def.capabilities = args.capabilities;
+    def.persona = parsed.body;
+    dropWireDefaultIfScoped(def);
+    return def;
+  }
+  const authored = fromPrompt !== undefined || args.subscribe !== undefined;
+  const subscribe = args.subscribe ?? fromPrompt?.subscribe ?? [];
+  const def: AgentDef = {
+    name: args.name,
+    owner: args.owner,
+    persona: parsed.body,
+    model: args.model ?? fromPrompt?.model,
+    role: args.role ?? fromPrompt?.role,
+    agent: args.agent ?? fromPrompt?.agent,
+    subscribe,
+    allowSubscribe: args.allowSubscribe ?? fromPrompt?.allowSubscribe,
+    allowPublish: args.allowPublish ?? fromPrompt?.allowPublish,
+    capabilities: args.capabilities,
+    description: fromPrompt?.description,
+    tags: fromPrompt?.tags,
+    variant: fromPrompt?.variant,
+    quiet: fromPrompt?.quiet,
+    muted: fromPrompt?.muted,
+    launchOptions: fromPrompt?.launchOptions,
+    meta: authored ? fromPrompt?.meta : { scope_source: "wire-default" },
+  };
+  dropWireDefaultIfScoped(def);
+  return def;
+}
+
+/** The persona catalog of a root, `<root>/.cotal/agents`. Every surface that loads, lists or names
+ *  a persona derives the directory from here, so moving the catalog moves all of them together. */
+export function personaDir(root: string): string {
+  return join(root, ".cotal", "agents");
+}
+
+/** Resolve a name-or-path to an agent file. A path (absolute, contains a slash — `/` or, on
+ *  Windows, `\` — or ends in `.md`) is used as given; a bare name maps to the directory
+ *  convention `<root>/.cotal/agents/<name>.md`. */
+export function agentFilePath(root: string, nameOrPath: string): string {
+  if (isAbsolute(nameOrPath)) return nameOrPath;
+  if (nameOrPath.includes("/") || nameOrPath.includes("\\") || nameOrPath.endsWith(".md"))
+    return resolve(root, nameOrPath);
+  return join(personaDir(root), `${nameOrPath}.md`);
+}
+
+/** One local persona catalog entry. A malformed file is an error row, not a throw. */
+export interface PersonaCatalogEntry {
+  /** The filename stem (`.cotal/agents/<name>.md`), which is also the spawn name. */
+  name: string;
+  path: string;
+  /** Parsed definition, or undefined when the file failed to parse (see `error`). */
+  def?: AgentDef;
+  /** Parse error message, if the file is malformed — surfaced rather than crashing the list. */
+  error?: string;
+  /** Why the file cannot be read when it was saved as UTF-16: the one parse reason that quotes nothing
+   *  from the file, so a list that keeps `error` private can still name it. */
+  encoding?: string;
+  /** Set when the file is not a regular file, such as a FIFO, so it was not opened (see `error`). */
+  notRegular?: true;
+  /** The file a persona that is a symbolic link names. `persona show`, `edit` and `remove` refuse
+   *  a link, so a listing warns about it. */
+  link?: string;
+}
+
+/** The file `path` links to when it is a symbolic link: its resolved path, or the link's own text
+ *  when that does not resolve. Undefined for anything else. */
+export function personaLinkTarget(path: string): string | undefined {
+  try {
+    if (!lstatSync(path).isSymbolicLink()) return undefined;
+  } catch {
+    return undefined;
+  }
+  try { return realpathSync(path); } catch { /* a dangling link or a loop */ }
+  try { return readlinkSync(path); } catch { return undefined; }
+}
+
+/** List the local catalog, treating absent or unreadable directories as empty. Reports that must
+ *  distinguish an unreadable catalog use {@link readPersonaCatalog}. */
+export function listPersonaCatalog(root: string): PersonaCatalogEntry[] {
+  try {
+    return readPersonaCatalog(root);
+  } catch {
+    return [];
+  }
+}
+
+/** Read the catalog in filename order. Only an absent directory is empty; an unreadable or
+ *  unsearchable directory throws. Files that fail parsing become error rows. Non-regular files
+ *  are not opened, and entries retain encoding and symbolic-link details for local reports. */
+export function readPersonaCatalog(root: string): PersonaCatalogEntry[] {
+  const dir = personaDir(root);
+  let files: string[];
+  try {
+    files = readdirSync(dir).filter((f) => f.endsWith(".md"));
+    accessSync(dir, constants.X_OK);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw e;
+  }
+  return files.sort().map((f) => {
+    const name = f.slice(0, -3);
+    const path = join(dir, f);
+    const link = personaLinkTarget(path);
+    try {
+      // A FIFO or a device would block the read, so only a regular file is opened. A link is
+      // followed, as the read follows it.
+      if (!statSync(path).isFile()) return { name, path, error: `persona is not a regular file: ${path}`, notRegular: true as const, ...(link !== undefined ? { link } : {}) };
+      return { name, path, def: loadAgentFile(path), ...(link !== undefined ? { link } : {}) };
+    } catch (e) {
+      let encoding: string | undefined;
+      try { encoding = utf16Problem(readFileSync(path, "utf8")); } catch { /* unreadable: `error` says so */ }
+      return { name, path, error: (e as Error).message, ...(encoding ? { encoding } : {}), ...(link !== undefined ? { link } : {}) };
+    }
+  });
+}
+
+/** The one-line description `cotal personas list` prints: `description:` if set, else the
+ *  first non-empty persona line. Truncated to 100 characters, matching the CLI. */
+export function personaCatalogDescription(def: AgentDef): string | undefined {
+  const raw = def.description ?? def.persona?.split("\n").find((l) => l.trim())?.trim();
+  if (!raw) return undefined;
+  return raw.length > 100 ? `${raw.slice(0, 99)}…` : raw;
+}
+
+/** Same ownership as `definePersona` redefine: the creator, or admin. Ownerless files
+ *  (legacy / operator-written) are admin-only. Used by the mesh catalog read so a peer
+ *  cannot pull role/model/description/body of a card it could not rewrite. */
+export function personaCatalogReadable(owner: string | undefined, caller: string, admin: boolean): boolean {
+  return admin || owner === caller;
+}
+
+/** The separator the auto-numbering scheme appends a counter with. `_`, NOT `-`: in user mode the
+ *  allocated name IS the mesh actor, and {@link assertValidOwnerToken} rejects `-` because it is the
+ *  sole separator of `principalKey`'s JetStream-name form. A `-` here made every name past the first
+ *  unmintable — spawn a persona twice and the second peer could not be granted at all. The failure
+ *  was invisible in static/open mode, which keys the actor on the minted nkey rather than the name,
+ *  so it fired only where per-user auth is on. Kept adjacent to the name rule below so the two
+ *  cannot drift: whatever this scheme can PRODUCE, that rule must ACCEPT. */
+const NUMBER_SEPARATOR = "_";
+
+/** The rail bound an actor token must fit, the same bound {@link assertBoundedOwner} enforces. The
+ *  auto-numbering below appends `_<n>` to a base that has already passed the name door, so a base of
+ *  63 or 64 characters would otherwise be numbered into a name the exchange can never serve. */
+const ACTOR_TOKEN_MAX = 64;
+
+/** First free name in the series `base`, `base_2`, `base_3`, … — the first candidate for which
+ *  `taken` returns false. The single source of the spawn auto-numbering scheme, shared by the
+ *  manager's funnel (checked against its live + reserved slots) and `cotal spawn` (checked against
+ *  the live mesh roster), so a colliding name numbers up identically whichever path spawns it.
+ *
+ *  `actorBound` caps a numbered candidate at {@link ACTOR_TOKEN_MAX}. Only a user-mode caller passes
+ *  it, because only there is the name the actor: past the bound the exchange can never serve it, so
+ *  the series ends rather than handing one out. Static and open mode key the actor on the minted
+ *  nkey, so a numbered name there has no length to fit and the cap would refuse a spawn that works.
+ *  The requested base is returned even when it is longer, because the name door judges a base on its
+ *  own and this function only resolves collisions. Throws when every candidate that fits is taken. */
+export function firstFreeName(base: string, taken: (name: string) => boolean, opts?: { actorBound?: boolean }): string {
+  if (!taken(base)) return base;
+  for (let n = 2; ; n++) {
+    const candidate = `${base}${NUMBER_SEPARATOR}${n}`;
+    if (opts?.actorBound && candidate.length > ACTOR_TOKEN_MAX)
+      throw new Error(
+        `no free name for ${JSON.stringify(base)} fits the ${ACTOR_TOKEN_MAX}-character actor bound: ` +
+        `numbering it would name an actor the exchange refuses`,
+      );
+    if (!taken(candidate)) return candidate;
+  }
+}
+
+/** THE agent-name rule, in one place, for every door that accepts a model- or operator-supplied
+ *  name (the manager's spawn ref, identity, roster entry and persona-define; the CLI's `--name`).
+ *
+ *  Two constraints, and they are not the same constraint:
+ *   - ALWAYS: the name becomes a `.cotal/agents/<name>.md` path, so it must be a bare token and
+ *     never a path — this is the traversal guard, and it holds in every mode.
+ *   - USER MODE ONLY: the name is additionally the mesh ACTOR, so it must be one the exchange can
+ *     serve: the principal grammar (no `-`) AND the 64-character rail bound. Static/open mode keys
+ *     the actor on the freshly minted nkey instead of the name, so the narrow rule does not apply
+ *     there and an existing `my-agent` persona keeps spawning across an upgrade.
+ *
+ *  The narrow half DELEGATES to {@link assertBoundedOwner}, the validator the exchange's permission
+ *  rows are built through, rather than restating its alphabet or its bound. A copy of an authority's
+ *  rule drifts silently, and the copy that drifts is the one on the door nobody is reading. The door
+ *  and the exchange then refuse the same names, and a name the exchange can never serve is refused
+ *  here, before a spawn enrolls it.
+ *  Returns undefined when the name is acceptable, else the refusal to show the caller. */
+export function spawnNameError(name: string, opts: { userMode: boolean }): string | undefined {
+  if (!/^[A-Za-z0-9_-]+$/.test(name))
+    return `unsafe name ${JSON.stringify(name)} (allowed: letters, digits, _ -)`;
+  if (!opts.userMode) return undefined;
+  try {
+    assertBoundedOwner(name, "actor");
+  } catch (e) {
+    const why = e instanceof Error ? e.message : String(e);
+    return (
+      `name ${JSON.stringify(name)} cannot be a mesh identity in user mode: the name becomes this ` +
+      `agent's actor token, and the exchange refuses it (${why})`
+    );
+  }
+  return undefined;
+}

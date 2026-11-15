@@ -1,0 +1,40 @@
+import "./service-adapter.js"; // self-registers native service metadata and guarded lifecycle hooks
+import "./commands.js"; // self-registers the control-plane commands on import
+
+export {
+  Manager,
+  ManagerInstanceLeaseHeld,
+  READINESS_TIMEOUT_MS,
+  type ManagerOptions,
+  type ManagerStopOptions,
+  type ManagerServiceObservation,
+  type ManagerServiceIdentity,
+  type ManagerMaintenanceState,
+  type ManagerResumeIdentity,
+  type ManagerResumeAgent,
+  type ManagerResumeInventory,
+  type ManagerResumeResult,
+  type ManagerPreserveFailure,
+  type ManagerPreservationPlan,
+  type ManagerPreserveOptions,
+  type ManagerPreserveResult,
+} from "./manager.js";
+export {
+  parseResumeControlArgs,
+  parseResumeCommitArgs,
+  parseResumeFinalizeArgs,
+  MAX_RESUME_CONTROL_BYTES,
+  MAX_RESUME_COMMIT_BYTES,
+  type ResumeControlArgs,
+} from "./resume.js";
+export { SPAWN_INPUT_KEYS, type ManagerStaticReconciliationSweep } from "./manager-service-contract.js";
+export { managerBrowserContractSource, managerClusterArtifacts } from "./manager-service-contract.js";
+export type { ManagerStatus, ManagerStopImpact } from "./manager-service-contract.js";
+export { measureManagerVitals, MANAGER_VITALS_MAX_MOUNTS, MANAGER_VITALS_MAX_MOUNT_BYTES } from "./vitals.js";
+export type { ManagerVitals, ManagerVitalsDeps } from "./vitals.js";
+export { RunHosting, type RunHostingContext } from "./run-hosting.js";
+export * as remoteManagerClient from "./remote-authority.js";
+export { registerRemoteManagerAuthority } from "./remote-register.js";
+export type { RemoteManagerIdentityState } from "./remote-authority.js";
+export { createRuntime, requireRuntimeAdopt } from "./runtime/index.js";
+export type { Runtime, AgentHandle, AttachSession, RuntimeKind, RuntimeMode } from "./runtime/index.js";

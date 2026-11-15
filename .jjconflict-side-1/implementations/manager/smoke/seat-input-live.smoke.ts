@@ -1,0 +1,720 @@
+/**
+ * SEAT INPUT smoke (lane C3): the manager op `input` and `cotal input`, over a REAL Manager, a REAL
+ * JWT broker and REAL pty children, graded on THE BYTES THAT REACHED THE CHILD.
+ *
+ * WHY THE CHILD AND NOT THE REPLY. `input` answers `{name, bytes}`. A suite that asserted that
+ * reply would be grading the manager's own arithmetic: it stays green if the write never leaves the
+ * process, if the runtime handle drops it, if node-pty mangles the encoding, or if a future
+ * refactor computes `bytes` from the request instead of from what it wrote. The claim the feature
+ * actually makes is that a line typed by an external UI arrives at the seat's harness, so the
+ * witness has to be the harness end. Every delivery cell here reads a file the CHILD appends its
+ * raw stdin to (`input-echo-stub.mjs`), byte for byte, with no decoding and no trimming. The stub
+ * puts its tty in RAW MODE, as every TUI harness this feature drives does; see the stub for the
+ * measured reason a cooked-mode child would grade bytes no real seat ever sees.
+ *
+ * WHAT IS GRADED
+ *   1. Fixture first: the sink witnesses reality (it is EMPTY before anything is typed), so an
+ *      absence cell below cannot pass because the mechanism never worked.
+ *   2. Owner reach: the spawner types into its own seat, and the exact bytes arrive.
+ *   3. `enter:false` types the text with NO trailing carriage return (byte-exact, and read as a
+ *      DELTA on the same live seat, so the two enter modes are compared against one child).
+ *   4. A caller that did not spawn the seat is refused (`permission-denied`), and nothing arrives.
+ *   5. An operator instrument's ANY-mode call types into a seat it did not spawn (admin reach,
+ *      the same row shape `attach`/`despawn` carry), over the GENERIC describe/store invoke path.
+ *   6. A spawn-capable agent publishing the ANY-mode subject is broker-dropped: the tier boundary
+ *      is the grant, not a handler branch.
+ *   9. THE PLACEMENT GUARD: a credential holding only the `spawn` capability is dropped on BOTH
+ *      the owner-mode and the any-mode input subject, while its `inspect` still answers. `input`
+ *      is operator-only on purpose; see the cell for what the one-word edit would cost.
+ *   7. A seat that is not running refuses (see the cell for exactly what is forced and why).
+ *  10. THE SUBMIT KEY IS ITS OWN KEYSTROKE (issue #1649): the return is handed to the pty as its OWN
+ *      write rather than fused onto the tail of the text, and the text is written in slices under
+ *      the pty's 4096-byte input buffer so no write is re-split by the kernel onto the return.
+ *      `enter:false` still presses nothing. Graded at the runtime write seam through a recording
+ *      PASS-THROUGH (every byte still reaches the real child), because the sink is a concatenation
+ *      and cannot tell `submit-me` + `\r` from `submit-me\r`.
+ *   8. THE CLI PATH, end to end: the real binary as a subprocess runs
+ *      `cotal input --name <seat> --text "/compact"`, exits 0, prints a receipt naming the seat and
+ *      the acknowledged byte count, and the child receives `/compact\r`. A rejected or dropped
+ *      runtime write instead exits 3 as an unconfirmed outcome naming the agent and the manager's
+ *      reason, is not sent again, and prints no written receipt. An external UI calls the CLI
+ *      before anything else, and a defect anywhere in agents.ts -> control.ts -> the mint -> the
+ *      subject leaves cells 2-7 green.
+ *
+ * COVERAGE BOUNDARY, stated so it is not over-read. This is a STATIC-auth mesh, so cell 4's refusal
+ * is the own-child arm of the shared `authorizeNamedControl` policy (the caller is not the
+ * spawner); the cross-OWNER arm needs a user-mode ledger and is graded where that fixture already
+ * exists (`implementations/auth/smoke/user-spawn.smoke.ts`, whose despawn/attach cells cover the
+ * same one policy function this op calls). Nothing here grades a runtime other than `pty`: the
+ * tmux/cmux/orca/herdr refusal is the ABSENCE of `AgentHandle.write` on those handles, which is a
+ * type-level fact plus the handler's `if (!write)` branch, not something this fixture can spawn.
+ *
+ * MUTATION-PROOF TARGETS (named BEFORE the run, per cell, not per suite):
+ *   `input-authz`: delete the `authorizeNamed` refusal in manager.ts's `input` handler
+ *      -> cell 4 "a caller that did NOT spawn the seat is refused" goes red.
+ *   `input-enter`: flip `args.enter !== false ? "\r" : ""` in `inputAuthorized` to always append
+ *      -> cell 3 "enter:false types the text with NO trailing carriage return" goes red.
+ *   `input-ack`: discard the runtime acknowledgement and restore intended-buffer arithmetic
+ *      -> cell 8 "a dropped PTY write exits 3 as an unconfirmed outcome" goes red.
+ *   `input-submit`: fuse the return back onto the text (one `${text}\r` write) in `inputAuthorized`
+ *      -> cell 10 "THE RETURN ARRIVED AS ITS OWN READ" goes red, while every byte-exact cell above
+ *      stays green - which is exactly why #1649 shipped.
+ *
+ * Run: pnpm smoke:seat-input   (needs nats-server + node on PATH; boots its own broker; the CLI
+ * cell drives bin/cotal.ts, which imports dist, so build first)
+ */
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { connect } from "@nats-io/transport-node";
+import {
+  isReachable, createSpaceAuth, serverConfig, setupSpaceStreams, mintCreds, newIdentity,
+  mintLifecycleUid, standaloneConnectOpts, principalKey, DEV_OWNER,
+  epCall, EpEnvelopeError, resolveService, invokeCommand, registry,
+  type Connector, type EpCaller, type LaunchOpts, type LaunchSpec,
+} from "@cotal-ai/core";
+import { authDir, saveSpaceAuth, recordMesh } from "@cotal-ai/workspace";
+import { Manager } from "../src/manager.js";
+import { MANAGER_ENDPOINT, MANAGER_CONTRACTS } from "../src/manager-service-contract.js";
+import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
+
+// The wire bytes, written out rather than imported from the code under test. Importing the
+// production constants made every expectation compare production against itself, and it made the
+// revert gate impossible: restoring manager.ts removes the exports, so the suite died at module
+// instantiation with a SyntaxError instead of failing an assertion by name.
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
+const TSX = join(import.meta.dirname, "..", "..", "..", "node_modules", ".bin", "tsx");
+
+const here = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(here, "../../..");
+const STUB = join(here, "input-echo-stub.mjs");
+const BIN = join(repoRoot, "bin", "cotal.ts");
+const PORT = await freePort();
+const SERVERS = `nats://127.0.0.1:${PORT}`;
+
+// The CLI cell spawns the REAL binary, which resolves a mesh from the environment before it reads a
+// flag. A stray COTAL_SERVERS inherited from a seat's own env would point `cotal input` at the live
+// broker and type into somebody's production agent, so refuse to run at all rather than find out.
+const LIVE_HOST = "broker.cotal.ai";
+for (const k of ["COTAL_SERVERS", "COTAL_SERVER", "COTAL_CREDS", "COTAL_SPACE"]) delete process.env[k];
+for (const [k, v] of Object.entries(process.env))
+  if (typeof v === "string" && v.includes(LIVE_HOST)) throw new Error(`refusing to run: ${k} points at the live broker (${v})`);
+if (!/^nats:\/\/127\.0\.0\.1:\d+$/.test(SERVERS)) throw new Error(`this suite only runs against an ephemeral loopback broker; got ${SERVERS}`);
+console.log(`broker-url guard: ${SERVERS} is ephemeral loopback; no env var references ${LIVE_HOST}\n`);
+
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+let pass = 0, fail = 0;
+const check = (name: string, cond: boolean, extra?: unknown) => {
+  if (cond) { pass++; console.log(`  ✓ ${name}`); }
+  else { fail++; console.log(`  ✗ FAIL: ${name}`, extra !== undefined ? JSON.stringify(extra) : ""); }
+};
+
+const space = `seatin-${randomUUID().slice(0, 8)}`;
+const auth = await createSpaceAuth(space);
+const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+// COTAL_HOME BEFORE any recordMesh: the mesh registry the CLI cell reads is written under it, and
+// this suite must never touch the operator's real `~/.cotal`. The CLI child inherits the same value.
+const home = join(dir, "home");
+mkdirSync(home, { recursive: true });
+process.env.COTAL_HOME = home;
+const workspaceRoot = join(dir, "ws");
+const sinkDir = join(dir, "sinks");
+mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
+mkdirSync(sinkDir, { recursive: true });
+saveSpaceAuth(authDir(workspaceRoot), auth);
+for (const n of ["typist", "guarded", "opseat", "cliseat", "dropseat", "deadseat", "menuseat"])
+  // No role: the suite's spawner holds no issued evidence, so it hands on no role (SPEC 13.15).
+  writeFileSync(join(workspaceRoot, ".cotal", "agents", `${n}.md`), `---\nname: ${n}\n---\n`);
+writeFileSync(join(dir, "server.conf"), serverConfig(auth, [auth], { transport: { kind: "plaintext" }, port: PORT, storeDir: join(dir, "js") }));
+const srv = spawn("nats-server", ["-c", join(dir, "server.conf")], { stdio: "ignore" });
+const releaseBroker = teardownOnSignal(srv, dir);
+
+/** Where a seat's child writes what it was typed. Derived from the ALLOCATED name (the manager may
+ *  number a collision into `typist-2`), so a fixture that read the requested name would silently
+ *  watch an empty file. */
+const sinkFor = (name: string): string => join(sinkDir, `${name}.bin`);
+/** Where the child announces that its tty is in raw mode and a reader is attached. A SEPARATE file
+ *  from the sink, never a byte on it, because the sink is compared byte for byte. */
+const readyFor = (name: string): string => join(sinkDir, `${name}.ready`);
+/** The raw bytes the child has received so far, `<empty>` before it has been typed into at all.
+ *  Deliberately a Buffer and never a string: a `\r` present or absent IS a cell here, so a helper
+ *  that decoded or trimmed would answer the question the suite is asking. */
+const sinkBytes = (name: string): Buffer => {
+  try { return readFileSync(sinkFor(name)); } catch { return Buffer.alloc(0); }
+};
+/** Wait for the child's sink to reach `want` bytes. Delivery is a real pty write to a real
+ *  process, so it is not synchronous with the reply; polling for a LENGTH (not for a match) means a
+ *  wrong-bytes delivery is graded by the assertion that follows, never masked by this wait. */
+/** Block until the child has actually booted far enough to receive a keystroke correctly.
+ *  REQUIRED, not belt and braces: the manager lists a seat in `ps` from the moment it LAUNCHES the
+ *  process, so a `ps` row proves a process exists, never that node has run the stub. Typing into
+ *  the gap lands on a tty still in cooked mode, where ICRNL rewrites the CR as an LF and a
+ *  byte-exact cell reds for a reason that is not the product. Caught in review as a once-in-six
+ *  false red, which is precisely the failure profile that teaches a team to re-run a suite instead
+ *  of reading it. */
+const seatReady = async (name: string, ms = 60_000): Promise<void> => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (existsSync(readyFor(name))) return;
+    await wait(100);
+  }
+  throw new Error(`FIXTURE FAILURE: ${name} never announced stdin readiness within ${ms}ms; nothing typed at it could be graded`);
+};
+const sinkReaches = async (name: string, want: number, ms = 15_000): Promise<Buffer> => {
+  const deadline = Date.now() + ms;
+  let b = sinkBytes(name);
+  while (b.length < want && Date.now() < deadline) { await wait(100); b = sinkBytes(name); }
+  return b;
+};
+
+const envFor = (o: LaunchOpts): Record<string, string> => ({
+  COTAL_SPACE: o.space, COTAL_SERVERS: String(o.servers ?? SERVERS), COTAL_CREDS: String(o.creds),
+  COTAL_ID: String(o.id), COTAL_NAME: o.name, PATH: process.env.PATH ?? "",
+  COTAL_INPUT_SINK: sinkFor(o.name), COTAL_INPUT_READY: readyFor(o.name),
+  ...(o.name === "menuseat" ? { COTAL_INPUT_MENU: "1" } : {}),
+  ...(o.lifecycleUid ? { COTAL_LIFECYCLE_UID: o.lifecycleUid } : {}),
+});
+const echoCon: Connector = { kind: "connector", name: "input-echo", requires: ["node"], buildLaunch: (o): LaunchSpec => ({ command: "node", args: [STUB], env: envFor(o) }) };
+registry.register(echoCon);
+registry.register({ ...echoCon, name: "claude" });
+
+const mgr = new Manager({ space, servers: SERVERS, runtime: "pty", workspaceRoot });
+type PrivHandle = { status: () => "running" | "exited"; kind: string; write?: (data: string) => Promise<number> };
+const M = mgr as unknown as {
+  managerInstanceId: string;
+  agents: Map<string, { id: string; lifecycleUid: string; handle: PrivHandle }>;
+};
+
+type Call = (c: string, a?: Record<string, unknown>, t?: { actor: string; lifecycleUid: string }) => Promise<{ reply: { ok: boolean; data?: unknown; error?: { code?: string; message?: string; outcome?: string } } }>;
+
+/** `spawn` is an ACTION: its reply is the acceptance, returned before the child is live. Poll `ps`
+ *  for the allocated row, which carries the id + lifecycle uid a targeted call needs. */
+const spawnLive = async (call: Call, args: Record<string, unknown>): Promise<{ name: string; id: string; lifecycleUid: string }> => {
+  const r = await call("spawn", args);
+  if (r.reply.ok !== true) throw new Error(`spawn ${String(args.name)} was not accepted: ${JSON.stringify(r.reply)}`);
+  const name = String((r.reply.data as { name: string }).name);
+  for (let i = 0; i < 120; i++) {
+    const ps = await call("ps");
+    const row = ((ps.reply.data as Array<{ name: string; id: string; lifecycleUid: string }>) ?? []).find((x) => x.name === name);
+    // Readiness is awaited HERE rather than at each call site, so a cell added later cannot forget
+    // it: `ps` proves the process was launched, this proves it can receive a keystroke.
+    if (row) { await seatReady(name); return row; }
+    await wait(250);
+  }
+  throw new Error(`agent ${name} never became live in ps`);
+};
+
+/** An agent-grade caller instrument: the given ep capabilities on the manager endpoint, owner-mode
+ *  where marked. This is the AGENT tier - it can never hold an any-mode row (cell 6 proves it). */
+async function instrument(caps: Array<{ command: string; owner?: true }>): Promise<{ caller: EpCaller; principal: string; nc: Awaited<ReturnType<typeof connect>>; call: Call }> {
+  const id = newIdentity();
+  const uid = mintLifecycleUid();
+  const caller: EpCaller = { owner: DEV_OWNER, actor: id.id, uid };
+  const creds = await mintCreds(auth, id, "agent", {
+    lifecycleUid: uid,
+    capabilities: ["spawn"],
+    endpointCapabilities: caps.map((c) => ({
+      endpoint: MANAGER_ENDPOINT, command: c.command,
+      ...(c.owner ? { target: { mode: "owner" as const, tOwner: DEV_OWNER } } : {}),
+    })),
+  });
+  const nc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds, tls: false }), maxReconnectAttempts: 0 });
+  const call: Call = (command, callArgs, target) =>
+    epCall(nc, space, { mode: "one" }, {
+      endpoint: MANAGER_ENDPOINT, command, contract: MANAGER_CONTRACTS[command], caller,
+      ...(callArgs !== undefined ? { args: callArgs } : {}),
+      ...(target ? { target: { mode: "owner" as const, owner: DEV_OWNER, actor: target.actor, lifecycleUid: target.lifecycleUid } } : {}),
+    }, { deadlineMs: 30_000, currentEpoch: async () => 0 });
+  return { caller, principal: principalKey(DEV_OWNER, id.id).key, nc, call };
+}
+
+/** How the CLI child ENDED rides in the result: a launch failure, a signal death, or this suite's
+ *  own timeout each produce output that would otherwise be graded as if the command had spoken. */
+type Run = { status: number | null; out: string; timedOut: boolean; signal: NodeJS.Signals | null; launchError?: string };
+function cotal(args: string[], timeoutMs = 120_000): Promise<Run> {
+  return new Promise((res) => {
+    const child = spawn(TSX, [BIN, ...args], {
+      cwd: workspaceRoot, env: { ...process.env, COTAL_HOME: home, XDG_CONFIG_HOME: join(home, "xdg"), COTAL_SKIP_CONNECTOR_SEED: "1" }, stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "", timedOut = false, settled = false;
+    let status: number | null = null, signal: NodeJS.Signals | null = null;
+    const done = (r: Run): void => { if (settled) return; settled = true; clearTimeout(t); res(r); };
+    const t = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs);
+    child.on("error", (e) => done({ status: null, out, timedOut, signal: null, launchError: e.message }));
+    child.stdout!.on("data", (d: Buffer) => { out += d.toString(); });
+    child.stderr!.on("data", (d: Buffer) => { out += d.toString(); });
+    child.on("exit", (s, sg) => { status = s; signal = sg; });
+    child.on("close", (s, sg) => done({ status: s ?? status, out, timedOut, signal: sg ?? signal }));
+  });
+}
+/** Refuse to grade anything but a self-terminated child with a real exit code: every shape rejected
+ *  here would otherwise satisfy a "the CLI delivered it" cell without the CLI having run. */
+function mustHaveRun(r: Run, what: string): void {
+  const why =
+    r.launchError ? `never launched (${r.launchError})`
+    : r.timedOut ? "was SIGKILLed by this suite's timeout"
+    : r.signal ? `was killed by ${r.signal} from outside this suite`
+    : r.status === null ? "ended with neither an exit code nor a signal"
+    : null;
+  if (why === null) return;
+  process.exitCode = 1;
+  throw new Error(`FIXTURE FAILURE, not a product defect: ${what} ${why}, which fakes the pass shape.\n${r.out.slice(-800)}`);
+}
+const strip = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
+/** One `Label: value` row of a CLI report. A piped child has no terminal width, so every row prints
+ *  on one line with its label padded; matching the whole line keeps `9` from matching `19`. */
+const field = (out: string, label: string, value: string): boolean =>
+  out.split("\n").some((line) => line.trim().startsWith(`${label}:`) && line.trim().slice(label.length + 1).trim() === value);
+/** The report `cotal input` prints when the manager did not confirm the write. Its message names the
+ *  agent and ends with the manager's own reason; the space and the answering manager attribute it. */
+const unconfirmed = (out: string, agent: string, reason: string): boolean => out.includes("Outcome unconfirmed")
+  && out.includes(`the manager did not confirm the outcome of terminal input for agent "${agent}"; it was not submitted again: ${reason}`)
+  && field(out, "Code", "OPERATION_UNKNOWN") && field(out, "Space", space) && field(out, "Manager", M.managerInstanceId)
+  && field(out, "Native code", "unavailable");
+/** Any part of the success receipt. */
+const written = (out: string): boolean => out.includes("Terminal input written") || out.includes("Bytes reported:");
+
+let stoppedCleanly = false;
+try {
+  let up = false;
+  for (let i = 0; i < 60; i++) { if (await isReachable(SERVERS)) { up = true; break; } await wait(200); }
+  if (!up) throw new Error(`nats-server did not come up on ${PORT}`);
+  await setupSpaceStreams({ servers: SERVERS, space, creds: await mintCreds(auth, newIdentity(), "provisioner") });
+  recordMesh({ space, server: SERVERS, root: workspaceRoot, mode: "auth", ts: new Date().toISOString() });
+  await mgr.start();
+
+  // Both A and B are HAND-MINTED with the owner-mode `input` row, and neither shape occurs in
+  // production: seat input is operator-only, so no standing capability set hands it out this way.
+  // The row is hand-granted here so the cells below grade the HANDLER, not the broker. B in
+  // particular spawns nothing and is the non-spawner in cell 4, so its refusal is the policy
+  // refusing rather than a missing grant refusing, which would prove nothing about the handler.
+  // Where the row really comes from is graded separately, and adversarially, in cell 9.
+  const A = await instrument([
+    { command: "status" }, { command: "ps" }, { command: "inspect" }, { command: "spawn" },
+    { command: "despawn", owner: true }, { command: "input", owner: true },
+  ]);
+  const B = await instrument([{ command: "inspect" }, { command: "input", owner: true }]);
+
+  console.log("1. the fixture witnesses reality: a live seat whose sink is EMPTY before anything is typed");
+  const typist = await spawnLive(A.call, { name: "typist", agent: "input-echo", cwd: repoRoot, events: false });
+  // Without this, every byte-exact cell below could pass on a broken stub: an absence assertion
+  // ("no trailing \r") is satisfied by a sink that never receives anything at all.
+  check("the spawned seat's sink starts empty (so an absence below means absence, not a dead stub)",
+    sinkBytes(typist.name).length === 0, sinkBytes(typist.name).toString("hex"));
+  check("...and the child has announced its tty is in RAW mode with a reader attached, so a keystroke can be graded at all",
+    existsSync(readyFor(typist.name)), readyFor(typist.name));
+
+  console.log("\n2. owner reach: the spawner types into its OWN seat and the exact bytes reach the child");
+  {
+    const r = await A.call("input", { text: "hello" }, { actor: typist.id, lifecycleUid: typist.lifecycleUid });
+    check("the op is served and reports the seat + the byte count (text + the appended \\r)",
+      r.reply.ok === true && (r.reply.data as { name: string; bytes: number }).name === typist.name
+      && (r.reply.data as { bytes: number }).bytes === 6, r.reply);
+    // The child receives the text wrapped in bracketed-paste markers and then the return, which is
+    // what makes the return a keystroke rather than a pasted block's trailing newline (cell 10 and
+    // issue #1649). The markers are FRAMING: they are not counted into the receipt above, so the
+    // byte count still reports what the caller asked to deliver.
+    const want = Buffer.from(`${PASTE_START}hello${PASTE_END}\r`, "utf8");
+    const got = await sinkReaches(typist.name, want.length);
+    check("THE CHILD RECEIVED EXACTLY `hello` as a bracketed paste followed by a lone `\\r`: the bytes left the manager, crossed the pty and arrived",
+      got.equals(want), { hex: got.toString("hex"), want: want.toString("hex") });
+  }
+
+  console.log("\n3. enter:false types the text and presses nothing (mutation-proof cell `input-enter`)");
+  {
+    // Read as a DELTA on the SAME live child, so the two enter modes are compared through one pty
+    // and one stub rather than against a constant. A second seat would make this cell independent
+    // of cell 2, and an independent cell can drift green while the pair it is supposed to
+    // distinguish has collapsed into one behaviour.
+    const before = sinkBytes(typist.name).length;
+    const r = await A.call("input", { text: "part", enter: false }, { actor: typist.id, lifecycleUid: typist.lifecycleUid });
+    check("the op reports 4 bytes: the text alone, no carriage return counted",
+      r.reply.ok === true && (r.reply.data as { bytes: number }).bytes === 4, r.reply);
+    const wantPart = Buffer.from(`${PASTE_START}part${PASTE_END}`, "utf8");
+    const got = await sinkReaches(typist.name, before + wantPart.length);
+    const delta = got.subarray(before);
+    check("THE CHILD RECEIVED EXACTLY `part` as a bracketed paste with NO trailing carriage return",
+      delta.equals(wantPart), { hex: delta.toString("hex"), want: wantPart.toString("hex") });
+    // Belt and braces on the whole conversation: a mutation that appended `\r` unconditionally
+    // would be caught by the delta above, and one that appended it LATE (say on the next write)
+    // would not. The full transcript pins the exact byte sequence the child has ever seen.
+    check("...and the child's WHOLE transcript is the `hello` paste + `\\r`, then the `part` paste, in that order, nothing else",
+      got.equals(Buffer.from(`${PASTE_START}hello${PASTE_END}\r${PASTE_START}part${PASTE_END}`, "utf8")), { hex: got.toString("hex") });
+  }
+
+  console.log("\n4. a caller that did NOT spawn the seat is refused (mutation-proof cell `input-authz`)");
+  {
+    const before = sinkBytes(typist.name).length;
+    const r = await B.call("input", { text: "intruder" }, { actor: typist.id, lifecycleUid: typist.lifecycleUid });
+    check("a caller that did NOT spawn the seat is refused (permission-denied, the shared named-control policy)",
+      r.reply.ok === false && r.reply.error?.code === "permission-denied", r.reply);
+    // The refusal must be a refusal to ACT, not a refusal to REPORT. A handler that denied after
+    // writing would satisfy the code check above and still have typed into somebody else's agent.
+    await wait(750);
+    check("...and NOTHING reached the child: the refusal happened before the write, not after it",
+      sinkBytes(typist.name).length === before, { before, after: sinkBytes(typist.name).length });
+  }
+
+  console.log("\n5. operator ANY-mode reach: an instrument types into a seat it did not spawn");
+  {
+    // The CLI's exact credential and the CLI's exact path: a `control-caller-admin` one-shot whose
+    // ep rows come from operatorInstrumentCapabilities("admin"), driving the GENERIC describe ->
+    // store fetch -> recompile invoke path with no hand-imported schema and no epoch stub.
+    const opId = newIdentity();
+    const opUid = mintLifecycleUid();
+    const opCaller: EpCaller = { owner: DEV_OWNER, actor: opId.id, uid: opUid };
+    const opCreds = await mintCreds(auth, opId, "control-caller-admin", { lifecycleUid: opUid });
+    const opNc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds: opCreds, tls: false }), maxReconnectAttempts: 0 });
+    const opseat = await spawnLive(A.call, { name: "opseat", agent: "input-echo", cwd: repoRoot, events: false });
+    check("fixture: A spawned the seat, so the instrument is NOT its spawner", opseat.name.startsWith("opseat"), opseat.name);
+    const svc = await resolveService(opNc, space, MANAGER_ENDPOINT, opCaller, { deadlineMs: 15_000 });
+    check("the instrument resolves `input` generically off the served document (digest-verified recompile)",
+      svc.commands.has("input"), [...svc.commands.keys()]);
+    const r = await invokeCommand(opNc, space, svc, "input", { text: "/model opus" }, {
+      target: { mode: "any", owner: DEV_OWNER, actor: opseat.id, lifecycleUid: opseat.lifecycleUid },
+    });
+    check("ANY-mode input is served for an agent the caller did not spawn (admin reach, the attach/despawn row shape)",
+      r.reply.ok === true && (r.reply.data as { bytes: number }).bytes === 12, r.reply);
+    const wantOp = Buffer.from(`${PASTE_START}/model opus${PASTE_END}\r`, "utf8");
+    const got = await sinkReaches(opseat.name, wantOp.length);
+    check("THE CHILD RECEIVED EXACTLY `/model opus` as a bracketed paste + `\\r`: a leading `/` survives the whole path unparsed",
+      got.equals(wantOp), { hex: got.toString("hex"), want: wantOp.toString("hex") });
+    await opNc.drain().catch(() => opNc.close());
+  }
+
+  console.log("\n6. the tier boundary is the GRANT: an agent cred's any-mode input never reaches the handler");
+  {
+    // B holds the OWNER-mode input row. The any-mode form of the same command is a different
+    // subject its credential does not carry, so the broker refuses the publish (default deny) and
+    // the admin path is structurally unreachable from every agent-grade credential: exactly the
+    // property that lets `input` share `attach`'s row shape without inventing a second tier.
+    // epCall watches the connection for the violation, so the refusal is permission-denied in the
+    // broker's own words naming the subject; a handler refusal carries the code without them.
+    let refused: string | undefined;
+    let detail = "";
+    try {
+      const r = await epCall(B.nc, space, { mode: "one" }, {
+        endpoint: MANAGER_ENDPOINT, command: "input", contract: MANAGER_CONTRACTS.input, caller: B.caller,
+        args: { text: "escalate" },
+        target: { mode: "any", owner: DEV_OWNER, actor: typist.id, lifecycleUid: typist.lifecycleUid },
+      }, { deadlineMs: 3_000, currentEpoch: async () => 0 });
+      refused = r.reply.ok === false ? r.reply.error?.code : "SERVED-OK";
+      detail = r.reply.ok === false ? r.reply.error?.message ?? "" : "";
+    } catch (e) {
+      refused = e instanceof EpEnvelopeError ? e.code : (e as Error).message;
+      detail = (e as Error).message;
+    }
+    check("a spawn-capable agent publishing the ANY-mode input subject is refused by the broker (permission-denied naming the subject, never served)",
+      refused === "permission-denied" && /REFUSED BY THE BROKER/.test(detail), { refused, detail: detail.slice(0, 200) });
+  }
+
+  console.log("\n7. a seat that is not running refuses");
+  {
+    // WHAT IS FORCED AND WHY, so this cell is not over-read. On the pty runtime a child's exit is
+    // reaped SYNCHRONOUSLY (the attach session's onExit -> onAgentExit -> freeSlot deletes the slot
+    // in the same tick), so the state this branch guards - a slot still held by an agent whose
+    // process has gone - cannot be produced by killing a child and racing the manager. What is
+    // forced is exactly one fact, on a REAL live managed agent: its handle reports `exited`. The
+    // request, the subject, the credential, the authorization and the handler are all real and
+    // unmodified, and the forcing is undone immediately. It is graded here rather than left to a
+    // reasoned argument because "refuses to type into a dead seat" is the one thing an external UI
+    // must be able to rely on when a seat dies mid-session.
+    const deadseat = await spawnLive(A.call, { name: "deadseat", agent: "input-echo", cwd: repoRoot, events: false });
+    const managed = M.agents.get(deadseat.name);
+    if (!managed) throw new Error(`FIXTURE FAILURE: ${deadseat.name} is live in ps but absent from the manager's slot map`);
+    const realStatus = managed.handle.status.bind(managed.handle);
+    let r;
+    try {
+      managed.handle.status = () => "exited";
+      r = await A.call("input", { text: "ghost" }, { actor: deadseat.id, lifecycleUid: deadseat.lifecycleUid });
+    } finally {
+      managed.handle.status = realStatus;
+    }
+    check("input into a seat whose process is gone refuses (failed-precondition), naming the state",
+      r.reply.ok === false && r.reply.error?.code === "failed-precondition"
+      && String(r.reply.error?.message ?? "").includes("is not running"), r.reply);
+    // Refused before the first write, so the reply states that nothing ran (SPEC 13.3).
+    check("...and the refusal carries the not-executed outcome", r.reply.ok === false && r.reply.error?.outcome === "not-executed", r.reply);
+    check("...and nothing was typed into it", sinkBytes(deadseat.name).length === 0, sinkBytes(deadseat.name).toString("hex"));
+    await A.call("despawn", { graceful: false }, { actor: deadseat.id, lifecycleUid: deadseat.lifecycleUid });
+  }
+
+  console.log("\n8. THE CLI PATH: the real binary types a harness command into a seat");
+  {
+    // The cell the whole lane exists for. An external UI reaches this feature through `cotal input`,
+    // and every layer between the flag and the subject (flag parsing, the seat-locality pin, the
+    // instrument mint, the alias -> triple resolution, the reach choice) is invisible to cells 2-7:
+    // a defect in any of them leaves those green and the product broken.
+    const cliseat = await spawnLive(A.call, { name: "cliseat", agent: "input-echo", cwd: repoRoot, events: false });
+    const run = await cotal(["input", "--name", cliseat.name, "--text", "/compact", "--space", space]);
+    mustHaveRun(run, "`cotal input`");
+    const out = strip(run.out);
+    check("`cotal input --name <seat> --text \"/compact\"` exits 0", run.status === 0, { status: run.status, tail: out.slice(-400) });
+    check("...and reports what it delivered", out.includes("Terminal input written") && field(out, "Agent", cliseat.name)
+      && field(out, "Bytes reported", "9") && field(out, "Enter requested", "yes"), out.slice(-400));
+    const wantCompact = Buffer.from(`${PASTE_START}/compact${PASTE_END}\r`, "utf8");
+    const got = await sinkReaches(cliseat.name, wantCompact.length);
+    check("THE SEAT'S HARNESS RECEIVED EXACTLY `/compact` as a bracketed paste + `\\r`: a slash command typed in a UI reaches the child verbatim",
+      got.equals(wantCompact), { hex: got.toString("hex"), want: wantCompact.toString("hex") });
+
+    // The receipt is derived from the runtime acknowledgement, not from `data`. A dropped write that
+    // resolves without an accepted-byte count is the mutation control from issue #1333: before the
+    // fix this exited 0 and printed a 9-byte receipt while the child received nothing. Neither
+    // failure proves the child received nothing: a write that throws may have handed the custodian
+    // part of the paste, and the manager's error carries no effect outcome, which SPEC §13.3 reads
+    // as unknown. So both report an unconfirmed outcome and are not sent again.
+    const dropseat = await spawnLive(A.call, { name: "dropseat", agent: "input-echo", cwd: repoRoot, events: false });
+    const dropped = M.agents.get(dropseat.name);
+    if (!dropped?.handle.write) throw new Error(`FIXTURE FAILURE: ${dropseat.name} has no writable managed handle`);
+    const realWrite = dropped.handle.write;
+    let rejectedRun: Run;
+    let droppedRun: Run;
+    try {
+      dropped.handle.write = async () => { throw new Error("custodian write rejected"); };
+      rejectedRun = await cotal(["input", "--name", dropseat.name, "--text", "/compact", "--space", space]);
+      dropped.handle.write = async () => undefined as unknown as number;
+      droppedRun = await cotal(["input", "--name", dropseat.name, "--text", "/compact", "--space", space]);
+    } finally {
+      dropped.handle.write = realWrite;
+    }
+    mustHaveRun(rejectedRun, "`cotal input` with a rejected PTY write");
+    const rejectedOut = strip(rejectedRun.out);
+    check("a rejected PTY write exits 3 as an unconfirmed outcome, is not sent again, and prints NO written receipt",
+      rejectedRun.status === 3 && unconfirmed(rejectedOut, dropseat.name, `input for seat "${dropseat.name}" failed: custodian write rejected`)
+      && !written(rejectedOut), { status: rejectedRun.status, tail: rejectedOut.slice(-500) });
+    mustHaveRun(droppedRun, "`cotal input` with a dropped PTY write");
+    const droppedOut = strip(droppedRun.out);
+    check("a dropped PTY write exits 3 as an unconfirmed outcome, is not sent again, and prints NO written receipt",
+      droppedRun.status === 3 && unconfirmed(droppedOut, dropseat.name, `input for seat "${dropseat.name}" failed: runtime accepted undefined of 9 bytes`)
+      && !written(droppedOut), { status: droppedRun.status, tail: droppedOut.slice(-500) });
+    await wait(750);
+    check("...and the dropped bytes never reached the child", sinkBytes(dropseat.name).length === 0,
+      { hex: sinkBytes(dropseat.name).toString("hex") });
+
+    // `--no-enter` through the same real binary, carrying the HARDEST payload: text that is itself
+    // a flag spelling. `--text=<value>` is the form node's `parseArgs` requires for a dash-leading
+    // value, and it is what docs/cli.mdx tells the operator to use.
+    const before = sinkBytes(cliseat.name).length;
+    const run2 = await cotal(["input", "--name", cliseat.name, `--text=--not-a-flag`, "--no-enter", "--space", space]);
+    mustHaveRun(run2, "`cotal input --no-enter`");
+    const out2 = strip(run2.out);
+    check("`--no-enter` exits 0 and reports only the text's bytes", run2.status === 0 && out2.includes("Terminal input written")
+      && field(out2, "Agent", cliseat.name) && field(out2, "Bytes reported", "12") && field(out2, "Enter requested", "no"), { status: run2.status, tail: out2.slice(-400) });
+    const wantFlag = Buffer.from(`${PASTE_START}--not-a-flag${PASTE_END}`, "utf8");
+    const got2 = await sinkReaches(cliseat.name, before + wantFlag.length);
+    check("...and the child received EXACTLY `--not-a-flag`, unparsed and with no carriage return",
+      got2.subarray(before).equals(wantFlag), { hex: got2.subarray(before).toString("hex"), want: wantFlag.toString("hex") });
+
+    // THE SPACE FORM OF A DASH-LEADING VALUE MUST FAIL LOUD, and this is graded rather than
+    // reasoned because the alternative outcomes are both bad and both plausible: `parseArgs` could
+    // swallow `--not-a-flag` as an option (delivering nothing while exiting 0) or could take the
+    // NEXT token as the text (delivering the wrong bytes). It does neither, and nothing typed
+    // reaches the seat. Measured on the first run of this suite, which is why the docs carry the
+    // `--text=` form rather than leaving an operator to discover this at a live agent.
+    const beforeRefusal = sinkBytes(cliseat.name).length;
+    const run3 = await cotal(["input", "--name", cliseat.name, "--text", "--not-a-flag", "--space", space]);
+    mustHaveRun(run3, "`cotal input` with a space-separated dash-leading value");
+    check("a dash-leading value in the SPACE form is a usage error, not a silent or wrong delivery",
+      run3.status !== 0 && sinkBytes(cliseat.name).length === beforeRefusal,
+      { status: run3.status, delivered: sinkBytes(cliseat.name).length - beforeRefusal, tail: strip(run3.out).slice(-300) });
+
+    // The refusal path, through the binary: a name that does not exist must be a non-zero exit with
+    // the manager's own message, never a silent success an external UI would render as delivered.
+    const run4 = await cotal(["input", "--name", `no-such-seat-${randomUUID().slice(0, 6)}`, "--text", "/compact", "--space", space]);
+    mustHaveRun(run4, "`cotal input` at an absent seat");
+    check("an absent seat exits NON-ZERO and says so", run4.status !== 0 && /no managed agent|could not resolve/.test(strip(run4.out)), { status: run4.status, tail: strip(run4.out).slice(-400) });
+  }
+
+  console.log("\n9. the PLACEMENT guard: the `spawn` capability alone grants no seat input, in either mode");
+  {
+    // WHY THIS CELL EXISTS. `input` is deliberately NOT in SPAWN_OWNER_LIFECYCLE_COMMANDS, and the
+    // edit that would put it there is one word beside its two obvious siblings. Security review
+    // measured what that would cost: a spawn-capability credential holds the owner-mode `attach`
+    // request row and ZERO `eps.` session rails, so it cannot complete an attach write today, and
+    // on a USER mesh authorizeNamedControl's owner-domain arm admits any seat under the caller's
+    // owner, not just its own children. The edit would therefore hand every spawn-scoped agent
+    // blind WRITE into a sibling's harness: control of a peer, where despawn only gave it denial.
+    //
+    // The core suite pins the row set; this pins the CONSEQUENCE, on a live broker, which is the
+    // half a row-shape assertion cannot show: the publish does not reach the handler.
+    const S = await instrument([{ command: "inspect" }]); // capabilities: ["spawn"], NO input row
+    for (const mode of ["owner", "any"] as const) {
+      let refused: string | undefined;
+      let detail = "";
+      try {
+        const r = await epCall(S.nc, space, { mode: "one" }, {
+          endpoint: MANAGER_ENDPOINT, command: "input", contract: MANAGER_CONTRACTS.input, caller: S.caller,
+          args: { text: "sibling-takeover" },
+          target: { mode, owner: DEV_OWNER, actor: typist.id, lifecycleUid: typist.lifecycleUid },
+        }, { deadlineMs: 3_000, currentEpoch: async () => 0 });
+        refused = r.reply.ok === false ? r.reply.error?.code : "SERVED-OK";
+        detail = r.reply.ok === false ? r.reply.error?.message ?? "" : "";
+      } catch (e) {
+        refused = e instanceof EpEnvelopeError ? e.code : (e as Error).message;
+        detail = (e as Error).message;
+      }
+      check(`a credential holding ONLY the spawn capability is refused by the broker on the ${mode}-mode input subject (permission-denied naming the subject)`,
+        refused === "permission-denied" && /REFUSED BY THE BROKER/.test(detail), { mode, refused, detail: detail.slice(0, 200) });
+    }
+    // The control that stops the cell above passing vacuously: the SAME credential class reaches
+    // the manager fine on a row it does hold, so the refusals are about the missing input row and
+    // not about a broken instrument, a wrong subject, or a dead responder.
+    const rOk = await S.call("inspect", { name: typist.name });
+    check("...while the same credential's `inspect` is served, so the refusals above are the missing row and not a dead caller",
+      rOk.reply.ok === true, rOk.reply);
+    await S.nc.drain().catch(() => S.nc.close());
+  }
+
+  console.log("\n10. THE SUBMIT KEY IS ITS OWN KEYSTROKE (issue #1649, mutation-proof cell `input-submit`)");
+  {
+    // WHAT BROKE, AND WHY EVERY CELL ABOVE STAYED GREEN THROUGH IT. `input` used to hand the runtime
+    // ONE `${text}\r`. A TUI harness reads keystrokes, so with the return fused onto the tail of the
+    // text it is the text's last character rather than the submit key: the line sits in the composer
+    // and the NEXT call's return submits the PREVIOUS call's text. Every delivery runs one call
+    // behind while the op still reports the full byte count, so every observable signal says
+    // "delivered".
+    //
+    // SEPARATING THE RETURN IS NOT ENOUGH, which is what a second round of live measurement showed.
+    // A TUI classifies a fast burst of input as a PASTE and consumes the newline trailing it (Jcode
+    // spells this `paste_guard::consume_paste_trailing_enter`), so any text long enough to need more
+    // than one write was STILL one call behind with a lone return. Measured on a real jcode seat
+    // through a real pty, 2048-char slices with a yield before the return: 120 and 700 bytes were
+    // submitted on their own call; 2500 and 3100 bytes were not, each appearing only when the NEXT
+    // call's return arrived. The text is therefore delivered as a BRACKETED PASTE
+    // (`ESC[200~ … ESC[201~`), which states the block's boundary so the following return is
+    // unambiguously a keystroke. Bracketed, 120 / 2600 / 5912 bytes each submitted on their own call.
+    //
+    // GRADED AT THE RUNTIME SEAM, on a live managed seat, by recording what the handler hands the
+    // pty. That is the manager's half of the contract and the only half it owns: how promptly a
+    // given harness then redraws is the harness's, and a cell that waited on a child's read
+    // boundaries would be grading the child's scheduler and would flake in CI. That the SEAT then
+    // submits on the call that sent it is graded end to end, on a real jcode seat, by
+    // `implementations/manager/smoke/acceptance-1649-e2e.mjs`.
+    const shapeseat = await spawnLive(A.call, { name: "typist", agent: "input-echo", cwd: repoRoot, events: false });
+    const managed = M.agents.get(shapeseat.name);
+    if (!managed?.handle.write) throw new Error(`FIXTURE FAILURE: ${shapeseat.name} has no writable managed handle`);
+    const realWrite = managed.handle.write.bind(managed.handle);
+    // A recording PASS-THROUGH, not a stub: every byte still reaches the real pty and the real child,
+    // so the sink assertions below grade the same delivery this cell is reading the shape of.
+    const writes: string[] = [];
+    const record = async (data: string): Promise<number> => { writes.push(data); return realWrite(data); };
+
+    try {
+      managed.handle.write = record;
+      const r = await A.call("input", { text: "submit-me" }, { actor: shapeseat.id, lifecycleUid: shapeseat.lifecycleUid });
+      check("the op still reports the text + the appended \\r as ONE byte count, with the paste markers NOT counted (framing, not content)",
+        r.reply.ok === true && (r.reply.data as { bytes: number }).bytes === 10, r.reply);
+      const wantShape = Buffer.from(`${PASTE_START}submit-me${PASTE_END}\r`, "utf8");
+      const got = await sinkReaches(shapeseat.name, wantShape.length);
+      check("the child received the text wrapped in paste markers with the return after the close marker",
+        got.equals(wantShape), { hex: got.toString("hex"), want: wantShape.toString("hex") });
+      check("THE RETURN WAS WRITTEN ALONE, AFTER the paste close: the harness is handed a submit key, not a pasted newline",
+        writes.length === 4 && writes[0] === PASTE_START && writes[1] === "submit-me"
+        && writes[2] === PASTE_END && writes[3] === "\r", { writes });
+
+      // THE SIZE ARM, which is where a lone return alone was measured to fail. A text past one slice
+      // is several writes, so the burst looks like a paste to the harness; the markers are what stop
+      // its trailing-newline rule from eating the submit key. A single write past the pty's
+      // 4096-byte input buffer is also re-split by the KERNEL at its own boundary, so the slices stay
+      // under it.
+      writes.length = 0;
+      const big = "x".repeat(5912);
+      const beforeBig = sinkBytes(shapeseat.name).length;
+      const rBig = await A.call("input", { text: big }, { actor: shapeseat.id, lifecycleUid: shapeseat.lifecycleUid });
+      check("a 5912-byte order is accepted and acknowledged in full (5913 with the return, markers uncounted)",
+        rBig.reply.ok === true && (rBig.reply.data as { bytes: number }).bytes === 5913, rBig.reply);
+      const wantBig = Buffer.from(`${PASTE_START}${big}${PASTE_END}\r`, "utf8");
+      const gotBig = await sinkReaches(shapeseat.name, beforeBig + wantBig.length);
+      check("...and every byte of it reached the child, in order, inside the paste with the return last",
+        gotBig.subarray(beforeBig).equals(wantBig), { got: gotBig.length - beforeBig, want: wantBig.length });
+      check("...and NO single write exceeded the pty's 4096-byte input buffer, so no write is re-split by the kernel",
+        writes.length > 1 && writes.every((w) => Buffer.byteLength(w, "utf8") <= 4096), { sizes: writes.map((w) => Buffer.byteLength(w, "utf8")) });
+      check("...and it was delivered as a CLOSED paste block whose return is the last write, so a large order submits on the call that sent it",
+        writes[0] === PASTE_START && writes.at(-2) === PASTE_END && writes.at(-1) === "\r"
+        && !writes.some((w) => w.length > 1 && w.endsWith("\r")),
+        { first: JSON.stringify(writes[0]), last2: writes.slice(-2).map((w) => JSON.stringify(w)) });
+
+      // The control that stops every assertion above from being satisfied by "always write a lone
+      // return": `enter:false` must still press nothing at all, while the paste is still closed.
+      writes.length = 0;
+      await A.call("input", { text: "staged", enter: false }, { actor: shapeseat.id, lifecycleUid: shapeseat.lifecycleUid });
+      check("...while `enter:false` writes the text as a CLOSED paste and NO return at all",
+        writes.length === 3 && writes[0] === PASTE_START && writes[1] === "staged" && writes[2] === PASTE_END, { writes });
+    } finally {
+      managed.handle.write = realWrite;
+    }
+  }
+
+  console.log("\n11. Claude selection menus refuse text before it can confirm the highlighted answer");
+  {
+    const menu = await spawnLive(A.call, { name: "menuseat", agent: "claude", cwd: workspaceRoot, events: false });
+    const managed = M.agents.get(menu.name);
+    if (!managed?.handle.write) throw new Error("menu fixture has no writable handle");
+    const handle = managed.handle as PrivHandle & { attach(): { backlog(): Promise<Buffer>; write(data: string): void } };
+    const session = handle.attach();
+    for (let i = 0; i < 100; i++) {
+      if ((await session.backlog()).includes(Buffer.from("Enter to select"))) break;
+      await wait(100);
+    }
+    const writes: string[] = [];
+    const realWrite = handle.write!.bind(handle);
+    handle.write = async (data) => { writes.push(data); return realWrite(data); };
+    const outcomes: Run[] = [];
+    try {
+      for (const text of ["2", "3", "plain fixture answer"])
+        outcomes.push(await cotal(["input", "--name", menu.name, "--text", text, "--space", space]));
+      outcomes.push(await cotal(["input", "--name", menu.name, "--text", "2", "--no-enter", "--space", space]));
+      const refused = outcomes.every((r) => r.status === 2 && !r.timedOut && !r.signal
+        && strip(r.out).includes("input text cannot safely select an option") && !written(strip(r.out)));
+      const untouched = writes.length === 0 && sinkBytes(menu.name).length === 0;
+      // A real attach cancels the menu. Leave its footer in scrollback: history must not block chat.
+      session.write("\x1b");
+      await sinkReaches(menu.name, 1);
+      await wait(250);
+      const control = await cotal(["input", "--name", menu.name, "--text", "ordinary control", "--space", space]);
+      const want = Buffer.from(`\x1b${PASTE_START}ordinary control${PASTE_END}\r`);
+      const got = await sinkReaches(menu.name, want.length);
+      check("Claude menu input refuses 2, 3, plain text and no-enter without writing, but accepts chat after the menu leaves the viewport",
+        refused && untouched && control.status === 0 && got.equals(want), { outcomes, writes, control, hex: got.toString("hex") });
+    } finally { handle.write = realWrite; }
+  }
+
+  await A.nc.drain().catch(() => A.nc.close());
+  await B.nc.drain().catch(() => B.nc.close());
+  // WITH agents, and nothing less (#1712). `stop()` without the flag is the DETACHED mode: it
+  // releases only this manager's local custody handle and exits, which tells no custodian
+  // anything. Every seat this suite spawned survived that as a live detached custodian holding
+  // ~65 MB, and the CI shard's leak check failed the suite for it (all cells green). `withAgents`
+  // hard-stops each child and AWAITS the runtime's exit proof, so the custodians settle and remove
+  // their own records before this process exits - the same teardown every sibling suite that
+  // spawns pty seats already uses.
+  await mgr.stop({ withAgents: true });
+  stoppedCleanly = true;
+} finally {
+  // A cell that threw never reached the stop above, and this suite still holds live seats it
+  // spawned. Stop them best-effort so a FAILING run does not also leak custodians (the CI shard
+  // kills them, but this suite reaps its own); caught so the original failure is what the run
+  // reports, exactly as a cell's own error must not be masked by teardown noise.
+  if (!stoppedCleanly) await mgr.stop({ withAgents: true }).catch(() => {});
+  srv.kill("SIGKILL");
+  rmSync(dir, { recursive: true, force: true });
+  releaseBroker(); // last: ownership is held until this teardown has actually finished
+}
+
+// Every cell this suite is expected to run, counted INCLUDING this assertion itself. A suite that
+// only reports `N passed, 0 failed` is green when cells are silently dropped: deleting cell 10
+// entirely (the #1649 guards) leaves 29 passed, 0 failed, exit 0 - measured, not supposed. The
+// tally has nothing to compare itself against, so a refactor that skips a block removes the
+// evidence without removing the green. Bumping this number is the deliberate edit that makes such
+// a drop impossible to miss. The count is read BEFORE this cell is tallied, so it is the number of
+// preceding cells (37), not 38.
+const EXPECTED_CELLS = 39;
+check(`every cell ran (a silently skipped cell must not read as green): expected ${EXPECTED_CELLS}`,
+  pass + fail === EXPECTED_CELLS, { ran: pass + fail, expected: EXPECTED_CELLS });
+
+console.log(`\n${fail === 0 ? "SEAT INPUT SMOKE OK ✅" : "SEAT INPUT SMOKE FAILED"}  (${pass} passed, ${fail} failed)`);
+process.exit(fail === 0 ? 0 : 1);

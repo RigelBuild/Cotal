@@ -1,0 +1,685 @@
+import { randomUUID } from "node:crypto";
+import type { InboxItem, MeshAgent } from "@cotal-ai/connector-core";
+import { formatInjection, renderPendingTurnText } from "@cotal-ai/connector-core";
+import { InboxTurn } from "./inbox-turn.js";
+
+const CUSTOM_TYPE = "cotal-inbox";
+const BATCH_LIMIT = 32;
+const DEFAULT_START_TIMEOUT_MS = 5_000;
+// A non-terminal agent_end with a batch pending is retried this many times, with this fixed
+// backoff, before the driver holds for operator intervention instead (issue #726: the hold's
+// only exit was a turn nothing in the process could start).
+const CONTINUATION_ATTEMPT_LIMIT = 2;
+const CONTINUATION_BACKOFF_MS = 50;
+const LOST_STEER_POLL_MS = 100;
+// Longer than a host's post-run auto-compaction, after which it drains a queued steer.
+const DEFAULT_LOST_STEER_SETTLE_MS = 120_000;
+
+const HISTORY_REFUSAL_MARKER = "Refusal (";
+const HISTORY_REFUSAL_ACTIVITY =
+  "provider refused this session's history; retries stopped — restart this seat with a fresh session (no --resume)";
+
+function isHistoryRefusal(errorText: string | undefined): boolean {
+  return errorText?.includes(HISTORY_REFUSAL_MARKER) ?? false;
+}
+
+export type DriverState = "idle" | "dispatching" | "streaming" | "held" | "shuttingDown";
+
+export interface CotalBatchDetails {
+  version: 1;
+  batchId: string;
+  ids: string[];
+  items?: InboxItem[];
+  /** Goal ids of run turns in this batch; repeated goal text can be removed when rebuilding copies. */
+  turnIds?: string[];
+  suffix?: string;
+  turnHeader?: string;
+  turnFooter?: string;
+  turnBlocks?: Record<string, string>;
+}
+
+export interface PiContextLike {
+  signal?: AbortSignal;
+  isIdle(): boolean;
+  hasPendingMessages(): boolean;
+  hasUI: boolean;
+  ui: { notify(message: string, level?: "info" | "warning" | "error"): void };
+  shutdown(): void;
+}
+
+export interface PiHost {
+  sendMessage(
+    message: { customType: string; content: string; display: boolean; details: CotalBatchDetails },
+    options: { triggerTurn: true; deliverAs: "steer" },
+  ): void;
+}
+
+/** Stands in for a kept later copy that carries nothing new and sits after an assistant message. */
+const ALREADY_DELIVERED_STUB = "Cotal batch already delivered above; no new items.";
+
+interface Batch {
+  id: string;
+  ids: string[];
+  content: string;
+  started: boolean;
+  confirmed: boolean;
+  watchdog?: ReturnType<typeof setTimeout>;
+  /** Run-turn goal ids riding this batch; they commit as surfaced only once the provider took the
+   *  request carrying it (two-phase — a lost batch re-surfaces them instead of arming a `done` for
+   *  unseen work). */
+  turnIds?: string[];
+  /** Inbox items and run-turn blocks carried for the Pi renderer; re-sent unchanged on continuation. */
+  items?: InboxItem[];
+  suffix?: string;
+  turnHeader?: string;
+  turnFooter?: string;
+  turnBlocks?: Record<string, string>;
+}
+
+function detailsOf(message: unknown): CotalBatchDetails | undefined {
+  if (!message || typeof message !== "object") return undefined;
+  const value = message as { role?: unknown; customType?: unknown; details?: unknown };
+  if (value.role !== "custom" || value.customType !== CUSTOM_TYPE || !value.details || typeof value.details !== "object")
+    return undefined;
+  const details = value.details as Partial<CotalBatchDetails>;
+  if (details.version !== 1 || typeof details.batchId !== "string" || !Array.isArray(details.ids)) return undefined;
+  if (!details.ids.every((id) => typeof id === "string")) return undefined;
+  return details as CotalBatchDetails;
+}
+
+function ownChannelEcho(mesh: MeshAgent, item: InboxItem): boolean {
+  return item.kind === "channel" && item.fromId === mesh.id;
+}
+
+function wakeable(mesh: MeshAgent, item: InboxItem): boolean {
+  if (ownChannelEcho(mesh, item)) return false;
+  if (item.kind !== "channel" || item.mentionsMe) return true;
+  return mesh.attention === "open";
+}
+
+/** Serialized Pi-owned delivery driver. No event callback calls the host send API outside this class. */
+export class PiDriver {
+  private readonly inbox: InboxTurn;
+  private host?: PiHost;
+  private context?: PiContextLike;
+  private batches: Batch[] = [];
+  private contextBatchIds = new Set<string>();
+  private requestBatchIds = new Set<string>();
+  private terminalEvidenceBatchIds = new Set<string>();
+  private nudges: string[] = [];
+  private presence = Promise.resolve();
+  private activeSignal?: AbortSignal;
+  private pendingContinuation = false;
+  private overflowRetry = false;
+  private continuationAttempts = 0;
+  private continuationTimer?: ReturnType<typeof setTimeout>;
+  private _state: DriverState = "idle";
+  private heldReason?: string;
+  private retryableErrorHold = false;
+  private inboundDuringTurn?: InboxItem;
+  private knownAtTurnStart = new Set<string>();
+  private knownAtErrorEnd = new Set<string>();
+  private startHoldBatchId?: string;
+  private runSeq = 0;
+
+  constructor(
+    private readonly mesh: MeshAgent,
+    private readonly startTimeoutMs = DEFAULT_START_TIMEOUT_MS,
+    private readonly lostSteerSettleMs = DEFAULT_LOST_STEER_SETTLE_MS,
+  ) {
+    this.inbox = new InboxTurn(mesh);
+  }
+
+  get state(): DriverState {
+    return this._state;
+  }
+
+  get reason(): string | undefined {
+    return this.heldReason;
+  }
+
+  bind(host: PiHost): void {
+    this.host = host;
+  }
+
+  onSessionStart(context: PiContextLike): void {
+    this.context = context;
+    if (this._state === "shuttingDown") {
+      context.shutdown();
+      return;
+    }
+    this.pump();
+  }
+
+  onSessionShutdown(): void {
+    this.context = undefined;
+  }
+
+  onIncoming(item: InboxItem): void {
+    if (this.batches.length > 0 && this._state !== "held" && this.automaticWakeable(item) &&
+      !this.knownAtTurnStart.has(item.recvKey)) this.inboundDuringTurn = item;
+    this.retryHeldErrorOnInbound(item);
+    this.pump();
+  }
+
+  onWake(): void {
+    this.pump();
+  }
+
+  onMentionWake(item: InboxItem): void {
+    if (this._state === "shuttingDown") return;
+    const who = item.fromRole ? `${item.fromName}/${item.fromRole}` : item.fromName;
+    this.nudges.push(
+      `Cotal: you were @mentioned on #${item.channel} by ${who} while focused. ` +
+        "The body is held; read it with cotal_inbox and reply with cotal_send if warranted.",
+    );
+    if (this.nudges.length > BATCH_LIMIT) this.nudges.splice(0, this.nudges.length - BATCH_LIMIT);
+    this.pump();
+  }
+
+  onAgentStart(context: PiContextLike): void {
+    this.context = context;
+    if (this._state === "shuttingDown") {
+      context.shutdown();
+      return;
+    }
+    this.activeSignal = context.signal;
+    this.knownAtTurnStart = new Set(this.inbox.peek().map((item) => item.recvKey));
+    this.overflowRetry = false;
+    this.runSeq++;
+    if (this.pendingContinuation) {
+      this.pendingContinuation = false;
+      this.heldReason = undefined;
+      if (this.continuationTimer) {
+        clearTimeout(this.continuationTimer);
+        this.continuationTimer = undefined;
+      }
+      this._state = this.batches.some((batch) => !batch.confirmed) ? "dispatching" : "streaming";
+    } else if (this._state === "held" && this.batches.length === 0) {
+      this.heldReason = undefined;
+      this._state = "streaming";
+    } else if (this._state !== "held") {
+      this._state = this.batches.some((batch) => !batch.confirmed) ? "dispatching" : "streaming";
+    }
+    this.enqueuePresence("working", this.activity("thinking"));
+    if (this._state !== "held") this.pump(true);
+  }
+
+  onMessageStart(message: unknown): void {
+    if (this._state === "shuttingDown") return;
+    const details = detailsOf(message);
+    if (!details) return;
+    const batch = this.batches.find((candidate) => candidate.id === details.batchId);
+    if (!batch || batch.ids.length !== details.ids.length || !batch.ids.every((id, i) => id === details.ids[i])) return;
+    batch.started = true;
+    // The batch is in Pi's session now. Its acceptance comes with the provider's answer, which a once
+    // task's handoff bound does not measure.
+    if (batch.turnIds) this.mesh.noteTurnsDispatched(batch.turnIds);
+    if (this.contextBatchIds.has(batch.id)) {
+      this.requestBatchIds.add(batch.id);
+      this.terminalEvidenceBatchIds.add(batch.id);
+    }
+    clearTimeout(batch.watchdog);
+    batch.watchdog = undefined;
+    // Pi consumes a mid-run steer at its next turn boundary, which can land after the watchdog.
+    if (this._state === "held" && this.startHoldBatchId === batch.id) {
+      this.startHoldBatchId = undefined;
+      this.heldReason = undefined;
+      this._state = "dispatching";
+      this.enqueuePresence("working", "thinking");
+    }
+  }
+
+  onContext<T>(messages: readonly T[]): T[] | undefined {
+    if (this._state === "shuttingDown") return undefined;
+    const visible = new Set(messages.map(detailsOf).filter((details): details is CotalBatchDetails => Boolean(details)).map((d) => d.batchId));
+    const candidates = this.batches.filter((batch) => !batch.confirmed && visible.has(batch.id));
+    this.contextBatchIds = new Set(candidates.map((batch) => batch.id));
+    this.requestBatchIds = new Set(candidates.filter((batch) => batch.started).map((batch) => batch.id));
+    for (const id of this.requestBatchIds) this.terminalEvidenceBatchIds.add(id);
+    return this.withoutSupersededBatches(messages);
+  }
+
+  onProviderResponse(status: number): void {
+    if (this._state === "shuttingDown") return;
+    if (status >= 200 && status < 300) {
+      for (const id of this.requestBatchIds) {
+        const batch = this.batches.find((candidate) => candidate.id === id);
+        if (batch) this.confirm(batch);
+      }
+    } else {
+      for (const id of this.requestBatchIds) this.terminalEvidenceBatchIds.delete(id);
+    }
+    this.contextBatchIds.clear();
+    this.requestBatchIds.clear();
+    if (this._state !== "held") {
+      this._state = "streaming";
+      this.pump();
+    }
+  }
+
+  onToolStart(name: string): void {
+    if (this._state === "shuttingDown") return;
+    // A transport without after_provider_response confirms nothing before agent end, but Pi runs a
+    // tool only from a clean answer to the request that carried these batches. Their run turns are
+    // seen, and cotal_yield is itself a tool, so it must find them surfaced.
+    for (const id of this.requestBatchIds) {
+      const turnIds = this.batches.find((candidate) => candidate.id === id)?.turnIds;
+      if (turnIds) this.mesh.commitSurfacedTurns(turnIds);
+    }
+    this.enqueuePresence("working", this.activity(`running ${name || "tool"}`));
+  }
+
+  onToolEnd(): void {
+    if (this._state === "shuttingDown") return;
+    this.enqueuePresence("working", this.activity("thinking"));
+  }
+
+  onAgentEnd(messages: readonly unknown[], context: PiContextLike): void {
+    if (this._state === "shuttingDown") return;
+    const lastAssistant = [...messages]
+      .reverse()
+      .find((message) => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant") as
+      | { stopReason?: string; usage?: { output?: number }; errorMessage?: string }
+      | undefined;
+    const aborted = this.activeSignal?.aborted === true;
+    this.activeSignal = undefined;
+    this.contextBatchIds.clear();
+    this.requestBatchIds.clear();
+    if (!aborted && lastAssistant?.stopReason === "error" && isHistoryRefusal(lastAssistant.errorMessage)) {
+      this.terminalEvidenceBatchIds.clear();
+      this.pendingContinuation = false;
+      this.inboundDuringTurn = undefined;
+      this.hold(HISTORY_REFUSAL_ACTIVITY);
+      return;
+    }
+    const terminal =
+      !aborted &&
+      (lastAssistant?.stopReason === "stop" ||
+        lastAssistant?.stopReason === "toolUse" ||
+        (lastAssistant?.stopReason === "length" && (lastAssistant.usage?.output ?? 0) > 0));
+
+    if (!terminal) {
+      this.terminalEvidenceBatchIds.clear();
+      if (this.batches.length === 0) {
+        this.inboundDuringTurn = undefined;
+        this.continuationAttempts = 0;
+        this._state = "idle";
+        this.publishIdleWhenSettled(context);
+        return;
+      }
+      this.pendingContinuation = true;
+      if (aborted || lastAssistant?.stopReason === "aborted") {
+        // The person who aborted is the party who continues: a plain hold, never an automatic retry.
+        this.hold("Pi turn was aborted; Cotal delivery is retained until a proven clean continuation completes");
+        return;
+      }
+      const reasonLabel = `Pi turn ended with ${lastAssistant?.stopReason ?? "an unknown stop reason"}`;
+      if (this.continuationAttempts < CONTINUATION_ATTEMPT_LIMIT) {
+        this.continuationAttempts++;
+        this.hold(`${reasonLabel}; Cotal delivery is retained until a proven clean continuation completes`);
+        this.scheduleContinuation();
+      } else {
+        this.hold(
+          `${reasonLabel} after ${CONTINUATION_ATTEMPT_LIMIT} automatic continuation attempts; Cotal delivery ` +
+            "needs intervention: start a new turn in this session, or replace the seat.",
+        );
+      }
+      // `hold` clears eligibility, so arm the provider-error inbound retry after it (RIG-4249).
+      this.retryableErrorHold = lastAssistant?.stopReason === "error";
+      this.knownAtErrorEnd = new Set(this.inbox.peek().map((item) => item.recvKey));
+      const inbound = this.inboundDuringTurn;
+      this.inboundDuringTurn = undefined;
+      if (inbound) this.knownAtErrorEnd.delete(inbound.recvKey);
+      if (inbound) this.retryHeldErrorOnInbound(inbound);
+      return;
+    }
+
+    for (const id of this.terminalEvidenceBatchIds) {
+      const batch = this.batches.find((candidate) => candidate.id === id);
+      if (batch) this.confirm(batch);
+    }
+    this.terminalEvidenceBatchIds.clear();
+    this.pendingContinuation = false;
+    this.knownAtErrorEnd.clear();
+    this.retryableErrorHold = false;
+    this.inboundDuringTurn = undefined;
+    this.finalizeEnd(context);
+  }
+
+  onBeforeCompact(reason: string, willRetry: boolean): void {
+    if (this._state === "shuttingDown") return;
+    if (reason !== "overflow" || !willRetry) return;
+    this.overflowRetry = true;
+  }
+
+  requestShutdown(): void {
+    if (this._state === "shuttingDown") return;
+    this._state = "shuttingDown";
+    this.clearTimers();
+    if (this.context) this.context.shutdown();
+  }
+
+  async quit(): Promise<void> {
+    this._state = "shuttingDown";
+    this.clearTimers();
+    await this.presence.catch(() => {});
+  }
+
+  async flushPresence(): Promise<void> {
+    await this.presence.catch(() => {});
+  }
+
+  private pump(force = false): void {
+    if (!this.host || !this.context || this._state === "held" || this._state === "shuttingDown") return;
+    if (this.batches.some((batch) => !batch.confirmed)) return;
+
+    this.inbox.discardTombstoned();
+    this.inbox.discardMatching((item) => ownChannelEcho(this.mesh, item));
+    const reserved = new Set(this.batches.flatMap((batch) => batch.ids));
+    const available = this.inbox.peek("automatic").filter((item) => !reserved.has(item.recvKey));
+    // A pending run turn is directed-strength: it justifies a pump on its own, like a wakeable item.
+    const turnPeek = this.mesh.peekPendingTurns();
+    if (!force && this.nudges.length === 0 && !turnPeek && !available.some((item) => wakeable(this.mesh, item))) {
+      if (this.batches.length === 0) this.publishIdleWhenSettled(this.context);
+      return;
+    }
+
+    let ids: string[] = [];
+    let items: InboxItem[] = [];
+    let content: string | undefined;
+    if (this.nudges.length > 0) {
+      content = this.nudges.splice(0).join("\n");
+    } else {
+      items = this.inbox.select(reserved, BATCH_LIMIT);
+      if (items.length === 0 && !turnPeek) return;
+      ids = items.map((item) => item.recvKey);
+      // The batch stays this seat's until its turn commits it: unheld, a role request's ack wait runs
+      // out mid-turn and the broker hands it to another holder (#5637). At the hold ceiling, defer.
+      if (ids.length > 0 && !this.mesh.holdInFlight(ids)) return;
+      content = items.length > 0 ? formatInjection(items) : undefined;
+    }
+    // The turns' permit, right before the dispatch with no await between. Without it, a once task
+    // already handed over stays out of the batch.
+    const turns = turnPeek && this.mesh.claimTurns(turnPeek.goalIds) ? turnPeek : undefined;
+    if (turns) content = content ? `${content}\n\n${turns.text}` : turns.text;
+    if (!content) return;
+
+    const batch: Batch = {
+      id: randomUUID(), ids, content, started: false, confirmed: false, items,
+      ...(turns ? {
+        turnIds: turns.goalIds,
+        suffix: turns.text,
+        ...(turns.blocks ? {
+          turnHeader: turns.header ?? "",
+          turnFooter: turns.footer ?? "",
+          turnBlocks: turns.blocks,
+        } : {}),
+      } : {}),
+    };
+    this.batches.push(batch);
+    this._state = "dispatching";
+    this.dispatch(batch);
+  }
+
+  /** The only call to `host.sendMessage`, the only thing that starts a Pi turn. Shared by `pump`
+   *  (new content) and `continueBatch` (re-dispatch of an already-batched, still-unconfirmed one). */
+  private dispatch(batch: Batch): void {
+    if (!this.host) return;
+    try {
+      this.host.sendMessage(
+        {
+          customType: CUSTOM_TYPE,
+          content: batch.content,
+          display: true,
+          details: {
+            version: 1,
+            batchId: batch.id,
+            ids: [...batch.ids],
+            items: batch.items ?? [],
+            ...(batch.turnIds ? { turnIds: [...batch.turnIds] } : {}),
+            ...(batch.suffix !== undefined ? { suffix: batch.suffix } : {}),
+            ...(batch.turnHeader !== undefined ? { turnHeader: batch.turnHeader } : {}),
+            ...(batch.turnFooter !== undefined ? { turnFooter: batch.turnFooter } : {}),
+            ...(batch.turnBlocks !== undefined ? { turnBlocks: batch.turnBlocks } : {}),
+          },
+        },
+        { triggerTurn: true, deliverAs: "steer" },
+      );
+      if (!batch.started) {
+        batch.watchdog = setTimeout(() => {
+          if (batch.started) return;
+          this.hold(`Pi did not start dispatched Cotal batch ${batch.id}`);
+          this.startHoldBatchId = batch.id;
+        }, this.startTimeoutMs);
+        batch.watchdog.unref?.();
+      }
+    } catch (error) {
+      this.hold(`Pi rejected Cotal dispatch: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private automaticWakeable(item: InboxItem): boolean {
+    return wakeable(this.mesh, item) && this.inbox.peek("automatic").some((candidate) => candidate.recvKey === item.recvKey);
+  }
+
+  private retryHeldErrorOnInbound(item: InboxItem): void {
+    if (this._state !== "held" || !this.retryableErrorHold || this.overflowRetry || !this.context || !this.host) return;
+    if (!this.automaticWakeable(item) || this.knownAtErrorEnd.has(item.recvKey)) return;
+
+    // The ended turn cannot confirm its batch; the inbox still owns every receive key.
+    this.batches = [];
+    this.retryableErrorHold = false;
+    this.knownAtErrorEnd.clear();
+    this.pendingContinuation = false;
+    clearTimeout(this.continuationTimer);
+    this.continuationTimer = undefined;
+    this.heldReason = undefined;
+    this._state = "idle";
+    this.pump();
+  }
+
+  /** The messages a provider request carries. A lost steer re-dispatched after its settle window can
+   *  still drain into Pi beside its replacement, so a delivery can sit in the request twice. A later
+   *  copy is dropped only when no assistant message has appeared since the last kept Cotal copy.
+   *  Otherwise the request would end on an assistant turn. Kept copies are rebuilt only when their
+   *  retained metadata covers every new item and goal block. */
+  private withoutSupersededBatches<T>(messages: readonly T[]): T[] | undefined {
+    const seenIds = new Set<string>();
+    const seenTurnIds = new Set<string>();
+    const kept: T[] = [];
+    let changed = false;
+    let assistantSinceLastCopy = false;
+    for (const message of messages) {
+      if (message && typeof message === "object" && "role" in message && message.role === "assistant") {
+        assistantSinceLastCopy = true;
+        kept.push(message);
+        continue;
+      }
+      const details = detailsOf(message);
+      if (!details) {
+        kept.push(message);
+        continue;
+      }
+      const newIds = details.ids.filter((id) => !seenIds.has(id));
+      const turnIds = details.turnIds ?? [];
+      const newTurnIds = turnIds.filter((id) => !seenTurnIds.has(id));
+      for (const id of details.ids) seenIds.add(id);
+      for (const id of turnIds) seenTurnIds.add(id);
+      const repeats = newIds.length < details.ids.length || newTurnIds.length < turnIds.length;
+      if (!repeats) {
+        kept.push(message);
+        assistantSinceLastCopy = false;
+        continue;
+      }
+      changed = true;
+      const dropped = newIds.length === 0 && newTurnIds.length === 0;
+      if (dropped && !assistantSinceLastCopy) continue;
+      // Legacy batches without complete metadata can repeat text; retaining it avoids losing unseen work.
+      const items = (details.items ?? []).filter((item) => newIds.includes(item.recvKey));
+      if (items.length < newIds.length) {
+        kept.push(message);
+        assistantSinceLastCopy = false;
+        continue;
+      }
+      const turnBlocks = details.turnBlocks;
+      if (newTurnIds.length > 0 && (!turnBlocks || !newTurnIds.every((id) => typeof turnBlocks[id] === "string"))) {
+        kept.push(message);
+        assistantSinceLastCopy = false;
+        continue;
+      }
+      const suffix = newTurnIds.length > 0 && turnBlocks
+        ? renderPendingTurnText(details.turnHeader ?? "", newTurnIds.map((id) => turnBlocks[id] ?? ""), details.turnFooter ?? "")
+        : undefined;
+      const body = [items.length > 0 ? formatInjection(items) : undefined, suffix]
+        .filter((part): part is string => part !== undefined)
+        .join("\n\n");
+      const rebuilt: CotalBatchDetails = {
+        version: 1,
+        batchId: details.batchId,
+        ids: newIds,
+        items,
+        ...(newTurnIds.length > 0 ? { turnIds: newTurnIds } : {}),
+        ...(suffix !== undefined ? { suffix } : {}),
+        ...(details.turnHeader !== undefined ? { turnHeader: details.turnHeader } : {}),
+        ...(details.turnFooter !== undefined ? { turnFooter: details.turnFooter } : {}),
+        ...(turnBlocks ? { turnBlocks: Object.fromEntries(newTurnIds.flatMap((id) => {
+          const block = turnBlocks[id];
+          return block === undefined ? [] : [[id, block]];
+        })) } : {}),
+      };
+      kept.push({ ...(message as object), content: body.length > 0 ? body : ALREADY_DELIVERED_STUB, details: rebuilt } as T);
+      assistantSinceLastCopy = false;
+    }
+    return changed ? kept : undefined;
+  }
+
+  /** Surfacing at confirmation, not at agent end: a confirmation lets `pump` run mid-turn, which
+   *  would steer a still-unsurfaced turn in again, and the model's own cotal_yield inside this Pi
+   *  turn is refused for a turn that is not surfaced yet. */
+  private confirm(batch: Batch): void {
+    batch.confirmed = true;
+    if (batch.turnIds) this.mesh.commitSurfacedTurns(batch.turnIds);
+  }
+
+  private finalizeEnd(context: PiContextLike): void {
+    if (this._state === "shuttingDown") return;
+    if (this.overflowRetry) return;
+    const confirmed = this.batches.filter((batch) => batch.confirmed);
+    const ids = confirmed.flatMap((batch) => batch.ids);
+    this.inbox.commitConfirmed(ids);
+    this.mesh.releaseInFlight(ids);
+    this.batches = this.batches.filter((batch) => !batch.confirmed);
+
+    if (this.batches.length > 0) {
+      this.hold("Pi ended before confirming a queued Cotal steer");
+      this.watchLostSteer();
+      return;
+    }
+
+    this.continuationAttempts = 0;
+    this._state = "idle";
+    this.heldReason = undefined;
+    this.pump();
+    if (this._state === "idle") this.publishIdleWhenSettled(context);
+  }
+
+  /** Fires once after the fixed backoff to re-dispatch the still-unconfirmed batch through the same
+   *  host.sendMessage path `pump` uses, giving Pi a bounded number of real turns to clear the hold
+   *  itself before the driver gives up and holds for intervention. */
+  private scheduleContinuation(): void {
+    if (this.continuationTimer) clearTimeout(this.continuationTimer);
+    this.continuationTimer = setTimeout(() => this.continueBatch(), CONTINUATION_BACKOFF_MS);
+    this.continuationTimer.unref?.();
+  }
+
+  private continueBatch(): void {
+    this.continuationTimer = undefined;
+    if (this._state !== "held" || !this.pendingContinuation || !this.host) return;
+    const batch = this.batches.find((candidate) => !candidate.confirmed);
+    if (!batch) return;
+    // A re-dispatch takes the permit again. A once task's permit was spent on the first dispatch, so
+    // its batch stays held: the manager ends that task and stops this seat.
+    if (batch.turnIds && !this.mesh.claimTurns(batch.turnIds)) return;
+    batch.started = false;
+    this.dispatch(batch);
+  }
+
+  private hold(reason: string): void {
+    if (this._state === "shuttingDown") return;
+    this.retryableErrorHold = false;
+    this.startHoldBatchId = undefined;
+    this._state = "held";
+    this.heldReason = reason;
+    this.clearWatchdogs();
+    // A once task in a batch Pi has not confirmed may have run in part: it is sealed and reported,
+    // never dispatched again.
+    for (const batch of this.batches) if (!batch.confirmed && batch.turnIds) this.mesh.releaseTurns(batch.turnIds);
+    this.enqueuePresence("waiting", reason);
+    if (this.context?.hasUI) this.context.ui.notify(`Cotal delivery held: ${reason}`, "warning");
+  }
+
+  /** A steer queued past the ended run's last poll stays in Pi's queue, and Pi's idle drain starts
+   *  the turn that confirms it. Once Pi stays idle with nothing queued for the settle window, no turn
+   *  can carry the batch: drop it and dispatch again from the inbox, which owns every receive key. */
+  private watchLostSteer(): void {
+    // Hosts build a fresh context per event, so watch the session-bound one, not agent_end's.
+    const bound = this.context;
+    if (!bound) return;
+    const seq = this.runSeq;
+    let settledSince: number | undefined;
+    const check = (): void => {
+      if (this._state !== "held" || this.runSeq !== seq || this.context !== bound) return;
+      // The window covers post-run work (auto-compaction) before a host drains a steer it does not count.
+      if (!bound.isIdle() || bound.hasPendingMessages()) settledSince = undefined;
+      else settledSince ??= Date.now();
+      if (settledSince === undefined || Date.now() - settledSince < this.lostSteerSettleMs) {
+        setTimeout(check, LOST_STEER_POLL_MS).unref?.();
+        return;
+      }
+      this.batches = [];
+      this.heldReason = undefined;
+      this._state = "idle";
+      this.pump(true);
+      if (this._state === "idle") this.publishIdleWhenSettled(bound);
+    };
+    setTimeout(check, LOST_STEER_POLL_MS).unref?.();
+  }
+
+  /** While held, every presence update keeps the hold visible instead of reading as normal work. */
+  private activity(text: string): string {
+    return this._state === "held" && this.heldReason ? `${text} · Cotal delivery held: ${this.heldReason}` : text;
+  }
+
+  private publishIdleWhenSettled(context: PiContextLike): void {
+    const check = (): void => {
+      if (this._state !== "idle") return;
+      if (this.context !== context) return;
+      if (!context.isIdle()) {
+        setTimeout(check, 10).unref?.();
+        return;
+      }
+      this.enqueuePresence("idle");
+    };
+    check();
+  }
+
+  private enqueuePresence(status: "idle" | "working" | "waiting", activity?: string): void {
+    this.presence = this.presence
+      .then(() => this.mesh.setStatus(status, activity))
+      .catch(() => {});
+  }
+
+  private clearWatchdogs(): void {
+    for (const batch of this.batches) {
+      if (batch.watchdog) clearTimeout(batch.watchdog);
+      batch.watchdog = undefined;
+    }
+  }
+
+  private clearTimers(): void {
+    this.clearWatchdogs();
+    if (this.continuationTimer) clearTimeout(this.continuationTimer);
+    this.continuationTimer = undefined;
+  }
+}

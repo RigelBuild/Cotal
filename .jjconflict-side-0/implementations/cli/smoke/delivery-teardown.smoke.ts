@@ -1,0 +1,71 @@
+/**
+ * stopDelivery teardown smoke: a creds-delete failure must NOT leave the delivery daemon alive.
+ * The pid kill + pidfile cleanup run in `finally` regardless, and the delete error still
+ * propagates to the caller (logged there, never silently swallowed). The delete failure is forced
+ * deterministically by making `.cotal/delivery.creds` a NON-EMPTY DIRECTORY — `rmSync` without
+ * `recursive` throws on it, cross-platform. Pure process/filesystem, no broker.
+ *
+ * Run: pnpm smoke:delivery-teardown
+ */
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { stopDelivery } from "../src/lib/delivery-proc.js";
+import { defaultStartToken } from "@cotal-ai/workspace";
+
+let pass = 0, fail = 0;
+const check = (name: string, cond: boolean) => { if (cond) { pass++; console.log(`  ✓ ${name}`); } else { fail++; console.log(`  ✗ FAIL: ${name}`); } };
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const sandbox = mkdtempSync(join(tmpdir(), "cotal-teardown-"));
+const cotal = join(sandbox, ".cotal");
+mkdirSync(join(cotal, "delivery.creds"), { recursive: true }); // the un-deletable "creds"
+writeFileSync(join(cotal, "delivery.creds", "block"), "x");
+
+// A live stand-in daemon the teardown must still kill. Its argv carries the `deliver` token,
+// because that is the whole of what the record's attribution reads (#1528): a live pid that is
+// provably NOT a delivery daemon is deliberately never signalled, so a stand-in without it would be
+// spared and this suite would grade the wrong branch.
+const cooperative = process.platform === "win32";
+const code = cooperative
+  ? `import { listenForLocalStop } from ${JSON.stringify(new URL("../../../packages/workspace/src/local-stop.ts", import.meta.url).href)};
+      listenForLocalStop(${JSON.stringify(join(cotal, "delivery.pid"))}, () => process.exit(0));
+      process.send("ready"); setInterval(() => {}, 1000);`
+  : "setInterval(() => {}, 1000)";
+const victim = spawn(process.execPath, [...(cooperative ? ["--import", import.meta.resolve("tsx"), "--input-type=module"] : []), "-e", code, "deliver"], { stdio: cooperative ? ["ignore", "ignore", "inherit", "ipc"] : "ignore" });
+if (cooperative) await new Promise<void>((resolve, reject) => {
+  const timer = setTimeout(() => reject(new Error("local delivery control did not become ready")), 30_000);
+  victim.once("message", () => { clearTimeout(timer); resolve(); });
+  victim.once("exit", () => { clearTimeout(timer); reject(new Error("local delivery control exited before ready")); });
+});
+let victimExited = false;
+victim.on("exit", () => { victimExited = true; });
+await wait(300); // let it exec, so the argv read sees its final command line
+writeFileSync(join(cotal, "delivery.pid"), String(victim.pid));
+// #969: a real `up` pins the pidfile to its process start; the planted record must match that
+// shape or the identity gate correctly refuses it as a legacy record before the kill this suite
+// grades ever runs.
+writeFileSync(join(cotal, "delivery.pid.identity"), `${victim.pid} ${defaultStartToken(victim.pid ?? 0)}`);
+
+const prevCwd = process.cwd();
+process.chdir(sandbox); // stopDelivery resolves .cotal by walking up from cwd
+let deleteError: Error | undefined;
+try {
+  await stopDelivery();
+} catch (e) {
+  deleteError = e as Error;
+} finally {
+  process.chdir(prevCwd); // chdir out BEFORE cleanup (Windows: EBUSY removing the cwd)
+}
+
+check("the creds-delete failure propagates (loud, not swallowed)", deleteError !== undefined);
+for (let i = 0; i < 20 && !victimExited; i++) await wait(100);
+check("the daemon is still killed when the delete fails (finally)", victimExited);
+check("the pidfile is still cleaned up", !existsSync(join(cotal, "delivery.pid")));
+
+try { if (!victimExited) victim.kill("SIGKILL"); } catch { /* gone */ }
+rmSync(sandbox, { recursive: true, force: true });
+
+console.log(`\nDELIVERY-TEARDOWN SMOKE ${fail === 0 ? "OK ✅" : "FAILED ❌"}  (${pass} passed, ${fail} failed)`);
+if (fail) process.exitCode = 1;

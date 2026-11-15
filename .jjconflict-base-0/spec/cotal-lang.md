@@ -1,0 +1,1387 @@
+# Cotal Lang: the workflow language
+
+> **Status:** Draft, language version `2`, companion to [SPEC.md](../SPEC.md) §14 (v0.5). Version
+> `1` is the tree-walker and stays supported: it is the replay engine for every run recorded
+> under it, and §8.4 says what the two versions differ on. This
+> document is the normative reference for the language a Cotal workflow run executes: what a
+> program may say, what it means, and what it writes into the step journal. SPEC.md §14 defines
+> the wire the journal and the run record travel on; this document defines their content and the
+> program that produces it. Where the reference implementation (`@cotal-ai/lang`) disagrees with
+> this document, this document wins.
+>
+> The key words MUST, MUST NOT, SHOULD, and MAY are to be interpreted as in RFC 2119 and RFC 8174.
+> Every ```` ```js ```` block in this document is a program the validator accepts as written, or a
+> refusal whose first line names the code it produces (`// refused: L1001`); the reference
+> implementation's surface suite executes that claim.
+
+## 1. Scope
+
+A **program** is one source text. A **run** is one execution of a program under a **pin set**
+(§8.3), identified by a run id the driver mints. A run performs **effects** through a small set of
+primitives (§6); everything else a program does is **pure** and is ordinary JavaScript (§2). Every
+effect writes an entry into the run's **step journal** (§10), keyed by where in the program it
+happened rather than when, and a run can be re-executed from that journal on any host: recorded
+effects return their recorded results and unrecorded ones are performed (§11).
+
+Three properties hold by construction, and every rule below serves one of them:
+
+- **Determinism.** Two executions of one program under one pin set that observe the same effect
+  results reach the same next effect with the same inputs. There is no ambient clock, randomness,
+  IO, or host object a program can reach.
+- **Immutability at the boundary.** A value that crosses an effect boundary in either direction is
+  what the journal recorded, and it cannot change afterwards.
+- **Legibility.** Every refusal, static or at run time, carries a stable code (`Lnnnn`), the cause,
+  and the edit that fixes it, in the coordinates of the author's source. The catalog is Appendix A.
+
+The audience of this document is an implementer of the language or of a tool that reads its
+journal, and the author of a program, who is usually a language model.
+
+## 2. Programs and syntax
+
+### 2.1 A program is one module
+
+A program is parsed as an ECMAScript 2023 **module** (strict mode; top-level `await` is allowed and
+is how a program performs its first effect). It MUST NOT import or export (L1020): a run pins to
+the content hash of exactly this text, so there is no second file. Its **program hash** is
+`sha256:<hex>` over the RFC 8785 canonical form of `{ "source": <the text> }`.
+
+Automatic semicolon insertion is allowed. The two constructs where a newline changes what a program
+means are refused (L1008): a value on the line after a bare `return`, and a line opening with `(`
+or `[` that continues the statement above it. Source that does not parse is refused with L1008 too.
+
+### 2.2 The syntax table
+
+The language is a subset of JavaScript defined by a table of AST node types, and every admitted
+construct means what ECMAScript says it means, with the exceptions §3 to §5 name explicitly. An
+implementation MUST accept exactly the admitted set and MUST refuse everything else with the code
+the table gives, or with L1029 for syntax the table does not name.
+
+**Admitted statements:** program, expression statement, `const`/`let` declaration, `function`
+declaration, block, `if`, `while`, `for`, `for...of`, `return`, `break`, `continue`, `throw`,
+`try`/`catch`/`finally`, `switch`, empty statement.
+
+**Admitted expressions:** literal (string, number, boolean, `null`; not regex, not bigint),
+identifier,
+template literal, array literal, object literal (with spread), member access (`.name`, `[expr]`),
+optional chain (`?.`), unary (`!`, `-`, `+`, `~`, `typeof`), update (`++`, `--`), binary (`===`,
+`!==`, `<`, `<=`, `>`, `>=`, `+`, `-`, `*`, `/`, `%`, `**`, `&`, `|`, `^`, `<<`, `>>`, `>>>`),
+logical (`&&`, `||`, `??`), conditional (`?:`), assignment (`=`, every compound form including
+`&&=`, `||=`, `??=`, and destructuring targets), `await`, arrow function, function expression, call
+(with spread arguments).
+
+**Structural (inside an admitted node):** declarator, property, spread element, rest element,
+default value, object and array patterns, template element, switch case, catch clause.
+
+**Refused, with the code and the repair:**
+
+| Construct | Code | Instead |
+| --- | --- | --- |
+| `class`, `this`, `new`, `super` | L1001, L1002, L1019 | records and functions |
+| `var` | L1003 | `const`, or `let` when reassigned |
+| `for...in`, the `in` operator | L1004 | `for (const k of keys(record))`, `has(record, key)` |
+| generators, `yield` | L1005 | a loop with `await` inside it |
+| regular expression literal | L1007 | `contains`, `startsWith`, `endsWith`, `split` |
+| unbraced `if`/loop body | L1009 | braces |
+| `switch` case that falls through | L1010 | end each case with `return`, `break`, `continue` or `throw` |
+| computed property key `{ [k]: v }` | L1011 | a literal key, `merge`, or `record[k] = v` |
+| array elision `[1, , 3]` | L1012 | write the value, or `null` |
+| `with` | L1013 | none |
+| getters and setters | L1015 | store the value, or call a function |
+| `instanceof` | L1016 | compare a field |
+| labels, labelled `break`/`continue` | L1017 | a helper function or a flag |
+| tagged template | L1018 | a plain template literal |
+| `import`, `export`, `import()`, `import.meta`, `new.target` | L1020 | one file; `run()` for run metadata |
+| `delete` | L1021 | build a new record |
+| `do...while` | L1022 | `while` or `for` |
+| `await` in a non-async function | L1023 | mark the function `async` |
+| top-level `return` | L1024 | `log(...)`, or publish the result through an effect |
+| `==`, `!=` | L1025 | `===`, `!==`, `?? `, `=== null` |
+| comma operator | L1026 | one statement per expression |
+| `void` | L1027 | `undefined`, or drop the expression |
+| the property name `__proto__` | L1028 | another name |
+| bigint literal (`10n`) | L1030 | a number, or a string |
+| `debugger`, and any other syntax | L1029 | none |
+
+`eval`, `Function` and `Symbol` are host globals and are refused by name (L2012, §3); no module
+syntax reaches L1006 or L1014, which stay reserved.
+
+```js
+// refused: L1001
+class Plan { constructor(days) { this.days = days } }
+```
+
+```js
+// refused: L1025
+const same = 0 == ""
+```
+
+### 2.3 Static rules beyond syntax
+
+The validator MUST also refuse, before a program runs:
+
+- An identifier that is not declared in the program and is not a reserved name (L2001); a host
+  global by name (L2012, with the language's replacement in the fix, §3); the name `Promise` (L2011).
+- A declaration, parameter or function name that shadows a reserved name (L2002); a write to a
+  `const` binding (L2003), whether by plain assignment, as a destructuring assignment target or as
+  the target of a `for...of` with no declaration.
+- **A reference to a `let`/`const` binding above its declaration (L2004, the dead zone; §3)**, where
+  straight-line code makes it visible. A reference from inside a nested function is not refused —
+  the function may run after the declaration — and the same refusal moves to run time when the call
+  comes first.
+- **A call that starts an effect and is not awaited (L2013).** A call to an effect primitive, or to
+  a user function declared `async` (or bound by `const` to an async function expression), MUST be
+  the operand of `await`, the operand of `return`, or the concise body of an arrow function passed
+  as a branch to a scope (§7). Anything else starts work whose result
+  nothing waits for, and calls outside a combinator run in sequence, so the program would say
+  "concurrently" while the runtime did the opposite. The validator enforces this where the call
+  site is syntactically visible; an effect reached through a function value it cannot follow (an
+  arrow passed to a user function that calls it without awaiting) is not refused, and the program
+  is responsible for awaiting it.
+- The effect call-shape rules of §6.2 and §6.3 (L3011 to L3044).
+- **A write from a concurrent branch to a binding declared outside it (L2032, §7.7).**
+
+```js
+// refused: L2013
+async function work(n) { return await sleep("1m") }
+const pa = work(1)
+const pb = work(2)
+```
+
+Warnings (returned, never blocking): array-form `parallel`/`race` branches (L3023, keyed by index),
+and a `fanOut` over a literal list whose items carry no `id` and no `key` (L3021).
+
+## 3. Names
+
+A program may reference, and MUST NOT redeclare, the **reserved names**: the primitives (§6),
+the event constructors (`replied`, `message`, `idle`, `down`), the pure primitives (`channel`,
+`run`), the builtins (§5.1), and the value `undefined`. Every other name
+a program uses it declares. Name resolution is lexical and static: `let`/`const` are block-scoped
+and bind their whole block — a reference above the declaration is the dead zone, refused when the
+program is read where straight-line code makes it visible and at run time otherwise (L2004, §2.3);
+`function` declarations are hoisted within their block and bind immutably (assignment is L2003); a
+named function expression binds its own name inside its own body, and nowhere else; parameters bind
+left to right, so a default value reaches only the parameters before it (L2004 past that);
+`for (let ...)` binds per iteration; and a `catch` parameter is `const`.
+
+The following host globals are refused by name (L2012), each with the replacement this language
+offers: `Math`, `JSON`, `Object`, `Array`, `Number`, `String`, `Boolean`, `parseInt`,
+`parseFloat`, `isNaN`, `isFinite`, `Infinity`, `NaN`, `Date`, `Map`, `Set`, `Error`, `console`,
+`setTimeout`, `setInterval`; and without a replacement: `globalThis`, `global`, `window`, `self`,
+`process`, `fetch`, `RegExp`, `Reflect`, `Proxy`, `Symbol`, `WeakMap`, `WeakSet`, `WeakRef`,
+`Function`, `setImmediate`, `queueMicrotask`, `require`, `module`, `exports`, `__dirname`,
+`__filename`, `Buffer`, `crypto`, `performance`, `structuredClone`, `eval`, `arguments`, `BigInt`,
+`Intl`, `Atomics`, `SharedArrayBuffer`, `ArrayBuffer`, `DataView`, `TextEncoder`, `TextDecoder`,
+`URL`, `URLSearchParams`, `AbortController`, `encodeURIComponent`, `decodeURIComponent`,
+`encodeURI`, `decodeURI`, `escape`, `unescape`, and the typed array constructors.
+
+## 4. Values
+
+### 4.1 Kinds
+
+A value is one of: `null`; a boolean; a number (an IEEE 754 double); a string; an **array**; a
+**record** (an object literal: own string-keyed fields, no prototype a program can reach); a
+**function** (a closure the program wrote, or a builtin); or `undefined`, which the runtime produces
+for a missing field, an out-of-range index, and a function that returns nothing, and which a
+program can name and test for but which cannot cross an effect boundary (§4.4).
+
+The runtime additionally mints **handles** and **descriptors**, all frozen records:
+
+| Value | Shape |
+| --- | --- |
+| agent handle (from `spawn`) | `{ agent, persona, worktree?, role? }`; `agent` is the agent's stable identity, never a session or host pointer |
+| channel handle (from `channel`, `conclave`) | `{ channel }` |
+| event descriptor (§6.6) | `{ event: "replied", agent }` \| `{ event: "message", channel, from?, matches? }` \| `{ event: "idle", channel, duration }` \| `{ event: "down", agent }` |
+| run metadata (from `run()`) | `{ id, programHash, startedAt }` |
+
+### 4.2 Members
+
+Member access reaches no host prototype. A **record** answers its own fields and `undefined` for
+any other name (`o.constructor`, `o.toString`, `o.hasOwnProperty` are `undefined`). An **array**
+answers an index, `length`, and the array method table (§5.2). A **string** answers an index,
+`length`, and the string method table. A **number** answers the number method table. Any other
+member of an array, string or number is a refusal naming the table (L4014). Reading a member of
+`null` or `undefined` is L4010; a function or a boolean has no members (L4014). Iteration
+(`for...of`, spread) accepts an array or a string and nothing else (L4015). Calling a value that is
+not a function is L4011. A method is not a value: reading a method name off an array, string or
+number without calling it is refused (L4020) — write `(x) => xs.includes(x)`, not `xs.includes`.
+Destructuring follows member access: `const { a } = v` reads `a` as a member of `v`, so
+destructuring `null` or `undefined` is L4010 and a primitive answers from its method table (L4014
+for a name that is not there), never by ECMAScript's object coercion. A computed key must be a
+primitive: `o[1]` and `o[true]` spell as JavaScript spells them, and an array, record or function
+key is refused (L4018, §4.5) before any conversion — ECMAScript would pass it through `toString`
+and address a field named `"[object Object]"` the program never wrote.
+
+### 4.3 Mutation and freezing
+
+A record or array the program builds is **writable by the frame that built it**: member assignment
+(`o.a = v`, `xs[i] = v`), update (`o.n++`), compound assignment, and the mutating array methods
+(`push`, `pop`, `shift`, `unshift`, `splice`) are ordinary JavaScript. `xs.length = n` truncates as
+in JavaScript, and only truncates: `n` MUST be an integer between 0 and the current length, because a
+longer length would create holes, a value class this language does not have (its methods do not skip
+holes, so a program with holes would read differently here and on a real engine); anything else is
+L4017. An index write is contiguous for the same reason: `xs[i] = v` takes an index up to and
+including `xs.length` — writing at `length` appends — and a write past the end is refused (L4019).
+Two writes are refused:
+
+- **L2031, a frozen value.** Every value that crosses an effect boundary in either direction is
+  deep-frozen: an effect's arguments, its result, and the copies a concurrency scope carries of the
+  value it returns and of a value the program throws out of it (§9.1). A record a branch returned
+  from outside the scope is not frozen by it. What crossed is what the journal recorded, so it
+  cannot change afterwards — through a store too: a journal seeded from serialized entries freezes
+  each recorded value on the way in, so a result replayed on resume is as frozen as it was live.
+  Build a new value instead (`{ ...record, field: value }`, `[...list, item]`).
+- **L2032, a value born outside a concurrent branch and written inside it** (§7.7), whether it is
+  reached through its binding or through an alias.
+
+Records take any own field name except `__proto__` (L4014) and a callable `then` (L4021); arrays
+take an index or `length` (L4014). A record literal, a spread, and a rest pattern always define
+**own** fields. The `then` refusal holds wherever a record member is written, on a literal key or
+a computed one, in a literal, a spread, a rest pattern, or a member assignment: an object with a
+callable `then` is a thenable, which the host's promise machinery would adopt in place of the
+value the program built, its `then` running with the machinery's own continuations while one that
+throws or rejects escapes the run as an unowned rejection. The language carries no thenable values
+at all; a `then` that is not callable is data like any other member.
+
+### 4.4 Canonical form, and what may cross an effect boundary
+
+The **canonical form** of a value is its RFC 8785 (JCS) serialization. A value MAY cross an effect
+boundary only if it has one: `null`, a boolean, a **finite** number, a string, and arrays and
+records of these. `undefined`, `NaN`, `Infinity`, functions, and objects that are not plain records
+have no canonical form. An implementation MUST refuse such a value in any argument of an effect
+primitive **before any journal entry is written**, naming the argument and the path inside it:
+L3041 for `undefined`, a non-finite number or an opaque object, L3042 for a function. A sparse
+array (a hole), a cyclic value, and a record carrying an own `__proto__` field are refused the same
+way: a hole would canonicalize into a `null` the program never wrote, and a cycle does not
+serialize. A shared subtree without a cycle (a diamond) crosses. An effect
+**result** that has no canonical form is a failed step: the entry settles `failed` with error
+`{ code: "L4000", kind: "handler-fault" }` and the failure is thrown to the program.
+
+`json.stringify(value)` is the canonical form (§5.1), so a program that serializes a value writes
+exactly what the journal would — and is refused (L4016) exactly where the boundary would refuse.
+
+### 4.5 Operators and equality
+
+Only strict equality exists (`===`, `!==`; §2.2 refuses `==`). On **primitives** every arithmetic,
+bitwise, comparison and logical operator has its ECMAScript meaning, including coercion (`"a" + 1`
+is `"a1"`, `+"3"` is `3`); a program that wants a number from text uses `parseNumber`. An array, a
+record or a function never coerces: the arithmetic, bitwise and ordering operators, unary `-`, `+`
+and `~`, the update operators (`++`, `--`) on a binding or a member, template interpolation, a
+computed member key (`o[k]`, read or written), and a builtin or method parameter that takes a
+primitive (§5.4) refuse such an operand (L4018), because ECMAScript's answer would pass through a
+`toString` this language does not give its values. An update's operand must already be a number; a
+numeric string or null is refused rather than counted, so `x++`, `x + 1` and `x += 1` agree.
+`===`/`!==` (identity), `!`, `typeof` and the logical operators take every value. `??` is the
+recovery operator: `wait` resolves `null` on timeout (§6.5), so `await wait(...) ?? fallback` reads
+as Orc's `otherwise`.
+
+### 4.6 Durations
+
+A duration is a string of a whole number and one unit: `ms`, `s`, `m`, `h`, `d` (`"30s"`, `"10m"`,
+`"4h"`, `"2d"`). Nothing else parses; there is no bare number and no default unit. `duration(text)`
+converts one to milliseconds. A validator MUST refuse a literal that is not a duration, with L2034,
+where the language reads one: the argument of `sleep` and `duration`, the second argument of `idle`,
+the `deadline` of `turn` and `ask`, the `timeout` of `checkpoint` and `wait`, and the `every` and
+`deadline` of `waitUntil`. A value computed at run time is refused where it is used.
+
+## 5. The library
+
+The library is small and closed. Nothing in it reaches a host object; every function has the
+meaning JavaScript gives its namesake, so a pure program produces the same output here and on a
+JavaScript engine with these functions injected (the reference implementation's differential suite
+runs exactly that comparison).
+
+### 5.1 Builtins
+
+Free functions, declared as immutable bindings. Callback-taking builtins call the callback **one
+element at a time and await each call**, in order; a callback may perform an effect, and a program
+that wants concurrency says so with `parallel` or `fanOut` (§7).
+
+| Group | Builtins |
+| --- | --- |
+| records | `keys(r)`, `values(r)`, `entries(r)`, `has(r, key)` (own fields only), `merge(a, b)` |
+| arrays | `len(xs)`, `map(xs, f)`, `filter(xs, f)`, `find(xs, f)` (→ `null` when absent), `some(xs, f)`, `every(xs, f)`, `sort(xs, keyFn?)`, `slice(xs, start, end?)`, `concat(xs, ys)`, `join(xs, sep)`, `reverse(xs)`, `unique(xs)`, `range(n)`, `sum(xs)` |
+| strings | `split(s, sep)`, `trim(s)`, `lower(s)`, `upper(s)`, `startsWith(s, p)`, `endsWith(s, p)`, `contains(s, p)`, `replace(s, from, to)` (**every** occurrence) |
+| numbers | `min(...xs)`, `max(...xs)`, `abs(n)`, `floor(n)`, `ceil(n)`, `round(n)`, `parseNumber(text)` (`Number(text)`) |
+| data and control | `json.parse(text)` (refuses a `"__proto__"` key, L4016), `json.stringify(value)` (the RFC 8785 canonical form; a value that cannot cross an effect boundary cannot stringify, L4016), `assert(cond, message?)` (L4012 when false), `log(...values)` |
+| tamed nondeterminism | `random()`, `randomInt(n)`, `pick(xs)` (§8.2), `now()` (§8.1), `duration(text)` (§4.6) |
+
+`f` in `map`, `filter`, `find`, `some`, `every` receives `(item, index)`. `sort` returns a new
+array ordered by a **total order** (§5.3) over `keyFn(item, index)` when given, else over the
+items; a returned array or record is a fresh value the calling frame owns. `log` is not journalled,
+and a `log` that succeeds MUST NOT influence control flow: it exists for a human reading the trace,
+and each line carries the scope path it was written from. A `log` that is *refused* is a refusal
+like any other, which under version `2` is a case a program can meet: uncaught it ends the run, and
+caught it skips the rest of its `try`. Under version `1` no `log` refuses, so the question does not
+arise there.
+
+Under language version `2`, `log` is **data**, and the rule is about code rather than about
+crossing: a function anywhere inside a logged value is refused with L4016 (§8.4), naming the value
+and the path, whether it arrives as the argument itself, inside a record, or as a namespace.
+Everything else a program can build reaches the trace as it is, `undefined` and the non-finite
+numbers included, because the trace is not the journal and a human wants to see them. This is
+deliberately **not** the effect-crossing rule of §4.4, which refuses those same values and which
+`json.stringify` does apply. Version `1` prints what it is given. This is one of the differences a
+version exists to separate, and it is why a log line written by one engine is not a log line the
+other would have written.
+
+### 5.2 Methods
+
+| Receiver | Methods |
+| --- | --- |
+| array | `map`, `filter`, `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `forEach`, `reduce`, `flatMap` (callbacks awaited in order, receiving `(item, index, array)`); `includes`, `indexOf`, `lastIndexOf`, `slice`, `concat`, `join`, `flat`, `at`, `toReversed`; the mutators `push`, `pop`, `shift`, `unshift`, `splice` (§4.3) |
+| string | `trim`, `trimStart`, `trimEnd`, `toLowerCase`, `toUpperCase`, `startsWith`, `endsWith`, `includes`, `indexOf`, `lastIndexOf`, `slice`, `substring`, `split`, `replace` (first occurrence), `replaceAll`, `repeat`, `padStart`, `padEnd`, `at`, `charAt`, `concat` |
+| number | `toFixed`, `toString`, `toPrecision` |
+
+Every pattern argument (`split`, `replace`, `startsWith`, ...) is a string; there are no regular
+expressions. Note the two places the free builtin and the method deliberately differ: `find(xs,
+f)` yields `null` where `xs.find(f)` yields `undefined`, and `replace(s, a, b)` replaces every
+occurrence where `s.replace(a, b)` replaces the first, in each case exactly as JavaScript spells the
+method. The string `replace` and `replaceAll` methods honour JavaScript's replacement patterns
+(`$$`, `$&`, `` $` ``, `$'`): the replacement is a string with ECMAScript's substitution, not a
+template. Callback methods read the array's length once, before the first call, as JavaScript's do,
+so a callback that pushes does not extend its own iteration. And a method is looked up at the call,
+never read as a value (L4020, §4.2).
+
+### 5.3 The total order
+
+`sort` never answers "equal" for two distinct values, and answers consistently in both directions.
+Values order by kind — `undefined`, then `null`, `false`, `true`, numbers, strings, arrays,
+records — and within a kind numbers compare by value with `NaN` after every number, strings by code
+unit, and arrays and records by canonical form. A tie on the key falls to the canonical form of the
+elements themselves and then to their original position. What is left equal is identical, so the
+result of `sort` is a function of its input alone.
+
+### 5.4 Library failures
+
+A builtin or method given inputs the host refuses (`"a".repeat(-1)`, `json.parse("{")`, `[].reduce(f)`)
+raises L4016 naming the builtin; the host's own error class and stack never reach the program.
+A host that runs out of stack inside a builtin is not a refusal and is not L4016: it is uncatchable
+(§9.2).
+`len` counts the elements of an array or the units of a string; every other kind is refused
+(L4016) in the language, before the host is reached, because the only `length` anything else has
+is a host property: a function's is its parameter count, a property of the implementation's
+wrapper rather than a program value, and a record, a number, a boolean, `null` and `undefined`
+have none. For a record's size, `len(keys(r))`.
+A run RECORDED under language version `1` before this narrowing may have called `len` on another
+kind and COMPLETED, because the walker of the day handed back the host's `undefined`. Such a record
+does not replay: the refusal is raised at that `len`, before any recorded entry is consumed, so the
+resume stops rather than half-running. See §8.4.
+The record and array arguments of the other builtins are checked the same way. `keys`, `values`,
+`entries`, `has` and both arguments of `merge` take a record; `map`, `filter`, `find`, `some`,
+`every`, `sort`, `slice`, `join`, `reverse`, `unique`, `sum`, `pick` and the first argument of
+`concat` take an array. Any other kind, a string, `null` and `undefined` included, is refused
+(L4016) in the language, before the host is reached, because the host answers each of these for
+any kind it is handed: the keys of a number and a walk over its missing `length` are empty, `every`
+over nothing is true, an array or a function has an own `length` field, and a string spreads into
+its units. The second argument of `concat` keeps the method's meaning: an array's elements, or the
+one value. A version-1 record that relied on the host's answer does not replay either (§8.4).
+`assert` raises L4012 with the message.
+
+Where a parameter takes a **primitive**, an array, record or function in that position is refused
+(L4018) before any host conversion — the operators' rule (§4.5) at the library boundary — and this
+includes each element `join` and `sum` would stringify or add, and `assert`'s message. The positions
+that take a container or a function by contract (a callback, a list or record argument, a search
+value compared by identity, `log`'s values, `json.stringify`'s value) are not refused there: L4018
+is a rule about the position, and a value position takes a value, primitive or not. What a
+position accepts past that point is its own rule rather than the group's: `log`'s values pass no
+further check under version `1` and must carry no code under version `2` (L4016, §8.4);
+`json.stringify`'s value must satisfy the effect-crossing rule of §4.4 at both versions (L4016),
+which refuses the `undefined` and non-finite values `log` accepts.
+
+## 6. Effects
+
+An **effect** is a call to one of the primitives below. Every effect is journalled (§10) under a
+**step key** allocated at the call, its **inputs are hashed** (§6.4), and its result is what the
+journal recorded. `channel()` and `run()` are pure primitives: they build a value and write nothing.
+
+### 6.1 The primitives
+
+| Primitive | Signature | Journal kind | Name |
+| --- | --- | --- | --- |
+| `participant` | `participant({ name? }) -> AgentHandle` | `participant` | optional |
+| `spawn` | `spawn(persona, { name?, cwd?, placement?, worktree?, join?, role?, permits?, supervise?, onFork?, events?, runtime? }) -> AgentHandle` | `spawn` | `name`, else the persona |
+| `turn` | `turn(agent, { name, deadline? }) -> { status, to?, note?, at }` | `turn` | required |
+| `ask` | `ask(agent, { name, schema, deadline?, attempts? }) -> record` | `ask` | required |
+| `checkpoint` | `checkpoint(name, prompt, { schema?, timeout?, onExpiry?, to? }) -> { status, value?, by?, at, artifact? }` | `checkpoint` | required, positional |
+| `sleep` | `sleep(duration, { name? }) -> null` | `sleep` | optional |
+| `wait` | `wait(event, { name?, timeout? }) -> value \| null` | `wait` | optional |
+| `waitUntil` | `waitUntil(probe, { name, every, deadline, terminal? }) -> observation` | `waitUntil` | required |
+| `notify` | `notify(agents, fact, { name? }) -> null` | `notify` | optional |
+| `monitor` | `monitor(agent, { name? }) -> null` | `monitor` | optional |
+| `parallel` | `parallel(branches, { name? }) -> results` | scope `parallel` | optional |
+| `race` | `race(branches, { name? }) -> { index, value }` | scope `race` | optional |
+| `fanOut` | `fanOut(items, fn, { name, key? }) -> results` | scope `fanOut` | required |
+| `conclave` | `conclave(members, fn, { name, channel? }) -> result` | scope `conclave` | required |
+| `once` | `once(fn, { name }) -> value` | scope `once` | required |
+
+`persona` in `spawn` is a persona name, a record `{ persona, model?, variant? }`, or an **inline
+persona**: `{ name, prompt, role?, model?, variant?, description?, subscribe?, allowSubscribe?,
+allowPublish?, capabilities?, save? }`. A record with `prompt` is inline and a record with `persona`
+names the catalog. An inline record is closed: one that also names `persona`, carries another key,
+names no `name`, has a blank `prompt`, a string field that is blank, a list that is not of strings, or a
+`save` that is not a boolean is refused (L3049) before the step key is minted.
+
+### 6.2 Step names
+
+A step name is a **kebab-case token of 1 to 64 characters** (`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`,
+L3014). Where the table says *required*, the name MUST be present (L3012) and MUST be a string
+literal (L3013), because the derived flowchart, the linter and the migration report all read it
+without running the program. Where it is optional it MAY be computed (a `fanOut` naming each
+branch's step after its item is the idiom), and a computed name is checked when the key is minted.
+No name and no branch key may contain `/`, `#` or `:` (L3025): keys are built by concatenation
+(§10.2), so such a value would forge a scope path.
+
+### 6.3 Option bags
+
+Every option bag sits at a **fixed argument position** (`checkpoint` and `notify` take theirs
+third, `fanOut` and `conclave` third, every other primitive second) and is **closed**: a key not in
+the signature is L3011, answered with the full signature. `to` on a `checkpoint` is legal only with
+`onExpiry: "escalate"` (L3044).
+
+### 6.4 What is hashed
+
+Each effect's **input hash** is `sha256:<hex>` over the canonical form of the projection below,
+which is exactly the set of inputs that decide whether a recorded result is still an answer to the
+question the program is asking. Everything else steers live execution and is reapplied from current
+source on a resume. An implementation MUST hash exactly these fields (an absent option is `null`; an
+absent `join` is `[]`; an absent `cwd` or `placement` on `spawn` contributes no key); the reference
+implementation's option suite edits each one on a resumed run and requires exactly these to diverge
+(§11.1).
+
+| Effect | Projection |
+| --- | --- |
+| `participant` | `{}` |
+| `spawn` | `{ persona, model, variant, worktree, role, join: [channel names] }`, plus `cwd` when the option bag carries it, `placement: { endpoint, instanceId }` when the option bag carries it, and `inline`, the whole definition as written, for an inline persona |
+| `turn` | `{ agent, deadline }` |
+| `ask` | `{ agent, schema, deadline, attempts }` |
+| `checkpoint` | `{ prompt, schema, timeout }`, plus `{ onExpiry: "escalate", to }` when and only when `onExpiry` is `"escalate"` |
+| `sleep` | `{ duration }` |
+| `wait` | `{ event, timeout }` |
+| `waitUntil` | `{ every, deadline }` |
+| `notify` | `{ agents: [agent ids], fact }` |
+| `monitor` | `{ agent }` |
+| `parallel`, `race`, `fanOut` | `{ kind, name }` |
+| `once` | `{ kind, name }` |
+| `conclave` | `{ kind, name, subject: { members: [agent ids], channel } }` |
+
+Two rules in that table are deliberate. `deadline`, `timeout` and `attempts` **stop observation**: a
+`wait` that returned `null` observed "not within this timeout", never "never", so an edited timeout
+asks a different question. And `onExpiry` is hashed **only** at `escalate`, because `fail` and
+`proceed` choose how to read a recorded expiry (a reapply that MUST replay clean) while `escalate`
+mints a second effect (a different question that MUST diverge). `permits`, `supervise`, `onFork`
+and `events` on `spawn` are policy over a result and are never hashed. `runtime` is the same kind of
+policy: it names the terminal runtime of this one seat, and omitted leaves the serving manager's own.
+
+For an inline persona, `persona` is its `name` and `model` and `variant` are its own. The definition
+holds only the keys the program wrote, so an omitted list and an empty one hash differently, and a
+catalog spawn adds no `inline` key, so its hash is unchanged.
+
+`cwd` and `placement` were added after runs were recorded without them, so a spawn that omits both
+hashes the six-key object it hashed before. Adding or removing `cwd` or `placement`, or changing the
+canonical value of `cwd`, `placement.endpoint` or `placement.instanceId`, diverges (L5001). Other
+keys in a placement record are not projected, and key order never matters (§4.4).
+
+### 6.5 Semantics of each primitive
+
+- **`participant`** resolves the personal native session whose exact issued caller admitted the
+  hosted run and returns a handle with `kind: "participant"`. Program text cannot choose its owner,
+  actor, lifecycle or display name. The host reads those from the immutable run admission, requires
+  one exact live presence row, and journals the owner, actor, lifecycle, name and manager instance.
+  Resume rebuilds the run roster from that entry and never selects a successor lifecycle. It creates
+  no seat, worktree, permits or process custody. A host without an issued personal admission refuses
+  it as L4000; an absent exact live presence is L4002.
+- **`spawn`** brings an agent into the run and returns its handle. `permits` are budgets whose
+  violation the handler reports as a catchable failure (L4001); `supervise` is a declarative
+  restart policy; `onFork` is `"respawn"` (default) or `"adopt"` (§11.3); `events: false` starts the
+  agent without an event plane, for a connector that publishes none, and omitted leaves the host's
+  default; `runtime` names the terminal runtime of this one seat, and omitted leaves the serving
+  manager's own. A runtime the serving manager cannot resolve refuses the spawn and starts nothing.
+  Two agents MUST NOT share a worktree concurrently (L3022, L4008). An inline persona is bound into
+  the entry's `external` as `inline: { definition, digest }` before anything is submitted, and every
+  later bind of the step restates it, so a resume submits the definition it recorded.
+- **`turn`** wakes an agent for one turn; it reads its own channels and speaks for itself. The
+  result is its yield status: `done`, `blocked`, or `handoff` (with `to`), and `at`. The handler
+  reports a handoff to an agent outside the run as L4005, one across worktrees as L4004, an elapsed
+  `deadline` as L4003, and a dead agent as L4002. Two concurrent `turn`s on one handle (two
+  branches turning the same agent) MUST be serialized at the dispatch: the second begins when the
+  first settles, in dispatch order, so an agent is never asked to take two turns at once and no
+  handler has to defend against it.
+- **`ask`** is the narrow case where the program needs a value: the agent publishes a record, the
+  program awaits it, and the handler checks it against `schema`; `attempts` (default 1) bounds how
+  many non-conforming replies are tolerated before the handler reports L4006. `schema` (here and
+  on `checkpoint`) is an opaque record to the language: it is canonicalized into the input hash
+  and handed to the handler unchanged. Its handler-side contract on `ask` is the **shorthand**: a
+  record mapping each required top-level field of the reply to one of `"string"`, `"number"`,
+  `"boolean"`, `"array"`, `"record"`, `"null"`. A conforming reply is a record carrying every
+  declared field with its declared kind; extra fields are allowed, and `{}` accepts any record. A
+  handler enforcing the shorthand MUST refuse a schema it cannot read as one (L4022) rather than
+  skip the check, MUST count each non-conforming reply against `attempts`, and MUST report L4006
+  when they are exhausted. The reference simulator enforces exactly this; a `checkpoint`'s
+  `schema` remains uninterpreted in this revision.
+- **`checkpoint`** is a durable pause a human or an agent resolves from anywhere, raced against a
+  durable timer. The handler reports the **raw** outcome, `resolved` (`value?`, `by?`, `artifact?`,
+  `answerId?`, `at`) or `expired` (`at`); the journal holds that outcome plus the interpreter's
+  `attempts` chain, `[{ attempt, requestId, to?, settled }]`, one row per mint under the entry, so
+  an escalation's second identity is in the record and a recovery completes the open attempt rather
+  than re-running the chain; the **disposition** is
+  computed from the current source afterwards, on the live and the replay path alike: `fail`
+  (default) throws L4007, `proceed` returns `{ status: "expired", at }`, `escalate` mints exactly one
+  further checkpoint addressed to `to` under the same entry (a second attempt with its own request
+  id, §10.4) and, if that expires too, returns `{ status: "expired", at }`. There is never a third
+  hop.
+- **`sleep`** is a durable timer; a resumed run does not re-sleep an elapsed sleep. It fails at the
+  call, not in the handler, on a malformed duration.
+- **`wait`** awaits one event (§6.6) and resolves `null` on timeout rather than throwing.
+- **`waitUntil`** blocks until a predicate over a resource OUTSIDE the mesh holds, and it is the
+  only primitive whose observations are journalled as **observations** rather than as the step's
+  result (§10.1). `probe` is a program function the runtime calls; `every` is the cadence between
+  observations and `deadline` is when the wait gives up, both required and neither defaulted;
+  `terminal(observation)` decides whether an observation ENDS the wait, and defaults to
+  "the observation is not `null`". The division is normative: **the program owns the probe and the
+  predicate, the runtime owns the cadence and the deadline.**
+
+  Each observation is appended to the entry and **the entry stays `pending` until one is terminal**.
+  That is what a resume rests on: a resumed run finds a pending entry, re-enters the live path, and
+  **OBSERVES THE WORLD AGAIN**, where an ordinary effect would replay its recorded result. A wait
+  whose non-terminal observation settled as a result would answer "still pending" forever for a
+  resource that had since finished, which is the defect this primitive exists to remove rather than
+  a detail of it. Only the terminal observation settles the step, because only that one is an
+  answer; it is recorded as both the result and the last observation, so the history survives.
+
+  Each observation runs in **its own key namespace**, `/waitUntil:<name>#<n>/b:<i>`, counted from
+  0. A probe reaches the outside world by performing effects, and those effects are keyed in the
+  frame the probe runs in, so a shared namespace would have the second observation's probe replay
+  the first one's recorded result: the wait would re-observe while its probe did not.
+
+  An elapsed `deadline` is a **catchable** failure carrying `L4023`, as `turn`'s deadline carries
+  L4003: a wait that gave up is a fact about the world the program asked about, so the program
+  decides what happens next. A probe or a `terminal` that answers the wrong shape is L4024.
+  `every` and `deadline` are hashed (both stop observation); `terminal` is not, because it READS
+  an observation rather than making one, so a program may correct its own predicate on a run that
+  is already waiting.
+- **`notify`** tells agents about a branch decision. It writes a **notice** onto the run, rendered
+  ahead of each addressee's next turn; it is never a channel message. The fact is bounded (§6.8).
+- **`monitor`** registers interest in an agent's health, after which `down(agent)` is an event a
+  branch can `wait` on.
+- The scopes are §7.
+
+### 6.6 Events
+
+Event constructors are pure; they build a descriptor and `wait` observes it: `replied(agent)` (the
+agent finished a reply), `message(channel, { from?, matches? })` (a message landed on the channel,
+optionally filtered by sender or content), `idle(channel, duration)` (the channel went quiet for
+the duration), `down(agent)` (a monitored agent died; the value carries the reason).
+
+### 6.7 Pure primitives
+
+`channel(name)` names a channel and returns its handle; a name is a name and membership is what
+costs something. `run()` returns this run's `{ id, programHash, startedAt }`.
+
+### 6.8 The `notify` bound
+
+`notify` is the only primitive that moves program-authored bytes toward an agent's context, so its
+fact is a **bounded decision record**, checked exactly on a literal fact by the validator and by the
+same rules at the effect boundary on a computed one (L3043), and never truncated: `decision` and
+`outcome` are step-name tokens (§6.2); `detail`, if present, is a record of at most 8 keys, each key
+a kebab-case token of at most 32 characters, each value a finite number, a boolean, or a single-line
+string of at most 128 characters (no control characters or line separators). Nothing else may
+appear.
+
+```js
+const planner = await spawn("planner")
+const builder = await spawn("builder", { worktree: "wt-1" })
+const r = await turn(builder, { name: "build", deadline: "30m" })
+if (r.status === "blocked") {
+  await notify([planner], { decision: "build", outcome: "blocked", detail: { note: r.note ?? "" } })
+  await turn(planner, { name: "unblock" })
+}
+```
+
+## 7. Concurrency
+
+Concurrency is visible in the source: a program has no `Promise` and no way to start work it does
+not await except through the **scopes**, the primitives whose journal kind §6.1 marks as a scope. Each
+scope opens a **scope frame** in the step-key grammar (§10.2), gives every branch its own key
+namespace, and writes one journal entry of its own whose result records how it settled.
+
+Scopes differ in the three traits below. The rules that depend on a trait read its column here
+instead of naming kinds, so a new scope is a row in §6.1 and a row in this table.
+
+| Scope | Settles (§10.6) | Orphaned on migrate (§11.2) | A fork cut inside it (§11.3) |
+| --- | --- | --- | --- |
+| `parallel` | an assembly of branch outcomes | ignored: a scope outlives nothing of its own | re-entered: it decides nothing of its own |
+| `race` | an assembly of branch outcomes | ignored: a scope outlives nothing of its own | **refused** (L5020): re-entering would decide the winner again |
+| `fanOut` | an assembly of branch outcomes | ignored: a scope outlives nothing of its own | re-entered: it decides nothing of its own |
+| `conclave` | its body's own value | ignored if `closed`; else **rejected** (L5014) | **refused** (L5020): re-entering would open the conclave again on a fresh handler |
+| `once` | its body's own value | ignored: a scope outlives nothing of its own | re-entered: it decides nothing of its own |
+
+### 7.1 Branches and branch keys
+
+`parallel` and `race` take their branches **unevaluated**, as a record of thunks (`{ lint: () =>
+..., tests: () => ... }`) or an array of thunks; a branch runs in its own frame. Record keys are
+the branch keys and survive reordering and insertion; array branches are keyed by their index (a
+warning, L3023: inserting a branch shifts every later branch's namespace). `fanOut(items, fn, { key })`
+runs `fn(item, index)` per item; the branch key is `key(item)`, else the item's string `id`, else
+the fan-out is refused (L3021). Branch keys MUST be unique (L3024), and every key is computed before
+any branch launches.
+
+### 7.2 `parallel`
+
+Runs every branch and settles all of them; the value is the results keyed as the branches were. The
+first rejection cancels the rest (§7.6) and the scope fails with it. The scope's clock joins its
+branches' clocks (§8.1).
+
+### 7.3 `race`
+
+Runs every branch and yields the **earliest** one as `{ index, value }`, where `index` is the branch
+key. An arm's **logical settlement time** is its branch clock at settle: the greatest `endedAt` of
+the effects it awaited, or the scope's entry clock if it awaited none (§8.1). The winner is the
+settled arm with the least logical time; equal times fall to **declaration order**. A branch that
+rejected with a failure is a candidate and wins by failing the scope; a branch that was cancelled
+is not a candidate. Both facts are recorded, so a replay resolves the same arm regardless of
+scheduling.
+
+Live, no scheduler and no host tuning value chooses the winner. When an arm settles at logical time
+*t*, every sibling is cancelled (it performs no new effect, §7.6), and a sibling is additionally cut
+short in pure work only if it **can no longer win**: its clock is later than *t*, or equal and it is
+declared later. A sibling that could still win runs its pure tail to a settle; a sibling that
+reaches a new effect is cut there, having proven it would end after *t*. A later settle with an
+earlier clock re-decides the cut for the rest. So does a landing: an effect a cancelled arm already
+had in flight advances that arm's clock when it lands, and a landing that pushes the arm past the
+frontier cuts its pure tail at the next yield — one that leaves it earlier lets it run on, still
+able to win. The scope entry records the winner, the losers
+(`cancel.losers`), and, when the branches are written as an object literal, a **branch digest** over
+the losers' bodies (§10.6), so an edit inside an arm the walk never enters still diverges.
+
+```js
+const builder = await spawn("builder")
+const outcome = await race({
+  reply: () => wait(replied(builder), { timeout: "20m" }),
+  giveUp: () => sleep("1h"),
+}, { name: "await-or-move-on" })
+if (outcome.index === "giveUp") {
+  await notify([builder], { decision: "await-reply", outcome: "gave-up" })
+}
+```
+
+### 7.4 `fanOut`
+
+Runs `fn(item, index)` for every item concurrently and settles all of them; the value is the array
+of results in item order. The first rejection cancels the rest (§7.6) and the scope fails with it,
+carrying the losers, exactly as `parallel`. Its journal namespace per branch is the branch key, so a
+reordered or filtered list keeps every recorded step where it was.
+
+### 7.5 `conclave`
+
+Opens a scoped sub-team: the handler creates (or names, with `channel`) a conclave channel, joins
+`members`, `fn(channelHandle)` runs as the single branch `in`, and the members leave when it
+returns. It is a scope **and** an effect: its one entry (kind `conclave`) hashes the members and
+channel (§6.4) and carries a `closed` fact stating whether the membership was released (§10.6). A
+body that merely fails is closed; a body that was cancelled is not, and its release travels the
+recovery path of every other branch-local resource. A settled `conclave` is replayed from its entry
+without entering `fn`, so `fn` MUST NOT write to a binding declared outside it or into a record or
+array born outside it (L2032, §7.7), and returns what the program reads instead.
+
+### 7.6 Cancellation
+
+Cancellation is by semantics, never by an API the program calls, and it has one law on the program
+side: **a cancelled branch performs no new effect** (the effect boundary raises the cancellation
+instead of dispatching, and a pending entry it held settles `cancelled`). The boundary holds across
+its own gap: a cancellation raised while the pending entry was being written is seen again after
+the write, so the effect is still not dispatched and the entry settles `cancelled` — the signal
+reaches a branch asynchronously, but from the moment it is raised no new effect starts. Work
+already in flight is
+the handler's: an agent reply already in progress completes and is ignored. Cancellation is issued only by the scope's own semantics: a race's decision, and a
+branch's failure cancelling its siblings. A host release (L5012), a refused append (L5010,
+L5006) and a divergence (L5001) are not failures of a branch: a scope such an unwind passes
+through cancels no sibling and settles nothing, its in-flight branches run to their own next
+boundary (where each releases in turn), and the journal stays exactly where it was (§9.2, §10.5). A `catch` never sees a
+cancellation (§9.2). A `race` may additionally cut a loser's pure work at a yield point once it can
+no longer win (§7.3); a pure loop in an arm that could still win ends on the step budget (L4013).
+
+### 7.7 Writes across branches
+
+A branch MUST NOT write to a binding declared outside it (L2032; refused statically where the
+branch is a function the validator can follow, and at run time in every case), and MUST NOT write
+into a record or array **born** outside it, through any alias (L2032 at run time). Freezing does not
+cover this: nothing crosses an effect boundary. And it is silent: live, branches write in completion
+order; on resume the recorded effects return instantly and they write in launch order, so the run
+takes a path it never recorded with no divergence to catch it. Return the value from the branch and
+read it out of the scope's result. `conclave` and `once` raise the depth like a branch of
+`parallel`, though nothing runs beside their one body, because a settled `conclave` or `once` is
+replayed without entering its body (§7.5, §7.8), so a write from the body would happen live and never
+on resume. A `waitUntil` raises it for its probe and its `terminal` for the same reason: each
+observation calls them in its own frame (§6.5), and a settled `waitUntil` is replayed without
+calling either.
+
+```js
+// refused: L2032
+let winner = null
+const a = await spawn("a")
+const b = await spawn("b")
+await parallel({
+  first: async () => { const r = await turn(a, { name: "go" }); winner = r },
+  second: async () => { const r = await turn(b, { name: "go" }); winner = r },
+})
+```
+
+### 7.8 `once`
+
+`once(fn, { name })` runs `fn` as the single branch `in` and settles with its value. Every step
+whose scope path contains a `once` frame is **at-most-once**: an implementation MUST NOT dispatch
+it twice, where a dispatch is a call of the step's handler method under the step's recorded
+request id that does not end in a refusal. A refused call performed nothing, so its step
+dispatches again as a fresh attempt; retries a handler performs inside one call are not
+dispatches, and neither are the hold's own calls, which run under the hold id. Under a `once`
+frame only `ask` may run, and every other effect MUST be refused before its entry begins, with
+L4028. A validator MUST refuse such an effect called in the body of `once`, or in a function the
+body calls by name, with L2033, so a program that writes one does not start; L4028 refuses one the
+run reaches that the validator could not see. A `checkpoint`, a `waitUntil` and a `conclave` call a handler method more than once at one
+key (a hold is itself a checkpoint, one observation per look, an open and a close that a resume
+calls again). A `spawn`, a `turn`, a `monitor` and a `notify` build run state inside that method
+(a seat, a handoff, a watched agent, a filed notice), which a settled answer cannot build. A
+`sleep` and a `wait` write nothing to bound, and their first dispatch holds a pause or a durable
+consumer that only their own ending ends. A resume that finds an
+at-most-once step `pending` MUST NOT call its handler method; it opens a **hold** instead, a
+checkpoint whose request carries only a prompt, dispatched at attempt 0 under the **hold id**,
+the sha256 of the canonical form of `[<recorded request id>, "hold"]` in base64url, whose
+binding is written to the entry's `hold` field and never to `external`. Before the hold's first
+bind the host MUST end the pause the step's first dispatch armed, so the hold is the step's only
+open pause; an answer, an amendment or a journal view addressed to a step whose entry carries
+`hold` MUST read the hold id's pause, never the one the first dispatch armed. A
+resolved hold settles the step `ok` with the answered value (`null` when none). An expired hold
+settles it `failed` with L4027, kind `outcome-unknown`, which a program may catch and a resume
+replays. A hold the host refuses MUST leave the step `pending`,
+never `refused`, and halts the run (L5025), so the next capable host opens the same hold; a
+cancelled hold settles the step `cancelled`, a failed one settles it `failed`, and neither is
+dispatched again. A `miss` and a `refused` verdict dispatch as they do anywhere, because a step
+with no `pending` entry was never started. `once` raises the depth like a branch of `parallel`
+(§7.7): a settled `once` is replayed without entering `fn`, so `fn` MUST NOT write to a binding
+declared outside it or into a record or array born outside it (L2032), and returns what the
+program reads instead. `once` bounds the number of dispatches; it does not make a far side's
+write exactly-once.
+
+```js
+const publisher = await spawn("publisher")
+const res = await once(async () => {
+  return await ask(publisher, { name: "publish", schema: { commentId: "number" } })
+}, { name: "publish-360" })
+log("comment", res.commentId)
+```
+
+## 8. Determinism
+
+### 8.1 Time
+
+There is no wall clock. `now()` returns the calling branch's **run clock**: the greatest `endedAt`
+over the effects that causally precede the call, that is, the ones this point actually awaited.
+Sequentially that is the previous effect's end; a branch inherits its parent's clock when it forks;
+joining branches takes the maximum; a branch never sees a sibling's completion it did not await.
+The clock starts at the run's **logical epoch**, `startedAt`, and is deterministic under replay,
+which is what makes "time advances only at effect boundaries" a property of the design rather than
+a convention. A concurrency scope's own entry stamps its `endedAt` with the joined branch clock —
+that same maximum, a cancelled arm's landings included — not the host clock at settle, so `now()`
+after a scope answers the same value live and on resume (§10.1).
+
+### 8.2 Randomness
+
+`random()`, `randomInt(n)` and `pick(xs)` draw from a PRNG seeded per run and **derived per scope
+path**: the *n*-th draw in scope *p* is the first 48 bits of the SHA-256 of the concatenation
+`seed, U+0000, p, U+0000, n` (the UTF-8 bytes of the seed, ONE NUL BYTE, the scope path string of
+§10.2, ONE NUL BYTE, and the decimal draw index; the separator is U+0000, not a space) divided by
+2^48. Draws are never journalled: they are a pure function of the seed and the
+scope, so an edit that adds a draw elsewhere in the program does not disturb this scope's sequence.
+
+### 8.3 Pins
+
+A run is not pinned by its source alone. The **pin set** is resolved once when the run starts,
+recorded on the run record (SPEC.md §14), and read back on every resume; a resume that supplies a
+different value for any pin is refused (L5009), and a resume handed history without pins is refused
+(L5021).
+
+| Pin | Meaning | Default |
+| --- | --- | --- |
+| `seed` | the PRNG seed (§8.2) | the run id |
+| `startedAt` | the logical epoch, in ms; `now()` before the first effect | the host clock at start |
+| `yieldEvery` | interpreter dispatches between yields to the host's event loop | 1024 |
+| `stepBudget` | interpreter dispatches allowed in **one walk** before L4013 | 1 000 000 |
+| `effectCeiling` | effects allowed in **the run** before L4009 | 10 000 |
+| `languageVersion` | the language version the run started under | the version of the engine that resolves them |
+
+`yieldEvery` selects no outcome (§7.3): it is pinned so a run record never churns, and a future
+revision MAY drop it from the pin set. `stepBudget` bounds a walk and not the run because steps are
+not recorded, and a **step is whatever the running engine counts** (a walker dispatch under
+version 1, a transformed-site hit under version 2), so the same budget does not buy the same
+program two engines, and a recorded `stepBudget` is not comparable across versions; `effectCeiling` bounds the run because the journal records every dispatch, and a
+resume counts the recorded distinct effect keys toward it, a `conclave`'s included, so re-entering a
+pending or refused step does not count it again.
+
+### 8.4 Language version
+
+The **language version** is bumped when a revision changes what a program means: the PRNG, a
+builtin, numeric behaviour, or the scheduling of the walker. It is deliberately not the package
+version.
+
+There are two versions, and they are two languages rather than two speeds of one:
+
+| Version | Engine | What differs |
+| --- | --- | --- |
+| `1` | the tree-walker | a step is one walker dispatch; `log` takes any value the walker can print |
+| `2` | the compiled engine | a step is one transformed-site hit; `log` is **data** and refuses code (L4016) |
+
+Version `1` is not deprecated and does not expire: a run recorded under it has nowhere else to go,
+so the walker remains its replay engine for as long as its records exist.
+
+That sentence names WHICH ENGINE serves version `1`. It does not freeze the walker's semantics, and
+it is not a promise that every version-1 record replays: a revision that narrows a builtin changes
+what a version-1 program means on the current walker, and a record whose program relied on the
+older, wider behaviour is refused rather than replayed. The known case is `len` over a kind other
+than an array or a string (§5.4): such a run completed under the earlier walker, answering
+`undefined`, and is now refused L4016 at that line, before any recorded entry is consumed. The
+second known case is an update operator (§4.5): a version-1 record whose program incremented or
+decremented a value other than a number completed under the earlier walker, and is now refused
+L4018 at that line, before any recorded entry is consumed. The third known case is a record or
+array builtin over another kind (§5.4): a version-1 record whose program called `keys(5)`,
+`map(5, f)` or another such call completed under the earlier walker on the host's answer, and is
+now refused L4016 at that line, before any recorded entry is consumed. The statements are consistent
+because they answer different questions: which engine serves a recorded version, and what that
+engine's current semantics are.
+
+The version is a property of the ENGINE that runs a program, not of this document. An engine MUST
+stamp the pins it resolves with **its own** version and MUST compare a recorded version against
+**its own**, never against a shared notion of "the current language": an engine that stamped one
+version and compared another would refuse its own records.
+
+Two refusals divide the work, and the difference is what the operator does next:
+
+- **L5008**, at the engine: this record was handed to an engine whose version differs. There is an
+  engine that speaks it, so the repair is to run it there, or to fork (§11.3).
+- **L5023**, at whatever dispatches to engines: no engine in this build serves the recorded
+  version. There is nothing here to name, so the repair is a build that serves it, or a fork. The
+  refusal MUST name both the version it met and the set it serves; "this build cannot" is only
+  actionable if it says what it can.
+
+A build MAY serve several versions at once. Which versions it serves is a fact about that build,
+declared, and a fresh run MUST be stamped with the version of the engine that will actually execute
+it, never with the newest version the build knows of, unless that is the one that will run it.
+
+## 9. Errors
+
+### 9.1 What a program can catch
+
+`throw` and `try`/`catch`/`finally` are JavaScript's. A value the program throws arrives in `catch`
+as itself. Out of a concurrency scope it arrives as the deep-frozen copy the scope's record carries
+(§10.6), live and on resume, and the thrown value itself is not frozen. A thrown value with no
+canonical form (§4.4) cannot be carried, so the scope delivers its `L4000` `scope-fault` record in
+its place, live as well. A failure the runtime raised arrives as a **frozen record**: an effect's
+failure as `{ code, kind, message, detail? }` (the recorded `EntryError`, §10.1) and an interpreter
+fault as `{ code, kind: "runtime", message }`. A program cannot construct an `Error`, so anything
+that is one came from the runtime or the host and is delivered as
+`{ code: "L4000", kind: "host", message }`. A scope it fails records it under that code and kind
+(§10.6), so a resume delivers the same.
+`finally` carries ECMAScript's completion semantics: a `return`, `break`, `continue` or `throw`
+that completes the finalizer replaces whatever the `try` or `catch` was completing with.
+
+```js
+const builder = await spawn("builder")
+try {
+  await turn(builder, { name: "build", deadline: "10m" })
+} catch (e) {
+  if (e.code === "L4003") {
+    await notify([builder], { decision: "build", outcome: "timed-out" })
+  } else {
+    throw e
+  }
+}
+```
+
+### 9.2 What a program cannot catch
+
+A `catch` MUST NOT see, and an implementation MUST unwind the run through, six things that are not
+the program's to handle: a **cancellation** (§7.6); a **journal append the store refused** (L5010:
+the run has lost its ability to have a result, and effects performed past it would exist only in the
+world; L5006, the result-size refusal ahead of the append, travels the same way); a **host release** (L5012: the driver stopped, the program did not); a
+**capability refusal's halt** (L5025, §10.7: this host cannot perform the step, the entry is
+settled `refused`, and the run is held for a capable host); a **divergence**
+(L5001, §11.1: the journal is saying this program is not the one that wrote it); and a **migration
+walk's refusal to enter a scope** (L5022, or an unwalkable `conclave`). These unwind past `finally`
+too: a finalizer neither runs on the way out nor replaces the fault, because none of the six
+leaves the program a next step to take — a cancelled branch performs no new work, and a run that
+has diverged, lost its journal, been released or been held cannot be allowed one more effect on the
+way down.
+
+A **host stack exhaustion** unwinds the run the same way, in a builtin or in the program's own
+recursion. The depth at which a host runs out of stack belongs to the host (its stack size, a worker
+thread's default, the runtime version) and not to the program, so a program that could catch it
+would choose its next effect by the machine it ran on (§1), and a journal recorded on one host would
+diverge (L5001) on resume on another. It carries no catalog code: the run fails as a host fault, and
+a resume on a host with more stack proceeds from the journal. It unwinds past `finally` like the six
+above, and inside a concurrency scope (§7) it is a divergence's shape: the scope settles nothing,
+it cancels no sibling, it surfaces ahead of a `race` winner and of a branch failure that a sibling
+reached first (a cancellation that failure already sent stands), and a `conclave` whose body ran
+out of stack does not close, so its close stays owed.
+
+### 9.3 Error rendering
+
+Every static refusal is reported in user-program coordinates as `{ code, title, where: { file, line,
+column, frame }, cause, fix, callee? }`, where `frame` is the offending line with a caret and
+`callee`, present when the error is blamed on a call to a primitive, carries that primitive's
+signature, doc and one working example. The validator collects every error before reporting.
+
+## 10. The step journal
+
+### 10.1 Entries
+
+The journal is an append-only log of entries. An entry is JSON:
+
+```text
+{
+  v: 1,
+  seq,                 // append order, for reading only; matching never uses it
+  run,                 // the run id
+  scope,               // the scope path string (§10.2)
+  kind,                // the primitive's journal kind (§6.1)
+  name,                // the step name, "" when unnamed
+  occurrence,          // the n-th (kind, name) in this scope, from 0
+  inputHash,           // "sha256:<hex>" (§6.4)
+  requestId?, attempt?,// the identity the handler submits under (§10.4)
+  state,               // "pending" | "settled"
+  status?,             // "ok" | "failed" | "cancelled" | "refused"
+  result?,             // status ok: the recorded value
+  error?,              // status failed or refused: { code, kind, message, stack?, detail?, thrown? }
+                       //   stack: where the throw came from, when the thrown value carried one
+                       //   thrown: a scope's failure that was a value the program threw (§10.6)
+  external?,           // what the handler bound (recovery)
+  observations?,       // a waitUntil: [{ at, value }], what it has seen so far (§6.5)
+                       //   NOT results: a resumed run RE-OBSERVES rather than replaying these
+  cancel?,             // a scope: { losers: [branch keys], issued }
+  branchDigest?,       // a race: the digest over the losers' bodies (§10.6)
+  branches?,           // a scope that failed: its branch keys
+  closed?,             // a conclave: whether membership was released
+  startedAt, endedAt?  // host clock at begin and settle; a scope entry's endedAt is the
+                       //   joined branch clock at settle (§8.1)
+}
+```
+
+An entry is written **twice**: once `pending`, before the effect is dispatched, and once `settled`,
+after; a reader folds by key and the last write wins. `result` and `error` are exclusive. A
+`refused` status records a **capability refusal** under the code the handler raised (L5016 for the
+reference handler), with `error` carrying it: the step was never attempted, and a later activation
+performs it live (§10.7), beginning the step again, so a refused step's subject carries a further
+`pending` and `settled` pair that supersedes the refusal in the fold. `branches`
+is present only on a failed scope, because a successful one carries them inside `result`. Unknown
+fields MUST be ignored.
+
+`external` and `error.detail` are **values that crossed an effect boundary** and answer to the same
+rule as `result` and an effect's arguments (§4.4): a host MUST refuse either one if it is not
+crossable, where it is written, and a resume MUST refuse a journal whose recorded `external` or
+`error.detail` is not crossable, with **L5024**. The refusal on load names the entry AND which of
+the two fields, because "this journal cannot load" is otherwise not actionable. A value refused
+where it is written is a failure of the handler's own dispatch and carries `L4000` with kind
+`handler-fault` (or `host` inside a scope, the kind its `catch` binds there, §9.1); it is not a
+catalog code of its own, because the catalog already says exactly that. Inside a scope a classified refusal the language itself raised
+(a `RuntimeFault`, which carries its own catalog code) settles under that code with kind `runtime`,
+because `L4000` is for failures the catalog does not name and this one it does. A failure whose
+`detail` is refused is recorded under `L4000` rather than under the code the handler chose, and
+the recorded message MUST say that the detail could not be kept: dropping the field while keeping
+the code would hand a program a classified failure whose recorded form is missing the field sent
+to explain it.
+
+An entry MAY carry `hold`, the binding of the hold opened for an at-most-once step (§7.8); it
+answers to the crossing rule like `external`, and a resume refuses a loaded `hold` that fails it
+(L5024).
+
+The rule makes a binding **canonical, not round-trip-exact**, and the difference is a property of
+the store rather than of the language. A crossable value has a canonical form (§10.3), but a store
+is free to encode in a way that loses distinctions the canonical form keeps: JSON, the encoding this
+repo's durable store uses, writes `-0` as `0` while `JSON.parse` can still produce `-0`, and the
+step key's own input hash equates the two. So a host MUST NOT read this rule as a promise that
+`external` survives a round trip byte for byte. The same property decides what a resume does with
+a record written before a rule tightened: a value the store already flattened comes back canonical,
+so the record loads (§10.6).
+
+### 10.2 Keys
+
+A step is keyed by **where** it is, never by when: `(scope path, kind, name, occurrence)`, with the
+input hash compared **after** lookup so a changed input is a diagnosable divergence rather than a
+silent miss. The key's string form, used in the journal, the trace and every error, is:
+
+```text
+scope frame  := "/" kind [":" name] "#" occurrence "/b:" branchKey
+scope path   := scope frame*                       // "" at the root
+step key     := scope path "/" kind [":" name] "#" occurrence
+```
+
+Examples: `/turn:build#0`, `/race:first-answer#0/b:reply/wait#0`,
+`/parallel:checks#1/b:tests/turn:tests#0`. Nothing is escaped, which is why `/`, `#` and `:` are
+refused in names and branch keys (§6.2). Occurrences are counted per `(kind, name)` within one
+namespace, and every branch of a scope is its own namespace, so two branches calling the same named
+effect never race for a counter. Both counters are allocated synchronously at the call, before any
+await, which is the whole determinism argument: the allocating code is either sequential or already
+inside a deterministic namespace.
+
+#### Reusable helpers
+
+A plain function call does not open a journal scope. Calls to a helper whose turn is named `review`
+use the enclosing occurrence sequence: `/turn:review#0`, `/turn:review#1`, and so on. Inserting
+another call before them shifts their occurrences; naming the turn alone does not give each
+helper instance a stable key.
+
+Instantiate a reusable helper inside a named, single-branch `parallel`. Give each instance a
+distinct scope name and use a record branch key, even though no concurrency is needed:
+
+```js
+const reviewer = await spawn("reviewer")
+async function review(agent) {
+  return await turn(agent, { name: "review" })
+}
+const first = await parallel({ call: () => review(reviewer) }, { name: "panel-one" })
+const second = await parallel({ call: () => review(reviewer) }, { name: "panel-two" })
+log(first.call.status, second.call.status)
+```
+
+The turns now key as `/parallel:panel-one#0/b:call/turn:review#0` and
+`/parallel:panel-two#0/b:call/turn:review#0`. An earlier instance with a different scope name does
+not renumber either. Each wrapper adds one scope entry, and its result is under `.call`.
+Reusing the same scope name still advances that scope's occurrence counter.
+
+Keep required step names literal inside the helper; L3013 is unchanged. This convention gives
+instances separate namespaces, not an exemption from input-hash checks or the migration rules
+(§11.2). `once` is not a general-purpose replacement: it has the effect restrictions in §7.8.
+
+### 10.3 The digest
+
+`digest(value)` is `"sha256:" + hex(SHA-256(canonical(value)))` where `canonical` is RFC 8785. The
+program hash is `digest({ source })`; an input hash is `digest(projection)` (§6.4).
+
+### 10.4 The request id
+
+The identity a handler submits under is written on the pending entry **before** the handler runs:
+`base64url(SHA-256(canonical([runId, stepKeyString, inputHash, attempt])))`, 43 characters in the id
+token alphabet. `attempt` is 0 except for the second mint of an escalated checkpoint (§6.5), which
+is re-issued on the same entry as attempt 1 before it is dispatched. A resumed run that finds a
+pending entry re-submits under the **recorded** id and attempt, never a re-derived one, so the far
+side recognises the work rather than receiving a second request. A hold (§7.8) is dispatched under
+the hold id derived from the recorded id of the step it holds, never under that id itself, because
+the step may already have armed and settled a pause there; the step's own id and attempt do not
+change.
+
+### 10.5 Two phases, two failure domains
+
+An implementation MUST await the durable append of the pending entry before dispatching, MUST
+settle the entry from the handler's outcome, and MUST keep the settling append outside the handler's
+failure domain: a handler that completed and a store that refused to record the completion is a
+**durability failure** (L5010), never a recorded `failed` step. A journal belongs to one run; an
+entry from another run is refused (L5011).
+
+### 10.6 Scope entries
+
+A scope writes one entry of its own kind, keyed in the namespace that opened it, beside the effects
+of that namespace; its branches live under it. On success `result` is `{ branches: [keys], value }`
+where `value` is the scope's result (`{ index, value }` for a `race`); on failure `branches` is
+carried as a fact. The settled `value` MUST have a canonical form (§4.4), exactly as an effect's
+result must: a value the record cannot carry is refused AT THE SETTLE, and the scope is recorded as
+a fault under `L4000` with kind `host` rather than settled `ok`. A failure the program itself
+caused (§9) keeps its own catalog code with kind `runtime`, and a failure the handler raised keeps
+its code and kind (§10.1). Any other failure that is an `Error`, the refusal included, is recorded
+as the `L4000` `host` fault a `catch` binds for it live (§9.1), so a replay hands `catch` the same
+record. A value the program threw is recorded under `L4000` `scope-fault` as a copy,
+`thrown: { value }`, `{}` for `undefined`, and the live run and a replay both hand `catch` that
+copy (§9.1). The copy is the value as the
+journal's JSON reads it back, so a record the value holds at two places arrives as two records, live
+as on a resume from a durable store. A thrown value with no canonical form is recorded without
+`thrown`, with the crossing rule's refusal (§4.4) as its message. A resume refuses a loaded
+`error.thrown` that is not `{ value }` or `{}`, or whose value is not crossable, naming the entry and
+the field (L5024). ABSENCE IS
+EXEMPT, and where it is exempt follows what the scope's §7 row says it settles. A scope that settles
+an assembly of branch outcomes exempts a BRANCH that produced no value: its slot is not put through
+the rule; anything deeper is, including a field the branch's own value carries. A scope that settles
+its body's own value assembles nothing, so only a body that produced NO VALUE AT ALL is absence, and
+every field of a value it did produce answers to the rule. A resume refuses a loaded record whose
+`result` fails the rule, naming the entry and the field (L5024). THE RULE FENCES WHAT IS WRITTEN
+AND DOES NOT REPAIR WHAT WAS WRITTEN BEFORE IT: a record produced under an earlier host may carry a
+scope value the store already flattened, and such a record still loads and still replays, because
+its recorded form is canonical and nothing in it separates a branch whose function the encoding
+dropped from a branch that answered `{}` on purpose. Measured on records produced before this rule
+and loaded after it: a `parallel` whose branch returned a function is on the wire as `{}`, one whose
+branch returned a record holding a function as `{"a":{}}`, a `conclave` whose body returned a record
+holding one as `{}`, and a `conclave` whose body returned a record with one absent field as `{}`
+where the live run's keys were `["x"]`. All four load, all four resume to completion, and in all
+four the replayed program reads a key set the live run never produced. This is the quieter direction of the
+version-1 `len` disclosure (§5.4, §8.4): that one fails loudly before consuming an entry, while this
+one succeeds and says nothing. A cancelling scope records `cancel: { losers, issued }`: the intent travels with
+the outcome, and `issued` flips only once the driver has established the losers are quiescent,
+because a journal write cancels nothing by itself. A `race` whose branches are an object literal
+records `branchDigest`: `digest` over `[[loserKey, body] ...]` sorted by key, where `body` is the
+loser's function node with `start`, `end`, `loc` and `range` removed (or `null` for a key with no
+literal body), so a reformat is silent and an edit is not. A `conclave` records `closed`.
+
+### 10.7 Lookup
+
+At each effect the interpreter looks its key up and acts on one of seven verdicts: **miss** (perform
+it live), **replay** (return the recorded result, advance the clock, perform nothing),
+**replay-failed** (throw the recorded error), **replay-cancelled** (raise cancellation in this
+branch), **pending** (re-bind to `external` under the recorded request id and await its terminal),
+**refused** (the step was never attempted: perform it live, as a fresh attempt, with the usual
+input-hash check), **diverged** (the recorded `inputHash` differs: stop, mutate nothing, name the
+step; L5001). Under a `once` frame (§7.8) the **pending** verdict opens a hold instead of
+re-binding.
+
+A settled **scope** is delivered from its own entry without entering a branch: the subtree is
+accounted for (a loser still `pending` is settled `cancelled`), then the cancellation intent is the
+driver's to discharge, and only then is the outcome delivered. On a migration walk (§11.2) the
+recorded **winning** branches are entered instead so that removed steps inside them surface, and a
+value a branch throws again out of a scope recorded as failed reaches `catch` as the record's copy
+(§9.1), as it does live and on resume.
+
+## 11. Resume, migrate, fork
+
+### 11.1 Resume
+
+Resume is not a cursor: it is **re-running the program from the top** under the recorded pins,
+with journalled effects returning recorded results by key. Out-of-order concurrency replays
+correctly because keys are structural, and no continuation or interpreter state is ever serialized.
+A resume MUST refuse a journal that belongs to another run (L5011), a pin that differs (L5009), a
+language version that differs (L5008), and history without pins (L5021); it MUST stop on the first
+divergence (L5001). Where a build dispatches to more than one engine, a record whose version no
+engine of that build serves is refused before any of this, with L5023 (§8.4), and the run MUST be
+left untouched: nothing activated, nothing appended. (A recorded branch missing from the source is L5022 only on a migration or fork
+walk entering a SETTLED scope, §11.2; a `pending` scope records no arm names to check and is
+re-entered by a resume.) A resume performs live every
+effect the journal has not settled, so a run that stops before its next effect (L5012, the host's
+release, asked before every unrecorded effect and never inside one) is exactly where its journal
+says it is. A **capability refusal** is the same shape one step later: the handler attempted
+nothing, the entry settles `refused` under the handler's code, and the run unwinds with L5025
+rather than recording a failure; a resume on a host that can perform the step finds the `refused`
+verdict (§10.7) and performs it live.
+
+### 11.2 Migrate
+
+A **migration** moves a run onto edited source. It is decided by a **dry walk** of the new program
+over the recorded journal with a read-only journal, and the walk answers two questions: whether each
+recorded step is still valid (the hash comparison, on the raw fact) and which recorded steps the new
+program still reaches (through the program's own view, checkpoint policy applied). Steps the walk
+never looks up are **orphans**, and what happens to each depends on what it did:
+
+| Orphaned kind | Verdict |
+| --- | --- |
+| `sleep`, `wait`, `monitor`, `ask` | ignored: nothing outlives it |
+| `waitUntil` | ignored, settled or pending: it holds no agent, membership or decision, and its recorded observations stay in the journal |
+| `turn` | kept: the agent already spoke; the record stays and the migration says the source no longer accounts for it |
+| `notify` | ignored if its notice was carried by the addressee's next turn; else **rejected** (L5013) |
+| `spawn` | **rejected** (L5003) unless the agent is adopted or released by an explicit override |
+| `checkpoint` | ignored if never resolved; a resolved one is **rejected** (L5004) unless discarded by an explicit override, recorded with the actor |
+| a scope (§7) | the **Orphaned on migrate** verdict in its §7 row |
+| any other kind | **rejected** (L5015): a kind with no policy is not waved through |
+
+A seat adopted under an override goes to the edited program's next spawn of the same persona name,
+and only when that spawn's inline definition has the recorded digest: a catalog seat goes only to a
+catalog spawn, and an inline seat only to a spawn of the same definition. Any other spawn of that name
+is refused, and the hand-over stays queued.
+
+A divergence inside a reached step is a rejection naming the step (L5001); an edit inside a losing
+arm of a recorded `race` diverges through the branch digest (§10.6). The decision is filed as a
+`migration` record (SPEC.md §14) whose id is a digest of the report itself, so a walk re-run after
+a crash lands on the same record.
+
+### 11.3 Fork
+
+A **fork** starts a **new run** whose journal is a copy of a parent's prefix up to, and excluding,
+a named step key (never an ordinal), under the parent's pins **unchanged, seed included**: a
+reseeded prefix would re-decide every pure draw inside history it is supposed to copy, and no entry
+records a draw. The cut is found by a dry walk in migration mode (§11.2), so a cut inside a settled
+scope is found rather than swept past. The cut step MUST exist in the parent's journal (L5017), MUST
+be reached by the parent program's own path (L5018), and MUST NOT lie inside a scope unless its §7
+row re-enters a fork cut (L5020). A scope that encloses the cut and is re-entered is left out of the
+prefix, so the child enters it again: its other branches replay from the entries the prefix holds,
+and the branch holding the cut runs live from it. A fork that asks to pin a new program hash is
+refused (L5002) until the run record carries one. Agents the prefix spawned are respawned at the
+frontier by default and adopted only where the spawn said `onFork: "adopt"`, and a host that cannot
+honour that refuses (L5019). The child is a new run under a new id whose record names its lineage:
+the spec's `forkedFrom` carries the parent run and the cut step (SPEC.md §14.3), written with the
+spec itself. The parent is untouched.
+
+## 12. Limits
+
+An implementation MUST enforce the run's `stepBudget` per walk (L4013) and `effectCeiling` per run
+(L4009), and MUST yield to its host at least every `yieldEvery` dispatches so a pure loop cannot
+starve the host's timers. The step and the dispatch are the engine's own unit (§8.4); an effect is
+not, and `effectCeiling` counts the same thing under either version. The journal store's payload bound is the store's own: an entry it will not
+take is a refused append (L5010, §10.5). A journal MAY be constructed with a **result bound**, the
+most bytes a settled `ok` result may canonicalize to; a result over it is refused **ahead of the
+settling append** (L5006), before anything is written, and travels the L5010 path (§9.2): the
+effect stands in the world and the entry stays pending. A journal constructed without a bound
+enforces none.
+
+## Appendix A. The error catalog
+
+Codes are stable. L1xxx grammar, L2xxx names and static rules, L3xxx effect call shape, L4xxx run
+time, L5xxx durability, L6xxx simulation.
+
+| Code | Title |
+| --- | --- |
+| L1001 | Forbidden syntax: `class` |
+| L1002 | Forbidden syntax: `this` |
+| L1003 | Forbidden syntax: `var` |
+| L1004 | Forbidden syntax: `for...in` |
+| L1005 | Forbidden syntax: generator |
+| L1006 | Forbidden syntax: `eval` or `Function` |
+| L1007 | Forbidden syntax: regular expression literal |
+| L1008 | Invalid syntax or newline hazard |
+| L1009 | Unbraced branch |
+| L1010 | `switch` case does not terminate |
+| L1011 | Computed property name |
+| L1012 | Array elision |
+| L1013 | Forbidden syntax: `with` |
+| L1014 | Forbidden syntax: symbol |
+| L1015 | Forbidden syntax: accessor |
+| L1016 | Forbidden syntax: `instanceof` |
+| L1017 | Forbidden syntax: label |
+| L1018 | Forbidden syntax: tagged template literal |
+| L1019 | Forbidden syntax: `new` |
+| L1020 | Forbidden syntax: `import` or `export` |
+| L1021 | Forbidden syntax: `delete` |
+| L1022 | Forbidden syntax: `do...while` |
+| L1023 | Forbidden syntax: `await` outside an async function |
+| L1024 | `return` outside a function |
+| L1025 | Forbidden syntax: loose equality |
+| L1026 | Forbidden syntax: comma operator |
+| L1027 | Forbidden syntax: `void` |
+| L1028 | Forbidden property name |
+| L1029 | Syntax outside the language |
+| L1030 | Forbidden literal: bigint |
+| L2001 | Unknown identifier |
+| L2002 | Shadows a builtin or a primitive |
+| L2003 | Assignment to a `const` binding |
+| L2004 | Use before declaration |
+| L2011 | The Promise API is not available |
+| L2012 | Host global is not available |
+| L2013 | An async call is not awaited |
+| L2031 | Mutation of a frozen value |
+| L2032 | Write from a concurrent branch to something declared outside it |
+| L2033 | Effect not admitted inside `once` |
+| L2034 | Literal is not a duration |
+| L3011 | Unknown option key |
+| L3012 | Missing required step name |
+| L3013 | Step name is not a literal |
+| L3014 | Malformed step name |
+| L3021 | `fanOut` has no stable key |
+| L3022 | Two agents share a worktree concurrently |
+| L3023 | Array-form `parallel` holds named effects |
+| L3024 | `fanOut` branch keys are not unique |
+| L3025 | Branch key contains a reserved step-key character |
+| L3041 | Value cannot cross an effect boundary |
+| L3042 | Function passed as effect data |
+| L3043 | `notify` fact is not a bounded decision record |
+| L3044 | `to` without `onExpiry: "escalate"` |
+| L3045 | `waitUntil` probe is not a function |
+| L3046 | `waitUntil` needs a cadence and a deadline |
+| L3047 | `waitUntil` cadence is zero, or does not divide its deadline usefully |
+| L3048 | `spawn` placement is not an endpoint and instanceId pair |
+| L3049 | `spawn` inline persona is malformed |
+| L4001 | Permit exhausted |
+| L4002 | Agent down |
+| L4003 | Turn deadline elapsed |
+| L4004 | Handoff across worktrees |
+| L4005 | Handoff to an agent outside the run |
+| L4006 | `ask` never produced a conforming record |
+| L4007 | Checkpoint expired |
+| L4008 | Concurrent worktree write |
+| L4009 | Run effect ceiling reached |
+| L4010 | Field access on `null` or `undefined` |
+| L4011 | Call of a value that is not a function |
+| L4012 | Assertion failed |
+| L4013 | Step budget exhausted |
+| L4014 | Unknown member |
+| L4015 | Not iterable |
+| L4016 | Builtin failed |
+| L4017 | Invalid array length |
+| L4018 | No implicit conversion |
+| L4019 | Array write past the end |
+| L4020 | A method is not a value |
+| L4021 | A callable `then` is not a record member |
+| L4022 | Unreadable ask schema |
+| L4023 | `waitUntil` deadline elapsed |
+| L4024 | `waitUntil` probe or predicate answered the wrong shape |
+| L4025 | Host did not schedule the run |
+| L4026 | Pause plane did not answer before the client deadline |
+| L4027 | At-most-once step's outcome was never settled |
+| L4028 | Effect not admitted inside `once` |
+| L5001 | Run divergence |
+| L5002 | Program hash not available |
+| L5003 | Orphaned `spawn` on migrate |
+| L5004 | Orphaned resolved checkpoint on migrate |
+| L5005 | A pending effect cannot be recovered |
+| L5006 | Effect result too large |
+| L5007 | Lease lost |
+| L5008 | Resume under a different language version |
+| L5009 | Resume pin mismatch |
+| L5010 | Journal append rejected |
+| L5011 | Journal belongs to a different run |
+| L5012 | Run released before the next effect |
+| L5013 | Orphaned undelivered `notice` on migrate |
+| L5014 | Orphaned open `conclave` on migrate |
+| L5015 | No orphan policy for this entry kind on migrate |
+| L5016 | Effect not durable on this host |
+| L5017 | Fork cut step is not in the journal |
+| L5018 | Fork cut was never reached |
+| L5019 | Fork cannot honour `onFork` on this host |
+| L5020 | A fork cut lies inside a scope whose outcome was already decided |
+| L5021 | Resume over a journal without the run's pins |
+| L5022 | A recorded branch is not in the migrated source |
+| L5023 | No engine in this build serves this record's language version |
+| L5024 | A recorded value has no canonical form |
+| L5025 | Effect refused; run held for a capable host |
+| L6001 | Unscripted effect in simulation |
+| L6002 | Simulation script entry unused |
+
+`L4000` is not a catalog code: it is the generic code an unclassified failure carries (`kind`
+`handler-fault`, `scope-fault`, or `host`), and it is what a program sees for a failure the catalog
+does not name. A catalog code the language itself raised is never recorded as `L4000`: inside a
+scope it settles under its own code with kind `runtime` (§10.6). L3022, L4001 to L4006, L4008,
+L4025 and L4026 are the effect handler's failure vocabulary: a host reports them, the interpreter
+journals and delivers them, and none is raised by the language itself.
+L1006, L1014, L5005, L5007 and L6002 are reserved: no path in this revision raises them.
+L6001 and L6002 belong to the reference implementation's simulator (`SimHandler`, `dryRun`), which
+runs a program against a script of scripted answers and refuses an effect the script does not
+answer; simulation is a tool, not part of this language, and this document does not define it.
+
+## Appendix B. Change log
+
+| Date | Revision |
+| --- | --- |
+| 2026-08-18 | First normative reference, language version `1`, alongside SPEC.md v0.5 §14. |
+| 2026-08-18 | Review folds, same revision: the PRNG separator is U+0000 (§8.2, the earlier text said a space and was wrong; the code never changed); `any`/`all` are no longer reserved (§3); `xs.length = n` truncates only, L4017 (§4.3); the L2013 rule states where the validator can see (§2.3); `fanOut` fails like `parallel` (§7.4); L5022 is a walk refusal, not a resume stop (§11.1); no lineage on a fork's child (§11.3); `schema` is opaque and concurrent turns on one handle are the handler's (§6.5); the checkpoint entry's `attempts` chain (§6.5). |
+| 2026-08-18 | Language-lane folds, same revision: operators, computed member keys and the library's primitive parameters coerce primitives only, an array, record or function operand is refused (L4018, §4.5, §5.4); the dead zone is refused statically where visible and at run time otherwise (L2004, §2.3, §3); bigint literals are refused (L1030, §2.2); array index writes are contiguous and an at-length write appends (L4019, §4.3); a method is not a value (L4020, §4.2, §5.2); holes, cycles and an own `__proto__` field cannot cross, stringify or parse in (§4.4, §5.1); `sort`'s total order is defined over kinds with `NaN` placed (§5.3); the string `replace`/`replaceAll` replacement is an ECMAScript substitution string (§5.2); crossing values are frozen in both directions, replayed results included (§4.3); a scope entry's `endedAt` is the joined branch clock (§8.1, §10.1); a race re-decides a cut when an in-flight effect lands (§7.3); cancellation holds across the boundary's own begin gap (§7.6); an uncatchable fault skips `finally` (§9.2), and `finally` otherwise carries ECMAScript's completion semantics (§9.1). |
+| 2026-08-19 | A record may not carry a callable `then`, on a literal, a spread, a rest pattern or a member write alike, literal key or computed (L4021, §4.3): an object with a callable `then` is a thenable, the host's promise machinery adopts it in place of the value the program built, and its failure escaped the run as an unowned rejection that killed the host. |
+| 2026-08-19 | `len` counts an array or a string and refuses every other kind in the language with L4016 before the host is reached (§5.4): the only `length` a function has on the host is its parameter count, a property of the implementation's wrapper and not a program value, and the other kinds have none. |
+| 2026-08-19 | A record written before the scope value rule still loads and still replays, with the value the store already flattened (§10.1, §10.6): `{}` is canonical, so no door can tell a branch whose function the encoding dropped from a branch that answered `{}` on purpose. Disclosed rather than repaired, and the quieter direction of the version-1 `len` case, which fails loudly before consuming an entry while this one completes and says nothing. Measured at the rule's own commit on four records produced before it: wire `{}`, `{"a":{}}`, `{}`, `{}` against live key sets `["a"]`, `["x"]`, `["x"]`, `["x"]`; all four loaded, all four resumed to completion, and each replayed program read an empty key set. |
+| 2026-08-19 | The scope value rule's absence exemption follows the scope's KIND (§10.6): `parallel`, `fanOut` and `race` exempt a BRANCH SLOT that answered nothing, while a `conclave` assembles nothing and exempts only a body that produced no value at all, so its record fields answer to the rule like any other recorded value. Measured before it: a conclave body returning a record with an absent field completed, the store wrote the field away, and a replay handed the program a record one key short of the live run's, silently. |
+| 2026-08-19 | A scope's settled value answers to the crossing rule like an effect's result (§4.4, §10.6): a branch whose value has no canonical form is refused at the settle and the scope is recorded as an `L4000` `scope-fault`, while a branch that produced no value is absence and is not put through the rule. Measured before it: the walker and the engine recorded a function and completed, a worker died on a host clone algorithm, and the durable store wrote the function away as `{}` so a resume replayed a value the live run never produced, silently. The load door refuses a record whose `result` carries a value with no canonical form, by name (L5024); a value the store already flattened is canonical and loads. |
+| 2026-08-19 | A version-1 record whose program called `len` on a kind other than an array or a string does not replay (§5.4, §8.4): it completed under the walker that recorded it, answering `undefined`, and the narrowing above refuses it L4016 at that line, before any recorded entry is consumed. Disclosed rather than repaired: §8.4's "the walker remains its replay engine" names which engine serves version `1`, not a freeze of the walker's semantics. |
+| 2026-08-19 | Language version `2`, the compiled engine, alongside version `1`, the tree-walker (§8.4): a step is the engine's own unit and budgets are not comparable across versions (§8.3, §12); `log` is data under version 2 and refuses code (L4016); an engine stamps and compares its own version, so a record binds only under the engine that wrote it (L5008); and a build that dispatches to engines refuses a version none of its engines serves, naming what it does serve, leaving the run untouched (L5023, §11.1). |
+| 2026-08-19 | A binding is a value and answers to the value rule (§10.1): a host refuses a binding that is not crossable at the bind, carrying `L4000` with the dispatch's own kind rather than a code of its own, and a resume refuses a journal whose recorded `external` is not crossable, naming the entry and the field (L5024). Stated as canonical and NOT round-trip-exact, because a store may lose distinctions the canonical form keeps: JSON writes `-0` as `0`. |
+| 2026-08-19 | The same rule reaches a failure's `detail` (§10.1): it is a value the handler chose and the record keeps, so it is refused where it is written and on load, and a failure whose detail is refused is recorded under `L4000` with the reason rather than under the handler's own code with the field quietly missing. Reachable because a program that CATCHES an effect failure still completes, so a successful run can carry a settled failure. |
+| 2026-09-01 | The `ask` schema shorthand is the handler-side reply contract (§6.5): a handler enforcing it refuses a schema it cannot read (L4022) and reports exhausted `attempts` as L4006; the reference simulator enforces it. A journal MAY carry a result bound, refusing an oversized `ok` result ahead of the settling append (L5006, §12), which leaves the reserved list. A host release or refused append inside a scope cancels no sibling and settles nothing (§7.6): the run unwinds with the journal exactly where it was, so a stopped run resumes past the scope instead of replaying a cancellation it never chose. A refused append among a race's settled arms unwinds the run ahead of the winner scan: a race may not settle over an entry the journal refused to record, whichever arm won. |
+| 2026-09-01 | A capability refusal is durable and retryable: a handler's refusal settles the entry `refused` under the handler's code (§10.1), the run unwinds with the uncatchable L5025 and is held (§9.2); a resume on a capable host finds the **refused** verdict (§10.7) and performs the step live (§11.1). A held arm among a race's settled arms unwinds ahead of the winner scan for the same reason a refused append does: a race that completed over it would settle the scope a resume short-circuits, burying the heal it owes (§7.3, §9.2). Two concurrent `turn`s on one handle are serialized at the dispatch (§6.5). A fork's child records its lineage: the run record's `forkedFrom` names the parent and the cut step (§11.3, SPEC.md §14.3). |
+| 2026-09-12 | A host that cannot schedule the run's own process reports that, and not a failed effect (L4025): a pause-plane deadline that elapsed while the process was demonstrably off the CPU is evidence about the host, so the operation is re-entered on the durable pause it already holds and a `sleep` whose deadline passed during the starvation completes LATE, which is what a lower-bound wait promises. The distinction is measured rather than assumed, by event-loop lag across the window AND a shortfall in the ticks that window should have contained, because a wall clock alone cannot separate "the timer did not fire" from "this process never ran". A caller that still cannot be served after a bounded number of consecutive starved attempts fails with L4025 naming the measurement, never hangs; a deadline on a loop that was running, and every failure that is not a client deadline, is unchanged and still `L4000`. |
+| 2026-09-17 | A pause plane that answers LATE is not a failed effect either (L4026): while a step is parked the host issues roughly one plane read per second, each with its own client deadline, so a single slow reply used to end the step and the run under `L4000` with most of its deadline unspent — and the exposure grew with how long the step waited. A deadline-shaped failure on a loop that WAS running is now read as one late reply rather than as a broken plane: the pause is durable and still answerable, so the read is re-issued with bounded exponential backoff and the step settles on the answer it was waiting for. Bounded separately from L4025 and never reset, so neither condition nor any interleaving of them retries forever; after that bound the step fails with L4026 naming the measurement. Every failure that is not a client deadline is unchanged and still `L4000`. |
+| 2026-09-23 | A refusal the language itself raised inside a scope keeps its catalog code in the scope's failure record (§10.1, §10.6, Appendix A): a `RuntimeFault` settles under its own code with kind `runtime`, because `L4000` is the generic code an unclassified failure carries and this one is classified. Measured before it: a `fanOut` with no stable key raised L3021 inside the scope, the program caught `L3021` live, and the settled entry said `L4000` `scope-fault` with the L3021 sentence still inside the message, so every resume replayed `L4000` where the live run had thrown `L3021`. A plain non-`EffectError` throw inside a scope still records `L4000` `scope-fault`, and a handler's `EffectError` still keeps its code and kind. |
+| 2026-09-25 | A divergence inside a scope settles nothing (§7.6, §9.2): it is the journal saying this program is not the one that wrote it, so the scope entry stays pending and the next resume re-enters it and diverges again at the step that broke, instead of replaying a recorded `L4000` `scope-fault` a program's `catch` can swallow. Measured before it: a resume whose edited `sleep` diverged inside a pending `parallel` settled the scope `failed` under `L4000`, a second resume threw the replayed scope-fault rather than the divergence, and inside `try`/`catch` the program caught it and performed a new effect against the journal it had diverged from. A divergence among a race's settled arms unwinds the run ahead of the winner scan for the same reason a refused append and a held arm do (§7.3): a race may not hand back a winner's value over a run-level fault, whichever arm raised it. |
+| 2026-09-27 | An update operator's operand (`x++`, `x--`) must already be a number, on the walker as it already did on the compiled engine (§4.5): a record, a numeric string or null is refused L4018 rather than settled as NaN or silently counted, so `x++`, `x + 1` and `x += 1` agree. A version-1 record whose program incremented or decremented a value other than a number is the second known case of §8.4's replay posture: it completed under the earlier walker and is now refused L4018 at that line, before any recorded entry is consumed. |
+| 2026-10-02 | A host stack exhaustion is uncatchable (§9.2) and is not L4016 (§5.4): the depth at which a host runs out of stack belongs to the host, so a program that caught it chose its next effect by the machine it ran on, and a journal recorded on one host diverged (L5001) on resume on another. It unwinds past `finally` on both engines, and a scope it fails inside settles nothing, cancels no sibling and closes no conclave. Measured before it: a `parallel` branch that overflowed settled the scope `failed` under `L4000` and cancelled its sibling, and on the compiled engine a `finally { throw ... }` replaced the overflow, which an outer `catch` then caught. A `conclave` body that overflowed still closed the room, and a close that failed replaced the overflow with an error the program caught. A `race` whose arm overflowed left its entry pending but still sent every sibling the race's cancellation after the arms settled, which a live handler saw. A `parallel` or `fanOut` whose other branch failed first settled `failed` under `L4000` over a later sibling's overflow, and the program caught it and performed its next effect. |
+| 2026-10-03 | The record and array arguments of the free builtins are checked like `len`'s (§5.4): `keys`, `values`, `entries`, `has` and `merge` take a record, and `map`, `filter`, `find`, `some`, `every`, `sort`, `slice`, `join`, `reverse`, `unique`, `sum`, `pick` and `concat`'s first argument take an array; every other kind is refused L4016 before the host is reached. Measured before it: `map(5, f)` and `keys(5)` answered `[]`, `every(5, f)` answered true, `has(f, "length")` answered true off the implementation's function wrapper, `keys("ab")` answered index strings, `concat("a", [1])` answered `"a1"` past L4018, and `keys(null)` refused with the host's error text. A version-1 record that relied on the host's answer is the third known case of §8.4's replay posture. |
+| 2026-10-05 | A fifth scope, `once` (§7.8): every step under it is dispatched at most once, and a resume that finds one pending opens a hold under a token derived from its recorded request id instead of dispatching it again. An entry may carry `hold` (§10.1). An expired hold fails the step with the catchable L4027, and an effect `once` does not admit is refused with L4028. `once` is a reserved name. |
+| 2026-10-06 | The migrate orphan table has a `waitUntil` row (§11.2): an orphaned `waitUntil` is ignored whether it settled or is still pending, and its recorded observations stay in the journal. The reference migrate check already admitted it, while the table's "any other kind" row required L5015, so an implementation written from the table refused every migration that orphaned a `waitUntil`. |
+| 2026-10-06 | A `conclave` body may not write outside itself (L2032, §7.5, §7.7): `conclave` raises the depth on both engines and the validator walks its body, as it does for `once`. Measured before it: a body that assigned an outer `let` or wrote a field of a record built outside it completed, the live run read the new value, and the resume, which delivers a settled `conclave` from its entry, read the old one and diverged (L5001) at the next effect that took it as input. |
+| 2026-10-06 | The scopes and the three traits in which they differ are one table (§7): what a scope settles, its verdict when a migration orphans it, and whether a fork re-enters it when the cut lies inside it. §2.3, §6.5, §10.1, §10.6, §11.2 and §11.3 cite that table or §6.1 instead of listing or counting kinds, so a new scope is a row in §6.1 and a row in §7. §11.3 refused a cut inside "a scope whose outcome was already decided" without naming those scopes; it now re-enters `parallel`, `fanOut` and `once` and refuses `race` and `conclave` (L5020), as the reference already did, and refuses a cut inside a scope with no row. No behavior changes. |
+| 2026-10-06 | A `conclave` counts toward `effectCeiling` (§8.3): opening one is a dispatch, so it is counted once before its entry begins, and a resume's tally counts its recorded key. Before this a program whose only effect was `conclave` could open any number of them, live or across a resume, without reaching L4009. A resume that re-enters a pending or refused step no longer counts it a second time: its key is already in the tally, and counting it again faulted the resumed run at a step where a fresh run went on. |
+| 2026-10-07 | A value the program throws out of a concurrency scope reaches `catch` as itself on resume, as it does live (§9.1, §10.6): the scope's `L4000` `scope-fault` record carries it as `error.thrown` (§10.1), the live run, a replay and a migration's dry walk (§11.2) all deliver that recorded copy, deep-frozen like a scope's result (§4.3). The copy is the value as JSON reads it back, so a record held at two places in it arrives as two on the live run as on a resume from a durable store, and a resume refuses a loaded `error.thrown` that is not `{ value }` or `{}` (L5024). Measured before it: a `conclave` body that threw `"failure"` was caught as `"failure"` live and as `{ code: "L4000", kind: "scope-fault", message: "failure" }` on resume, on both engines, and a `notify` branching on the caught value diverged (L5001) on the resume of unchanged source. A thrown value with no canonical form is delivered as the record live as well. |
+| 2026-10-18 | A `waitUntil` probe and its `terminal` may not write outside themselves (L2032, §7.7): both engines already call them one level deeper and refuse the write at run time, and the validator now walks them as it walks a `once` body. Measured before it: a probe that assigned an outer `let` or pushed onto an outer array, and a `terminal` that assigned an outer `let`, passed `validate` and then failed with L2032 after the first observation of every run. |
+| 2026-10-20 | Clarification with no change in meaning: §6.1 lists `spawn`'s `cwd` and `placement`, and §6.4 states that each is hashed only when the option bag carries it, `placement` as `{ endpoint, instanceId }`. A spawn that omits both keeps its six-key hash. The reference has hashed this way since lang 0.50.0. |
+| 2026-10-24 | An effect `once` does not admit, called in its body or in a function the body calls by name, is refused by the validator with L2033 (§7.8), and L4028 stays the run's refusal of one the validator could not see. Measured before it: `once(async () => { await sleep("1s") })`, directly and through a named helper, passed `validate` and a hosted start and then failed every run with L4028. |
+| 2026-10-24 | A literal that is not a duration, written where the language reads one, is refused by the validator with L2034 (§4.6). Measured before it: `sleep("5")`, `sleep(5000)`, `sleep("1.5s")`, `sleep("")`, a `checkpoint` `timeout` of `"PT5M"`, a `waitUntil` `every` of `"1.5s"` and `duration("5")` passed `validate` and a hosted start, and each run then failed when it reached the call. |
+| 2026-11-03 | A concurrency scope's value reaches the program as the deep-frozen copy its record carries, live as on resume (§4.3, §10.6), as a thrown value already does (§9.1). Measured before it: a `parallel` branch that returned a record built outside the scope froze that record for the rest of the live run, so a later write raised L2031 live and succeeded on resume, and the effect that depended on it diverged (L5001) on the resume of unchanged source. |
+| 2026-11-03 | An `Error` that fails a concurrency scope is recorded as the `L4000` `host` fault a `catch` binds for it live (§9.1, §10.1, §10.6), so a resume binds the same kind; a refused scope value is recorded the same way. Measured before it: a `parallel` branch returning a function, and a plain throw from a `conclave`'s dispatch, were caught as `{ code: "L4000", kind: "host" }` live and as kind `scope-fault` on resume, on both engines, and a `notify` carrying the kind diverged (L5001) on the resume of unchanged source. A value the program throws is still recorded as `scope-fault`. |
+| 2026-10-30 | `spawn` takes an inline persona, `{ name, prompt, role?, model?, variant?, description?, subscribe?, allowSubscribe?, allowPublish?, capabilities?, save? }`, as its first argument (§6.1). The record is closed and a malformed one is refused before the step key is minted (L3049). The whole definition is hashed as `inline` and a catalog spawn's hash is unchanged (§6.4). The definition and its digest are bound into the entry before submission (§6.5), and a migration hands an adopted seat only to a spawn of the same definition (§11.2). |
+| 2026-11-04 | A client deadline is an instance of the NATS client's `TimeoutError`, not an error that carries that name. The client's request and API deadlines reject that class with no cause. `AbortSignal.timeout` raises a `DOMException` of the same name, and any error can be renamed to it; matching the name retried those and, after the bound, failed the step as L4026. They are not a client deadline, so they fail on the first attempt as `L4000`. |

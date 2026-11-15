@@ -1,0 +1,49 @@
+{
+  "$schema": "https://unpkg.com/@changesets/config@3.1.4/schema.json",
+  "changelog": "@changesets/cli/changelog",
+  "commit": false,
+  "fixed": [
+    [
+      "cotal-ai",
+      "@cotal-ai/core",
+      "@cotal-ai/workspace",
+      "@cotal-ai/lang",
+      "@cotal-ai/seat",
+      "@cotal-ai/runtime",
+      "@cotal-ai/cli",
+      "@cotal-ai/manager",
+      "@cotal-ai/delivery",
+      "@cotal-ai/web",
+      "@cotal-ai/linear",
+      "@cotal-ai/cmux",
+      "@cotal-ai/orca",
+      "@cotal-ai/tmux",
+      "@cotal-ai/herdr",
+      "@cotal-ai/connector-core",
+      "@cotal-ai/connector-claude-code",
+      "@cotal-ai/connector-hermes",
+      "@cotal-ai/connector-jcode",
+      "@cotal-ai/connector-opencode",
+      "@cotal-ai/connector-codex",
+      "@cotal-ai/pi",
+      "@cotal-ai/omp",
+      "@cotal-ai/zellij",
+      "@cotal-ai/auth",
+      "@cotal-ai/registry"
+    ]
+  ],
+  "linked": [],
+  "access": "public",
+  "baseBranch": "main",
+  "snapshot": {
+    "useCalculatedVersion": true
+  },
+  "updateInternalDependencies": "patch",
+  "___experimentalUnsafeOptions_WILL_CHANGE_IN_PATCH": {
+    "onlyUpdatePeerDependentsWhenOutOfRange": true
+  },
+  "ignore": [
+    "@cotal-ai/example-01-lateral-coordination",
+    "@cotal-ai/example-02-self-improving-console"
+  ]
+}

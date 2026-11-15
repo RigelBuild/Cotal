@@ -1,0 +1,3378 @@
+/**
+ * The mesh handler: `packages/lang`'s `EffectHandler` over the real planes.
+ *
+ * The language performs effects through an interface and knows nothing about NATS. The simulator
+ * implements that interface with scripted answers, which is what lets a program be tested without a
+ * broker. This is the other implementation — the one where an effect actually happens — and it is
+ * deliberately thin: everything hard about durability already lives in the planes it calls.
+ *
+ * **The request id IS the durable token.** `ctx.requestId` is `base64url(sha256(runId, stepKey,
+ * inputHash, attempt))`, written onto the pending journal entry BEFORE the handler is called, and
+ * it is a valid `<token>` by construction — same alphabet, 43 characters. So a crashed run that
+ * resumes re-derives the same token and ATTACHES to the pause the crashed attempt recorded instead
+ * of opening a second one. Nothing here remembers anything across a crash, because the identity was
+ * recorded before the work started and the pause itself holds the rest: `mintCheckpoint` is
+ * idempotent only if the ENTIRE spec is identical, and the deadline in it cannot be recomputed from
+ * a clock that has moved, so `arm()` reads the recorded spec rather than doing the arithmetic
+ * again.
+ */
+import { createHash } from "node:crypto";
+import { isAbsolute } from "node:path";
+import { realpathSync } from "node:fs";
+import {
+  mintCheckpoint,
+  heartbeatCheckpoint,
+  resumeCheckpoint,
+  readCheckpointSettle,
+  readCheckpointAnswer,
+  readCheckpointStatus,
+  readCheckpointSpec,
+  reconcileCheckpointSchedule,
+  handleCheckpointFire,
+  eptStreamName,
+  eptSubject,
+  chatStream,
+  waitConsumerName,
+  waitConsumerConfig,
+  isConcreteChannel,
+  assertSafePattern,
+  assertValidChannel,
+  presenceBucket,
+  isPresenceRow,
+  principalKey,
+  liveKvEntries,
+  IncompleteKvScan,
+  openMembersRegistry,
+  openChannelRegistry,
+  openAclRegistry,
+  readAcl,
+  channelInAllow,
+  memberKey,
+  writeChannelConfig,
+  readMember,
+  commitMemberRevision,
+  tombstoneMember,
+  StaleMembershipWrite,
+  runNoticeId,
+  writeRunNotice,
+  actionContext,
+  invokeCommand,
+  invokeRepairingSplit,
+  replyRefusedBeforeEffect,
+  readGoalResult,
+  readGoalStatus,
+  readGoalSpec,
+  readGoalIndex,
+  resolveService,
+  listRunNotices,
+  listRunMigrations,
+  markRunNoticeConsumed,
+  listRunNoticesForRun,
+  readRunRecord,
+  writeRunStatus,
+  EpEnvelopeError,
+  replyTargetUnmapped,
+  unansweredRequest,
+  type ActionContext,
+  type CheckpointRef,
+  type CheckpointSettleFact,
+  type CotalMessage,
+  type EpAttributedReply,
+  type EpCaller,
+  type EpError,
+  type EpErrorCode,
+  type EpVerbTarget,
+  type GoalRef,
+  type GoalResultFact,
+  type Presence,
+  type ResolvedService,
+  type RunAdmissionView,
+  assertAdmittedPublish,
+  assertAdmittedSubscribe,
+  assertNotRevoked,
+  isStreamNotFound,
+} from "@cotal-ai/core";
+import { renderRunContext } from "./run-context.js";
+import { migrationSeats } from "./migrate.js";
+import type { NatsConnection } from "@nats-io/transport-node";
+import type { JetStreamClient, JetStreamManager } from "@nats-io/jetstream";
+import { Kvm, type KV } from "@nats-io/kv";
+import {
+  parseDuration,
+  Cancelled,
+  EffectError,
+  Journal,
+  EffectRefused,
+  askSchemaShape,
+  conformsToAskSchema,
+  type AskFieldKind,
+  type AskRequest,
+  type AgentHandleValue,
+  type CancelSignal,
+  type ChannelHandleValue,
+  type ConclaveRequest,
+  type WaitRequest,
+  type CheckpointRaw,
+  type CheckpointRequest,
+  type EffectContext,
+  type InlineSpawnDefinition,
+  type JournalEntry,
+  type MonitorRequest,
+  type NotifyRequest,
+  type ObserveRequest,
+  type ParticipantRequest,
+  type SleepRequest,
+  type SpawnRequest,
+  type TurnRequest,
+  type TurnResultValue,
+  digest,
+  journalEntryKeyString,
+  stepKeyString,
+} from "@cotal-ai/lang";
+
+import { PauseOverdue, type RunPauseHost } from "./run-pause-host.js";
+import type { RunWaitHost } from "./run-wait-host.js";
+import { loopLag, servedDespiteStarvation, type LoopLagObserver } from "./host-starvation.js";
+import type { RunScopeAuthority } from "./run-scope-authority.js";
+import { askAttemptToken, observeToken, pauseTokens, waitTimeoutToken, waitTimers } from "./pause-tokens.js";
+import { delay } from "./delay.js";
+
+export interface RunMeshServices {
+  readonly pauses: RunPauseHost;
+  readonly waits: RunWaitHost;
+  readonly authority: RunScopeAuthority;
+  /**
+   * The run's ADMISSION (SPEC 14.8), re-read leader-served at every channel effect this handler
+   * performs on its own connection: a conclave's registration and membership writes, checked
+   * AFTER a generated channel name is derived. The wait host holds the same reader for the
+   * channel reads it mediates. A mediated run with no reader admits no channel effect.
+   */
+  readonly admission: () => Promise<RunAdmissionView>;
+  readonly cancellationObserved?: () => string | undefined;
+}
+
+/** Who this handler acts as, and where. All of it is the DRIVER's identity, not the program's. */
+export interface MeshHandlerBinding {
+  readonly space: string;
+  /** The endpoint hosting the driver — the manager daemon. */
+  readonly endpoint: string;
+  /**
+   * WHICH RUN this handler performs for.
+   *
+   * It is here rather than on `EffectContext` because the effect context deliberately
+   * carries the step's identity and nothing about the run: `requestId` already folds the run
+   * in, and a handler that needed to name the run for recovery would be recovering by something
+   * other than the recorded identity. A NOTICE is keyed by its run, though — it is filed onto the
+   * run — so the run is part of what this handler is bound to. A drive is already shaped that way:
+   * the caller hands `drive()` a run id and a handler together.
+   */
+  readonly runId: string;
+  /**
+   * The caller triple this run's durable ACTIONS ride: goal facts key on
+   * `epf.<e>.goal.<owner>.<actor>.<uid>.<goalId>.result`, so the triple that submits a spawn must
+   * be the triple that reads its terminal back after a crash — on any host, at any epoch. It is
+   * therefore RUN-STABLE by contract: derive it from the run id (the run-command derivation), never
+   * from the process identity, or a resumed run polls a subject its own submission never wrote.
+   */
+  readonly caller: EpCaller;
+  readonly instanceId: string;
+  readonly epoch: number;
+  /**
+   * MANDATORY, and the reason is worth keeping next to it: a checkpoint's resume is holder-bound,
+   * so an omitted holder would make the token a BEARER credential resumable by anyone who learns
+   * it (SPEC 13.6/13.10).
+   */
+  readonly holder: { readonly id: string; readonly lifecycleUid: string };
+  /**
+   * The deadline a `checkpoint` gets when the program names no `timeout`.
+   *
+   * MANDATORY, because `mintCheckpoint` requires a future deadline and there is no such thing as a
+   * checkpoint that waits forever on this plane: an unbounded pause is a run that can never be
+   * reconciled, and picking a silent constant here would be this file deciding a pin. It is read
+   * ONLY at the first mint — a resume finds the checkpoint already minted, and the recorded
+   * deadline is the authority from then on, so changing this never moves a pause already taken.
+   */
+  readonly defaultCheckpointTimeout: string;
+}
+
+/**
+ * A checkpoint resumed with no answer to read.
+ *
+ * The settle fact is the arbiter and it NAMES the answer it accepted, so a `resumed` settlement
+ * with no id — or with an id no record answers to — means the token was presented by something
+ * other than the run driver's own `resolveCheckpoint`. There is no honest value to return for it:
+ * the program asked a question, something released the pause, and what was answered is not
+ * recoverable. Returning `resolved` with an empty value would invent one.
+ */
+export class CheckpointAnswerMissing extends Error {
+  constructor(readonly token: string, readonly answerId: string | undefined) {
+    super(
+      `checkpoint "${token}" settled as resumed but ${answerId === undefined
+        ? "its settle fact names no answer"
+        : `no answer record exists under the id ${answerId} it names`}; ` +
+        `a workflow checkpoint is answered through the run driver's resolveCheckpoint, which writes the answer BEFORE presenting the token`,
+    );
+    this.name = "CheckpointAnswerMissing";
+  }
+}
+
+/** How the handler learns that a checkpoint settled. Injected so a test can drive it directly. */
+export interface SettleWatcher {
+  /**
+   * Resolve when this ref's one-use settle fact exists. Called AFTER the mint, so a fact that
+   * already landed — the ordinary case for a run resuming across a crash — must resolve at once
+   * rather than wait for an event that has already happened.
+   */
+  awaitSettle(ref: CheckpointRef): Promise<CheckpointSettleFact>;
+}
+
+/**
+ * The one subject the remaining seam is gated by: `turn` and `wait(replied)` both ride the turn
+ * machinery an agent handle answers through (`spawn`, `conclave`, `ask`, `monitor` and
+ * `wait(down)` perform). Named once so the refusals cannot drift apart.
+ */
+
+export class MeshHandler {
+  constructor(
+    private readonly nc: NatsConnection,
+    private readonly kv: KV,
+    private readonly js: JetStreamClient,
+    private readonly jsm: JetStreamManager,
+    private readonly binding: MeshHandlerBinding,
+    private readonly watcher: SettleWatcher,
+    private readonly clock: () => number = () => Date.now(),
+    private readonly services?: RunMeshServices,
+    /**
+     * How this handler learns whether its own process was scheduled (#1508). Injected so a suite
+     * can drive a starved loop deterministically; the default is the process-wide observer, which
+     * is the only honest source outside a test.
+     */
+    private readonly lag: LoopLagObserver = loopLag(),
+    /**
+     * Where the operator notice for an absorbed starvation goes (#1508). A daemon routes it to its
+     * own log rather than stderr, and a suite counts it: an absorbed starvation is otherwise
+     * INVISIBLE, and a cell asserting "the sleep completed" cannot tell a completion that survived
+     * starvation from one that was never starved at all.
+     */
+    private readonly onStarved: (note: string) => void = (note) => console.error(note),
+  ) {}
+
+  /**
+   * Resolved manager commands, each memoized as a PROMISE so concurrent branches asking for the
+   * same command share one describe round-trip. A failed resolve is dropped, so a manager restart
+   * does not poison later effects. Different commands stay separate and never fetch one another's
+   * contract closures.
+   */
+  private readonly managerServices = new Map<string, Promise<ResolvedService>>();
+  private manager(command: string, instanceId?: string): Promise<ResolvedService> {
+    // #1616 ITEM 3 — PINNED DISPATCH. An explicit placement target resolves through the EXISTING
+    // instance-dispatch API: `resolveService`'s `instanceId` opt becomes
+    // `EpRoute { mode: "inst", instanceId }`, and the handle it returns carries
+    // `pinnedInstanceId` so `invokeCommand` addresses that instance and never the class
+    // queue. It is deliberately NOT served from `managerServices`: those memos hold class-anycast
+    // resolution, and handing a pinned caller the anycast handle would reinstate the exact fallback
+    // this item removes. A wrong, unavailable or replaced instance therefore fails to resolve —
+    // before a child exists — instead of quietly succeeding somewhere else.
+    if (instanceId !== undefined)
+      return resolveService(this.nc, this.binding.space, this.binding.endpoint, this.binding.caller, { instanceId, commands: [command] });
+    let service = this.managerServices.get(command);
+    if (service === undefined) {
+      service = resolveService(this.nc, this.binding.space, this.binding.endpoint, this.binding.caller, { commands: [command] })
+        .catch((e) => {
+          this.managerServices.delete(command);
+          throw e;
+        });
+      this.managerServices.set(command, service);
+    }
+    return service;
+  }
+
+  /** A silent pinned describe before submission is host reachability evidence, not seat death. */
+  private async relayManagerBeforeSubmit(host: string | undefined, command: string, ref: GoalRef, kind: "turn" | "ask" | "checkpoint", label: string): Promise<ResolvedService> {
+    try { return await this.manager(command, host); }
+    catch (err) {
+      if (host !== undefined && unansweredRequest(err) && (await readGoalStatus(await this.actionCtx(), ref)) === undefined)
+        throw new EffectError("L4002", kind, `${label}: placed host ${host} unreachable`);
+      throw err;
+    }
+  }
+
+  /**
+   * One manager call, with a SPEC 13.2 bind refusal REPAIRED rather than raised
+   * ({@link invokeRepairingSplit}).
+   *
+   * A run resolves the manager on the class rail, so in a space with more than one manager its
+   * invoke routinely reaches a member other than the one that answered the describe, and that
+   * member refuses before dispatching. Raised as the effect's own failure, that refusal ends the
+   * run and consumes the run id and its journal (#1638), although it says the command did not run.
+   * The class memo is dropped before each re-describe, so later calls do not start from the bind
+   * that was just refused. After the shared bound the refusal surfaces unchanged; what removes that
+   * residual is addressing one instance, and the run's caller holds no instance-rail grant for a
+   * command its program did not place (SPEC 13.9, `run-driver-grants.ts`).
+   */
+  private async invokeManager(
+    service: ResolvedService,
+    command: string,
+    args: Record<string, unknown> | undefined,
+    opts: { target?: EpVerbTarget; deadlineMs?: number; id?: string },
+  ): Promise<EpAttributedReply> {
+    return invokeRepairingSplit(this.nc, this.binding.space, service, command, args, opts, () => {
+      this.managerServices.delete(command);
+      return this.manager(command);
+    });
+  }
+
+  /**
+   * #1616 item 5 — PHASE A, RESOLVE ON THE HOST THAT WILL LAUNCH. A directory is a fact about one
+   * filesystem, so the only process that can canonicalize it is the manager instance that will
+   * `chdir` into it. This asks the PINNED instance for the canonical form and returns it together
+   * with the identity that answered, so phase B dispatches the resolved path and the journal records
+   * which host resolved it. There is deliberately NO envelope `id`: a resolve binds no goal, takes
+   * no reservation and allocates nothing, so a retry or a crash between the phases costs nothing.
+   *
+   * EVERY failure direction is a REFUSAL. A path the target cannot resolve is not passed through as
+   * the raw string: the raw string would launch somewhere plausible on the manager's own root, which
+   * is the fail-open outcome this repair exists to remove.
+   */
+  private async resolveCwd(req: SpawnRequest, service: ResolvedService, cwd: string, instanceId: string): Promise<CwdResolution> {
+    let reply: EpAttributedReply;
+    try {
+      reply = await invokeCommand(this.nc, this.binding.space, service, "resolve-cwd", { cwd }, {
+        deadlineMs: SPAWN_ACCEPT_DEADLINE_MS,
+      });
+    } catch (err) {
+      // An older manager does not list `resolve-cwd`, and `invokeCommand` refuses an unlisted
+      // command with `not-found` before it publishes anything. That is
+      // the fail-CLOSED direction and it stays closed: a host that cannot answer the question does
+      // not get handed the caller's guess.
+      throw cwdResolutionRefusal(req.persona, instanceId, cwd,
+        err instanceof EpEnvelopeError && err.code === "not-found"
+          ? `this manager serves no resolve-cwd command, so it can state no canonical form (${err.message})`
+          : String((err as Error)?.message ?? err));
+    }
+    if (reply.reply.ok === false)
+      throw cwdResolutionRefusal(req.persona, instanceId, cwd, reply.reply.error.message);
+    const data = reply.reply.data as { cwd?: unknown; host?: unknown } | undefined;
+    if (typeof data?.cwd !== "string" || data.cwd.length === 0 || !isAbsolute(data.cwd))
+      throw cwdResolutionRefusal(req.persona, instanceId, cwd,
+        `the reply names no absolute directory (${JSON.stringify(data?.cwd)})`);
+    // The AUTHORITATIVE identity is the one that answered, off the attributed reply's subject, not
+    // the one the caller asked for: the pinned resolve already rejects a reply from another
+    // instance, so recording the responder is recording what was checked.
+    return {
+      cwd: data.cwd,
+      endpoint: reply.responder.endpoint,
+      instanceId: reply.responder.instanceId,
+      ...(typeof data.host === "string" ? { host: data.host } : {}),
+    };
+  }
+
+  /** The branded goal-fact context over this handler's own connection, memoized the same way. */
+  private actions: Promise<ActionContext> | undefined;
+  private actionCtx(): Promise<ActionContext> {
+    this.actions ??= actionContext(this.nc, this.binding.space).catch((e) => {
+      this.actions = undefined;
+      throw e;
+    });
+    return this.actions;
+  }
+
+  // The three registries a conclave touches, memoized like the service resolves above. All three
+  // are OPENED, never created: the provisioner pre-creates them at `cotal up` (auth mode) and the
+  // endpoints create presence/channels lazily in open mode — a mesh where one is genuinely absent
+  // was never provisioned for durable membership, and that fails loud rather than self-provisions.
+  private presenceKvOpen: Promise<KV> | undefined;
+  private presenceRegistry(): Promise<KV> {
+    this.presenceKvOpen ??= new Kvm(this.nc).open(presenceBucket(this.binding.space)).catch((e) => {
+      this.presenceKvOpen = undefined;
+      throw e;
+    });
+    return this.presenceKvOpen;
+  }
+
+  private membersKvOpen: Promise<KV> | undefined;
+  private membersRegistry(): Promise<KV> {
+    this.membersKvOpen ??= openMembersRegistry(this.nc, this.binding.space).catch((e) => {
+      this.membersKvOpen = undefined;
+      throw e;
+    });
+    return this.membersKvOpen;
+  }
+
+  private channelsKvOpen: Promise<KV> | undefined;
+  private channelRegistry(): Promise<KV> {
+    this.channelsKvOpen ??= openChannelRegistry(this.nc, this.binding.space).catch((e) => {
+      this.channelsKvOpen = undefined;
+      throw e;
+    });
+    return this.channelsKvOpen;
+  }
+
+  /** The lifecycle read-ACL registry a conclave's membership write is fenced on (#4995). Opened,
+   *  never created. A mesh without one (open mode) records no read ACLs, so there is nothing to
+   *  fence on and the write proceeds as before: opening a bucket is lazy, so its absence is found
+   *  by the first read, which marks the registry absent here. Any other failure stays loud. */
+  private aclKvOpen: Promise<KV | undefined> | undefined;
+  private aclRegistry(): Promise<KV | undefined> {
+    this.aclKvOpen ??= openAclRegistry(this.nc, this.binding.space).then((kv) => kv, (e: unknown) => {
+      if (isStreamNotFound(e)) return undefined;
+      this.aclKvOpen = undefined;
+      throw e;
+    });
+    return this.aclKvOpen;
+  }
+
+  /** Whether the member lifecycle's exact read-ACL row allows `channel` now; true when the space has
+   *  no ACL registry at all (open mode), which the read is the first to find out. */
+  private async memberAclAllows(aclKv: KV, m: { principal: string; uid: string }, channel: string): Promise<boolean> {
+    let row: Awaited<ReturnType<typeof readAcl>>;
+    try {
+      row = await readAcl(aclKv, m.principal, m.uid);
+    } catch (e) {
+      if (!isStreamNotFound(e)) throw e;
+      this.aclKvOpen = Promise.resolve(undefined);
+      return true;
+    }
+    return row !== undefined && channelInAllow(row.record.allowSubscribe, channel);
+  }
+
+  /** The post-write half of the conclave's ACL fence: keep the row just written (at `revision`) only
+   *  on proof the member's ACL row still allows the channel. A row the ACL proves disallowed goes by
+   *  its exact key, whoever wrote its latest revision. When the read fails nothing is proven, so only
+   *  this write is taken back (a later revision belongs to another writer) and the failure is thrown. */
+  private async keepMemberRowIfAclAllows(aclKv: KV, membersKv: KV, m: { principal: string; uid: string }, channel: string, revision: number): Promise<void> {
+    let allowed: boolean | undefined;
+    let readFailure: unknown;
+    try { allowed = await this.memberAclAllows(aclKv, m, channel); } catch (e) { readFailure = e; }
+    if (allowed === true) return;
+    const key = memberKey(channel, m.principal, m.uid);
+    if (allowed === false) { await membersKv.purge(key); return; }
+    try { await membersKv.purge(key, { previousSeq: revision }); } catch { /* a later write replaced it: that write's row */ }
+    throw new Error(`conclave ${channel}: the read ACL of member ${m.principal} (lifecycle ${m.uid}) could not be re-read after its row was written; the write was taken back`, { cause: readFailure });
+  }
+
+  /** The chat stream's current last sequence — a conclave join/leave cursor (SPEC §7 interval). */
+  private async chatFrontier(): Promise<number> {
+    return (await this.jsm.streams.info(chatStream(this.binding.space))).state.last_seq;
+  }
+
+  /** The open conclaves this process performed, keyed by the scope's request id, so the close that
+   *  follows the body reads the SAME plan the open executed. A crash loses the map and loses
+   *  nothing: the plan was bound as the entry's external state before a single row was written,
+   *  and a re-entered open repopulates the map from `ctx.resume`. */
+  private readonly conclaves = new Map<string, ConclavePlan>();
+
+  /** The run's roster: every agent this run spawned, by name — the handle a handoff resolves to,
+   *  the owner/actor address a `turn` targets (absent when the spawn's acceptance floor was
+   *  never served; a `turn` on such an agent refuses loudly rather than guessing an address), and
+   *  the spawn goal whose terminal names the manager that allocated it, and, for a placed spawn,
+   *  the `host` instance it was placed on, which is where its turns are addressed.
+   *  Seeded live by `spawn`, rebuilt at adoption from the journal's settled spawn entries. */
+  private readonly roster = new Map<string, { handle: AgentHandleValue; owner?: string; actor?: string; uid: string; goalId?: string; permits?: AgentPermits; spawnedAt?: number; host?: string }>();
+  /** Turns this run has dispatched per handle composite, live and seeded — what a `turns` permit is spent against. */
+  private readonly turnsTaken = new Map<string, number>();
+  /** Handle composites a `monitor` registered, live and seeded — what makes `down(agent)` observable. */
+  private readonly monitored = new Set<string>();
+
+  /** The most recent unhonored handoff yield per SCOPE (lang §5.3): the goal-chain linkage memo.
+   *  `"ambiguous"` when two pending handoffs in one scope named the same agent — ambiguity records
+   *  no linkage at all. Spent (deleted) by the next `turn` in the scope, honored or not: honoring
+   *  is immediate-only. Rebuilt at adoption by replaying the same two rules over the journal. */
+  private readonly handoffMemos = new Map<string, { to: string; fromGoalId: string } | "ambiguous">();
+
+  /** This run's turn goals per handle composite ("name#uid") — the observable `wait(replied)`
+   *  rides. Fed by `turn` at submission and adoption, reseeded from journal turn entries. */
+  private readonly turnGoals = new Map<string, Set<string>>();
+
+  /** The last agent this run spawned into each logical worktree — what the L4008 guard reads.
+   *  Fed by `spawn` and reseeded from journal spawn results at adoption. */
+  private readonly worktreeHolders = new Map<string, WorktreeHolder>();
+
+  /** Seats a committed migration handed to this program under `--adopt`, keyed by persona and
+   *  handed out in journal order: the next `spawn` of that persona receives the recorded seat
+   *  instead of minting one. Fed by {@link adoptMigratedSeats}; spent by `spawn`. */
+  private readonly adoptable = new Map<string, JournalEntry[]>();
+
+  now(): number {
+    return this.clock();
+  }
+
+  /**
+   * WHAT to repair when this process takes a run over. The driver decides WHEN and calls this.
+   *
+   * It is a method rather than an optional hook the host wires: an adopted run whose timers stay
+   * armed at the predecessor's coordinates fires where nobody listens, and the object that knows how
+   * to re-arm is the one the driver already holds.
+   *
+   * Failures are raised, not swallowed: a driver holding a run whose pauses it could not re-arm
+   * cannot advance it.
+   */
+  async adopted(entries: readonly JournalEntry[]): Promise<string[]> {
+    const folded = foldEntries(this.services ? await this.services.authority.journal() : entries);
+    this.seedRunMemos(folded);
+    if (this.services) return [...await this.services.pauses.rearm()];
+    return await rearmOutstandingPauses(
+      { kv: this.kv, js: this.js, jsm: this.jsm },
+      this.binding,
+      folded,
+    );
+  }
+
+  /**
+   * Hand this program the seats a committed migration kept for it under `--adopt` (spec §11.2).
+   * The orphaned spawn's settled entry is the whole hand-over: the next `spawn` of its persona
+   * returns that entry's handle, binds that entry's floor, and submits nothing, so the seat keeps
+   * its identity, its worktree and its turn history across the edit. Called by the driver on the
+   * migrated run before the program runs; a map with no entry for a persona changes nothing.
+   */
+  async restoreMigratedSeats(entries: readonly JournalEntry[]): Promise<void> {
+    const source = this.services ? await this.services.authority.journal() : entries;
+    const kept = new Map<string, JournalEntry[]>();
+    for (const migration of await listRunMigrations(this.kv, this.binding.endpoint, this.binding.runId)) {
+      if (migration.applied === undefined) continue;
+      for (const [persona, seats] of migrationSeats(source, migration.spec).adopt)
+        kept.set(persona, [...(kept.get(persona) ?? []), ...seats]);
+    }
+    if (kept.size > 0) this.adoptMigratedSeats(kept);
+  }
+
+  adoptMigratedSeats(seats: ReadonlyMap<string, readonly JournalEntry[]>): void {
+    for (const [persona, entries] of seats)
+      this.adoptable.set(persona, [...(this.adoptable.get(persona) ?? []), ...entries]);
+  }
+
+  /**
+   * Rebuild the in-memory run memos an adopted run needs to keep performing `turn`: the roster
+   * (from every settled ok `spawn`, its result the handle and its bound floor the address), the
+   * worktree holders (a settled spawn holds its tree by identity, a spawn still in flight by the
+   * reservation its bound request took) and the handoff memos (replaying, in journal order, the
+   * same two rules the live path applies — a turn's begin spends its scope's memo, a settled
+   * handoff yield writes one, a second pending handoff to the same name in one scope makes it
+   * ambiguous). Deterministic from the journal alone.
+   */
+  private seedRunMemos(entries: readonly JournalEntry[]): void {
+    for (const e of entries) {
+      if (e.kind === "participant" && e.state === "settled" && e.status === "ok" && e.result !== undefined) {
+        const handle = e.result as AgentHandleValue;
+        if (handle.kind !== "participant" || typeof handle.agent !== "string") continue;
+        const { name, uid } = parseAgentHandle(handle.agent);
+        const ext = e.external as { owner?: unknown; actor?: unknown; uid?: unknown; name?: unknown; host?: unknown } | undefined;
+        if (ext?.uid !== uid || ext?.name !== name || typeof ext.owner !== "string" || typeof ext.actor !== "string") continue;
+        this.roster.set(name, { handle, owner: ext.owner, actor: ext.actor, uid,
+          ...(typeof ext.host === "string" ? { host: ext.host } : {}) });
+        continue;
+      }
+      if (e.kind === "spawn" && e.state === "pending") {
+        const x = e.external as { goalId?: unknown; worktree?: unknown } | undefined;
+        if (typeof x?.goalId === "string" && typeof x?.worktree === "string")
+          this.worktreeHolders.set(x.worktree, { pending: x.goalId });
+        continue;
+      }
+      if (e.kind === "spawn" && e.state === "settled" && e.status === "ok" && e.result !== undefined) {
+        const handle = e.result as AgentHandleValue;
+        if (typeof handle.agent !== "string") continue; // a garbled result seeds nothing; the turn that needs it refuses loudly
+        const { name, uid } = parseAgentHandle(handle.agent);
+        const ext = e.external as { goalId?: unknown; owner?: unknown; actor?: unknown; permits?: unknown; spawnedAt?: unknown; host?: unknown } | undefined;
+        this.roster.set(name, {
+          handle,
+          uid,
+          ...(typeof ext?.goalId === "string" ? { goalId: ext.goalId } : {}),
+          ...(typeof ext?.owner === "string" ? { owner: ext.owner } : {}),
+          ...(typeof ext?.actor === "string" ? { actor: ext.actor } : {}),
+          ...(ext?.permits !== undefined ? { permits: readPermits(ext.permits, handle.persona) } : {}),
+          ...(typeof ext?.spawnedAt === "number" ? { spawnedAt: ext.spawnedAt } : {}),
+          ...(typeof ext?.host === "string" ? { host: ext.host } : {}),
+        });
+        if (typeof handle.worktree === "string") this.worktreeHolders.set(handle.worktree, { name, uid });
+        continue;
+      }
+      if (e.kind === "monitor" && e.state === "settled" && e.status === "ok") {
+        const m = e.external as { agent?: unknown } | undefined;
+        if (typeof m?.agent === "string") this.monitored.add(m.agent);
+        continue;
+      }
+      if (e.kind !== "turn") continue;
+      const x = e.external as { name?: unknown; uid?: unknown; goalId?: unknown } | undefined;
+      // Every relayed turn spent one of its agent's turns, whatever it came to.
+      if (typeof x?.name === "string" && typeof x?.uid === "string")
+        this.turnsTaken.set(`${x.name}#${x.uid}`, (this.turnsTaken.get(`${x.name}#${x.uid}`) ?? 0) + 1);
+      if (typeof x?.name === "string" && typeof x?.uid === "string" && typeof x?.goalId === "string" && (e.state === "pending" || e.status === "ok"))
+        this.recordTurnGoal(`${x.name}#${x.uid}`, x.goalId);
+      this.handoffMemos.delete(e.scope); // its begin spent whatever was pending, honored or not
+      if (e.state !== "settled" || e.status !== "ok" || e.result === undefined) continue;
+      const r = e.result as TurnResultValue;
+      if (r.status !== "handoff" || r.to === undefined || typeof r.to.agent !== "string") continue;
+      this.recordHandoffMemo(e.scope, parseAgentHandle(r.to.agent).name, e.requestId ?? "");
+    }
+  }
+
+  /**
+   * The runtime half of "two agents MUST NOT share a worktree concurrently" (spec 6.5; the
+   * validator owns the literal case as L3022). The registry records who holds each logical
+   * worktree this run spawned into — the live seat, or the spawn still bringing one up — and a
+   * new spawn CLAIMS the tree here before anything is submitted: a tree nobody holds is taken in
+   * the same synchronous step that read it, so two branches spawning into one computed id cannot
+   * both pass; a tree held by a spawn in flight refuses; a tree held by a seat is admitted only
+   * when that holder is no longer live on presence, and re-read after the liveness wait, because
+   * a sibling may have claimed it meanwhile. Sequential reuse is legal, concurrency is data loss.
+   * The liveness read is the same witness `wait(down)` and a conclave join use, so "still
+   * holding" and "down" are one definition — a discharged loser or a crashed seat releases its
+   * tree the moment its presence row is gone, with no bookkeeping of its own.
+   */
+  private async claimWorktree(worktree: string, persona: string, goalId: string): Promise<void> {
+    const holder = this.worktreeHolders.get(worktree);
+    if (holder === undefined) {
+      this.worktreeHolders.set(worktree, { pending: goalId });
+      return;
+    }
+    if ("pending" in holder)
+      throw new EffectError(
+        "L4008", "worktree",
+        `spawn(${persona}) would put a second agent into the worktree "${worktree}" while spawn goal ${holder.pending} is still bringing one up in it; two agents MUST NOT share a worktree concurrently (L3022/L4008)`,
+      );
+    let rows: readonly Presence[];
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        rows = await this.presenceRows();
+        break;
+      } catch (e) {
+        // A scan that keeps coming back incomplete is a broken presence plane, and a guard that
+        // never answers would park the spawn for good: bounded, then the scan's own error.
+        if (!(e instanceof IncompleteKvScan) || attempt >= WORKTREE_SCAN_ATTEMPTS) throw e;
+        await delay(WAIT_POLL_MS);
+      }
+    }
+    if (rows.some((p) => p.card.name === holder.name && p.lifecycleUid === holder.uid))
+      throw new EffectError(
+        "L4008", "worktree",
+        `spawn(${persona}) would put a second agent into the worktree "${worktree}" while ${holder.name}#${holder.uid} is live in it; two agents MUST NOT share a worktree concurrently (L3022/L4008)`,
+      );
+    const now = this.worktreeHolders.get(worktree);
+    if (now !== undefined && now !== holder)
+      throw new EffectError(
+        "L4008", "worktree",
+        `spawn(${persona}) would put a second agent into the worktree "${worktree}", which ${"pending" in now ? `spawn goal ${now.pending}` : `${now.name}#${now.uid}`} claimed while this spawn read its previous holder's liveness; two agents MUST NOT share a worktree concurrently (L3022/L4008)`,
+      );
+    this.worktreeHolders.set(worktree, { pending: goalId });
+  }
+
+  /** One turn goal registered under its handle composite — what `wait(replied)` observes. */
+  private recordTurnGoal(handle: string, goalId: string): void {
+    const set = this.turnGoals.get(handle);
+    if (set === undefined) this.turnGoals.set(handle, new Set([goalId]));
+    else set.add(goalId);
+  }
+
+  /** One handoff yield's memo write: most-recent-wins across different names, ambiguous when a
+   *  pending handoff to the SAME name is already waiting (lang §5.3 — ambiguity records nothing). */
+  private recordHandoffMemo(scope: string, to: string, fromGoalId: string): void {
+    const prev = this.handoffMemos.get(scope);
+    this.handoffMemos.set(scope, prev !== undefined && (prev === "ambiguous" || prev.to === to) ? "ambiguous" : { to, fromGoalId });
+  }
+
+  /**
+   * Despawn the seats of a run that completed (the driver's `releaseSeats` is the caller). On the
+   * mediated path the run's own journal decides which seats those are, never the entries handed in.
+   */
+  async release(entries: readonly JournalEntry[]): Promise<void> {
+    const owed = this.services ? await this.services.authority.releaseEntries() : entries;
+    for (const e of owed)
+      if (e.kind === "spawn" && e.requestId !== undefined) await this.dischargeSpawn(e);
+  }
+
+  /**
+   * End the external state of a cancelled scope's LOSERS: the world half of the discharge the
+   * scope entry's `cancel.issued` records (§7.6, and the driver's `dischargeCancellations` is the
+   * caller). The entries handed in are the losers' subtrees; what has external state to end is the
+   * three pause kinds — a pause's timer is claimed so its armed schedule cannot fire into a run
+   * that moved on, and a wait's durable consumer is deleted because a cancelled wait replays as
+   * cancelled and nothing will ever read its position.
+   *
+   * IDEMPOTENT BY THE PLANE: `cancelTimer` declines a pause that is not waiting, the consumer
+   * delete tolerates one already gone, and both tolerate a loser that cleaned up after itself on
+   * the live path — this is the durable backstop for the process that died before its own cleanup
+   * landed, and the flip to `issued: true` happens only after it returns.
+   */
+  async discharge(entries: readonly JournalEntry[]): Promise<void> {
+    const owed = this.services ? await this.services.authority.cleanupEntries() : entries;
+    for (const e of owed) {
+      if (e.requestId === undefined) continue;
+      await this.endPause(e);
+      // A relay to a seat rides its step's pause token (a turn's goal, an ask's attempt, an
+      // escalation), and a decision the run withdrew must not reach the seat afterwards.
+      if (e.kind === "turn" || e.kind === "ask" || e.kind === "checkpoint")
+        for (const token of pauseTokens(e)) await this.withdrawRelay(token);
+      if (e.kind === "spawn") {
+        await this.dischargeSpawn(e);
+        continue;
+      }
+      if (e.kind === "conclave") {
+        await this.dischargeConclave(e);
+        continue;
+      }
+      if (e.kind === "notify") {
+        await this.dischargeNotify(e);
+        continue;
+      }
+      if (e.kind === "turn") {
+        // A cancelled turn is never a reply, whatever the seat yields to the relay later.
+        const x = e.external as { name?: unknown; uid?: unknown; goalId?: unknown } | undefined;
+        if (typeof x?.name === "string" && typeof x?.uid === "string" && typeof x?.goalId === "string")
+          this.turnGoals.get(`${x.name}#${x.uid}`)?.delete(x.goalId);
+      }
+    }
+  }
+
+  /**
+   * End the pauses a step armed: claim every token {@link pauseTokens} says it owns and, for a
+   * `wait`, close its consumer. A cancelled loser's discharge calls it, and so does a hold before
+   * its first bind (spec/cotal-lang.md §7.8), which claims the held step's open attempt. The relay
+   * an `ask` attempt rode is the discharge's to withdraw, not this.
+   */
+  async endPause(e: JournalEntry): Promise<void> {
+    if (e.requestId === undefined) return;
+    for (const token of pauseTokens(e)) await this.cancelTimer({ endpoint: this.binding.endpoint, token });
+    if (e.kind !== "wait") return;
+    if (this.services) {
+      await this.services.waits.close(e.requestId);
+      return;
+    }
+    try {
+      await this.jsm.consumers.delete(chatStream(this.binding.space), waitConsumerName(e.requestId));
+    } catch { /* never created, or already deleted — nothing is held either way */ }
+  }
+
+  /**
+   * Withdraw a cancelled `notify`'s undelivered notices.
+   *
+   * A notice is world state exactly as a live seat or an armed timer is: it sits on the run
+   * waiting to be rendered ahead of its addressee's next turn. A branch the run cancelled decided
+   * nothing, and a decision the run withdrew must not arrive at an agent afterwards — which is
+   * what happened, because the discharge released seats, memberships and timers and walked past
+   * this one kind.
+   *
+   * Withdrawn is spelled as CONSUMED, by the discharge rather than by a turn. The notice's status
+   * is a closed record with one meaning — this notice will not be delivered again — and that is
+   * the fact being recorded; `by` says which cancelled step withdrew it, so a reader tracing a
+   * notice finds the withdrawal instead of a delivery that never happened. It also puts the
+   * migration verdict where it belongs: an orphaned `notify` is rejected only while its notice is
+   * still owed to somebody, and this one is not owed to anybody any more.
+   *
+   * IDEMPOTENT BY THE PLANE, like the rest of the discharge: the consumption write is create-only,
+   * so a notice a turn already carried, or that an earlier discharge pass already withdrew, is
+   * left exactly as it is.
+   */
+  private async dischargeNotify(e: JournalEntry): Promise<void> {
+    const step = journalEntryKeyString(e);
+    const notices = await listRunNoticesForRun(this.kv, this.binding.endpoint, this.binding.runId);
+    for (const n of notices) {
+      if (n.spec.step !== step || n.consumed !== undefined) continue;
+      try {
+        await markRunNoticeConsumed(
+          this.kv, this.binding.endpoint, this.binding.runId,
+          n.spec.addressee, n.noticeId, `discharge:${step}`, this.now(),
+        );
+      } catch (err) {
+        // A turn carried it between the read and the write: the create-only status is the arbiter
+        // and it has spoken. Anything else is the store, and a discharge that could not finish
+        // must not be flipped to `issued`.
+        if (!(err instanceof EpEnvelopeError && err.code === "conflict")) throw err;
+      }
+    }
+  }
+
+  /**
+   * Release a cancelled spawn's AGENT (§8.6.4): the world half a loser `spawn` leaves behind is a
+   * seat the run will never address, so the discharge despawns it. The goal's identity re-derives
+   * from the entry alone — the request id IS the goalId (the pinned envelope id) unless the entry
+   * bound another (an adopted seat's), and the caller triple is run-stable — so a crash before the
+   * acceptance was even bound still finds its goal.
+   *
+   * The terminal is what says whether a seat exists. No goal at all: the submission never landed,
+   * nothing to release. Accepted but not terminal: the manager owes a terminal within the accepted
+   * readiness window, so this waits it out (bounded by the recorded window plus one poll of slack)
+   * and THROWS if none lands — an unfinished discharge must not be flipped to `issued`, and the
+   * driver's next sweep retries idempotently. `succeeded` and `uncertain` both despawn (an
+   * uncertain readiness verdict leaves the process running); `failed` was reaped by the manager
+   * and `cancelled` means a despawn already drove the teardown, so both are already released.
+   */
+  private async dischargeSpawn(e: JournalEntry): Promise<void> {
+    // The bound goal when the entry carries one (a spawn a migration handed a seat binds the
+    // ORPHANED spawn's goal, under which its terminal and its seat live); the request id otherwise.
+    const goalId = typeof e.external?.goalId === "string" ? e.external.goalId : e.requestId as string;
+    const ref: GoalRef = { endpoint: this.binding.endpoint, caller: this.binding.caller, goalId };
+    const actx = await this.actionCtx();
+    let fact = await readGoalResult(actx, ref);
+    if (fact === undefined) {
+      if ((await readGoalStatus(actx, ref)) === undefined) return;
+      const window = typeof e.external?.readinessDeadlineMs === "number" ? e.external.readinessDeadlineMs : DISCHARGE_TERMINAL_BOUND_MS;
+      const deadline = this.now() + window + GOAL_POLL_MS;
+      for (;;) {
+        fact = await readGoalResult(actx, ref);
+        if (fact !== undefined) break;
+        if (this.now() >= deadline)
+          throw new Error(`the spawn goal "${goalId}" is accepted but reached no terminal within its ${window}ms readiness window; its agent cannot be released yet, and the discharge stays open to retry`);
+        await delay(GOAL_POLL_MS);
+      }
+    }
+    if (fact.state !== "succeeded" && fact.state !== "uncertain") return;
+    const target = spawnDespawnTarget(e.external, fact);
+    if (target === undefined) {
+      // An `uncertain` terminal carries no identity, and this entry bound none (the crash landed
+      // between the acceptance and the bind). The seat — if one came up — is not addressable from
+      // here, and no retry will ever learn more, so throwing would wedge every future sweep of
+      // this run behind an answer that cannot arrive. Name the leak for the operator instead.
+      console.error(`! discharge: the spawn goal "${goalId}" settled ${fact.state} with no readable agent identity; if its seat is up it must be despawned by hand (\`cotal ps\`)`);
+      return;
+    }
+    // The manager that committed the terminal allocated the seat, and a manager's target resolver
+    // knows only its own seats: any other member answers `expired` for this one while it runs. So a
+    // miss says "already gone" only from the allocator. One from another member is re-issued on the
+    // class rail, and so is a split refusal `invokeManager` gave up repairing, since it states that
+    // nothing ran. A bounded run of them leaves the discharge open rather than claiming it gone.
+    const allocator = fact.committer?.instanceId;
+    for (let attempt = 0; ; attempt += 1) {
+      const reply = await this.invokeManager(await this.manager("despawn"), "despawn", { graceful: true }, {
+        target: { mode: "owner", ...target },
+        deadlineMs: SPAWN_ACCEPT_DEADLINE_MS,
+      });
+      // Tolerated refusals are the two "already gone" shapes: `not-found` (no such agent), and
+      // `expired` (the target's lifecycle mapping is gone or rotated — this despawn pins one
+      // incarnation, and an incarnation the mapping no longer names is not running).
+      if (reply.reply.ok) return;
+      const code = reply.reply.error.code;
+      const unrun = replyRefusedBeforeEffect(reply.reply.error);
+      if (!unrun && code !== "not-found" && code !== "expired")
+        throw new Error(`the spawn's agent could not be despawned: ${reply.reply.error.message}`);
+      if (!unrun && (allocator === undefined || reply.responder.instanceId === allocator)) return;
+      if (attempt === MANAGER_ROUTE_ATTEMPTS)
+        throw new Error(`the spawn goal "${goalId}" was allocated by manager instance ${allocator ?? "(unrecorded)"}, but none of ${attempt + 1} despawns was answered by it, and neither another manager's miss nor a refusal that ran nothing means it is gone; the discharge stays open to retry`);
+      this.managerServices.delete("despawn");
+    }
+  }
+
+  /**
+   * Release a cancelled conclave's MEMBERSHIP (spec §7.5): a cancelled body performs no new
+   * effect, so it never closed its room, and the release travels this recovery path like every
+   * other branch-local resource. The entry's own `closed` fact is the gate — a conclave whose
+   * body failed but whose close acknowledged holds nothing. An entry with no bound plan created
+   * nothing (rows are written only after the bind), so there is nothing to release and no retry
+   * that could learn more. Failures are raised: an unfinished release must not be flipped to
+   * `issued`, and the driver's next sweep retries idempotently.
+   */
+  private async dischargeConclave(e: JournalEntry): Promise<void> {
+    if (e.closed === true) return;
+    const plan = e.external;
+    if (!isConclavePlan(plan)) return;
+    assertConclaveOwnership(plan, e.requestId!);
+    await this.releaseConclave(plan);
+    this.conclaves.delete(e.requestId as string);
+  }
+
+  /**
+   * `sleep` is a checkpoint nobody answers.
+   *
+   * There is no separate timer plane and there should not be one: a durable pause with a deadline,
+   * a token that survives a crash, and a one-use settle is exactly what the checkpoint plane is,
+   * and a second mechanism would be a second thing to get wrong. The difference is only that no
+   * `resolveCheckpoint` will ever arrive for this token, so the timer's expiry is the whole story
+   * and `null` is the whole answer.
+   */
+  async sleep(req: SleepRequest, ctx: EffectContext): Promise<null> {
+    if (ctx.signal.cancelled) throw new Cancelled(ctx.signal.reason ?? "cancelled");
+    const ref: CheckpointRef = { endpoint: this.binding.endpoint, token: ctx.requestId };
+    const now = this.now();
+    const deadline = now + parseDuration(req.duration);
+
+    // The record is durable BEFORE the timer exists, and the MINT is what asks for the timer —
+    // this handler never emits its own schedule request. That is not tidiness: mint re-emits at
+    // the status's CURRENT authoritative generation, so a replay repairs the crash-before-arm
+    // window without rolling a heartbeat-advanced deadline back to the one this caller computed.
+    // A request emitted from here would carry the caller's coordinates and could arm a stale
+    // generation the writer would then have to be trusted to ignore.
+    try {
+      await this.arm(ref, deadline);
+    } catch (error) {
+      // Only a relative sleep has finished when its authorized first arm finds no pause
+      // and its duration has already elapsed. Existing pauses still settle on their facts.
+      if (!(error instanceof PauseOverdue)) throw error;
+      if (ctx.signal.cancelled) throw new Cancelled(ctx.signal.reason ?? "cancelled");
+      return null;
+    }
+
+    await this.settle(ref, ctx.signal);
+    return null;
+  }
+
+  /**
+   * `waitUntil`'s cadence, as a durable pause nobody answers.
+   *
+   * THE SAME PLANE AS `sleep`, for the reason `sleep` gives for reusing the checkpoint plane: a
+   * durable pause with a deadline, a token that survives a crash and a one-use settle is what this
+   * needs, and a second timer mechanism would be a second thing to get wrong. What differs is that
+   * a `waitUntil` parks MANY times under one step, so each observation's pause takes its own
+   * DERIVED token (`observeToken`), exactly as an ask's re-attempts and a wait's second deadline do.
+   * Deriving rather than remembering is what makes it recoverable: a resumed run re-derives the
+   * same token from the request id and the attempt index, and re-attaches to the pause the crashed
+   * attempt armed instead of arming a second one.
+   *
+   * THIS HANDLER NEVER OBSERVES ANYTHING. The probe is the program's and the interpreter calls it;
+   * all that happens here is the waiting. So there is nothing to bind and nothing to read back:
+   * the observations are the journal's, written by the interpreter, and this returns only whether
+   * there was time left.
+   */
+  async observe(req: ObserveRequest, ctx: EffectContext): Promise<boolean> {
+    if (ctx.signal.cancelled) throw new Cancelled(ctx.signal.reason ?? "cancelled");
+    // OUT OF TIME IS ANSWERED BEFORE ANYTHING IS ARMED. A pause armed at an instant that has
+    // already passed is a timer that fires immediately and a record nobody needs, and the caller's
+    // next act on `false` is to fail the step.
+    if (this.now() >= req.deadlineAt) return false;
+    // ATTEMPT 0 LOOKS IMMEDIATELY: a wait that sleeps before it has ever looked cannot notice a
+    // predicate that already holds, and "are the checks finished" is often already true.
+    if (req.attempt === 0) return true;
+
+    // The cadence, CLAMPED to the deadline. Parking past it would hold the run beyond the instant
+    // the program said to give up at, and then report a lateness the wait never agreed to.
+    const wake = Math.min(this.now() + parseDuration(req.every), req.deadlineAt);
+    const ref: CheckpointRef = {
+      endpoint: this.binding.endpoint,
+      token: observeToken(ctx.requestId, req.attempt),
+    };
+    if (!(await this.armUnlessDue(ref, wake, ctx.signal))) await this.settle(ref, ctx.signal);
+    // Re-read the clock rather than trusting the arithmetic: the pause may have been settled by a
+    // heartbeat-advanced deadline or by this host being away, and what decides whether there is
+    // still time is where the clock actually is now.
+    return this.now() < req.deadlineAt;
+  }
+
+  /**
+   * `checkpoint` is the same durable pause with somebody expected to answer it.
+   *
+   * The mint is identical to `sleep`'s — one token, one deadline, one settle fact — and everything
+   * that differs is on the ANSWER side, which is deliberately not this handler's to arrange: the
+   * run driver's `resolveCheckpoint` writes the answer record and presents the token, because the
+   * checkpoint's holder is the driver and a resume is holder-bound. So this waits, and then reads
+   * what the arbiter says was accepted.
+   *
+   * It returns the RAW outcome and never the program's result. Whether an expiry throws or returns
+   * is `onExpiry`, which is computed from today's source on the live path and the replay path
+   * alike; deciding it here would bake one answer into the journal.
+   *
+   * WHAT IT ASKS IS BOUND ON THE ENTRY, and that is not decoration. A pause the reference calls
+   * "a durable pause a human or an agent resolves from anywhere" is answered by address (`run`
+   * plus step key), and the prompt lived only in the source: everything durable held the input
+   * HASH, so whoever was asked saw a token and had to go find the program to learn the question.
+   * `to` rides with it for the same reason — an escalation names an addressee, and an addressee
+   * nothing records is an addressee nobody can be shown.
+   */
+  async checkpoint(req: CheckpointRequest, ctx: EffectContext): Promise<CheckpointRaw> {
+    if (ctx.signal.cancelled) throw new Cancelled(ctx.signal.reason ?? "cancelled");
+    const ref: CheckpointRef = { endpoint: this.binding.endpoint, token: ctx.requestId };
+    // ONE deadline per attempt, decided when the attempt is first bound and read back from the
+    // entry on every re-entry, exactly as `ask` does. Recomputing `now + timeout` on a resume
+    // handed the relay an instant the pause did not have: `arm` attaches to the recorded spec and
+    // keeps ITS deadline, so the seat's hold and the checkpoint plane denied at different times.
+    // The binding is this attempt's only if this attempt wrote it: an escalation reissues the entry
+    // with attempt 0's binding still on it, and read as attempt 1's it handed the hop a deadline
+    // that had already passed and skipped the hop's own bind. A binding with no index predates the
+    // index and is attempt 0's, as an entry with no `attempt` is.
+    const bound = (ctx.resume?.attempt ?? 0) === ctx.attempt ? ctx.resume : undefined;
+    const recorded = bound?.deadlineAt;
+    const deadline = typeof recorded === "number"
+      ? recorded
+      : this.now() + parseDuration(req.timeout ?? this.binding.defaultCheckpointTimeout);
+
+    // Once per attempt, before the pause exists: a crash between the bind and the mint leaves a
+    // pending entry that says what it was going to ask, which is the harmless direction.
+    // `onExpiry` rides beside them for the operator view, as this attempt was armed (`fail` when the
+    // program sets none). What an expiry does is still decided from the source, never read from here.
+    if (bound?.asks === undefined)
+      await ctx.bind({ attempt: ctx.attempt, asks: req.prompt, deadlineAt: deadline, onExpiry: req.onExpiry ?? "fail", ...(req.to !== undefined ? { addressee: req.to } : {}) });
+
+    // AN ESCALATION IS ADDRESSED, so where the addressee is an agent of this run it is TOLD.
+    // Attempt 0 has no addressee (the reference allows `to` only with `onExpiry: "escalate"`,
+    // and the escalation is the second mint), and a `to` that names no agent of this run is a
+    // person: nothing to relay to, and the pause is answerable from anywhere by design. Both
+    // are visible at the operator surface, which is what the bind above is for. Told BEFORE the
+    // pause is armed, the order `ask` uses: a relay this endpoint refuses outright then fails the
+    // step with nothing armed behind it, instead of leaving a timer to fire into a failed step.
+    if (ctx.attempt > 0 && req.to !== undefined) await this.relayEscalation(req, ctx, ref.token, deadline);
+
+    if (await this.armUnlessDue(ref, deadline, ctx.signal)) return { outcome: "expired", at: this.now() };
+
+    const settled = await this.settle(ref, ctx.signal, true);
+    if (settled.settle === "expired") return { outcome: "expired", at: settled.ts };
+    // The settle NAMES its answer, and the record is read under that name rather than by looking
+    // for "the answer to this token": two resolvers can have filed answers and only one of them
+    // was accepted, so an answer found by token alone could be the loser's.
+    const answer = settled.answerId === undefined
+      ? undefined
+      : this.services ? await this.services.pauses.readAnswer(ref.token) : await readCheckpointAnswer(this.kv, this.binding.endpoint, ref.token, settled.answerId);
+    if (answer === undefined) throw new CheckpointAnswerMissing(ref.token, settled.answerId);
+    return {
+      outcome: "resolved",
+      ...(answer.value !== undefined ? { value: answer.value } : {}),
+      ...(answer.artifact !== undefined ? { artifact: answer.artifact } : {}),
+      by: answer.by,
+      answerId: answer.answerId,
+      at: settled.ts,
+    };
+  }
+
+  /**
+   * `wait` — an event await that survives the process waiting for it.
+   *
+   * A DURABLE consumer named from `ctx.requestId` holds the run's position on the channel, so an
+   * event published while the host was down is still there when the run re-attaches under the same
+   * derived name. An ephemeral consumer, or one created on resume, starts from "now" and the event
+   * never happened.
+   *
+   * The TIMEOUT rides the checkpoint plane and is minted once with an absolute deadline, so a
+   * resumed 20-minute wait with 30 seconds left has 30 seconds left. A timeout resolves `null` and
+   * never throws: `??` is `otherwise`.
+   *
+   * `down(agent)` and `replied(agent)` are agent-addressed events with no channel, so they branch
+   * to `waitDown` and `waitReplied` before any of the channel machinery. The binding comes first
+   * because a hosted run mints only the timers its entry records, whichever branch arms them.
+   */
+  async wait(req: WaitRequest, ctx: EffectContext): Promise<unknown | null> {
+    if (ctx.signal.cancelled) throw new Cancelled(ctx.signal.reason ?? "cancelled");
+    const ev = req.event;
+    if (!isWaitEvent(ev))
+      throw new Error(`wait() takes an event built by message(channel("<name>")), idle(channel("<name>"), duration), replied(agent) or down(agent), and was given ${JSON.stringify(ev) ?? String(ev)}`);
+    const channel = ev.event === "replied" || ev.event === "down" ? undefined : ev.channel;
+    if (channel !== undefined && !isConcreteChannel(channel)) {
+      throw new Error(`wait() cannot await a wildcard channel ("${channel}"); an await names one channel`);
+    }
+    const timers = waitTimers(req, ctx.requestId);
+    const waitBinding = {
+      ...ctx.resume,
+      ...(channel !== undefined ? { waitChannel: channel } : {}),
+      waitTimers: [timers.primary, timers.outer].filter((token) => token !== undefined),
+    };
+    if (this.services) {
+      if (ctx.resume?.waitChannel !== undefined && ctx.resume.waitChannel !== channel)
+        throw new Error(`wait ${ctx.requestId} recorded a different channel`);
+      await ctx.bind(waitBinding);
+    }
+    if (ev.event === "replied") return await this.waitReplied(ev, req, ctx);
+    if (ev.event === "down") return await this.waitDown(ev, req, ctx);
+    // A recorded seq is a previous attempt's MATCH, taken before the crash. Return that message
+    // rather than looking again: the consumer has already acked it, so looking again would wait for
+    // a second event the program never asked for.
+    const bound = ctx.resume?.chatSeq;
+    if (typeof bound === "number") {
+      // The match is recorded, so this wait is over — and the deadlines the PREVIOUS attempt armed
+      // are still live, because the crash came before it could claim them. Claim them here for the
+      // same reason the live match path does: this is the ending, it just happened last time.
+      await this.cancelTimer({ endpoint: this.binding.endpoint, token: ctx.requestId });
+      await this.cancelTimer({ endpoint: this.binding.endpoint, token: waitTimeoutToken(ctx.requestId) });
+      return await this.messageAt(bound, ctx.requestId);
+    }
+
+    const timeoutAt = req.timeout === undefined ? undefined : this.now() + parseDuration(req.timeout);
+    const idleFor = ev.event === "idle" ? parseDuration(ev.duration) : undefined;
+    const matcher = ev.event === "message" && ev.matches !== undefined ? compileMatch(ev.matches) : undefined;
+    const from = ev.event === "message" ? ev.from : undefined;
+
+    // ONE token per deadline, both derived, so a resume re-derives them instead of remembering. The
+    // arm takes the tokens the binding recorded above, so it can never mint one the binding did not.
+    const primary = timers.primary === undefined ? undefined : { endpoint: this.binding.endpoint, token: timers.primary };
+    const outer = timers.outer === undefined ? undefined : { endpoint: this.binding.endpoint, token: timers.outer };
+    // A deadline that passed before its pause was minted has nothing to settle. It ends the wait in
+    // the loop, once the channel is open under the run's read admission and after cancellation.
+    const primaryDue = primary !== undefined && await this.armUnlessDue(primary, idleFor !== undefined ? this.now() + idleFor : timeoutAt!, ctx.signal);
+    const outerDue = outer !== undefined && await this.armUnlessDue(outer, timeoutAt!, ctx.signal);
+    const timedOut = outer !== undefined ? outerDue : idleFor === undefined && primaryDue;
+
+    const durable = waitConsumerName(ctx.requestId);
+    const stream = chatStream(this.binding.space);
+    if (this.services) await this.services.waits.open(ctx.requestId, ev.channel);
+    else await this.jsm.consumers.add(stream, waitConsumerConfig(this.binding.space, ctx.requestId, ev.channel));
+    const consumer = this.services ? undefined : await this.js.consumers.get(stream, durable);
+    // Set on each of the three paths that END the wait, and read by the cleanup below. A THROW is
+    // not one of them — see the note there.
+    let over = false;
+    try {
+      for (;;) {
+        // THE CANCELLATION IS OBSERVED ON THE SAME CADENCE AS THE DEADLINE: once per poll, so a
+        // race decided against this branch ends its wait within one fetch rather than never
+        // (§7.6 — a cancelled branch performs no new work, and a wait mid-poll is this branch's
+        // one in-flight effect). A cancelled wait is OVER, not abandoned: its timers are claimed
+        // here and its consumer is deleted by the cleanup below, because a `cancelled` settle
+        // replays as cancelled and nothing will ever re-attach to this position.
+        if (ctx.signal.cancelled) {
+          if (primary !== undefined) await this.cancelTimer(primary);
+          if (outer !== undefined) await this.cancelTimer(outer);
+          over = true;
+          throw new Cancelled(ctx.signal.reason ?? "cancelled");
+        }
+        // A deadline that passed before its pause was minted, the timeout ahead of the idle window.
+        if (timedOut || idleFor !== undefined && primaryDue) {
+          if (outer !== undefined) await this.cancelTimer(timedOut ? primary! : outer);
+          over = true;
+          return timedOut ? null : { channel: ev.channel, at: this.now() };
+        }
+        // The deadline is durable and authoritative — a checkpoint's settle fact — and this is only
+        // the OBSERVATION of it, so the cost of polling is lateness bounded by one poll rather than
+        // a wait that outlives its deadline.
+        // A WAIT THAT IS OVER CLAIMS BOTH OF ITS DEADLINES, on every path that ends it. An idle
+        // wait with a timeout arms two, and each expiry used to claim only the one it read: the
+        // sibling stayed armed, fired into a run that had moved on, and sat there as an unclaimed
+        // settle until the run's own discharge swept it. The match path below already did this.
+        const ended = await this.expired(outer ?? (idleFor === undefined ? primary : undefined));
+        if (ended !== undefined) {
+          if (outer !== undefined && primary !== undefined) await this.cancelTimer(primary);
+          over = true;
+          return null;
+        }
+        if (idleFor !== undefined && (await this.expired(primary)) !== undefined) {
+          if (outer !== undefined) await this.cancelTimer(outer);
+          over = true;
+          return { channel: ev.channel, at: this.now() };
+        }
+        const batch = this.services
+          ? (await this.services.waits.fetch(ctx.requestId)).map((message) => ({
+              seq: message.sequence, data: message.data,
+              ack: () => this.services!.waits.ack(ctx.requestId, message.receipt),
+            }))
+          : await consumer!.fetch({ max_messages: 16, expires: WAIT_POLL_MS });
+        for await (const m of batch) {
+          const msg = decodeMessage(m.data);
+          if (idleFor !== undefined) {
+            // ANY traffic resets an idle window, matched or not: "idle" is a fact about the
+            // channel, not about the messages this program finds interesting.
+            await m.ack();
+            await this.push(primary!, this.now() + idleFor);
+            continue;
+          }
+          if (msg === undefined || !matchesEvent(msg, from, matcher)) { await m.ack(); continue; }
+          // BIND BEFORE ACK. The bind is durable; the ack is what makes the message unrecoverable.
+          // In this order a crash in between redelivers it, and a crash after it is answered from
+          // the recorded sequence — in the other order the match is simply lost.
+          await ctx.bind(this.services ? { ...waitBinding, chatSeq: m.seq } : { chatSeq: m.seq });
+          await m.ack();
+          if (primary !== undefined) await this.cancelTimer(primary);
+          if (outer !== undefined) await this.cancelTimer(outer);
+          over = true;
+          return msg;
+        }
+      }
+    } finally {
+      // A THROW IS NOT AN ENDING — with one exception, and it marks itself. The three returns above
+      // are the wait being over and its position worthless; a throw leaves the step pending, and
+      // the consumer's position is the only record of where this run reached on the channel.
+      // `ctx.bind` is a journal append and a journal can refuse one (L5010, RunSuperseded), so a
+      // throw here is ordinary operation and not only a bug. The exception is `Cancelled`, which
+      // sets `over` before it leaves: a cancelled wait settles `cancelled` and replays as
+      // cancelled, so its position answers nothing ever again.
+      // Keeping the consumer costs one durable on an abandoned run, which is what a host crash
+      // already costs; reaping on inactivity instead could delete a live wait's position while its
+      // host was down.
+      if (over && this.services) await this.services.waits.close(ctx.requestId);
+      else if (over) {
+        try {
+          await this.jsm.consumers.delete(stream, durable);
+        } catch { /* already gone, or never created — either way there is nothing to hold */ }
+      }
+    }
+  }
+
+  /**
+   * `wait(down(agent))` — the death of one incarnation, read off presence liveness.
+   *
+   * The handle pins `<name>#<lifecycleUid>` and DOWN is a fact about the INCARNATION. The mesh's
+   * liveness witness is the presence row a seat heartbeats — TTL'd out of the bucket when the
+   * heartbeats stop — and it is the same source conclave membership resolves members through, so
+   * "down" here and "down or gone" at a conclave join are one definition. No live row carrying
+   * the name AND this incarnation is the death, with the reason split by what the name shows now:
+   * `"lapsed"` when nothing live holds the name any more, `"superseded"` when a live row holds it
+   * under a DIFFERENT incarnation — this incarnation dead with a successor already up. A lapse is
+   * read as the death only once the row has stayed absent for {@link LAPSE_CONFIRM_MS} and its manager
+   * no longer runs the seat: a seat whose connector stalled past the row's TTL renews it under the same
+   * uid, and that seat is not down.
+   *
+   * THE DEATH NEVER BINDS, because a death is re-observable where a matched message is not: a dead
+   * incarnation's uid never heartbeats again, so a crash between the observation and the settle
+   * re-observes the same death on resume (after a fresh confirmation window) — at worst
+   * with the reason upgraded from `"lapsed"` to `"superseded"` by a successor that appeared in
+   * between. `at` is the time of OBSERVATION: presence records no time of death, and inventing
+   * one would be a value the planes cannot back.
+   *
+   * The TIMEOUT is the same mediated pause every wait arms — minted once with an absolute
+   * deadline under the step's own request id, so a resume ATTACHES to the recorded deadline
+   * rather than restarting the clock — and it resolves `null`, never a throw: `??` is
+   * `otherwise`. The discharge and the adoption re-arm already speak this wait's tokens (the
+   * `wait` kind arms under its request id), so a cancelled or adopted down-wait needs nothing of
+   * its own.
+   */
+  private async waitDown(
+    ev: { readonly agent: string },
+    req: WaitRequest,
+    ctx: EffectContext,
+  ): Promise<unknown | null> {
+    const { name, uid } = parseAgentHandle(ev.agent);
+    // `down(agent)` is an event AFTER `monitor` registered interest (cotal-lang 6.5); a wait on an
+    // agent nobody monitored would be a registration this run never recorded.
+    if (!this.monitored.has(`${name}#${uid}`))
+      throw new Error(`wait(down(${name}#${uid})) observes a monitored agent, and this run never performed monitor() on that handle; register interest first (cotal-lang 6.5)`);
+    const { primary: token } = waitTimers(req, ctx.requestId);
+    const primary = token === undefined ? undefined : { endpoint: this.binding.endpoint, token };
+    if (primary !== undefined) await this.arm(primary, this.now() + parseDuration(req.timeout!));
+    const watch: DeathWatch = {};
+    const decided = async (): Promise<boolean> => ctx.signal.cancelled || (await this.expired(primary)) !== undefined;
+    for (;;) {
+      if (ctx.signal.cancelled) {
+        if (primary !== undefined) await this.cancelTimer(primary);
+        throw new Cancelled(ctx.signal.reason ?? "cancelled");
+      }
+      const ended = await this.expired(primary);
+      if (ended !== undefined) return null;
+      const reason = await this.presenceDeath(name, uid, watch, decided);
+      if (reason !== undefined) {
+        if (primary !== undefined) await this.cancelTimer(primary);
+        return { agent: ev.agent, reason, at: this.now() };
+      }
+      await delay(WAIT_POLL_MS);
+    }
+  }
+
+  /**
+   * `wait(replied(agent))` — the agent finished a reply, observed over THIS RUN's turn terminals.
+   *
+   * The honest observable a run holds for "finished a reply" is the terminal fact of a turn it
+   * relayed itself: a `succeeded` turn goal IS a completed reply, durable on the goal plane. The
+   * wait resolves off the run's turn-goal registry for the handle — fed by `turn` at submission
+   * and reseeded from the journal on adoption — and REPLIED IS A LEVEL, exactly as `down` is: a
+   * reply that already exists resolves the wait at once (the latest, by the yield's own `at`
+   * stamp), and a wait that begins before any reply parks for the next terminal. A denied or
+   * cancelled turn is not a reply — the agent never finished one — so it leaves the wait parked.
+   * A handle outside the run's roster with no recorded turn can never be observed (only this
+   * run's turns are), so it refuses loudly instead of parking on nothing.
+   *
+   * THE REPLY NEVER BINDS, for `down`'s reason: goal terminals are durable facts, so a crash between
+   * the observation and the settle re-observes the same reply on resume — at worst a NEWER reply
+   * completed in between. The value is the observation record, `down`-shaped:
+   * `{ agent, status, note?, at }`, where `at` is the yield's own stamp. The TIMEOUT is the same
+   * mediated pause every wait arms, resolving `null`, never a throw.
+   */
+  private async waitReplied(
+    ev: { readonly agent: string },
+    req: WaitRequest,
+    ctx: EffectContext,
+  ): Promise<unknown | null> {
+    const { name, uid } = parseAgentHandle(ev.agent);
+    const handle = `${name}#${uid}`;
+    if (this.turnGoals.get(handle) === undefined) {
+      const entry = this.roster.get(name);
+      if (entry === undefined || entry.uid !== uid)
+        throw new Error(`wait(replied(${handle})) addresses an agent that is not in this run's roster; a reply is observed on a turn this run relayed`);
+    }
+    const { primary: token } = waitTimers(req, ctx.requestId);
+    const primary = token === undefined ? undefined : { endpoint: this.binding.endpoint, token };
+    if (primary !== undefined) await this.arm(primary, this.now() + parseDuration(req.timeout!));
+    const actx = await this.actionCtx();
+    for (;;) {
+      if (ctx.signal.cancelled) {
+        if (primary !== undefined) await this.cancelTimer(primary);
+        throw new Cancelled(ctx.signal.reason ?? "cancelled");
+      }
+      const ended = await this.expired(primary);
+      if (ended !== undefined) return null;
+      const goals = this.turnGoals.get(handle);
+      let latest: { status: string; note?: string; at: number } | undefined;
+      for (const goalId of goals ?? []) {
+        const fact = await readGoalResult(actx, { endpoint: this.binding.endpoint, caller: this.binding.caller, goalId });
+        if (fact === undefined) continue;
+        // Denied (deadline) or cancelled: the agent never finished a reply. Stop reading it.
+        if (fact.state !== "succeeded") { goals!.delete(goalId); continue; }
+        const d = fact.data as { status?: unknown; note?: unknown; at?: unknown } | undefined;
+        if ((d?.status !== "done" && d?.status !== "blocked" && d?.status !== "handoff") || typeof d.at !== "number")
+          throw new Error(`wait(replied(${handle})) observed a malformed turn terminal (${JSON.stringify(fact.data)}); a garbled yield never resolves a wait`);
+        // A handoff the turn refuses (an addressee outside the run, or across worktrees) is the
+        // turn's own failure, so it is not a reply here either: both observers read one verdict.
+        if (d.status === "handoff" && this.handoffRefusal(this.roster.get(name)?.handle.worktree, (d as { to?: unknown }).to) !== undefined) {
+          goals!.delete(goalId);
+          continue;
+        }
+        if (latest === undefined || d.at > latest.at)
+          latest = { status: d.status, ...(typeof d.note === "string" ? { note: d.note } : {}), at: d.at };
+      }
+      if (latest !== undefined) {
+        if (primary !== undefined) await this.cancelTimer(primary);
+        return { agent: ev.agent, ...latest };
+      }
+      await delay(WAIT_POLL_MS);
+    }
+  }
+
+  /**
+   * `notify` writes one bounded decision record per addressee, onto the run.
+   *
+   * NOT a channel post, and that is the whole point of the primitive: a post would put the program
+   * into the conversation as a participant, where conversation is the data plane and
+   * the program is the control plane. A notice is data filed on the run and rendered ahead of the
+   * addressee's next turn.
+   *
+   * **One call to N agents is N records, and a retry lands on its own.** The id is derived from the
+   * step's request id and the addressee, so a crash between the second and third write is repaired
+   * by re-running the call: the first two creates find their own bytes and return, the third
+   * happens. Nothing is written twice and nothing needs a memo of how far it got. That holds only
+   * because the instant every notice carries is bound with the step rather than read from the
+   * clock again, which is the one field a second pass could otherwise change.
+   *
+   * The fact's bound is the language's and is enforced BEFORE this is reached (L3043 at the effect
+   * boundary), so a fact that could not be rendered as one table row cannot arrive here.
+   */
+  async notify(req: NotifyRequest, ctx: EffectContext): Promise<null> {
+    // THE INSTANT IS BOUND, never re-read. `writeRunNotice` is create-only and compares canonical
+    // bytes, so a second pass carrying a fresh clock reading hits `conflict` on the notice the
+    // first pass already wrote, and every retry after that hits it identically: the run wedges on
+    // the one effect whose whole design is that re-running it is safe. A crash between the write
+    // and the settling append is ordinary, so the retry has to rewrite the same bytes.
+    const recorded = ctx.resume?.at;
+    const at = typeof recorded === "number" ? recorded : this.now();
+    if (typeof recorded !== "number") await ctx.bind({ at });
+    const step = stepKeyString(ctx.key);
+    for (const agent of req.agents) {
+      const noticeId = runNoticeId(ctx.requestId, agent.agent);
+      await writeRunNotice(this.kv, this.binding.endpoint, noticeId, {
+        v: 1,
+        run: this.binding.runId,
+        step,
+        addressee: agent.agent,
+        fact: req.fact,
+        at,
+      });
+    }
+    return null;
+  }
+
+  /**
+   * `spawn` is the manager's spawn ACTION, submitted under the step's own identity.
+   *
+   * **The request id is the goalId.** The envelope id is pinned to `ctx.requestId`, and the
+   * manager binds its goal under the envelope id — so a resumed run that re-submits is served the
+   * RECORDED acceptance (same fingerprint, same goal) instead of allocating a second seat, and the
+   * goal's terminal fact sits on a subject this run can re-derive from nothing but its journal.
+   *
+   * The ACCEPTANCE is bound as the entry's external state before the terminal is awaited, so a
+   * crash mid-await resumes straight into the poll — it must NOT re-invoke, because by then the
+   * manager may have restarted and a fresh submission would be judged against a live seat rather
+   * than served from its acceptance cache. The terminal await itself is a read of a durable fact,
+   * deliberately not `submitAndFollowGoal`: a live progress subscription dies with the process,
+   * and the fact is the thing a resume can still read.
+   *
+   * `permits`, `supervise` and `onFork` are POLICY, not identity (§6.4): they ride the journalled
+   * request and are enforced where they bind (`permits` at `turn`, `supervise` as the manager's
+   * restart budget on the spawn submission, an `onFork` at fork adoption).
+   */
+  async spawn(req: SpawnRequest, ctx: EffectContext): Promise<AgentHandleValue> {
+    if (ctx.signal.cancelled) throw new Cancelled(ctx.signal.reason ?? "cancelled");
+    const goalId = ctx.requestId;
+
+    // Placement is explicit and host-local. Refuse malformed values before manager discovery or
+    // submission, so an invalid request can never turn into an omitted `cwd` and inherit the
+    // manager's workspace root. Existence and launch authority stay with the serving manager.
+    if (req.cwd !== undefined && (typeof req.cwd !== "string" || req.cwd.length === 0 || !isAbsolute(req.cwd)))
+      throw new EffectError("L4000", "spawn",
+        `spawn(${req.persona}) cwd must be a non-empty absolute directory on the serving manager's host; refusing ${JSON.stringify(req.cwd)} rather than falling back`);
+
+    // #1616 ITEM 2 — THE AFFINITY GATE. A directory is HOST-LOCAL, so a request that names one but
+    // names no manager instance rides the class `one` queue and lands wherever the anycast fell.
+    // The design record calls that combination not acceptable, so it REFUSES. There is deliberately
+    // NO anycast fallback: falling back IS the defect. And the refusal is raised HERE, ahead of
+    // `readPermits`, ahead of `this.manager()`'s describe round-trip, ahead of any submission,
+    // acceptance or launch — so nothing is reserved, claimed or started before it. Legacy
+    // cwd-omitted spawns never reach this line and keep their prior behaviour byte for byte.
+    if (req.cwd !== undefined && req.placement === undefined)
+      throw new EffectError("L4000", "spawn",
+        `spawn(${req.persona}) names a cwd but no placement target: a host-local directory needs an explicit { endpoint, instanceId } manager instance, and this spawn refuses rather than falling back to class anycast`);
+    if (req.placement !== undefined
+        && (typeof req.placement.endpoint !== "string" || req.placement.endpoint.length === 0
+          || typeof req.placement.instanceId !== "string" || req.placement.instanceId.length === 0))
+      throw new EffectError("L4000", "spawn",
+        `spawn(${req.persona}) placement must name both an endpoint and an instanceId; refusing ${JSON.stringify(req.placement)} rather than dispatching unpinned`);
+    // Naming a target the run is not bound to is a mismatched target, not a request to go find it:
+    // automatic manager discovery is outside this bounded repair, so it refuses here too.
+    if (req.placement !== undefined && req.placement.endpoint !== this.binding.endpoint)
+      throw new EffectError("L4000", "spawn",
+        `spawn(${req.persona}) placement targets endpoint ${JSON.stringify(req.placement.endpoint)} but this run is bound to ${JSON.stringify(this.binding.endpoint)}; refusing rather than dispatching off-binding`);
+    // The manager reads only a boolean `events`, so any other value would arm the default plane
+    // the author was trying to opt out of. Refused before anything is submitted.
+    if (req.events !== undefined && typeof req.events !== "boolean")
+      throw new EffectError("L4000", "spawn",
+        `spawn(${req.persona}) events must be true or false; refusing ${JSON.stringify(req.events)} rather than launching with the default event plane`);
+    if (req.runtime !== undefined && (typeof req.runtime !== "string" || req.runtime.trim() === ""))
+      throw new EffectError("L4000", "spawn",
+        `spawn(${req.persona}) runtime must be a non-empty runtime name; refusing ${JSON.stringify(req.runtime)} rather than launching on the manager's own runtime`);
+
+    // A recorded goalId is a previous attempt's ACCEPTANCE: the submission landed and its
+    // identity was bound before the crash. Go straight back to the terminal. An entry that says
+    // `adoptedFrom` names the goal the ORPHANED spawn submitted, not this step's own request id:
+    // that goal is the terminal this step reads on every pass, and no pass ever submits one.
+    const recorded = ctx.resume as Readonly<Record<string, unknown>> | undefined;
+    let ext: Readonly<Record<string, unknown>> | undefined =
+      typeof recorded?.goalId === "string" && (recorded.goalId === goalId || typeof recorded.adoptedFrom === "string")
+        ? recorded
+        : undefined;
+    const checkRecordedPlacement = (floor: Readonly<Record<string, unknown>> | undefined): void => {
+      if (req.placement !== undefined && floor?.host !== req.placement.instanceId)
+        throw new EffectError("L4000", "spawn", `spawn(${req.persona}) requested placement ${req.placement.instanceId} but the accepted seat's recorded host is ${typeof floor?.host === "string" ? floor.host : "unrecorded"}; an adopted or resumed seat cannot be moved by a new request`);
+    };
+    if (ext !== undefined) checkRecordedPlacement(ext);
+    // An inline persona is bound with its digest before anything is submitted, and every later bind
+    // restates it, so a resume submits the definition it recorded and a migration hands a seat only
+    // to a spawn of the same definition. The input hash already ties the two; this checks it.
+    const inlineDigest = req.inline === undefined ? undefined : digest(req.inline);
+    const recordedInline = readInlineBinding(recorded?.inline);
+    if (recordedInline !== undefined && recordedInline.digest !== inlineDigest)
+      throw new Error(`spawn(${req.persona}): the journal recorded an inline definition with digest ${recordedInline.digest}, and this spawn's is ${inlineDigest ?? "a catalog persona"}; a resume never submits another definition than the one it recorded`);
+    let inline = recordedInline ?? (req.inline === undefined ? undefined : { definition: req.inline, digest: inlineDigest! });
+    // A budget this host cannot meter is refused before anything is submitted: accepting it and
+    // enforcing nothing would be the silent no-op the effect table exists to prevent.
+    const permits = req.permits !== undefined ? readPermits(req.permits, req.persona) : undefined;
+    // Same rule, for the other policy option. `supervise` is a declarative restart policy: it
+    // is parsed here (a malformed or unknown-key record is refused before anything is submitted)
+    // and travels on the spawn args so the manager can restart the seat in place. A host that
+    // cannot restart in place refuses at accept rather than accepting a silent no-op.
+    if (req.supervise !== undefined) readSupervise(req.supervise, req.persona);
+    // A seat a migration kept for this persona (§11.2): the orphaned spawn's GOAL becomes this
+    // step's own, bound with that spawn's floor and the step it came from. From here the two kinds
+    // of spawn are one path — the terminal is read under the bound goal, the handle comes from it,
+    // a resume re-reads it, and a discharge despawns by it — so the hand-over is spent exactly
+    // once and this step never mints a second seat for a persona it was handed one for.
+    const adoptions = ext === undefined ? this.adoptable.get(req.persona) : undefined;
+    const adopted = adoptions?.[0];
+    if (adopted !== undefined) {
+      const handle = adopted.result as AgentHandleValue | undefined;
+      const floor = adopted.external as Readonly<Record<string, unknown>> | undefined;
+      if (typeof handle?.agent !== "string" || typeof adopted.requestId !== "string")
+        throw new Error(`spawn(${req.persona}): the migrated seat's entry carries no readable handle or goal; a garbled hand-over is refused rather than minted over`);
+      if (req.worktree !== undefined && handle.worktree !== req.worktree)
+        throw new Error(`spawn(${req.persona}) asks for worktree "${req.worktree}" but the seat the migration hands it holds ${handle.worktree === undefined ? "none" : `"${handle.worktree}"`}; an adopted seat keeps its tree, so the edited program names that tree or none`);
+      const adoptedInline = readInlineBinding(floor?.inline);
+      if (adoptedInline?.digest !== inlineDigest)
+        throw new Error(`spawn(${req.persona}) is ${inlineDigest === undefined ? "a catalog spawn" : `an inline definition with digest ${inlineDigest}`}, but the seat the migration hands it was spawned from ${adoptedInline === undefined ? "a catalog persona" : `an inline definition with digest ${adoptedInline.digest}`}; an adopted seat keeps its definition, so the edited program spawns that same definition, or the migration releases the seat`);
+      inline = adoptedInline;
+      checkRecordedPlacement(floor);
+      // Refused validation leaves the hand-over queued; claim it before the first await.
+      adoptions!.shift();
+      ext = {
+        goalId: adopted.requestId,
+        ...(floor !== undefined ? pickAcceptanceFloor(floor) : {}),
+        ...(inline !== undefined ? { inline } : {}),
+        ...(typeof floor?.host === "string" ? { host: floor.host } : {}),
+        ...(handle.worktree !== undefined ? { worktree: handle.worktree } : {}),
+        ...(req.onFork !== undefined ? { onFork: req.onFork } : {}),
+        ...(req.permits !== undefined ? { permits: req.permits } : {}),
+        spawnedAt: typeof floor?.spawnedAt === "number" ? floor.spawnedAt : this.now(),
+        adoptedFrom: journalEntryKeyString(adopted),
+      };
+      await ctx.bind(ext);
+    }
+    // The goal this step reads its terminal under: its own submission, or the adopted spawn's.
+    const ref: GoalRef = { endpoint: this.binding.endpoint, caller: this.binding.caller, goalId: typeof ext?.goalId === "string" ? ext.goalId : goalId };
+    if (ext === undefined && req.worktree !== undefined) await this.claimWorktree(req.worktree, req.persona, goalId);
+    try {
+      if (ext === undefined) {
+        let reply: EpAttributedReply | undefined;
+        // #1616 item 5 — PHASE A, then phase B. A previous attempt's journalled resolution is
+        // reused rather than re-asked, so the path a resumed spawn launches in is the one the
+        // resolve recorded and cannot drift under a re-resolve. A spawn naming no cwd has nothing
+        // to resolve and skips both the invoke and the bind, so its behaviour is unchanged.
+        let resolution = readCwdResolution(recorded?.resolution);
+        // PERSIST BEFORE SUBMITTING, as the resolution below is: the definition a resume submits is
+        // the one this bind recorded.
+        if (inline !== undefined && recordedInline === undefined) await ctx.bind({ inline });
+        try {
+          const command = req.cwd !== undefined && resolution === undefined ? "resolve-cwd" : "spawn";
+          const service = await this.manager(command, req.placement?.instanceId);
+          if (req.cwd !== undefined && resolution === undefined) {
+            // `req.placement` is guaranteed here: a cwd without one refused at the affinity gate above.
+            resolution = await this.resolveCwd(req, service, req.cwd, req.placement?.instanceId ?? "");
+            // PERSIST BEFORE SUBMITTING. The resolution is what phase B dispatches and what a
+            // resume re-reads; binding it after the submission would leave a crash in between with
+            // a launched seat whose directory no record names.
+            await ctx.bind({ ...(inline !== undefined ? { inline } : {}), resolution });
+          }
+          const spawnService = service.commands.has("spawn") ? service : await this.manager("spawn", req.placement?.instanceId);
+          reply = await this.invokeManager(spawnService, "spawn",
+            // The run id lets a static manager that does not host this run, placed or reached through
+            // the class queue, read the run's admission and bound the helper by it (SPEC 14.8).
+            { ...spawnArgs({ ...req, ...(inline !== undefined ? { inline: inline.definition } : {}), ...(resolution !== undefined ? { cwd: resolution.cwd } : {}) }), runId: this.binding.runId }, {
+              id: goalId,
+              deadlineMs: SPAWN_ACCEPT_DEADLINE_MS,
+            });
+        } catch (err) {
+          // A refusal this handler RAISED is never a lost reply: it was decided here, before
+          // anything was submitted, so it is re-thrown rather than weighed against a goal record.
+          if (err instanceof EffectError) throw err;
+          // The invoke did not come back — which does not prove nothing happened: the request may
+          // have been accepted while the reply was lost. The goal record is the arbiter: a durable
+          // trace under this goalId means the submission landed, so proceed to its terminal; none
+          // means it never did, and the raised error is the honest outcome.
+          if ((await readGoalStatus(await this.actionCtx(), ref)) === undefined) throw err;
+        }
+        if (reply !== undefined && reply.reply.ok === false) {
+          // Refused AT ACCEPT: the manager bound no goal and provisioned nothing, so this is the
+          // effect's own failure, catchable as such — and never L4002, because no agent existed to
+          // be down. A seat budget the endpoint will not extend is a permit the run does not hold
+          // (L4001); every other refusal (persona unknown, name taken) is the host declining the
+          // request (L4000), the manager's own code carried in the detail.
+          const err = reply.reply.error;
+          throw new EffectError(err.code === "resource-exhausted" ? "L4001" : "L4000", "spawn",
+            `spawn(${req.persona}) was refused by the ${this.binding.endpoint} endpoint: ${err.message}`,
+            { code: err.code });
+        }
+        const floor = reply === undefined ? undefined : (reply.reply.data as Record<string, unknown> | undefined);
+        if (floor !== undefined && floor.goalId !== goalId)
+          throw new Error(`the spawn acceptance names goal "${String(floor.goalId)}" but this submission pinned "${goalId}"; a mismatched acceptance never authorizes (SPEC 13.6)`);
+        // BIND BEFORE AWAITING: the goalId is re-derivable, but the bind is what tells a resume the
+        // submission LANDED — and the identity floor beside it is what a discharge despawns by when
+        // the terminal alone carries none (an `uncertain` verdict). The worktree rides along so an
+        // adoption re-takes this spawn's reservation; `onFork` so a fork can read the policy.
+        ext = {
+          goalId,
+          ...(floor !== undefined ? pickAcceptanceFloor(floor) : {}),
+          // `bind` REPLACES the external record, so the phase-A resolution is re-stated here or the
+          // acceptance bind would erase it and a resume would re-resolve against a moved target.
+          ...(resolution !== undefined ? { resolution } : {}),
+          ...(inline !== undefined ? { inline } : {}),
+          ...(req.worktree !== undefined ? { worktree: req.worktree } : {}),
+          ...(req.onFork !== undefined ? { onFork: req.onFork } : {}),
+          ...(req.permits !== undefined ? { permits: req.permits } : {}),
+          // The placed instance hosts the seat, and only its resolver maps it: an adopted run
+          // re-addresses this seat's turns there from the journal alone.
+          ...(req.placement !== undefined ? { host: req.placement.instanceId } : {}),
+          spawnedAt: this.now(),
+        };
+        await ctx.bind(ext);
+      }
+
+      const fact = await this.goalTerminal(ref, ctx.signal);
+      const handle = spawnHandleOf(req, ext, fact, this.binding.endpoint);
+      // Register the run-roster entry `turn` addresses and a handoff resolves to, by the same
+      // identity the discharge despawns (see spawnDespawnTarget).
+      const address = spawnDespawnTarget(ext, fact);
+      this.roster.set(parseAgentHandle(handle.agent).name, {
+        handle,
+        uid: parseAgentHandle(handle.agent).uid,
+        goalId: ref.goalId,
+        ...(address !== undefined ? { owner: address.owner, actor: address.actor } : {}),
+        ...(permits !== undefined ? { permits } : {}),
+        ...(typeof ext.spawnedAt === "number" ? { spawnedAt: ext.spawnedAt } : {}),
+        ...(typeof ext.host === "string" ? { host: ext.host } : {}),
+      });
+      if (typeof handle.worktree === "string")
+        this.worktreeHolders.set(handle.worktree, { name: parseAgentHandle(handle.agent).name, uid: parseAgentHandle(handle.agent).uid });
+      return handle;
+    } catch (e) {
+      const tree = typeof ext?.worktree === "string" ? ext.worktree : req.worktree;
+      if (tree !== undefined) this.releaseWorktree(tree, ref.goalId, ext, e instanceof Cancelled);
+      throw e;
+    }
+  }
+
+  /**
+   * A spawn that ends without a handle gives its tree back. The one exception is a cancellation
+   * while parked on an ACCEPTED submission: the seat may well be up in the tree until its
+   * discharge lands, so the reservation becomes a hold by the accepted identity, which presence
+   * liveness then releases the way it releases any holder.
+   */
+  private releaseWorktree(worktree: string, goalId: string, ext: Readonly<Record<string, unknown>> | undefined, parked: boolean): void {
+    const holder = this.worktreeHolders.get(worktree);
+    if (holder === undefined || !("pending" in holder) || holder.pending !== goalId) return;
+    if (parked && typeof ext?.name === "string" && typeof ext.uid === "string") {
+      this.worktreeHolders.set(worktree, { name: ext.name, uid: ext.uid });
+      return;
+    }
+    this.worktreeHolders.delete(worktree);
+  }
+
+  /** Poll the goal's durable terminal fact, observing cancellation on the poll cadence — the same
+   *  discipline as `wait`: a race decided against this branch stops parking within one poll, and
+   *  the seat its acceptance may have produced is the DISCHARGE's to release, not this branch's. */
+  private async goalTerminal(ref: GoalRef, signal: CancelSignal): Promise<GoalResultFact> {
+    const actx = await this.actionCtx();
+    for (;;) {
+      if (signal.cancelled) throw new Cancelled(signal.reason ?? "cancelled");
+      const fact = await readGoalResult(actx, ref);
+      if (fact !== undefined) return fact;
+      await delay(GOAL_POLL_MS);
+    }
+  }
+
+  /** Resolve the native personal session whose exact issued caller admitted this run. Its identity
+   * comes only from the immutable admission, never from program text. The manager separately requires
+   * a current finite participation lease when a turn is dispatched. */
+  async participant(_req: ParticipantRequest, ctx: EffectContext): Promise<AgentHandleValue> {
+    if (!this.services)
+      throw new EffectError("L4000", "participant", "participant() requires a hosted run with an admission reader");
+    const view = await this.services.admission();
+    if (view.revoked)
+      throw new EffectError("L4000", "participant", `participant() refused because run ${this.binding.runId} is revoked`);
+    const admitted = view.admission;
+    const caller = admitted.caller;
+    if (admitted.provenance.kind !== "issued" || !/^pa_[a-z2-7]{26}$/.test(caller.actor))
+      throw new EffectError("L4000", "participant", "participant() binds only an issued personal conversation that admitted this run");
+    const principal = `${caller.owner}.${caller.actor}`;
+    const rows = (await this.presenceRows()).filter((p) =>
+      p.card.id === principal && p.lifecycleUid === caller.uid && p.status !== "offline");
+    if (rows.length !== 1)
+      throw new EffectError("L4002", "participant", rows.length === 0
+        ? `participant() found no live exact presence for ${principal}#${caller.uid}`
+        : `participant() found multiple exact presence rows for ${principal}#${caller.uid}; no row was selected`);
+    const name = rows[0]!.card.name;
+    const handle: AgentHandleValue = { kind: "participant", agent: `${name}#${caller.uid}`, persona: "participant" };
+    await ctx.bind({ owner: caller.owner, actor: caller.actor, uid: caller.uid, name, host: admitted.instanceId });
+    this.roster.set(name, { handle, owner: caller.owner, actor: caller.actor, uid: caller.uid, host: admitted.instanceId });
+    return handle;
+  }
+
+  /**
+   * `turn` wakes ONE AGENT for one turn, over the manager's relay (a seat is not an endpoint):
+   * the manager accepts the goal, parks the rendered context durably, the seat pulls and yields
+   * under its own self reach, and the yield is this goal's terminal. The request id is the goalId,
+   * the same recovery discipline as `spawn`: a resumed run re-enters the poll, never re-submits.
+   *
+   * THREE AUTHORITIES END IT, one per ending. The seat's yield is the manager's `succeeded`
+   * terminal, carrying the TurnResult. The DEADLINE is double-covered: the manager arms a
+   * goal-bound hold (its expiry commits `failed` reason `turn-deadline`), and this client arms its
+   * OWN pause under the step's request id — the L4003 authority that survives a dead manager.
+   * DEATH: the manager's reap hook marks pending turns; death rides the deadline terminal as
+   * `agentDownAt`. This client's presence watch is the early L4002 authority even while the
+   * manager runs. The watch reads death the way `wait(down)` does: a superseded incarnation at
+   * once, a lapsed row only once it has stayed absent for {@link LAPSE_CONFIRM_MS} and its manager
+   * no longer runs the seat.
+   *
+   * Handoff honoring (lang §5.3) happens HERE: the scope's pending memo is spent at every turn's
+   * begin, and when this turn targets its `to`, the link rides the submission (`handoffFrom`, the
+   * manager mirrors it into the terminal) and the bound external state. A handoff YIELD is
+   * validated against the run roster: an addressee outside it is L4005, one in a different
+   * worktree is L4004.
+   */
+  async turn(req: TurnRequest, ctx: EffectContext): Promise<TurnResultValue> {
+    if (ctx.signal.cancelled) throw new Cancelled(ctx.signal.reason ?? "cancelled");
+    const { name, uid } = parseAgentHandle(req.agent.agent);
+    const goalId = ctx.requestId;
+    const ref: GoalRef = { endpoint: this.binding.endpoint, caller: this.binding.caller, goalId };
+    const primary: CheckpointRef = { endpoint: this.binding.endpoint, token: goalId };
+    const scope = scopeOf(ctx.key);
+
+    let ext: Readonly<Record<string, unknown>> | undefined =
+      ctx.resume?.goalId === goalId ? (ctx.resume as Readonly<Record<string, unknown>>) : undefined;
+    if (ext === undefined) {
+      const seat = this.seatAddress(name, uid);
+      if (seat.address === undefined) {
+        if (seat.why === "not-in-roster")
+          throw new Error(`turn(${name}#${uid}) addresses an agent that is not in this run's roster; a turn wakes an agent this run spawned`);
+        throw new Error(`turn(${name}#${uid}) has no address: the spawn's acceptance floor was never served, so the seat's owner/actor coordinates are unknown`);
+      }
+      const { owner, actor, host } = seat.address;
+      // The permits are the roster entry's, not the address's: a budget is spent per spawn, and
+      // the address is only where this turn is sent.
+      const entry = this.roster.get(name)!;
+      // Spend the scope's handoff memo at BEGIN, honored or not — honoring is immediate-only.
+      const memo = this.handoffMemos.get(scope);
+      this.handoffMemos.delete(scope);
+      const handoffFrom = memo !== undefined && memo !== "ambiguous" && memo.to === name ? memo.fromGoalId : undefined;
+      // Render the seat's context: every unconsumed notice addressed to it, as one durable payload.
+      const step = stepKeyString(ctx.key);
+      // Addressed by the HANDLE COMPOSITE, exactly as `notify` filed them (an incarnation is the
+      // addressee, and a successor under the name is somebody else).
+      const notices = (await listRunNotices(this.kv, this.binding.endpoint, this.binding.runId, req.agent.agent))
+        .filter((n) => n.consumed === undefined);
+      const context = renderRunContext({ run: this.binding.runId, step, notices });
+      const deadlineMs = parseDuration(req.deadline ?? this.binding.defaultCheckpointTimeout);
+      // The agent's permits are budgets this run spends at the call that would exceed them
+      // (cotal-lang 6.5, L4001): one turn per `turns`, and a turn whose deadline runs past the
+      // agent's remaining wall clock is already over it. Counted on the fresh path only: a resume
+      // re-enters a turn the seed already counted from its journal entry.
+      const taken = this.turnsTaken.get(`${name}#${uid}`) ?? 0;
+      if (entry.permits?.turns !== undefined && taken >= entry.permits.turns)
+        throw new EffectError("L4001", "permit-turns", `turn(${name}#${uid}) would be that agent's turn ${taken + 1}, past its permit of ${entry.permits.turns}`);
+      if (entry.permits?.wallClockMs !== undefined && entry.spawnedAt !== undefined) {
+        const remaining = entry.spawnedAt + entry.permits.wallClockMs - this.now();
+        if (remaining <= 0)
+          throw new EffectError("L4001", "permit-wall-clock", `turn(${name}#${uid}): the agent's wall-clock permit (${entry.permits.wallClockMs}ms from its spawn) is spent`);
+        if (deadlineMs > remaining)
+          throw new EffectError("L4001", "permit-wall-clock", `turn(${name}#${uid}): a ${deadlineMs}ms deadline runs past the agent's remaining wall clock (${remaining}ms of its ${entry.permits.wallClockMs}ms permit)`);
+      }
+      const payload = JSON.stringify({ run: this.binding.runId, step, context, noticeIds: notices.map((n) => n.noticeId) });
+      let submitted = false;
+      const submit = async (): Promise<EpAttributedReply> => {
+        const service = submitted ? await this.manager("turn", host)
+          : await this.relayManagerBeforeSubmit(host, "turn", ref, "turn", `turn(${name}#${uid})`);
+        // After invocation may have run, retain the existing goal reconciliation.
+        submitted = true;
+        return this.invokeManager(service, "turn",
+          { payload, deadlineMs, ...(handoffFrom !== undefined ? { handoffFrom } : {}) }, {
+            id: goalId,
+            deadlineMs: TURN_ACCEPT_DEADLINE_MS,
+            target: { mode: "owner", owner, actor, lifecycleUid: uid },
+          });
+      };
+
+      let reply: EpAttributedReply | undefined;
+      try {
+        reply = await submit();
+      } catch (err) {
+        // The invoke did not come back — the goal record is the arbiter, exactly as in `spawn`.
+        if ((await readGoalStatus(await this.actionCtx(), ref)) === undefined) throw err;
+      }
+      // ONE reading of a refused acceptance, for both submits: a seat that dies between the first
+      // submit and the re-read is the same dead seat, and the resubmit path classing it as an
+      // ordinary refusal made an L4002 the program can catch arrive as an uncatchable L4000.
+      const refusal = (r: EpAttributedReply, resubmitted: boolean): Error => {
+        const err = r.reply.error;
+        // `expired` is the serve boundary's "target is not a live managed agent". From the placed
+        // host that is the seat's own manager answering about it. From the class rail it is only
+        // the members this call reached, so the message does not claim more than that.
+        if (err?.code === "expired")
+          return new EffectError("L4002", "turn", `turn(${name}#${uid}) ${seatDownReading(err, host)} before the relay began: ${err.message}`);
+        return new Error(resubmitted
+          ? `turn(${name}#${uid}) landed but its acceptance could not be re-read: ${err?.message ?? "refused with no message"}`
+          : `turn(${name}#${uid}) was refused by the ${this.binding.endpoint} endpoint: ${err?.message ?? "refused with no message"}`);
+      };
+      if (reply !== undefined && reply.reply.ok === false) throw refusal(reply, false);
+      if (reply === undefined) {
+        // The acceptance carries the deadline authority, so a lost reply is asked for again: the
+        // same goalId under the same fingerprint is served from the manager's acceptance cache.
+        reply = await submit();
+        if (reply.reply.ok === false) throw refusal(reply, true);
+      }
+      const floor = reply.reply.data as { deadlineAt?: unknown } | undefined;
+      if (typeof floor?.deadlineAt !== "number")
+        throw new Error(`turn(${name}#${uid}) was accepted with no readable deadline (${JSON.stringify(reply.reply.data)}); a garbled acceptance never authorizes (SPEC 13.6)`);
+      // ONE deadline for the turn: the acceptance's `deadlineAt` is the instant the manager's own
+      // hold denies at, and the client's pause is armed on that same instant. A second clock read
+      // before the accept round-trip would fire first by the round-trip plus skew and throw away a
+      // yield the manager's window still admitted.
+      const deadlineAt = floor.deadlineAt;
+      ext = {
+        goalId, name, owner, actor, uid, deadlineAt,
+        noticeIds: notices.map((n) => n.noticeId),
+        ...(handoffFrom !== undefined ? { handoffFrom } : {}),
+      };
+      await ctx.bind(ext);
+      // Spent once the turn is RECORDED, which is the same event the adoption seed counts. Spending
+      // it before the submit charged a permit for a turn the seat never saw (a dead seat's L4002,
+      // an endpoint refusal), and a recovering run would then read a different number off the
+      // journal than the live one held.
+      this.turnsTaken.set(`${name}#${uid}`, taken + 1);
+    }
+    this.recordTurnGoal(`${name}#${uid}`, goalId);
+    const deadlineAt = ext.deadlineAt;
+    if (typeof deadlineAt !== "number")
+      throw new Error(`turn(${name}#${uid}) resumed with no recorded deadline; a garbled external state never authorizes`);
+    // The client's OWN deadline authority: minted on the first pass, attached to on re-entry.
+    await this.arm(primary, deadlineAt);
+
+    const actx = await this.actionCtx();
+    const watch: DeathWatch = {};
+    const decided = async (): Promise<boolean> =>
+      ctx.signal.cancelled || (await readGoalResult(actx, ref)) !== undefined || (await this.expired(primary)) !== undefined;
+    try {
+        for (;;) {
+        if (ctx.signal.cancelled) {
+          await this.cancelTimer(primary);
+          await this.withdrawCancelledRelay(goalId);
+          throw new Cancelled(ctx.signal.reason ?? "cancelled");
+        }
+        const fact = await readGoalResult(actx, ref);
+        if (fact !== undefined) {
+          await this.cancelTimer(primary);
+          return await this.turnOutcome(req, fact, ext, scope, name, uid);
+        }
+        const ended = await this.expired(primary);
+        if (ended !== undefined)
+          throw new EffectError("L4003", "turn-deadline", `turn(${name}#${uid}) deadline elapsed before a yield`);
+        const reason = await this.presenceDeath(name, uid, watch, decided);
+        if (reason !== undefined) {
+          await this.cancelTimer(primary);
+          throw new EffectError("L4002", "turn", `turn(${name}#${uid}) found the agent down (${reason}) before a yield`);
+        }
+        await delay(WAIT_POLL_MS);
+      }
+    } catch (e) {
+      // A turn that ends on the run's side without a yield the run accepted (its deadline, the
+      // seat's death, a refused handoff, a cancellation) is not a reply, whatever the relay
+      // records later: `wait(replied)` reads the verdict this branch raised, never a stale yield.
+      this.turnGoals.get(`${name}#${uid}`)?.delete(goalId);
+      throw e;
+    }
+  }
+
+  /**
+   * A yielded handoff's refusal class: L4005 when the addressee is not in this run's roster,
+   * L4004 when it sits in a different worktree than the seat handing off, undefined when the
+   * handoff is honorable. One reading for the turn that raises it and the `wait(replied)` that
+   * must not count it, so the two observers never diverge on a spoofed or misdirected `to`.
+   */
+  private handoffRefusal(fromWorktree: string | undefined, to: unknown): "L4005" | "L4004" | undefined {
+    const toName = typeof to === "string" ? to : "";
+    const target = this.roster.get(toName);
+    if (toName.length === 0 || target === undefined) return "L4005";
+    if ((target.handle.worktree ?? undefined) !== (fromWorktree ?? undefined)) return "L4004";
+    return undefined;
+  }
+
+  /** Map a turn goal's terminal onto the effect's contract: `succeeded` carries the TurnResult
+   *  (a handoff addressee resolved against the roster — L4005 outside it, L4004 across
+   *  worktrees), `failed` splits on the manager's recorded reason, `cancelled` unwinds. The
+   *  consumed notices are marked HERE, by the goal that carried them, tolerating the re-entry
+   *  conflict (a crash between the terminal and the mark re-marks on resume). */
+  private async turnOutcome(
+    req: TurnRequest,
+    fact: GoalResultFact,
+    ext: Readonly<Record<string, unknown>>,
+    scope: string,
+    name: string,
+    uid: string,
+  ): Promise<TurnResultValue> {
+    if (fact.state === "cancelled") throw new Cancelled(`the turn goal for ${name}#${uid} was cancelled`);
+    if (fact.state === "failed") {
+      const d = fact.data as { reason?: unknown; error?: unknown; agentDownAt?: unknown } | undefined;
+      // The one reasoned failure a relay commits. A dead target has no early terminal of its own
+      // on the goal plane (SPEC 13.6 item 7): the client's presence watch in the poll loop is the
+      // first L4002 authority, and a death that rode to the deadline arrives on this same deny,
+      // MARKED by the relay (`agentDownAt`) — read here as the agent-down failure it is, never as
+      // a deadline the program could have set longer.
+      if (d?.reason === "turn-deadline") {
+        if (typeof d.agentDownAt === "number")
+          throw new EffectError("L4002", "turn", `turn(${name}#${uid}) found the agent down (it left presence at ${new Date(d.agentDownAt).toISOString()}) before a yield; the deadline terminal carries its death`);
+        throw new EffectError("L4003", "turn-deadline", `turn(${name}#${uid}) deadline elapsed before a yield`);
+      }
+      throw new Error(`turn(${name}#${uid}) failed at the ${this.binding.endpoint} endpoint: ${typeof d?.error === "string" ? d.error : JSON.stringify(fact.data)}`);
+    }
+    if (fact.state !== "succeeded")
+      throw new Error(`turn(${name}#${uid}) settled ${fact.state}; a turn's yield is a succeeded terminal or a reasoned failure, never this`);
+    const d = fact.data as { status?: unknown; to?: unknown; note?: unknown; at?: unknown } | undefined;
+    if ((d?.status !== "done" && d?.status !== "blocked" && d?.status !== "handoff") || typeof d.at !== "number")
+      throw new Error(`turn(${name}#${uid}) succeeded with a malformed TurnResult (${JSON.stringify(fact.data)}); a garbled terminal never yields a result`);
+    let to: AgentHandleValue | undefined;
+    if (d.status === "handoff") {
+      const toName = typeof d.to === "string" ? d.to : "";
+      const refusal = this.handoffRefusal(req.agent.worktree, d.to);
+      if (refusal === "L4005")
+        throw new EffectError("L4005", "turn-handoff", `turn(${name}#${uid}) yielded a handoff to "${toName}", which is not in this run's roster`);
+      const target = this.roster.get(toName)!;
+      if (refusal === "L4004")
+        throw new EffectError("L4004", "turn-handoff", `turn(${name}#${uid}) yielded a handoff to "${toName}" across worktrees (${req.agent.worktree ?? "none"} -> ${target.handle.worktree ?? "none"}); you cannot hand someone a working tree they are not in`);
+      to = target.handle;
+    }
+    // The notices this turn carried are consumed by THIS goal — the create-only CAS arbitrates,
+    // and a re-entry's conflict reads as "already recorded", never as a failure.
+    const noticeIds = Array.isArray(ext.noticeIds) ? ext.noticeIds.filter((n): n is string => typeof n === "string") : [];
+    for (const noticeId of noticeIds) {
+      try {
+        await markRunNoticeConsumed(this.kv, this.binding.endpoint, this.binding.runId, req.agent.agent, noticeId, String(ext.goalId), this.now());
+      } catch (e) {
+        if (!(e instanceof EpEnvelopeError && e.code === "conflict")) throw e;
+      }
+    }
+    if (d.status === "handoff" && to !== undefined)
+      this.recordHandoffMemo(scope, parseAgentHandle(to.agent).name, String(ext.goalId));
+    return {
+      status: d.status,
+      ...(to !== undefined ? { to } : {}),
+      ...(typeof d.note === "string" ? { note: d.note } : {}),
+      at: d.at,
+    };
+  }
+
+  /**
+   * `ask` is a schema-checked pause the ADDRESSED AGENT is expected to answer.
+   *
+   * Each attempt is one checkpoint-plane pause — the same mint, settle and answer record a
+   * `checkpoint` rides, answered through the run driver's `resolveCheckpoint` (`cotal run
+   * answer`), which is how "the agent publishes a record" reaches a holder-bound plane: the agent,
+   * or anyone the run's ACL admits on its behalf, answers through the driver exactly as a human
+   * answers a checkpoint. What `ask` adds is the handler-side contract of §6.5: the schema is read
+   * as the SHORTHAND (refused L4022 when it cannot be), every answer is checked against it, a
+   * non-conforming answer costs one attempt and the refusal reason is bound onto the entry for the
+   * answerer to read, and exhausted attempts are the effect's own catchable L4006.
+   *
+   * **One absolute deadline for the whole ask**, computed once and bound with the first attempt: a
+   * re-ask does not restart the clock, or a stream of non-conforming answers could stretch the
+   * pause forever. The deadline elapsing with no conforming answer is the ask's own L4006, the
+   * same outcome exhausted attempts name: the budget it ran out of is the ask's, and L4003 belongs
+   * to a `turn` whose own deadline elapsed.
+   *
+   * **Attempt N's token derives from the step's request id** (attempt 1 IS the request id), and
+   * the CURRENT attempt's token is bound as `askToken` before its pause is armed — so a resume
+   * re-enters the attempt in flight, an answer judged non-conforming just before a crash is
+   * re-judged identically from its durable settle, and the discharge and the adoption re-arm
+   * address the one timer that is actually armed.
+   */
+  async ask(req: AskRequest, ctx: EffectContext): Promise<unknown> {
+    if (ctx.signal.cancelled) throw new Cancelled(ctx.signal.reason ?? "cancelled");
+    const shape = askSchemaShape(req.schema);
+    if (shape === null) {
+      throw new EffectError(
+        "L4022",
+        "ask-schema-unreadable",
+        `L4022 Unreadable ask schema\n\n  step  ${stepKeyString(ctx.key)}\n\nThe schema is not the shorthand this handler enforces: a record mapping each field name to one of "string", "number", "boolean", "array", "record", "null".\n\nFix: write the shorthand, for example { steps: "array" }, or pass {} to accept any record.`,
+      );
+    }
+    const attempts = req.attempts ?? 1;
+    // The seat the ask is told to, resolved before anything binds: an ask addresses an agent this
+    // run spawned, and one it cannot tell opens no attempt.
+    const seat = this.askSeat(req, ctx);
+    const resume = askResume(ctx.resume);
+    const deadlineAt = resume?.deadlineAt
+      ?? this.now() + parseDuration(req.deadline ?? this.binding.defaultCheckpointTimeout);
+    let attempt = resume?.attempt ?? 1;
+    // The resumed attempt is already bound; every attempt this call opens binds before it arms.
+    let bindOwed = resume === undefined;
+    let refused: string | undefined = resume?.refused;
+    for (;;) {
+      const token = askAttemptToken(ctx.requestId, attempt);
+      if (bindOwed) {
+        await ctx.bind({
+          attempt,
+          askToken: token,
+          deadlineAt,
+          ...(refused !== undefined ? { refused } : {}),
+        });
+      }
+      bindOwed = true;
+      // The addressed agent is TOLD: the attempt rides the turn relay under the attempt's own
+      // token, carrying the token, the schema, the attempt count, the deadline and the previous
+      // refusal, so the seat can answer through `cotal run answer`. Idempotent by goal id: a
+      // re-entry finds the relay already accepted and submits nothing.
+      await this.relayAsk(seat, ctx, token, { attempt, attempts, deadlineAt, ...(refused !== undefined ? { refused } : {}) });
+      const ref: CheckpointRef = { endpoint: this.binding.endpoint, token };
+      // The deadline is the ask's whole budget of time: passing it with no conforming record
+      // is the same outcome exhausted attempts name (L4006), never a turn's deadline (L4003),
+      // and that holds when it passed while the attempt was bound and relayed, before its pause
+      // could be minted.
+      const expired = () => new EffectError(
+        "L4006",
+        "ask-deadline",
+        `ask(${stepKeyString(ctx.key)}) produced no conforming record before its recorded deadline: attempt ${attempt} of ${attempts} was still open when it passed`,
+      );
+      try {
+        await this.arm(ref, deadlineAt);
+      } catch (e) {
+        if (e instanceof PauseOverdue) throw expired();
+        throw e;
+      }
+      const settled = await this.settle(ref, ctx.signal, true);
+      if (settled.settle === "expired") throw expired();
+      const answer = settled.answerId === undefined
+        ? undefined
+        : this.services ? await this.services.pauses.readAnswer(token) : await readCheckpointAnswer(this.kv, this.binding.endpoint, token, settled.answerId);
+      if (answer === undefined) throw new CheckpointAnswerMissing(token, settled.answerId);
+      if (conformsToAskSchema(answer.value, shape)) return answer.value;
+      const why = askNonconformance(answer.value, shape);
+      if (attempt >= attempts) {
+        throw new EffectError(
+          "L4006",
+          "ask-nonconforming",
+          `L4006 ask never produced a conforming record\n\n  step  ${stepKeyString(ctx.key)}\n\n${attempts} repl${attempts === 1 ? "y was" : "ies were"} checked against the schema and none conformed; the last was refused: ${why}.\n\nFix: have the agent publish a record matching the schema, widen the schema, or raise attempts.`,
+        );
+      }
+      refused = why;
+      attempt += 1;
+    }
+  }
+
+  /**
+   * One ask attempt's relay to the addressed seat: a `turn` goal under the attempt's token whose
+   * payload carries the ask (token, schema, attempt, deadline, the previous refusal), rendered by
+   * the seat's connector as the request to answer. The goal is the seat's to yield when it has
+   * answered; the ask itself settles on the checkpoint plane, so the relay's terminal is never
+   * read here, and it is never a reply `wait(replied)` observes. A seat the serve boundary reports
+   * gone is the agent-down failure (L4002).
+   */
+  private askSeat(req: AskRequest, ctx: EffectContext): AskSeat {
+    const { name, uid } = parseAgentHandle(req.agent.agent);
+    const seat = this.seatAddress(name, uid);
+    const step = stepKeyString(ctx.key);
+    if (seat.address === undefined) {
+      if (seat.why === "not-in-roster")
+        throw new Error(`ask(${step}) addresses ${name}#${uid}, which is not in this run's roster; an ask is relayed to an agent this run spawned`);
+      throw new Error(`ask(${step}) has no address for ${name}#${uid}: the spawn's acceptance floor was never served, so the seat's owner/actor coordinates are unknown`);
+    }
+    return { ...seat.address, schema: req.schema };
+  }
+
+  /**
+   * Where a relay to an agent of this run is addressed: the roster entry under the handle's name,
+   * at the handle's incarnation, with the owner/actor coordinates its acceptance floor served.
+   * One resolver for the three relays (`turn`, `ask`, an escalation), because the three
+   * dispositions differ and the lookup does not: a turn and an ask refuse, an escalation stands.
+   */
+  private seatAddress(name: string, uid?: string): { address: SeatAddress; why?: undefined } | { address?: undefined; why: "not-in-roster" | "no-floor" } {
+    const entry = this.roster.get(name);
+    if (entry === undefined || (uid !== undefined && entry.uid !== uid)) return { why: "not-in-roster" };
+    if (entry.owner === undefined || entry.actor === undefined) return { why: "no-floor" };
+    return { address: { name, uid: entry.uid, owner: entry.owner, actor: entry.actor, ...(entry.host !== undefined ? { host: entry.host } : {}) } };
+  }
+
+  private async relayAsk(
+    seat: AskSeat,
+    ctx: EffectContext,
+    token: string,
+    ask: { attempt: number; attempts: number; deadlineAt: number; refused?: string },
+  ): Promise<void> {
+    const step = stepKeyString(ctx.key);
+    const context = renderRunContext({ run: this.binding.runId, step, notices: [] });
+    const payload = JSON.stringify({
+      run: this.binding.runId, step, context, noticeIds: [],
+      ask: { token, schema: seat.schema, attempt: ask.attempt, attempts: ask.attempts, deadlineAt: ask.deadlineAt, ...(ask.refused !== undefined ? { refused: ask.refused } : {}) },
+    });
+    await this.relayToSeat(seat, token, payload, ask.deadlineAt, "ask", step);
+  }
+
+  /**
+   * An escalated checkpoint, delivered to the agent it names.
+   *
+   * `to` is legal only with `onExpiry: "escalate"` and the escalation is the SECOND mint, so this
+   * runs once per chain at most. The addressee is resolved through the run's own roster: a name
+   * this run spawned is a seat and is told, and anything else is a person — the pause is
+   * answerable from anywhere by design, its addressee is on the entry, and refusing a program
+   * that escalates to a human would be this host narrowing an option the reference leaves open.
+   *
+   * The relay is the ask's, because the two are the same act: one turn on the seat, carrying what
+   * is asked and the token to answer under, settling on the checkpoint plane rather than on the
+   * relay's own terminal.
+   */
+  private async relayEscalation(req: CheckpointRequest, ctx: EffectContext, token: string, deadlineAt: number): Promise<void> {
+    const to = req.to as string;
+    const step = stepKeyString(ctx.key);
+    // A seat is a roster entry whose acceptance floor was served: that is what carries the
+    // owner/actor coordinates a relay is addressed by. Anything else — a name this run never
+    // spawned, or one whose floor never landed — is not a seat, and the escalation stays the
+    // durable pause it already is, addressed on its entry and answerable from anywhere.
+    const seat = this.seatAddress(to);
+    if (seat.address === undefined) return;
+    const context = renderRunContext({ run: this.binding.runId, step, notices: [] });
+    const payload = JSON.stringify({
+      run: this.binding.runId, step, context, noticeIds: [],
+      checkpoint: { token, prompt: req.prompt, schema: req.schema ?? null, deadlineAt, escalatedTo: to },
+    });
+    try {
+      await this.relayToSeat(seat.address, token, payload, deadlineAt, "checkpoint", step);
+    } catch (e) {
+      // THE PAUSE OUTLIVES ITS ADDRESSEE. The reference defines no failure for an escalation whose
+      // addressee cannot be reached: it "mints exactly one further checkpoint addressed to `to`",
+      // and a checkpoint is "a durable pause a human or an agent resolves from anywhere". A seat
+      // the endpoint reports gone is therefore the same case as a `to` that names a person: nobody
+      // is told, the addressee is on the entry, and anyone may still answer. L4002 is the turn's
+      // vocabulary, and this is not a turn the program asked for. Said once, not swallowed.
+      if (!(e instanceof EffectError && e.code === "L4002")) throw e;
+      console.error(`run ${this.binding.runId}: the escalation at ${step} could not be told to ${to} (${e.message}); the pause stands, answerable from anywhere`);
+    }
+  }
+
+  /**
+   * Submit one relay to a seat as a `turn` goal, and read its acceptance.
+   *
+   * IDEMPOTENT BY THE GOAL RECORD, which is also the arbiter when the invoke does not come back:
+   * a relay that landed and lost its reply is a relay that landed, and re-submitting it would put
+   * a second turn on the seat for one request. A seat the serve boundary reports gone is the
+   * agent-down failure (L4002); every other refusal is this endpoint's and is uncatchable.
+   *
+   * The relay carries the pause's own `deadlineAt` and the manager holds it to that instant: a
+   * duration counted from the manager's acceptance would outlive the pause by the submit's trip
+   * plus skew and show the seat an attempt whose answer is refused. A relay the manager refuses as
+   * already past, and that is past on this clock too, has nobody left to tell, because the pause
+   * denies at that same instant; the arm that follows meets the passed deadline and decides the
+   * outcome.
+   */
+  private async relayToSeat(
+    seat: SeatAddress,
+    goalId: string,
+    payload: string,
+    deadlineAt: number,
+    kind: "ask" | "checkpoint",
+    step: string,
+  ): Promise<void> {
+    const { name, uid } = seat;
+    const ref: GoalRef = { endpoint: this.binding.endpoint, caller: this.binding.caller, goalId };
+    const actx = await this.actionCtx();
+    if ((await readGoalStatus(actx, ref)) !== undefined) return;
+    const service = await this.relayManagerBeforeSubmit(seat.host, "turn", ref, kind, `${kind}(${step})`);
+    let reply: EpAttributedReply;
+    try {
+      reply = await this.invokeManager(service, "turn",
+        { payload, deadlineAt }, {
+          id: goalId,
+          deadlineMs: TURN_ACCEPT_DEADLINE_MS,
+          target: { mode: "owner", owner: seat.owner, actor: seat.actor, lifecycleUid: uid },
+        });
+    } catch (err) {
+      // The invoke did not come back — the goal record is the arbiter, exactly as in `turn`.
+      if ((await readGoalStatus(actx, ref)) === undefined) throw err;
+      return;
+    }
+    if (reply.reply.ok === false) {
+      const err = reply.reply.error;
+      if (err.code === "expired")
+        throw new EffectError("L4002", kind, `${kind}(${step}): ${name}#${uid} ${seatDownReading(err, seat.host)} before its relay began: ${err.message}`);
+      if (err.code === "deadline-exceeded" && this.now() >= deadlineAt) return;
+      throw new Error(`${kind}(${step}) was refused by the ${this.binding.endpoint} endpoint: ${err.message}`);
+    }
+  }
+
+  /**
+   * Withdraw the relay a cancelled step sent to a seat, through the manager's reserved `cancel`
+   * (SPEC 13.6 item 4), so the seat is not shown it again. A token no relay rode has no goal and
+   * nothing to withdraw, and a relay that already ended is the outcome either way: the manager
+   * refuses it with the cached terminal, so a repeated withdrawal is a no-op. Any other refusal
+   * throws under the code it was refused with, which leaves a discharge open to retry.
+   *
+   * Only the manager that accepted the relay holds it, and the class rail reaches any member, so a
+   * refusal is final only from the accepter its index entry names. One from another member is
+   * re-issued on the class rail, as the spawn discharge's despawn is.
+   */
+  private async withdrawRelay(goalId: string): Promise<void> {
+    const ref: GoalRef = { endpoint: this.binding.endpoint, caller: this.binding.caller, goalId };
+    const actx = await this.actionCtx();
+    if ((await readGoalStatus(actx, ref)) === undefined) return;
+    const accepter = (await readGoalIndex(actx, ref))?.iid;
+    for (let attempt = 0; ; attempt += 1) {
+      const reply = await this.invokeManager(await this.manager("cancel"), "cancel", { goalId }, { deadlineMs: TURN_ACCEPT_DEADLINE_MS });
+      if (reply.reply.ok !== false || (await readGoalResult(actx, ref)) !== undefined) return;
+      if (accepter === undefined || reply.responder.instanceId === accepter) {
+        const err = reply.reply.error;
+        throw new EpEnvelopeError(err.code as EpErrorCode, `the relay "${goalId}" could not be withdrawn from its seat: ${err.message}`);
+      }
+      if (attempt === MANAGER_ROUTE_ATTEMPTS)
+        throw new Error(`the relay "${goalId}" was accepted by manager instance ${accepter}, but none of ${attempt + 1} cancels was answered by it; the discharge stays open to retry`);
+      this.managerServices.delete("cancel");
+    }
+  }
+
+  /**
+   * Withdraw a cancelled step's relay before the cancellation leaves the step, so the scope it
+   * settles shows the seat nothing the run withdrew. A withdrawal that fails is tried again rather
+   * than left to the discharge, which runs only when the run ends: until then the relay would stay
+   * first on the seat and hold back the run's next turn to it. The retries stop when the relay's
+   * deadline passes, because the manager no longer serves it then, and a failure that outlasts it
+   * is the step's error. A refusal no retry can change is the step's error at once, since retrying
+   * it would only hold the cancelled step in its scope until that deadline: of the refusals, only
+   * `unavailable` (a manager still reconciling at boot) and `deadline-exceeded` (a lost reply) are
+   * tried again.
+   *
+   * That deadline is read from the relay's goal, where the accepting manager recorded the instant
+   * it stops serving the relay; a withdrawal holds only the goal id. No deadline is known until that
+   * goal is read, and the relay may be served until then, so a failed read is tried again as well.
+   * A goal record that can never yield a deadline is thrown.
+   */
+  private async withdrawCancelledRelay(goalId: string): Promise<void> {
+    let deadlineAt: number | undefined;
+    for (;;) {
+      try {
+        if (deadlineAt === undefined) {
+          const spec = (await readGoalSpec(await this.actionCtx(), { endpoint: this.binding.endpoint, caller: this.binding.caller, goalId }))?.value;
+          if (spec === undefined) return;
+          if (spec.readinessDeadlineMs === undefined)
+            throw new EpEnvelopeError("internal", `the relay "${goalId}" was accepted with no deadline on its goal; a garbled acceptance never authorizes (SPEC 13.6)`);
+          deadlineAt = spec.acceptedAt + spec.readinessDeadlineMs;
+        }
+        return await this.withdrawRelay(goalId);
+      } catch (e) {
+        const final = e instanceof EpEnvelopeError && e.code !== "unavailable" && e.code !== "deadline-exceeded";
+        if (deadlineAt === undefined ? e instanceof EpEnvelopeError : final || this.now() >= deadlineAt) throw e;
+      }
+      await delay(WAIT_POLL_MS);
+    }
+  }
+
+  /**
+   * `monitor` registers interest: after it, `down(agent)` is an event a branch can await (§5.9).
+   *
+   * THE REGISTRATION IS THE JOURNAL ENTRY, and that is the whole mechanism. Death is a STATE on
+   * this mesh — the monitored incarnation's presence row gone (see `waitDown`) — not a message
+   * that must find a standing mailbox, so there is no subscription to create, nothing to arm, and
+   * nothing for a discharge or a migration to release: `wait(down(...))` reads the same fact
+   * whenever it is asked, and the migration table's row for `monitor` ("nothing outlives it")
+   * stays true. What the step performs is the validation a registration owes: the value must BE
+   * an agent handle, refused loudly when it is not, because a wait parked on a malformed handle
+   * would poll for a death nothing can ever report.
+   *
+   * Monitoring an agent that is ALREADY dead succeeds — Erlang's monitor of a dead process
+   * delivers its DOWN rather than failing, and the rescue idiom (race work against
+   * `wait(down(...))`) needs exactly that: the death is observed by the wait, immediately.
+   */
+  async monitor(req: MonitorRequest, ctx: EffectContext): Promise<null> {
+    if (ctx.signal.cancelled) throw new Cancelled(ctx.signal.reason ?? "cancelled");
+    const { name, uid } = parseAgentHandle(req.agent.agent);
+    // The entry carries the handle it registered, so an adopted run rebuilds the same registry.
+    await ctx.bind({ agent: `${name}#${uid}` });
+    this.monitored.add(`${name}#${uid}`);
+    return null;
+  }
+
+  /**
+   * `conclave` open: mint (or take) the channel and join the members as durable membership rows.
+   *
+   * **The plan is the recovery identity.** Everything the close and the discharge need — the
+   * channel, whether this open minted its registry row, and per member the resolved principal,
+   * incarnation, generation and whether THIS conclave created the row — is computed first, bound
+   * as the entry's external state, and only then executed. A crash before the bind created
+   * nothing (rows are written after it); a crash after it re-enters with `ctx.resume` carrying
+   * the plan, and the execute converges idempotently without re-resolving anything: the members
+   * may have died since, and the recorded plan — not the world's current shape — is what a
+   * release answers to.
+   *
+   * **The channel is handler-derived** when the program names none: `conclave-` plus a digest of
+   * the step's own request id, so a resumed run re-derives the same room instead of opening a
+   * second one. A program-named channel is taken as-is (validated concrete) and its registry row
+   * is left alone — naming a room is not creating one, and the close must not tear down a channel
+   * the run merely borrowed.
+   *
+   * **Members resolve through presence.** A handle carries `<name>#<lifecycleUid>`; the row that
+   * maps it to the principal a membership record needs is the seat's own self-published presence —
+   * the same source DM name-resolution reads, and the witness the manager's readiness gate
+   * requires before a spawn reports `succeeded`. A member with no matching row is down or gone,
+   * which is the effect's own catchable failure (L4002), not a handler fault.
+   *
+   * A member already durably in the channel (a pinned pre-existing room) is planned `joined:
+   * false`: the conclave neither re-joins nor — at close — evicts a membership it did not create.
+   */
+  async openConclave(req: ConclaveRequest, ctx: EffectContext): Promise<ChannelHandleValue> {
+    if (ctx.signal.cancelled) throw new Cancelled(ctx.signal.reason ?? "cancelled");
+    let plan: ConclavePlan;
+    if (isConclavePlan(ctx.resume)) {
+      plan = ctx.resume;
+    } else {
+      plan = await this.planConclave(req, ctx);
+      await ctx.bind({ ...plan });
+    }
+    assertConclaveOwnership(plan, ctx.requestId, req);
+    await this.executeConclavePlan(plan);
+    this.conclaves.set(ctx.requestId, plan);
+    return { channel: plan.channel };
+  }
+
+  /**
+   * `conclave` close: release exactly what the recorded plan says the open created — tombstone
+   * the memberships planned `joined: true`, delete the registry row when this conclave minted the
+   * channel. A member that left and rejoined on its own since carries a newer generation, and the
+   * stale-write guard makes this leave a no-op for it: the membership is theirs now.
+   *
+   * Idempotent by the plane (a tombstone at or below an existing leave cursor is a no-op), so the
+   * re-entry that retries an unacknowledged close converges. The failure mode is the interpreter's
+   * `CloseOwed`: a close that throws leaves the entry pending, which IS the durable "a close is
+   * still owed".
+   */
+  async closeConclave(_req: ConclaveRequest, ctx: EffectContext): Promise<null> {
+    const plan = this.conclaves.get(ctx.requestId) ?? (isConclavePlan(ctx.resume) ? ctx.resume : undefined);
+    if (plan === undefined)
+      throw new Error(`conclave close for "${ctx.requestId}" has no recorded plan: the open that owes this close bound none`);
+    assertConclaveOwnership(plan, ctx.requestId);
+    await this.releaseConclave(plan);
+    this.conclaves.delete(ctx.requestId);
+    return null;
+  }
+
+  /** Compute the conclave plan from the world: derive or validate the channel, resolve every
+   *  member handle to its principal, and read each existing membership row so the join generation
+   *  and the created-by-us fact are decided BEFORE anything is written. Duplicate handles collapse
+   *  to one planned member — one identity is one membership row. */
+  private async planConclave(req: ConclaveRequest, ctx: EffectContext): Promise<ConclavePlan> {
+    const derived = req.channel === undefined;
+    const channel = derived
+      ? `conclave-${createHash("sha256").update(ctx.requestId).digest("hex").slice(0, 12)}`
+      : assertConclaveChannel(req.channel!);
+    const members: ConclavePlanMember[] = [];
+    if (req.members.length > 0) {
+      const presence = await this.presenceRows();
+      const membersKv = await this.membersRegistry();
+      const seen = new Set<string>();
+      for (const m of req.members) {
+        const { name, uid } = parseAgentHandle(m.agent);
+        if (seen.has(`${name}#${uid}`)) continue;
+        seen.add(`${name}#${uid}`);
+        const principal = resolveMemberPrincipal(presence, m.agent, name, uid);
+        const existing = await readMember(membersKv, channel, principal, uid);
+        const open = existing !== undefined && existing.record.state === "durable-active" && existing.record.leaveCursor === undefined;
+        members.push({
+          agent: m.agent,
+          principal,
+          uid,
+          generation: open ? existing.record.generation : (existing?.record.generation ?? 0) + 1,
+          joined: !open,
+        });
+      }
+    }
+    return { channel, registered: derived, members };
+  }
+
+  /** Execute a conclave plan against the registries, idempotently: the registry row is a merge
+   *  the re-entry rewrites byte-identical, and a member row is committed only where the plan's
+   *  generation is NEWER than what is stored — a re-entry must not roll a landed row's join
+   *  cursor forward (the members were mid-conversation when the host died), and a row the world
+   *  moved past (an independent leave or rejoin) is theirs, not this conclave's. */
+  private async executeConclavePlan(plan: ConclavePlan): Promise<void> {
+    if (this.services) {
+      // SPEC 14.8: registering a room and writing third-party memberships are management writes
+      // the run performs as its own principal, so the admitted ceiling must cover the channel in
+      // BOTH directions. A program-named room the run merely borrows is held to the same rule: a
+      // conclave is a channel effect whichever way the name was chosen.
+      // The publish row an agent's credential carries names the AGENT's triple, so the ceiling
+      // is checked under the caller the run was admitted for, never under the run-driver principal
+      // this handler runs as: that principal holds no chat row and would deny every conclave the
+      // starting caller may in fact hold.
+      const view = await this.services.admission();
+      const reason = this.services.cancellationObserved?.();
+      if (view.revoked !== undefined && reason !== undefined)
+        throw new Cancelled(reason);
+      assertAdmittedPublish(view, plan.channel, view.admission.caller);
+      assertAdmittedSubscribe(view, plan.channel);
+    }
+    if (plan.registered) {
+      await writeChannelConfig(await this.channelRegistry(), plan.channel, {
+        description: `a workflow conclave of run ${this.binding.runId}`,
+      });
+    }
+    const joins = plan.members.filter((m) => m.joined);
+    if (joins.length === 0) return;
+    const membersKv = await this.membersRegistry();
+    const joinCursor = await this.chatFrontier();
+    for (const m of joins) {
+      const existing = await readMember(membersKv, plan.channel, m.principal, m.uid);
+      if (existing !== undefined && existing.record.generation >= m.generation) continue;
+      const aclKv = await this.aclRegistry();
+      // The member lifecycle's exact read-ACL row is the fence a retirement relies on: it is narrowed
+      // before the retirement's membership inventory is read, so a row created after that read must
+      // refuse itself (#4984). This write is a creating writer outside the delivery daemon (#4995), so
+      // it reads that row just before the commit and again after it, as the daemon's join does: a
+      // member the row no longer covers gets no row, and a row written while it was narrowed goes.
+      if (aclKv !== undefined && !(await this.memberAclAllows(aclKv, m, plan.channel))) continue;
+      let written: { revision: number };
+      try {
+        written = await commitMemberRevision(membersKv, {
+          channel: plan.channel,
+          owner: m.principal,
+          lifecycleUid: m.uid,
+          state: "durable-active",
+          joinCursor,
+          generation: m.generation,
+          // No activation catch-up is owed: eligibility starts at the join cursor captured here,
+          // so the completeness the flag reports holds by construction — nothing before the join
+          // is in this membership's interval.
+          activated: true,
+          writerIdentity: `${this.binding.caller.owner}.${this.binding.caller.actor}`,
+          updatedAt: this.now(),
+        });
+      } catch (e) {
+        // A concurrent newer write won between the read and the commit — same verdict as the
+        // read-side skip above: the membership is the newer writer's now.
+        if (!(e instanceof StaleMembershipWrite)) throw e;
+        continue;
+      }
+      if (aclKv !== undefined) await this.keepMemberRowIfAclAllows(aclKv, membersKv, m, plan.channel, written.revision);
+    }
+  }
+
+  /** The world half of ending a conclave, shared by the close and the discharge: tombstone the
+   *  memberships this conclave created, then delete the registry row it minted. Idempotent, and
+   *  tolerant of exactly one foreign move — a NEWER generation on a row (the member left and
+   *  rejoined on its own), which the stale-write guard reports and this leave must not evict. */
+  private async releaseConclave(plan: ConclavePlan): Promise<void> {
+    // A release is owed cleanup of resources this run created (recorded in the plan), which a
+    // revocation does not cancel: the tombstones and the registry delete undo the run's own
+    // writes and grant nothing new. The admission must still be READABLE, so an unreachable store
+    // refuses here too rather than proceeding on nothing.
+    if (this.services) await this.services.admission();
+    const joined = plan.members.filter((m) => m.joined);
+    if (joined.length > 0) {
+      const membersKv = await this.membersRegistry();
+      const leaveCursor = await this.chatFrontier();
+      const writer = `${this.binding.caller.owner}.${this.binding.caller.actor}`;
+      for (const m of joined) {
+        try {
+          await tombstoneMember(membersKv, plan.channel, m.principal, m.uid, leaveCursor, writer, m.generation);
+        } catch (e) {
+          if (!(e instanceof StaleMembershipWrite)) throw e;
+        }
+      }
+    }
+    if (plan.registered) {
+      await (await this.channelRegistry()).delete(plan.channel);
+    }
+  }
+
+  /** Every live presence row {@link isPresenceRow} accepts under its KV key. Foreign bytes in
+   *  the bucket are skipped — a peer's malformed self-publish must not break another agent's name
+   *  resolution — and what an ABSENT row means belongs to the caller: `resolveMemberPrincipal`
+   *  refuses the join loudly, and `waitDown` reads it as the death it is waiting for. */
+  private async presenceRows(): Promise<Presence[]> {
+    const rows: Presence[] = [];
+    for (const e of await liveKvEntries(await this.presenceRegistry())) {
+      let row: unknown;
+      try {
+        row = e.json<unknown>();
+      } catch {
+        continue;
+      }
+      if (isPresenceRow(row, e.key)) rows.push(row);
+    }
+    return rows;
+  }
+
+  /** One poll of the presence death watch `wait(down)` and `turn` share. `undefined` means this
+   *  incarnation is still live, or a lapse has not yet stood for {@link LAPSE_CONFIRM_MS}. A missing
+   *  incarnation is `"superseded"` when a live row holds the name and `"lapsed"` when nothing does.
+   *  `watch` is the caller's own window, written here and read on the next poll. An incomplete scan
+   *  decides nothing and returns `undefined`; every other read failure is raised. */
+  private async presenceDeath(
+    name: string,
+    uid: string,
+    watch: DeathWatch,
+    decided: () => Promise<boolean>,
+  ): Promise<"superseded" | "lapsed" | undefined> {
+    let rows: readonly Presence[];
+    const readAt = this.now();
+    try {
+      rows = await this.presenceRows();
+    } catch (e) {
+      // `liveKvEntries` REFUSES a pass cut short mid-scan instead of returning a partial view —
+      // and a partial view is exactly what must not decide a death. Its own contract says retry,
+      // so the next poll is the retry; a link that stays down keeps surfacing here rather than
+      // as a false DOWN, and the caller's deadline still ends the wait.
+      if (e instanceof IncompleteKvScan) return undefined;
+      throw e;
+    }
+    if (!rows.some((p) => p.card.name === name && p.lifecycleUid === uid)) {
+      const reason = rows.some((p) => p.card.name === name) ? "superseded" : "lapsed";
+      watch.lapsedSince = lapseWindow(watch.lapsedSince, watch.lastReadAt ?? 0, this.now());
+      if (reason === "superseded" || readAt - watch.lapsedSince >= LAPSE_CONFIRM_MS) {
+        if (reason === "lapsed" && !(await this.lapseStands(name, uid, decided))) watch.lapsedSince = undefined;
+        else {
+          watch.lastReadAt = readAt;
+          return reason;
+        }
+      }
+    } else watch.lapsedSince = undefined;
+    watch.lastReadAt = readAt;
+    return undefined;
+  }
+
+  /** Whether a lapse of `name#uid` confirmed from presence stands as the death, asked of the manager
+   *  first. A lapse is only the seat's heartbeats going quiet: on a loaded host a live seat's presence
+   *  writer stalls past {@link LAPSE_CONFIRM_MS} while its process goes on working (#2807), and the
+   *  manager owns that process. Only the manager holding the seat has a running row under its
+   *  incarnation, so that row keeps it alive whoever reports it. A miss decides only from the manager
+   *  that allocated it, the committer of its spawn terminal: another member of the class rail knows
+   *  only its own seats, so the class rail is asked again, as a spawn's discharge asks it. An allocator
+   *  that does not answer leaves presence as the only witness, which is the case presence is the
+   *  authority for: the manager died with the seat. The asking can outlast the caller's own
+   *  cancellation, deadline or terminal, so once `decided` holds nothing stands and no refusal is
+   *  raised: that authority decides at the caller's next check. */
+  private async lapseStands(name: string, uid: string, decided: () => Promise<boolean>): Promise<boolean> {
+    const entry = this.roster.get(name);
+    const spawned = entry?.uid === uid && entry.goalId !== undefined
+      ? await readGoalResult(await this.actionCtx(), { endpoint: this.binding.endpoint, caller: this.binding.caller, goalId: entry.goalId })
+      : undefined;
+    const allocator = spawned?.committer?.instanceId;
+    for (let attempt = 0; attempt <= MANAGER_ROUTE_ATTEMPTS; attempt += 1) {
+      if (await decided()) return false;
+      let answer: EpAttributedReply;
+      try {
+        answer = await this.invokeManager(await this.manager("inspect"), "inspect", { name }, {});
+      } catch (e) {
+        if (unansweredRequest(e)) break;
+        if (await decided()) return false;
+        throw e;
+      }
+      const { reply, responder } = answer;
+      const row = reply.ok ? reply.data as { lifecycleUid?: unknown; status?: unknown } : undefined;
+      if (row?.lifecycleUid === uid && row.status === "running") return false;
+      if (responder.instanceId === allocator && !replyRefusedBeforeEffect(reply.error)) {
+        if (reply.ok || reply.error?.code === "not-found") break;
+        if (await decided()) return false;
+        throw new Error(`inspect(${name}) was refused by manager instance ${allocator}, which allocated ${name}#${uid}: ${reply.error?.message ?? "refused with no message"}`);
+      }
+      this.managerServices.delete("inspect");
+    }
+    return !(await decided());
+  }
+
+  /**
+   * Arm this pause, or ATTACH to the one already recorded under the same token.
+   *
+   * A mint is idempotent only if the whole spec is identical, so the recorded spec is the
+   * authority for BOTH halves of the mint's identity and a resume may not recompute either. The
+   * deadline, because `now() + duration` is a different deadline a second later, and the plane
+   * reads a different deadline as a different intent. And the HOLDER, because a resumed run does
+   * not necessarily arrive under the principal that minted its pause: the CLI mints a fresh holder
+   * per invocation, and a cross-host adoption is a different principal by definition. Only the
+   * recorded holder itself may mint again — completing its own crash between the spec and the
+   * status, where the identical spec is exactly what makes the retry idempotent. Everyone else
+   * attaches. Measured before the repair, through the CLI: one `resume` of a checkpoint-parked
+   * run re-minted under its own fresh holder, the plane refused ("a token is minted once"), and
+   * the interpreter recorded that infrastructure refusal as the step's own failure (L4000) — a
+   * stranded run whose journal blames the program.
+   *
+   * An already-passed deadline cannot be minted at all, correctly, because a due pause is not being
+   * armed. It needs its schedule re-emitted at the status's current generation, which is the
+   * reconciler's job — the same operation an attaching successor needs, so the two share the exit.
+   * A first arm whose deadline has passed has nothing to attach to and raises `PauseOverdue`.
+   * A spec with no status that this holder cannot complete is unrepairable from here, so it is
+   * raised rather than waited on.
+   */
+  private async arm(ref: CheckpointRef, deadline: number): Promise<void> {
+    // #1508: every read and write below rides a client-side deadline, and a deadline that elapsed
+    // because THIS PROCESS was off the CPU is not evidence about the plane. See `host-starvation`.
+    return await servedDespiteStarvation(() => this.armOnce(ref, deadline), this.lag, `arming the pause ${ref.token}`, this.onStarved);
+  }
+
+  /** `arm`, answering `true` when the deadline passed before anything was minted for it. Only a
+   *  first arm finds that (`PauseOverdue`), and there is then no pause to settle, so a caller whose
+   *  deadline is its own outcome takes `true` as that outcome. Cancellation still wins. */
+  private async armUnlessDue(ref: CheckpointRef, deadline: number, signal: CancelSignal): Promise<boolean> {
+    try {
+      await this.arm(ref, deadline);
+      return false;
+    } catch (error) {
+      if (error instanceof PauseOverdue) {
+        if (signal.cancelled) throw new Cancelled(signal.reason ?? "cancelled");
+        return true;
+      }
+      throw error;
+    }
+  }
+
+  private async armOnce(ref: CheckpointRef, deadline: number): Promise<void> {
+    if (this.services) return this.services.pauses.arm(ref.token, deadline);
+    // Over already: an expiry or an answer landed while this host was away. Nothing to arm, and the
+    // caller reads the fact next.
+    if ((await readCheckpointSettle(this.jsm, this.binding.space, ref)) !== undefined) return;
+    const prior = await readCheckpointSpec(this.kv, ref);
+    const now = this.now();
+    if (prior === undefined) {
+      // The first arm: this driver's own mint, under its own holder, at the deadline the caller
+      // computed from the duration it was just handed.
+      if (deadline <= now) throw new PauseOverdue(ref.token, deadline, now);
+      await mintCheckpoint(this.kv, this.js, this.binding.space, {
+        ref,
+        instanceId: this.binding.instanceId,
+        epoch: this.binding.epoch,
+        holder: this.binding.holder,
+        deadline,
+        now,
+      });
+      return;
+    }
+    const mine = prior.holder.id === this.binding.holder.id
+      && prior.holder.lifecycleUid === this.binding.holder.lifecycleUid;
+    if (mine && prior.initialDeadline > now) {
+      // A retry of this holder's own mint: idempotent-if-identical, and the one path that can
+      // repair a crash between the spec and the status, because only an identical spec completes.
+      await mintCheckpoint(this.kv, this.js, this.binding.space, {
+        ref,
+        instanceId: this.binding.instanceId,
+        epoch: this.binding.epoch,
+        holder: this.binding.holder,
+        deadline: prior.initialDeadline,
+        now,
+      });
+      return;
+    }
+    // ATTACH: the pause exists and is not this attempt's to mint — another holder's pause, or this
+    // holder's own come back overdue (a due pause is being collected, not armed). Both need the
+    // same thing: the schedule re-emitted at THIS instance's coordinates, so the fire lands where
+    // this driver is listening. The settle the caller waits on next is coordinate-free.
+    const status = await readCheckpointStatus(this.kv, ref);
+    if (status === undefined) {
+      throw new Error(
+        `checkpoint "${ref.token}" carries a spec with no status`
+        + `${mine ? "" : ` held by ${prior.holder.id}, and only its own holder's identical re-mint can repair a half-minted pause`}; `
+        + `this pause has to be reconciled on the plane before the run can go on`,
+      );
+    }
+    await reconcileCheckpointSchedule(this.kv, this.js, this.jsm, this.binding.space, {
+      ref,
+      instanceId: this.binding.instanceId,
+      epoch: this.binding.epoch,
+    });
+  }
+
+  /** Push a live deadline out — the idle window restarting. The heartbeat CAS-advances the
+   *  generation before replacing the timer, so a fire from the old one no-ops rather than racing. */
+  private async push(ref: CheckpointRef, deadline: number): Promise<void> {
+    if (this.services) return this.services.pauses.heartbeat(ref.token, deadline);
+    await heartbeatCheckpoint(this.kv, this.js, this.jsm, this.binding.space, {
+      ref,
+      instanceId: this.binding.instanceId,
+      epoch: this.binding.epoch,
+      deadline,
+      now: this.now(),
+    });
+  }
+
+  /**
+   * Take the broker's `.fire` for this deadline, if it has published one, and let the checkpoint
+   * plane judge it. Answers whether the fire SETTLED the pause.
+   *
+   * A fire is a MESSAGE and a settlement is a FACT; `handleCheckpointFire` is what turns one into
+   * the other, and a pause nobody answers ends no other way.
+   *
+   * READ BY SUBJECT rather than by a subscription, because the fire is a record of a deadline
+   * passing and callers here are already polling: `last_by_subj` gives the current one whether it
+   * arrived a moment ago or while this host was down, and a resume lands in the second case.
+   *
+   * IDEMPOTENT BY THE PLANE rather than by bookkeeping here: a fire handed over twice finds the
+   * pause settled and declines. The one repeated verdict with a side effect is `re-armed` under
+   * owner-behind clock skew, and over-emission is idempotent at the timer writer.
+   */
+  private async takeFire(ref: CheckpointRef): Promise<boolean> {
+    if (this.services) return this.services.pauses.takeFire(ref.token);
+    const subject = eptSubject(
+      this.binding.space, ref.endpoint,
+      this.binding.instanceId, this.binding.epoch, ref.token, "fire",
+    );
+    const fired = await this.jsm.streams
+      .getMessage(eptStreamName(this.binding.space), { last_by_subj: subject })
+      .catch((e: unknown) => {
+        // 10037 is the stream saying there is no message on that subject, which IS the ordinary
+        // "the timer has not fired yet" answer. Every other error is the broker refusing or
+        // unreachable, and reading those as "not yet" is how a `wait` with a timeout outlives its
+        // own durable deadline in silence, which is the failure this method exists to prevent.
+        if ((e as { code?: unknown })?.code === 10037) return null;
+        throw e;
+      });
+    if (fired === null || fired === undefined) return false;
+    const verdict = await handleCheckpointFire(this.kv, this.js, this.jsm, this.binding.space, {
+      ref,
+      instanceId: this.binding.instanceId,
+      epoch: this.binding.epoch,
+      msg: { subject, ...(fired.header !== undefined ? { headers: fired.header } : {}), data: fired.data },
+      now: this.now(),
+    });
+    return verdict.acted;
+  }
+
+  /** Has this deadline settled? `undefined` for "no deadline" and for "not yet".
+   *
+   *  A `wait` observes its deadlines by polling this, so the fire is taken on the same poll: the
+   *  settle fact a `wait` is reading for is one this process has to produce, and reading for it
+   *  without ever producing it is how a `wait` with a timeout waited past its timeout forever. */
+  private async expired(ref: CheckpointRef | undefined): Promise<CheckpointSettleFact | undefined> {
+    if (ref === undefined) return undefined;
+    if (this.services) {
+      const settled = await this.services.pauses.readSettle(ref.token);
+      if (settled !== undefined) return settled;
+      if (!(await this.services.pauses.takeFire(ref.token))) return undefined;
+      return this.services.pauses.readSettle(ref.token);
+    }
+    const settled = await readCheckpointSettle(this.jsm, this.binding.space, ref);
+    if (settled !== undefined) return settled;
+    if (!(await this.takeFire(ref))) return undefined;
+    return await readCheckpointSettle(this.jsm, this.binding.space, ref);
+  }
+
+  /** End a deadline that is no longer waited on, by claiming its one-use settlement with no answer.
+   *  A timer left armed would fire into a run that has moved on; claiming it is how the plane says
+   *  "this pause is over" without a second mechanism for cancellation. */
+  private async cancelTimer(ref: CheckpointRef): Promise<void> {
+    if (this.services) return this.services.pauses.claim(ref.token);
+    const st = await readCheckpointStatus(this.kv, ref);
+    if (st?.value.state !== "waiting") return;
+    try {
+      // The presenter is the ARMING holder read off the pause's own record, as everywhere on this
+      // plane: a timer minted by a predecessor is still this run's to end after a takeover, and a
+      // successor presenting its own identity would be refused (resume is holder-bound, SPEC
+      // 13.10). A spec that cannot be read leaves the timer to its own deadline, which the catch
+      // below already tolerates: it fires, settles expired, and nobody is reading that token.
+      const spec = await readCheckpointSpec(this.kv, ref);
+      if (spec === undefined) return;
+      await resumeCheckpoint(this.kv, this.js, this.jsm, this.binding.space, {
+        ref,
+        presenter: spec.holder,
+        now: this.now(),
+      });
+    } catch (e) {
+      // IT SETTLED UNDERNEATH US is one outcome, and it is the expected one: the deadline won a
+      // race it was always allowed to win, the caller has its answer either way, and a claimed
+      // timer is not a fact anyone reads. A BROKER THAT REFUSED OR WENT AWAY is a different thing
+      // wearing the same silence, and this catch used to swallow both. It still must not replace
+      // the caller's answer — a timer left armed fires, settles expired, and nobody reads that
+      // token — so the second one is loud on the way past instead.
+      const settledAlready = e instanceof EpEnvelopeError
+        && (e.code === "conflict" || e.code === "failed-precondition");
+      if (!settledAlready)
+        console.error(`run ${this.binding.runId}: the pause ${ref.token} could not be claimed (${(e as Error).message}); it will fire and settle expired with nobody reading it`);
+    }
+  }
+
+  /** The message at a recorded stream sequence — the re-bind path after a crash. */
+  private async messageAt(seq: number, requestId: string): Promise<unknown> {
+    if (this.services) {
+      const message = decodeMessage(await this.services.waits.messageAt(requestId, seq));
+      if (message === undefined) throw new Error(`wait ${requestId}'s recorded message does not decode`);
+      return message;
+    }
+    const m = await this.jsm.streams.getMessage(chatStream(this.binding.space), { seq });
+    if (m === null || m === undefined) {
+      throw new Error(`the message this wait matched (sequence ${seq}) is no longer on the channel's stream; a recorded match cannot be re-read`);
+    }
+    const msg = decodeMessage(m.data);
+    if (msg === undefined) throw new Error(`the message at sequence ${seq} did not decode; a recorded match cannot be re-read`);
+    return msg;
+  }
+
+  /**
+   * Wait for this token's one-use settlement.
+   *
+   * A settle that ALREADY landed is the ordinary case on a resume: the run crashed while paused and
+   * the timer fired, or somebody answered, without it. Reading before waiting is not an
+   * optimization, it is the difference between resuming and waiting forever for an event that is
+   * already in the past.
+   */
+  private async settle(ref: CheckpointRef, signal?: CancelSignal, relayed = false): Promise<CheckpointSettleFact> {
+    // #1508, and the load-bearing half: this is where a `sleep` spends its whole duration, so this
+    // is where a starved host was reporting its own scheduling as the effect's failure. The pause
+    // and its timer are durable facts on the plane; re-reading them observes the same world, and a
+    // sleep whose deadline passed while this process was blocked settles `ok`, late.
+    try {
+      return await servedDespiteStarvation(() => this.settleOnce(ref, signal), this.lag, `waiting on the pause ${ref.token}`, this.onStarved);
+    } catch (e) {
+      // An `ask` attempt or an escalation may have relayed this token to a seat.
+      if (e instanceof Cancelled && relayed) await this.withdrawCancelledRelay(ref.token);
+      throw e;
+    }
+  }
+
+  private async settleOnce(ref: CheckpointRef, signal?: CancelSignal): Promise<CheckpointSettleFact> {
+    const already = this.services ? await this.services.pauses.readSettle(ref.token) : await readCheckpointSettle(this.jsm, this.binding.space, ref);
+    if (already !== undefined) return already;
+    // The watcher waits for the FACT. For a pause with an answer the fact arrives because somebody
+    // answered; for a pause nobody answers - a `sleep`, or a `checkpoint` whose timeout wins - it
+    // arrives only because this process took the fire and the plane wrote it. So the two run
+    // together for the life of one wait, and the pump ends when the wait does.
+    const wait = { over: false };
+    const pump = this.pumpFires(ref, wait);
+    try {
+      return await Promise.race([
+        this.watcher.awaitSettle(ref),
+        // A pump that ENDED is not an answer, only one that FAILED is: a failure means this process
+        // cannot expire the pause, so it is raised rather than absorbed and the step stays pending.
+        pump.then<CheckpointSettleFact>(() => new Promise<never>(() => {})),
+        // A cancelled branch stops parking NOW (§7.6): the rejection decides the race first, so a
+        // `checkpoint` cannot mistake its own claim below for an answer, and then the claim ends
+        // the pause in the world. The claim is not awaited here — a claim that loses its own race
+        // is tolerated by `cancelTimer`, and the discharge sweep at the run's completion re-claims
+        // idempotently for the case where this process died before the claim landed.
+        ...(signal === undefined ? [] : [this.settleCancelled(ref, signal)]),
+      ]);
+    } finally {
+      wait.over = true;
+      // THE PUMP IS DRAINED BEFORE THE SETTLE RETURNS (#1460). The race above has already decided
+      // — the fact, the failure, or the cancellation is this call's answer — but the pump's
+      // in-flight `takeFire` is a journal replay under the run's takeover id, created, read and
+      // deleted inside one `replayRunJournal` call with nothing serialising it across two
+      // authorities for the same run and lease. A settle that returned past it let a completed
+      // `driveRun` hold the replay open after it resolved, and the next reader under the same
+      // takeover hit `RunJournalReplayRaced` about a driver that did not exist. So only the RETURN
+      // is delayed, until the pump has ended: `wait.over` stops it after its current `takeFire`
+      // without starting another, and awaiting it here means no pump fire is left in flight on any
+      // exit. A pump that FAILED raises through this await on its way out, exactly as it did
+      // through the race; the settle's own answer is decided either way and is what this returns.
+      await pump;
+    }
+  }
+
+  /** Reject with `Cancelled` the moment this branch's signal fires, then claim the pause so its
+   *  armed schedule cannot fire into a run that has moved on. The claim also writes the one-use
+   *  settle, which is what lets an abandoned `awaitSettle` poll loop see a fact and end. */
+  private settleCancelled(ref: CheckpointRef, signal: CancelSignal): Promise<never> {
+    return new Promise<never>((_, reject) => {
+      let fired = false;
+      const fire = (reason?: string): void => {
+        if (fired) return;
+        fired = true;
+        reject(new Cancelled(reason ?? "cancelled"));
+        void this.cancelTimer(ref).catch(() => undefined);
+      };
+      if (signal.cancelled) {
+        fire(signal.reason);
+        return;
+      }
+      signal.onCancel(fire);
+    });
+  }
+
+  /** Take this deadline's fire for as long as somebody is waiting on it. */
+  private async pumpFires(ref: CheckpointRef, wait: { over: boolean }): Promise<void> {
+    while (!wait.over) {
+      await this.takeFire(ref);
+      // THE FLAG IS RE-READ AFTER THE FIRE, before the poll sleeps (#1460): `takeFire` is a journal
+      // replay under the run's takeover id, so the wait can have ENDED while this one was in
+      // flight — and a pump that slept another poll on a wait that is over keeps exactly one more
+      // fire in flight past the drain `settleOnce` awaits. Checked here, the pump ends right after
+      // its current fire without starting another.
+      if (wait.over) break;
+      await delay(FIRE_POLL_MS);
+    }
+  }
+}
+
+export { waitConsumerName, waitConsumerConfig } from "@cotal-ai/core";
+
+/** How long one poll of a wait's consumer blocks. The deadline itself is durable; this is only how
+ *  late its observation can be, and a shorter poll buys latency at the cost of fetch traffic. */
+const WAIT_POLL_MS = 2_000;
+/**
+ * How long an incarnation's presence row must stay absent before `turn` and `wait(down)` read it as
+ * `lapsed`. A row is gone 6s after its last heartbeat, and a live seat whose connector stalls for
+ * longer (host load, a reconnect) comes back under the same lifecycle uid on its next heartbeat. One
+ * absent read failed a turn L4002 while the seat went on working (#2344). Five liveness windows lets
+ * a stalled seat renew, and stays short against a turn's deadline. A `superseded` read needs no
+ * wait: a different incarnation already holds the name. The window is measured from the end of the
+ * read that opened it to the start of the read that closes it, over reads {@link lapseWindow} chains.
+ */
+const LAPSE_CONFIRM_MS = 30_000;
+/**
+ * The longest span from the start of one presence read to the end of the next across which an
+ * absent row still counts as continuously absent: the presence bucket's 6s TTL. A heartbeat keeps
+ * the row live at least that long, so a renewal cannot fall between two reads that close. A slower
+ * read or a run of failed scans leaves the gap unobserved, and the lapse window starts over.
+ */
+const PRESENCE_GAP_MS = 6_000;
+/** The start of the lapse window after an absent read that ended at `now`: kept when the previous
+ *  read began within {@link PRESENCE_GAP_MS}, otherwise this read opens a new one. */
+const lapseWindow = (lapsedSince: number | undefined, lastReadAt: number, now: number): number =>
+  lapsedSince === undefined || now - lastReadAt > PRESENCE_GAP_MS ? now : lapsedSince;
+/** One caller's window across polls of the presence death watch. */
+interface DeathWatch { lapsedSince?: number; lastReadAt?: number }
+/** The budgets this host meters for an agent, read from the spawn's `permits` record. */
+type AgentPermits = { turns?: number; wallClockMs?: number };
+/** The seat an ask is told to: its roster identity and address.
+ *  `host` pins a placed seat's turns to its placement instance; unplaced seats use the class rail. */
+type SeatAddress = { name: string; uid: string; owner: string; actor: string; host?: string };
+
+/** What an `expired` turn refusal shows. The placed host speaks for its own seat. A class-rail
+ *  target-unmapped refusal says only that no member the call reached maps the seat: in a space with
+ *  more than one manager a live seat on a member it missed answers the same as a dead one. */
+function seatDownReading(err: EpError, host: string | undefined): string {
+  if (host !== undefined) return `found the agent down on its placed host ${host}`;
+  return replyTargetUnmapped(err)
+    ? "found the agent down or unreachable (no manager the class rail reached maps it; a live seat on a member the call missed answers the same)"
+    : "found the agent down";
+}
+type AskSeat = SeatAddress & { schema: unknown };
+
+/** The restart budget this host asks the manager to enforce for a spawn. */
+type AgentSupervise = { restarts: number; windowMs: number };
+
+/**
+ * Read a spawn's `supervise` as the restart policy this host can enforce: `restarts`, a positive
+ * integer of in-window process deaths the manager may restart under the same handle, and
+ * `window`, an optional duration (default `10m`) those deaths are counted in. Anything else is a
+ * policy this host has no restart for, and a policy it cannot enforce is refused loudly rather
+ * than accepted as a silent no-op.
+ */
+export function readSupervise(raw: unknown, persona: string): AgentSupervise {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+    throw new Error(`spawn(${persona}): supervise must be a record of { restarts, window? }, got ${JSON.stringify(raw)}`);
+  let restarts: number | undefined;
+  let windowMs: number | undefined;
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (key === "restarts") {
+      if (typeof value !== "number" || !Number.isInteger(value) || value < 1)
+        throw new Error(`spawn(${persona}): supervise.restarts must be a positive integer, got ${JSON.stringify(value)}`);
+      restarts = value;
+    } else if (key === "window") {
+      if (typeof value !== "string")
+        throw new Error(`spawn(${persona}): supervise.window must be a duration string, got ${JSON.stringify(value)}`);
+      windowMs = parseDuration(value);
+    } else {
+      throw new Error(`spawn(${persona}): supervise.${key} is not a restart policy this host enforces; it takes restarts and window, and a policy it cannot enforce is refused rather than ignored`);
+    }
+  }
+  if (restarts === undefined)
+    throw new Error(`spawn(${persona}): supervise.restarts must be a positive integer`);
+  return { restarts, windowMs: windowMs ?? parseDuration("10m") };
+}
+
+/**
+ * Read a spawn's `permits` as the budgets this host can enforce: `turns`, a positive integer of
+ * turns the run may dispatch to the agent, and `wallClock`, a duration from the spawn after which
+ * no turn is admitted. Anything else (tokens, spend) is a budget this host has no meter for, and a
+ * budget it cannot enforce is refused loudly rather than accepted as a silent no-op.
+ */
+function readPermits(raw: unknown, persona: string): AgentPermits {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+    throw new Error(`spawn(${persona}): permits must be a record of budgets, got ${JSON.stringify(raw)}`);
+  const out: AgentPermits = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (key === "turns") {
+      if (typeof value !== "number" || !Number.isInteger(value) || value < 1)
+        throw new Error(`spawn(${persona}): permits.turns must be a positive integer, got ${JSON.stringify(value)}`);
+      out.turns = value;
+    } else if (key === "wallClock") {
+      if (typeof value !== "string")
+        throw new Error(`spawn(${persona}): permits.wallClock must be a duration string, got ${JSON.stringify(value)}`);
+      out.wallClockMs = parseDuration(value);
+    } else {
+      throw new Error(`spawn(${persona}): permits.${key} is a budget this host has no meter for; it meters turns and wallClock, and a budget it cannot enforce is refused rather than ignored`);
+    }
+  }
+  return out;
+}
+
+/** A worktree's holder: the live seat spawned into it, or the spawn goal still bringing one up. */
+type WorktreeHolder = { name: string; uid: string } | { pending: string };
+/**
+ * The keyed view of an append log: the last record written for each step, in the order the run
+ * first reached it.
+ *
+ * A DRIVER HANDS OVER AN APPEND LOG, never a keyed journal. Settling appends a second record rather
+ * than editing the first, so every completed step is in the list twice and a retried one is in it
+ * more times still. Seeding from the raw list charged one turn to `permits.turns` once per RECORD,
+ * so an agent with two turns was refused its second the moment its run recovered; it also left a
+ * failed spawn holding a worktree reservation forever, and re-registered turn goals for turns the
+ * run had cancelled. `fork.ts` carries the same warning about the same list, from the same defect.
+ *
+ * The fold is the journal's own, so "the state of this step" has one definition here and there.
+ */
+function foldEntries(entries: readonly JournalEntry[]): readonly JournalEntry[] {
+  const first = entries[0];
+  if (first === undefined) return entries;
+  return new Journal({ run: first.run, entries, readOnly: true }).entries();
+}
+
+/** How many incomplete presence scans the worktree guard tolerates before it fails loudly. */
+const WORKTREE_SCAN_ATTEMPTS = 5;
+
+/** How often an action's durable terminal fact is looked for. Same argument as `WAIT_POLL_MS`. */
+const GOAL_POLL_MS = 2_000;
+
+/** How long one acceptance round-trip may take. The ACCEPT is synchronous and cheap on the far
+ *  side (the manager replies at identity mint, before any provision), so this bounds a lost
+ *  broker, not the spawn itself — the spawn's own outcome rides the goal terminal. */
+const SPAWN_ACCEPT_DEADLINE_MS = 30_000;
+/** Bound on the manager's synchronous `turn` ACCEPT reply (the relay registration, not the yield). */
+const TURN_ACCEPT_DEADLINE_MS = 30_000;
+/** How many class-rail calls a despawn, a relay withdrawal or a lapse's inspect sends before it stops
+ *  waiting for the one manager that holds its goal (the spawn's allocator, the relay's accepter) to
+ *  answer. Each is one {@link MeshHandler.invokeManager} call, whose describe and invoke both land on
+ *  that manager with probability 1/m^2 per trip in a space of m managers, so one call reaches it with
+ *  probability (1 - ((m-1)/m)^17) / m: about 1/2 for m = 2 and 0.25 for m = 4. All 65 then miss
+ *  with probability about 2^-65 and 9e-9. */
+const MANAGER_ROUTE_ATTEMPTS = 64;
+/** A step key's enclosing scope: the journal's own rendering (`entry.scope`), re-derived so the
+ *  live path and the adoption rebuild key the handoff memos identically. */
+function scopeOf(key: Parameters<typeof stepKeyString>[0]): string {
+  const k = stepKeyString(key);
+  return k.slice(0, k.lastIndexOf("/"));
+}
+
+/** The terminal wait a discharge grants a goal whose entry recorded no readiness window (the
+ *  crash-before-bind case). Matches the manager's default readiness budget. */
+const DISCHARGE_TERMINAL_BOUND_MS = 30_000;
+
+/**
+ * #1616 proof item 5 — ALIAS NORMALIZATION POLICY. One clone reached through a symlink and through
+ * its realpath is ONE writable directory, and the single-writer rule keys on identity, so the two
+ * forms must collapse before any claim is taken. THE CANONICAL FORM IS THE REALPATH: it is the form
+ * the kernel and the child's own `process.cwd()` report, so a claim keyed on it matches what any
+ * concurrent run or imperative spawn path observes, whichever alias that caller typed. The symlink
+ * path is NOT canonical — normalizing toward it would require resolving every other alias to it,
+ * which has no unique answer. Resolution is done ONCE, on the serving host, before the claim and
+ * before launch; an unresolvable path is a refusal, never a pass-through of the raw string.
+ */
+export function canonicalCwd(cwd: string): string {
+  return realpathSync(cwd);
+}
+
+/** What phase A establishes and the step journal keeps: the canonical directory as the SERVING host
+ *  stated it, plus the authoritative identity that stated it. Phase B dispatches `cwd` from here. */
+export interface CwdResolution {
+  cwd: string;
+  endpoint: string;
+  instanceId: string;
+  host?: string;
+}
+
+/** The single named refusal every phase-A failure direction produces: the target does not serve
+ *  `resolve-cwd`, refuses the path, or answers with something that is not an absolute directory.
+ *  `L4000` is the host declining the request, and it is raised before any submission, so nothing is
+ *  bound, allocated or launched. There is no raw-path arm: a fall-back to the caller's string is
+ *  fail-OPEN, and launching somewhere plausible is the outcome being removed. */
+export function cwdResolutionRefusal(persona: string, instanceId: string, cwd: string, cause: string): EffectError {
+  return new EffectError("L4000", "spawn",
+    `spawn(${persona}) cwd ${JSON.stringify(cwd)} was not resolved by manager instance ${instanceId}: ${cause}; refusing rather than dispatching a path this host never canonicalized`);
+}
+
+/** A journalled phase-A resolution, read back on resume. A garbled entry is treated as absent and
+ *  phase A runs again: re-resolving is free (no goal, no reservation), trusting a broken record is
+ *  not. */
+function readCwdResolution(value: unknown): CwdResolution | undefined {
+  const r = value as { cwd?: unknown; endpoint?: unknown; instanceId?: unknown; host?: unknown } | undefined;
+  if (typeof r?.cwd !== "string" || r.cwd.length === 0 || typeof r.endpoint !== "string" || typeof r.instanceId !== "string")
+    return undefined;
+  return { cwd: r.cwd, endpoint: r.endpoint, instanceId: r.instanceId, ...(typeof r.host === "string" ? { host: r.host } : {}) };
+}
+
+/** The manager `spawn` args a {@link SpawnRequest} submits: persona names the persona file
+ *  (`name`), `join` becomes the seat's channel subscriptions. `permits` stay on the run (they
+ *  bind at `turn`); `supervise` travels because the manager is who restarts the process, and
+ *  `events` because the manager is who arms the event plane (`false` is `--no-events`). */
+export function spawnArgs(req: SpawnRequest): Record<string, unknown> {
+  return {
+    name: req.persona,
+    // An inline persona travels as the manager's `persona` record, whose `name` is the spawn's own.
+    ...(req.inline !== undefined ? { persona: Object.fromEntries(Object.entries(req.inline).filter(([k]) => k !== "name")) } : {}),
+    ...(req.model !== undefined ? { model: req.model } : {}),
+    ...(req.variant !== undefined ? { variant: req.variant } : {}),
+    // #1616 item 5: the cwd dispatched here is ALREADY the canonical form, resolved by the serving
+    // manager in phase A (see MeshEffectHandler.resolveCwd) and read back off the journalled
+    // resolution. This projection no longer canonicalizes anything: `realpathSync` in the driver
+    // answers about the DRIVER's filesystem, which is a different host's answer to the question.
+    ...(req.cwd !== undefined ? { cwd: req.cwd } : {}),
+    ...(req.role !== undefined ? { role: req.role } : {}),
+    ...(req.join !== undefined && req.join.length > 0 ? { subscribe: req.join.map((c) => c.channel) } : {}),
+    ...(req.supervise !== undefined ? { supervise: readSupervise(req.supervise, req.persona) } : {}),
+    ...(req.events !== undefined ? { events: req.events } : {}),
+    ...(req.runtime !== undefined ? { runtime: req.runtime } : {}),
+  };
+}
+
+/** An inline binding read back off a journal entry, or `undefined` when the entry has none. A
+ *  binding that is present but unreadable is refused, never read as a catalog spawn. */
+function readInlineBinding(value: unknown): { definition: InlineSpawnDefinition; digest: string } | undefined {
+  if (value === undefined) return undefined;
+  const r = value as { definition?: unknown; digest?: unknown } | null;
+  if (r === null || typeof r !== "object" || typeof r.digest !== "string" || r.definition === null || typeof r.definition !== "object"
+    || digest(r.definition) !== r.digest)
+    throw new Error(`a journalled inline persona binding is unreadable or does not match its digest (${JSON.stringify(value)?.slice(0, 120)}); refused rather than read as a catalog spawn`);
+  return { definition: r.definition as InlineSpawnDefinition, digest: r.digest };
+}
+
+/** The acceptance-floor fields worth binding: the allocated identity a discharge despawns by, and
+ *  the readiness window that bounds its wait for a terminal. Copied field-by-field so a widened
+ *  acceptance never smuggles unknown keys into the journal. */
+function pickAcceptanceFloor(floor: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k of ["name", "owner", "actor", "uid", "readinessDeadlineMs"] as const) {
+    if (floor[k] !== undefined) out[k] = floor[k];
+  }
+  return out;
+}
+
+/** The despawn target for a discharged spawn: the identity a SUCCEEDED terminal records (`id` is
+ *  the `owner.actor` principal, `lifecycleUid` the incarnation), else the bound acceptance floor,
+ *  else what any other terminal records. A host that enrolls a user-auth agent picks its lifecycle
+ *  after the acceptance, so only the terminal names the incarnation that came up. `undefined` when
+ *  none names an agent. */
+function spawnDespawnTarget(
+  external: Readonly<Record<string, unknown>> | undefined,
+  fact: GoalResultFact,
+): { owner: string; actor: string; lifecycleUid: string } | undefined {
+  const recorded = terminalAgent(fact);
+  if (fact.state === "succeeded" && recorded !== undefined) return recorded;
+  if (typeof external?.owner === "string" && typeof external.actor === "string" && typeof external.uid === "string")
+    return { owner: external.owner, actor: external.actor, lifecycleUid: external.uid };
+  return recorded;
+}
+
+/** The agent a spawn terminal records, when its `id` is an `owner.actor` principal. */
+function terminalAgent(fact: GoalResultFact): { owner: string; actor: string; lifecycleUid: string } | undefined {
+  const d = fact.data as { id?: unknown; lifecycleUid?: unknown } | undefined;
+  if (typeof d?.id !== "string" || typeof d.lifecycleUid !== "string") return undefined;
+  const dot = d.id.indexOf(".");
+  if (dot <= 0 || dot === d.id.length - 1) return undefined;
+  return { owner: d.id.slice(0, dot), actor: d.id.slice(dot + 1), lifecycleUid: d.lifecycleUid };
+}
+
+/**
+ * The program's value from a spawn terminal. `succeeded` yields the agent handle — `agent` is the
+ * `<name>#<lifecycleUid>` composite, one string that addresses the NAME the mesh knows the seat by
+ * while pinning WHICH incarnation this run spawned (a respawned namesake is not this handle).
+ * Every other state throws the catchable spawn failure (L4002) carrying the terminal's own reason:
+ * `failed` and `uncertain` are the manager's readiness verdicts, `cancelled` means a despawn ended
+ * the launch under it. Each of them leaves the program with an agent that is not up, which is
+ * what L4002 names; each replays identically because the fact is durable. A refusal at accept is
+ * a different thing (no agent was ever allocated) and is classed at the accept, in `spawn`. The
+ * handle's worktree is the BOUND one: the request's for a spawn this step submitted, the seat's own
+ * for one a migration handed it (an adopted seat keeps its tree whether or not the edit names it).
+ */
+function spawnHandleOf(req: SpawnRequest, ext: Readonly<Record<string, unknown>>, fact: GoalResultFact, endpoint: string): AgentHandleValue {
+  if (fact.state !== "succeeded") {
+    const d = fact.data as { error?: unknown; reason?: unknown; cancelledBy?: unknown } | undefined;
+    const why =
+      typeof d?.error === "string" ? d.error
+      : typeof d?.reason === "string" ? d.reason
+      : d?.cancelledBy !== undefined ? `cancelled by ${JSON.stringify(d.cancelledBy)}`
+      : `the ${endpoint} endpoint recorded no reason`;
+    throw new EffectError("L4002", "spawn", `spawn(${req.persona}) ${fact.state}: ${why}`, { state: fact.state });
+  }
+  const d = fact.data as { name?: unknown; lifecycleUid?: unknown; role?: unknown } | undefined;
+  if (typeof d?.name !== "string" || typeof d.lifecycleUid !== "string")
+    throw new Error(`the spawn goal's succeeded terminal carries no readable agent identity (${JSON.stringify(fact.data)}); a garbled terminal never yields a handle (SPEC 13.6)`);
+  return {
+    agent: `${d.name}#${d.lifecycleUid}`,
+    persona: req.persona,
+    ...(typeof ext.worktree === "string" ? { worktree: ext.worktree } : {}),
+    ...(typeof d.role === "string" ? { role: d.role } : {}),
+  };
+}
+
+/**
+ * A conclave's recovery identity: everything the execute, the close and the discharge act on,
+ * decided before anything was written and bound as the entry's external state. `registered` is
+ * whether THIS conclave minted the channel's registry row (a program-named channel is borrowed,
+ * never torn down); per member, `joined` is whether this conclave created the membership row.
+ */
+interface ConclavePlanMember {
+  readonly agent: string;
+  /** The member's owner+actor dot-form principal, resolved from its presence row. */
+  readonly principal: string;
+  readonly uid: string;
+  readonly generation: number;
+  readonly joined: boolean;
+}
+interface ConclavePlan {
+  readonly channel: string;
+  readonly registered: boolean;
+  readonly members: readonly ConclavePlanMember[];
+}
+
+/** A recorded flag cannot turn a borrowed channel into a channel this step owns. */
+function assertConclaveOwnership(plan: ConclavePlan, requestId: string, req?: ConclaveRequest): void {
+  const derived = `conclave-${createHash("sha256").update(requestId).digest("hex").slice(0, 12)}`;
+  if (plan.registered && plan.channel !== derived)
+    throw new Error(`recorded conclave channel ${plan.channel} is not owned by step ${requestId}`);
+  if (req !== undefined) {
+    if (plan.channel !== (req.channel ?? derived) || plan.registered !== (req.channel === undefined))
+      throw new Error(`recorded conclave channel does not match the requested channel for ${requestId}`);
+    const members = new Set(req.members.map((member) => member.agent));
+    if (plan.members.length !== members.size || plan.members.some((member) => !members.delete(member.agent)))
+      throw new Error(`recorded conclave members do not match the request for ${requestId}`);
+  }
+  for (const member of plan.members) {
+    const [owner, actor, ...extra] = member.principal.split(".");
+    if (owner === undefined || actor === undefined || extra.length !== 0 || principalKey(owner, actor).key !== member.principal
+      || parseAgentHandle(member.agent).uid !== member.uid || !Number.isSafeInteger(member.generation) || member.generation < 1)
+      throw new Error(`recorded conclave member identity is malformed for ${requestId}`);
+  }
+}
+
+/** Whether a recorded external is a conclave plan. A journal is bytes from an earlier process, so
+ *  the shape is checked rather than trusted — a malformed external reads as "nothing was bound". */
+function isConclavePlan(v: unknown): v is ConclavePlan {
+  if (typeof v !== "object" || v === null) return false;
+  const p = v as Record<string, unknown>;
+  if (typeof p.channel !== "string" || typeof p.registered !== "boolean" || !Array.isArray(p.members)) return false;
+  return p.members.every((m) => {
+    if (typeof m !== "object" || m === null) return false;
+    const r = m as Record<string, unknown>;
+    return typeof r.agent === "string" && typeof r.principal === "string" && typeof r.uid === "string"
+      && typeof r.generation === "number" && typeof r.joined === "boolean";
+  });
+}
+
+/** Split an agent handle `<name>#<lifecycleUid>` on its LAST `#` — the uid alphabet
+ *  (`[a-z0-9]{26,32}`) cannot carry one, a name could. */
+function parseAgentHandle(agent: string): { name: string; uid: string } {
+  const i = agent.lastIndexOf("#");
+  if (i <= 0 || i === agent.length - 1)
+    throw new Error(`"${agent}" is not an agent handle of the form <name>#<lifecycleUid>`);
+  return { name: agent.slice(0, i), uid: agent.slice(i + 1) };
+}
+
+/** The one presence row that carries the handle's name AND incarnation, as a principal. None is
+ *  the effect's own catchable failure — the agent is down or gone (L4002) — and more than one is
+ *  an ambiguity no membership row may be written under. */
+function resolveMemberPrincipal(rows: readonly Presence[], agent: string, name: string, uid: string): string {
+  const matches = rows.filter((p) => p.card.name === name && p.lifecycleUid === uid);
+  if (matches.length === 1) return matches[0]!.card.id;
+  if (matches.length === 0)
+    throw new EffectError("L4002", "conclave",
+      `conclave member "${agent}" is not present on the mesh: no live presence row carries that name and incarnation, so the agent is down or gone`);
+  throw new Error(`conclave member "${agent}" is ambiguous: ${matches.length} presence rows claim that name and incarnation`);
+}
+
+/** A program-named conclave channel: valid channel grammar AND concrete — membership rows and a
+ *  room to talk in are per-channel things a wildcard cannot name. */
+function assertConclaveChannel(channel: string): string {
+  assertValidChannel(channel);
+  if (!isConcreteChannel(channel))
+    throw new Error(`conclave channel "${channel}" is a wildcard; a conclave joins its members to one concrete channel`);
+  return channel;
+}
+
+/** How often a pause that nobody will answer looks for the broker's fire. Same argument as
+ *  `WAIT_POLL_MS`: the deadline is durable and this is only how late its observation can be. */
+const FIRE_POLL_MS = 2_000;
+
+/** The recorded ask progress a resume re-enters at, or undefined for a fresh first attempt. The
+ *  external is bytes from an earlier process, so the shape is checked rather than trusted. */
+function askResume(v: Readonly<Record<string, unknown>> | undefined):
+  { attempt: number; deadlineAt: number; refused?: string } | undefined {
+  if (v === undefined) return undefined;
+  if (!(typeof v.attempt === "number" && v.attempt >= 1 && typeof v.deadlineAt === "number")) return undefined;
+  // The refusal is bound with the attempt it belongs to. A resume that dropped it would re-ask the
+  // seat with no reason its last answer failed, which is the one thing the re-ask exists to say.
+  return {
+    attempt: v.attempt,
+    deadlineAt: v.deadlineAt,
+    ...(typeof v.refused === "string" ? { refused: v.refused } : {}),
+  };
+}
+
+/** WHY a reply does not conform, per declared field — the refusal an answerer reads off the entry
+ *  before answering again. Judged with the same single-field check that judged the reply, so the
+ *  description can never disagree with the verdict. */
+function askNonconformance(value: unknown, shape: Readonly<Record<string, AskFieldKind>>): string {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return "the reply is not a record";
+  const record = value as Record<string, unknown>;
+  const bad: string[] = [];
+  for (const [field, kind] of Object.entries(shape)) {
+    if (conformsToAskSchema({ [field]: record[field] }, { [field]: kind })) continue;
+    bad.push(field in record ? `"${field}" wants ${kind}` : `"${field}" is missing (wants ${kind})`);
+  }
+  return bad.join("; ");
+}
+
+/**
+ * A `matches` pattern, admitted through the repo's bounded-regex subset before it is compiled.
+ *
+ * A workflow is other people's text and a channel can be busy, so an exponential pattern here is a
+ * run that stalls with nothing to show for it. The subset is the same one the schema profile
+ * admits, which means the same rule applies: a pattern is ANCHORED (`^…`), and an author who wants
+ * "somewhere in the message" writes `^.*…` themselves. Wrapping it for them was the alternative and
+ * it is worse — the wrapper turns patterns that are safe as written into refusals about a `.*` the
+ * author never typed.
+ */
+function compileMatch(pattern: string): RegExp {
+  try {
+    assertSafePattern(pattern, 256);
+  } catch (e) {
+    throw new Error(`wait()'s \`matches\` is a bounded regular expression, anchored like every pattern in this repo: ${(e as Error).message}`);
+  }
+  return new RegExp(pattern);
+}
+
+/** Is `ev` an event descriptor `wait` can observe? The program passes it as a value, so a string or
+ *  a constructor given the wrong argument arrives here unbuilt, and the channel and agent paths
+ *  below would fail on it with a host TypeError that names nothing the program wrote. */
+function isWaitEvent(ev: unknown): ev is WaitRequest["event"] {
+  if (ev === null || typeof ev !== "object") return false;
+  const e = ev as { event?: unknown; channel?: unknown; agent?: unknown };
+  if (e.event === "message" || e.event === "idle") return typeof e.channel === "string";
+  return (e.event === "replied" || e.event === "down") && typeof e.agent === "string";
+}
+
+function decodeMessage(data: Uint8Array): CotalMessage | undefined {
+  try {
+    const v = JSON.parse(new TextDecoder().decode(data)) as CotalMessage;
+    return v !== null && typeof v === "object" ? v : undefined;
+  } catch {
+    // Someone else's malformed publish is not this run's failure. It does not match, and the wait
+    // goes on waiting — which is what would happen if the message had never been sent.
+    return undefined;
+  }
+}
+
+/** Does this message answer the await? `from` is matched on the SENDER'S NAME as the mesh records
+ *  it, never on the subject: the subject carries a principal, and a program names an agent. */
+function matchesEvent(msg: CotalMessage, from: string | undefined, matcher: RegExp | undefined): boolean {
+  if (from !== undefined && msg.from?.name?.toLowerCase() !== from.toLowerCase()) return false;
+  if (matcher === undefined) return true;
+  const text = (msg.parts ?? [])
+    .filter((p): p is { kind: "text"; text: string } => p.kind === "text" && typeof (p as { text?: unknown }).text === "string")
+    .map((p) => p.text)
+    .join("\n");
+  return matcher.test(text);
+}
+
+
+/**
+ * RE-ARM the timers of every pause this run is still holding, under THIS driver's coordinates.
+ *
+ * A checkpoint's armed schedule fires onto `ept.<space>.<e>.<instanceId>.<epoch>.<token>.fire`,
+ * derived from the coordinates of the instance that armed it. A run adopted by another host — or by
+ * the same host at a new epoch — therefore has live timers firing at a subject nobody is reading,
+ * and its pauses would sit until something else swept them. Nothing about that is repaired by
+ * resuming the program: the effect is a replayed pending step that goes straight back to waiting.
+ *
+ * So the driver re-emits a schedule request for each outstanding token at the CURRENT generation,
+ * which the timer writer arms onto this instance's own fire subject. Over-emission is harmless by
+ * construction (same `(timerId, generation)` re-derives the same `.armed`, a no-op replacement), so
+ * this is safe to run on every takeover and needs no record of what it did last time.
+ *
+ * Called AFTER the barrier activated, never before: arming timers for a run this process turned out
+ * not to hold would point another driver's fires at this one.
+ */
+export async function rearmOutstandingPauses(
+  deps: { kv: KV; js: JetStreamClient; jsm: JetStreamManager },
+  binding: Pick<MeshHandlerBinding, "space" | "endpoint" | "instanceId" | "epoch">,
+  entries: readonly JournalEntry[],
+): Promise<string[]> {
+  const rearmed: string[] = [];
+  for (const token of outstandingPauseTokens(entries)) {
+    const r = await reconcileCheckpointSchedule(deps.kv, deps.js, deps.jsm, binding.space, {
+      ref: { endpoint: binding.endpoint, token },
+      instanceId: binding.instanceId,
+      epoch: binding.epoch,
+    });
+    if (r.reEmitted) rearmed.push(token);
+  }
+  return rearmed;
+}
+
+/**
+ * The checkpoint tokens a replayed prefix leaves open.
+ *
+ * An entry is open when its LAST record is `pending`, so the map is built in append order and the
+ * later record wins — a step that settled has a settled entry after its pending one, and reading
+ * only the first would re-arm timers for pauses that are already over. What each open step owns is
+ * {@link pauseTokens}: a held step's attempt token is still listed after its hold binds and
+ * re-arms nothing, because the reconciler re-emits a schedule only for a waiting pause.
+ */
+export function outstandingPauseTokens(entries: readonly JournalEntry[]): string[] {
+  const last = new Map<string, JournalEntry>();
+  for (const e of entries) last.set(journalEntryKeyString(e), e);
+  return [...last.values()].filter((e) => e.state === "pending").flatMap(pauseTokens);
+}
+
+/**
+ * The settle watcher over EPF, which is where the one-use settle fact lives.
+ *
+ * It POLLS the fact's subject through the plane's own leader-served read rather than binding a
+ * consumer to it. The earlier shape created an ephemeral consumer per wait, and an ephemeral create
+ * rides the bare `CONSUMER.CREATE.<stream>` form, whose request body is not subject-ACL confinable
+ * and which no minted profile may hold (SPEC 13.9). The run driver's credential holds the
+ * `STREAM.MSG.GET` read on EPF already, for the same fact, so the watcher reads what the driver can
+ * read and nothing more. A settle is a record, not a notification: the fact may already be there
+ * when the wait begins, and the first read answers at once.
+ *
+ * The cadence is the same one the handler already takes its fires on: the deadline is durable and
+ * authoritative, and a poll only bounds how late its observation can be.
+ */
+export class EpfSettleWatcher implements SettleWatcher {
+  private readonly read: (ref: CheckpointRef) => Promise<CheckpointSettleFact | undefined>;
+  private readonly pollMs: number;
+
+  constructor(jsm: JetStreamManager, space: string, pollMs?: number);
+  constructor(read: (ref: CheckpointRef) => Promise<CheckpointSettleFact | undefined>, pollMs?: number);
+  constructor(
+    jsmOrRead: JetStreamManager | ((ref: CheckpointRef) => Promise<CheckpointSettleFact | undefined>),
+    spaceOrPollMs?: string | number,
+    pollMs?: number,
+  ) {
+    const space = spaceOrPollMs as string;
+    this.read = typeof jsmOrRead === "function"
+      ? jsmOrRead
+      : (ref) => readCheckpointSettle(jsmOrRead, space, ref);
+    this.pollMs = (typeof jsmOrRead === "function" ? (spaceOrPollMs as number | undefined) : pollMs) ?? FIRE_POLL_MS;
+  }
+
+  async awaitSettle(ref: CheckpointRef): Promise<CheckpointSettleFact> {
+    for (;;) {
+      const settled = await this.read(ref);
+      if (settled !== undefined) return settled;
+      await delay(this.pollMs);
+    }
+  }
+}

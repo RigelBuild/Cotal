@@ -1,0 +1,392 @@
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { loadAgentFile, registry, writeLaunchArtifact, type Connector, type LaunchOpts, type LaunchSpec } from "@cotal-ai/core";
+import { aclEnv, connectorLaunchOptions, controlEndpoint, eventChannel, launchArmsEvents, launchEnv, materialEnv, mcpServerEnvKeys } from "@cotal-ai/connector-core";
+import { carriedForkRecord, claudeResumeTranscript, placeCarried, refuseCarriedLaunch } from "./carried.js";
+import { CLAUDE_READY_TEXTS, CLAUDE_STARTUP_BLOCKERS, CLAUDE_WORKSPACE_TRUST_REPLIES } from "./trust.js";
+import { assertChannelServerDeclared, claudeUserMcpEnvKeys } from "./user-mcp.js";
+import { HOST_EXE_ENV, resolveHostExe } from "./once-exit.js";
+import { HOOK_CONTEXT_CHARS } from "./hooks.js";
+
+/** Name the cotal MCP server is registered under via --mcp-config (see buildLaunch). */
+const MCP_SERVER_NAME = "cotal";
+
+/** Auth and provider-routing env `claude` actually reads for a headless or container seat.
+ *  Drawn from Anthropic's authentication precedence
+ *  (https://docs.anthropic.com/en/docs/claude-code/iam) and the env-vars page, not from a
+ *  prefix guess. `CLAUDE_CODE_OAUTH_TOKEN` is the load-bearing name: `docs/deploy.mdx` and
+ *  `deploy/` tell operators a container Claude authenticates with it, and a container has no
+ *  Keychain. Host-session markers (`CLAUDE_CODE_CHILD_SESSION`, `CLAUDECODE`,
+ *  `CLAUDE_CODE_ENTRYPOINT`) are deliberately absent — those are how a nested `claude` decides
+ *  it must not save a transcript. Files under the default `~/.claude` and `~/.aws` locations
+ *  remain reachable through HOME. A credential file at a non-default path is reachable only when
+ *  its path variable, such as `GOOGLE_APPLICATION_CREDENTIALS`, is forwarded explicitly. */
+export const CLAUDE_PROVIDER_KEYS = [
+  // First-party / subscription (setup-token, Console key, gateway bearer).
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+  "CLAUDE_CODE_OAUTH_SCOPES",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "CLAUDE_CONFIG_DIR",
+  // Cloud provider selection. Without the matching flag, the credential vars below are inert.
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+  "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+  "CLAUDE_CODE_USE_MANTLE",
+  "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+  "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+  "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+  "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+  "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+  "CLAUDE_CODE_SKIP_AWS_CRED_CACHE",
+  "CLAUDE_CODE_AWS_CHAIN_RESOLVE_TIMEOUT_MS",
+  // Amazon Bedrock / Claude Platform on AWS.
+  "ANTHROPIC_AWS_API_KEY",
+  "ANTHROPIC_AWS_BASE_URL",
+  "ANTHROPIC_AWS_WORKSPACE_ID",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AWS_PROFILE",
+  "AWS_REGION",
+  "AWS_DEFAULT_REGION",
+  "AWS_SHARED_CREDENTIALS_FILE",
+  "AWS_CONFIG_FILE",
+  "AWS_BEARER_TOKEN_BEDROCK",
+  "ANTHROPIC_BEDROCK_BASE_URL",
+  "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+  "ANTHROPIC_BEDROCK_REGION_PREFIX",
+  "ANTHROPIC_BEDROCK_SERVICE_TIER",
+  "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+  // Google Cloud's Agent Platform.
+  "ANTHROPIC_VERTEX_BASE_URL",
+  "ANTHROPIC_VERTEX_PROJECT_ID",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "CLOUD_ML_REGION",
+  "GCLOUD_PROJECT",
+  "GOOGLE_CLOUD_PROJECT",
+  "VERTEX_REGION_CLAUDE_3_5_HAIKU",
+  "VERTEX_REGION_CLAUDE_3_5_SONNET",
+  "VERTEX_REGION_CLAUDE_3_7_SONNET",
+  "VERTEX_REGION_CLAUDE_4_0_OPUS",
+  "VERTEX_REGION_CLAUDE_4_0_SONNET",
+  "VERTEX_REGION_CLAUDE_4_1_OPUS",
+  "VERTEX_REGION_CLAUDE_4_5_OPUS",
+  "VERTEX_REGION_CLAUDE_4_5_SONNET",
+  "VERTEX_REGION_CLAUDE_4_6_OPUS",
+  "VERTEX_REGION_CLAUDE_4_6_SONNET",
+  "VERTEX_REGION_CLAUDE_4_7_OPUS",
+  "VERTEX_REGION_CLAUDE_4_8_OPUS",
+  "VERTEX_REGION_CLAUDE_5_OPUS",
+  "VERTEX_REGION_CLAUDE_5_SONNET",
+  "VERTEX_REGION_CLAUDE_FABLE_5",
+  "VERTEX_REGION_CLAUDE_FABLE_5_1",
+  "VERTEX_REGION_CLAUDE_HAIKU_4_5",
+  // Microsoft Foundry.
+  "ANTHROPIC_FOUNDRY_API_KEY",
+  "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+  "ANTHROPIC_FOUNDRY_BASE_URL",
+  "ANTHROPIC_FOUNDRY_RESOURCE",
+  // Workload Identity Federation / named Anthropic profiles.
+  "ANTHROPIC_PROFILE",
+  "ANTHROPIC_FEDERATION_RULE_ID",
+  "ANTHROPIC_ORGANIZATION_ID",
+  "ANTHROPIC_WORKSPACE_ID",
+  "ANTHROPIC_IDENTITY_TOKEN",
+  "ANTHROPIC_IDENTITY_TOKEN_FILE",
+] as const;
+/** Channel ref for `--dangerously-load-development-channels`, which turns on the cotal MCP server's
+ *  `claude/channel` capability so an idle session wakes the instant a peer message arrives. The ref
+ *  is the server tagged `server:<name>` (the CLI rejects a plugin ref or a bare name here), and
+ *  Claude Code accepts it only when a server of that name is declared in its own configuration,
+ *  the user config or the project's `.mcp.json`; the `--mcp-config` entry alone does not count
+ *  (measured on 2.1.295). `cotal setup` registers that entry at user scope, a carried home gets
+ *  its own, and a managed launch without one is refused (see assertChannelServerDeclared) rather
+ *  than started as a seat that never wakes. The plugin stays installed for its hooks, which do
+ *  message delivery independent of this wake nudge. */
+const CHANNEL_REF = `server:${MCP_SERVER_NAME}`;
+
+/** Package root (parent of dist/), which doubles as the installable plugin dir: it carries
+ *  .claude-plugin/, .mcp.json, hooks/ and the dist/*.cjs bundles. */
+const PLUGIN_ROOT = fileURLToPath(new URL("..", import.meta.url));
+/** The explicit mesh server remains available when a launch restricts native MCP discovery. It
+ *  names the seat entry, which enables Node's compile cache and then loads `dist/mcp.cjs`. */
+const SEAT_ENTRY = resolve(PLUGIN_ROOT, "dist", "seat.cjs");
+/** Preserve the operator's documented native MCP switches without choosing new values. */
+const CLAUDE_MCP_KEYS = ["ENABLE_CLAUDEAI_MCP_SERVERS", "ENABLE_TOOL_SEARCH", "MCP_TIMEOUT", "MCP_CONNECTION_NONBLOCKING"] as const;
+
+/**
+ * Refuse a model this connector cannot serve, at LAUNCH, the way an unsupported `variant` is
+ * refused below.
+ *
+ * THE INCIDENT, because the cost was not the crash it did not cause. `model:` on an agent file is
+ * honoured by the opencode connector and was a dead letter here: this connector pushed whatever it
+ * was given straight through to `claude`. Two review seats were spawned as
+ * `claude --model xai/grok-4.6`, which `claude` cannot serve. They did not fail closed - they came
+ * up on a Claude model, reported for hours under a grok label, and their operator's written claim
+ * of two-vendor corroboration was false in a way nothing observable to them could reveal. The
+ * seats were in fact the same family as the agent grading their output.
+ *
+ * SO THE FAILURE MODE THIS CLOSES IS NOT "wrong model", IT IS "wrong model, silently, with a
+ * confident label attached". A launch that refuses costs one spawn. A launch that mislabels costs
+ * every conclusion drawn from that seat, retroactively, and there is no artifact in the session to
+ * catch it with - the environment variable says grok, and only the process's own argv disagrees.
+ *
+ * The discriminator is the provider-prefixed `provider/model` form that other runtimes use, since
+ * an allow-list of Claude model names would need editing every time one ships and would fail
+ * closed on a model that works. `arn:` is exempt: a Bedrock inference-profile ARN legitimately
+ * carries a slash and `claude` does serve it.
+ */
+function assertServableModel(model: string): void {
+  if (!model.includes("/") || model.startsWith("arn:")) return;
+  throw new Error(
+    `claude connector: cannot serve model ${JSON.stringify(model)} - a "provider/model" specifier ` +
+      `belongs to another runtime (use the opencode connector for it). Refusing at launch: passing ` +
+      `it through starts a session on a DIFFERENT model than the one named, and everything that ` +
+      `session produces would carry the wrong attribution.`,
+  );
+}
+
+/**
+ * The Claude Code connector: launches the real `claude` with the Cotal identity in
+ * the environment and the mesh channel enabled, so the session joins the mesh and
+ * wakes on incoming peer messages. Self-registers on import; the manager resolves it
+ * by agent type "claude".
+ */
+export const claudeConnector: Connector = {
+  kind: "connector",
+  name: "claude",
+  setup: { kind: "connector-setup", name: "claude" },
+  // The event channel is core's own derivation, exposed through the contract so the grant the
+  // manager mints and the subject this session publishes to come from ONE function. Re-deriving it
+  // here would be a second place the subject is decided, and the two would drift the first time
+  // either changed.
+  eventChannel,
+  pluginRoot: PLUGIN_ROOT,
+  requires: ["claude"],
+  supportsResume: true, // renders `--resume <id> --fork-session` (fork-from, never hijack) — see buildLaunch
+  resumeTranscript: claudeResumeTranscript,
+  supportsToolListAnnounce: true, // MCP McpServer.registerTool; SDK fires tools/list_changed
+  supportsPrompt: true, // a leading positional is auto-submitted as the first turn — see buildLaunch
+  // A session wakes for a relayed task while idle only with channels on, and Claude reports that only
+  // on its startup screen: the development-channels gate, then its registration notice for this
+  // server (confirmNotice below). A once seat is served its task only when its startup watch saw
+  // both; the hooks hand it over at most once (hooks.ts).
+  supportsTurnRelay: true,
+  onceNeedsConfirmed: "its startup did not show channels on (Claude's development-channels prompt and its notice that server:cotal messages reach the session)",
+  // A plain spawn starts anyway. Its reply and the seat's ps row say that nothing wakes the seat.
+  idleWakeNeedsConfirmed: "channels are off for this session (Claude showed no development-channels prompt), so mesh traffic does not wake it while idle; type into its pane to start a turn, or enable channels for the organization",
+  turnFrameLimit: HOOK_CONTEXT_CHARS,
+  launchHint: "press Enter at the dev-channels prompt", // Claude Code opens on that one-time gate
+  // `--opt resume=` renders a bare `--resume`, which opens Claude's session picker; the session joins
+  // the mesh only after the operator picks one. `--opt resume=<id>` resumes that session directly.
+  waitsForOperator: (launchOptions) => (launchOptions?.resume === "" ? "Claude's session picker" : undefined),
+
+  buildLaunch(opts: LaunchOpts): LaunchSpec {
+    if (opts.continueSession) throw new Error("claude connector does not support exact-session continuation");
+    if (opts.variant) throw new Error("claude connector: model variants are not supported");
+    // Operator MCP servers shared with this agent: the cotal config's list (see the --mcp-config block).
+    const shared = opts.mcpServers ?? {};
+    const exclusive = opts.mcpServersExclusive === true || opts.carried !== undefined;
+    const nativeEnvKeys = exclusive ? [] : claudeUserMcpEnvKeys();
+    // Auth is CLAUDE_PROVIDER_KEYS: CLAUDE_CODE_OAUTH_TOKEN (the deploy-doc promise, required in
+    // a container with no Keychain), ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN, and the cloud-provider
+    // flags plus their credential vars. Host-session markers stay off that list. mcpKeys still
+    // forward `${VAR}` names a shared MCP server declared. Unrelated operator secrets stay out.
+    // The session's local control endpoint: the MCP server LISTENS on it (auth), and the lifecycle
+    // hooks (child processes of `claude`, which inherit this env) CONNECT to it. Both read the
+    // SOCKET PATH from the env and the TOKEN from the launch-material file the env points at, never
+    // recomputed from public identity, and the manager keeps the pair (returned as `control` below)
+    // to drive a cooperative shutdown on Windows.
+    //
+    // This connector is the one that CANNOT drop the material reference after startup, and that is a
+    // property of the host rather than an oversight: its readers are short-lived children (the MCP
+    // server, one process per hook event) that start after the session is running, so the reference
+    // has to stay reachable in `claude`'s environment for them to find it. A shell `claude` runs
+    // therefore still inherits a path to the material file. Narrowing that further means handing the
+    // MCP server its material through the --mcp-config `env` block and giving the hooks a separate
+    // control-only file, which depends on host behaviour that has to be verified against a live
+    // `claude` first. Tracked separately rather than guessed at here.
+    const control = controlEndpoint(opts.space, opts.name);
+    const env: Record<string, string> = {
+      ...launchEnv({ providerKeys: CLAUDE_PROVIDER_KEYS, mcpKeys: [...mcpServerEnvKeys(shared), ...nativeEnvKeys, ...CLAUDE_MCP_KEYS], envAllow: opts.envAllow }),
+      ...aclEnv(opts),
+      COTAL_SPACE: opts.space,
+      COTAL_NAME: opts.name,
+      // Force the connector to emit channel wake-nudges: Claude doesn't advertise the
+      // `claude/channel` capability back over MCP, so auto-detection would see it "off".
+      COTAL_CHANNEL: "1",
+      COTAL_CONTROL_SOCKET: control.path,
+    };
+    // The AG-UI event plane. Supporting connectors arm by default; `events: false` is the explicit
+    // opt-out. `COTAL_EVENTS` is what makes the matching grant meaningful:
+    // holding publish rights on a channel is not a request to publish to it. `COTAL_WORKSPACE_ROOT`
+    // rides with it because the emitter's write-ahead log has to live somewhere a LATER start will
+    // look, and there is no safe default: a WAL written under the launch cwd is invisible to the
+    // next start, which then reads an already-published thread as virgin and republishes sequences
+    // the stream has seen. Sent only when events are on, so a session that never emits carries no
+    // path it has no use for.
+    if (launchArmsEvents(opts)) {
+      env.COTAL_EVENTS = "1";
+      if (!opts.workspaceRoot)
+        throw new Error(
+          "claude connector: events were requested but the launch carries no workspaceRoot, so the " +
+            "event write-ahead log has nowhere to live that a later start would look. Refusing rather " +
+            "than defaulting to the working directory.",
+        );
+      env.COTAL_WORKSPACE_ROOT = opts.workspaceRoot;
+    }
+    // A carried resume needs credentials its private home can use. Managed workspace trust is
+    // accepted through the native startup dialog below, without rewriting the manager's config.
+    // A once launch starts the absolute real path of `claude` and passes it on, so the seat can tell
+    // its parent is that file before its once exit signals it (once-exit.ts).
+    const named = opts.resolvedBinaries?.claude ?? "claude";
+    const hostExe = opts.once ? resolveHostExe(named, env) : undefined;
+    if (hostExe !== undefined) env[HOST_EXE_ENV] = hostExe;
+    const binary = hostExe ?? named;
+    if (opts.carried) refuseCarriedLaunch(binary, env);
+    if (opts.role) env.COTAL_ROLE = opts.role;
+    if (opts.id) env.COTAL_ID = opts.id;
+    if (opts.lifecycleUid) env.COTAL_LIFECYCLE_UID = opts.lifecycleUid;
+    if (opts.backfillFloor !== undefined) env.COTAL_BACKFILL_FLOOR = String(opts.backfillFloor);
+    if (opts.acceptedToken) env.COTAL_ACCEPTED_TOKEN = opts.acceptedToken;
+
+    // A leading positional is claude's first message, auto-submitted on start —
+    // so a driving session can greet the operator the moment it joins.
+    // A prompt with no text in it cannot be submitted as a turn: refuse the launch rather than start
+    // a seat that quietly ignores what the operator passed (same rule as the other connectors).
+    const prompt = opts.prompt === undefined ? undefined : opts.prompt.trim();
+    if (prompt === "")
+      throw new Error("claude connector: an initial prompt was given but it is empty, there is no first turn to submit");
+    // A managed seat (the manager marks one with its `cwd`) has nobody at its terminal to notice a
+    // channel that did not bind. A carried home declares the server itself (placeCarried); a
+    // foreground launch keeps Claude's own notice.
+    if (opts.cwd !== undefined && !opts.carried) assertChannelServerDeclared(MCP_SERVER_NAME, opts.cwd);
+    // BOTH loaders, deliberately. The dev-channels ref binds the wake CHANNEL, but on current
+    // claude (measured on 2.1.246) it no longer loads the plugin's HOOKS — the MCP server came up
+    // and every lifecycle hook was simply never invoked. That silence took out everything the
+    // hooks carry: presence never left "idle" during a running turn, queued peer messages were
+    // never surfaced into the model's context, and the AG-UI emitter — which lazy-starts on the
+    // first hook that hands over a transcript path — never started, so `--events` published
+    // nothing at all. `--plugin-dir` is the host's supported way to load a plugin (hooks
+    // included) for one session; verified live that it fires SessionStart/UserPromptSubmit/
+    // Stop/SessionEnd with this exact hooks.json. The plugin's own .mcp.json riding along is
+    // deduplicated by Claude against the explicit server with the same command and arguments.
+    const args = prompt
+      ? [prompt, "--dangerously-load-development-channels", CHANNEL_REF, "--plugin-dir", PLUGIN_ROOT]
+      : ["--dangerously-load-development-channels", CHANNEL_REF, "--plugin-dir", PLUGIN_ROOT];
+
+    // Pre-allow fetching the public Cotal docs so a doc-grounded persona (e.g. david)
+    // can look something up under `npx` (no repo on disk) without prompting the operator
+    // mid-demo. Additive under the default permission mode — leaves other tools as-is.
+    args.push("--allowedTools", "WebFetch(domain:github.com),WebFetch(domain:raw.githubusercontent.com)");
+
+    // Keep Claude's native MCP sources and policy by default. Explicit sharing selections and
+    // carried private homes remain isolated. The plugin stays enabled for hooks and channel wakes.
+    // cotal is spread LAST so a shared server can never shadow the mesh server by reusing its name.
+    const mcpServers = { ...shared, [MCP_SERVER_NAME]: { command: "node", args: ["--optimize-for-size", "--max-semi-space-size=1", SEAT_ENTRY] } };
+    // Every refusal below runs before the first private file is written, so a refused launch leaves
+    // none behind. An agent file carries identity (read in-session via COTAL_AGENT_FILE) plus a
+    // persona, which can only be applied to a `claude` session at launch.
+    const agentFile = opts.configPath ? resolve(opts.configPath) : undefined;
+    const def = agentFile ? loadAgentFile(agentFile) : undefined;
+    if (opts.model) assertServableModel(opts.model);
+    // Rendered to strings here, so a value that cannot become a flag argument refuses before any file
+    // exists. After the first write, only writeLaunchArtifact can throw, and it removes every file
+    // this launch wrote before it does.
+    const passthrough = connectorLaunchOptions("claude", opts.launchOptions).map(([k, v]) => [k, String(v)] as const);
+    // The private files this launch writes. The launcher that spawns the spec removes them once the
+    // child has exited (core launch-artifacts).
+    const artifacts: string[] = [];
+    // Creds, broker URL and the control token ride a 0600 file; only its path is exported, so the
+    // shells, builds and third-party CLIs this session runs no longer inherit live authority. Its
+    // directory is the first artifact, so a later writeLaunchArtifact failure removes it too.
+    Object.assign(env, materialEnv({ creds: opts.creds, servers: opts.servers, controlToken: control.token, eventsRequired: opts.eventsRequired, userAuth: opts.userAuth }, artifacts));
+    // Default (no shared servers): pass the config inline, unchanged. With shared servers, write it
+    // to a file instead and pass the path. Either way the secret stays a `${VAR}` reference (Claude
+    // expands it from the child env at launch — see the mcpKeys forwarding above), never the resolved
+    // value, so nothing secret reaches disk or argv. We prefer the file when sharing because env
+    // expansion is only *documented* for --mcp-config files (inline expansion does work today, but
+    // isn't contracted), and a file keeps a potentially multi-server config off the process argv.
+    // Verified end-to-end on claude 2.1.183: ${VAR} expands in the --mcp-config file and the value
+    // is handed to the shared server. This is host-version behavior — if a future claude stops
+    // expanding here, a shared server would receive a literal `${VAR}`; re-check on host upgrades.
+    let mcpConfig: string;
+    if (Object.keys(shared).length === 0) {
+      mcpConfig = JSON.stringify({ mcpServers });
+    } else {
+      // A private 0700 temp dir (unique per spawn) holds the 0600 config. It must outlive this call
+      // (Claude reads it at startup and on /mcp reconnect), so it is a launch artifact the launcher
+      // removes after the child exits.
+      mcpConfig = writeLaunchArtifact(artifacts, "cotal-mcp-", "mcp.json", JSON.stringify({ mcpServers }, null, 2));
+    }
+    if (exclusive) args.push("--strict-mcp-config");
+    args.push("--mcp-config", mcpConfig);
+
+    if (agentFile) env.COTAL_AGENT_FILE = agentFile;
+    if (def?.persona) {
+      // A persona can carry private project vocabulary or instructions. Passing its body through
+      // `--append-system-prompt` publishes it in the process argv to every same-host observer.
+      // Claude Code has a native file-shaped input, so write the text owner-only and expose only
+      // its path. No text-argv fallback: failing to create a private carrier refuses the launch.
+      // The file must outlive buildLaunch for startup and resume, so it is a launch artifact too.
+      args.push("--append-system-prompt-file", writeLaunchArtifact(artifacts, "cotal-claude-persona-", "persona.md", def.persona));
+    }
+    if (opts.model) {
+      args.push("--model", opts.model);
+      env.COTAL_MODEL = opts.model;
+    }
+
+    // Fork an existing session INTO the mesh (opts.resume, an opaque host-local id). `--fork-session`
+    // is pushed in the SAME branch — resume here is fork-only, never a hijack: claude mints a NEW
+    // session id from that transcript and leaves the original untouched. The id is a single argv
+    // token (no shell), so a hostile-looking id can't inject. The persona prompt-file flag
+    // above still applies, so the forked context runs under the current mesh persona.
+    if (opts.resume) args.push("--resume", opts.resume, "--fork-session");
+    if (opts.carried) Object.assign(env, placeCarried(opts.carried.home, opts.carried.transcript, opts.resume, opts.carried.cwd, mcpServers[MCP_SERVER_NAME]!));
+
+    // Opaque connector options → native `claude` flags, RAW passthrough: `key=value` renders
+    // `--key value`, and an empty value (`--opt foo=`) renders a bare boolean `--foo`. No allow-list,
+    // no deny-list — the spawn capability is the trust boundary (see connectorLaunchOptions), not the
+    // flag set. An operator can already run `claude` with any flag directly, and a peer's cotal_spawn
+    // is gated by the spawn capability itself; every `claude` flag is forwarded verbatim.
+    // A managed seat has no human at its terminal, so a permission prompt under the default mode
+    // is a prompt nobody answers: the seat's first mesh tool call stalled there and it looked dead
+    // to its peers. Bypass is the default for a managed seat, which the manager marks with `cwd`. A
+    // foreground launch runs in the operator's terminal and keeps Claude's own mode, so the operator
+    // answers its prompts there. An operator who wants another mode passes
+    // `--opt permission-mode=<mode>`, and either permission flag in the passthrough wins.
+    if (opts.cwd && !passthrough.some(([k]) => k === "permission-mode" || k === "dangerously-skip-permissions"))
+      args.push("--permission-mode", "bypassPermissions");
+    for (const [k, val] of passthrough) {
+      if (val === "") args.push(`--${k}`);
+      else args.push(`--${k}`, val);
+    }
+
+    return {
+      command: binary,
+      args,
+      env,
+      // The dev-channels flag shows this one-time gate. Use its unique title rather than the generic
+      // "Enter to confirm" footer, which the workspace-trust dialog also renders with a different
+      // default action. The runtime presses Enter once when this connector-owned text appears.
+      // Claude skips the gate when channels are off for the session, and opens its input screen.
+      confirm: "WARNING: Loading development channels",
+      // Answering the gate is not registration: Claude then prints this line for an admitted
+      // channel server, and a policy warning in its place for a blocked one. Only a once seat waits
+      // for it, because only a once seat's spawn depends on it; a missed notice stops the seat.
+      ...(opts.once ? { confirmNotice: `messages from ${CHANNEL_REF} inject directly in this session` } : {}),
+      confirmReady: CLAUDE_READY_TEXTS,
+      confirmBlockers: CLAUDE_STARTUP_BLOCKERS,
+      ...(opts.cwd ? { confirmBefore: CLAUDE_WORKSPACE_TRUST_REPLIES } : {}),
+      control,
+      ...(opts.carried ? { resumeRecordPath: carriedForkRecord(opts.carried.home) } : {}),
+      ...(artifacts.length > 0 ? { artifacts } : {}),
+    };
+  },
+};
+
+registry.register(claudeConnector);

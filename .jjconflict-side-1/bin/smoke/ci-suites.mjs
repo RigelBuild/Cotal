@@ -1,0 +1,176 @@
+// @ts-check
+/**
+ * The one reader of the CI suite registry: the frozen positional list in `ci-suites.txt` plus one
+ * file per future suite in `ci-suites.d/`. Three things read the registry - the serial/sharded
+ * runner and the gate inventory's two directions - and three copies of "strip comments, split
+ * lines, load fragments" is three places for them to disagree about what the gate is.
+ *
+ * A malformed line THROWS. It does not skip: a chain that silently drops the entry it could not
+ * parse is a chain that runs fewer suites than it prints, which is the failure this whole file
+ * exists downstream of.
+ */
+import { createHash } from "node:crypto";
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+export const CI_SUITES_PATH = fileURLToPath(new URL("./ci-suites.txt", import.meta.url));
+export const CI_SUITES_DIR = fileURLToPath(new URL("./ci-suites.d", import.meta.url));
+export const CI_SUITE_COSTS_PATH = fileURLToPath(new URL("./ci-suite-costs.json", import.meta.url));
+
+/**
+ * Script names in execution order. Comments and blanks removed; nothing else is.
+ *
+ * TRAILING WHITESPACE IS NORMALISED AND A `pnpm ` PREFIX IS REFUSED, which are deliberately
+ * different answers. A stray space is a typo with exactly one meaning, so trimming it cannot pick
+ * the wrong one. `pnpm smoke:x` is what every line of the OLD chain looked like, so someone will
+ * paste one in - and accepting it would mean guessing that the leading token is noise. Refusing
+ * names the mistake at the point it is made; the alternative is a line that reads correct and runs
+ * nothing.
+ */
+/** @param {string} raw @param {string} [label] @returns {string[]} */
+export function parseCiSuites(raw, label = CI_SUITES_PATH) {
+  /** @type {string[]} */
+  const out = [];
+  raw.split("\n").forEach((line, i) => {
+    const s = line.trim();
+    if (!s || s.startsWith("#")) return;
+    if (/^pnpm\s+/.test(s))
+      throw new Error(
+        `${label}:${i + 1}: drop the \`pnpm \` prefix - this file holds script NAMES, one per line: ` +
+          `${JSON.stringify(s)}`,
+      );
+    if (!/^smoke(?::[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)*)?$/.test(s))
+      throw new Error(`${label}:${i + 1}: not a smoke script name: ${JSON.stringify(s)}`);
+    out.push(s);
+  });
+  return out;
+}
+
+/** Filename a new suite must use under `ci-suites.d/`. Derived from the public script name so two
+ *  branches adding unrelated suites cannot share a path. */
+/** @param {string} suite @returns {string} */
+export function fragmentFileName(suite) {
+  return `${createHash("sha256").update(suite).digest("hex")}.txt`;
+}
+
+/** Suite names present in `headRaw` that `baseRaw` does not already carry. Derived from the two
+ *  blobs with the same parser the chain uses: comment edits and deletions do not appear, a new
+ *  `smoke:*` line does. The frozen list is whatever suite names the file currently parses to, not a
+ *  copy of those names kept beside it. */
+/** @param {string} baseRaw @param {string} headRaw @param {string} [baseLabel] @param {string} [headLabel] @returns {string[]} */
+export function addedLegacySuites(
+  baseRaw,
+  headRaw,
+  baseLabel = "ci-suites.txt (base)",
+  headLabel = "ci-suites.txt (head)",
+) {
+  const base = new Set(parseCiSuites(baseRaw, baseLabel));
+  /** @type {string[]} */
+  const added = [];
+  for (const suite of parseCiSuites(headRaw, headLabel)) {
+    if (!base.has(suite) && !added.includes(suite)) added.push(suite);
+  }
+  return added;
+}
+
+/** Reads the chain file. A MISSING or unreadable file throws here - it never yields an empty chain,
+ *  because "the chain cannot be empty" is only a real guard if empty cannot be produced silently. */
+export function readCiSuites(path = CI_SUITES_PATH) {
+  const legacy = parseCiSuites(readFileSync(path, "utf8"), path);
+  if (path !== CI_SUITES_PATH) return legacy;
+  return [...legacy, ...readCiSuiteFragments()];
+}
+
+/** One suite per fragment file, sorted by filename for deterministic serial execution. The file
+ * name is deliberately NOT the execution/shard identity; simultaneous PRs add different paths, so
+ * GitHub can merge them independently, and the suite name inside remains the audited public script. */
+/** @param {string} [dir] @returns {string[]} */
+export function readCiSuiteFragments(dir = CI_SUITES_DIR) {
+  return readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".txt"))
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .flatMap((entry) => {
+      const path = join(dir, entry.name);
+      const suites = parseCiSuites(readFileSync(path, "utf8"), path);
+      if (suites.length !== 1)
+        throw new Error(`${path}: a suite fragment must contain exactly one smoke script, got ${suites.length}`);
+      const expected = fragmentFileName(suites[0]);
+      if (entry.name !== expected)
+        throw new Error(`${path}: fragment filename must be sha256(${suites[0]}) = ${expected}`);
+      return suites;
+    });
+}
+
+/** Stable shard for fragment suites. The frozen legacy list retains `index % count`; fragments
+ * cannot use a concatenated index because another independently-merged filename before them would
+ * move their runner. SHA-256 over the public suite name makes assignment independent of filenames,
+ * directory order and merge order. */
+/** @param {string} suite @param {number} count @returns {number} */
+export function fragmentShard(suite, count) {
+  if (!Number.isInteger(count) || count < 1) throw new Error(`shard count must be positive, got ${count}`);
+  return createHash("sha256").update(suite).digest().readUInt32BE(0) % count;
+}
+
+/** @typedef {{ count: number, suites: Map<string, { seconds: number, shard: number }> }} ShardCosts */
+
+/** Measured cost and pinned shard per suite, from `ci-suite-costs.json`. Neither index nor name hash
+ * knows what a suite costs, so shards drift apart as suites land; `rebalance-shards.mjs` measures
+ * CI job logs and writes this table, and a suite it lists runs on its pinned shard. The pins are
+ * committed data, so a suite moves only when a reviewed edit to the table moves it. A malformed
+ * table THROWS: a table that silently drops a pin moves that suite. */
+/** @param {string} raw @param {string} [label] @returns {ShardCosts} */
+export function parseShardCosts(raw, label = CI_SUITE_COSTS_PATH) {
+  const table = JSON.parse(raw);
+  const count = table?.count;
+  if (!Number.isInteger(count) || count < 1) throw new Error(`${label}: count must be a positive integer`);
+  if (table.suites === null || typeof table.suites !== "object" || Array.isArray(table.suites))
+    throw new Error(`${label}: suites must be an object of suite name to { seconds, shard }`);
+  /** @type {Map<string, { seconds: number, shard: number }>} */
+  const suites = new Map();
+  for (const [suite, entry] of Object.entries(table.suites)) {
+    const names = parseCiSuites(suite, label);
+    if (names.length !== 1 || names[0] !== suite) throw new Error(`${label}: not a smoke script name: ${JSON.stringify(suite)}`);
+    const { seconds, shard } = entry ?? {};
+    if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0)
+      throw new Error(`${label}: ${suite} needs a non-negative number of seconds`);
+    if (!Number.isInteger(shard) || shard < 0 || shard >= count)
+      throw new Error(`${label}: ${suite} needs a shard from 0 to ${count - 1}`);
+    suites.set(suite, { seconds, shard });
+  }
+  return { count, suites };
+}
+
+/** @param {string} [path] @returns {ShardCosts} */
+export function readShardCosts(path = CI_SUITE_COSTS_PATH) {
+  return parseShardCosts(readFileSync(path, "utf8"), path);
+}
+
+/** One suite's runner. A pin applies only under the shard count it was measured for; any other
+ * count is already a full reassignment, so it falls to the frozen index or the name hash. */
+/** @param {string} suite @param {number} legacyIndex @param {number} count @param {ShardCosts} costs @returns {number} */
+export function suiteShard(suite, legacyIndex, count, costs) {
+  const pin = costs.count === count ? costs.suites.get(suite) : undefined;
+  if (pin) return pin.shard;
+  return legacyIndex >= 0 ? legacyIndex % count : fragmentShard(suite, count);
+}
+
+/** The exact assignment the runner executes: a pinned shard from the cost table, else the frozen
+ * positional legacy index, else the independently hashed fragment name. Shared so the regression
+ * tests the production selector, not a copy. */
+/** @param {string[]} legacy @param {string[]} fragments @param {number} shard @param {number} count @param {ShardCosts} [costs] @returns {string[]} */
+export function suitesForShard(legacy, fragments, shard, count, costs = readShardCosts()) {
+  if (!Number.isInteger(shard) || !Number.isInteger(count) || count < 1 || shard < 0 || shard >= count)
+    throw new Error(`invalid shard ${shard}/${count}`);
+  return [
+    ...legacy.filter((suite, index) => suiteShard(suite, index, count, costs) === shard),
+    ...fragments.filter((suite) => suiteShard(suite, -1, count, costs) === shard),
+  ];
+}
+
+/** The chain as the `&&` string it used to be, for consumers that grade script BODIES. */
+export function ciChainBody() {
+  return readCiSuites()
+    .map((s) => `pnpm ${s}`)
+    .join(" && ");
+}

@@ -1,0 +1,44 @@
+{
+  "suite": [
+    "implementations/manager/smoke/manager-service-invoke.smoke.ts",
+    "implementations/manager/smoke/contract-vocabulary.smoke.ts"
+  ],
+  "guard": "resolved manager command count is derived from the shipped cluster document, not restated; and the contract module compiles on first use, not at import",
+  "command": "pnpm smoke:manager-service-invoke && pnpm smoke:contract-vocabulary",
+  "proveWith": "node scripts/mutation-proof.mjs --config implementations/manager/smoke/mutations/shipped-surface-pin.json",
+  "why": [
+    "Reached suites used to pin 18 while the shipped document served 20. Restating the count is the",
+    "defect class: correct the day it is written, wrong after the next served command.",
+    "",
+    "M2 keeps revision 51 after the fork's retained-seat, deferred-seat, allowlist and spawn-input validation changes advance the upstream revision 46 surface.",
+    "The named revision cell runs after resolving the actual shipped document over the wire.",
+    "M3 re-introduces module-scope compilation (#1323): the mutant reads every pair from the lazy table",
+    "at import and compiles them all, as the removed eager map did. The contract-vocabulary import-cost",
+    "cell counts Ajv.compile calls during import and expects zero; the eager mutant produces a nonzero count."
+  ],
+  "mutations": [
+    {
+      "name": "M1 restate commandCount as 18",
+      "file": "implementations/manager/src/manager-service-contract.ts",
+      "find": "  return { revision: document.revision, commandCount: names.length, names };",
+      "replace": "  return { revision: document.revision, commandCount: 18, names };",
+      "expectRed": "the resolved surface matches the shipped cluster document",
+      "cell": "the resolved surface matches the shipped cluster document"
+    },
+    {
+      "name": "M2 keep revision 51 after adding roster",
+      "file": "implementations/manager/src/manager-service-contract.ts",
+      "find": "  return buildClusterDocument(MANAGER_CLUSTER_URN, 52, ROWS);",
+      "replace": "  return buildClusterDocument(MANAGER_CLUSTER_URN, 51, ROWS);",
+      "cell": "roster advances the manager cluster revision and retains existing commands"
+    },
+    {
+      "name": "M3 compile every contract pair at module scope again",
+      "file": "implementations/manager/src/manager-service-contract.ts",
+      "find": "const TABLE = serviceContractTable(ROWS);",
+      "replace": "const TABLE = serviceContractTable(ROWS);\nfor (const r of ROWS) void TABLE.contracts[r.name];",
+      "expectRed": "importing the contract module compiles nothing (describe-only readers pay no Ajv)",
+      "cell": "importing the contract module compiles nothing (describe-only readers pay no Ajv)"
+    }
+  ]
+}

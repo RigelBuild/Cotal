@@ -1,0 +1,153 @@
+/** Two-account native fixture for the hosted auth lifetime smoke: one real broker, two data
+ *  accounts, each with its own callout account and a fully provisioned in-memory injected store. */
+import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { composeSpaceAuth, createBrokerAuth, createSpaceAccountAuth, isReachable, serverConfig, type SecretStore, type SpaceAuth } from "@cotal-ai/core";
+import { SMOKE_BROKER_TOKEN, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
+import { ensureCalloutAuth, ensureIssuer, ensureOwnerSecret, ensurePinnedIdp, saveServiceKeys } from "../src/store.js";
+import { pickFreePort } from "./_free-port.js";
+
+export class MemoryStore implements SecretStore {
+  readonly values = new Map<string, string>();
+  constructor(readonly identity: { kind: "injected"; coordinate: string }) {}
+  async get(k: string) { return this.values.get(k); }
+  async put(k: string, v: string) { this.values.set(k, v); }
+  async create(k: string, v: string) { if (this.values.has(k)) return false; this.values.set(k, v); return true; }
+  async delete(k: string) { this.values.delete(k); }
+}
+
+export interface HostedAuthAccount {
+  space: string;
+  accountPublicKey: string;
+  store: MemoryStore;
+  stateDir: string;
+  sentinelCreds: string;
+  /** The composed space auth, including the broker $SYS signing seed for the smoke-only KICK. */
+  auth: SpaceAuth;
+}
+
+export interface HostedAuthFixture {
+  servers: string;
+  /** The broker's loopback websocket listener (`ws://`), present only when asked for. */
+  wsServers?: string;
+  dir: string;
+  accounts: HostedAuthAccount[];
+  /** Provision one more injected store for an EXISTING space slug under a freshly created account
+   *  (same-slug recreation). The account is not preloaded on the broker. */
+  recreateSlug(space: string, coordinate: string): Promise<{ store: MemoryStore; accountPublicKey: string }>;
+  stopBroker(): Promise<void>;
+  restartBroker(): Promise<void>;
+  /** Rewrite this broker's configuration and RELOAD it in place (SIGHUP), so the same incarnation
+   *  keeps serving: `server_id` and `start` do not move, VARZ `config_digest` does. `addAccount`
+   *  preloads one more operator-signed account, as provisioning another tenant does; `maxPayload`
+   *  replaces the broker-wide payload limit. Returns once nats-server has logged the reload. */
+  reloadBroker(change?: { addAccount?: boolean; maxPayload?: number }): Promise<void>;
+  close(): Promise<void>;
+}
+
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export async function startHostedAuthFixture(label: string, count = 2, opts: { websocket?: boolean; maxPayload?: number; clusterPort?: number; clusterName?: string } = {}): Promise<HostedAuthFixture> {
+  const port = await pickFreePort();
+  const wsPort = opts.websocket ? await pickFreePort() : undefined;
+  const servers = `nats://127.0.0.1:${port}`;
+  const broker = await createBrokerAuth(`${label}-broker`);
+  const stamp = Date.now();
+  const spaces = Array.from({ length: count }, (_, i) => `${label}-${String.fromCharCode(97 + i)}-${stamp}`);
+  const spaceAccounts = await Promise.all(spaces.map((s) => createSpaceAccountAuth(broker, s)));
+  const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+  const accounts: HostedAuthAccount[] = [];
+  const calloutAccounts: Array<{ pub: string; jwt: string }> = [];
+  for (const [i, space] of spaces.entries()) {
+    const auth = composeSpaceAuth(broker, spaceAccounts[i]);
+    const store = new MemoryStore({ kind: "injected", coordinate: `memory:${space}` });
+    const callout = await ensureCalloutAuth(store, { space, operatorSeed: broker.operator.seed!, accountPub: auth.account.pub });
+    await ensureIssuer(store, space);
+    await ensureOwnerSecret(store, space);
+    await saveServiceKeys(store, space, { dataAccount: { pub: auth.account.pub, signingSeed: auth.account.signingSeed! } });
+    const stateDir = join(dir, `state-${i}`);
+    mkdirSync(stateDir, { recursive: true });
+    ensurePinnedIdp(stateDir, "http://127.0.0.1:1/api/auth");
+    calloutAccounts.push({ pub: callout.account.pub, jwt: callout.account.jwt });
+    accounts.push({ space, accountPublicKey: auth.account.pub, store, stateDir, sentinelCreds: callout.sentinelCreds, auth });
+  }
+  const clusterPeer = opts.clusterPort === undefined ? undefined : { port: await pickFreePort(), route: await pickFreePort() };
+  // Mutable so `reloadBroker` can re-render the same broker with one more account or another
+  // payload limit. Every other input stays what the fixture started with.
+  let maxPayload = opts.maxPayload;
+  const render = (clientPort: number, node: string, route?: number) => serverConfig(broker, spaceAccounts, {
+    transport: { kind: "plaintext" }, port: clientPort, storeDir: join(dir, `js-${node}`), extraAccounts: calloutAccounts,
+    ...(maxPayload === undefined ? {} : { maxPayload }), ...(wsPort !== undefined ? { wsPort } : {}),
+  }) + (route === undefined ? "" : `\nserver_name: "owned-payload-${node}"\ncluster {\n name: ${JSON.stringify(opts.clusterName ?? "owned-fixture")}\n host: 127.0.0.1\n port: ${route}\n routes: ["nats://127.0.0.1:${opts.clusterPort}", "nats://127.0.0.1:${clusterPeer!.route}"]\n}\n`);
+  writeFileSync(join(dir, "server.conf"), render(port, "primary", opts.clusterPort));
+  let peer: ChildProcess | undefined, releasePeer: (() => void) | undefined;
+  if (clusterPeer) {
+    writeFileSync(join(dir, "peer.conf"), render(clusterPeer.port, "peer", clusterPeer.route));
+    peer = spawn("nats-server", ["-c", join(dir, "peer.conf")], { stdio: "ignore" });
+    releasePeer = teardownOnSignal(peer, dir);
+  }
+  let startupError = "";
+  // Reloads are counted off whole LINES: nats-server logs one `Reloaded server configuration` line
+  // per applied SIGHUP, and a chunk boundary inside that phrase would otherwise lose the count.
+  let reloads = 0, partial = "";
+  const absorb = (bytes: Buffer): void => {
+    const text = bytes.toString();
+    startupError = (startupError + text).slice(-4096);
+    const lines = (partial + text).split("\n");
+    partial = lines.pop() ?? "";
+    for (const line of lines) if (line.includes("Reloaded server configuration")) reloads++;
+  };
+  let nats: ChildProcess = spawn("nats-server", ["-c", join(dir, "server.conf")], { stdio: ["ignore", "ignore", "pipe"] });
+  nats.stderr?.on("data", absorb);
+  let release = teardownOnSignal(nats, dir);
+  let up = false;
+  for (let i = 0; i < 50 && !up; i++) { up = await isReachable(servers); if (!up) await wait(200); }
+  if (!up) { await killAndAwaitExit(nats, "SIGKILL"); if (peer) await killAndAwaitExit(peer, "SIGKILL"); releasePeer?.(); release(); throw new Error(`nats-server did not come up on ${port}: ${startupError}`); }
+  return {
+    servers, dir, accounts,
+    ...(wsPort !== undefined ? { wsServers: `ws://127.0.0.1:${wsPort}` } : {}),
+    async stopBroker() {
+      await killAndAwaitExit(nats, "SIGTERM");
+      nats.unref();
+      release();
+    },
+    async restartBroker() {
+      nats = spawn("nats-server", ["-c", join(dir, "server.conf")], { stdio: ["ignore", "ignore", "pipe"] });
+      nats.stderr?.on("data", absorb);
+      release = teardownOnSignal(nats, dir);
+      for (let i = 0; i < 50; i++) { if (await isReachable(servers)) return; await wait(200); }
+      throw new Error("hosted-auth broker did not restart");
+    },
+    async reloadBroker(change = {}) {
+      if (change.addAccount) {
+        const extra = await createSpaceAccountAuth(broker, `${label}-extra-${calloutAccounts.length}`);
+        calloutAccounts.push({ pub: extra.account.pub, jwt: extra.account.jwt });
+      }
+      if (change.maxPayload !== undefined) maxPayload = change.maxPayload;
+      const before = reloads;
+      writeFileSync(join(dir, "server.conf"), render(port, "primary", opts.clusterPort));
+      nats.kill("SIGHUP");
+      for (let i = 0; i < 100 && reloads === before; i++) await wait(100);
+      if (reloads === before) throw new Error(`nats-server did not apply the reload: ${startupError.slice(-1024)}`);
+    },
+    async recreateSlug(space, coordinate) {
+      const auth = composeSpaceAuth(broker, await createSpaceAccountAuth(broker, space));
+      const store = new MemoryStore({ kind: "injected", coordinate });
+      await ensureCalloutAuth(store, { space, operatorSeed: broker.operator.seed!, accountPub: auth.account.pub });
+      await ensureIssuer(store, space);
+      await ensureOwnerSecret(store, space);
+      await saveServiceKeys(store, space, { dataAccount: { pub: auth.account.pub, signingSeed: auth.account.signingSeed! } });
+      return { store, accountPublicKey: auth.account.pub };
+    },
+    async close() {
+      await killAndAwaitExit(nats, "SIGKILL");
+      if (peer) await killAndAwaitExit(peer, "SIGKILL");
+      releasePeer?.();
+      nats.unref();
+      if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+      release();
+    },
+  };
+}

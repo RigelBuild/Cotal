@@ -1,0 +1,4 @@
+# A foreground spawn from a pre-minted credential must launch with no trust material on the host:
+# the credential and its lifecycle uid are the whole grant, and a wrong or missing uid is refused
+# before any launch. The creds path reaches the child only through the launch material file.
+smoke:spawn-creds

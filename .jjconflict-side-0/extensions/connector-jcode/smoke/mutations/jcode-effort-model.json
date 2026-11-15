@@ -1,0 +1,35 @@
+{
+  "suite": [
+    "extensions/connector-jcode/smoke/jcode-effort-model.smoke.ts"
+  ],
+  "guard": "only the exact Jcode Harness invalid_request capability refusal is classified as unsupported; copied text, another code, and near-miss wording stay generic",
+  "command": "pnpm smoke:jcode-effort-model",
+  "progressPattern": "✓",
+  "minTicks": 4,
+  "mutations": [
+    {
+      "name": "Jcode exact capability refusal loses its unsupported classification",
+      "file": "extensions/connector-jcode/src/startup-diagnostics.ts",
+      "find": "    return new JcodeEffortUnsupported(requestedTier, identity.model, identity.provider, identity.apiMethod);",
+      "replace": "    return new JcodeEffortRefusal(requestedTier, identity.model, identity.provider, identity.apiMethod, []);",
+      "expectRed": "the exact Harness invalid_request capability refusal is classified separately",
+      "cell": "the exact Harness invalid_request capability refusal is classified separately"
+    },
+    {
+      "name": "Jcode capability classification accepts copied untrusted Error text",
+      "file": "extensions/connector-jcode/src/startup-diagnostics.ts",
+      "find": "    error instanceof HarnessError &&",
+      "replace": "    error instanceof Error &&",
+      "expectRed": "a plain Error with copied capability text stays a generic refusal",
+      "cell": "a plain Error with copied capability text stays a generic refusal"
+    },
+    {
+      "name": "Jcode capability classification accepts any unsupported-reasoning invalid_request",
+      "file": "extensions/connector-jcode/src/startup-diagnostics.ts",
+      "find": "    /^invalid_request: Reasoning effort is not supported by the current model\\/profile\\./.test(error.message)",
+      "replace": "    /^invalid_request: Reasoning effort is not supported/.test(error.message)",
+      "expectRed": "a near-miss invalid_request message stays a generic refusal",
+      "cell": "a near-miss invalid_request message stays a generic refusal"
+    }
+  ]
+}

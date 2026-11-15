@@ -1,0 +1,1986 @@
+/**
+ * USER-MODE SPAWN live smoke (gate-1, the managed-agent end-to-end) — the whole "a logged-in
+ * operator spawns a detached agent on a user-auth mesh" story, driven against a REAL broker (callout
+ * account preloaded), the REAL auth-service daemon (a killable subprocess), a REAL Better Auth IdP,
+ * and the REAL {@link Manager} class IN-PROCESS (so the in-process `e2e` connector + the auth provider
+ * share one registry; the spawned "agent" is a genuine long-lived node child through the real pty
+ * runtime, connecting user-mode with a bearer SOURCE that execs its refresh command).
+ *
+ *  A. Setup: user-auth broker + streams + the auth-service daemon; a device login; the interactive
+ *     `cli` actor granted (scope [spawn]).
+ *  B. Detached user-mode spawn: Manager.startAgent grants a MANAGED-actor row (tokenHash), provisions
+ *     the sentinel/token/health files + bearer command, preflights it, launches — and the child JOINS
+ *     presence as the `owner.actor` principal (witnessed via an observer on the operator's own user bearer).
+ *  C. Exchange-mode confinement: an IdP proof for the managed name is refused ("managed agent"), the
+ *     interactive grant path refuses to shadow it, and a token-hash forged into the interactive row
+ *     fails closed.
+ *  D. Agent exchange + live-expiry: a direct `{ owner, actorToken, ttlSec:10 }` exchange mints a bearer;
+ *     a raw endpoint opened with it connects and then DIES at the bearer-bound JWT expiry (~10s).
+ *  E/G. Health + heal + preflight refusal: kill the auth service — the agent's own bearer command fails
+ *     with the `cotal up` recovery (health file → failed; `ps` → auth-renewal-failed) and a fresh spawn
+ *     is refused at preflight with the row rolled back; restart it — the bearer command heals and `ps`
+ *     is auth-clean again.
+ *  F. Revocation: manager teardown deletes the managed row + shreds the token/sentinel/health files, and
+ *     the OLD captured actor token is thereafter uniformly denied (401).
+ *
+ * COTAL_HOME + the workspace root are sandboxed to temp dirs; kills ONLY the pids it starts (NEVER
+ * pkill nats-server). Needs nats-server on PATH. Run: pnpm smoke:user-spawn:live  (pnpm build first —
+ * the pty-launched agent child imports @cotal-ai/core from dist).
+ */
+import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
+
+// ---------- SELF-DISPATCH (must be the FIRST thing that runs) ----------
+// The manager builds the agent's bearer argv from `process.argv[1]` — which, in this in-process smoke,
+// is THIS file. So when the manager (or the spawned agent) execs the bearer command, it re-execs this
+// smoke with "agent-bearer" as argv[2]; the smoke ITSELF also re-execs itself to run the long-lived
+// "auth-service" daemon. Intercept both here, resolve the real command from the core registry, run it
+// with a minimally-parsed ParsedArgs, and exit — before the heavy harness below ever loads.
+const SUBCOMMAND = process.argv[2] ?? "";
+if (SUBCOMMAND === "agent-bearer" || SUBCOMMAND === "auth-service") {
+  await import("@cotal-ai/auth"); // self-registers `agent-bearer` / `auth-service` (+ the provider) into the registry
+  const { registry } = await import("@cotal-ai/core");
+  type Command = import("@cotal-ai/core").Command;
+  const rest = process.argv.slice(3);
+  const values: Record<string, string | boolean | undefined> = {};
+  const positionals: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a.startsWith("--")) {
+      const key = a.slice(2);
+      const next = rest[i + 1];
+      if (next !== undefined && !next.startsWith("--")) { values[key] = next; i++; }
+      else values[key] = true;
+    } else positionals.push(a);
+  }
+  // The real contract, rather than a hand-written shape: `all` constrains its type argument to
+  // Extension, which the inline shape did not satisfy because it omitted `kind`, and ParsedArgs is
+  // exactly the values/positionals/raw triple this dispatcher already passes.
+  const cmd = registry.all<Command>("command").find((c) => c.name === SUBCOMMAND);
+  if (!cmd) { console.error(`self-dispatch: command "${SUBCOMMAND}" is not registered`); process.exit(1); }
+  try {
+    await cmd.run({ values, positionals, raw: rest }); // agent-bearer prints its bearer + returns; auth-service never returns
+    process.exit(0);
+  } catch (e) {
+    console.error(e instanceof Error ? (e.stack ?? e.message) : String(e));
+    process.exit(1);
+  }
+}
+
+// ---------- MAIN HARNESS ----------
+type ChildProcess = import("node:child_process").ChildProcess;
+type Connector = import("@cotal-ai/core").Connector;
+type LaunchOpts = import("@cotal-ai/core").LaunchOpts;
+type LaunchSpec = import("@cotal-ai/core").LaunchSpec;
+type ControlReply = import("@cotal-ai/core").ControlReply;
+
+const { spawn, execFile, execFileSync } = await import("node:child_process");
+const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync } = await import("node:fs");
+
+/** `Manager.list` is PRIVATE; the cells below assert the row shape `cotal ps` renders, so the reach
+ *  goes through one named view rather than a cast per call site, and the view names exactly the
+ *  fields those cells read, at exactly the width the real method returns them: `mesh` is a roster
+ *  status or the absent sentinel, never an arbitrary string, `pid` is present only on a runtime that
+ *  owns a real process, and `authHealth` is the non-ok half of `agentAuthState`. A local view WIDER than the real return would let a cell certify a value
+ *  production cannot emit. Widening the method to public would be a shipped-source change made for a
+ *  test's convenience, which is not this change's business. */
+type PresenceStatus = import("@cotal-ai/core").PresenceStatus;
+type PsRow = { name: string; id: string; mesh: PresenceStatus | "absent"; pid?: number; authHealth?: "auth-renewal-failed" | "auth-unknown" | "auth-stale" };
+const psList = (m: object, ownerFilter?: string): PsRow[] =>
+  (m as unknown as { list: (o?: string) => PsRow[] }).list(ownerFilter);
+const { tmpdir } = await import("node:os");
+const { join } = await import("node:path");
+
+const home = mkdtempSync(join(tmpdir(), "cotal-uspawn-home-"));
+process.env.COTAL_HOME = home;
+const root = mkdtempSync(join(tmpdir(), `${SMOKE_BROKER_TOKEN}uspawn-root-`));
+const cliHome = join(home, "cli-home");
+const cliConfig = join(home, "cli-config");
+mkdirSync(cliHome, { recursive: true });
+mkdirSync(cliConfig, { recursive: true });
+
+const { betterAuth } = await import("better-auth");
+const { memoryAdapter } = await import("better-auth/adapters/memory");
+const { jwt } = await import("better-auth/plugins/jwt");
+const { deviceAuthorization } = await import("better-auth/plugins/device-authorization");
+const { bearer: baBearer } = await import("better-auth/plugins/bearer");
+const { toNodeHandler } = await import("better-auth/node");
+const { createServer } = await import("node:http");
+type AddressInfo = import("node:net").AddressInfo;
+
+const {
+  CotalEndpoint, createSpaceAuth, isReachable, mintCreds, newIdentity, serverConfig,
+  setupSpaceStreams, principalKey, registry, spaceWildcard, clearChannel, mintLifecycleUid, eventChannel,
+  resolveService, invokeCommand, standaloneConnectOpts, EpEnvelopeError, epAuthBucket,
+  mintMembershipObserverCreds, observePlaneLivenessWithCreds, sessionsBucket, sessionLedgerKey, mintSessionId,
+} = await import("@cotal-ai/core");
+const { connect: rawConnect } = await import("@nats-io/transport-node");
+const { Kvm } = await import("@nats-io/kv");
+const { createHash } = await import("node:crypto");
+const { decodeJwt } = await import("jose");
+const { agentCredsDir, authDir, userAuthStateDir, saveSpaceAuth, recordMesh, assertUserAuthInfo, workspaceSecretStore, agentLifecycleSecretFilePaths } = await import("@cotal-ai/workspace");
+const {
+  cotalAuthProvider, establishIdpSession, fetchIdpJwt, grantActor, loadCalloutAuth, loadAuthServiceInfo,
+  actorLedgerDir, managedActorLedgerDir, ledgerRowFilename, deriveOwnerForIdpSubject, loadOwnerSecret, loadPinnedIdp, loadIssuer, loadIdpSession,
+} = await import("@cotal-ai/auth");
+// @cotal-ai/manager + @cotal-ai/connector-core are not deps of @cotal-ai/auth. Drive the REAL Manager
+// from its built dist by relative path (shares the one @cotal-ai/core registry instance — dist — so the
+// in-process `e2e` connector + the auth provider are visible to it); inline the tiny launch-env mapping
+// @cotal-ai/connector-core's userAuthEnv would otherwise supply.
+const { Manager, remoteManagerClient: remote, registerRemoteManagerAuthority, managerClusterArtifacts } = await import("../../manager/dist/index.js");
+const { remoteManagerRegistrationProof, remoteManagerActors } = await import("@cotal-ai/core");
+const { managerShippedSurface } = await import("../../manager/src/manager-service-contract.js");
+const shipped = managerShippedSurface();
+/** The four COTAL_* vars configFromEnv parses for a user-mode launch (connector-core's userAuthEnv). */
+function userAuthEnv(o: LaunchOpts): Record<string, string> {
+  if (!o.userAuth) return {};
+  return {
+    COTAL_OWNER: o.userAuth.owner,
+    COTAL_ACTOR: o.userAuth.actor,
+    COTAL_SENTINEL_CREDS: o.userAuth.sentinelCredsPath,
+    COTAL_BEARER_CMD: JSON.stringify(o.userAuth.bearerCmd),
+  };
+}
+/** OS env the child (and its tsx-loaded agent-bearer re-exec) needs (connector-core's launchEnv, trimmed). */
+function launchEnv(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const k of ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "LANG", "TERM", "NODE_EXTRA_CA_CERTS"]) {
+    const v = process.env[k];
+    if (v) out[k] = v;
+  }
+  return out;
+}
+type DeviceLoginPrompt = import("@cotal-ai/auth").DeviceLoginPrompt;
+
+const withTimeout = <T,>(p: Promise<T>, ms: number, msg: string): Promise<T> =>
+  Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
+let pass = 0, fail = 0;
+let cells = 0;
+const check = (name: string, cond: boolean, extra?: unknown) => {
+  cells++;
+  if (cond) { pass++; console.log(`  ✓ ${name}`); }
+  else { fail++; console.log(`  ✗ FAIL: ${name}`, extra ?? ""); }
+};
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const until = async (cond: () => boolean, ms = 8000): Promise<boolean> => {
+  const end = Date.now() + ms;
+  while (!cond() && Date.now() < end) await wait(100);
+  return cond();
+};
+
+const SELF = process.argv[1]; // this smoke file — the bearer/auth-service re-exec target (matches the manager's argv[1])
+const CLI_BIN = join(import.meta.dirname, "..", "..", "..", "bin", "cotal.ts");
+const TSX = join(import.meta.dirname, "..", "..", "..", "node_modules", ".bin", "tsx");
+// The real binary must see the fixture's registry and login state, but never the operator's home,
+// Cotal state, or seeded extension registry.
+const cliEnv = {
+  ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("COTAL_"))),
+  HOME: cliHome,
+  COTAL_HOME: home,
+  XDG_CONFIG_HOME: cliConfig,
+  COTAL_SKIP_CONNECTOR_SEED: "1",
+};
+function cotal(args: string[], timeoutMs = 20_000): Promise<{ status: number | null; out: string; timedOut: boolean; launchError?: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(TSX, [CLI_BIN, ...args], { cwd: root, env: cliEnv, stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs);
+    child.stdout.on("data", (data: Buffer) => { out += data.toString(); });
+    child.stderr.on("data", (data: Buffer) => { out += data.toString(); });
+    child.on("error", (error) => { clearTimeout(timer); resolve({ status: null, out, timedOut, launchError: error.message }); });
+    child.on("close", (status) => { clearTimeout(timer); resolve({ status, out, timedOut }); });
+  });
+}
+/** Run the real binary until `ready` appears in its output (or it exits, or the deadline), then
+ *  SIGKILL it. For long-lived commands such as `attach`, whose success is a banner, not an exit. */
+function cotalUntil(args: string[], ready: RegExp, timeoutMs: number): Promise<{ status: number | null; plain: string; sawReady: boolean }> {
+  return new Promise((resolve) => {
+    // Its own process group: tsx runs the CLI in a grandchild that holds the pipes, so killing only
+    // the wrapper would leave the session (and this promise) open.
+    const child = spawn(TSX, [CLI_BIN, ...args], { cwd: root, env: { ...cliEnv, NO_COLOR: "1" }, stdio: ["ignore", "pipe", "pipe"], detached: true });
+    const killAll = () => { try { process.kill(-child.pid!, "SIGKILL"); } catch { /* already gone */ } };
+    let out = "";
+    let done = false;
+    const finish = (status: number | null) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      const plain = out.replace(/\x1b\[[0-9;]*m/g, "");
+      resolve({ status, plain, sawReady: ready.test(plain) });
+    };
+    const onData = (data: Buffer) => {
+      out += data.toString();
+      if (ready.test(out)) setTimeout(killAll, 300);
+    };
+    const timer = setTimeout(killAll, timeoutMs);
+    child.stdout.on("data", onData);
+    child.stderr.on("data", onData);
+    child.on("error", () => finish(null));
+    child.on("close", (status) => finish(status));
+  });
+}
+const { pickFreePort } = await import("./_free-port.js");
+const { approveDevice } = await import("./_device-approval.js");
+const PORT = await pickFreePort();
+const publicPort = await pickFreePort();
+const proxyPort = await pickFreePort();
+const publicUrl = `https://127.0.0.1:${proxyPort}`;
+const cert = join(home, "cert.pem"), key = join(home, "key.pem");
+execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key,
+  "-out", cert, "-days", "2", "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
+  "-addext", "basicConstraints=critical,CA:TRUE"], { stdio: "ignore" });
+process.env.NODE_EXTRA_CA_CERTS = cert;
+const { createServer: createHttpsServer } = await import("node:https");
+const { request: httpRequest } = await import("node:http");
+const exchangeProxy = createHttpsServer({ cert: readFileSync(cert), key: readFileSync(key) }, (req, res) => {
+  const upstream = httpRequest({ host: "127.0.0.1", port: publicPort, path: req.url, method: req.method, headers: req.headers }, (reply) => {
+    res.writeHead(reply.statusCode ?? 502, reply.headers); reply.pipe(res);
+  });
+  upstream.on("error", () => { res.statusCode = 502; res.end(); });
+  req.pipe(upstream);
+});
+await new Promise<void>((r) => exchangeProxy.listen(proxyPort, "127.0.0.1", r));
+const SERVER = `nats://127.0.0.1:${PORT}`;
+const SPACE = `uspawn-${Math.floor(Math.random() * 1e6)}`;
+const CLIENT_ID = "cotal-cli";
+const dir = userAuthStateDir(root, SPACE); // the provider's space-scoped state dir (ledger, pin, discovery)
+const store = workspaceSecretStore(root); // the secret kinds ride the seam, keyed auth/<space>/…
+// This space's agent-secret segment (P1) — where the CLI and manager actually file an
+// incarnation's family, so a scan for one reads the layout under test.
+const credsDir = agentCredsDir(root, SPACE);
+// The manager files each incarnation's user secrets lifecycle-keyed (`<name>.<uid>.<kind>`).
+// Recover the uid from the token/sentinel already on disk, then derive the whole family (so a
+// not-yet-written health file still resolves to the right path); `noIncFiles` asserts a name has NO
+// incarnation secrets left (for rollback/teardown "gone" checks, uid-agnostic).
+const incUid = (name: string): string => {
+  const re = new RegExp(`^${name}\\.([a-z0-9]{26,32})\\.(actor-token|sentinel\\.creds)$`);
+  for (const f of readdirSync(credsDir)) { const m = re.exec(f); if (m) return m[1]; }
+  throw new Error(`no incarnation secret on disk for ${name} in ${credsDir}`);
+};
+const incFiles = (name: string) => agentLifecycleSecretFilePaths(root, SPACE, name, incUid(name));
+const noIncFiles = (name: string): boolean => {
+  const re = new RegExp(`^${name}\\.[a-z0-9]{26,32}\\.`);
+  return !readdirSync(credsDir).some((f) => re.test(f));
+};
+const coreDist = join(import.meta.dirname, "..", "..", "..", "packages", "core", "dist", "index.js");
+const offlineSignalReady = join(root, ".e2e-offline-signal-ready");
+
+// The agent CHILD: a REAL long-lived node process through the REAL pty runtime, connecting USER-MODE
+// with a bearer SOURCE (execs COTAL_BEARER_CMD for each token) + the sentinel creds — the exact wire
+// contract configFromEnv/agent.ts parse from the four COTAL_* vars the manager forwards.
+const CHILD = [
+  "const cp=require('node:child_process');",
+  "const fs=require('node:fs');",
+  "const {pathToFileURL}=require('node:url');",
+  "const argv=JSON.parse(process.env.COTAL_BEARER_CMD);",
+  "const sentinel=fs.readFileSync(process.env.COTAL_SENTINEL_CREDS,'utf8');",
+  "function bearer(){return new Promise((res,rej)=>{cp.execFile(argv[0],argv.slice(1),{maxBuffer:1<<20,timeout:30000},(e,so,se)=>{if(e)return rej(new Error(((se||'').toString().trim())||e.message));const t=(so||'').toString().trim();t?res(t):rej(new Error('empty bearer'));});});}",
+  "import(pathToFileURL(process.env.CORE_DIST).href).then(async(m)=>{",
+  "const ep=new m.CotalEndpoint({space:process.env.COTAL_SPACE,servers:process.env.COTAL_SERVERS,bearer:bearer,sentinelCreds:sentinel,lifecycleUid:process.env.COTAL_LIFECYCLE_UID,channels:[],consume:false,registerPresence:true,watchPresence:false,card:{name:process.env.COTAL_NAME,owner:process.env.COTAL_OWNER,actor:process.env.COTAL_ACTOR,kind:'agent'}});",
+  "ep.on('error',()=>{});await ep.start();",
+  "setInterval(()=>{},1000);",
+  "}).catch((e)=>{console.error(e&&e.message||String(e));process.exit(1);});",
+].join("\n");
+
+const e2eCon: Connector = {
+  kind: "connector",
+  name: "e2e",
+  requires: ["node"],
+  eventChannel,
+  buildLaunch: (o: LaunchOpts): LaunchSpec => ({
+    command: process.execPath,
+    args: ["-e", CHILD],
+    env: {
+      ...launchEnv(),        // OS allow-list (PATH/HOME/TMPDIR/…) — the agent-bearer re-exec runs under tsx
+      ...userAuthEnv(o),     // COTAL_OWNER / COTAL_ACTOR / COTAL_SENTINEL_CREDS / COTAL_BEARER_CMD (all-or-nothing)
+      ...(o.events !== false ? { COTAL_EVENTS: "1" } : {}),
+      ...(o.eventsRequired ? { COTAL_EVENTS_REQUIRED: "1" } : {}),
+      CORE_DIST: coreDist,
+      COTAL_SPACE: o.space,
+      COTAL_NAME: o.name,
+      COTAL_SERVERS: o.servers ?? "",
+      // The manager mints one lifecycle uid per spawn; the register-only agent child binds by it
+      // (an authed presence-registering agent proves its lifecycle before presence, SPEC 13.1).
+      ...(o.lifecycleUid ? { COTAL_LIFECYCLE_UID: o.lifecycleUid } : {}),
+    },
+  }),
+};
+registry.register(e2eCon);
+
+// A connector whose buildLaunch THROWS after the manager has already provisioned the user grant —
+// exercises the post-provision failure window the freelance found leaking the managed row + files.
+const e2eFailCon: Connector = {
+  kind: "connector",
+  name: "e2e-fail",
+  requires: ["node"],
+  buildLaunch: (): LaunchSpec => { throw new Error("e2e-fail: buildLaunch deliberately rejects this launch"); },
+};
+registry.register(e2eFailCon);
+
+// A connector whose child LAUNCHES and stays alive but never joins the mesh: the only seat state in
+// which a managed row exists with NO roster entry, which is the `?? "absent"` half of the ps
+// projection. Same provisioning path as `e2e`, with one difference: it never opens an endpoint.
+const e2eQuietCon: Connector = {
+  kind: "connector",
+  name: "e2e-quiet",
+  requires: ["node"],
+  buildLaunch: (o: LaunchOpts): LaunchSpec => ({
+    command: process.execPath,
+    args: ["-e", "setInterval(()=>{},1000);"],
+    env: { ...launchEnv(), ...userAuthEnv(o), COTAL_SPACE: o.space, COTAL_NAME: o.name },
+  }),
+};
+registry.register(e2eQuietCon);
+
+// A connector whose child joins the mesh normally and then, on SIGUSR1, publishes presence
+// `offline` and keeps running. That is the third mesh state a managed row can carry, and the only
+// one that is neither the default a joined seat starts in nor the sentinel for no roster row at
+// all. Flipping on a signal rather than on a timer keeps the state change ordered against the
+// assertions instead of racing the manager's readiness wait.
+const CHILD_OFFLINE = CHILD.replace(
+  "setInterval(()=>{},1000);",
+  "setInterval(()=>{},1000);const seq=['working','waiting'];let phase=0;process.on('SIGUSR2',()=>{ep.setStatus(seq[Math.min(phase++,seq.length-1)]).catch(()=>{});});process.on('SIGUSR1',()=>{ep.setStatus('offline').catch(()=>{});});fs.writeFileSync(process.env.E2E_OFFLINE_READY,'ready',{flag:'wx',mode:0o600});",
+);
+const e2eOfflineCon: Connector = {
+  kind: "connector",
+  name: "e2e-offline",
+  requires: ["node"],
+  buildLaunch: (o: LaunchOpts): LaunchSpec => ({
+    command: process.execPath,
+    args: ["-e", CHILD_OFFLINE],
+    env: {
+      ...launchEnv(),
+      ...userAuthEnv(o),
+      CORE_DIST: coreDist,
+      COTAL_SPACE: o.space,
+      COTAL_NAME: o.name,
+      COTAL_SERVERS: o.servers ?? "",
+      E2E_OFFLINE_READY: offlineSignalReady,
+      ...(o.lifecycleUid ? { COTAL_LIFECYCLE_UID: o.lifecycleUid } : {}),
+    },
+  }),
+};
+registry.register(e2eOfflineCon);
+
+
+// ---------- the real Better Auth IdP (device-code, auto-approved) ----------
+let handler: ReturnType<typeof toNodeHandler> | undefined;
+const idpSrv = createServer((req, res) => handler!(req, res));
+await new Promise<void>((r) => idpSrv.listen(0, "127.0.0.1", r));
+const origin = `http://127.0.0.1:${(idpSrv.address() as AddressInfo).port}`;
+const base = `${origin}/api/auth`;
+const ba = betterAuth({
+  baseURL: origin,
+  secret: "smoke-only-better-auth-secret-0123456789",
+  database: memoryAdapter({ user: [], session: [], account: [], verification: [], jwks: [], deviceCode: [] }),
+  emailAndPassword: { enabled: true },
+  plugins: [
+    jwt({ jwt: { issuer: origin, audience: origin } }),
+    deviceAuthorization({ expiresIn: "2m", interval: "1s", validateClient: (id) => id === CLIENT_ID }),
+    baBearer(),
+  ],
+});
+handler = toNodeHandler(ba);
+const signup = await ba.api.signUpEmail({
+  body: { email: "human@example.test", password: "correct-horse-battery", name: "Human 42" },
+  returnHeaders: true,
+});
+const cookie = signup.headers.get("set-cookie")!.split(";")[0];
+const userId = signup.response.user.id;
+const approve = (userCode: string) => approveDevice({ base, cookie, origin }, userCode);
+
+// ---------- helpers over the auth-service daemon (a killable subprocess) ----------
+function spawnAuthService(): ChildProcess {
+  // Re-exec THIS file (tsx) → the self-dispatch runs the real `auth-service` command. cwd=root so the
+  // daemon's findCotalRoot() resolves the space-scoped state dir; ephemeral port (it writes its bound
+  // url+pid+cap into the discovery file).
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (key.startsWith("COTAL_")) delete env[key];
+  env.COTAL_HOME = home;
+  return spawn(process.execPath, [...process.execArgv, SELF, "auth-service", "--space", SPACE, "--server", SERVER, "--exchange-public-port", String(publicPort), "--exchange-public-url", publicUrl], {
+    cwd: root,
+    env,
+    stdio: process.env.SMOKE_AUTH_SERVICE_DEBUG ? ["ignore", "inherit", "inherit"] : "ignore",
+  });
+}
+async function waitAuthReady(ms = 15000): Promise<{ url: string; pid: number; cap: string }> {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    const info = loadAuthServiceInfo(dir);
+    if (info) {
+      let alive = false;
+      try { process.kill(info.pid, 0); alive = true; } catch { /* not up yet */ }
+      if (alive) { try { const r = await fetch(`${info.url}/health`); if (r.ok) return info; } catch { /* not bound yet */ } }
+    }
+    await wait(150);
+  }
+  throw new Error(`auth service did not become ready under ${dir} in ${ms}ms`);
+}
+async function killPid(pid: number | undefined): Promise<void> {
+  if (!pid) return;
+  try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+  await until(() => { try { process.kill(pid, 0); return false; } catch { return true; } }, 5000);
+}
+function execBearer(argv: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  return new Promise((res) => {
+    execFile(argv[0], argv.slice(1), { timeout: 30_000, maxBuffer: 1 << 20 }, (err, stdout, stderr) =>
+      res({ ok: !err, stdout: stdout.toString(), stderr: stderr.toString() }));
+  });
+}
+// The manager composes the agent's bearer argv exactly like this (execPath + tsx loader flags + this
+// file + agent-bearer + the four grant coordinates); recompose it to drive the agent's OWN refresh.
+const bearerArgvFor = (actor: string) => [
+  process.execPath, ...process.execArgv, SELF, "agent-bearer",
+  "--dir", dir, "--space", SPACE, "--owner", "", "--actor", actor,
+  "--token-file", incFiles(actor).actorToken,
+  "--health-file", incFiles(actor).health,
+];
+const rowFile = (space: "interactive" | "managed", owner: string, actor: string) =>
+  join(space === "interactive" ? actorLedgerDir(dir) : managedActorLedgerDir(dir), ledgerRowFilename(owner, actor));
+async function agentExchange(actor: string, actorToken: string, owner: string, ttlSec?: number): Promise<{ status: number; body: { token?: string; error?: string } }> {
+  const info = loadAuthServiceInfo(dir)!;
+  const res = await fetch(`${info.url}/exchange`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${info.cap}` },
+    body: JSON.stringify({ owner, actor, actorToken, ...(ttlSec !== undefined ? { ttlSec } : {}) }),
+  });
+  return { status: res.status, body: (await res.json().catch(() => ({}))) as { token?: string; error?: string } };
+}
+
+let manager: InstanceType<typeof Manager> | undefined;
+let broker: ChildProcess | undefined;
+let authChild: ChildProcess | undefined;
+let managerStopped = false;
+let participant: InstanceType<typeof Manager> | undefined;
+let observer: InstanceType<typeof CotalEndpoint> | undefined;
+let shortEp: InstanceType<typeof CotalEndpoint> | undefined;
+const ctlEps: Array<InstanceType<typeof CotalEndpoint>> = []; // section O control callers, closed in finally
+let deliveryDaemon: { stop: () => Promise<void> } | undefined;
+try {
+  // ---------- A. setup ----------
+  console.log("A) user-auth broker + streams + auth service + login + grant");
+  const auth = await createSpaceAuth(SPACE);
+  saveSpaceAuth(authDir(root), auth); // the pre-flip manager still needs the space trust bundle
+  // Provision all user-auth material (callout/issuer/owner-secret/idp/service-keys) + get the callout
+  // account the broker must preload.
+  const prepared = await cotalAuthProvider.prepareServer({
+    space: SPACE,
+    operatorSeed: auth.operator.seed,
+    account: { pub: auth.account.pub, signingSeed: auth.account.signingSeed },
+    store,
+    dir,
+    idpUrl: base,
+  });
+  const jsDir = mkdtempSync(join(tmpdir(), "cotal-uspawn-js-"));
+  writeFileSync(join(root, "server.conf"), serverConfig(auth, [auth], { transport: { kind: "plaintext" }, port: PORT, storeDir: jsDir, extraAccounts: prepared.extraAccounts }));
+  broker = spawn("nats-server", ["-c", join(root, "server.conf")], { stdio: "ignore" });
+  teardownOnSignal(broker);
+  let up = false;
+  for (let i = 0; i < 50 && !up; i++) { up = await isReachable(SERVER); if (!up) await wait(200); }
+  check("user-auth broker is reachable", up);
+  await setupSpaceStreams({ servers: SERVER, space: SPACE, creds: await mintCreds(auth, newIdentity(), "provisioner") });
+  // Record the mesh mode "user" — Manager.start() cross-checks the registry against the on-disk marker.
+  recordMesh({ space: SPACE, server: SERVER, root, mode: "user", policy: { events: "required" }, userAuth: assertUserAuthInfo(prepared.publicAuth), ts: new Date().toISOString() });
+  // Personas (identity + file ACL) for the two spawns.
+  mkdirSync(join(root, ".cotal", "agents"), { recursive: true });
+  // `iota` is the never-joining seat the ps-projection cell needs, and `kappa` the one that joins
+  // and then goes offline while its process stays alive. Both are spawned through the same persona
+  // path as any other, so each row differs from the rest in exactly one way: its mesh state.
+  for (const n of ["alpha", "beta", "delta", "iota", "kappa"])
+    writeFileSync(join(root, ".cotal", "agents", `${n}.md`), `---\nname: ${n}\nrole: worker\nsubscribe: [general]\nallowPublish: [general]\n---\n${n} persona.\n`);
+  // `epsilon`, `zeta`, `lambda`, `mu` and `nu` carry NO role on purpose: section E asks what a peer
+  // may delegate on the EVENT PLANE, and a role is itself a delegated capability, so a `role: worker`
+  // persona would be refused for the role before the channel was ever weighed and the cell would read
+  // as a pass. There are five because section E gives every spawn its own child name; see the block.
+  for (const n of ["epsilon", "zeta", "lambda", "mu", "nu"])
+    writeFileSync(join(root, ".cotal", "agents", `${n}.md`), `---\nname: ${n}\nsubscribe: [general]\nallowPublish: [general]\n---\n${n} persona.\n`);
+
+  authChild = spawnAuthService();
+  await waitAuthReady();
+  check("auth service is up (discovery file + /health)", !!loadAuthServiceInfo(dir));
+
+  const { sub } = await establishIdpSession({
+    dir: home, idpUrl: base, clientId: CLIENT_ID,
+    onPrompt: (p: DeviceLoginPrompt) => approve(p.userCode),
+  });
+  check("device login established (sub = the signed-up user)", sub === userId, { sub, userId });
+  // The REAL spawn-path owner resolution — ownerForLogin reads `sub` back OUT OF THE CACHE FILE
+  // (the cross-process path both spawn entry points ride; this smoke found the save/load path
+  // dropping `sub`, which broke it in production while every in-process test passed). Cross-check
+  // it against the direct derivation the server uses at exchange time — they must be the same bytes.
+  const OWNER = await cotalAuthProvider.ownerForLogin({ store, dir, space: SPACE });
+  const idpPin = loadPinnedIdp(dir)!;
+  check(
+    "ownerForLogin (cache round-trip) == exchange-time derivation",
+    OWNER === deriveOwnerForIdpSubject((await loadOwnerSecret(store, SPACE))!, idpPin.issuer, sub),
+    { OWNER },
+  );
+  // The cli alias keeps ONE lifecycle for the whole run: every later scope change upserts with
+  // this same uid — a bare upsert would rotate it, and the issuance takeover barrier (R1)
+  // refuses minting under a rotated grant while the predecessor lifecycle is active.
+  const cliRow0 = grantActor(dir, { owner: OWNER, actor: "cli", scope: ["spawn"], allowSubscribe: ["general"], allowPublish: ["general"], label: "smoke operator" });
+  check("interactive cli actor granted (scope [spawn])", existsSync(rowFile("interactive", OWNER, "cli")));
+
+  // ---------- B. detached user-mode spawn ----------
+  console.log("B) Manager.startAgent (user mode) → managed grant + presence join as the principal");
+  manager = new Manager({ space: SPACE, servers: SERVER, runtime: "pty", workspaceRoot: root, eventsRequired: true });
+  await manager.start();
+  const alphaPrincipal = principalKey(OWNER, "alpha").key;
+  const spawnReply: ControlReply = await manager.startAgent({ name: "alpha", agent: "e2e", owner: OWNER });
+  check("detached user-mode spawn reply ok (joined the mesh as the principal id)", spawnReply.ok === true, spawnReply);
+  // The managed-actor row exists, in ITS OWN row space, carrying the sha256 secret hash.
+  let managedRow: { tokenHash?: string } = {};
+  const managedRowPath = rowFile("managed", OWNER, "alpha");
+  try { managedRow = JSON.parse(readFileSync(managedRowPath, "utf8")); } catch { /* missing */ }
+  check("a managed-actors row exists with a 64-hex tokenHash", typeof managedRow.tokenHash === "string" && /^[0-9a-f]{64}$/.test(managedRow.tokenHash), managedRow.tokenHash);
+  const alphaPid = psList(manager).find((a) => a.name === "alpha")?.pid;
+  const alphaEnv = alphaPid ? readFileSync(`/proc/${alphaPid}/environ`, "utf8").split("\0") : [];
+  const alphaRow = JSON.parse(readFileSync(managedRowPath, "utf8")) as { allowPublish?: string[] };
+  const alphaEvent = eventChannel({ owner: OWNER, actor: "alpha" });
+  check("required policy arms the real child without a launch flag",
+    alphaEnv.includes("COTAL_EVENTS=1") && alphaEnv.includes("COTAL_EVENTS_REQUIRED=1"), alphaEnv.filter((v) => v.startsWith("COTAL_EVENTS")));
+  check("required policy adds the child's own event channel to its managed grant",
+    alphaRow.allowPublish?.includes(alphaEvent) === true, alphaRow.allowPublish);
+  const optedOutRequired = await manager.startAgent({ name: "beta", agent: "e2e", owner: OWNER, events: false });
+  check("required user-auth policy refuses events false by space name before provisioning",
+    optedOutRequired.ok === false && (optedOutRequired.error ?? "").includes(SPACE) && /--no-events/.test(optedOutRequired.error ?? "") && !existsSync(rowFile("managed", OWNER, "beta")), optedOutRequired);
+  // The remaining sections exercise explicit opt-outs and unrelated authorization paths. They predate
+  // the required-policy scenario above, so return this in-process fixture to unrestricted behavior.
+  (manager as unknown as { eventsRequired: boolean }).eventsRequired = false;
+  const alphaToken = readFileSync(incFiles("alpha").actorToken, "utf8").trim(); // capture for D + F
+  // Witness the presence join on the OPERATOR's OWN user bearer (login → exchange → connect), watching the roster.
+  const opCreds = await cotalAuthProvider.userCredentials({ store, dir, space: SPACE, actor: "cli" });
+  observer = new CotalEndpoint({
+    space: SPACE, servers: SERVER, bearer: opCreds.bearer, sentinelCreds: opCreds.sentinelCreds,
+    channels: [], consume: false, registerPresence: false, watchPresence: true,
+    card: { name: "observer", kind: "endpoint" },
+  });
+  observer.on("error", () => {});
+  await observer.start();
+  const seen = await until(() => observer!.getRoster().some((p) => p.card.id === alphaPrincipal && p.card.name === "alpha"));
+  check("observer (operator user bearer) sees alpha join as the owner.actor principal", seen, observer.getRoster().map((p) => p.card.id));
+
+  // ---- B1b. THE SECOND SPAWN OF THE SAME NAME (the arm nothing covered) ----------------------
+  // Every other spawn in this suite uses a DISTINCT name — alpha, iota, kappa. That is exactly why
+  // a defect on this path survived a suite that otherwise drives the whole authed spawn end to end:
+  // the gap was never depth, it was that nobody ever spawned the same name twice.
+  //
+  // In user mode the ALLOCATED name becomes the actor token (`agentTriple.actor = name`), and
+  // `assertValidOwnerToken` rejects `-` because it is the sole separator of principalKey's
+  // JetStream-name form. The auto-numbering scheme appended its counter with that character, so the
+  // second live instance of any persona was named `<base>-2` and could never be granted at all —
+  // one teammate worked, two did not. Invisible in static/open mode, which keys the actor on the
+  // freshly minted nkey rather than on the name, so every non-auth mesh numbered up happily.
+  //
+  // Nothing below restates that rule. The name is allocated by the real manager, the row is minted
+  // by the real auth service, and the child must actually JOIN as the resulting principal — so this
+  // reddens on a regression in the allocator, in the grammar, or in the mint, without naming any of
+  // them.
+  console.log("B1b) a SECOND spawn of the same name → auto-numbered, minted, joined");
+  const { firstFreeName } = await import("@cotal-ai/core");
+  const secondName = firstFreeName("alpha", (n) => n === "alpha");
+  check(`control: the allocator numbers a collision away from the base (${secondName})`,
+    secondName !== "alpha" && secondName.startsWith("alpha"), secondName);
+  // The SPAWN runs before the principal is derived, and the derivation is GUARDED. Order matters:
+  // `principalKey` validates the actor token, so on a tree where the allocator emits a name the
+  // grammar refuses, deriving it first throws and the suite DIES — reporting that something broke
+  // but not which claim failed. A mutation that crashes a suite instead of reddening a named cell
+  // is an illegible kill, indistinguishable from no coverage. Measured: reverting the separator
+  // did exactly that, and this ordering is what turns it into a named failure.
+  // The call itself can REJECT rather than return { ok:false }: on a tree whose allocator emits a
+  // name the grammar refuses, the mint throws out of startAgent. Gating on `second.ok` is not
+  // enough — the await has to survive first, or the section aborts before any cell runs and the
+  // kill is illegible again. Measured twice: 10 marks, no completion marker, both times.
+  const second: ControlReply = await manager
+    .startAgent({ name: "alpha", agent: "e2e", owner: OWNER, events: false })
+    .catch((e: unknown) => ({ ok: false, error: `startAgent threw: ${(e as Error)?.message ?? String(e)}` }) as ControlReply);
+  // EVERY step below is gated on `accepted` and nothing in this section throws. A section that
+  // aborts when its subject regresses produces an ILLEGIBLE kill: the run dies, the completion
+  // marker never prints, and "something broke" is indistinguishable from "this is not covered".
+  // Measured — reverting the separator reddened the right cell and then killed the suite anyway,
+  // which the harness correctly refused to count.
+  const accepted = second.ok === true;
+  check("the SECOND spawn of a LIVE name is accepted (the `-` separator made this impossible)",
+    accepted, second);
+  check(`...and allocated the auto-numbered name (${secondName})`,
+    accepted && (second.data as { name?: string } | undefined)?.name === secondName,
+    { got: (second.data as { name?: string } | undefined)?.name, expected: secondName });
+  // THE HALF THAT USED TO BE IMPOSSIBLE. A `-` in an actor is refused by the grammar before any row
+  // is written, so a managed row for the numbered name could not exist. Its presence is the mint
+  // having actually happened, not a name having been formatted.
+  check("...and the auth service MINTED a managed-actors row for the numbered actor",
+    accepted && existsSync(rowFile("managed", OWNER, secondName)), rowFile("managed", OWNER, secondName));
+  const secondPrincipal = (() => {
+    try { return principalKey(OWNER, secondName).key; } catch { return "<ungrammatical actor: the allocator emitted a name the mesh cannot mint>"; }
+  })();
+  check("...and the child JOINED presence as owner.<numbered> (end to end, not a string check)",
+    accepted && await until(() => observer!.getRoster().some((r) => r.card.id === secondPrincipal && r.card.name === secondName), 20000),
+    observer.getRoster().map((r) => r.card.id));
+  // RESTORE. The sections below assert over the managed-row set and the live roster, so the extra
+  // seat is torn down and its teardown is WAITED FOR rather than assumed — a stop that had not
+  // landed yet would silently widen every set those sections measure.
+  const mAny = manager as unknown as {
+    opStop: (a: Record<string, unknown>, caller: string, admin: boolean) => Promise<ControlReply>;
+    ep: { ref: () => { id: string } };
+  };
+  if (accepted) await mAny.opStop({ name: secondName, graceful: false }, mAny.ep.ref().id, true).catch(() => undefined);
+  check("...and the numbered seat leaves no trace, so the sections below see the state they expect",
+    await until(() => !existsSync(rowFile("managed", OWNER, secondName))
+      && !observer!.getRoster().some((r) => r.card.name === secondName && r.status !== "offline"), 20000),
+    { row: existsSync(rowFile("managed", OWNER, secondName)), roster: observer.getRoster().map((r) => `${r.card.name}:${r.status}`) });
+  // `mesh !== "absent"` accepted ANY other string, so a row carrying a value no roster can produce
+  // read as live. The reach is a cast through `unknown`, which severs the local view from the real
+  // return type, so no width declared above can catch that: the closed set has to be asserted here.
+  //
+  // Two halves, because the closed set is NOT the live set. `PRESENCE_STATUSES` is the whole
+  // `PresenceStatus` union, which is what rejects a value no roster can produce; but it contains
+  // `offline`, so on its own it would pass a row this cell calls live while production does not.
+  // Live is production's own predicate, `Manager.liveRosterNames` (`status !== "offline"`), and
+  // asserting the union alone left the cell's name untrue. A review caught that.
+  //
+  // AND NEITHER HALF PROVED THE VALUE CAME FROM THE ROSTER. A security review severed the
+  // projection, `mesh: "idle" as const` in place of `roster.get(a.name)?.status ?? "absent"`, and
+  // the suite stayed green: every managed row would then render live whatever the mesh says, which
+  // is the unsafe direction, an unavailable principal admitted to the operator's live view.
+  //
+  // Comparing `mesh` to the roster's status does NOT catch that on its own, which was measured
+  // rather than assumed: a joined agent's status is `idle` (core `endpoint.ts`, the default
+  // `PresenceStatus`), so a hard-coded `idle` AGREES with the roster and the comparison passes.
+  // Sampling for a transition does not help either, since on this tree a seat is already `idle` in
+  // the roster by the time the spawn returns, so there is no non-live sample to catch a constant.
+  //
+  // What no constant can satisfy is the projection's OTHER branch. `?? "absent"` is reached by a
+  // managed row whose name has no roster entry at all, so the cell pins two rows at once: `alpha`,
+  // joined, which must carry the roster's own status, and a seat that launches and stays alive
+  // without ever joining the mesh, which must carry `absent`. One literal cannot be both, whichever
+  // literal it is, and a lookup rekeyed off the name renders `absent` for the joined row.
+  // The tie to the enum, not a copy of it: `Record<PresenceStatus, ...>` is missing a property the
+  // moment a member is added to the union, and this file is typechecked by the root config, which is
+  // the gate this branch exists to close. So the coverage below cannot silently fall behind the set
+  // of values a row can carry, and the list is derived from it rather than written out twice.
+  type PresenceStatus = import("@cotal-ai/core").PresenceStatus;
+  const STATUS_COVERAGE: Record<PresenceStatus, string> = {
+    idle: "alpha, the default a joined seat starts in",
+    working: "kappa, signalled",
+    waiting: "kappa, signalled",
+    offline: "kappa, signalled",
+  };
+  const PRESENCE_STATUSES: readonly string[] = Object.keys(STATUS_COVERAGE);
+  type RosterEntry = { card: { name: string }; status: string };
+  // The manager's OWN roster, keyed the way `Manager.list` keys it (`new Map(...)` by card NAME, so
+  // a later entry for a name wins). Deriving the expected value any other way measures this oracle's
+  // keying rather than the question production asks.
+  // Bound once: `manager` is a `let` the teardown clears, so a closure over it reads
+  // `Manager | undefined` and the file stops typechecking, which is the very thing this branch fixes.
+  const mgr = manager;
+  const managerRoster = (): RosterEntry[] =>
+    (mgr as unknown as { ep: { getRoster: () => RosterEntry[] } }).ep.getRoster();
+  const rosterOf = (n: string): string =>
+    new Map(managerRoster().map((p) => [p.card.name, p])).get(n)?.status ?? "absent";
+  const meshOf = (n: string): string => psList(mgr).find((a) => a.name === n)?.mesh ?? "absent";
+  // The never-joining seat. `startAgent` waits for presence and finally reports the launch
+  // UNCERTAIN, but the row is in the manager's table from launch, so the state under test is
+  // readable long before that reply: assert while the readiness wait is still in flight, then end
+  // the wait by killing the child rather than paying its full timeout.
+  const quietPending = manager.startAgent({ name: "iota", agent: "e2e-quiet", owner: OWNER, events: false });
+  const quietListed = await until(() => psList(mgr).some((a) => a.name === "iota"));
+  const listed = psList(manager).find((a) => a.name === "alpha");
+  const mesh = listed?.mesh ?? "absent";
+  check(
+    "manager ps lists alpha under its principal id, mesh live",
+    listed?.id === alphaPrincipal && PRESENCE_STATUSES.includes(mesh) && mesh !== "offline",
+    { listed, mesh },
+  );
+  // The offline seat. `alpha` is `idle` and `iota` has no roster row at all, so both of those rows
+  // are satisfied by a projection that passes `idle` and `absent` through while rewriting only
+  // `offline` to `idle`, which is the direction that matters: it renders an unavailable principal
+  // live in an operator's view. A security review measured exactly that severing green here.
+  // `kappa` joins like any other seat and then publishes `offline` on a signal, so its row stays
+  // managed with its process alive while its roster status is the one value neither other row can
+  // carry. Signalling rather than timing keeps the flip ordered after the manager's readiness wait
+  // instead of racing it.
+  const offlineReply: ControlReply = await manager.startAgent({ name: "kappa", agent: "e2e-offline", owner: OWNER, events: false });
+  const signalHandlersReady = await until(() => existsSync(offlineSignalReady), 5_000);
+  check("precondition: kappa installed its signal handlers before the status walk", signalHandlersReady, offlineSignalReady);
+  const signalPid = psList(mgr).find((a) => a.name === "kappa")?.pid;
+  // One row walks the rest of the union. A review found the hole at `offline`, having found an
+  // earlier one at `idle`, and the shape of both is the same: a rewrite of a status no row carries
+  // is invisible. So rather than add the one value that was named, this walks EVERY member of
+  // `PresenceStatus` that a joined row can reach and records what the projection carried for it.
+  const carried: Record<string, string> = { idle: meshOf("alpha") };
+  for (const want of ["working", "waiting", "offline"] as const) {
+    let signalSent = false;
+    if (signalHandlersReady && signalPid) {
+      try { process.kill(signalPid, want === "offline" ? "SIGUSR1" : "SIGUSR2"); signalSent = true; }
+      catch { /* named below; a dead child is a failed precondition, never an opaque ESRCH abort */ }
+    }
+    check(`precondition: kappa remained alive to receive the ${want} status signal`, signalSent);
+    const reached = signalSent && await until(() => rosterOf("kappa") === want);
+    carried[want] = reached ? meshOf("kappa") : `the roster never reached ${want} (it says ${rosterOf("kappa")})`;
+  }
+  check(
+    "a seat that joins and then walks the rest of the status union is still a managed row, and each status the roster holds is the one the row carries",
+    offlineReply.ok === true && signalPid !== undefined
+      && (["working", "waiting", "offline"] as const).every((st) => carried[st] === st),
+    JSON.stringify(carried),
+  );
+  const projection = psList(manager).map((a) => ({ name: a.name, mesh: a.mesh, expected: rosterOf(a.name) }));
+  check(
+    "every ps row's mesh is the manager's own roster status for that name, and the absent sentinel where the roster has no entry for it",
+    quietListed && projection.length > 0 && projection.every((r) => r.mesh === r.expected),
+    JSON.stringify(projection),
+  );
+  // The closure this cell claims: every member of the union was observed on a row, plus the sentinel
+  // for a row with no roster entry at all, and the values are distinct. No constant satisfies that,
+  // and neither does a rewrite of any single status, whichever member it targets.
+  const observed = new Set([...Object.values(carried), meshOf("iota")]);
+  const uncovered = Object.keys(STATUS_COVERAGE).filter((st) => !observed.has(st));
+  check(
+    "the fixture carries every status the union can hold plus the absent sentinel, so no rewrite of any single status can hide in a value no row exercises",
+    uncovered.length === 0 && observed.has("absent") && observed.size === Object.keys(STATUS_COVERAGE).length + 1,
+    JSON.stringify({ observed: [...observed], uncovered }),
+  );
+  const quietPid = (psList(manager).find((a) => a.name === "iota"))?.pid;
+  // #798: the pid above came from a listing, and a child can be gone by the time it is signalled. On an
+  // ensure-gone kill ESRCH is the desired end state, never an abort. Prove the cleanup tolerates exactly
+  // that state: end the child, then run the same cleanup once more against the pid it just ended.
+  await killPid(quietPid);
+  const goneAgain = await killPid(quietPid).then(() => "ok", (e: Error) => e.message);
+  check("ensure-gone on the quiet seat tolerates a child that already exited (#798)", goneAgain === "ok", { quietPid, goneAgain });
+  const quietReply: ControlReply = await quietPending;
+  check("a seat that never joins the mesh is not reported as a successful launch", quietReply.ok === false, quietReply);
+
+  // ---------- B1f. a spawn-scope caller HEARS ITS OWN GOAL'S TERMINAL (#610) ----------
+  // The end-to-end half of the goal-follow contract. `epCallerGrantRows` returns `{pub, sub}` and
+  // documents its `sub` as the row that lets "the caller may follow its OWN goal to terminal", but
+  // the `spawn` mint branch took `.pub` alone, so a spawn-capable credential could SUBMIT a goal
+  // and not HEAR it: the broker refused the follow, the manager committed the terminal on time, and
+  // the caller reported a timeout about a goal that had already settled. An operator reads that as
+  // failure and re-issues, which mints a duplicate.
+  //
+  // The spawn under test is REFUSED by design (persona `beta` carries `role: worker`, which the cli
+  // actor's `[spawn]` scope may not delegate), so the manager commits a `failed` terminal promptly
+  // and no child is created. What is asserted is not the refusal - it is that this caller HEARS it.
+  console.log("B1f) a spawn-scope caller follows its own goal to a terminal (#610)");
+  {
+    const claims = JSON.parse(Buffer.from(opCreds.bearer.split(".")[1], "base64url").toString("utf8")) as { act: { lifecycleUid: string } };
+    const follower = new CotalEndpoint({
+      space: SPACE, servers: SERVER, bearer: opCreds.bearer, sentinelCreds: opCreds.sentinelCreds,
+      lifecycleUid: claims.act.lifecycleUid,
+      channels: [], consume: false, registerPresence: false, watchPresence: false,
+      card: { name: "goal-follower", kind: "endpoint" },
+    });
+    // Surface rather than swallow: a broker refusal on this connection is the defect itself, and a
+    // swallowed one is indistinguishable from silence (the product had the same bug).
+    const connErrors: string[] = [];
+    follower.on("error", (e: unknown) => connErrors.push((e as Error)?.message ?? String(e)));
+    await follower.start();
+    ctlEps.push(follower);
+    const t0 = Date.now();
+    const r = await follower.invokeService("manager", "spawn", { name: "beta", agent: "e2e", events: false }, { deadlineMs: 20_000, follow: true });
+    const elapsed = Date.now() - t0;
+    const code = r.reply.ok === true ? "ok" : (r.reply.error?.code ?? "?");
+    // THE ASSERTION THE FIX EXISTS FOR: a real terminal, not a deadline and not a refusal to listen.
+    check("a spawn-scope caller HEARS its own goal's terminal (not a deadline, not a denied subscription)",
+      code === "failed", { code, elapsed, message: r.reply.error?.message?.slice(0, 160), connErrors });
+    check("...and the terminal carries the refusal's own reason, so the caller learns WHY",
+      (r.reply.error?.message ?? "").includes("would exceed its spawner's grant"), r.reply.error?.message?.slice(0, 200));
+    check(`...delivered on the goal's own timing, well inside the caller's budget (${elapsed}ms of 20000ms)`,
+      elapsed < 15_000, elapsed);
+    check("...with no broker refusal on the follower's connection", connErrors.length === 0, connErrors);
+  }
+
+  // ---------- B1e. the v0.4 ep rails under a USER bearer (1c.2c) ----------
+  // The manager REGISTERS its service on this user mesh (the mode-neutral 1c.2c flip), the cli
+  // actor's callout-minted rows carry the spawn set + baseline, and the bearer's ledger lifecycle
+  // claim is the caller triple's uid - the whole user-mode generic-invoke chain, live.
+  console.log("B1e) the user bearer rides the manager's v0.4 service (registered on this USER mesh)");
+  {
+    const bearerClaims = JSON.parse(Buffer.from(opCreds.bearer.split(".")[1], "base64url").toString("utf8")) as { sub: string; act: { actor: string; lifecycleUid: string } };
+    const epCaller = { owner: bearerClaims.sub, actor: bearerClaims.act.actor, uid: bearerClaims.act.lifecycleUid };
+    // `tls: false` is REQUIRED, not decorative: this file is outside every tsconfig, so the guard
+    // in `standaloneConnectOpts` is the only thing that reaches it, and it throws rather than
+    // defaulting. SERVER is a plaintext local broker, the same value its two sibling auth smokes
+    // pass. Without it this line threw and took every cell below it with it.
+    const epNc = await rawConnect({ servers: SERVER, ...standaloneConnectOpts({ bearer: opCreds.bearer, sentinelCreds: opCreds.sentinelCreds, tls: false }), maxReconnectAttempts: 0 });
+    try {
+      const svc = await resolveService(epNc, SPACE, "manager", epCaller, { deadlineMs: 10_000 });
+      check("user bearer resolves the manager generically (describe + store fetch + digest-verified recompile, all over the bearer)",
+        svc.commands.size === shipped.commandCount && svc.responder.instanceId.length > 0, { size: svc.commands.size, responder: svc.responder });
+      const ri = await invokeCommand(epNc, SPACE, svc, "inspect", { name: "alpha" }, {});
+      check("user bearer invokes `inspect` over ep (a spawn-set row; describe-bound currency, no epoch stub)",
+        ri.reply.ok === true && (ri.reply.data as { name: string }).name === "alpha", ri.reply);
+      let refused: string | undefined;
+      let detail = "";
+      try {
+        const rp = await invokeCommand(epNc, SPACE, svc, "ps", undefined, { deadlineMs: 2500 });
+        refused = rp.reply.ok === false ? rp.reply.error?.code : "SERVED-OK";
+        detail = rp.reply.ok === false ? rp.reply.error?.message ?? "" : "";
+      } catch (e) {
+        refused = e instanceof EpEnvelopeError ? e.code : String(e);
+        detail = e instanceof Error ? e.message : String(e);
+      }
+      // The broker refuses the publish and the caller's connection-status watch names the refused
+      // subject, so the refusal is permission-denied in the broker's words (a handler refusal
+      // would carry the same code without them).
+      check("a spawn-scope bearer's `ps` is refused by the broker (manager.read is not in the spawn set - the ep tier boundary holds on a user mesh)",
+        refused === "permission-denied" && /REFUSED BY THE BROKER/.test(detail), { refused, detail: detail.slice(0, 200) });
+    } finally {
+      await epNc.drain().catch(() => epNc.close());
+    }
+  }
+
+  // ---------- B1g. the shipped generic endpoint CLI under a USER bearer ----------
+  // This uses the real composition-root binary and the same spawn-scoped login as B1e. The user
+  // holds `spawn`, not `manager.read` or `manager.admin`: describe and inspect must work over its
+  // bearer, while enumeration and admin maintenance remain broker-denied. The missing `--name`
+  // request proves the generic targeted resolver uses the authorized name-keyed inspect path, not
+  // manager-wide ps, without creating a session or changing a managed seat.
+  console.log("B1g) the shipped generic endpoint CLI rides the user bearer without widening it");
+  const cliResult = async (args: string[], timeoutMs?: number) => {
+    const result = await cotal(args, timeoutMs);
+    return { ...result, plain: result.out.replace(/\x1b\[[0-9;]*m/g, "") };
+  };
+  const described = await cliResult(["describe", "manager", "--space", SPACE]);
+  check("the shipped CLI describes manager through the normal user's bearer",
+    !described.timedOut && described.status === 0 && /\bmanager\b/.test(described.plain) && /\binspect\b/.test(described.plain), described);
+  const inspected = await cliResult(["invoke", "manager", "inspect", "--args", '{"name":"alpha"}', "--space", SPACE]);
+  check("the shipped CLI invokes the spawn-authorized manager inspect shape through the user's bearer",
+    !inspected.timedOut && inspected.status === 0 && /"name": "alpha"/.test(inspected.plain), inspected);
+  const ownerAttach = await cliResult(["invoke", "manager", "attach", "--name", "alpha", "--space", SPACE]);
+  check("a generic --name call without --admin keeps the user bearer on its owner routing tier",
+    !ownerAttach.timedOut && ownerAttach.status === 0, ownerAttach);
+  // #2312: the operator's own `cotal attach` on this USER mesh. The real binary runs against the live
+  // seat `alpha` with no local static seed in play for the redeem; it must open the session (the
+  // banner is printed once the caller rail is up) rather than refuse with the no-seed sentence.
+  const userAttach = await cotalUntil(["attach", "--name", "alpha", "--no-reconnect", "--space", SPACE], /attached to alpha/, 25_000);
+  check("#2312: `cotal attach` on a user-auth mesh opens the seat's session (banner printed, no no-seed refusal)",
+    /attached to alpha/.test(userAttach.plain) && !/needs this space's local seed/.test(userAttach.plain),
+    userAttach.plain.slice(0, 600));
+  // #2312 refusals. A real grant comes from the manager's own `attach` over the operator's bearer,
+  // and every decision below is the shipped exchange or the shipped callout's: nothing here restates
+  // the rule, it only presents a grant or a bearer and reads the answer.
+  {
+    const exchangeSession = async (idpToken: string, sessionGrant: unknown) => {
+      const info = loadAuthServiceInfo(dir)!;
+      const res = await fetch(`${info.url}/exchange`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${info.cap}` },
+        body: JSON.stringify({ idpToken, actor: "cli", view: "session-caller", sessionGrant }),
+      });
+      return { status: res.status, body: (await res.json().catch(() => ({}))) as { token?: string; error?: string } };
+    };
+    const dialBearer = async (bearer: string): Promise<string> => {
+      try {
+        const nc = await rawConnect({ servers: SERVER, ...standaloneConnectOpts({ bearer, sentinelCreds: opCreds.sentinelCreds, tls: false }), maxReconnectAttempts: 0, timeout: 5_000 });
+        await nc.close();
+        return "connected";
+      } catch (e) { return `refused: ${(e as Error).message}`; }
+    };
+    const grantNc = await rawConnect({ servers: SERVER, ...standaloneConnectOpts({ bearer: opCreds.bearer, sentinelCreds: opCreds.sentinelCreds, tls: false }), maxReconnectAttempts: 0 });
+    const ledgerNc = await rawConnect({ servers: SERVER, ...standaloneConnectOpts({ creds: await mintCreds(auth, newIdentity(), "session-ledger"), tls: false }), maxReconnectAttempts: 0 });
+    try {
+      const claims0 = JSON.parse(Buffer.from(opCreds.bearer.split(".")[1], "base64url").toString("utf8")) as { sub: string; act: { actor: string; lifecycleUid: string } };
+      const svc = await resolveService(grantNc, SPACE, "manager", { owner: claims0.sub, actor: claims0.act.actor, uid: claims0.act.lifecycleUid }, { deadlineMs: 10_000 });
+      const row = (await invokeCommand(grantNc, SPACE, svc, "inspect", { name: "alpha" }, {})).reply.data as { lifecycleUid: string };
+      const attached = await invokeCommand(grantNc, SPACE, svc, "attach", undefined, { target: { mode: "owner", owner: OWNER, actor: "alpha", lifecycleUid: row.lifecycleUid } });
+      check("#2312 precondition: the manager's attach issues a real session grant to the operator", attached.reply.ok === true, attached.reply.error);
+      const grant = (attached.reply.data as { grant: { sessionId: string; endpoint: string; sig: string; serving: { instanceId: string; epoch: number } } }).grant;
+      const idpToken = await fetchIdpJwt(base, (await establishIdpSession({ dir: home, idpUrl: base, clientId: CLIENT_ID, onPrompt: (p) => approve(p.userCode) })).session.token);
+
+      const good = await exchangeSession(idpToken, grant);
+      check("#2312 control: the holder's own redeemed grant exchanges for a session-caller bearer (200)",
+        good.status === 200 && typeof good.body.token === "string", { status: good.status, error: good.body.error });
+
+      // Another OWNER: a second human signs in to the same IdP and holds its own `cli` grant.
+      const other = await ba.api.signUpEmail({ body: { email: "other@example.test", password: "correct-horse-battery-2", name: "Other 7" } });
+      const otherOwner = deriveOwnerForIdpSubject((await loadOwnerSecret(store, SPACE))!, idpPin.issuer, other.user.id);
+      grantActor(dir, { owner: otherOwner, actor: "cli", scope: [], allowSubscribe: ["general"], allowPublish: ["general"], label: "second owner" });
+      const otherEx = await exchangeSession(await fetchIdpJwt(base, other.token!), grant);
+      check("#2312: a grant held by another owner is refused at the exchange (401)",
+        otherEx.status === 401 && otherEx.body.token === undefined && /was issued to/.test(otherEx.body.error ?? ""), { status: otherEx.status, error: otherEx.body.error });
+
+      const flipped = grant.sig.slice(0, -2) + (grant.sig.endsWith("AA") ? "BB" : "AA");
+      const tampered = await exchangeSession(idpToken, { ...grant, sig: flipped });
+      check("#2312: a grant with a tampered signature is refused at the exchange (401)",
+        tampered.status === 401 && tampered.body.token === undefined && /not the one this session was redeemed with/.test(tampered.body.error ?? ""), { status: tampered.status, error: tampered.body.error });
+
+      // An expired session: the real row, re-filed under a fresh id with an expiry in the past.
+      const kv = await new Kvm(ledgerNc).open(sessionsBucket(SPACE));
+      const live = JSON.parse(new TextDecoder().decode((await kv.get(sessionLedgerKey(grant.sessionId)))!.value)) as { exp: number; grantSig: string };
+      const expiredId = mintSessionId();
+      const expiredExp = Date.now() - 60_000;
+      await kv.create(sessionLedgerKey(expiredId), JSON.stringify({ ...live, sessionId: expiredId, exp: expiredExp }));
+      const expiredEx = await exchangeSession(idpToken, { ...grant, sessionId: expiredId, sig: live.grantSig });
+      check("#2312: an expired session is refused at the exchange (401, the reason names the expiry)",
+        expiredEx.status === 401 && expiredEx.body.token === undefined && /expired at/.test(expiredEx.body.error ?? ""), { status: expiredEx.status, error: expiredEx.body.error });
+
+      // The callout. The exchange-minted bearer is the control; the variants keep every claim it
+      // carries (lifecycle, credential id) and change only the session claim, signed by the space's
+      // own issuer, so the callout's own re-verification is the only thing that can refuse them.
+      check("#2312 control: the callout admits the exchange-minted session-caller bearer",
+        good.status === 200 && await dialBearer(good.body.token!) === "connected");
+      const act = (decodeJwt(good.body.token ?? "") as { act: { lifecycleUid: string; credentialId: string; session: { endpoint: string; sessionId: string; epoch: number; exp: number } } }).act;
+      const issuer = (await loadIssuer(store, SPACE))!;
+      const forge = (session: { endpoint: string; sessionId: string; epoch: number; exp: number }) => issuer.issue({
+        owner: OWNER, space: SPACE, actor: "cli", lifecycleUid: act.lifecycleUid, credentialId: act.credentialId,
+        view: "session-caller", session, ttlSec: 300,
+      });
+      const wrongEpoch = await dialBearer(await forge({ ...act.session, epoch: act.session.epoch + 1 }));
+      check("#2312: a wrong-epoch session claim is refused at the callout",
+        /refused: .*authorization violation/i.test(wrongEpoch), wrongEpoch);
+      const expiredDial = await dialBearer(await forge({ ...act.session, sessionId: expiredId, exp: Math.floor(expiredExp / 1000) }));
+      check("#2312: an expired session claim is refused at the callout",
+        /refused: .*authorization violation/i.test(expiredDial), expiredDial);
+    } finally {
+      await grantNc.drain().catch(() => grantNc.close());
+      await ledgerNc.drain().catch(() => ledgerNc.close());
+    }
+  }
+  const missing = await cliResult(["invoke", "manager", "attach", "--name", "missing", "--space", SPACE]);
+  // The manager answers the attach target's inspection with not-found; a denied ps scan would be a
+  // PERMISSION_DENIED that no instance answered.
+  check("a nonexistent generic --name target is refused by its inspect resolution, not the denied manager ps scan",
+    !missing.timedOut && missing.status === 2 && /Code:\s+TARGET_NOT_FOUND/.test(missing.plain) && /Native command:\s+attach/.test(missing.plain) &&
+      /Native code:\s+not-found/.test(missing.plain) && /Answering instance:/.test(missing.plain), missing);
+  // The broker refuses the publish, so the call is not executed and no manager instance answers it.
+  const brokerDenied = (r: { plain: string; status: number | null; timedOut: boolean }) =>
+    !r.timedOut && r.status === 2 && /Code:\s+PERMISSION_DENIED/.test(r.plain) && /Native code:\s+permission-denied/.test(r.plain) &&
+      /Native outcome:\s+not-executed/.test(r.plain) && !/Answering instance:/.test(r.plain);
+  const deniedRead = await cliResult(["invoke", "manager", "ps", "--space", SPACE]);
+  check("the shipped CLI leaves manager.read denied to a spawn-scoped user bearer", brokerDenied(deniedRead), deniedRead);
+  const deniedAdmin = await cliResult(["invoke", "manager", "purge", "--args", "{}", "--space", SPACE]);
+  check("the shipped CLI leaves manager.admin denied to a spawn-scoped user bearer", brokerDenied(deniedAdmin), deniedAdmin);
+  // `who` asks the same denied manager.read for the managed column. The roster is still this bearer's
+  // to read, so the denial labels that column rather than failing or partialling the run.
+  const deniedWho = await cliResult(["who", "--json", "--space", SPACE]);
+  const deniedWhoEnvelope = (() => { try { return JSON.parse(deniedWho.out.split("\n").find((line) => line.startsWith('{"schemaVersion"')) ?? "") as { outcome: string; completeness: string; result: { managers: string; items: { name: string; managed: boolean | null }[] } | null; warnings: { code: string }[] }; } catch { return undefined; } })();
+  check("who labels the census this bearer may not ask as denied, with every agent's managed unknown",
+    deniedWhoEnvelope?.result?.managers === "denied" && deniedWhoEnvelope.warnings.some((w) => w.code === "MANAGERS_DENIED") && deniedWhoEnvelope.result.items.some((row) => row.name === "alpha") && deniedWhoEnvelope.result.items.every((row) => row.managed === null), deniedWho);
+  check("that label is not a part left unread: who exits 0, ok and complete",
+    !deniedWho.timedOut && deniedWho.status === 0 && deniedWhoEnvelope?.outcome === "ok" && deniedWhoEnvelope.completeness === "complete", deniedWho);
+
+  // The same narrow bearer has no admin grant and no human delivery ACL mirror. History must
+  // use its real channel grant, include its own send and refuse a channel outside that grant.
+  grantActor(dir, { ...cliRow0, scope: [] });
+  try {
+  const nativeText = `narrow native history ${Date.now()}`;
+  const postedHistory = await cliResult(["send", "-c", "general", nativeText, "--space", SPACE]);
+  check("narrow user sends its own history fixture message", postedHistory.status === 0 && !postedHistory.timedOut, postedHistory);
+  const parseHistory = (r: { out: string }) => {
+    try { return JSON.parse(r.out.split("\n").find((line) => line.startsWith('{"schemaVersion"')) ?? "") as {
+      outcome: string; result: { items: { text: string; channel: string | null }[] } | null;
+      error?: { code: string }; warnings: { code: string }[];
+    }; } catch { return undefined; }
+  };
+  const narrowHistory = await cliResult(["history", "general", "--json", "--space", SPACE]);
+  check("native narrow user history reads its own message without capabilities or a delivery ACL row",
+    narrowHistory.status === 0 && !narrowHistory.timedOut && parseHistory(narrowHistory)?.result?.items.some((m) => m.text === nativeText && m.channel === "general") === true,
+    narrowHistory);
+  const deniedHistory = await cliResult(["history", "ops.secret", "--json", "--space", SPACE]);
+  check("native narrow user history refuses a channel outside its grant without content",
+    deniedHistory.status === 2 && parseHistory(deniedHistory)?.error?.code === "PERMISSION_DENIED" && parseHistory(deniedHistory)?.result === null,
+    deniedHistory);
+  } finally {
+    grantActor(dir, cliRow0); // subsequent manager tests still need the original spawn grant
+  }
+
+  // The mutation proof runs this same fixture with only the native endpoint setup and B1g. It is
+  // not a substitute: the full smoke still runs every section below. It keeps the old-guard red
+  // bounded so a timeout cannot be mistaken for a named assertion failure.
+  const endpointCliFocus = process.env.COTAL_USER_ENDPOINT_CLI_ONLY === "1";
+  if (!endpointCliFocus) {
+  // ---------- B2. delegation attenuation (the ENVELOPE rule, end to end) ----------
+  console.log("B2) a spawner-attributed spawn is attenuated to the spawner's own grant");
+  // The cli grant is [general] + scope [spawn]: an imperative over-ask (`spawn --allow-subscribe`
+  // beyond the spawner's own read ACL — the exact escalation vector) must be refused at the grant
+  // write, name the operator's widening re-grant, and leave no row behind.
+  const overReply: ControlReply = await manager.startAgent(
+    { name: "delta", agent: "e2e", events: false, allowSubscribe: ["general", "ops.secret"] }, `${OWNER}.cli`);
+  check("an over-envelope spawn is refused (read beyond the spawner's [general])",
+    overReply.ok === false && /delegation only narrows/.test(overReply.error ?? ""), overReply);
+  check("…the refusal names the exact widening re-grant", /cotal actor grant cli --owner/.test(overReply.error ?? ""), overReply.error);
+  check("…and left no managed row", !existsSync(rowFile("managed", OWNER, "delta")));
+  // The delta persona carries `role: worker` — a ROLE is receive reach on the shared task queue,
+  // so it too is delegated: refused until the spawner's scope carries `role:worker`.
+  const roleReply: ControlReply = await manager.startAgent(
+    { name: "delta", agent: "e2e", events: false, allowSubscribe: ["general"] }, `${OWNER}.cli`);
+  check("a persona ROLE outside the spawner's scope is refused (role = delegated capability)",
+    roleReply.ok === false && /role "worker" beyond scope/.test(roleReply.error ?? ""), roleReply);
+  grantActor(dir, { owner: OWNER, actor: "cli", scope: ["spawn", "role:worker"], allowSubscribe: ["general"], allowPublish: ["general"], label: "smoke operator", lifecycleUid: cliRow0.lifecycleUid });
+  const withinReply: ControlReply = await manager.startAgent(
+    { name: "delta", agent: "e2e", events: false, allowSubscribe: ["general"] }, `${OWNER}.cli`);
+  check("the same spawn within the envelope (read + role delegated) succeeds", withinReply.ok === true, withinReply);
+  const deltaRow = JSON.parse(readFileSync(rowFile("managed", OWNER, "delta"), "utf8")) as { parent?: string };
+  check("the delegated row records the spawner as parent", deltaRow.parent === `${OWNER}.cli`, deltaRow);
+
+  // ---------- C. exchange-mode confinement ----------
+  console.log("C) a managed agent is NOT IdP-exchangeable, cannot be shadowed, and fails closed on tamper");
+  const idpJwt = await fetchIdpJwt(base, (await establishIdpSession({ dir: home, idpUrl: base, clientId: CLIENT_ID, onPrompt: (p) => approve(p.userCode) })).session.token);
+  const info0 = loadAuthServiceInfo(dir)!;
+  const humanEx = await fetch(`${info0.url}/exchange`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${info0.cap}` },
+    body: JSON.stringify({ idpToken: idpJwt, actor: "alpha" }),
+  });
+  const humanExBody = (await humanEx.json().catch(() => ({}))) as { error?: string };
+  check("an IdP proof for the MANAGED actor name is refused 401 (names 'managed agent')", humanEx.status === 401 && /managed agent/.test(humanExBody.error ?? ""), { status: humanEx.status, error: humanExBody.error });
+  let grantThrew = "";
+  try { grantActor(dir, { owner: OWNER, actor: "alpha", scope: [], allowSubscribe: ["general"], allowPublish: ["general"] }); }
+  catch (e) { grantThrew = (e as Error).message; }
+  check("grantActor refuses to shadow the managed agent (names 'managed')", /managed/.test(grantThrew), grantThrew);
+  const cliRowPath = rowFile("interactive", OWNER, "cli");
+  const cliRowOrig = readFileSync(cliRowPath, "utf8");
+  const tampered = JSON.parse(cliRowOrig) as Record<string, unknown>;
+  tampered.tokenHash = "0".repeat(64); // forge a managed-shape field into an interactive row
+  writeFileSync(cliRowPath, JSON.stringify(tampered, null, 2));
+  let credThrew = "";
+  try { await cotalAuthProvider.userCredentials({ store, dir, space: SPACE, actor: "cli" }); }
+  catch (e) { credThrew = (e as Error).message; }
+  writeFileSync(cliRowPath, cliRowOrig); // restore the honest row
+  check("a token-hash forged into the interactive cli row fails closed (readRow denies)", /interactive grant|token hash/i.test(credThrew), credThrew);
+
+  // ---------- D. agent exchange + live-expiry proof ----------
+  console.log("D) direct agent exchange (ttlSec:10) → a live connection that dies at the bearer's exp");
+  const shortEx = await agentExchange("alpha", alphaToken, OWNER, 10);
+  check("direct agent exchange { owner, actorToken, ttlSec:10 } mints a bearer (200)", shortEx.status === 200 && typeof shortEx.body.token === "string", shortEx.status);
+  const callout = (await loadCalloutAuth(store, SPACE))!;
+  // Declared WITHOUT an initializer. The endpoint's connection callback is what moves this, and the
+  // checker does not follow an assignment made inside a callback, so a `= false` initializer narrows
+  // the binding to the literal `false` and `connected === true` below reports as a comparison
+  // between types with no overlap: the cell could not pass. Dropping the initializer also removes a
+  // false green further down, where `until(() => connected === false)` returned immediately if the
+  // endpoint never emitted at all, greening "the connection dies at its bearer expiry" for an
+  // endpoint that never connected. `undefined` now means "no connection event yet", which is what
+  // the pre-connect state actually is.
+  let connected: boolean | undefined;
+  shortEp = new CotalEndpoint({
+    space: SPACE, servers: SERVER, bearer: shortEx.body.token!, sentinelCreds: callout.sentinelCreds,
+    channels: [], consume: false, registerPresence: false, watchPresence: false,
+    card: { name: "shortlived", owner: OWNER, actor: "alpha", kind: "agent" },
+  });
+  shortEp.on("error", () => {});
+  shortEp.on("connection", (s: { connected: boolean }) => { connected = s.connected; });
+  await shortEp.start();
+  check("a raw endpoint opened with the 10s bearer connects", connected === true);
+  const dropped = await until(() => connected === false, 20000); // NATS closes the conn at the JWT exp (~10s)
+  check("the live connection dies at its bearer-bound JWT expiry (~10s)", dropped, { connected });
+  await shortEp.stop().catch(() => {});
+  shortEp = undefined;
+
+  // ---------- E (part 1) + G: dead auth service ----------
+  console.log("E) kill the auth service → the agent's bearer command fails + `ps` surfaces it");
+  await killPid(authChild.pid); // SIGKILL leaves the discovery file (stale pid) — the exact dead-daemon shape
+  authChild = undefined;
+  const alphaBearerArgv = bearerArgvFor("alpha");
+  alphaBearerArgv[alphaBearerArgv.indexOf("--owner") + 1] = OWNER;
+  const deadRun = await execBearer(alphaBearerArgv);
+  check("the agent bearer command fails when the auth service is down (names the `cotal up` recovery)", !deadRun.ok && /restart it with `cotal up`/.test(deadRun.stderr), deadRun.stderr.slice(0, 160));
+  let deadHealth: { state?: string; reason?: string } = {};
+  try { deadHealth = JSON.parse(readFileSync(incFiles("alpha").health, "utf8")); } catch { /* */ }
+  check("the health file records state=failed with the restart copy", deadHealth.state === "failed" && /restart it with `cotal up`/.test(deadHealth.reason ?? ""), deadHealth);
+  check("manager ps reports authHealth = auth-renewal-failed", psList(manager).find((a) => a.name === "alpha")?.authHealth === "auth-renewal-failed", psList(manager).find((a) => a.name === "alpha"));
+
+  console.log("G) spawning with the auth service down is refused at preflight (row rolled back)");
+  const gReply = await manager.startAgent({ name: "beta", agent: "e2e", owner: OWNER, events: false });
+  check("spawn with a dead auth service is refused at preflight (names `cotal up`)", !gReply.ok && /preflight/.test(gReply.error ?? "") && /restart it with `cotal up`/.test(gReply.error ?? ""), gReply.error);
+  check("the refused spawn leaves NO managed row behind (rollback proven)", !existsSync(rowFile("managed", OWNER, "beta")), rowFile("managed", OWNER, "beta"));
+
+  // ---------- E (part 2): heal ----------
+  console.log("E) restart the auth service → the bearer command heals and `ps` is auth-clean again");
+  // The restarted service must adjudicate the SIGKILLed predecessor's plane claim through the
+  // delivery daemon's liveness oracle before it serves (the W6 fail-safe: UNKNOWN never
+  // reclaims — without the oracle this restart refuses forever and /health never comes up).
+  // Boot the REAL oracle for the adjudication window — a delivery endpoint serving
+  // `ctl.delivery-admin` with the $SYS-CONNZ-backed hook, exactly what `cotal up` provisions —
+  // then stop it so the rest of the run keeps the no-daemon regime. On this single-server
+  // broker CONNZ is complete, so the predecessor's two dead connections read GONE and the
+  // claim reclaims (a cluster would read UNKNOWN and hold, by design).
+  const oracleObserverCreds = await mintMembershipObserverCreds(auth, newIdentity());
+  const oracleId = newIdentity();
+  const oracle = new CotalEndpoint({
+    space: SPACE, servers: SERVER, creds: await mintCreds(auth, oracleId, "delivery"),
+    card: { id: oracleId.id, name: "dlv-oracle", role: "delivery", kind: "endpoint" },
+    channels: [], consume: false, registerPresence: false, watchPresence: false,
+  });
+  oracle.on("error", () => {});
+  await oracle.start();
+  await oracle.startPlane3(() => undefined, {
+    planeConnLiveness: (query) => observePlaneLivenessWithCreds({
+      servers: SERVER, observerCreds: oracleObserverCreds, accountId: auth.account.pub,
+      query: query as import("@cotal-ai/core").PlaneLivenessQuery,
+    }),
+  });
+  authChild = spawnAuthService();
+  await waitAuthReady();
+  await oracle.stop();
+  const healRun = await execBearer(alphaBearerArgv);
+  check("the agent bearer command succeeds after the auth service heals", healRun.ok && healRun.stdout.trim().split(".").length === 3, { ok: healRun.ok, err: healRun.stderr.slice(0, 120) });
+  check("manager ps is auth-clean again (no authHealth flag)", psList(manager).find((a) => a.name === "alpha")?.authHealth === undefined, psList(manager).find((a) => a.name === "alpha"));
+
+  // ---------- H. post-provision failure window (freelance blocker 1) ----------
+  console.log("H) a spawn that provisions then FAILS at buildLaunch leaves no managed grant behind");
+  const hReply = await manager.startAgent({ name: "gamma", agent: "e2e-fail", owner: OWNER, events: false });
+  check("a spawn failing after provisioning is reported not-ok", hReply.ok === false, hReply);
+  // The orphan-rollback must run the USER-MODE teardown (revoke + shred), not just static durables —
+  // so the managed row AND all three secret files are gone, and the grant can't mint a bearer.
+  const gammaRowGone = !existsSync(rowFile("managed", OWNER, "gamma"));
+  const gammaFilesGone = noIncFiles("gamma");
+  check("the failed spawn left NO managed row and NO secret files (orphan rollback ran the user-mode teardown)", gammaRowGone && gammaFilesGone, { gammaRowGone, gammaFilesGone });
+
+  // ---------- O. own-agent control (owner-domain attach/stop on the SPAWN tier) ----------
+  // The live half of the own-agent-control matrix (the pure policy is pinned broker-free in
+  // implementations/manager/smoke/own-agent-control.smoke.ts): REAL wire requests on the
+  // PRIVILEGED ctl subject, admitted by the callout-minted scope grants and decided by the
+  // manager's owner-domain authorization.
+  console.log("O) own-agent control: owner-domain attach/stop on the spawn tier");
+  const ctlCaller = async (actor: string, owner: string, scope: string[], acl?: { allowSubscribe?: string[]; allowPublish?: string[] }) => {
+    // The row's lifecycleUid ALSO rides the endpoint options: invokeService's caller triple is
+    // (owner, actor, uid) and refuses without it (SPEC 13.1 — no alias-keyed fallback).
+    const uid = mintLifecycleUid();
+    const g = await cotalAuthProvider.grantAgent({ custody: { kind: "foreground" }, store, dir, space: SPACE, owner, actor, scope, allowSubscribe: acl?.allowSubscribe ?? [], allowPublish: acl?.allowPublish ?? [], lifecycleUid: uid });
+    const ex = await agentExchange(actor, g.actorToken, owner);
+    if (ex.status !== 200 || !ex.body.token) throw new Error(`ctlCaller ${owner}.${actor}: exchange HTTP ${ex.status} ${ex.body.error ?? ""}`);
+    const ep = new CotalEndpoint({
+      space: SPACE, servers: SERVER, bearer: ex.body.token, sentinelCreds: g.sentinelCreds,
+      channels: [], consume: false, registerPresence: false, watchPresence: false, lifecycleUid: uid,
+      card: { name: actor, owner, actor, kind: "endpoint" },
+    });
+    ep.on("error", () => {});
+    await ep.start();
+    ctlEps.push(ep);
+    return ep;
+  };
+  // 1d: the manager `ctl` rail is deleted — an operator drives it over the v0.4 ep rails, EXACTLY
+  // as the CLI does (askManagerEp): resolve the alias to its principal triple via `inspect`, then
+  // invoke the mapped command. Target mode is DERIVED from the resolved owner: own-domain rides
+  // `owner` mode, a cross-owner target rides `any` mode — which the broker admits only for a caller
+  // holding the admin instrument rows (a bearer whose ledger `admin` scope the callout minted), so
+  // a spawn-only cross-owner op is broker-DENIED at publish while an admin operator's is admitted
+  // and the manager's fresh ledger read governs.
+  type EpReply = { ok: boolean; data?: unknown; error?: string };
+  const epTargeted = async (ep: InstanceType<typeof CotalEndpoint>, op: "attach" | "stop" | "input", name: string, forceMode?: "owner" | "any"): Promise<EpReply> => {
+    let info;
+    try { info = await ep.invokeService("manager", "inspect", { name }); }
+    catch (e) { return { ok: false, error: e instanceof EpEnvelopeError ? `${e.code}: ${e.message}` : (e as Error).message }; }
+    if (info.reply.ok !== true) return { ok: false, error: info.reply.error?.message ?? info.reply.error?.code ?? "inspect failed" };
+    const rowInfo = info.reply.data as { id: string; lifecycleUid: string };
+    const dot = rowInfo.id.indexOf(".");
+    const [tOwner, tActor] = dot > 0 ? [rowInfo.id.slice(0, dot), rowInfo.id.slice(dot + 1)] : [ep.principal.owner, rowInfo.id];
+    // Derived from the owners, EXCEPT when a caller forces it. The derivation is right for every
+    // ordinary call, and wrong for one question: a same-owner target always derives `owner`, so a
+    // cell that wants to prove the ANY-mode subject is also closed can never reach it by asking
+    // nicely. `forceMode` exists for exactly that cell and for nothing else.
+    const mode = forceMode ?? (tOwner !== ep.principal.owner ? "any" : "owner");
+    const command = op === "stop" ? "despawn" : op;
+    // `input` is the one op here that carries a body. Everything else about the call is identical,
+    // which is the point: the same resolve, the same derived mode, the same rails.
+    const body = op === "input" ? { text: "/compact", enter: false } : undefined;
+    try {
+      const r = await ep.invokeService("manager", command, body, { target: { mode, owner: tOwner, actor: tActor, lifecycleUid: rowInfo.lifecycleUid } });
+      return r.reply.ok === true ? { ok: true, ...(r.reply.data !== undefined ? { data: r.reply.data } : {}) } : { ok: false, error: r.reply.error?.message ?? r.reply.error?.code };
+    } catch (e) { return { ok: false, error: e instanceof EpEnvelopeError ? `${e.code}: ${e.message}` : (e as Error).message }; }
+  };
+  const epPs = async (ep: InstanceType<typeof CotalEndpoint>): Promise<EpReply> => {
+    try {
+      const r = await ep.invokeService("manager", "ps");
+      return r.reply.ok === true ? { ok: true, data: r.reply.data } : { ok: false, error: r.reply.error?.message ?? r.reply.error?.code };
+    } catch (e) { return { ok: false, error: e instanceof EpEnvelopeError ? `${e.code}: ${e.message}` : (e as Error).message }; }
+  };
+  // The target: `delta`, already live from the envelope section (spawned WITH spawner `u_….cli`),
+  // so a DIFFERENT actor under the same owner is a true sibling — not the spawner, not the manager.
+  check("precondition: delta is live under the operator's owner", psList(manager).some((a) => a.name === "delta"), psList(manager).map((a) => a.name));
+  const opsmate = await ctlCaller("opsmate", OWNER, ["spawn"]);
+  // delta's lifecycle uid, read off the same `inspect` the helper uses, so the retirement cells
+  // below key on the incarnation that is actually stopped rather than on a name.
+  const deltaInfo = await opsmate.invokeService("manager", "inspect", { name: "delta" });
+  const deltaUid = (deltaInfo.reply.data as { lifecycleUid: string }).lifecycleUid;
+  const sibAttach = await epTargeted(opsmate, "attach", "delta");
+  check("owner-domain: a spawn-scoped SIBLING actor attaches an agent under its owner (ep owner mode)", sibAttach.ok === true && typeof (sibAttach.data as { grant?: { sessionId?: string } })?.grant?.sessionId === "string", sibAttach);
+  const sibStop = await epTargeted(opsmate, "stop", "delta");
+  check("owner-domain: the same sibling actor stops it (stop travels with attach)", sibStop.ok === true, sibStop);
+  check("delta is gone from the manager after the sibling stop", !psList(manager).some((a) => a.name === "delta"), psList(manager).map((a) => a.name));
+  // ---------- ABSENT-DAEMON CONTROL: HELD RETIREMENT AND RETAINED RESIDUE ----------
+  // While the delivery daemon is absent, the manager's membership inventory challenge cannot
+  // reach a responder. Lack of daemon NEVER proves empty storage: retirement stays held,
+  // the name remains reserved pending retirement, and a same-name spawn is refused.
+  const mRetiring = (manager as unknown as { retiring: Map<string, { opId: string; target: { lifecycleUid: string }; lastError?: string }> }).retiring;
+  for (let i = 0; i < 50 && (!mRetiring.has("delta") || !mRetiring.get("delta")?.lastError); i++) await wait(100);
+  check("absent delivery daemon holds retirement: delta is held in retiring with incomplete inventory",
+    mRetiring.has("delta") && /membership inventory incomplete/i.test(mRetiring.get("delta")?.lastError ?? ""),
+    mRetiring.get("delta"));
+  const rHeldSpawn = await manager.startAgent({ name: "delta", agent: "e2e", events: false });
+  check("absent delivery daemon holds retirement: same-name spawn is refused pending retirement",
+    rHeldSpawn.ok === false && /reserved pending retirement/i.test(rHeldSpawn.error ?? ""),
+    rHeldSpawn);
+
+  // ---------- RECOVERY WHEN GENUINE DELIVERY RETURNS ----------
+  // Completed-retirement cells need a REAL delivery daemon and actual provisioned credentials.
+  const { bootDeliveryDaemon } = await import("../../manager/smoke/_boot-delivery.js");
+  deliveryDaemon = await bootDeliveryDaemon({
+    space: SPACE,
+    servers: SERVER,
+    auth,
+    reloadStoreIdentity: workspaceSecretStore(root).identity,
+  });
+  // The refused spawn above re-drove delta's teardown before any daemon served, and that teardown can
+  // still be in flight here. A re-drive joins an in-flight teardown of the same lifecycle instead of
+  // starting another, so re-driving now would only rejoin the one whose inventory found no responder.
+  // Let it settle first; the re-drive below then reads the inventory from the daemon that now serves.
+  const teardowns = (manager as unknown as { deprovisioningFlight: Map<string, Promise<void>> }).deprovisioningFlight;
+  await teardowns.get(JSON.stringify(["delta", deltaUid]))?.catch(() => {});
+  await manager.startAgent({ name: "delta", agent: "e2e", events: false }).catch(() => {});
+
+  // ---------- THE RETIREMENT IS AUTHORIZED AND ACTS (Cotal #549) ----------
+  // Read from STATE, never from the despawn's log copy. The defect this covers made the auth rail's
+  // principal cross-check unsatisfiable, because the gate is bound to `principalKey(DEV_OWNER,
+  // serveIdentity.id)` while the request used to carry the manager's ENDPOINT identity: two real
+  // identities of the same manager that can never be equal. Every user-mesh retirement was refused.
+  //
+  // WHY NOT REQUIRE THE TERMINAL. The barrier's terminal also depends on the delivery daemon's
+  // verified eviction, the drain and the cleaner. Asserting "the name was released" would therefore
+  // be red for reasons that have nothing to do with authorization.
+  //
+  // WHY NOT ASSERT THE REFUSAL IS GONE. That is the wrong experiment, and it is the one I would
+  // most easily have run: a fix that only rewrote the refusal's wording would pass it. Measured on
+  // the broken tree, the string disappearing and the retirement working are genuinely different
+  // outcomes, because with the cross-check fixed the requests still fail further down.
+  //
+  // WHAT IS ASSERTED. The two durable facts the barrier writes BEFORE any of that, both of which a
+  // request refused at the cross-check never reaches: the operation intent row exists, and the
+  // agent's own issuance gate has moved from `open` to `frozen` under exactly that opId. The gate
+  // freeze is the load-bearing half: an intent row alone would only prove something was recorded,
+  // while the freeze proves the retirement began ACTING on the lifecycle.
+  //
+  // The opId is recomputed here rather than exported from the manager, because it is deterministic
+  // by contract (a stable op per retiring incarnation, so retries re-drive the same operation). If
+  // that derivation ever changes, this cell fails loudly rather than silently reading a stale key.
+  //
+  // FIXTURE HYGIENE. The freeze this cell waits for is real state left in the auth store, and a
+  // frozen gate is a known wedge class. It cannot wedge anything here: the row is `gate.<uid>` for
+  // delta's ONE stopped incarnation, `delta` is never spawned again below (the later cells use
+  // `alpha` and fresh names), and an issuance gate is keyed per lifecycle uid, so no later mint or
+  // registration reads it. The manager's OWN endpoint gate, which is the row whose freeze deadlocks
+  // a restart, is a different key family and is untouched.
+  {
+    const retireOpId = (uid: string): string => createHash("sha256").update(`retire:${uid}`).digest("hex").slice(0, 26);
+    // A `lifecycle-executor` pinned to delta. That profile is the one credential documented as able
+    // to READ (never write) other rows in the auth store for its one-shot lifetime, because its
+    // reads are body-selected `STREAM.MSG.GET` and a subject grant cannot see the requested key.
+    // It is used here rather than widening any production profile for a test, and it is pinned to
+    // exactly the incarnation under test.
+    const kvCreds = await mintCreds(auth, newIdentity(), "lifecycle-executor", {
+      lifecycleExecutor: { owner: OWNER, actor: "delta", lifecycleUid: deltaUid, alias: "delta" },
+    });
+    const kvNc = await rawConnect({ servers: SERVER, ...standaloneConnectOpts({ creds: kvCreds, tls: false }), maxReconnectAttempts: 0 });
+    try {
+      const authKv = await new Kvm(kvNc).open(epAuthBucket(SPACE));
+      // The retirement is single-flighted and driven off the despawn rather than awaited by it, so
+      // this polls to a deadline. A timeout leaves both observations at their last read, which is
+      // what the failure payload prints.
+      let intent: unknown, gateState: string | undefined, gateOp: string | undefined;
+      const deadline = Date.now() + 20_000;
+      while (Date.now() < deadline) {
+        const i = await authKv.get(`stage.${retireOpId(deltaUid)}`);
+        const g = await authKv.get(`gate.${deltaUid}`);
+        intent = i?.operation === "PUT" ? JSON.parse(new TextDecoder().decode(i.value)) as unknown : undefined;
+        const row = g?.operation === "PUT" ? JSON.parse(new TextDecoder().decode(g.value)) as { state?: string; op?: { opId?: string } } : undefined;
+        gateState = row?.state; gateOp = row?.op?.opId;
+        if (intent !== undefined && gateState === "frozen") break;
+        await wait(250);
+      }
+      check("the sibling stop's retirement was AUTHORIZED: the auth rail wrote its durable operation intent for delta's lifecycle",
+        (intent as { kind?: string; lifecycleUid?: string })?.kind === "retirement"
+        && (intent as { lifecycleUid?: string })?.lifecycleUid === deltaUid, { intent, deltaUid });
+      check("...and it ACTED: delta's own issuance gate is FROZEN under exactly that opId (an unauthorized request never reaches a gate)",
+        gateState === "frozen" && gateOp === retireOpId(deltaUid), { gateState, gateOp, expected: retireOpId(deltaUid) });
+    } finally {
+      await kvNc.close().catch(() => {});
+    }
+  }
+  // THE SIBLING-WRITE VECTOR, executed on a real user mesh rather than argued from the mint table.
+  // The two cells above are the reason it exists: on a user mesh the own-domain arm admits any seat
+  // under the caller's owner, so `opsmate` attaches and stops an agent it never spawned. That is the
+  // policy working as designed, because both are denial. Seat INPUT is not denial, it is control of
+  // whatever the peer is running, so it must NOT ride the same spawn scope. It does not: a spawn
+  // bearer is minted no `input` row in either mode, so the publish is broker-denied before the
+  // manager sees it. `alpha` rather than `delta` because the sibling stop above took delta.
+  // The refusal is asserted BY SHAPE, not just by `ok === false`, because an absence assertion is
+  // the kind that passes for the wrong reason. A broker refusal surfaces as `permission-denied`
+  // in the BROKER's words: the caller's connection-status watch sees the publish violation and
+  // names the refused subject, so the publish never reached a manager. Restoring the grant would
+  // not merely change that string, it would make the owner-mode call SUCCEED, since the own-domain
+  // arm admits the sibling. A handler `permission-denied` carries the same code without the
+  // broker's words, and would mean the publish was ADMITTED, which is the weaker property these
+  // cells are not for; the words are what tell the two apart.
+  const brokerDropped = (r: EpReply): boolean =>
+    r.ok === false && /^permission-denied: .*REFUSED BY THE BROKER/.test(r.error ?? "");
+  // BOTH modes, and the second one has to be forced. The helper derives `owner` for a same-owner
+  // target, so without the override the any-mode subject is never published and a claim about it
+  // would be untested text sitting next to a green cell.
+  const sibInput = await epTargeted(opsmate, "input", "alpha", "owner");
+  check("owner-domain: the SAME sibling actor that could attach and stop is REFUSED owner-mode seat input, dropped at the BROKER",
+    brokerDropped(sibInput), sibInput);
+  const sibInputAny = await epTargeted(opsmate, "input", "alpha", "any");
+  check("...and the any-mode subject is closed to it too, so the refusal is the missing grant and not the mode derivation",
+    brokerDropped(sibInputAny), sibInputAny);
+  // Named for what it proves and no more. `input` never removes a seat, so this rules out a wild
+  // despawn rather than a successful write; the load-bearing half is the pair above.
+  check("the refused input did not take alpha with it (it never should; this is the belt, not the braces)",
+    psList(manager).some((a) => a.name === "alpha"), psList(manager).map((a) => a.name));
+  // A CROSS-OWNER caller with only spawn scope: the ep any-mode row it would need is broker-DENIED
+  // at publish (a spawn bearer holds owner-mode rows only), so the op fails before the manager.
+  const OWNER_B = "u_" + "b".repeat(26);
+  const intruder = await ctlCaller("intruder", OWNER_B, ["spawn"]);
+  const crossAttach = await epTargeted(intruder, "attach", "alpha");
+  check("cross-owner attach is refused fail-closed (any-mode broker-denied for a spawn bearer)", crossAttach.ok === false, crossAttach);
+  const crossStop = await epTargeted(intruder, "stop", "alpha");
+  check("cross-owner stop is refused the same way", crossStop.ok === false, crossStop);
+  check("alpha survived the refused cross-owner stop", psList(manager).some((a) => a.name === "alpha"), psList(manager).map((a) => a.name));
+  // A cross-owner caller whose LEDGER row carries admin: the callout minted it the any-mode admin
+  // instrument rows, so the broker admits the any-mode publish and the manager's fresh ledger read → allowed.
+  const auditor = await ctlCaller("auditor", OWNER_B, ["spawn", "admin"]);
+  const adminAttach = await epTargeted(auditor, "attach", "alpha");
+  check("cross-owner attach with ledger admin passes (any-mode admin rows + fresh ledger read)", adminAttach.ok === true, adminAttach);
+  // And the same ledger row reaches seat input, which is the whole point of putting `input` on the
+  // operator instrument instead of on `spawn`: the authority that already crosses owners carries it,
+  // and nothing weaker does. This is also the live proof that the any-mode `input` row the admin
+  // mint emits is REACHABLE, not merely present in a decoded JWT.
+  const adminInput = await epTargeted(auditor, "input", "alpha");
+  check("cross-owner seat input with ledger admin passes, and reports the bytes it wrote",
+    adminInput.ok === true && (adminInput.data as { bytes?: number })?.bytes === 8, adminInput);
+  // ---------- D1. an ADMIN-scope caller HEARS ITS OWN GOAL'S TERMINAL (#610, the admin fold) ----------
+  // `permissionsFor` folds the per-goal progress row on TWO branches, `spawn` and `admin`, and B1f
+  // covers only the first. Every other cell that follows a goal is minted with `spawn`, which
+  // supplies the same row, so reverting the admin branch alone left the whole suite green. This is
+  // the assertion that branch is missing: an admin-scope caller with NO `spawn` in its ledger row
+  // submits a goal-bearing command and hears its terminal, rather than being refused the follow.
+  console.log("D1) an admin-scope caller follows its own goal to a terminal (#610)");
+  {
+    const adminFollower = await ctlCaller("adminfollower", OWNER_B, ["admin"]);
+    const followErrors: string[] = [];
+    adminFollower.on("error", (e: unknown) => followErrors.push((e as Error)?.message ?? String(e)));
+    const t0 = Date.now();
+    const r = await adminFollower.invokeService("manager", "spawn", { name: "beta", agent: "e2e", events: false }, { deadlineMs: 20_000, follow: true });
+    const elapsed = Date.now() - t0;
+    const code = r.reply.ok === true ? "ok" : (r.reply.error?.code ?? "?");
+    console.log(`   [D1 observed] code=${code} elapsed=${elapsed} msg=${(r.reply.error?.message ?? "").slice(0, 140)} errs=${JSON.stringify(followErrors)}`);
+    check("an admin-scope caller HEARS its own goal's terminal (the admin mint branch folds the progress row too)",
+      code === "ok" || code === "failed", { code, elapsed, message: r.reply.error?.message?.slice(0, 160), followErrors });
+    check(`...on the goal's own timing, not at the caller's budget (${elapsed}ms of 20000ms)`, elapsed < 15_000, elapsed);
+    check("...with no broker refusal on the admin follower's connection", followErrors.length === 0, followErrors);
+    if (r.reply.ok === true) {
+      const spawned = (r.reply.data as { name?: string })?.name ?? "beta";
+      await adminFollower.invokeService("manager", "despawn", { name: spawned, owner: OWNER_B }).catch(() => undefined);
+    }
+  }
+
+  // Narrow the auditor back to [spawn] (upsert) — its NEXT exchange mints owner-mode-only rows, so a
+  // cross-owner op loses the any-mode reach (the callout re-reads the ledger per exchange).
+  await cotalAuthProvider.grantAgent({ custody: { kind: "foreground" }, store, dir, space: SPACE, owner: OWNER_B, actor: "auditor", scope: ["spawn"], allowSubscribe: [], allowPublish: [], lifecycleUid: mintLifecycleUid() });
+  const narrowedAttach = await epTargeted(auditor, "attach", "alpha");
+  check("narrowing the auditor's scope bites its cross-owner reach on the next exchange", narrowedAttach.ok === false, narrowedAttach);
+
+  // ---------- D2. a spawn-scoped view reads status, counting only its own owner's seats ----------
+  // The auth service offers this co-located Manager to every owner, so OWNER_B's manager-caller view
+  // reaches the Manager that runs OWNER's seats. Its spawn scope lets it read the launch options, and
+  // the count it reads is OWNER_B's seats, as its `ps` would list them. Admin reach counts every seat.
+  console.log("D2) a spawn-scoped view of the shared Manager counts only its own owner's seats");
+  {
+    const viewStatus = async (actor: string, scope: string[]): Promise<number | string> => {
+      const g = await cotalAuthProvider.grantAgent({ custody: { kind: "foreground" }, store, dir, space: SPACE, owner: OWNER_B, actor, scope, allowSubscribe: [], allowPublish: [], lifecycleUid: mintLifecycleUid() });
+      const info = loadAuthServiceInfo(dir)!;
+      const res = await fetch(`${info.url}/exchange`, {
+        method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${info.cap}` },
+        body: JSON.stringify({ owner: OWNER_B, actor, actorToken: g.actorToken, view: "manager-caller" }),
+      });
+      const ex = await res.json() as { token?: string; error?: string };
+      if (!res.ok || !ex.token) return `exchange HTTP ${res.status} ${ex.error ?? ""}`;
+      const { lifecycleUid: uid, managerInstanceId } = (decodeJwt(ex.token) as { act: { lifecycleUid: string; managerInstanceId: string } }).act;
+      const nc = await rawConnect({ servers: SERVER, ...standaloneConnectOpts({ bearer: ex.token, sentinelCreds: g.sentinelCreds, tls: false }), maxReconnectAttempts: 0 });
+      try {
+        const svc = await resolveService(nc, SPACE, "manager", { owner: OWNER_B, actor, uid }, { instanceId: managerInstanceId, deadlineMs: 10_000 });
+        const r = await invokeCommand(nc, SPACE, svc, "status", undefined, { deadlineMs: 10_000 });
+        return r.reply.ok ? (r.reply.data as { agentCount: number }).agentCount : `refused ${r.reply.error?.code}`;
+      } catch (e) {
+        return `refused ${(e as Error).message.slice(0, 200)}`;
+      } finally {
+        await nc.close();
+      }
+    };
+    const total = psList(manager!).length, own = psList(manager!, OWNER_B).length;
+    check("D2 fixture: the shared Manager runs a seat of another owner", total > own, { total, own });
+    const spawnCount = await viewStatus("launchview", ["spawn"]);
+    check("a spawn-scoped view of the shared Manager reads status and counts only its own owner's seats", spawnCount === own, { spawnCount, own, total });
+    const adminCount = await viewStatus("launchadmin", ["spawn", "admin"]);
+    check("...and an admin-scoped view of the same owner counts every seat", adminCount === total, { adminCount, total });
+  }
+
+  // ---------- E. the event plane, at the real door, under BOTH rules ----------
+  // Two rules meet here and the ORDER is the finding. The delegation envelope says a peer may hand
+  // down a subset of what it holds and no more. The OWN-CHANNEL rule says the agent being created
+  // may hold its OWN event plane and no other, whatever the spawner holds, because that plane
+  // carries the session's tool inputs and outputs verbatim. The own-channel rule runs FIRST and is
+  // NOT envelope-dependent, so widening the peer's own grant does not admit the request: a reader
+  // of somebody else's plane is granted out of band, never through a spawn.
+  //
+  // WHY THESE CELLS WERE REWRITTEN RATHER THAN REPAIRED. Before the rule existed the door ACCEPTED
+  // the over-ask (spawn is an action: the door replies the instant the identity is minted) and the
+  // ledger refused it afterwards, so these cells asserted acceptance plus the absence of a row.
+  // The rule moved the refusal AHEAD of the mint. Keeping the old assertion would be asserting the
+  // defect, so what is asserted now is the refusal itself, at the door, over a real bearer.
+  //
+  // WHY EVERY SPAWN BELOW NOW USES ITS OWN CHILD NAME. They all asked for `epsilon`, which was safe
+  // only while every one of them was refused: the name never existed, so "no row for the child" was
+  // a real reading. #2078 made the bare spawn SERVED, and one served spawn under the shared name
+  // turned five later absence assertions into statements about the FIRST spawn's row instead of
+  // their own (#2105). Distinct names put each cell back on its own subject, and each uses its own
+  // role-free persona.
+  //
+  // The stated limit is asserted too, from the other side, because a limit nobody tests is a
+  // sentence: the CONCRETE form is refused whatever the envelope says, and the WILDCARD form is
+  // left to the envelope exactly as every other channel is.
+  console.log("E) the own-channel rule at the real door, and the envelope's remaining half");
+  const VICTIM = eventChannel({ owner: OWNER_B, actor: "auditor" });
+  const VICTIM_WILDCARD = `events.${OWNER_B}.>`;
+  type Accepted = { ok: boolean; name?: string; eventsNotice?: string; error?: string };
+  const epSpawnAccept = async (ep: InstanceType<typeof CotalEndpoint>, args: Record<string, unknown>): Promise<Accepted> => {
+    try {
+      const r = await ep.invokeService("manager", "spawn", args, { deadlineMs: 15_000 });
+      if (r.reply.ok !== true) return { ok: false, error: r.reply.error?.message ?? r.reply.error?.code };
+      const d = r.reply.data as { name?: string; eventsNotice?: string };
+      return { ok: true, name: d.name, eventsNotice: d.eventsNotice };
+    } catch (e) { return { ok: false, error: e instanceof EpEnvelopeError ? `${e.code}: ${e.message}` : (e as Error).message }; }
+  };
+  const settle = async (ms: number) => { await new Promise((r) => setTimeout(r, ms)); };
+  const ownChannelRefusal = (r: Accepted): boolean =>
+    r.ok === false && /another agent's event channel/.test(r.error ?? "") && (r.error ?? "").includes(VICTIM);
+  const evtpeer = await ctlCaller("evtpeer", OWNER, ["spawn"], { allowSubscribe: ["general"], allowPublish: ["general", `events.${OWNER}.>`] });
+  const defaultPlane = eventChannel({ owner: OWNER, actor: "epsilon" });
+  // Same-owner arming still needs the spawner's publish envelope to cover the child's channel.
+  const bare = await (async (): Promise<Accepted> => {
+    try {
+      const r = await evtpeer.invokeService(
+        "manager",
+        "spawn",
+        { name: "epsilon", agent: "e2e", allowSubscribe: ["general"], allowPublish: ["general"] },
+        { deadlineMs: 15_000, follow: true },
+      );
+      const d = r.reply.data as { name?: string; eventsNotice?: string };
+      return r.reply.ok === true
+        ? { ok: true, name: d.name, eventsNotice: d.eventsNotice }
+        : { ok: false, error: r.reply.error?.message ?? r.reply.error?.code };
+    } catch (e) {
+      return { ok: false, error: e instanceof EpEnvelopeError ? `${e.code}: ${e.message}` : (e as Error).message };
+    }
+  })();
+  check("a peer-initiated owned bare spawn is served with no event downgrade notice",
+    bare.ok === true && bare.name === "epsilon" && bare.eventsNotice === undefined, bare);
+  await settle(2500);
+  // Read the durable grant rather than trusting only the successful reply.
+  const bareRow = existsSync(rowFile("managed", OWNER, "epsilon"))
+    ? (JSON.parse(readFileSync(rowFile("managed", OWNER, "epsilon"), "utf8")) as { allowSubscribe?: string[]; allowPublish?: string[] })
+    : undefined;
+  check("...and the child row publishes only its own event plane without adding read reach",
+    bareRow !== undefined && !(bareRow.allowSubscribe ?? []).includes(defaultPlane) && (bareRow.allowPublish ?? []).includes(defaultPlane),
+    { bareRow, defaultPlane });
+  const readOverAsk = await epSpawnAccept(evtpeer, { name: "zeta", agent: "e2e", events: false, allowSubscribe: ["general", VICTIM], allowPublish: ["general"] });
+  check("a peer's ep spawn asking a FOREIGN event channel as its child's READ set is refused AT THE DOOR, naming the channel",
+    ownChannelRefusal(readOverAsk), readOverAsk);
+  await settle(1500);
+  check("...and no managed row for the child", !existsSync(rowFile("managed", OWNER, "zeta")));
+  check("...and no live agent by that name", !psList(manager).some((a) => a.name === "zeta"), psList(manager).map((a) => a.name));
+  const writeOverAsk = await epSpawnAccept(evtpeer, { name: "lambda", agent: "e2e", events: false, allowSubscribe: ["general"], allowPublish: ["general", VICTIM] });
+  check("the same over-ask on the child's WRITE set is refused at the door too: publishing INTO another agent's plane is forgery, not eavesdropping",
+    ownChannelRefusal(writeOverAsk), writeOverAsk);
+  await settle(1500);
+  check("...and leaves no row either", !existsSync(rowFile("managed", OWNER, "lambda")));
+  // THE HALF THE ENVELOPE NO LONGER DECIDES. An operator widening the peer's own grant used to
+  // admit this exact request, and that was the whole "containment rather than ban" story. The
+  // own-channel rule takes the CONCRETE form out of the envelope's hands: the answer is the same
+  // refusal, from a spawner that demonstrably holds the channel.
+  const widened = await ctlCaller("evtpeer2", OWNER, ["spawn"], { allowSubscribe: ["general", VICTIM], allowPublish: ["general"] });
+  const admitted = await epSpawnAccept(widened, { name: "mu", agent: "e2e", events: false, allowSubscribe: ["general", VICTIM], allowPublish: ["general"] });
+  check("with the peer's OWN grant widened by the operator, the identical spawn is STILL refused: the concrete form is not the envelope's to hand down",
+    ownChannelRefusal(admitted), admitted);
+  await settle(2500);
+  check("...and still writes no row", !existsSync(rowFile("managed", OWNER, "mu")), admitted);
+  // THE STATED LIMIT, ASSERTED. `eventChannelPrincipal` decodes exactly two principal tokens, so a
+  // WILDCARD is not an event channel to the rule and passes it untouched, governed by the envelope
+  // alone. That is deliberate: the wildcard is the form an operator writes on purpose for an
+  // observer, and this cell is what stops the limit being a comment nobody tests.
+  const wildpeer = await ctlCaller("evtpeer3", OWNER, ["spawn"], { allowSubscribe: ["general", VICTIM_WILDCARD], allowPublish: ["general"] });
+  const wildAdmitted = await epSpawnAccept(wildpeer, { name: "nu", agent: "e2e", events: false, allowSubscribe: ["general", VICTIM_WILDCARD], allowPublish: ["general"] });
+  check("the WILDCARD form is left to the delegation envelope: a peer whose own grant covers it CAN hand it down", wildAdmitted.ok === true, wildAdmitted);
+  await settle(2500);
+  const wildRow = existsSync(rowFile("managed", OWNER, "nu"))
+    ? (JSON.parse(readFileSync(rowFile("managed", OWNER, "nu"), "utf8")) as { allowSubscribe?: string[]; parent?: string })
+    : undefined;
+  check("...and a row IS written, carrying exactly the pattern it asked for", wildRow?.allowSubscribe?.includes(VICTIM_WILDCARD) === true, wildRow);
+  check("...recording the peer that delegated it as parent", wildRow?.parent === `${OWNER}.evtpeer3`, wildRow);
+  // THE TWO REFUSALS, SIDE BY SIDE, through the op core with the same spawner principal, so the
+  // TEXT of each is on the record. Without the second one the first proves only that something
+  // refused: the envelope is still the authority for every channel that is not a concrete event
+  // channel, and a rule that had swallowed it would look identical from one cell.
+  const overText: ControlReply = await manager.startAgent(
+    { name: "zeta", agent: "e2e", events: false, allowSubscribe: ["general", VICTIM], allowPublish: ["general"] }, `${OWNER}.evtpeer`);
+  check("the refusal for a concrete event channel is the OWN-CHANNEL rule, and it names the channel",
+    overText.ok === false && /another agent's event channel/.test(overText.error ?? "") && (overText.error ?? "").includes(VICTIM), overText);
+  // THE REMEDY THAT REFUSAL PRINTS, PARSED AND RUN. A confinement refusal lends its own authority
+  // to whatever command it prints, and BOTH halves of this one were once wider than the sentence
+  // around them: the static half named a profile that ignores `--allow-subscribe`, and this half
+  // named a bare `cotal actor grant`. A bare grant is not a narrow one. `runActor` fills every
+  // omitted flag from `csv(values.x, dflt)` with the WIDE default (`>` read, `>` post,
+  // `spawn,role:default` scope), and it says so in its own comment, so an operator following this
+  // refusal to the letter in order to grant a READER would have written a row that reads and posts
+  // everywhere and can spawn. That is a worse outcome than the spawn the refusal blocked, and it
+  // arrives carrying the manager's authority.
+  //
+  // Two cells, because the text and the effect are different claims. The first is that the command
+  // spells every field out, which is what stops a default applying at all. The second RUNS the
+  // values it printed through the real ledger writer and grades the row that lands.
+  const grantCmd = /cotal actor grant [^`]+/.exec(overText.error ?? "")?.[0] ?? "";
+  const flag = (name: string): string | undefined => new RegExp(`--${name} '([^']*)'`).exec(grantCmd)?.[1];
+  const ownerFlag = /--owner (\S+)/.exec(grantCmd)?.[1];
+  check("the user-mesh refusal prints an actor grant that spells out EVERY field, so no wide default applies",
+    grantCmd.length > 0 && flag("allow-subscribe") === VICTIM && flag("allow-publish") === "" && flag("scope") === "" && ownerFlag === OWNER,
+    { grantCmd, sub: flag("allow-subscribe"), pub: flag("allow-publish"), scope: flag("scope"), owner: ownerFlag });
+  // The static suite grades the same selector at its resume door (the remedy there is `cotal mint`,
+  // not `cotal actor grant`, chosen off the MANAGER's mesh); this is the user-mesh mirror, so R2 in
+  // the remedy fixture has its own cell.
+  const remedyText = overText.error ?? "";
+  check("the user-mesh refusal prints the user-mesh route (actor grant), never the static mint route",
+    /cotal actor grant /.test(remedyText) && !/cotal mint /.test(remedyText), remedyText.slice(0, 600));
+  // A THIRD claim, and the one no cell read until now: the RATIONALE. The two cells above grade the
+  // printed command and the row it writes; both stay green while the sentence explaining WHY every
+  // field must be spelled out understates how wide the default is. It said `spawn` scope when
+  // `runActor` omitting `--scope` writes `spawn,role:default` - dropping a DELEGATION capability
+  // from a sentence whose only job is calibration. An operator auditing a past omitted-scope grant
+  // by that sentence concludes it "only got spawn" and closes a question that is open.
+  check("the user-mesh remedy states the omitted-scope default in FULL, both capabilities, and not the narrower one",
+    /spawn,role:default/.test(remedyText) && !/`spawn` scope/.test(remedyText), remedyText);
+  const READER = "evtreader";
+  grantActor(dir, {
+    owner: ownerFlag ?? "",
+    actor: READER,
+    scope: (flag("scope") ?? ">").split(",").filter(Boolean),
+    allowSubscribe: (flag("allow-subscribe") ?? ">").split(",").filter(Boolean),
+    allowPublish: (flag("allow-publish") ?? ">").split(",").filter(Boolean),
+  });
+  const readerRow = existsSync(rowFile("interactive", OWNER, READER))
+    ? (JSON.parse(readFileSync(rowFile("interactive", OWNER, READER), "utf8")) as { allowSubscribe: string[]; allowPublish: string[]; scope: string[] })
+    : undefined;
+  check("running exactly what it printed writes a row that reads that ONE channel, posts nowhere, and cannot spawn",
+    JSON.stringify(readerRow?.allowSubscribe) === JSON.stringify([VICTIM]) && readerRow?.allowPublish.length === 0 && readerRow?.scope.length === 0,
+    readerRow);
+
+  const envelopeText: ControlReply = await manager.startAgent(
+    { name: "zeta", agent: "e2e", events: false, allowSubscribe: ["general", "not-mine"], allowPublish: ["general"] }, `${OWNER}.evtpeer`);
+  check("and an ORDINARY channel the peer does not hold is still refused by the delegation envelope, which the rule did not replace",
+    envelopeText.ok === false && /delegation only narrows/.test(envelopeText.error ?? "") && (envelopeText.error ?? "").includes("not-mine"), envelopeText);
+  // AND THE WILDCARD FORM IS ATTENUATED LIKE ANY OTHER PATTERN. The rule leaves it alone; that is
+  // not the same as nothing governing it. A peer that does NOT hold the pattern cannot hand it
+  // down, on either side, and these are the cells that would notice an author exempting the
+  // `events.` prefix from the containment walk to make arming "just work".
+  const wildOverText: ControlReply = await manager.startAgent(
+    { name: "zeta", agent: "e2e", events: false, allowSubscribe: ["general", VICTIM_WILDCARD], allowPublish: ["general"] }, `${OWNER}.evtpeer`);
+  check("a WILDCARD the peer does NOT hold is refused by the envelope on the READ side",
+    wildOverText.ok === false && /delegation only narrows/.test(wildOverText.error ?? "") && (wildOverText.error ?? "").includes(VICTIM_WILDCARD), wildOverText);
+  const wildPubText: ControlReply = await manager.startAgent(
+    { name: "zeta", agent: "e2e", events: false, allowSubscribe: ["general"], allowPublish: ["general", VICTIM_WILDCARD] }, `${OWNER}.evtpeer`);
+  check("and on the WRITE side: a peer cannot hand down a wildcard write over another owner's planes",
+    wildPubText.ok === false && /delegation only narrows/.test(wildPubText.error ?? "") && (wildPubText.error ?? "").includes(VICTIM_WILDCARD), wildPubText);
+
+  // ---------- V. elevated views (exchange-gated per-connection profiles), live ----------
+  // The live half of the views design (unit layers: smoke:views). Real wire: refused under-scoped
+  // exchange, managed-path rejection, a standing god-view tap over a bearer SOURCE that survives
+  // its ≤20s tokens (fresh ledger check per re-mint), a channel-purger purge, the deployer view on
+  // the privileged tier, and the ps owner-domain filter.
+  console.log("V) elevated views: ledger-gated god view / purge / deploy over the real wire");
+  const svc = loadAuthServiceInfo(dir)!;
+  const freshIdpJwt = async () =>
+    fetchIdpJwt(base, (await establishIdpSession({ dir: home, idpUrl: base, clientId: CLIENT_ID, onPrompt: (p) => approve(p.userCode) })).session.token);
+  const humanViewEx = async (view: string, ttlSec?: number) => {
+    const res = await fetch(`${svc.url}/exchange`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${svc.cap}` },
+      body: JSON.stringify({ idpToken: await freshIdpJwt(), actor: "cli", view, ...(ttlSec ? { ttlSec } : {}) }),
+    });
+    return { status: res.status, body: (await res.json().catch(() => ({}))) as { token?: string; error?: string } };
+  };
+  // cli's scope is still [spawn] here — every admin-gated view must refuse naming the gate.
+  const deniedView = await humanViewEx("admin");
+  check('an admin-view exchange under scope [spawn] refuses 401 naming scope "admin"', deniedView.status === 401 && /needs scope "admin"/.test(deniedView.body.error ?? ""), deniedView);
+  // ...and the re-grant it prints is a WHOLE-row upsert, not a scope edit. `runActor` fills every
+  // omitted flag from `csv(v, dflt)` with the WIDE default, so a scope-only paste silently resets
+  // this row's read/post to `>`/`>`: adding a view would widen the operator to the whole chat
+  // plane.
+  //
+  // Naming the flags is NOT enough, and a security lens is why this cell says more than that: a
+  // command that names `--allow-subscribe '<its current read set>'` reads as paste-ready, fails on
+  // an invalid channel, and the operator's shortest route to a command that succeeds is to delete
+  // the flag or write `>`. So the values are graded against the ROW, not the sentence: whatever the
+  // refusal prints must be what the row actually holds right now.
+  const viewErr = deniedView.body.error ?? "";
+  const viewRegrant = /cotal actor grant [^(]+/.exec(viewErr)?.[0] ?? "";
+  const flagOf = (name: string): string | undefined =>
+    new RegExp(`--${name} '([^']*)'`).exec(viewRegrant)?.[1];
+  const liveRow = JSON.parse(readFileSync(rowFile("interactive", OWNER, "cli"), "utf8")) as {
+    allowSubscribe: string[]; allowPublish: string[]; scope: string[]; label?: string;
+  };
+  check(
+    "the view refusal's re-grant names read AND post, not scope alone, and says the upsert replaces the WHOLE row",
+    /--scope '/.test(viewRegrant) &&
+      /--allow-subscribe '/.test(viewRegrant) &&
+      /--allow-publish '/.test(viewRegrant) &&
+      /WHOLE row/.test(viewErr),
+    { viewRegrant, error: viewErr },
+  );
+  check(
+    "the ACL values it prints are the row's REAL current sets, not a placeholder and not the wide default",
+    flagOf("allow-subscribe") === liveRow.allowSubscribe.join(",") &&
+      flagOf("allow-publish") === liveRow.allowPublish.join(",") &&
+      !/[<>]/.test(`${flagOf("allow-subscribe")}${flagOf("allow-publish")}`),
+    { printed: { sub: flagOf("allow-subscribe"), pub: flagOf("allow-publish") }, row: liveRow },
+  );
+  check(
+    "and it carries the scope ADDED to the row's own, plus the label the upsert would otherwise drop",
+    (flagOf("scope") ?? "").split(",").includes("admin") &&
+      liveRow.scope.every((sc) => (flagOf("scope") ?? "").split(",").includes(sc)) &&
+      flagOf("label") === liveRow.label,
+    { printedScope: flagOf("scope"), printedLabel: flagOf("label"), row: liveRow },
+  );
+  // The managed (agent-secret) path never mints views — even for a row that CARRIES admin.
+  const vg = await cotalAuthProvider.grantAgent({ custody: { kind: "foreground" }, store, dir, space: SPACE, owner: OWNER, actor: "viewbot", scope: ["spawn", "admin"], allowSubscribe: [], allowPublish: [], lifecycleUid: mintLifecycleUid() });
+  const mgdViewRes = await fetch(`${svc.url}/exchange`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${svc.cap}` },
+    body: JSON.stringify({ owner: OWNER, actor: "viewbot", actorToken: vg.actorToken, view: "admin" }),
+  });
+  const mgdViewBody = (await mgdViewRes.json().catch(() => ({}))) as { error?: string };
+  check("the managed exchange rejects views outright (400, even with admin on the row)", mgdViewRes.status === 400 && /never mints elevated views/.test(mgdViewBody.error ?? ""), { status: mgdViewRes.status, error: mgdViewBody.error });
+  // ADD admin to the cli grant (the upsert replaces the list — spawn kept deliberately), on the
+  // alias's ONE lifecycle (see cliRow0).
+  const cliUid = cliRow0.lifecycleUid;
+  grantActor(dir, { owner: OWNER, actor: "cli", scope: ["spawn", "admin"], allowSubscribe: ["general"], allowPublish: ["general"], label: "smoke operator", lifecycleUid: cliUid });
+  let viewMints = 0;
+  const mintAdminView = async (): Promise<string> => {
+    viewMints++;
+    const r = await humanViewEx("admin", 20);
+    if (r.status !== 200 || !r.body.token) throw new Error(`admin-view exchange failed: HTTP ${r.status} ${r.body.error ?? ""}`);
+    return r.body.token;
+  };
+  const firstView = await mintAdminView();
+  check("with admin ADDED, the admin-view exchange mints act.view", (decodeJwt(firstView).act as { view?: string }).view === "admin");
+  // The standing god-view tap: a bearer SOURCE over ≤20s tokens (the endpoint refreshes ahead of
+  // each expiry and reconnects across the bearer-bound JWT's death), pinned principal up front.
+  const sentinel = (await loadCalloutAuth(store, SPACE))!.sentinelCreds;
+  const godEye = new CotalEndpoint({
+    space: SPACE, servers: SERVER, bearer: mintAdminView, sentinelCreds: sentinel,
+    channels: [], consume: false, registerPresence: false, watchPresence: false,
+    card: { owner: OWNER, actor: "cli", name: "web", kind: "endpoint" },
+  });
+  godEye.on("error", () => {});
+  await godEye.start();
+  ctlEps.push(godEye);
+  const tapped: string[] = [];
+  // The admin view's sub is the ENUMERATED messaging plane (chat/inst/svc — never the space-wide
+  // `>`, which would plain-subscribe every v0.4 endpoint rail), so the tap pins the DM subtree it
+  // asserts on; a space-wide tap would be a silent sub violation and see nothing.
+  godEye.tap((subject: string) => { tapped.push(subject); }, { subject: `cotal.${SPACE}.inst.>` });
+  await wait(300); // let the tap subscription settle
+  // A written `<owner>.<actor>` literal, so it is a valid recipient by construction rather than
+  // by anything checking it here. Any future change to the principal grammar has to visit this
+  // line: it builds a recipient instead of borrowing one from a card, and this suite is not in
+  // the CI chain, so nothing would fail if it stopped being well formed.
+  await opsmate.unicast(`${OWNER}.alpha`, "psst — a DM between two other principals");
+  let sawDm = false;
+  for (let i = 0; i < 20 && !sawDm; i++) { await wait(100); sawDm = tapped.some((s) => s.includes(".inst.")); }
+  check("the admin-view tap sees a DM between two OTHER principals (the god view)", sawDm, tapped.slice(-3));
+  // channel-purger view: publish two chat messages on a scratch channel, purge them via clearChannel
+  // over a one-shot purger-view bearer (the standalone user-mode connect path).
+  const wg = await cotalAuthProvider.grantAgent({ custody: { kind: "foreground" }, store, dir, space: SPACE, owner: OWNER, actor: "writer", scope: [], allowSubscribe: ["viewtest"], allowPublish: ["viewtest"], lifecycleUid: mintLifecycleUid() });
+  const wx = await agentExchange("writer", wg.actorToken, OWNER);
+  const writer = new CotalEndpoint({
+    space: SPACE, servers: SERVER, bearer: wx.body.token!, sentinelCreds: wg.sentinelCreds,
+    channels: [], consume: false, registerPresence: false, watchPresence: false,
+    card: { name: "writer", owner: OWNER, actor: "writer", kind: "endpoint" },
+  });
+  writer.on("error", () => {});
+  await writer.start();
+  ctlEps.push(writer);
+  await writer.multicast("purge me", { channel: "viewtest" });
+  await writer.multicast("me too", { channel: "viewtest" });
+  const purgeView = await humanViewEx("channel-purger");
+  check("the channel-purger view mints under scope admin", purgeView.status === 200 && !!purgeView.body.token, purgeView);
+  const purged = await clearChannel({ servers: SERVER, space: SPACE, channel: "viewtest", bearer: purgeView.body.token!, sentinelCreds: sentinel });
+  check("clearChannel purges over the purger-view bearer (standalone user-mode connect)", purged.purged >= 2, purged);
+  // deployer view: spawn-gated (no admin needed — but cli has both), control rides the ep manager endpoint (owner mode).
+  const depView = await humanViewEx("deployer");
+  check("the deployer view mints (spawn-gated)", depView.status === 200 && !!depView.body.token, depView);
+  const deployer = new CotalEndpoint({
+    space: SPACE, servers: SERVER, bearer: depView.body.token!, sentinelCreds: sentinel,
+    channels: [], consume: false, registerPresence: false, watchPresence: false, lifecycleUid: cliUid,
+    card: { owner: OWNER, actor: "cli", name: "spawn-f", kind: "endpoint" },
+  });
+  deployer.on("error", () => {});
+  await deployer.start();
+  ctlEps.push(deployer);
+  const depPs = await epPs(deployer);
+  check("the deployer view drives ps on the ep manager endpoint", depPs.ok === true, depPs);
+  // Enumeration is INSTRUMENT-gated in v0.4 (`ps` is a manager.read row minted only into
+  // operator instruments and views, never a raw spawn bearer): both the foreign owner's and the
+  // own-owner sibling's direct `ps` are broker-denied outright — stricter than the ctl era's
+  // owner-filtered reply (nothing to filter when you cannot even ask). The read DOORS beside
+  // this pin the filter semantics: the deployer view lists (own-owner) and the admin-scoped
+  // overseer below sees across owners. (Both raw callers are live from section O.)
+  const psB = await epPs(intruder);
+  check("a raw spawn bearer cannot ps at all (broker-denied; enumeration is instrument-gated)", psB.ok === false, psB);
+  const psA = await epPs(opsmate);
+  check("...same for an own-owner spawn bearer (the deployer VIEW is the read door)", psA.ok === false, psA);
+  // A fresh ledger `admin` scope (not just any-mode reach) sees ALL owners — the SAME authority that
+  // lets stop/attach reach cross-owner (section O). Without this, ps/status disagreed with control:
+  // an admin could cross-owner STOP an agent it could not LIST. An owner-B admin sees owner-A's alpha.
+  const overseer = await ctlCaller("overseer", OWNER_B, ["spawn", "admin"]);
+  const psAdmin = await epPs(overseer);
+  check(
+    "an admin-SCOPED ep ps sees across owners (owner-B admin lists owner-A's alpha)",
+    psAdmin.ok === true && Array.isArray(psAdmin.data) && (psAdmin.data as Array<{ name: string }>).some((a) => a.name === "alpha"),
+    psAdmin.data,
+  );
+  // The refresh proof: past the first 20s bearer's death the endpoint has re-minted (fresh ledger
+  // checks) and reconnected — a live wire round-trip still answers.
+  await wait(25_000);
+  const channelsAfter = await godEye.listChannels();
+  check("the god-view endpoint outlives its first ≤20s bearer (source re-mint + reconnect)", Array.isArray(channelsAfter), channelsAfter?.length);
+  check("the bearer source re-minted at least once (fresh ledger check per refresh)", viewMints >= 2, { viewMints });
+
+  // ---------- P. stale-bearer lifecycle crossover (D15 Track A #9) ----------
+  console.log("P) a predecessor lifecycle's still-unexpired bearer is DENIED after a same-alias re-grant");
+  {
+    // Lifecycle A: grant + exchange -> a valid bearer BOUND to A's row uid.
+    const gA = await cotalAuthProvider.grantAgent({ custody: { kind: "foreground" }, store, dir, space: SPACE, owner: OWNER, actor: "phoenix", scope: [], allowSubscribe: ["general"], allowPublish: [], lifecycleUid: mintLifecycleUid() });
+    const exA = await agentExchange("phoenix", gA.actorToken, OWNER);
+    check("P: lifecycle A's exchange mints a bearer", exA.status === 200 && typeof exA.body.token === "string", exA);
+    // Same-alias RE-GRANT rotates the row to lifecycle B (fresh uid + fresh secret) - the respawn shape.
+    const gB = await cotalAuthProvider.grantAgent({ custody: { kind: "foreground" }, store, dir, space: SPACE, owner: OWNER, actor: "phoenix", scope: [], allowSubscribe: ["general"], allowPublish: [], lifecycleUid: mintLifecycleUid() });
+    // A's captured actorToken is dead (tokenHash rotated) - the OLD guarantee, still holding:
+    const exStale = await agentExchange("phoenix", gA.actorToken, OWNER);
+    check("P: lifecycle A's captured actorToken is denied at exchange after the re-grant", exStale.status === 401, exStale.status);
+    // THE CROSSOVER GATE: A's still-unexpired BEARER must be refused at CONNECT - without the
+    // lifecycle claim + equality check, the callout would mint it B's exact broker authority.
+    const staleEp = new CotalEndpoint({
+      space: SPACE, servers: SERVER, bearer: exA.body.token!, sentinelCreds: gA.sentinelCreds,
+      channels: [], consume: false, registerPresence: false, watchPresence: false,
+      card: { name: "phoenix", owner: OWNER, actor: "phoenix", kind: "endpoint" },
+    });
+    staleEp.on("error", () => {});
+    let staleDenied = false;
+    try {
+      await withTimeout(staleEp.start(), 8000, "stale-bearer connect neither authed nor refused in 8s");
+    } catch { staleDenied = true; }
+    try { await staleEp.stop(); } catch { /* never started */ }
+    check("P: lifecycle A's still-unexpired BEARER is refused at connect (never minted B's authority)", staleDenied);
+    // The respawn shape's ISSUANCE half is now the R1 takeover barrier: rotation alone does not
+    // transfer mintability. While lifecycle A is still ACTIVE (its exchange activated it), B's
+    // exchange refuses naming the active uid — retiring a live predecessor is the spawn path's
+    // job (despawn/retire), never issuance's (SPEC 13.1).
+    const exB = await agentExchange("phoenix", gB.actorToken, OWNER);
+    check("P: lifecycle B's exchange is refused while A is still active (R1 takeover barrier)", exB.status === 401 && /active at uid/.test(exB.body.error ?? ""), { status: exB.status, error: exB.body.error });
+    // A CLEAN alias beside the blocked rotation proves the equality gate blocks only stale
+    // incarnations: a fresh lifecycle's chain works end-to-end (secret -> bearer -> connect).
+    const gC = await cotalAuthProvider.grantAgent({ custody: { kind: "foreground" }, store, dir, space: SPACE, owner: OWNER, actor: "phoenix2", scope: [], allowSubscribe: ["general"], allowPublish: [], lifecycleUid: mintLifecycleUid() });
+    const exC = await agentExchange("phoenix2", gC.actorToken, OWNER);
+    check("P: a fresh alias's exchange mints (the barrier pins the ALIAS's active lifecycle, not the owner)", exC.status === 200 && typeof exC.body.token === "string", exC);
+    const liveEp = new CotalEndpoint({
+      space: SPACE, servers: SERVER, bearer: exC.body.token!, sentinelCreds: gC.sentinelCreds,
+      channels: [], consume: false, registerPresence: false, watchPresence: false,
+      card: { name: "phoenix2", owner: OWNER, actor: "phoenix2", kind: "endpoint" },
+    });
+    liveEp.on("error", () => {});
+    let liveOk = true;
+    try { await withTimeout(liveEp.start(), 8000, "current-bearer connect did not settle in 8s"); }
+    catch { liveOk = false; }
+    check("P: the CURRENT (fresh-lifecycle) bearer connects (the equality gate blocks only stale incarnations)", liveOk);
+    try { await liveEp.stop(); } catch { /* already down */ }
+    await cotalAuthProvider.revokeAgent({ dir, owner: OWNER, actor: "phoenix" }).catch(() => {});
+    await cotalAuthProvider.revokeAgent({ dir, owner: OWNER, actor: "phoenix2" }).catch(() => {});
+  }
+
+  }
+
+  // ---------- F. revocation ----------
+  console.log("F) explicit manager teardown revokes the managed row + shreds files; the old token is uniformly denied");
+  const alphaFamily = incFiles("alpha"); // resolve the incarnation paths BEFORE teardown shreds them
+  await manager.stop({ withAgents: true }); // explicit teardown deprovisions alpha: row delete + token/sentinel/health shred
+  managerStopped = true;
+  const rowGone = !existsSync(managedRowPath);
+  const filesGone = [alphaFamily.actorToken, alphaFamily.sentinelCreds, alphaFamily.health].every((f) => !existsSync(f)) && noIncFiles("alpha");
+  check("explicit manager teardown deleted the managed row and shredded the token/sentinel/health files", rowGone && filesGone, { rowGone, filesGone });
+  const revokedEx = await agentExchange("alpha", alphaToken, OWNER); // the OLD captured secret
+  check("the old captured actor token is uniformly denied (401) after revocation", revokedEx.status === 401, { status: revokedEx.status, error: revokedEx.body.error });
+
+  // A genuine signerless participant, registered through the stock auth authority service.
+  // The owner's actor has spawn and supervise, but never admin.
+  grantActor(dir, { ...cliRow0, scope: ["spawn", "supervise"], allowPublish: ["general", `events.${OWNER}.>`] });
+  const idpToken = await fetchIdpJwt(base, loadIdpSession(home, base)!.token);
+  const authorityCall = async <T,>(request: unknown): Promise<T> => {
+    const info = loadAuthServiceInfo(dir)!;
+    const response = await fetch(`${info.url}/manager-service-authority`, { method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${info.cap}` },
+      body: JSON.stringify({ idpToken, request }) });
+    const result = await response.json() as { error?: string };
+    if (!response.ok) throw new Error(`participant authority HTTP ${response.status}: ${result.error ?? "refused"}`);
+    return result as T;
+  };
+  const participantRoot = join(root, "participant");
+  mkdirSync(join(participantRoot, ".cotal", "agents"), { recursive: true });
+  for (const n of ["omega", "omicron", "foreign", "adminprobe", "downgrade"])
+    writeFileSync(join(participantRoot, ".cotal", "agents", `${n}.md`), `---\nname: ${n}\nsubscribe: [general]\nallowPublish: [general]\n---\n${n} persona.\n`);
+  const state = remote.loadOrCreateRemoteManagerIdentity(participantRoot, SPACE);
+  const actors = remoteManagerActors(state.instanceId);
+  const preparedManager = await authorityCall<import("@cotal-ai/core").RemoteManagerAuthorityMaterial>(remote.remoteManagerAuthorityRequest(state, "cli", "prepare"));
+  const supervisorCreds = remote.materialCredential(preparedManager, "supervisor", state.identities.supervisor);
+  const executorCreds = remote.materialCredential(preparedManager, "executor", state.identities.executor);
+  const registered = await registerRemoteManagerAuthority({ space: SPACE, server: SERVER, owner: OWNER,
+    instanceId: state.instanceId, serveActor: actors.serve, prepareCreds: executorCreds, tlsRequired: false,
+    evict: async (principals) => principals.map(() => true) });
+  const artifacts = managerClusterArtifacts();
+  const contractArtifacts = [artifacts.document, artifacts.manifest];
+  const activated = await authorityCall<import("@cotal-ai/core").RemoteManagerAuthorityMaterial>(remote.remoteManagerAuthorityRequest(state, "cli", "activate", {
+    registrationProof: remoteManagerRegistrationProof(OWNER, state, contractArtifacts), contractArtifacts }));
+  const proof = remote.currentRegistrationProof(activated);
+  participant = new Manager({ space: SPACE, servers: SERVER, runtime: "pty", workspaceRoot: participantRoot, eventsRequired: true,
+    remoteAuthority: { owner: OWNER, actors, instanceId: state.instanceId, lifecycleUid: state.lifecycleUid, identities: state.identities,
+      supervisorCreds, executorCreds, serveGrant: registered.serveGrant,
+      serveCreds: remote.materialCredential(activated, "serve", state.identities.serve),
+      goalWriterCreds: remote.materialCredential(activated, "goalWriter", state.identities.goalWriter),
+      sessionLedgerCreds: remote.materialCredential(activated, "sessionLedger", state.identities.sessionLedger),
+      agentBearerExchangeUrl: publicUrl,
+      renewExecutor: async () => remote.materialCredential(await authorityCall(remote.remoteManagerAuthorityRequest(state, "cli", "renew", { registrationProof: proof })), "executor", state.identities.executor),
+      authorizeAdmin: async (caller) => { const r = remote.remoteManagerAdminAuthorizationRequest(state, "cli", proof, registered.processEpoch, caller);
+        return remote.remoteManagerAdminAuthorized(await authorityCall(r), r, OWNER); },
+      enrollManagedAgent: async ({ target }) => { const r = remote.remoteManagedAgentEnrollmentRequest(state, "cli", proof, registered.processEpoch, target);
+        return remote.remoteManagedAgentEnrollmentMaterial(await authorityCall(r), r); },
+      scanGoalIndex: async () => { const r = remote.remoteManagerGoalIndexScanRequest(state, "cli", proof, registered.processEpoch);
+        return remote.remoteManagerGoalIndexEntries(await authorityCall(r), r, OWNER); },
+      mintSessionServing: async () => { throw new Error("unused fixture session serving"); },
+      mintRetirementRequester: async () => { throw new Error("unused fixture retirement requester"); },
+      prepareAgentRetirement: async () => { throw new Error("fixture process cleanup leaves host retirement to broker removal"); },
+      validateRetainedAgent: async () => { throw new Error("unused fixture retained agent"); },
+    } });
+  await participant.start();
+
+  // Owner-equal event-plane admission through the real typed door, over a non-admin bearer.
+  const ownerUid = mintLifecycleUid();
+  const ownerGrant = await cotalAuthProvider.grantAgent({ custody: { kind: "foreground" }, store, dir, space: SPACE, owner: OWNER, actor: "eventowner",
+    scope: ["spawn"], allowSubscribe: ["general"], allowPublish: ["general", `events.${OWNER}.>`], lifecycleUid: ownerUid });
+  const ownerExchange = await agentExchange("eventowner", ownerGrant.actorToken, OWNER);
+  if (ownerExchange.status !== 200 || !ownerExchange.body.token) throw new Error("event owner exchange failed");
+  const ownerCaller = new CotalEndpoint({ space: SPACE, servers: SERVER, bearer: ownerExchange.body.token,
+    sentinelCreds: ownerGrant.sentinelCreds, lifecycleUid: ownerUid, channels: [], consume: false,
+    registerPresence: false, watchPresence: false, card: { name: "eventowner", owner: OWNER, actor: "eventowner", kind: "endpoint" } });
+  ownerCaller.on("error", () => {});
+  await ownerCaller.start();
+  ctlEps.push(ownerCaller);
+  for (const [name, explicit] of [["omega", false], ["omicron", true]] as const) {
+    const result = await ownerCaller.invokeService("manager", "spawn", { name, agent: "e2e", ...(explicit ? { events: true } : {}) },
+      { deadlineMs: 20_000, follow: true }).catch((e: Error) => ({ reply: { ok: false, error: { message: e.message } } }));
+    check(explicit ? "cell 2: owned explicit events spawn is served under required policy" : "cell 1: owned bare spawn is served under required policy",
+      result.reply.ok === true, { ok: result.reply.ok, error: result.reply.error?.message });
+    const childRow = existsSync(rowFile("managed", OWNER, name))
+      ? JSON.parse(readFileSync(rowFile("managed", OWNER, name), "utf8")) as { allowPublish?: string[] } : undefined;
+    const childPid = psList(participant).find((a) => a.name === name)?.pid;
+    const childEnv = childPid ? readFileSync(`/proc/${childPid}/environ`, "utf8").split("\0") : [];
+    check(`owned ${name} has its own event publish grant and armed child`,
+      childRow?.allowPublish?.includes(eventChannel({ owner: OWNER, actor: name })) === true
+      && childEnv.includes("COTAL_EVENTS=1") && childEnv.includes("COTAL_EVENTS_REQUIRED=1"));
+  }
+  const participantCaller = async (actor: string, owner: string, scope: string[]) => {
+    const uid = mintLifecycleUid();
+    const grant = await cotalAuthProvider.grantAgent({ custody: { kind: "foreground" }, store, dir, space: SPACE, owner, actor, scope,
+      allowSubscribe: ["general"], allowPublish: ["general", `events.${owner}.>`], lifecycleUid: uid });
+    const exchange = await agentExchange(actor, grant.actorToken, owner);
+    if (exchange.status !== 200 || !exchange.body.token) throw new Error("participant caller exchange refused");
+    const ep = new CotalEndpoint({ space: SPACE, servers: SERVER, bearer: exchange.body.token, sentinelCreds: grant.sentinelCreds,
+      lifecycleUid: uid, channels: [], consume: false, registerPresence: false, watchPresence: false,
+      card: { name: actor, owner, actor, kind: "endpoint" } });
+    ep.on("error", () => {}); await ep.start(); ctlEps.push(ep); return ep;
+  };
+  const participantAccept = async (ep: InstanceType<typeof CotalEndpoint>, args: Record<string, unknown>) => {
+    try {
+      const result = await ep.invokeService("manager", "spawn", args, { deadlineMs: 20_000 });
+      const data = result.reply.data as { eventsNotice?: string } | undefined;
+      return { ok: result.reply.ok, eventsNotice: data?.eventsNotice, error: result.reply.error?.message };
+    } catch (e) { return { ok: false, error: (e as Error).message }; }
+  };
+  const foreignOwner = `u_${"b".repeat(26)}`;
+  const foreignCaller = await participantCaller("eventforeign", foreignOwner, ["spawn"]);
+  const foreignRequired = await participantAccept(foreignCaller, { name: "foreign", agent: "e2e" });
+  check("cell 3: non-admin foreign-owner required plane is refused before provisioning",
+    foreignRequired.ok === false && /cannot be met without the admin tier/.test(foreignRequired.error ?? "")
+    && !existsSync(rowFile("managed", OWNER, "foreign")), { ok: foreignRequired.ok, error: foreignRequired.error });
+  const adminCaller = await participantCaller("eventadmin", OWNER, ["spawn", "admin"]);
+  const adminResult = await adminCaller.invokeService("manager", "spawn", { name: "adminprobe", agent: "e2e", events: true },
+    { deadlineMs: 20_000, follow: true }).catch((e: Error) => ({ reply: { ok: false, error: { message: e.message } } }));
+  const adminRow = existsSync(rowFile("managed", OWNER, "adminprobe"))
+    ? JSON.parse(readFileSync(rowFile("managed", OWNER, "adminprobe"), "utf8")) as { allowPublish?: string[] } : undefined;
+  check("cell 4: admin explicit plane remains served with the own-channel grant",
+    adminResult.reply.ok === true && adminRow?.allowPublish?.includes(eventChannel({ owner: OWNER, actor: "adminprobe" })) === true,
+    { ok: adminResult.reply.ok, error: adminResult.reply.error?.message });
+  (participant as unknown as { eventsRequired: boolean }).eventsRequired = false;
+  // Observe the options entering the real provisioning method, not a stubbed success reply.
+  // A u_-owner foreign caller is refused later by enrollment, so its notice never reaches the wire.
+  const actualStart = participant.startAgent.bind(participant);
+  let downgradeOptions: import("../../manager/src/manager.js").StartAgentOpts | undefined;
+  participant.startAgent = async (opts, ...rest) => { if (opts.name === "downgrade") downgradeOptions = opts; return actualStart(opts, ...rest); };
+  const downgraded = await participantAccept(foreignCaller, { name: "downgrade", agent: "e2e" });
+  check("cell 5: non-owner silent caller keeps disarmed options and downgrade notice before enrollment's owner refusal",
+    downgradeOptions?.events === false && /event plane not armed/.test(downgradeOptions.eventsNotice ?? "")
+    && downgraded.ok === false && /not the spawning owner/.test(downgraded.error ?? ""), downgraded);
+  await participant.stop({ withAgents: true });
+  participant = undefined;
+  // A count, because several cells above only run when the spawn before them succeeded: a regression
+  // that refuses every spawn DELETES them rather than failing them, and the run still prints a
+  // verdict. The focus mode (COTAL_USER_ENDPOINT_CLI_ONLY=1) skips the block between the switch and
+  // its closing brace, so it runs a different total than the full mode.
+  // 121 -> 122: section E's bare spawn is served rather than refused since #2078, so the re-pin
+  // (#2105) reads the child's managed row to prove the plane really is disarmed, not just announced.
+  // 122 -> 124: section O absent-daemon control proves retirement held before delivery returns.
+  // 40/124 -> 42/125: B1g's user-mesh `cotal attach` cell (#2312). Measured with that one cell
+  // added: 43 cells reported before this count check in focus mode, so the focus pin moves by two
+  // (the old 40 was already one short in focus mode; inferred from that run, not run at the base).
+  // 42/125 -> 50/133: B1g's eight #2312 cells (precondition, two controls, five refusals).
+  // 50/133 -> 57/140: seven owner-equal event-plane admission and grant cells.
+  // Main adds three shared-Manager status cells; the redesign adds five focused CLI cells.
+  // These combined expectations still require an actual integrated run.
+  const EXPECTED = endpointCliFocus ? 62 : 148;
+  check(`every cell ran - ${EXPECTED} expected`, cells === EXPECTED + 1, `${cells} cells reported`);
+
+  console.log(`\n${endpointCliFocus ? "USER-ENDPOINT CLI SMOKE" : "USER-SPAWN SMOKE"} ${fail === 0 ? "OK ✅" : "FAILED ❌"}  (${pass} passed, ${fail} failed)`);
+  if (fail) process.exitCode = 1;
+} catch (e) {
+  fail++;
+  console.error("  ✗ scenario threw:", e);
+  // THE SUMMARY BELONGS ON BOTH PATHS. A cell here can red and the cascade behind it throw: the
+  // refusal text that the next lines parse is missing, so the flags they extract are empty and the
+  // real ledger writer refuses them. Printing the verdict only on the success path meant such a run
+  // ended silently, and a reader (or a mutation gate keyed on this line) saw an unfinished run
+  // rather than a failed one.
+  console.log(`\nUSER-SPAWN SMOKE FAILED ❌  (${pass} passed, ${fail} failed)`);
+  process.exitCode = 1;
+} finally {
+  try { await participant?.stop({ withAgents: true }); } catch { /* fixture cleanup */ }
+  try { await deliveryDaemon?.stop(); } catch { /* */ }
+  try { await observer?.stop(); } catch { /* */ }
+  try { await shortEp?.stop(); } catch { /* */ }
+  for (const e of ctlEps) { try { await e.stop(); } catch { /* */ } }
+  if (manager && !managerStopped) await manager.stop({ withAgents: true }).catch(() => {});
+  await killPid(authChild?.pid);
+  broker?.kill("SIGKILL");
+  idpSrv.close();
+  exchangeProxy.close();
+  rmSync(home, { recursive: true, force: true });
+  rmSync(root, { recursive: true, force: true });
+}
+process.exit(process.exitCode ?? 0);

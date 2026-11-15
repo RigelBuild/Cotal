@@ -1,0 +1,241 @@
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  hardenPrivate,
+  registry,
+  writeSecretFile,
+  SpawnRefused,
+  confirmWatch,
+  type AgentHandle,
+  type ConfirmPane,
+  type LaunchSpec,
+  type Runtime,
+  type RuntimeProvider,
+} from "@cotal-ai/core";
+import * as zellij from "./driver.js";
+import { readZellijPlacement, type AgentPlacement } from "./placement.js";
+const CONFIRM_BUDGET_MS = 1_000;
+
+export interface PrivateLauncher {
+  /** Runs the launcher script from `cwd`, so zellij's fallback pane title reads `./<agent>`. */
+  readonly argv: string[];
+  readonly cwd: string;
+  readonly dir: string;
+  readonly payload: string;
+}
+
+function launcherSource(dir: string, payload: string, name: string): string {
+  return `#!${process.execPath}\n` +
+    `const { spawn } = require("node:child_process");\n` +
+    `const { lstatSync, readFileSync, rmSync, writeFileSync } = require("node:fs");\n` +
+    `const dir = ${JSON.stringify(dir)};\n` +
+    `const payload = ${JSON.stringify(payload)};\n` +
+    `const alreadyRun = () => { console.error("[cotal-zellij-launch] this pane's launch has already run; respawn the agent through cotal"); process.exit(1); };\n` +
+    `let dirInfo;\n` +
+    `try { dirInfo = lstatSync(dir); } catch { alreadyRun(); }\n` +
+    `if (!dirInfo.isDirectory() || (typeof process.getuid === "function" && (dirInfo.uid !== process.getuid() || (dirInfo.mode & 0o077) !== 0))) alreadyRun();\n` +
+    `let launch;\n` +
+    `try { launch = JSON.parse(readFileSync(payload, "utf8")); } catch (error) {\n` +
+    `  try { rmSync(payload, { force: true }); } catch {}\n` +
+    `  if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") alreadyRun();\n` +
+    `  throw error;\n` +
+    `}\n` +
+    `rmSync(payload, { force: true });\n` +
+    `writeFileSync(dir + "/pid", String(process.pid));\n` +
+    `process.stdout.write("\\x1b]0;" + ${JSON.stringify(name.replace(/[\x00-\x1f\x7f-\x9f]/g, ""))} + "\\x07");\n` +
+    `process.chdir(launch.cwd);\n` +
+    `const child = spawn(launch.command, launch.args, { env: launch.env, stdio: "inherit" });\n` +
+    `let exiting = false;\n` +
+    `const forward = (signal) => { if (!exiting && child.pid) child.kill(signal); };\n` +
+    `process.on("SIGINT", () => forward("SIGINT"));\n` +
+    `process.on("SIGTERM", () => forward("SIGTERM"));\n` +
+    `child.on("error", (err) => { console.error("[cotal-zellij-launch] " + launch.command + ": " + err.message); process.exit(127); });\n` +
+    `child.on("exit", (code, signal) => { exiting = true; try { writeFileSync(dir + "/exit", signal ?? String(code ?? 0)); } catch {} if (signal) process.exit(128); process.exit(code ?? 0); });\n`;
+}
+
+export function privateLauncher(spec: LaunchSpec, cwd: string, name: string): PrivateLauncher {
+  const dir = mkdtempSync(join(tmpdir(), "cotal-zellij-launch-"));
+  hardenPrivate(dir, "dir");
+  // A space keeps the payload name out of the sanitized script-name space.
+  const payload = join(dir, "launch payload.json");
+  writeSecretFile(payload, JSON.stringify({ cwd, command: spec.command, args: spec.args, env: spec.env ?? {} }));
+  // Named after the agent for the pane title; it outlives the payload so a rerun reaches the "already run" message.
+  const file = name.replace(/[^A-Za-z0-9_.-]/g, "_") || "agent";
+  const script = join(dir, file);
+  writeFileSync(script, launcherSource(dir, payload, name), { mode: 0o700 });
+  chmodSync(script, 0o700);
+  const argv = process.platform === "win32" ? [process.execPath, script] : [`./${file}`];
+  return { argv, cwd: dir, dir, payload };
+}
+
+/** Seat liveness from the launcher's own files, with no zellij call: polling list-panes per seat loads the server. */
+export function launcherState(dir: string): "running" | "exited" {
+  if (existsSync(join(dir, "exit"))) return "exited";
+  let pid: number;
+  try {
+    pid = Number(readFileSync(join(dir, "pid"), "utf8"));
+  } catch {
+    // No pid yet means the pane has not started the launcher; a missing dir means the seat was stopped.
+    return existsSync(dir) ? "running" : "exited";
+  }
+  try {
+    process.kill(pid, 0);
+    return "running";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM" ? "running" : "exited";
+  }
+}
+
+export async function waitForLauncherExit(dir: string, pollMs = 1_000): Promise<void> {
+  while (launcherState(dir) === "running") await new Promise<void>((resolve) => setTimeout(resolve, pollMs));
+}
+
+function cleanupLauncher(launcher: PrivateLauncher): void {
+  try {
+    rmSync(launcher.dir, { recursive: true, force: true });
+  } catch {
+    /* the launcher removes its private payload before starting the child */
+  }
+}
+
+const shellQuote = (arg: string): string => `'${arg.replace(/'/g, `'\\''`)}'`;
+
+/** zellij ignores `--cwd` for shell panes, so the typed line changes directory itself. */
+export function launchLine(launcher: PrivateLauncher): string {
+  return `cd ${shellQuote(launcher.cwd)} && exec ${launcher.argv.map(shellQuote).join(" ")}`;
+}
+
+function paneForTab(session: string, tabId: number): string {
+  const pane = zellij.listPanes(session).find((candidate) => candidate.tab_id === tabId && !candidate.is_plugin);
+  if (!pane) throw new Error(`zellij runtime: no terminal pane found in tab ${tabId}`);
+  return pane.id;
+}
+
+/** The zellij handle: the shared AgentHandle, plus the startup confirm's outcome. The outcome is
+ * undefined until the watch settles, so a caller waits on that event rather than on a timer. */
+export interface ZellijAgentHandle extends AgentHandle {
+  confirmOutcome(): string | undefined;
+}
+
+export class ZellijRuntime implements Runtime {
+  readonly kind = "zellij" as const;
+  readonly streamsTerminal = false;
+
+  constructor(
+    private readonly session: string,
+    // False when the server that owns the session must not gain one from Cotal; spawn then refuses instead.
+    private readonly createSession: boolean = true,
+  ) {}
+
+  spawn(name: string, spec: LaunchSpec, cwd: string): ZellijAgentHandle {
+    if (!/^[A-Za-z0-9_.-]+$/.test(name))
+      throw new SpawnRefused(`zellij runtime: unsafe agent name ${JSON.stringify(name)} (allowed: letters, digits, _ . -)`);
+    if (!zellij.available()) throw new SpawnRefused("zellij runtime: zellij is not available — is it installed and on PATH?");
+    let watch: ((pane: ConfirmPane) => void) | undefined;
+    try {
+      if (spec.confirmBefore?.length && spec.confirm === undefined) throw new Error("startup choices require a final confirmation prompt");
+      watch = spec.confirm === undefined ? undefined : confirmWatch(spec.confirm, spec.confirmBefore);
+    } catch (error) {
+      throw new SpawnRefused(error instanceof Error ? error.message : String(error));
+    }
+
+    const placement = readZellijPlacement(spec.env?.COTAL_AGENT_FILE);
+    if (this.createSession) zellij.ensureSession(this.session);
+    else if (!zellij.sessionExists(this.session))
+      throw new SpawnRefused(`zellij runtime: session ${JSON.stringify(this.session)} is not running and COTAL_ZELLIJ_NO_CREATE_SESSION=1 forbids creating it`);
+    let paneId: string | undefined;
+    let createdTabId: string | undefined;
+    const targetTabName = placement?.tab ?? name;
+    const tabsBefore = zellij.listTabs(this.session);
+    const existingTab = placement?.tab
+      ? tabsBefore.find((candidate) => candidate.name === placement.tab)
+      : undefined;
+    // Created last: every later failure path deletes it, and it holds the connector's secrets.
+    const launcher = privateLauncher(spec, cwd, name);
+    try {
+      if (!placement?.tab || !existingTab) {
+        createdTabId = zellij.createTab(this.session, targetTabName, launcher.cwd, launcher.argv);
+        paneId = paneForTab(this.session, Number(createdTabId));
+      } else {
+        paneId = zellij.createPane(
+          this.session,
+          String(existingTab.tab_id),
+          launcher.cwd,
+          launchLine(launcher),
+          placement,
+        );
+      }
+    } catch (error) {
+      try {
+        if (paneId) zellij.closePane(this.session, paneId);
+        else {
+          const partialTabId = createdTabId ?? zellij.listTabs(this.session)
+            .find((candidate) => candidate.name === targetTabName && !tabsBefore.some((previous) => previous.tab_id === candidate.tab_id))
+            ?.tab_id.toString();
+          if (partialTabId) zellij.closeTab(this.session, partialTabId);
+        }
+      } catch {
+        /* best-effort teardown of a partially created agent */
+      }
+      cleanupLauncher(launcher);
+      throw error;
+    }
+
+    const startedPane = paneId;
+    // The watch reports how it ended through `settled`. The handle exposes that outcome, so a caller
+    // waits on the event itself rather than on a timer.
+    let settledOutcome: string | undefined;
+    watch?.({
+      read: () => zellij.dumpScreen(this.session, startedPane, Date.now() + CONFIRM_BUDGET_MS),
+      enter: () => zellij.writePane(this.session, startedPane, "13", Date.now() + CONFIRM_BUDGET_MS),
+      down: () => zellij.writeKeyDown(this.session, startedPane, Date.now() + CONFIRM_BUDGET_MS),
+      fail: (message) => {
+        console.error(`zellij runtime: "${name}": ${message}`);
+        try {
+          zellij.closePane(this.session, startedPane, Date.now() + CONFIRM_BUDGET_MS);
+        } catch (error) {
+          console.error(`zellij runtime: failed to close pane for "${name}":`, error);
+        }
+        cleanupLauncher(launcher);
+      },
+      settled: (outcome) => { settledOutcome = outcome; },
+    });
+
+    return {
+      name,
+      kind: "zellij",
+      status: () => launcherState(launcher.dir),
+      stop: () => {
+        try {
+          zellij.closePane(this.session, startedPane);
+        } finally {
+          cleanupLauncher(launcher);
+        }
+      },
+      interrupt: () => zellij.interruptPane(this.session, startedPane),
+      confirmOutcome: () => settledOutcome,
+      waitForExit: () => waitForLauncherExit(launcher.dir),
+      attach: () => {
+        throw new Error(`zellij runtime: attach natively with zellij attach ${this.session}`);
+      },
+    };
+  }
+}
+
+export const zellijRuntimeProvider: RuntimeProvider = {
+  kind: "runtime",
+  name: "zellij",
+  available: () => zellij.available(),
+  create: ({ session }) => {
+    const target = process.env.COTAL_ZELLIJ_SESSION ?? session;
+    // Fails closed: any value except empty, "0", or "false" turns the mode on, so a typo never re-enables creation.
+    const noCreateRaw = process.env.COTAL_ZELLIJ_NO_CREATE_SESSION?.trim().toLowerCase() ?? "";
+    // Cotal must not create the session in this mode: the server that owns it is started by someone else.
+    if (noCreateRaw !== "" && noCreateRaw !== "0" && noCreateRaw !== "false") return new ZellijRuntime(target, false);
+    zellij.ensureSession(target);
+    return new ZellijRuntime(target);
+  },
+};
+
+registry.register(zellijRuntimeProvider);

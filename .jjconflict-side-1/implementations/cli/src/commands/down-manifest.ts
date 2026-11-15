@@ -1,0 +1,411 @@
+/**
+ * `cotal down -f cotal.yaml` — ownership-scoped teardown of a `spawn -f` deploy: stop + remove ONLY
+ * the agents/channels that run created, never foreign actors on the shared mesh. The ledger is
+ * treated as untrusted input and the WHOLE of it is validated + every path resolved up front, before
+ * any destructive action (fail closed). Local-only: works from the same checkout/host that created
+ * the run (the ledger is local state).
+ *
+ * Safety invariants (security/critic/UX early-PR2 review):
+ *  - find the ledger by manifest hash; an edited file / >1 match FAILS with `--run`, never guesses;
+ *  - stop an owned agent only when the live agent matches the recorded name AND nkey id — a name
+ *    match with a different id is left alone (foreign reuse), never stopped by name;
+ *  - cred paths are DERIVED from the auth root (never read from the ledger) and deleted no-follow;
+ *  - a ledger-owned channel card is removed only when no members remain and membership is knowable —
+ *    skipped (best-effort, racy) on ANY uncertainty, including an owned agent that failed to stop;
+ *  - `--allow-stale` is apply-only and has no effect here.
+ */
+import { lstatSync, rmSync } from "node:fs";
+import { join, resolve } from "node:path";
+import {
+  DEV_OWNER,
+  deleteChannels,
+  isReachable,
+  mintCreds,
+  mintLifecycleUid,
+  newIdentity,
+  parsePrincipalKey,
+  realDirNoSymlink,
+  resolveAuthProvider,
+  subjectMatches,
+  durableCovers,
+  unlinkFileNoFollow,
+  type EpCaller,
+} from "@cotal-ai/core";
+import { agentLifecycleSecretFilePaths, agentSecretFilePaths, agentSecretKeyForFile, connectTargetOrThrow, getSpaceAuth, isCommandFailure, resolveMeshTarget, userAuthStateDir, userViewAuth, workspaceSecretStore } from "@cotal-ai/workspace";
+import { c, stderrLine } from "../ui.js";
+import { cotalRoot } from "../lib/paths.js";
+import { connectProbe } from "../lib/manifest/live.js";
+import { readManifestSource } from "../lib/manifest/index.js";
+import { findLedgerByHash, findLedgerByRun, hashManifestSource, ownedCredPath, writeLedger, type MeshLedger } from "../lib/manifest/ledger.js";
+
+export interface DownManifestFlags {
+  run?: string;
+  dryRun?: boolean;
+}
+
+export async function downManifest(file: string, flags: DownManifestFlags): Promise<void> {
+  const abs = resolve(file);
+  const root = cotalRoot();
+
+  // 1) Resolve the ledger — fail, never guess (edited file / ambiguous → require --run).
+  let ledgerPath: string;
+  let ledger: MeshLedger;
+  try {
+    const found = flags.run ? findLedgerByRun(root, flags.run) : findLedgerByHash(root, hashManifestSource(readManifestSource(abs)));
+    ledgerPath = found.path;
+    ledger = found.ledger; // loadLedger already validated the WHOLE ledger as untrusted input
+  } catch (e) {
+    stderrLine("✗ ", `${(e as Error).message}`, c.red);
+    if (isCommandFailure(e) && e.remedy) stderrLine("  ↳ ", e.remedy, c.dim, e.remedyIsCommand);
+    process.exit(1);
+  }
+
+  // 2) Show exactly what is being torn down BEFORE deleting anything.
+  console.log(c.bold(`Tear down run ${ledger.runId}`));
+  console.log(c.dim(`  ledger:   ${ledgerPath}`));
+  console.log(c.dim(`  manifest: ${ledger.manifestPath} · hash ${ledger.manifestHash}`));
+  console.log(c.dim(`  mesh:     ${ledger.space} @ ${ledger.server}`));
+  console.log(c.dim(`  owns:     ${ledger.created.agents.length} agent(s), ${ledger.created.channels.length} channel(s)`));
+
+  // 3) Resolve every owned path from validated IDs up front — a bad name fails the WHOLE teardown
+  //    before any side effect (no partial "validated the one I'm deleting" flow).
+  let credPaths: Array<{ requested: string; name: string; id: string; path: string; lifecycleUid?: string }>;
+  let runDir: string | null;
+  let specPath: string;
+  try {
+    credPaths = ledger.created.agents.map((a) => ({ requested: a.requested, name: a.name, id: a.id, path: ownedCredPath(root, ledger.space, a.name, a.lifecycleUid), lifecycleUid: a.lifecycleUid }));
+    const runParent = realDirNoSymlink(root, ".cotal", "run"); // refuse a symlinked .cotal/run before deriving under it
+    runDir = realDirNoSymlink(root, ".cotal", "run", ledger.runId);
+    specPath = join(runParent ?? join(root, ".cotal", "run"), `${ledger.runId}.json`);
+  } catch (e) {
+    stderrLine("✗ ", `refusing teardown - unsafe owned resource: ${(e as Error).message}`, c.red);
+    process.exit(1);
+  }
+
+  if (flags.dryRun) {
+    console.log(c.bold("\nWould remove (dry run):"));
+    for (const a of credPaths) console.log(`  ${c.red("-")} agent ${a.name} ${c.dim(`(id ${a.id.slice(0, 8)}, creds ${a.path}) - stopped only if name+id match live`)}`);
+    for (const ch of ledger.created.channels) console.log(`  ${c.red("-")} channel ${c.cyan("#" + ch)} ${c.dim("(auth mesh: only if no members remain · open mesh: metadata cleanup, no membership audit)")}`);
+    console.log(`  ${c.red("-")} run dir ${runDir ?? "(none)"} + ledger ${ledgerPath} ${c.dim("(only if every owned resource is removed/proven gone; else the ledger is kept)")}`);
+    console.log(c.dim("\nDry run - nothing was changed. The live membership check + actual disposition happen at apply."));
+    return;
+  }
+
+  // 4) Best-effort live teardown: stop owned agents (name AND id match) + remove childless owned
+  //    channels. If the broker is down, nothing remote is torn down and the ledger is RETAINED.
+  const stoppedIds = new Set<string>();
+  const removed: string[] = [];
+  const openNoFeed: string[] = []; // owned channels removed on an open mesh with no membership proof
+  const skipped: Array<{ channel: string; why: string }> = [];
+  const reachable = await isReachable(ledger.server);
+  let liveById = new Map<string, { name: string; id: string; lifecycleUid?: string }>();
+  // controlOk: we completed the live ps/stop/channel pass. A control-plane error (no manager
+  // responder, a thrown ps/stop/membership/delete) is teardown UNCERTAINTY, not a crash — we catch
+  // it, mark everything unresolved below, and fall through to ledger retention (engineer/security/ux).
+  let controlOk = false;
+  if (reachable) {
+    try {
+      // A static caller on a user mesh sees an owner-filtered ps, not proof of absence.
+      const target = resolveMeshTarget(root, { space: ledger.space, server: ledger.server, readOnly: true });
+      if (resolve(target.root) !== resolve(root) || target.server !== ledger.server)
+        throw new Error("run teardown from the checkout and broker recorded by this ledger");
+      if (target.mode === "auth" && !target.auth)
+        throw new Error("the recorded static-auth mesh has no local trust material; refusing bare teardown");
+      const connection = target.mode === "user" ? await connectTargetOrThrow(target, "teardown") : undefined;
+      const user = connection ? await userViewAuth(connection, "admin") : undefined;
+      if (user && ledger.created.agents.some((a) => parsePrincipalKey(a.id)?.owner !== user.owner))
+        throw new Error("this user-mode ledger contains another owner's agents; refusing an owner-scoped absence check");
+      const teardownAuth = target.mode === "auth" ? await mintIfAuth(root, ledger.space) : undefined;
+      const creds = teardownAuth?.creds;
+      const ep = await connectProbe({ space: ledger.space, server: ledger.server, creds,
+        lifecycleUid: connection?.epCaller?.uid ?? teardownAuth?.epCaller.uid,
+        ...(connection && user ? { user: { source: async () => connection.bearer!, sentinelCreds: connection.sentinelCreds!, owner: user.owner, actor: user.actor } } : {}),
+        tls: target.tlsRequired,
+      });
+      let membershipProbe: Awaited<ReturnType<typeof connectProbe>> | undefined;
+      try {
+        // v0.4 ep rails (1c.2c): `ps` over the generic invoke path, then per-agent any-mode despawn.
+        const psR = await ep.invokeService("manager", "ps", undefined, { deadlineMs: 8_000 });
+        // A FAILED ps reply is teardown uncertainty too — not a trustworthy empty roster. Throw so it
+        // joins the no-responder/thrown path → controlOk stays false → partial retention (review-ux).
+        if (psR.reply.ok !== true) throw new Error(psR.reply.error.message);
+        const live = ((psR.reply.data as Array<{ name: string; id: string; lifecycleUid: string }>) ?? []);
+        liveById = new Map(live.map((r) => [r.id, r]));
+        for (const a of ledger.created.agents) {
+          const l = liveById.get(a.id);
+          if (!l) {
+            const sameName = live.find((r) => r.name === a.name);
+            if (sameName) console.log(c.yellow(`  ~ ${a.name}: a different agent (id ${sameName.id.slice(0, 8)}) holds this name - NOT ours, left running`));
+            else console.log(c.dim(`  • ${a.name}: not running`));
+            continue;
+          }
+          // any-mode despawn: teardown stops agents it did not spawn (the admin instrument's
+          // operator reach); the target is the agent's CURRENT principal triple (from the ps row).
+          if (!l.lifecycleUid) { console.log(c.yellow(`  ! ${l.name}: stop skipped - no lifecycle uid in the ps row (a pre-1c manager)`)); continue; }
+          const [tOwner, tActor] = l.id.indexOf(".") > 0 ? [l.id.slice(0, l.id.indexOf(".")), l.id.slice(l.id.indexOf(".") + 1)] : [DEV_OWNER, l.id];
+          const stopR = await ep.invokeService("manager", "despawn", undefined, {
+            target: { mode: "any", owner: tOwner, actor: tActor, lifecycleUid: l.lifecycleUid },
+            deadlineMs: 8_000,
+          });
+          if (stopR.reply.ok === true) {
+            stoppedIds.add(a.id);
+            console.log(c.green(`  ✓ stopped ${l.name}`));
+          } else {
+            console.log(c.yellow(`  ! ${l.name}: stop failed - ${stopR.reply.error.message}`));
+          }
+        }
+        // Channel removal: skip on ANY uncertainty (best-effort, racy — said so in output). The
+        // fail-closed "skip when membership is unobservable" rule protects ACL isolation, which exists
+        // only on an AUTH mesh; an open mesh has no isolation and no membership feed by design, so an
+        // owned card is removable there (otherwise `down -f` could never clean an open dev mesh).
+        const openMesh = target.mode === "open";
+        const stopFailed = ledger.created.agents.some((a) => liveById.has(a.id) && !stoppedIds.has(a.id));
+        let membershipFailure: string | undefined;
+        const snapshot = await (async () => {
+          try {
+            // The base bearer carries control, not the silent-reader census. Read through
+            // the existing admin view, issued against the current user's grant.
+            if (user) membershipProbe = await connectProbe({ space: ledger.space, server: ledger.server,
+              lifecycleUid: user.lifecycleUid, user, tls: target.tlsRequired });
+            return await (membershipProbe ?? ep).readMembership();
+          } catch (error) {
+            membershipFailure = error instanceof Error ? error.message : String(error);
+            return null;
+          }
+        })();
+        const ownedIds = new Set(ledger.created.agents.map((a) => a.id));
+        const toRemove: string[] = [];
+        for (const ch of ledger.created.channels) {
+          if (stopFailed) {
+            skipped.push({ channel: ch, why: "an owned agent failed to stop" });
+            continue;
+          }
+          if (snapshot) {
+            const others = snapshot.members.filter(
+              (m) => !ownedIds.has(m.id) && (durableCovers(m.durable, ch) || m.live.some((p) => subjectMatches(p, ch))),
+            );
+            if (others.length) {
+              skipped.push({ channel: ch, why: `members present (${others.length})` });
+              continue;
+            }
+          } else if (!openMesh) {
+            skipped.push({ channel: ch, why: `membership unknown on an auth mesh: ${membershipFailure ?? "no membership snapshot"}` });
+            continue;
+          } else {
+            openNoFeed.push(ch); // open mesh, no feed: removable (no isolation), but no membership proof
+          }
+          toRemove.push(ch);
+        }
+        if (toRemove.length) {
+          const writer = connection ? await userViewAuth(connection, "channel-writer") : undefined;
+          await deleteChannels({ servers: ledger.server, space: ledger.space,
+            ...(writer ? { bearer: writer.bearer, sentinelCreds: writer.sentinelCreds } : { creds }), channels: toRemove });
+          removed.push(...toRemove);
+        }
+        controlOk = true; // got all the way through — the live pass is trustworthy
+      } finally {
+        try { await membershipProbe?.stop(); }
+        finally { await ep.stop(); }
+      }
+    } catch (e) {
+      console.log(c.yellow(`  ! ${ledger.server}: control plane incomplete (${(e as Error).message}) - unresolved resources are RETAINED for a later \`down -f --run ${ledger.runId}\``));
+    }
+  } else {
+    console.log(c.yellow(`  ! ${ledger.server} unreachable - can't stop processes or remove channels; the ledger is RETAINED for a later \`down -f --run ${ledger.runId}\``));
+  }
+
+  // 5) Remote resolution: which owned REMOTE resources are NOT proven handled. An agent is unresolved
+  //    if the broker was unreachable, or it's still live under our recorded id and its stop failed (an
+  //    id we don't see live is gone; a same-name/different-id agent is foreign, not ours). A channel
+  //    is unresolved if it wasn't removed.
+  // An agent is resolved only when we explicitly stopped it, OR the control pass was trustworthy and
+  // its id isn't live (gone). If the broker was unreachable or the control plane failed, only the
+  // agents we actually stopped are resolved — everything else is assumed maybe-running (safe).
+  const controlReliable = reachable && controlOk;
+  const removedSet = new Set(removed);
+  const unresolvedAgents = ledger.created.agents.filter((a) => !stoppedIds.has(a.id) && (!controlReliable || liveById.has(a.id)));
+  const unresolvedChannels = ledger.created.channels.filter((ch) => !removedSet.has(ch));
+  const unresolvedIds = new Set(unresolvedAgents.map((a) => a.id));
+
+  // 6) Local cred cleanup of RESOLVED agents. A cred is deleted only after its own nkey id matches the
+  //    recorded id. The dispositions, narrowed by review-fact so retention can't strand the ledger:
+  //    - no file (undefined) → proven absent, resolved;
+  //    - sub !== id → a foreign/overwritten cred (OUR cred is already gone) — left in place, reported,
+  //      NOT retained (retaining would re-trigger every retry → a permanently un-downable ledger);
+  //    - unverifiable (null: symlink/corrupt) → left in place, reported, NOT retained (same trap; a
+  //      symlink isn't a cred we wrote) — surfaced loudly so a genuine stale cred isn't silent;
+  //    - id matches but the DELETE THROWS → OUR cred, a recoverable store/FS error → retained so a
+  //      retry finishes.
+  const unresolvedCredIds = new Set<string>();
+  const secrets = workspaceSecretStore(root);
+  for (const cp of credPaths) {
+    if (unresolvedIds.has(cp.id)) continue; // remote-unresolved agent keeps its cred (still in use / retry)
+    // Which plane provisioned this agent? The ledgered id says: a user-mode launch records the
+    // owner+actor PRINCIPAL key, a static launch the bare nkey id. A user-mode agent's standing
+    // authority is <name>.actor-token + <name>.sentinel.creds + its provider grant row — never
+    // <name>.creds — so the static-only sweep below would read it as "proven absent" and let the
+    // ledger die with the mint authority standing (the crashed-manager residual).
+    const principal = parsePrincipalKey(cp.id);
+    if (principal && principal.owner.startsWith("u_") && principal.actor === cp.name) {
+      await teardownUserModeAuthority(root, ledger.space, cp, principal.owner, secrets, liveById, unresolvedCredIds);
+      continue;
+    }
+    // The no-follow lstat gate below keeps guarding the FS MATERIALIZATION (a symlink is tamper
+    // evidence, not a cred we wrote); the VALUE the id check runs on comes through the seam — the
+    // source of truth (byte-identical under the local FS composition), as does the delete.
+    const gate = credMaterializationGate(cp.path);
+    if (gate === "absent") continue; // no cred file — proven absent
+    const raw = gate === "ok" ? await secrets.get(agentSecretKeyForFile(cp.path, ledger.space)) : undefined;
+    const sub = gate === "suspect" || raw === undefined ? null : credSubject(raw);
+    if (sub === null) {
+      console.error(c.yellow(`  ! ${cp.name} creds: unreadable/unverifiable - left in place (resolve by hand if it's a stale cred)`));
+      continue;
+    }
+    if (sub !== cp.id) {
+      console.error(c.yellow(`  ~ ${cp.name} creds belong to a different agent (id ${sub.slice(0, 8)} ≠ ${cp.id.slice(0, 8)}) - ours is gone, left in place`));
+      continue;
+    }
+    try {
+      await secrets.delete(agentSecretKeyForFile(cp.path, ledger.space));
+      unlinkFileNoFollow(cp.path); // clear the materialization (locally the delete above WAS it)
+      console.log(c.dim(`  • removed creds for ${cp.name}`));
+    } catch (e) {
+      console.error(c.yellow(`  ! ${cp.name} creds: ${(e as Error).message} - retained for retry`));
+      unresolvedCredIds.add(cp.id); // OUR id-verified cred, delete failed (recoverable) → keep the record
+    }
+  }
+
+  // 7) Disposition. The ledger is deleted only when EVERY owned resource — remote agents, channels,
+  //    AND our own credential files — is removed or proven gone; otherwise it's rewritten DOWN to the
+  //    unresolved set (atomic temp-then-rename) so a later `down -f --run` finishes. Never erase the
+  //    only ownership record while anything owned may remain (critic/security/engineer/ux PR2 gate).
+  const retainIds = new Set([...unresolvedIds, ...unresolvedCredIds]);
+  const complete = retainIds.size === 0 && unresolvedChannels.length === 0;
+
+  for (const s of skipped) console.log(c.yellow(`  ~ left ${c.cyan("#" + s.channel)}: ${s.why}`) + c.dim(" (best-effort membership check - racy)"));
+  if (openNoFeed.length)
+    console.log(c.dim(`  note: removed ${openNoFeed.length} channel(s) on an OPEN mesh with no membership feed - no ACL isolation to protect, no membership proof: ${openNoFeed.map((n) => "#" + n).join(", ")}`));
+
+  if (complete) {
+    // Everything owned is removed/proven gone — safe to delete the run dir + launch spec + ledger.
+    try {
+      unlinkFileNoFollow(specPath);
+    } catch (e) {
+      console.error(c.yellow(`  ! launch spec: ${(e as Error).message}`));
+    }
+    if (runDir) rmSync(runDir, { recursive: true, force: true });
+    try {
+      unlinkFileNoFollow(ledgerPath);
+    } catch (e) {
+      console.error(c.yellow(`  ! ledger: ${(e as Error).message}`));
+    }
+    console.log(c.green(`✓ torn down run ${ledger.runId}`) + (removed.length ? c.dim(` - removed ${removed.length} channel(s): ${removed.map((n) => "#" + n).join(", ")}`) : ""));
+  } else {
+    // Partial: rewrite the ledger DOWN to the unresolved resources so a later `down -f --run` finishes.
+    const remainAgents = ledger.created.agents.filter((a) => retainIds.has(a.id));
+    const remaining: MeshLedger = { ...ledger, created: { channels: unresolvedChannels, agents: remainAgents } };
+    writeLedger(root, remaining, { update: true });
+    console.log(
+      c.yellow(`! partial teardown of run ${ledger.runId}`) +
+        c.dim(` - ${remainAgents.length} agent(s) + ${unresolvedChannels.length} channel(s) still owned; ledger kept`),
+    );
+    if (unresolvedCredIds.size) console.log(c.dim(`  local credential cleanup incomplete for ${unresolvedCredIds.size} agent(s) - ledger kept for retry`));
+    console.log(c.dim(`  finish later (broker up / members gone): \`cotal down -f ${ledger.manifestPath} --run ${ledger.runId}\``));
+    process.exitCode = 1; // not a full success
+  }
+}
+
+/** The user-mode half of local authority cleanup for one RESOLVED ledger entry: revoke OUR grant
+ *  row first (owner+actor-keyed, so it can only ever touch this ledger's principal — standing MINT
+ *  authority even when the secret files are gone, e.g. a manager that crashed mid-deprovision),
+ *  then delete the actor-token + sentinel pair through the seam. The static branch's `sub !== id`
+ *  protection has no content analog here (the token is an opaque secret, the sentinel is
+ *  per-space), so the reuse guard is the LIVE roster: a different id holding this name means the
+ *  name-keyed files are the successor's materialization — left in place (a same-owner successor
+ *  shares OUR principal id and is caught upstream as unresolved-live). Any failure retains the
+ *  ledger row for a retry, like the static delete path; a user-mode entry with NO registered auth
+ *  provider is a broken composition and fails into retention, never a silent skip. */
+async function teardownUserModeAuthority(
+  root: string,
+  space: string,
+  cp: { requested: string; name: string; id: string; path: string; lifecycleUid?: string },
+  owner: string,
+  secrets: ReturnType<typeof workspaceSecretStore>,
+  liveById: Map<string, { name: string; id: string; lifecycleUid?: string }>,
+  unresolvedCredIds: Set<string>,
+): Promise<void> {
+  // A uid-carrying ledger row maps to the lifecycle-keyed family its spawn materialized; a
+  // pre-split row to the legacy name-keyed layout.
+  const files = cp.lifecycleUid
+    ? agentLifecycleSecretFilePaths(root, space, cp.name, cp.lifecycleUid)
+    : agentSecretFilePaths(root, space, cp.name);
+  const tokenGate = credMaterializationGate(files.actorToken);
+  const sentinelGate = credMaterializationGate(files.sentinelCreds);
+  try {
+    // Revoke FIRST and unconditionally for a resolved entry — the grant row is standing MINT
+    // authority keyed to OUR owner+actor, independent of whatever is (or isn't) on disk. A
+    // suspect materialization must never shield the row: completion may only ever delete the
+    // ledger once no standing authority remains (the round-2 panel gate).
+    await resolveAuthProvider().revokeAgent({ dir: userAuthStateDir(root, space), owner, actor: cp.name });
+    if (tokenGate === "suspect" || sentinelGate === "suspect") {
+      // Tamper evidence (symlink/irregular/unstatable): the files stay for the operator, and —
+      // deliberately — the entry is NOT retained (retaining would re-trigger every retry, the
+      // permanently-undownable-ledger trap the static dispositions narrowed). With the row
+      // revoked, nothing standing survives the ledger's deletion.
+      console.error(c.yellow(`  ! ${cp.name} user-mode secrets: unreadable/unverifiable - files left in place (resolve by hand); the grant row IS revoked, no standing authority remains`));
+      return;
+    }
+    const foreign = [...liveById.values()].some((r) => r.name === cp.name && r.id !== cp.id);
+    if (foreign) {
+      console.log(c.yellow(`  ~ ${cp.name}: a different live agent holds this name - its secret files are left in place (our grant row is revoked)`));
+    } else if (tokenGate === "ok" || sentinelGate === "ok") {
+      await secrets.delete(agentSecretKeyForFile(files.actorToken, space));
+      await secrets.delete(agentSecretKeyForFile(files.sentinelCreds, space));
+      unlinkFileNoFollow(files.actorToken); // the materializations (locally the deletes above WERE them)
+      unlinkFileNoFollow(files.sentinelCreds);
+      rmSync(files.health, { force: true });
+      console.log(c.dim(`  • removed user-mode authority for ${cp.name} (grant row + token + sentinel)`));
+    } else {
+      console.log(c.dim(`  • ${cp.name}: user-mode secrets already gone; grant row revoked`));
+    }
+  } catch (e) {
+    console.error(c.yellow(`  ! ${cp.name} user-mode teardown: ${(e as Error).message} - retained for retry`));
+    unresolvedCredIds.add(cp.id);
+  }
+}
+
+/** No-follow gate over a cred's FS materialization: "absent" (proven gone), "suspect" (symlink /
+ *  irregular / unstattable — tamper evidence, never something we wrote), or "ok". */
+function credMaterializationGate(path: string): "absent" | "suspect" | "ok" {
+  try {
+    const st = lstatSync(path);
+    return st.isSymbolicLink() || !st.isFile() ? "suspect" : "ok";
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "suspect";
+  }
+}
+
+/** The nkey subject of a creds VALUE (its user JWT's `sub`), or null if unparseable. */
+function credSubject(raw: string): string | null {
+  const jwt = raw.split("\n").find((l) => l && !l.startsWith("-") && l.split(".").length === 3);
+  if (!jwt) return null;
+  try {
+    const claims = JSON.parse(Buffer.from(jwt.split(".")[1], "base64url").toString("utf8")) as { sub?: unknown };
+    return typeof claims.sub === "string" ? claims.sub : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Mint a scoped `teardown` cred for the ledger's space from the local trust material, or undefined for
+ *  an open mesh / mismatched checkout (then we connect bare and do local cleanup). `teardown` is the SOLE
+ *  cred that keeps `STREAM.DELETE` (deleteSpace + clearChannel) — no read, no forge, no other stream. */
+async function mintIfAuth(root: string, space: string): Promise<{ creds: string; epCaller: EpCaller } | undefined> {
+  const auth = await getSpaceAuth(workspaceSecretStore(root), space);
+  if (!auth || auth.space !== space) return undefined;
+  // The teardown instrument's ep rows are lifecycle-keyed (1c.2c): mint a fresh uid and return the
+  // caller triple so the ps/despawn calls ride the v0.4 rails.
+  const identity = newIdentity();
+  const uid = mintLifecycleUid();
+  return { creds: await mintCreds(auth, identity, "teardown", { lifecycleUid: uid }), epCaller: { owner: DEV_OWNER, actor: identity.id, uid } };
+}

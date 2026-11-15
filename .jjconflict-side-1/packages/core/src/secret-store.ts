@@ -1,0 +1,221 @@
+/**
+ * The abstract seam for persisting secret material.
+ *
+ * Core owns ONLY this tiny value-store contract. The default filesystem adapter (`FsSecretStore`)
+ * lives in `@cotal-ai/workspace` because on-disk layout is a workstation concern, not the wire
+ * protocol. A closed hosted composition injects its own KMS/Vault-backed implementation at its
+ * composition root; nothing here knows it is being hosted.
+ *
+ * SCOPE — what routes through a `SecretStore`. Only DURABLE HOSTED SECRET BLOBS: the full persisted
+ * space trust bundle (operator + account seeds and the account signing seed; only the system-account
+ * seed is stripped before disk), the auth service's callout / issuer / owner-secret / service-key
+ * material, agent standing creds, and any daemon standing credential the hosted composition persists
+ * (renewable ones — delivery / membership-rw — are read via `get` on each refresh, never a one-shot
+ * snapshot; rotation-renewed observer / evictor creds are read at start or per use).
+ * Machine-local, transient, or non-secret artifacts are NOT `SecretStore` material and remain the
+ * local filesystem owner's responsibility: the mesh registry,
+ * the transient MCP config, launcher scripts, personas, auth-service discovery (pid/port), the IdP
+ * pin, `membership.json`, the login cache, and the actor ledger (authorization DB state, not an
+ * exportable blob). Every
+ * durable secret that routes through here must be READ through `get` too, or a hosted `put` is a
+ * silent no-op while a raw `readFileSync` stays authoritative.
+ *
+ * KEYS are OPAQUE logical strings built by the owning package. Core assigns them no taxonomy: a
+ * KMS key-id / policy / HSM-slot mapping is the closed adapter's concern. Typing the key could not
+ * enforce "signing-seed never leaves the HSM" anyway, because {@link SecretStore.get} necessarily
+ * exports the value; non-exportable signing, if ever needed, is a separate capability seam
+ * (sign / mint), not a richer key here. v1 accepts that signing material DOES enter process memory
+ * (e.g. `mintCreds`).
+ */
+export interface SecretStore {
+  /** Stable, non-secret identity of the authority this adapter reads and writes. A first-party
+   *  filesystem adapter declares this intrinsically. A hosted adapter may declare its Vault/KMS
+   *  coordinate here, so callers do not have to reconstruct the adapter's authority from cwd or
+   *  another local root. Optional for compatibility; a composition that needs identity proof must
+   *  otherwise supply an explicit coordinate at its boundary. */
+  readonly identity?: SecretStoreIdentity;
+
+  /** The stored value for `key`, or `undefined` if absent. */
+  get(key: string): Promise<string | undefined>;
+
+  /** Store `value` under `key`, replacing any prior value AS A WHOLE: a concurrent `get` observes
+   *  either the complete old value or the complete new one, never a partial or torn intermediate
+   *  (FS adapter → atomic temp+rename; a managed backend → a conditional / whole-object put). This
+   *  atomicity is part of the contract because standing daemon/agent creds are re-read live during
+   *  renewal. Private perms / hardening beyond the atomicity guarantee remain the adapter's concern. */
+  put(key: string, value: string): Promise<void>;
+
+  /** Store `value` under `key` only while `key` is absent, deciding that in one atomic step: of
+   *  concurrent creates of one key exactly one resolves `true`, and the others resolve `false` with
+   *  the winner's value untouched. A concurrent `get` observes the key absent or the complete value
+   *  (FS adapter → temp + exclusive link; a managed backend → a conditional create). A load-or-create
+   *  kind writes its first value here and adopts the stored one when it loses, because a read
+   *  followed by `put` lets two first callers each keep a value of their own. */
+  create(key: string, value: string): Promise<boolean>;
+
+  /** Remove `key`. Idempotent. The ONLY portable contract is: after a successful `delete`,
+   *  `get(key)` returns absent. This is NOT cryptographic shred, revocation, or credential kill —
+   *  a backend may retain recoverable versions, and any already-issued NATS cred or signing seed
+   *  stays valid until its credential lifetime ends or broker/key rotation invalidates it (those
+   *  are mint / renewal / eviction concerns, not `SecretStore`). */
+  delete(key: string): Promise<void>;
+}
+
+/**
+ * How a process names the SecretStore it uses as the standing-daemon credential authority.
+ *
+ * Fingerprint-only `reloadCreds` is safe only when the renewal owner and the delivery daemon
+ * genuinely read one store. This identity is that proof: it names the store, never a secret.
+ * Two workstation filesystem stores agree only when they name the same root AND carry the same
+ * `id`, a random value the store records inside its own directory. The root alone is a local path,
+ * and two hosts can mount different directories at one path (#2580). An
+ * injected (hosted) store is identified by an operator-supplied coordinate, never guessed from
+ * a local root. A store may declare this identity itself; otherwise the composition root must
+ * provide it explicitly. There is no fallback between the two shapes.
+ */
+export type SecretStoreIdentity =
+  | { kind: "fs"; root: string; id: string }
+  | { kind: "injected"; coordinate: string };
+
+/** Compare two store identities. Filesystem identities match on root, after a POSIX-style
+ *  trailing-slash trim, and on id. */
+export function sameSecretStoreIdentity(a: SecretStoreIdentity, b: SecretStoreIdentity): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "fs" && b.kind === "fs") return trimStorePath(a.root) === trimStorePath(b.root) && a.id === b.id;
+  if (a.kind === "injected" && b.kind === "injected") return a.coordinate === b.coordinate;
+  return false;
+}
+
+function trimStorePath(p: string): string {
+  return p.replace(/[/\\]+$/, "") || p;
+}
+
+/** Operator-facing label used in the divergence notice that names both stores. */
+export function formatSecretStoreIdentity(id: SecretStoreIdentity): string {
+  return id.kind === "fs" ? `${id.root} (store ${id.id})` : `injected:${id.coordinate}`;
+}
+
+/**
+ * Parse a store identity off the delivery-admin rail. Unknown fields, extra keys, blank
+ * values, and mixed fs/injected shapes are refused rather than guessed.
+ */
+export function parseSecretStoreIdentity(raw: unknown): SecretStoreIdentity {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+    throw new Error("secret-store identity must be an object");
+  const o = raw as Record<string, unknown>;
+  const keys = Object.keys(o);
+  if (o.kind === "fs") {
+    if (keys.some((k) => k !== "kind" && k !== "root" && k !== "id"))
+      throw new Error("secret-store identity of kind fs admits only {kind, root, id}");
+    if (typeof o.root !== "string" || !o.root.trim())
+      throw new Error("secret-store identity of kind fs requires a non-blank root");
+    if (typeof o.id !== "string" || !o.id.trim())
+      throw new Error("secret-store identity of kind fs requires a non-blank id");
+    return { kind: "fs", root: o.root, id: o.id };
+  }
+  if (o.kind === "injected") {
+    if (keys.some((k) => k !== "kind" && k !== "coordinate"))
+      throw new Error("secret-store identity of kind injected admits only {kind, coordinate}");
+    if (typeof o.coordinate !== "string" || !o.coordinate.trim())
+      throw new Error("secret-store identity of kind injected requires a non-blank coordinate");
+    return { kind: "injected", coordinate: o.coordinate };
+  }
+  throw new Error('secret-store identity kind must be "fs" or "injected"');
+}
+
+/**
+ * Name an injected store: its declared identity, else the coordinate in `COTAL_SECRET_STORE`. The
+ * manager and the delivery daemon both call this, because the store challenge compares their two
+ * answers and a second copy of the rule could name one shared store two ways. The coordinate goes
+ * through the parser the challenge answer goes through, so a value the rail would refuse is
+ * refused here, at start, naming the variable.
+ */
+export function injectedSecretStoreIdentity(store: SecretStore): SecretStoreIdentity {
+  if (store.identity !== undefined) return parseSecretStoreIdentity(store.identity);
+  try {
+    return parseSecretStoreIdentity({ kind: "injected", coordinate: process.env.COTAL_SECRET_STORE });
+  } catch (cause) {
+    throw new Error(
+      "an injected SecretStore must declare its identity or name a non-blank coordinate in COTAL_SECRET_STORE so the manager and the delivery daemon name the same authority (never a silent local-root fallback)",
+      { cause },
+    );
+  }
+}
+
+/**
+ * The delivery daemon's answer to the `reloadStoreIdentity` challenge: the store it reloads from,
+ * PLUS the binding that says whose answer this is.
+ *
+ * The binding is why this is not just a {@link SecretStoreIdentity}. The delivery-admin rail is
+ * QUEUE-GROUPED, so a request lands on whichever bound responder the broker picks. Every process
+ * holding a `delivery` credential for the space can serve it, while only ONE of them holds the
+ * delivery lease and therefore actually reloads the standing credentials. Taking the first reply
+ * and calling it "the daemon's store" answers a question nobody asked: it reports the store of AN
+ * answerer, and a manager then decides whether to remint based on a process that may reload
+ * nothing. Carrying the answerer's identity and its lease claim lets the caller require that the
+ * store it compares against belongs to the process that reloads (#1694).
+ */
+export interface DaemonStoreAnswer {
+  /** The store the answering process reloads standing credentials from. */
+  identity: SecretStoreIdentity;
+  /** The answering endpoint's wire identity, so the answer names a process rather than a rail. */
+  responder: string;
+  /** Did the answering process say it held this space's delivery lease at the moment it answered?
+   *
+   *  THIS IS THE ANSWERER'S OWN CLAIM, NOT A VERIFIED FACT, and a caller that decides anything on
+   *  it alone is trusting a boolean the answerer chose. `false` is the honest reading for a
+   *  responder that does not own the shard, and it is useful exactly because an honest non-holder
+   *  sends it. A responder that is not honest can send `true`. A caller requiring the answer to
+   *  come from the process that reloads must verify the binding itself, by reading the lease row
+   *  and comparing its holder against {@link DaemonStoreAnswer.responder}. */
+  holdsDeliveryLease: boolean;
+}
+
+/** Parse a {@link DaemonStoreAnswer} off the wire through the same closed-parser discipline as
+ *  {@link parseSecretStoreIdentity}: a reply that cannot produce every field is a failure to
+ *  determine, raised here, never a partially trusted answer assembled by the caller. CLOSED means
+ *  closed in both directions: an unknown top-level key is refused rather than ignored, so a reply
+ *  carrying a field this version does not know about is a failure to determine instead of an
+ *  answer that was silently read as something narrower than it claimed to be.
+ *
+ *  A daemon older than #1694 replies with a bare identity and no binding. That lands here as a
+ *  parse failure, which is the intended reading: the caller cannot establish who answered, so it
+ *  must refuse rather than fall back to the unbound comparison this type exists to replace. */
+export function parseDaemonStoreAnswer(raw: unknown): DaemonStoreAnswer {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+    throw new Error("delivery-daemon store answer must be an object");
+  const o = raw as Record<string, unknown>;
+  const ADMITTED = ["identity", "responder", "holdsDeliveryLease"];
+  const unknown = Object.keys(o).filter((k) => !ADMITTED.includes(k));
+  if (unknown.length)
+    throw new Error(
+      `delivery-daemon store answer admits only {identity, responder, holdsDeliveryLease} (unknown: ${unknown.sort().join(", ")})`,
+    );
+  if (typeof o.responder !== "string" || !o.responder.trim())
+    throw new Error("delivery-daemon store answer requires a non-blank responder identity");
+  if (typeof o.holdsDeliveryLease !== "boolean")
+    throw new Error("delivery-daemon store answer requires holdsDeliveryLease as a boolean (an absent claim is not a false one)");
+  return { identity: parseSecretStoreIdentity(o.identity), responder: o.responder, holdsDeliveryLease: o.holdsDeliveryLease };
+}
+
+
+/**
+ * The notice a manager logs when its remint store and the daemon's reload source are not one
+ * authority. That manager is not the daemon-credential renewal owner: it serves the space and
+ * leaves those credentials to the manager whose store the daemon reloads from (#1634). Both
+ * identities appear, because a notice that declines ownership without naming them leaves the
+ * operator no way to find the owner.
+ *
+ * Matching this identity is NECESSARY but NOT SUFFICIENT for ownership. It is pure equality with
+ * no holder and no tiebreak, so every manager sharing one store passes it; the per-space renewal
+ * lease is what makes the owner single.
+ */
+export function divergentSecretStoreNotice(owner: SecretStoreIdentity, daemon: SecretStoreIdentity): string {
+  return (
+    `not the daemon-credential renewal owner for this space: ` +
+    `this manager remints through ${formatSecretStoreIdentity(owner)} while the delivery daemon ` +
+    `reloads from ${formatSecretStoreIdentity(daemon)}, so it leaves those credentials to the ` +
+    `manager on the daemon's own store. Give both processes the same store ` +
+    `(one explicit SecretStore coordinate, or one shared filesystem root) to renew from here.`
+  );
+}

@@ -1,0 +1,745 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - rigel-release
+  workflow_dispatch:
+    inputs:
+      acquisition:
+        description: Generate the fixed validator comparison lock for source review only
+        required: true
+        type: choice
+        options: [validators-0155]
+
+# A new push to a PR supersedes the run already going; a merge to rigel-release does not.
+#
+# Deliberately not unconditional: a release-branch commit's CI result is the record for that commit, not a
+# preview of the next, and a cancelled run leaves a merge ungradable, neither red nor green.
+# Superseding is only right where the earlier answer has stopped being interesting, which is true
+# of a PR revision and false of a merge.
+#
+# `cancel-in-progress: false` on its own does not deliver that, which is what #976 measured. A
+# group holds one pending run by default, so when a third push arrives the queued run is evicted
+# rather than made to wait: it is cancelled with zero jobs, and that commit ends up with no CI
+# result of any kind. It happened to 13 of 29 consecutive main runs. `queue: max` is the part that
+# actually makes them wait, FIFO, up to 100 deep.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-r2${{ github.event_name == 'workflow_dispatch' && format('-acquire-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # `queue: max` with `cancel-in-progress: true` is a validation error, so this tracks the line
+  # above: a PR keeps the default single slot and supersedes, rigel-release queues instead of evicting.
+  queue: ${{ github.event_name == 'pull_request' && 'single' || 'max' }}
+
+# Linux x64 jobs run on GitHub-hosted runners (`ubuntu-latest`). They moved to Tenki runners on
+# 2026-09-11 (#1454) to escape the org's 20-concurrent-job cap; on 2026-09-15 the Tenki app started
+# cancelling every job on a tenki-* label 0 to 5 seconds after start, with no successful Linux job
+# for over an hour, so every Linux job is back on GitHub-hosted runners. bin/smoke/verify-shard-inputs.sh
+# still accepts both runner homes, so a later move back is a label change only.
+# Same coverage as before, fanned across parallel jobs so wall-clock is the slowest job, not the sum:
+#   • unit  — typecheck + build + unit tests + the view/pack checks (fast).
+#   • smoke — the protocol/security suite (smoke:ci), round-robin sharded across runners by
+#             bin/smoke/shard.mjs (each smoke still runs in its own broker; shards are on separate
+#             runners, so no cross-smoke port contention).
+#   • live  — the Linux-only live/lifecycle e2es (real broker + real agents, tmux/cmux/opencode).
+#   • platforms — the suites in bin/smoke/platform-suites.txt, run the same way on Linux, macOS and
+#             Windows, so each must pass on all three.
+# `ci-ok` fans them back in to one advisory status. A red `ci-ok` reports the result without
+# blocking a merge unless repository rules make it required.
+# The CLI runs for real in these jobs; its usage telemetry would count our runners as users.
+# DO_NOT_TRACK also reaches the suites that drop every COTAL_ variable from a child's env.
+env:
+  DO_NOT_TRACK: 1
+
+jobs:
+  unit:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    env:
+      NATS_VERSION: v2.12.12
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The shard-stability check reads ci-suites.txt at the base commit, which a
+          # depth-1 clone does not contain.
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v6.0.8
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Ubuntu 24.04 runners block unprivileged user namespaces via AppArmor; the seat's
+      # reused-pid cell needs one to own ns_last_pid.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Cache nats-server
+        id: nats
+        uses: actions/cache@v4
+        with:
+          path: ~/nats-bin
+          key: verified-nats-server-${{ env.NATS_VERSION }}-linux-amd64-${{ runner.os }}
+      - name: Install nats-server
+        if: steps.nats.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-amd64.tar.gz" -o /tmp/nats-server.tar.gz
+          echo "0ade8c59f966a37b9898e5f9ae408ad47f64e529423d3d07330848f4c3bb9300  /tmp/nats-server.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/nats-server.tar.gz -C /tmp
+          mkdir -p ~/nats-bin
+          install "/tmp/nats-server-${NATS_VERSION}-linux-amd64/nats-server" ~/nats-bin/nats-server
+      - name: nats-server on PATH
+        run: echo "$HOME/nats-bin" >> "$GITHUB_PATH"
+      # ci-suites.txt is round-robin `index % count`. Inserting a line mid-file moves every
+      # suite below it while membership, count, and duplicate checks stay green.
+      - name: Smoke chain shard stability
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -eu
+          base="$BASE"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base="$(git rev-parse HEAD~1)" || { echo "no base commit or first parent"; exit 2; }
+            echo "no base commit on this event; using first parent $base"
+          fi
+
+          # Four checks keep an unrelated exit 1 from impersonating a real re-shard.
+          test -s bin/smoke/shard-stability.ts || { echo "detector missing"; exit 2; }
+          out="$(pnpm -s check:shard-stability "$base" "$(git rev-parse HEAD)" 2>&1)" && rc=0 || rc=$?
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -q 'v1 starting' || { echo "detector never started"; exit 2; }
+          tok="$(printf '%s\n' "$out" | grep -oE 'shard-stability: [A-Z]+=[0-9]' || true)"
+          tok_count="$(printf '%s\n' "$tok" | grep -c . || true)"
+          [ "$tok_count" = 1 ] || { echo "no single verdict"; exit 2; }
+          [ "${tok##*=}" = "$rc" ] || { echo "verdict $tok disagrees with exit $rc"; exit 2; }
+          exit "$rc"
+      - name: Typecheck
+        run: pnpm typecheck
+      # sync-docs (check:docs-site) imports website/ deps, which the root pnpm install does not cover.
+      - name: Install website deps
+        working-directory: website
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Docs bundle in sync
+        run: pnpm check:docsbundle
+      # Broker-free and network-free; it reads the connector built by Typecheck.
+      # It was reachable from `check` and executed by nothing, which is how it sat red on main.
+      - name: Docs smoke
+        run: pnpm smoke:docs
+      - name: Portable launch smoke
+        run: pnpm smoke:windows
+      - name: Secret-file smoke
+        run: pnpm smoke:secret-fs
+      - name: Update-concurrency smoke
+        run: pnpm smoke:update-concurrency
+      - name: Unit tests
+        run: pnpm test
+      - name: Validator lock acquisition source controls
+        run: node --test --test-reporter=tap --test-concurrency=1 scripts/ci-validator-lock-acquisition.test.mjs
+      # Quarantined on the upstream sync: red on pristine upstream main. Still runs so its output stays visible.
+      - name: Remaining schema direct-engine diagnostic
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: pnpm smoke:schema-remaining15-diagnostic
+      - name: Remaining schema schemasafe comparison
+        if: ${{ !cancelled() }}
+        run: pnpm smoke:schema-remaining15-schemasafe-comparison
+      - name: Released schemasafe public-error diagnostic
+        if: ${{ !cancelled() }}
+        run: pnpm smoke:schema-schemasafe-public-errors
+      # The direct-engine diagnostic above keeps its known wrong verdicts as failing tests, so a
+      # step after it with no `if:` never runs. Each check below reports its own result.
+      # Layer 3 cells need a delegated cgroup and a distinct agent uid. Root gets both: a system
+      # scope with Delegate=yes, and a created user. REQUIRE turns any skipped cell into a failure.
+      # The peer-uid cell runs the custodian as the agent, so every checkout ancestor gets o+x.
+      - name: Seat cgroup custody (distinct uid)
+        run: |
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin cotal-seat-agent
+          d="$GITHUB_WORKSPACE"; while [ "$d" != / ]; do sudo chmod o+x "$d"; d="$(dirname "$d")"; done
+          sudo env "PATH=$PATH" COTAL_SEAT_CGROUP_DELEGATED=1 COTAL_SEAT_CGROUP_REQUIRE=1 COTAL_SEAT_SMOKE_AGENT_UID="$(id -u cotal-seat-agent)" pnpm smoke:seat-cgroup
+      - name: View smoke
+        if: ${{ !cancelled() }}
+        run: pnpm smoke:view
+      - name: Verify Claude connector package
+        if: ${{ !cancelled() }}
+        run: pnpm --filter @cotal-ai/connector-claude-code pack --dry-run
+      # Grades the convention, not one suite: every file that defaults COTAL_SERVERS with `||=`
+      # must also print what it resolved. Pure — reads sources, spawns nothing, dials nothing.
+      # Placed here rather than in the smoke:ci chain so the chain migration lands without a
+      # rebase; `gate-inventory` counts a suite named in a workflow as reached.
+      - name: Broker disclosure
+        if: ${{ !cancelled() }}
+        run: pnpm smoke:broker-disclosure
+
+  smoke:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    needs: [workspace-native, seat-native-linux-x64, seat-native-linux-arm64]
+    name: smoke (shard ${{ matrix.shard }}/4)
+    # The slowest shard runs about 58 minutes with no single smoke over 7 minutes.
+    # Sized at about 1.5x that, so runner variance does not cancel healthy runs.
+    timeout-minutes: 90
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # egress-guard-differential resolves the predecessor commit of the egress classifier and
+          # diffs HEAD's verdicts against it. A depth-1 clone reaches no role-carrying ancestor of
+          # agui.ts, so the resolver cell fails with "deepen the checkout" and takes shard 0 with
+          # it. Same reason the unit job pins this.
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v6.0.8
+        with:
+          standalone: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Capture smoke toolchain
+        id: smoke-tools
+        shell: /usr/bin/env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+        run: |
+          node_path="$(command -v node)"
+          pnpm_path="$(command -v pnpm)"
+          node_target="$(/usr/bin/readlink -f "$node_path")"
+          pnpm_target="$(/usr/bin/readlink -f "$pnpm_path")"
+          echo "node_path=$node_path" >> "$GITHUB_OUTPUT"
+          echo "node_target=$node_target" >> "$GITHUB_OUTPUT"
+          echo "node_sha=$(/usr/bin/sha256sum "$node_target" | /usr/bin/cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "pnpm_path=$pnpm_path" >> "$GITHUB_OUTPUT"
+          echo "pnpm_target=$pnpm_target" >> "$GITHUB_OUTPUT"
+          echo "pnpm_sha=$(/usr/bin/sha256sum "$pnpm_target" | /usr/bin/cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - run: pnpm install --frozen-lockfile
+      # Ubuntu 24.04 runners block unprivileged user namespaces via AppArmor; the seat's
+      # reused-pid cell needs one to own ns_last_pid.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Cache nats-server
+        id: nats
+        uses: actions/cache@v4
+        with:
+          path: ~/nats-bin
+          key: nats-server-v2.12.12-${{ runner.os }}
+      - name: Install nats-server
+        if: steps.nats.outputs.cache-hit != 'true'
+        run: |
+          NATS_VERSION=v2.12.12
+          curl -fsSL "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-amd64.tar.gz" -o /tmp/nats-server.tar.gz
+          tar -xzf /tmp/nats-server.tar.gz -C /tmp
+          mkdir -p ~/nats-bin
+          install "/tmp/nats-server-${NATS_VERSION}-linux-amd64/nats-server" ~/nats-bin/nats-server
+      - name: nats-server on PATH
+        run: echo "$HOME/nats-bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: pnpm build
+      - uses: actions/download-artifact@v4
+        with:
+          name: workspace-native-x64
+          path: ${{ runner.temp }}/workspace-native-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: workspace-native-arm64
+          path: ${{ runner.temp }}/workspace-native-arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: workspace-native-darwin-x64
+          path: ${{ runner.temp }}/workspace-native-darwin-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: workspace-native-darwin-arm64
+          path: ${{ runner.temp }}/workspace-native-darwin-arm64
+      - name: Assemble source-matched Windows and macOS process identity bindings
+        run: node scripts/workspace-assemble-natives.mjs
+        env:
+          WORKSPACE_NATIVE_X64: ${{ runner.temp }}/workspace-native-x64
+          WORKSPACE_NATIVE_ARM64: ${{ runner.temp }}/workspace-native-arm64
+          WORKSPACE_NATIVE_DARWIN_X64: ${{ runner.temp }}/workspace-native-darwin-x64
+          WORKSPACE_NATIVE_DARWIN_ARM64: ${{ runner.temp }}/workspace-native-darwin-arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: seat-native-linux-x64
+          path: ${{ runner.temp }}/seat-native-linux-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: seat-native-linux-arm64
+          path: ${{ runner.temp }}/seat-native-linux-arm64
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: seat-native-darwin-*
+          path: ${{ runner.temp }}/seat-host-native
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: seat-native-win32-*
+          path: ${{ runner.temp }}/seat-host-native
+      - name: Assemble the seat SO_PEERCRED helpers
+        run: node scripts/seat-assemble-natives.mjs
+        env:
+          SEAT_NATIVE_X64: ${{ runner.temp }}/seat-native-linux-x64
+          SEAT_NATIVE_ARM64: ${{ runner.temp }}/seat-native-linux-arm64
+          SEAT_NATIVE_DARWIN_X64: ${{ runner.temp }}/seat-host-native/seat-native-darwin-x64/peercred.node
+          SEAT_NATIVE_DARWIN_ARM64: ${{ runner.temp }}/seat-host-native/seat-native-darwin-arm64/peercred.node
+          SEAT_NATIVE_WIN32_X64: ${{ runner.temp }}/seat-host-native/seat-native-win32-x64/peercred.node
+          SEAT_NATIVE_WIN32_ARM64: ${{ runner.temp }}/seat-host-native/seat-native-win32-arm64/peercred.node
+      - name: Protocol & security smoke tests (shard ${{ matrix.shard }}/4)
+        # The detector grades committed blobs. Earlier steps must not change inputs or execution hooks.
+        shell: /usr/bin/env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.sha }}
+        run: /usr/bin/git --no-replace-objects show "$GITHUB_SHA:bin/smoke/verify-shard-inputs.sh" | /usr/bin/bash --noprofile --norc -s -- "$GITHUB_SHA" ${{ matrix.shard }} 4 ci "${{ steps.smoke-tools.outputs.node_path }}" "${{ steps.smoke-tools.outputs.node_target }}" "${{ steps.smoke-tools.outputs.node_sha }}" "${{ steps.smoke-tools.outputs.pnpm_path }}" "${{ steps.smoke-tools.outputs.pnpm_target }}" "${{ steps.smoke-tools.outputs.pnpm_sha }}"
+
+  live:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    timeout-minutes: 25
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6.0.8
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Cache nats-server
+        id: nats
+        uses: actions/cache@v4
+        with:
+          path: ~/nats-bin
+          key: nats-server-v2.12.12-${{ runner.os }}
+      - name: Install nats-server
+        if: steps.nats.outputs.cache-hit != 'true'
+        run: |
+          NATS_VERSION=v2.12.12
+          curl -fsSL "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-amd64.tar.gz" -o /tmp/nats-server.tar.gz
+          tar -xzf /tmp/nats-server.tar.gz -C /tmp
+          mkdir -p ~/nats-bin
+          install "/tmp/nats-server-${NATS_VERSION}-linux-amd64/nats-server" ~/nats-bin/nats-server
+      - name: nats-server on PATH
+        run: echo "$HOME/nats-bin" >> "$GITHUB_PATH"
+      - name: Install tmux
+        run: tmux -V || (sudo apt-get update && sudo apt-get install -y tmux)
+      # smoke:runtime includes smoke:herdr, which exits 0 with a SKIPPED notice when herdr is
+      # absent. Without this step the whole herdr suite is a silent no-op on every run — which is
+      # exactly how a driver incompatible with current stable herdr passed CI green.
+      - name: Install herdr
+        run: |
+          set -euo pipefail
+          HERDR_VERSION=v0.8.0
+          curl -fsSL "https://github.com/herdrdev/herdr/releases/download/${HERDR_VERSION}/herdr-linux-x86_64" -o /tmp/herdr
+          sudo install -m 0755 /tmp/herdr /usr/local/bin/herdr
+          herdr --version
+      - name: Build
+        run: pnpm build
+      - name: Web console auth
+        run: pnpm smoke:web-console-auth
+      - name: Cooperative-stop live smoke
+        run: pnpm smoke:cooperative-stop:live
+      # Broker-free boundary/preflight guards + the live target-resolution / spawn-from-anywhere /
+      # readiness / up-manifest / ext / dogfood e2es (real broker, real agents).
+      - name: Core boundary, mesh preflight & resolution
+        run: pnpm smoke:core-boundary && pnpm smoke:preflight && pnpm smoke:server-resolution:live && pnpm smoke:spawn-from-anywhere:live && pnpm smoke:spawn-detach:live && pnpm smoke:readiness:live && pnpm smoke:up-manifest:live && pnpm smoke:ext:live && pnpm smoke:dogfood:live
+      # Quarantined (RIG-9150): upstream's setup first run exits 4 when the Codex plugin install fails.
+      - name: Setup first-run live smoke
+        continue-on-error: true
+        run: pnpm smoke:setup-pure:live
+      # Quarantined: upstream asserts an in-process pty seat dies with the manager; fork seats are custodied.
+      - name: Up-stack live smoke
+        continue-on-error: true
+        run: pnpm smoke:up-stack:live
+      # Own step so a later failure cannot hide whether this suite ran. First CI execution
+      # of join-external:live passed 19 checks at 2850a5a2e.
+      - name: Join an external broker
+        run: pnpm smoke:join-external:live
+      # Broker-only credential renewal warning
+      - name: Broker-only credential renewal warning
+        run: pnpm smoke:no-manager-credential-warning:live
+      - name: Stock broker logging and rotation
+        # This suite pins 2.15.1 separately; the other smoke suites keep their 2.12.12 broker.
+        shell: bash
+        run: |
+          set -euo pipefail
+          broker_dir="$(mktemp -d "$RUNNER_TEMP/broker-logging.XXXXXX")"
+          curl -fsSL "https://github.com/nats-io/nats-server/releases/download/v2.15.1/nats-server-v2.15.1-linux-amd64.tar.gz" -o "$broker_dir/nats-server.tar.gz"
+          echo "bf5edc7b1ce98e885c368cb43a886eb148dc5d0551d99f3cf6141fb5e1954c70  $broker_dir/nats-server.tar.gz" | sha256sum -c -
+          mkdir "$broker_dir/extracted"
+          tar -xzf "$broker_dir/nats-server.tar.gz" -C "$broker_dir/extracted"
+          COTAL_BROKER_LOG_NATS="$broker_dir/extracted/nats-server-v2.15.1-linux-amd64/nats-server" pnpm smoke:broker-logging:live
+      - name: Manager lifecycle e2e (real broker + real agents)
+        continue-on-error: true
+        run: pnpm smoke:lifecycle-e2e
+      # T6 delegated proof: root manager in a Delegate=yes scope, seats under a created agent uid.
+      # Its own step and not quarantined: the legacy step above keeps continue-on-error (quarantined, RIG-10098).
+      # The agent uid loads the custodian and the stub from the checkout, so every ancestor gets o+x.
+      - name: Manager lifecycle e2e, delegated (custodial pty, cgroups, distinct agent uid)
+        run: |
+          id -u cotal-seat-e2e >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin cotal-seat-e2e
+          d="$GITHUB_WORKSPACE"; while [ "$d" != / ]; do sudo chmod o+x "$d"; d="$(dirname "$d")"; done
+          sudo systemd-run --scope -p Delegate=yes --quiet -- env "PATH=$PATH" COTAL_SEAT_CGROUP_DELEGATED=1 COTAL_SEAT_AGENT_UID="$(id -u cotal-seat-e2e)" pnpm smoke:lifecycle-e2e
+      - name: Runtime smoke tests (tmux, orca, herdr)
+        run: pnpm smoke:runtime
+      # Runs BEFORE the soak because it grades the soak's own instrument: the wait behind the
+      # positive control, and the nonce the survivor count matches on. If either is wrong the soak
+      # still goes green — a control that can pass while the payload is absent, or a count that
+      # includes a neighbouring run's processes. Deterministic (fake clock, injected probe), so it
+      # is a cheap gate on the expensive one, not a second copy of it.
+      - name: herdr soak instrument (visibility wait + nonce)
+        run: pnpm smoke:herdr:probe
+      # Accumulation is invisible to a single-shot suite: a per-cycle leak of a pane, workspace,
+      # launcher dir or process only shows up over many spawn/stop cycles, which is what a
+      # long-lived manager actually does.
+      - name: herdr endurance soak (spawn/stop churn, leak deltas)
+        run: pnpm smoke:herdr:soak
+      # The integration the unit suite cannot reach: real broker + real Manager + a real agent in
+      # presence, then SIGKILL the manager to prove the agent outlives it. Quarantined (RIG-10098):
+      # the herdr server is not running when the manager starts; remove continue-on-error once fixed.
+      - name: herdr e2e (real broker + manager + agent, manager-kill survival)
+        continue-on-error: true
+        run: pnpm smoke:herdr-e2e:live
+      - name: cmux launcher secret-hygiene smoke
+        run: pnpm smoke:cmux
+      - name: OpenCode cooperative-stop smoke test
+        run: pnpm smoke:opencode-coop
+      - name: Transport liveness unit baseline
+        run: pnpm smoke:transport-liveness
+
+  # Native linux-x64 and linux-arm64 peercred.node and pty.node, then one pack on x64.
+  # The platform matrix is Linux-only on this fork; Windows CI remains retired.
+  workspace-native:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    uses: ./.github/workflows/workspace-native.yml
+    with:
+      darwin: true
+
+  platforms:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    needs: workspace-native
+    name: platforms (${{ matrix.os }})
+    timeout-minutes: 25
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6.0.8
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/download-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: workspace-native-x64
+          path: packages/workspace/build/Release/win32-x64
+      - run: pnpm install --frozen-lockfile
+      - name: Cache nats-server
+        id: nats
+        uses: actions/cache@v4
+        with:
+          path: ~/nats-bin
+          key: nats-server-v2.12.12-${{ runner.os }}-${{ runner.arch }}-verified
+      # Checksum-pinned, from the release's SHA256SUMS.
+      - name: Install nats-server
+        if: steps.nats.outputs.cache-hit != 'true' && runner.os != 'Windows'
+        run: |
+          NATS_VERSION=v2.12.12
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64) NAME=linux-amd64 SHA256=0ade8c59f966a37b9898e5f9ae408ad47f64e529423d3d07330848f4c3bb9300 ;;
+            macOS-ARM64) NAME=darwin-arm64 SHA256=19981a9c7234fc1182c913f4590c2feb8704eb67dae0d7682c9aeba3b524cc8f ;;
+            *) echo "::error::no pinned nats-server for ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+          esac
+          curl -fsSL "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-${NAME}.tar.gz" -o "$RUNNER_TEMP/nats-server.tar.gz"
+          echo "$SHA256  $RUNNER_TEMP/nats-server.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/nats-server.tar.gz" -C "$RUNNER_TEMP"
+          mkdir -p ~/nats-bin
+          install "$RUNNER_TEMP/nats-server-${NATS_VERSION}-${NAME}/nats-server" ~/nats-bin/nats-server
+      - name: Install nats-server (Windows)
+        if: steps.nats.outputs.cache-hit != 'true' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ("${{ runner.arch }}" -ne "X64") { Write-Output "::error::no pinned nats-server for Windows-${{ runner.arch }}"; exit 1 }
+          $NatsVersion = "v2.12.12"
+          $Sha256 = "66e2ab6250083794321905e1f79db4f4ea53465d84ba0760e9b00d022133050e"
+          $Name = "nats-server-$NatsVersion-windows-amd64"
+          $Zip = Join-Path $env:RUNNER_TEMP "$Name.zip"
+          Invoke-WebRequest -Uri "https://github.com/nats-io/nats-server/releases/download/$NatsVersion/$Name.zip" -OutFile $Zip
+          $Actual = (Get-FileHash $Zip -Algorithm SHA256).Hash
+          if ($Actual -ne $Sha256) { throw "nats-server zip checksum mismatch: got $Actual expected $Sha256" }
+          Expand-Archive -Path $Zip -DestinationPath $env:RUNNER_TEMP -Force
+          New-Item -ItemType Directory -Force -Path "$HOME\nats-bin" | Out-Null
+          Copy-Item "$env:RUNNER_TEMP\$Name\nats-server.exe" "$HOME\nats-bin\nats-server.exe" -Force
+      - name: nats-server on PATH
+        if: runner.os != 'Windows'
+        run: echo "$HOME/nats-bin" >> "$GITHUB_PATH"
+      - name: nats-server on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "$HOME\nats-bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build
+        run: pnpm build
+      - name: Platform suites
+        env:
+          COTAL_CI_SUITES: bin/smoke/platform-suites.txt
+        run: node bin/smoke/shard.mjs 0 1
+
+  # Native linux-x64 and linux-arm64 peercred.node and pty.node, then one pack on x64
+  # that assembles BOTH into the tarball the ARM load job consumes unchanged.
+  # The ARM load job must not rebuild. A queued-never-started job is not a measurement.
+  # Pin x64 to Ubuntu 24.04 so the host-built PTY addon stays within the published glibc floor.
+  seat-native-linux-x64:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    name: seat native (linux-x64)
+    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6.0.8
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build host native
+        run: pnpm --filter @cotal-ai/seat build
+      - name: Native symbol-version ceiling
+        run: node packages/seat/scripts/assert-native-ceiling.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seat-native-linux-x64
+          path: packages/seat/build/Release/linux-x64/
+          if-no-files-found: error
+          retention-days: 7
+
+  seat-native-linux-arm64:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    name: seat native (linux-arm64)
+    timeout-minutes: 15
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6.0.8
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build host native
+        run: pnpm --filter @cotal-ai/seat build
+      - name: Native symbol-version ceiling
+        run: node packages/seat/scripts/assert-native-ceiling.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seat-native-linux-arm64
+          path: packages/seat/build/Release/linux-arm64/
+          if-no-files-found: error
+          retention-days: 7
+
+  seat-pack:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    name: seat pack (assembled)
+    timeout-minutes: 20
+    needs: [seat-native-linux-x64, seat-native-linux-arm64, workspace-native]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6.0.8
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: TypeScript dist only
+        run: pnpm --filter @cotal-ai/seat exec tsc -p tsconfig.json
+      - uses: actions/download-artifact@v4
+        with:
+          name: seat-native-linux-x64
+          path: ${{ runner.temp }}/seat-native-linux-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: seat-native-linux-arm64
+          path: ${{ runner.temp }}/seat-native-linux-arm64
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: seat-native-darwin-*
+          path: ${{ runner.temp }}/seat-host-native
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: seat-native-win32-*
+          path: ${{ runner.temp }}/seat-host-native
+      - name: Assemble natives and pack
+        env:
+          SEAT_NATIVE_X64: ${{ runner.temp }}/seat-native-linux-x64
+          SEAT_NATIVE_ARM64: ${{ runner.temp }}/seat-native-linux-arm64
+          SEAT_NATIVE_DARWIN_X64: ${{ runner.temp }}/seat-host-native/seat-native-darwin-x64/peercred.node
+          SEAT_NATIVE_DARWIN_ARM64: ${{ runner.temp }}/seat-host-native/seat-native-darwin-arm64/peercred.node
+          SEAT_NATIVE_WIN32_X64: ${{ runner.temp }}/seat-host-native/seat-native-win32-x64/peercred.node
+          SEAT_NATIVE_WIN32_ARM64: ${{ runner.temp }}/seat-host-native/seat-native-win32-arm64/peercred.node
+          SEAT_PACK_DEST: ${{ runner.temp }}/seat-pack
+        run: sh scripts/ci-seat-pack.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seat-npm-pack
+          path: ${{ runner.temp }}/seat-pack/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  seat-linux-arm64:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    name: seat load (linux-arm64, same artifact)
+    timeout-minutes: 15
+    needs: [seat-pack]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          name: seat-npm-pack
+          path: ${{ runner.temp }}/seat-pack
+      - name: Toolchain-less npm install of the packed seat
+        run: |
+          set -eu
+          echo "host=$(uname -m)"
+          echo "platform-arch=$(node -p 'process.platform + "-" + process.arch')"
+          tarball="$(find "${RUNNER_TEMP}/seat-pack" -maxdepth 1 -name '*.tgz' | head -n 1)"
+          test -n "$tarball" || { echo "downloaded artifact had no tarball"; exit 2; }
+          echo -n "load_sha256="
+          sha256sum "$tarball"
+          prefix="${RUNNER_TEMP}/seat-prefix"
+          mkdir -p "$prefix"
+          block="${RUNNER_TEMP}/blocked-cc"
+          mkdir -p "$block"
+          for name in cc gcc g++ c++ make node-gyp; do
+            printf '%s\n' '#!/bin/sh' 'echo blocked compiler >&2' 'exit 127' > "$block/$name"
+            chmod 0755 "$block/$name"
+          done
+          PATH="${block}:${PATH}" npm install --no-audit --no-fund --prefix "$prefix" "$tarball"
+      - name: Load native addon through the shipped package path
+        run: |
+          set -eu
+          cd "${RUNNER_TEMP}/seat-prefix"
+          node --input-type=module <<'EOF'
+          import { existsSync } from "node:fs";
+          import { spawnSync } from "node:child_process";
+          import { join } from "node:path";
+          import { pathToFileURL } from "node:url";
+
+          const pkg = join(process.cwd(), "node_modules", "@cotal-ai", "seat");
+          const native = join(pkg, "build", "Release", `linux-${process.arch}`, "peercred.node");
+          const loader = join(pkg, "dist", "peercred.js");
+          const fileOut = spawnSync("file", [native], { encoding: "utf8" });
+          console.log(`SEAT_SHIPPED_NATIVE host=${process.platform}-${process.arch}`);
+          console.log(`SEAT_SHIPPED_NATIVE native_path=${native}`);
+          console.log(`SEAT_SHIPPED_NATIVE native_exists=${existsSync(native)}`);
+          console.log(`SEAT_SHIPPED_NATIVE file=${(fileOut.stdout || "").trim()}`);
+          console.log(`SEAT_SHIPPED_NATIVE loader_exists=${existsSync(loader)}`);
+          if (!existsSync(loader)) {
+            console.log("SEAT_SHIPPED_NATIVE RESULT=FAIL missing dist/peercred.js");
+            process.exit(1);
+          }
+          let err;
+          try {
+            const mod = await import(pathToFileURL(loader).href);
+            try {
+              mod.peerCredentials({});
+            } catch (e) {
+              err = e;
+            }
+          } catch (e) {
+            err = e;
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          const code = err instanceof Error && "code" in err ? String(err.code ?? "") : "";
+          if (err && /unix socket has no file descriptor/.test(message)) {
+            console.log("SEAT_SHIPPED_NATIVE RESULT=PASS native loaded via dist/peercred.js");
+            process.exit(0);
+          }
+          console.log(`SEAT_SHIPPED_NATIVE RESULT=FAIL code=${code} message=${message}`);
+          if (err instanceof Error && err.stack) console.log(err.stack);
+          process.exit(1);
+          EOF
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: packages/seat/smoke/fixtures/pinned-load.mjs
+          sparse-checkout-cone-mode: false
+          path: src
+      - name: Pinned PTY load through the shipped pty.node
+        run: node src/packages/seat/smoke/fixtures/pinned-load.mjs "${RUNNER_TEMP}/seat-prefix/node_modules/@cotal-ai/seat"
+
+  ci-ok:
+    # One aggregate status, advisory on main: no ruleset requires it.
+    # A ruleset that did require it would have to name the check run
+    # `ci-ok (live outcome classified)`, since a context spelled `ci-ok` matches nothing.
+    # It owns the explicit live diagnosis too: adding a separate
+    # always-running dependent job was measured on PR #1043 and left a superseded run queued
+    # through TWO later runner jobs, which held the replacement run behind it. ARM validation
+    # jobs may sit on ci-ok's needs as long as they are not always-running aggregates.
+    name: ci-ok (live outcome classified)
+    if: ${{ always() && github.event_name != 'workflow_dispatch' }}
+    needs: [unit, smoke, live, platforms, seat-pack, seat-linux-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Classify a cancelled live job
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LIVE_RESULT: ${{ needs.live.result }}
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: >-
+          node scripts/live-job-conclusion.mjs
+          --result "$LIVE_RESULT"
+          --repo "$GITHUB_REPOSITORY"
+          --run-id "$GITHUB_RUN_ID"
+          --attempt "$GITHUB_RUN_ATTEMPT"
+          --workflow ci.yml
+          --job live
+          --timeout-seconds 1500
+          --event "$GITHUB_EVENT_NAME"
+          --pr-number "$PR_NUMBER"
+          --head-ref "$HEAD_REF"
+      - name: Gate
+        run: |
+          echo "unit=${{ needs.unit.result }} smoke=${{ needs.smoke.result }} live=${{ needs.live.result }} platforms=${{ needs.platforms.result }} seat-pack=${{ needs.seat-pack.result }} seat-linux-arm64=${{ needs.seat-linux-arm64.result }}"
+          [ "${{ needs.unit.result }}" = "success" ] && [ "${{ needs.smoke.result }}" = "success" ] && [ "${{ needs.live.result }}" = "success" ] && [ "${{ needs.platforms.result }}" = "success" ] && [ "${{ needs.seat-pack.result }}" = "success" ] && [ "${{ needs.seat-linux-arm64.result }}" = "success" ]
+
+  validator-lock-acquisition:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.acquisition == 'validators-0155' }}
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6.0.8
+        with:
+          version: 11.28.2
+          run_install: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Generate fixed validator lock for review
+        env:
+          ACQUISITION_MODE: ${{ inputs.acquisition }}
+        run: node scripts/ci-validator-lock-acquisition.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validator-lock-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/validator-lock-${{ github.run_id }}-${{ github.run_attempt }}/core-package.json
+            ${{ runner.temp }}/validator-lock-${{ github.run_id }}-${{ github.run_attempt }}/pnpm-lock.yaml
+            ${{ runner.temp }}/validator-lock-${{ github.run_id }}-${{ github.run_attempt }}/source.diff
+            ${{ runner.temp }}/validator-lock-${{ github.run_id }}-${{ github.run_attempt }}/receipt.json
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,272 @@
+import { basename, dirname, join } from "node:path";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { mkSecretDir, writeSecretFileAtomic } from "@cotal-ai/core";
+import {
+  MeshAgent,
+  configFromEnv,
+  eventPlaneArmed,
+  hasIdentity,
+  startControlServer,
+  type AgentConfig,
+  type InboxItem,
+  controlFromEnv,
+  scrubLaunchMaterial,
+  resolveEventsStateRoot,
+  eventPlaneStopped,
+  registerOnceExit,
+} from "@cotal-ai/connector-core";
+import type { ExtensionAPI, ExtensionContext, ProjectTrustEventResult } from "@earendil-works/pi-coding-agent";
+import { PiDriver, type CotalBatchDetails, type PiContextLike } from "./driver.js";
+import { registerCotalTools } from "./tools.js";
+import { renderCotalInbox } from "./inbox-render.js";
+import { PiEvents } from "./events.js";
+
+const CUSTOM_TYPE = "cotal-inbox";
+const RUNTIMES = Symbol.for("cotal.pi.runtimes");
+
+interface PiRuntime {
+  config: AgentConfig;
+  mesh: MeshAgent;
+  driver: PiDriver;
+  controlServer?: ReturnType<typeof startControlServer>;
+  personaCleaned: boolean;
+  sessionId?: string;
+  expectedSessionId?: string;
+  events?: PiEvents;
+}
+
+type GlobalWithPi = typeof globalThis & { [RUNTIMES]?: Map<string, PiRuntime> };
+
+function runtimeMap(): Map<string, PiRuntime> {
+  const root = globalThis as GlobalWithPi;
+  return (root[RUNTIMES] ??= new Map());
+}
+
+function runtimeKey(config: AgentConfig): string {
+  return `${config.space}\0${config.id ?? config.name}`;
+}
+
+function asContext(context: ExtensionContext): PiContextLike {
+  return context;
+}
+
+function sessionStatePath(): string | undefined {
+  const explicit = process.env.COTAL_PI_SESSION_STATE?.trim();
+  if (explicit) return explicit;
+  // Upgrade path for seats launched before COTAL_PI_SESSION_STATE existed. Managed Pi receives the
+  // persona path and lifecycle UID; from <root>/.cotal/agents/<name>.md the same lifecycle-keyed
+  // state path is derivable without selecting a newest session.
+  const agentFile = process.env.COTAL_AGENT_FILE?.trim();
+  const name = process.env.COTAL_NAME?.trim();
+  const lifecycleUid = process.env.COTAL_LIFECYCLE_UID?.trim();
+  const agentsDir = agentFile ? dirname(agentFile) : "";
+  const cotalDir = agentsDir ? dirname(agentsDir) : "";
+  if (!agentFile || !name || !lifecycleUid || basename(agentsDir) !== "agents" || basename(cotalDir) !== ".cotal")
+    return undefined;
+  return join(cotalDir, "pi-sessions", `${name}-${lifecycleUid}.json`);
+}
+
+export function persistSessionId(sessionId: string, status: "running" | "quit" = "running"): void {
+  const path = sessionStatePath();
+  if (!path) return;
+  mkSecretDir(dirname(path));
+  writeSecretFileAtomic(path, `${JSON.stringify({ version: 1, sessionId, status })}\n`);
+}
+
+export function persistProjectTrustPrompt(cwd: string): void {
+  const path = sessionStatePath();
+  if (!path) return;
+  mkSecretDir(dirname(path));
+  writeSecretFileAtomic(path, `${JSON.stringify({
+    version: 2,
+    connector: "pi",
+    status: "prompt",
+    prompt: "Trust project folder?",
+    cwd,
+  })}\n`);
+}
+
+/** Preserve Pi's own saved decision. With none, a supervised seat chooses untrusted for this run
+ * only, because nobody is present to approve project code at its terminal. Pi's trust store is loaded
+ * here, from the Pi host running this handler: the cotal CLI imports this package to register the
+ * connector without Pi installed, so a top-level value import would fail that load. */
+export async function supervisedProjectTrust(cwd: string): Promise<ProjectTrustEventResult> {
+  const { getAgentDir, ProjectTrustStore } = await import("@earendil-works/pi-coding-agent");
+  const saved = new ProjectTrustStore(getAgentDir()).getEntry(cwd);
+  if (saved?.decision === true) return { trusted: "undecided" };
+  if (saved?.decision === false) {
+    console.error(
+      `[cotal-pi/trust] Project resources in ${cwd} were skipped because Pi's saved trust decision denies this directory. ` +
+      `Run pi once there in a foreground terminal to review or change trust.`,
+    );
+    return { trusted: "undecided" };
+  }
+  persistProjectTrustPrompt(cwd);
+  console.error(
+    `[cotal-pi/trust] Project resources in ${cwd} were skipped because this supervised seat has no saved Pi trust decision. ` +
+    `Run pi once in that directory in a foreground terminal to review and save trust.`,
+  );
+  return { trusted: "no" };
+}
+
+function cleanPersonaFile(runtime: PiRuntime): void {
+  if (runtime.personaCleaned) return;
+  runtime.personaCleaned = true;
+  const file = process.env.COTAL_PI_PERSONA_FILE;
+  if (!file) return;
+  const dir = dirname(file);
+  if (basename(file) !== "persona.md" || !basename(dir).startsWith("cotal-persona-") || dirname(dir) !== tmpdir())
+    return;
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // A pre-start crash can leave the OS-temp file behind; normal cleanup remains best-effort.
+  }
+}
+
+function createRuntime(config: AgentConfig, control: { path: string; token: string } | undefined): PiRuntime {
+  const mesh = new MeshAgent(config);
+  const driver = new PiDriver(mesh);
+  const runtime: PiRuntime = {
+    config,
+    mesh,
+    driver,
+    personaCleaned: false,
+  };
+
+  mesh.on("incoming", (item: InboxItem) => driver.onIncoming(item));
+  mesh.on("wake", () => driver.onWake());
+  mesh.on("mention-wake", (item: InboxItem) => driver.onMentionWake(item));
+  mesh.start();
+  // A once seat that must end itself, because its task's handoff could not be reported, quits Pi the
+  // way the manager's own stop does.
+  registerOnceExit(() => driver.requestShutdown());
+
+  if (control) {
+    runtime.controlServer = startControlServer(
+      mesh,
+      control,
+      async () => ({ ok: false, error: "pi uses in-process lifecycle events; only control operations are supported" }),
+      {
+        fatalBind: true,
+        onShutdown: () => driver.requestShutdown(),
+        onSession: () => runtime.sessionId,
+      },
+    );
+  }
+  return runtime;
+}
+
+/** Load Cotal into the operator's Pi. With no mesh identity this extension is completely inert. */
+export default async function cotalMesh(pi: ExtensionAPI): Promise<void> {
+  if (!hasIdentity()) return;
+  if (typeof pi.sendMessage !== "function" || typeof pi.registerMessageRenderer !== "function" || typeof pi.on !== "function") {
+    throw new Error("pi connector: this Pi version lacks the required custom-message lifecycle API (requires Pi 0.79.10)");
+  }
+
+  const config = configFromEnv();
+  const eventsEnabled = eventPlaneArmed(config);
+  if (eventsEnabled) resolveEventsStateRoot(process.env);
+  // CLI startup opens/creates/forks the session BEFORE extension factories run, so the first
+  // session_start may already be past. Pi publishes the active id through PI_SESSION_ID for exactly
+  // this host-integration case. Later in-process /resume/new/fork transitions are captured by the
+  // session_start handler below.
+  const startupSessionId = process.env.PI_SESSION_ID?.trim() || undefined;
+  const expectedSessionId = process.env.COTAL_PI_EXPECTED_SESSION?.trim() || undefined;
+  const freshManagedSession = process.env.COTAL_PI_FRESH_SESSION === "1";
+  const supervisedCwd = process.env.COTAL_PI_SUPERVISED_CWD?.trim() || undefined;
+  delete process.env.COTAL_PI_FRESH_SESSION;
+  delete process.env.COTAL_PI_EXPECTED_SESSION;
+  delete process.env.COTAL_PI_SUPERVISED_CWD;
+  // The socket path rides the env; the first-frame token rides the launch material, so a shell this
+  // seat runs cannot pick a control-plane bearer out of its own environment. Read BEFORE the scrub
+  // below, and read on every load rather than inside createRuntime: a second load reuses the cached
+  // runtime, but the first one must not find the pointer already gone. That ordering is not a
+  // detail - reversed, it refused every pi launch with the half-pair error `controlFromEnv` throws,
+  // which is the failure that contract is supposed to produce and did.
+  const control = controlFromEnv();
+  // Both readers are done, so the pointer to the launch material has none left. Dropping it here is
+  // what keeps it out of the environment of every shell command, build and tool this seat runs.
+  scrubLaunchMaterial();
+  config.connector = "pi";
+  const key = runtimeKey(config);
+  const runtimes = runtimeMap();
+  let runtime = runtimes.get(key);
+  if (!runtime) {
+    runtime = createRuntime(config, control);
+    runtimes.set(key, runtime);
+  }
+  if (eventsEnabled) {
+    runtime.events ??= new PiEvents(runtime.mesh, config.space, eventPlaneStopped({ log: (line) => console.error(`Pi ${line}`) }));
+  }
+  runtime.expectedSessionId = expectedSessionId;
+  if (startupSessionId) {
+    if (expectedSessionId && startupSessionId !== expectedSessionId)
+      throw new Error(`pi connector: expected startup session ${expectedSessionId}, host opened ${startupSessionId}`);
+    runtime.sessionId = startupSessionId;
+    runtime.expectedSessionId = undefined;
+    persistSessionId(startupSessionId);
+  }
+  runtime.driver.bind(pi);
+  registerCotalTools(pi, runtime.mesh, runtime.config);
+  pi.registerMessageRenderer<CotalBatchDetails>(CUSTOM_TYPE, renderCotalInbox);
+  // The session carries the agent's mesh name, so /resume pickers and titles match `cotal ps`.
+  const nameSession = async (): Promise<void> => {
+    if (typeof pi.setSessionName !== "function" || pi.getSessionName?.() === config.name) return;
+    await pi.setSessionName(config.name);
+  };
+
+  if (supervisedCwd) {
+    pi.on("project_trust", (event) => supervisedProjectTrust(event.cwd));
+  }
+
+  pi.on("session_start", async (_event, context) => {
+    cleanPersonaFile(runtime);
+    runtime.sessionId = context.sessionManager.getSessionId();
+    if (runtime.expectedSessionId && runtime.sessionId !== runtime.expectedSessionId)
+      throw new Error(`pi connector: expected session ${runtime.expectedSessionId}, host opened ${runtime.sessionId}`);
+    runtime.expectedSessionId = undefined;
+    persistSessionId(runtime.sessionId);
+    await runtime.events?.start(runtime.sessionId, context.sessionManager.getSessionFile(),
+      _event.reason === "new" || _event.reason === "fork" ||
+      (_event.reason === "startup" && (freshManagedSession || !startupSessionId && !expectedSessionId)));
+    runtime.driver.onSessionStart(asContext(context));
+    await nameSession();
+  });
+  pi.on("agent_start", async (_event, context) => {
+    await runtime.events?.start(context.sessionManager.getSessionId(), context.sessionManager.getSessionFile(),
+      freshManagedSession || !startupSessionId && !expectedSessionId);
+    runtime.driver.onAgentStart(asContext(context));
+    await nameSession();
+  });
+  pi.on("message_start", (event) => runtime.driver.onMessageStart(event.message));
+  pi.on("context", (event) => {
+    const messages = runtime.driver.onContext(event.messages);
+    return messages ? { messages } : undefined;
+  });
+  pi.on("after_provider_response", (event) => runtime.driver.onProviderResponse(event.status));
+  pi.on("tool_execution_start", (event) => runtime.driver.onToolStart(event.toolName));
+  pi.on("tool_execution_end", () => runtime.driver.onToolEnd());
+  pi.on("session_before_compact", (event) => runtime.driver.onBeforeCompact(event.reason, event.willRetry));
+  pi.on("agent_end", (event, context) => runtime.driver.onAgentEnd(event.messages, asContext(context)));
+  pi.on("turn_end", (_event, context) => {
+    runtime.events?.start(context.sessionManager.getSessionId(), context.sessionManager.getSessionFile());
+    runtime.events?.flush(context.sessionManager.getSessionId(), context.sessionManager.getSessionFile());
+  });
+  pi.on("session_shutdown", async (event, context) => {
+    runtime.driver.onSessionShutdown();
+    runtime.events?.flush(context.sessionManager.getSessionId(), context.sessionManager.getSessionFile());
+    await runtime.events?.shutdown();
+    if (event.reason !== "quit") return;
+    if (runtime.sessionId) persistSessionId(runtime.sessionId, "quit");
+    await runtime.driver.quit();
+    try {
+      runtime.controlServer?.close();
+    } catch {
+      // The server may already be closing after the manager's shutdown request.
+    }
+    await runtime.mesh.stop().catch(() => {});
+    runtimes.delete(key);
+  });
+}

@@ -1,0 +1,353 @@
+/**
+ * v0.4 endpoint envelope smoke (broker-free) — the SPEC §13.3 consuming-boundary contract:
+ * every shape violation rejects with the exact catalog code the spec assigns
+ * (unsupported-version / bad-request / contract-mismatch / op-mismatch / target-mismatch /
+ * sender-mismatch / class-mismatch), the auth slot digests as carried bytes, and invocation-time
+ * schema failure (`bad-request`) stays distinct from registration-time `contract-invalid`.
+ *
+ * Run: pnpm smoke:ep-envelope   (no broker; part of smoke:ci)
+ */
+import { createHash } from "node:crypto";
+import {
+  EP_ERROR_CODES, isEpErrorCode, EpEnvelopeError,
+  parseEndpointRequest, parseEndpointReply, parseEndpointEvent, controlReplyFrom, controlReplyFromThrown,
+  checkRequestSubjectAgreement, assertClassMatches, assertArgsValid, assertOutputValid, authDigest,
+  epRequestSubject, parseEpSubject, type ParsedEpRequest,
+  compileContractSchema, VOID_SCHEMA, VOID_SCHEMA_DIGEST, SCHEMA_PROFILE,
+  compileContract, epCast, undeclaredArg, undeclaredArgInstance,
+} from "../src/index.js";
+
+let ok = 0, fail = 0;
+const c = (n: string, v: boolean, extra?: unknown) => { if (v) { ok++; } else { fail++; console.log("  ✗ FAIL:", n, extra ?? ""); } };
+const rejects = (n: string, code: string, fn: () => unknown) => {
+  try { fn(); c(n, false, "no throw"); }
+  catch (e) { c(n, e instanceof EpEnvelopeError && e.code === code, e instanceof EpEnvelopeError ? e.code : (e as Error).message); }
+};
+/** A BARE CALL IS NOT A CELL. The admitted directions here were written `fn(); c(label, true)`, so a
+ *  mutant that makes `fn()` throw ends the process before the cell is reached: the suite dies with a
+ *  stack trace and no assertion name on it, and the count it prints is whatever it got to. A named
+ *  failure is the only thing a grader can hold the implementation to. */
+const admits = (n: string, fn: () => unknown) => {
+  try { fn(); c(n, true); }
+  catch (e) { c(n, false, (e as Error).message); }
+};
+
+const UID = "u".repeat(26);
+const caller = { owner: "u_abc", actor: "worker", uid: UID };
+const NONCE = "n".repeat(24);
+const D = VOID_SCHEMA_DIGEST;
+
+// ── error catalog ──
+c("catalog is the §13.3 list (21 codes), all self-valid", EP_ERROR_CODES.length === 21 && EP_ERROR_CODES.every(isEpErrorCode));
+c("reverse-DNS extension code accepted", isEpErrorCode("com.acme.throttled"));
+c("two-label code refused (extensions are reverse-DNS)", !isEpErrorCode("acme.throttled"));
+c("over-64-byte code refused", !isEpErrorCode(`com.acme.${"x".repeat(64)}`));
+c("uppercase / wildcard codes refused", !isEpErrorCode("com.acme.Throttled") && !isEpErrorCode("com.acme.>"));
+
+// ── signed-artifact binding ──
+const authSlot = '{ "grant":  "exactly-as-carried" }';
+c("authDigest digests the carried bytes exactly",
+  authDigest(authSlot) === "sha256:" + createHash("sha256").update(authSlot, "utf8").digest("hex"));
+c("authDigest never re-canonicalizes (whitespace changes the digest)",
+  authDigest(authSlot) !== authDigest('{"grant":"exactly-as-carried"}'));
+rejects("authDigest refuses a lone surrogate (would collapse distinct slots onto one digest)", "bad-request",
+  () => authDigest("\ud800"));
+
+// ── request shape ──
+const TP = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+const goodReq = {
+  v: 1, id: "req-1",
+  op: { endpoint: "manager", command: "spawn", inputDigest: D, outputDigest: D },
+  class: "ephemeral", replyExpected: true, deadlineMs: 5000,
+  args: { name: "x" }, from: { id: "u_abc.worker", name: "worker" },
+  correlation: { traceparent: TP },
+  auth: authSlot,
+  unknownField: "ignored (§5), never kept",
+};
+const req = parseEndpointRequest(goodReq);
+c("request parses and picks exactly the defined fields",
+  req.id === "req-1" && req.op.inputDigest === D && req.auth === authSlot && !("unknownField" in req));
+c("correlation is picked through", req.correlation?.traceparent === TP);
+rejects("a malformed traceparent is bad-request (W3C grammar enforced)", "bad-request",
+  () => parseEndpointRequest({ ...goodReq, correlation: { traceparent: "00-abc-def-01" } }));
+rejects("an all-zero trace-id is bad-request (invalid per W3C)", "bad-request",
+  () => parseEndpointRequest({ ...goodReq, correlation: { traceparent: `00-${"0".repeat(32)}-b7ad6b7169203331-01` } }));
+rejects("a version-00 traceparent with an extension tail is bad-request (v00 is exactly 55 chars)", "bad-request",
+  () => parseEndpointRequest({ ...goodReq, correlation: { traceparent: `${TP}-extra` } }));
+rejects("an oversized future-version traceparent is bad-request (finite profile bound)", "bad-request",
+  () => parseEndpointRequest({ ...goodReq, correlation: { traceparent: `01-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01-${"x".repeat(1000)}` } }));
+c("a bounded future-version traceparent tail is accepted (W3C forward compatibility)",
+  parseEndpointRequest({ ...goodReq, correlation: { traceparent: "01-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01-extra" } })
+    .correlation?.traceparent?.startsWith("01-") === true);
+rejects("a control character in tracestate is bad-request (no CR/LF crosses the boundary)", "bad-request",
+  () => parseEndpointRequest({ ...goodReq, correlation: { tracestate: "a=b\r\nX-Evil: 1" } }));
+rejects("an oversized baggage is bad-request (W3C byte bound)", "bad-request",
+  () => parseEndpointRequest({ ...goodReq, correlation: { baggage: "k=" + "v".repeat(8200) } }));
+rejects("a lone-surrogate auth slot is bad-request (no UTF-8 form; cannot digest as carried)", "bad-request",
+  () => parseEndpointRequest({ ...goodReq, auth: "\ud800grant" }));
+rejects("v !== 1 is unsupported-version, checked before any shape", "unsupported-version",
+  () => parseEndpointRequest({ v: 2, garbage: true }));
+rejects("missing digest on a non-describe command is contract-mismatch", "contract-mismatch",
+  () => parseEndpointRequest({ ...goodReq, op: { endpoint: "manager", command: "spawn", outputDigest: D } }));
+c("describe needs no digests (the discovery bootstrap)",
+  parseEndpointRequest({ ...goodReq, op: { endpoint: "manager", command: "describe" } }).op.command === "describe");
+rejects("a malformed digest is bad-request", "bad-request",
+  () => parseEndpointRequest({ ...goodReq, op: { ...goodReq.op, inputDigest: "sha256:xyz" } }));
+rejects("a journal submission with replyExpected true is bad-request", "bad-request",
+  () => parseEndpointRequest({ ...goodReq, class: "journal" }));
+rejects("a call without deadlineMs is bad-request", "bad-request",
+  () => parseEndpointRequest({ ...goodReq, deadlineMs: undefined }));
+rejects("a journal submission without deadlineMs is bad-request (the decision deadline)", "bad-request",
+  () => parseEndpointRequest({ ...goodReq, class: "journal", replyExpected: false, deadlineMs: undefined }));
+c("a cast needs no deadline",
+  parseEndpointRequest({ ...goodReq, replyExpected: false, deadlineMs: undefined }).replyExpected === false);
+rejects("a zero deadline is bad-request (bounded, never degenerate)", "bad-request",
+  () => parseEndpointRequest({ ...goodReq, deadlineMs: 0 }));
+rejects("record as a request class is bad-request (a state contract, never a request class)", "bad-request",
+  () => parseEndpointRequest({ ...goodReq, class: "record" }));
+rejects("non-object args is bad-request", "bad-request",
+  () => parseEndpointRequest({ ...goodReq, args: [1] }));
+rejects("a malformed target lifecycleUid is bad-request", "bad-request",
+  () => parseEndpointRequest({ ...goodReq, target: { owner: "u_abc", actor: "a", lifecycleUid: "SHORT" } }));
+
+// ── body <-> subject agreement ──
+const parse = (s: string) => parseEpSubject(s) as ParsedEpRequest;
+const untargeted = parse(epRequestSubject("demo", { route: { mode: "one" }, endpoint: "manager", command: "spawn", caller, nonce: NONCE }));
+const ownerSub = parse(epRequestSubject("demo", { route: { mode: "one" }, endpoint: "manager", command: "spawn", target: { mode: "owner", tOwner: "u_abc" }, caller, nonce: NONCE }));
+const selfSub = parse(epRequestSubject("demo", { route: { mode: "one" }, endpoint: "manager", command: "restart", target: { mode: "self" }, caller, nonce: NONCE }));
+const handleSub = parse(epRequestSubject("demo", { route: { mode: "one" }, endpoint: "manager", command: "attach", target: { mode: "handle", tOwner: "u_t", tActor: "svc", tUid: "h".repeat(26) }, caller, nonce: NONCE }));
+const exactSub = parse(epRequestSubject("demo", { route: { mode: "one" }, endpoint: "manager", command: "attach", target: { mode: "exact", tOwner: "u_t", tActor: "svc", tUid: "h".repeat(26) }, caller, nonce: NONCE }));
+const bodyTarget = { owner: "u_abc", actor: "runner", lifecycleUid: "t".repeat(26) };
+
+admits("untargeted request agrees with its subject", () => checkRequestSubjectAgreement(req, untargeted));
+admits("owner-mode request with a matching body target agrees",
+  () => checkRequestSubjectAgreement(parseEndpointRequest({ ...goodReq, target: bodyTarget }), ownerSub));
+rejects("op.command disagreement is op-mismatch", "op-mismatch",
+  () => checkRequestSubjectAgreement(parseEndpointRequest({ ...goodReq, op: { ...goodReq.op, command: "stop" } }), untargeted));
+rejects("a body target on an untargeted subject is target-mismatch, never ignored", "target-mismatch",
+  () => checkRequestSubjectAgreement(parseEndpointRequest({ ...goodReq, target: bodyTarget }), untargeted));
+rejects("a body target on a self subject is target-mismatch", "target-mismatch",
+  () => checkRequestSubjectAgreement(parseEndpointRequest({ ...goodReq, op: { ...goodReq.op, command: "restart" }, target: bodyTarget }), selfSub));
+rejects("a missing body target on an owner-mode subject is target-mismatch", "target-mismatch",
+  () => checkRequestSubjectAgreement(req, ownerSub));
+rejects("the body target owner must equal the subject token", "target-mismatch",
+  () => checkRequestSubjectAgreement(parseEndpointRequest({ ...goodReq, target: { ...bodyTarget, owner: "u_other" } }), ownerSub));
+rejects("handle mode compares the whole redemption triple", "target-mismatch",
+  () => checkRequestSubjectAgreement(
+    parseEndpointRequest({ ...goodReq, op: { ...goodReq.op, command: "attach" }, target: { owner: "u_t", actor: "other", lifecycleUid: "h".repeat(26) } }),
+    handleSub));
+rejects("exact mode compares the whole triple exactly like handle", "target-mismatch",
+  () => checkRequestSubjectAgreement(
+    parseEndpointRequest({ ...goodReq, op: { ...goodReq.op, command: "attach" }, target: { owner: "u_t", actor: "other", lifecycleUid: "h".repeat(26) } }),
+    exactSub));
+rejects("from.id must equal the subject sender principal", "sender-mismatch",
+  () => checkRequestSubjectAgreement(parseEndpointRequest({ ...goodReq, from: { id: "u_abc.impostor", name: "x" } }), untargeted));
+rejects("the declared class must equal the contract class", "class-mismatch",
+  () => assertClassMatches(req, "journal"));
+const scatterSub = parse(epRequestSubject("demo", { route: { mode: "all" }, endpoint: "manager", command: "spawn", caller, nonce: NONCE }));
+rejects("a deadline-less cast on the scatter rail is bad-request (deadlineMs is a MUST for scatter)", "bad-request",
+  () => checkRequestSubjectAgreement(parseEndpointRequest({ ...goodReq, replyExpected: false, deadlineMs: undefined }), scatterSub));
+admits("a scatter cast WITH a deadline agrees",
+  () => checkRequestSubjectAgreement(parseEndpointRequest({ ...goodReq, replyExpected: false }), scatterSub));
+
+// ── reply / event shapes ──
+const okReply = parseEndpointReply({ v: 1, id: "req-1", ok: true, data: { pid: 1 }, junk: 1 });
+c("ok reply parses, unknown fields dropped", okReply.ok && (okReply.data as { pid: number }).pid === 1 && !("junk" in okReply));
+const errReply = parseEndpointReply({ v: 1, id: "req-1", ok: false, error: { code: "expired", message: "mapping moved", details: [{ kind: "ai.cotal.mapping", revision: 4 }] } });
+c("error reply parses with reverse-DNS detail kinds", errReply.error?.code === "expired" && errReply.error.details?.[0].kind === "ai.cotal.mapping");
+rejects("an ok reply with an error is bad-request", "bad-request",
+  () => parseEndpointReply({ v: 1, id: "r", ok: true, error: { code: "internal", message: "x" } }));
+rejects("a failed reply with data is bad-request", "bad-request",
+  () => parseEndpointReply({ v: 1, id: "r", ok: false, data: 1, error: { code: "internal", message: "x" } }));
+rejects("a failed reply without an error is bad-request", "bad-request",
+  () => parseEndpointReply({ v: 1, id: "r", ok: false }));
+const acceptance = { name: "allocated", goalId: "goal-1" };
+const followed = controlReplyFrom({ v: 1, id: "followed", ok: false, data: acceptance,
+  error: { code: "uncertain", message: "inspect the allocated agent" }, receipt: "receipt" });
+c("a failed local follow keeps its acceptance in ControlReply",
+  followed.ok === false && followed.data === acceptance && followed.code === "uncertain"
+    && followed.error === "inspect the allocated agent", followed);
+const receiptReply = parseEndpointReply({ v: 1, id: "receipt", ok: false,
+  error: { code: "internal", message: "failed" }, receipt: "receipt" });
+c("a parsed failed reply keeps its receipt and omits data",
+  receiptReply.ok === false && receiptReply.receipt === "receipt" && !("data" in receiptReply), receiptReply);
+rejects("an off-catalog non-reverse-DNS error code is bad-request", "bad-request",
+  () => parseEndpointReply({ v: 1, id: "r", ok: false, error: { code: "Nope", message: "x" } }));
+rejects("a non-reverse-DNS detail kind is bad-request", "bad-request",
+  () => parseEndpointReply({ v: 1, id: "r", ok: false, error: { code: "internal", message: "x", details: [{ kind: "oops" }] } }));
+rejects("reply version skew is unsupported-version", "unsupported-version",
+  () => parseEndpointReply({ v: 0, id: "r", ok: true }));
+
+// ── §13.3 error.outcome: the field a conformant peer sends and this parser used to drop ──
+// `pickError` REBUILDS the error rather than passing it through, so a field it does not name is
+// discarded. Discarding THIS one is not a lossy round-trip, it is a changed meaning: §13.3 says an
+// omitted `outcome` MUST be read as `unknown`, so dropping a peer's `not-executed` downgrades a
+// PROOF that nothing ran into an ABSENCE of evidence, at the parser, for a caller that did
+// everything right. Graded on the way IN because that is the direction where the other
+// implementation is the one being wronged and cannot tell.
+const outcomeReply = parseEndpointReply({ v: 1, id: "req-o", ok: false,
+  error: { code: "failed-precondition", message: "not this incarnation", outcome: "not-executed" } });
+c("a peer's `outcome: not-executed` SURVIVES the parse — it is not rebuilt away",
+  outcomeReply.error?.outcome === "not-executed", outcomeReply.error);
+const execReply = parseEndpointReply({ v: 1, id: "req-o2", ok: false,
+  error: { code: "internal", message: "the handler ran and then failed", outcome: "executed" } });
+c("...and so does `executed`, which is the one that must never be read as a refusal",
+  execReply.error?.outcome === "executed", execReply.error);
+// Absence stays absence. The parser must not MANUFACTURE `unknown`: §13.3 puts that reading on the
+// consumer, and a parser that fills it in makes "the peer said unknown" and "the peer said nothing"
+// indistinguishable on the wire, which is a different fact.
+c("an omitted outcome stays omitted — the parser does not invent `unknown`",
+  errReply.error !== undefined && !("outcome" in errReply.error), errReply.error);
+rejects("an unrecognised outcome is bad-request, not passed through and not coerced", "bad-request",
+  () => parseEndpointReply({ v: 1, id: "r", ok: false, error: { code: "internal", message: "x", outcome: "maybe" } }));
+rejects("...and neither is a non-string outcome", "bad-request",
+  () => parseEndpointReply({ v: 1, id: "r", ok: false, error: { code: "internal", message: "x", outcome: 0 } }));
+// The other direction: what THIS implementation emits. The bind fence refuses before dispatching to
+// the handler, which §13.3 says MUST carry `not-executed` — and a conformant peer that has never
+// heard of `ai.cotal.ep.bind-refused` reads only this field, so emitting the marker without the
+// outcome is exactly what makes two implementations disagree about whether the command ran.
+c("toEpError() carries the outcome the fence sets",
+  new EpEnvelopeError("failed-precondition", "x", undefined, "not-executed").toEpError().outcome === "not-executed");
+c("...and omits it entirely on a caller-raised refusal, which is not a reply",
+  !("outcome" in new EpEnvelopeError("internal", "x").toEpError()));
+
+for (const outcome of ["executed", "not-executed", "unknown"] as const) {
+  const reply = parseEndpointReply({ v: 1, id: "req-control", ok: false,
+    error: { code: "failed-precondition", message: "the operation failed", outcome } });
+  const converted = controlReplyFrom(reply);
+  c(`ControlReply preserves the reply's ${outcome} outcome`,
+    converted.outcome === outcome && converted.code === "failed-precondition", converted);
+  const thrown = controlReplyFromThrown(new EpEnvelopeError("bad-request", "schema refusal", undefined, outcome), "caller context");
+  c(`ControlReply preserves the envelope error's ${outcome} outcome`,
+    thrown.outcome === outcome && thrown.code === "bad-request" && thrown.error === "caller context", thrown);
+}
+const withoutOutcome = controlReplyFrom(errReply);
+c("ControlReply keeps an absent reply outcome absent and preserves details",
+  !("outcome" in withoutOutcome) && withoutOutcome.details === errReply.error?.details, withoutOutcome);
+const thrownWithoutOutcome = controlReplyFromThrown(new EpEnvelopeError("internal", "x"), "caller context");
+c("ControlReply keeps an absent envelope error outcome absent", !("outcome" in thrownWithoutOutcome), thrownWithoutOutcome);
+const successfulControl = controlReplyFrom(okReply);
+c("successful ControlReply keeps its data without inventing an outcome",
+  successfulControl.ok && successfulControl.data === okReply.data && !("outcome" in successfulControl), successfulControl);
+
+const ev = parseEndpointEvent({ v: 1, topic: "ev.ai_cotal_lifecycle.started", ts: 1720500000000, data: null });
+c("event parses (a null data field IS data)", ev.topic.startsWith("ev.") && ev.data === null);
+rejects("an event without data is bad-request", "bad-request", () => parseEndpointEvent({ v: 1, topic: "t", ts: 1 }));
+rejects("a negative ts is bad-request", "bad-request", () => parseEndpointEvent({ v: 1, topic: "t", ts: -1, data: 1 }));
+
+// ── invocation-time schema validation, distinct from registration time ──
+const validate = compileContractSchema({ root: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } });
+c("valid args pass and are returned", (assertArgsValid(validate, { name: "x" }) as { name: string }).name === "x");
+rejects("invalid args are the invocation-time bad-request", "bad-request",
+  () => assertArgsValid(validate, {}));
+const voidValidate = compileContractSchema({ root: VOID_SCHEMA });
+c("absent args validate against the void schema as null", assertArgsValid(voidValidate, undefined) === null);
+rejects("present args against the void schema are bad-request", "bad-request",
+  () => assertArgsValid(voidValidate, { any: 1 }));
+
+// A closed-contract refusal must NAME the offending property. AJV carries the rejected key only in
+// `params.additionalProperty`; dropping it prints "/ must NOT have additional properties" and
+// turns a caller/responder version skew (a newer caller sending a key an older deployed
+// responder's contract predates) into a guessing game: nothing says which key or which side is
+// stale. The args and output render sites share one helper, so both are asserted.
+{
+  const closed = compileContractSchema({ root: { type: "object", properties: { name: { type: "string" } }, required: ["name"], additionalProperties: false } });
+  let argsMsg = "";
+  try { assertArgsValid(closed, { name: "x", events: true }); } catch (e) { argsMsg = (e as Error).message; }
+  c("a closed-contract args refusal names the offending property", /additional properties: "events"/.test(argsMsg), argsMsg);
+  let outMsg = "";
+  try { assertOutputValid(closed, { name: "x", events: true }); } catch (e) { outMsg = (e as Error).message; }
+  c("a closed-contract output refusal names the offending property", /additional properties: "events"/.test(outMsg), outMsg);
+  // Control: the name is appended ONLY for the additionalProperties keyword, never fabricated.
+  let typeMsg = "";
+  try { assertArgsValid(closed, { name: 7 }); } catch (e) { typeMsg = (e as Error).message; }
+  c("a non-additionalProperties refusal does not grow a property name", !typeMsg.includes("additional properties:"), typeMsg);
+}
+
+// The caller-side refusal marks the key AND the instance the request binds, so a surface can ask
+// that instance which release it runs. Refused before publish, so the connection is never touched.
+{
+  const contract = { input: compileContract({ root: { type: "object", properties: { name: { type: "string" } }, additionalProperties: false } }), output: compileContract({ root: VOID_SCHEMA }) };
+  const IID = "b".repeat(26);
+  const refusal = async (bind?: { instanceId: string; epoch: number }): Promise<unknown> => {
+    try { await epCast(undefined as never, "s", { mode: "one" }, { endpoint: "manager", command: "spawn", contract, caller, args: { name: "x", runtime: "pty" }, ...(bind ? { bind } : {}) }); }
+    catch (e) { return e; }
+    return undefined;
+  };
+  const bound = await refusal({ instanceId: IID, epoch: 3 });
+  c("an undeclared key in a bound request names the key and the bound instance, not-executed",
+    undeclaredArg(bound) === "runtime" && undeclaredArgInstance(bound) === IID && (bound as EpEnvelopeError).outcome === "not-executed", bound);
+  const unbound = await refusal();
+  c("an unbound request names the key and no instance", undeclaredArg(unbound) === "runtime" && undeclaredArgInstance(unbound) === undefined, unbound);
+}
+
+// The §13.8 validation budget on the REQUEST path is REPORTED, not enforced. No available
+// instrument can justify refusing a caller on it: elapsed counts the machine (this budget refused
+// an 82ms cold-JIT validation of a small, schema-VALID object during a gate run), and process CPU
+// counts V8's JIT threads and any sibling Worker (16.4ms process CPU against 0.18ms on the
+// measuring thread). A false positive here tells a legitimate caller its valid arguments are
+// malformed. Enforcement stays at REGISTRATION and is asserted in schema-profile.smoke.
+//
+// These legs use a REACHABLE request shape on purpose. An earlier version passed a root ARRAY
+// through `as unknown as Record`, which proved a helper branch rather than a request property:
+// §13.3 says `args` is an object and `parseEndpointRequest` rejects arrays long before this
+// boundary. A test that reaches past a contract via a cast proves nothing about traffic that must
+// cross it — the defect this repo documents in manifest-launch.smoke.ts, committed here inside the
+// very fix that was correcting it. The payload is now an OBJECT carrying the heavy array, no cast.
+const heavySchemaRoot = {
+  type: "object",
+  properties: { rows: { type: "array", items: { type: "object", properties: { s: { type: "string", pattern: "^[a-z]{1,12}-[0-9]{1,6}$" } }, required: ["s"], additionalProperties: false } } },
+  required: ["rows"],
+  additionalProperties: false,
+};
+// Once the budget is REPORTED rather than enforced, its only observable is the line on stderr.
+// "It did not throw" cannot tell a reported over-budget validation apart from one that was never
+// over budget at all, so a leg written that way passes vacuously — and measurement says it does:
+// at 300k rows this payload costs 8ms of process CPU against the 10ms budget on a quiet box, i.e.
+// UNDER it, and the earlier 20ms reading only appeared because sixty preceding assertions had
+// already loaded the process. Both legs below therefore REQUIRE the report, and the size is taken
+// from the measured curve (300k=8ms, 600k=15ms, 1M=21ms, 2M=41ms; linear, no cliff), which puts
+// this at ~2x budget on the fastest host we run on and only further over on a slower one.
+{
+  const ROWS = 1_000_000;
+  const heavySchema = compileContractSchema({ root: heavySchemaRoot });
+  const heavy = { rows: Array.from({ length: ROWS }, (_, i) => ({ s: `item-${i % 999999}` })) };
+
+  const reports: string[] = [];
+  const realError = console.error;
+  console.error = (...a: unknown[]) => { reports.push(a.map(String).join(" ")); };
+  let argsRows = -1, outThrew = "";
+  let freshOut: ReturnType<typeof compileContractSchema>;
+  try {
+    argsRows = (assertArgsValid(heavySchema, heavy) as typeof heavy).rows.length;
+    // A FRESH validator for the output side, per the review note. It is not what makes this leg
+    // live (a fresh compile still validates warm DATA ~25% cheaper), so the report is the guard.
+    freshOut = compileContractSchema({ root: heavySchemaRoot });
+    try { assertOutputValid(freshOut, heavy); } catch (e) { outThrew = (e as Error).message; }
+  } finally { console.error = realError; }
+
+  const budgetOf = (what: string): number => {
+    const line = reports.find((r) => r.includes(`${what} validation took`));
+    return line ? Number(/took ~(\d+)ms/.exec(line)?.[1] ?? -1) : -1;
+  };
+  const argsMs = budgetOf("args"), outMs = budgetOf("output");
+  // Print the margin. A leg that stops being over budget must FAIL here, not quietly stop testing.
+  console.log(`  (§13.8 budget ${SCHEMA_PROFILE.validateBudgetMs}ms; ${ROWS} rows measured args=${argsMs}ms output=${outMs}ms process CPU, ` +
+    `${(argsMs / SCHEMA_PROFILE.validateBudgetMs).toFixed(1)}x / ${(outMs / SCHEMA_PROFILE.validateBudgetMs).toFixed(1)}x)`);
+
+  c("the ARGS payload really did go over the §13.8 budget, so the leg below is not vacuous",
+    argsMs > SCHEMA_PROFILE.validateBudgetMs, `args reported ${argsMs}ms`);
+  c("an over-budget ARGS validation is REPORTED and still returns the args", argsRows === ROWS, `rows=${argsRows}`);
+  c("...and that payload was schema-valid, so nothing was refused for the other reason", heavySchema(heavy) === true);
+  c("the OUTPUT payload really did go over the §13.8 budget too", outMs > SCHEMA_PROFILE.validateBudgetMs, `output reported ${outMs}ms`);
+  c("an over-budget OUTPUT validation is reported, never `internal`", outThrew === "", outThrew);
+
+  // The SCHEMA's own verdict is untouched by the demotion — only the budget stopped refusing.
+  rejects("an invalid payload is still the invocation-time bad-request", "bad-request",
+    () => assertArgsValid(heavySchema, { rows: [{ s: "NOT-A-MATCH" }] }));
+  rejects("an invalid output is still `internal`", "internal",
+    () => assertOutputValid(freshOut!, { rows: [{ s: "NOT-A-MATCH" }] }));
+}
+
+console.log(`\nENDPOINT ENVELOPE SMOKE ${fail === 0 ? "OK ✅" : "FAILED ❌"}  (${ok} passed, ${fail} failed)`);
+if (fail > 0) process.exit(1);

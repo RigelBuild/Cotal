@@ -1,0 +1,327 @@
+import { HarnessError } from "@1jehuang/jcode-sdk";
+import { constants, lstatSync, mkdirSync, openSync, writeSync } from "node:fs";
+import { join } from "node:path";
+import { hardenPrivate } from "@cotal-ai/core";
+import { activeModelRoute, type RuntimeIdentity } from "./route-identity.js";
+
+export type JcodeConnectorFailureCode =
+  | "model_prefix_rejected"
+  | "model_refused"
+  | "model_mismatch"
+  | "private_state"
+  | "readiness_timeout"
+  | "sessions_enumeration_failed"
+  | "sessions_unwritable"
+  | "cursor_state_unreadable"
+  | "provider_auth_refused"
+  | "provider_payment_required"
+  | "provider_forbidden"
+  | "provider_rate_limited"
+  | "provider_request_failed";
+
+/** A bounded connector-owned startup refusal. Only its allow-listed code is rendered publicly. */
+export class JcodeConnectorError extends Error {
+  constructor(readonly code: JcodeConnectorFailureCode, message: string, options?: ErrorOptions) {
+    super(message, options);
+  }
+}
+
+/** A route-verification refusal with bounded identity fields, never route details or child output.
+ * Reported runtime identity is not the accepted session pin, and effort has not yet been applied. */
+export class JcodeModelMismatch extends JcodeConnectorError {
+  constructor(requestedModel: string | undefined, requestedTier: string, runtime: RuntimeIdentity | undefined) {
+    const model = requestedModel ?? runtime?.model;
+    const matches = model ? runtime?.routes?.filter((route) => route?.model === model) ?? [] : [];
+    const route = model ? activeModelRoute(runtime, model) : undefined;
+    const reason = !model ? "no model was reported"
+      : matches.length === 0 ? "no matching model route was reported"
+      : !route ? "matching routes could not be disambiguated by the reported provider"
+      : "the selected route has no provider";
+    const identity = (value: string | undefined, missing = "(unreported)"): string =>
+      value === undefined || value === "" ? missing
+        : typeof value === "string" && SAFE_VALUE.test(value) ? JSON.stringify(value) : "(withheld)";
+    const tier = SAFE_EFFORT_TIERS.has(requestedTier) ? JSON.stringify(requestedTier) : "(withheld)";
+    super(
+      "model_mismatch",
+      `${reason}; requested model ${identity(requestedModel, "(provider default)")}; reported model ${identity(runtime?.model)}; reported provider ${identity(runtime?.provider)}; matching model routes: ${matches.length}; requested tier ${tier} was not applied`,
+    );
+  }
+}
+
+/** Listing stored sessions killed the harness. Cause and path are connector-owned, not child stderr. */
+export class JcodeSessionsEnumerationFailure extends Error {
+  readonly code = "sessions_enumeration_failed" as const;
+
+  constructor(
+    readonly sessionsPath: string,
+    readonly causeText: string,
+  ) {
+    super(`could not enumerate stored sessions at ${sessionsPath}: ${causeText}`);
+  }
+}
+
+/** The seat's stored-sessions directory exists but will not take the harness's writes. Raised
+ * BEFORE any `create_session`: the harness accepts that request and only dies while persisting
+ * the session during the first turn, which lands outside every guard this connector owns and
+ * renders as `startup failed (unknown)` (#1538). Like the enumeration failure above, the path and
+ * the errno are connector-owned facts, never harness or provider bytes. */
+export class JcodeSessionsUnwritableFailure extends Error {
+  readonly code = "sessions_unwritable" as const;
+
+  constructor(
+    readonly sessionsPath: string,
+    readonly errnoCode: string,
+  ) {
+    super(`stored sessions directory is not writable at ${sessionsPath} (${errnoCode})`);
+  }
+}
+
+export type CursorStateUnreadableReason =
+  | "not_sqlite"
+  | "locked"
+  | "hot_journal"
+  | "corrupt"
+  | "no_item_table"
+  | "value_type"
+  | "value_size"
+  | "sqlite_error";
+
+/** Cursor's state database exists but gave no consistent read of the keys Jcode uses. The reason is
+ * a connector-owned word and the SQLite result code a number, so no SQLite text reaches the public
+ * line. The path is relative to the operator's home. */
+export class JcodeCursorStateUnreadable extends Error {
+  readonly code = "cursor_state_unreadable" as const;
+
+  constructor(
+    readonly sourceRelative: string,
+    readonly reason: CursorStateUnreadableReason,
+    readonly sqliteCode?: number,
+  ) {
+    super(`Cursor's state database ~/${sourceRelative} could not be read (${reason}${sqliteCode === undefined ? "" : `, SQLite code ${sqliteCode}`})`);
+  }
+}
+
+let diagnosticLogFd: number | undefined;
+
+/** Start the per-seat connector diagnostic log before any private Jcode process is launched. */
+export function installJcodeDiagnosticLog(home: string): string {
+  const logs = join(home, "logs");
+  try {
+    const stats = lstatSync(logs);
+    if (stats.isSymbolicLink()) throw new Error(`refusing symlinked Jcode connector log directory: ${logs}`);
+    if (!stats.isDirectory()) throw new Error(`Jcode connector log path is not a directory: ${logs}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    mkdirSync(logs, { mode: 0o700 });
+  }
+  hardenPrivate(logs, "dir");
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const path = join(logs, `connector-${timestamp}-${process.pid}.log`);
+  diagnosticLogFd = openSync(
+    path,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+    0o600,
+  );
+  hardenPrivate(path, "file");
+  return path;
+}
+
+/** Write one connector-owned diagnostic to the terminal and the seat's private connector log. */
+export function writeJcodeDiagnostic(message: string): void {
+  process.stderr.write(message);
+  if (diagnosticLogFd !== undefined) writeSync(diagnosticLogFd, message);
+}
+
+/** A bounded, connector-owned account of a provider refusal during the mandatory readiness turn.
+ * It deliberately contains only a provider error code and a model/effort value the connector could
+ * classify; the original Harness API message may include private configuration or child output. */
+export class JcodeReadinessProviderRefusal extends Error {
+  constructor(
+    readonly providerCode: string,
+    readonly parameter: "model" | "reasoning effort",
+    readonly value: string,
+  ) {
+    super(`provider refused ${parameter} ${JSON.stringify(value)} (${providerCode})`);
+  }
+}
+
+/** A Jcode reasoning-effort refusal with only fields safe for an external observer/UI.
+ * The underlying HarnessError can include arbitrary provider response text and must never escape
+ * through the host's startup diagnostic. */
+export class JcodeEffortRefusal extends Error {
+  readonly providerCode = "invalid_request";
+
+  constructor(
+    readonly requestedTier: string,
+    readonly effectiveModel: string,
+    readonly provider: string,
+    readonly apiMethod: string | undefined,
+    readonly acceptedLadder: readonly string[],
+  ) {
+    super("Jcode reasoning effort was refused");
+  }
+}
+
+/** A verified model route whose provider/profile has no reasoning-effort surface. */
+export class JcodeEffortUnsupported extends Error {
+  constructor(
+    readonly requestedTier: string,
+    readonly effectiveModel: string,
+    readonly provider: string,
+    readonly apiMethod: string | undefined,
+  ) {
+    super("Jcode route does not support reasoning effort");
+  }
+}
+
+const SAFE_CODE = /^[a-z][a-z0-9_]{0,63}$/;
+const SAFE_EFFORT_TIERS = new Set(["minimal", "low", "medium", "high", "xhigh", "max", "none"]);
+const SAFE_VALUE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+
+type ProviderBody = { code?: unknown; message?: unknown };
+
+function providerBody(message: string): ProviderBody | undefined {
+  // HarnessError prefixes the wire message with its stable SDK code (`invalid_request: ...`),
+  // so a provider's JSON body can begin after that prefix rather than at byte zero.
+  const json = message.slice(message.indexOf("{"));
+  try {
+    const parsed = JSON.parse(json) as { error?: unknown };
+    const body = parsed.error ?? parsed;
+    if (!body || typeof body !== "object") return undefined;
+    return body as ProviderBody;
+  } catch {
+    return undefined;
+  }
+}
+
+function providerCode(message: string, body: ProviderBody | undefined): string | undefined {
+  if (typeof body?.code === "string" && SAFE_CODE.test(body.code)) return body.code;
+  const prefix = /^\s*([a-z][a-z0-9_]{0,63}):/.exec(message)?.[1];
+  return prefix && SAFE_CODE.test(prefix) ? prefix : undefined;
+}
+
+function classifiedCode(message: string, body: ProviderBody | undefined): string {
+  // The SDK error is `invalid_request`; a provider may put its own code in JSON or as a textual
+  // prefix. Prefer the provider's code when safely present, otherwise name the SDK's stable code.
+  return providerCode(message, body) ?? "invalid_request";
+}
+
+function rejectedParameter(message: string): { parameter: "model" | "reasoning effort"; value: string } | undefined {
+  const match = /\b(model(?:[ _-]?(?:id|parameter))?|reasoning[ _-]?effort|effort(?:[ _-]?tier)?)\s*(?:=|:|is|was)?\s*["'`]?([A-Za-z0-9][A-Za-z0-9._:/-]{0,255})/i.exec(message);
+  if (!match || !SAFE_VALUE.test(match[2]!)) return undefined;
+  return { parameter: /^model/i.test(match[1]!) ? "model" : "reasoning effort", value: match[2]! };
+}
+
+/** A display-only parser, never validation. It accepts only the documented generic effort names,
+ * stops before prose delimiters, and cannot reproduce arbitrary downstream text. */
+function acceptedEffortLadder(error: unknown): string[] {
+  if (!(error instanceof Error)) return [];
+  const listed = /\b(?:accepted\s+(?:tiers?|efforts?)|available)\s*:\s*([^;\r\n]{1,256})/i.exec(error.message)?.[1];
+  if (!listed) return [];
+  return [...new Set(
+    listed
+      .split(",")
+      .map((part) => part.trim().replace(/^["'`(\[]+|["'`\])\s]+$/g, "").toLowerCase())
+      .filter((tier) => SAFE_EFFORT_TIERS.has(tier)),
+  )];
+}
+
+/** Compose a bounded effort-refusal diagnostic. `invalid_request` is intentionally fixed: Jcode
+ * rejected this API operation, while provider-supplied codes and text are untrusted. */
+export interface JcodeEffortIdentity {
+  model: string;
+  provider: string;
+  apiMethod?: string;
+}
+
+/** Classify the two stable invalid-request outcomes without rendering downstream text. HarnessError
+ * prefixes its message with the stable code, so the anchored `invalid_request:` predicate below is
+ * also the code gate; a second `error.code` check would be redundant. */
+export function jcodeEffortRefusal(
+  error: unknown,
+  requestedTier: string,
+  identity: JcodeEffortIdentity,
+): JcodeEffortRefusal | JcodeEffortUnsupported {
+  if (
+    error instanceof HarnessError &&
+    /^invalid_request: Reasoning effort is not supported by the current model\/profile\./.test(error.message)
+  ) {
+    return new JcodeEffortUnsupported(requestedTier, identity.model, identity.provider, identity.apiMethod);
+  }
+  return new JcodeEffortRefusal(
+    requestedTier,
+    identity.model,
+    identity.provider,
+    identity.apiMethod,
+    acceptedEffortLadder(error),
+  );
+}
+
+/** Classify measured readiness failures without exposing endpoints, auth details or child output.
+ * A failed send does not establish why the provider could not be reached. */
+export function classifyReadinessFailure(error: unknown): JcodeConnectorError | undefined {
+  if (!(error instanceof HarnessError) || error.code !== "internal") return undefined;
+  if (error.message.startsWith("internal: Failed to send OpenAI-compatible chat request\n")) {
+    return new JcodeConnectorError(
+      "provider_request_failed",
+      "Jcode could not send the readiness request to its provider",
+    );
+  }
+  if (
+    error.message.startsWith("internal: OpenAI-compatible chat request failed\n") &&
+    /^  status: 401 Unauthorized\r?$/m.test(error.message)
+  ) {
+    return new JcodeConnectorError("provider_auth_refused", "Jcode provider refused readiness authentication");
+  }
+  if (
+    error.message.startsWith("internal: OpenAI-compatible chat request failed\n") &&
+    /^  status: 402 Payment Required\r?$/m.test(error.message)
+  ) {
+    return new JcodeConnectorError("provider_payment_required", "Jcode provider refused the readiness request for payment");
+  }
+  if (
+    error.message.startsWith("internal: OpenAI-compatible chat request failed\n") &&
+    /^  status: 403 Forbidden\r?$/m.test(error.message)
+  ) {
+    return new JcodeConnectorError("provider_forbidden", "Jcode provider refused the readiness request as forbidden");
+  }
+  if (
+    error.message.startsWith("internal: OpenAI-compatible chat request failed\n") &&
+    /^  status: 429 Too Many Requests\r?$/m.test(error.message)
+  ) {
+    return new JcodeConnectorError("provider_rate_limited", "Jcode provider rate-limited the readiness request");
+  }
+  return undefined;
+}
+
+/**
+ * Classify only the Jcode SDK's invalid-request response and only when both fields are safely
+ * extractable. The OpenAI-compatible adapter wraps HTTP model-not-found in `internal`; recognize
+ * that measured envelope separately and use only the requested pin, never provider prose.
+ * Everything else retains the existing scrubbed startup diagnostic.
+ */
+export function classifyReadinessProviderRefusal(error: unknown, requestedModel?: string): JcodeReadinessProviderRefusal | undefined {
+  if (!(error instanceof HarnessError)) return undefined;
+  if (error.code === "internal") {
+    if (
+      !requestedModel || !SAFE_VALUE.test(requestedModel) ||
+      !error.message.startsWith("internal: OpenAI-compatible chat request failed\n") ||
+      !/^  status: 404 Not Found\r?$/m.test(error.message)
+    ) return undefined;
+    const response = /^  response: (\{[^\r\n]*\})\r?$/m.exec(error.message)?.[1];
+    if (!response) return undefined;
+    try {
+      const parsed = JSON.parse(response) as { error?: { code?: unknown; param?: unknown } };
+      if (parsed?.error?.code === "model_not_found" && parsed.error.param === "model")
+        return new JcodeReadinessProviderRefusal("model_not_found", "model", requestedModel);
+    } catch {
+      // An unrecognized provider body remains private.
+    }
+    return undefined;
+  }
+  if (error.code !== "invalid_request") return undefined;
+  const body = providerBody(error.message);
+  const code = classifiedCode(error.message, body);
+  const parameter = rejectedParameter(typeof body?.message === "string" ? body.message : error.message);
+  return parameter ? new JcodeReadinessProviderRefusal(code, parameter.parameter, parameter.value) : undefined;
+}

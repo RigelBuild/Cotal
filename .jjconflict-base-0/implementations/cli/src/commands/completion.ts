@@ -1,0 +1,387 @@
+import { basename, dirname, isAbsolute } from "node:path";
+import {
+  findCommand,
+  findSubcommand,
+  oneLine,
+  type Command,
+  type CompletionItem,
+  type CompletionResult,
+  type FlagValues,
+  type ParsedArgs,
+  type Subcommand,
+} from "@cotal-ai/core";
+import { codeSpan, CommandFailure, isCommandFailure, jsonFlag, loadMeshes, loadPreparedSpaces, plainFlag, presentationOf, writeResult, type OutputWarning, type Report, type Styled } from "@cotal-ai/workspace";
+import { metadataPositionals } from "../lib/command-path.js";
+import { fileCompletion, spaceCompletion } from "../lib/completion.js";
+import { debugFlag } from "../lib/debug-flag.js";
+import { servicePresetCommand } from "../lib/service-presets.js";
+import { commandSurface } from "../ext-loader.js";
+import { changeCompletion, completionOwnership, completionPaths as stubPaths, completionSourceLine, completionUnsafeFolders, readCompletionText } from "../lib/completion-install.js";
+import { SCRIPTS, LOAD_NOW } from "../lib/completion-scripts.js";
+
+/**
+ * Shell completion, the standard two-layer way (Cobra/Click/clap): a thin per-shell stub —
+ * printed to stdout by `cotal completion script <shell>`, installed once — that forwards each <TAB>
+ * to the hidden `cotal __complete` dispatcher. The dispatcher returns live candidates, so
+ * completion sees real data (your personas) that a static script never could.
+ *
+ * The stub is installed once; the protocol between it and `__complete` is line-oriented and
+ * tolerant (unknown lines are ignored), so it can grow without anyone re-installing the stub.
+ *
+ *   cotal completion                            # which shells have the stub, and whether it is current
+ *   cotal completion script <shell>             # print the stub to stdout
+ *   cotal completion install [shell]            # install or refresh unchanged owned files
+ *   cotal completion uninstall [shell]          # remove unchanged owned files and startup block
+ *   cotal __complete <words…>                   # internal: emit candidates for the cursor
+ *
+ * `__complete` is import-light and side-effect-free by contract — completion reads only local
+ * files (your personas and their declared channels/roles), never the mesh — so a keystroke never
+ * blocks on the network. And there is no fallback: a completer that can't produce its authoritative
+ * answer (e.g. a malformed agent file) fails the process — nothing on stdout, non-zero exit — so a
+ * partial set is never mistaken for a complete one. Set COTAL_COMPLETE_DEBUG=1 to see why on stderr,
+ * and to see the warnings a completion records; the stubs discard stderr, so run it by hand.
+ */
+
+/** Wire format: one `value\tdescription` (or bare `value`) per line, then a `:directive`
+ *  trailer the stub reads (`:nofiles` / `:nospace` / `:default`). A candidate can come from a file
+ *  name a cloned project brings, so a value holding a control character is left out: the shell would
+ *  write it to the terminal or the command line, a newline would forge more lines, and its escaped
+ *  form names nothing. */
+function emit(items: CompletionItem[], directive: NonNullable<CompletionResult["directive"]>): void {
+  const lines = items.filter((i) => oneLine(i.value) === i.value).map((i) => (i.description ? `${i.value}\t${i.description}` : i.value));
+  lines.push(`:${directive}`);
+  process.stdout.write(`${lines.join("\n")}\n`);
+}
+
+/** The hidden dispatcher the shell stubs call (`rawArgs`: its argv is another command's
+ *  half-typed line, never parsed). The words after `cotal`, up to and including the (possibly
+ *  empty) word being completed, arrive as `args.positionals` verbatim. */
+export async function complete(args: ParsedArgs): Promise<void> {
+  const argv = args.positionals;
+  // Mirror help()'s visibility: the SAME surface runCli resolved (registered commands plus
+  // extension stubs when the root opted in), minus `__`-internal and `hidden` ones. Extension
+  // candidates come from the manifest CACHE — a <TAB> never imports an extension.
+  const commands = commandSurface().filter((cmd) => !cmd.name.startsWith("__") && !cmd.hidden);
+  // No command word yet: offer the command names. If the lone word is an exact command, many
+  // shells omitted the trailing empty cursor word; complete inside that command instead.
+  if (argv.length === 0) {
+    emit(commands.map((cmd) => ({ value: cmd.name, description: cmd.summary })), "nofiles");
+    return;
+  }
+  // The command word resolves as dispatch resolves it: by exact name or alias, never by prefix. A
+  // lone alias is still the word being typed (`sp` on the way to `spawn`), so only a lone exact name
+  // completes inside its command.
+  const cmd = findCommand(commands, argv[0]);
+  if (argv.length === 1 && cmd?.name === argv[0]) return emitCommandCompletion(cmd, [""]);
+  if (argv.length === 1) {
+    emit(commands.map((cmd) => ({ value: cmd.name, description: cmd.summary })), "nofiles");
+    return;
+  }
+  // A finished subcommand word reaches the command's completer by its canonical name.
+  const words = argv.slice(1);
+  const sub = cmd && words.length > 1 ? findSubcommand(cmd, words[0]) : undefined;
+  return emitCommandCompletion(cmd, sub ? [sub.name, ...words.slice(1)] : words);
+}
+
+async function emitCommandCompletion(cmd: Command | undefined, argv: string[]): Promise<void> {
+  // A word starting with `-` completes against the command's DECLARED flags — generated from
+  // the specs, so it can never drift from what parsing accepts. Value/positional completion
+  // stays with the command's own `complete` hook below.
+  const word = argv[argv.length - 1] ?? "";
+  const original = cmd ? metadataPositionals(cmd, argv, { completing: true }) : undefined;
+  if (cmd?.name === "service" && original?.valueFlag?.name !== "preset" && !word.startsWith("--preset=")) {
+    try { cmd = servicePresetCommand(cmd, argv); }
+    catch { if (debugFlag("COTAL_COMPLETE_DEBUG")) process.stderr.write("cotal __complete: service preset metadata is unavailable or changed\n"); process.exit(1); }
+  }
+  const context = cmd ? metadataPositionals(cmd, argv, { completing: true }) : undefined;
+  let selected: Subcommand | undefined;
+  let parent: Pick<Command, "subcommands"> | undefined = cmd;
+  for (const token of context?.positionals ?? []) {
+    if (token.index === argv.length - 1) break;
+    const child: Subcommand | undefined = parent && findSubcommand(parent, token.value);
+    if (!child) break;
+    selected = child; parent = child;
+    if (!child.subcommands?.length) break;
+  }
+  const flagNames = selected?.flagNames ?? cmd?.flagNames;
+  const flags = (cmd?.flags ?? []).filter((flag) => !flagNames || flagNames.includes(flag.name));
+  if (cmd && !context?.valueFlag && !context?.optionsEnded && word.startsWith("-") && !word.includes("=")) {
+    emit(flags.map((flag) => ({ value: `--${flag.name}`, description: flag.description })), "nofiles");
+    return;
+  }
+  // Every `--space` names a space and every `--creds` a file, so one rule completes each for every
+  // command: the spaces `use` offers, and the shell's file names.
+  const value = word.startsWith("-") ? undefined : context?.valueFlag?.name;
+  const completer = value === "space" ? spaceCompletion : value === "creds" ? fileCompletion : cmd?.complete;
+  if (!completer) {
+    const cursor = context?.positionals.find((item) => item.index === argv.length - 1);
+    const children = parent?.subcommands?.filter((item) => !item.hidden);
+    if (cursor && children?.length) emit(children.map((item) => ({ value: item.name, description: item.summary })), "nofiles");
+    else if (context?.optionsEnded || context?.valueFlag) emit([], context?.valueFlag?.completion === "files" && !word.startsWith("-") ? "default" : "nofiles");
+    else emit(flags.map((flag) => ({ value: `--${flag.name}`, description: flag.description })), flags.length ? "nofiles" : "default");
+    return;
+  }
+  try {
+    const res = await completer(argv);
+    emit(res.items, res.directive ?? "nofiles");
+  } catch (e) {
+    // No fallback: a completer that can't produce its authoritative set (e.g. a malformed agent
+    // file) fails the process — nothing on stdout, non-zero exit — so the shell offers nothing and
+    // never mistakes a failure for a successful empty result. Silent unless explicitly debugging.
+    if (debugFlag("COTAL_COMPLETE_DEBUG"))
+      process.stderr.write(`cotal __complete: ${(e as Error).message}\n`);
+    process.exit(1);
+  }
+}
+
+
+export const completionFlags = [jsonFlag, plainFlag,
+  { name: "force", type: "boolean", description: "install/uninstall: rewrite or remove a modified owned stub and cotal-marked startup block; text outside the markers is kept" },
+] as const;
+const currentShell = (): string => { const name = basename(process.env.SHELL ?? ""); return name === "pwsh" ? "powershell" : name; };
+
+/** Validate output mode and grammar before reading or changing shell files. */
+export function validateCompletionArguments(args: ParsedArgs): void {
+  presentationOf(args.values);
+  const [sub, shell] = args.positionals;
+  if (args.positionals.length > 2) throw new CommandFailure("refused", "USAGE_INVALID", "completion takes one operation and one shell");
+  if (args.values.force && sub !== "install" && sub !== "uninstall") throw new CommandFailure("refused", "USAGE_INVALID", "--force applies to completion install and uninstall");
+  if (sub === undefined) return;
+  if (Object.hasOwn(SCRIPTS, sub)) throw new CommandFailure("refused", "USAGE_INVALID", `cotal completion ${sub} is now \`cotal completion script ${sub}\``, { remedy: `load it with: ${codeSpan(LOAD_NOW[sub])}` });
+  if (!["script", "install", "uninstall"].includes(sub)) throw new CommandFailure("refused", "USAGE_INVALID", "choose completion script, install or uninstall");
+  if (sub === "script" && (args.values.json || args.values.plain)) throw new CommandFailure("refused", "USAGE_INVALID", "completion script prints raw shell code, without --json or --plain");
+  if ((sub === "script" && shell === undefined) || (shell !== undefined && !Object.hasOwn(SCRIPTS, shell))) throw new CommandFailure("refused", "USAGE_INVALID", "choose a supported shell", { remedy: `pass one of: ${Object.keys(SCRIPTS).join(", ")}` });
+}
+
+export async function completion(args: ParsedArgs): Promise<void> {
+  validateCompletionArguments(args);
+  const [sub, shell] = args.positionals;
+  const values = args.values as FlagValues<typeof completionFlags>;
+  const presentation = presentationOf(values);
+  if (sub === undefined) {
+    const { status, unread, unsafe, repairs, warnings: nonPartialWarnings } = completionStatus();
+    const count = unread.length + unsafe.reduce((sum, folder) => sum + folder.unopened, 0);
+    const warnings = [...unsafe.map(folderWarning), ...unread, ...nonPartialWarnings];
+    const partial = count ? { completeness: "partial" as const, warnings, partial: { message: `completion could not read ${count === 1 ? "one file" : `${count} files`}`, remedy: unread.length ? "review each named file without overwriting custom startup content" : "fix the folder the warning names, then run `cotal completion` again" } } : warnings.length ? { warnings } : {};
+    return writeResult(presentation, { command: "completion", target: null, result: status, ...partial }, (result) => statusView(result, unsafe, repairs));
+  }
+  if (sub === "script") { process.stdout.write(SCRIPTS[shell!]!); return; }
+  const sh = shell ?? currentShell();
+  // A shell SHELL names is known even when completion does not support it, so it is named.
+  if (!Object.hasOwn(SCRIPTS, sh)) throw sh
+    ? new CommandFailure("refused", "UNSUPPORTED", `completion does not support ${sh}, the shell SHELL names`, { target: { shell: sh }, remedy: "pass one of: bash, zsh, fish, powershell" })
+    : new CommandFailure("refused", "USAGE_INVALID", "SHELL is not set, so the current shell is unknown", { remedy: "pass one of: bash, zsh, fish, powershell" });
+  const paths = stubPaths(sh);
+  if (!paths) throw new CommandFailure("refused", "UNSUPPORTED", "owned PowerShell profile installation is unavailable on this host or the shell is not installed; no profile path was guessed", { remedy: `review your profile manually; the supported loading command is: ${codeSpan(LOAD_NOW.powershell)}` });
+  if (sh === "zsh" && process.env.ZDOTDIR && !isAbsolute(process.env.ZDOTDIR)) throw new CommandFailure("refused", "USAGE_INVALID", "relative ZDOTDIR makes the startup target depend on the shell's working directory", { remedy: "use an absolute ZDOTDIR or manage the printed script manually" });
+  const operation = sub as "install" | "uninstall";
+  const result = changeCompletion(operation, sh, paths, SCRIPTS[sh]!, Boolean(values.force));
+  writeResult(presentation, { command: `completion ${operation}`, target: { shell: sh }, noOp: result.noOp, result }, (data): Report => ({ sections: [
+    { title: data.noOp ? "Shell completion unchanged" : operation === "install" ? "Shell completion installed" : "Shell completion removed", blocks: [
+      { kind: "fields", rows: [["Shell", data.shell], ["Script", data.stub], ["Startup", data.startup ?? "fish completion directory"], ["Changed files", String(data.changed.length)]] },
+      { kind: "lines", lines: [{ text: data.forced ? `${operation === "install" ? "Rewrote" : "Removed"} modified owned material with --force. Startup content outside the cotal markers was retained.` : data.noOp ? "Nothing needed changing; the owned material was already as this command leaves it." : "Only recorded, unchanged owned material was changed. Other startup content was retained.", tone: "hint" }, { text: operation === "install" ? "Open a new shell to load the installed completion. This command did not change the parent shell." : "Functions already loaded in the parent shell cannot be unloaded by this command. Open a new shell.", tone: "hint" }] },
+    ] },
+    { title: "Next", blocks: [{ kind: "commands", items: [{ command: "cotal completion", description: "Read installed files and ownership, without loading a shell" }, { command: `cotal completion script ${sh}`, description: "Print the supported script for manual wiring" }] }] },
+  ] }));
+}
+
+type StubState = "missing" | "current" | "differs" | "unreadable";
+
+/** One shell's completion as this machine has it. `wiredIn` is where `completion install` wires the
+ *  stub in: the startup file holding the line it writes, or fish's completions directory, which fish
+ *  loads by itself. It is null when that wiring is not found, which does not mean the shell loads no
+ *  completion some other way. PowerShell reports only the profile its installed host identifies. */
+export interface ShellCompletion {
+  readonly shell: string;
+  readonly stub: string | null;
+  readonly state: StubState | "not-installed-by-cotal";
+  readonly wiredIn: string | null;
+  readonly ownership: "managed" | "unrecorded" | "modified" | "unreadable" | "manual";
+  readonly legacyWiring: boolean;
+}
+
+/** Unsafe folders above some shells' completion files: named once, with the chmod that fixes them
+ *  when one does, and how many existing files under them were not opened. */
+interface UnsafeFolder { readonly problem: string; readonly chmod?: string; readonly shells: Set<string>; unopened: number }
+
+/** A completion file whose refusal blocks install, with the chmod that fixes it when one does. */
+interface FileRepair { readonly shell: string; readonly chmod?: string }
+
+/** The `chmod` command in a file refusal's remedy, when the refusal has one. The trailing sentence is
+ *  removed only as a suffix: the same words can occur inside a shell-quoted path. */
+const chmodOf = (error: unknown): string | undefined => {
+  if (!isCommandFailure(error) || typeof error.remedy !== "string") return undefined;
+  const command = error.remedy.replace(/ and run the command again, or wire completion yourself from `cotal completion script <shell>`$/, "");
+  return command.startsWith("chmod ") ? command : undefined;
+};
+
+const folderWarning = (folder: UnsafeFolder): OutputWarning => ({
+  code: "COMPLETION_FOLDER_UNSAFE",
+  target: { shells: [...folder.shells] },
+  message: `${folder.problem}; completion does not open the ${[...folder.shells].join(", ").replace(/, (?=[^,]*$)/, " and ")} completion files under it, and install and uninstall refuse there${folder.chmod ? `; ${folder.chmod} fixes it` : ""}`,
+});
+
+export interface CompletionStatus {
+  /** The shell `$SHELL` names, when it is one Cotal completes. */
+  readonly shell: string | null;
+  readonly shells: ShellCompletion[];
+}
+
+/** The line `completion install` adds to a startup file for `stub`. */
+const sourceLine = completionSourceLine;
+
+/** Whether a startup file holds the install line as a line of its own, so a comment or a longer
+ *  line that only contains it does not count. Only spaces and tabs around it are blanks: bash keeps
+ *  a carriage return in the file name it sources, so a CRLF copy of the line loads nothing. */
+const holdsSourceLine = (rc: string, stub: string, shell: string): boolean => rc.split("\n").some((line) => line.replace(/^[ \t]+|[ \t]+$/g, "") === sourceLine(stub, shell) || shell !== "powershell" && line.replace(/^[ \t]+|[ \t]+$/g, "") === `source "${stub}"`);
+
+/** A file's text, `undefined` when it does not exist, or the error that stopped the read. */
+function readText(path: string): string | undefined | NodeJS.ErrnoException {
+  try {
+    return readCompletionText(path);
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "ENOENT" ? undefined : (e as NodeJS.ErrnoException);
+  }
+}
+
+/** Each shell's stub against the script this binary prints, a warning for each file it could not
+ *  read, and each unsafe folder above them. Reads local files only. */
+export function completionStatus(): { status: CompletionStatus; unread: OutputWarning[]; warnings: OutputWarning[]; unsafe: UnsafeFolder[]; repairs: FileRepair[] } {
+  const unread: OutputWarning[] = [];
+  const warnings: OutputWarning[] = [];
+  const detected = currentShell();
+  const unsafe = new Map<string, UnsafeFolder>();
+  const repairs: FileRepair[] = [];
+  /** The unsafe folders above `path`, noted once for every shell under them. A check that cannot run
+   *  here is left to the read, which reports it. */
+  const unsafeAbove = (shell: string, path: string): UnsafeFolder | undefined => {
+    let found;
+    try { found = completionUnsafeFolders(path); } catch { return undefined; }
+    if (!found) return undefined;
+    const folder = unsafe.get(found.problem) ?? { ...found, shells: new Set<string>(), unopened: 0 };
+    unsafe.set(found.problem, folder);
+    folder.shells.add(shell);
+    return folder;
+  };
+  const read = (shell: string, path: string): string | undefined | null => {
+    const folder = unsafeAbove(shell, path);
+    const text = readText(path);
+    if (typeof text !== "object") return text;
+    // The folder's warning says why, so a file under it is counted there instead of named again.
+    if (folder) { folder.unopened++; return null; }
+    const reason = isCommandFailure(text) ? text.message : text.code ?? text.message;
+    const chmod = chmodOf(text);
+    repairs.push({ shell, ...(chmod ? { chmod } : {}) });
+    // A refusal that already names the file, such as a symlink's, is not prefixed with it again.
+    unread.push({ code: "COMPLETION_UNREADABLE", target: { shell }, message: reason.startsWith(path) ? reason : `${path} could not be read: ${reason}` });
+    return null;
+  };
+  const shells = Object.keys(SCRIPTS).map((shell): ShellCompletion => {
+    let paths: ReturnType<typeof stubPaths>;
+    try { paths = stubPaths(shell); }
+    catch {
+      (shell === detected ? unread : warnings).push({ code: "COMPLETION_PROFILE_UNAVAILABLE", target: { shell }, message: "the pwsh current-user profile probe failed, timed out, or returned no usable profile path; no alternate profile was guessed" });
+      return { shell, stub: null, state: "unreadable", wiredIn: null, ownership: "unreadable", legacyWiring: false };
+    }
+    if (!paths) return { shell, stub: null, state: "not-installed-by-cotal", wiredIn: null, ownership: "manual", legacyWiring: false };
+    const content = read(shell, paths.stub);
+    const state: StubState = content === null ? "unreadable" : content === undefined ? "missing" : content === SCRIPTS[shell] ? "current" : "differs";
+    let ownership: ShellCompletion["ownership"];
+    try { ownership = completionOwnership(shell, paths); }
+    // The refusal names the record or folder and why, so it is passed on rather than a generic sentence.
+    catch (error) {
+      ownership = "unreadable";
+      const folder = unsafeAbove(shell, paths.stub);
+      if (folder) folder.unopened++;
+      else {
+        const chmod = chmodOf(error);
+        repairs.push({ shell, ...(chmod ? { chmod } : {}) });
+        unread.push({ code: "COMPLETION_OWNERSHIP_UNREADABLE", target: { shell }, message: isCommandFailure(error) ? `${error.message}${error.remedy ? `; ${error.remedy}` : ""}` : `the completion ownership record beside ${paths.stub} could not be read safely` });
+      }
+    }
+    if (!paths.rc) return { shell, stub: paths.stub, state, wiredIn: content === undefined || content === null ? null : dirname(paths.stub), ownership, legacyWiring: false };
+    const rc = read(shell, paths.rc);
+    const legacyWiring = typeof rc === "string" && new RegExp(`cotal[ \t]+completion[ \t]+${shell}(?:[ \t;|)]|$)`, "m").test(rc);
+    return { shell, stub: paths.stub, state, wiredIn: rc && holdsSourceLine(rc, paths.stub, shell) ? paths.rc : null, ownership, legacyWiring };
+  });
+  return { status: { shell: Object.hasOwn(SCRIPTS, detected) ? detected : null, shells }, unread, warnings, unsafe: [...unsafe.values()], repairs };
+}
+
+const STATE: Record<ShellCompletion["state"], Styled> = {
+  current: { text: "current", tone: "ok" },
+  differs: { text: "differs from this version", tone: "waiting" },
+  missing: { text: "not installed", tone: "hint" },
+  unreadable: { text: "unreadable", tone: "failed" },
+  "not-installed-by-cotal": { text: "not installed by cotal", tone: "hint" },
+};
+
+function completionCell(shell: ShellCompletion): Styled {
+  if (shell.ownership === "modified" || shell.ownership === "unreadable") return { text: `${shell.ownership} owned integration`, tone: "waiting", mark: "●" };
+  if (shell.legacyWiring) return { text: "old custom loading command needs migration", tone: "waiting", mark: "●" };
+  if (shell.state === "current") return shell.wiredIn
+    ? { text: "installed · startup reference found", tone: "ok", mark: "●" }
+    : { text: "script present · startup not configured", tone: "waiting", mark: "●" };
+  if (shell.state === "missing" && shell.wiredIn) return { text: "startup points at a missing script", tone: "failed", mark: "●" };
+  return { ...STATE[shell.state], mark: shell.state === "unreadable" || shell.state === "differs" ? "●" : "○" };
+}
+
+function statusView(status: CompletionStatus, unsafe: readonly UnsafeFolder[] = [], repairs: readonly FileRepair[] = []): Report {
+  const selected = status.shells.find((shell) => shell.shell === status.shell);
+  // An unsafe folder, a refused file or an unreadable record makes install and uninstall refuse, so its
+  // chmod comes first. They are offered only when every block has one. Uninstall is offered only when
+  // something is installed.
+  const blocking = selected ? unsafe.filter((folder) => folder.shells.has(selected.shell)) : [];
+  const fileRepairs = selected ? repairs.filter((repair) => repair.shell === selected.shell) : [];
+  const fileChmods = [...new Set(fileRepairs.flatMap((repair) => repair.chmod ? [repair.chmod] : []))];
+  const changeable = selected?.ownership !== "unreadable" && blocking.every((folder) => folder.chmod) && fileRepairs.every((repair) => repair.chmod);
+  const installed = !selected || selected.state !== "missing" || selected.wiredIn !== null || selected.ownership === "managed" || selected.ownership === "modified";
+  const dangling = status.shells.filter((shell) => shell.state === "missing" && shell.wiredIn !== null);
+  return {
+    sections: [
+      { title: "Shell completion", blocks: [
+        ...(selected ? [{ kind: "fields" as const, rows: [
+          ["Shell", selected.shell] as const,
+          ["Integration", completionCell(selected)] as const,
+          ["Startup", selected.wiredIn ?? "no managed startup reference"] as const,
+          ["Script", selected.stub ?? "manual setup"] as const,
+          ["Ownership", selected.ownership] as const,
+        ] }] : []),
+        { kind: "table", columns: [{ key: "shell", label: "Shell" }, { key: "state", label: "Integration" }], rows: status.shells.map((shell) => ({ shell: shell.shell, state: completionCell(shell) })) },
+        { kind: "lines", lines: [
+          ...dangling.map((shell) => ({ text: `${shell.wiredIn} sources ${shell.stub}, which is missing.`, tone: "waiting" as const })),
+          ...status.shells.filter((shell) => shell.legacyWiring).map((shell) => ({ text: `Custom ${shell.shell} wiring needs manual migration to: ${codeSpan(LOAD_NOW[shell.shell])}`, tone: "waiting" as const })),
+          { text: "Files only. The running shell was not inspected or changed.", tone: "hint" },
+        ] },
+      ] },
+      { title: "Next", blocks: [{ kind: "commands", items: [
+        // A modified integration refuses a plain install or uninstall, so it is offered only with --force.
+        ...blocking.flatMap((folder) => folder.chmod ? [{ command: folder.chmod, description: "Remove the access another local account could use, so completion can read and change its files there" }] : []),
+        ...fileChmods.map((command) => ({ command, description: "Remove the access another local account could use, so completion can read and change this file" })),
+        ...status.shells.filter((shell) => shell.ownership === "modified" && shell !== selected).map((shell) => ({ command: `cotal completion install ${shell.shell} --force`, description: "Rewrite the modified owned integration; text outside the cotal markers is kept" })),
+        ...!changeable ? [] : [selected?.ownership === "modified"
+          ? { command: `cotal completion install ${selected.shell} --force`, description: "Rewrite the modified owned integration; text outside the cotal markers is kept" }
+          : { command: `cotal completion install ${selected?.shell ?? "<shell>"}`, description: "Install or refresh the managed integration" }],
+        { command: `cotal completion script ${selected?.shell ?? "<shell>"}`, description: "Print the script for manual setup" },
+        ...!changeable || !installed ? [] : [selected?.ownership === "modified"
+          ? { command: `cotal completion uninstall ${selected.shell} --force`, description: "Remove the modified owned integration; text outside the cotal markers is kept" }
+          : { command: `cotal completion uninstall ${selected?.shell ?? "<shell>"}`, description: "Remove only unchanged recorded material" }],
+      ] }] },
+    ],
+  };
+}
+
+/** Argument completion for `cotal completion` itself: its subcommands, then the shells. */
+export function completionComplete(argv: string[]): CompletionResult {
+  const shells = Object.keys(SCRIPTS).map((value) => ({ value }));
+  if (argv.length <= 1)
+    return {
+      items: [
+        { value: "script", description: "print the stub for a shell" },
+        { value: "install", description: "install or refresh unchanged owned files" },
+        { value: "uninstall", description: "remove unchanged owned completion" },
+      ],
+      directive: "nofiles",
+    };
+  if (argv.length === 2 && (argv[0] === "script" || argv[0] === "install" || argv[0] === "uninstall")) return { items: argv[0] === "script" || process.platform !== "win32" ? shells : shells.filter((item) => item.value !== "powershell"), directive: "nofiles" };
+  return { items: [], directive: "nofiles" };
+}

@@ -1,0 +1,345 @@
+/**
+ * RESOLVE RTT AMPLIFICATION — the #385 measurement, and the regression guard for its fix.
+ *
+ * The reported figure (idle mesh, WAN caller: mint 1.5s / connect 0.7s / resolveService 11.6s /
+ * scatter both managers 1.9s) cannot be reproduced on localhost — the RTT is ~0.1ms, not ~150ms.
+ * So this measures the RTT-INDEPENDENT invariants instead, and derives the seconds from them:
+ *
+ *   1. the COUNT of caller->broker round-trips one `resolveService` performs, and
+ *   2. how many of them are IN FLIGHT at once,
+ *
+ * with a latency-injecting connection proxy turning this box into a WAN emulator, so the
+ * arithmetic is proven rather than asserted.
+ *
+ * WHAT IT MEASURED BEFORE THE BATCHING CHANGE (the defect, for the record):
+ *   70 round-trips for a 17-command surface, 22 of them re-reads of a digest already read;
+ *   max-in-flight 1 (strictly sequential); 11.7s at an injected 160ms/read, against the 11.6s
+ *   reported from the WAN. The reconstruction landed on the report with no slow manager and no
+ *   load anywhere, which is the whole point: this needs no contention to happen.
+ *
+ * WHAT IT GUARDS NOW: the reads are deduped through one per-resolve artifact memo and the closure
+ * walks run concurrently, so the same surface costs 48 round-trips with none repeated, overlapped
+ * rather than queued. The assertions are written against the TRIP COUNT, the IN-FLIGHT count, and
+ * the UNION of injected wait intervals — never `elapsed < count × RTT`. Injected delay plus host
+ * and broker work can exceed serial inject even when max-in-flight is high (15ms × N is smaller
+ * than this box's per-request overhead). Occupancy of the synthetic waits still collapses when
+ * those waits overlap, and still sums to ~count × inject when they queue. Revert the memo and
+ * phase 1 goes red on the refetch count; revert the concurrency and phase 2 goes red on
+ * max-in-flight; revert either and the occupancy cell goes red. Phase 6 fails one early closure
+ * read and goes red if the pool starts any walk after the resolve has rejected (#3449).
+ *
+ * `deadlineMs` bounds the whole resolve: each closure walk is budgeted with what remains of it.
+ *
+ * Run: pnpm tsx implementations/manager/smoke/resolve-rtt-probe.smoke.ts
+ *      (needs nats-server + node on PATH; boots its own broker on a free port)
+ */
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { connect, type NatsConnection } from "@nats-io/transport-node";
+import {
+  isReachable, createSpaceAuth, serverConfig, setupSpaceStreams, mintCreds, newIdentity,
+  mintLifecycleUid, standaloneConnectOpts, DEV_OWNER,
+  CotalEndpoint, resolveService,
+  type EpCaller,
+} from "@cotal-ai/core";
+import { authDir, saveSpaceAuth } from "@cotal-ai/workspace";
+import { Manager } from "../src/manager.js";
+import { MANAGER_ENDPOINT, managerShippedSurface } from "../src/manager-service-contract.js";
+import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal } from "@cotal-ai/smoke-kit";
+const shipped = managerShippedSurface();
+
+const here = dirname(fileURLToPath(import.meta.url));
+
+const PORT = await freePort();
+const SERVERS = `nats://127.0.0.1:${PORT}`;
+
+// FIRST ACTION, before any broker work: this probe must never touch the live mesh.
+//
+// The operator environment really does carry COTAL_SERVERS=nats://broker.cotal.ai:4222, so an
+// ambient read by ANY layer below (manager, core, a connector) would reach production. Scrub the
+// inherited pointers first, THEN assert the scrub held and that the URL we chose is loopback.
+// Neutralize-then-verify, not verify-and-hope.
+const LIVE_HOST = "broker.cotal.ai";
+for (const k of ["COTAL_SERVERS", "COTAL_SERVER", "COTAL_CREDS", "COTAL_SPACE"]) delete process.env[k];
+for (const [k, v] of Object.entries(process.env))
+  if (typeof v === "string" && v.includes(LIVE_HOST))
+    throw new Error(`refusing to run: ${k} still points at the live broker (${v})`);
+if (SERVERS.includes(LIVE_HOST))
+  throw new Error(`refusing to run against the live broker: SERVERS=${SERVERS}`);
+if (!/^nats:\/\/127\.0\.0\.1:\d+$/.test(SERVERS))
+  throw new Error(`this probe only runs against an ephemeral loopback broker; got ${SERVERS}`);
+console.log(`broker-url guard: ${SERVERS} is ephemeral loopback; no env var references ${LIVE_HOST}\n`);
+
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+let pass = 0, fail = 0;
+const check = (name: string, cond: boolean, extra?: unknown) => {
+  if (cond) { pass++; console.log(`  ✓ ${name}`); }
+  else { fail++; console.log(`  ✗ FAIL: ${name}`, extra ?? ""); }
+};
+
+/** Request counts, ordering, concurrency and injected-delay occupancy for one metered run. */
+interface Meter {
+  total: number;
+  bySubject: Map<string, number>;
+  maxInFlight: number;
+  order: string[];
+  /** Wall time during which at least one injected wait is open. Host/broker work after the wait is excluded. */
+  delayOccupancyMs: number;
+}
+
+/** Wrap a connection so every `request` is COUNTED by subject, and optionally DELAYED by
+ *  `delayMs` before it is issued — a synthetic caller->broker RTT. Concurrency is tracked so the
+ *  sequential-vs-batched question is answered by observation, not by reading the source. A request
+ *  whose subject ends in `failHex` fails after 10ms instead, well before any delayed read answers. */
+function meteredConnection(nc: NatsConnection, meter: Meter, delayMs: number, failHex?: string): NatsConnection {
+  let inFlight = 0;
+  let delaying = 0;
+  let delayOpenAt: number | null = null;
+  return new Proxy(nc, {
+    get(target, prop, receiver) {
+      const v = Reflect.get(target, prop, receiver);
+      if (prop !== "request" || typeof v !== "function") {
+        return typeof v === "function" ? v.bind(target) : v;
+      }
+      return async (subject: string, ...rest: unknown[]) => {
+        meter.total++;
+        const key = subject.split(".").slice(0, 4).join(".");
+        meter.bySubject.set(key, (meter.bySubject.get(key) ?? 0) + 1);
+        meter.order.push(subject);
+        inFlight++;
+        if (inFlight > meter.maxInFlight) meter.maxInFlight = inFlight;
+        try {
+          if (failHex !== undefined && subject.endsWith(failHex)) {
+            await wait(10);
+            throw new Error("injected contract-store read fault");
+          }
+          if (delayMs > 0) {
+            delaying++;
+            if (delaying === 1) delayOpenAt = performance.now();
+            await wait(delayMs);
+            delaying--;
+            if (delaying === 0 && delayOpenAt !== null) {
+              meter.delayOccupancyMs += performance.now() - delayOpenAt;
+              delayOpenAt = null;
+            }
+          }
+          return await (v as (s: string, ...r: unknown[]) => Promise<unknown>).call(target, subject, ...rest);
+        } finally { inFlight--; }
+      };
+    },
+  }) as NatsConnection;
+}
+
+const newMeter = (): Meter => ({ total: 0, bySubject: new Map(), maxInFlight: 0, order: [], delayOccupancyMs: 0 });
+
+const space = `rttprobe-${randomUUID().slice(0, 8)}`;
+const auth = await createSpaceAuth(space);
+const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+const workspaceRoot = join(dir, "ws");
+mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
+saveSpaceAuth(authDir(workspaceRoot), auth);
+writeFileSync(join(dir, "server.conf"), serverConfig(auth, [auth], { transport: { kind: "plaintext" }, port: PORT, storeDir: join(dir, "js") }));
+const srv = spawn("nats-server", ["-c", join(dir, "server.conf")], { stdio: "ignore" });
+const releaseBroker = teardownOnSignal(srv, dir);
+
+const mgr = new Manager({ space, servers: SERVERS, runtime: "pty", workspaceRoot });
+
+try {
+  let up = false;
+  for (let i = 0; i < 50; i++) { if (await isReachable(SERVERS)) { up = true; break; } await wait(200); }
+  if (!up) throw new Error(`nats-server did not come up on ${PORT}`);
+  await setupSpaceStreams({ servers: SERVERS, space, creds: await mintCreds(auth, newIdentity(), "provisioner") });
+  await mgr.start();
+
+  const id = newIdentity();
+  const uid = mintLifecycleUid();
+  const caller: EpCaller = { owner: DEV_OWNER, actor: id.id, uid };
+  const creds = await mintCreds(auth, id, "control-caller-privileged", { lifecycleUid: uid });
+  const rawNc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds, tls: false }), maxReconnectAttempts: 0 });
+
+  // ---- 1. COUNT the round-trips one cold resolveService performs -------------------------------
+  console.log("1. read count of ONE cold resolveService (the RTT-independent invariant)");
+  const m1 = newMeter();
+  const t0 = performance.now();
+  const service = await resolveService(meteredConnection(rawNc, m1, 0), space, MANAGER_ENDPOINT, caller, { deadlineMs: 10_000 });
+  const coldMs = performance.now() - t0;
+  console.log(`   commands resolved:      ${service.commands.size}`);
+  console.log(`   caller->broker requests:${String(m1.total).padStart(4)}`);
+  console.log(`   max concurrent in-flight:${String(m1.maxInFlight).padStart(3)}`);
+  console.log(`   localhost elapsed:      ${coldMs.toFixed(0)}ms`);
+  console.log(`   by subject prefix:`);
+  for (const [k, v] of [...m1.bySubject.entries()].sort((a, b) => b[1] - a[1])) console.log(`     ${String(v).padStart(4)}  ${k}`);
+  // How much of the 70 is REPEATED work? Distinct subjects = the irreducible set of artifacts;
+  // the difference is re-fetching a digest this same resolve already read. Sizes the two batching
+  // seams separately: dedupe (free) vs concurrency (needs restructuring).
+  const distinct = new Set(m1.order).size;
+  console.log(`   distinct artifacts:     ${distinct}  (${m1.total - distinct} of the ${m1.total} reads are REFETCHES of a digest already read this resolve)`);
+  // RED-FIRST TARGET #1 (dedupe). Reverting the shared artifact memo puts the 22 refetches back
+  // and this goes red on the count, not on a timing wobble.
+  check("no artifact is read twice in one resolve — the shared memo eliminated every refetch",
+    m1.total === distinct, { reads: m1.total, distinct });
+  check("the resolve still reads every distinct artifact it needs (dedupe dropped nothing)",
+    distinct >= 40 && service.commands.size === shipped.commandCount, { distinct, commands: service.commands.size });
+
+  // ---- 2. CONCURRENCY: the reads no longer queue one behind another ----------------------------
+  // RED-FIRST TARGET #2. Reverting the concurrent walks pins max-in-flight back to 1.
+  console.log("\n2. concurrency (the other half of count x RTT)");
+  console.log(`   max concurrent in-flight: ${m1.maxInFlight}`);
+  // Threshold, not `> 1`, and deliberately so: serializing the walks again would still leave TWO
+  // reads in flight (a command's input and output closure resolve as a pair), so `> 1` would let
+  // the regression through. This surface overlaps ~23; 8 is clear of both the fixed and the
+  // reverted behaviour.
+  check("the reads are issued CONCURRENTLY — many overlap, not just a command's own input/output pair",
+    m1.maxInFlight >= 8, `maxInFlight=${m1.maxInFlight}`);
+
+  // ---- 2b. ONE COMMAND: an invoke does not pay for the endpoint's whole surface -----------------
+  console.log("\n2b. one-command resolution reads only that command's cluster and schema closures");
+  const mOne = newMeter();
+  const one = await resolveService(meteredConnection(rawNc, mOne, 0), space, MANAGER_ENDPOINT, caller, {
+    deadlineMs: 10_000, commands: ["despawn"],
+  });
+  const oneDistinct = new Set(mOne.order).size;
+  console.log(`   commands resolved: ${one.commands.size}`);
+  console.log(`   reads: ${mOne.total} (${oneDistinct} distinct)`);
+  check("one-command resolution returns only the requested command",
+    one.commands.size === 1 && one.commands.has("despawn"), [...one.commands.keys()]);
+  check("one-command resolution avoids the other 39 commands' contracts",
+    mOne.total === oneDistinct && mOne.total <= 6 && mOne.total < m1.total / 10,
+    { oneReads: mOne.total, fullReads: m1.total, distinct: oneDistinct });
+  const missingMeter = newMeter();
+  let missing: unknown;
+  try {
+    await resolveService(meteredConnection(rawNc, missingMeter, 0), space, MANAGER_ENDPOINT, caller, {
+      deadlineMs: 10_000, commands: ["not-visible"],
+    });
+  } catch (error) { missing = error; }
+  check("an absent requested command fails after describe and before contract-store reads",
+    (missing as { code?: string } | undefined)?.code === "not-found" && missingMeter.total === 0,
+    { error: (missing as Error | undefined)?.message, reads: missingMeter.total });
+
+  // ---- 2c. ENDPOINT CACHE: partial invoke handles never truncate discovery or thrash -------------
+  // The core smoke covers this cache contract hermetically. This live cell proves the same public
+  // methods against a real manager, real describe, and real contract-store reads.
+  console.log("\n2c. command handles and the full describe surface use separate caches");
+  const client = new CotalEndpoint({
+    space, servers: SERVERS, creds, lifecycleUid: uid,
+    card: { id: id.id, name: "cache-probe", kind: "agent" }, channels: [],
+    consume: false, watchPresence: false, watchChannels: false, registerPresence: false,
+  });
+  await client.start();
+  const clientPriv = client as unknown as { nc: NatsConnection };
+  const cacheMeter = newMeter();
+  clientPriv.nc = meteredConnection(clientPriv.nc, cacheMeter, 0);
+  const ps = await client.invokeService(MANAGER_ENDPOINT, "ps", undefined, { deadlineMs: 10_000 });
+  const afterPs = cacheMeter.total;
+  const status = await client.invokeService(MANAGER_ENDPOINT, "status", undefined, { deadlineMs: 10_000 });
+  const afterStatus = cacheMeter.total;
+  await client.invokeService(MANAGER_ENDPOINT, "ps", undefined, { deadlineMs: 10_000 });
+  const afterRepeatedPs = cacheMeter.total;
+  const described = await client.describeService(MANAGER_ENDPOINT);
+  check("invokeService resolves and invokes two different manager commands",
+    ps.reply.ok === true && status.reply.ok === true && afterPs > 0 && afterStatus > afterPs,
+    { ps: ps.reply, status: status.reply, afterPs, afterStatus });
+  check("alternating invokes retain each command handle instead of re-resolving the first command",
+    afterRepeatedPs === afterStatus, { afterPs, afterStatus, afterRepeatedPs });
+  check("a prior narrowed invoke never truncates describeService's complete discovery surface",
+    described.commands.size === shipped.commandCount && described.commands.has("ps") && described.commands.has("status"),
+    { commands: [...described.commands.keys()], expected: shipped.commandCount });
+  await client.stop();
+
+  // ---- 3. WAN RECONSTRUCTION: inject a synthetic RTT and check the arithmetic -------------------
+  const INJECT_MS = 15; // a scaled-down stand-in for the reported ~150ms WAN RTT
+  console.log(`\n3. WAN reconstruction: re-run the SAME resolve with ${INJECT_MS}ms injected per request`);
+  const m2 = newMeter();
+  const t1 = performance.now();
+  await resolveService(meteredConnection(rawNc, m2, INJECT_MS), space, MANAGER_ENDPOINT, caller, { deadlineMs: 120_000 });
+  const slowMs = performance.now() - t1;
+  const serialInject = m2.total * INJECT_MS;
+  console.log(`   requests:  ${m2.total}`);
+  console.log(`   serial inject (count x delay): ${serialInject}ms`);
+  console.log(`   delay occupancy (union of waits): ${m2.delayOccupancyMs.toFixed(0)}ms`);
+  console.log(`   wall observed (inject + host + broker): ${slowMs.toFixed(0)}ms`);
+  console.log(`   max in-flight: ${m2.maxInFlight}`);
+  // 15ms is shorter than this host's per-request stagger, so occupancy here can sit near serial
+  // even with max-in-flight in the twenties. Phase 5 uses a 160ms inject, which is the occupancy
+  // proof. This phase only logs the 15ms reconstruction and re-checks in-flight overlap.
+  check("the 15ms reconstruction still issues overlapping reads (in-flight, not wall-clock)",
+    m2.maxInFlight >= 8,
+    { serialInject, delayOccupancyMs: Math.round(m2.delayOccupancyMs), maxInFlight: m2.maxInFlight, wallObserved: Math.round(slowMs) });
+
+  // ---- 4. EXTRAPOLATION to the reported WAN profile --------------------------------------------
+  const WAN_RTT = 150;
+  const serialSecs = (m1.total * WAN_RTT) / 1000;
+  console.log(`\n4. extrapolation to the reported caller->broker RTT (~${WAN_RTT}ms)`);
+  console.log(`   before this change: 70 sequential reads x ${WAN_RTT}ms = 10.5s (reported: 11.6s)`);
+  console.log(`   now: ${m1.total} reads, but overlapped — serial-equivalent would be ${serialSecs.toFixed(1)}s`);
+  console.log(`   measured wall time at ~${WAN_RTT}ms/read is phase 5 below, not this arithmetic`);
+
+  // ---- 5. THE WAN PROFILE INSIDE THE CALLER'S DEADLINE ------------------------------------------
+  // `deadlineMs` bounds the whole resolve, store reads included, so the overlapped reads must finish
+  // inside the caller's 10s at the reported ~160ms per read; serialized they would not.
+  const SLOW_MS = 160; // 70 reads x 160ms ~ 11.2s, comfortably past the nominal 10s
+  console.log(`\n5. does the WAN-profile resolve fit the caller's deadlineMs:10_000? (${SLOW_MS}ms/read)`);
+  const m3 = newMeter();
+  const t2 = performance.now();
+  let outcome: string;
+  try {
+    const svc3 = await resolveService(meteredConnection(rawNc, m3, SLOW_MS), space, MANAGER_ENDPOINT, caller, { deadlineMs: 10_000 });
+    outcome = `RESOLVED ${svc3.commands.size} commands`;
+  } catch (e) {
+    outcome = `THREW ${(e as Error).message}`;
+  }
+  const slowTotal = performance.now() - t2;
+  const slowSerialInject = m3.total * SLOW_MS;
+  console.log(`   elapsed: ${(slowTotal / 1000).toFixed(1)}s with deadlineMs: 10_000`);
+  console.log(`   outcome: ${outcome}`);
+  console.log(`   delay occupancy: ${m3.delayOccupancyMs.toFixed(0)}ms  serial inject: ${slowSerialInject}ms`);
+  console.log(`   the SAME probe measured 11.7s here before the batching change (reported WAN: 11.6s)`);
+  // Operator-visible wall time is logged, not asserted: this host has paid ~1.8s of overhead on a
+  // concurrent 160ms inject, which sits next to a 2s wall cap and flakes. Occupancy of the
+  // synthetic waits is the concurrency invariant; serialized walks occupy ~count×160ms.
+  check("WAN-profile injected waits overlap — occupancy well under serial inject (was ~11s serialized)",
+    m3.delayOccupancyMs < slowSerialInject * 0.5 && m3.maxInFlight >= 8,
+    { serialInject: slowSerialInject, delayOccupancyMs: Math.round(m3.delayOccupancyMs), maxInFlight: m3.maxInFlight, wallObserved: Math.round(slowTotal) });
+  check("...and still resolves the full shipped command surface", outcome === `RESOLVED ${shipped.commandCount} commands`, outcome);
+
+  // ---- 6. A FAILED WALK STOPS THE POOL FROM STARTING MORE ---------------------------------------
+  // The command stage walks 16 commands at a time, so the rest of the surface queues behind the
+  // first window. Fail the first command's input-closure read: the resolve rejects at once, and a
+  // closure first read after that is a walk the pool started for a call that had already failed.
+  console.log("\n6. a failed closure walk stops the pool from starting more walks (100ms/read, one read failed)");
+  const declared = [...service.commands.values()];
+  const closures = new Set(declared.flatMap((rc) => [rc.contract.input.closureDigest, rc.contract.output.closureDigest].map((d) => d.slice("sha256:".length))));
+  const failHex = declared[0].contract.input.closureDigest.slice("sha256:".length);
+  const m4 = newMeter();
+  let rejection: unknown;
+  try {
+    await resolveService(meteredConnection(rawNc, m4, 100, failHex), space, MANAGER_ENDPOINT, caller, { deadlineMs: 60_000 });
+  } catch (e) { rejection = e; }
+  const readsAtRejection = m4.order.length;
+  await wait(2_000); // late walks start as the first window's reads answer, ~100-300ms after the rejection
+  const hexOf = (subject: string) => subject.slice(-64);
+  const readBefore = new Set(m4.order.slice(0, readsAtRejection).map(hexOf));
+  const lateWalks = new Set(m4.order.slice(readsAtRejection).map(hexOf).filter((h) => closures.has(h) && !readBefore.has(h)));
+  console.log(`   rejected: ${(rejection as Error | undefined)?.message?.slice(0, 100)}`);
+  console.log(`   reads before the rejection: ${readsAtRejection}, after it: ${m4.order.length - readsAtRejection}, closure walks started after it: ${lateWalks.size}`);
+  check("the surface queues commands behind the 16-wide command pool, so a late walk is observable",
+    declared.length > 16, { commands: declared.length });
+  check("the failed closure read rejects the resolve as unavailable",
+    (rejection as { code?: string } | undefined)?.code === "unavailable" && (rejection as Error).message.includes(failHex), rejection);
+  check("no closure walk starts after the resolve has rejected",
+    lateWalks.size === 0, { lateWalks: lateWalks.size, readsAfter: m4.order.length - readsAtRejection });
+
+  console.log(`\n${fail === 0 ? "PASS" : "FAIL"} — ${pass} passed, ${fail} failed`);
+  await rawNc.drain().catch(() => rawNc.close());
+} finally {
+  await mgr.stop({ withAgents: true }).catch(() => {});
+  srv.kill("SIGKILL");
+  rmSync(dir, { recursive: true, force: true });
+  releaseBroker(); // last: ownership is held until this teardown has actually finished
+}
+process.exit(fail === 0 ? 0 : 1);

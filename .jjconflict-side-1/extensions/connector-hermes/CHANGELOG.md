@@ -1,0 +1,2072 @@
+# @cotal-ai/connector-hermes
+
+## 0.151.2
+
+No changes in this release.
+
+## 0.151.1
+
+No changes in this release.
+
+## 0.151.0
+
+No changes in this release.
+
+## 0.150.0
+
+No changes in this release.
+
+## 0.149.0
+
+No changes in this release.
+
+## 0.148.2
+
+No changes in this release.
+
+## 0.148.1
+
+No changes in this release.
+
+## 0.148.0
+
+No changes in this release.
+
+## 0.147.8
+
+No changes in this release.
+
+## 0.147.7
+
+No changes in this release.
+
+## 0.147.6
+
+No changes in this release.
+
+## 0.147.5
+
+No changes in this release.
+
+## 0.147.4
+
+No changes in this release.
+
+## 0.147.3
+
+No changes in this release.
+
+## 0.147.2
+
+No changes in this release.
+
+## 0.147.1
+
+No changes in this release.
+
+## 0.147.0
+
+No changes in this release.
+
+## 0.146.0
+
+No changes in this release.
+
+## 0.145.1
+
+No changes in this release.
+
+## 0.145.0
+
+No changes in this release.
+
+## 0.144.0
+
+No changes in this release.
+
+## 0.143.0
+
+No changes in this release.
+
+## 0.142.0
+
+No changes in this release.
+
+## 0.141.11
+
+### Patch Changes
+
+- d389b22: A pause-plane deadline is recognized by the NATS client's TimeoutError class, so an error that only carries that name is no longer retried and then failed as a late reply.
+
+## 0.141.10
+
+No changes in this release.
+
+## 0.141.9
+
+No changes in this release.
+
+## 0.141.8
+
+No changes in this release.
+
+## 0.141.7
+
+No changes in this release.
+
+## 0.141.6
+
+No changes in this release.
+
+## 0.141.5
+
+No changes in this release.
+
+## 0.141.4
+
+No changes in this release.
+
+## 0.141.3
+
+No changes in this release.
+
+## 0.141.2
+
+No changes in this release.
+
+## 0.141.1
+
+No changes in this release.
+
+## 0.141.0
+
+No changes in this release.
+
+## 0.140.8
+
+No changes in this release.
+
+## 0.140.7
+
+No changes in this release.
+
+## 0.140.6
+
+No changes in this release.
+
+## 0.140.5
+
+No changes in this release.
+
+## 0.140.4
+
+No changes in this release.
+
+## 0.140.3
+
+No changes in this release.
+
+## 0.140.2
+
+No changes in this release.
+
+## 0.140.1
+
+No changes in this release.
+
+## 0.140.0
+
+No changes in this release.
+
+## 0.139.1
+
+No changes in this release.
+
+## 0.139.0
+
+No changes in this release.
+
+## 0.138.2
+
+No changes in this release.
+
+## 0.138.1
+
+No changes in this release.
+
+## 0.138.0
+
+No changes in this release.
+
+## 0.137.0
+
+No changes in this release.
+
+## 0.136.8
+
+No changes in this release.
+
+## 0.136.7
+
+No changes in this release.
+
+## 0.136.6
+
+No changes in this release.
+
+## 0.136.5
+
+No changes in this release.
+
+## 0.136.4
+
+No changes in this release.
+
+## 0.136.3
+
+No changes in this release.
+
+## 0.136.2
+
+No changes in this release.
+
+## 0.136.1
+
+No changes in this release.
+
+## 0.136.0
+
+No changes in this release.
+
+## 0.135.21
+
+No changes in this release.
+
+## 0.135.20
+
+No changes in this release.
+
+## 0.135.19
+
+No changes in this release.
+
+## 0.135.18
+
+No changes in this release.
+
+## 0.135.17
+
+No changes in this release.
+
+## 0.135.16
+
+No changes in this release.
+
+## 0.135.15
+
+No changes in this release.
+
+## 0.135.14
+
+No changes in this release.
+
+## 0.135.13
+
+No changes in this release.
+
+## 0.135.12
+
+No changes in this release.
+
+## 0.135.11
+
+No changes in this release.
+
+## 0.135.10
+
+No changes in this release.
+
+## 0.135.9
+
+No changes in this release.
+
+## 0.135.8
+
+No changes in this release.
+
+## 0.135.7
+
+No changes in this release.
+
+## 0.135.6
+
+No changes in this release.
+
+## 0.135.5
+
+No changes in this release.
+
+## 0.135.4
+
+### Patch Changes
+
+- 3db141d: Keep Hermes tool arguments out of shared presence activity while retaining the tool name and status transitions.
+
+## 0.135.3
+
+No changes in this release.
+
+## 0.135.2
+
+No changes in this release.
+
+## 0.135.1
+
+No changes in this release.
+
+## 0.135.0
+
+No changes in this release.
+
+## 0.134.0
+
+### Minor Changes
+
+- 8b80ca6: Every connector now hands its agent the same briefing, composed once in `@cotal-ai/connector-core` (`briefing(config, harness)`): identity, orient first, feedback, mesh-first delegation, durable workflow runs, where to talk, how a peer message arrives, how to reply, attention modes and reply etiquette. Codex, Jcode, OpenCode, Hermes and pi used to carry their own shorter copies and drifted; each now adds only the sentence that says how a peer message appears in its context. `docs/agent-briefing.mdx` is generated from the module (`pnpm gen:briefingdoc`) so a wording change shows as a diff of what each harness reads, and `pnpm check:docsbundle` fails when it drifts.
+  
+  A conversation that joins through `cotal_connect` (the Claude Code plugin in a session you opened, Claude Desktop, a hosted connector) used to be told only how to connect and listen; the connect result now carries its orientation card and the briefing. The Claude Code session-start hook hands the orientation card over at startup, resume, fork, clear and compaction, or with the next prompt when the seat was not bound yet, so the model has its bearings without asking. `orientationCard()` is the one rendering the `cotal_orientation` tool, the connect result and the hook share. Hermes' `setupProfile` takes the seat's `config` to render the briefing into `SOUL.md`.
+
+## 0.133.13
+
+No changes in this release.
+
+## 0.133.12
+
+No changes in this release.
+
+## 0.133.11
+
+### Patch Changes
+
+- 9182cfc: Restore the tool specs' and gateway's zod namespace import. The by-name imports released in 0.133.9 made the bundled claude, codex, hermes, jcode and opencode connectors throw `Class2 is not a constructor` when imported, so a fresh `cotal setup` failed its first connector seed.
+
+## 0.133.10
+
+No changes in this release.
+
+## 0.133.9
+
+No changes in this release.
+
+## 0.133.8
+
+No changes in this release.
+
+## 0.133.7
+
+No changes in this release.
+
+## 0.133.6
+
+No changes in this release.
+
+## 0.133.5
+
+No changes in this release.
+
+## 0.133.4
+
+No changes in this release.
+
+## 0.133.3
+
+No changes in this release.
+
+## 0.133.2
+
+No changes in this release.
+
+## 0.133.1
+
+No changes in this release.
+
+## 0.133.0
+
+### Minor Changes
+
+- 1e554e4: Precompute documentation search at build time and load the corpus and compact index only when needed. Search results and scoring are unchanged. Documentation data now lives in two digest-checked files beside each module or bundle; normal packages, plugins and installers include them automatically. Custom integrations that copy or bundle an executable alone must also carry its matching `docs-bundle.bin` and `docs-index.bin` files.
+
+## 0.132.7
+
+No changes in this release.
+
+## 0.132.6
+
+No changes in this release.
+
+## 0.132.5
+
+No changes in this release.
+
+## 0.132.4
+
+No changes in this release.
+
+## 0.132.3
+
+No changes in this release.
+
+## 0.132.2
+
+No changes in this release.
+
+## 0.132.1
+
+No changes in this release.
+
+## 0.132.0
+
+No changes in this release.
+
+## 0.131.6
+
+No changes in this release.
+
+## 0.131.5
+
+No changes in this release.
+
+## 0.131.4
+
+No changes in this release.
+
+## 0.131.3
+
+No changes in this release.
+
+## 0.131.2
+
+No changes in this release.
+
+## 0.131.1
+
+No changes in this release.
+
+## 0.131.0
+
+No changes in this release.
+
+## 0.130.2
+
+No changes in this release.
+
+## 0.130.1
+
+No changes in this release.
+
+## 0.130.0
+
+No changes in this release.
+
+## 0.129.9
+
+No changes in this release.
+
+## 0.129.8
+
+No changes in this release.
+
+## 0.129.7
+
+No changes in this release.
+
+## 0.129.6
+
+No changes in this release.
+
+## 0.129.5
+
+No changes in this release.
+
+## 0.129.4
+
+No changes in this release.
+
+## 0.129.3
+
+No changes in this release.
+
+## 0.129.2
+
+No changes in this release.
+
+## 0.129.1
+
+No changes in this release.
+
+## 0.129.0
+
+No changes in this release.
+
+## 0.128.7
+
+No changes in this release.
+
+## 0.128.6
+
+No changes in this release.
+
+## 0.128.5
+
+No changes in this release.
+
+## 0.128.4
+
+No changes in this release.
+
+## 0.128.3
+
+No changes in this release.
+
+## 0.128.2
+
+No changes in this release.
+
+## 0.128.1
+
+No changes in this release.
+
+## 0.128.0
+
+No changes in this release.
+
+## 0.127.5
+
+No changes in this release.
+
+## 0.127.4
+
+No changes in this release.
+
+## 0.127.3
+
+No changes in this release.
+
+## 0.127.2
+
+No changes in this release.
+
+## 0.127.1
+
+No changes in this release.
+
+## 0.127.0
+
+No changes in this release.
+
+## 0.126.3
+
+No changes in this release.
+
+## 0.126.2
+
+No changes in this release.
+
+## 0.126.1
+
+No changes in this release.
+
+## 0.126.0
+
+No changes in this release.
+
+## 0.125.0
+
+No changes in this release.
+
+## 0.124.3
+
+No changes in this release.
+
+## 0.124.2
+
+No changes in this release.
+
+## 0.124.1
+
+No changes in this release.
+
+## 0.124.0
+
+No changes in this release.
+
+## 0.123.0
+
+No changes in this release.
+
+## 0.122.0
+
+No changes in this release.
+
+## 0.121.7
+
+No changes in this release.
+
+## 0.121.6
+
+No changes in this release.
+
+## 0.121.5
+
+No changes in this release.
+
+## 0.121.4
+
+No changes in this release.
+
+## 0.121.3
+
+No changes in this release.
+
+## 0.121.2
+
+No changes in this release.
+
+## 0.121.1
+
+No changes in this release.
+
+## 0.121.0
+
+No changes in this release.
+
+## 0.120.2
+
+No changes in this release.
+
+## 0.120.1
+
+No changes in this release.
+
+## 0.120.0
+
+No changes in this release.
+
+## 0.119.5
+
+No changes in this release.
+
+## 0.119.4
+
+No changes in this release.
+
+## 0.119.3
+
+No changes in this release.
+
+## 0.119.2
+
+No changes in this release.
+
+## 0.119.1
+
+No changes in this release.
+
+## 0.119.0
+
+No changes in this release.
+
+## 0.118.3
+
+No changes in this release.
+
+## 0.118.2
+
+No changes in this release.
+
+## 0.118.1
+
+No changes in this release.
+
+## 0.118.0
+
+No changes in this release.
+
+## 0.117.1
+
+No changes in this release.
+
+## 0.117.0
+
+No changes in this release.
+
+## 0.116.5
+
+No changes in this release.
+
+## 0.116.4
+
+No changes in this release.
+
+## 0.116.3
+
+No changes in this release.
+
+## 0.116.2
+
+No changes in this release.
+
+## 0.116.1
+
+No changes in this release.
+
+## 0.116.0
+
+### Minor Changes
+
+- 50ee624: Cut what an idle seat costs its host, with stock build and runtime mechanisms.
+  
+  Every connector bundle that loads into a long-running process now ships as one-byte text. V8 holds a
+  string at one byte per character only while every character is Latin-1, and a single character above
+  U+00FF made each 5 MB bundle two-byte for the life of the process. The characters were em dashes and
+  arrows in comments, so the bundles are built with esbuild's `--minify-whitespace`, which drops
+  comments and the parentheses around a single arrow parameter, and keeps every identifier. Anything
+  matching text in a built bundle sees the second part: `(e) => f(e)` now reads `e=>f(e)`. `pnpm smoke:connector-bundle-text` reads the 19 built bundles
+  and fails on any character above U+00FF. Stack-trace frames keep their function names and their line
+  and column numbers move, because the bundle is now fewer, longer lines.
+  
+  The Claude Code connector's seat is launched through a new entry, `dist/seat.cjs`, which enables
+  Node's module compile cache in `~/.cotal/compile-cache` and then loads `dist/mcp.cjs`. Node's cache
+  covers modules compiled after it is enabled, so the entry has to sit in front of the bundle. The
+  directory is created 0700 like the rest of `~/.cotal`, whatever the launching umask was. A cache
+  that cannot be opened prints one line and the seat serves without it,
+  `NODE_DISABLE_COMPILE_CACHE=1` turns it off, and `NODE_COMPILE_CACHE` takes precedence and is left
+  alone. `dist/mcp.cjs` remains the library entry (`@cotal-ai/connector-claude-code/mcp`) and still
+  serves when run directly.
+  
+  The declared Node floor rises from 22 to 22.10, which is where `module.flushCompileCache()` lands,
+  and every package's `engines.node` now says so. The `cotal` binary checks it at its front door and
+  refuses an older runtime with the floor, the running version and the repair for how it was
+  installed; the seat entry refuses before its first cache call, so an old Node gets one sentence
+  rather than a `TypeError`; and the installer compares the minor version, so a host whose own Node is
+  22.9 gets the pinned Node downloaded and verified instead. `node dist/mcp.cjs` still serves on an
+  older runtime. Operators moving a host read
+  [the upgrade note](https://github.com/Cotal-AI/Cotal/blob/main/docs/UPGRADING.md).
+  
+  Measured on one idle seat per arm, Node v22.23.2, paired and read at 160 s and 600 s: 41.9 MiB USS
+  on the stock bundle, 35.2 with one-byte text, 26.3 with the seat entry's compile cache as well.
+
+## 0.115.4
+
+No changes in this release.
+
+## 0.115.3
+
+No changes in this release.
+
+## 0.115.2
+
+No changes in this release.
+
+## 0.115.1
+
+No changes in this release.
+
+## 0.115.0
+
+No changes in this release.
+
+## 0.114.1
+
+No changes in this release.
+
+## 0.114.0
+
+No changes in this release.
+
+## 0.113.3
+
+No changes in this release.
+
+## 0.113.2
+
+No changes in this release.
+
+## 0.113.1
+
+No changes in this release.
+
+## 0.113.0
+
+No changes in this release.
+
+## 0.112.0
+
+No changes in this release.
+
+## 0.111.1
+
+No changes in this release.
+
+## 0.111.0
+
+No changes in this release.
+
+## 0.110.0
+
+No changes in this release.
+
+## 0.109.25
+
+No changes in this release.
+
+## 0.109.24
+
+No changes in this release.
+
+## 0.109.23
+
+No changes in this release.
+
+## 0.109.22
+
+No changes in this release.
+
+## 0.109.21
+
+No changes in this release.
+
+## 0.109.20
+
+No changes in this release.
+
+## 0.109.19
+
+No changes in this release.
+
+## 0.109.18
+
+No changes in this release.
+
+## 0.109.17
+
+No changes in this release.
+
+## 0.109.16
+
+No changes in this release.
+
+## 0.109.15
+
+No changes in this release.
+
+## 0.109.14
+
+No changes in this release.
+
+## 0.109.13
+
+No changes in this release.
+
+## 0.109.12
+
+No changes in this release.
+
+## 0.109.11
+
+No changes in this release.
+
+## 0.109.10
+
+No changes in this release.
+
+## 0.109.9
+
+No changes in this release.
+
+## 0.109.8
+
+No changes in this release.
+
+## 0.109.7
+
+No changes in this release.
+
+## 0.109.6
+
+No changes in this release.
+
+## 0.109.5
+
+No changes in this release.
+
+## 0.109.4
+
+No changes in this release.
+
+## 0.109.3
+
+No changes in this release.
+
+## 0.109.2
+
+No changes in this release.
+
+## 0.109.1
+
+No changes in this release.
+
+## 0.109.0
+
+No changes in this release.
+
+## 0.108.1
+
+No changes in this release.
+
+## 0.108.0
+
+No changes in this release.
+
+## 0.107.0
+
+No changes in this release.
+
+## 0.106.1
+
+No changes in this release.
+
+## 0.106.0
+
+No changes in this release.
+
+## 0.105.1
+
+No changes in this release.
+
+## 0.105.0
+
+No changes in this release.
+
+## 0.104.2
+
+No changes in this release.
+
+## 0.104.1
+
+No changes in this release.
+
+## 0.104.0
+
+### Patch Changes
+
+- e0c4e6e: Correct the documentation page by page against the implementation, including CLI commands, connector delivery and activity sharing, authentication, observer surfaces, hosted composition, telemetry and historical design status. Refresh package guides and generated tool and HTTP references while preserving existing links and normative contracts.
+
+## 0.103.4
+
+No changes in this release.
+
+## 0.103.3
+
+No changes in this release.
+
+## 0.103.2
+
+No changes in this release.
+
+## 0.103.1
+
+No changes in this release.
+
+## 0.103.0
+
+No changes in this release.
+
+## 0.102.0
+
+No changes in this release.
+
+## 0.101.7
+
+No changes in this release.
+
+## 0.101.6
+
+No changes in this release.
+
+## 0.101.5
+
+No changes in this release.
+
+## 0.101.4
+
+No changes in this release.
+
+## 0.101.3
+
+No changes in this release.
+
+## 0.101.2
+
+No changes in this release.
+
+## 0.101.1
+
+No changes in this release.
+
+## 0.101.0
+
+No changes in this release.
+
+## 0.100.2
+
+No changes in this release.
+
+## 0.100.1
+
+No changes in this release.
+
+## 0.100.0
+
+No changes in this release.
+
+## 0.99.3
+
+No changes in this release.
+
+## 0.99.2
+
+No changes in this release.
+
+## 0.99.1
+
+No changes in this release.
+
+## 0.99.0
+
+No changes in this release.
+
+## 0.98.0
+
+No changes in this release.
+
+## 0.97.1
+
+No changes in this release.
+
+## 0.97.0
+
+No changes in this release.
+
+## 0.96.1
+
+No changes in this release.
+
+## 0.96.0
+
+No changes in this release.
+
+## 0.95.2
+
+No changes in this release.
+
+## 0.95.1
+
+No changes in this release.
+
+## 0.95.0
+
+No changes in this release.
+
+## 0.94.7
+
+No changes in this release.
+
+## 0.94.6
+
+No changes in this release.
+
+## 0.94.5
+
+No changes in this release.
+
+## 0.94.4
+
+No changes in this release.
+
+## 0.94.3
+
+No changes in this release.
+
+## 0.94.2
+
+No changes in this release.
+
+## 0.94.1
+
+No changes in this release.
+
+## 0.94.0
+
+No changes in this release.
+
+## 0.93.0
+
+No changes in this release.
+
+## 0.92.2
+
+No changes in this release.
+
+## 0.92.1
+
+No changes in this release.
+
+## 0.92.0
+
+### Patch Changes
+
+- ab2acc8: Tell every agent where to talk when it joins. A fresh agent can start on no channel, so the Claude Code, Codex, Jcode, OpenCode and Hermes startup text now says how to find its team's channel with `cotal_channels` and `cotal_join`, to use `cotal_dm` for one peer and `cotal_anycast` for a role, and to post on `#announce` only for a deliberate space-wide notice. OpenCode and Hermes previously carried no channel guidance at all. This is guidance only: no grant, subscription, mention or wake behaviour changes.
+
+## 0.91.0
+
+## 0.90.1
+
+## 0.90.0
+
+## 0.89.0
+
+## 0.88.0
+
+## 0.87.0
+
+### Patch Changes
+
+- af82e8d: A seat's launch-material directory (`cotal-launch-*` in the OS temp dir, holding the broker URL, the creds path and the control token) is now removed when the seat's process exits. Before this change a Claude seat left it behind after `cotal stop`, while the persona file and control socket of the same launch were removed. `materialEnv` in `@cotal-ai/connector-core` now takes the launch's artifact array as a second, required argument and appends the material's private directory to it, and every connector returns that array on `LaunchSpec.artifacts`, so the manager, the pty runtime and the foreground `cotal spawn` remove it the way they remove a persona file. Each connector now writes the material after its last refusal, so a refused launch leaves no material file behind. The second material file the Hermes launcher writes for its gateway child is not covered by this change.
+
+## 0.86.0
+
+## 0.85.0
+
+## 0.84.0
+
+## 0.83.0
+
+## 0.82.2
+
+## 0.82.1
+
+## 0.82.0
+
+## 0.81.1
+
+## 0.81.0
+
+## 0.80.0
+
+## 0.79.0
+
+## 0.78.1
+
+## 0.78.0
+
+## 0.77.1
+
+## 0.77.0
+
+## 0.76.0
+
+## 0.75.0
+
+## 0.74.0
+
+## 0.73.0
+
+## 0.72.1
+
+## 0.72.0
+
+## 0.71.0
+
+## 0.70.2
+
+## 0.70.1
+
+## 0.70.0
+
+### Patch Changes
+
+- 7986785: The connector and the CLI now print every peer with one label, from the new `peerLabel` in `@cotal-ai/core`: `name/role`, or the bare name for a peer with no role, with any line break or bracket shown as a space. Before, `cotal console` dropped a role equal to the name and its roster pane showed the name alone, the console's managed-agent row and the spawn line printed `name (role)`, and only message attribution sanitized the role, so `cotal_roster`, the orientation card, the ambiguous-DM candidate list, `cotal endpoints`, `cotal status` and `cotal ps` printed a role holding `]` or a newline verbatim. The DM target check that refuses a pasted label compares against the same label.
+
+## 0.69.0
+
+## 0.68.0
+
+### Minor Changes
+
+- 585fdb2: Connectors launch on the model and variant their launcher resolved. `LaunchOpts.model` and `LaunchOpts.variant` are now the launcher's resolved values (the flag, else the agent file's `model:` / `variant:`), and every connector renders them as given instead of reading the agent file again in `buildLaunch`. Before, a model the launcher did not resolve was taken from a later read of a file that could have changed since, so the seat could run a model the launcher never checked or recorded, and a supervised restart re-read it each time. The in-session config takes the model and variant from `COTAL_MODEL` / `COTAL_VARIANT` only, so the card and the orientation pin no longer report a model the seat was not launched on. The Hermes connector no longer falls back to `HERMES_MODEL` from the spawning process, including one `spawn.env` forwards; set the model with `--model` or the persona's `model:`. Code that calls `buildLaunch` directly must pass `model` and `variant` itself.
+
+## 0.67.0
+
+## 0.66.1
+
+## 0.66.0
+
+## 0.65.0
+
+## 0.64.0
+
+## 0.63.0
+
+## 0.62.0
+
+## 0.61.0
+
+## 0.60.0
+
+## 0.59.0
+
+### Patch Changes
+
+- b0ec4f9: The Hermes launcher now refuses a `COTAL_HERMES_ADOPT_HOME` that is not an absolute path, before it writes anything. A relative value used to resolve against whatever directory the launcher ran in, so the same setting installed the plugin into a different directory, or failed as missing, depending on where the seat started, and a literal `~/.hermes` that no shell expanded was taken as a directory named `~`. `docs/connect-hermes.md` now says the value must be absolute.
+- f65b6c6: Say what lands in an adopted Hermes profile. `docs/connect-hermes.md` described `COTAL_HERMES_ADOPT_HOME` as leaving the profile as found apart from `plugins/cotal`, but the Hermes gateway records one-time hints under `onboarding.seen` by writing `config.yaml` back whole, which drops comments and can change its layout, and the launcher also writes `cotal-tools.json` there. The page now names both writes and gives the `onboarding.seen` flags to set so the gateway leaves `config.yaml` as written.
+- 0d267ab: Stop two Hermes seats on one channel from answering each other in a loop. The Hermes gateway posts every turn's answer, and its own busy notices, back to the channel as a reply to the message that started the turn, and the connector started a turn on every channel message, so each seat's answer started a turn on the other and the chatter ran until the gateways stopped. On a Hermes seat a channel message that replies to another message now waits in `cotal_inbox` instead of starting a turn, unless it `@mention`s the seat. The new `channelRepliesPullOnly` field of the connector-core agent config applies the rule, and the Hermes sidecar sets it.
+- 1e182e7: `docs/connect-hermes.md` now documents how a Hermes seat reaches a custom OpenAI-compatible endpoint. A seat does not inherit the endpoint variables from your shell, and Hermes 0.19 reads `CUSTOM_BASE_URL` only when its provider is `custom`, so a managed profile needs `HERMES_INFERENCE_PROVIDER=custom` and `CUSTOM_BASE_URL` exported and listed in `spawn.env`. An endpoint that needs a key belongs in an adopted profile's `config.yaml` model block. The page also says that `--model custom:<model>` is passed to Hermes unchanged and does not select the provider, and its spawn commands now carry `--no-events`, because the connector publishes no AG-UI event plane and a launch that arms one is refused.
+- 7614b7e: Remove a managed Hermes profile when its seat stops. `cotal stop` used to end the gateway and drop the seat while the generated `HERMES_HOME` stayed in the temp dir with the written config, the plugin copy and the state Hermes wrote, and Hermes's kanban database stayed beside it, so every stopped seat left a directory behind. Each managed seat now gets a temp root of its own, `$TMPDIR/cotal-hermes-<id>`, which also holds the gateway's `TMPDIR`. On stop the launcher sends the gateway SIGTERM, kills its process tree if it is still running 1.5 seconds later, waits for it to exit, and then removes the root, so nothing is deleted while the gateway can still write. A `--resume` seat's root is kept, because its profile holds the fork that a relaunch under the same name continues. A fork kept under the earlier root, `$TMPDIR/cotal-hermes-<space>-<name>`, moves into the seat's own root on its next launch, replacing a profile there that holds no fork, so it is still continued and still refuses a different session. An adopted profile (`COTAL_HERMES_ADOPT_HOME`) is never removed. `docs/connect-hermes.md` says where the managed profile lives and what a hard stop leaves behind.
+- 4c3fbaf: Run a managed Hermes seat as a Hermes named profile under its temp root, so its gateway gets a systemd unit name of its own, `hermes-gateway-cotal-<id>`. Hermes used to read the managed temp home as a root and give the seat the bare `hermes-gateway` name of the operator's own gateway: the seat refused to start while the operator's gateway service was active, and every launch tried to rewrite the operator's `hermes-gateway.service` to point at the seat's temp profile.
+- 569cb6f: The Hermes connector accepts `cotal spawn --resume <id>`. Before the seat joins the mesh, the launcher forks the named session out of the operator's Hermes profile (`HERMES_HOME`, or `~/.hermes`) into the seat's managed profile through Hermes' own session store, reading the source database read-only. The fork keeps the session's title, numbered `#N` the way `/branch` numbers a branch when the seat already holds that title from an earlier fork, and kept within Hermes' 100-character title limit. This works across the supported `hermes-agent` range, 0.18 included. Each mesh chat starts as a branch of that fork the first time the resumed seat uses it, so its first turn carries the source context; a chat holding history from an earlier seat of the same name moves to its branch too, and that history is kept under its own session. A missing or empty session is refused before the seat joins, a seat relaunched under the same name keeps its fork without reading the source again, and resume is refused together with `COTAL_HERMES_ADOPT_HOME`.
+- b84dd9a: Replies now carry their correlation, so an answer reaches the Hermes session that asked. A `cotal_dm` to a peer answers the message its new `replyTo` argument names, or else the oldest DM or anycast that peer sent and that no DM back has answered yet, as long as that peer's waiting messages share one conversation; across several conversations the DM is refused with their ids rather than guessing. The reply names that message in `replyTo` and copies its `contextId` (SPEC §5), and the message counts as answered only once the reply is published; until then it still counts as waiting when a later DM to that peer has to pick what it answers. `MeshAgent.withCorrelation` stamps a per-call `contextId`, `replyTo` and conversation peer on the sends one call makes. A call bound to a message it answers copies that message's `contextId` when it names none. `MeshAgent.answersQuestion` tells whether a DM answers a question asked that way, from the peer it went to. The Hermes bridge's `tool` frame takes an optional `contextId` and `peerId`, its `reply` frame an optional `replyTo` and `contextId`, and an `incoming` frame carries `answersQuestion`. The Hermes plugin stamps each `cotal_dm` and `cotal_anycast` question with a `contextId` minted for it and runs the answer in the session that asked: a Cotal session directly, a session on another platform such as a Telegram topic through Hermes' `inject_message`, which the operator allows with `plugins.entries.cotal.allow_gateway_injection`. When the host refuses that injection or fails with an error, the answer is neither run in another session nor acknowledged: the new `deferred` bridge frame keeps it buffered and offers it again after 30 seconds. A turn's reply names the message the gateway says it answers. A question from a Cotal session records the session's chat type from its chat id, because not every supported Hermes version binds one for a tool call, so its answer runs in the session that asked rather than one keyed without a type. A `cotal_dm`'s own `replyTo` wins over the message a `withCorrelation` scope binds, both for the reply's correlation and for which message counts as answered.
+- 569cb6f: A `--resume` seat's fork provenance is recorded on the manager. `LaunchSpec` gains `resumeRecordPath`, where a connector whose seat forks after launch has it record the source session id, the source title and a SHA-256 of the transcript it read; the Hermes and Jcode connectors declare it. The manager reads that record once the seat has written it, keeps it on the seat's resume document (an optional `resumed` field, so earlier documents still resume), and adds a `resume` object to the `ps`/`inspect` row (manager cluster revision 20). `cotal ps --wide` prints `forked from <id>` with the title and hash, and the Hermes and Jcode seats print the same facts when they fork. The Jcode fork now carries a count above 2^53 byte for byte instead of rounding it, refuses a count outside the u64 range by name, and refuses a fork record that is not an object by name.
+
+## 0.58.0
+
+### Patch Changes
+
+- e5ee584: The Hermes Python client now acks a surfaced delivery under `recvKey`, the field the bridge matches, so each delivery is retired and the bridge no longer stops after the first automatic item of a gateway boot.
+- a5327b4: The Hermes bridge now forwards an inbox item's `historical` flag to the sidecar, and the adapter frames a join-time backfill with the same `(history) ` prefix connector-core's `fmtItem` gives the other connectors, so a retained @mention replayed after a gateway restart no longer reads as a live request.
+
+## 0.57.0
+
+## 0.56.1
+
+### Patch Changes
+
+- 6b76946: A seat resumed from a preservation cut backfills its channels from the chat stream sequence its prior incarnation had reached instead of replaying the whole retained window.
+- 8137d83: The Hermes bridge's local Unix-socket listener now authenticates the first frame of every connection against the launch's control token, dropping an unauthenticated or wrongly-tokened connection before it ever reaches the adapter or a tool call, and the Python-side client now presents that same token on every connect and reconnect.
+
+## 0.56.0
+
+## 0.55.0
+
+## 0.54.0
+
+## 0.53.0
+
+## 0.52.1
+
+## 0.52.0
+
+## 0.51.0
+
+### Minor Changes
+
+- ec8649b: Preserve the closed required-events registration policy and enforce it across discovery, launch,
+  grant coverage, direct connector sessions, and trusted upgrades of existing manual registrations.
+
+## 0.50.1
+
+### Patch Changes
+
+- f1d8d84: A spawned Hermes seat on the managed profile now refuses to launch when no model was resolved.
+  The managed profile is a temporary directory and does not read `~/.hermes`, so a model configured
+  there is not used, and with no `--model`, no agent file `model:` and no ambient `HERMES_MODEL` the
+  generated `config.yaml` carried no `model:` key at all. Hermes then chose a default of its own over
+  a provider the operator may hold no key for. The seat still joined the mesh and still accepted a
+  turn, so the first sign of it was a provider authentication error partway through that turn, whose
+  advice pointed at the operator's own credentials.
+
+  The refusal names the three inputs that set a model and `COTAL_HERMES_ADOPT_HOME` for running on
+  the operator's own profile instead. It fires before the profile directory or the plugin is written, so a refused launch
+  leaves nothing on disk, and it prints as one line rather than a stack. A launch with a model is unchanged.
+
+  Refs #1715
+
+## 0.50.0
+
+### Minor Changes
+
+- 6f248ac: Enumerate broker spawn sites so an unmigrated suite fails the gate instead of leaking
+
+  The reaper claims a leaked `nats-server` by matching the store-dir token in its argv, and its header
+  states the standing condition: it "is only ever as complete as the migration that mints the token".
+  #1008 measured what that costs, 108 orphaned brokers on one box in a day, all holding loopback ports
+  inside the OS ephemeral range that suites draw from. The five suites it named were migrated, and
+  nothing was left behind that could notice the sixth.
+
+  `pnpm smoke:broker-migration` is that missing piece. It names no filenames: it walks `git ls-files`,
+  finds every call that starts a `nats-server`, and fails when one is not claimable by the reaper or
+  killable by the teardown helper. A suite added next week is in the population on the commit that
+  adds it. The census currently reads 319 spawn sites across 297 files, and the gate checks all 315
+  that are in scope.
+
+  The census found 98 unadopted sites, not five. Two conditions each break the chain on their own and
+  both are now required: the token has to be in a path the broker is STARTED with, since the reaper
+  reads argv and nothing else, and the handle has to reach `teardownOnSignal`, since the token only
+  helps once the owner is dead. Three shapes were leaking for reasons a named list would never have
+  surfaced. A suite minting a tokened store dir but launching with `-c <conf>` put the token somewhere
+  argv never carries, so it was unclaimable despite looking migrated. Brokers started with neither
+  `-sd` nor `-c` left no evidence at all; those now pass a tokened `-sd` purely as a marker, which
+  `nats-server` accepts without JetStream and writes nothing into. And suites that owned one broker
+  while leaving a sibling unowned read as clean under any file-level check, so ownership is decided per
+  spawn site.
+
+  A deliberate negative control opts out with a `SMOKE_BROKER_UNADOPTED_OK` marker, which is greppable
+  and per-site rather than a silent exclusion: `reaper.smoke.ts` must be able to start an untokened
+  broker, since that is the case it exists to detect.
+
+  The teardown helper no longer stalls three seconds and then reports a false alarm on every green
+  run. It waited on `process.kill(pid, 0)`, which keeps succeeding for a child that has been killed but
+  not yet waited on, so a suite whose own `finally` kills the broker first left a zombie that read as
+  alive until the deadline elapsed, and the helper then printed `did not exit before path cleanup`
+  about a process that was already dead. Liveness now distinguishes a zombie from a running process,
+  and a genuinely running broker is still waited on before its store dir is removed.
+
+- b7e5942: A peer can no longer forge the framing of an auto-injected message
+
+  The block that carries waiting peer messages into a turn interpolated the message body and the
+  sender name raw, and the Hermes sidecar built the same shape by string concatenation. Both were
+  forgeable the two ways the inbox reply used to be: a body carrying a newline produced a second item
+  in the block, reading to the agent as a separate delivered message from a peer that never sent one,
+  and a sender naming itself with a closing bracket ended the real attribution and opened a forged
+  one. These frames are auto-injected rather than returned when the agent asks, so the agent never
+  had a chance to distrust them.
+
+  The rule both surfaces now hold is the one the inbox reply already held, and they hold it through
+  the same code rather than a second convention: a line that begins at column zero is written by the
+  connector, never by a peer. One message is one line plus indented continuations, with the
+  attribution inside a single bracket pair. The neutralization moved into a shared module that the
+  injected block and the inbox reply both render through, so the body, the sender name and role, and
+  the service and channel labels all pass through one implementation. The Python sidecar carries a
+  matching module, kept to the same character class on purpose, since a peer that can forge the frame
+  on either side of the socket has the whole class back.
+
+  Two widenings came out of stating the rule positionally rather than by example. The attribution
+  class now neutralizes the opening bracket as well as the closing one, because stripping only the
+  closing one still let a name render a bracket pair a reader takes as the innermost attribution. The
+  injected block's per-item separator is the bracketed attribution the inbox reply uses, replacing the
+  bullet, so the text of an injected block changed and the wake-path suites that assert on it were
+  updated with it.
+
+  A third injected surface holds the same rule now. A wake hint carries no message body and reads as
+  one short sentence, so it does not look like a frame, but it is written into the agent's context
+  without being asked for and it names a peer-controlled channel label, which three connectors
+  interpolated raw. A label carrying a newline put a second line at column zero reading as another
+  delivered message. That label renders through the shared module too, and the absent-channel fallback
+  moved there with it, since three connectors each spelled it themselves and an absent field is what a
+  per-call-site spelling is most likely to get wrong.
+
+### Patch Changes
+
+- 0a52594: Census the in-process half of the ambient-environment rule. `smoke:suite-ambient-env` grades the environment a suite hands a child; the new `smoke:suite-ambient-env-self` grades a suite that reads its own `process.env` through `configFromEnv` and friends, and requires a module-scope `COTAL_` prefix scrub before that first read. The connector suites in the class now scrub the whole prefix instead of dropping one variable, so running them from inside a connected session no longer dies in its own import on the one-identity-plane refusal.
+
+## 0.49.0
+
+### Minor Changes
+
+- 36d1779: Issued authority and run admission (SPEC 13.15, 14.8). A static credential is now an issuance: the issuer records its permission ceiling as evidence under a fresh generation before the material exists, its endpoint rows ride the versioned `ep.v1` rail with that generation pinned beside the caller triple, and a connected client reads its generation from an issuer-written accepted row. A hosted workflow run is admitted under the starting caller's resolved ceiling, recorded once per run in a dedicated admission store the driver cannot write, checked before every channel effect (wait open, fetch, recorded re-read, conclave writes), and revoked by an independent create-only marker that ends open waits at their next poll and refuses resume, takeover and reconcile. `run-start` on the legacy rail is refused with `permission-denied` and the `ai.cotal.ep.unbound-caller-authority` detail. `cotal run start --local` takes `--admit-read` and `--admit-publish` (required) and `cotal run revoke <runId> --local --by <who> --reason <text>` writes the marker. Three new per-space stores (`cotal_issued_`, `cotal_accepted_`, `cotal_admission_`), immutable at the broker: the admission and accepted stores are write-once per key, the evidence store is append-only and read first-on-key, and all three refuse rollup headers, message deletes and purges, so a holder of its own key row can neither widen nor erase what was recorded. Two new one-shot profiles (`issuer`, `run-admitter`), an admission read on the run mediator and operator profiles, and `COTAL_ACCEPTED_TOKEN` on every connector's spawn environment. Breaking pre-1.0 authority change.
+
+## 0.48.2
+
+## 0.48.1
+
+## 0.48.0
+
+## 0.47.1
+
+## 0.47.0
+
+## 0.46.0
+
+### Minor Changes
+
+- 9d745af: Add the local durable runtime adoption seam and report legacy manager continuity before a running update can be described as hot. `Runtime.adopt` is optional: runtimes without durable custody omit it, and the manager refuses by name rather than requiring a throwing stub on every adapter. `cotal update --self` reports the selected manager before a global install and hands `--space` / `--server` / `--creds` to the replacement child.
+
+## 0.45.0
+
+## 0.44.0
+
+## 0.43.0
+
+## 0.42.0
+
+## 0.41.4
+
+## 0.41.3
+
+## 0.41.2
+
+## 0.41.1
+
+## 0.41.0
+
+## 0.40.0
+
+## 0.39.1
+
+## 0.39.0
+
+### Minor Changes
+
+- 34ff272: `cotal run`, the workflow-run operator surface, self-registered by `@cotal-ai/runtime` and composed
+  into the `cotal` binary: `start --file <program>` drives a new run on the mesh handler, `resume
+<runId> --file <program>` takes an existing run over and drives it to quiescence, `ps` lists an
+  endpoint's run records (state, holder, journal high-water, fork lineage), `journal <runId>` prints
+  the durable step journal, and `answer <runId> <stepKey> --by <who> [--value <json>]` resolves an
+  open checkpoint through the run driver, presenting as the arming holder read back from the
+  checkpoint record (resume is holder-bound). One raw connection per invocation against the resolved
+  mesh target; the journal's result bound is taken from the broker's own max_payload.
+
+  `docs/workflows.md` gains an "Operating a run" section, the connector docs bundle carries it, and
+  every connector folds a workflow steer (`WORKFLOW_STEER`) into its agent instructions beside the
+  mesh-first steer, so agents reach for a durable journalled run instead of improvising long
+  coordination loops in their own context.
+
+## 0.38.0
+
+## 0.37.0
+
+### Patch Changes
+
+- d088094: Inspect and launch the external `uv` harness Hermes actually requires instead of treating the project-provided `hermes` command as a PATH prerequisite.
+- e703873: Report connector harness availability at manager boot and expose resolved binary paths in status.
+- c4094cb: Drop inherited `COTAL_LAUNCH_MATERIAL` from suites that default `COTAL_SERVERS` then call `configFromEnv()` on `process.env`, so `pnpm test` no longer trips the one-identity-plane refusal inside a managed seat.
+
+## 0.36.0
+
+## 0.35.0
+
+## 0.34.0
+
+## 0.33.9
+
+## 0.33.8
+
+## 0.33.7
+
+## 0.33.6
+
+## 0.33.5
+
+## 0.33.4
+
+## 0.33.3
+
+## 0.33.2
+
+## 0.33.1
+
+## 0.33.0
+
+## 0.32.0
+
+## 0.31.0
+
+### Minor Changes
+
+- 4ef59c3: A spawned seat now receives a constructed environment (PATH/HOME/locale, the machine-wide COTAL\_\* knobs, connector-declared provider keys) instead of the manager's ambient environment. Host-session markers such as CLAUDE_CODE_CHILD_SESSION no longer leak into seats and silently disable transcript saving. The Claude connector declares CLAUDE_CODE_OAUTH_TOKEN (and the rest of claude's documented credential set) so a container seat still authenticates; spawn.env remains the explicit opt-in for extra names, including a host marker a persona has chosen to receive.
+
+## 0.30.2
+
+## 0.30.1
+
+## 0.30.0
+
+### Minor Changes
+
+- 569f4d3: An empty message id is never a dedup key, and an id-less delivery is individually addressable at the drain seam.
+
+  Two distinct messages that each carry an empty id collapsed to one: the receiver-side id
+  dedup read empty-equals-empty as a duplicate, silently dropped the second, and once the
+  first was handled it dropped every later empty-id message on arrival. Measured live, two
+  such messages arrived on the wire and only the first was ever delivered.
+
+  An empty id is now treated as no id: the ingest coalescing (pending, handled, protected)
+  is skipped for it in both directions, so distinct messages that carry an empty id are all
+  delivered. At the drain seam a per-delivery receive key (the wire id when there is one, a
+  per-session secret-namespaced minted key when the id is empty, never on any wire) is what
+  hosts, adapters, and the exact-key drain select by: cotal_inbox, the Claude Code hooks,
+  the OpenCode plugin, the Codex host, the Hermes bridge and its Python sidecar, and the pi
+  driver. The drain API is renamed for what it takes (drainInboxDeliveries, missingKeys).
+  Eviction classification, in-flight holds, scope routing, the focus-recall tie-break, and
+  the scoped drain's selection no longer key on the empty id either. The Hermes bridge no
+  longer wedges on an empty-id message. Delivery pumps in core now treat an absent or
+  non-string id as a malformed envelope per SPEC section 5 (durable terminate, live drop,
+  history and recall skip).
+
+  What this restores: before the receive key, an id-less delivery was unaddressable: the
+  raw id swept every pending empty-id item in one drain call, and once filtering closed
+  that, the item could never be drained or acked, was re-shown on every windowed inbox
+  read, and on a durable channel accumulated as an unretirable entry until the 200-entry
+  overflow valve evicted it, roughly a model turn of churn per entry, while one hostile
+  empty-id ambient publish self-drove back-to-back host turns on the pi adapter. This was
+  a violation of the SPEC section 8 ack-only-after-surfaced obligation at the receiver,
+  not only an adapter defect.
+
+  The cost is stated rather than hidden: with no id there is no coalescing either, so a
+  redelivered copy of an empty-id message can surface twice on a path that is already
+  at-least-once (live remains at-most-once). Dedup for real ids is unchanged: their
+  receive key is their wire id and their coalescing is untouched. SPEC section 4, section
+  7 item 5, section 8, and section 12 item 12 now state the receiver-scoped rule, and the
+  client-builder guidance mirrors it.
+
+  One named follow-up stays open: Plane-3 durable fan-out derives its publish msgID from
+  the message id, so distinct empty-id messages can still be collapsed inside the broker's
+  duplicate window on a durable channel before this receiver sees them. That path is its
+  own issue; this change's guarantee is the receiver.
+
+## 0.29.2
+
+## 0.29.1
+
+## 0.29.0
+
+## 0.28.2
+
+## 0.28.1
+
+## 0.28.0
+
+## 0.27.0
+
+## 0.26.0
+
+## 0.25.0
+
+### Minor Changes
+
+- b31d2af: Drop `NEBIUS_API_KEY` from the model-provider allow-list. How a harness authenticates to an
+  inference provider is the harness's business, not Cotal's: OpenCode, Codex, and Hermes each
+  have their own provider config and credential store, and Cotal carrying a per-vendor env name
+  meant every new inference provider needed a change here to work through a managed spawn. The
+  Token Factory operator guide goes with it.
+- a087c2b: A spawned agent now inherits the operator's environment. A harness you installed and configured
+  should behave under `cotal spawn` the way it behaves when you run it yourself, and the alternative
+  was Cotal maintaining a list of inference vendors: every new provider needed a change in Cotal
+  before it would work through a managed spawn. `MODEL_PROVIDER_KEYS` and the per-connector lists
+  that extended it are gone, and Cotal no longer names an inference vendor anywhere in its source.
+
+  Cotal still resets its own `COTAL_*` namespace before the child starts, keeping the machine-wide
+  knobs (`COTAL_HOME`, the feedback set, the default-agent pair, the `*_BIN` overrides, the timing
+  knobs). That reset is not configurable, because it is identity and not preference: a connector
+  supplies the per-session names for each child and does so conditionally, so an inherited value is
+  never overwritten and would hand an agent another agent's credential path, ACL, or lifecycle uid.
+  The whole prefix is stripped rather than a named list, because which names a connector sets varies
+  between connectors and a deny-list only ever names what its author remembered.
+
+  To confine a spawned agent instead, declare `spawn.env` in the cotal config file. The child then
+  gets a fixed OS allow-list plus exactly the names you list. An empty array is a real policy meaning
+  the OS allow-list alone. Note what this does and does not buy: `HOME` is forwarded either way, so
+  an agent with a shell reads `~/.aws` and `~/.ssh` regardless, and this protects only secrets that
+  live nowhere but the environment.
+
+- 34caaf4: Agent seats no longer export their connection material into the environment every descendant
+  process inherits. The broker URL, the creds path, the auth token, the user-mode identity and the
+  local control token now ride a private 0600 launch-material file whose path is the only thing in the
+  seat's environment; pi, codex and OpenCode drop even that path once they have read it (for OpenCode
+  that happens in the `opencode serve` process its seat shim starts, which is also what runs the
+  session's tool calls), while claude and hermes keep the reference because their readers are
+  short-lived children that start later. A session driven by hand still sets `COTAL_CREDS` / `COTAL_SERVERS` itself, and a
+  launch that carries both carriers is refused rather than resolved by precedence.
+
+## 0.24.0
+
+## 0.23.0
+
+## 0.22.0
+
+## 0.21.0
+
+### Patch Changes
+
+- 219d33c: `cotal spawn --agent pi --prompt <text>` now delivers the prompt as Pi's initial message (its first turn) instead of silently dropping it; an empty prompt, or one starting with `-` or `@`, refuses the launch. The connector contract no longer describes an initial prompt as something a connector may ignore: a connector delivers it or throws at launch. The other connectors follow the same rule: Claude Code and Codex refuse a prompt that is empty after trimming instead of dropping it, and Hermes refuses an initial prompt outright until its first turn is wired.
+
+## 0.20.1
+
+## 0.20.0
+
+## 0.19.0
+
+### Minor Changes
+
+- 4e8d776: The `cotal_*` tools now refuse an argument they do not model instead of silently
+  dropping it. A call carrying an unmodelled key (`owner` or `actor` alongside the
+  real arguments) previously succeeded with that key stripped before the tool ran,
+  so the caller was told nothing and the tool did something other than what was
+  asked. It is now refused by name, on every adapter and on every tool: the MCP
+  renderers and pi publish a closed schema and the host rejects the call, while
+  OpenCode and Hermes pass the caller's object through untouched and are closed at
+  the connector's own dispatch. Tools that take no arguments are closed too: they
+  were previously published with no schema at all, so a host had nothing to check
+  against and forwarded the extras to be dropped, as is `cotal_inbox`, whose
+  arguments four of the connectors replace with their own. Behaviourally breaking
+  for any caller that was relying on extra keys being ignored. Every refusal names
+  the rejected keys; where the connector is the one refusing it also lists the
+  arguments the tool accepts, or says it takes none.
+
+## 0.18.0
+
+## 0.17.0
+
+## 0.16.0
+
+## 0.15.0
+
+## 0.14.11
+
+### Patch Changes
+
+- c1fc62a: Fix the Hermes connector when it runs as an installed extension: `dist/launch.js` now
+  carries a `createRequire` banner (the esbuild ESM bundle crashed at import with `Dynamic
+require of "crypto"` on every installed-ext launch; dev runs via tsx masked it), and the
+  launch-env filter now forwards Hermes' own model-provider API keys (`OPENCODE_GO_API_KEY`,
+  `OPENCODE_ZEN_API_KEY`, `NOVITA_API_KEY`, and the other dedicated key names in the hermes
+  0.16 provider registry, bundled model-provider plugins included) so a managed or
+  containerized Hermes can authenticate any of its providers from the operator's
+  environment. Generic cross-tool and cloud-wide credentials (`GH_TOKEN`,
+  `CLAUDE_CODE_OAUTH_TOKEN`, `GOOGLE_API_KEY`, …) stay excluded from the forward list.
+
+## 0.14.10
+
+## 0.14.9
+
+## 0.14.8
+
+## 0.14.7
+
+## 0.14.6
+
+## 0.14.5
+
+## 0.14.4
+
+## 0.14.3
+
+## 0.14.2
+
+## 0.14.1
+
+## 0.14.0
+
+## 0.13.2
+
+## 0.13.1
+
+## 0.13.0
+
+### Minor Changes
+
+- 5491661: v0.4 endpoint control surface: a breaking wire revision (SPEC section 13).
+
+  Adds the endpoint control surface: the `ep` request rails and grant grammar, the
+  message envelope and error catalog, the callable-service verbs, and the session
+  and virtual-endpoint composites. Deletes the v0.3 `ctl` rail (the hard cut).
+  Requires nats-server 2.12 or newer, since the auth marker store uses native
+  per-message TTL; clients read the server version from the pre-auth INFO and fail
+  loud below the floor.
+
+  Completes the agent lifecycle end to end: registration, admission, despawn,
+  retirement, and safe name reuse, backed by a lifecycle registry, a credential
+  ledger, and a retirement barrier. Durables are keyed by lifecycle uid, so a
+  manager-resumed agent recovers its original incarnation rather than re-minting,
+  and readiness is incarnation-exact. The connectors forward the lifecycle uid into
+  spawned children so a child joins as its intended incarnation.
+
+  From v0.4 an AgentCard MUST advertise `protocolVersion "0.4"`; a participant that
+  omits it is treated as pre-0.4 and is not addressed on the endpoint rails.
+
+## 0.12.0
+
+## 0.11.6
+
+## 0.11.5
+
+## 0.11.4
+
+### Patch Changes
+
+- 1935221: Ship the built-in agent connectors (claude, opencode, hermes, pi) as removable `cotal ext` plugins. They are seeded on first run through the same `ext add` path a third party uses, resolved lazily per spawn, and deletable with `cotal ext remove`; they are no longer hardcoded imports or dependencies of `cotal-ai`.
+
+## 0.11.3
+
+### Patch Changes
+
+- @cotal-ai/connector-core@0.11.3
+
+## 0.11.2
+
+### Patch Changes
+
+- @cotal-ai/connector-core@0.11.2
+
+## 0.11.1
+
+### Patch Changes
+
+- Updated dependencies [5b2863a]
+  - @cotal-ai/connector-core@0.11.1
+
+## 0.11.0
+
+### Minor Changes
+
+- 9061d0e: feat: per-user authentication (owner+actor identity, IdP login, credential death)
+
+  Add per-user auth as a first-class mesh mode. A mesh brought up with `cotal up --user-auth --idp <url>`
+  authenticates humans against an identity provider and issues short-lived, ledger-scoped bearers through an
+  auth callout, in place of long-lived static credential files.
+
+  - **owner+actor identity.** An instance's wire identity becomes the two-token principal `(owner, actor)`:
+    every subject carries the sender as `<owner>.<actor>`, and grants, durables, presence, and `from.id`
+    re-key onto the pair. Cross-owner and same-owner cross-actor forge/read isolation is enforced by the
+    broker; the connection nkey survives only as the transport credential.
+  - **Login and delegation.** Humans sign in with `cotal login --idp <url>` (device-code); operators grant
+    access with `cotal actor grant`. Agents are spawned under the signed-in human as managed `(owner, actor)`
+    children whose scope is a subset of the spawner's (the delegation envelope rule). Agent identities live in
+    a separate managed-actor ledger space, exchanged via their own per-agent secret, so they outlive the
+    human's login session.
+  - **Credential death.** Every managed credential is now lifetime-bounded, with supervisor and delivery
+    standing renewal, `$SYS` rotation-renewal, live connection eviction on revoke, and a `cotal doctor auth`
+    repair surface. On a user-auth mesh, static agent creds are retired (the flip): revocation closes the live
+    window at the next connect.
+  - **Elevated operator surfaces.** `cotal web`, `console`, `history clear`, `channels set/default`, and
+    `spawn -f` come online in user mode via server-authored elevated view bearers, minted only by the
+    signed-in human exchange and gated on ledger scope (`admin` / `spawn`); `ps` and `status` are
+    owner-domain scoped.
+  - **Connectors.** Add the `cotal_docs` tool (version-exact Cotal docs the agent reads natively) and an
+    opaque `launchOptions` raw passthrough for the Claude Code, OpenCode, and Hermes adapters.
+
+### Patch Changes
+
+- Updated dependencies [9061d0e]
+  - @cotal-ai/connector-core@0.11.0
+
+## 0.10.1
+
+### Patch Changes
+
+- e3a53e3: Add a connector-agnostic model/variant selector: the `cotal models` command, a `--variant` flag on spawn, and the core `listModels` / `ModelCatalog` + `LaunchOpts.variant` contract. OpenCode discovers its models and variants from the installed CLI; Claude and Hermes reject variants (fail loud) and set `COTAL_MODEL` when a model is given.
+- Updated dependencies [e3a53e3]
+  - @cotal-ai/connector-core@0.10.1
+
+## 0.10.0
+
+### Minor Changes
+
+- 6c40280: Release the 0.10 line with the onboarding and local-stack work since 0.9.1:
+
+  - Rework the CLI around dispatcher-parsed commands, operator-installed extensions (`cotal ext`), and extension-packaged web/demo surfaces.
+  - Make `cotal setup` configure-only: it checks prerequisites, installs the Claude plugin and web dashboard extension, seeds one default persona, and keeps the guided david/sven/me team behind `--demo` or `--full`.
+  - Have `cotal up` own the local stack (broker, delivery daemon, and manager), with safer teardown, manifest launch handling, and automatic free-port selection for default-port collisions.
+  - Collapse foreground and detached launches into one `spawn` grammar, with hardened manager readiness behavior and default persona / default agent environment overrides.
+  - Strengthen auth, credential lifetime/rotation, delivery, and OpenCode cancellation handling.
+  - Refresh README and getting-started onboarding around `npx cotal-ai setup`, then `cotal up --detach`, `cotal web`, `cotal spawn`, and `cotal down`.
+
+### Patch Changes
+
+- Updated dependencies [6c40280]
+  - @cotal-ai/connector-core@0.10.0
+
+## 0.9.1
+
+### Patch Changes
+
+- @cotal-ai/connector-core@0.9.1
+
+## 0.9.0
+
+### Minor Changes
+
+- 1bcc154: feat: manager least-privilege — no allow-all credential — plus session resume
+
+  A coordinated minor across the workspace (lockstep `fixed` group). No wire break — the message
+  schema is unchanged and `protocolVersion` stays `0.2`; this release is about who the manager is
+  allowed to be on the broker, plus a new way to bring an existing session into the mesh.
+
+  **Security — the manager is no longer an all-powerful credential**
+
+  Until now every manager action ran under a single, blanket `manager` credential that could do almost
+  anything on the broker — read any DM, tamper with any stream, publish as any agent. That credential
+  is **gone**. Manager work now runs under a set of small, purpose-built credentials, each able to do
+  only its own job and nothing else:
+
+  - The **always-on supervisor** can serve control requests, hold its lease, and publish presence — but
+    it **cannot read anyone's messages, create arbitrary consumers, or delete/purge streams**.
+  - **Spawning, teardown, and history-purge** each run on their own short-lived, tightly scoped
+    credential that exists only for that operation.
+  - The **CLI verbs** (`send`, `spawn`, `channels`, `up`, `join`, `down -f`, …) each connect as the
+    least-privileged profile for the job — an operator posts only as itself and can never forge another
+    agent.
+
+  The practical effect: a leaked or compromised manager credential can no longer read message bodies or
+  meddle with other agents' streams — the blast radius is contained to exactly what that one credential
+  was scoped to. Control replies are bounded per caller, `cotal join` now self-provisions its own inbox
+  (no more `ConsumerNotFound` on a fresh console), and `cotal down` tears down all of a space's streams
+  and buckets rather than a subset.
+
+  **New — resume an existing session into the mesh**
+
+  `cotal spawn --resume <id>` and `cotal start --resume <id>` fork an existing `claude` session — its
+  deep context and long transcript — into the mesh, instead of always starting an agent from scratch.
+  It **forks, never hijacks**: the meshed agent gets a _new_ session branched off that transcript, and
+  the original is left untouched. Connectors that can't support this (`opencode`, `hermes`) are
+  **rejected up front, before any provisioning**, with a clear error rather than a half-provisioned
+  space.
+
+  **Fixes & UX**
+
+  - **`cotal attach` shows the real screen on (re)attach to a full-screen agent.** Re-attaching, or
+    attaching late, now reconstructs and repaints the agent's current screen instead of leaving you on
+    a blank or partial one.
+  - **Mouse-wheel scrolling works in full-screen agents over `cotal attach`.**
+  - **The `pty` runtime fails loud under Bun.** It isn't supported there, so it now says so clearly
+    instead of misbehaving silently.
+  - **Removed the `face:` viewer that had leaked from the frontier-faces example into shared connector
+    code**, so an OpenCode persona with a `face:` field boots normally. Face rendering lives entirely
+    in `examples/04-frontier-faces`.
+
+  **Migration — re-`up` spaces created before this release**
+
+  The supervisor now records its lease in a per-space manager bucket that older spaces don't have. A
+  space that was brought up on an earlier version must be re-`up`'d (a fresh `cotal up` is fine);
+  otherwise the supervisor throws `stream not found` on its first lease write. Nothing on the message
+  wire changed, so running agents and clients are otherwise unaffected.
+
+### Patch Changes
+
+- Updated dependencies [1bcc154]
+  - @cotal-ai/connector-core@0.9.0
+
+## 0.8.3
+
+### Patch Changes
+
+- Updated dependencies [a10ed79]
+  - @cotal-ai/connector-core@0.8.3
+
+## 0.8.2
+
+### Patch Changes
+
+- @cotal-ai/connector-core@0.8.2
+
+## 0.8.1
+
+### Patch Changes
+
+- @cotal-ai/connector-core@0.8.1
+
+## 0.8.0
+
+### Minor Changes
+
+- cce0a6a: feat: mesh manifests, the tmux runtime, and a new `@cotal-ai/workspace` layer
+
+  A coordinated minor across the workspace (lockstep `fixed` group). No wire break — `protocolVersion`
+  stays `0.2`; this release is all tooling, packaging, and hardening. The new publishable
+  `@cotal-ai/workspace` package joins the lockstep group.
+
+  **New**
+
+  - **Mesh manifests — describe and launch a whole topology from one `cotal.yaml` (`kind: Mesh`).**
+    The file is organized by channel (each lists `subscribe`/`allowSubscribe`/`allowPublish` —
+    Cotal's native verbs, holding agent names); a top `agents:` table resolves each name to a persona
+    (bare path / file + overrides / fully inline) and a connector (`agent:`, per-agent or a top-level
+    default — no silent default). Under `personaPermissions: include` a persona's own channel grants are
+    inherited for channels the manifest doesn't declare.
+
+    - `cotal up -f <cotal.yaml>` brings up a **fresh** mesh — broker + seeded channels + booted agents —
+      and owns the whole space (`cotal down` tears it down). A broker already reachable at the
+      manifest's address is refused with a redirect to `spawn -f`, never re-seeded as fresh.
+    - `cotal spawn -f <cotal.yaml>` deploys a manifest **additively** onto a mesh that's already
+      running: brand-new channels are seeded and owned, already-present ones are left untouched
+      (`exists-unmanaged`), and exactly what it created is written to a creation-only ledger
+      (`.cotal/manifests/<runId>.json`). A re-declared agent whose policy changed is **stale** and
+      exits non-zero unless `--allow-stale <names>`; unmanaged actors with access to a declared channel
+      are surfaced as a SECURITY warning.
+    - `cotal down -f <cotal.yaml>` (or `--run <id>`) tears down **only** what a `spawn -f` run created —
+      never foreign actors on the shared mesh. The ledger is treated as untrusted input and validated
+      whole before any deletion; an owned agent is stopped only when its recorded name **and** id match
+      the live one, cred paths are derived from the auth root and deleted without following symlinks,
+      and an owned channel is removed only when no other members remain. Local-only: same checkout/host
+      that created the run.
+    - `cotal topology view -f <cotal.yaml>` validates a manifest and renders its access graph
+      (per-channel and per-agent subscribe/read/post, persona-inherited scopes, warnings) — read-only,
+      no broker needed. `--dry-run` previews `up -f`/`spawn -f` and mutates nothing.
+
+    Resolved agents boot via a transient, non-authoritative launch artifact under `.cotal/run/` (no
+    generated personas in `.cotal/agents/`), handed to the manager through a new **operator-only**
+    `launch` control op that reads the run spec by id, never an arbitrary path.
+
+  - **`@cotal-ai/tmux` — a tmux Runtime and `TerminalLayout` extension.** Each agent spawned via
+    `--runtime tmux` gets its own window in a shared per-space tmux session, with P3 `env -i`
+    isolation; a `TerminalLayout` provider lets `cotal setup` open and close tmux windows from the
+    ambient `$TMUX` session. Self-registers on import (`import "@cotal-ai/tmux"`), exactly like
+    `@cotal-ai/cmux`. `cotal setup` now offers a tmux demo when run inside a tmux session.
+
+  - **Web graph — hide offline members by default**, with a toggle to show them. Backed by
+    broker-sourced authoritative channel membership.
+
+  **Architecture**
+
+  - **New `@cotal-ai/workspace` package — the machine-local workstation layer, split out of
+    `@cotal-ai/core`.** Core is now strictly the wire standard (endpoint, subjects, message types,
+    extension contracts) and depends on nothing else in the repo; the `~/.cotal` mesh registry, target
+    resolution, preflight, `.cotal/` auth-path I/O, and the `cotal …` command-copy renderer now live in
+    `@cotal-ai/workspace`. Dependencies flow one way:
+    `examples → implementations → workspace → core ← (peer) extensions`. A `smoke:core-boundary` guard
+    (in `pnpm check` and CI) fails the build if core ever imports workspace.
+
+    **Migration (importers only — no runtime/wire change):** `mesh-registry`, `mesh-target`,
+    `preflight`, and the auth-path helpers (`authDir`/`findCotalRoot`/`loadSpaceAuth`/`saveSpaceAuth`)
+    now import from `@cotal-ai/workspace` instead of `@cotal-ai/core`. Mesh-target failures throw a
+    typed `MeshTargetError` (with a `code` and structured `details`); detect it with the exported
+    `isWorkspaceTargetError(e)` guard rather than `instanceof`. The `cotal …`-flavored error copy is
+    rendered through a single `renderWorkspaceError(...)` over a `target | preflight | reachable`
+    union.
+
+  - **`cotal ps` / `start` / `stop` / `attach` now resolve their broker from the mesh registry** — the
+    same way `send` / `channels` / `console` / `web` and the manifest verbs already do — instead of
+    silently defaulting to `nats://127.0.0.1:4222`. `--space <name>` finds the recorded broker (and
+    mints the privileged `manager` cred from that mesh's own recorded root); `--server` stays an
+    override and `--creds` a raw off-registry escape hatch. The shared mesh-target preflight is now
+    used by both the transient commands and the manager control commands.
+
+  **Fixes & hardening**
+
+  - **Manager forwards the resolved channel ACL to spawned connectors**, so a manifest-spawned agent
+    actually subscribes to the channels its persona grants (no missing `COTAL_SUBSCRIBE`).
+  - **Never prune a recorded mesh on an explicit `--server` override** — an off-registry target no
+    longer evicts the registry entry it didn't come from.
+  - **Web graph correctness** — mode chips filter persistent edges (not just animation), hidden nodes
+    stay hidden under the visibility filters, and dashboard assets are served with
+    `cache-control: no-cache` so the UI doesn't get pinned to a stale build.
+  - **`cotal attach` restores terminal modes on detach** — focus-reporting is reset and stdout writes
+    are guarded against a dead pipe, so detaching no longer leaves the terminal in a wedged state.
+  - **Security hardening** — symlink-safe run directories, launch-policy re-validation at spawn,
+    tightened launch-spec validation, and the operator-only manager `launch` op (above).
+  - **CI** — the security/protocol smoke suite (`smoke:ci`) and the mesh-resolution / spawn-from-anywhere
+    / core-boundary smokes are gated in the `check` workflow.
+
+  **Runtime defaults (carried from the tmux work)**
+
+  The built-in `tmux` manager runtime is gone — `tmux` is resolved from `@cotal-ai/tmux`, exactly like
+  `cmux`. The default `auto` mode is deterministic `pty`; tmux and cmux are never auto-selected. Choose
+  them explicitly with `--runtime tmux`/`cmux`, which fails loud with a clear
+  `"import @cotal-ai/<runtime>"` error if the matching extension isn't imported — no silent fallback to
+  pty.
+
+### Patch Changes
+
+- Updated dependencies [cce0a6a]
+  - @cotal-ai/connector-core@0.8.0
+
+## 0.7.0
+
+### Minor Changes
+
+- a6a0a8d: feat: agent orientation, spawn-from-anywhere, live space graph, model-aware spawning
+
+  A coordinated minor across the workspace (lockstep `fixed` group). No wire break — `protocolVersion`
+  stays 0.2.
+
+  **New**
+
+  - **`cotal_orientation`** — a self/context card MCP tool: an agent's identity, the channels it can
+    read and post to, its capabilities, available tools, and who's present. Claude Code, OpenCode, and
+    Hermes connectors all point new agents at it on boot for the same first-turn orientation.
+  - **Spawn from any directory** — `cotal spawn` resolves a running mesh from a registry, so agents can
+    be spawned outside the project directory. The registry self-prunes space-mismatched and stale
+    `current` entries; its dir is locked to `0700` so space names aren't world-readable.
+  - **Model- and harness-aware spawning** — `cotal start --model` overrides the model, the harness CLI
+    is preflighted before spawn, and the harness/model knobs are shared across both spawn doors (CLI
+    `cotal spawn` and MCP `cotal_spawn`).
+  - **Live space graph** — a force-directed graph view of a space in the web UI, backed by
+    broker-sourced authoritative channel membership (offline agents drop from the graph immediately).
+
+  **Fixes & hardening**
+
+  - **Manager persona spawn is fail-loud and ACL-correct.** A spawn (`start` op / `cotal_spawn` /
+    roster boot) now treats its argument as a persona ref (a filename in `.cotal/agents`), takes the
+    mesh identity from the file's `name:` (auto-numbered on collision), fails loud on a missing persona,
+    and always provisions read/post ACLs from the loaded persona. Previously a miss silently minted
+    default creds (read `general` only, default-deny publish, no capabilities), so a persona spawned by
+    display name, a typo, or a renamed file became a live agent with silently-wrong ACLs.
+  - **Mesh-connect resolution unified** — `web`/`console`/`join` (and the transient commands) route
+    through a shared `resolveMeshTarget` + preflight: the recorded server/mode is honored (open ≠ auth),
+    the `--server`+`--space` raw escape works again for open remote meshes, the `channels` subcommand is
+    validated, and a silent wrong-mesh fallback is refused rather than connecting to the wrong broker.
+  - **`cotal web` no longer holds the account signing seed.** The dashboard used to keep the space
+    `SpaceAuth` (which can mint _any_ identity/role) in scope for the whole session, re-minting on every
+    channel delete — a compromise of the loopback process could mint anything for the account. It now
+    pre-mints one scoped `manager` cred at startup for the lone write path (channel delete) and lets the
+    seed fall out of scope, shrinking the blast radius from "mint anything" to "purge channels as one
+    manager". Open / `--creds` modes are unaffected (no seed; they use the connection creds).
+
+### Patch Changes
+
+- Updated dependencies [a6a0a8d]
+  - @cotal-ai/connector-core@0.7.0
+
+## 0.6.0
+
+### Patch Changes
+
+- Updated dependencies [ba5e622]
+  - @cotal-ai/connector-core@0.6.0
+
+## 0.5.0
+
+### Patch Changes
+
+- Updated dependencies [58f2d41]
+  - @cotal-ai/connector-core@0.5.0
+
+## 0.4.0
+
+### Patch Changes
+
+- Updated dependencies [878f406]
+  - @cotal-ai/connector-core@0.4.0
+
+## 0.3.2
+
+### Patch Changes
+
+- @cotal-ai/connector-core@0.3.2
+
+## 0.3.1
+
+### Patch Changes
+
+- c74007a: connector-hermes: Docker-aware install, and stop leaving duplicate sidecars.
+
+  `npx @cotal-ai/connector-hermes install` now finds Hermes on its own: `hermes` on PATH (host),
+  else a running Hermes container (copy the plugin into the bind-mounted `HERMES_HOME` or `docker
+cp`, rewrite a loopback `COTAL_SERVERS` to `host.docker.internal`, and `plugins enable` inside the
+  container), else `--target-home <path>` for a files-only placement. `uninstall` is symmetric and
+  removes only the `COTAL_*` keys it manages.
+
+  The standalone sidecar now watches the exact pid of the gateway that launched it
+  (`COTAL_PARENT_PID`) instead of a racy parent-pid check, so the official image's transient boot
+  gateway no longer leaves an orphan sidecar advertising a phantom peer. Also resolves Node from
+  PATH or the bundled `<HERMES_HOME>/node`, and ignores the host's extra tool-call kwargs so the
+  `cotal_*` tools stop erroring.
+
+  - @cotal-ai/connector-core@0.3.1
+
+## 0.3.0
+
+### Patch Changes
+
+- Updated dependencies [df8e64c]
+  - @cotal-ai/connector-core@0.3.0

@@ -1,0 +1,806 @@
+import { chmodSync, closeSync, existsSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { createServer, type Socket } from "node:net";
+import { inSeatCgroup } from "./cgroup.js";
+import { argsAsStringForTest, dropPidfdForTest, NoChildStarted, spawnPinned, type PinnedPty } from "./pty.js";
+import Headless from "@xterm/headless";
+import { SerializeAddon } from "@xterm/addon-serialize";
+import { discardSeatArtifacts } from "./artifacts.js";
+import { peerCredentials, tryLockFd } from "./peercred.js";
+import { preferSeatForOomKill } from "./oom.js";
+import {
+  CONFIRM_TIMEOUT_MS,
+  DEFAULT_COLS,
+  DEFAULT_ROWS,
+  FrameReader,
+  GRACE_MS,
+  MAX_FRAME_SIZE,
+  PROTOCOL_VERSION,
+  SCROLLBACK_ROWS,
+  UNATTENDED_MS as UNATTENDED_DEFAULT_MS,
+  encodeFrame,
+  type ClientRequest,
+  type SeatExit,
+  type ServerMessage,
+} from "./protocol.js";
+import { ConnectorDiagnosticReader } from "./diagnostic.js";
+import { RECORD_VERSION, appendPrivate, bootToken, exitPath, processStartToken, writePrivate, writeRecord, type SeatRecord } from "./record.js";
+import { StartupConfirmGate } from "./startup-confirm.js";
+
+export interface CustodianLaunch {
+  id: string;
+  name: string;
+  command: string;
+  args: string[] | string;
+  env: Record<string, string>;
+  cwd: string;
+  socket: string;
+  token: string;
+  recordPath: string;
+  /** The launch fence (`<root>/.launch-<id>`): admission is its unsealed lock, held until ready. */
+  fence: string;
+  logPath?: string;
+  confirm?: string;
+  confirmBefore?: readonly import("./startup-confirm.js").StartupReply[];
+  confirmReady?: readonly string[];
+  confirmBlockers?: readonly import("./startup-confirm.js").StartupBlocker[];
+  /** Who started this custodian: the launcher's run marker, carried so a census can attribute an
+   *  orphan to its run without walking `/proc/*\/cwd` (#1648). */
+  run?: string;
+  /** How long to stay up with no authenticated controller before stopping the child and exiting.
+   *  Resolved by the LAUNCHER, because the launcher scrubs the environment it hands this process
+   *  (the child must not inherit the caller's), so an env override read here would never see one. */
+  unattendedMs?: number;
+  /** The launch's private temporary directories, copied onto the seat record. This custodian removes
+   *  them once it sees its child exit, the one exit it observes directly. */
+  artifacts?: string[];
+  /** The launcher's temp dir, which every entry of `artifacts` must sit directly under. */
+  artifactRoot?: string;
+  /** The layer 3 seat cgroup the launcher moves this process into. No child is spawned outside it. */
+  cgroup?: string;
+  /** The only uid whose connections this custodian serves: the launcher's. With a distinct agent uid
+   *  it is not this process's uid, so the agent cannot drive its own seat. */
+  adopterUid: number;
+}
+
+/** The stdin payload `launchSeat` writes: a launch plus the seam `setCustodianTestSeam` set. */
+type LaunchPayload = CustodianLaunch & { testSeam?: CustodianTestSeam };
+
+/** Test-only control points. A production launch never carries one. */
+export interface CustodianTestSeam {
+  /** Drop the fork's pidfd, as a kernel without `pidfd_open` would. */
+  dropPidfd?: boolean;
+  /** Pass string args through to native node-pty to exercise its recognized pre-fork refusal. */
+  argsAsString?: boolean;
+  /** Pause at each `at`: write `reached`, then wait until `release` exists, for up to `timeoutMs`
+   *  (default CONFIRM_TIMEOUT_MS). `unpinned` pauses after a failed pin, so a test child can arm its
+   *  handlers before this process exits and hangs it up. */
+  holds?: Array<{ at: "before-fs" | "after-pin" | "unpinned"; reached: string; release: string; timeoutMs?: number }>;
+  /** Fail startup at this point, after the child is pinned. */
+  fail?: "after-pin" | "listen-error" | "after-bind";
+  /** Make the delayed SIGKILL of a graceful stop fail, as a send the kernel refused would. */
+  failEscalation?: boolean;
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+function send(sock: Socket, msg: ServerMessage): void {
+  if (!sock.writable) return;
+  sock.write(encodeFrame(msg));
+}
+
+export function runCustodian(launch: CustodianLaunch): Promise<void> {
+  return custody(launch, undefined);
+}
+
+// The seam reaches here only from the stdin payload, never from the exported entry point.
+async function custody(launch: CustodianLaunch, seam: CustodianTestSeam | undefined): Promise<void> {
+  if (process.platform !== "linux") {
+    throw new Error(`custody transport unsupported on ${process.platform}`);
+  }
+  const startedAt = Date.now();
+  const holdAt = async (at: "before-fs" | "after-pin" | "unpinned"): Promise<void> => {
+    const hold = seam?.holds?.find((h) => h.at === at);
+    if (!hold) return;
+    writeFileSync(hold.reached, String(process.pid));
+    const deadline = Date.now() + (hold.timeoutMs ?? CONFIRM_TIMEOUT_MS);
+    while (!existsSync(hold.release)) {
+      if (Date.now() >= deadline) throw new Error(`test seam hold at ${at} was never released`);
+      await sleep(25);
+    }
+  };
+
+  const note = (line: string): void => {
+    try {
+      if (launch.logPath) appendPrivate(launch.logPath, line);
+      else process.stderr.write(line);
+    } catch {
+      /* the seat directory may already be gone */
+    }
+  };
+  // Removes the launch's files, logging rather than throwing: a refused path must not take down the
+  // custodian of a live seat.
+  const discardArtifacts = (artifacts: readonly string[] | undefined): void => {
+    try {
+      discardSeatArtifacts(artifacts, launch.artifactRoot);
+    } catch (e) {
+      note(`${(e as Error).message}\n`);
+    }
+  };
+
+  // Every throw from here to the spawn starts no child, so none will read the files. The launcher
+  // handed them over once it spawned this process, and no record exists for a reap to remove them.
+  let confirmGate: StartupConfirmGate | undefined;
+  let fenceFd: number;
+  let custodianStart: string;
+  let bootId: string | undefined;
+  try {
+    if (!Number.isInteger(launch.adopterUid) || launch.adopterUid < 0) throw new Error(`launch adopterUid ${String(launch.adopterUid)} is not a uid; starting no child`);
+    await holdAt("before-fs");
+    // Admission. Read-only and without O_CREAT: a fence that is gone admits nothing, and the read goes
+    // through this fd so a rename after the open cannot hide a seal.
+    fenceFd = openSync(launch.fence, "r");
+    const admitBy = Date.now() + CONFIRM_TIMEOUT_MS;
+    while (!tryLockFd(fenceFd)) {
+      if (Date.now() >= admitBy) throw new Error(`launch fence ${launch.fence} stayed locked for ${CONFIRM_TIMEOUT_MS}ms; starting no child`);
+      await sleep(25);
+    }
+    if (readFileSync(fenceFd, "utf8").trim() === "sealed") throw new Error(`launch fence ${launch.fence} is sealed; the seat was released, starting no child`);
+
+    // Membership is checked under the fence lock. A removed cgroup can never be joined, so it fails at once.
+    if (launch.cgroup !== undefined) {
+      const cgroup = { path: launch.cgroup };
+      while (!inSeatCgroup(cgroup)) {
+        if (!existsSync(cgroup.path)) throw new Error(`seat cgroup ${cgroup.path} was removed before this custodian joined it; starting no child`);
+        if (Date.now() >= startedAt + CONFIRM_TIMEOUT_MS) throw new Error(`custodian is not in seat cgroup ${cgroup.path} after ${CONFIRM_TIMEOUT_MS}ms; starting no child`);
+        await sleep(25);
+      }
+    }
+
+    try {
+      unlinkSync(launch.socket);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    }
+
+    // Build confirmation before the child exists, then pin this custodian's identity.
+    if ((launch.confirmBefore?.length || launch.confirmReady?.length || launch.confirmBlockers?.length) && launch.confirm === undefined) throw new Error("startup choices require a final confirmation prompt");
+    confirmGate = launch.confirm === undefined ? undefined : new StartupConfirmGate(launch.confirm, launch.confirmBefore, launch.confirmReady, launch.confirmBlockers);
+    const start = processStartToken(process.pid);
+    if (start === undefined) throw new Error(`cannot read the process start identity of custodian ${process.pid} from /proc`);
+    custodianStart = start;
+    bootId = bootToken();
+    if (seam?.dropPidfd) dropPidfdForTest();
+    if (typeof launch.args === "string") throw new Error("args as a string is not supported on unix.");
+  } catch (e) {
+    discardArtifacts(launch.artifacts);
+    throw e;
+  }
+  let proc: PinnedPty;
+  try {
+    if (seam?.argsAsString) argsAsStringForTest();
+    proc = spawnPinned(launch.command, launch.args, {
+      name: "xterm-256color",
+      cols: DEFAULT_COLS,
+      rows: DEFAULT_ROWS,
+      cwd: launch.cwd,
+      env: launch.env,
+    });
+  } catch (e) {
+    if (e instanceof NoChildStarted) discardArtifacts(launch.artifacts);
+    await holdAt("unpinned");
+    throw e;
+  }
+  // From here until ready every failure stops the child through its pidfd, before any log write.
+  try {
+    await serveSeat(launch, proc, { custodianStart, bootId, fenceFd, holdAt, seam, confirmGate, note, discardArtifacts });
+  } catch (cause) {
+    try {
+      proc.handle.signal("SIGKILL");
+    } catch (e) {
+      throw new Error(`${(cause as Error).message}; and the startup SIGKILL failed: ${(e as Error).message}`);
+    }
+    throw cause;
+  }
+}
+
+async function serveSeat(
+  launch: CustodianLaunch,
+  proc: PinnedPty,
+  pinned: {
+    custodianStart: string;
+    bootId: string | undefined;
+    fenceFd: number;
+    holdAt: (at: "after-pin") => Promise<void>;
+    seam: CustodianTestSeam | undefined;
+    confirmGate: StartupConfirmGate | undefined;
+    note: (line: string) => void;
+    discardArtifacts: (artifacts: readonly string[] | undefined) => void;
+  },
+): Promise<void> {
+  const { custodianStart, bootId, seam, confirmGate, note, discardArtifacts } = pinned;
+  const child = proc.handle;
+  const oomPref = preferSeatForOomKill(proc.pid);
+  const logNote = (line: string): void => {
+    try {
+      if (launch.logPath) appendPrivate(launch.logPath, line);
+      else process.stderr.write(line);
+    } catch {
+      /* the seat directory may already be gone */
+    }
+  };
+  if (!oomPref.applied) note(`oom preference not applied to child ${proc.pid}: ${oomPref.reason}\n`);
+  // A zombie still reports its start token; the pidfd decides whether it had already exited.
+  const childStartRead = processStartToken(proc.pid);
+  const childStart = child.exited() ? undefined : childStartRead;
+  await pinned.holdAt("after-pin");
+  if (seam?.fail === "after-pin") throw new Error("test seam: startup failure after pinning");
+  const term = new Headless.Terminal({
+    cols: DEFAULT_COLS,
+    rows: DEFAULT_ROWS,
+    scrollback: SCROLLBACK_ROWS,
+    allowProposedApi: true,
+  });
+  const serializer = new SerializeAddon();
+  term.loadAddon(serializer);
+
+  let alive = true;
+  let ready = false;
+  let settling = false;
+  let seenClient = false;
+  let cols = DEFAULT_COLS;
+  let rows = DEFAULT_ROWS;
+  let exit: SeatExit | undefined;
+  const diagnostic = new ConnectorDiagnosticReader();
+  const dataSubs = new Map<number, Set<Socket>>();
+  const waiters = new Map<Socket, Set<number>>();
+  const controllers = new Set<Socket>();
+  const clients = new Set<Socket>();
+  let nextSub = 1;
+  let early = "";
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let handoffTimer: ReturnType<typeof setTimeout> | undefined;
+  let unattendedTimer: ReturnType<typeof setTimeout> | undefined;
+  let reap: ReturnType<typeof setInterval> | undefined;
+  let server: ReturnType<typeof createServer> | undefined;
+  /** Wait for the first adopter when the child has already exited at listen. */
+  const LAUNCH_HANDOFF_MS = 5_000;
+  /** How long a child already gone from /proc may wait for node-pty to report how it ended. */
+  const EXIT_STATUS_GRACE_MS = 1_000;
+  const UNATTENDED_MS = launch.unattendedMs ?? UNATTENDED_DEFAULT_MS;
+
+  const snapshot = (): Promise<string> =>
+    new Promise((resolve) => term.write("", () => resolve(serializer.serialize())));
+
+  const resolveWaiters = (): void => {
+    for (const [sock, ids] of waiters) {
+      for (const id of ids) send(sock, { id, ok: true, op: "wait-exit", exit });
+    }
+    waiters.clear();
+  };
+
+  const childGone = (): boolean => child.exited();
+
+
+  /**
+   * Mark a child that its pidfd shows gone as exited WITHOUT a status, but only once node-pty has had
+   * time to report the status itself. node-pty reports an exit only when the pty closes, and when a
+   * descendant still holds the pty open it forces that close 200 ms after reaping the child. The
+   * exit event carries whatever is known when it is sent, so marking earlier sent no status.
+   */
+  let goneSince: number | undefined;
+  const markGone = (): void => {
+    if (!alive || !childGone()) return;
+    goneSince ??= Date.now();
+    if (Date.now() - goneSince >= EXIT_STATUS_GRACE_MS) markExited({});
+  };
+
+  const settleTerminal = (): void => {
+    if (alive || settling || !ready) return;
+    // Only an AUTHENTICATED peer holds this custodian open. A connected socket that never said
+    // hello owns no session, no output subscription and no wait, so it is owed nothing by a settle,
+    // and counting it kept a custodian whose child had already exited resident for nothing: one
+    // unauthenticated dial (a probe, a half-open connect) pinned ~65 MB for the life of the host.
+    // Every authed socket is added to `controllers` by the same `hello` that authenticates it and
+    // removed by `drop`, so this is exactly "someone can still be told something".
+    if (controllers.size > 0) return;
+    if (!seenClient) return;
+    settling = true;
+    confirmGate?.disarm();
+    if (killTimer) {
+      clearTimeout(killTimer);
+      killTimer = undefined;
+    }
+    if (handoffTimer) {
+      clearTimeout(handoffTimer);
+      handoffTimer = undefined;
+    }
+    if (unattendedTimer) {
+      clearTimeout(unattendedTimer);
+      unattendedTimer = undefined;
+    }
+    if (reap) {
+      clearInterval(reap);
+      reap = undefined;
+    }
+    try {
+      term.dispose();
+    } catch {
+      /* already gone */
+    }
+    server?.close();
+    for (const sock of clients) {
+      try {
+        sock.destroy();
+      } catch {
+        /* already gone */
+      }
+    }
+    clients.clear();
+    controllers.clear();
+    waiters.clear();
+    dataSubs.clear();
+    try {
+      unlinkSync(launch.socket);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    }
+    process.exit(0);
+  };
+
+  /**
+   * Bound the time this custodian runs with NOBODY authenticated to it. A manager that crashed, or a
+   * suite that returned without reaping, leaves a live child and a custodian that will otherwise wait
+   * forever for a controller that no longer exists (#1648).
+   *
+   * Armed whenever the controller set is empty and disarmed the moment one authenticates, so an
+   * ordinary detach-and-re-adopt never trips it: the window restarts from the last disconnect, not
+   * from launch. The child is stopped rather than left behind, because this custodian owns the only
+   * reader of its PTY; the settle that follows its exit is the ordinary one.
+   */
+  const armUnattended = (): void => {
+    if (settling || !ready || unattendedTimer || controllers.size > 0) return;
+    unattendedTimer = setTimeout(() => {
+      unattendedTimer = undefined;
+      if (settling || controllers.size > 0) return;
+      // An unattended custodian has nobody to tell, so record the reason where an operator reading
+      // an empty seat directory can still find it.
+      note(`${JSON.stringify({ unattended: true, afterMs: UNATTENDED_MS, childPid: proc.pid, custodianPid: process.pid, run: launch.run })}\n`);
+      if (alive) {
+        // `seenClient` gates the settle, and a custodian nobody ever adopted must still be able to
+        // exit: without this the stop below kills the child and the settle refuses, which is the
+        // orphan again with a dead child instead of a live one.
+        seenClient = true;
+        stopFromTimer("unattended");
+        // The settle runs off the child's exit. If the child ignores SIGTERM, `stopChild`'s own
+        // SIGKILL escalation takes it within GRACE_MS and `markExited` follows from that.
+        return;
+      }
+      seenClient = true;
+      settleTerminal();
+    }, UNATTENDED_MS);
+    unattendedTimer.unref();
+  };
+
+  const disarmUnattended = (): void => {
+    if (!unattendedTimer) return;
+    clearTimeout(unattendedTimer);
+    unattendedTimer = undefined;
+  };
+
+  const armUnobservedHandoff = (): void => {
+    if (alive || seenClient || settling || !ready || handoffTimer) return;
+    handoffTimer = setTimeout(() => {
+      handoffTimer = undefined;
+      seenClient = true;
+      settleTerminal();
+    }, LAUNCH_HANDOFF_MS);
+    handoffTimer.unref();
+  };
+
+  const markExited = (info?: { code?: number; signal?: number }): void => {
+    if (!alive) {
+      resolveWaiters();
+      settleTerminal();
+      armUnobservedHandoff();
+      return;
+    }
+    alive = false;
+    const last = diagnostic.read();
+    exit = { ...(info ?? exit ?? {}), ...(last ? { diagnostic: last } : {}) };
+    // Kept beside the custody record so a reap that runs after every controller is gone, even in a
+    // successor manager, can still say how the child ended. Renamed into place, so a reader never
+    // sees half a record.
+    const exitFile = exitPath(launch.recordPath);
+    try {
+      writePrivate(`${exitFile}.tmp`, `${JSON.stringify(exit)}\n`);
+      renameSync(`${exitFile}.tmp`, exitFile);
+    } catch (e) {
+      // A seat directory that is already gone has nobody left to read the record. Any other failure
+      // loses the only account a later reap has, so it is said where an operator can find it, and
+      // the reap reports the record missing or unreadable.
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+        try {
+          unlinkSync(`${exitFile}.tmp`);
+        } catch {
+          /* never created */
+        }
+        note(`exit record not written: ${(e as Error).message}\n`);
+      }
+    }
+    // The child is gone, so it has made every read it will make. Remove its files before anyone is
+    // told of the exit, and drop the removed ones from the record so a later reap does not remove the
+    // same names again. One that could not be removed stays listed, so the reap that proves this seat
+    // gone tries it again. Losing a controller's connection is not this: only the child's exit is.
+    if (record.artifacts) {
+      discardArtifacts(record.artifacts);
+      const left = record.artifacts.filter((dir) => existsSync(dir));
+      if (left.length) record.artifacts = left;
+      else {
+        delete record.artifacts;
+        delete record.artifactRoot;
+      }
+      if (ready) {
+        try {
+          const tmp = `${launch.recordPath}.tmp`;
+          writeRecord(tmp, record);
+          renameSync(tmp, launch.recordPath);
+        } catch (e) {
+          note(`${(e as Error).message}\n`);
+        }
+      }
+    }
+    confirmGate?.disarm();
+    for (const sock of controllers) send(sock, { event: "exit", exit });
+    resolveWaiters();
+    settleTerminal();
+    armUnobservedHandoff();
+  };
+
+  proc.onData((d) => {
+    term.write(d);
+    diagnostic.push(d);
+    if (early.length < MAX_FRAME_SIZE) {
+      early += early.length + d.length > MAX_FRAME_SIZE ? d.slice(0, MAX_FRAME_SIZE - early.length) : d;
+    }
+    const encoded = Buffer.from(d, "utf8").toString("base64");
+    for (const [sub, socks] of dataSubs) {
+      for (const sock of socks) send(sock, { event: "output", sub, data: encoded });
+    }
+    if (confirmGate?.push(d)) proc.write("\r");
+  });
+  proc.onExit(({ exitCode, signal }) => {
+    markExited({ code: exitCode, ...(signal === undefined ? {} : { signal }) });
+  });
+  reap = setInterval(() => {
+    if (!alive) {
+      if (reap) clearInterval(reap);
+      reap = undefined;
+      return;
+    }
+    markGone();
+  }, 50);
+  reap.unref();
+
+  // Every send goes through the pidfd. A first send that fails throws, so `stop` replies with the
+  // error; a failed delayed SIGKILL has no requester and is logged instead.
+  const stopChild = (mode: "graceful" | "hard"): void => {
+    if (!alive) return;
+    if (mode === "hard") {
+      child.signal("SIGKILL");
+      return;
+    }
+    child.signal("SIGTERM");
+    clearTimeout(killTimer);
+    killTimer = setTimeout(() => {
+      if (!alive) return;
+      try {
+        if (seam?.failEscalation) throw new Error("test seam: delayed SIGKILL send failed");
+        child.signal("SIGKILL");
+      } catch (e) {
+        const note = `${JSON.stringify({ escalationFailed: (e as Error).message, childPid: proc.pid })}\n`;
+        logNote(note);
+      }
+    }, GRACE_MS);
+  };
+  // A timer has no requester to reply to, and a throw here would kill the custodian with the child
+  // still under it: log the failed send instead.
+  const stopFromTimer = (why: string): void => {
+    try {
+      stopChild("graceful");
+    } catch (e) {
+      const note = `${JSON.stringify({ stopFailed: (e as Error).message, why, childPid: proc.pid })}\n`;
+      logNote(note);
+    }
+  };
+
+  confirmGate?.arm(diagnostic, {
+    report: (message) => {
+      const line = `\r\n${message}\r\n`;
+      term.write(line);
+      const encoded = Buffer.from(line, "utf8").toString("base64");
+      for (const [sub, socks] of dataSubs) {
+        for (const sock of socks) send(sock, { event: "output", sub, data: encoded });
+      }
+      note(`${message}\n`);
+    },
+    // A gate timer has no requester: stopFromTimer logs a failed pidfd send instead of throwing.
+    stop: () => stopFromTimer("startup-confirm timeout"),
+  }, {
+    read: () => alive ? Array.from({ length: term.rows }, (_, row) => term.buffer.active.getLine(term.buffer.active.baseY + row)?.translateToString(true) ?? "").join("\n") : undefined,
+    key: (key) => proc.write(key === "Down" ? "\x1b[B" : "\r"),
+  });
+
+  const record: SeatRecord = {
+    version: RECORD_VERSION,
+    id: launch.id,
+    name: launch.name,
+    socket: launch.socket,
+    token: launch.token,
+    custodianPid: process.pid,
+    childPid: proc.pid,
+    custodianStart,
+    ...(childStart === undefined ? {} : { childStart }),
+    // Bind the pids to THIS boot: their start tokens are ticks since boot and the record outlives a
+    // reboot on disk, so without this a survivor could match an innocent process on the next boot.
+    ...(bootId === undefined ? {} : { bootId }),
+    ...(launch.artifacts?.length ? { artifacts: launch.artifacts, artifactRoot: launch.artifactRoot } : {}),
+  };
+
+  server = createServer((sock) => {
+    const reader = new FrameReader();
+    let authed = false;
+    const owned = new Set<number>();
+    clients.add(sock);
+    const drop = (): void => {
+      clients.delete(sock);
+      controllers.delete(sock);
+      for (const sub of owned) {
+        const socks = dataSubs.get(sub);
+        if (!socks) continue;
+        socks.delete(sock);
+        if (socks.size === 0) dataSubs.delete(sub);
+      }
+      owned.clear();
+      waiters.delete(sock);
+      settleTerminal();
+      // A settle exits the process, so reaching here means this custodian is staying up. If that was
+      // the last controller, it is now unattended and the bound starts from this disconnect.
+      armUnattended();
+    };
+    sock.on("data", (chunk) => {
+      let messages: unknown[];
+      try {
+        messages = reader.push(chunk);
+      } catch {
+        sock.destroy();
+        return;
+      }
+      for (const raw of messages) {
+        void handle(sock, raw, {
+          authed: () => authed,
+          setAuthed: (v) => {
+            authed = v;
+          },
+          owned,
+        }).catch((err) => {
+          send(sock, { id: (raw as { id?: number }).id ?? 0, ok: false, error: (err as Error).message });
+        });
+      }
+    });
+    sock.on("close", drop);
+    sock.on("error", drop);
+  });
+
+  async function handle(
+    sock: Socket,
+    raw: unknown,
+    session: { authed: () => boolean; setAuthed: (v: boolean) => void; owned: Set<number> },
+  ): Promise<void> {
+    const req = raw as ClientRequest;
+    if (typeof req !== "object" || req === null || typeof req.id !== "number" || typeof req.op !== "string") {
+      send(sock, { id: 0, ok: false, error: "malformed request" });
+      return;
+    }
+    try {
+      const cred = peerCredentials(sock);
+      if (cred.uid !== launch.adopterUid) {
+        send(sock, { id: req.id, ok: false, error: "peer uid mismatch" });
+        sock.destroy();
+        return;
+      }
+    } catch (e) {
+      send(sock, { id: req.id, ok: false, error: (e as Error).message });
+      sock.destroy();
+      return;
+    }
+    if (req.op !== "hello" && !session.authed()) {
+      send(sock, { id: req.id, ok: false, error: "not authenticated" });
+      sock.destroy();
+      return;
+    }
+    switch (req.op) {
+      case "hello": {
+        if (req.token !== launch.token) {
+          send(sock, { id: req.id, ok: false, error: "capability token mismatch" });
+          sock.destroy();
+          return;
+        }
+        session.setAuthed(true);
+        seenClient = true;
+        // Join the controller set BEFORE anything below can settle. `markExited` runs the settle,
+        // and a settle with no controller tears this socket down mid-`hello`, so the peer that just
+        // authenticated would see "custodian socket closed" instead of its reply.
+        controllers.add(sock);
+        disarmUnattended();
+        if (handoffTimer) {
+          clearTimeout(handoffTimer);
+          handoffTimer = undefined;
+        }
+        markGone();
+        send(sock, {
+          id: req.id,
+          ok: true,
+          op: "hello",
+          name: launch.name,
+          pid: proc.pid,
+          cols,
+          rows,
+          status: alive ? "running" : "exited",
+          ...(exit ? { exit } : {}),
+        });
+        if (!alive) send(sock, { event: "exit", ...(exit ? { exit } : {}) });
+        return;
+      }
+      case "snapshot": {
+        const data = await snapshot();
+        send(sock, { id: req.id, ok: true, op: "snapshot", data, cols, rows });
+        return;
+      }
+      case "subscribe-output": {
+        const sub = nextSub++;
+        const socks = dataSubs.get(sub) ?? new Set<Socket>();
+        socks.add(sock);
+        dataSubs.set(sub, socks);
+        session.owned.add(sub);
+        send(sock, { id: req.id, ok: true, op: "subscribe-output", sub });
+        if (early) send(sock, { event: "output", sub, data: Buffer.from(early, "utf8").toString("base64") });
+        if (!alive) send(sock, { event: "exit", sub, ...(exit ? { exit } : {}) });
+        return;
+      }
+      case "unsubscribe-output": {
+        const socks = dataSubs.get(req.sub);
+        if (socks) {
+          socks.delete(sock);
+          if (socks.size === 0) dataSubs.delete(req.sub);
+        }
+        session.owned.delete(req.sub);
+        send(sock, { id: req.id, ok: true, op: "unsubscribe-output" });
+        return;
+      }
+      case "write": {
+        if (!alive) throw new Error(`seat ${launch.name} is not running; the PTY rejected the write`);
+        proc.write(req.data);
+        send(sock, { id: req.id, ok: true, op: "write", bytes: Buffer.byteLength(req.data, "utf8") });
+        return;
+      }
+      case "resize": {
+        if (req.cols > 0 && req.rows > 0) {
+          cols = req.cols;
+          rows = req.rows;
+          term.resize(req.cols, req.rows);
+          if (alive) proc.resize(req.cols, req.rows);
+        }
+        send(sock, { id: req.id, ok: true, op: "resize" });
+        return;
+      }
+      case "interrupt": {
+        if (alive) proc.write("\x03");
+        send(sock, { id: req.id, ok: true, op: "interrupt" });
+        return;
+      }
+      case "stop": {
+        stopChild(req.mode);
+        send(sock, { id: req.id, ok: true, op: "stop" });
+        return;
+      }
+      case "wait-exit": {
+        markGone();
+        if (!alive) {
+          send(sock, { id: req.id, ok: true, op: "wait-exit", exit });
+          return;
+        }
+        const ids = waiters.get(sock) ?? new Set<number>();
+        ids.add(req.id);
+        waiters.set(sock, ids);
+        return;
+      }
+      case "health": {
+        markGone();
+        send(sock, {
+          id: req.id,
+          ok: true,
+          op: "health",
+          pid: proc.pid,
+          status: alive ? "running" : "exited",
+          protocol: PROTOCOL_VERSION,
+        });
+        return;
+      }
+      default: {
+        const id = typeof (raw as { id?: unknown }).id === "number" ? (raw as { id: number }).id : 0;
+        send(sock, { id, ok: false, error: "unknown op" });
+      }
+    }
+  }
+
+  const listening = server;
+  if (!listening) throw new Error("custodian server missing");
+  // A listen `error` rejects into `runCustodian`'s catch, which sends the startup SIGKILL.
+  // Executor form: the repo's `lib` is ES2023, which has no `Promise.withResolvers`.
+  let resolve!: () => void;
+  let reject!: (e: Error) => void;
+  const listened = new Promise<void>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  listening.once("error", reject);
+  if (seam?.fail === "listen-error") setImmediate(() => listening.emit("error", new Error("test seam: listen error")));
+  else
+    listening.listen(launch.socket, () => {
+      // EVERY throw in here must reach `reject`. A callback is not on the promise's call stack, so an
+      // exception raised inside it becomes an UNCAUGHT exception: it bypasses the `.catch` at the
+      // bottom of this file that writes the log, and the process dies having explained nothing. The
+      // launcher then reports only `custodian exited before ready: pid N gone`, which is what made a
+      // silently-truncated socket path unattributable.
+      try {
+        // The bind can land on a DIFFERENT path than the one requested: libuv copies into a fixed
+        // 108-byte `sun_path` and truncates rather than failing. `launchSeat` refuses an overlong
+        // path up front, but a custodian can also be started directly, so verify what was actually
+        // created rather than trusting that listen succeeded on the name we asked for.
+        const bound = listening.address();
+        if (typeof bound === "string" && bound !== launch.socket)
+          throw new Error(`custodian bound ${bound} but was asked for ${launch.socket}; the path was truncated, so it would clean up a socket it never created`);
+        chmodSync(launch.socket, 0o600);
+        if (seam?.fail === "after-bind") throw new Error("test seam: startup failure after bind");
+        writeRecord(launch.recordPath, record);
+        ready = true;
+        // Admission ends at ready. Nothing after writeRecord may throw: the launcher returns success
+        // once the record exists, and process exit drops the lock anyway.
+        try {
+          closeSync(pinned.fenceFd);
+        } catch {
+          /* the lock goes with the fd at exit */
+        }
+        const announced = `${JSON.stringify({ ready: true, childPid: proc.pid, custodianPid: process.pid })}\n`;
+        if (launch.logPath) note(announced);
+        else process.stdout.write(announced);
+        armUnobservedHandoff();
+        armUnattended();
+        settleTerminal();
+        resolve();
+      } catch (e) {
+        reject(e as Error);
+      }
+    });
+  await listened;
+}
+
+function readLaunch(): LaunchPayload {
+  const raw = readFileSync(0, "utf8");
+  if (!raw.trim()) throw new Error("custodian requires a JSON launch on stdin");
+  return JSON.parse(raw) as LaunchPayload;
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const { testSeam, ...launch } = readLaunch();
+  custody(launch, testSeam).catch((err) => {
+    const text = `${(err as Error).stack ?? (err as Error).message}\n`;
+    try {
+      if (launch.logPath) appendPrivate(launch.logPath, text);
+      else process.stderr.write(text);
+    } catch {
+      process.stderr.write(text);
+    }
+    process.exit(1);
+  });
+}

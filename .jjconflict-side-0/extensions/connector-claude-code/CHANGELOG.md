@@ -1,0 +1,2687 @@
+# @cotal-ai/connector-claude-code
+
+## 0.151.2
+
+No changes in this release.
+
+## 0.151.1
+
+No changes in this release.
+
+## 0.151.0
+
+### Patch Changes
+
+- 143a69e: A plain spawn of a Claude seat whose startup showed no development-channels prompt now says that mesh traffic does not wake the seat while idle: the spawn result carries `startupNotice`, `cotal spawn` prints a `STARTUP_NOTICE` warning, the `cotal_spawn` result ends with the notice, and `cotal ps` marks the seat `no idle wake`. A connector declares this with `idleWakeNeedsConfirmed`.
+
+## 0.150.0
+
+No changes in this release.
+
+## 0.149.0
+
+No changes in this release.
+
+## 0.148.2
+
+No changes in this release.
+
+## 0.148.1
+
+No changes in this release.
+
+## 0.148.0
+
+### Patch Changes
+
+- c8cf718: Your own Claude Code and Codex conversations can now join an open or static mesh this computer runs with `cotal up`, not only a signed-in space. A natively bound conversation's `cotal_connect` opens its identity at once with the grant a bare `cotal spawn` gets on that mesh: the default persona's channels, role and capabilities, or the part of them a selection names. Concurrent requests for the same native session are serialized so they cannot create two identities. On a static mesh the space's local signing authority issues it as a terminal seat under its own lifecycle, and disconnecting, ending the session, or the next connection after a killed plugin server retires it with its issuance and broker footprint. A call without a native session, and a static mesh whose signing authority this account does not hold, open nothing. Signed-in spaces still require a person's approval. An endpoint whose credential expires more than about 24.8 days out, such as a terminal seat's with no expiry, no longer refreshes in a 1 ms loop and fails to connect.
+
+## 0.147.8
+
+No changes in this release.
+
+## 0.147.7
+
+No changes in this release.
+
+## 0.147.6
+
+No changes in this release.
+
+## 0.147.5
+
+No changes in this release.
+
+## 0.147.4
+
+No changes in this release.
+
+## 0.147.3
+
+No changes in this release.
+
+## 0.147.2
+
+No changes in this release.
+
+## 0.147.1
+
+No changes in this release.
+
+## 0.147.0
+
+No changes in this release.
+
+## 0.146.0
+
+No changes in this release.
+
+## 0.145.1
+
+No changes in this release.
+
+## 0.145.0
+
+### Minor Changes
+
+- 20f8ff2: A managed Claude Code seat wakes on peer messages again. Claude Code binds the `server:cotal` wake channel only to a server its own configuration declares, the user config or the project's `.mcp.json`, and never to the launch's `--mcp-config` entry alone; a seat launched without one joined the mesh, reported idle and let every turn and direct message expire. `cotal setup` and `cotal update` now register the plugin's server as the user-scope MCP entry `cotal` (`claude mcp add --scope user`, the same command and arguments as the plugin's own server, so a plain session runs one process), a carried seat's private home declares it, `cotal status` reports it under `Claude wake channel`, and a managed launch whose user config and project `.mcp.json` declare no `cotal` server is refused with a message naming `cotal setup`. Run `cotal update` on each machine that spawns Claude seats; `docs/UPGRADING.md` has the details.
+
+## 0.144.0
+
+### Minor Changes
+
+- f792696: Refuse MCP environment references to reserved per-seat COTAL names before launch, preventing a spawned agent from inheriting its parent's role or model. Keep non-COTAL references and machine-wide operator variables available.
+
+## 0.143.0
+
+No changes in this release.
+
+## 0.142.0
+
+No changes in this release.
+
+## 0.141.11
+
+### Patch Changes
+
+- d389b22: A pause-plane deadline is recognized by the NATS client's TimeoutError class, so an error that only carries that name is no longer retried and then failed as a late reply.
+
+## 0.141.10
+
+No changes in this release.
+
+## 0.141.9
+
+No changes in this release.
+
+## 0.141.8
+
+No changes in this release.
+
+## 0.141.7
+
+No changes in this release.
+
+## 0.141.6
+
+No changes in this release.
+
+## 0.141.5
+
+No changes in this release.
+
+## 0.141.4
+
+No changes in this release.
+
+## 0.141.3
+
+No changes in this release.
+
+## 0.141.2
+
+No changes in this release.
+
+## 0.141.1
+
+No changes in this release.
+
+## 0.141.0
+
+No changes in this release.
+
+## 0.140.8
+
+No changes in this release.
+
+## 0.140.7
+
+No changes in this release.
+
+## 0.140.6
+
+No changes in this release.
+
+## 0.140.5
+
+No changes in this release.
+
+## 0.140.4
+
+No changes in this release.
+
+## 0.140.3
+
+No changes in this release.
+
+## 0.140.2
+
+No changes in this release.
+
+## 0.140.1
+
+No changes in this release.
+
+## 0.140.0
+
+No changes in this release.
+
+## 0.139.1
+
+No changes in this release.
+
+## 0.139.0
+
+### Minor Changes
+
+- 6454ee0: The Claude Code connector publishes a `CUSTOM` event named `cotal.toolResult` on the event plane at each tool result, with the value `{ toolCallId, isError }` and the result's timestamp. It carries no tool input or output: tool arguments and results stay off the channel, and the marker only says which call finished and whether it returned an error. The closed schema admits only that shape, and the vocabulary gate checks it before the frame is written: a marker whose value is malformed, or that carries `rawEvent`, is refused as a vocabulary error rather than frozen in the write-ahead log, where it would halt recovery on every restart. The write path strips `rawEvent` from a marker, and a frozen frame from an older version that still carries one halts. The gate also refuses a marker for a call that is still open. `cotal console` draws the marker as `done` or `failed` under its call, and the dashboard uses it to show whether each call is running, done or failed and how long it took. A connector downgraded across a write-ahead log that holds a marker refuses the event name and halts.
+
+## 0.138.2
+
+No changes in this release.
+
+## 0.138.1
+
+No changes in this release.
+
+## 0.138.0
+
+No changes in this release.
+
+## 0.137.0
+
+No changes in this release.
+
+## 0.136.8
+
+No changes in this release.
+
+## 0.136.7
+
+No changes in this release.
+
+## 0.136.6
+
+No changes in this release.
+
+## 0.136.5
+
+No changes in this release.
+
+## 0.136.4
+
+No changes in this release.
+
+## 0.136.3
+
+No changes in this release.
+
+## 0.136.2
+
+No changes in this release.
+
+## 0.136.1
+
+No changes in this release.
+
+## 0.136.0
+
+No changes in this release.
+
+## 0.135.21
+
+No changes in this release.
+
+## 0.135.20
+
+No changes in this release.
+
+## 0.135.19
+
+No changes in this release.
+
+## 0.135.18
+
+No changes in this release.
+
+## 0.135.17
+
+No changes in this release.
+
+## 0.135.16
+
+No changes in this release.
+
+## 0.135.15
+
+No changes in this release.
+
+## 0.135.14
+
+No changes in this release.
+
+## 0.135.13
+
+No changes in this release.
+
+## 0.135.12
+
+No changes in this release.
+
+## 0.135.11
+
+No changes in this release.
+
+## 0.135.10
+
+No changes in this release.
+
+## 0.135.9
+
+No changes in this release.
+
+## 0.135.8
+
+No changes in this release.
+
+## 0.135.7
+
+No changes in this release.
+
+## 0.135.6
+
+No changes in this release.
+
+## 0.135.5
+
+### Patch Changes
+
+- 724edaa: Keep a `once` task off a hook frame that a turn end, session end or replacing session overtook while the frame was being built. The task stays unclaimed for the next frame, instead of being confirmed for a session that had already ended.
+
+## 0.135.4
+
+No changes in this release.
+
+## 0.135.3
+
+No changes in this release.
+
+## 0.135.2
+
+No changes in this release.
+
+## 0.135.1
+
+No changes in this release.
+
+## 0.135.0
+
+### Minor Changes
+
+- e7fbeb8: `cotal_spawn` takes `once: true` with a `prompt` to start a helper for one task. The manager relays the prompt to the helper as its only turn and stops the helper when that turn ends or when the deadline passes. The deadline is one hour unless `deadline` sets another, and `-1` sets none. A spawn that succeeds names the task's goal in its result, and `goal-result` reads how it ended. A task that ends without the helper ending its turn may have run in part or in full, and nothing runs it again. A once spawn needs no `run` capability.
+  
+  The manager's `spawn` command takes `once: { deadlineMs }`, and the manager contract revision is 44. The task is served only after the spawn's succeeded terminal is written, so a manager that restarts before then cancels the task as never served. A seat hands a once task to its harness at most once. When it cannot confirm the harness took the task, it reports that with the new self-mode `turn-unconfirmed` command, which fails the task with `delivery-unconfirmed` and stops the seat. A manager that inherits a once seat it cannot hold ends the task without serving it, says so in the outcome, and answers that seat's every `turn-pending` with `stop` while its debt stays recorded.
+  
+  A connector declares `supportsTurnRelay` to take a once task: Jcode, OpenCode, pi and Claude Code do. A connector whose seat needs a confirmed startup declares `onceNeedsConfirmed`, and the manager serves its task only when the runtime reports the startup watch ended `confirmed`. Claude Code needs it: a once launch waits for Claude's development-channels prompt and then its `confirmNotice`, the line saying `server:cotal` messages reach the session. A runtime declares `reportsStartupOutcome` and its handles report `startupOutcome()`; the built-in pty runtime, tmux, cmux, herdr and orca do. A connector may declare `turnFrameLimit`, and a once prompt whose task does not fit it is refused at admission. A once exit registered with `registerOnceExit` may answer false to decline, and the seat then keeps reporting instead of exiting. A connector whose seat launches processes outside its own implements `retireAfterExit`, and the manager keeps the task's debt until that hook proves them gone. Jcode records each native launch of a once seat under the seat's uid for that proof, and a Jcode once seat always starts a fresh session, never one an earlier seat of the same name left in its home.
+
+## 0.134.0
+
+### Minor Changes
+
+- 8b80ca6: Every connector now hands its agent the same briefing, composed once in `@cotal-ai/connector-core` (`briefing(config, harness)`): identity, orient first, feedback, mesh-first delegation, durable workflow runs, where to talk, how a peer message arrives, how to reply, attention modes and reply etiquette. Codex, Jcode, OpenCode, Hermes and pi used to carry their own shorter copies and drifted; each now adds only the sentence that says how a peer message appears in its context. `docs/agent-briefing.mdx` is generated from the module (`pnpm gen:briefingdoc`) so a wording change shows as a diff of what each harness reads, and `pnpm check:docsbundle` fails when it drifts.
+  
+  A conversation that joins through `cotal_connect` (the Claude Code plugin in a session you opened, Claude Desktop, a hosted connector) used to be told only how to connect and listen; the connect result now carries its orientation card and the briefing. The Claude Code session-start hook hands the orientation card over at startup, resume, fork, clear and compaction, or with the next prompt when the seat was not bound yet, so the model has its bearings without asking. `orientationCard()` is the one rendering the `cotal_orientation` tool, the connect result and the hook share. Hermes' `setupProfile` takes the seat's `config` to render the briefing into `SOUL.md`.
+
+## 0.133.13
+
+No changes in this release.
+
+## 0.133.12
+
+### Patch Changes
+
+- 13499c0: Preserve documentation bookmarks and offline HTTP reference navigation after the MDX migration. Keep executable documentation checks aligned with the split references, validate generated HTTP content on root builds, preserve complete Card destinations, and improve light-mode navigation contrast.
+
+## 0.133.11
+
+### Patch Changes
+
+- 9182cfc: Restore the tool specs' and gateway's zod namespace import. The by-name imports released in 0.133.9 made the bundled claude, codex, hermes, jcode and opencode connectors throw `Class2 is not a constructor` when imported, so a fresh `cotal setup` failed its first connector seed.
+
+## 0.133.10
+
+No changes in this release.
+
+## 0.133.9
+
+No changes in this release.
+
+## 0.133.8
+
+No changes in this release.
+
+## 0.133.7
+
+No changes in this release.
+
+## 0.133.6
+
+No changes in this release.
+
+## 0.133.5
+
+No changes in this release.
+
+## 0.133.4
+
+No changes in this release.
+
+## 0.133.3
+
+No changes in this release.
+
+## 0.133.2
+
+No changes in this release.
+
+## 0.133.1
+
+No changes in this release.
+
+## 0.133.0
+
+### Minor Changes
+
+- 1e554e4: Precompute documentation search at build time and load the corpus and compact index only when needed. Search results and scoring are unchanged. Documentation data now lives in two digest-checked files beside each module or bundle; normal packages, plugins and installers include them automatically. Custom integrations that copy or bundle an executable alone must also carry its matching `docs-bundle.bin` and `docs-index.bin` files.
+
+## 0.132.7
+
+No changes in this release.
+
+## 0.132.6
+
+### Patch Changes
+
+- 85fdb96: Keep weighted term frequencies instead of repeated token strings in the lazy documentation search index. Search results and BM25 scores are unchanged. This reduces retained memory after documentation searches in the tested stock connector workload, with extra first-search work to build the frequency maps.
+
+## 0.132.5
+
+No changes in this release.
+
+## 0.132.4
+
+No changes in this release.
+
+## 0.132.3
+
+No changes in this release.
+
+## 0.132.2
+
+### Patch Changes
+
+- d776fcf: Share the OpenCode adapters' surfaced batch so a native prompt cannot replace the messages carried by an active turn. Queued messages remain pending for a later eligible turn. Update the Claude Code connector's comment naming that acknowledgment boundary.
+
+## 0.132.1
+
+No changes in this release.
+
+## 0.132.0
+
+No changes in this release.
+
+## 0.131.6
+
+No changes in this release.
+
+## 0.131.5
+
+No changes in this release.
+
+## 0.131.4
+
+No changes in this release.
+
+## 0.131.3
+
+No changes in this release.
+
+## 0.131.2
+
+No changes in this release.
+
+## 0.131.1
+
+No changes in this release.
+
+## 0.131.0
+
+No changes in this release.
+
+## 0.130.2
+
+No changes in this release.
+
+## 0.130.1
+
+No changes in this release.
+
+## 0.130.0
+
+No changes in this release.
+
+## 0.129.9
+
+No changes in this release.
+
+## 0.129.8
+
+No changes in this release.
+
+## 0.129.7
+
+No changes in this release.
+
+## 0.129.6
+
+No changes in this release.
+
+## 0.129.5
+
+No changes in this release.
+
+## 0.129.4
+
+No changes in this release.
+
+## 0.129.3
+
+No changes in this release.
+
+## 0.129.2
+
+No changes in this release.
+
+## 0.129.1
+
+No changes in this release.
+
+## 0.129.0
+
+No changes in this release.
+
+## 0.128.7
+
+No changes in this release.
+
+## 0.128.6
+
+No changes in this release.
+
+## 0.128.5
+
+No changes in this release.
+
+## 0.128.4
+
+No changes in this release.
+
+## 0.128.3
+
+No changes in this release.
+
+## 0.128.2
+
+No changes in this release.
+
+## 0.128.1
+
+No changes in this release.
+
+## 0.128.0
+
+No changes in this release.
+
+## 0.127.5
+
+No changes in this release.
+
+## 0.127.4
+
+No changes in this release.
+
+## 0.127.3
+
+No changes in this release.
+
+## 0.127.2
+
+No changes in this release.
+
+## 0.127.1
+
+No changes in this release.
+
+## 0.127.0
+
+### Minor Changes
+
+- 53fbd95: Allow an authorized personal native conversation to bind itself with `participant()` and receive hosted workflow turns through a finite exact-lifecycle lease without gaining manager seat custody.
+
+## 0.126.3
+
+No changes in this release.
+
+## 0.126.2
+
+No changes in this release.
+
+## 0.126.1
+
+No changes in this release.
+
+## 0.126.0
+
+No changes in this release.
+
+## 0.125.0
+
+No changes in this release.
+
+## 0.124.3
+
+No changes in this release.
+
+## 0.124.2
+
+No changes in this release.
+
+## 0.124.1
+
+No changes in this release.
+
+## 0.124.0
+
+No changes in this release.
+
+## 0.123.0
+
+No changes in this release.
+
+## 0.122.0
+
+No changes in this release.
+
+## 0.121.7
+
+No changes in this release.
+
+## 0.121.6
+
+No changes in this release.
+
+## 0.121.5
+
+No changes in this release.
+
+## 0.121.4
+
+No changes in this release.
+
+## 0.121.3
+
+No changes in this release.
+
+## 0.121.2
+
+### Patch Changes
+
+- b02da28: Explain confirmed Claude Code hook deliveries when a later inbox read has no unread messages. The receipt names the latest handoff without returning message bodies again or changing acknowledgements.
+- c13e443: Keep Claude Code hook context below its inline output limit. Deliver only complete messages that fit, count the remainder, and leave omitted or oversized messages unacknowledged for the inbox or a later hook.
+
+## 0.121.1
+
+No changes in this release.
+
+## 0.121.0
+
+No changes in this release.
+
+## 0.120.2
+
+No changes in this release.
+
+## 0.120.1
+
+No changes in this release.
+
+## 0.120.0
+
+No changes in this release.
+
+## 0.119.5
+
+No changes in this release.
+
+## 0.119.4
+
+### Patch Changes
+
+- ed5c23f: Remedies, hints and messages from `run`, `actor` and `auth`, `logout`, `supervise` and `manager`, `deliver`, `docs`, `daemon`, `linear`, the web dashboard, the console, the Claude Code connector, a run's checkpoint prompt and the endpoint issuance gate now name the commands they suggest in backticks, so a terminal keeps each one whole and `--json` carries the same text. They named them bare after other words, as in "list the recorded runs with cotal run", which split inside the command when the line wrapped.
+
+## 0.119.3
+
+No changes in this release.
+
+## 0.119.2
+
+### Patch Changes
+
+- 99d87c9: Keep command text and tool arguments out of permission-wait presence activity. Report working when a main-agent tool begins a turn without a prompt hook, while preserving permission waits and terminal status handling.
+
+## 0.119.1
+
+No changes in this release.
+
+## 0.119.0
+
+No changes in this release.
+
+## 0.118.3
+
+No changes in this release.
+
+## 0.118.2
+
+No changes in this release.
+
+## 0.118.1
+
+No changes in this release.
+
+## 0.118.0
+
+No changes in this release.
+
+## 0.117.1
+
+No changes in this release.
+
+## 0.117.0
+
+No changes in this release.
+
+## 0.116.5
+
+### Patch Changes
+
+- f074dfc: `cotal update` now installs the `cotal` plugin at user scope on a machine that only has the per-project installs earlier releases made, so it loads in every project, and removes the per-project installs that had it on. A project that turned the plugin off keeps it off, and an account that turned it off is left as it is.
+
+## 0.116.4
+
+No changes in this release.
+
+## 0.116.3
+
+No changes in this release.
+
+## 0.116.2
+
+No changes in this release.
+
+## 0.116.1
+
+No changes in this release.
+
+## 0.116.0
+
+### Minor Changes
+
+- 50ee624: Cut what an idle seat costs its host, with stock build and runtime mechanisms.
+  
+  Every connector bundle that loads into a long-running process now ships as one-byte text. V8 holds a
+  string at one byte per character only while every character is Latin-1, and a single character above
+  U+00FF made each 5 MB bundle two-byte for the life of the process. The characters were em dashes and
+  arrows in comments, so the bundles are built with esbuild's `--minify-whitespace`, which drops
+  comments and the parentheses around a single arrow parameter, and keeps every identifier. Anything
+  matching text in a built bundle sees the second part: `(e) => f(e)` now reads `e=>f(e)`. `pnpm smoke:connector-bundle-text` reads the 19 built bundles
+  and fails on any character above U+00FF. Stack-trace frames keep their function names and their line
+  and column numbers move, because the bundle is now fewer, longer lines.
+  
+  The Claude Code connector's seat is launched through a new entry, `dist/seat.cjs`, which enables
+  Node's module compile cache in `~/.cotal/compile-cache` and then loads `dist/mcp.cjs`. Node's cache
+  covers modules compiled after it is enabled, so the entry has to sit in front of the bundle. The
+  directory is created 0700 like the rest of `~/.cotal`, whatever the launching umask was. A cache
+  that cannot be opened prints one line and the seat serves without it,
+  `NODE_DISABLE_COMPILE_CACHE=1` turns it off, and `NODE_COMPILE_CACHE` takes precedence and is left
+  alone. `dist/mcp.cjs` remains the library entry (`@cotal-ai/connector-claude-code/mcp`) and still
+  serves when run directly.
+  
+  The declared Node floor rises from 22 to 22.10, which is where `module.flushCompileCache()` lands,
+  and every package's `engines.node` now says so. The `cotal` binary checks it at its front door and
+  refuses an older runtime with the floor, the running version and the repair for how it was
+  installed; the seat entry refuses before its first cache call, so an old Node gets one sentence
+  rather than a `TypeError`; and the installer compares the minor version, so a host whose own Node is
+  22.9 gets the pinned Node downloaded and verified instead. `node dist/mcp.cjs` still serves on an
+  older runtime. Operators moving a host read
+  [the upgrade note](https://github.com/Cotal-AI/Cotal/blob/main/docs/UPGRADING.md).
+  
+  Measured on one idle seat per arm, Node v22.23.2, paired and read at 160 s and 600 s: 41.9 MiB USS
+  on the stock bundle, 35.2 with one-byte text, 26.3 with the seat entry's compile cache as well.
+
+## 0.115.4
+
+No changes in this release.
+
+## 0.115.3
+
+No changes in this release.
+
+## 0.115.2
+
+No changes in this release.
+
+## 0.115.1
+
+No changes in this release.
+
+## 0.115.0
+
+No changes in this release.
+
+## 0.114.1
+
+No changes in this release.
+
+## 0.114.0
+
+No changes in this release.
+
+## 0.113.3
+
+No changes in this release.
+
+## 0.113.2
+
+No changes in this release.
+
+## 0.113.1
+
+No changes in this release.
+
+## 0.113.0
+
+No changes in this release.
+
+## 0.112.0
+
+No changes in this release.
+
+## 0.111.1
+
+No changes in this release.
+
+## 0.111.0
+
+No changes in this release.
+
+## 0.110.0
+
+No changes in this release.
+
+## 0.109.25
+
+No changes in this release.
+
+## 0.109.24
+
+No changes in this release.
+
+## 0.109.23
+
+No changes in this release.
+
+## 0.109.22
+
+No changes in this release.
+
+## 0.109.21
+
+No changes in this release.
+
+## 0.109.20
+
+No changes in this release.
+
+## 0.109.19
+
+No changes in this release.
+
+## 0.109.18
+
+No changes in this release.
+
+## 0.109.17
+
+No changes in this release.
+
+## 0.109.16
+
+No changes in this release.
+
+## 0.109.15
+
+No changes in this release.
+
+## 0.109.14
+
+### Patch Changes
+
+- 60e6671: A managed Claude Code seat that stops on Claude's first-run text style picker, its login method choice or its Bypass Permissions warning now fails at the startup bound naming that screen and the step that clears it. It used to fail saying the development-channels prompt did not appear, which pointed at the wrong cause. Cotal still never answers any of these screens: the Bypass Permissions warning stays for the user to accept once, or the launch passes `--opt permission-mode=default` (`launchOptions: {permission-mode: default}` in a manifest). A launch recipe declares such screens in the new optional `LaunchSpec.confirmBlockers`. The pty, custody, tmux, cmux, Orca and Herdr runtimes send no key while one is on screen and name its reason when the bound ends there. A runtime that ignores the field fails as before, with the generic message.
+  
+  A foreground `cotal spawn` of Claude Code no longer passes `--permission-mode bypassPermissions`. It runs in your terminal, so Claude keeps its own permission mode and you answer its prompts there; before, it opened on the Bypass Permissions warning while the spawn's hint said to press Enter at the development-channels prompt, and Enter there exits Claude. A managed seat keeps bypass as its default, and a permission option you pass still wins in both.
+  
+  `cotal up -f` no longer prints a success mark for its agents. It says the stack is up and the agents' launch is pending, that it does not wait for them to join, and names `cotal ps --space <space>` and the manager's log, where a failed launch is recorded with its reason.
+  
+  The quickstart and the team guide now say to finish Claude's first run once before the manager launches Claude Code, and give both permission routes.
+
+## 0.109.13
+
+No changes in this release.
+
+## 0.109.12
+
+No changes in this release.
+
+## 0.109.11
+
+No changes in this release.
+
+## 0.109.10
+
+No changes in this release.
+
+## 0.109.9
+
+No changes in this release.
+
+## 0.109.8
+
+No changes in this release.
+
+## 0.109.7
+
+No changes in this release.
+
+## 0.109.6
+
+No changes in this release.
+
+## 0.109.5
+
+No changes in this release.
+
+## 0.109.4
+
+No changes in this release.
+
+## 0.109.3
+
+No changes in this release.
+
+## 0.109.2
+
+No changes in this release.
+
+## 0.109.1
+
+No changes in this release.
+
+## 0.109.0
+
+No changes in this release.
+
+## 0.108.1
+
+No changes in this release.
+
+## 0.108.0
+
+No changes in this release.
+
+## 0.107.0
+
+No changes in this release.
+
+## 0.106.1
+
+No changes in this release.
+
+## 0.106.0
+
+### Patch Changes
+
+- ba25fb6: Agent seats no longer watch presence. Every member of a space received every other member's heartbeat every two seconds, so an idle space of K seats moved K² presence deliveries per heartbeat. An idle 400-seat space pushed about 35 MB/s out of the broker. A seat now reads the roster when a tool needs it: `cotal_roster`, `cotal_orientation`, a DM to a name, a send with `@mentions`, and the anycast holder count. An idle seat now costs the broker one put, one ack and one delivery to each liveness watcher per heartbeat, whatever the size of its space. The manager, the delivery daemon, `cotal chat` and the dashboard still watch.
+  
+  The new `CotalEndpoint.readPresence()` makes batched Direct Gets of the presence bucket. It binds no consumer, applies the same reader rules as the watch, and reads a record older than the liveness window as offline. A peer that an earlier read saw stays on the roster as offline after it leaves the bucket. When a read fails, the seat refuses to say a name is absent: the error names the failed read instead of reporting an unknown peer. The agent credential gains `$JS.API.DIRECT.GET.KV_cotal_presence_<space>` (SPEC §6 and Appendix B). A credential minted before this release lacks that grant, and its reads are refused with the grant named, so upgrade the manager and auth service before the connectors. Whole-bucket Direct Get reads, including `readOnce`, now page past 1024 keys instead of refusing the read.
+
+## 0.105.1
+
+### Patch Changes
+
+- 2d269dd: Let a native Claude conversation replace an unwanted pending name or permission request without approving it first. Stop the superseded approval watcher, recover and retire any identity issued during the change, and require a fresh approval before the replacement connects.
+
+## 0.105.0
+
+No changes in this release.
+
+## 0.104.2
+
+No changes in this release.
+
+## 0.104.1
+
+No changes in this release.
+
+## 0.104.0
+
+### Minor Changes
+
+- a4bbb26: A personal Claude Code conversation whose `cotal_connect` is awaiting approval no longer depends on the person coming back to say "retry". The plugin's server follows the pending request, serialized with the conversation's own connect, until the authority records the decision, the request expires, or the session ends. An approval finishes the same request and holds the issued identity for that conversation's `cotal_connect` with its `approval_id`; the person's decision reaches only the native session that asked, through its wake reader, as one fixed approved, denied or expired line that the native module admits exactly. An approved identity nobody claimed is retired when its session ends. `cotal app-identity provision` now reports a recorded refusal as `refused: denied | expired | refused` beside its message, so a host never classifies a decision from prose.
+
+### Patch Changes
+
+- 3149792: Point the absent-origin mapper comment at its rule table for accepted prompt sources and attribution, preserving the historical measurements. Runtime behavior is unchanged.
+- e0c4e6e: Correct the documentation page by page against the implementation, including CLI commands, connector delivery and activity sharing, authentication, observer surfaces, hosted composition, telemetry and historical design status. Refresh package guides and generated tool and HTTP references while preserving existing links and normative contracts.
+
+## 0.103.4
+
+### Patch Changes
+
+- c05e0e3: Let personal Claude Code conversations choose a registered mesh with `cotal_connect`'s optional `space` argument, without changing project configuration. Keep hosted grants space-bound, require disconnect before replacing a live connection, and retire a previous space's pending identity before requesting another.
+
+## 0.103.3
+
+No changes in this release.
+
+## 0.103.2
+
+No changes in this release.
+
+## 0.103.1
+
+No changes in this release.
+
+## 0.103.0
+
+No changes in this release.
+
+## 0.102.0
+
+No changes in this release.
+
+## 0.101.7
+
+No changes in this release.
+
+## 0.101.6
+
+No changes in this release.
+
+## 0.101.5
+
+No changes in this release.
+
+## 0.101.4
+
+### Patch Changes
+
+- 0642c8f: A managed launch that waits for you before it joins no longer ends as an unknown outcome. A
+  connector can name the screen a launch waits at (`waitsForOperator`), and Claude does for
+  `--opt resume=` with no session id, which opens its session picker. The manager reports such a
+  launch ready once its process runs, and `cotal spawn` says the agent is waiting for you at that
+  screen and attaches to it in a terminal, `-d` included, or prints the attach command, exiting 0.
+  When the readiness window passes and the manager saw the agent's process still running, the
+  `uncertain` result carries an `ai.cotal.goal.entity-running` detail, and `cotal spawn` says the
+  agent has not joined yet and how to attach instead of reporting an unknown outcome.
+
+## 0.101.3
+
+No changes in this release.
+
+## 0.101.2
+
+No changes in this release.
+
+## 0.101.1
+
+No changes in this release.
+
+## 0.101.0
+
+No changes in this release.
+
+## 0.100.2
+
+No changes in this release.
+
+## 0.100.1
+
+No changes in this release.
+
+## 0.100.0
+
+### Patch Changes
+
+- e7d11cc: On macOS, `cotal setup` and `cotal update` no longer write Cotal's entry into Claude Desktop's
+  `claude_desktop_config.json` while Claude Desktop is running. Desktop reads that file when it starts
+  and writes the copy it holds back on ordinary use, such as switching a Code session or changing the
+  model, so an entry added while it ran was dropped. Setup now finishes its other steps and reports
+  that the Desktop entry was not added, with the fix: quit Claude Desktop, then run `cotal setup`
+  again from a terminal outside it. Windows is unchanged.
+
+## 0.99.3
+
+No changes in this release.
+
+## 0.99.2
+
+No changes in this release.
+
+## 0.99.1
+
+### Patch Changes
+
+- 50de78d: Point Claude Desktop chat on a signed-in space at the space's hosted connector. Desktop chat
+  supplies no native session, so this computer's `--desktop` server cannot join a signed-in space,
+  yet setup wrote its entry and status reported it as added. Setup for a signed-in space now writes no
+  Desktop entry and prints the hosted connector URL to add under Settings > Connectors > Add custom
+  connector, the Claude Desktop status row prints it for a signed-in selected space, and the server's
+  refusal names it. The URL comes from `cloudCapabilities.hostedConnector` (version 1, HTTPS) in the
+  space's discovery document; a space that advertises none is reported that way. The Desktop server's
+  instructions no longer tell the model to prefer the local path for a signed-in space.
+- 0b5c02d: A Claude plugin installation at local or project scope that its update does not reach no longer
+  blocks every Cotal command after an upgrade. Claude Code can apply `claude plugin update --scope
+  local`, run in a project folder nested inside another project with its own installation, to the
+  enclosing project and report the plugin as already current, so the nested folder's record stayed old
+  and the connector refresh failed on every command. The refresh now completes and prints a warning
+  that names the folder and the `claude plugin uninstall` command that removes the installation there.
+  A user-scope installation that does not update is still an error, and a failed update now names the
+  project folder.
+
+## 0.99.0
+
+No changes in this release.
+
+## 0.98.0
+
+No changes in this release.
+
+## 0.97.1
+
+No changes in this release.
+
+## 0.97.0
+
+No changes in this release.
+
+## 0.96.1
+
+No changes in this release.
+
+## 0.96.0
+
+No changes in this release.
+
+## 0.95.2
+
+No changes in this release.
+
+## 0.95.1
+
+No changes in this release.
+
+## 0.95.0
+
+No changes in this release.
+
+## 0.94.7
+
+No changes in this release.
+
+## 0.94.6
+
+No changes in this release.
+
+## 0.94.5
+
+No changes in this release.
+
+## 0.94.4
+
+### Patch Changes
+
+- 489e9c6: Explain the native data sharing a person approves: new user messages, assistant replies, tool inputs and tool results are published to readers permitted by the space's activity policy. Reasoning is off by default, and history from before approved activation is not shared. Correct the event-plane documentation's old transcript-boundary description. No event behavior or permission is changed.
+
+## 0.94.3
+
+No changes in this release.
+
+## 0.94.2
+
+No changes in this release.
+
+## 0.94.1
+
+No changes in this release.
+
+## 0.94.0
+
+### Patch Changes
+
+- 8e05f65: Explain how to update an older recorded identity CLI that cannot enforce permission approval, without falling back or exposing its diagnostic output. Update the installed plugin instructions to describe the permission review page, mandatory direct messages and activity sharing, and unsupported local approval paths.
+
+## 0.93.0
+
+### Minor Changes
+
+- 92f0b8c: Report pending permission approval with an authenticated review link and no usable connection. Hosted gateways can resume one unchanged request with its approval ID; the ID grants no authority and cannot rename or replace an approved connection. Native conversations wait for the person's decision before starting their connection or capturing activity. Permission arguments are proposals, never human consent.
+- 69b0538: A signed-in native Claude Code conversation can now ask for channels, a role and capabilities within the person's own grant.
+  
+  `cotal_connect` in a native Code session takes proposed `channels` (read, or read and post), a `role` and `capabilities` (`spawn`, `run`). The person must review, edit and approve the permissions in Cotal before a new connection is issued. The approved set must stay within their current access, and the returned grant must match that approved set, not the proposal. Unsupported or refused requests never fall back to baseline or broader access. A remote mesh must advertise selection v1 and connection approval v1. The authority may refuse a capability it does not support; endpoint selection is unavailable in v1.
+  
+  A connection is offered the tools its own grant can use: spawn, despawn and the persona tools with `spawn`, `cotal_run` with `run`, and `cotal_reconnect`. Manager calls exchange the conversation's own secret for a manager-call view. A conversation is not a managed seat, so a self-despawn refuses instead of stopping the app, and `cotal_yield` is not offered.
+  
+  Core exports `conversationSelection`, `checkConversationSelection` and `conversationGrant`. The gateway gains `NATIVE_GATEWAY_TOOLS`, `GatewayOptions.tools`, `GatewayOptions.selection` and `GatewayConnection.tools`. `cotal app-identity provision` takes `--selection <json>`. The hosted gateway's tool set is unchanged.
+- 6703917: Connect personal native Claude conversations to signed-in meshes with separate identities, real lifecycle and own-event publication, durable request recovery, and exact-lifecycle retirement. Bind native wake readers to their conversation while retaining immediate idle and busy-boundary delivery. Capture lifecycle metadata through ordinary command hooks so the native connection does not depend on intercepting the built-in guard's protected events. Keep notification presentation off protected notes and skill output while retaining native sender attribution.
+
+### Patch Changes
+
+- 2a56547: Recover a signed-in native Claude conversation whose identity retirement is still pending. Disconnect, every routed tool and reconnect now report one disconnected state with the mesh's retirement phase and the available retry, instead of advising a reconnect that the same conversation then refused. Reconnecting retries the pending retirement and connects with a new identity once the mesh confirms it, including after the plugin server restarts. After each signed-in connection, the plugin retires the same mesh's saved conversation identities whose plugin server process no longer exists, through the new `cotal app-identity reap` plumbing. It runs in the background, so a connection never waits for it, and it keeps any identity whose server process still exists and retains any retirement that does not finish. The same conversation from another plugin server reuses a saved identity only once the server that held it no longer exists, so a live server keeps its identity even when its process start time reads differently, as macOS `ps` does across time zones and locales.
+- 42fe091: Deliver complete short messages to personally opened Claude Code conversations without an extra inbox call. Preserve message identity and reply context, acknowledge only confirmed native handoffs, and rearm later messages while retaining the inbox path for larger deliveries. A stale offer from a closed connection no longer suppresses its replacement's messages.
+
+## 0.92.2
+
+No changes in this release.
+
+## 0.92.1
+
+### Patch Changes
+
+- 8bb9766: Verify folder-backed Claude plugins by their resolved manifest and file contents, so older native installation records do not incorrectly fail an upgrade.
+
+## 0.92.0
+
+### Patch Changes
+
+- eb9aef9: Show a bounded, attributed preview inside Claude Code's existing native Cotal disclosure without consuming the inbox. The collapsed row reports unread count, expansion renders neutralized DM/channel rows, and UI state never drains, acknowledges or commits delivery. Unsupported chat hosts keep the existing tool and wait paths.
+
+  `GatewayWake.signal` now receives the rendered preview as a required second argument. Embedders that implement `GatewayWake` with a one-argument `signal` still conform. Code that calls `signal` directly must pass the preview.
+
+  Preview rows replace peer control characters and lone surrogates with U+FFFD before they are bounded, so a wake frame always fits the feed and no terminal control reaches the host UI. Line breaks keep their indented continuation.
+
+- 05a110a: Serialize Claude plugin setup, skills installation and refresh through their final native verification. Overlapping Cotal commands can no longer replace the shared plugin generation while another command is checking it.
+- ab2acc8: Tell every agent where to talk when it joins. A fresh agent can start on no channel, so the Claude Code, Codex, Jcode, OpenCode and Hermes startup text now says how to find its team's channel with `cotal_channels` and `cotal_join`, to use `cotal_dm` for one peer and `cotal_anycast` for a role, and to post on `#announce` only for a deliberate space-wide notice. OpenCode and Hermes previously carried no channel guidance at all. This is guidance only: no grant, subscription, mention or wake behaviour changes.
+- 3cefc75: Report the Cotal release a server actually loaded as its standard MCP `serverInfo.version`, instead of the placeholder `0.0.0`. The conversation gateway over HTTP and stdio and the managed Claude Code server now use the same value `cotal_orientation` shows, so a long-running server keeps reporting the release it loaded rather than whatever is installed on disk now.
+
+## 0.91.0
+
+### Patch Changes
+
+- 0e40d19: Files written in place under `~/.cotal` or a project's `.cotal` are no longer written through a symlink. The manager's own delivery-aware marker, the `agent-bearer` health file, the onboarding marker, the `setup` log and personas, the web session file and detached log, the feedback store, persona files saved by `saveAgentFile`, the seat custody record, payload, exit record and log, the Claude seat home and plugin marketplace, the Codex host log, the Jcode launch record, the `ext` extensions prefix `package.json`, and the isolated broker's config rewrite and watchdog now refuse a symlink and leave it unchanged. A file rewritten in place is set to `0600` through the open file. `hardenPrivate` on a file now uses the same no-follow descriptor. A directory is still hardened to `0700` by its path, so a symlinked `~/.cotal` or `.cotal` is not refused there. The manager and native service custody no longer chmod their pid records by path, since those are created `0600`. The broker ports report refusal names the report's path, and a failed close no longer hides it.
+- 28ae779: Deliver incoming local-mesh messages through Claude Code's native plugin hooks, including supported Desktop Code sessions, without special launch flags. Surface busy notifications at a main-conversation boundary instead of waiting for the whole turn. Preserve plugin attribution, respect native Stop, and reoffer unread wakes when the local reader restarts. Idle wake notifications display as a compact, expandable Cotal indicator. Setup can use Desktop's bundled Code executable and records Node's absolute path so the app needs neither a separate terminal CLI nor Node on its PATH.
+
+  Refresh existing Claude messaging and skills plugin registrations during updates and ordinary first use after an npm upgrade. Preserve disabled settings and check the resolved payload rather than only the marketplace copy. A missing native runtime refuses the upgrade without accepting a stale generation. Allow an update after configure-only setup when the local project has no manager or broker running. Use provider readiness through the public setup entrypoint, including Desktop-only installations. Probe native executables only at an explicit availability or action boundary, with bounded timeouts, so a broken unrelated Claude command does not block connector registration, seeding or another harness's setup. Report a partial setup if the selected harness loses readiness before an action, rather than silently skipping it.
+
+## 0.90.1
+
+## 0.90.0
+
+## 0.89.0
+
+## 0.88.0
+
+## 0.87.0
+
+### Patch Changes
+
+- af82e8d: A seat's launch-material directory (`cotal-launch-*` in the OS temp dir, holding the broker URL, the creds path and the control token) is now removed when the seat's process exits. Before this change a Claude seat left it behind after `cotal stop`, while the persona file and control socket of the same launch were removed. `materialEnv` in `@cotal-ai/connector-core` now takes the launch's artifact array as a second, required argument and appends the material's private directory to it, and every connector returns that array on `LaunchSpec.artifacts`, so the manager, the pty runtime and the foreground `cotal spawn` remove it the way they remove a persona file. Each connector now writes the material after its last refusal, so a refused launch leaves no material file behind. The second material file the Hermes launcher writes for its gateway child is not covered by this change.
+
+## 0.86.0
+
+### Minor Changes
+
+- 31dccc4: A Claude app conversation can join a local mesh. `serveGatewayStdio(host, options)` in `@cotal-ai/connector-core` serves the remote gateway's tools over stdio, so a local MCP server offers the same `cotal_connect`, `cotal_wait` and routed tools as the hosted connector without importing an MCP SDK. The hidden `cotal app-identity` plumbing command opens one conversation's own identity on the selected mesh: it answers `taken` for a live name, takes its channels and role from the mesh's default persona, provisions the identity's own delivery durables on a mesh with static credentials, and writes the credential to a 0600 file that never appears on stdout. `cotal app-identity retire --dir` removes the identity's broker footprint and then that file, and each provision retires what a host that exited without retiring left behind. A mesh that uses per-user sign-in is refused. The Claude Code plugin's server now serves those tools to a session Cotal did not launch, in place of `cotal_how_to_join`, and joins only when the conversation calls `cotal_connect`. `cotal setup` records the CLI's own argv beside the plugin, so that server runs the CLI by absolute path; a connector's install action receives it as `ConnectorSetupInput` from `@cotal-ai/core`. Started with `--desktop`, the same server suits Claude Desktop, whose working directory is no project. Without `--space`, provision sweeps the registry first, as `cotal spawn` does, so a recorded mesh whose broker is down no longer makes the choice ambiguous. A conversation in a Claude Code session is woken when a message arrives: the plugin declares a monitor, each local server writes the connection id of each wake to a private socket of its own, and the monitor turns each valid id into a fixed event line, so no socket text reaches the model. `GatewayOptions.wake` in `@cotal-ai/connector-core` is the hook for this: it signals a connection once until it is read, never while a `cotal_wait` holds it, and again when a client starts listening, and `cotal_connect` says whether the client will be woken. `GATEWAY_INSTRUCTIONS` now tells a conversation how to keep listening when asked, and is exported in two parts, `GATEWAY_CONNECTING` and `GATEWAY_LISTENING`. Claude Code runs the `cotal` plugin in place from the copy `cotal setup` materializes under `~/.cotal/claude-plugin`, and before this change neither a repeat `cotal setup` nor `cotal update` rewrote that copy, so after an upgrade plain sessions kept starting the old server, hooks and monitor. A setup provider can now declare `refresh` (`ConnectorSetupProvider.refresh` in `@cotal-ai/core`), which brings what it installed to this release and installs nothing new; a repeat `cotal setup` and `cotal update` run it, and `cotal update` fails when the refresh fails. The copy's version is now the release plus a digest of its files, and `cotal status` reports the plugin as current or stale against it, in place of only whether it is installed. `cotal setup` always runs `claude plugin marketplace update` after adding the marketplace, since Claude Code 2.1.295 answers a repeat add with wording the old check did not match. On macOS and Windows, where Claude Desktop is installed, `cotal setup` adds a `cotal` server to Desktop's `claude_desktop_config.json` that runs the same server with `--desktop`, keeps every other entry, refuses a file that is not valid JSON, and the refresh keeps the entry current; `cotal status` reports it.
+- 15043fa: `cotal setup` now installs the `cotal` Claude Code plugin for your user account, so every Claude Code session on the machine gets the `cotal_*` tools in any project: the terminal, the IDE extensions and the Desktop app's local Code sessions. It used to install it only for the project setup ran in. Running `cotal setup` again moves the per-project installs an earlier release made under the one user-scope install. `cotal update` still only rewrites the plugin copy and does not change where it is installed. If Claude Code cannot change one project's settings, setup still removes the others and writes the Claude Desktop entry, then fails naming that project and the `claude plugin uninstall` command to run there. `cotal status` reads `current (user scope)`. Setup and `cotal status` now read a plugin list longer than 1 MiB, which a machine with many old per-project installs reaches; before, the output was cut short and status showed `unknown`. A session Cotal launches still loads one cotal server, because its `--plugin-dir` copy replaces the installed one for that session.
+
+  The plugin's hook, which Claude Code starts for every tool call, prompt and stop, no longer bundles the `@cotal-ai/core` package root. It shrinks from 945 KB to 14 KB and starts in about half the time. `peerLabel` is now also exported from the new `@cotal-ai/core/peer-label` subpath, and the root export is unchanged.
+
+### Patch Changes
+
+- bf1c2c3: The AG-UI mapping smoke's comments now describe the run-opening rule the mapper uses, the `ORIGIN_RULE` and `ABSENT_ORIGIN_RULE` enumerations restated once as `attributableTurn`, in place of the retired `promptSource`-presence gate. The mutation ledger names the population cell by its current name, and the restatement's doc block now sits on `attributableTurn`. No behavior changes.
+- e31affd: A forked Claude Code session no longer acts under the hosted Cotal connection of the session it was forked from. A fork inherits the parent's `connection_id` in its transcript, so before this it reused the parent's mesh name from a new session. The plugin now records which session opened each hosted connection, from a `PostToolUse` hook on `cotal_connect`, in the plugin's data directory, and its `PreToolUse` hook refuses that id in any other session with a reason that says to call `cotal_connect`. A resumed session and its subagents keep the session id and are unaffected, and `cotal_disconnect` releases the record. `runHookRelay`'s local answer now runs in every session and is told whether the session carries a mesh identity.
+- af26dda: A Claude Code session that Cotal launched now refuses the `cotal_*` tools of every MCP server other than its local Cotal server. Claude Code loads connected-account connectors in a spawned session by default, so a hosted Cotal connector beside the plugin let one session join the mesh twice under two names. The plugin's `PreToolUse` hook now denies those calls with the reason, and decides in the hook process, so the refusal holds when the control socket is down. A session Cotal did not launch keeps the hosted connector. `runHookRelay` takes an optional answer that settles an event in the hook process before the control socket is resolved.
+- 7a2c574: Claude Code sessions report the directory their own `SessionStart` hook supplies on startup, resume or fork, not the connector process directory, so sessions hosted in one process no longer all show the host's directory. The directory is absent until the hook reports it and is not changed by clear or compact. `CotalEndpoint.setCardCwd` and `MeshAgent.setCwd` set it, and `MeshAgent`'s new `withholdProcessCwd` option leaves it unset at construction.
+
+## 0.85.0
+
+### Patch Changes
+
+- fa35dd7: The AG-UI mapping smoke's comments now name `JsonlFileSource.read` for the seal check at the cursor offset and for the fresh-adopt branch, and the `durable-source.ts` module doc for cursor opacity. They used to cite `durable-source.ts` by line number, and two of those lines had drifted onto unrelated code. No behavior changes.
+- 6e10d50: A detached Claude Code spawn no longer fails its startup confirmation when Claude skips the development-channels warning and opens its input screen. Claude 2.1.301 does that when channels are off for the session, for example under a Team or Enterprise organization that has not set `channelsEnabled: true` in managed settings. Such a seat now stays up, and gets mesh messages through its hooks only, so a message does not wake it while it is idle. When the warning appears it is still answered with one Enter, and an unknown startup dialog still gets no key and fails within 15 seconds. A launch recipe can now declare `LaunchSpec.confirmReady`, texts that show the harness reached its input screen. Seeing one on two screen reads in a row ends the startup watch with no key. The PTY, tmux, cmux, Orca and Herdr runtimes honour it; a custom runtime that ignores it keeps failing such a launch as before.
+- ff09b5c: A detached Claude Code spawn into a folder Claude has not trusted no longer fails its startup confirmation when Claude draws the trust dialog as a numbered list with Yes first and selected. The managed launch now confirms that layout with Enter, and still answers the layout with No first by moving to Yes before confirming. It never confirms while No is selected. A startup choice can now be marked `optional`, so a choice that never appears does not block the next one. A custom runtime that answers `LaunchSpec.confirmBefore` with its own matcher must honour that flag; runtimes that use the core or seat startup sequence get it already.
+
+## 0.84.0
+
+### Minor Changes
+
+- 6d48a0b: Load Claude Code's native MCP sources by default alongside Cotal and declared overrides. Preserve explicit per-spawn sharing restrictions, carried-session isolation, native policy and narrow environment forwarding.
+
+## 0.83.0
+
+## 0.82.2
+
+## 0.82.1
+
+## 0.82.0
+
+### Minor Changes
+
+- 6afa12f: The Claude Code MCP server can now be hosted. `serveClaudeSession({ env, input, output })`, exported from `@cotal-ai/connector-claude-code/mcp`, serves one managed session over the streams it is given and reads its launch env only from `env`, so one process can serve several sessions. Each call snapshots that complete environment for its presence label, bearer commands, carried-fork records and feedback contact lookup, including Git; it does not merge the host environment. Hosted feedback reads only the session's global Git configuration, including includes, so the host repository cannot supply its contact. Legacy tool hosts that omit the environment retain their existing repository lookup. The runtime subpath exports only `serveClaudeSession`. `EndpointOptions.environment` accepts an explicit presence label, or `null` to omit it without reading `COTAL_ENVIRONMENT`; an omitted option preserves process inheritance. The subpath includes CommonJS declarations for TypeScript hosts. Direct stdio launches remain supported and also shut down on input closure; a failure in that teardown exits with code 1. Hosted teardown releases its input listeners, handles input EOF and transport closure, refuses input that ends during startup, and reports teardown failures without an unhandled rejection in the host. A pending broker dial that fails after shutdown begins no longer makes close fail or strands local inbox custody. Shutdown still waits for pending start and reconnect work, proves every owned connection closed, and propagates connection-close failures.
+
+### Patch Changes
+
+- 3417a95: Launch the per-session MCP server with `--optimize-for-size --max-semi-space-size=1` to cut its memory footprint.
+
+## 0.81.1
+
+## 0.81.0
+
+### Patch Changes
+
+- be1a061: A Claude Code seat whose run turn passed a permission or input prompt now yields `done` when the turn ends. The plugin registers `PostToolBatch`, and when the main agent's batch resolves after the prompt, the connector sets the seat back to `working` and clears the condition, even while the `waiting` write is still being published. A subagent's batch leaves the prompt in place, and a batch relayed after `Stop`, `StopFailure` or `SessionEnd` leaves the ended turn's status and condition alone. Before this the turn ended `waiting` to `idle`, which is not a turn boundary, so the run step stayed pending until the seat was reaped and presence kept the `approval` condition while idle.
+
+## 0.80.0
+
+### Minor Changes
+
+- d759b79: Managed Claude seats now launch with `--permission-mode bypassPermissions` by default. A spawned seat has no human at its terminal, so under the default mode its first `cotal_dm` stopped at a permission prompt nobody could answer and the seat looked dead to its peers. An operator who wants prompts back passes `--opt permission-mode=default` (or any other mode); the connector adds the default only when the launch options carry neither `permission-mode` nor `dangerously-skip-permissions`.
+- 5417401: Authorized managed Claude launches now accept the selected workspace through the native trust dialog. Startup choices are matched against the current screen and answered once before the existing development-channel confirmation. Foreground trust prompts are unchanged. No tool-permission bypass flag is added; accepting trust enables the checkout's own hooks and settings. Upgrade the connector, core and runtime together; older runtimes do not implement the new startup choices.
+- fded3ab: A seat never leaves the mesh because its event plane stopped, and the plane comes back on its own. The emitter holder re-establishes the plane at once after any failure, then every second while it stays down, by a fresh start that replaces the emitter: it reopens the write-ahead log, settles any pending frame, and builds the connector's mapper from the run the log has open before reading on. A turn that ends while the plane is down keeps its terminal, as does one whose terminal's own log write failed, and the re-establish closes that run with it once it has read on; every turn that ends during one outage keeps its own terminal, placed on the last turn the source had begun at the position the terminal was reported at (a turn the mapper opens no run for takes its terminal and publishes nothing, and a repeated terminal replaces nothing), a terminal is owed to its run until the frame carrying it freezes, a terminal reported with the plane up goes to the emitter at the hook too so a flush still reading when the next prompt lands closes the turn with its own terminal, and when the next prompt was already written before the plane came back the failure is published in place of the finish that prompt would have synthesized, in a frame of the failed run and ahead of the next run's first. The mapper contract gains `{ turn: true }` for a record that begins a turn and opens no run. `DurableSource` gains `end()`, the cursor after the last complete record as of the call, which every connector's source implements; the holder's hooks gain `sourceEnd`, `closeRun` returns a promise that resolves once that position is read (the Claude Code hook awaits it before replying), and the emitter takes a `ReportedTerminal` through `queueTerminal`, with `waitingTerminals`, `takeOwed`, `unsettled` and `seedLastTurn` beside it. The wait between attempts is fixed: it neither doubles nor caps, so the plane is back within a second of the fault clearing. The pi adapter's start factory, re-entered by the re-establish, checks the native file instead of reading an acknowledged cursor as a vanished file, and seeds its mapper from the pending frame. A transcript line that is not a record is stepped over and reported on every connector, the jcode journal wrapper included, and one written past the position a terminal was reported at does not hold that terminal: it is placed after the records before it, as is a terminal reported past a record no read answers, such as an OpenCode part still filling when its turn died, which used to hold the turn end reading the session without end; the OpenCode source now reads every record at or before the end reported at a turn end as settled, so that part no longer stops the turns after it from publishing. A terminal reported while the very first start is still waiting on the broker reaches the emitter before its first read, where it used to be queued behind the flush that read past it and close the next turn. On a space that requires events the seat used to exit with code 1 instead; for Claude Code that exit was the "MCP server cotal has disconnected" banner, and Claude Code restarted the server on the next tool call. The `eventPlaneStopped` sink no longer takes `required` or `stopSeat`, the holder's `onError` receives the delay before the next re-establish (`0` for at once) and `retryMs` is that fixed wait, the Claude and OpenCode mappers take `resumeRunId`, and a reported unreadable-line reason carries no text from the record itself.
+- fded3ab: A transcript line the harness left unreadable no longer ends the event plane for good. A write cut short by a full disk leaves part of one record glued to the next on a single line; the reader threw on that line and its cursor never passed it, so every restart died at the same byte, and on a space that requires events the Claude Code connector exited with it, which the harness showed as a disconnect. `JsonlFileSource` now steps over such a line and reports it on the read as a `SourceGap` with its offset, length and the parser's reason; `AguiEmitter.start` takes an `onUnreadable` reporter and refuses to advance over a gap when none was given. The Claude Code connector reports each gap on its stderr and keeps the records after it.
+
+## 0.79.0
+
+### Patch Changes
+
+- 6ff1075: The Claude Code AG-UI mapper's comments no longer restate its origin tables by hand. The module header listed `human` and `channel` as the only origins that open a run, while `ORIGIN_RULE` also opens `auto-continuation`; it now points to `ORIGIN_RULE` and `ABSENT_ORIGIN_RULE` as the only list. The `promptSource` field doc no longer says only `"sdk"` is read, and the run-opening comment no longer calls `channel` the only change from the plan's table. No behavior changes.
+
+## 0.78.1
+
+## 0.78.0
+
+### Patch Changes
+
+- 1bda7c1: A Claude Code session driven by hand without a control endpoint is now refused with a message that names `COTAL_CONTROL_SOCKET` and `COTAL_CONTROL_TOKEN`, and the configuration reference says a hand-driven Claude Code or jcode session sets both. The reference used to say `COTAL_CREDS` and `COTAL_SERVERS` were enough, and the refusal named neither variable.
+
+## 0.77.1
+
+### Patch Changes
+
+- a1948eb: The Codex and Jcode hosts now arm the event plane when the session's registration requires events, even without `COTAL_EVENTS`. They used to read only that flag, so a hand-driven user-mode launch with `COTAL_EVENTS_REQUIRED=1`, or a custom launcher that passed `eventsRequired` with events opted out, ran with no event plane and the required-events policy never applied. The Claude, OpenCode, Codex, Jcode and Pi launches that carry `eventsRequired` now also set `COTAL_EVENTS` and the workspace root when the launcher passed `events: false`, so the armed session has a place for its event log. Both decisions go through `launchArmsEvents` and `eventPlaneArmed` in `@cotal-ai/connector-core`; an OpenCode 2.x session still reads only `COTAL_EVENTS`.
+
+## 0.77.0
+
+## 0.76.0
+
+### Minor Changes
+
+- 15d10c9: Refuse competing patched same-host consuming sessions without replacing their logical inbox owner. Preserve live control listeners and existing foreground actor material. Make fresh local foreground grants and departure cleanup generation-aware. This containment does not fence other hosts, broker URL aliases or older clients.
+
+### Patch Changes
+
+- 665fa71: Keep MCP alive while event recording waits for an initial mesh connection or a reconnect. Resume queued event publication when both the mesh binding and transport recover, and cancel the wait on shutdown without weakening required-recording failures.
+- 9baeb35: The Claude Code event mapper now exposes only what the connector calls: `map` and `forgetOpenRun`. It drops `closeOpenRun`, `openRun` and `diagnose`, which nothing shipped called. The `Stop` and `StopFailure` hooks close a session's last run through the event holder, and the mapper's header now says so instead of saying that run never closes. No behavior changes.
+
+## 0.75.0
+
+## 0.74.0
+
+### Patch Changes
+
+- ad81083: The connector on/off flags `COTAL_CHANNEL`, `COTAL_EVENTS`, `COTAL_EVENTS_REQUIRED`, `COTAL_CODEX_TUI` and `COTAL_JCODE_TUI` now share one parser in `@cotal-ai/connector-core`. It accepts `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` in any case, treats an unset or blank value as unset, and refuses anything else at startup with an error naming the variable and the value. Before, each connector kept its own copy and read any other value, such as `enabled`, `2` or `y`, as off without a word. The OpenCode 2.x adapter now refuses `COTAL_EVENTS=true` the same way it refuses `COTAL_EVENTS=1`, where before only `1` was refused.
+
+## 0.73.0
+
+## 0.72.1
+
+## 0.72.0
+
+## 0.71.0
+
+## 0.70.2
+
+## 0.70.1
+
+### Patch Changes
+
+- 40f637b: The Claude connector now decides whether to push `claude/channel` wake nudges when the MCP client completes its handshake. With `COTAL_CHANNEL` unset it used to read the client's capabilities as soon as stdio was attached, before `initialize` had been read, so the capability was always empty and nudges stayed off even for a client that declares `claude/channel`. `COTAL_CHANNEL` still overrides the detection, so sessions started by the Cotal launcher, which sets it to `1`, keep their nudges on.
+- 5c6c92d: The Claude Code lifecycle hook no longer loads the NATS client, zod or yaml on every event. It imports `runHookRelay` from the new `@cotal-ai/connector-core/relay` subpath, whose environment readers (`hasIdentity`, `controlFromEnv`) now live in their own module and read the launch material through the new `@cotal-ai/core/launch-material` subpath, so neither package's barrel is in the hook's graph. `dist/hook.cjs` drops from about 1.5 MB and 305 modules to about 10 kB and six, and a hook event with no mesh identity now costs what a bare `node` does. Both readers are still exported from the package root.
+
+## 0.70.0
+
+### Minor Changes
+
+- 76113ce: `AguiEmitterHolder` now takes its hooks as one named object after the emitter factory, `new AguiEmitterHolder(startEmitter, { onError, onRunClosed, waitLive, runMeta })`, typed by the exported `AguiEmitterHolderHooks`, where only `onError` is required. Before, the four hooks were positional, and a `runMeta` provider passed third was accepted as `onRunClosed`: it typechecked, ran after the run had already closed, and its metadata was dropped with no error. A caller no longer fills earlier slots with `undefined` to reach a later hook. The Claude Code, Codex, jcode, OpenCode and pi connectors pass their hooks by name, with no change in behavior.
+
+### Patch Changes
+
+- 95788eb: A seat whose AG-UI event plane stops for good now follows the space's policy on every connector. On a space that requires events the seat stops, where Pi, Claude Code and OpenCode used to keep it running without events. On any other space the seat keeps running and its log records `AG-UI emitter stopped`, where Jcode used to stop the seat and refuse further turns. Codex no longer rebuilds a stopped plane at its next turn boundary on any space, and it now waits for the mesh before starting its emitter, as the other connectors do. The rule is `eventPlaneStopped` in connector-core, which each connector passes its log sink and its stop hook.
+- b01ab5d: Restate the remaining comments in the connector-core event WAL and the Claude Code AG-UI mapper as the rule each one carries, in the present tense. They no longer tell the story of an earlier version, speak in the first person, or name the internal reviewers who found a defect, so none of that reaches the published `dist`. Every rule they held is kept: no `sourceCursor` relation because a cursor is opaque, one check for an absent `pending` key, no seeding in `bindSubjectFrontier`, `expectedTip` throwing while unbound, the stale-writer refusal before the shared record moves, and the `O_EXCL | O_NOFOLLOW` random-name temp file. No behavior changes.
+
+## 0.69.0
+
+### Minor Changes
+
+- 2d45766: The cotal config reader now refuses a shared MCP server that cannot launch as written, naming the file and the field (`cotal config <path>: connectors.<name>.mcpServers.<server>.<field> must be ...`). A wrong-typed `command`, `type`, `url`, `args`, `env` or `headers` used to pass the reader and fail every Claude spawn with a bare `TypeError` that named neither, and a server with no transport to start (no `command` for stdio, no `url` for http, sse or ws, or any other `type`) was forwarded to `claude` and silently never loaded. `cotal setup` copies a server from the Claude config by the same check. A config file that holds such a server now refuses every spawn until it is fixed; `docs/UPGRADING.md` lists what to check before upgrading.
+
+## 0.68.0
+
+### Minor Changes
+
+- 585fdb2: Connectors launch on the model and variant their launcher resolved. `LaunchOpts.model` and `LaunchOpts.variant` are now the launcher's resolved values (the flag, else the agent file's `model:` / `variant:`), and every connector renders them as given instead of reading the agent file again in `buildLaunch`. Before, a model the launcher did not resolve was taken from a later read of a file that could have changed since, so the seat could run a model the launcher never checked or recorded, and a supervised restart re-read it each time. The in-session config takes the model and variant from `COTAL_MODEL` / `COTAL_VARIANT` only, so the card and the orientation pin no longer report a model the seat was not launched on. The Hermes connector no longer falls back to `HERMES_MODEL` from the spawning process, including one `spawn.env` forwards; set the model with `--model` or the persona's `model:`. Code that calls `buildLaunch` directly must pass `model` and `variant` itself.
+
+### Patch Changes
+
+- bdb0132: The Claude connector now finds a session's `/rename` title when the transcript row spells its type with a JSON escape, such as `"custom\u002dtitle"`. Before, such a row was skipped: a detached `--resume <name>` naming that title went to the manager host as an id instead of being refused, the carried title was missing, and a later rename written that way lost to an earlier one. Every transcript line is now parsed before its type is read.
+- 33be936: A Claude Code seat no longer re-prints the wake nudge for a DM it already announced each time JetStream redelivers that DM. While one long tool call kept the hook drain from running, an unacked DM was redelivered every 60s and every copy queued another identical "New dm" notice, so a 51-minute call left about 50 of them per message. The connector now nudges once per message until a hook frame carries it, including a message first counted in a batch notice, and a redelivery after a frame whose reply never reached Claude Code still nudges again, even when the original nudge was still queued behind a full stdout. The retry after a rejected nudge follows the same rule: it counts only messages no live nudge announces, and a rejection that a newer nudge already superseded is not retried. `MeshAgent.pendingWake` takes an optional predicate that leaves out items the caller has already woken the session for.
+- 681c5b0: A supervised Claude seat whose directory the manager host's own Claude does not trust is now refused before it launches, with an error that names the directory and Claude's workspace-trust dialog. Claude opens such a directory on that dialog, whose default answer exits, so the seat used to die on launch with only `EntertoconfirmEsctocancel` as its last output. Trust is read as Claude reads it: a parent directory's trust counts up to the root of the directory's own Git repository, and a linked worktree shares its main checkout's trust. The manager passes the seat's directory to the connector as the new `LaunchOpts.cwd`, so a spawn, a supervised restart and a preserved-seat resume are all checked. A foreground `cotal spawn` still shows the dialog in the operator's terminal. A carried resume uses the same check.
+
+## 0.67.0
+
+### Minor Changes
+
+- f389576: `cotal spawn --resume <id> --detach --on <instance>` carries a Claude session held on the operator's host to a manager on another host, as `docs/design/resume-transfer.md` lays out. The CLI finds the transcript with the connector's new `resumeTranscript` locator and writes it into a JetStream Object Store bucket owned by the target instance, in chunks sized to the broker's `max_payload`, as a chain that an interrupted carry continues. The manager's new operator-only `transcript-receive` command stages it, removes the broker object, and issues a one-time `resumeClaim` that `spawn` consumes; a re-run of the same bytes moves none. The seat forks the transcript in a seat-private Claude home that authenticates with an environment credential, and `cotal ps --wide` names the source host, session, digest and carry time. The manager cluster document moves to revision 21. Two one-shot credentials carry it on an authenticated mesh: a `transfer-writer` the CLI mints from the space's signing seed for the one transcript it hashed, or on a user-auth mesh exchanges from the operator's login as the new `transfer-writer` view (scope `admin`), and a `transfer-reader` the target manager mints for its own bucket on each receive or sweep, or that the host issues a remote manager through the new manager-service `transferReader` operation. A carried seat records the digest of the transcript Claude forked, and the manager stops a seat whose record does not match the carried bytes, including one whose launch was uncertain and that joined later. Space deletion lists the transfer buckets and deletes them: `deleteSpace` given the space's trust material mints its own `teardown` naming them, and it now throws naming every stream it could not delete instead of reporting success. The console space picker deletes a space this host registered as a static-auth mesh that way. The `transfer-writer` view, and the broker connection minted from it, lives at most five minutes, the static credential's lifetime.
+
+### Patch Changes
+
+- 7f909a1: Remove sentences from the AG-UI holder and the Claude Code and OpenCode AG-UI mapper comments that described what earlier revisions of those comments got wrong. The comments now state only the current contract: the `boundPath` gate keeps start-once, the chain serializes hook events, the refusals live in `subject-frontier.ts` and `event-wal.ts`, the bracket interleave is open, OpenCode publishes `RUN_ERROR` through `AguiEmitterHolder.closeRun`, and the Claude Code mapper keeps its measured predicate counts. No behavior changes.
+- 8e0c2a3: Remove comment passages from the connector-core event WAL and the Claude Code AG-UI mapper that narrated earlier revisions of those comments, who flagged them, and the session they were written in. The `bindSubjectFrontier` doc ends at its contract, the temp-file write keeps its `O_EXCL`, `O_NOFOLLOW`, random suffix and `0600` rationale, and the mapper header states its measurement directly: 67 runs and 5217 events on the 5938-record session, with `diagnose()` returning `null`. No behavior changes.
+
+## 0.66.1
+
+### Patch Changes
+
+- abddc24: The Claude Code connector now leaves the mesh when its stdin closes. An MCP client closes the server's stdin to end the session, and a killed `claude` closes it without firing `SessionEnd`. The connector used to keep running after either, held open by its mesh connection, so it kept heartbeating presence and every peer's `cotal_roster` showed the dead session as a live peer indefinitely. It now stops on stdin end as it does on SIGTERM, publishing `offline` before it exits.
+
+## 0.66.0
+
+## 0.65.0
+
+## 0.64.0
+
+### Minor Changes
+
+- d121d21: Design record for carrying a detached `cotal spawn --resume <id> --detach --on <instance>` session to a manager on another host (`docs/design/resume-transfer.md`). The transcript moves through a per-space JetStream Object Store bucket for the target manager instance, in chunks sized to the broker's `max_payload`, with a chunk chain that resumes an interrupted upload and a content-addressed staging copy that makes a repeat move no bytes. The manager gains the operator-only `transcript-receive` command and `spawn` gains a one-time `resumeClaim`. The carried transcript is placed in a seat-private Claude config home that authenticates with an environment credential, and `cotal ps` and `cotal attach` show where a seat was resumed from. The implementation follows this record in the same change.
+
+## 0.63.0
+
+### Patch Changes
+
+- 9d5cc09: First-run `cotal setup` now shares your own Claude Code MCP servers with the sessions Cotal spawns. It copies the user-scope servers from your Claude Code config into the cotal config's `connectors.claude.mcpServers` and names them in its output, so a spawned session has the tools you know plus the cotal tools. Before this, a spawned session loaded only the cotal server and setup never said why. With none to copy it writes an empty list, and a cotal config that already declares that list keeps it. A server with an `env` or `headers` value that is anything but `${VAR}` references is left out and named, because the cotal config keeps secrets only as `${VAR}` references. So is an entry no session can start, such as one with a missing or empty `command` or `url`, or one whose `command` is not a string. For a lighter seat, remove entries from the cotal config or spawn with `--share-tools none`. Connector setup providers gain an optional `mcpServers` action whose `seed` input the CLI binds to workspace's new `seedConnectorServers`, which writes under a lock so two setups run at once record one list. Core exports `readCotalConfigFile` and the `ConnectorShareSetupInput` type, and connector-core exports the `ENV_REFERENCE` pattern it already used.
+
+## 0.62.0
+
+## 0.61.0
+
+### Patch Changes
+
+- 8a9d279: The repo now carries an installable Claude Code plugin tree under `claude-plugin/`. Each release regenerates it with the built MCP and hook bundles, the `team-topology` skill, a README and the license, and stamps both plugin manifests with the release version, so an install from the repo's marketplace or from a pinned commit runs without a build and updates with each release. The marketplace at `.claude-plugin/marketplace.json` now points at that tree. Both plugin manifests also gain `homepage`, `repository`, `license` and `keywords`.
+
+## 0.60.0
+
+## 0.59.0
+
+### Patch Changes
+
+- bdaa187: Keep the Claude Code connector's MCP server answering in a plain session. With no `COTAL_NAME`, `COTAL_LINK` or `COTAL_AGENT_FILE` it used to exit before `initialize`, so every plain `claude` with the plugin installed showed `Connection closed` and an MCP introspection check such as Glama's saw no tools. It now serves one static `cotal_how_to_join` tool over stdio and still stays off the mesh: no mesh agent, no broker connection and no control socket.
+- cfc3b95: `cotal status` now has one Machine row per installed connector instead of fixed `Claude` and `OpenCode` rows. Each row reports whether the executables that connector declares in `requires` are on PATH, so a machine running Codex, jcode, pi or Hermes sees its harness. The `Claude plugin` and `Claude skills` rows now come from the Claude Code connector: a setup provider may declare a read-only `status`, and `cotal status` and the setup card print the rows it returns. A machine without the Claude connector no longer shows them. The extensions manifest caches each connector's setup ref, so status imports only connectors that declare a provider, and the seed reconcile refreshes a seeded entry whose cache predates it instead of checking the Claude connector by name. The debug handoff that `cotal setup` offers when a step fails now comes from connectors: a setup provider may declare an `assist`, and the menu offers one `Debug it with <harness>` option for each present connector that declares one. The Claude Code connector declares the existing Claude handoff. When no connector can host a handoff, the menu says so instead of silently omitting the option.
+- 608f5f4: Re-attach doc comments that had drifted away from the declarations they document. A `/** */` block followed directly by another one documented nothing, so editor hovers and the published type declarations showed no doc for the intended declaration (for example `Manager`, the `plane3` field and `AclResolver`). Each such block now sits above its declaration, is merged into the block it duplicated, or is removed when its declaration no longer exists. A new `pnpm check:doc-comments` check, run as part of `check:docsbundle`, refuses a doc block followed directly by another in shipped source.
+- 8316efb: A Claude Code hook that throws after it has started to surface peer messages no longer acks them. The empty reply it returns carries nothing, so the batch stays un-acked and reaches the model on a later frame. The seat also drops `turn-pending` rows that break the manager contract, such as one with no integer deadline, which used to make every hook frame throw. A `turn-pending` reply with no `turns` array leaves the seat's known turns in place.
+- 5f13124: Private launch files now have an owner. The Claude persona file, the Claude shared-server MCP config file and the pi persona file are listed on the new `LaunchSpec.artifacts`, and the launcher removes them once it has proved the agent process gone. On the default pty runtime the manager removes them when it sees the agent exit; on tmux, cmux, orca and herdr the manager removes them by polling the seat's status and waiting for the runtime's exit proof; the foreground `cotal spawn` removes them when its child exits. Every one of those launches also starts its child through the new core `reclaimWithChild`: a watcher started beside the child removes the files once the child's process is gone, and tries a failed removal again every five seconds until it succeeds, so a killed manager or foreground `cotal spawn` no longer strands them (POSIX; Windows has no shell for the watcher). Each directory name carries a random per-launch identity, so a stale path can never name a later launch's directory. The tmux, cmux, orca and herdr runtimes now throw the new core `SpawnRefused` for an unsafe name, an unreachable backend, (herdr) a missing working directory or an unknown layout, (orca) a working directory that is missing or outside any Orca worktree, and a launcher script they cannot write or (tmux, herdr) a session or server that will not start, all before the agent's command is handed to the backend, and the manager removes the files at once. A removal that fails, after an exit or after a refusal, is tried again until it succeeds. A batch resume removes the files of specs it built and never launched. Both connectors now refuse a bad model, prompt or launch option before writing anything. Any other spawn that throws is not proof that nothing started, so its files stay for the child's watcher, or for the OS temp reaper when no child started, as do a killed launcher's on Windows. A seat started under a custodian with `launchSeat` from `@cotal-ai/seat`, which the manager no longer does for a new launch, hands them to that custodian: a launch it refuses before any process started removes them at once, the custodian removes them when it sees the agent exit, a removal that fails stays on the custody record, and a reap that proves the seat gone removes what the record still lists from the temp dir the launch wrote to, so a successor with a different `TMPDIR` still removes them. Losing a custodian's connection no longer counts as the agent's exit. The docs now say that owner-private means any process running as the same user can read the file while it exists.
+
+## 0.58.0
+
+## 0.57.0
+
+## 0.56.1
+
+### Patch Changes
+
+- 6b76946: A seat resumed from a preservation cut backfills its channels from the chat stream sequence its prior incarnation had reached instead of replaying the whole retained window.
+
+## 0.56.0
+
+## 0.55.0
+
+### Patch Changes
+
+- a13c8bb: Capture the event plane's start boundary at adopt instead of at the emitter's first read, so a complete record written while the connector is still starting up (the mesh wait, log open, and preflight) is no longer silently dropped. Claude Code and OpenCode both wrap their session source with the shared `BoundStartSource`.
+- de989c0: The events-arm smoke asserts the connector's event channel is core's function by identity, so a clone that agrees on one sample is caught.
+- d284ee6: A manifest or spawn prompt on a connector that cannot deliver one is refused at preflight (including `up -f --dry-run`), at spawn and in the manager, the way an unsupported model variant is: connectors now declare `supportsPrompt`, and claude, opencode, codex, jcode and pi declare it; hermes keeps its launch-time throw as the second line of defence.
+
+## 0.54.0
+
+## 0.53.0
+
+## 0.52.1
+
+### Patch Changes
+
+- d28860f: Preserve working or waiting presence when a Claude session restarts during an open turn, including compaction. Reset to idle only when no turn is open.
+
+## 0.52.0
+
+## 0.51.0
+
+### Minor Changes
+
+- 64d723e: Enable the AG-UI event plane by default for connectors that publish one. Operators and peer spawns
+  can opt out explicitly, while connectors without an event plane refuse unless that opt-out is set.
+- ec8649b: Preserve the closed required-events registration policy and enforce it across discovery, launch,
+  grant coverage, direct connector sessions, and trusted upgrades of existing manual registrations.
+
+### Patch Changes
+
+- 0a03e3e: Wait for a forked Claude session's transcript before the first event read. Claude copies the parent
+  transcript into the fork's own file after its SessionStart hook, so the connector's first flush could
+  open a file that did not exist yet and silence the session's event plane for good. The fork path now
+  waits for the file with the startup path's bounded deadline and still adopts at the copied history's
+  end.
+- 4dd4b90: Add harness-reported presence conditions, opaque environment references, binding diagnostics, and compact roster rendering.
+
+## 0.50.1
+
+## 0.50.0
+
+### Minor Changes
+
+- b7e5942: A peer can no longer forge the framing of an auto-injected message
+
+  The block that carries waiting peer messages into a turn interpolated the message body and the
+  sender name raw, and the Hermes sidecar built the same shape by string concatenation. Both were
+  forgeable the two ways the inbox reply used to be: a body carrying a newline produced a second item
+  in the block, reading to the agent as a separate delivered message from a peer that never sent one,
+  and a sender naming itself with a closing bracket ended the real attribution and opened a forged
+  one. These frames are auto-injected rather than returned when the agent asks, so the agent never
+  had a chance to distrust them.
+
+  The rule both surfaces now hold is the one the inbox reply already held, and they hold it through
+  the same code rather than a second convention: a line that begins at column zero is written by the
+  connector, never by a peer. One message is one line plus indented continuations, with the
+  attribution inside a single bracket pair. The neutralization moved into a shared module that the
+  injected block and the inbox reply both render through, so the body, the sender name and role, and
+  the service and channel labels all pass through one implementation. The Python sidecar carries a
+  matching module, kept to the same character class on purpose, since a peer that can forge the frame
+  on either side of the socket has the whole class back.
+
+  Two widenings came out of stating the rule positionally rather than by example. The attribution
+  class now neutralizes the opening bracket as well as the closing one, because stripping only the
+  closing one still let a name render a bracket pair a reader takes as the innermost attribution. The
+  injected block's per-item separator is the bracketed attribution the inbox reply uses, replacing the
+  bullet, so the text of an injected block changed and the wake-path suites that assert on it were
+  updated with it.
+
+  A third injected surface holds the same rule now. A wake hint carries no message body and reads as
+  one short sentence, so it does not look like a frame, but it is written into the agent's context
+  without being asked for and it names a peer-controlled channel label, which three connectors
+  interpolated raw. A label carrying a newline put a second line at column zero reading as another
+  delivered message. That label renders through the shared module too, and the absent-channel fallback
+  moved there with it, since three connectors each spelled it themselves and an absent field is what a
+  per-call-site spelling is most likely to get wrong.
+
+## 0.49.0
+
+### Minor Changes
+
+- 36d1779: Issued authority and run admission (SPEC 13.15, 14.8). A static credential is now an issuance: the issuer records its permission ceiling as evidence under a fresh generation before the material exists, its endpoint rows ride the versioned `ep.v1` rail with that generation pinned beside the caller triple, and a connected client reads its generation from an issuer-written accepted row. A hosted workflow run is admitted under the starting caller's resolved ceiling, recorded once per run in a dedicated admission store the driver cannot write, checked before every channel effect (wait open, fetch, recorded re-read, conclave writes), and revoked by an independent create-only marker that ends open waits at their next poll and refuses resume, takeover and reconcile. `run-start` on the legacy rail is refused with `permission-denied` and the `ai.cotal.ep.unbound-caller-authority` detail. `cotal run start --local` takes `--admit-read` and `--admit-publish` (required) and `cotal run revoke <runId> --local --by <who> --reason <text>` writes the marker. Three new per-space stores (`cotal_issued_`, `cotal_accepted_`, `cotal_admission_`), immutable at the broker: the admission and accepted stores are write-once per key, the evidence store is append-only and read first-on-key, and all three refuse rollup headers, message deletes and purges, so a holder of its own key row can neither widen nor erase what was recorded. Two new one-shot profiles (`issuer`, `run-admitter`), an admission read on the run mediator and operator profiles, and `COTAL_ACCEPTED_TOKEN` on every connector's spawn environment. Breaking pre-1.0 authority change.
+
+### Patch Changes
+
+- f4672fd: Generate the Claude Code marketplace manifest with object plugin entries
+
+  `cotal setup` wrote `.claude-plugin/marketplace.json` with `plugins` as bare names. Claude Code
+  validates that form, so `plugin marketplace add` and `plugin marketplace update` both report
+  success, and the install then fails with `Plugin "cotal" not found in marketplace "cotal-mesh"`.
+  The message points at a stale local copy rather than at the manifest, so the suggested
+  `marketplace update` changes nothing, and re-running setup regenerates the same file over a hand
+  repair. Setup pauses at that step, so later steps including persona seeding never run.
+
+  Each present plugin is now listed as an object carrying `name`, `source` and the `description`
+  read from that plugin's own `plugin.json`.
+
+- 9a334ae: Honor connector-declared startup confirmation prompts in PTY seats by matching normalized terminal output, pressing Enter only when the prompt appears, and failing with a named bounded error when it does not.
+
+## 0.48.2
+
+## 0.48.1
+
+## 0.48.0
+
+## 0.47.1
+
+## 0.47.0
+
+## 0.46.0
+
+## 0.45.0
+
+## 0.44.0
+
+## 0.43.0
+
+## 0.42.0
+
+### Minor Changes
+
+- a87709c: Every cotal-lang effect now performs on the mesh: the durable-action group is built end to end and
+  the not-yet-durable seam is gone.
+
+  `spawn` submits a real manager goal and returns the allocated seat's handle, and meters the
+  agent's `permits` (`turns`, `wallClock`; the turn that would exceed one is L4001, and a budget the
+  host cannot meter is refused at spawn); `conclave` opens a scoped sub-team as durable membership
+  rows; `ask` parks schema-checked pauses answered through `cotal run answer` and tells the agent
+  over the turn relay, one relay per attempt carrying the schema, the attempt and the previous
+  refusal, which every connector's intake renders with the answer command; `monitor` registers the
+  handle on its journal entry and `wait(down)` reads a monitored incarnation's death off presence
+  liveness, refusing an agent nobody monitored.
+  `turn` rides a new pull-shaped manager relay: the manager serves `turn` (targeted, the
+  despawn/input reach) plus `turn-pending` and `turn-yield` (self reach, manager contract revision
+  10), holds the payload on the goal-index note, pins the goal to the seat's incarnation, and denies
+  at a goal-bound deadline hold; the seat side (all connectors) pulls pending turns, surfaces them
+  two-phase into host context, auto-yields `done` when the host turn ends, and yields `blocked` or
+  `handoff` through the new `cotal_yield` tool; the run client renders context with pending notices,
+  arms its own pause on the acceptance's deadline as the L4003 authority, watches presence as the
+  L4002 authority (a death the manager marks on the deadline terminal reads the same way), and
+  honors handoffs (L4005/L4004 validation, the `handoffFrom` goal chain); the manager shows a seat
+  one turn at a time. The relay holds on an auth mesh: the agent baseline gains the self-mode
+  `turn-pending` and `turn-yield` rows, the operator seat-write set (`control-caller-admin`, the
+  `admin` capability) gains `turn` beside `input`, and the manager mints the deadline hold's
+  schedule over its serve connection and owner-expires the hold once due instead of reading a
+  fire it holds no grant for. `wait(replied)` observes the run's own turn terminals as a level, and never a
+  turn the run itself ended without an accepted yield. A `spawn` may bind a logical worktree: the
+  validator rejects two literal-worktree spawns in one concurrent scope (L3022, named branch
+  functions included) and the runtime claims a tree before it submits, refusing a second spawn into
+  a tree held by a live seat or by a spawn in flight (L4008), with sequential reuse the moment the
+  holder's presence lapses. A spawn refused at accept is L4000 (L4001 for seat capacity) and one
+  whose seat never came up is L4002; an `ask` whose deadline passes with no conforming record is
+  L4006; a fork copies a spawn that said `onFork: "adopt"` and refuses one that would have to
+  respawn (L5019). The run driver re-issues
+  recorded-but-undischarged cancellations at adoption, so recovery does not wait for completion to
+  release a dead loser's seat, pause, or tree. A migration's `--adopt <handle>` hands the orphaned
+  seat to the edited program's next spawn of that persona, and `--release <handle>` despawns it at
+  commit through the run's own discharge; both name the agent the step spawned, and a spawn that
+  produced none is an orphan like a sleep; the adopting spawn binds the orphaned spawn's goal as
+  its own, so a resume re-reads the seat and a cancellation despawns it. A turn accept the manager
+  cannot finish unwinds to a failed terminal on its bound goal, and a retry of it is refused naming
+  that terminal. The delivery daemon hosts the checkpoint timer writer, so mediated deadlines fire
+  with no suite pump.
+
+## 0.41.4
+
+## 0.41.3
+
+## 0.41.2
+
+### Patch Changes
+
+- 04dc3fb: Forward the documented Amazon Bedrock and Google Cloud provider credentials into managed Claude Code seats. Keep the explicit environment allowlist and grade it against an independent documentation-derived fixture.
+
+## 0.41.1
+
+## 0.41.0
+
+## 0.40.0
+
+## 0.39.1
+
+## 0.39.0
+
+### Minor Changes
+
+- 34ff272: `cotal run`, the workflow-run operator surface, self-registered by `@cotal-ai/runtime` and composed
+  into the `cotal` binary: `start --file <program>` drives a new run on the mesh handler, `resume
+<runId> --file <program>` takes an existing run over and drives it to quiescence, `ps` lists an
+  endpoint's run records (state, holder, journal high-water, fork lineage), `journal <runId>` prints
+  the durable step journal, and `answer <runId> <stepKey> --by <who> [--value <json>]` resolves an
+  open checkpoint through the run driver, presenting as the arming holder read back from the
+  checkpoint record (resume is holder-bound). One raw connection per invocation against the resolved
+  mesh target; the journal's result bound is taken from the broker's own max_payload.
+
+  `docs/workflows.md` gains an "Operating a run" section, the connector docs bundle carries it, and
+  every connector folds a workflow steer (`WORKFLOW_STEER`) into its agent instructions beside the
+  mesh-first steer, so agents reach for a durable journalled run instead of improvising long
+  coordination loops in their own context.
+
+## 0.38.0
+
+### Patch Changes
+
+- 7ea4757: Keep Claude personas out of process arguments by writing them to an owner-private file and using Claude Code's prompt-file flag.
+
+## 0.37.0
+
+### Patch Changes
+
+- 31443f1: Make package-filtered test commands run counted assertions instead of succeeding without tests.
+- a9947d6: Reconcile a wake when the Claude channel activates. A focus mention received during channel startup is re-notified before buffered inbox work, while repeated active state remains a no-op.
+- e703873: Report connector harness availability at manager boot and expose resolved binary paths in status.
+- b7b932e: Point status skills rows at `cotal setup --skills`, with harness-native setup declared and implemented by connectors rather than the base CLI.
+- b88edd9: Connectors declare `supportsToolListAnnounce` (default-deny). A connection-changing op against a connector that cannot announce a tool-list change fails loud, without naming harnesses in shared code.
+
+## 0.36.0
+
+## 0.35.0
+
+## 0.34.0
+
+## 0.33.9
+
+## 0.33.8
+
+## 0.33.7
+
+## 0.33.6
+
+### Patch Changes
+
+- 7e250a3: Keep Claude lifecycle hooks inside their existing bounded relay window when the connector control socket has not bound yet, and wait boundedly for a new startup transcript that the retained `SessionStart` can precede.
+
+## 0.33.5
+
+### Patch Changes
+
+- 75e890d: Preserve Claude event startup when `UserPromptSubmit` or a turn terminal reaches the connector before the separate `SessionStart` hook process supplies its source context.
+
+## 0.33.4
+
+### Patch Changes
+
+- 2151b4a: Preserve the first Claude event run when a startup prompt is written before `SessionStart`, while resumed, forked, cleared, compacted, and recovered sessions keep their no-history-replay cursor behavior.
+
+## 0.33.3
+
+## 0.33.2
+
+### Patch Changes
+
+- 8e212a6: Fix two defects that each, independently, left the AG-UI event plane permanently silent.
+
+  The lifecycle hooks were declared with a split `command`/`args` shape the host schema does not
+  have, so the host ran `node` with no script and every hook silently never fired — taking presence,
+  peer-message surfacing and the emitter's lazy start with it. The manifest now uses the single-string
+  command form, with the interpolated plugin root quoted so paths containing a space still work. The
+  plugin directory is also passed on both launch shapes; it was missing from the `--prompt` shape,
+  which is how hosted agents start.
+
+  Separately, the emitter set itself up before the endpoint had bound. With `--prompt` the first hook
+  beats the first bind, the holder failed terminally, and one line of stderr was the only trace for
+  the rest of the session. The emitter now awaits a bounded `whenConnected()` before setup, and that
+  wait fails past its window rather than resolving as if connected.
+
+## 0.33.1
+
+## 0.33.0
+
+## 0.32.0
+
+## 0.31.0
+
+### Minor Changes
+
+- 4ef59c3: A spawned seat now receives a constructed environment (PATH/HOME/locale, the machine-wide COTAL\_\* knobs, connector-declared provider keys) instead of the manager's ambient environment. Host-session markers such as CLAUDE_CODE_CHILD_SESSION no longer leak into seats and silently disable transcript saving. The Claude connector declares CLAUDE_CODE_OAUTH_TOKEN (and the rest of claude's documented credential set) so a container seat still authenticates; spawn.env remains the explicit opt-in for extra names, including a host marker a persona has chosen to receive.
+
+## 0.30.2
+
+## 0.30.1
+
+## 0.30.0
+
+### Minor Changes
+
+- 569f4d3: An empty message id is never a dedup key, and an id-less delivery is individually addressable at the drain seam.
+
+  Two distinct messages that each carry an empty id collapsed to one: the receiver-side id
+  dedup read empty-equals-empty as a duplicate, silently dropped the second, and once the
+  first was handled it dropped every later empty-id message on arrival. Measured live, two
+  such messages arrived on the wire and only the first was ever delivered.
+
+  An empty id is now treated as no id: the ingest coalescing (pending, handled, protected)
+  is skipped for it in both directions, so distinct messages that carry an empty id are all
+  delivered. At the drain seam a per-delivery receive key (the wire id when there is one, a
+  per-session secret-namespaced minted key when the id is empty, never on any wire) is what
+  hosts, adapters, and the exact-key drain select by: cotal_inbox, the Claude Code hooks,
+  the OpenCode plugin, the Codex host, the Hermes bridge and its Python sidecar, and the pi
+  driver. The drain API is renamed for what it takes (drainInboxDeliveries, missingKeys).
+  Eviction classification, in-flight holds, scope routing, the focus-recall tie-break, and
+  the scoped drain's selection no longer key on the empty id either. The Hermes bridge no
+  longer wedges on an empty-id message. Delivery pumps in core now treat an absent or
+  non-string id as a malformed envelope per SPEC section 5 (durable terminate, live drop,
+  history and recall skip).
+
+  What this restores: before the receive key, an id-less delivery was unaddressable: the
+  raw id swept every pending empty-id item in one drain call, and once filtering closed
+  that, the item could never be drained or acked, was re-shown on every windowed inbox
+  read, and on a durable channel accumulated as an unretirable entry until the 200-entry
+  overflow valve evicted it, roughly a model turn of churn per entry, while one hostile
+  empty-id ambient publish self-drove back-to-back host turns on the pi adapter. This was
+  a violation of the SPEC section 8 ack-only-after-surfaced obligation at the receiver,
+  not only an adapter defect.
+
+  The cost is stated rather than hidden: with no id there is no coalescing either, so a
+  redelivered copy of an empty-id message can surface twice on a path that is already
+  at-least-once (live remains at-most-once). Dedup for real ids is unchanged: their
+  receive key is their wire id and their coalescing is untouched. SPEC section 4, section
+  7 item 5, section 8, and section 12 item 12 now state the receiver-scoped rule, and the
+  client-builder guidance mirrors it.
+
+  One named follow-up stays open: Plane-3 durable fan-out derives its publish msgID from
+  the message id, so distinct empty-id messages can still be collapsed inside the broker's
+  duplicate window on a durable channel before this receiver sees them. That path is its
+  own issue; this change's guarantee is the receiver.
+
+## 0.29.2
+
+## 0.29.1
+
+## 0.29.0
+
+## 0.28.2
+
+## 0.28.1
+
+## 0.28.0
+
+### Minor Changes
+
+- a71fbd3: A failed turn is published as a run error, so a reader of an event plane can tell a turn that failed from a turn that finished.
+
+  Every connector used to close a run with `RUN_FINISHED` whichever way the turn ended, including a
+  turn its own harness had already classified as failed. `RUN_ERROR` was in the vocabulary, the
+  bracket machine accepted it as a close and the dashboard rendered it, but the shared close path had
+  no way to say it.
+
+  The close on the shared emitter and holder now takes an optional failure, and two connectors supply
+  one from a record they actually receive. Claude Code ends a failed turn on its own `StopFailure`
+  hook, and that turn now closes with `RUN_ERROR` carrying the harness's error kind (`rate_limit`,
+  `billing_error`, `server_error` and the rest) as the code. OpenCode reports a dead turn on
+  `session.error`, and that turn now closes with `RUN_ERROR` carrying OpenCode's own error name and
+  reason, except a turn a person stopped, which arrives on the same event and is not a failure.
+
+  The shared close also bounds that failure detail. Upstream free text (`error_details`,
+  `data.message`) can encode past the live frame ceiling; packing it as-is used to refuse the close
+  before any terminal became durable and then permanently kill the holder. The close now rebuilds the
+  one `RUN_ERROR` so it fits, keeps the code, and the emitted message says the original detail was
+  omitted or shortened because of the bound. A short message is unchanged. There is no second protocol
+  and no per-connector size table: every producer already goes through this close.
+
+  Deliberately not built: connector-specific caps, a second close method, preview-plane truncation on
+  the durable path, and any change to `packUnits`'s fail-loud rule for source observations. Those would
+  not close this hole and would duplicate a contract that already has a caller.
+
+  Migration: nothing is removed and no existing call changes shape. A consumer that only handles
+  `RUN_FINISHED` now sees fewer of them on failing sessions; the event type it needs to also handle
+  has been part of the vocabulary and accepted by the bracket machine all along.
+
+## 0.27.0
+
+## 0.26.0
+
+## 0.25.0
+
+### Minor Changes
+
+- a087c2b: A spawned agent now inherits the operator's environment. A harness you installed and configured
+  should behave under `cotal spawn` the way it behaves when you run it yourself, and the alternative
+  was Cotal maintaining a list of inference vendors: every new provider needed a change in Cotal
+  before it would work through a managed spawn. `MODEL_PROVIDER_KEYS` and the per-connector lists
+  that extended it are gone, and Cotal no longer names an inference vendor anywhere in its source.
+
+  Cotal still resets its own `COTAL_*` namespace before the child starts, keeping the machine-wide
+  knobs (`COTAL_HOME`, the feedback set, the default-agent pair, the `*_BIN` overrides, the timing
+  knobs). That reset is not configurable, because it is identity and not preference: a connector
+  supplies the per-session names for each child and does so conditionally, so an inherited value is
+  never overwritten and would hand an agent another agent's credential path, ACL, or lifecycle uid.
+  The whole prefix is stripped rather than a named list, because which names a connector sets varies
+  between connectors and a deny-list only ever names what its author remembered.
+
+  To confine a spawned agent instead, declare `spawn.env` in the cotal config file. The child then
+  gets a fixed OS allow-list plus exactly the names you list. An empty array is a real policy meaning
+  the OS allow-list alone. Note what this does and does not buy: `HOME` is forwarded either way, so
+  an agent with a shell reads `~/.aws` and `~/.ssh` regardless, and this protects only secrets that
+  live nowhere but the environment.
+
+- 34caaf4: Agent seats no longer export their connection material into the environment every descendant
+  process inherits. The broker URL, the creds path, the auth token, the user-mode identity and the
+  local control token now ride a private 0600 launch-material file whose path is the only thing in the
+  seat's environment; pi, codex and OpenCode drop even that path once they have read it (for OpenCode
+  that happens in the `opencode serve` process its seat shim starts, which is also what runs the
+  session's tool calls), while claude and hermes keep the reference because their readers are
+  short-lived children that start later. A session driven by hand still sets `COTAL_CREDS` / `COTAL_SERVERS` itself, and a
+  launch that carries both carriers is refused rather than resolved by precedence.
+
+## 0.24.0
+
+## 0.23.0
+
+### Minor Changes
+
+- 5e3951a: events: an agent's second session publishes again, and the halt names the causes that can actually produce it
+
+  Only an agent's first session ever published AG-UI events. Every session after it halted the emitter
+  permanently. The write-ahead log is keyed per session and the event channel is keyed per principal,
+  so a new session opened with an expectation that its channel was empty, while its own previous
+  session had already filled it. The broker refused the publish and the emitter stopped for good. On a
+  mesh with user authentication the agent name is the actor, and a restart forks the session id, so
+  the first restart of any agent spawned with the event plane armed was enough to take its event
+  stream dark. An agent on a static credential is reached the same way through preserve and resume,
+  which relaunches the recorded identity while the session under it is new. Reproduced against a real
+  broker across three sessions, and it did not recover on its own.
+
+  Alongside the per-session logs the connector now keeps one record per principal, holding the last
+  sequence the broker assigned on that channel, so a new session continues the stream instead of
+  starting again from nothing. An installation upgrading from a release without that record recovers
+  the sequence from the session logs already on disk, so the fix applies to agents that have already
+  run rather than only to ones starting fresh. That recovery reads the sequence a log took an
+  acknowledgement for but did not fold, which is where the real number sits when a session died in
+  that window, and it refuses a log it cannot account for rather than taking the largest number it can
+  find. An abandonment after a channel purge clears the record with the logs, and a record that reads
+  zero is never re-seeded, because that is what abandonment writes.
+
+  The halt message previously offered three causes, another writer, a restored stream, or a filtered
+  purge, and the real one was not among them, so an operator went looking for a rogue writer. It now
+  names what a moved tip can actually mean, including a concurrent session under the same principal
+  and a frontier record that disagrees with the stream. It also names the one cause that is not
+  another writer at all: a crash between the shared record's advance and the log's own record of the
+  ack leaves the record ahead of the expectation the log is still holding, so the retry publishes a
+  sequence the subject has already passed and the halt looks exactly like a foreign write. The
+  message says what that state looks like on disk. It also states the real gap in the per-principal
+  lock rather than claiming the lock prevents the case the halt fires on: the lock file lives under a
+  workspace root, so a second emitter started against a different root meets no lock, while another
+  host or a stale pid refuse the start instead of slipping past. And where it used to name an
+  abandonment as the remedy, it now says no command performs one, names the directory that has to go,
+  and says removing less leaves a mixed state the next start refuses. Clearing that state is valid
+  only once the channel itself is back to empty, which of the causes above is true of a filtered
+  purge alone; on any other cause the tip stays where it is, so removing the directory returns the
+  same halt with the logs a tip could have been rebuilt from now gone, and the channel purge is the
+  half that comes first.
+
+  The scan that recovers a tip from the session logs refuses a linked entry and refuses a linked log,
+  matching the directory chain that creates this state and already refused a symlinked component.
+  Without that, a link planted where a session directory belongs took the scan to a log in another
+  tree. What it does not close is a session directory swapped for a link in the moment between the
+  check and the open: the non-following open flag covers the final name only, and closing that window
+  would take a per-component walk the scan does not do. A log reachable under more than one name is
+  refused too, and the ordinary way to produce one is copying a workspace with hard links, which makes
+  the recovery refuse every log rather than half-trust them.
+
+  The record itself is now graded on the file rather than on the writer's view of it. A second view of
+  one record could take the tip backwards with no error at all, because the comparison was against
+  memory while the rule was written about the value on disk. Nothing shipped reaches that today, and
+  that is measured rather than assumed: a stale view publishes a stale expectation and the broker
+  refuses it before an acknowledgement exists to record. It is guarded anyway, because an assumption
+  recorded in prose where a guard belongs is what produced this defect in the first place. A record
+  that goes corrupt underneath a live writer is now refused before the write instead of being
+  overwritten, and an abandonment refuses outright when it cannot reach the shared record, rather than
+  clearing the log's half and reporting a completed abandonment.
+
+  MIGRATION: `AguiEmitter.start` now requires a `subjectFrontier`, and refuses at runtime without one
+  rather than falling back to the per-session number, because that fallback is the defect. `EventWal`
+  refuses the same way: a log with no record bound has no publish expectation and says so instead of
+  offering its own last acknowledged sequence, and an abandonment on an unbound log now refuses rather
+  than clearing half of the state, so anyone driving a log outside the emitter must bind one first.
+  Anyone embedding the emitter directly must open a `FileSubjectFrontier` at the `subjectPath` that
+  `ensureEventWalDir` now returns and pass it. Connectors in this repository are updated. No wire
+  bytes move and no grant changes: the channel grammar is unchanged.
+
+## 0.22.0
+
+### Minor Changes
+
+- 57d3a57: A Claude session publishes a structured event plane, and the `tr-<name>` transcript mirror is
+  retired
+
+  A session launched with `cotal spawn --events` now actually publishes. The Claude connector maps
+  its session records to structured events behind the same hook relay the mirror used to sit behind:
+  run boundaries per turn, assistant text, reasoning, and each tool call with its arguments, its end
+  and its result, written to a per-session write-ahead log before they go on the wire so a restart
+  resumes at its cursor instead of replaying or skipping. Until now no connector constructed the
+  emitter at all, so every event channel was empty.
+
+  The `tr-<name>` mirror is removed in the same change rather than deprecated alongside it. Gone with
+  it: the `--transcript` and `--no-transcript` flags on `cotal spawn`, the `transcript` field on the
+  manager's spawn op and its service contract, `COTAL_TRANSCRIPT` and `COTAL_TRANSCRIPT_DEFAULT`,
+  `LaunchOpts.transcript`, `Connector.transcriptChannel`, and the mirror in all three connectors that
+  carried one.
+
+  MIGRATION. If you read a `tr-<name>` channel, nothing publishes to it any more. A managed session no
+  longer mirrors its prose there under any flag or environment variable, and a spawn that passes
+  `--transcript` now fails on an unknown flag rather than being ignored. Read the session's event
+  channel instead: launch with `--events` and subscribe to `events.<owner>.<actor>`, which is keyed on
+  the session's principal. On a static mesh that is `events.local.<key>`, where the key is what the
+  manager allocated and the spawn reply carries it as `id`; on a user-auth mesh it is
+  `events.<your-owner>.<agent-name>`, where the actor half is the agent's own name. `connect-claude.md`
+  gives both forms. `cotal console` and the web console render event frames directly. Unlike
+  `tr-<name>`, you cannot simply subscribe: the plane needs an out-of-band grant, and the command for
+  it is under "To let something read a plane" below.
+
+  What you gain and what you lose, both stated. A tool call now arrives with its full arguments, its
+  end and its result, in a vocabulary a program can read, where the mirror gave a truncated one-liner
+  of glyph-prefixed text. What you lose is prompt text somebody else wrote: the mirror republished
+  every prompt, and the event plane withholds the body of a turn the agent did not author, because
+  republishing a peer's message onto a channel that peer may not read crosses an ACL boundary. A
+  peer-authored turn still opens a run and still shows the work it caused. One stated limit on that,
+  because the loss column is only useful if it is complete: a tool result is this session's own output
+  and is republished, so peer text quoted inside one still reaches the wire. A cell in
+  `agui-authorship.smoke.ts` holds that as a measured limit rather than leaving it to be discovered.
+
+  A spawn may be granted the event plane of the agent it is creating, and no other. A spawn that names
+  a different agent's event channel in `allowSubscribe` or `allowPublish` is refused at the door,
+  because that channel carries the session's tool inputs and outputs. The same rule runs on a manager
+  resume: a retained inventory naming another agent's event channel is refused rather than adopted.
+
+  The rule reads a **concrete** channel, two principal tokens and nothing else. A pattern such as
+  `events.<owner>.>` is not an event channel to it and passes untouched, governed by ordinary ACL
+  authority. That is deliberate, since the pattern is the form an operator writes on purpose for an
+  observer.
+
+  To let something read a plane, grant it out of band. The refusal prints one command, spelled out in
+  full, for the mesh it is running on. On a user-auth mesh:
+  `cotal actor grant <reader> --owner <owner> --scope '' --allow-subscribe '<channel>' --allow-publish
+''`, every field named because `actor grant` is an upsert of the whole row and an omitted flag is the
+  wide default (`>` read, `>` post, `spawn,role:default` scope), not "leave it alone". On a static mesh there is no
+  actor ledger for `actor grant` to write to, so mint the reader instead:
+  `cotal mint watcher --profile agent --allow-subscribe '<channel>' --provision`, the agent profile and
+  not the observer one, since `mint` reads `--allow-subscribe` only for that profile and refuses it off
+  that profile.
+
+  `cotal mint` now REFUSES `--allow-subscribe` / `--allow-publish` off the agent profile rather than
+  ignoring them. Those profiles carry a FIXED read set, the chat plane for observer and the whole
+  messaging plane for admin, so
+  `--profile observer --allow-subscribe <one channel>` used to exit 0, print a success line, and hand
+  out a credential that reads every channel in the space: an operator asking to narrow got the
+  opposite, silently. `--role` and `--provision` were already refused there for the same reason. The
+  rows in `cli.md` and the sentence in `build-a-client.md` now say the same thing.
+
+## 0.21.0
+
+### Minor Changes
+
+- 4cf5f72: Give a session's structured event plane a way to be turned on, and a channel that names who is publishing.
+
+  An agent can now be launched with `cotal spawn --events`, foreground or detached, which publishes
+  that session's structured event stream, what it did rather than the prose it wrote, on a channel of
+  its own so an external observer or UI can read it. Off by default. Nothing about an existing launch
+  changes.
+
+  **The channel is named after the principal, never the display name.** It is `events.<owner>.<actor>`,
+  derived from the principal the manager actually allocated. A display name is UI convenience: this
+  mesh permits two live agents to carry one, and the manager itself auto-numbers a collision, so a
+  name-keyed channel would fuse two principals onto one subject and, in auth mode, would authorize both
+  onto it from a value that identifies neither. The derivation is a single function on the connector
+  contract, `eventChannel`, so the subject the manager grants and the subject the session publishes to
+  cannot drift apart. A connector that does not implement it refuses `--events` before any provisioning
+  rather than starting a session whose events have nowhere legal to land, and the refusal releases the
+  name it had already reserved.
+
+  **The flag and the grant are deliberately separate.** Holding publish rights on a channel is not a
+  request to publish to it. An agent file or a manifest can hand-write anything into `allowPublish`, so
+  if a grant could arm the plane, any author who could write an agent file could turn on a full
+  transcript of another seat's tool inputs and outputs without ever touching the launch grammar. Only
+  the launch arms the session; the grant is what makes the arming useful. `cotal_spawn`, the peer-facing
+  tool, does not expose the option at all. That is the shape of the tool and not a control-plane refusal:
+  the manager's spawn service op is a second door onto the same handler and still accepts the field,
+  which is a pre-existing property of that door and is fenced separately.
+
+  **The flag rides the whole launch path, including the record a restart reads.** It is on the
+  foreground launch, the detached spawn payload, the manager service contract, and the resume document,
+  so a manager restart brings an armed session back armed. The foreground path mints its own grant, from
+  the principal it allocated, and passes the workspace root the emitter's write-ahead log needs: a
+  session armed by one launch surface and not the other would be a flag that means two different
+  things. A resume adopts the credential the spawn wrote rather than minting a new
+  one, so what a restart can lose is the record: either the channel leaves `allowPublish`, or the
+  arming flag does and the session returns holding publish rights it will never use, which reads as a
+  working system with an empty panel. Both halves are now carried and both are asserted.
+
+  **One behaviour change to state plainly.** The foreground launch now passes the mesh's root as the
+  launch's workspace root, on every foreground spawn rather than only on an armed one, which is what the
+  manager has always done. Two connectors already read that field and root their per-agent home at it:
+  Codex, which puts its per-agent home under it, and OpenCode, which puts its database and its serve
+  pidfile there. Both previously fell back to the directory the operator happened to run the command
+  in. So a foreground Codex or OpenCode session moves its local state from that directory to the mesh
+  root, which is where its detached counterpart has always put it. Operators who ran `cotal spawn` from
+  somewhere other than the mesh root will find that session's state under the mesh root instead. The
+  Claude connector reads the field only on an armed launch, and Hermes and pi do not read it at all.
+
+  **Supporting pieces in the shared connector runtime.** The event vocabulary is exported from
+  `@cotal-ai/connector-core` for the first time, so a connector can reach it by package name instead of
+  by deep path. The emitter gained a way to close an open run out of band: a harness reports the end of
+  a turn through a lifecycle hook that writes no record, so a record-sourced stream previously had no
+  vehicle for a turn terminal. The closing frame is an ordinary frame with one exception, it republishes
+  the source cursor unchanged, because advancing it would mark records consumed that were never mapped
+  and leave a consumer no gap to notice it by. The emitter refuses to close while a message or a tool
+  call is still open under the run, while a frame is still pending recovery, and after a halt.
+
+  **One pre-existing limit this makes visible earlier.** In user mode the allocated actor is the display
+  name, and principal tokens forbid `-`, which is reserved as the principal name form's separator. The
+  manager's collision handling appends `-2`, so the second user-mode launch of any persona has never
+  been principal-keyable; it already failed at the identity and provisioning sites. The event grant is
+  derived before provisioning, so that launch now fails before it leaves a footprint rather than after.
+  The underlying naming limit is unchanged and is not addressed here.
+
+### Patch Changes
+
+- 219d33c: `cotal spawn --agent pi --prompt <text>` now delivers the prompt as Pi's initial message (its first turn) instead of silently dropping it; an empty prompt, or one starting with `-` or `@`, refuses the launch. The connector contract no longer describes an initial prompt as something a connector may ignore: a connector delivers it or throws at launch. The other connectors follow the same rule: Claude Code and Codex refuse a prompt that is empty after trimming instead of dropping it, and Hermes refuses an initial prompt outright until its first turn is wired.
+
+## 0.20.1
+
+## 0.20.0
+
+## 0.19.0
+
+## 0.18.0
+
+## 0.17.0
+
+### Patch Changes
+
+- a306df0: Never consume a Claude Code peer's message without delivering it.
+
+  An unattended agent could go permanently silent after a direct message. The connector's lifecycle
+  hook acked the message and marked it handled while it was still only _formatting_ the hook reply
+  that carries it, but that reply has to reach the runtime through the hook relay, which abandons the
+  exchange after two seconds. When it did not land, the agent's model never saw the message while the
+  connector had already committed it — and because the message was recorded as handled, its own
+  JetStream redelivery was acked and discarded on arrival, so nothing could bring it back. The peer
+  simply stopped answering, and only a human noticed.
+
+  A message is now committed only once the reply carrying it has cleared both legs of its journey, not
+  just the first. The hook relay confirms back to the connector only after its own write to the
+  runtime has completed cleanly, and the connector waits for that receipt
+  (`startControlServer` gains an additive `onReply(event, delivered)`, and a client opts in with
+  `handoff: true`); anything less leaves the message un-acked, so it redelivers and the agent is woken
+  again. Binding to the connector's own socket write was not enough: a large injection that the
+  relay's one-second flush backstop kills mid-write reaches nothing, and the batch was still
+  committed. The verdict is tracked per hook event rather than in one slot, because hook frames are
+  separate connections that can overlap and would otherwise let one frame's outcome commit another
+  frame's messages. This errs toward delivering twice rather than losing one: a re-surfaced batch is
+  flagged as a possible repeat.
+
+  Two further ways the same path could go quiet are closed. Presence updates no longer gate delivery —
+  a failed presence write used to skip both the message injection and the end-of-turn flush of
+  anything held while the agent was busy. And a rejected wake notification is now retried with a
+  bounded backoff, since for an idle agent it is the only thing that can wake it.
+
+## 0.16.0
+
+## 0.15.0
+
+### Minor Changes
+
+- f89560a: New Codex connector (`--agent codex`): an OpenAI Codex session as a full lateral mesh peer, in Codex's own TUI. A host-mode peer drives a `codex app-server` thread over JSON-RPC: inbound batches wake a real turn, and directed messages steer INTO a live turn mid-flight.
+
+  `cotal spawn --agent codex` opens Codex's own TUI. The app-server runs as a loopback websocket listener guarded by a per-incarnation capability token (0600, inside the agent's private home), and the TUI attaches to the very thread the mesh drives, so mesh turns render as they happen and anything you type is a real user turn on that same thread. With no terminal (piped output, CI, a smoke) the host stays headless with an activity feed instead; `COTAL_CODEX_TUI=1|0` picks the mode explicitly when the tty check would guess wrong. Once Codex owns the terminal the host's own log moves to `host.log` in the agent's private home, and the handoff line names that path so a later failure is findable.
+
+  The shared `cotal_*` tools are served by the host process itself over a bearer-authenticated loopback MCP endpoint, with the token passed to codex by env var name so it never reaches the process table. Because the app-server is the MCP client, the same tools work on a mesh-driven turn and on one typed into the TUI; the connector's own tools are pre-approved so an unattended agent never stalls on an approval prompt nobody is watching, and `mcp_servers.cotal.*` is reserved and refused rather than silently overridden.
+
+  Autonomy defaults suit an agent woken by peer messages when nobody is watching: `approval_policy=never` (never ask before running a command, not refuse), `sandbox_mode=workspace-write`, and `sandbox_workspace_write={network_access=true}`. Network is on because Codex's own workspace-write default has it off, which breaks installing a dependency or pushing a branch with an error that reads like the task is impossible rather than the sandbox refusing; filesystem containment is kept, because a peer's message is a remote input that can make the agent run commands. The network default is applied only where the sandbox is actually `workspace-write`, so tightening the mode does not leave a network grant in the launch. All three are overridable per spawn with `--opt` (including `sandbox_mode=danger-full-access` for no sandbox at all), while an interactive `approval_policy` is refused loud rather than auto-answered on the operator's behalf.
+
+  The guide states the sandbox's guarantee literally: it blocks out-of-workspace local filesystem writes, and does not block reads, exfiltration, or networked side effects. With the network on, a peer-driven turn can read broadly and send what it reads, reach loopback and link-local services, and act through any credential it can read, including irreversibly, via a force-push or an API delete. Containing filesystem writes is not the same as containing damage, and the docs say so rather than implying the residual is disclosure-only. The offline, tighter-mode, and separate-OS-user mitigations are named in both the autonomy section and Limits.
+
+  At-least-once delivery with exact-id acks on turn completion: a failed turn retries with backoff, an interrupt redelivers, and an app-server crash restarts the child in place on the same mesh lifecycle and re-drives the un-acked batch (a crash loop is fatal, never an endless respawn). Presence from the event stream, an opt-in transcript mirror, model catalog + reasoning-effort variants (`cotal models --agent codex`, `--variant`), `--opt` passthrough to codex `-c` config overrides, and a private per-agent `CODEX_HOME` (operator config/hooks/MCP servers never load; auth.json symlinked; trust writes never touch the operator's config). Unwired options fail loud: `--resume` (a resumed codex thread comes up without its configured MCP servers, so the agent would be mute on the mesh) and tool-sharing.
+
+  Also fixes the seed reconciler, which treated a generation match alone as up-to-date: a built-in connector added at an unchanged generation would never seed on an already-installed workstation (`--agent codex` reporting no connector installed). Both fast paths now also require every `SEED_BUILTINS` entry to be present in the ever-seeded set.
+
+  A connector can now declare `launchHint`, the one line a foreground `cotal spawn` prints about what to expect next. That text used to be hard-coded to Claude Code's first-run gate for every agent type, telling operators of other harnesses to press Enter at a prompt that never appears.
+
+  The web dashboard gains Codex branding (the OpenAI mark, from Simple Icons), so a codex agent renders with an icon and a label instead of a blank badge. That map was hand-maintained with nothing tying it to the connector set, so it is now covered by a test: every official connector must have a complete entry, and a new connector cannot ship icon-less with a green suite again.
+
+## 0.14.11
+
+## 0.14.10
+
+## 0.14.9
+
+## 0.14.8
+
+## 0.14.7
+
+## 0.14.6
+
+## 0.14.5
+
+## 0.14.4
+
+## 0.14.3
+
+## 0.14.2
+
+## 0.14.1
+
+## 0.14.0
+
+## 0.13.2
+
+## 0.13.1
+
+## 0.13.0
+
+### Minor Changes
+
+- 5491661: v0.4 endpoint control surface: a breaking wire revision (SPEC section 13).
+
+  Adds the endpoint control surface: the `ep` request rails and grant grammar, the
+  message envelope and error catalog, the callable-service verbs, and the session
+  and virtual-endpoint composites. Deletes the v0.3 `ctl` rail (the hard cut).
+  Requires nats-server 2.12 or newer, since the auth marker store uses native
+  per-message TTL; clients read the server version from the pre-auth INFO and fail
+  loud below the floor.
+
+  Completes the agent lifecycle end to end: registration, admission, despawn,
+  retirement, and safe name reuse, backed by a lifecycle registry, a credential
+  ledger, and a retirement barrier. Durables are keyed by lifecycle uid, so a
+  manager-resumed agent recovers its original incarnation rather than re-minting,
+  and readiness is incarnation-exact. The connectors forward the lifecycle uid into
+  spawned children so a child joins as its intended incarnation.
+
+  From v0.4 an AgentCard MUST advertise `protocolVersion "0.4"`; a participant that
+  omits it is treated as pre-0.4 and is not addressed on the endpoint rails.
+
+## 0.12.0
+
+### Patch Changes
+
+- 046f485: Re-announce an unacked durable message on JetStream redelivery, so a wake the host dropped (e.g. during Claude's channel startup window) recovers at the next redelivery instead of leaving the agent a zombie until an unrelated message arrives.
+
+## 0.11.6
+
+## 0.11.5
+
+## 0.11.4
+
+### Patch Changes
+
+- 1935221: Ship the built-in agent connectors (claude, opencode, hermes, pi) as removable `cotal ext` plugins. They are seeded on first run through the same `ext add` path a third party uses, resolved lazily per spawn, and deletable with `cotal ext remove`; they are no longer hardcoded imports or dependencies of `cotal-ai`.
+
+## 0.11.3
+
+### Patch Changes
+
+- @cotal-ai/connector-core@0.11.3
+
+## 0.11.2
+
+### Patch Changes
+
+- @cotal-ai/connector-core@0.11.2
+
+## 0.11.1
+
+### Patch Changes
+
+- Updated dependencies [5b2863a]
+  - @cotal-ai/connector-core@0.11.1
+
+## 0.11.0
+
+### Minor Changes
+
+- 9061d0e: feat: per-user authentication (owner+actor identity, IdP login, credential death)
+
+  Add per-user auth as a first-class mesh mode. A mesh brought up with `cotal up --user-auth --idp <url>`
+  authenticates humans against an identity provider and issues short-lived, ledger-scoped bearers through an
+  auth callout, in place of long-lived static credential files.
+
+  - **owner+actor identity.** An instance's wire identity becomes the two-token principal `(owner, actor)`:
+    every subject carries the sender as `<owner>.<actor>`, and grants, durables, presence, and `from.id`
+    re-key onto the pair. Cross-owner and same-owner cross-actor forge/read isolation is enforced by the
+    broker; the connection nkey survives only as the transport credential.
+  - **Login and delegation.** Humans sign in with `cotal login --idp <url>` (device-code); operators grant
+    access with `cotal actor grant`. Agents are spawned under the signed-in human as managed `(owner, actor)`
+    children whose scope is a subset of the spawner's (the delegation envelope rule). Agent identities live in
+    a separate managed-actor ledger space, exchanged via their own per-agent secret, so they outlive the
+    human's login session.
+  - **Credential death.** Every managed credential is now lifetime-bounded, with supervisor and delivery
+    standing renewal, `$SYS` rotation-renewal, live connection eviction on revoke, and a `cotal doctor auth`
+    repair surface. On a user-auth mesh, static agent creds are retired (the flip): revocation closes the live
+    window at the next connect.
+  - **Elevated operator surfaces.** `cotal web`, `console`, `history clear`, `channels set/default`, and
+    `spawn -f` come online in user mode via server-authored elevated view bearers, minted only by the
+    signed-in human exchange and gated on ledger scope (`admin` / `spawn`); `ps` and `status` are
+    owner-domain scoped.
+  - **Connectors.** Add the `cotal_docs` tool (version-exact Cotal docs the agent reads natively) and an
+    opaque `launchOptions` raw passthrough for the Claude Code, OpenCode, and Hermes adapters.
+
+### Patch Changes
+
+- Updated dependencies [9061d0e]
+  - @cotal-ai/connector-core@0.11.0
+
+## 0.10.1
+
+### Patch Changes
+
+- e3a53e3: Add a connector-agnostic model/variant selector: the `cotal models` command, a `--variant` flag on spawn, and the core `listModels` / `ModelCatalog` + `LaunchOpts.variant` contract. OpenCode discovers its models and variants from the installed CLI; Claude and Hermes reject variants (fail loud) and set `COTAL_MODEL` when a model is given.
+- Updated dependencies [e3a53e3]
+  - @cotal-ai/connector-core@0.10.1
+
+## 0.10.0
+
+### Minor Changes
+
+- 6c40280: Release the 0.10 line with the onboarding and local-stack work since 0.9.1:
+
+  - Rework the CLI around dispatcher-parsed commands, operator-installed extensions (`cotal ext`), and extension-packaged web/demo surfaces.
+  - Make `cotal setup` configure-only: it checks prerequisites, installs the Claude plugin and web dashboard extension, seeds one default persona, and keeps the guided david/sven/me team behind `--demo` or `--full`.
+  - Have `cotal up` own the local stack (broker, delivery daemon, and manager), with safer teardown, manifest launch handling, and automatic free-port selection for default-port collisions.
+  - Collapse foreground and detached launches into one `spawn` grammar, with hardened manager readiness behavior and default persona / default agent environment overrides.
+  - Strengthen auth, credential lifetime/rotation, delivery, and OpenCode cancellation handling.
+  - Refresh README and getting-started onboarding around `npx cotal-ai setup`, then `cotal up --detach`, `cotal web`, `cotal spawn`, and `cotal down`.
+
+### Patch Changes
+
+- Updated dependencies [6c40280]
+  - @cotal-ai/connector-core@0.10.0
+
+## 0.9.1
+
+### Patch Changes
+
+- @cotal-ai/connector-core@0.9.1
+
+## 0.9.0
+
+### Minor Changes
+
+- 1bcc154: feat: manager least-privilege — no allow-all credential — plus session resume
+
+  A coordinated minor across the workspace (lockstep `fixed` group). No wire break — the message
+  schema is unchanged and `protocolVersion` stays `0.2`; this release is about who the manager is
+  allowed to be on the broker, plus a new way to bring an existing session into the mesh.
+
+  **Security — the manager is no longer an all-powerful credential**
+
+  Until now every manager action ran under a single, blanket `manager` credential that could do almost
+  anything on the broker — read any DM, tamper with any stream, publish as any agent. That credential
+  is **gone**. Manager work now runs under a set of small, purpose-built credentials, each able to do
+  only its own job and nothing else:
+
+  - The **always-on supervisor** can serve control requests, hold its lease, and publish presence — but
+    it **cannot read anyone's messages, create arbitrary consumers, or delete/purge streams**.
+  - **Spawning, teardown, and history-purge** each run on their own short-lived, tightly scoped
+    credential that exists only for that operation.
+  - The **CLI verbs** (`send`, `spawn`, `channels`, `up`, `join`, `down -f`, …) each connect as the
+    least-privileged profile for the job — an operator posts only as itself and can never forge another
+    agent.
+
+  The practical effect: a leaked or compromised manager credential can no longer read message bodies or
+  meddle with other agents' streams — the blast radius is contained to exactly what that one credential
+  was scoped to. Control replies are bounded per caller, `cotal join` now self-provisions its own inbox
+  (no more `ConsumerNotFound` on a fresh console), and `cotal down` tears down all of a space's streams
+  and buckets rather than a subset.
+
+  **New — resume an existing session into the mesh**
+
+  `cotal spawn --resume <id>` and `cotal start --resume <id>` fork an existing `claude` session — its
+  deep context and long transcript — into the mesh, instead of always starting an agent from scratch.
+  It **forks, never hijacks**: the meshed agent gets a _new_ session branched off that transcript, and
+  the original is left untouched. Connectors that can't support this (`opencode`, `hermes`) are
+  **rejected up front, before any provisioning**, with a clear error rather than a half-provisioned
+  space.
+
+  **Fixes & UX**
+
+  - **`cotal attach` shows the real screen on (re)attach to a full-screen agent.** Re-attaching, or
+    attaching late, now reconstructs and repaints the agent's current screen instead of leaving you on
+    a blank or partial one.
+  - **Mouse-wheel scrolling works in full-screen agents over `cotal attach`.**
+  - **The `pty` runtime fails loud under Bun.** It isn't supported there, so it now says so clearly
+    instead of misbehaving silently.
+  - **Removed the `face:` viewer that had leaked from the frontier-faces example into shared connector
+    code**, so an OpenCode persona with a `face:` field boots normally. Face rendering lives entirely
+    in `examples/04-frontier-faces`.
+
+  **Migration — re-`up` spaces created before this release**
+
+  The supervisor now records its lease in a per-space manager bucket that older spaces don't have. A
+  space that was brought up on an earlier version must be re-`up`'d (a fresh `cotal up` is fine);
+  otherwise the supervisor throws `stream not found` on its first lease write. Nothing on the message
+  wire changed, so running agents and clients are otherwise unaffected.
+
+### Patch Changes
+
+- Updated dependencies [1bcc154]
+  - @cotal-ai/connector-core@0.9.0
+
+## 0.8.3
+
+### Patch Changes
+
+- a10ed79: OpenCode connector: mirror each agent's session transcript to its per-agent `tr-<name>` channel, event-driven from the plugin's in-process bus events (`message.updated` / `message.part.updated` / `session.idle`) — parity with the Claude connector, with no per-turn session refetch. The `tr-<name>` channel convention is exposed through the `Connector` contract (`Connector.transcriptChannel`) so the manager can grant the agent's publish ACL without the channel literal living in `@cotal-ai/core`, and the manager forwards control-plane `capabilities` (`COTAL_CAPABILITIES`) so a manifest-spawned agent exposes the `cotal_spawn` / `cotal_persona` tools its creds already authorize. Adds an end-to-end smoke for the mirror (`smoke:opencode-transcript`).
+- Updated dependencies [a10ed79]
+  - @cotal-ai/connector-core@0.8.3
+
+## 0.8.2
+
+### Patch Changes
+
+- @cotal-ai/connector-core@0.8.2
+
+## 0.8.1
+
+### Patch Changes
+
+- @cotal-ai/connector-core@0.8.1
+
+## 0.8.0
+
+### Minor Changes
+
+- cce0a6a: feat: mesh manifests, the tmux runtime, and a new `@cotal-ai/workspace` layer
+
+  A coordinated minor across the workspace (lockstep `fixed` group). No wire break — `protocolVersion`
+  stays `0.2`; this release is all tooling, packaging, and hardening. The new publishable
+  `@cotal-ai/workspace` package joins the lockstep group.
+
+  **New**
+
+  - **Mesh manifests — describe and launch a whole topology from one `cotal.yaml` (`kind: Mesh`).**
+    The file is organized by channel (each lists `subscribe`/`allowSubscribe`/`allowPublish` —
+    Cotal's native verbs, holding agent names); a top `agents:` table resolves each name to a persona
+    (bare path / file + overrides / fully inline) and a connector (`agent:`, per-agent or a top-level
+    default — no silent default). Under `personaPermissions: include` a persona's own channel grants are
+    inherited for channels the manifest doesn't declare.
+
+    - `cotal up -f <cotal.yaml>` brings up a **fresh** mesh — broker + seeded channels + booted agents —
+      and owns the whole space (`cotal down` tears it down). A broker already reachable at the
+      manifest's address is refused with a redirect to `spawn -f`, never re-seeded as fresh.
+    - `cotal spawn -f <cotal.yaml>` deploys a manifest **additively** onto a mesh that's already
+      running: brand-new channels are seeded and owned, already-present ones are left untouched
+      (`exists-unmanaged`), and exactly what it created is written to a creation-only ledger
+      (`.cotal/manifests/<runId>.json`). A re-declared agent whose policy changed is **stale** and
+      exits non-zero unless `--allow-stale <names>`; unmanaged actors with access to a declared channel
+      are surfaced as a SECURITY warning.
+    - `cotal down -f <cotal.yaml>` (or `--run <id>`) tears down **only** what a `spawn -f` run created —
+      never foreign actors on the shared mesh. The ledger is treated as untrusted input and validated
+      whole before any deletion; an owned agent is stopped only when its recorded name **and** id match
+      the live one, cred paths are derived from the auth root and deleted without following symlinks,
+      and an owned channel is removed only when no other members remain. Local-only: same checkout/host
+      that created the run.
+    - `cotal topology view -f <cotal.yaml>` validates a manifest and renders its access graph
+      (per-channel and per-agent subscribe/read/post, persona-inherited scopes, warnings) — read-only,
+      no broker needed. `--dry-run` previews `up -f`/`spawn -f` and mutates nothing.
+
+    Resolved agents boot via a transient, non-authoritative launch artifact under `.cotal/run/` (no
+    generated personas in `.cotal/agents/`), handed to the manager through a new **operator-only**
+    `launch` control op that reads the run spec by id, never an arbitrary path.
+
+  - **`@cotal-ai/tmux` — a tmux Runtime and `TerminalLayout` extension.** Each agent spawned via
+    `--runtime tmux` gets its own window in a shared per-space tmux session, with P3 `env -i`
+    isolation; a `TerminalLayout` provider lets `cotal setup` open and close tmux windows from the
+    ambient `$TMUX` session. Self-registers on import (`import "@cotal-ai/tmux"`), exactly like
+    `@cotal-ai/cmux`. `cotal setup` now offers a tmux demo when run inside a tmux session.
+
+  - **Web graph — hide offline members by default**, with a toggle to show them. Backed by
+    broker-sourced authoritative channel membership.
+
+  **Architecture**
+
+  - **New `@cotal-ai/workspace` package — the machine-local workstation layer, split out of
+    `@cotal-ai/core`.** Core is now strictly the wire standard (endpoint, subjects, message types,
+    extension contracts) and depends on nothing else in the repo; the `~/.cotal` mesh registry, target
+    resolution, preflight, `.cotal/` auth-path I/O, and the `cotal …` command-copy renderer now live in
+    `@cotal-ai/workspace`. Dependencies flow one way:
+    `examples → implementations → workspace → core ← (peer) extensions`. A `smoke:core-boundary` guard
+    (in `pnpm check` and CI) fails the build if core ever imports workspace.
+
+    **Migration (importers only — no runtime/wire change):** `mesh-registry`, `mesh-target`,
+    `preflight`, and the auth-path helpers (`authDir`/`findCotalRoot`/`loadSpaceAuth`/`saveSpaceAuth`)
+    now import from `@cotal-ai/workspace` instead of `@cotal-ai/core`. Mesh-target failures throw a
+    typed `MeshTargetError` (with a `code` and structured `details`); detect it with the exported
+    `isWorkspaceTargetError(e)` guard rather than `instanceof`. The `cotal …`-flavored error copy is
+    rendered through a single `renderWorkspaceError(...)` over a `target | preflight | reachable`
+    union.
+
+  - **`cotal ps` / `start` / `stop` / `attach` now resolve their broker from the mesh registry** — the
+    same way `send` / `channels` / `console` / `web` and the manifest verbs already do — instead of
+    silently defaulting to `nats://127.0.0.1:4222`. `--space <name>` finds the recorded broker (and
+    mints the privileged `manager` cred from that mesh's own recorded root); `--server` stays an
+    override and `--creds` a raw off-registry escape hatch. The shared mesh-target preflight is now
+    used by both the transient commands and the manager control commands.
+
+  **Fixes & hardening**
+
+  - **Manager forwards the resolved channel ACL to spawned connectors**, so a manifest-spawned agent
+    actually subscribes to the channels its persona grants (no missing `COTAL_SUBSCRIBE`).
+  - **Never prune a recorded mesh on an explicit `--server` override** — an off-registry target no
+    longer evicts the registry entry it didn't come from.
+  - **Web graph correctness** — mode chips filter persistent edges (not just animation), hidden nodes
+    stay hidden under the visibility filters, and dashboard assets are served with
+    `cache-control: no-cache` so the UI doesn't get pinned to a stale build.
+  - **`cotal attach` restores terminal modes on detach** — focus-reporting is reset and stdout writes
+    are guarded against a dead pipe, so detaching no longer leaves the terminal in a wedged state.
+  - **Security hardening** — symlink-safe run directories, launch-policy re-validation at spawn,
+    tightened launch-spec validation, and the operator-only manager `launch` op (above).
+  - **CI** — the security/protocol smoke suite (`smoke:ci`) and the mesh-resolution / spawn-from-anywhere
+    / core-boundary smokes are gated in the `check` workflow.
+
+  **Runtime defaults (carried from the tmux work)**
+
+  The built-in `tmux` manager runtime is gone — `tmux` is resolved from `@cotal-ai/tmux`, exactly like
+  `cmux`. The default `auto` mode is deterministic `pty`; tmux and cmux are never auto-selected. Choose
+  them explicitly with `--runtime tmux`/`cmux`, which fails loud with a clear
+  `"import @cotal-ai/<runtime>"` error if the matching extension isn't imported — no silent fallback to
+  pty.
+
+### Patch Changes
+
+- Updated dependencies [cce0a6a]
+  - @cotal-ai/connector-core@0.8.0
+
+## 0.7.0
+
+### Minor Changes
+
+- a6a0a8d: feat: agent orientation, spawn-from-anywhere, live space graph, model-aware spawning
+
+  A coordinated minor across the workspace (lockstep `fixed` group). No wire break — `protocolVersion`
+  stays 0.2.
+
+  **New**
+
+  - **`cotal_orientation`** — a self/context card MCP tool: an agent's identity, the channels it can
+    read and post to, its capabilities, available tools, and who's present. Claude Code, OpenCode, and
+    Hermes connectors all point new agents at it on boot for the same first-turn orientation.
+  - **Spawn from any directory** — `cotal spawn` resolves a running mesh from a registry, so agents can
+    be spawned outside the project directory. The registry self-prunes space-mismatched and stale
+    `current` entries; its dir is locked to `0700` so space names aren't world-readable.
+  - **Model- and harness-aware spawning** — `cotal start --model` overrides the model, the harness CLI
+    is preflighted before spawn, and the harness/model knobs are shared across both spawn doors (CLI
+    `cotal spawn` and MCP `cotal_spawn`).
+  - **Live space graph** — a force-directed graph view of a space in the web UI, backed by
+    broker-sourced authoritative channel membership (offline agents drop from the graph immediately).
+
+  **Fixes & hardening**
+
+  - **Manager persona spawn is fail-loud and ACL-correct.** A spawn (`start` op / `cotal_spawn` /
+    roster boot) now treats its argument as a persona ref (a filename in `.cotal/agents`), takes the
+    mesh identity from the file's `name:` (auto-numbered on collision), fails loud on a missing persona,
+    and always provisions read/post ACLs from the loaded persona. Previously a miss silently minted
+    default creds (read `general` only, default-deny publish, no capabilities), so a persona spawned by
+    display name, a typo, or a renamed file became a live agent with silently-wrong ACLs.
+  - **Mesh-connect resolution unified** — `web`/`console`/`join` (and the transient commands) route
+    through a shared `resolveMeshTarget` + preflight: the recorded server/mode is honored (open ≠ auth),
+    the `--server`+`--space` raw escape works again for open remote meshes, the `channels` subcommand is
+    validated, and a silent wrong-mesh fallback is refused rather than connecting to the wrong broker.
+  - **`cotal web` no longer holds the account signing seed.** The dashboard used to keep the space
+    `SpaceAuth` (which can mint _any_ identity/role) in scope for the whole session, re-minting on every
+    channel delete — a compromise of the loopback process could mint anything for the account. It now
+    pre-mints one scoped `manager` cred at startup for the lone write path (channel delete) and lets the
+    seed fall out of scope, shrinking the blast radius from "mint anything" to "purge channels as one
+    manager". Open / `--creds` modes are unaffected (no seed; they use the connection creds).
+
+### Patch Changes
+
+- Updated dependencies [a6a0a8d]
+  - @cotal-ai/connector-core@0.7.0
+
+## 0.6.0
+
+### Patch Changes
+
+- Updated dependencies [ba5e622]
+  - @cotal-ai/connector-core@0.6.0
+
+## 0.5.0
+
+### Patch Changes
+
+- Updated dependencies [58f2d41]
+  - @cotal-ai/connector-core@0.5.0
+
+## 0.4.0
+
+### Patch Changes
+
+- Updated dependencies [878f406]
+  - @cotal-ai/connector-core@0.4.0
+
+## 0.3.2
+
+### Patch Changes
+
+- @cotal-ai/connector-core@0.3.2
+
+## 0.3.1
+
+### Patch Changes
+
+- @cotal-ai/connector-core@0.3.1
+
+## 0.3.0
+
+### Patch Changes
+
+- df8e64c: Add `cotal-ai` — a guided, two-tier setup. The composition root (`bin/`) ships as the
+  publishable `cotal-ai` package, so `npm i -g cotal-ai` / `npx cotal-ai <cmd>` works (bare
+  `cotal` runs `setup`). The **first run** is a narrated, branded flow (`@clack/prompts` UI,
+  wordmark splash, a live pane that streams the mesh booting) that checks prerequisites, locates
+  the NATS server (bundled platform binary via `@eplightning/nats-server-*`, or one already on
+  PATH), then a **connector picker** (Claude / OpenCode — only Claude installs a plugin; OpenCode
+  auto-wires at spawn), and writes two default Cotal experts you can chat with — **david — the
+  engineer** (how it works) and **sven — the guide** (what to build) — plus **me**, the session
+  you drive. The finale is cmux-aware: inside cmux it opens a manager tab that pre-spawns david/sven
+  into their own tabs alongside a console + driving session, otherwise a background manager
+  pre-spawns them and the terminal is handed to your session. **Later runs** are a compact
+  ensure+status card; `cotal setup --full` forces the full flow, and `cotal setup --yes` runs it
+  non-interactively (agents/CI) — installs the plugin, writes the experts, starts the web, and exits
+  non-zero with the log path on failure. Each failed interactive step offers a Claude handoff
+  (skippable with `COTAL_SKIP_ASSIST=1`) that carries the failure context and resumes setup on
+  `/exit`.
+
+  Supporting changes across the stack:
+
+  - **core** — `Connector.pluginRoot` (find a connector's installable plugin assets without
+    importing the extension), `LaunchOpts.prompt` (an auto-submitted first message), a `TerminalLayout`
+    extension contract (a host-side, not-wire contract: open/close editor tabs from a backend-agnostic
+    `Tab` — panes as argv + an optional split — resolved by name from the registry), and `findCotalRoot`
+    (walk up to `.cotal/`, so `cotal` runs from any subdirectory).
+  - **connector-core** — `cotal_purge`, an agent-driven request that has the manager clear the
+    space's retained chat backlog (the privileged `STREAM.PURGE` regular agents are denied).
+  - **manager** — pre-spawn teammates at startup (`cotal cmux --spawn a,b`, staggered on presence),
+    the `purge` control op (native JetStream purge), and a WS attach endpoint.
+  - **cmux** — a self-registering `TerminalLayout` provider (plus `listWorkspaces`/`workspaceRefs` on
+    the driver) that translates the agnostic `Tab` into cmux's native layout, so `cotal setup`
+    opens/closes cmux tabs through the registry without depending on the package or building any
+    cmux-shaped layout itself.
+  - **connector-claude-code** — MCP isolation for spawned sessions (`--strict-mcp-config` +
+    `--mcp-config`, channel ref `server:cotal`), `prompt` passthrough, and the plugin manifest files
+    shipped in the published package.
+
+  Adds `cotal up --detach` + `cotal down` for a background mesh. `cotal up` now pre-creates the
+  space's JetStream streams + KV buckets for **both** modes (open connects without creds), so
+  anything that touches a stream before an endpoint has joined — `cotal spawn`'s DM-inbox
+  provisioning, `cotal_purge`, `history clear` — works on a fresh open mesh instead of failing with
+  StreamNotFound. When run via `npx` without a global
+  `cotal`, setup offers to `npm i -g cotal-ai` (default yes; non-interactive takes the default),
+  best-effort — and the status-card hints render the right prefix (`cotal` / `npx cotal-ai` /
+  `pnpm cotal`) for how you ran it.
+
+- Updated dependencies [df8e64c]
+  - @cotal-ai/connector-core@0.3.0
+
+## 0.2.0
+
+### Minor Changes
+
+- 0954ea6: Transcript mirror: a managed Claude Code session now publishes its own condensed
+  transcript (assistant text, tool one-liners, truncated results) to a per-agent
+  `tr-<name>` channel, driven by the lifecycle hooks' `transcript_path`. Gated by
+  `COTAL_TRANSCRIPT`, which `buildLaunch` sets for managed sessions; personal
+  sessions never mirror.
+
+### Patch Changes
+
+- 73b030f: Add the `cotal_feedback` sender: a connector tool (always exposed) and a `cotal feedback "<summary>"` CLI mode. With a `COTAL_FEEDBACK_KEY` feedback routes to the keyed broker intake as before; without one it goes to the public intake at `https://cotal.ai/v1/feedback`, which requires a contact email (`COTAL_FEEDBACK_EMAIL` → git config → ask). `COTAL_FEEDBACK_URL` overrides either URL for self-hosted intakes.
+- Updated dependencies [b3a790e]
+- Updated dependencies [73b030f]
+- Updated dependencies [739649a]
+  - @cotal-ai/core@0.1.3
+  - @cotal-ai/connector-core@0.2.0
+
+## 0.1.3
+
+### Patch Changes
+
+- 246c9b9: Add the `cotal_feedback` beta egress: a `COTAL_FEEDBACK_KEY` config plus `feedbackLine()` guidance folded into the Claude/Codex connector instructions, and a `cotal feedback` authenticated intake server (tester keys, JSONL source of truth, republish to an internal `#feedback` channel). Note: the agent-side `cotal_feedback` tool registration is still pending.
+- Updated dependencies [246c9b9]
+- Updated dependencies [246c9b9]
+  - @cotal-ai/connector-core@0.1.3
+
+## 0.1.2
+
+### Patch Changes
+
+- 5f9e171: Publish all packages: add repository field for OIDC provenance, plus in-flight changes (cmux runtime exec-via-env fix, manager runtime selector, .gitignore product/, etc.).
+- Updated dependencies [5f9e171]
+  - @cotal-ai/core@0.1.2
+  - @cotal-ai/connector-core@0.1.2
+
+## 0.1.1
+
+### Patch Changes
+
+- 18c271f: Publish all packages: configure GitHub Actions changesets workflow with npm OIDC trusted publishing.
+- Updated dependencies [18c271f]
+  - @cotal-ai/core@0.1.1
+  - @cotal-ai/connector-core@0.1.1

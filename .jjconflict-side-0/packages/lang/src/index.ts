@@ -1,0 +1,204 @@
+/**
+ * cotal-lang: the restricted-JS workflow language.
+ *
+ * A program orchestrates turns and events, never message content: agents read their own channels
+ * and speak for themselves, and the program only decides who acts next. Determinism is by
+ * construction rather than by convention, because the interpreter has nothing nondeterministic to
+ * offer, and durability is a step journal keyed by name rather than by position.
+ *
+ * This package is pure: it depends on nothing else in the repo, so the validator, the key
+ * machinery, and the simulation handler run with no broker and no mesh.
+ *
+ * @module index
+ */
+
+export {
+  CATALOG,
+  EngineUnavailable,
+  InterpreterDefect,
+  LangError,
+  LangErrors,
+  codeFrame,
+  type CalleeDoc,
+  type LangErrorCode,
+  type LangErrorInit,
+  type LangErrorJson,
+  type SourceSpan,
+} from "./errors.js";
+
+export {
+  BUILTINS,
+  EFFECT_KINDS,
+  EVENT_CONSTRUCTORS,
+  FORBIDDEN_GLOBALS,
+  HOST_GLOBAL_HINTS,
+  PRIMITIVES,
+  PURE_PRIMITIVES,
+  RESERVED_NAMES,
+  STEP_NAME_RE,
+  VALUE_NAMES,
+  primitiveDoc,
+  type EffectKind,
+  type PrimitiveSpec,
+} from "./primitives.js";
+
+export {
+  ADMITTED_NODES,
+  FORBIDDEN_CHILDREN,
+  FORBIDDEN_NODES,
+  KNOWN_NODES,
+  STRUCTURAL_NODES,
+} from "./syntax.js";
+
+export { MUTATING_METHODS } from "./library.js";
+
+export { validate, type ValidateResult } from "./grammar.js";
+
+export { ADJUDICATION, conformanceCorpus, type ConformanceCase, type ConformanceCorpus } from "./conformance.js";
+
+export {
+  RunDivergence,
+  RuntimeFault,
+  ScopeBranchMissing,
+  UnwalkableScope,
+  resume,
+  run,
+  type RunOptions,
+  type RunResult,
+} from "./interpret.js";
+
+export { NotCrossable, Prng, assertCrossable, deepFreeze } from "./values.js";
+
+export {
+  ENGINE_LANGUAGE_VERSION,
+  LANGUAGE_VERSION,
+  PIN_DEFAULTS,
+  PinMismatch,
+  WALKER_LANGUAGE_VERSION,
+  bindPins,
+  resolvePins,
+  type PinnableOptions,
+  type RunPins,
+} from "./pins.js";
+
+export {
+  Cancelled,
+  RootCancellation,
+  type RootCancellationSource,
+  RunReleased,
+  EffectRefused,
+  RunHeld,
+  EffectError,
+  askSchemaShape,
+  conformsToAskSchema,
+  type AgentHandleValue,
+  type AskFieldKind,
+  type AskRequest,
+  type CancelSignal,
+  type ChannelHandleValue,
+  type CheckpointRaw,
+  type CheckpointRequest,
+  type CheckpointResultValue,
+  type ConclaveRequest,
+  type EffectContext,
+  type EffectHandler,
+  type EventDescriptor,
+  type MonitorRequest,
+  type NotifyFact,
+  type NotifyRequest,
+  type ObserveRequest,
+  type ParticipantRequest,
+  type SleepRequest,
+  type InlineSpawnDefinition,
+  type SpawnRequest,
+  type TurnRequest,
+  type TurnResultValue,
+  type TurnStatus,
+  type WaitRequest,
+} from "./effects.js";
+
+export {
+  DurationError,
+  isDuration,
+  parseDuration,
+} from "./duration.js";
+
+export {
+  RecordingHandler,
+  dryRun,
+  dryRunOutcome,
+  renderReport,
+  type DryRunFailure,
+  type DryRunOptions,
+  type DryRunReport,
+  type PlannedAgent,
+  type PlannedCheckpoint,
+  type PlannedEffect,
+  type PlannedWait,
+} from "./dryrun.js";
+
+export {
+  SimHandler,
+  SimUnscriptedError,
+  type Scripted,
+  type SimFault,
+  type SimScript,
+} from "./sim.js";
+
+export { notifyFactViolation } from "./notify-fact.js";
+
+export {
+  EffectResultTooLarge,
+  Journal,
+  JournalAppendRejected,
+  JournalReadOnlyError,
+  RunClock,
+  journalEntryKeyString,
+  type EntryError,
+  type EntryState,
+  type EntryStatus,
+  type JournalEntry,
+  type JournalInit,
+  type JournalStore,
+  type LookupVerdict,
+} from "./journal.js";
+
+export {
+  DIGEST_PREFIX,
+  KeyScope,
+  atMostOnce,
+  branchKeys,
+  digest,
+  holdRequestId,
+  programHashOf,
+  scopePathString,
+  scopeTraits,
+  stepKeyEquals,
+  stepKeyString,
+  type ScopeFrame,
+  type ScopeKind,
+  type StepKey,
+} from "./keys.js";
+
+export { CheckpointNotAmendable, CheckpointNotOpen, openCheckpointToken, settledPauseToken, stepPauseToken } from "./pause-token.js";
+
+/**
+ * The compiled engine's driver-facing surface: the transform that produces what the engine runs,
+ * and the worker runner a host executes it with. The evaluator itself is NOT exported — it lives
+ * in the worker entry, where the Compartment is, and naming it here would offer an unconfined
+ * production path.
+ */
+export { transform, type TransformMeta, type TransformOptions } from "./transform/index.js";
+export {
+  runInWorker,
+  type WorkerHandlerSpec,
+  type WorkerRun,
+  type WorkerRunFailed,
+  type WorkerRunOk,
+  type WorkerRunOptions,
+  type WorkerRunRequest,
+  type WorkerRunResult,
+} from "./engine/worker.js";
+export { NODE_FLOOR, assertNodeFloor } from "./engine/host.js";
+
+export type { InspectionExit, InspectionSnapshot } from "./engine/inspection.js";

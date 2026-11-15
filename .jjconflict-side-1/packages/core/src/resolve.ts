@@ -1,0 +1,183 @@
+/**
+ * Peer name resolution + name validation — the client-side half of addressing.
+ *
+ * The wire routes on the unforgeable instance id (the nkey carried in the subject); a human
+ * **name** is only a convenience this resolves to an id. Resolution is deterministic and
+ * fail-loud: it returns exactly one peer or throws {@link AmbiguousPeerError} — it never
+ * silently picks among same-named peers. The id is authoritative; the name is best-effort.
+ *
+ * `owner/name` handles (per-owner namespaces) land with the accounts/auth feature; until then
+ * `/` is reserved in a name ({@link assertValidName}) so they slot in without a migration.
+ * See .internal/plans/peer-addressing.md.
+ */
+import type { Presence, PresenceStatus } from "./types.js";
+import { LINE_BREAK } from "./peer-label.js";
+import { peerLabel } from "./peer-label.js";
+import { isWellFormedUnicode } from "./canonical-json.js";
+
+export { peerLabel };
+
+/** A peer that matched an ambiguous name — structural, so each surface renders it itself.
+ *  The full `id` is the authoritative, routable address. */
+export interface PeerCandidate {
+  id: string;
+  name: string;
+  role?: string;
+  status: PresenceStatus;
+  /** Epoch ms of the peer's last heartbeat. */
+  ts: number;
+}
+
+/** Thrown when a name resolves to two or more peers that could each be the target. Carries the
+ *  candidates structurally so a caller can show them and re-address by the exact `id`. */
+export class AmbiguousPeerError extends Error {
+  constructor(
+    readonly target: string,
+    readonly candidates: PeerCandidate[],
+  ) {
+    super(
+      `"${target}" is ambiguous - ${candidates.length} peers share that name: ` +
+        candidates.map((c) => `${c.name} (${c.id}, ${c.status})`).join("; ") +
+        `. Re-send to the exact instance id.`,
+    );
+    this.name = "AmbiguousPeerError";
+  }
+}
+
+function candidate(p: Presence): PeerCandidate {
+  return { id: p.card.id, name: p.card.name, role: p.card.role, status: p.status, ts: p.ts };
+}
+const NON_READING_ROLES = new Set(["manager", "delivery", "provisioner", "feedback"]);
+/** Only these infrastructure endpoints do not bind direct-message consumers. */
+export function readsDirectMessages(p: Presence): boolean {
+  if (p.card.kind !== "endpoint") return true;
+  return !NON_READING_ROLES.has(p.card.role ?? "");
+}
+
+/**
+ * Resolve a `target` (an exact instance id, or a display name) to one peer on `roster`.
+ *
+ * - an exact instance-id match wins (any status — an id is unambiguous);
+ * - otherwise a case-insensitive name match, preferring live peers over stale offline ghosts:
+ *   one live match resolves; **2+ live matches throw**; with no live match a unique offline peer
+ *   resolves (best-effort), but **2+ offline duplicates throw**;
+ * - a target that is a peer's `name/role` roster label throws, naming the bare name;
+ * - no match → `undefined` (the caller renders "no such peer").
+ *
+ * `opts.selfId`, when given, is excluded (you don't DM yourself). Throws
+ * {@link AmbiguousPeerError} rather than ever silently picking.
+ */
+export function resolvePeer(
+  roster: Presence[],
+  target: string,
+  opts: { selfId?: string } = {},
+): Presence | undefined {
+  const peers = opts.selfId ? roster.filter((p) => p.card.id !== opts.selfId) : roster;
+
+  const byId = peers.find((p) => p.card.id === target);
+  if (byId) return byId;
+
+  const want = target.trim().toLowerCase();
+  if (!want) return undefined;
+  const matches = peers.filter((p) => p.card.name.toLowerCase() === want);
+  if (matches.length === 0) {
+    // Rosters print a peer as `name/role`, so that label is what gets copied into a target. It is
+    // refused rather than resolved: `/` is reserved for `owner/name` handles, and reading it as a
+    // role here would give the same string two meanings once handles land. The label is trimmed
+    // like the target, or one whose sanitized edge became a space (a role ending in `]`) never matches.
+    const labelled = peers.find((p) => p.card.role && peerLabel(p.card).trim().toLowerCase() === want);
+    if (labelled)
+      throw new Error(
+        `"${target}" is the roster label of ${labelled.card.name} (role ${labelled.card.role}), not an ` +
+          `address: use the name "${labelled.card.name}" or its instance id`,
+      );
+    return undefined;
+  }
+
+  const live = matches.filter((p) => p.status !== "offline");
+  const pool = live.length > 0 ? live : matches;
+  if (pool.length === 1) return pool[0];
+  throw new AmbiguousPeerError(target, pool.map(candidate));
+}
+
+/**
+ * The instance ids whose display name is not an address, by the comparison
+ * {@link resolvePeer} uses: trimmed and case-insensitive, the caller's own id left out when
+ * `opts.selfId` is given, and a lone offline ghost beside a live peer not counted. An id is in the
+ * set when two or more of the peers that comparison would consider share its name, so a row that
+ * carries one of these ids cannot be reached by name. A renderer appends its own spelling of the id.
+ */
+export function sharedNameIds(roster: Presence[], opts: { selfId?: string } = {}): ReadonlySet<string> {
+  const peers = opts.selfId ? roster.filter((p) => p.card.id !== opts.selfId) : roster;
+  const groups = new Map<string, Presence[]>();
+  for (const p of peers) {
+    const key = p.card.name.trim().toLowerCase();
+    const group = groups.get(key);
+    if (group) group.push(p);
+    else groups.set(key, [p]);
+  }
+  const ids = new Set<string>();
+  for (const group of groups.values()) {
+    const live = group.filter((p) => p.status !== "offline");
+    const pool = live.length > 0 ? live : group;
+    if (pool.length > 1) for (const p of pool) ids.add(p.card.id);
+  }
+  return ids;
+}
+
+/** Maximum length of a display name, in UTF-16 code units.
+ *
+ *  Derived from the transport budget, not picked. The client's CONNECT line carries the user JWT
+ *  plus every payload the identity rides into (presence rows, message envelopes), and the broker
+ *  caps that line at `max_control_line` (65536 in the generated config, provision.ts). A name is
+ *  display data on that path, so an unbounded name is an unbounded CONNECT line: a 70,000-char
+ *  name was accepted end to end and the connect then hung (issue #375) — the broker drops the
+ *  oversized line silently and the client retries forever. 128 leaves every human name (~40 chars
+ *  at the extreme) 3× headroom while keeping dozens of in-flight name-bearing rows an order of
+ *  magnitude inside the 64 KB line. The grants themselves key on the principal, never the name
+ *  (event-channel.ts), so this bound guards the payload side of the budget.
+ */
+export const MAX_NAME_LENGTH = 128;
+
+export { LINE_BREAK } from "./peer-label.js";
+
+
+/**
+ * Validate a display name. A name must be non-empty, single-line, and free of surrounding
+ * whitespace; `/` is reserved as the future `owner/name` separator (and already means "a path"
+ * to the agent-file loader). Throws — no silent rewrite (per AGENTS.md, no fallbacks). Internal
+ * spaces are allowed (human display names like "Ada Lovelace").
+ */
+export function assertValidName(name: string): void {
+  if (name.length === 0 || name !== name.trim())
+    throw new Error(`invalid name ${JSON.stringify(name)}: must be non-empty with no surrounding whitespace`);
+  if (name.length > MAX_NAME_LENGTH)
+    throw new Error(
+      `invalid name ${JSON.stringify(name.slice(0, 32))}…: ${name.length} characters exceeds the ` +
+        `${MAX_NAME_LENGTH}-character limit (the CONNECT line budget that carries it)`,
+    );
+  if (LINE_BREAK.test(name))
+    throw new Error(`invalid name ${JSON.stringify(name)}: must be a single line`);
+  if (name.includes("/"))
+    throw new Error(`invalid name ${JSON.stringify(name)}: "/" is reserved (the owner/name separator)`);
+  if (name.includes("\\"))
+    throw new Error(`invalid name ${JSON.stringify(name)}: "\\" is reserved (a Windows path separator)`);
+  // A name must be well-formed UTF-16 — no unpaired surrogate. This is an IDENTITY rule, not a
+  // tidiness one, and it is here at the shared choke point rather than at one consumer.
+  //
+  // An unpaired surrogate cannot be encoded as UTF-8: every encoder replaces it with U+FFFD. So the
+  // moment a name crosses any UTF-8 boundary, DISTINCT names become the SAME bytes. Two consequences
+  // were measured on this repo, and both are silent:
+  //   - `createHash().update(name)` hashes the replaced bytes, so "\uD800", "\uD801" and "\uFFFD"
+  //     produce one digest — and any identifier derived from that digest merges the three principals.
+  //   - the launch environment normalizes the name on the way to a child process, so the child's
+  //     idea of its own name can differ from the parent's while both believe they agree.
+  // Refusing here is the only fix that covers both; a consumer that hashes injectively still cannot
+  // stop the name itself from changing shape as it crosses a process boundary.
+  if (!isWellFormedUnicode(name))
+    throw new Error(
+      `invalid name ${JSON.stringify(name)}: contains an unpaired UTF-16 surrogate. Such a name ` +
+        `cannot survive UTF-8 encoding — it is replaced with U+FFFD — so distinct names would ` +
+        `silently become one identity.`,
+    );
+}

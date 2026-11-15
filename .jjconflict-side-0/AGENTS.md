@@ -1,0 +1,323 @@
+# AGENTS.md
+
+Guidance for any coding agent (Claude Code, OpenCode, Codex, Cursor, and others) working in
+this repo. This is the **canonical** agent guide; `CLAUDE.md` points here.
+
+Keep your answers short and to the point.
+
+## This fork: broken tests are disabled, not fixed
+
+This is the Rigel fork. `main` mirrors upstream; our changes land on `rigel-release`.
+
+- **A test that fails or flakes on upstream code is disabled, never fixed.** Do not debug it,
+and do not file a question about it. This is a standing owner ruling.
+  - A smoke suite: add a `QUARANTINED` entry in `bin/smoke/ci-quarantine.mjs` with a `reason`
+  that names the evidence and a `recheckBy` date. Keep its line in `bin/smoke/ci-suites.txt`,
+  because removing a line re-shards every suite below it.
+  - A `ci.yml` smoke step: add `continue-on-error: true` and a matching `LIVE_QUARANTINED` entry.
+- **A test for code we wrote is fixed.** Fix a race by waiting for the event, not with a retry
+or a quarantine.
+
+## Syncing upstream into `rigel-release`
+
+1. Branch `harness/rig-5440-upstream-sync` from `rigel-release` and merge `main` into it. Keep the
+merge commit; this PR must not be squashed or rebased. Mutation reproof is disabled on this fork:
+the workflow is renamed `.github/workflows/mutation-reproof.yml.disabled`, so GitHub never runs it.
+Its fixtures and script remain for local runs.
+2. Resolve conflicts in favor of our custody guarantees (custodian-run Linux pty seats, no
+numeric or process-group signals, retain or refuse an unproven reap). If an upstream test asserts
+the opposite, quarantine it unchanged.
+3. Quarantine every other upstream-red suite as above, then run `pnpm smoke:gate-inventory`.
+4. Add review fixes as new commits on the branch, never as a rebase. The PR body needs its own
+paragraph `Approved-at: <full 40-character head sha>` naming the final pushed head.
+
+## What this is
+
+**Cotal** is a standard wire interface for software, especially AI agents, to coordinate in
+real time.
+The wire contract (subjects, message schemas, presence/discovery conventions) *is* the standard;
+libraries are thin clients over it. Transport is **NATS + JetStream**; the reference
+implementation is **TypeScript**.
+
+**Thin waist, real substance, guarded core:**
+
+- **Thin waist** — the normative wire contract (subjects, schemas, presence/discovery, delivery
+semantics, the owner+actor auth grammar) is the standard.
+- **Pluggable edges** — identity, transport, storage, secrets, discovery, payments are adapters over
+existing building blocks. Compose, don't reinvent (e.g. any OIDC IdP plugs in via a thin
+auth-callout adapter).
+- **Not hollow** — the substance is the contract *and its guarantees*, the reference implementation,
+and the local operator tooling; not a bare shim.
+- **Guard the core** — keep adapters thin and swappable, and never let an adapter's or example's
+concepts leak into `@cotal-ai/core` or the shared layers.
+
+## Read these first
+
+- [README.md](README.md): what Cotal is, for a general audience.
+- [docs/README.md](docs/README.md): the docs index and reading path.
+- [docs/what-is-cotal.mdx](docs/what-is-cotal.mdx) (*what* it does) →
+[docs/architecture.mdx](docs/architecture.mdx) (*how*) →
+[docs/connect-claude.mdx](docs/connect-claude.mdx) (the connector).
+- [SPEC.md](SPEC.md): the **normative** wire contract. Where a client disagrees with the spec,
+the spec wins. [spec/cotal-lang.md](spec/cotal-lang.md) is the normative reference for the
+workflow language (SPEC §14); every `js` block in it is validated by `pnpm smoke:lang-surface`.
+- `.internal/` (private submodule): working build-plans, research, and guidelines. Make sure it
+is current before changing behavior.
+
+## Commands
+
+```bash
+pnpm cotal <cmd>   # run the CLI via tsx bin/cotal.ts (base + manager commands)
+pnpm smoke         # core smoke test
+pnpm smoke:ci      # security/protocol smoke suite (the CI gate); needs nats-server on PATH
+pnpm smoke:ci:offline # the gate minus the suites that start a stack or drive real processes; prints what it excluded, and is not the gate
+pnpm typecheck     # tsc --noEmit across all packages
+pnpm build         # tsc build across all packages
+pnpm check         # every local check, :live suites included; runs every step and lists each failure at the end
+```
+
+ESM only (`"type": "module"`); `tsx` runs TS directly, but packages import each other from their
+built `dist/`, so run `pnpm build` after `pnpm install` and after editing a package
+([CLI usage](https://docs.cotal.ai/api-reference/cli-usage/#running-it)). Node &gt;= 22.10.
+
+## Repository map
+
+
+| Path                                    | What it is                                                                                                                                                                                                                        |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/*`                            | The standard plus the local workstation layer. `@cotal-ai/core` is the wire protocol (generic; depends on nothing else in the repo); `@cotal-ai/workspace` is the machine-local operator and client-surface layer over `~/.cotal` and depends on core; `@cotal-ai/lang` is the cotal-lang workflow language and depends on nothing else here; `@cotal-ai/seat` is local PTY seat custody (one detached custodian per seat) and depends on nothing else here; `@cotal-ai/smoke-kit` is private test-only helpers for the smoke suites, never published and never imported by shipped code. |
+| `extensions/*`                          | Pluggable adapters (connectors, runtimes). Peer-depend core; self-register on import.                                                                                                                                             |
+| `implementations/*`                     | Opinionated surfaces over core (CLI, manager, delivery daemon, the cotal-lang runtime host). Self-contained; never import each other.                                                                                                                          |
+| `examples/*`                            | Use-cases / composition roots. Private, never published. Each self-documents in its README.                                                                                                                                       |
+| `bin/`                                  | The `cotal` binary (the published `cotal-ai` package): the composition root.                                                                                                                                                      |
+| `docs/`                                 | Protocol documentation (start at `docs/README.md`).                                                                                                                                                                               |
+| `SPEC.md`, `spec/`                      | The normative wire spec, plus the generated `cotal.schema.json`.                                                                                                                                                                  |
+| `deploy/`                               | Containerized agent teams against an external broker.                                                                                                                                                                             |
+| `scripts/`                              | Maintenance scripts (schema generation, feedback admin).                                                                                                                                                                          |
+| `assets/`, `remotion/`, `presentation/` | README images, the animation project, and a slide deck.                                                                                                                                                                           |
+| `reserved/`                             | npm name placeholders (`cotal`, `cotal-mesh`).                                                                                                                                                                                    |
+
+
+### The packages (one-way dependency tiers)
+
+Dependencies flow one way: `examples → implementations → workspace → core ← (peer) extensions`
+(`packages/*` is core + workspace; extensions peer-depend core only). `@cotal-ai/smoke-kit` sits
+outside that flow entirely: it is a test-only devDependency of the packages whose smokes use it, and
+no shipped file may import it.
+Extensions, connectors, runtimes, and commands **self-register into the core `Registry` on
+import**; a composition root just imports the surfaces it wants. An unknown agent type throws,
+with no silent fallback.
+
+- `**@cotal-ai/core**` (`packages/core`): endpoint, subjects, message types; the NATS client
+layer plus the extension contracts (`Connector`, `Command`, `Runtime`) and the `Registry`
+they self-register into. The wire standard — depends on nothing else in the repo.
+- `**@cotal-ai/workspace**` (`packages/workspace`): the machine-local operator and client-surface
+layer over `~/.cotal` — the mesh registry, target resolution, preflight, the `.cotal/` auth-path
+helpers, the command-copy renderer, and what terminal surfaces share: the live space model
+(`MeshView`, `openObserver`), the manager control calls (`@cotal-ai/workspace/control`), the
+managed-launch request (`requestManagedLaunch`), the chat session (`@cotal-ai/workspace/chat`), and
+the terminal attach (`@cotal-ai/workspace/attach`).
+Depends on core; not part of the wire standard.
+- `**@cotal-ai/smoke-kit**` (`packages/smoke-kit`): private test-only helpers shared by the smoke
+suites — the broker ownership that kills a spawned `nats-server` when a suite is
+*signalled* rather than only when it returns, and the spawn-site census behind
+`pnpm smoke:broker-migration`, which walks `git ls-files` and fails when any suite starts a broker
+the reaper cannot claim or the helper cannot kill. Never published and never imported by shipped code
+(enforced by `pnpm smoke:core-boundary`); it has no `dist`, so there is no build step and no
+compiled second copy that can disagree with the source.
+- `**@cotal-ai/lang**` (`packages/lang`): the cotal-lang workflow language, as
+[spec/cotal-lang.md](spec/cotal-lang.md) defines it: its grammar (one syntax table drives the
+validator and the interpreter), the interpreter's sequential core and concurrency scopes, the step
+journal, the effect interface a host implements, and the simulator and dry run that exercise a
+program with no broker. Depends on nothing else in the repo; it knows about effects, not about NATS.
+- `**@cotal-ai/seat**` (`packages/seat`): local PTY seat custody. A one-shot launcher starts one
+detached custodian process per seat. The custodian owns the `node-pty` object, child relationship,
+screen mirror, and exit observation. A manager worker adopts a proxy handle over a permissioned
+Unix socket. Depends on nothing else in the repo; it knows about host processes, not about NATS.
+Custody is Linux only; its host primitives for the daemon endpoint build on Linux, macOS and Windows. The built-in `pty` runtime does not
+launch through it: the manager spawns pty seats in-process on every platform, and uses this
+package only to adopt and reap seats that an earlier manager left under a custodian (on Linux;
+elsewhere `adopt` throws).
+- `**@cotal-ai/runtime**` (`implementations/runtime`): the host that runs a cotal-lang program on
+the mesh: the mesh handler binding the effect interface onto the real planes, the durable step
+journal, and the `RunDriver` the manager daemon hosts. Depends on core and lang.
+- `**@cotal-ai/connector-core**` (`extensions/connector-core`): the shared MCP-bridge runtime:
+the mesh agent, the `cotal_*` tool specs (incl. `cotal_spawn` / `cotal_persona` /
+`cotal_personas` / `cotal_despawn`), and the hook relay. The adapters below are thin clients over it.
+- `**@cotal-ai/connector-claude-code**` (`extensions/connector-claude-code`): the Claude Code
+adapter (installed plugin + `claude/channel` push).
+- `**@cotal-ai/connector-opencode**` (`extensions/connector-opencode`): the OpenCode adapter
+(native in-process plugin injected via `OPENCODE_CONFIG_CONTENT`).
+- `**@cotal-ai/connector-hermes**` (`extensions/connector-hermes`): the Hermes (Nous Research)
+adapter; includes a Python sidecar.
+- `**@cotal-ai/connector-codex**` (`extensions/connector-codex`): the OpenAI Codex adapter: a
+host-mode peer that drives `codex app-server`, with Codex's own TUI attached and the `cotal_*`
+tools served on a loopback MCP endpoint.
+- `**@cotal-ai/connector-jcode**` (`extensions/connector-jcode`): the Jcode adapter: a host-mode
+peer driven through Jcode's Harness API bridge.
+- `**@cotal-ai/pi**` (`extensions/pi`): the pi adapter — a pi extension (loaded into the
+user's own pi, no bundled runtime) that embeds `MeshAgent` in the session's process and
+drives it off the inbox with true mid-turn steering; also covers agents built on pi's SDK.
+See [docs/connect-pi.mdx](docs/connect-pi.mdx).
+- `**@cotal-ai/cmux**` (`extensions/cmux`): the cmux integration: a driver over the cmux CLI
+plus a self-registering `cmux` Runtime provider.
+- `**@cotal-ai/tmux**` (`extensions/tmux`): the tmux integration: a driver over the tmux CLI
+plus a self-registering `tmux` Runtime provider.
+- `**@cotal-ai/orca**` (`extensions/orca`): the Orca integration: a driver over the public Orca
+CLI plus a self-registering `orca` Runtime provider.
+- `**@cotal-ai/herdr**` (`extensions/herdr`): the Herdr integration: a driver over the herdr CLI
+plus a self-registering `herdr` Runtime provider that spawns agents into panes of a dedicated
+Herdr session (they survive the manager's terminal going away).
+- `**@cotal-ai/cli**` (`implementations/cli`): the mesh CLI: `up`, `join`, `console`,
+`spawn`, `mint`, `status`, `doctor`, `channels`, `history`, `ext` (operator-installed command extensions).
+- `**@cotal-ai/web**` (`implementations/web`): the browser dashboard as a `cotal ext`-installable
+extension package — it peer-depends on core + workspace (linked to the binary's copies at add
+time) and self-registers its command.
+- `**@cotal-ai/tui**` (`implementations/tui`): the terminal app, one full-screen workspace that
+lists this machine's spaces and opens one, which the human watches unseen and writes to through a
+chat session opened on the first write. Built on OpenCode's Solid and OpenTUI
+components, vendored under `vendor/opencode/` and held to their recorded hashes by
+`scripts/check-vendor.mjs`. Private, needs Node 26.4 or newer, and depends on core and workspace.
+The `cotal` binary does not start it yet.
+- `**@cotal-ai/linear**` (`implementations/linear`): serves the official Linear MCP server as a
+registered endpoint that agents call with `cotal_describe` and `cotal_invoke`, plus the
+`cotal linear` operator command. A `cotal ext`-installable package that peer-depends on core +
+workspace.
+- `**@cotal-ai/manager**` (`implementations/manager`): the agent supervisor: spawns and manages
+nodes via a pluggable Runtime (`pty` built-in; `tmux`, `cmux`, `orca`, and `herdr` via extensions), with `spawn --detach`/`stop`/`ps`/`attach`
+(attach streams over a mesh session) and a credentialed local HTTP console.
+- `**@cotal-ai/delivery**` (`implementations/delivery`): the server-side Plane-3 delivery daemon
+— the durable backstop (fan-out writer + trusted reader + membership/ACL authority), a scoped,
+least-privilege NATS client co-located with the broker. Self-registers the `deliver` command.
+- `**@cotal-ai/auth**` (`implementations/auth`): per-user auth: owner-token derivation,
+user-token validation for the NATS auth callout, and the auth service. Self-registers the
+`auth-service`, `actor`, `agent-bearer`, `login`, and `logout` commands. Depends on core, lang,
+and workspace.
+
+An example only *configures and orchestrates* (roles, config, space name, runbook, optional
+driver) and picks which extensions to register. It never adds message kinds, subjects, or
+endpoint methods; those go into `core`, generalized.
+
+**Core primitives:** endpoint, agent node, space, channel, direct message, presence, history.
+**Delivery modes:** multicast / unicast / anycast.
+
+## Conventions
+
+- **Never fix an issue you could not reproduce.** Reproduce the failure (live, not just in
+reasoning or a unit simulation) before writing a fix; the repro is also the only proof the
+fix works. If you can't reproduce it, report that and stop, don't ship a guess.
+- **Prove fixes against unchanged pre-fix code.** Run the real reproducer or regression test against
+that implementation before editing it, then run it against the fix. If a baseline is needed later,
+use a separate checkout at the pre-fix commit and install and build its dependencies before testing.
+Name the expected failure: a setup error or unrelated early failure is not proof. If the test builds
+its inputs by hand, also show that a real entry point reaches that code.
+- **Mutation and fix-reversion proofs require an explicit request.** Do not run them otherwise,
+including in delegated work, reviews or checks that execute mutations indirectly. Mutation configs
+(`*/mutations/*.json`) and `pnpm mutation-proof` are optional tools, not a delivery gate. A change
+does not need to add, update or re-pin them.
+- **Every package's `typecheck` also runs a `tsconfig.smoke.json` over its smoke tree.** A new
+package with smoke files adds the same pair, because a smoke file that is typechecked by nothing
+runs green over real type errors.
+- **Keep the code clean and minimal.** No bloat, no overcomplication.
+- **Do only what is asked**, not more, not less. Do not add features or abstractions that are
+not explicitly requested or clearly needed.
+- **Keep docs short and human**, and **keep them updated in the same change** as the behavior:
+when behavior changes, update the affected pages under [docs/](docs/README.md) (and
+[SPEC.md](SPEC.md) for wire changes) so they never drift from the code. Use direct sentences:
+no em dashes, filler words such as `exactly` or `fold`, list-style headings, or slogan-shaped
+"this, not that" contrasts. `pnpm check:docs-voice` enforces the mechanical parts. An operator
+string a page quotes must be one the source still emits, with a substituted value written as a
+placeholder such as `<id>`; `pnpm check:docs-literals` checks that.
+A published page's relative link to `SPEC.md` or a top-level `docs/*.md` page must name a page
+the group map in `website/scripts/sync-docs.mjs` publishes. Any other relative link, a design note
+under `docs/design/` included, must name a file that exists and goes to GitHub. A `#anchor` on a
+link to a published page, the same page included, must name a heading there or an explicit
+`<a id>`. The docs index links the same Markdown and MDX pages and `SPEC.md` that the group map publishes.
+`pnpm check:docs-site` runs that sync and fails otherwise.
+`docs/` describes the **protocol** only; each example documents itself in its own
+`examples/*/README.md`.
+- **A doc comment sits directly above what it documents.** TypeScript attaches only the nearest
+`/** */` block to a declaration, so a block followed by another block documents nothing and its
+contract shows nowhere on hover. Move the block with its declaration, or merge or delete it.
+`pnpm check:doc-comments` refuses that shape in shipped source. Every doc block must close and
+must not contain another literal `/**`, including in examples: block comments do not nest, so a
+missing close can swallow the next block. Write an example opener as `&#47;**` instead.
+- **Docs reach agents through a build artifact, so just edit the page.** `cotal_docs` serves a
+version-exact bundle of `docs/`, `SPEC.md` and `spec/`. It is generated by
+`@cotal-ai/connector-core`'s own `build` and `typecheck`, and the generated file is gitignored.
+There is nothing to regenerate by hand and nothing to commit: edit the page and the next build
+carries it. It used to be committed, and two branches that regenerated the same region of it
+conflicted in a file no human wrote while their pages merged cleanly.
+- **No fallbacks.** Throw if something is not supported in the current environment or config,
+rather than silently degrading.
+- **Keep the customer update path clean and secure.** Upgrading (`npm i -g cotal-ai@<new>`) must
+bring every installed extension and connector to a current, core-matched version, or fail loud. It
+must never leave a customer silently on stale exts, on a skewed core/ext pair, or on an unverified
+download. Any change to install, `setup`/seed, or `ext` resolution must preserve this.
+- **Use native NATS/JetStream features** first, rather than re-implementing them.
+- **Do not switch branches** without being prompted. To work independently, use a git worktree.
+- **Favor the long-term trustworthy, maintainable choice**, even when it costs more upfront.
+Avoid shortcuts that add technical debt or fragility.
+- **Look at the relevant docs**, make sure `.internal` is current, and follow its guidelines
+when making changes.
+- **Track plan status.** `.internal/plans/STATUS.md` is the single source of truth for whether each
+plan is executed — check it before acting on a plan. When you start, advance, finish, block, or
+supersede a plan, update its row there in the same change; add a `planned` row for any new plan.
+**Commit the plan file and its STATUS row together as their own `.internal` commit** (a
+`plans: …` message) as you make the change — never leave plan/STATUS edits uncommitted in the
+shared submodule working tree, where another agent's commit could sweep in your half-done work.
+
+## Closing out a lane
+
+A lane is one piece of delegated work: its worktree, its workers, and what it built. The agent
+that spawned the lane cleans it up when the lane finishes. A scheduled cleanup job is only a
+backstop.
+
+1. **Keep what must survive.** Commit and push the source, and keep compact proof of the required
+checks: the tested head, the logs, and their hashes. Keeping proof does not keep every build or
+dependency copy.
+2. **Retire the lane's workers.** A worker is ready only when it is terminal and quiescent, with no
+live jobs, transfers, or unresolved ownership. A quiet worker can still be in a live, blocked turn.
+Confirm the lane owns it, stop only that worker through a native control that targets it alone,
+such as despawn, and confirm it exited. Never stop a manager as cleanup.
+3. **Remove the disposable copies.** Delete the lane's dependency installs, build outputs, test
+stores, downloads, and the finished worktree. Remove a directory only while holding a barrier that
+keeps new owners and new processes out of it, from the final check through the deletion. A
+one-time check that nothing runs there is not enough, because a process can enter after it.
+4. **Record the result.** Note the bytes reclaimed. For anything that stays, such as evidence or
+unfinished work, record who owns its cleanup and the condition that releases it.
+
+Never delete anything live, held, shared, foreign, or of unknown ownership, any credential, an
+unpushed commit, or an unmerged branch. Do not clean by age alone. The rule covers only what the
+lane can show it owns.
+
+## Git and public messages
+
+- **Our contribution style.** Maintainer-prepared commits and PRs use plain Conventional
+Commits without AI/tool credits, generator footers or trailers. Other contributors may acknowledge
+their agents; this is not a repository-wide ban or merge requirement.
+- **Maintainer messages must not self-advertise.** Our commits, PRs, issues and mesh channel posts
+should read as a human contributor wrote them. Do not name or promote the agent or tool that
+produced them.
+
+## Changesets and PR text
+
+- **Changesets.** Packages are 0.x, so a breaking change is a **minor**. The `fixed` group versions every package in lockstep, so one changeset
+bumps them all; list every package with a first-party change and write one clear summary.
+The summary's first sentence is the change's headline: the GitHub Release lists it under
+`## What changed` and the Discord announcement carries only those sentences, so write it as one
+plain sentence a user understands on its own, and put the mechanism after it.
+Verify the plan with `pnpm changeset status` before committing.
+- **PR title** is a plain Conventional Commit subject (`!` marks a breaking change). **PR body**
+states the full scope of the work, not just the headline.
+- **Never cite an internal references from the plan or campaign** in a PR or commit.
+
+## Research and web tools
+
+- **Research online first.** Before implementing a feature (NATS/JetStream APIs, MCP SDK,
+A2A/SLIM conventions), verify current behavior against real docs rather than memory.
+- **Searching the web** (open-ended queries, finding docs): prefer the Tavily MCP
+(`tavily_search` / `tavily_research`); it returns higher-signal results than built-in search.
+- **Fetching a known URL:** use the built-in `WebFetch`; do not route those through Tavily.
+
+You are strictly forbidden from changing the current worktree into another branch, if you need another branch you MUST use git worktree (not the main one).

@@ -1,0 +1,197 @@
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import {
+  hardenPrivate,
+  launcherSource,
+  registry,
+  SpawnRefused,
+  confirmWatch,
+  writeSecretFile,
+  type AgentHandle,
+  type ConfirmPane,
+  type LaunchSpec,
+  type Runtime,
+  type RuntimeProvider,
+  type StartupOutcome,
+} from "@cotal-ai/core";
+import * as orca from "./driver.js";
+
+const GRACE_MS = 2_000;
+const MAX_WORKTREE_CACHE = 32;
+/** Bounds every Orca call the startup-confirm watch makes, because it polls on the manager's event
+ *  loop. */
+const CONFIRM_CALL = { timeoutMs: 1_000 };
+
+export interface PrivateLauncher {
+  command: string;
+  dir: string;
+  script: string;
+}
+
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+export function privateLauncher(spec: LaunchSpec, cwd: string): PrivateLauncher {
+  const dir = mkdtempSync(join(tmpdir(), "cotal-orca-"));
+  hardenPrivate(dir, "dir");
+  const script = join(dir, "launch.mjs");
+  writeSecretFile(script, launcherSource("[cotal-orca-launch]", { cwd, command: spec.command, args: spec.args, env: spec.env ?? {} }));
+  // Orca types --command into an interactive shell. exec makes terminal connectivity track
+  // launcher lifetime, while single-quote escaping prevents shell interpolation in temp paths.
+  return { command: `exec ${shellQuote(process.execPath)} ${shellQuote(script)}`, dir, script };
+}
+
+function cleanupLauncher(launcher: PrivateLauncher): void {
+  try {
+    rmSync(launcher.dir, { recursive: true, force: true });
+  } catch {
+    /* the launcher also removes itself after loading */
+  }
+}
+
+/** Spawns each managed agent into an Orca terminal in the Orca worktree enclosing the launch cwd. */
+export class OrcaRuntime implements Runtime {
+  readonly kind = "orca" as const;
+  readonly streamsTerminal = false;
+  readonly reportsStartupOutcome = true;
+  readonly #worktrees = new Map<string, orca.OrcaWorktree>();
+
+  #cacheWorktree(cwd: string, worktree: orca.OrcaWorktree): void {
+    this.#worktrees.delete(cwd);
+    this.#worktrees.set(cwd, worktree);
+    if (this.#worktrees.size > MAX_WORKTREE_CACHE) this.#worktrees.delete(this.#worktrees.keys().next().value!);
+  }
+
+  spawn(name: string, spec: LaunchSpec, cwd: string): AgentHandle {
+    if (!/^[A-Za-z0-9_.-]+$/.test(name))
+      throw new SpawnRefused(`orca runtime: unsafe agent name ${JSON.stringify(name)} (allowed: letters, digits, _ . -)`);
+    if (!orca.available()) throw new SpawnRefused("orca runtime: Orca CLI/runtime is not reachable (run `orca status --json`)");
+
+    // No terminal exists yet, so a failure here (a confirm prompt that cannot match, a lookup, a
+    // launcher script that cannot be written) is a refusal.
+    let watch: ((pane: ConfirmPane) => void) | undefined;
+    let cwdKey: string;
+    let worktree: orca.OrcaWorktree;
+    let cachedWorktree: boolean;
+    let launcher: PrivateLauncher;
+    try {
+      if ((spec.confirmBefore?.length || spec.confirmReady?.length || spec.confirmBlockers?.length) && spec.confirm === undefined) throw new Error("startup choices require a final confirmation prompt");
+      watch = spec.confirm === undefined ? undefined : confirmWatch(spec.confirm, spec.confirmBefore, spec.confirmReady, spec.confirmBlockers, spec.confirmNotice);
+      cwdKey = realpathSync(cwd);
+      const cached = this.#worktrees.get(cwdKey);
+      cachedWorktree = !!cached;
+      worktree = cached ?? orca.resolveWorktree(cwd);
+      if (!cached) this.#cacheWorktree(cwdKey, worktree);
+      launcher = privateLauncher(spec, cwd);
+    } catch (err) {
+      throw new SpawnRefused((err as Error).message);
+    }
+    const title = `cotal-${name}`;
+    let terminal: orca.OrcaTerminal;
+    try {
+      terminal = orca.createTerminal({ worktreeId: worktree.id, title, command: launcher.command });
+    } catch (err) {
+      if (cachedWorktree && err instanceof orca.OrcaCliError && /selector_not_found|worktree.*not_found/i.test(err.code)) {
+        this.#worktrees.delete(cwdKey);
+        worktree = orca.resolveWorktree(cwd);
+        this.#cacheWorktree(cwdKey, worktree);
+        try {
+          terminal = orca.createTerminal({ worktreeId: worktree.id, title, command: launcher.command });
+        } catch (retryErr) {
+          cleanupLauncher(launcher);
+          throw retryErr;
+        }
+      } else {
+        cleanupLauncher(launcher);
+        throw err;
+      }
+    }
+    const current = (): orca.OrcaTerminal => {
+      terminal = orca.currentTerminal(terminal) ?? terminal;
+      return terminal;
+    };
+    let startup: StartupOutcome = "pending";
+    watch?.({
+      settled: (outcome) => { startup = outcome; },
+      read: () => {
+        const resolved = orca.currentTerminal(terminal, CONFIRM_CALL);
+        if (!resolved || resolved.connected === false) return undefined;
+        terminal = resolved;
+        return orca.readScreen(terminal.handle, CONFIRM_CALL);
+      },
+      // Enter follows the read at once, so it uses the handle the read resolved.
+      enter: () => orca.sendTerminal(terminal.handle, { enter: true, ...CONFIRM_CALL }),
+      down: () => orca.sendTerminal(terminal.handle, { text: "\x1b[B", ...CONFIRM_CALL }),
+      fail: (message) => {
+        console.error(`orca runtime: "${name}": ${message}`);
+        try {
+          orca.closeManagedTerminal(terminal, CONFIRM_CALL);
+        } catch (err) {
+          console.error(`orca runtime: failed to close terminal for "${name}":`, err);
+        } finally {
+          cleanupLauncher(launcher);
+        }
+      },
+    });
+
+    return {
+      name,
+      kind: "orca",
+      startupOutcome: () => startup,
+      status: () => (orca.terminalAlive(terminal) ? "running" : "exited"),
+      stop: (opts) => {
+        if (opts?.graceful === false) {
+          try {
+            orca.closeManagedTerminal(terminal);
+          } finally {
+            cleanupLauncher(launcher);
+          }
+          return;
+        }
+        try {
+          orca.sendTerminal(current().handle, { text: "/exit", enter: true });
+        } catch {
+          /* still ensure it closes below */
+        }
+        setTimeout(() => {
+          try {
+            orca.closeManagedTerminal(terminal);
+          } catch (err) {
+            console.error(`orca runtime: failed to close terminal for "${name}":`, err);
+          } finally {
+            cleanupLauncher(launcher);
+          }
+        }, GRACE_MS);
+      },
+      waitForExit: () => orca.waitManagedTerminalExit(terminal),
+      interrupt: () => {
+        try {
+          orca.sendTerminal(current().handle, { interrupt: true });
+        } catch (err) {
+          if (err instanceof orca.OrcaCliError && (orca.isGoneCode(err.code) || /not_writable/i.test(err.code))) return;
+          throw err;
+        }
+      },
+      attach: () => {
+        throw new Error(
+          `orca runtime: watch this agent in Orca terminal ${current().handle}` +
+            `${worktree.displayName ? ` (${worktree.displayName})` : ""}; ` +
+            `run \`orca terminal switch --terminal ${terminal.handle}\` to focus it`,
+        );
+      },
+    };
+  }
+}
+
+/** Self-registering runtime provider — `import "@cotal-ai/orca"` makes the manager's `orca`
+ *  runtime available without the manager depending on this package. */
+export const orcaRuntimeProvider: RuntimeProvider = {
+  kind: "runtime",
+  name: "orca",
+  available: () => orca.available(),
+  create: () => new OrcaRuntime(),
+};
+
+registry.register(orcaRuntimeProvider);

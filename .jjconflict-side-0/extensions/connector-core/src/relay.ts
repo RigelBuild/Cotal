@@ -1,0 +1,241 @@
+/**
+ * Cotal lifecycle hook relay — stateless.
+ *
+ * The agent runtime runs a hook on a lifecycle event and pipes the event JSON (which
+ * includes `hook_event_name`) on stdin. We forward it to this session's connector over
+ * its local control socket and print the reply for the runtime to apply. It must NEVER
+ * block the session: any error → exit 0, no output. The Claude Code hook
+ * entry points are one-liners over {@link runHookRelay}.
+ */
+import { connect } from "node:net";
+import { controlFromEnv, hasIdentity } from "./session-env.js";
+import { HANDOFF_RECEIPT } from "./control.js";
+
+/** Re-exported for a plugin process that must stay off the barrel, as a hook does. */
+export { hasIdentity };
+
+const TIMEOUT_MS = 2000;
+/** A startup hook may run before the MCP process has bound its socket. Stay inside the existing
+ * hook budget, but do not turn one early ENOENT into a permanently lost lifecycle event. */
+const CONNECT_RETRY_INITIAL_MS = 25;
+const CONNECT_RETRY_MAX_MS = 250;
+
+const isRetryableConnectError = (error: unknown): boolean => {
+  const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+  // These all mean no connection was established and can describe a listener that is still coming
+  // up or being replaced. Permission/path-shape/resource faults are permanent and fail open now.
+  return ["ENOENT", "ECONNREFUSED", "ECONNRESET", "EPIPE", "EAGAIN", "EBUSY"].includes(code ?? "");
+};
+
+const isSessionStart = (event: unknown): boolean =>
+  event !== null &&
+  typeof event === "object" &&
+  (event as { hook_event_name?: unknown }).hook_event_name === "SessionStart";
+
+/**
+ * One bounded warning per hook process, on stderr, with no values in it.
+ *
+ * FAIL OPEN IS NOT THE SAME AS FAIL SILENT, and this relay was doing both. A hook that throws is a
+ * hook that blocked a human's session, so the catch below stays. But a material file that is
+ * missing, permissive, malformed, or contradicted by a direct carrier used to produce a hook that
+ * did nothing and said nothing: the seat runs, presence never advances, no queued peer message is
+ * ever injected, and there is no line anywhere to read. That is the same failure this connector's
+ * Python counterpart shipped, one connector over, and it is why the repair is a WARNING rather than
+ * a stricter refusal.
+ *
+ * Bounded means once per process, and the runtime starts one hook process per lifecycle event, so a
+ * genuinely broken session keeps saying so. That is the intended trade: the alternative is a single
+ * line early in a session that scrolls away, for a fault that persists until someone fixes the
+ * launch. Nothing is interpolated into the message. The variable NAMES are the diagnosis and the
+ * operator can read their own environment; a value in a hook's stderr is a disclosure in whatever
+ * captures that stream.
+ */
+let warned = false;
+function warnOnce(message: string): void {
+  if (warned) return;
+  warned = true;
+  try {
+    process.stderr.write(`[cotal-connector] ${message}\n`);
+  } catch {
+    /* a hook that cannot even warn still must not block the session */
+  }
+}
+
+function readStdin(): Promise<string> {
+  return new Promise((resolve) => {
+    if (process.stdin.isTTY) return resolve("");
+    let d = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (c) => (d += c));
+    process.stdin.on("end", () => resolve(d));
+    process.stdin.on("error", () => resolve(d));
+  });
+}
+
+/**
+ * Print the reply for the runtime and leave.
+ *
+ * `confirm` is the connector's delivery receipt. stdout to a pipe is async, so exit()ing right
+ * after write() can truncate a large reply — we exit from the write callback, and a 1s backstop
+ * guarantees we still leave if it never flushes. That backstop is the dangerous path: the connector
+ * has already handed us peer messages, and if we die here they are gone from the runtime's point of
+ * view. So the receipt is sent from the flush callback ONLY. A backstop exit sends nothing, the
+ * connector scores the reply undelivered, and the batch stays un-acked for redelivery.
+ */
+function done(out: string, confirm?: (then: () => void) => void): void {
+  const exit = (): void => process.exit(0);
+  const t = out.trim();
+  if (!t) return exit(); // fail open — never blocks the session
+  // A failing stdout ALSO emits "error"; unhandled on a stream that throws, which would turn a
+  // vanished runtime into a non-zero hook exit. The callback below is what decides the receipt; this
+  // only keeps the promise that a hook never blocks the session.
+  process.stdout.on("error", () => exit());
+  // The callback fires on FAILURE too (EPIPE, ERR_STREAM_DESTROYED — a runtime that closed the pipe).
+  // Confirming there would be the exact lie this receipt exists to prevent: a commit with zero bytes
+  // delivered. Only a clean write earns the receipt; anything else exits silent and the batch
+  // redelivers.
+  process.stdout.write(t + "\n", (err?: Error | null) => {
+    if (err || !confirm) return exit();
+    confirm(exit);
+  });
+  setTimeout(exit, 1000);
+}
+
+/** Answers one hook event inside the hook process, before the control socket is resolved. A reply
+ *  is printed as the hook's output and the event is not relayed; `undefined` relays it as usual.
+ *  It runs in every session. `managed` says whether the session carries a mesh identity, which is
+ *  the only kind the relay forwards. */
+export type LocalHookAnswer = (event: unknown, session: { managed: boolean }) => Record<string, unknown> | undefined;
+
+/** Relay one hook event from stdin to the connector's control socket and print the reply. `answer`
+ *  runs first, so a decision that needs no connector state holds even when the socket is down. */
+export async function runHookRelay(answer?: LocalHookAnswer, observe?: (event: unknown, session: { managed: boolean }) => Promise<void>): Promise<void> {
+  const managed = hasIdentity();
+  if (!managed && !answer && !observe) return done(""); // plain session with nothing to answer — no-op
+  const raw = (await readStdin()).trim() || "{}";
+  let event: unknown = {};
+  try {
+    event = JSON.parse(raw); // the hook event the runtime piped in
+  } catch {
+    /* malformed — relay an empty event under a valid token */
+  }
+  let local: Record<string, unknown> | undefined;
+  try {
+    local = answer?.(event, { managed });
+  } catch {
+    /* an answer that throws must not block the session; relay the event instead */
+  }
+  if (local) return done(JSON.stringify(local));
+  try { await observe?.(event, { managed }); } catch { /* observation cannot block a native hook */ }
+  if (!managed) return done(""); // plain session, not a managed one — no connector to relay to
+  // The socket path comes from the launch env; the token comes from the launch-material file that
+  // env points at (the same file the in-agent server reads), never recomputed from public identity.
+  // A malformed or missing material file THROWS from controlFromEnv, and a hook that throws is a
+  // hook that blocked the session, so it is caught here and treated as "no control session": fail
+  // open is this relay's whole contract.
+  let control: { path: string; token: string } | undefined;
+  try {
+    control = controlFromEnv();
+  } catch {
+    warnOnce(
+      "this session's control endpoint could not be resolved: the launch material is missing, " +
+        "unreadable, readable beyond its owner, malformed, or contradicted by direct COTAL_ variables. " +
+        "Lifecycle relays are disabled for this session, so presence will not advance and queued peer " +
+        "messages will not be injected. Check COTAL_LAUNCH_MATERIAL and COTAL_CONTROL_SOCKET.",
+    );
+    return done("");
+  }
+  // No control endpoint AT ALL is not warned about: the MCP server refuses that session at startup
+  // and names the missing pair, and warning here would repeat it on every hook and teach the
+  // operator to ignore the channel.
+  if (!control) return done("");
+  const { path, token } = control;
+  const startupCritical = isSessionStart(event);
+  let sock: ReturnType<typeof connect> | undefined;
+  let settled = false;
+  let retryDelayMs = CONNECT_RETRY_INITIAL_MS;
+  const drop = (candidate = sock): void => {
+    try {
+      candidate?.destroy();
+    } catch {
+      /* ignore */
+    }
+  };
+  const settle = (): boolean => {
+    if (settled) return false;
+    settled = true;
+    clearTimeout(timer);
+    return true;
+  };
+  const finish = (out: string): void => {
+    if (!settle()) return;
+    drop();
+    done(out);
+  };
+  /** Got a reply: keep the socket until stdout has flushed, then send the receipt down it. Anything
+   *  that kills us first (the 1s backstop, the runtime SIGKILLing the hook) closes the socket with
+   *  no receipt, which is exactly the signal the connector needs to NOT commit the batch. */
+  const finishWithReceipt = (out: string, candidate: ReturnType<typeof connect>): void => {
+    if (!settle()) return;
+    done(out, (then) => {
+      try {
+        candidate.write(HANDOFF_RECEIPT, () => {
+          drop(candidate);
+          then();
+        });
+      } catch {
+        then(); // connector already gone; it scores this undelivered and redelivers
+      }
+    });
+  };
+  const timer = setTimeout(() => finish(""), TIMEOUT_MS);
+
+  const retryLater = (): void => {
+    const wait = retryDelayMs;
+    retryDelayMs = Math.min(retryDelayMs * 2, CONNECT_RETRY_MAX_MS);
+    setTimeout(dial, wait);
+  };
+  const dial = (): void => {
+    if (settled) return;
+    const candidate = connect(path);
+    sock = candidate;
+    let connected = false;
+    let reply = "";
+    candidate.setEncoding("utf8");
+    // `handoff` opts into the confirmed-delivery protocol: the connector holds the connection open
+    // and treats our receipt, not its own socket write, as proof the reply reached the runtime.
+    candidate.on("connect", () => {
+      if (settled || sock !== candidate) return;
+      connected = true;
+      try {
+        candidate.write(JSON.stringify({ token, event, handoff: true }) + "\n");
+      } catch {
+        finish("");
+      }
+    });
+    candidate.on("data", (d) => {
+      if (settled || sock !== candidate) return;
+      reply += d;
+      const nl = reply.indexOf("\n");
+      if (nl >= 0) finishWithReceipt(reply.slice(0, nl), candidate);
+    });
+    candidate.on("error", (error) => {
+      if (settled || sock !== candidate) return;
+      if (!connected && startupCritical && isRetryableConnectError(error)) {
+        drop(candidate);
+        retryLater();
+        return;
+      }
+      // Only SessionStart may outpace creation of the connector process. Later hooks must preserve
+      // immediate fail-open, and once the frame may have reached a connector any retry could deliver
+      // one lifecycle event twice.
+      finish("");
+    });
+    candidate.on("end", () => {
+      if (settled || sock !== candidate) return;
+      finish(reply);
+    });
+  };
+
+  dial();
+}

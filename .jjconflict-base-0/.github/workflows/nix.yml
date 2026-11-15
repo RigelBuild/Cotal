@@ -1,0 +1,47 @@
+name: Nix
+
+# Checks the release flake. Every package is a fetchurl of a published runtime tarball, so the
+# Linux x64 build only downloads and installs; nothing is compiled. The eval step walks every
+# system the flake exposes, so a new entry in nix/release.json is covered without editing this file.
+
+on:
+  pull_request:
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'nix/**'
+      - '.github/workflows/nix.yml'
+  push:
+    branches: [rigel-release]
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'nix/**'
+      - '.github/workflows/nix.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@91f6a0f59e94dfb2cfed0f4000f36a68ead1d20c # v31.11.4
+      - name: Check flake outputs without building
+        run: nix flake check --no-build --all-systems
+      - name: Evaluate every release package to a derivation
+        run: |
+          set -euo pipefail
+          for system in $(nix eval --json '.#packages' --apply builtins.attrNames | jq -r '.[]'); do
+            nix eval --raw ".#packages.${system}.cotal.drvPath" >/dev/null
+            echo "ok: packages.${system}.cotal evaluates"
+          done
+      - name: Build the Linux x64 package and run it
+        run: |
+          set -euo pipefail
+          nix build .#packages.x86_64-linux.cotal --print-build-logs --out-link result
+          ./result/bin/cotal --version

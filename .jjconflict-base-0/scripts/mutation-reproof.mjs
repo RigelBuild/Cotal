@@ -1,0 +1,962 @@
+#!/usr/bin/env node
+/**
+ * Re-prove every mutation fixture whose guarded source changed at this head.
+ *
+ * This gate exists to catch a suite that has quietly stopped proving what it claims. Its own
+ * all-clear therefore must not be a way for it to prove nothing: an exit 0 that means "I looked and
+ * found nothing to re-prove" has to be distinguishable from an exit 0 that means "I looked at
+ * nothing." Every path that returns 0 below prints the evidence a reader needs to tell those apart,
+ * and every path where the selector could not measure the corpus exits non-zero instead.
+ *
+ * Three earlier silent-success paths, reproduced at the blocked head and refused here:
+ *   - a deleted guarded source never entered the changed set, because the diff excluded `D`;
+ *   - a renamed guarded source reported only its new path, so a fixture still pointing at the old
+ *     path was never selected;
+ *   - a selected count of zero exited 0 unconditionally, whether the tree was clean or the selector
+ *     had been handed nothing to look at.
+ *   - a head PRE-RED was classified from a declared suite PATH even though mutation-proof may have
+ *     refused a different per-mutation command. Attribution now follows that exact command's
+ *     base-to-head transition instead of inferring causation from selection provenance.
+ *   - an unstable failure signature (a suite printing per-run text) was reported as contamination
+ *     or as a changed failure; it is now named as unstable and stays UNMEASURED.
+ *   - under --all, one killing fixture held the floor up for every other fixture that had gone
+ *     pre-red or inconclusive; a full sweep now requires every proven fixture to discriminate.
+ *
+ * A selection can hold more proof work than the job's step has time for. With `--budget-minutes` the
+ * run ends itself instead of being killed from outside with no tally: every proof child gets the
+ * deadline, stops grading at it and puts its mutant back, and the run names each selected fixture
+ * the budget cut short or never started and exits 1. That is UNMEASURED, never a pass. Each child
+ * also gets a restore deadline a minute before its own kill: an `afterRestore` rebuild still running
+ * then is killed by the proof and reported as RESTORE FAILED, never left writing after both return.
+ *
+ * A fixture whose guarded source was deleted or renamed away is a DANGLING fixture: its anchor can
+ * no longer resolve, so its proof is unrunnable. That is precisely the state this gate refuses, so a
+ * dangling fixture is a loud failure, not a silent skip.
+ */
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
+import { comparableFailure, failureSignatureHash, unmeasurableFailure } from "./mutation-failure-signature.mjs";
+import { liveShapedCommandReason, liveShapedFixtureReason } from "./mutation-command-safety.mjs";
+import { runMark, sweepMarked } from "./mutation-run-mark.mjs";
+import { mutationShard } from "./mutation-shard.mjs";
+import { parseSuiteSources } from "./mutation-suite-metadata.mjs";
+
+const SCRIPT = fileURLToPath(import.meta.url);
+const PROOF = resolve(dirname(SCRIPT), "mutation-proof.mjs");
+const COMMAND_TIMEOUT_MS = 900_000;
+// mutation-proof already budgets each suite command at COMMAND_TIMEOUT_MS. The proof
+// CHILD is one fixture: baseline plus every mutant. Putting 900s on that child killed
+// mutation-reproof.json at 901s on PR #1445 shard 0/12 (hang-fix d3b693e62) while the
+// 145-minute step still had ~130 minutes left. Bound the child under that step instead
+// so a hung proof cannot sit until the job times out, and a 20-mutation fixture can finish.
+const PROOF_TIMEOUT_MS = 140 * 60 * 1000;
+// Past the --budget-minutes deadline, a proof child still gets this long to cut its suite and put its
+// mutant back, an `afterRestore` rebuild included, and then PROOF_EXIT_MS to report and exit before
+// it is killed.
+const DEADLINE_GRACE_MS = 5 * 60 * 1000;
+const PROOF_EXIT_MS = 60 * 1000;
+
+function usage(message) {
+  if (message) console.error(message);
+  console.error("usage: node scripts/mutation-reproof.mjs --base <commit> [--head <commit>] [--root <dir>] [--all] [--budget-minutes <n>] [--shard <index>/<count> | --list-shards <count>]");
+  process.exit(2);
+}
+
+function args(argv) {
+  const out = {};
+  const known = new Set(["base", "head", "root", "all", "shard", "list-shards", "budget-minutes"]);
+  for (let i = 0; i < argv.length; i++) {
+    if (!argv[i].startsWith("--")) usage(`unexpected argument: ${argv[i]}`);
+    const key = argv[i].slice(2);
+    if (!known.has(key)) usage(`unknown option: --${key}`);
+    if (key === "all") { out.all = true; continue; }
+    if (i + 1 === argv.length || argv[i + 1].startsWith("--")) usage(`missing value for --${key}`);
+    out[key] = argv[++i];
+  }
+  return out;
+}
+
+function git(root, argv) {
+  return execFileSync("git", argv, { cwd: root, encoding: "utf8", env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
+}
+
+/** The mark every command {@link runCommand} starts carries, for {@link sweepMarked}. */
+const RUN = runMark("mutation-reproof");
+
+function runCommand(command, cwd, env) {
+  const liveReason = liveShapedCommandReason(command, { cwd });
+  if (liveReason) {
+    const output = `REFUSING live-shaped command \`${command}\` (${liveReason}) — mutation-reproof never executes a live suite\n`;
+    return { status: 2, signal: null, error: undefined, stdout: "", stderr: output, output };
+  }
+  // The shell leads its own group so a timeout can kill what it forked too, and the mark reaches
+  // what left that group, as mutation-proof does.
+  const run = spawnSync(command, {
+    cwd, shell: true, encoding: "utf8", timeout: commandTimeoutMs(),
+    maxBuffer: 64 * 1024 * 1024, killSignal: "SIGKILL",
+    detached: process.platform !== "win32",
+    env: { ...env, MUTATION_PROOF_RUN: RUN.mark },
+  });
+  if (run.error?.code === "ETIMEDOUT" && run.pid !== undefined && process.platform !== "win32") {
+    try { process.kill(-run.pid, "SIGKILL"); } catch { /* the group is already gone */ }
+    sweepMarked(RUN.token, console.log);
+  }
+  return { ...run, output: `${run.stdout ?? ""}${run.stderr ?? ""}` };
+}
+
+/**
+ * Membership in the corpus is decided by PATH CONVENTION, not by whether the file parses. A fixture
+ * config is a mutations-directory JSON or a `*.mutations.json` — that rule matches every committed
+ * fixture in the tree and nothing else (data fixtures under `fixtures/` and JSONC tsconfigs are
+ * excluded). Deciding membership before parsing is what lets a MALFORMED fixture be refused rather
+ * than silently dropped from the corpus: a fixture that no longer parses is still a fixture.
+ */
+function fixtureConfigPaths(root) {
+  return git(root, ["ls-files", "*/mutations/*.json", "*.mutations.json"])
+    .split("\n")
+    .filter(Boolean);
+}
+
+/** Parse the corpus, collecting errors instead of dropping the offender. A fixture that fails to
+ *  parse, or that carries no `mutations` array, leaves the corpus unmeasured and must be refused. */
+function loadCorpus(root, paths) {
+  const fixtures = [];
+  const errors = [];
+  for (const path of paths) {
+    let config;
+    try {
+      config = JSON.parse(readFileSync(resolve(root, path), "utf8"));
+    } catch (err) {
+      errors.push(`${path}: ${err.message}`);
+      continue;
+    }
+    // Length matters, not just shape. A fixture with `"mutations": []` is well-formed JSON that
+    // grades nothing: mutation-proof reports `All 0 mutation(s) killed` and exits 0. Admitting it
+    // to the corpus lets a member that can never discriminate be counted as one that does.
+    if (!Array.isArray(config.mutations)) {
+      errors.push(`${path}: no top-level "mutations" array`);
+      continue;
+    }
+    if (config.mutations.length === 0) {
+      errors.push(`${path}: "mutations" array is empty, and a fixture that grades nothing cannot stand as coverage`);
+      continue;
+    }
+    let suites;
+    try {
+      suites = parseSuiteSources(root, path, config.suite, { checkExists: false });
+    } catch (err) {
+      errors.push(err.message);
+      continue;
+    }
+    fixtures.push({ path, config, suites, command: config.command, mutations: config.mutations });
+  }
+  return { fixtures, errors };
+}
+
+/**
+ * The changed set, seeing deletions and BOTH sides of a rename.
+ *
+ * `--name-status -M` reports one record per change: `A/C/M/D\tpath`, and `R<score>\told\tnew` for a
+ * rename. `--name-only` (the blocked version) dropped `D` and reported only a rename's new path, so
+ * a deleted guarded source never entered the set and a fixture still anchored to a pre-rename path
+ * was never selected. Adding both the old and the new path of a rename is what makes a rename-away
+ * select the fixture that still points at the old path.
+ *
+ * Returns the changed paths and the raw record count, so a caller can print the size of the diff as
+ * evidence for a legitimate all-clear.
+ */
+function changedSet(root, base, head) {
+  const raw = git(root, ["diff", "--name-status", "-M", `${base}...${head}`])
+    .split("\n")
+    .filter(Boolean);
+  const changed = new Set();
+  for (const line of raw) {
+    const parts = line.split("\t");
+    const status = parts[0];
+    if (status.startsWith("R") || status.startsWith("C")) {
+      if (parts[1]) changed.add(parts[1]);
+      if (parts[2]) changed.add(parts[2]);
+    } else if (parts[1]) {
+      changed.add(parts[1]);
+    }
+  }
+  return { changed, diffSize: raw.length };
+}
+
+/**
+ * The suite metadata migration changed legacy fixture configs even when their proof definition did
+ * not change. Classify that one-time base diff without weakening head validation: load the exact
+ * base blob, require legacy non-array -> canonical array, and compare every other top-level field.
+ * Additions, unreadable base blobs, canonical array changes, and any proof-field change remain
+ * selecting config changes.
+ */
+function isMetadataOnlySuiteCanonicalization(root, base, fixture) {
+  let baseConfig;
+  try {
+    baseConfig = JSON.parse(git(root, ["show", `${base}:${fixture.path}`]));
+  } catch {
+    return false;
+  }
+  if (Array.isArray(baseConfig?.suite) || !Array.isArray(fixture.config.suite)) return false;
+  const { suite: _baseSuite, ...baseRest } = baseConfig;
+  const { suite: _headSuite, ...headRest } = fixture.config;
+  return isDeepStrictEqual(baseRest, headRest);
+}
+
+/**
+ * Declaring `executes` tells mutation-coverage which repository entrypoint a subprocess suite
+ * launches. That is a coverage witness, not a proof definition: the mutations, command, and
+ * suite are unchanged. Selecting those fixtures for re-proof would re-run live attach kill sets
+ * that already carry a documented SURVIVED (and can exhaust the 145-minute shard). Any other
+ * top-level field change stays a selecting config change.
+ */
+function isExecutesOnlyConfigChange(root, base, fixture) {
+  let baseConfig;
+  try {
+    baseConfig = JSON.parse(git(root, ["show", `${base}:${fixture.path}`]));
+  } catch {
+    return false;
+  }
+  const { executes: _baseExecutes, ...baseRest } = baseConfig ?? {};
+  const { executes: _headExecutes, ...headRest } = fixture.config;
+  return isDeepStrictEqual(baseRest, headRest);
+}
+
+async function quarantinedSuitePaths(root) {
+  // A root without the registry (a fixture-only test tree) quarantines nothing.
+  const registry = resolve(root, "bin/smoke/ci-quarantine.mjs");
+  if (!existsSync(registry)) return new Map();
+  const { QUARANTINED, LIVE_QUARANTINED } = await import(pathToFileURL(registry).href);
+  const { scripts = {} } = existsSync(resolve(root, "package.json"))
+    ? JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"))
+    : {};
+  const suites = new Map();
+  for (const scriptName of [...Object.keys(QUARANTINED), ...Object.keys(LIVE_QUARANTINED)]) {
+    const command = scripts[scriptName];
+    if (typeof command !== "string") continue;
+    const suiteFiles = command.split(/\s+/).filter((token) => /(?:\.smoke\.ts|\.suite\.mjs)$/.test(token));
+    // Chained suite commands do not identify which suite is quarantined.
+    if (suiteFiles.length === 1) suites.set(suiteFiles[0], scriptName);
+  }
+  return suites;
+}
+
+const a = args(process.argv.slice(2));
+const root = resolve(a.root ?? process.cwd());
+const head = a.head ?? "HEAD";
+if (!a.all && !a.base) usage("--base is required unless --all is set");
+const shard = a.shard === undefined ? undefined : a.shard.match(/^(\d+)\/(\d+)$/);
+if (a.shard !== undefined && (!shard || Number(shard[2]) < 1 || Number(shard[1]) >= Number(shard[2])))
+  usage(`invalid --shard ${a.shard}; use <index>/<count>`);
+const listShards = a["list-shards"] === undefined ? undefined : Number(a["list-shards"]);
+if (listShards !== undefined && (!Number.isInteger(listShards) || listShards < 1))
+  usage(`invalid --list-shards ${a["list-shards"]}; use a shard count of at least 1`);
+if (listShards !== undefined && shard) usage("--list-shards and --shard are exclusive: one plans the fan-out, the other runs one shard of it");
+const budgetMinutes = a["budget-minutes"] === undefined ? undefined : Number(a["budget-minutes"]);
+if (budgetMinutes !== undefined && !(Number.isFinite(budgetMinutes) && budgetMinutes > 0))
+  usage(`invalid --budget-minutes ${a["budget-minutes"]}; use a positive number of minutes`);
+const deadline = budgetMinutes === undefined ? undefined : Date.now() + budgetMinutes * 60_000;
+const pastDeadline = () => deadline !== undefined && Date.now() >= deadline;
+const commandTimeoutMs = () => deadline === undefined
+  ? COMMAND_TIMEOUT_MS
+  : Math.max(1, Math.min(COMMAND_TIMEOUT_MS, deadline - Date.now()));
+const proofTimeoutMs = () => deadline === undefined
+  ? PROOF_TIMEOUT_MS
+  : Math.max(1, Math.min(PROOF_TIMEOUT_MS, deadline - Date.now() + DEADLINE_GRACE_MS + PROOF_EXIT_MS));
+// The restore deadline is PROOF_EXIT_MS before the kill this child's timeout sends, so the proof
+// stops an `afterRestore` rebuild itself instead of leaving it writing behind a killed parent.
+const proofArgs = (configPath) => [PROOF, "--config", configPath, ...(deadline === undefined ? []
+  : ["--deadline", String(deadline), "--restore-deadline", String(Date.now() + proofTimeoutMs() - PROOF_EXIT_MS)])];
+// mutation-proof exits 5 when the deadline cut it; a kill by the grace timeout is the backstop.
+const cutByBudget = (run) => deadline !== undefined
+  && (run.status === 5 || (run.error?.code === "ETIMEDOUT" && pastDeadline()));
+const budgetReason = (what) => `the ${budgetMinutes}-minute run budget ran out before ${what} finished`;
+
+if (!a.all) {
+  try {
+    git(root, ["merge-base", "--is-ancestor", a.base, head]);
+  } catch {
+    console.error(`${a.base} is not an ancestor of ${head}; refuse a comparison that includes another branch's changes`);
+    process.exit(2);
+  }
+  const dirty = git(root, ["status", "--porcelain"]);
+  const actualHead = git(root, ["rev-parse", "HEAD"]).trim();
+  const requestedHead = git(root, ["rev-parse", head]).trim();
+  if (dirty || actualHead !== requestedHead) {
+    console.error("mutation reproof: UNMEASURED — root must be clean and checked out at the requested head before comparison");
+    if (dirty) console.error(dirty.trimEnd());
+    if (actualHead !== requestedHead) console.error(`  checked out: ${actualHead}\n  requested:   ${requestedHead}`);
+    process.exit(1);
+  }
+}
+
+// UNMEASURED, exit 1: the corpus is empty. There is nothing this gate could have proven, which is
+// not the same as there being nothing that needed proving.
+const configPaths = fixtureConfigPaths(root);
+if (configPaths.length === 0) {
+  console.error("mutation reproof: UNMEASURED — no fixture configs found in the corpus (expected */mutations/*.json or *.mutations.json)");
+  process.exit(1);
+}
+
+// UNMEASURED, exit 1: a fixture failed to parse or is missing its mutations array. A malformed
+// fixture must fail here rather than vanish from the corpus and shrink the set that gets proven.
+const { fixtures, errors } = loadCorpus(root, configPaths);
+if (errors.length) {
+  console.error(`mutation reproof: UNMEASURED — ${errors.length} malformed fixture(s), refusing rather than dropping them:`);
+  for (const e of errors) console.error(`  ${e}`);
+  process.exit(1);
+}
+
+const { changed, diffSize } = a.all ? { changed: new Set(), diffSize: 0 } : changedSet(root, a.base, head);
+// The exact commit the diff above was taken from, in full, so the printed selection names its own
+// input rather than only its result.
+const resolvedBase = a.all ? undefined : git(root, ["rev-parse", a.base]).trim();
+
+const metadataOnlyExclusions = new Set(a.all ? [] : fixtures
+  .filter((fixture) => changed.has(fixture.path)
+    && (isMetadataOnlySuiteCanonicalization(root, a.base, fixture)
+      || isExecutesOnlyConfigChange(root, a.base, fixture)))
+  .map((fixture) => fixture.path));
+
+let selected = fixtures.map((fixture) => ({
+  ...fixture,
+  selectedBy: {
+    all: Boolean(a.all),
+    config: changed.has(fixture.path) && !metadataOnlyExclusions.has(fixture.path),
+    suite: fixture.suites.some((suite) => changed.has(suite)),
+    mutation: fixture.mutations.some((mutation) =>
+      typeof mutation?.file === "string" && changed.has(mutation.file)),
+  },
+})).filter(({ selectedBy }) => Object.values(selectedBy).some(Boolean));
+if (shard) selected = selected.filter(({ path }) => mutationShard(path, Number(shard[2])) === Number(shard[1]));
+const selectedBeforeQuarantine = selected;
+let quarantinedSkipped = [];
+// Diff-mode quarantine applies only to mutation-only selection; changed configs and suites still run.
+if (a.all || selected.some(({ selectedBy }) => selectedBy.mutation && !selectedBy.config && !selectedBy.suite)) {
+  const quarantinedSuites = await quarantinedSuitePaths(root);
+  quarantinedSkipped = selected.flatMap((fixture) => {
+    const onlyMutationChanged = !a.all
+      && fixture.selectedBy.mutation
+      && !fixture.selectedBy.config
+      && !fixture.selectedBy.suite;
+    if (!a.all && !onlyMutationChanged) return [];
+    const scriptName = fixture.suites.map((suite) => quarantinedSuites.get(suite)).find(Boolean);
+    return scriptName ? [{ path: fixture.path, scriptName }] : [];
+  });
+  const skippedPaths = new Set(quarantinedSkipped.map(({ path }) => path));
+  selected = selected.filter(({ path }) => !skippedPaths.has(path));
+  console.log(`mutation reproof: skipped ${quarantinedSkipped.length} fixture(s) of quarantined suites:`);
+  for (const { path, scriptName } of quarantinedSkipped) console.log(`  ${path} (${scriptName})`);
+}
+
+const liveRefused = selected.flatMap((fixture) => {
+  const reason = liveShapedFixtureReason(fixture, { cwd: root });
+  return reason ? [{ path: fixture.path, command: fixture.command, reason }] : [];
+});
+const liveRefusedPaths = new Set(liveRefused.map(({ path }) => path));
+const prove = selected.filter((fixture) => !liveRefusedPaths.has(fixture.path));
+
+// Selection evidence precedes dangling validation. A deleted or renamed declared source is one of
+// the reasons a fixture is selected, so reporting the source error before the selected set would
+// hide the selector result the failure is meant to make observable.
+//
+// The resolved base sha is printed with the counts because the counts alone could not explain
+// themselves: #1520 printed "diff 30 record(s), 30 changed path(s)" for a four-file PR, and naming
+// the base it diffed from is what makes a wrong selection legible from a transcript without a clone.
+console.log(`mutation reproof: ${selected.length} fixture(s) selected from ${fixtures.length}`
+  + (a.all
+    ? " for a full sweep"
+    : ` (base ${resolvedBase}, diff ${diffSize} record(s), ${changed.size} changed path(s), corpus ${fixtures.length})`));
+if (metadataOnlyExclusions.size > 0)
+  console.log(`metadata-only config-path exclusions (${metadataOnlyExclusions.size}):\n${[...metadataOnlyExclusions].map((path) => `  ${path}`).join("\n")}`);
+if (selected.length > 0) console.log(`selected fixture paths:\n${selected.map(({ path }) => `  ${path}`).join("\n")}`);
+if (liveRefused.length) {
+  console.log(`live-shaped fixtures refused (${liveRefused.length}):`);
+  for (const { path, command, reason } of liveRefused) {
+    console.log(`  ${path}  REFUSED \`${command}\` (${reason})`);
+  }
+}
+
+// UNMEASURED, exit 1: a selected fixture's guarded file does not exist at head — a dangling fixture.
+// Its guarded source was deleted or renamed away, so its anchor cannot resolve and its proof is
+// unrunnable. This is the failure the gate exists to refuse, so it is loud, not a skip. It reads the
+// pre-quarantine selection, so a quarantine skip can never hide a deleted guard.
+const dangling = [];
+for (const { path, suites, mutations } of selectedBeforeQuarantine) {
+  const missing = [...new Set([
+    ...suites.filter((suite) => !existsSync(resolve(root, suite))),
+    ...mutations
+      .map((mutation) => mutation?.file)
+      .filter((file) => typeof file === "string" && !existsSync(resolve(root, file))),
+  ])];
+  if (missing.length) dangling.push({ path, missing });
+}
+if (dangling.length) {
+  console.error(`mutation reproof: UNMEASURED — ${dangling.length} dangling fixture(s); a guarded source was deleted or renamed away and the proof is unrunnable:`);
+  for (const { path, missing } of dangling) console.error(`  ${path} -> missing: ${missing.join(", ")}`);
+  process.exit(1);
+}
+
+// The plan: which shards of a fan-out would hold at least one selected fixture. Runs the same
+// selector, the same UNMEASURED refusals and the same dangling check as a shard run, so a plan that
+// prints is a plan whose selection a shard would also have made; only the proof is skipped. The last
+// line is the JSON a workflow reads; an empty list is printed, not turned into exit 0 with no output,
+// so a caller that fans out on it can tell "nothing to prove" from "nothing was said".
+if (listShards !== undefined) {
+  const shardCandidates = selectedBeforeQuarantine.filter(({ path }) => !liveRefusedPaths.has(path));
+  const shards = [...new Set(shardCandidates.map(({ path }) => mutationShard(path, listShards)))].sort((x, y) => x - y);
+  console.log(`shard plan: ${shards.length} of ${listShards} shard(s) hold a selected fixture${shards.length ? `: ${shards.join(", ")}` : ""}`);
+  console.log(JSON.stringify({ shards }));
+  process.exit(0);
+}
+
+// A zero after filtering means either no diff match or no assignment to this shard.
+// Keep the diff, corpus and selected counts visible in both cases.
+if (prove.length === 0) {
+  if (!a.all && quarantinedSkipped.length > 0) {
+    console.log("No mutation fixtures to re-prove: selected fixtures belong only to quarantined suites.");
+    process.exit(0);
+  }
+  console.log(shard
+    ? `No selected mutation fixtures are assigned to shard ${a.shard}.`
+    : liveRefused.length > 0
+      ? "No mutation fixtures to re-prove: every selected fixture was a named live-shaped refusal."
+      : metadataOnlyExclusions.size > 0
+        ? "No mutation fixtures to re-prove: the only intersections were metadata-only config-path exclusions."
+        : "No mutation fixtures to re-prove: no fixture config, suite, or guarded source intersects the diff.");
+  process.exit(0);
+}
+
+// A fixture's proof has more than two outcomes, and collapsing any of them is itself a silent
+// failure. mutation-proof grades each mutation and encodes the run in its exit code:
+//   exit 0  — every mutation KILLED: the guard discriminates. PASS.
+//   exit 4  — one of the fixture's distinct baseline COMMANDS was RED BEFORE any mutation. Path
+//             provenance cannot say whether the diff caused that red: a fixture may declare suite A
+//             while a per-mutation command runs suite B. In diff mode, re-run the exact command that
+//             refused against the base tree. GREEN -> RED is attributable and fatal; RED -> RED is
+//             inherited and non-fatal. An absent or unmeasurable base comparison fails loud. Under
+//             --all there is deliberately no base comparison, so PRE-RED is never attributed, but
+//             it still counts against the full-sweep floor below.
+//   exit 1  — at least one mutation did not produce a clean, named red. That splits again:
+//               SURVIVED / UNGRADABLE / WRONG-RED / ERROR — fatal at head. In diff mode, re-run the
+//                                       same fixture proof against clean head and base snapshots.
+//                                       An unchanged fatal verdict is inherited and non-fatal; a
+//                                       verdict the PR actually moves still fails. An absent or
+//                                       unmeasurable base comparison fails loud. Under --all there
+//                                       is no base comparison, so these remain absolute findings.
+//               INCONCLUSIVE (only)   — a timeout or a teardown hang left no evidence either way.
+//                                       Collapsing it into SURVIVED is a false blocker and into
+//                                       KILLED a false clearance, so it is its own reported state.
+//                                       A run whose proven fixtures are all INCONCLUSIVE still
+//                                       fails the discrimination floor: that is vacuity, not a
+//                                       kill. A mixed KILLED+INCONCLUSIVE fixture counts as
+//                                       discriminated because a kill was observed.
+// A proven set that discriminated zero fixtures is not an all-clear. In diff mode the floor is 1
+// when any fixture was proven, and 0 when none were (the "nothing applicable" path already printed
+// above). Under --all the floor is every proven fixture: a full sweep grades the health of the
+// tree rather than a diff, so one killing fixture cannot clear a corpus whose other members went
+// pre-red, inconclusive, or graded nothing. Either required count follows from the selected
+// configs, not from a corpus-size constant.
+// The classification reads mutation-proof's own verdict lines rather than re-deriving them, so the
+// two tools cannot drift on what a verdict means. mutation-proof colours each verdict, so a line is
+// `\x1b[32mKILLED      \x1b[0m <label>`: strip ANSI before matching, or every verdict reads as
+// absent and a real SURVIVED would fall through to the unexplained-non-zero branch by luck rather
+// than by being recognised. The verdict is the padded word at the start of a line once the colour
+// is gone; the trailing space (from `padEnd`) is required so `KILLED` cannot match inside a label.
+// The vocabulary is the complete set mutation-proof can emit: any token outside it, or none at all,
+// is an unrecognised run and is treated as a finding, never as a pass.
+const ANSI = /\x1b\[[0-9;]*m/g;
+const VERDICTS = ["KILLED", "SURVIVED", "INCONCLUSIVE", "UNGRADABLE", "WRONG-RED", "ERROR"];
+const FATAL_VERDICTS = new Set(["SURVIVED", "UNGRADABLE", "WRONG-RED", "ERROR"]);
+// mutation-proof prints `${verdict.padEnd(12)} ${label}`. That 12-wide field is the parse of a
+// report line: ERROR why-text can name KILLED, so a loose `^VERDICT ` match is not a parse.
+// Duplicate names are valid, and array position is not identity: reordering or inserting
+// unchanged objects must not attribute a still-SURVIVED mutant. Identity is the mutation's
+// `file`, `find`, and `replace` from the snapshot fixture — the code the mutation edits.
+// `find` alone is not enough when two mutants in the same file share an anchor and differ
+// only in the replacement. Same key more than once compares the multiset of verdicts.
+const mutationIdentity = (mutation, index) => {
+  if (!mutation || typeof mutation !== "object") return `\0unbound:${index}`;
+  return JSON.stringify([
+    typeof mutation.file === "string" ? mutation.file : null,
+    mutation.find ?? null,
+    mutation.replace ?? null,
+  ]);
+};
+const readFixtureMutations = (snapshotRoot, configPath) => {
+  try {
+    const config = JSON.parse(readFileSync(join(snapshotRoot, configPath), "utf8"));
+    return Array.isArray(config.mutations) ? config.mutations : [];
+  } catch {
+    return [];
+  }
+};
+const labeledVerdictsIn = (output, mutations = []) => {
+  const records = [];
+  for (const line of output.replace(ANSI, "").split("\n")) {
+    const verdict = VERDICTS.find((token) => line.startsWith(`${token.padEnd(12)} `));
+    if (!verdict) continue;
+    records.push({
+      index: records.length,
+      verdict,
+      label: line.slice(13).trim(),
+      identity: mutationIdentity(mutations[records.length], records.length),
+    });
+  }
+  return records;
+};
+const verdictsIn = (output) => labeledVerdictsIn(output).map((rec) => rec.verdict);
+
+function runProof(cwd, configPath, env) {
+  // Proof-child budget, not per-command. A snapshot compare that re-runs
+  // attach-reconnect after WRONG-RED/SURVIVED sat unbounded until the 145-minute
+  // job step timed out (PR #1445, shard 10/12, 8712s). spawnSync with no timeout
+  // is that hang. COMMAND_TIMEOUT_MS here is too small: one fixture is baseline
+  // plus every mutant.
+  const run = spawnSync(process.execPath, proofArgs(configPath), {
+    cwd, encoding: "utf8", timeout: proofTimeoutMs(), maxBuffer: 64 * 1024 * 1024,
+    killSignal: "SIGKILL", env,
+  });
+  return { ...run, output: `${run.stdout ?? ""}${run.stderr ?? ""}` };
+}
+
+function compareFatalVerdicts(headRecords, baseRecords) {
+  const unused = baseRecords.map((_, i) => i);
+  const inherited = [];
+  const attributable = [];
+  const take = (pred) => {
+    const at = unused.findIndex((i) => pred(baseRecords[i]));
+    if (at === -1) return undefined;
+    const rec = baseRecords[unused[at]];
+    unused.splice(at, 1);
+    return rec;
+  };
+  for (const rec of headRecords) {
+    if (!FATAL_VERDICTS.has(rec.verdict)) continue;
+    const same = take((candidate) => candidate.identity === rec.identity && candidate.verdict === rec.verdict);
+    if (same) { inherited.push({ ...rec, baseVerdict: same.verdict }); continue; }
+    const other = take((candidate) => candidate.identity === rec.identity);
+    attributable.push({ ...rec, baseVerdict: other?.verdict ?? "ABSENT" });
+  }
+  return { inherited, attributable };
+}
+
+/** mutation-proof aborts at its first red distinct command, so exactly one refusal is its contract.
+ *  The all-command matrix below comes from fixture config without changing that contract. */
+function refusedCommand(output) {
+  const matches = [...output.replace(ANSI, "").matchAll(
+    /^REFUSING: `(.*)` is red BEFORE any mutation \(exit ([^)]+)\)\.$/gm,
+  )];
+  if (matches.length !== 1) return { error: `expected exactly one baseline refusal, found ${matches.length}` };
+  return { command: matches[0][1], headStatus: matches[0][2] };
+}
+
+function refusedProvenance(output) {
+  const prefix = "MUTATION-PROOF BASELINE PROVENANCE ";
+  const lines = output.replace(ANSI, "").split("\n").filter((line) => line.startsWith(prefix));
+  if (lines.length !== 1) return { error: `expected exactly one baseline provenance record, found ${lines.length}` };
+  try { return JSON.parse(lines[0].slice(prefix.length)); }
+  catch (err) { return { error: `invalid baseline provenance record: ${err.message}` }; }
+}
+
+const snapshots = {
+  base: { revision: a.base, path: undefined, error: undefined, prepared: false, preparationError: undefined },
+  head: { revision: head, path: undefined, error: undefined, prepared: false, preparationError: undefined },
+};
+const snapshotHolders = [];
+process.on("exit", () => {
+  for (const holder of snapshotHolders) rmSync(holder, { recursive: true, force: true });
+});
+
+function ensureSnapshot(snapshot, label) {
+  if (snapshot.path || snapshot.error) return;
+  const holder = mkdtempSync(join(tmpdir(), `mutation-reproof-${label}-`));
+  snapshotHolders.push(holder);
+  snapshot.path = join(holder, "repo");
+  if (insideRoot(snapshot.path)) {
+    snapshot.error = `refusing ${label} snapshot inside root: ${snapshot.path}`;
+    snapshot.path = undefined;
+    return;
+  }
+  try {
+    // A separate clone is the correctness boundary: commands must resolve first-party workspace
+    // packages from BASE, never through node_modules links into the head worktree. With no copied
+    // node_modules, pnpm may populate this disposable clone from its store; nothing is installed into
+    // or retained in any lane tree.
+    execFileSync("git", ["clone", "--quiet", "--shared", "--no-checkout", root, snapshot.path],
+      { encoding: "utf8" });
+    git(snapshot.path, ["checkout", "--quiet", "--detach", snapshot.revision]);
+  } catch (err) {
+    snapshot.error = `could not materialize ${label} ${snapshot.revision}: ${err.message}`;
+    snapshot.path = undefined;
+  }
+}
+
+const insideRoot = (entry) => {
+  if (!entry) return false;
+  const rel = relative(root, resolve(entry));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+};
+function comparisonEnv({ offline = true } = {}) {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (key.startsWith("COTAL_")) delete env[key];
+  for (const key of ["PATH", "NODE_PATH"])
+    if (env[key]) env[key] = env[key].split(delimiter).filter((entry) => !insideRoot(entry)).join(delimiter);
+  env.CI = "true";
+  env.pnpm_config_frozen_lockfile = "true";
+  // Load-bearing on both paths: three selftest fixtures assert this value; it prevents pnpm from
+  // installing into the mutation worktree, makes the tool-list pnpm wrapper safe, and prevents the
+  // install result block from entering only one failure signature. It must never inherit a host value.
+  env.pnpm_config_verify_deps_before_run = "false";
+  if (offline) env.pnpm_config_offline = "true";
+  else delete env.pnpm_config_offline;
+  return env;
+}
+// Separate call sites are intentional mutation seams. Both delegate to one policy, but the smoke
+// suite proves that neither the root proof child nor snapshot commands may bypass normalization.
+const rootComparisonEnv = () => comparisonEnv();
+const snapshotComparisonEnv = (options) => comparisonEnv(options);
+
+function preparationFailure(label, run) {
+  if (pastDeadline() && run.status !== 0) return budgetReason(label);
+  if (run.error) return `${label} could not start: ${run.error.message}`;
+  if (run.status === null || run.signal)
+    return `${label} produced no exit status${run.signal ? ` (signal ${run.signal})` : ""}`;
+  if (run.status !== 0) return `${label} failed (exit ${run.status})`;
+  return undefined;
+}
+
+function ensureSnapshotPrepared(snapshot, label) {
+  ensureSnapshot(snapshot, label);
+  if (snapshot.error || snapshot.prepared || snapshot.preparationError) return;
+  // A minimal fixture repository may intentionally exercise a direct `node` command and have no
+  // package manager contract to prepare. Production repositories declare package.json; those always
+  // take the frozen-install/full-build path below.
+  if (!existsSync(join(snapshot.path, "package.json"))) { snapshot.prepared = true; return; }
+  const install = runCommand("pnpm install --frozen-lockfile", snapshot.path, snapshotComparisonEnv({ offline: false }));
+  snapshot.preparationError = preparationFailure(`${label} dependency install`, install);
+  if (snapshot.preparationError) return;
+  const build = runCommand("pnpm build", snapshot.path, snapshotComparisonEnv());
+  snapshot.preparationError = preparationFailure(`${label} build`, build);
+  if (!snapshot.preparationError) snapshot.prepared = true;
+}
+
+// A signature that changes between two runs of the SAME command in the SAME clean snapshot is
+// not evidence of anything except itself: a suite printing per-run text (a minted principal, a
+// seat uid, a run marker) hashes differently every time, so comparing it against another hash
+// cannot classify anything. Probe that instability by re-running the command once, lazily and
+// only on a hash mismatch, cached per command so a fixture with several commands pays once at
+// most and a stable signature never pays at all.
+const unstableSignatureReason = (command) =>
+  `the failure signature of \`${command}\` is not stable across two runs of the clean head snapshot,`
+  + " so its root provenance cannot be compared; the suite's failure output carries per-run text";
+
+const repeatHeadRuns = new Map();
+function headSignatureInstabilityReason(command, firstHash) {
+  let entry = repeatHeadRuns.get(command);
+  if (!entry) {
+    entry = runCommand(command, snapshots.head.path, snapshotComparisonEnv());
+    repeatHeadRuns.set(command, entry);
+  }
+  const reason = unmeasurableFailure(entry);
+  if (reason) return `head confirmation repeat ${reason}`;
+  const repeatHash = failureSignatureHash(entry.output, snapshots.head.path);
+  return repeatHash === undefined || repeatHash !== firstHash
+    ? unstableSignatureReason(command)
+    : undefined;
+}
+
+function compareSnapshots(command, headRun, baseRun) {
+  const reason = unmeasurableFailure(baseRun);
+  if (reason) return { kind: "unmeasured", reason };
+  if (baseRun.status === 0) return { kind: "attributable", baseStatus: baseRun.status };
+
+  const headReason = unmeasurableFailure(headRun);
+  if (headReason) return { kind: "unmeasured", reason: `head command ${headReason}` };
+
+  // A bare non-zero cannot distinguish a suite verdict from broken setup. Only an identical,
+  // non-infrastructure red from the independently run head command proves RED -> RED. Any difference
+  // is ambiguity and therefore UNMEASURED, never a silent inherited clearance. A difference caused
+  // by per-run text in the output is named as instability, not left to read as a verdict change.
+  const baseFailure = comparableFailure(baseRun.output, snapshots.base.path);
+  const headFailure = comparableFailure(headRun.output, snapshots.head.path);
+  if (headRun.status !== baseRun.status || baseFailure === undefined || headFailure === undefined
+      || headFailure !== baseFailure) {
+    const headHash = failureSignatureHash(headRun.output, snapshots.head.path);
+    const unstable = headRun.status === baseRun.status && headHash !== undefined
+      && headSignatureInstabilityReason(command, headHash);
+    return { kind: "unmeasured", reason: unstable
+      ? unstableSignatureReason(command)
+      : "base and head were both red but did not produce the same stable failure signature" };
+  }
+  return { kind: "inherited", baseStatus: baseRun.status };
+}
+
+function rootContaminationReason(provenance, cleanHeadRun) {
+  // Infrastructure classification precedes status/signature comparison. Otherwise two unavailable
+  // commands (exit 127 with identical "not found" text) look inherited and earn a false green.
+  const rootInfrastructureReason = provenance.unmeasurableReason;
+  if (rootInfrastructureReason) return rootInfrastructureReason;
+  const headReason = unmeasurableFailure(cleanHeadRun);
+  if (headReason) return `head confirmation ${headReason}`;
+  const cleanHash = failureSignatureHash(cleanHeadRun.output, snapshots.head.path);
+  if (provenance.status !== cleanHeadRun.status || provenance.signatureHash === null
+      || cleanHash === undefined || provenance.signatureHash !== cleanHash) {
+    // Equal statuses with two differing hashes can still be ONE failure whose output changes per
+    // run. Only a signature that is stable across two clean-head runs is evidence of contamination.
+    if (provenance.status === cleanHeadRun.status && provenance.signatureHash !== null
+        && cleanHash !== undefined
+        && headSignatureInstabilityReason(provenance.command, cleanHash)) {
+      return unstableSignatureReason(provenance.command);
+    }
+    return "root PRE-RED was not reproduced in the clean head snapshot; root execution-state contamination detected";
+  }
+  return undefined;
+}
+
+const fatal = [];       // SURVIVED / UNGRADABLE / WRONG-RED / ERROR the PR actually moved
+const inheritedFatal = []; // same fatal verdict already present at base
+const unmeasuredFatal = []; // fatal at head but base comparison absent or unrunnable
+const preRed = [];      // exit 4 + base RED, or any exit 4 under --all — inherited/non-attributed
+const attributablePreRed = []; // exit 4 + the SAME command base GREEN -> head RED
+const unmeasuredPreRed = []; // exit 4 + absent/ambiguous/unrunnable base comparison — loud failure
+const inconclusive = []; // INCONCLUSIVE only — unmeasured, evidence in neither direction
+const discriminated = []; // fixtures that produced at least one KILLED (including mixed)
+const zeroGraded = []; // exit 0 with no KILLED parsed: graded nothing, never counts as discrimination
+const cutShort = []; // started, and the budget ended its proof before every mutation was graded
+const notStarted = []; // the budget was spent before its proof began
+for (const { path, command, mutations } of prove) {
+  if (pastDeadline()) { notStarted.push(path); continue; }
+  console.log(`\n===== ${path} =====`);
+  const run = spawnSync(process.execPath, proofArgs(path), {
+    cwd: root, encoding: "utf8", timeout: proofTimeoutMs(), maxBuffer: 64 * 1024 * 1024,
+    killSignal: "SIGKILL", env: rootComparisonEnv(),
+  });
+  const output = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+  process.stdout.write(run.stdout ?? "");
+  process.stderr.write(run.stderr ?? "");
+  if (cutByBudget(run)) { cutShort.push(path); continue; }
+  // Exit 0 means "no mutation failed to produce a clean named red", which is NOT the same as
+  // "a kill was observed": mutation-proof prints `All 0 mutation(s) killed` and exits 0 for a
+  // fixture whose `mutations` array is empty. Crediting discrimination on the status alone would
+  // let a fixture that graded nothing hold the floor up for a corpus that killed nothing, which is
+  // the very vacuity this floor exists to refuse, one layer down. Credit the observed verdict.
+  if (run.status === 0) {
+    if (verdictsIn(output).includes("KILLED")) discriminated.push(path);
+    else zeroGraded.push(path);
+    continue;
+  }
+  // Pre-red is keyed on exit 4 ALONE, the code mutation-proof sets only in its pre-mutation baseline
+  // refusal and nowhere a mutation actually ran. Attribute it by the SAME command's base-to-head
+  // transition, never by a declared suite path that may name a different command.
+  if (run.status === 4) {
+    const refused = refusedCommand(output);
+    if (refused.error) { unmeasuredPreRed.push({ path, command: "unknown", reason: refused.error }); continue; }
+    const provenance = refusedProvenance(output);
+    if (provenance.error || provenance.command !== refused.command) {
+      unmeasuredPreRed.push({ path, command: refused.command,
+        reason: provenance.error ?? "baseline provenance did not name the refused command" });
+      continue;
+    }
+    const commands = [...new Set([command, ...mutations.map((mutation) => mutation.command)]
+      .filter((fixtureCommand) => typeof fixtureCommand === "string"))];
+    if (a.all) { preRed.push({ path, ...refused, baseStatus: undefined }); continue; }
+    if (pastDeadline()) { unmeasuredPreRed.push({ path, command: refused.command, reason: budgetReason("the base comparison") }); continue; }
+    ensureSnapshotPrepared(snapshots.head, "head");
+    ensureSnapshotPrepared(snapshots.base, "base");
+    const preparationError = snapshots.head.error ?? snapshots.head.preparationError
+      ?? snapshots.base.error ?? snapshots.base.preparationError;
+    if (preparationError) { unmeasuredPreRed.push({ path, command: refused.command, reason: preparationError }); continue; }
+    const commandMatrix = [];
+    for (const fixtureCommand of commands) {
+      const headRun = runCommand(fixtureCommand, snapshots.head.path, snapshotComparisonEnv());
+      const baseRun = runCommand(fixtureCommand, snapshots.base.path, snapshotComparisonEnv());
+      commandMatrix.push({ command: fixtureCommand, headRun, baseRun });
+    }
+    const cleanRefusal = commandMatrix.find(({ command: fixtureCommand }) => fixtureCommand === refused.command)?.headRun;
+    const refusalReason = cleanRefusal
+      ? rootContaminationReason(provenance, cleanRefusal)
+      : "root PRE-RED was not reproduced in the clean head snapshot; root execution-state contamination detected";
+    if (!cleanRefusal || cleanRefusal.status === 0) {
+      unmeasuredPreRed.push({ path, command: refused.command, reason: refusalReason });
+      continue;
+    }
+    const headRedCommands = commandMatrix.filter(({ headRun }) => headRun.status !== 0);
+    for (const { command: fixtureCommand, headRun, baseRun } of headRedCommands) {
+      const headReason = unmeasurableFailure(headRun);
+      if (headRun.error || headRun.status === null || headRun.signal) {
+        unmeasuredPreRed.push({ path, command: fixtureCommand, reason: `head confirmation ${headReason}` });
+        continue;
+      }
+      const transition = compareSnapshots(fixtureCommand, headRun, baseRun);
+      if (fixtureCommand === refused.command && transition.kind === "inherited" && refusalReason) {
+        unmeasuredPreRed.push({ path, command: fixtureCommand, reason: refusalReason });
+        continue;
+      }
+      const finding = { path, command: fixtureCommand, headStatus: headRun.status, ...transition };
+      if (transition.kind === "attributable") attributablePreRed.push(finding);
+      else if (transition.kind === "inherited") preRed.push(finding);
+      else unmeasuredPreRed.push(finding);
+    }
+    continue;
+  }
+  const verdicts = verdictsIn(output);
+  // A single adverse verdict anywhere in the fixture is a finding: SURVIVED does not become benign
+  // because another mutation in the same file was INCONCLUSIVE. INCONCLUSIVE is its own reported
+  // state ONLY when every parsed verdict is INCONCLUSIVE and at least one was parsed. An empty
+  // parse (`[].every` is true) is unexplained, not INCONCLUSIVE. Mixed KILLED+INCONCLUSIVE
+  // counts as discriminated: a kill was observed. Anything else is a finding and never a pass,
+  // including an empty parse, an exit-1 with only KILLED lines, or a token this gate cannot name.
+  if (verdicts.some((v) => FATAL_VERDICTS.has(v))) {
+    if (verdicts.includes("KILLED")) discriminated.push(path);
+    if (a.all) { fatal.push(path); continue; }
+    if (pastDeadline()) { unmeasuredFatal.push({ path, reason: budgetReason("the base comparison") }); continue; }
+    ensureSnapshotPrepared(snapshots.head, "head");
+    ensureSnapshotPrepared(snapshots.base, "base");
+    const preparationError = snapshots.head.error ?? snapshots.head.preparationError
+      ?? snapshots.base.error ?? snapshots.base.preparationError;
+    if (preparationError) { unmeasuredFatal.push({ path, reason: preparationError }); continue; }
+    if (!existsSync(join(snapshots.head.path, path)) || !existsSync(join(snapshots.base.path, path))) {
+      unmeasuredFatal.push({ path, reason: "fixture is absent from a comparison snapshot" });
+      continue;
+    }
+    const headProof = runProof(snapshots.head.path, path, snapshotComparisonEnv());
+    const baseProof = pastDeadline() ? undefined : runProof(snapshots.base.path, path, snapshotComparisonEnv());
+    if (!baseProof || cutByBudget(headProof) || cutByBudget(baseProof)) {
+      unmeasuredFatal.push({ path, reason: budgetReason("the head and base comparison") });
+      continue;
+    }
+    const headMutations = readFixtureMutations(snapshots.head.path, path);
+    const baseMutations = readFixtureMutations(snapshots.base.path, path);
+    const headRecordsClean = labeledVerdictsIn(headProof.output, headMutations);
+    const rootFatals = labeledVerdictsIn(output, mutations).filter((rec) => FATAL_VERDICTS.has(rec.verdict));
+    const cleanFatals = headRecordsClean.filter((rec) => FATAL_VERDICTS.has(rec.verdict));
+    if (JSON.stringify(rootFatals) !== JSON.stringify(cleanFatals)) {
+      unmeasuredFatal.push({ path, reason: "root fatal verdicts were not reproduced in the clean head snapshot" });
+      continue;
+    }
+    const baseReason = unmeasurableFailure(baseProof);
+    if (baseProof.error || baseProof.status === null || baseProof.signal) {
+      unmeasuredFatal.push({ path, reason: `base proof ${baseReason ?? "could not run"}` });
+      continue;
+    }
+    const baseRecords = labeledVerdictsIn(baseProof.output, baseMutations);
+    if (!baseRecords.length && baseProof.status !== 0) {
+      unmeasuredFatal.push({ path, reason: "base proof produced no comparable mutation verdicts" });
+      continue;
+    }
+    const transition = compareFatalVerdicts(headRecordsClean, baseRecords);
+    if (transition.attributable.length) fatal.push(path);
+    else if (transition.inherited.length) inheritedFatal.push({ path, mutations: transition.inherited });
+    else fatal.push(path);
+    continue;
+  }
+  else if (verdicts.length > 0 && verdicts.every((v) => v === "INCONCLUSIVE")) inconclusive.push(path);
+  else if (verdicts.includes("INCONCLUSIVE") && verdicts.every((v) => v === "KILLED" || v === "INCONCLUSIVE")) {
+    discriminated.push(path);
+  }
+  else fatal.push(path);
+}
+
+const fixtureCount = (findings) => new Set(findings.map(({ path }) => path)).size;
+if (preRed.length) {
+  console.log(`\nPRE-RED (${fixtureCount(preRed)} fixture(s)) INHERITED — ${a.all
+    ? "--all supplied no base comparison; not attributed, but counted against the full-sweep floor"
+    : "the same command was already red at base; not caused by this diff"}:`);
+  for (const { path, command, baseStatus, headStatus } of preRed) {
+    console.log(baseStatus === undefined
+      ? `  ${path} -> command: ${command}; head RED (exit ${headStatus}), base NOT COMPARED (--all)`
+      : `  ${path} -> command: ${command}; transition: base RED (exit ${baseStatus}) -> head RED (exit ${headStatus})`);
+  }
+}
+if (inheritedFatal.length) {
+  console.log(`\nFATAL INHERITED (${fixtureCount(inheritedFatal)} fixture(s)) — the same mutation verdict was already fatal at base; not caused by this diff:`);
+  for (const { path, mutations } of inheritedFatal) {
+    for (const rec of mutations)
+      console.log(`  ${path} -> mutation: ${rec.label}; transition: base ${rec.baseVerdict} -> head ${rec.verdict}`);
+  }
+}
+if (inconclusive.length) {
+  console.log(`\nINCONCLUSIVE (${inconclusive.length} fixture(s)) — a timeout, a teardown hang, or a swallowed exit code left no evidence either way; not treated as SURVIVED and not treated as KILLED: ${inconclusive.join(", ")}`);
+}
+if (attributablePreRed.length) {
+  console.error(`\nPRE-RED TRANSITION FAILED (${fixtureCount(attributablePreRed)} fixture(s)) — the same command was green at base and red at head:`);
+  for (const { path, command, baseStatus, headStatus } of attributablePreRed)
+    console.error(`  ${path} -> command: ${command}; transition: base GREEN (exit ${baseStatus}) -> head RED (exit ${headStatus})`);
+}
+if (unmeasuredPreRed.length) {
+  console.error(`\nPRE-RED TRANSITION UNMEASURED (${fixtureCount(unmeasuredPreRed)} fixture(s)) — base comparison was absent or could not run; refusing to clear:`);
+  for (const { path, command, reason } of unmeasuredPreRed)
+    console.error(`  ${path} -> command: ${command}; transition: UNMEASURED (${reason}) -> head RED`);
+}
+if (unmeasuredFatal.length) {
+  console.error(`\nFATAL TRANSITION UNMEASURED (${fixtureCount(unmeasuredFatal)} fixture(s)) — base comparison was absent or could not run; refusing to clear:`);
+  for (const { path, reason } of unmeasuredFatal)
+    console.error(`  ${path} -> transition: UNMEASURED (${reason})`);
+}
+if (cutShort.length || notStarted.length) {
+  console.error(`\nMUTATION REPROOF BUDGET EXHAUSTED (${cutShort.length + notStarted.length} of ${prove.length} proven fixture(s) not finished inside the ${budgetMinutes}-minute budget; UNMEASURED, not a pass):`);
+  for (const path of cutShort)
+    console.error(`  ${path} -> cut short: the budget ended its proof before every mutation was graded; its partial verdicts are above`);
+  for (const path of notStarted) console.error(`  ${path} -> not run: the budget was spent before its proof began`);
+}
+if (fatal.length) {
+  console.error(`\nMUTATION REPROOF FAILED (${fatal.length} fixture(s)): ${fatal.join(", ")}`);
+}
+if (attributablePreRed.length || unmeasuredPreRed.length || fatal.length || unmeasuredFatal.length
+    || cutShort.length || notStarted.length) {
+  process.exit(1);
+}
+function discriminationFloor(provenCount, discriminatedCount) {
+  // Required kills follow the configs actually proven: under --all every one of them, in diff
+  // mode none if the selector had nothing to prove, otherwise at least one. A constant such as
+  // "50" would pass today's corpus by accident and would fail a legitimate one-fixture synthetic.
+  if (a.all) return { pass: discriminatedCount === provenCount, required: provenCount };
+  if (provenCount === 0) return { pass: true, required: 0 };
+  return { pass: discriminatedCount > 0, required: 1 };
+}
+// A fixture that exited 0 without a single parsed KILLED graded nothing. It is not a finding
+// against the guard and not a pass for it, so it is named rather than folded into either: a
+// reader who sees the corpus shrink this way should see WHICH member stopped grading.
+if (zeroGraded.length) {
+  console.log(`\nZERO GRADED (${zeroGraded.length} fixture(s)): exited 0 with no KILLED verdict parsed, so they graded nothing and cannot count toward the floor:\n${zeroGraded.map((path) => `  ${path}`).join("\n")}`);
+}
+const floor = discriminationFloor(prove.length, discriminated.length);
+if (!floor.pass) {
+  // The floor's question is corpus-shaped but its scope is the unit it runs in, and under a
+  // sharded fan-out that unit is one shard. A shard can therefore draw only work that CANNOT
+  // discriminate, every fixture pre-red before any mutation or graded nothing, while the
+  // corpus as a whole kills. That still reds, deliberately: a unit that obtained no verdict has
+  // not earned an all-clear, and exempting an all-PRE-RED set is precisely the vacuity this
+  // floor exists to refuse. But the two cases need different human responses, so they are named
+  // differently. COULD NOT means re-shard or fix the already-red commands, and blaming a
+  // specific fixture for failing to produce a kill it was never in a position to produce is
+  // what a single banner would do.
+  const unableSet = new Set([
+    ...preRed.map(({ path }) => path),
+    ...unmeasuredPreRed.map(({ path }) => path),
+    ...inconclusive,
+    ...zeroGraded,
+  ]);
+  const expected = prove.map(({ path }) => path).filter((path) => !unableSet.has(path));
+  const unable = prove.map(({ path }) => path).filter((path) => unableSet.has(path));
+  // Only a full sweep reaches here with a kill, because its floor is every proven fixture. The
+  // fixtures that killed are not the finding; the ones that could not are coverage the tree lost.
+  if (discriminated.length > 0) {
+    console.error(`\nMUTATION REPROOF FLOOR ERODED (${discriminated.length} of ${prove.length} proven fixture(s) discriminated; required ${floor.required} from the selected configs, every proven fixture under --all: ${fixtureCount(preRed)} pre-red, ${inconclusive.length} inconclusive, ${zeroGraded.length} graded nothing). A full sweep grades the tree, so these fixtures no longer prove their guard; repair them: ${unable.join(", ")}`);
+    process.exit(1);
+  }
+  if (expected.length === 0) {
+    console.error(`\nMUTATION REPROOF ZERO DISCRIMINATED, COULD NOT (0 of ${prove.length} proven fixture(s) discriminated; required ${floor.required} from the selected configs). No proven fixture here was in a position to kill: every one was pre-red, inconclusive, or graded nothing, so this unit obtained no verdict and cannot stand as an all-clear. Not attributable to any fixture below; re-shard or repair the already-red commands: ${unable.join(", ")}`);
+  } else {
+    console.error(`\nMUTATION REPROOF ZERO DISCRIMINATED (${discriminated.length} of ${prove.length} proven fixture(s) discriminated; required ${floor.required} from the selected configs), expected a kill from: ${expected.join(", ")}${unable.length ? `; not attributable to (could not discriminate): ${unable.join(", ")}` : ""}`);
+  }
+  process.exit(1);
+}
+console.log(a.all
+  ? `\nMUTATION REPROOF OK (${selected.length} fixture(s) selected; ${discriminated.length} discriminated; ${quarantinedSkipped.length} quarantined skipped; ${preRed.length} pre-red, ${inconclusive.length} inconclusive; base not compared under --all)`
+  : `\nMUTATION REPROOF OK (${selected.length} fixture(s) selected; ${discriminated.length} discriminated, ${fixtureCount(preRed)} inherited pre-red, 0 attributable pre-red, 0 unmeasured pre-red, ${inconclusive.length} inconclusive${quarantinedSkipped.length ? `, ${quarantinedSkipped.length} quarantined skipped` : ""})`);

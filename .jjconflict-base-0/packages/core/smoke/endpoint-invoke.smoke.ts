@@ -1,0 +1,442 @@
+/**
+ * GENERIC describe/invoke REQUEST-BINDING smoke (control-surface P2 item 1, 1c.2c hardening) —
+ * proves {@link describeEndpoint} binds its reply to the request it sent, so the describe-derived
+ * invoke currency cannot be captured by an injected reply (freelance cold-review HIGH #1).
+ *
+ * The responder grant `epResponderReplyPattern` spans EVERY caller-nonce suffix, so any live
+ * responder can publish on a caller's reply rail at any nonce. A describe that accepted the first
+ * `{ok:true}` on the rail (no nonce match, no request-id echo) would adopt an ATTACKER-chosen
+ * responder identity + epoch as "current", defeating the whole describe-bound currency check.
+ *
+ * Hermetic: a fake NatsConnection captures the subscription callback and, on publish, reads the
+ * outgoing request's nonce + id off the subject/body and synchronously delivers crafted replies.
+ * No broker. Run: pnpm smoke:ep-invoke
+ */
+import {
+  CotalEndpoint, compileContract, describeEndpoint, epReplySubject, invokeCommand, parseEpSubject, resolveService,
+  unansweredRequest, epCall, EpEnvelopeError, EP_UNANSWERED, submitAndFollowGoal, type EpCaller, type ResolvedService,
+} from "../src/index.js";
+
+const enc = new TextEncoder(), dec = new TextDecoder();
+let pass = 0, fail = 0;
+const c = (name: string, cond: boolean, extra?: unknown) => {
+  if (cond) { pass++; console.log(`  ✓ ${name}`); }
+  else { fail++; console.log(`  ✗ FAIL: ${name}`, extra ?? ""); }
+};
+const rejects = async (name: string, fn: () => Promise<unknown>, code?: string) => {
+  try { await fn(); c(name, false, "did not throw"); }
+  catch (e) { c(name, code === undefined || (e as { code?: string }).code === code, (e as { code?: string }).code ?? (e as Error).message); }
+};
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const SPACE = "invbind";
+const CALLER: EpCaller = { owner: "local", actor: "cliabc", uid: "u".repeat(26) };
+const ENDPOINT = "manager";
+const HONEST = { instanceId: "honestiiiiiiiiiiiiiiiiiiiii", epoch: 3 };
+const ATTACKER = { instanceId: "attackerjjjjjjjjjjjjjjjjjjj", epoch: 99 };
+const answer = { public: true, descriptor: { endpoint: ENDPOINT, owner: "local", clusters: [] } };
+
+/** A fake NatsConnection: on publish, parse the request the code sent and deliver `crafted(req)`
+ *  replies through the captured subscription callback (each an {subject,data} message). */
+function fakeNc(
+  crafted: (req: { nonce: string; id: string }) => Array<{ subject: string; data: Uint8Array }>,
+  beforePublish?: (req: { nonce: string; id: string }) => void,
+) {
+  let cb: ((err: unknown, msg: { subject: string; data: Uint8Array }) => void) | undefined;
+  return {
+    subscribe(_filter: string, opts: { callback: (err: unknown, msg: { subject: string; data: Uint8Array }) => void }) {
+      cb = opts.callback;
+      return { unsubscribe() {} };
+    },
+    publish(subject: string, data: Uint8Array) {
+      const parsed = parseEpSubject(subject);
+      if (!parsed || parsed.plane !== "request") throw new Error(`unexpected publish subject ${subject}`);
+      const body = JSON.parse(dec.decode(data)) as { id: string };
+      const req = { nonce: parsed.nonce, id: body.id };
+      beforePublish?.(req);
+      // deliver on the next tick so describeEndpoint's promise is armed
+      queueMicrotask(() => { for (const m of crafted(req)) cb?.(null, m); });
+    },
+    // The describe watches this stream to tell a broker-REFUSED publish from an unanswered one, so
+    // the double has to model it or it stops being a NatsConnection. Modelled after the real
+    // transport's QueuedIterator, INCLUDING the part that matters: a healthy connection emits no
+    // status, so `next()` parks, and only `stop()` releases it: a queued `return()` on a parked
+    // generator does not run until the next event, which is exactly the leak this shape exists to
+    // keep honest. A double that settled on `return()` would let that regression back in silently.
+    status() {
+      let release: (() => void) | undefined;
+      const stopped = new Promise<void>((r) => { release = r; });
+      return {
+        stop() { release?.(); },
+        [Symbol.asyncIterator]() {
+          return {
+            async next(): Promise<IteratorResult<{ type: string; error?: unknown }>> {
+              await stopped;
+              return { done: true, value: undefined };
+            },
+            async return(): Promise<IteratorResult<{ type: string; error?: unknown }>> {
+              return { done: true, value: undefined };
+            },
+          };
+        },
+      };
+    },
+  } as unknown as Parameters<typeof describeEndpoint>[0];
+}
+
+/** A fake NatsConnection that answers an ordinary resolved command and counts every publish. */
+function fakeInvokeNc(onPublish: () => void) {
+  let cb: ((err: unknown, msg: { subject: string; data: Uint8Array }) => void) | undefined;
+  return {
+    subscribe(_filter: string, opts: { callback: (err: unknown, msg: { subject: string; data: Uint8Array }) => void }) {
+      cb = opts.callback;
+      return { unsubscribe() { cb = undefined; } };
+    },
+    publish(subject: string, data: Uint8Array) {
+      onPublish();
+      const parsed = parseEpSubject(subject);
+      if (!parsed || parsed.plane !== "request") throw new Error(`unexpected publish subject ${subject}`);
+      const body = JSON.parse(dec.decode(data)) as { id: string };
+      const replySubject = epReplySubject(SPACE, {
+        endpoint: parsed.endpoint, instanceId: HONEST.instanceId, epoch: HONEST.epoch,
+        caller: parsed.caller, nonce: parsed.nonce,
+      });
+      queueMicrotask(() => cb?.(null, {
+        subject: replySubject,
+        data: enc.encode(JSON.stringify({ v: 1, id: body.id, ok: true, data: { ran: true } })),
+      }));
+    },
+    // epCall watches nc.status() for a broker-refused publish. A double without it
+    // is not a NatsConnection for that path.
+    status() {
+      let release: (() => void) | undefined;
+      const stopped = new Promise<void>((r) => { release = r; });
+      return {
+        stop() { release?.(); },
+        [Symbol.asyncIterator]() {
+          return {
+            async next(): Promise<IteratorResult<{ type: string; error?: unknown }>> {
+              await stopped;
+              return { done: true, value: undefined };
+            },
+            async return(): Promise<IteratorResult<{ type: string; error?: unknown }>> {
+              return { done: true, value: undefined };
+            },
+          };
+        },
+      };
+    },
+  } as unknown as Parameters<typeof invokeCommand>[0];
+}
+
+const reply = (who: { instanceId: string; epoch: number }, nonce: string, id: string, ok = true) => ({
+  subject: epReplySubject(SPACE, { endpoint: ENDPOINT, instanceId: who.instanceId, epoch: who.epoch, caller: CALLER, nonce }),
+  data: enc.encode(JSON.stringify({ v: 1, id, ok, ...(ok ? { data: answer } : { error: { code: "unavailable", message: "x" } }) })),
+});
+
+console.log("describe REQUEST-BINDING (freelance HIGH #1):");
+
+// Class-only credentials select an attributed responder without using an instance subject.
+{
+  const nc = fakeNc((req) => [reply(ATTACKER, req.nonce, req.id), reply(HONEST, req.nonce, req.id)]);
+  const { responder } = await describeEndpoint(nc, SPACE, ENDPOINT, CALLER, { classInstanceId: HONEST.instanceId, deadlineMs: 1000 });
+  c("class responder selection ignores an earlier sibling reply", responder.instanceId === HONEST.instanceId);
+  await rejects("an absent class responder never falls back to a live sibling", () =>
+    describeEndpoint(fakeNc((req) => [reply(ATTACKER, req.nonce, req.id)]), SPACE, ENDPOINT, CALLER, { classInstanceId: HONEST.instanceId, deadlineMs: 100 }), "deadline-exceeded");
+  await rejects("class responder and instance route cannot be combined", () =>
+    describeEndpoint(fakeNc(() => { throw new Error("transport must not be touched"); }), SPACE, ENDPOINT, CALLER, { classInstanceId: HONEST.instanceId, instanceId: ATTACKER.instanceId }), "bad-request");
+  await rejects("an invalid class responder token refuses before transport", () =>
+    describeEndpoint(fakeNc(() => { throw new Error("transport must not be touched"); }), SPACE, ENDPOINT, CALLER, { classInstanceId: "bad.token" }));
+  const ep = new CotalEndpoint({ space: SPACE, lifecycleUid: CALLER.uid, card: { name: "selected-cache", kind: "agent" }, channels: [] });
+  const cached: ResolvedService = { endpoint: ENDPOINT, owner: "local", caller: CALLER, responder: ATTACKER, commands: new Map([["mutate", {} as never]]) };
+  const cache = new Map([[ENDPOINT, cached]]);
+  (ep as unknown as { nc: unknown }).nc = fakeNc(() => []);
+  (ep as unknown as { resolvedServices: Map<string, ResolvedService> }).resolvedServices = cache;
+  await rejects("class responder invoke bypasses a sibling's ordinary class cache", () =>
+    ep.invokeService(ENDPOINT, "mutate", undefined, { classInstanceId: HONEST.instanceId, deadlineMs: 100 }), "deadline-exceeded");
+  c("failed class responder selection leaves the ordinary class cache intact", cache.get(ENDPOINT) === cached);
+}
+
+// 1) An attacker reply on a DIFFERENT nonce (its own valid responder triple + a wrong request id)
+//    delivered BEFORE the honest one is IGNORED; describe binds to the honest responder.
+{
+  const otherNonce = "z".repeat(24);
+  const nc = fakeNc((req) => [
+    reply(ATTACKER, otherNonce, "wrongreqid00000000000000"), // wrong nonce AND wrong id
+    reply(HONEST, req.nonce, req.id), // the real answer, on our nonce, echoing our id
+  ]);
+  const { responder } = await describeEndpoint(nc, SPACE, ENDPOINT, CALLER, { deadlineMs: 2000 });
+  c("an injected reply on a different nonce is ignored; describe binds to the HONEST responder", responder.instanceId === HONEST.instanceId && responder.epoch === HONEST.epoch, responder);
+}
+
+// 2) An attacker reply on OUR nonce but with a wrong request id is IGNORED (the id echo is
+//    load-bearing: the rail is shared, an id mismatch is not our answer).
+{
+  const nc = fakeNc((req) => [
+    reply(ATTACKER, req.nonce, "wrongreqid00000000000000"), // our nonce, wrong id
+    reply(HONEST, req.nonce, req.id),
+  ]);
+  const { responder } = await describeEndpoint(nc, SPACE, ENDPOINT, CALLER, { deadlineMs: 2000 });
+  c("a reply on our nonce with a wrong request id is ignored; the id-echo binding holds", responder.instanceId === HONEST.instanceId, responder);
+}
+
+// 3) An attacker reply for a DIFFERENT endpoint on our rail is ignored.
+{
+  const nc = fakeNc((req) => [
+    { subject: epReplySubject(SPACE, { endpoint: "delivery", instanceId: ATTACKER.instanceId, epoch: 1, caller: CALLER, nonce: req.nonce }), data: enc.encode(JSON.stringify({ v: 1, id: req.id, ok: true, data: answer })) },
+    reply(HONEST, req.nonce, req.id),
+  ]);
+  const { responder } = await describeEndpoint(nc, SPACE, ENDPOINT, CALLER, { deadlineMs: 2000 });
+  c("a reply attributed to a different endpoint is ignored", responder.instanceId === HONEST.instanceId, responder);
+}
+
+// 4) When ONLY an injected reply exists (wrong nonce), describe does NOT accept it — it
+//    deadline-exceeds. The attacker cannot force acceptance of its identity by racing.
+{
+  const nc = fakeNc(() => [reply(ATTACKER, "y".repeat(24), "someid000000000000000000")]);
+  await rejects("with only an injected (wrong-nonce) reply present, describe times out - never adopts the attacker", () => describeEndpoint(nc, SPACE, ENDPOINT, CALLER, { deadlineMs: 300 }), "deadline-exceeded");
+  // The deadline is the one describe failure that observed NO answer: it carries EP_UNANSWERED.
+  let e: unknown;
+  try { await describeEndpoint(nc, SPACE, ENDPOINT, CALLER, { deadlineMs: 300 }); } catch (err) { e = err; }
+  c("the describe deadline is marked EP_UNANSWERED (nothing answered on our nonce)", unansweredRequest(e), e);
+}
+
+// 4b) A responder ANSWERS the describe with ok:false: it is rethrown under the responder's own code
+//     (`unavailable` here, as core's describe handler produces when its trusted auth view failed) and
+//     WITHOUT the EP_UNANSWERED marker. A consumer keyed on the marker never reads it as absence;
+//     one keyed on the code did, and printed "no manager reachable" for an answering manager.
+{
+  const nc = fakeNc((req) => [reply(HONEST, req.nonce, req.id, false)]);
+  let e: unknown;
+  try { await describeEndpoint(nc, SPACE, ENDPOINT, CALLER, { deadlineMs: 2000 }); } catch (err) { e = err; }
+  c("an answered ok:false describe rethrows under the responder's own code (`unavailable`)", (e as { code?: string })?.code === "unavailable", e);
+  c("an answered ok:false describe is NOT marked EP_UNANSWERED (the code alone is not evidence of silence)", !unansweredRequest(e), e);
+}
+
+// 5) Sanity: the honest reply alone resolves.
+{
+  const nc = fakeNc((req) => [reply(HONEST, req.nonce, req.id)]);
+  const { answer: a, responder } = await describeEndpoint(nc, SPACE, ENDPOINT, CALLER, { deadlineMs: 2000 });
+  c("the honest reply alone resolves with its attributed responder + answer", responder.epoch === HONEST.epoch && a.descriptor.endpoint === ENDPOINT, { responder, a });
+}
+
+// 6) Core NATS drops a request published before a responder subscribes. The describe bootstrap is
+//    read-only, so it re-publishes the SAME bound request inside the ORIGINAL deadline. Model that
+//    registration gap exactly: the first publish has nobody behind it; the second reaches the newly
+//    available responder. A one-shot describe waits out the deadline and fails this cell.
+{
+  let publishes = 0;
+  const nc = fakeNc((req) => ++publishes === 1 ? [] : [reply(HONEST, req.nonce, req.id)]);
+  let responder: { instanceId: string; epoch: number } | undefined;
+  let error: unknown;
+  try { ({ responder } = await describeEndpoint(nc, SPACE, ENDPOINT, CALLER, { deadlineMs: 800 })); }
+  catch (e) { error = e; }
+  c("an unanswered describe is re-published within its original deadline when the responder registers after the first request", publishes === 2 && responder?.instanceId === HONEST.instanceId, { publishes, responder, error });
+}
+
+// 7) `publish` throws synchronously after a real connection closes or begins draining. The first
+//    retry runs from a timer, so that throw must reject the pending describe rather than escape as an
+//    uncaught exception. The short deadline keeps the deliberately unguarded mutation below its
+//    second retry: one captured uncaught exception can therefore redden this named cell without the
+//    mutant crashing before mutation-proof sees which assertion failed.
+{
+  let publishes = 0;
+  let uncaught: unknown;
+  const onUncaught = (e: unknown) => { uncaught = e; };
+  process.once("uncaughtException", onUncaught);
+  const nc = fakeNc(() => [], () => {
+    publishes++;
+    if (publishes === 2) throw new Error("closed connection");
+  });
+  let error: unknown;
+  try { await describeEndpoint(nc, SPACE, ENDPOINT, CALLER, { deadlineMs: 400 }); }
+  catch (e) { error = e; }
+  process.removeListener("uncaughtException", onUncaught);
+  c("a retry publish failure rejects the pending describe as unavailable and never escapes the timer",
+    publishes === 2 && uncaught === undefined && (error as { code?: string })?.code === "unavailable" && (error as Error)?.message.includes("closed connection"),
+    { publishes, uncaught, error });
+}
+
+// 7b/7c) Constructed-only: a poisoned Error.message getter or a poisoned non-Error toString must not
+//     escape the retry timer. Real NATS close/drain failures were ordinary Error values; these cells
+//     prove the catch formats an arbitrary thrown value without throwing, not that production produces
+//     either poison. The describe must still settle as unavailable (not hang to the deadline).
+{
+  const poison = (makeThrow: () => unknown, name: string) => {
+    let publishes = 0;
+    let uncaught: unknown;
+    const onUncaught = (e: unknown) => { uncaught = e; };
+    process.once("uncaughtException", onUncaught);
+    const started = Date.now();
+    const nc = fakeNc(() => [], () => {
+      publishes++;
+      if (publishes === 2) throw makeThrow();
+    });
+    return (async () => {
+      let error: unknown;
+      try { await describeEndpoint(nc, SPACE, ENDPOINT, CALLER, { deadlineMs: 400 }); }
+      catch (e) { error = e; }
+      process.removeListener("uncaughtException", onUncaught);
+      const elapsed = Date.now() - started;
+      c(name,
+        publishes === 2 && uncaught === undefined && elapsed < 380
+          && (error as { code?: string })?.code === "unavailable"
+          && (error as Error)?.message.includes("unknown publish failure"),
+        { publishes, uncaught, elapsed, error });
+    })();
+  };
+  await poison(() => {
+    const err = new Error("closed connection");
+    Object.defineProperty(err, "message", { get() { throw new Error("message getter poisoned"); } });
+    return err;
+  }, "a poisoned Error.message getter on retry publish still rejects as unavailable and never escapes the timer");
+  await poison(() => ({ toString() { throw new Error("toString poisoned"); } }),
+    "a poisoned non-Error toString on retry publish still rejects as unavailable and never escapes the timer");
+}
+
+// 7d) A cancellation settles a resolve with the signal's reason whichever leg it lands in. Aborted
+//     while the describe waits for its reply, it used to reject `unavailable`, the code a real
+//     transport failure carries, while an abort before the publish rejected with the reason itself.
+//     A `TimeoutError` abort still ends the wait as the deadline would.
+{
+  const cancelIn = async (reason: unknown, aborted: boolean) => {
+    const ctl = new AbortController();
+    if (aborted) ctl.abort(reason);
+    else setTimeout(() => ctl.abort(reason), 50);
+    const e = await resolveService(fakeNc(() => []), SPACE, ENDPOINT, CALLER, { signal: ctl.signal, deadlineMs: 2000 })
+      .then(() => undefined, (err: unknown) => err);
+    return { e, reason: ctl.signal.reason as unknown };
+  };
+  const stop = new Error("caller-stop");
+  for (const [label, reason] of [["the default AbortError", undefined], ["a caller's Error", stop]] as const) {
+    const before = await cancelIn(reason, true), during = await cancelIn(reason, false);
+    c(`a resolve aborted before the describe rejects with the signal's reason (${label})`, before.e === before.reason, before.e);
+    c(`a resolve aborted while the describe waits rejects with the signal's reason (${label})`, during.e === during.reason, during.e);
+  }
+  const timedOut = await cancelIn(new DOMException("deadline passed", "TimeoutError"), false);
+  c("a TimeoutError abort while the describe waits still reports the unanswered deadline",
+    (timedOut.e as { code?: string })?.code === "deadline-exceeded" && unansweredRequest(timedOut.e), timedOut.e);
+}
+
+// 8) A narrowed resolve validates its command list before touching the transport. These options are
+//    a public API boundary, so malformed values fail as envelope preconditions rather than leaking a
+//    lower-level token assertion or attempting a describe.
+{
+  await rejects("a narrowed resolve refuses an empty command list before transport", () =>
+    resolveService(fakeNc(() => { throw new Error("transport must not be touched"); }), SPACE, ENDPOINT, CALLER, { commands: [] }), "failed-precondition");
+  await rejects("a narrowed resolve refuses a non-array command list before transport", () =>
+    resolveService(fakeNc(() => { throw new Error("transport must not be touched"); }), SPACE, ENDPOINT, CALLER, { commands: "mutate" as unknown as readonly string[] }), "failed-precondition");
+  await rejects("a narrowed resolve refuses an invalid command token before transport", () =>
+    resolveService(fakeNc(() => { throw new Error("transport must not be touched"); }), SPACE, ENDPOINT, CALLER, { commands: ["bad command"] }), "failed-precondition");
+  await rejects("optional commands refuse an empty list before transport", () =>
+    resolveService(fakeNc(() => { throw new Error("transport must not be touched"); }), SPACE, ENDPOINT, CALLER, { optionalCommands: [] }), "failed-precondition");
+  await rejects("optional commands refuse a non-array before transport", () =>
+    resolveService(fakeNc(() => { throw new Error("transport must not be touched"); }), SPACE, ENDPOINT, CALLER, { optionalCommands: "goal-result" as unknown as readonly string[] }), "failed-precondition");
+  await rejects("optional commands refuse an invalid token before transport", () =>
+    resolveService(fakeNc(() => { throw new Error("transport must not be touched"); }), SPACE, ENDPOINT, CALLER, { optionalCommands: ["bad command"] }), "failed-precondition");
+}
+
+// 9) The retry above is confined to reserved, read-only describe. A resolved command rides epCall
+//    and is published exactly once, including after the describe retry interval has elapsed.
+{
+  const input = compileContract({ root: { type: "null" } });
+  const output = compileContract({ root: { type: "object", properties: { ran: { type: "boolean" } }, required: ["ran"], additionalProperties: false } });
+  const service: ResolvedService = {
+    endpoint: ENDPOINT, owner: "local", caller: CALLER, responder: HONEST,
+    commands: new Map([["mutate", {
+      command: "mutate", contract: { input, output }, class: "ephemeral", targeted: false,
+      modes: [], capability: "endpoint.mutate",
+    }]]),
+  };
+  let publishes = 0;
+  const nc = fakeInvokeNc(() => { publishes++; });
+  const result = await invokeCommand(nc, SPACE, service, "mutate", undefined, { deadlineMs: 800 });
+  await wait(350);
+  c("a resolved command is published exactly ONCE; describe readiness retry never widens to caller-supplied commands",
+    publishes === 1 && result.reply.ok === true, { publishes, result });
+}
+
+// A pinned describe must not borrow a class handle or replace it. The pin has no responder here,
+// so the real describe path must time out while the cached unpinned control keeps resolving.
+{
+  const ep = new CotalEndpoint({ space: SPACE, servers: "nats://127.0.0.1:1", lifecycleUid: CALLER.uid, card: { name: "cache-probe", kind: "agent" }, channels: [] });
+  const service: ResolvedService = { endpoint: ENDPOINT, owner: "local", caller: CALLER, responder: HONEST, commands: new Map() };
+  const cache = new Map([[ENDPOINT, service]]);
+  const commandCache = new Map([[ENDPOINT, new Map([["mutate", service]])]]);
+  (ep as unknown as { nc: unknown }).nc = fakeNc(() => []);
+  (ep as unknown as { resolvedServices: Map<string, ResolvedService> }).resolvedServices = cache;
+  (ep as unknown as { resolvedCommandServices: Map<string, Map<string, ResolvedService>> }).resolvedCommandServices = commandCache;
+  c("CONTROL: unpinned describe uses the existing class cache", await ep.describeService(ENDPOINT) === service);
+  await rejects("pinned describe bypasses the class cache and addresses its missing instance",
+    () => ep.describeService(ENDPOINT, { instanceId: ATTACKER.instanceId, deadlineMs: 100 }), "deadline-exceeded");
+  c("a failed pinned describe leaves the class cache intact", cache.get(ENDPOINT) === service);
+  c("an unpinned describe still returns its original class handle after the pinned refusal", await ep.describeService(ENDPOINT) === service);
+}
+
+// Narrow invocation handles and the complete discovery handle have independent cache slots. Exercise
+// the public methods against those slots so core owns the cache contract, while the manager smoke
+// separately proves the same sequence through live resolveService writes.
+{
+  const ep = new CotalEndpoint({ space: SPACE, servers: "nats://127.0.0.1:1", lifecycleUid: CALLER.uid, card: { name: "command-cache-probe", kind: "agent" }, channels: [] });
+  const contract = { input: compileContract({ root: { type: "null" } }), output: compileContract({ root: { type: "object", properties: { ran: { type: "boolean" } }, required: ["ran"], additionalProperties: false } }) };
+  const resolved = (command: string): ResolvedService => ({
+    endpoint: ENDPOINT, owner: "local", caller: CALLER, responder: HONEST,
+    commands: new Map([[command, { command, contract, class: "ephemeral", targeted: false, modes: [], capability: `endpoint.${command}` }]]),
+  });
+  const mutate = resolved("mutate"), query = resolved("query");
+  const full: ResolvedService = { ...mutate, commands: new Map([...mutate.commands, ...query.commands]) };
+  let publishes = 0;
+  (ep as unknown as { nc: unknown }).nc = fakeInvokeNc(() => { publishes++; });
+  const fullCache = new Map<string, ResolvedService>();
+  (ep as unknown as { resolvedServices: Map<string, ResolvedService> }).resolvedServices = fullCache;
+  (ep as unknown as { resolvedCommandServices: Map<string, Map<string, ResolvedService>> }).resolvedCommandServices =
+    new Map([[ENDPOINT, new Map([["mutate", mutate], ["query", query]])]]);
+  await ep.invokeService(ENDPOINT, "mutate");
+  await ep.invokeService(ENDPOINT, "query");
+  await ep.invokeService(ENDPOINT, "mutate");
+  c("alternating invokeService calls retain and reuse each command-specific handle", publishes === 3, publishes);
+  fullCache.set(ENDPOINT, full);
+  const described = await ep.describeService(ENDPOINT);
+  c("invokeService command handles do not truncate describeService's complete surface",
+    described === full && described.commands.size === 2 && described.commands.has("mutate") && described.commands.has("query"), [...described.commands]);
+}
+
+// Submitted identity survives both the call's timer and the follower's earlier timer/stop.
+// These constructed connections grade races and correlation, not real manager acceptance.
+{
+  const contract = { input: compileContract({ root: { type: "null" } }), output: compileContract({ root: { type: "null" } }) };
+  const op = { endpoint: ENDPOINT, command: "spawn", contract, caller: CALLER };
+  const detail = (e: unknown) => e instanceof EpEnvelopeError ? e.details?.find(d => d.kind === EP_UNANSWERED) : undefined;
+  let sent: string | undefined;
+  const nc = { ...fakeNc(() => [], req => { sent = req.id; }), flush: async () => {} };
+  const errorOf = (p: Promise<unknown>) => p.then(() => undefined, (e: unknown) => e);
+  const direct = await errorOf(epCall(nc as never, SPACE, { mode: "one" }, op, { deadlineMs: 20, currentEpoch: () => HONEST.epoch }));
+  c("an unanswered call retains the actual generated envelope id with unknown outcome", detail(direct)?.requestId === sent && typeof sent === "string" && direct instanceof EpEnvelopeError && direct.outcome === "unknown", direct);
+  const ctl = new AbortController();
+  const call = epCall(nc as never, SPACE, { mode: "one" }, op, { deadlineMs: 1000, currentEpoch: () => HONEST.epoch, signal: ctl.signal });
+  ctl.abort();
+  const cancelled = await errorOf(call);
+  c("a cancelled published call retains its own envelope id", detail(cancelled)?.requestId === sent && cancelled instanceof EpEnvelopeError && cancelled.outcome === "unknown", cancelled);
+  const followed = await errorOf(submitAndFollowGoal(nc as never, SPACE, ENDPOINT, CALLER, 20,
+    signal => epCall(nc as never, SPACE, { mode: "one" }, op, { deadlineMs: 1000, currentEpoch: () => HONEST.epoch, signal })));
+  c("the follower deadline wins before epCall but retains the submitted id", detail(followed)?.requestId === sent && followed instanceof EpEnvelopeError && followed.code === "deadline-exceeded" && followed.outcome === "unknown", followed);
+  const innerTimeout = await errorOf(submitAndFollowGoal(nc as never, SPACE, ENDPOINT, CALLER, 1000,
+    signal => epCall(nc as never, SPACE, { mode: "one" }, op, { deadlineMs: 20, currentEpoch: () => HONEST.epoch, signal })));
+  c("an epCall deadline winning first keeps both request id and generic no-retry guidance", detail(innerTimeout)?.requestId === sent && innerTimeout instanceof EpEnvelopeError && innerTimeout.message.includes("do NOT retry"), innerTimeout);
+  const stop = new AbortController();
+  const waiting = submitAndFollowGoal(nc as never, SPACE, ENDPOINT, CALLER, 1000,
+    signal => epCall(nc as never, SPACE, { mode: "one" }, op, { deadlineMs: 1000, currentEpoch: () => HONEST.epoch, signal }), { signal: stop.signal });
+  await wait(10); stop.abort();
+  const stopped = await errorOf(waiting);
+  c("stopping an in-flight follower retains id without asserting acceptance", detail(stopped)?.requestId === sent && stopped instanceof EpEnvelopeError && stopped.outcome === "unknown" && !stopped.message.includes("was accepted"), stopped);
+  const before = await errorOf(submitAndFollowGoal(nc as never, SPACE, ENDPOINT, CALLER, 20, async () => { throw new Error("must not submit"); }, {
+    prepare: async () => { throw new EpEnvelopeError("deadline-exceeded", "no describe reply", [{ kind: EP_UNANSWERED, endpoint: ENDPOINT, command: "describe" }]); },
+  }));
+  c("a preparation refusal never invents a submitted request id", detail(before)?.command === "describe" && detail(before)?.requestId === undefined, before);
+  const refusal = new EpEnvelopeError("unavailable", "broker no responders", [{ kind: EP_UNANSWERED, endpoint: ENDPOINT, command: "spawn" }], "not-executed");
+  const refused = await errorOf(submitAndFollowGoal(nc as never, SPACE, ENDPOINT, CALLER, 100, async () => { throw refusal; }));
+  c("a concrete pre-effect refusal survives unchanged without a submitted goal", refused === refusal && detail(refused)?.requestId === undefined, refused);
+}
+
+console.log(`\n${fail === 0 ? "ENDPOINT-INVOKE BINDING SMOKE OK ✅" : "ENDPOINT-INVOKE BINDING SMOKE FAILED"}  (${pass} passed, ${fail} failed)`);
+process.exit(fail === 0 ? 0 : 1);

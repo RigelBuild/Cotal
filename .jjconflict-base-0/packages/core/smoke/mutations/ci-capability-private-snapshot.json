@@ -1,0 +1,21 @@
+{
+  "suite": [
+    "packages/core/smoke/endpoint-binding.smoke.ts"
+  ],
+  "guard": "Minted baseline and spawn capability arrays must be unchanged after a post-import mutation attempt, regardless of legitimate vocabulary growth.",
+  "command": "pnpm --filter @cotal-ai/core build && pnpm smoke:ep-binding",
+  "completionMarker": "ENDPOINT BINDING SMOKE",
+  "progressPattern": "  \u2713 ",
+  "proveWith": "pnpm mutation-proof --config packages/core/smoke/mutations/ci-capability-private-snapshot.json",
+  "mutations": [
+    {
+      "name": "the exported baseline vocabulary is not frozen, so a post-import push lands",
+      "file": "packages/core/src/endpoint-grants.ts",
+      "find": "export const BASELINE_SELF_LIFECYCLE_COMMANDS = Object.freeze([\"stop\", \"turn-pending\", \"turn-yield\", \"run-answer\"] as const);",
+      "replace": "export const BASELINE_SELF_LIFECYCLE_COMMANDS = [\"stop\", \"turn-pending\", \"turn-yield\", \"run-answer\"] as const;",
+      "expectRed": "the baseline/spawn command vocabularies are frozen",
+      "cell": "the baseline/spawn command vocabularies are frozen",
+      "afterRestore": "pnpm --filter @cotal-ai/core build"
+    }
+  ]
+}

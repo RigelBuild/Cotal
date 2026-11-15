@@ -1,0 +1,51 @@
+import { strict as assert } from "node:assert";
+import { readFileSync, rmSync, statSync } from "node:fs";
+import { dirname } from "node:path";
+import { skipSuite } from "@cotal-ai/smoke-kit";
+import { registry } from "@cotal-ai/core";
+import { isolatedCommand, mergedCommand, privateLaunch } from "./src/driver.js";
+import * as tmuxPkg from "./src/index.js";
+
+// The tmux launcher contract is POSIX by construction: a bash script written 0o600 inside a
+// 0o700 dir. On Windows those modes are a no-op and bash is not the shell; secret-at-rest
+// hardening there is asserted by smoke:secret-fs (NTFS ACLs). Report a skip without passing
+// cells when the platform cannot express this contract.
+if (process.platform === "win32") {
+  skipSuite("tmux launcher contract is POSIX-only");
+}
+
+
+let checks = 0;
+const check = (name: string, condition: boolean): void => {
+  assert.ok(condition, name);
+  checks++;
+  console.log(`  ✓ ${name}`);
+};
+
+const isolated = isolatedCommand({ FOO: "bar baz" }, "/bin/echo", ["hello world"]);
+check("isolated command starts with env -i", isolated.startsWith("env -i "));
+check("isolated command quotes env values and argv", isolated.includes("FOO='bar baz'") && isolated.includes("'hello world'"));
+const merged = mergedCommand({ FOO: "bar" }, "/bin/echo", ["hello"]);
+check("merged command keeps inherited environment", merged.startsWith("env ") && !merged.startsWith("env -i "));
+assert.throws(() => isolatedCommand({ "BAD-NAME": "x" }, "/bin/echo", []), /unsafe env var name/);
+checks++;
+console.log("  ✓ unsafe env names are refused");
+
+const secret = "tmux-package-test-secret";
+const launch = privateLaunch(isolatedCommand({ TOKEN: secret }, "/bin/echo", [])).command;
+const launchPath = launch.replace(/^bash\s+'?|'?$/g, "");
+try {
+  check("private launcher command does not expose secret env", !launch.includes(secret));
+  check("private launcher script is owner-only", (statSync(launchPath).mode & 0o777) === 0o600);
+  check("secret is confined to the private launcher", readFileSync(launchPath, "utf8").includes(secret));
+} finally {
+  rmSync(dirname(launchPath), { recursive: true, force: true });
+}
+
+check("package exports TmuxRuntime and tmuxRuntimeProvider, not tmuxTerminalProvider", "TmuxRuntime" in tmuxPkg && "tmuxRuntimeProvider" in tmuxPkg && !("tmuxTerminalProvider" in tmuxPkg));
+check("importing @cotal-ai/tmux registers runtime/tmux and no terminal provider", registry.has("runtime", "tmux") && !registry.has("terminal", "tmux") && registry.all("terminal").length === 0);
+assert.throws(() => registry.resolve("terminal", "tmux"), /no terminal registered for "tmux"/);
+checks++;
+console.log("  ✓ resolving terminal/tmux throws");
+
+console.log(`TMUX PACKAGE TESTS: ${checks} tests executed`);

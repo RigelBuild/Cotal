@@ -1,0 +1,289 @@
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { globalConfigDir } from "@cotal-ai/core";
+import { SEEDED_EXTENSIONS } from "@cotal-ai/workspace";
+
+/**
+ * Filesystem layout + version identity for the connector seeding engine. Everything the reconcile
+ * writes lives under `<config>/cotal/seed/`, a sibling of the `extensions/` npm prefix — the prefix
+ * is npm-owned (a stray dir there would confuse `npm install`), the seed state is ours.
+ *
+ * The seed store is DURABLE by design: `npm install --install-links <dir>` normalizes a `file:` dep
+ * pointing at `<dir>`, so a volatile source (an `npx` `_npx` cache) would later fail to reify. We
+ * copy each shipped connector payload into `store/<generation>/<name>` and `ext add` from THAT stable
+ * path, keyed by the binary's version so a `cotal-ai` upgrade lands a fresh generation.
+ */
+
+/** The first-party seeded extensions, in a stable seed order: the connectors plus the web dashboard.
+ *  Keys of {@link SEEDED_EXTENSIONS}. */
+export const SEED_BUILTINS: readonly string[] = Object.keys(SEEDED_EXTENSIONS);
+
+/** `<config>/cotal/seed` — the seed engine's own state root (NOT inside the npm prefix). */
+export function seedDir(): string {
+  return join(globalConfigDir(), "seed");
+}
+
+/** The monotonic ever-seeded authority: which built-ins were ever seeded (never shrinks). */
+export function authorityPath(): string {
+  return join(seedDir(), "authority.json");
+}
+
+/** The durable append-only backup of the authority — the ONLY source `ext seed --repair` can
+ *  recover a lost {@link authorityPath} from (a witness alone can't tell removed from never-seeded). */
+export function authorityBackupPath(): string {
+  return join(seedDir(), "authority.bak.json");
+}
+
+/** The initialization witness: proof the seeder ever ran here (distinguishes a pristine prefix from
+ *  one whose authority was lost). Written after the authority, before the stamp. */
+export function witnessPath(): string {
+  return join(seedDir(), "witness.json");
+}
+
+/** The version stamp, written LAST: the generation the last reconcile completed for. A boot whose
+ *  stamp equals the current generation short-circuits (after the health preamble). */
+export function stampPath(): string {
+  return join(seedDir(), "stamp.json");
+}
+
+/** The reconcile-wide lock (shared advisory-lock primitive: atomic hard-link publish, PID +
+ *  process-start liveness, bounded wait, dead-owner reclaim). */
+export function reconcileLockPath(): string {
+  return join(seedDir(), "reconcile.lock");
+}
+
+/** The durable reconcile cursor `{nonce, package, phase}`: a partial-reconcile journal a crashed
+ *  (SIGKILL) run leaves behind, so the next boot fails loud instead of silently proceeding. */
+export function reconcileCursorPath(): string {
+  return join(seedDir(), "reconcile.cursor.json");
+}
+
+/** The seed-child liveness marker `{pid, start, ts}`: a validated `ext add` seed child writes it
+ *  before it mutates the prefix and clears it on exit, so a reclaim/repair after a parent SIGKILL can
+ *  refuse to race an orphaned child that is still installing. */
+export function reconcileChildPath(): string {
+  return join(seedDir(), "reconcile.child.json");
+}
+
+/** The durable maintenance-recovery obligation `{rebuildFromDisk?, repairAllSeeded?}`: a `--repair`/
+ *  `--reset` writes it BEFORE it destructively quarantines a corrupt manifest/cursor, so a SIGKILL
+ *  after the quarantine but before the reinstalls doesn't forget that the built-ins must be rebuilt
+ *  from disk (or all reinstalled). Cleared only at the final commit. */
+export function reconcileRecoveryPath(): string {
+  return join(seedDir(), "reconcile.recovery.json");
+}
+
+/** The durable seed store root: `<config>/cotal/seed/store`. */
+export function seedStoreDir(): string {
+  return join(seedDir(), "store");
+}
+
+/** A seeded connector's stable copy for one generation: `store/<generation>/<name>`. */
+export function seedStorePath(generation: string, name: string): string {
+  const root = resolve(seedStoreDir());
+  const destination = resolve(root, generation, name);
+  const pathFromRoot = relative(root, destination);
+  if (pathFromRoot === "" || pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`)) {
+    throw new Error(`refusing seed-store destination ${destination}: it is not strictly inside ${root}`);
+  }
+  return destination;
+}
+
+export type SeedWriterKind = "released" | "checkout" | "unknown";
+
+/**
+ * Who is about to mutate the operator-global seed store. Fail closed: a released
+ * install or an npx unpack is allowed; a source checkout is refused; anything
+ * that cannot be proven is `unknown` and is also refused. A missing answer is
+ * never treated as a released install.
+ */
+export function seedWriterKind(): SeedWriterKind {
+  let entry: string;
+  try {
+    entry = entryScript();
+  } catch {
+    return "unknown";
+  }
+  if (/[/\\]_npx[/\\]/.test(entry)) return "released";
+  let root: string;
+  try {
+    root = cliPackageRoot();
+  } catch {
+    return "unknown";
+  }
+  let pkgName: unknown;
+  try {
+    pkgName = (JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { name?: unknown }).name;
+  } catch {
+    return "unknown";
+  }
+  if (pkgName !== "cotal-ai") return "unknown";
+  const parent = dirname(root);
+  if (
+    basename(root) === "bin" &&
+    (existsSync(join(parent, "implementations")) || existsSync(join(parent, "pnpm-workspace.yaml")))
+  ) {
+    return "checkout";
+  }
+  if (basename(root) === "bin") return "unknown";
+  return "released";
+}
+
+/**
+ * Refuse a checkout (or unproven) writer before it can copy payloads, stamp a
+ * generation, or GC an installed one. `COTAL_ALLOW_CHECKOUT_SEED=1` is the
+ * deliberate opt-in for a sandboxed release test.
+ */
+export function assertReleasedSeedWriter(generation: string, action: string): void {
+  if (process.env.COTAL_ALLOW_CHECKOUT_SEED === "1") return;
+  const kind = seedWriterKind();
+  if (kind === "released") return;
+  let entry: string;
+  try {
+    entry = entryScript();
+  } catch {
+    entry = process.argv[1] ?? "(no entry)";
+  }
+  const origin = kind === "checkout" ? "a source checkout" : "an unproven CLI entry";
+  throw new Error(
+    `refusing to ${action} the operator-global seed store at ${seedStoreDir()} for generation ${generation} from ${origin} (${entry}) - this would migrate the machine-wide store and can take an installed cotal down. Set COTAL_SKIP_CONNECTOR_SEED=1 to run other commands without seeding; isolating XDG_CONFIG_HOME alone does not lift this refusal. COTAL_HOME does not relocate this store.`,
+  );
+}
+
+/** Resolve package-manager bin symlinks to the exact CLI entry this process is running. */
+export function entryScript(): string {
+  const entry = process.argv[1];
+  if (!entry) throw new Error("cannot resolve the cotal entry script: no entry script (process.argv[1])");
+  try {
+    return realpathSync(entry);
+  } catch (e) {
+    throw new Error(`cannot resolve the cotal entry script ${entry}: ${(e as Error).message}`);
+  }
+}
+
+/** The package root that owns this process's resolved entry script. This is the shared artifact
+ *  identity for version and provenance reporting, so a package-manager bin symlink cannot make the
+ *  two surfaces describe different installs. */
+export function cliPackageRoot(): string {
+  const entry = entryScript();
+  let dir = dirname(entry);
+  for (;;) {
+    if (existsSync(join(dir, "package.json"))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) throw new Error(`cannot determine the cotal package root: no package.json above ${entry}`);
+    dir = parent;
+  }
+}
+
+/**
+ * This `cotal-ai` binary's published version — the nearest `package.json` above the {@link entryScript}
+ * (`cotal-ai` published, or `bin/package.json` in a dev `tsx bin/cotal.ts` run). Surfaced by
+ * `cotal version` and `cotal status`. Fails loud if unreadable.
+ */
+export function cliVersion(): string {
+  const root = cliPackageRoot();
+  const version = (JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { version?: string }).version;
+  if (typeof version === "string" && version) return version;
+  throw new Error(`cannot determine the cotal version: ${join(root, "package.json")} has no version`);
+}
+
+/**
+ * The seed generation: this binary's version ({@link cliVersion}). Ties a reconcile-refresh to the
+ * shipped payload changing — including the bundled `connector-core`, so a `cotal-ai` upgrade re-seeds
+ * the connectors that carry version-coupled behavior (e.g. the v0.4 lifecycle parse). Fails loud if
+ * unreadable — a generation-less seed can't gate refresh.
+ */
+export function seedGeneration(): string {
+  const generation = cliVersion();
+  const source = join(cliPackageRoot(), "package.json");
+  const invalid = (reason: string): never => {
+    throw new Error(`invalid seed generation ${JSON.stringify(generation)} read from ${source}: it must be a plausible semver and a single safe path segment with no path separator or ".." segment (${reason})`);
+  };
+  if (!isValidSemver(generation)) invalid("not plausible semver");
+  if (generation === "." || generation.includes("..")) invalid('".." segment');
+  if (/[\\/]/.test(generation)) invalid("path separator");
+  return generation;
+}
+
+/** True iff `v` parses as a numeric-core semver (the only thing the refresh comparison can order). */
+export function isValidSemver(v: string): boolean {
+  try {
+    parseSemver(v);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface Semver {
+  readonly rel: [number, number, number];
+  readonly pre: string[];
+}
+
+export function parseSemver(v: string): Semver {
+  const core = v.split("+")[0];
+  const dash = core.indexOf("-");
+  const pre = dash >= 0 ? core.slice(dash + 1).split(".") : [];
+  // Fail loud on a non-numeric release segment rather than coercing it to 0 (which would silently
+  // mis-order versions). The generation is a real package.json version and the stamp is one we wrote,
+  // so a non-semver core here means corrupt state → `cotal ext seed --repair`/`--reset`.
+  const release = (dash >= 0 ? core.slice(0, dash) : core).split(".").map((s) => {
+    if (!/^\d+$/.test(s)) throw new Error(`invalid version "${v}" (release segment "${s}" is not numeric) - repair with \`cotal ext seed --repair\` (or --reset)`);
+    return Number(s);
+  });
+  return { rel: [release[0] ?? 0, release[1] ?? 0, release[2] ?? 0], pre };
+}
+
+/** This module's repo root in a source checkout: `implementations/cli/{src,dist}/seed` → up 4. Only
+ *  meaningful in dev; a published `@cotal-ai/cli` resolves to `node_modules`, where the `extensions/`
+ *  probe below simply misses and the published `seeded-connectors/` path wins. */
+function repoRootFromHere(): string {
+  return join(import.meta.dirname, "..", "..", "..", "..");
+}
+
+/**
+ * The shipped payload directory for one built-in connector — the source the reconcile copies into the
+ * durable store. Dev resolves `extensions/<pkg-dir>` from this module's location (NEVER `cwd`);
+ * published resolves `<cotal-ai>/seeded-connectors/<name>` beside the {@link entryScript} (the `bin`
+ * prepublish copy). Fails loud if neither carries a `package.json` — a build missing its seeded
+ * connectors.
+ */
+export function shippedSourceDir(name: string): string {
+  const ext = SEEDED_EXTENSIONS[name];
+  if (!ext) throw new Error(`"${name}" is not a first-party seeded extension; only ${SEED_BUILTINS.join(", ")} are seeded`);
+  const devDir = join(repoRootFromHere(), ext.srcDir);
+  if (existsSync(join(devDir, "package.json"))) return devDir;
+  const pubDir = join(dirname(entryScript()), "..", "seeded-connectors", name);
+  if (existsSync(join(pubDir, "package.json"))) return pubDir;
+  throw new Error(
+    `no shipped payload for extension "${name}" (looked in ${devDir} and ${pubDir}) - this cotal-ai build is missing its seeded extensions`,
+  );
+}
+
+/** Atomically write JSON (temp-then-rename, exclusive temp — never follows a pre-planted symlink),
+ *  the same durability `writeLaunchSpec`/manifest writes use. Creates the parent dir. */
+export function writeJsonAtomic(path: string, value: unknown, mode = 0o600): void {
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const tmp = join(dir, `.${basename(path)}.${randomBytes(6).toString("hex")}.tmp`);
+  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode, flag: "wx" });
+  renameSync(tmp, path);
+}
+
+/** Read + parse a JSON state file. Returns undefined when absent; throws (loud) on corrupt JSON — a
+ *  seed-state file is never silently treated as missing (that would resurrect removed connectors). */
+export function readJsonFile<T>(path: string): T | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw e;
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch (e) {
+    throw new Error(`corrupt seed state ${path}: ${(e as Error).message} - repair with \`cotal ext seed --repair\` (or --reset)`);
+  }
+}

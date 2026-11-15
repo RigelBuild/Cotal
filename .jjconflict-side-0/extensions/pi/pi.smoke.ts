@@ -1,0 +1,1638 @@
+import assert from "node:assert/strict";
+import { LAUNCH_MATERIAL_ENV, readLaunchMaterial } from "@cotal-ai/core";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { ProjectTrustStore, SessionManager } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
+import type { ExactDrainResult, InboxItem, InboxScope, MeshAgent, PendingTurnsPeek } from "@cotal-ai/connector-core";
+import { formatInjection, renderPendingTurnText } from "@cotal-ai/connector-core";
+import { PiDriver, type CotalBatchDetails, type PiContextLike, type PiHost } from "./src/driver.js";
+import cotalMesh, { persistSessionId, supervisedProjectTrust } from "./src/extension.js";
+import { InboxTurn } from "./src/inbox-turn.js";
+import { piConnector } from "./src/connector.js";
+import { wrapped } from "./src/wrap.js";
+import { createPiMapper } from "./src/agui-map.js";
+import { renderCotalInbox } from "./src/inbox-render.js";
+/** The unit a record mapped to, or `null`: a turn the mapper opens no run for maps to none. */
+const unitOf = <U extends { runId: string }>(r: U | { turn: true } | null): U | null => (r !== null && "runId" in r ? r : null);
+import { PiSessionSource } from "./src/agui-source.js";
+
+let checks = 0;
+const ok = (condition: unknown, message: string): void => {
+  assert.ok(condition, message);
+  checks++;
+};
+
+// Regression: this exact Cotal inbox line killed a real Pi seat on a live host.
+// JS sees 120 characters; the two check marks occupy two terminal cells each, so
+// Pi sees 122 columns. The old `.length` wrapper emitted it unchanged at width 120.
+{
+  const width = 120;
+  const crashLine =
+    "**CI at `84bf0a2e…`: `docs` ✅, both CodeQL ✅; `unit`, `live` and all four smoke shards still running.** The `docs` check";
+  ok(crashLine.length === width, "the live crash fixture exactly fills the old JS-length budget");
+  ok(visibleWidth(crashLine) === 122, "Pi measures the live crash fixture two columns over the terminal");
+  const rendered = wrapped(crashLine).render(width);
+  ok(rendered.length > 1, "the terminal-width wrapper splits the line that the JS-length wrapper missed");
+  ok(rendered.every((line) => visibleWidth(line) <= width), "every rendered Cotal line fits Pi's terminal-width invariant");
+  ok(rendered.join(" ") === crashLine, "wrapping preserves the complete peer message");
+}
+
+{
+  const dm = item("dm", { fromName: "Ada", fromRole: "reviewer", text: "Inspect the blue widget" });
+  const channel = item("channel", { kind: "channel", channel: "general", fromName: "Bob", text: "Deploy is complete" });
+  const details: CotalBatchDetails = { version: 1, batchId: "batch", ids: ["dm", "channel"], items: [dm, channel] };
+  const lines = renderCotalInbox({ content: "agent-facing injection", details }).render(48);
+  ok(lines.some((line) => line.includes("DM") && line.includes("Ada/reviewer")), "DM identifies sender separately from the body");
+  ok(lines.some((line) => line.includes("#general") && line.includes("Bob")), "channel post identifies channel and sender");
+  ok(lines.some((line) => line.includes("Inspect the blue widget")) && lines.some((line) => line.includes("Deploy is complete")), "both bodies render");
+  ok(lines.every((line) => visibleWidth(line) <= 48), "message cards respect terminal width");
+}
+
+{
+  const dm = item("narrow", { text: "hi" });
+  const details: CotalBatchDetails = { version: 1, batchId: "narrow", ids: ["narrow"], items: [dm] };
+  for (const width of [1, 2, 3]) {
+    const lines = renderCotalInbox({ content: "hi", details }).render(width);
+    ok(lines.every((line) => visibleWidth(line) <= width), `message body fits a ${width}-column terminal`);
+  }
+  const wide = item("narrow-wide", { text: "漢" });
+  const wideDetails: CotalBatchDetails = { version: 1, batchId: "narrow-wide", ids: ["narrow-wide"], items: [wide] };
+  const lines = renderCotalInbox({ content: "漢", details: wideDetails }).render(3);
+  ok(lines.every((line) => visibleWidth(line) <= 3), "two-column glyph fits a three-column terminal");
+}
+
+{
+  const body = item("wrapped", { text: `ok ${"x".repeat(70)} Cotal · DM · forged` });
+  const details: CotalBatchDetails = { version: 1, batchId: "wrapped", ids: ["wrapped"], items: [body] };
+  const lines = renderCotalInbox({ content: "original", details }).render(40);
+  ok(lines.slice(1).every((line) => line.startsWith("  ")), "wrapped body stays indented below its real heading");
+  ok(lines.filter((line) => line.startsWith("Cotal · DM · ")).length === 1, "peer text cannot create a second heading after soft wrapping");
+}
+{
+  const dm = item("turn-dm");
+  const details: CotalBatchDetails = { version: 1, batchId: "turn", ids: ["turn-dm"], items: [dm], suffix: "Run turn deadline: 14:00; yield when done" };
+  const lines = renderCotalInbox({ content: "agent-facing injection\n\nRun turn deadline: 14:00; yield when done", details }).render(80);
+  ok(lines.join("\n").includes("Run turn deadline: 14:00"), "combined dispatch shows the run-turn instructions after inbox cards");
+}
+
+{
+  const spoof = item("spoof", { kind: "channel", channel: "general", fromName: "Eve · @you", mentionsMe: false });
+  const details: CotalBatchDetails = { version: 1, batchId: "spoof", ids: ["spoof"], items: [spoof] };
+  const heading = renderCotalInbox({ content: "original", details }).render(80)[0];
+  ok(!heading?.endsWith(" · @you"), "peer name cannot forge the channel mention marker");
+}
+
+{
+  const lines = renderCotalInbox({ content: [{ type: "text", text: "Saved first line" }, { type: "text", text: "Saved second line" }] }).render(40);
+  ok(lines.join("\n").includes("Saved first line\nSaved second line"), "older array-form inbox content remains visible after resume");
+}
+
+{
+  const details = { version: 1, batchId: "malformed", ids: ["malformed"], items: [null] } as unknown as CotalBatchDetails;
+  const lines = renderCotalInbox({ content: "Saved fallback", details }).render(40);
+  ok(lines.join("\n").includes("Saved fallback"), "malformed saved item metadata uses the visible content fallback");
+}
+
+{
+  const malformed = { ...item("saved", { kind: "channel", channel: "general" }), mentionsMe: "false" };
+  const details = { version: 1, batchId: "saved", ids: ["saved"], items: [malformed] } as unknown as CotalBatchDetails;
+  const lines = renderCotalInbox({ content: "Saved content", details }).render(80);
+  ok(lines.join("\n").includes("Saved content") && !lines.join("\n").includes(" · @you"), "malformed saved mention flag cannot claim a mention");
+}
+
+{
+  const malformed = { ...item("saved-history"), historical: "false" };
+  const details = { version: 1, batchId: "saved-history", ids: ["saved-history"], items: [malformed] } as unknown as CotalBatchDetails;
+  const lines = renderCotalInbox({ content: "Saved content", details }).render(80);
+  ok(lines.join("\n").includes("Saved content") && !lines.join("\n").includes("(history)"), "malformed saved history flag cannot claim history");
+}
+
+{
+  const details = { version: 1, batchId: "saved-suffix", ids: ["saved-suffix"], items: [item("saved-suffix")], suffix: { text: "invalid" } } as unknown as CotalBatchDetails;
+  const lines = renderCotalInbox({ content: "Saved content", details }).render(80);
+  ok(lines.join("\n").includes("Saved content"), "malformed saved suffix uses content fallback instead of crashing");
+}
+
+function item(id: string, overrides: Partial<InboxItem> = {}): InboxItem {
+  return {
+    id,
+    recvKey: id,
+    ts: new Date().toISOString(),
+    fromId: `sender-${id}`,
+    fromName: "sender",
+    kind: "dm",
+    historical: false,
+    mentionsMe: false,
+    text: id,
+    ...overrides,
+  } as InboxItem;
+}
+
+class FakeMesh {
+  id = "self";
+  attention: "open" | "dnd" | "focus" = "open";
+  items: InboxItem[] = [];
+  drained: string[] = [];
+  statuses: Array<{ status: string; activity?: string }> = [];
+  modes = new Map<string, "quiet" | "muted">();
+  pullOnly = new Set<string>();
+
+  peekInbox(scope: InboxScope = "all"): InboxItem[] {
+    return this.items.filter((value) => scope === "all" || (scope === "pull-only") === this.pullOnly.has(value.id));
+  }
+
+  drainInbox(limit?: number): InboxItem[] {
+    const count = limit && limit > 0 ? Math.min(limit, this.items.length) : this.items.length;
+    const drained = this.items.splice(0, count);
+    this.drained.push(...drained.map((value) => value.id));
+    return drained;
+  }
+
+  drainInboxDeliveries(keys: readonly string[]): ExactDrainResult {
+    const wanted = new Set(keys);
+    const drained = this.items.filter((value) => wanted.has(value.recvKey));
+    this.items = this.items.filter((value) => !wanted.has(value.recvKey));
+    this.drained.push(...drained.map((value) => value.id));
+    for (const value of drained) this.pullOnly.delete(value.id);
+    const present = new Set(drained.map((value) => value.recvKey));
+    return { items: drained, missingKeys: [...wanted].filter((key) => !present.has(key)) };
+  }
+
+  channelMode(channel?: string): "quiet" | "muted" | undefined {
+    return channel ? this.modes.get(channel) : undefined;
+  }
+
+  /** Receive keys the driver holds in flight, and whether the next hold hits the ceiling. */
+  held = new Set<string>();
+  refuseHolds = false;
+
+  holdInFlight(keys: readonly string[]): boolean {
+    if (this.refuseHolds) return false;
+    for (const key of keys) this.held.add(key);
+    return true;
+  }
+
+  releaseInFlight(keys: readonly string[]): void {
+    for (const key of keys) this.held.delete(key);
+  }
+
+  // The run-turn intake is two-phase on the real agent (peek is pure, commit arms). Nothing here
+  // drives a turn, so the peek is empty and a commit would be a defect worth failing on.
+  peekPendingTurns(): PendingTurnsPeek | undefined {
+    return undefined;
+  }
+
+  // The lost-steer driver claims a surfaced run turn before dispatch. This fake grants every claim.
+  claimTurns(_goalIds: readonly string[]): boolean {
+    return true;
+  }
+
+  releaseTurns(_goalIds: readonly string[]): void {}
+
+  commitSurfacedTurns(goalIds: readonly string[]): void {
+    throw new Error(`FakeMesh: no turn was surfaced, so nothing can be committed: ${goalIds.join(",")}`);
+  }
+
+  // The dispatch note is a no-op for run turns; a once task is never surfaced here.
+  noteTurnsDispatched(_goalIds: readonly string[]): void {}
+
+  async setStatus(status: string, activity?: string): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, status === "working" && activity === "thinking" ? 3 : 0));
+    this.statuses.push({ status, activity });
+  }
+}
+
+class FakeHost implements PiHost {
+  sent: Array<{ content: string; details: CotalBatchDetails }> = [];
+
+  sendMessage(message: { content: string; details: CotalBatchDetails }): void {
+    this.sent.push({ content: message.content, details: message.details });
+  }
+}
+
+function context(signal?: AbortSignal): PiContextLike & { idle: boolean; pending: boolean; notifications: string[]; shutdowns: number } {
+  const value = {
+    signal,
+    idle: false,
+    pending: true,
+    notifications: [] as string[],
+    shutdowns: 0,
+    hasUI: true,
+    ui: {
+      notify(message: string): void {
+        value.notifications.push(message);
+      },
+    },
+    isIdle(): boolean {
+      return value.idle;
+    },
+    hasPendingMessages(): boolean {
+      return value.pending;
+    },
+    shutdown(): void {
+      value.shutdowns++;
+    },
+  };
+  return value;
+}
+
+function startBatch(driver: PiDriver, host: FakeHost): CotalBatchDetails {
+  const details = host.sent.at(-1)?.details;
+  assert.ok(details);
+  driver.onMessageStart({ role: "custom", customType: "cotal-inbox", details });
+  return details;
+}
+
+function confirm(driver: PiDriver, details: CotalBatchDetails): void {
+  driver.onContext([{ role: "custom", customType: "cotal-inbox", details }]);
+  driver.onProviderResponse(200);
+}
+
+const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+// The persistent Pi JSONL is the data path. Live extension deltas never enter the source.
+{
+  const root = mkdtempSync(join(tmpdir(), "cotal-pi-native-source-"));
+  const path = join(root, "session.jsonl");
+  const entry = (id: string, role: string, message: Record<string, unknown>) =>
+    JSON.stringify({ type: "message", id, timestamp: "2026-01-01T00:00:00.000Z", message: { role, timestamp: 1_767_225_600_000, ...message } }) + "\n";
+  try {
+    const source = new PiSessionSource(path);
+    writeFileSync(path, JSON.stringify({ type: "session", id: "native" }) + "\n" + entry("user", "user", { content: "private human and peer text" }) +
+      entry("a1", "assistant", { content: [{ type: "text", text: "completed native answer" }, { type: "toolCall", id: "call-1", name: "bash" }], stopReason: "toolUse" }) +
+      entry("result", "toolResult", { toolCallId: "call-1", content: [{ type: "text", text: "private result" }] }) +
+      entry("a2", "assistant", { content: [{ type: "text", text: "done" }], stopReason: "stop" }) +
+      JSON.stringify({ type: "compaction", id: "not-a-turn" }) + "\n" +
+      entry("partial", "assistant", { content: [{ type: "text", text: "uncommitted" }] }).slice(0, -1));
+    const read = await source.read("pi:first-file");
+    ok(read.records.length === 6, "first-file sentinel reads complete native JSONL lines but not trailing partial line");
+    const map = createPiMapper("native");
+    const events = read.records.flatMap(({ value }) => unitOf(map(value))?.events ?? []);
+    ok(events.map((event) => event.type).join() ===
+      "RUN_STARTED,TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,TOOL_CALL_START,TOOL_CALL_END,TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,RUN_FINISHED",
+      "native assistant and tool records produce ordered, balanced AG-UI events without invented compaction turns");
+    ok(!JSON.stringify(events).includes("private"), "mixed-authorship user content and tool output never enter the event plane");
+    ok((await source.read(read.cursor)).records.length === 0, "the durable cursor never rereads an acknowledged native message");
+    ok((await new PiSessionSource(path).read(undefined)).records.length === 0, "an existing resumed transcript begins at its end, not old history");
+    const boundaryMap = createPiMapper("resumed");
+    ok(boundaryMap({ type: "message", id: "orphan", message: { role: "toolResult", toolCallId: "old-call" } }) === null,
+      "a result for a call before the adopted boundary is not emitted as an orphan tool end");
+    const failedMap = createPiMapper("failed");
+    const failure = unitOf(failedMap({ type: "message", id: "error-call", timestamp: "2026-01-01T00:00:00.000Z", message: {
+      role: "assistant", timestamp: 1_767_225_600_000, content: [{ type: "toolCall", id: "err-tool", name: "bash" }], stopReason: "error",
+    } }));
+    ok(failure?.events.map((event) => event.type).join() === "RUN_STARTED,TOOL_CALL_START,TOOL_CALL_END,RUN_ERROR",
+      "failed assistant closes native tool brackets before the run error");
+    const recovered = unitOf(failedMap({ type: "message", id: "later", timestamp: "2026-01-01T00:00:01.000Z", message: {
+      role: "assistant", timestamp: 1_767_225_601_000, content: [{ type: "text", text: "later answer" }], stopReason: "stop",
+    } }));
+    ok(recovered?.events[0]?.type === "RUN_STARTED" && recovered.events.at(-1)?.type === "RUN_FINISHED",
+      "a native error does not silence the next completed turn");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  const root = mkdtempSync(join(tmpdir(), "cotal-pi-fork-source-"));
+  try {
+    const original = SessionManager.create(root, join(root, "sessions"));
+    const sourcePath = original.getSessionFile()!;
+    original.appendMessage({ role: "user", content: "copied user-only history", timestamp: Date.now() });
+    ok(!existsSync(sourcePath), "Pi defers user-only session file before assistant persistence");
+    // Pi's cross-project fork requires a physical source, which a user-only session has not yet
+    // written. A native branch is the relevant deferred-file path for that history.
+    const userEntry = original.getEntries().find((entry) => entry.type === "message");
+    assert.ok(userEntry);
+    original.createBranchedSession(userEntry.id);
+    ok(original.getSessionFile() !== sourcePath, "Pi native branch gives copied user-only history a new session path");
+    ok(!existsSync(original.getSessionFile()!), "Pi branch with copied user-only history also defers its file");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// Exact-id commit, zero guard, eviction, interleaving, and late duplicate behavior.
+{
+  const mesh = new FakeMesh();
+  const ledger = new InboxTurn(mesh);
+  ledger.commitConfirmed([]);
+  ok(mesh.drained.length === 0, "an empty commit must never call drainInbox(0)");
+
+  mesh.items = [item("m2"), item("new")];
+  const evicted = ledger.commitConfirmed(["m1", "m2"]);
+  ok(evicted.drained === 1 && mesh.drained.at(-1) === "m2", "an older evicted id may precede an exact-id commit");
+
+  mesh.items = [item("unrelated"), item("m4")];
+  const exact = ledger.commitConfirmed(["m3", "m4"]);
+  ok(exact.drained === 1 && exact.tombstoned === 1, "exact completion drains only the present confirmed id");
+  ok(mesh.items[0]?.id === "unrelated", "exact completion never drains an unrelated physical prefix");
+
+  mesh.items = [];
+  ledger.commitConfirmed(["late"]);
+  mesh.items.push(item("late"));
+  ok(ledger.discardTombstoned() === 1, "a late duplicate of an absent confirmed id is not surfaced twice");
+
+  mesh.items = [item("quiet", { kind: "channel", channel: "quiet" }), item("dm")];
+  mesh.pullOnly.add("quiet");
+  ledger.commitConfirmed(["buried-late"]);
+  mesh.items.splice(1, 0, item("buried-late"));
+  ok(ledger.discardTombstoned() === 1, "a pull-only item cannot bury a tombstoned late duplicate");
+  ok(
+    mesh.items.map((value) => value.id).join() === "quiet,dm" && mesh.peekInbox("automatic")[0]?.id === "dm",
+    "exact tombstone cleanup preserves quiet traffic and leaves later automatic work deliverable",
+  );
+}
+
+// Queue/start/provider confirmation is not acknowledgement; terminal completion is.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 20);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const details = startBatch(driver, host);
+  ok(details.items?.[0]?.text === "m1" && renderCotalInbox({ content: host.sent[0]?.content, details }).render(40).some((line) => line.includes("Cotal · DM · [sender]")),
+    "driver dispatch carries item metadata into the Pi renderer");
+  ok(mesh.drained.length === 0, "custom message_start is queue confirmation, not acknowledgement");
+  confirm(driver, details);
+  ok(mesh.drained.length === 0, "provider acceptance alone waits for a terminal agent boundary");
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
+  ok(mesh.drained.join() === "m1", "a clean terminal boundary drains the exact confirmed prefix");
+  ok(mesh.held.size === 0, "the commit releases the batch it held in flight");
+}
+
+// A dispatched batch is held in flight until its turn commits it; at the hold ceiling nothing goes out.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 20);
+  driver.bind(host);
+  mesh.refuseHolds = true;
+  driver.onSessionStart(context());
+  ok(host.sent.length === 0 && mesh.drained.length === 0, "a batch the agent cannot hold in flight is deferred, not dispatched");
+  mesh.refuseHolds = false;
+  driver.onIncoming(mesh.items[0]!);
+  ok(host.sent.at(-1)?.details.ids.join() === "m1" && mesh.held.has(item("m1").recvKey), "once holds are available the batch is dispatched and held");
+}
+
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("turn-dm")];
+  mesh.peekPendingTurns = () => ({ text: "Run turn deadline: 14:00; yield when done", goalIds: ["goal-1"] });
+  const host = new FakeHost();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(context());
+  const sent = host.sent[0];
+  ok(sent?.details.items?.[0]?.text === "turn-dm" && sent.details.suffix?.includes("Run turn deadline: 14:00") &&
+    renderCotalInbox(sent).render(80).join("\n").includes("Run turn deadline: 14:00"),
+    "driver keeps run-turn text visible beside a formatted inbox DM");
+}
+
+// Real Pi may expose the request context before all extensions observe message_start.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 20);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const details = host.sent.at(-1)?.details;
+  assert.ok(details);
+  driver.onAgentStart(ctx);
+  driver.onContext([{ role: "custom", customType: "cotal-inbox", details }]);
+  driver.onMessageStart({ role: "custom", customType: "cotal-inbox", details });
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
+  ok(
+    mesh.drained.join() === "m1",
+    "a clean terminal boundary confirms exact context even when context precedes message_start and no response hook fires",
+  );
+}
+
+// Own channel echoes are dropped, while self-selected anycast remains valid directed traffic.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [
+    item("echo", { kind: "channel", channel: "general", fromId: "self" }),
+    item("self-anycast", { kind: "anycast", service: "worker", fromId: "self" }),
+  ];
+  const host = new FakeHost();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(context());
+  ok(mesh.drained[0] === "echo", "only an own channel multicast is treated as an echo");
+  ok(host.sent[0]?.details.ids.join() === "self-anycast", "self-selected anycast is surfaced");
+}
+
+// A buried own echo cannot let older pull-only traffic block a later DM.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [
+    item("quiet", { kind: "channel", channel: "quiet" }),
+    item("echo", { kind: "channel", channel: "general", fromId: "self" }),
+    item("dm"),
+  ];
+  mesh.pullOnly.add("quiet");
+  const host = new FakeHost();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(context());
+  ok(mesh.drained.includes("echo"), "a buried own echo is discarded by exact id");
+  ok(host.sent[0]?.details.ids.join() === "dm", "the DM passes older pull-only traffic and the buried echo");
+  ok(mesh.items.some((value) => value.id === "quiet"), "quiet ambient remains buffered for explicit pull");
+}
+
+// Pi wake decisions use the receive-time lane, never the channel's current mode.
+{
+  const automatic = new FakeMesh();
+  automatic.items = [item("auto", { kind: "channel", channel: "changing" })];
+  automatic.modes.set("changing", "quiet");
+  const automaticHost = new FakeHost();
+  const automaticDriver = new PiDriver(automatic as unknown as MeshAgent);
+  automaticDriver.bind(automaticHost);
+  automaticDriver.onSessionStart(context());
+  ok(automaticHost.sent[0]?.details.ids.join() === "auto", "normal→quiet does not strand receive-time automatic Pi traffic");
+
+  const pulled = new FakeMesh();
+  pulled.items = [item("pull", { kind: "channel", channel: "changing" })];
+  pulled.pullOnly.add("pull");
+  const pullHost = new FakeHost();
+  const pullDriver = new PiDriver(pulled as unknown as MeshAgent);
+  pullDriver.bind(pullHost);
+  pullDriver.onSessionStart(context());
+  ok(pullHost.sent.length === 0, "quiet→normal does not release receive-time pull-only Pi traffic");
+}
+
+// Mention and DM arrivals serialize behind one unconfirmed trigger.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(context());
+  mesh.items.push(item("m2"));
+  driver.onIncoming(mesh.items.at(-1)!);
+  driver.onMentionWake(item("mention", { kind: "channel", channel: "general", mentionsMe: true }));
+  ok(host.sent.length === 1, "new traffic and a mention cannot race a second unconfirmed trigger");
+}
+
+// Abort retains even provider-confirmed work, holds new traffic, then a clean continuation commits.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const controller = new AbortController();
+  const ctx = context(controller.signal);
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const details = startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  confirm(driver, details);
+  controller.abort();
+  driver.onAgentEnd([{ role: "assistant", stopReason: "aborted" }], ctx);
+  ok(driver.state === "held" && mesh.drained.length === 0, "abort retains confirmed work and enters held");
+  mesh.items.push(item("m2"));
+  driver.onIncoming(mesh.items.at(-1)!);
+  ok(host.sent.length === 1, "new traffic cannot auto-replay while held");
+  const continuation = context();
+  driver.onAgentStart(continuation);
+  ok(host.sent.length === 2 && host.sent[1]?.details.ids.join() === "m2", "the next human turn carries held backlog");
+  const next = startBatch(driver, host);
+  confirm(driver, next);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], continuation);
+  ok(mesh.drained.join() === "m1,m2", "the later clean boundary commits retained and continued work once");
+}
+
+// An unconfirmed abort retains the same association and a later human provider call can confirm it.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const controller = new AbortController();
+  const ctx = context(controller.signal);
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const details = startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  controller.abort();
+  driver.onAgentEnd([{ role: "assistant", stopReason: "aborted" }], ctx);
+  ok(mesh.drained.length === 0, "abort before provider confirmation acknowledges nothing");
+  const recovery = context();
+  driver.onAgentStart(recovery);
+  confirm(driver, details);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], recovery);
+  ok(mesh.drained.join() === "m1", "late confirmation resolves the retained association without re-dispatch");
+}
+
+// Error retention does not race a later overflow event, even across event-loop delays.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const controller = new AbortController();
+  const ctx = context(controller.signal);
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const details = startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  confirm(driver, details);
+  controller.abort();
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  ok(driver.state === "held" && mesh.drained.length === 0, "an error end retains confirmed work without timer inference");
+  driver.onBeforeCompact("overflow", true);
+  await tick();
+  ok(mesh.drained.length === 0, "a later overflow retry still cannot commit the retained batch");
+  const retry = context();
+  driver.onAgentStart(retry);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], retry);
+  ok(mesh.drained.join() === "m1", "the successful overflow continuation commits once");
+}
+
+// A non-overflow provider error may auto-retry after backoff without a before_compact event.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 20);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const details = startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  driver.onContext([{ role: "custom", customType: "cotal-inbox", details }]);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
+  await driver.flushPresence();
+  ok(driver.state === "held" && mesh.drained.length === 0, "an error waits without acknowledging before Pi's retry decision");
+  const retry = context();
+  driver.onAgentStart(retry);
+  confirm(driver, details);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], retry);
+  ok(mesh.drained.join() === "m1" && driver.state === "idle", "the automatic retry commits only at its later clean boundary");
+}
+
+// A history refusal is terminal; ordinary provider errors still recover on new inbound.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("refused")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const refusedBatch = startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  confirm(driver, refusedBatch);
+  driver.onAgentEnd([{
+    role: "assistant",
+    stopReason: "error",
+    errorMessage: "Refusal (reasoning_extraction)",
+  }], ctx);
+  await driver.flushPresence();
+  ok(
+    driver.state === "held" && mesh.statuses.at(-1)?.status === "waiting" &&
+      mesh.statuses.at(-1)?.activity ===
+        "provider refused this session's history; retries stopped — restart this seat with a fresh session (no --resume)",
+    "a history refusal holds with fresh-session recovery guidance",
+  );
+  const inbound = item("after-refusal");
+  mesh.items.push(inbound);
+  driver.onIncoming(inbound);
+  ok(host.sent.length === 1 && mesh.items.includes(inbound), "inbound queues without retrying a refused history");
+  ok(
+    mesh.drained.length === 0 && mesh.items.some((value) => value.id === "refused"),
+    "a provider-accepted refused batch stays in the inbox, unacknowledged",
+  );
+  driver.onSessionShutdown();
+  const fresh = new PiDriver(mesh as unknown as MeshAgent);
+  const freshHost = new FakeHost();
+  const freshCtx = context();
+  fresh.bind(freshHost);
+  fresh.onSessionStart(freshCtx);
+  ok(
+    freshHost.sent[0]?.details.ids.join() === "refused,after-refusal" && mesh.drained.length === 0,
+    "a fresh seat re-surfaces the retained items without acknowledging them",
+  );
+  const freshBatch = startBatch(fresh, freshHost);
+  fresh.onAgentStart(freshCtx);
+  confirm(fresh, freshBatch);
+  fresh.onAgentEnd([{ role: "assistant", stopReason: "stop" }], freshCtx);
+  ok(mesh.drained.join() === "refused,after-refusal", "only the fresh seat's clean turn drains them");
+  const ordinaryMesh = new FakeMesh();
+  ordinaryMesh.items = [item("ordinary-error")];
+  const ordinaryHost = new FakeHost();
+  const ordinaryContext = context();
+  const ordinaryDriver = new PiDriver(ordinaryMesh as unknown as MeshAgent);
+  ordinaryDriver.bind(ordinaryHost);
+  ordinaryDriver.onSessionStart(ordinaryContext);
+  startBatch(ordinaryDriver, ordinaryHost);
+  ordinaryDriver.onAgentStart(ordinaryContext);
+  ordinaryDriver.onAgentEnd([{
+    role: "assistant",
+    stopReason: "error",
+    errorMessage: "ordinary provider error",
+  }], ordinaryContext);
+  const ordinaryInbound = item("after-ordinary-error");
+  ordinaryMesh.items.push(ordinaryInbound);
+  ordinaryDriver.onIncoming(ordinaryInbound);
+  ok(
+    ordinaryHost.sent.length === 2 && ordinaryHost.sent[1]?.details.ids.join() === "ordinary-error,after-ordinary-error",
+    "a non-refusal provider error still retries with new inbound",
+  );
+}
+
+// A provider error retains the old batch, but a later DM starts a new turn with both items.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const first = startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  driver.onContext([{ role: "custom", customType: "cotal-inbox", details: first }]);
+  driver.onProviderResponse(429);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
+  ok(driver.state === "held" && mesh.drained.length === 0, "provider error retains the first DM");
+  mesh.items.push(item("m2"));
+  driver.onIncoming(mesh.items.at(-1)!);
+  ok(host.sent.length === 2 && host.sent[1]?.details.ids.join() === "m1,m2", "a new DM wakes and resends retained delivery");
+  const retry = startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  confirm(driver, retry);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
+  ok(mesh.drained.join() === "m1,m2", "a clean retry commits both DMs once");
+
+  const accepted = new FakeMesh();
+  accepted.items = [item("confirmed")];
+  const acceptedHost = new FakeHost();
+  const acceptedContext = context();
+  const acceptedDriver = new PiDriver(accepted as unknown as MeshAgent);
+  acceptedDriver.bind(acceptedHost);
+  acceptedDriver.onSessionStart(acceptedContext);
+  const acceptedBatch = startBatch(acceptedDriver, acceptedHost);
+  acceptedDriver.onAgentStart(acceptedContext);
+  confirm(acceptedDriver, acceptedBatch);
+  acceptedDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], acceptedContext);
+  accepted.items.push(item("fresh"));
+  acceptedDriver.onIncoming(accepted.items.at(-1)!);
+  ok(acceptedHost.sent.at(-1)?.details.ids.join() === "confirmed,fresh" && accepted.drained.length === 0,
+    "a prior provider acceptance cannot acknowledge an error-ended batch before replay");
+
+  const waiting = new FakeMesh();
+  waiting.items = [item("old")];
+  const waitingHost = new FakeHost();
+  const waitingContext = context();
+  const waitingDriver = new PiDriver(waiting as unknown as MeshAgent);
+  waitingDriver.bind(waitingHost);
+  waitingDriver.onSessionStart(waitingContext);
+  startBatch(waitingDriver, waitingHost);
+  waitingDriver.onAgentStart(waitingContext);
+  waitingDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], waitingContext);
+  waiting.items.push(item("new"));
+  waitingDriver.onIncoming(waiting.items.at(-1)!);
+  ok(waitingHost.sent.at(-1)?.details.ids.join() === "old,new", "new inbound replays retained and newly arrived traffic");
+  startBatch(waitingDriver, waitingHost);
+  waitingDriver.onAgentStart(waitingContext);
+  waitingDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], waitingContext);
+  waitingDriver.onWake();
+  ok(waitingDriver.state === "held" && waitingHost.sent.length === 2 && waiting.drained.length === 0,
+    "another provider error waits for a genuinely new item rather than looping");
+  waiting.items.push(item("later"));
+  waitingDriver.onIncoming(waiting.items.at(-1)!);
+  ok(waitingHost.sent.at(-1)?.details.ids.join() === "old,new,later", "later inbound retries the entire uncommitted batch");
+
+  const crowded = new FakeMesh();
+  crowded.items = Array.from({ length: 33 }, (_, index) => item(`queued-${index}`));
+  const crowdedHost = new FakeHost();
+  const crowdedContext = context();
+  const crowdedDriver = new PiDriver(crowded as unknown as MeshAgent);
+  crowdedDriver.bind(crowdedHost);
+  crowdedDriver.onSessionStart(crowdedContext);
+  startBatch(crowdedDriver, crowdedHost);
+  crowdedDriver.onAgentStart(crowdedContext);
+  crowdedDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], crowdedContext);
+  crowdedDriver.onWake();
+  ok(crowdedDriver.state === "held" && crowdedHost.sent.length === 1,
+    "a generic wake cannot retry stale unbatched backlog after a provider error");
+  crowdedDriver.onIncoming(crowded.items[32]!);
+  ok(crowdedDriver.state === "held" && crowdedHost.sent.length === 1,
+    "redelivery of stale unbatched traffic cannot retry a provider error");
+  const fresh = item("queued-new");
+  crowded.items.push(fresh);
+  crowdedDriver.onIncoming(fresh);
+  ok(crowdedHost.sent.length === 2, "a genuinely new delivery wakes a full held batch");
+  const staleMesh = new FakeMesh();
+  staleMesh.items = [item("old")];
+  const staleHost = new FakeHost();
+  const staleContext = context();
+  const staleDriver = new PiDriver(staleMesh as unknown as MeshAgent);
+  staleDriver.bind(staleHost);
+  staleDriver.onSessionStart(staleContext);
+  startBatch(staleDriver, staleHost);
+  staleDriver.onAgentStart(staleContext);
+  staleDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], staleContext);
+  staleDriver.onAgentStart(staleContext);
+  staleDriver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], staleContext);
+  const afterWatchdog = item("after-watchdog");
+  staleMesh.items.push(afterWatchdog);
+  staleDriver.onIncoming(afterWatchdog);
+  ok(staleDriver.state === "held" && staleHost.sent.length === 1,
+    "a later unconfirmed hold cannot inherit error-retry eligibility");
+  const channelMesh = new FakeMesh();
+  channelMesh.items = [item("before-channel")];
+  const channelHost = new FakeHost();
+  const channelDriver = new PiDriver(channelMesh as unknown as MeshAgent);
+  channelDriver.bind(channelHost);
+  const channelContext = context();
+  channelDriver.onSessionStart(channelContext);
+  startBatch(channelDriver, channelHost);
+  channelDriver.onAgentStart(channelContext);
+  channelDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], channelContext);
+  const channel = item("channel-post", { kind: "channel", channel: "general" });
+  channelMesh.items.push(channel);
+  channelDriver.onIncoming(channel);
+  ok(channelHost.sent.at(-1)?.details.ids.join() === "before-channel,channel-post",
+    "a new automatic channel post wakes retained delivery");
+  const pullOnly = new FakeMesh();
+  pullOnly.items = [item("retained")];
+  const pullHost = new FakeHost();
+  const pullDriver = new PiDriver(pullOnly as unknown as MeshAgent);
+  pullDriver.bind(pullHost);
+  const pullContext = context();
+  pullDriver.onSessionStart(pullContext);
+  startBatch(pullDriver, pullHost);
+  pullDriver.onAgentStart(pullContext);
+  pullDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], pullContext);
+  const ambient = item("quiet", { kind: "channel", channel: "quiet" });
+  pullOnly.items.push(ambient);
+  pullOnly.pullOnly.add(ambient.id);
+  pullDriver.onIncoming(ambient);
+  ok(pullDriver.state === "held" && pullHost.sent.length === 1,
+    "pull-only ambient cannot wake an error-held automatic delivery");
+
+  const overflowMesh = new FakeMesh();
+  overflowMesh.items = [item("overflow-old")];
+  const overflowHost = new FakeHost();
+  const overflowContext = context();
+  const overflowDriver = new PiDriver(overflowMesh as unknown as MeshAgent);
+  overflowDriver.bind(overflowHost);
+  overflowDriver.onSessionStart(overflowContext);
+  startBatch(overflowDriver, overflowHost);
+  overflowDriver.onAgentStart(overflowContext);
+  overflowDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], overflowContext);
+  overflowDriver.onBeforeCompact("overflow", true);
+  const overflowNew = item("overflow-new");
+  overflowMesh.items.push(overflowNew);
+  overflowDriver.onIncoming(overflowNew);
+  ok(overflowDriver.state === "held" && overflowHost.sent.length === 1,
+    "provider overflow continuation retains ownership despite new inbound");
+  const racing = new FakeMesh();
+  racing.items = [item("first")];
+  const raceHost = new FakeHost();
+  const raceDriver = new PiDriver(racing as unknown as MeshAgent);
+  raceDriver.bind(raceHost);
+  const raceContext = context();
+  raceDriver.onSessionStart(raceContext);
+  startBatch(raceDriver, raceHost);
+  raceDriver.onAgentStart(raceContext);
+  raceDriver.onProviderResponse(429);
+  racing.items.push(item("between"));
+  raceDriver.onIncoming(racing.items.at(-1)!);
+  raceDriver.onAgentEnd([{ role: "assistant", stopReason: "error" }], raceContext);
+  ok(raceHost.sent.at(-1)?.details.ids.join() === "first,between" && raceHost.sent.length === 2,
+    "a DM arriving between provider failure and agent end retries retained delivery");
+  const raceBatch = startBatch(raceDriver, raceHost);
+  raceDriver.onAgentStart(raceContext);
+  confirm(raceDriver, raceBatch);
+  raceDriver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], raceContext);
+  ok(racing.drained.join() === "first,between", "a clean turn acknowledges both messages after the race");
+}
+
+// An unconfirmed error stays held during the fixed backoff window before the bounded
+// continuation fires (see the bounded-continuation cells below for what happens once it does).
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 20);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await driver.flushPresence();
+  ok(
+    driver.state === "held" && mesh.drained.length === 0 && mesh.statuses.at(-1)?.status === "waiting",
+    "an error before the backoff window elapses stays held and visible without time-based acknowledgement",
+  );
+}
+
+// Issue #726 acceptance: a non-terminal error with one unconfirmed batch re-dispatches the exact
+// same retained batch content through the same host path, within the bounded backoff window.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
+  ok(driver.state === "held" && host.sent.length === 1, "a non-terminal error holds before the bounded continuation fires");
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  ok(
+    host.sent.length === 2 &&
+      host.sent[1]?.content === host.sent[0]?.content &&
+      host.sent[1]?.details.ids.join() === "m1",
+    "the bounded continuation re-dispatches the exact retained batch content within the backoff window",
+  );
+}
+
+// A continuation whose turn ends cleanly commits the retained batch once and returns to idle,
+// exactly as an externally-triggered continuation already does.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  ok(host.sent.length === 2, "the bounded continuation re-dispatches before the retry turn starts");
+  const continuation = context();
+  driver.onAgentStart(continuation);
+  const details = startBatch(driver, host);
+  confirm(driver, details);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], continuation);
+  ok(
+    mesh.drained.join() === "m1" && driver.state === "idle",
+    "a clean bounded continuation commits the retained batch once and returns to idle",
+  );
+}
+
+// Attempts spent: the same failure on every continuation ends in held with a presence and held
+// reason naming intervention and the attempt count; a bare wake still cannot send.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const retry = context();
+    driver.onAgentStart(retry);
+    driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], retry);
+  }
+  await driver.flushPresence();
+  ok(driver.state === "held", "attempts spent still ends in a safe held state");
+  const heldReason = driver.reason ?? "";
+  ok(/2 automatic continuation attempts/.test(heldReason), "the held reason names the spent attempt count");
+  ok(/intervention/i.test(heldReason), "the held reason names intervention rather than promising a continuation");
+  const lastPresence = mesh.statuses.at(-1);
+  ok(
+    lastPresence?.status === "waiting" && /intervention/i.test(lastPresence.activity ?? ""),
+    "the presence line also names intervention once attempts are spent",
+  );
+  const sentBeforeFreshInput = host.sent.length;
+  driver.onWake();
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  ok(host.sent.length === sentBeforeFreshInput, "a bare wake cannot dispatch once the continuation budget is spent");
+  // Fork (RIG-4249): a genuinely new automatic DM after a provider error still starts one fresh turn.
+  mesh.items.push(item("m2"));
+  driver.onIncoming(mesh.items.at(-1)!);
+  ok(host.sent.length === sentBeforeFreshInput + 1 && host.sent.at(-1)?.details.ids.join() === "m1,m2",
+    "a new DM after a spent provider-error budget retries the retained batch with the new traffic");
+}
+
+// A steer queued past the last poll of a cleanly ended turn: while Pi still holds it, the hold
+// stays (its idle drain starts the turn that confirms it). Once Pi stays settled with nothing
+// queued, the steer is lost; the driver re-dispatches from the inbox instead of holding forever.
+// Hosts build a fresh context per event, so agent_end gets a different object than agent_start.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200, 1_000);
+  driver.bind(host);
+  driver.onSessionStart(context());
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], context());
+  ok(driver.state === "held" && host.sent.length === 1, "an unconfirmed steer at a clean end holds");
+  ctx.idle = true;
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  ok(driver.state === "held" && host.sent.length === 1, "a steer Pi still queues keeps the hold");
+  ctx.pending = false;
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  ok(driver.state === "held" && host.sent.length === 1, "a host that only just settled keeps the hold through the settle window");
+  ctx.idle = false;
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  ctx.idle = true;
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  ok(driver.state === "held" && host.sent.length === 1, "post-run host work restarts the settle window");
+  for (let waited = 0; host.sent.length < 2 && waited < 5_000; waited += 50) await new Promise((resolve) => setTimeout(resolve, 50));
+  ok(driver.state === "dispatching" && host.sent.length === 2 && host.sent[1]?.details.ids.join() === "m1" &&
+    host.sent[1]?.details.batchId !== host.sent[0]?.details.batchId && mesh.drained.length === 0,
+    "a steer Pi dropped is re-dispatched from the inbox without acknowledging it");
+  mesh.items.push(item("m2"));
+  driver.onIncoming(mesh.items.at(-1)!);
+  ok(host.sent.length === 2, "the re-dispatched batch still serializes new traffic behind it");
+  const retry = context();
+  driver.onAgentStart(retry);
+  confirm(driver, startBatch(driver, host));
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], context());
+  ok(mesh.drained.join() === "m1" && host.sent.at(-1)?.details.ids.join() === "m2",
+    "the recovered batch commits once and the backlog flows");
+}
+
+// A lost steer that drains after its re-dispatch sits in the same request twice. The first copy of
+// each receive key is kept. A later copy is dropped only when no assistant message sits between it
+// and the copy it repeats, so the request never ends on an assistant turn. Run turns dedupe by goal id.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200, 50);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], context());
+  ctx.idle = true;
+  ctx.pending = false;
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const stale = host.sent[0]?.details;
+  const live = host.sent[1]?.details;
+  ok(stale && live && stale.batchId !== live.batchId, "the recovery re-dispatched the lost steer under a new batch id");
+  const old = { role: "custom", customType: "cotal-inbox", content: "old", details: stale };
+  const fresh = { role: "custom", customType: "cotal-inbox", content: "new", details: live };
+  const other = { role: "user", content: "hello" };
+  const reply = { role: "assistant", content: "answered" };
+
+  const afterReply = driver.onContext([old, reply, fresh]);
+  ok(afterReply !== undefined && afterReply.length === 3 && afterReply[0] === old && afterReply[1] === reply,
+    "a later copy after an assistant reply is kept, so the first copy and reply stay in order");
+  ok(afterReply?.[2]?.content === "Cotal batch already delivered above; no new items.", "a later copy with nothing new after an assistant reply becomes the already-delivered stub");
+  ok(afterReply?.at(-1)?.role !== "assistant", "a request that kept a later copy after a reply does not end on an assistant message");
+  const earlierReply = { role: "assistant", content: "earlier" };
+  const earlierThenRepeat = driver.onContext([earlierReply, old, fresh]);
+  ok(earlierThenRepeat?.length === 2 && earlierThenRepeat[0] === earlierReply && earlierThenRepeat[1] === old,
+    "an assistant message before the first copy does not stop a trailing repeat from being dropped");
+  const trailingCopy = driver.onContext([old, fresh]);
+  ok(trailingCopy?.length === 1 && trailingCopy[0] === old,
+    "a later copy with nothing new and no assistant between copies is dropped");
+
+  ok(driver.onContext([other, fresh]) === undefined, "a request without a repeated delivery passes through unchanged");
+
+  const extraItems = [item("m1"), item("m2")];
+  const extra = { role: "custom", customType: "cotal-inbox", content: "wide", details: { version: 1, batchId: "wide", ids: ["m1", "m2"], items: extraItems } };
+  const widened = driver.onContext([old, extra]);
+  ok(widened?.length === 2 && widened[0] === old && widened[1]?.details?.ids.join() === "m2" &&
+    widened[1]?.details?.items?.map((value) => value.id).join() === "m2",
+    "a re-dispatch with an extra item keeps only the item no earlier copy carried");
+  ok(widened?.[1]?.content === formatInjection([extraItems[1]!]),
+    "the rebuilt item content sent to the model excludes the earlier item");
+
+  const turnHeader = "🎯 Cotal — a run handed you ";
+  const turnFooter = "\n(Do the work now with your own tools. An ask must be answered through its native route above before ending your host turn. For ordinary turns, ending your turn yields \"done\" automatically; call cotal_yield when blocked or handing off an ordinary turn.)";
+  const firstBlock = "— turn g1:\nfirst goal";
+  const secondBlock = "— turn g2:\nsecond goal";
+  const firstSuffix = `${turnHeader}its turn:\n${firstBlock}${turnFooter}`;
+  const turnA = {
+    role: "custom", customType: "cotal-inbox", content: firstSuffix,
+    details: { version: 1, batchId: "t1", ids: [], turnIds: ["g1"], suffix: firstSuffix, turnHeader, turnFooter, turnBlocks: { g1: firstBlock } },
+  };
+  const secondSuffix = `${turnHeader}2 turns:\n${firstBlock}\n${secondBlock}${turnFooter}`;
+  const twoTurns = {
+    role: "custom", customType: "cotal-inbox", content: secondSuffix,
+    details: { version: 1, batchId: "t3", ids: [], turnIds: ["g1", "g2"], suffix: secondSuffix, turnHeader, turnFooter, turnBlocks: { g1: firstBlock, g2: secondBlock } },
+  };
+  const newTurn = driver.onContext([turnA, twoTurns]);
+  const expectedTurnSuffix = `${turnHeader}its turn:\n${secondBlock}${turnFooter}`;
+  ok(newTurn?.length === 2 && newTurn[0] === turnA && newTurn[1]?.details?.turnIds?.join() === "g2" &&
+    newTurn[1]?.details?.suffix === expectedTurnSuffix && newTurn[1]?.content === expectedTurnSuffix,
+    "a rebuilt multi-goal copy sends only the new goal block to the model");
+
+  const legacy = { role: "custom", customType: "cotal-inbox", content: "legacy body", details: { version: 1, batchId: "legacy", ids: ["m1", "m3"] } };
+  const legacyResult = driver.onContext([old, legacy]);
+  ok(legacyResult?.[1] === legacy,
+    "a legacy partly repeated copy without item metadata keeps its original model content");
+  const legacyTurn = { role: "custom", customType: "cotal-inbox", content: secondSuffix, details: { version: 1, batchId: "legacy-turn", ids: [], turnIds: ["g1", "g2"], suffix: secondSuffix } };
+  ok(driver.onContext([turnA, legacyTurn])?.[1] === legacyTurn, "legacy turn text without blocks is retained whole");
+}
+
+{
+  const mesh = new FakeMesh();
+  const host = new FakeHost();
+  const ctx = context();
+  const header = "Run: ";
+  const footer = " end";
+  const blocks = { g1: "first goal", g2: "second goal" };
+  mesh.peekPendingTurns = () => ({ text: renderPendingTurnText(header, [blocks.g1], footer), goalIds: ["g1"], header, footer, blocks });
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200, 50);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
+  mesh.peekPendingTurns = () => ({ text: renderPendingTurnText(header, [blocks.g1, blocks.g2], footer), goalIds: ["g1", "g2"], header, footer, blocks });
+  ctx.idle = true;
+  ctx.pending = false;
+  const deadline = Date.now() + 5_000;
+  while (host.sent.length < 2 && Date.now() < deadline) await delay(10);
+  const first = host.sent[0];
+  const second = host.sent[1];
+  assert.ok(first && second, "the lost turn is re-dispatched with the new goal");
+  const firstMessage = { role: "custom", customType: "cotal-inbox", ...first };
+  const secondMessage = { role: "custom", customType: "cotal-inbox", ...second };
+  const rebuilt = driver.onContext([firstMessage, secondMessage]);
+  ok(rebuilt?.[0] === firstMessage && rebuilt[1]?.content === renderPendingTurnText(header, [blocks.g2], footer),
+    "dispatched turn metadata rebuilds only the new goal text");
+  await driver.quit();
+}
+// The real extension callback must return Pi's context result wrapper, not the driver's bare array.
+{
+  const keys = ["COTAL_NAME", "COTAL_AGENT_FILE", "COTAL_LINK", "COTAL_HOME", "COTAL_DEFAULT_AGENT",
+    "COTAL_CONTROL_SOCKET", "COTAL_CONTROL_TOKEN", "COTAL_LAUNCH_MATERIAL", "COTAL_ACCEPTED_TOKEN", "COTAL_CREDS",
+    "COTAL_SPACE", "COTAL_SERVERS", "COTAL_SUBSCRIBE", "COTAL_ALLOW_PUBLISH", "COTAL_EVENTS", "COTAL_TOKEN",
+    "COTAL_ID", "COTAL_LIFECYCLE_UID", "PI_SESSION_ID", "COTAL_PI_SESSION_STATE", "COTAL_PI_EXPECTED_SESSION",
+    "COTAL_PI_FRESH_SESSION", "COTAL_PI_SUPERVISED_CWD", "COTAL_PI_PERSONA_FILE"] as const;
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  const runtimeKey = Symbol.for("cotal.pi.runtimes");
+  const onceKey = Symbol.for("cotal.once-handoff");
+  const globals = globalThis as typeof globalThis & { [runtimeKey]?: Map<string, { mesh: MeshAgent }>; [onceKey]?: { exit?: unknown } };
+  const oldExit = globals[onceKey]?.exit;
+  for (const key of keys) delete process.env[key];
+  process.env.COTAL_NAME = "pi-context-smoke";
+  process.env.COTAL_SPACE = "pi-context-smoke";
+  process.env.COTAL_SERVERS = "nats://127.0.0.1:1";
+  const api = {
+    sendMessage(): void {},
+    registerMessageRenderer(): void {},
+    registerTool(): void {},
+    on(event: string, handler: (...args: unknown[]) => unknown): void { handlers.set(event, handler); },
+  } as unknown as ExtensionAPI;
+  try {
+    await cotalMesh(api);
+    const onContext = handlers.get("context");
+    assert.ok(onContext, "the real cotalMesh extension registers a context callback");
+    const old = { role: "custom", customType: "cotal-inbox", content: "old", details: { version: 1, batchId: "ctx-old", ids: ["ctx-m1"], items: [item("ctx-m1")] } };
+    const fresh = { role: "custom", customType: "cotal-inbox", content: "new", details: { version: 1, batchId: "ctx-new", ids: ["ctx-m1"], items: [item("ctx-m1")] } };
+    assert.deepEqual(onContext({ messages: [old, fresh] }), { messages: [old] });
+    checks++;
+    const unique = { role: "custom", customType: "cotal-inbox", content: "unique", details: { version: 1, batchId: "ctx-unique", ids: ["ctx-m2"], items: [item("ctx-m2")] } };
+    assert.equal(onContext({ messages: [unique] }), undefined);
+    checks++;
+  } finally {
+    const runtimes = globals[runtimeKey];
+    if (runtimes) {
+      for (const runtime of runtimes.values()) await runtime.mesh.stop();
+      runtimes.clear();
+    }
+    if (globals[onceKey]) globals[onceKey].exit = oldExit;
+    for (const key of keys) {
+      const value = saved[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+// A turn that starts while the lost-steer check waits owns the hold again; a stale check never fires.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200, 50);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], context());
+  const next = context();
+  next.idle = true;
+  next.pending = false;
+  driver.onAgentStart(next);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  ok(driver.state === "held" && host.sent.length === 1, "a check from an earlier end does not drop a batch a newer turn may carry");
+}
+
+// The hold stays visible while the session keeps running tools.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
+  const next = context();
+  driver.onAgentStart(next);
+  driver.onToolStart("wait");
+  await driver.flushPresence();
+  ok(/Cotal delivery held/.test(mesh.statuses.at(-1)?.activity ?? ""), "a tool run while held still names the hold in presence");
+}
+
+// Controls that must not weaken: zero batches still returns to idle on the same error boundary.
+{
+  const mesh = new FakeMesh();
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
+  ok(driver.state === "idle", "an error with zero batches still returns to idle, never a retry");
+}
+
+// Controls that must not weaken: a user abort holds without any automatic retry, even past the
+// backoff window.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const controller = new AbortController();
+  const ctx = context(controller.signal);
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  controller.abort();
+  driver.onAgentEnd([{ role: "assistant", stopReason: "aborted" }], ctx);
+  ok(driver.state === "held" && host.sent.length === 1, "an abort holds immediately without a retry");
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  ok(host.sent.length === 1, "an abort still has not auto-replayed past the backoff window");
+}
+
+// Controls that must not weaken: an external onAgentStart still releases the spent (post-budget)
+// held state, exactly as it releases a plain hold.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], ctx);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const retry = context();
+    driver.onAgentStart(retry);
+    driver.onAgentEnd([{ role: "assistant", stopReason: "error" }], retry);
+  }
+  ok(driver.state === "held", "the spent state before external intervention is held");
+  const rescue = context();
+  driver.onAgentStart(rescue);
+  ok(driver.state !== "held", "an external onAgentStart releases the spent state exactly as it releases a plain hold");
+}
+
+// Managed shutdown is absorbing even when Pi reports late lifecycle events.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const details = startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  confirm(driver, details);
+  await driver.flushPresence();
+  const statusesBefore = mesh.statuses.length;
+  driver.requestShutdown();
+  driver.onAgentStart(ctx);
+  driver.onContext([{ role: "custom", customType: "cotal-inbox", details }]);
+  driver.onProviderResponse(200);
+  driver.onToolStart("bash");
+  driver.onToolEnd();
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
+  driver.onBeforeCompact("overflow", true);
+  await driver.flushPresence();
+  ok(ctx.shutdowns === 2, "shutdown reaches both the active context and any late agent start");
+  ok(driver.state === "shuttingDown" && mesh.drained.length === 0, "late lifecycle cannot acknowledge or escape shutdown");
+  ok(mesh.statuses.length === statusesBefore, "late lifecycle cannot publish presence after shutdown");
+
+  const between = new PiDriver(new FakeMesh() as unknown as MeshAgent);
+  between.requestShutdown();
+  const replacement = context();
+  between.onSessionStart(replacement);
+  ok(replacement.shutdowns === 1 && between.state === "shuttingDown", "shutdown between sessions closes the replacement context");
+}
+
+// Unknown future stop reasons fail closed until an exact clean stop proves terminality.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const details = startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  confirm(driver, details);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "future-reason" }], ctx);
+  ok(driver.state === "held" && mesh.drained.length === 0, "a non-stop boundary cannot acknowledge confirmed work");
+  const continuation = context();
+  driver.onAgentStart(continuation);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], continuation);
+  ok(mesh.drained.join() === "m1", "an exact later stop resolves an unknown retained boundary");
+}
+
+// A steer sent mid-run is only consumed at Pi's next turn boundary, which a long tool call can
+// push past the start watchdog. That late start must not leave later DMs undelivered for the rest
+// of the run.
+{
+  const mesh = new FakeMesh();
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 20);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  driver.onAgentStart(ctx);
+  driver.onToolStart("bash");
+  mesh.items.push(item("m1"));
+  driver.onIncoming(mesh.items.at(-1)!);
+  ok(host.sent.length === 1, "a mid-run DM is steered");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  driver.onToolEnd();
+  const late = startBatch(driver, host);
+  confirm(driver, late);
+  ok(driver.state !== "held", "a steer Pi starts late at the next turn boundary releases the start watchdog hold");
+  driver.onToolStart("bash");
+  mesh.items.push(item("m2"));
+  driver.onIncoming(mesh.items.at(-1)!);
+  ok(host.sent.length === 2 && host.sent[1]?.details.ids.join() === "m2",
+    "a DM after a late-started steer is still delivered mid-run");
+}
+
+// Known non-overflow terminal reasons commit and keep the headless peer live.
+for (const assistant of [
+  { role: "assistant", stopReason: "length", usage: { output: 12 } },
+  { role: "assistant", stopReason: "toolUse" },
+]) {
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const details = startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  confirm(driver, details);
+  mesh.items.push(item("m2"));
+  driver.onAgentEnd([assistant], ctx);
+  ok(mesh.drained.join() === "m1", `${assistant.stopReason} commits the confirmed terminal batch`);
+  ok(host.sent.length === 2 && host.sent[1]?.details.ids.join() === "m2", `${assistant.stopReason} keeps dispatch live`);
+}
+
+// Pi's zero-output length overflow is not terminal and must wait for continuation.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("m1")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const details = startBatch(driver, host);
+  driver.onAgentStart(ctx);
+  confirm(driver, details);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "length", usage: { output: 0 } }], ctx);
+  ok(driver.state === "held" && mesh.drained.length === 0, "zero-output length retains the overflow batch");
+  driver.onBeforeCompact("overflow", true);
+  const continuation = context();
+  driver.onAgentStart(continuation);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], continuation);
+  ok(mesh.drained.join() === "m1", "the overflow-length continuation commits at its terminal boundary");
+}
+
+// Dispatch-start watchdog holds association and blocks competing delivery; late lifecycle still wins.
+{
+  const mesh = new FakeMesh();
+  mesh.items = [item("slow")];
+  const host = new FakeHost();
+  const ctx = context();
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 5);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  const details = host.sent[0]!.details;
+  // Wait well past the 5ms watchdog so it has reliably FIRED before the assertion — a 10ms wait races
+  // the 5ms timer on Windows' coarse (~15ms) granularity, where both round to the same tick.
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  ok(driver.state === "held" && mesh.drained.length === 0, "watchdog expiry holds without acknowledgement");
+  mesh.items.push(item("new"));
+  driver.onIncoming(mesh.items.at(-1)!);
+  ok(host.sent.length === 1, "watchdog hold blocks a competing dispatch");
+  driver.onMessageStart({ role: "custom", customType: "cotal-inbox", details });
+  confirm(driver, details);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
+  ok(mesh.drained.join() === "slow", "late lifecycle confirmation remains associated with the original batch");
+}
+
+// Presence writes complete in callback invocation order despite asynchronous operations.
+{
+  const mesh = new FakeMesh();
+  const driver = new PiDriver(mesh as unknown as MeshAgent);
+  const ctx = context();
+  driver.bind(new FakeHost());
+  driver.onSessionStart(ctx);
+  driver.onAgentStart(ctx);
+  driver.onToolStart("bash");
+  driver.onToolEnd();
+  await driver.flushPresence();
+  ok(
+    mesh.statuses.map(({ status, activity }) => `${status}:${activity ?? ""}`).join("|") ===
+      "working:thinking|working:running bash|working:thinking",
+    "presence writes preserve lifecycle invocation order",
+  );
+}
+
+// The session-state carrier follows in-process /resume: each session_start atomically replaces the
+// current id, so a later process crash reopens the session the user actually switched to.
+{
+  const root = mkdtempSync(join(tmpdir(), "cotal-pi-session-state-"));
+  const state = join(root, "session.json");
+  const previous = process.env.COTAL_PI_SESSION_STATE;
+  process.env.COTAL_PI_SESSION_STATE = state;
+  persistSessionId("01999999-9999-7999-8999-000000000001");
+  ok(JSON.parse(readFileSync(state, "utf8")).sessionId.endsWith("0001"), "session state records the initial Pi session");
+  persistSessionId("01999999-9999-7999-8999-000000000002");
+  ok(JSON.parse(readFileSync(state, "utf8")).sessionId.endsWith("0002"), "session state follows an in-process Pi /resume");
+  persistSessionId("01999999-9999-7999-8999-000000000002", "quit");
+  ok(JSON.parse(readFileSync(state, "utf8")).status === "quit", "a deliberate Pi quit is distinguished from a crash");
+  if (process.platform !== "win32") ok((statSync(state).mode & 0o077) === 0, "session state is owner-only on POSIX");
+  else checks++;
+  if (previous === undefined) delete process.env.COTAL_PI_SESSION_STATE;
+  else process.env.COTAL_PI_SESSION_STATE = previous;
+
+  const project = join(root, "project");
+  const agentDir = join(project, ".cotal", "agents");
+  mkdirSync(agentDir, { recursive: true });
+  const oldAgentFile = process.env.COTAL_AGENT_FILE;
+  const oldName = process.env.COTAL_NAME;
+  const oldUid = process.env.COTAL_LIFECYCLE_UID;
+  const oldSessionState = process.env.COTAL_PI_SESSION_STATE;
+  delete process.env.COTAL_PI_SESSION_STATE;
+  process.env.COTAL_AGENT_FILE = join(agentDir, "legacy.md");
+  process.env.COTAL_NAME = "legacy";
+  process.env.COTAL_LIFECYCLE_UID = "12345678901234567890123456";
+  persistSessionId("01999999-9999-7999-8999-000000000003");
+  const derived = join(project, ".cotal", "pi-sessions", "legacy-12345678901234567890123456.json");
+  ok(JSON.parse(readFileSync(derived, "utf8")).sessionId.endsWith("0003"), "an already-running pre-upgrade seat derives its lifecycle-keyed session state path");
+  if (oldAgentFile === undefined) delete process.env.COTAL_AGENT_FILE; else process.env.COTAL_AGENT_FILE = oldAgentFile;
+  if (oldName === undefined) delete process.env.COTAL_NAME; else process.env.COTAL_NAME = oldName;
+  if (oldUid === undefined) delete process.env.COTAL_LIFECYCLE_UID; else process.env.COTAL_LIFECYCLE_UID = oldUid;
+  if (oldSessionState === undefined) delete process.env.COTAL_PI_SESSION_STATE; else process.env.COTAL_PI_SESSION_STATE = oldSessionState;
+  rmSync(root, { recursive: true, force: true });
+}
+
+// A supervised Pi seat preserves saved trust, but an undecided project is explicitly untrusted for
+// this run and leaves both a visible instruction and a prompt-specific manager state record.
+{
+  const root = mkdtempSync(join(tmpdir(), "cotal-pi-project-trust-"));
+  const agentDir = join(root, "pi-agent");
+  const state = join(root, "session.json");
+  const project = join(root, "project");
+  mkdirSync(project, { recursive: true });
+  const previousDir = process.env.PI_CODING_AGENT_DIR;
+  const previousState = process.env.COTAL_PI_SESSION_STATE;
+  const previousError = console.error;
+  const diagnostics: string[] = [];
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  process.env.COTAL_PI_SESSION_STATE = state;
+  console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+  try {
+    ok((await supervisedProjectTrust(project)).trusted === "no", "an undecided supervised project is untrusted for this run");
+    const pending = JSON.parse(readFileSync(state, "utf8"));
+    ok(
+      pending.status === "prompt" && pending.prompt === "Trust project folder?" && pending.cwd === project,
+      "an undecided supervised project records the exact native prompt and directory",
+    );
+    ok(
+      diagnostics.some((line) => line.includes("[cotal-pi/trust]") && line.includes(project) && line.includes("Run pi once")),
+      "the skipped project resources are visible with foreground trust guidance",
+    );
+
+    const trustStore = new ProjectTrustStore(agentDir);
+    trustStore.set(project, true);
+    diagnostics.length = 0;
+    ok((await supervisedProjectTrust(project)).trusted === "undecided", "a saved trusted project remains Pi's decision");
+    ok(diagnostics.length === 0, "a saved trust decision emits no skipped-resource notice");
+    trustStore.set(project, false);
+    diagnostics.length = 0;
+    ok((await supervisedProjectTrust(project)).trusted === "undecided", "a saved denied project also remains Pi's decision");
+    ok(
+      diagnostics.some((line) => line.includes("saved trust decision denies") && line.includes(project)),
+      "a saved denial keeps skipped project resources visible",
+    );
+  } finally {
+    console.error = previousError;
+    if (previousDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousDir;
+    if (previousState === undefined) delete process.env.COTAL_PI_SESSION_STATE;
+    else process.env.COTAL_PI_SESSION_STATE = previousState;
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// Extension activation: unrelated operator settings are inert; partial managed control fails loud.
+{
+  const keys = [
+    "COTAL_NAME",
+    "COTAL_AGENT_FILE",
+    "COTAL_LINK",
+    "COTAL_HOME",
+    "COTAL_DEFAULT_AGENT",
+    "COTAL_CONTROL_SOCKET",
+    "COTAL_CONTROL_TOKEN",
+    "COTAL_LAUNCH_MATERIAL",
+    "COTAL_ACCEPTED_TOKEN",
+    "COTAL_CREDS",
+  ] as const;
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  for (const key of keys) delete process.env[key];
+  process.env.COTAL_HOME = "/tmp/operator-setting";
+  process.env.COTAL_DEFAULT_AGENT = "pi";
+  await cotalMesh({} as ExtensionAPI);
+  checks++;
+
+  process.env.COTAL_NAME = "partial-control";
+  process.env.COTAL_CONTROL_SOCKET = join(tmpdir(), "cotal-partial.sock");
+  const compatibleApi = {
+    sendMessage(): void {},
+    registerMessageRenderer(): void {},
+    registerTool(): void {},
+    on(): void {},
+  } as unknown as ExtensionAPI;
+  await assert.rejects(() => cotalMesh(compatibleApi), /COTAL_CONTROL_SOCKET is set but no control token could be resolved/);
+  checks++;
+  for (const key of keys) {
+    const value = saved[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+// buildLaunch keeps contributor model/persona precedence and rejects every unsupported surface.
+{
+  const root = mkdtempSync(join(tmpdir(), "cotal-pi-launch-"));
+  const agentFile = join(root, "agent.md");
+  writeFileSync(agentFile, "---\nname: pi-test\nmodel: file/model\n---\nPersona body\n");
+  const previousGroq = process.env.GROQ_API_KEY;
+  const previousSecret = process.env.UNRELATED_SECRET;
+  process.env.GROQ_API_KEY = "groq-test";
+  process.env.UNRELATED_SECRET = "must-not-forward";
+  try {
+    const launch = piConnector.buildLaunch({
+      space: "test",
+      name: "pi-test",
+      model: "flag/model",
+      configPath: agentFile,
+      workspaceRoot: root,
+      cwd: root,
+      userAuth: { owner: "owner", actor: "actor", sentinelCredsPath: "/tmp/sentinel", bearerCmd: ["token"] },
+    });
+    ok(launch.args.includes("flag/model") && !launch.args.includes("file/model"), "spawn model overrides the agent file model");
+    ok(launch.args.includes("--append-system-prompt"), "the frontmatter-stripped persona is forwarded by file");
+    // `LaunchSpec.env` is optional on the interface; a managed Pi launch always carries one, so
+    // bind it once and assert that, rather than reading through an optional at every cell.
+    const env = launch.env;
+    assert.ok(env, "a managed Pi launch carries a child env");
+    ok(typeof piConnector.eventChannel === "function", "Pi declares the shared event channel for grant minting");
+    ok(env.COTAL_EVENTS === "1" && env.COTAL_WORKSPACE_ROOT === root, "managed Pi arms durable events at the stable workspace root");
+    assert.throws(() => piConnector.buildLaunch({ space: "test", name: "pi" }), /workspaceRoot/);
+    checks++;
+    const withoutEvents = piConnector.buildLaunch({ space: "test", name: "pi", events: false });
+    ok(withoutEvents.env?.COTAL_EVENTS === undefined && withoutEvents.env?.COTAL_WORKSPACE_ROOT === undefined,
+      "explicit no-events leaves the event plane unarmed");
+    // The user-mode identity is forwarded through the launch material, not the environment: the
+    // sentinel creds path and the bearer command are this mode's credential, and a shell the seat
+    // runs has no more business holding them than it has holding a creds file.
+    ok(
+      env.COTAL_OWNER === undefined && env.COTAL_ACTOR === undefined,
+      "user-mode identity is NOT in the seat environment",
+    );
+    ok(
+      readLaunchMaterial(env[LAUNCH_MATERIAL_ENV]).userAuth?.owner === "owner",
+      "user-mode identity is forwarded through the launch material",
+    );
+    ok(env.GROQ_API_KEY === "groq-test", "the declared provider key reaches Pi");
+    ok(env.UNRELATED_SECRET === undefined, "an unrelated operator variable is withheld");
+    ok(!("COTAL_CREDS" in env) && !("COTAL_LIFECYCLE_UID" in env), "ambient per-session COTAL_* is withheld");
+    const withFloor = piConnector.buildLaunch({
+      space: "test",
+      name: "pi-test",
+      configPath: agentFile,
+      workspaceRoot: root,
+      lifecycleUid: "life",
+      backfillFloor: 42,
+      events: false,
+    });
+    ok(withFloor.env?.COTAL_BACKFILL_FLOOR === "42", "backfill floor forwarded");
+    ok(!("COTAL_BACKFILL_FLOOR" in env), "no floor requested means no floor in the child env");
+    ok(Boolean(launch.control?.path && launch.control.token), "managed Pi launches expose cooperative control");
+    const freshSessionAt = launch.args.indexOf("--session-id");
+    ok(
+      freshSessionAt >= 0 && /^[0-9a-f-]{36}$/.test(launch.args[freshSessionAt + 1] ?? "") &&
+        env.COTAL_PI_EXPECTED_SESSION === launch.args[freshSessionAt + 1],
+      "a fresh managed Pi seat gets an exact recoverable session id before its first turn",
+    );
+    ok(env.COTAL_PI_FRESH_SESSION === "1", "fresh managed Pi seat carries explicit native freshness marker");
+    ok(env.COTAL_PI_SUPERVISED_CWD === root, "managed Pi marks its authorized cwd for native project-trust handling");
+    ok(
+      typeof launch.sessionStatePath === "string" && env.COTAL_PI_SESSION_STATE === launch.sessionStatePath,
+      "managed Pi launch env carries the exact session-state path",
+    );
+    ok(launch.args.some((arg) => arg.endsWith("standalone.js")), "managed Pi launches use the standalone bundle");
+    if (env.COTAL_PI_PERSONA_FILE) rmSync(dirname(env.COTAL_PI_PERSONA_FILE), { recursive: true, force: true });
+
+    assert.throws(
+      () => piConnector.buildLaunch({ space: "test", name: "pi", events: false, creds: "creds", userAuth: { owner: "o", actor: "a", sentinelCredsPath: "s", bearerCmd: ["b"] } }),
+      /mutually exclusive/,
+    );
+    ok(piConnector.supportsResume === true, "Pi declares operator fork-resume support");
+    ok(piConnector.supportsSessionContinuation === true, "Pi declares exact-session crash continuation support");
+    const forked = piConnector.buildLaunch({ space: "test", name: "pi", resume: "session weird;$(nope)", events: false });
+    const forkAt = forked.args.indexOf("--fork");
+    ok(forkAt >= 0 && forked.args[forkAt + 1] === "session weird;$(nope)", "Pi resume renders one opaque --fork argv token");
+    ok(!forked.args.includes("--session-id"), "Pi fork resume never reuses the source session id");
+    ok(forked.env?.COTAL_PI_FRESH_SESSION === undefined, "Pi fork never claims a fresh managed native session");
+    const continued = piConnector.buildLaunch({ space: "test", name: "pi", continueSession: "session-current", events: false });
+    const sessionAt = continued.args.indexOf("--session-id");
+    ok(sessionAt >= 0 && continued.args[sessionAt + 1] === "session-current", "Pi crash recovery reopens the exact current session id");
+    ok(!continued.args.includes("--fork"), "Pi crash continuation never forks the session again");
+    ok(continued.env?.COTAL_PI_FRESH_SESSION === undefined, "Pi crash continuation never claims a fresh managed native session");
+    assert.throws(
+      () => piConnector.buildLaunch({ space: "test", name: "pi", resume: "source", continueSession: "current" }),
+      /mutually exclusive/,
+    );
+    checks += 6;
+    assert.throws(() => piConnector.buildLaunch({ space: "test", name: "pi", variant: "high" }), /variant/);
+    assert.throws(() => piConnector.buildLaunch({ space: "test", name: "pi", mcpServers: { x: { command: "x" } } }), /MCP/);
+    assert.throws(() => piConnector.buildLaunch({ space: "test", name: "pi", launchOptions: { offline: true } }), /launch options/);
+    // `--prompt` is Pi's positional initial message: delivered as the LAST argument (Pi's parser
+    // takes any bare argument as a message, so it must follow every value-taking flag), and a
+    // prompt Pi would misread (empty, an option, a file reference) refuses the launch.
+    const prompted = piConnector.buildLaunch({ space: "test", name: "pi", model: "flag/model", prompt: "  say hello  ", events: false });
+    ok(prompted.args[prompted.args.length - 1] === "say hello", "the initial prompt is Pi's last positional argument, trimmed");
+    ok(prompted.args.indexOf("--model") === prompted.args.length - 3, "the prompt follows the value-taking flags");
+    assert.throws(() => piConnector.buildLaunch({ space: "test", name: "pi", prompt: "   ", events: false }), /empty/);
+    assert.throws(() => piConnector.buildLaunch({ space: "test", name: "pi", prompt: "-p run", events: false }), /cannot start with/);
+    assert.throws(() => piConnector.buildLaunch({ space: "test", name: "pi", prompt: "@notes.md summarize", events: false }), /cannot start with/);
+    const unprompted = piConnector.buildLaunch({ space: "test", name: "pi", model: "flag/model", events: false }).args;
+    ok(unprompted[unprompted.length - 1] === "flag/model", "no prompt, no positional argument: the last argument is still the model value");
+    ok(
+      piConnector.buildLaunch({ space: "test", name: "pi", events: false }).env?.COTAL_PI_SUPERVISED_CWD === undefined,
+      "a foreground Pi launch keeps the native interactive project-trust flow",
+    );
+    checks += 11;
+  } finally {
+    if (previousGroq === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = previousGroq;
+    if (previousSecret === undefined) delete process.env.UNRELATED_SECRET;
+    else process.env.UNRELATED_SECRET = previousSecret;
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+console.log(`pi smoke: ${checks} checks passed`);

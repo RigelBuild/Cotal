@@ -1,0 +1,44 @@
+{
+  "suite": ["bin/smoke/seat-installed-dist.smoke.ts"],
+  "assembles": ["packages/seat"],
+  "guard": "an assembled seat source tree with no dist packs declared entrypoints that support fresh seat import, manager import, and packaged CLI help",
+  "command": "pnpm --filter cotal-ai... build > /dev/null && pnpm smoke:seat-installed-dist",
+  "completionMarker": "SUITE COMPLETE: seat installed distribution",
+  "proveWith": "node scripts/mutation-proof.mjs --config bin/smoke/mutations/seat-installed-dist.json",
+  "mutations": [
+    {
+      "name": "M1 seat prepack omits the TypeScript compile",
+      "file": "packages/seat/package.json",
+      "find": "    \"prepack\": \"node scripts/assert-shipped-natives.mjs && pnpm run build:ts\",",
+      "replace": "    \"prepack\": \"node scripts/assert-shipped-natives.mjs\",",
+      "expectRed": "seat package inventory contains dist/index.js",
+      "cell": "seat package inventory contains dist/index.js"
+    },
+    {
+      "name": "M2 the TypeScript-only lifecycle build becomes a no-op",
+      "file": "packages/seat/package.json",
+      "find": "    \"build:ts\": \"tsc -p tsconfig.json\",",
+      "replace": "    \"build:ts\": \"node -e \\\"void 0\\\"\",",
+      "expectRed": "fresh installed @cotal-ai/seat import succeeds",
+      "cell": "fresh installed @cotal-ai/seat import succeeds"
+    },
+    {
+      "name": "T1 ship the @lydell prebuilt pty.node in place of the built one",
+      "file": "packages/seat/scripts/build-native.mjs",
+      "find": "assertMachine(ptyOut, \"pty addon\");\n",
+      "replace": "assertMachine(ptyOut, \"pty addon\");\ncpSync(join(root, \"..\", \"..\", \"node_modules\", \".pnpm\", `@lydell+node-pty-linux-${arch}@1.2.0-beta.12`, \"node_modules\", \"@lydell\", `node-pty-linux-${arch}`, \"prebuilds\", `linux-${arch}`, \"pty.node\"), ptyOut);\n",
+      "afterRestore": "pnpm --filter @cotal-ai/seat build",
+      "expectRed": "installed spawnPinned names its child: the pidfd's fdinfo Pid is the child pid",
+      "cell": "installed spawnPinned names its child: the pidfd's fdinfo Pid is the child pid",
+      "note": "The upstream prebuilt spawns but returns no pidfd; the installed load must refuse it."
+    },
+    {
+      "name": "T1 restore @lydell/node-pty in the seat dependencies",
+      "file": "packages/seat/package.json",
+      "find": "    \"@xterm/headless\": \"^5.5.0\"\n",
+      "replace": "    \"@xterm/headless\": \"^5.5.0\",\n    \"@lydell/node-pty\": \"1.2.0-beta.12\"\n",
+      "expectRed": "@lydell/node-pty does not resolve from the installed seat",
+      "cell": "@lydell/node-pty does not resolve from the installed seat"
+    }
+  ]
+}

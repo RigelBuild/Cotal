@@ -1,0 +1,429 @@
+/**
+ * Lifecycle e2e (#159 Part B) — the REAL end-to-end the fake-runtime preflight can't reach: a real
+ * JWT-auth broker + a real Manager + real agent PROCESSES (e2e-stub.mjs) that join presence, driving the
+ * actual production paths and INSPECTING the real broker footprint.
+ *
+ *   1. STARTED via real presence — startAgent resolves ok only once the agent's assigned id is live in
+ *      presence; its footprint (dm_local-/dlv_local- durables + ACL row + creds file) exists on the broker/disk.
+ *   2. DEPROVISION on despawn — a real despawn tears that footprint down: durables gone, ACL row gone,
+ *      creds file gone.
+ *   3. FAILED launch — an agent whose process exits on arrival is reported {ok:false} "exited on launch",
+ *      and its just-minted footprint is rolled back (deprovisioned), not orphaned.
+ *  3b. UNCERTAIN — a process that runs but never joins presence is reported {ok:false} "uncertain" and is
+ *      KEPT (not deprovisioned — it may still be booting), distinct from both started and failed.
+ *  3c. FAIL BEFORE PRESENCE — a launch missing the launcher uid, or lying a different one while
+ *      consuming, dies with NO roster ghost (SPEC 13.1 fail-before-presence).
+ *   4. SHUTDOWN teardown — Manager.stop() deprovisions every still-managed agent's footprint.
+ *
+ * Run: pnpm smoke:lifecycle-e2e   (needs nats-server + node on PATH)
+ */
+import { randomUUID } from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
+import { chmodSync, chownSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { connect, credsAuthenticator } from "@nats-io/transport-node";
+import { jetstreamManager } from "@nats-io/jetstream";
+import {
+  isReachable, createSpaceAuth, mintCreds, serverConfig, newIdentity, setupSpaceStreams,
+  openAclRegistry, readAcl, dmStream, dlvStream, dmDurable, dlvDurable, DEV_OWNER, principalKey,
+  mintLifecycleUid, presenceBucket,
+} from "@cotal-ai/core";
+import type { Connector, LaunchOpts, LaunchSpec } from "@cotal-ai/core";
+import { Manager } from "../src/manager.js";
+import { LegacyPtyRuntime } from "../src/runtime/pty.js";
+import { CustodialPtyRuntime } from "../src/runtime/custodial-pty.js";
+import { launchSeat, loadSeat, seatCgroupContained, seatId, trustedSetpriv } from "@cotal-ai/seat";
+import { registry } from "@cotal-ai/core";
+import { agentCredsDir, agentLifecycleSecretFilePaths, authDir, renewalRecordPath, saveSpaceAuth, workspaceSecretStore } from "@cotal-ai/workspace";
+import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal, killAndAwaitExit } from "@cotal-ai/smoke-kit";
+import { bootDeliveryDaemon } from "./_boot-delivery.js";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(here, "../../.."); // worktree root — the agent process runs here so `@cotal-ai/core` resolves
+const STUB = join(here, "e2e-stub.mjs");
+const prevSeatRoot = process.env.COTAL_SEAT_ROOT;
+const seatRoot = mkdtempSync(join(tmpdir(), "s"));
+process.env.COTAL_SEAT_ROOT = seatRoot;
+// OS-assigned free port (collision-safe at allocation) — the old random port had no bind guard, so
+// a rare collision could attach isReachable() to a FOREIGN broker and fail auth downstream.
+const PORT = await freePort();
+const SERVERS = `nats://127.0.0.1:${PORT}`;
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+let pass = 0, fail = 0;
+const check = (name: string, cond: boolean, extra?: unknown) => {
+  if (cond) { pass++; console.log(`  ✓ ${name}`); }
+  else { fail++; console.log(`  ✗ FAIL: ${name}`, extra ?? ""); }
+};
+const NO_PROOF = "setpriv not provably root-owned in this namespace";
+
+const space = `life-${randomUUID().slice(0, 8)}`;
+const auth = await createSpaceAuth(space);
+// launchSeat refuses a distinct agent uid without a root-owned setpriv; the seat cgroup smoke proves
+// that refusal. Checked before the broker and temp dir exist, so the refusal leaks neither.
+if (process.env.COTAL_SEAT_AGENT_UID !== undefined && trustedSetpriv() === undefined)
+  throw new Error(`delegated mode needs a root-owned setpriv: ${NO_PROOF}`);
+const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+const prevHome = process.env.COTAL_HOME;
+process.env.COTAL_HOME = join(dir, "home");
+mkdirSync(process.env.COTAL_HOME, { recursive: true });
+const workspaceRoot = join(dir, "ws");
+mkdirSync(join(workspaceRoot, ".cotal", "agents"), { recursive: true });
+saveSpaceAuth(authDir(workspaceRoot), auth); // seeds the FS composition; the manager's start() reads it via getSpaceAuth(this.secrets) (FS default)
+for (const n of ["w1", "w2", "bad1", "idle1", "nouid1", "wrong1", "wrongreg1", "bypass1"]) writeFileSync(join(workspaceRoot, ".cotal", "agents", `${n}.md`), `---\nname: ${n}\nrole: worker\n---\n`);
+writeFileSync(join(dir, "server.conf"), serverConfig(auth, [auth], { transport: { kind: "plaintext" }, port: PORT, storeDir: join(dir, "js") }));
+const srv = spawn("nats-server", ["-c", join(dir, "server.conf")], {
+  stdio: "ignore", env: { PATH: process.env.PATH, HOME: process.env.COTAL_HOME, TMPDIR: dir },
+});
+const releaseBroker = teardownOnSignal(srv);
+let delivery: Awaited<ReturnType<typeof bootDeliveryDaemon>> | undefined;
+
+const DM = dmStream(space), DLV = dlvStream(space);
+const provId = newIdentity();
+const provCreds = await mintCreds(auth, provId, "provisioner");
+
+/** Open a provisioner-cred jsm/acl connection to inspect the broker footprint. */
+async function inspect<T>(fn: (jsm: Awaited<ReturnType<typeof jetstreamManager>>, aclNc: import("@nats-io/transport-node").NatsConnection) => Promise<T>): Promise<T> {
+  const nc = await connect({ servers: SERVERS, authenticator: credsAuthenticator(new TextEncoder().encode(provCreds)), inboxPrefix: `_INBOX_${provId.id}`, maxReconnectAttempts: 0 });
+  try { return await fn(await jetstreamManager(nc), nc); } finally { await nc.drain().catch(() => {}); }
+}
+const consumerExists = (stream: string, name: string) =>
+  inspect(async (jsm) => { try { await jsm.consumers.info(stream, name); return true; } catch { return false; } });
+const localPrincipal = (id: string) => principalKey(DEV_OWNER, id).key;
+// Every lifecycle-keyed broker resource (dm_/dlv_ durables, ACL row) carries the incarnation's uid
+// (SPEC §13.1). The Manager mints it internally per spawn and records it on the ManagedAgent — read it
+// there to predict the exact names. Capture it BEFORE a despawn/stop clears the agent from the map.
+const uidOf = (name: string): string =>
+  (mgr as unknown as { agents: Map<string, { lifecycleUid?: string }> }).agents.get(name)?.lifecycleUid ?? "";
+const aclPresent = (id: string, uid: string) => inspect(async (_j, nc) => (await readAcl(await openAclRegistry(nc, space), localPrincipal(id), uid)) !== undefined);
+// Lifecycle-keyed (`<name>.<uid>.creds`): the manager's spawn files the incarnation's cred under
+// its uid, never the bare name (that's the standing-cred namespace).
+const credsFile = (name: string, uid: string) => agentLifecycleSecretFilePaths(workspaceRoot, space, name, uid).creds;
+/** Poll until `f()` matches `want`, up to `ms`. */
+async function until(f: () => Promise<boolean>, want: boolean, ms = 8000): Promise<boolean> {
+  const end = Date.now() + ms;
+  while (Date.now() < end) { if ((await f()) === want) return true; await wait(300); }
+  return (await f()) === want;
+}
+/** Does the whole local-principal footprint exist? (dm_local- + dlv_local- + acl + creds file) */
+async function footprint(id: string, uid: string, name: string): Promise<{ dm: boolean; dlv: boolean; acl: boolean; creds: boolean }> {
+  return {
+    dm: await consumerExists(DM, dmDurable(DEV_OWNER, id, uid)),
+    dlv: await consumerExists(DLV, dlvDurable(DEV_OWNER, id, uid)),
+    acl: await aclPresent(id, uid),
+    creds: existsSync(credsFile(name, uid)),
+  };
+}
+
+// A connector that launches the real stub agent (joins presence) or a die-on-arrival process.
+// COTAL_LIFECYCLE_UID rides exactly as every stock connector forwards it (LaunchOpts → env).
+const envFor = (o: LaunchOpts): Record<string, string> => ({
+  COTAL_SPACE: o.space, COTAL_SERVERS: String(o.servers ?? SERVERS), COTAL_CREDS: String(o.creds), COTAL_ID: String(o.id), COTAL_NAME: o.name, PATH: process.env.PATH ?? "",
+  ...(o.lifecycleUid ? { COTAL_LIFECYCLE_UID: o.lifecycleUid } : {}),
+});
+const stubCon: Connector = { kind: "connector", name: "e2e-stub", requires: ["node"], buildLaunch: (o): LaunchSpec => ({ command: "node", args: [STUB], env: envFor(o) }) };
+const dieCon: Connector = { kind: "connector", name: "e2e-die", requires: ["node"], buildLaunch: (o): LaunchSpec => ({ command: "node", args: ["-e", "process.exit(3)"], env: envFor(o) }) };
+// Runs but never connects/joins presence — exercises the UNCERTAIN outcome (no exit, no mesh join).
+const idleCon: Connector = { kind: "connector", name: "e2e-idle", requires: ["node"], buildLaunch: (o): LaunchSpec => ({ command: "node", args: ["-e", "setInterval(()=>{}, 1e9)"], env: envFor(o) }) };
+// The BROKEN-LAUNCHER shapes (residual #6, fail-before-presence): one DROPS the launcher uid off
+// the env (the pre-D15 connector shape), one LIES a different uid while consuming (the stub then
+// tries to bind lifecycle-keyed durables the credential/provisioner never named).
+const noUidCon: Connector = { kind: "connector", name: "e2e-nouid", requires: ["node"], buildLaunch: (o): LaunchSpec => {
+  const env = envFor(o);
+  delete env.COTAL_LIFECYCLE_UID;
+  return { command: "node", args: [STUB], env };
+} };
+const wrongUidCon: Connector = { kind: "connector", name: "e2e-wronguid", requires: ["node"], buildLaunch: (o): LaunchSpec => ({
+  command: "node", args: [STUB], env: { ...envFor(o), COTAL_LIFECYCLE_UID: mintLifecycleUid(), COTAL_E2E_CONSUME: "1" },
+}) };
+// The REGISTER-ONLY wrong-uid shape (consume:false): the broker proof is not a consumer bind but
+// the fail-before-presence dm_ durable proof, so a lied uid must still die with no roster ghost.
+const wrongUidRegCon: Connector = { kind: "connector", name: "e2e-wronguid-reg", requires: ["node"], buildLaunch: (o): LaunchSpec => ({
+  command: "node", args: [STUB], env: { ...envFor(o), COTAL_LIFECYCLE_UID: mintLifecycleUid() },
+}) };
+// The AUTHORITY-BYPASS shape (panel #6 authority boundary): a child holding a valid agent
+// credential claims kind:"endpoint" (client metadata) to SKIP the library register-only dm_ proof,
+// register-only + a lied uid. The manager readiness LIFECYCLE FENCE (presence uid == the minted
+// uid) must still reject it — client-authored kind is not the authority boundary.
+const bypassKindCon: Connector = { kind: "connector", name: "e2e-bypass-kind", requires: ["node"], buildLaunch: (o): LaunchSpec => ({
+  command: "node", args: [STUB], env: { ...envFor(o), COTAL_LIFECYCLE_UID: mintLifecycleUid(), COTAL_E2E_KIND: "endpoint" },
+}) };
+registry.register(stubCon);
+registry.register(dieCon);
+registry.register(idleCon);
+registry.register(noUidCon);
+registry.register(wrongUidCon);
+registry.register(wrongUidRegCon);
+registry.register(bypassKindCon);
+
+// COTAL_SEAT_AGENT_UID selects the delegated proof (T6): the custodial runtime under its own cgroup,
+// seats under a distinct uid. Unset keeps the legacy pty, which has no seat a despawn must prove gone.
+const delegated = process.env.COTAL_SEAT_AGENT_UID !== undefined;
+if (delegated) {
+  // The agent uid traverses into its seat and creds; mkdtemp made the run dir 0700. The Manager builds
+  // its own runtime first, which refuses a root (default ~/.cotal) the agent cannot reach.
+  chmodSync(dir, 0o711);
+  process.env.COTAL_SEAT_ROOT = join(dir, "seats");
+}
+const mgr = new Manager({ space, servers: SERVERS, runtime: "pty", workspaceRoot });
+let custodial: CustodialPtyRuntime | undefined;
+if (delegated) {
+  custodial = new CustodialPtyRuntime({ root: join(dir, "seats") });
+  if (custodial.cgroupBase === undefined || custodial.agentUid === process.geteuid?.())
+    throw new Error(`delegated mode needs a Delegate=yes scope and a distinct agent uid; got base ${String(custodial.cgroupBase)}, agent uid ${custodial.agentUid}`);
+}
+(mgr as unknown as { runtime: unknown }).runtime = custodial ?? new LegacyPtyRuntime();
+console.log(`runtime: ${custodial ? `custodial, agent uid ${custodial.agentUid}, cgroup base ${String(custodial.cgroupBase)}` : "legacy pty"}`);
+/** Run `node -e script ...args` as the agent uid; the exit status and stdout. */
+const asAgent = (script: string, ...args: string[]): { status: number | null; out: string } => {
+  const uid = String(custodial?.agentUid);
+  const gid = spawnSync("id", ["-g", uid], { encoding: "utf8" }).stdout.trim();
+  const r = spawnSync("setpriv", ["--reuid", uid, "--regid", gid, "--init-groups", "--", process.execPath, "-e", script, ...args], { encoding: "utf8", timeout: 15_000, env: { PATH: process.env.PATH ?? "" } });
+  return { status: r.status, out: r.stdout.trim() };
+};
+
+try {
+  let up = false;
+  for (let i = 0; i < 50; i++) { if (await isReachable(SERVERS)) { up = true; break; } await wait(200); }
+  if (!up) throw new Error(`auth nats-server did not come up on ${PORT}`);
+  await setupSpaceStreams({ servers: SERVERS, space, creds: provCreds });
+  delivery = await bootDeliveryDaemon({ space, servers: SERVERS, auth, reloadStoreIdentity: workspaceSecretStore(workspaceRoot).identity });
+  await mgr.start();
+
+  // 0 — the manager is the CLASS-2 RENEWAL OWNER (D5 slice 5): a real start runs the ordered
+  // renewal pass and persists the audit record — here with both daemon files absent (no delivery
+  // daemon staged), recorded honestly as skips, never a fabricated adoption.
+  const renewalPath = renewalRecordPath(workspaceRoot, space);
+  check("manager start writes the renewal audit record", existsSync(renewalPath));
+  {
+    const rec = JSON.parse(readFileSync(renewalPath, "utf8")) as { owner?: string; results?: Array<{ file: string; ok: boolean; skipped?: string }>; adoption?: unknown };
+    check("renewal record is the manager's pass", rec.owner === "manager", rec);
+    check("absent daemon files are honest skips (no fabricated re-sign/adoption)", rec.results?.every((r) => !r.ok && r.skipped === "missing-file") === true && rec.adoption === undefined, rec);
+  }
+
+  // 1 — STARTED via real presence + footprint exists.
+  console.log("1. real spawn → started via presence:");
+  const r1 = await mgr.startAgent({ name: "w1", agent: "e2e-stub", cwd: repoRoot, events: false });
+  check("startAgent reports started (agent joined the mesh)", r1.ok === true, r1);
+  const id1 = (r1.data as { id?: string } | undefined)?.id ?? "";
+  const uid1 = uidOf("w1"); // capture the manager-minted uid while w1 is still managed (despawn clears it)
+  const fp1 = await footprint(id1, uid1, "w1");
+  check("footprint exists after start — dm_ durable", fp1.dm, fp1);
+  check("footprint exists after start — dlv_ durable", fp1.dlv, fp1);
+  check("footprint exists after start — read-ACL row", fp1.acl, fp1);
+  check("footprint exists after start — creds file", fp1.creds, fp1);
+  let seat1: { path: string; childPid: number } | undefined;
+  if (custodial) {
+    console.log("1b. delegated: the seat runs as the agent uid, which reads only its own creds and cannot drive the seat:");
+    const seatsRoot = custodial.root;
+    const rec = readdirSync(seatsRoot).filter((e) => !e.startsWith(".")).map((id) => loadSeat(seatsRoot, id)).find((r) => r.name === "w1");
+    const statusOf = (pid: number): string => (existsSync(`/proc/${pid}/status`) ? readFileSync(`/proc/${pid}/status`, "utf8") : "");
+    const uidOfPid = (pid: number): number => Number(/^Uid:\s+\d+\s+(\d+)/m.exec(statusOf(pid))?.[1] ?? "-1");
+    check("w1's agent process runs as the agent uid", rec !== undefined && uidOfPid(rec.childPid) === custodial.agentUid, rec && uidOfPid(rec.childPid));
+    // Read only to assert, never to signal: libuv's setgroups(0) leaves no manager group behind.
+    const groups = rec === undefined ? "none" : (/^Groups:(.*)$/m.exec(statusOf(rec.custodianPid))?.[1] ?? "none").trim();
+    check("w1's custodian carries no supplementary groups", groups === "", groups);
+    const creds = credsFile("w1", uid1);
+    const read = asAgent("process.stdout.write(String(require('fs').readFileSync(process.argv[1]).length))", creds);
+    check("the agent uid reads its own creds file", read.status === 0 && Number(read.out) > 0, read);
+    const write = asAgent("require('fs').appendFileSync(process.argv[1], 'x')", creds);
+    const st = statSync(creds);
+    check("the agent uid cannot rewrite its creds file, which stays manager-owned and 0640",
+      write.status !== 0 && st.uid === process.geteuid?.() && (st.mode & 0o777) === 0o640, { write, uid: st.uid, mode: (st.mode & 0o777).toString(8) });
+    const list = asAgent("require('fs').readdirSync(process.argv[1])", dirname(creds));
+    check("the agent uid cannot list the creds directory", list.status !== 0, list);
+    // A seat whose root the agent cannot reach fails at construction, not at its first launch.
+    const sealed = mkdtempSync(join(dir, "sealed-"));
+    let refusal = "";
+    try {
+      new CustodialPtyRuntime({ root: join(sealed, "seats"), cgroupBase: custodial.cgroupBase, agentUid: custodial.agentUid });
+    } catch (e) {
+      refusal = (e as Error).message;
+    }
+    check("a custody root under a directory the agent cannot traverse is refused at construction", /cannot traverse/.test(refusal), refusal);
+    const refuse = (build: () => void): string => {
+      try {
+        build();
+        return "accepted";
+      } catch (e) {
+        return (e as Error).message;
+      }
+    };
+    const agentGid = Number(spawnSync("id", ["-g", String(custodial.agentUid)], { encoding: "utf8" }).stdout.trim());
+    // An agent-owned root would let the agent swap a seat entry for a directory it owns, forging the launch uid.
+    const owned = join(dir, "agent-owned-seats");
+    mkdirSync(owned);
+    chmodSync(owned, 0o711);
+    chownSync(owned, custodial.agentUid, agentGid);
+    const ownedRefusal = refuse(() => new CustodialPtyRuntime({ root: owned, cgroupBase: custodial?.cgroupBase, agentUid: custodial?.agentUid }));
+    check("an agent-owned custody root is refused at construction", /must be a directory owned by uid/.test(ownedRefusal), ownedRefusal);
+    // A creds ancestor the agent's group can write could be swapped between the check and the grant.
+    const swappable = join(workspaceRoot, "agent-writable");
+    mkdirSync(swappable);
+    chmodSync(swappable, 0o770);
+    chownSync(swappable, process.geteuid?.() ?? 0, agentGid);
+    const credsCheck = mgr as unknown as { checkSeatCredsPath: (p: string) => void };
+    const credsRefusal = refuse(() => credsCheck.checkSeatCredsPath(join(swappable, "creds", "x.creds")));
+    check("creds under a directory the agent can write are refused before any write", /can write .*agent-writable/.test(credsRefusal), credsRefusal);
+    // A POSIX ACL can grant the agent through a named entry the mode's group bits (the mask) bound,
+    // so g+w is refused whatever the dir's gid. A gid the agent is not in stands in for that ACL.
+    const otherGid = agentGid === 0 ? 1 : 0;
+    const masked = join(workspaceRoot, "acl-mask");
+    mkdirSync(masked);
+    chmodSync(masked, 0o770);
+    chownSync(masked, process.geteuid?.() ?? 0, otherGid);
+    const maskedRefusal = refuse(() => credsCheck.checkSeatCredsPath(join(masked, "creds", "x.creds")));
+    check("creds under a root-owned dir with g+w for another gid are refused (the ACL mask bounds named entries)", /can write .*acl-mask/.test(maskedRefusal), maskedRefusal);
+    const maskedRoot = join(dir, "acl-mask-seats");
+    mkdirSync(maskedRoot);
+    chmodSync(maskedRoot, 0o771);
+    chownSync(maskedRoot, process.geteuid?.() ?? 0, otherGid);
+    const maskedRootRefusal = refuse(() => new CustodialPtyRuntime({ root: maskedRoot, cgroupBase: custodial?.cgroupBase, agentUid: custodial?.agentUid }));
+    check("a root-owned custody root with g+w for another gid is refused at construction", /can write .*acl-mask-seats/.test(maskedRootRefusal), maskedRootRefusal);
+    // The seat dir's owner is the launch uid. A runtime set to another uid must not prove containment for it.
+    {
+      const side = { kind: "pty" as const, id: seatId() };
+      launchSeat({ root: seatsRoot, name: "uid-side", id: side.id, spec: { command: process.execPath, args: ["-e", "setInterval(()=>{},1e9)"], env: { PATH: process.env.PATH ?? "" } }, cwd: "/", cgroupBase: custodial.cgroupBase, agentUid: custodial.agentUid });
+      const sidePath = `${String(custodial.cgroupBase)}/seat-${side.id}`;
+      // Another real user whose containment holds here, so only the launch-uid binding can keep the reap retained.
+      const otherUid = spawnSync("getent", ["passwd"], { encoding: "utf8" }).stdout.split("\n").map((l) => Number(l.split(":")[2]))
+        .find((u) => Number.isInteger(u) && u > 0 && u !== custodial?.agentUid && seatCgroupContained({ path: sidePath, agentUid: u }));
+      check("another uid whose seat containment would hold exists", otherUid !== undefined, otherUid);
+      const other = new CustodialPtyRuntime({ root: seatsRoot, cgroupBase: custodial.cgroupBase, agentUid: otherUid ?? custodial.agentUid });
+      const mismatched = await other.reap(side);
+      check("a seat launched under another uid reaps as retained, its cgroup left in place",
+        mismatched.outcome === "retained" && existsSync(sidePath), { mismatched, cgroup: existsSync(sidePath) });
+      const matched = await custodial.reap(side);
+      check("the launching uid's runtime reaps it through its cgroup", matched.outcome === "reaped" && !existsSync(sidePath), matched);
+    }
+    if (rec) {
+      // One connection per op: the custodian closes the socket after a peer uid mismatch.
+      const PEER =
+        "const net=require('net');const [sock,op,token]=process.argv.slice(1);const s=net.connect(sock);let b=Buffer.alloc(0);" +
+        "const v=Buffer.from(JSON.stringify(op==='stop'?{id:1,op:'stop',mode:'hard'}:{id:1,op:'hello',token}));const h=Buffer.alloc(4);h.writeUInt32BE(v.length,0);" +
+        "s.on('connect',()=>s.write(Buffer.concat([h,v])));s.on('error',(e)=>{console.log('error:'+e.code);process.exit(0)});" +
+        "s.on('data',(c)=>{b=Buffer.concat([b,c]);if(b.length<4||b.length<4+b.readUInt32BE(0))return;const r=JSON.parse(b.subarray(4,4+b.readUInt32BE(0)).toString());console.log(r.ok?'ok':r.error);process.exit(0)});";
+      const stop = asAgent(PEER, rec.socket, "stop");
+      const hello = asAgent(PEER, rec.socket, "hello", rec.token);
+      check("a stop from the agent uid gets peer uid mismatch, and so does its hello with the right token",
+        stop.out === "peer uid mismatch" && hello.out === "peer uid mismatch", { stop, hello });
+      check("w1 survives the agent's stop", uidOfPid(rec.childPid) === custodial.agentUid);
+      seat1 = { path: `${String(custodial.cgroupBase)}/seat-${rec.id}`, childPid: rec.childPid };
+    }
+  }
+
+  // 2 — DEPROVISION on despawn (real): the footprint is torn down.
+  console.log("2. despawn → footprint deprovisioned:");
+  const callerId = (mgr as unknown as { ep: { ref: () => { id: string } } }).ep.ref().id;
+  // NOTE ON REACH: this is a private cast onto the handler, so no ep contract is applied — this
+  // suite proves lifecycle TRANSITIONS and the broker footprint, never door admission. Nothing
+  // here would catch a contract/handler disagreement (see manifest-launch.smoke.ts's header for
+  // the escape that shape produced). The door-level suites are manager-service-ops/-invoke.
+  (mgr as unknown as { opStop: (a: Record<string, unknown>, c: string, admin: boolean) => unknown }).opStop({ name: "w1", graceful: false }, callerId, true);
+  check("dm_local- durable gone after despawn", await until(() => consumerExists(DM, dmDurable(DEV_OWNER, id1, uid1)), false), await footprint(id1, uid1, "w1"));
+  check("dlv_local- durable gone after despawn", await until(() => consumerExists(DLV, dlvDurable(DEV_OWNER, id1, uid1)), false));
+  check("read-ACL row gone after despawn", await until(() => aclPresent(id1, uid1), false));
+  check("creds file gone after despawn", await until(async () => existsSync(credsFile("w1", uid1)), false));
+  if (seat1) {
+    const s = seat1;
+    check("delegated: w1's seat cgroup is removed and its agent process is gone after despawn",
+      await until(async () => !existsSync(s.path) && !existsSync(`/proc/${s.childPid}/status`), true), s);
+  }
+
+  // 3 — FAILED launch: process exits on arrival → {ok:false} + footprint rolled back.
+  console.log("3. die-on-arrival → failed + footprint rolled back:");
+  const r3 = await mgr.startAgent({ name: "bad1", agent: "e2e-die", cwd: repoRoot, events: false });
+  check("startAgent reports {ok:false}", r3.ok === false, r3);
+  check("failure names 'exited on launch'", /exited on launch/.test((r3 as { error?: string }).error ?? ""), (r3 as { error?: string }).error);
+  // The die connector still provisioned before it exited; that footprint must be torn down. Its id isn't
+  // returned on failure, so assert via the ACL registry being empty of any non-w2 owner after a beat.
+  await wait(2500);
+  // The failed spawn's uid never came back, so sweep by prefix: no `bad1.<uid>.creds` (nor any
+  // other `bad1.`-based secret) may remain.
+  check("bad1 creds file not left behind", !readdirSync(agentCredsDir(workspaceRoot, space)).some((f) => f.startsWith("bad1.")));
+
+  // 3b — UNCERTAIN: a process that runs but never joins presence → neither started nor failed within the
+  // backstop → {ok:false} uncertain, and the agent is KEPT (not deprovisioned; it may still be booting).
+  console.log("3b. runs-but-never-joins → uncertain + kept:");
+  (mgr as unknown as { readinessTimeoutMs: number }).readinessTimeoutMs = 3000; // shrink the backstop for the test
+  const r3b = await mgr.startAgent({ name: "idle1", agent: "e2e-idle", cwd: repoRoot, events: false });
+  check("startAgent reports {ok:false}", r3b.ok === false, r3b);
+  check("failure names it 'uncertain'", /uncertain/i.test((r3b as { error?: string }).error ?? ""), (r3b as { error?: string }).error);
+  const idleId = (mgr as unknown as { agents: Map<string, { id: string; agent: string }> }).agents.get("idle1")?.id ?? "";
+  const uidIdle = uidOf("idle1");
+  check("uncertain agent is KEPT (still managed, not despawned)", idleId !== "" && (await footprint(idleId, uidIdle, "idle1")).creds, [...(mgr as unknown as { agents: Map<string, unknown> }).agents.keys()]);
+  check("uncertain agent NOT deprovisioned (footprint intact)", (await footprint(idleId, uidIdle, "idle1")).dm, await footprint(idleId, uidIdle, "idle1"));
+  (mgr as unknown as { readinessTimeoutMs: number }).readinessTimeoutMs = 30000; // restore for w2 below
+
+  // 3c — FAIL BEFORE PRESENCE (SPEC 13.1, residual #6): an authed launch whose connector DROPS
+  // the launcher uid (a broken launcher, the pre-cut shape) or LIES a different one while
+  // consuming (the broker denies the lifecycle-keyed durable bind) must die with NO presence
+  // ghost — the roster never advertises an agent that could not prove its lifecycle. Assert by
+  // presence-key set difference: no key appears during either failed launch.
+  console.log("3c. missing/wrong launcher uid → fail BEFORE presence (no roster ghost):");
+  {
+    // Enumerate the presence bucket's keys via its backing stream's per-subject counts (no KV
+    // client needed): every present key is a `$KV.<bucket>.<key>` subject with messages.
+    const presenceKeys = (): Promise<string[]> =>
+      inspect(async (jsm) => {
+        const b = presenceBucket(space);
+        const info = await jsm.streams.info(`KV_${b}`, { subjects_filter: `$KV.${b}.>` });
+        return Object.keys(info.state.subjects ?? {});
+      });
+    const before = new Set(await presenceKeys());
+    const rNo = await mgr.startAgent({ name: "nouid1", agent: "e2e-nouid", cwd: repoRoot, events: false });
+    check("a launch whose connector DROPS the launcher uid never reports started", rNo.ok === false, rNo);
+    const rWrong = await mgr.startAgent({ name: "wrong1", agent: "e2e-wronguid", cwd: repoRoot, events: false });
+    check("a consuming launch that LIES a different uid never reports started (bind denied)", rWrong.ok === false, rWrong);
+    const rWrongReg = await mgr.startAgent({ name: "wrongreg1", agent: "e2e-wronguid-reg", cwd: repoRoot, events: false });
+    check("a REGISTER-ONLY (consume:false) launch that lies a uid never reports started (dm_ proof denied)", rWrongReg.ok === false, rWrongReg);
+    const added = (await presenceKeys()).filter((k) => !before.has(k));
+    check("NONE of the fail-before-presence launches left a presence ghost (dropped/lying uid, consume or register-only)", added.length === 0, added);
+
+    // The AUTHORITY BOUNDARY (panel #6): a child claims kind:endpoint to SKIP the library dm_
+    // proof, so it DOES publish presence with its lied uid (a ghost record exists). The manager
+    // readiness LIFECYCLE FENCE rejects it anyway - client-authored kind is not the authority
+    // boundary; the manager owns the expected uid, so the ghost never reports STARTED.
+    (mgr as unknown as { readinessTimeoutMs: number }).readinessTimeoutMs = 3000;
+    const rBypass = await mgr.startAgent({ name: "bypass1", agent: "e2e-bypass-kind", cwd: repoRoot, events: false });
+    check("a kind:endpoint child with a lied uid never reports STARTED (manager readiness lifecycle fence, not client kind)",
+      rBypass.ok === false && /uncertain/i.test((rBypass as { error?: string }).error ?? ""), rBypass);
+    (mgr as unknown as { readinessTimeoutMs: number }).readinessTimeoutMs = 30000;
+  }
+
+  // 4 — EXPLICIT SHUTDOWN teardown: withAgents deprovisions the still-managed agents (w2 + the kept idle1).
+  console.log("4. manager stop({ withAgents: true }) → still-managed footprint torn down:");
+  const r4 = await mgr.startAgent({ name: "w2", agent: "e2e-stub", cwd: repoRoot, events: false });
+  check("second agent started", r4.ok === true, r4);
+  const id2 = (r4.data as { id?: string } | undefined)?.id ?? "";
+  const uid2 = uidOf("w2"); // capture before stop() clears the managed set
+  check("w2 footprint exists before stop", (await footprint(id2, uid2, "w2")).dm, await footprint(id2, uid2, "w2"));
+  await mgr.stop({ withAgents: true }); // awaits teardownManagedAgents → deprovision
+  const fp2 = await footprint(id2, uid2, "w2");
+  check("w2 dm_ durable gone after explicit stop", !fp2.dm, fp2);
+  check("w2 dlv_ durable gone after explicit stop", !fp2.dlv, fp2);
+  check("w2 read-ACL row gone after explicit stop", !fp2.acl, fp2);
+  check("w2 creds file gone after explicit stop", !fp2.creds, fp2);
+
+  console.log(`\nLIFECYCLE E2E ${fail === 0 ? "OK ✅" : "FAILED ❌"}  (${pass} passed, ${fail} failed)`);
+  if (fail) process.exitCode = 1;
+} catch (e) {
+  console.error("  ✗ scenario threw:", e);
+  process.exitCode = 1;
+} finally {
+  let cleanupError: unknown;
+  try { await mgr.stop({ withAgents: true }); } catch (error) { cleanupError = error; }
+  try { await delivery?.stop(); } catch (error) { cleanupError ??= error; }
+  await killAndAwaitExit(srv, "SIGKILL");
+  releaseBroker();
+  if (prevHome === undefined) delete process.env.COTAL_HOME;
+  else process.env.COTAL_HOME = prevHome;
+  if (prevSeatRoot === undefined) delete process.env.COTAL_SEAT_ROOT;
+  else process.env.COTAL_SEAT_ROOT = prevSeatRoot;
+  if (cleanupError) throw cleanupError;
+  if (srv.exitCode === null && srv.signalCode === null) throw new Error("broker exit unproven; storage preserved");
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(seatRoot, { recursive: true, force: true });
+}
+process.exit(process.exitCode ?? 0);

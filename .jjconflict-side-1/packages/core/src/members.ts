@@ -1,0 +1,308 @@
+/**
+ * Durable-membership registry — read/write helpers over the per-space members KV bucket
+ * (`cotal_members_<space>`). One {@link MembershipRecord} per (concrete channel or family, owner)
+ * under {@link memberKey}. This is the Plane-3 source of truth for `channelMembers()` and the fan-out's
+ * member list, **moved off JetStream consumer topology** (core-sub joins create no consumer to
+ * enumerate — the migration trap).
+ *
+ * Writes are **privileged** (the manager / open-mode self-write); agent-authored membership is
+ * forbidden — it would self-authorize durable-backstop delivery + reads. Every write is guarded
+ * two ways: a **generation** monotonicity check (a stale control reply with an older generation is
+ * rejected, so it can't clobber a newer tombstone or rejoin) and a KV **revision CAS** (a concurrent
+ * same-generation write is retried against the fresh revision). Eligibility is always by CHAT stream
+ * **sequence** (`joinCursor`/`leaveCursor`), never wall-clock.
+ */
+import { Kvm, type KV, type KvEntry } from "@nats-io/kv";
+import { membersBucket, memberKey, parseMemberKey, isConcreteChannel, isChannelFamily, subjectMatches, assertLifecycleToken, parsePrincipalKey } from "./subjects.js";
+import type { MembershipRecord } from "./types.js";
+import { liveKvEntries } from "./kv-scan.js";
+
+/** Thrown when a write would regress membership generation — a stale/late control reply. Callers
+ *  treat this as "a newer membership change already won", not an error to retry. */
+export class StaleMembershipWrite extends Error {
+  constructor(channel: string, owner: string, attempted: number, current: number) {
+    super(
+      `stale membership write for ${channel}/${owner}: generation ${attempted} < current ${current}`,
+    );
+    this.name = "StaleMembershipWrite";
+  }
+}
+
+/** Open the members registry bucket. Auth mode OPENs the bucket pre-created at `cotal up`; open dev
+ *  mode lazily CREATEs it. Mirrors {@link openChannelRegistry}. */
+export async function openMembersRegistry(
+  nc: import("@nats-io/transport-node").NatsConnection,
+  space: string,
+  opts: { create?: boolean } = {},
+): Promise<KV> {
+  const kvm = new Kvm(nc);
+  return opts.create ? kvm.create(membersBucket(space)) : kvm.open(membersBucket(space));
+}
+
+/** Read one membership record (incl. a tombstone — `leaveCursor` set), or undefined if no record /
+ *  the key was deleted. The CAS revision is returned alongside so a caller can do its own
+ *  read-modify-write; most callers use {@link commitMember}/{@link tombstoneMember} instead. */
+export async function readMember(
+  kv: KV,
+  channel: string,
+  owner: string,
+  lifecycleUid: string,
+): Promise<{ record: MembershipRecord; revision: number } | undefined> {
+  const e = await kv.get(memberKey(channel, owner, lifecycleUid));
+  if (!e || e.operation === "DEL" || e.operation === "PURGE") return undefined;
+  try {
+    return { record: e.json<MembershipRecord>(), revision: e.revision };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Commit a membership record with the generation guard + revision CAS. `next` is the full intended
+ * record (the caller has already validated the channel ⊆ ACL, concrete, etc.). Returns the committed
+ * record. Throws {@link StaleMembershipWrite} if `next.generation` is older than what's stored.
+ * Retries a revision conflict (a concurrent same-or-newer write) by re-reading; if the re-read shows
+ * a newer generation, that surfaces as `StaleMembershipWrite` too — last writer by generation wins,
+ * deterministically.
+ */
+export async function commitMember(kv: KV, next: MembershipRecord): Promise<MembershipRecord> {
+  return (await commitMemberRevision(kv, next)).record;
+}
+
+/** {@link commitMember}, also returning the KV revision it wrote, so a caller can later take back
+ *  exactly that write and nothing written after it. */
+export async function commitMemberRevision(kv: KV, next: MembershipRecord): Promise<{ record: MembershipRecord; revision: number }> {
+  const key = memberKey(next.channel, next.owner, next.lifecycleUid);
+  const data = new TextEncoder().encode(JSON.stringify(next));
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const cur = await readMember(kv, next.channel, next.owner, next.lifecycleUid);
+    if (!cur) {
+      try {
+        return { record: next, revision: await kv.create(key, data) };
+      } catch {
+        continue; // lost the create race — re-read and try as an update
+      }
+    }
+    if (next.generation < cur.record.generation)
+      throw new StaleMembershipWrite(next.channel, next.owner, next.generation, cur.record.generation);
+    try {
+      return { record: next, revision: await kv.update(key, data, cur.revision) };
+    } catch {
+      continue; // revision moved under us — re-read and retry (generation guard re-checks)
+    }
+  }
+  throw new Error(`members CAS exhausted retries for ${key}`);
+}
+
+/**
+ * Tombstone a membership at `leaveCursor` (leave). Reads the current record and writes it back with
+ * `leaveCursor` set + `state: "live-confirmed"` (the durable backstop is closed), keeping its
+ * generation — so a later rejoin (a NEWER generation) wins, and a stale leave reply (an OLDER
+ * generation than what's stored, e.g. the agent already rejoined) is rejected. A no-op if there is
+ * no record (already gone) or it is already tombstoned at/below this cursor.
+ *
+ * UPDATE-ONLY: the write is a revision CAS on the row it read, so a row purged in between (a
+ * retirement's deprovisioner) stays purged and this returns undefined. It never recreates a key. With no
+ * `expectedGeneration`, the generation of the first read is the one tombstoned: a rejoin that lands
+ * before the write is a newer membership, refused as stale, never tombstoned on the retry.
+ */
+export async function tombstoneMember(
+  kv: KV,
+  channel: string,
+  owner: string,
+  lifecycleUid: string,
+  leaveCursor: number,
+  writerIdentity: string,
+  expectedGeneration?: number,
+): Promise<MembershipRecord | undefined> {
+  const key = memberKey(channel, owner, lifecycleUid);
+  let generation = expectedGeneration;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const cur = await readMember(kv, channel, owner, lifecycleUid);
+    if (!cur) return undefined;
+    // Stale-leave guard: a leave is for the generation the agent joined with (`expectedGeneration`,
+    // captured at durableJoin). If the record has since moved to a NEWER generation — the agent left
+    // and REJOINED — this stale leave must NOT tombstone the rejoin (it would durable-disable a live
+    // membership). Refuse it. (Same intent as the generation guard in commitMember, but a leave reads
+    // the current record so it needs the caller's expected generation to detect the rejoin.)
+    generation ??= cur.record.generation;
+    if (cur.record.generation !== generation)
+      throw new StaleMembershipWrite(channel, owner, generation, cur.record.generation);
+    if (cur.record.leaveCursor !== undefined && cur.record.leaveCursor <= leaveCursor)
+      return cur.record; // already left at/before this cursor
+    const next: MembershipRecord = {
+      ...cur.record,
+      state: "live-confirmed",
+      leaveCursor,
+      writerIdentity,
+      updatedAt: Date.now(),
+    };
+    try {
+      await kv.update(key, new TextEncoder().encode(JSON.stringify(next)), cur.revision);
+      return next;
+    } catch {
+      continue; // revision moved under us, or the row was removed: re-read
+    }
+  }
+  throw new Error(`members CAS exhausted retries for ${key}`);
+}
+
+/**
+ * Complete an activation: flip a pending join (generation `expectedGeneration`, `joinCursor` =
+ * `expectedJoinCursor`, `activated:false`, open) to `activated:true`. ATOMIC via revision CAS, and
+ * REFUSES (returns undefined) if the record is no longer that exact open pending join — a concurrent
+ * SAME-generation LEAVE (tombstone) or a rejoin could have superseded it while catch-up ran. This is the
+ * guard {@link commitMember}'s generation check can't provide: a same-generation activation write would
+ * otherwise CLOBBER a same-generation tombstone (clear its `leaveCursor`, resurrect the membership) and
+ * reopen the SPEC §7 leave boundary. Idempotent: an already-activated open record at the same generation
+ * is returned unchanged.
+ */
+export async function activateMember(
+  kv: KV,
+  channel: string,
+  owner: string,
+  lifecycleUid: string,
+  expectedGeneration: number,
+  expectedJoinCursor: number,
+): Promise<MembershipRecord | undefined> {
+  const key = memberKey(channel, owner, lifecycleUid);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const cur = await readMember(kv, channel, owner, lifecycleUid);
+    if (!cur) return undefined; // record gone
+    const r = cur.record;
+    // Only flip OUR exact open pending join. A different generation (rejoin), a different joinCursor, or
+    // a set leaveCursor (a SAME-generation leave that tombstoned while catch-up ran) ⇒ superseded: refuse.
+    if (r.generation !== expectedGeneration || r.joinCursor !== expectedJoinCursor || r.leaveCursor !== undefined)
+      return undefined;
+    if (r.activated) return r; // already flipped — idempotent
+    const next: MembershipRecord = { ...r, activated: true, updatedAt: Date.now() };
+    try {
+      await kv.update(key, new TextEncoder().encode(JSON.stringify(next)), cur.revision);
+      return next;
+    } catch {
+      continue; // revision moved under us (a concurrent leave/rejoin) — re-read and re-check
+    }
+  }
+  return undefined; // CAS kept losing to concurrent writes — treat as superseded (honest degrade)
+}
+
+/** Permanently remove a membership record (GC / footprint deletion — revocation deletes the footprint
+ *  AFTER invalidating creds). Distinct from {@link tombstoneMember}, which keeps the record so late
+ *  durable entries are denied by the cursor; only call this past the retention horizon. */
+export async function deleteMember(kv: KV, channel: string, owner: string, lifecycleUid: string): Promise<void> {
+  await kv.purge(memberKey(channel, owner, lifecycleUid));
+}
+
+/**
+ * Scan the registry, yielding every live (non-deleted) record matching the filter. `channel` →
+ * the rows on exactly that channel or family; `covering` → the rows that cover a concrete channel,
+ * its own and every family above it (fan-out's per-post list); `owner` → that owner's memberships.
+ * With no filter, every record. Tombstones (with `leaveCursor`) ARE yielded — a caller that wants only
+ * currently-open memberships filters on `leaveCursor === undefined`.
+ *
+ * ONE pass. This was a `keys()` scan plus a sequential per-key `get()`, which cost one round trip
+ * per surviving key; a filtered caller paid for the keys that matched, an unfiltered one paid for
+ * all of them. The filtering is still done in code (the registry stays the single canonical source;
+ * a derived channel→members index remains a separate, deferred decision), but the READ is now
+ * independent of record count.
+ */
+export async function listMembers(
+  kv: KV,
+  filter: { channel?: string; covering?: string; owner?: string } = {},
+): Promise<MembershipRecord[]> {
+  const out: MembershipRecord[] = [];
+  for (const e of await liveKvEntries(kv)) {
+    const parsed = parseMemberKey(e.key);
+    if (!parsed) continue;
+    // `parsed.principal` is the member's owner+actor dot-form (membership is per-agent); the
+    // members.ts API calls this identity token `owner` throughout — under the owner+actor grammar an
+    // "owner" here IS the full principal `<owner>.<actor>`, so `filter.owner` compares to it directly.
+    if (filter.channel !== undefined && parsed.channel !== filter.channel) continue;
+    if (filter.covering !== undefined && parsed.channel !== filter.covering &&
+      !(isChannelFamily(parsed.channel) && subjectMatches(parsed.channel, filter.covering))) continue;
+    if (filter.owner !== undefined && parsed.principal !== filter.owner) continue;
+    // Same decode + skip-garbled behaviour readMember applies; the DEL/PURGE half is already handled
+    // by the collapse in liveKvEntries.
+    try {
+      out.push(e.json<MembershipRecord>());
+    } catch {
+      /* skip undecodable */
+    }
+  }
+  return out;
+}
+
+/** True if a record makes the owner an **eligible durable recipient** for a CHAT message at `seq`:
+ *  the membership interval `joinCursor < seq <= leaveCursor` (open leave ⇒ no upper bound). The single
+ *  interval rule shared by fan-out routing and the trusted reader's re-auth (SPEC §7 L355-356) so they
+ *  can't drift. A tombstone stays interval-eligible for its PRE-leave window (`seq <= leaveCursor`) —
+ *  "leave is a hard read boundary" is the leaveCursor cutoff, not a drop of in-interval entries.
+ *
+ *  This is a pure DELIVERY predicate, deliberately INDEPENDENT of `activated`. `activated` is a
+ *  COMPLETENESS/reporting flag (it gates `durableJoin`'s return value + `channelMembers`), NOT a
+ *  delivery gate: a `durable-active` record is committed `activated:false` and routes in-interval
+ *  *immediately* so no live message published during activation catch-up is lost — only the *report*
+ *  (durable:true / member listing) waits for the catch-up to confirm. Gating delivery on `activated`
+ *  instead dropped the very catch-up + post-fence messages activation exists to deliver (the
+ *  activation race): the trusted reader ack-dropped catch-up dinbox entries and fan-out skipped
+ *  post-fence/pre-activation messages, both before the flip. */
+export function durableEligible(rec: MembershipRecord, seq: number): boolean {
+  if (seq <= rec.joinCursor) return false;
+  if (rec.leaveCursor !== undefined && seq > rec.leaveCursor) return false;
+  return true;
+}
+
+/** Per members-registry handle: the inventory pass running now, and the next one, not yet started. */
+const inventoryPasses = new WeakMap<KV, { running?: Promise<KvEntry[]>; next?: Promise<KvEntry[]> }>();
+
+/** One complete pass over `kv` that starts after this call: the queued pass if one has not started, or a
+ *  new one queued behind the running pass. Concurrent inventories share it, so N of them cost at most two
+ *  passes, and each still reads a pass that began after it was asked. A failed pass fails every caller. */
+function inventoryPassAfterNow(kv: KV): Promise<KvEntry[]> {
+  let passes = inventoryPasses.get(kv);
+  if (passes === undefined) inventoryPasses.set(kv, (passes = {}));
+  const state = passes;
+  if (state.next) return state.next;
+  const next = (state.running ?? Promise.resolve([])).catch(() => []).then(() => {
+    state.next = undefined;
+    const pass = liveKvEntries(kv);
+    state.running = pass;
+    const done = () => { if (state.running === pass) state.running = undefined; };
+    pass.then(done, done);
+    return pass;
+  });
+  state.next = next;
+  return next;
+}
+
+/**
+ * Authoritative membership inventory for one exact lifecycle: reads every live entry from the
+ * members registry and derives the complete, lifecycle-exact list of concrete channels and families
+ * holding durable membership rows for `(principal, lifecycleUid)`.
+ *
+ * Unlike {@link listMembers}, which silently skips undecodable JSON values for display and fan-out,
+ * this inventory derives membership keys from validated exact keys (`<channel>/<principal>.<lifecycleUid>`)
+ * so malformed or corrupt durable rows cannot be omitted from terminal teardown.
+ *
+ * Concurrent calls on one handle share a pass that began after each call (a mass stop asks for every
+ * seat's inventory at once). The key grammar leaves no native filter for one lifecycle: the channel's
+ * last segment and the principal's owner share a subject token, and channel depth varies.
+ */
+export async function listLifecycleMemberChannels(
+  kv: KV,
+  principal: string,
+  lifecycleUid: string,
+): Promise<string[]> {
+  const pr = parsePrincipalKey(principal);
+  if (!pr) throw new Error(`listLifecycleMemberChannels: invalid principal "${principal}"`);
+  assertLifecycleToken(lifecycleUid);
+  const channels = new Set<string>();
+  for (const e of await inventoryPassAfterNow(kv)) {
+    const parsed = parseMemberKey(e.key);
+    if (!parsed) continue;
+    if (parsed.principal !== principal || parsed.lifecycleUid !== lifecycleUid) continue;
+    if (!isConcreteChannel(parsed.channel) && !isChannelFamily(parsed.channel)) continue;
+    channels.add(parsed.channel);
+  }
+  return [...channels].sort();
+}

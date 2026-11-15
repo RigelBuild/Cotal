@@ -1,0 +1,192 @@
+/**
+ * A STALLED PRESENCE WATCH REBUILDS, AND ITS PREDECESSOR IS THE BROKER'S TO REAP.
+ *
+ * WHAT WAS MEASURED. A KV watch is an ordered push consumer. The client rebuilds it whenever it
+ * stops hearing from the server (`idle_heartbeat` 30s, two missed), and nats.js rebuilds by deleting
+ * its predecessor before creating the successor (`pushconsumer.ts` reset: `api.delete(stream, name)`
+ * then a new `oc_<nuid>_<serial+1>`). The elevated dashboard credential holds CREATE and INFO on the
+ * presence bucket and NOT DELETE: the generated name cannot be pinned at mint time, and the only
+ * expressible delete grant is stream-wide, which let one observer delete another principal's live
+ * watch cursors (#691). The endpoint reads the same publish claims that minting recorded and does not
+ * send that delete when they exclude it (#4123), so the broker logs nothing and the predecessor lives
+ * until its 5-minute inactivity threshold. A credential whose claims do include the delete still sends
+ * it, and the broker answers.
+ *
+ * THE STIMULUS IS A STALL, NOT A DROP, and the difference is the whole reason this fixture works.
+ * The client CANCELS the heartbeat monitor on a `disconnect` and restarts it on `reconnect`, so
+ * severing the connection - even for half a minute - provokes nothing. What provokes a rebuild is a
+ * link that stays UP while the bytes stop moving, which is what a saturated WAN link is. Measured
+ * both ways here: the drop arm is the control that proves the stall arm is doing the work.
+ *
+ * THE CLAIM. The stall rebuilds the watch, the rebuild publishes no delete of its predecessor (the
+ * broker log has no consumer-delete line), the predecessor is still listed after the rebuild, left to
+ * the inactive threshold, and the endpoint raises no `error` for the delete it did not send.
+ *
+ * Needs nats-server on PATH. Runs ~2 minutes: the heartbeat window is 30s and the client needs two.
+ * Run: pnpm smoke:presence-watch-rebuild:auth
+ */
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import net from "node:net";
+import { connect } from "@nats-io/transport-node";
+import {
+  CotalEndpoint, isReachable, createSpaceAuth, serverConfig, mintCreds, newIdentity,
+  setupSpaceStreams, standaloneConnectOpts, presenceBucket,
+} from "../src/index.js";
+import { pickFreePort } from "./_free-port.js";
+import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
+
+let cells = 0, failed = 0;
+const ok = (name: string, cond: boolean, detail?: unknown): void => {
+  cells++;
+  if (cond) return;
+  failed++;
+  console.log(`  x FAIL  ${name}${detail === undefined ? "" : `: ${JSON.stringify(detail)}`}`);
+};
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** A pass-through that can STALL (sockets open, bytes held) or DROP (sockets destroyed). Two
+ *  different failures, and the ordered consumer only reacts to one of them. */
+function link(listen: number, target: number) {
+  let stalled = false;
+  const held: { to: net.Socket; chunk: Buffer }[] = [];
+  const live = new Set<net.Socket>();
+  const pipe = (from: net.Socket, to: net.Socket) => {
+    from.on("data", (chunk: Buffer) => {
+      if (stalled) held.push({ to, chunk });
+      else if (!to.destroyed) to.write(chunk);
+    });
+    from.on("error", () => to.destroy());
+    from.on("close", () => to.destroy());
+  };
+  const srv = net.createServer((client) => {
+    const up = net.connect(target, "127.0.0.1");
+    live.add(client); live.add(up);
+    client.on("close", () => live.delete(client));
+    up.on("close", () => live.delete(up));
+    pipe(client, up);
+    pipe(up, client);
+  });
+  srv.listen(listen, "127.0.0.1");
+  return {
+    stall: () => { stalled = true; },
+    resume: () => { stalled = false; for (const h of held.splice(0)) if (!h.to.destroyed) h.to.write(h.chunk); },
+    drop: () => { for (const s of live) s.destroy(); },
+    close: () => { for (const s of live) s.destroy(); srv.close(); },
+  };
+}
+
+const PORT = await pickFreePort();
+const PROXY = await pickFreePort();
+const MON = await pickFreePort();
+const SERVERS = `nats://127.0.0.1:${PORT}`;
+const SLOW = `nats://127.0.0.1:${PROXY}`;
+const space = `preswatch-${randomUUID().slice(0, 8)}`;
+const auth = await createSpaceAuth(space);
+const dir = mkdtempSync(join(tmpdir(), SMOKE_BROKER_TOKEN));
+// The monitoring endpoint, because no minted profile in this repo holds `$JS.API.CONSUMER.LIST`:
+// an observer that had to be granted a new verb in order to observe the defect would be reporting
+// on a broker it changed.
+writeFileSync(join(dir, "server.conf"),
+  serverConfig(auth, [auth], { transport: { kind: "plaintext" }, port: PORT, storeDir: join(dir, "js") })
+  + `\nhttp: "127.0.0.1:${MON}"\n`);
+let log = "";
+const broker = spawn("nats-server", ["-c", join(dir, "server.conf")], { stdio: ["ignore", "pipe", "pipe"] });
+broker.stdout?.on("data", (d: Buffer) => { log += d.toString(); });
+broker.stderr?.on("data", (d: Buffer) => { log += d.toString(); });
+const releaseBroker = teardownOnSignal(broker, dir);
+const gate = link(PROXY, PORT);
+try {
+  let up = false;
+  for (let i = 0; i < 100; i++) { if (await isReachable(SERVERS)) { up = true; break; } await wait(100); }
+  if (!up) throw new Error(`fixture broker never came up on ${SERVERS} - refusing to report on a server that never started`);
+
+  const setupCreds = await mintCreds(auth, newIdentity(), "provisioner");
+  await setupSpaceStreams({ servers: SERVERS, space, creds: setupCreds });
+  const webCreds = await mintCreds(auth, newIdentity(), "admin"); // the profile `cotal web` mints
+
+  const stream = `KV_${presenceBucket(space)}`;
+  const consumers = async (): Promise<string[]> => {
+    const j = await (await fetch(`http://127.0.0.1:${MON}/jsz?consumers=true&streams=true&accounts=true`)).json() as
+      { account_details?: { stream_detail?: { name: string; consumer_detail?: { name: string }[] }[] }[] };
+    const out: string[] = [];
+    for (const acc of j.account_details ?? []) for (const st of acc.stream_detail ?? [])
+      if (st.name === stream) for (const c of st.consumer_detail ?? []) out.push(c.name);
+    return out.sort();
+  };
+  const deleteLines = (): string[] =>
+    log.split("\n").filter((l) => l.includes(`CONSUMER.DELETE.${stream}`));
+
+  // The dashboard's observer shape: watches presence, registers none, consumes nothing. Since #5183
+  // the default 10s transport ping disconnects a stalled link before two watch heartbeats are
+  // missed, and a disconnect rebuilds nothing (1.2). The explicit 120s ping keeps the link up
+  // through the stall so the watch's own rebuild path is the one measured.
+  const ep = new CotalEndpoint({
+    space, servers: SLOW, creds: webCreds, channels: [], consume: false,
+    registerPresence: false, watchPresence: true, card: { name: "web", kind: "endpoint" },
+    transportPingIntervalMs: 120_000, transportMaxPingOut: 2,
+  });
+  const deleteErrors: string[] = [];
+  ep.on("error", (e: Error) => {
+    // The stall raises connection errors by design; 1.6 claims none of them names a presence consumer delete.
+    const subject = (e.cause as { subject?: string } | undefined)?.subject;
+    if (subject?.startsWith(`$JS.API.CONSUMER.DELETE.${stream}.`)) deleteErrors.push(subject);
+  });
+  await ep.start();
+  await wait(1200);
+
+  const atStart = await consumers();
+  ok("1.1 CONTROL: the presence watch has a consumer at all (nothing below means anything without this)",
+    atStart.length === 1, atStart);
+  const predecessor = atStart[0];
+
+  // A DROP IS THE WRONG STIMULUS, and this arm is why that sentence is a measurement rather than a
+  // claim: the client cancels its heartbeat monitor while disconnected, so nothing rebuilds.
+  gate.drop();
+  await wait(6000);
+  const afterDrop = await consumers();
+  ok("1.2 CONTROL: a dropped connection does NOT rebuild the watch (so 1.4 is the stall's doing)",
+    afterDrop.includes(predecessor), { predecessor, afterDrop });
+
+  // THE STIMULUS. Two missed 30s heartbeats with the link UP.
+  gate.stall();
+  await wait(70_000);
+  gate.resume();
+  await wait(10_000);
+
+  const afterStall = await consumers();
+  const serial = (n: string): number => Number(n.slice(n.lastIndexOf("_") + 1));
+  ok("1.3 the stall REBUILT the watch (the live consumer is a later incarnation)",
+    afterStall.some((n) => serial(n) > serial(predecessor)), { predecessor, afterStall });
+  ok("1.4 the rebuild never publishes the predecessor delete (the broker logs no consumer delete)",
+    deleteLines().length === 0, deleteLines().slice(0, 2));
+  ok("1.5 so the predecessor is still listed, left to the broker's inactive threshold",
+    afterStall.includes(predecessor), { predecessor, afterStall });
+  ok("1.6 and the client treats the skipped delete as handled: no endpoint error names a delete",
+    deleteErrors.length === 0, deleteErrors.slice(0, 2));
+
+  await ep.stop().catch(() => { /* the stall may have left it mid-rebuild */ });
+
+  // POSITIVE CONTROL: provoke a violation deliberately, on a subject this credential is genuinely
+  // denied, and require that it shows up in the same log. 1.4 reads the same log for a consumer delete
+  // and requires none, so a fixture that cannot see a refusal would pass 1.4 for the wrong reason.
+  const nc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds: webCreds, tls: false }), maxReconnectAttempts: 0 });
+  nc.publish(`$JS.API.STREAM.DELETE.${stream}`, new TextEncoder().encode("{}"));
+  await nc.flush().catch(() => { /* the violation IS the point */ });
+  await wait(600);
+  ok("1.7 POSITIVE CONTROL: this fixture reads a refusal from this log, so 1.4's empty reading is real",
+    log.split("\n").some((l) => /Violation/i.test(l) && l.includes(`STREAM.DELETE.${stream}`)),
+    log.split("\n").filter((l) => /Violation/i.test(l)).slice(-2));
+  await nc.drain().catch(() => { /* already gone */ });
+} finally {
+  gate.close();
+  releaseBroker();
+  broker.kill("SIGKILL");
+  rmSync(dir, { recursive: true, force: true });
+}
+
+console.log(`\npresence watch rebuild smoke: ${cells - failed} passed, ${failed} failed`);
+if (failed) process.exit(1);

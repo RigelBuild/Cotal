@@ -1,0 +1,1602 @@
+/**
+ * The Cotal OpenCode plugin — loaded in-process by `opencode serve` (via the inline config the
+ * connector sets). The serve shim attaches a foreground `opencode` TUI to the session this plugin
+ * owns, so the human watches (and can type into) the exact session the agent drives. It turns the
+ * session into a first-class mesh peer, at parity with the Claude Code connector:
+ *
+ *  • holds the {@link MeshAgent} (NATS endpoint, inbox, presence) for the server's lifetime;
+ *  • registers the cotal_* tools natively, rendered from the SHARED {@link cotalToolSpecs}
+ *    (`./tools.ts`) — same surface as Claude Code, incl. channels / join / leave / channel_info;
+ *  • maps OpenCode bus events to presence (idle | working | waiting | offline);
+ *  • owns ONE session (created at boot) and drives it: it injects each inbox batch as a turn through
+ *    the authenticated OpenCode server HTTP API (the same server the TUI is attached to), acking ON
+ *    TURN COMPLETION (so a crash/error redelivers). Automatic pending messages are also injected
+ *    into the next native prompt creation when a human/API prompt starts in the attached session;
+ *    quiet ambient remains pull-only.
+ *    Delivery is **attention-aware** (open/dnd/focus) and never interrupts a running turn.
+ *
+ * Identity comes from COTAL_* env (the plugin runs in the opencode process and inherits it).
+ * No identity → inert, so an operator's own `opencode` never joins as a stray peer.
+ *
+ * WHAT THIS CONNECTOR GATES, AND WHAT IT DOES NOT. Every guard below sits on the connector's own
+ * submission path: `drive` is where this connector starts a turn, and `swapping`, `stopping`,
+ * `busy` and `bootPrompt` decide whether IT submits one. The host's own prompt path is a different
+ * road. A human typing in the attached TUI, or an API caller hitting the server directly, reaches
+ * `chat.message`. This connector's hooks return `Promise<void>` and influence the host by MUTATING
+ * the output object they are handed, and `chat.message`'s output names no cancel and no skip. So a
+ * natively submitted prompt REACHES THE HOST whether or not this connector is cutting over, busy,
+ * or holding the boot floor: none of those flags is consulted on that path. `stopping` is the
+ * exception: the `chat.message` entry in `hooks` refuses a prompt during teardown by rejecting.
+ * What the host does with an admitted prompt is OpenCode's business, not this connector's, and it
+ * is not always a new model turn. At the pinned 1.16.2, a prompt arriving while the session is
+ * already running is coalesced into the run in flight rather than starting a second one, which is
+ * the same COALESCE behaviour `busy` exists to avoid provoking.
+ *
+ * Read every ordering and precedence claim in this file with that scope: they are claims about
+ * connector-submitted turns against each other, not about the host's turns. Where a specific
+ * comment says "connector-submitted" it is inheriting this paragraph, not adding a new caveat.
+ */
+import { loadAgentFile, type PresenceStatus } from "@cotal-ai/core";
+import {
+  configFromEnv,
+  eventPlaneArmed,
+  hasIdentity,
+  MeshAgent,
+  startControlServer,
+  formatInjection,
+  fmtFrom,
+  fmtChannel,
+  briefing,
+  AguiEmitter,
+  AguiEmitterHolder,
+  eventPlaneStopped,
+  BoundStartSource,
+  EventWal,
+  FileSubjectFrontier,
+  ensureEventWalDir,
+  eventWalLocation,
+  resolveEventsStateRoot,
+  controlFromEnv,
+  scrubLaunchMaterial,
+  registerOnceExit,
+  type InboxItem,
+  type PrincipalLock,
+} from "@cotal-ai/connector-core";
+import { principalKey } from "@cotal-ai/core";
+import { randomUUID } from "node:crypto";
+import { rm, rmdir } from "node:fs/promises";
+import { OpenCodeSessionSource, type OpenCodeMessageWithParts, type OpenCodeRecord } from "./agui-source.js";
+import { createOpenCodeMapper, type OpenCodeMapper } from "./agui-map.js";
+import type { Plugin, Hooks, ToolDefinition } from "@opencode-ai/plugin";
+import { buildCotalTools } from "./tools.js";
+
+function log(msg: string): void {
+  process.stderr.write(`[cotal-connector] ${msg}\n`);
+}
+
+/** Process-global guard: opencode loads the plugin once per app/worktree scope, so the function
+ *  can run more than once in a single process. We want exactly one mesh endpoint — so the first
+ *  call wires up the agent, and every call returns the *same* hooks (the same tools, bound to that
+ *  one agent), whichever scope opencode ends up using. */
+const guard = globalThis as { __cotalOpencodeHooks?: Hooks };
+const ERROR_RETRY_INITIAL_MS = 1_000;
+const ERROR_RETRY_MAX_MS = 30_000;
+const INTERRUPT_INTENT_TTL_MS = 30_000;
+
+/** The machine-stable half of the retirement line. The suite asserts on THIS, never on the sentence
+ *  around it: a guard keyed on human prose dies the first time someone rewords a log message, and it
+ *  dies silently, which is the failure mode a guard exists to prevent. Reword the sentence freely;
+ *  do not change this token without updating the cells that import it. */
+export const SESSION_RETIRED = "opencode-session-retired";
+/** A bounded wait gave up. Exported so a cell keys on the token rather than on the sentence. */
+export const SETTLE_ABANDONED = "opencode-settle-abandoned";
+/** A retired session's write-ahead log was removed. Exported for the same reason as the two above:
+ *  a cell keys on the token, never on the sentence around it. */
+export const WAL_REAPED = "opencode-wal-reaped";
+/** A retired session's write-ahead log was KEPT, and the line says which of the reasons applied.
+ *  This is the token the reaping cell grades, because the lifetime is the claim and the deletion is
+ *  only the easy half of it. */
+export const WAL_KEPT = "opencode-wal-kept";
+/** The shared shape of a pre-join model refusal: `"<model>: <detail>. Refusing before join"`.
+ *  Exported so the 2.x adapter's own check (a different route, `/api/model`) produces the same
+ *  sentence shape as `verifyServerModel` below without duplicating it. */
+export function modelRefusalSentence(selectedModel: string, detail: string): string {
+  return `${selectedModel}: ${detail}. Refusing before join`;
+}
+export async function verifyServerModel(serverUrl: string, serverAuth: string, selectedModel: string): Promise<void> {
+  const response = await fetch(`${serverUrl}/provider`, {
+    headers: { authorization: serverAuth },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) throw new Error(`opencode connector: server /provider returned HTTP ${response.status} while checking model ${selectedModel}`);
+  const listing = await response.json() as { all?: Array<{ id?: string; models?: Record<string, unknown> }> };
+  const slash = selectedModel.indexOf("/");
+  const provider = selectedModel.slice(0, slash);
+  const model = selectedModel.slice(slash + 1);
+  if (slash < 1 || !model || !listing.all?.some((entry) => entry.id === provider && Object.hasOwn(entry.models ?? {}, model)))
+    throw new Error(modelRefusalSentence(selectedModel, "CLI opencode models --pure --verbose may list it; server /provider does not"));
+}
+/**
+ * How long one swap step may hold the chain, or a teardown may hold the process, before it is
+ * abandoned out loud rather than waited on forever.
+ *
+ * A GENUINE-HANG BACKSTOP, deliberately far above normal settle latency. The distance is the point:
+ * a bound near normal latency would fire on steps that were merely slow, and releasing those early
+ * is the cost the distance buys down. It does NOT drop them, because nothing here cancels: a
+ * released step keeps running and can publish late and out of order. The
+ * measure comes from a cell rather than a guess: `reset:the /new drain puts the old session's tail
+ * and its close ON THE WIRE` asserts that a whole drain, flush plus run close plus settle plus the
+ * broker round trip, AND a read-back of the subject both complete inside the 2s the suite waits.
+ * So a healthy settle in that fixture is comfortably under two seconds and this is five times that.
+ * Reaching it is treated as a hang; it is NOT proof the step will never return. A broker or network
+ * pause can outlast the bound and then recover, which is exactly why the abandoned step is left
+ * uncancelled and may still publish afterwards.
+ */
+const SWAP_SETTLE_MS = 10_000;
+/**
+ * How long teardown waits for interactive work it ALREADY ADMITTED before it attempts departure.
+ *
+ * DERIVED, NOT PICKED. It has to be under the shortest runtime grace window, which is 1.5s for tmux
+ * and cmux against 3s for the built-in pty, because a stop that spends longer than that waiting is a
+ * stop whose offline publish is killed before it lands. That is the failure the publish-before-join
+ * ordering exists to prevent, so a bound above the grace window would reintroduce it here. 1s leaves
+ * room for the publish itself, and what it waits on is one presence round trip or one tool call, not
+ * an event drain: those are excluded and joined afterwards.
+ */
+const INTAKE_SETTLE_MS = 1_000;
+
+/**
+ * Races `work` against a `ms` timeout so a stuck settle is abandoned out loud rather than waited on
+ * forever (see the note at its call sites in `quiesce`). Exported: the 2.x adapter's own teardown
+ * uses the same bounded-settle shape rather than a second copy of it.
+ */
+async function settleWithin(work: Promise<unknown> | undefined, ms: number, what: string): Promise<boolean> {
+  if (work === undefined) return true;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+    timer.unref?.();
+  });
+  try {
+    const settled = await Promise.race([work.then(() => true, () => true), expired]);
+    if (!settled)
+      log(
+        `${SETTLE_ABANDONED} ${what} did not settle within ${ms}ms, so it is abandoned: the WAIT ` +
+          `stopped, the work did not, and nothing here can cancel it. It may still publish, ` +
+          `possibly after frames from whatever replaced it, and a run it had open may stay open. ` +
+          `Ordering is guaranteed for a step that settles inside the bound, not for this one. The ` +
+          `plane continues rather than wedging every later step behind it.`,
+      );
+    return settled;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+export { settleWithin };
+
+/**
+ * The buffered-inbox + pending-run-turn composition that goes out ahead of a native prompt, read by
+ * {@link SurfacedBatch.inject}. Returns `undefined` when there is nothing to prepend.
+ */
+export function computeInjection(agent: MeshAgent): {
+  prefix: string;
+  surfacedIds: string[];
+  turnIds: string[];
+} | undefined {
+  const items = agent.peekInbox("automatic");
+  const turnPeek = agent.peekPendingTurns();
+  if (items.length === 0 && !turnPeek) return undefined;
+  const inj = items.length > 0 ? formatInjection(items) : undefined;
+  if (!inj && !turnPeek) return undefined;
+  const prefix = [inj, turnPeek?.text].filter(Boolean).join("\n\n");
+  return { prefix, surfacedIds: inj ? items.map((i) => i.recvKey) : [], turnIds: turnPeek?.goalIds ?? [] };
+}
+
+/**
+ * The inbox batch a turn carries, by receive key: THE SEAT'S ACK BOUNDARY, defined here once and
+ * driven by both adapters (the 1.x hooks below and `plugin2.ts`), so they cannot drift on what is
+ * acked when a turn ends and what is left to redeliver. A batch is surfaced into a turn and held in
+ * flight while it runs; the turn's end acks it when the turn finished or was stopped, and releases
+ * it when the turn failed. It is OPEN from the surface until that end, and a native prompt carries
+ * nothing while it is: its deliveries are still in the inbox, so a second batch would carry them
+ * again and settle them with a turn that never ran them.
+ */
+export class SurfacedBatch {
+  private carried: string[] = [];
+  private inTurn = false;
+
+  constructor(private readonly agent: MeshAgent) {}
+
+  /** A surfaced batch's turn has not ended yet. */
+  get open(): boolean {
+    return this.inTurn;
+  }
+
+  /** The receive keys the batch carries. */
+  get keys(): readonly string[] {
+    return this.carried;
+  }
+
+  /** Make `keys` the batch, HELD IN FLIGHT for as long as its turn runs. A turn outlasting the
+   *  consumer's ack wait is ordinary, and while the batch is held the agent restarts that wait, so
+   *  the broker does not hand a role request this seat is still working on to another reader of its
+   *  role. Refused at the hold ceiling, and then nothing may be surfaced. */
+  surface(keys: string[]): boolean {
+    if (!this.agent.holdInFlight(keys)) return false;
+    this.agent.releaseInFlight(this.carried);
+    this.carried = keys;
+    this.inTurn = true;
+    return true;
+  }
+
+  /** Carry the buffered inbox and pending run turns into a native prompt, returning the prefix that
+   *  goes ahead of its text, or `undefined` when there is nothing to carry or a batch is open. The
+   *  inbox keys it carries become the open batch; run turns alone open none, having nothing to ack.
+   *  The prompt running with the prefix in place IS the delivery, so the run turns commit here. */
+  inject(): string | undefined {
+    if (this.inTurn) return undefined;
+    const computed = computeInjection(this.agent);
+    if (!computed) return undefined;
+    if (computed.surfacedIds.length > 0 && !this.surface(computed.surfacedIds)) return undefined;
+    if (computed.turnIds.length) this.agent.commitSurfacedTurns(computed.turnIds);
+    return computed.prefix;
+  }
+
+  /** Ack exactly the surfaced deliveries by their receive keys (#624: an id-less item's wire id
+   *  would be "", unaddressable). Overflow may already have removed some; MeshAgent marks every
+   *  confirmed delivery handled while only acking entries still present. */
+  ack(): void {
+    if (this.carried.length > 0) this.agent.drainInboxDeliveries(this.carried);
+    this.abandon();
+  }
+
+  /** Stop holding the batch: its deliveries are no longer renewed, so whatever is still unacked
+   *  redelivers once its ack wait runs out. */
+  abandon(): void {
+    this.agent.releaseInFlight(this.carried);
+    this.carried = [];
+    this.inTurn = false;
+  }
+}
+
+export const cotal: Plugin = async () => {
+  // No identity → a plain `opencode`, not a launcher-spawned agent. Stay inert.
+  if (!hasIdentity()) {
+    log("no COTAL_NAME — not a managed session; staying off the mesh");
+    return {};
+  }
+  if (guard.__cotalOpencodeHooks) return guard.__cotalOpencodeHooks; // one agent; reuse the hooks
+  const config = configFromEnv();
+  const control = controlFromEnv();
+  // Read before the agent start below is queued, so a bad value refuses with nothing started.
+  const eventsArmed = eventPlaneArmed(config);
+  // Both readers of the launch material have now read it, so the pointer is dropped: the shells and
+  // tools this seat runs from here on inherit no reference to its credential or control token.
+  scrubLaunchMaterial();
+  config.connector = "opencode"; // advertise the host harness on our AgentCard (meta.connector)
+  const serverUrl = process.env.COTAL_OPENCODE_SERVER_URL?.trim();
+  const serverUsername = process.env.OPENCODE_SERVER_USERNAME?.trim() || "opencode";
+  const serverPassword = process.env.OPENCODE_SERVER_PASSWORD?.trim();
+  if (!serverUrl || !serverPassword) throw new Error("opencode connector: missing COTAL_OPENCODE_SERVER_URL/OPENCODE_SERVER_PASSWORD");
+  const serverAuth = `Basic ${Buffer.from(`${serverUsername}:${serverPassword}`).toString("base64")}`;
+
+  const selectedModel = process.env.COTAL_MODEL?.trim();
+  const modelReady = (async () => {
+    if (!selectedModel) return;
+    await verifyServerModel(serverUrl, serverAuth, selectedModel);
+  })();
+
+  const agent = new MeshAgent(config);
+  // OpenCode lazily loads plugins while answering /provider. Awaiting that request in this
+  // plugin's initializer would deadlock the server. Return hooks first, but do not join or
+  // create a session until the server has answered. This is a managed serve process: on a
+  // refusal, exit it so the shim reports the failure instead of waiting for a handshake.
+  void modelReady.then(() => agent.start(), (error: Error) => {
+    log(error.message);
+    process.exit(1);
+  });
+
+  /**
+   * Publishes this session's activity as AG-UI events on `events.<owner>.<actor>`, iff COTAL_EVENTS
+   * is on. A personal `opencode` never publishes, because the launcher sets that variable only for
+   * a managed session.
+   */
+  let events: AguiEmitterHolder<OpenCodeRecord> | undefined;
+  /** Per session, the cursor of its end when the connector last reported a turn over. */
+  const turnEndedAt = new Map<string, string>();
+  /** This principal's event WAL lock, taken by whichever holder started first and held until the
+   *  FINAL event teardown. See the assignment site for why a retirement does not release it. */
+  let eventLock: PrincipalLock | undefined;
+  /** Swaps run ONE AT A TIME (#600). The drain below suspends and the plugin bus does not await this
+   *  handler (it dispatches `void hook.event(...)`), so without this a second top-level create lands
+   *  mid-drain, reads the same holder to retire, and its replacement overwrites the first one. A
+   *  rejected swap is absorbed here rather than propagated, so a failed drain does not reach the
+   *  chain and the swap queued behind it still runs. */
+  let swapChain: Promise<void> = Promise.resolve();
+  /**
+   * A cutover is in progress. Read by `drive`, which is where this connector submits a turn, so a
+   * caller that reaches `drive` is covered by this rather than carrying its own guard.
+   *
+   * Gating the drive inside `adoptSession` was not enough and that is the lesson here: adopting
+   * also clears `busy` and `driving`, and the inbox, wake and mention-wake handlers all start a
+   * turn on `!busy`. So closing the one door inside the adopt left three open beside it, and an
+   * ordinary inbound message during a cutover would prompt the new session while its replacement
+   * holder was not installed yet. Found by review, and it is the same shape as the defect this
+   * whole change exists for: a window closed at one consumer rather than at the thing they share.
+   */
+  let swapping = false;
+  /**
+   * ONE HOLDER PER SESSION, built on demand rather than once per process.
+   *
+   * A holder binds to one thread for the life of its emitter and refuses a second, terminally: the
+   * write-ahead log is keyed to the thread, so re-adopting would continue one session's epoch and
+   * sequence against another session's bytes. That refusal is correct and stays. What it means here
+   * is that `/new`, a second top-level session in the same OpenCode process, needs its own holder,
+   * its own emitter and its own log, which is the sequential-sessions-one-principal case the shared
+   * subject frontier exists for.
+   */
+  function newEventHolder(): AguiEmitterHolder<OpenCodeRecord> {
+    // Scoped to this holder, not to the process: the run-closed callback below has to reach the
+    // mapper, and the two are assigned at different times because the mapper is built inside the
+    // factory, keyed on the session the bus names.
+    let mapper: OpenCodeMapper | undefined;
+    // ONE source for the holder's lifetime. The holder re-establishes a stopped plane by calling
+    // this factory again, and the boundary captured below is the position the thread adopted at;
+    // a second capture would sit at the re-establish, and every message between the two would be
+    // lost without a word. Same rule as the Claude Code connector's holder.
+    let source: BoundStartSource<OpenCodeRecord> | undefined;
+    // Built LAZILY, on the first event that names a session: `start()` reaches the broker, and that
+    // work must not run for a session that never emits.
+    return new AguiEmitterHolder<OpenCodeRecord>(
+      async (id: string) => {
+        // Captured as the FACTORY'S FIRST ACT, before the mesh wait below: a lazily-built source
+        // otherwise positions itself on its own first read, which happens only after the mesh wait
+        // and everything else this bind does first, and anything the session writes to its message
+        // list in that window is silently dropped.
+        const bound =
+          source ??
+          (source = await (async () => {
+            const session = new OpenCodeSessionSource({
+              // The session's end when its turn was last reported over: a part still filling then
+              // is settled by that, not by marks it will never get.
+              endedAt: () => turnEndedAt.get(id),
+              // The SUPPORTED surface. `opencodeApi` is the same authenticated HTTP client the rest
+              // of this plugin uses, and `/session/{id}/message` is the endpoint the SDK's
+              // `session.messages()` calls. The SQLite store behind it is OpenCode's private
+              // business and its schema migrates, so nothing here reads it.
+              read: () => opencodeApi<OpenCodeMessageWithParts[]>(`/session/${encodeURIComponent(id)}/message`, undefined, 30_000),
+              // A revert is a legitimate user action, so the divergence is RECORDED and the stream
+              // continues. The read itself is already correct without this, because the cursor is
+              // compared as an order and never dereferenced as an identity.
+              onVanished: (cursor) => log(`AG-UI: the resume cursor was removed from the session (revert): ${cursor}`),
+            });
+            const boundary = await session.read(undefined);
+            return new BoundStartSource(session, boundary.cursor);
+          })());
+        // WAIT FOR THE MESH FIRST. This factory runs off the first `session.created` on the bus,
+        // and the shim creates that session before the mesh link binds, so `AguiEmitter.start`
+        // reached an endpoint that had not started and the holder died terminally for the rest of
+        // the session with one stderr line as the only record. Measured live on a hosted mesh:
+        // "AG-UI emitter stopped: endpoint not started" landed before "connected to" every time,
+        // with or without a boot prompt. The same wait the Claude Code connector takes; past its
+        // window it fails into the holder's terminal error rather than hanging the bus handler.
+        await agent.whenConnected(20_000);
+        // Throws rather than defaulting to the working directory: a write-ahead log written
+        // somewhere no later start looks for is a silent loss.
+        const workspaceRoot = resolveEventsStateRoot(process.env);
+        const threadId = id; // the native session IS the AG-UI thread
+        const principal = principalKey(agent.ep.principal.owner, agent.ep.principal.actor).key;
+        const { walPath, subjectPath, lock } = await ensureEventWalDir({ workspaceRoot, space: config.space, principal, threadId });
+        // HELD FOR THE PROCESS, NOT FOR THIS HOLDER, and holding it at all is the half #599 named
+        // that this connector did not do. `ensureEventWalDir` hands back the lock it actually took;
+        // dropping it on the floor here left `release()` with no caller anywhere in shipped source,
+        // so the file outlived every session and its record went on naming a pid that was alive but
+        // no longer publishing. A replacement process for the same principal and workspace then met
+        // a live owner and refused its own event plane. Reproduced across two processes: dispose the
+        // plugin with its host still up, start a second one, and the second one's emitter dies on
+        // this principal's lock.
+        //
+        // THE SWAP MUST NOT RELEASE IT. A lock is per PRINCIPAL and a holder is per THREAD, so a
+        // `/new` that released it would hand this principal to another process while this one is
+        // still publishing. `acquirePrincipalLock` returns the SAME object for the same path within
+        // a process, so every holder's start assigns the same lock here and the release below has
+        // exactly one thing to release.
+        eventLock = lock;
+        // Per PRINCIPAL, not per thread: without it a second session of this agent opens virgin,
+        // expects an empty subject its own first session filled, and halts for good.
+        const subjectFrontier = await FileSubjectFrontier.open(subjectPath, { space: config.space, principal });
+        const wal = await EventWal.open(walPath, { space: config.space, threadId, principal, subjectMayExist: false });
+        // Seeded from the bracket state that will exist AFTER `start` settles a pending frame: a
+        // re-established plane starts with the log's run open, and a mapper that opened with none
+        // would drop every record until the next prompt, whose `RUN_STARTED` the brackets refuse.
+        const resumeRunId = wal.pending === null ? wal.brackets?.run : wal.pending.brackets.run;
+        mapper = createOpenCodeMapper({ threadId, mintRunId: () => randomUUID(), resumeRunId });
+        return AguiEmitter.start<OpenCodeRecord>({
+          endpoint: agent.ep,
+          wal,
+          subjectFrontier,
+          source: bound,
+          map: mapper.map,
+          onUnreadable: (gap) => log(`AG-UI source: skipped an unreadable session record at offset ${gap.offset} (${gap.bytes} bytes): ${gap.reason}`),
+        });
+      },
+      {
+        onError: eventPlaneStopped({ log }),
+        // The session's end when `session.idle` or `session.error` reports the turn over: what
+        // names the turn a terminal held through an outage ends.
+        sourceEnd: async (sessionId: string) => {
+          const end = await new OpenCodeSessionSource({
+            read: () => opencodeApi<OpenCodeMessageWithParts[]>(`/session/${encodeURIComponent(sessionId)}/message`, undefined, 30_000),
+          }).end();
+          // Recorded for the session's source: every record at or before this end belongs to a
+          // turn that has ended, and is read as settled whatever its own marks say.
+          turnEndedAt.set(sessionId, end);
+          return end;
+        },
+        // The turn terminal closes a run the record stream never described, so without this the
+        // mapper would still believe that run is open, attribute the next records to it, and have
+        // the batch refused. Keyed on the id, so a newer run opened in between is left alone.
+        onRunClosed: (runId: string) => mapper?.forgetOpenRun(runId),
+      },
+    );
+  }
+  if (eventsArmed) events = newEventHolder();
+
+  /**
+   * Give this principal's event WAL lock back, ONCE, at the final event teardown.
+   *
+   * Idempotent by construction rather than by the lock's own tolerance: the field is cleared before
+   * the await, so a second teardown has nothing to release. A failure is logged and swallowed,
+   * because this runs inside a stop that must still reach `agent.stop()`; a lock file left behind by
+   * a failed unlink is reclaimable by the next start on this host, while a teardown that threw here
+   * would leave the endpoint up instead.
+   *
+   * THE RESIDUAL, STATED. Work abandoned by the bound above is not cancelled, so a straggler can
+   * still be writing this principal's log after the lock is gone and a replacement process could
+   * start beside it. That window is closed on the WRITE path, not here: `EventWal.write` refuses a
+   * handle whose generation the file has moved past. The lock decides who starts; the generation
+   * guard decides who may write.
+   */
+  const releaseEventLock = async (): Promise<void> => {
+    const lock = eventLock;
+    eventLock = undefined;
+    if (!lock) return;
+    try {
+      await lock.release();
+    } catch (e) {
+      log(`event WAL lock release failed: ${(e as Error).message}`);
+    }
+  };
+
+  /**
+   * REAP A RETIRED SESSION'S WRITE-AHEAD LOG, AND THE LIFETIME IS THE DECISION HERE, not the two
+   * unlinks that carry it out.
+   *
+   * A log exists so a later start can recover what its thread had NOT yet published: the one frame
+   * it froze before publishing, and the position it had reached. Removing it while either still
+   * matters destroys exactly what it is for, which is why the rule is a property of the log rather
+   * than a step in the swap:
+   *
+   *   a thread's log may be removed once (a) this connector has closed that thread's run on the wire
+   *   and the drain that did it SETTLED rather than spending its bound, and (b) the log on disk holds
+   *   no pending frame.
+   *
+   * (a) is the connector's half. An abandoned drain is uncancelled work that may still write here,
+   * and a directory removed out from under it turns a bounded delay into a lost frame. (b) is the
+   * log's own half and is the half that is actually about recovery: a pending frame is one whose
+   * fate the broker never confirmed, and only a start that reads this file can settle it.
+   *
+   * WHAT IS DELIBERATELY NOT REAPED, so the claim is not read wider than it is. The LIVE thread's
+   * directory survives teardown: a process leaves exactly ONE behind rather than one per `/new`,
+   * which is the accumulation #599 names, and that one is kept because a teardown is not a
+   * retirement, since no observer has been told the thread ended, and a start that adopts it again is
+   * precisely the case the log is for. The principal's own `subject.json` and `.lock` sit one level
+   * up, are shared by every thread, and are not this directory's to remove.
+   *
+   * The log is read back FROM DISK rather than from the retired emitter's object, because the
+   * emitter has been released by this point and the file is the only authority on what it left. A
+   * log that cannot be read is KEPT: this is a cleanup and never a repair.
+   */
+  async function reapRetiredWal(threadId: string, drained: boolean): Promise<void> {
+    // (a), AND IT IS FIRST BECAUSE IT IS THE CHEAPEST WAY TO BE WRONG. An abandoned drain is
+    // uncancelled work that may still write into this directory, so removing it turns a bounded
+    // delay into a lost frame. The decision lives here, next to the lifetime it belongs to, rather
+    // than at the call site: a caller holding half the rule is how the easy half gets shipped alone.
+    if (!drained) {
+      log(`${WAL_KEPT} ${threadId}: its drain spent the bound, so it may still be writing`);
+      return;
+    }
+    const principal = principalKey(agent.ep.principal.owner, agent.ep.principal.actor).key;
+    const { threadDir, walPath } = eventWalLocation({
+      workspaceRoot: resolveEventsStateRoot(process.env),
+      space: config.space,
+      principal,
+      threadId,
+    });
+    try {
+      const wal = await EventWal.open(walPath, { space: config.space, threadId, principal, subjectMayExist: false });
+      // (b), AND THIS IS THE HALF THAT IS ACTUALLY ABOUT RECOVERY. A pending frame is one whose fate
+      // the broker never confirmed, and only a start that reads this file can settle it.
+      if (wal.pending !== null) {
+        log(`${WAL_KEPT} ${threadId}: a frame is still pending, which is the one thing a later start recovers`);
+        return;
+      }
+    } catch (e) {
+      log(`${WAL_KEPT} ${threadId}: its log could not be read (${(e as Error).message})`);
+      return;
+    }
+    // NEVER A RECURSIVE REMOVE. `rm` here is `force` but NOT `recursive`, so it can only ever unlink
+    // the one file this layout puts in the directory, and `rmdir` then refuses outright if anything
+    // else is in there. A computed path plus a recursive delete is one wrong component away from
+    // taking a tree with it, and the components here are hashes of values from outside this process.
+    try {
+      await rm(walPath, { force: true });
+      await rmdir(threadDir);
+      log(`${WAL_REAPED} ${threadId}`);
+    } catch (e) {
+      log(`${WAL_KEPT} ${threadId}: ${(e as Error).message}`);
+    }
+  }
+
+  async function opencodeApi<T>(path: string, init?: RequestInit, timeoutMs = 10_000): Promise<T> {
+    const res = await fetch(`${serverUrl}${path}`, {
+      ...init,
+      signal: init?.signal ?? AbortSignal.timeout(timeoutMs),
+      headers: {
+        authorization: serverAuth,
+        "content-type": "application/json",
+        ...(init?.headers ?? {}),
+      },
+    });
+    if (!res.ok) throw new Error(`OpenCode HTTP ${res.status} ${res.statusText} for ${path}`);
+    if (res.status === 204) return undefined as T;
+    return (await res.json()) as T;
+  }
+
+  const def = process.env.COTAL_AGENT_FILE?.trim() ? loadAgentFile(process.env.COTAL_AGENT_FILE.trim()) : undefined;
+  const persona = def?.persona || undefined;
+
+  // This agent OWNS one top-level OpenCode session at a time. The serve shim attaches the foreground
+  // TUI to the boot session; if the human runs `/new` in that same TUI/process, OpenCode creates a
+  // replacement top-level session. We adopt that as a context reset while keeping the same MeshAgent
+  // and creds alive. Used to match our turn-end (idle) vs subagent idles.
+  let sessionID: string | undefined;
+  let busy = false; // a turn is running (ours via drive(), OR the human's via session.status) → don't
+  // prompt: opencode would COALESCE onto it (no reject). Released at EVERY turn end (completeTurn).
+  let driving = false; // re-entrancy guard around an in-flight server prompt
+  let primed = false; // persona goes out as `system` on the first CONNECTOR-SUBMITTED turn, once
+  // Set on the first connector-submitted turn whether or not there was a briefing to send: the flag
+  // records that the attempt was made, so an empty briefing is not retried on every later turn.
+  let briefed = false;
+  // The batch the current turn carries, acked on completion (per delivery, not count). Open while
+  // our turn is in flight → ignore a duplicate idle that isn't its end.
+  const batch = new SurfacedBatch(agent);
+  // Every turn end this session reports (an idle, an idle status, an error), counted when its event
+  // arrives and before any await. A submission compares the count across its send, because a turn can
+  // end before the answer arrives. 1.x events carry no log position, and OpenCode can report an idle
+  // with no busy before it (a cancel while idle, a run that fails before its first step), so every
+  // end after the send counts and none before it does.
+  let turnEndsSeen = 0;
+  const noteTurnEnd = (): void => {
+    turnEndsSeen += 1;
+  };
+  let errorRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let errorRetryMs = ERROR_RETRY_INITIAL_MS;
+  let interruptIntent: { sessionID?: string; expires: number } | undefined;
+  let stopping = false; // dispose/shutdown ran — stop waiting on anything that may never arrive
+  // The auto-submitted boot turn (`cotal spawn --prompt`), handed over by the connector in the
+  // child env. Undelivered, it HOLDS THE FLOOR in drive(): peer traffic that lands during boot stays
+  // buffered (completeTurn drives it when the boot turn ends), so the operator's prompt is the first
+  // CONNECTOR-SUBMITTED turn rather than a batch that raced it. It holds connector-driven traffic
+  // only. This flag is read in drive() and nowhere else, so a prompt submitted natively in the host
+  // does not consult it and can start a turn while the boot task is still waiting below. Cleared by
+  // the one drive that carries it, so no later readiness event can issue a second boot turn.
+  let bootPrompt = process.env.COTAL_OPENCODE_PROMPT?.trim() || undefined;
+  // The boot turn's preconditions are met (session exists, mesh link up). Kept separate from the
+  // text itself because the text must OUTLIVE a failed attempt: see `bootPending` below.
+  let bootReady = false;
+  /** The focus @mention wake that is owed and not yet submitted. A focus @mention is acked-and-dropped
+   *  at ingest, so it is not in the inbox and `pendingForWake()` does not count it; this nudge is the
+   *  only thing that tells the seat to go and look. On a channel that permits replay the message
+   *  itself stays recallable through `cotal_inbox`; without the wake the seat never learns to look.
+   *
+   *  SET AT INGEST, READ BY `drive`, CLEARED ONLY BY A LANDED SUBMISSION (#719). The `mention-wake`
+   *  handler writes it and `drive` never takes it out: no exit of `drive` holds the wake, so no early
+   *  return, refusal or failed submission has anything to put back. It used to be handed to `drive`
+   *  as a parameter and parked back here by hand at every exit that did not submit it, and an exit
+   *  that parked the wrong value (a drive carrying no wake writing `undefined` back after an await)
+   *  erased a wake another caller had parked meanwhile.
+   *
+   *  ONE SLOT, AND THAT IS THE DESIGN RATHER THAN A LIMIT WORTH APOLOGISING FOR. A later nudge
+   *  overwrites an earlier one here, and nothing is lost by that: the nudge names the SENDER and not
+   *  the message, so two @mentions from one sender are byte-identical, and the bodies are recovered
+   *  by the seat's own inbox pull from the server frontier rather than carried in this string.
+   *
+   *  THE LIMIT OF THAT ARGUMENT, stated because it is easy to over-read. Recovery is the CHANNEL'S
+   *  to give: `recallChannel` honours the per-channel replay gate, so on a `replay=off` channel it
+   *  returns nothing and the dropped body is gone whatever this slot does. That is deliberate:
+   *  focus must not become a history bypass for a channel that denies replay to everyone else, and
+   *  it is not a gap this connector may close, because buffering the body here IS that bypass. On
+   *  such a channel a wake can only tell the seat it was mentioned. What the slot owes is unchanged
+   *  and is all it ever owed: deliver the wake. What
+   *  must never happen is the slot reaching EMPTY while a caller's wake is still owed, because then
+   *  no pull is ever triggered. The invariant is that at least one wake survives to fire, not that
+   *  every wake is preserved. */
+  let pendingWake: string | undefined;
+  // BUMPED ON EVERY WRITE to the slot above. Value equality cannot stand in for identity here: two
+  // @mentions from the same sender produce a BYTE-IDENTICAL nudge, so comparing the strings would
+  // report "still the one I submitted" about a wake that arrived while the submission was in flight.
+  let wakeSeq = 0;
+  // WHAT THE CURRENT TURN SUBMITTED, so a `session.error` after a landed submission (#715) can tell
+  // whether a wake rode this turn. `pendingWake` cannot answer that: it is cleared once the
+  // submission lands, which is correct for a turn that finishes but leaves nothing for the error arm
+  // to re-arm from. Set beside that clear, read only by the `session.error` arm, and cleared by
+  // whichever of them runs first (the turn cannot both finish and fail).
+  let submittedWake: string | undefined;
+  /**
+   * Interactive work that has been admitted and has not finished. Teardown waits for THIS before it
+   * attempts departure, which is a different thing from refusing new work: the fence closes the
+   * door, and this covers whoever was already through it.
+   *
+   * It has to exist because a presence write is not atomic. `setStatus` assigns, awaits `setActivity`
+   * and then awaits `setStatus`, so a teardown beginning in that gap publishes offline BETWEEN the
+   * two and the parked call then puts the seat back to work after it has announced it left.
+   * Reproduced on the real plugin and broker, not reasoned: the roster read `working` after offline.
+   *
+   * TRACKED HERE AND AT THE TOOL WRAPPER: the hooks go through this helper, and the tools bypass it
+   * to reach the agent directly, so each of those two routes is tracked whole rather than by naming
+   * the methods it calls. Tracking a list of the agent's presence-writing METHODS instead would be
+   * the same enumeration this file has already got wrong twice, and it would miss a tool that sends
+   * rather than publishes, which no amount of repairing presence afterwards can take back.
+   *
+   * THE PROMPT HOOK'S MODEL RECORD IS TRACKED TOO, at its own call site, because it publishes
+   * presence without passing through this helper. Its record cannot choose a status and is submitted
+   * before departure's, but whether departure is then the later write depends on how the endpoint
+   * orders its KV writes, a layer this file does not own. Tracking it makes that ordering true by
+   * construction.
+   *
+   * WHICH LEAVES A WEAKER PROPERTY THAN THE FENCE HAS, and the difference is worth being plain
+   * about. Admission is closed by MEMBERSHIP: a door is fenced by being in the intake table, so one
+   * added later cannot be forgotten. Presence tracking is by CALL SITE: these three are every place
+   * this plugin writes presence today, and a fourth added later would not be covered automatically.
+   *
+   * EVENT WORK IS DELIBERATELY NOT IN HERE. A session create awaits its whole swap, drain included,
+   * so waiting on it before publishing departure would queue offline behind exactly the drain that
+   * ordering exists to get in front of. The swap chain and the holder are joined AFTER offline, as
+   * before; this set is only ever one round trip or one tool call deep.
+   */
+  const inFlight = new Set<Promise<unknown>>();
+  const track = async <T>(work: Promise<T>): Promise<T> => {
+    inFlight.add(work);
+    try {
+      return await work;
+    } finally {
+      inFlight.delete(work);
+    }
+  };
+
+  const safeStatus = async (status: PresenceStatus, activity?: string): Promise<void> => {
+    try {
+      if (agent.connected) await track(agent.setStatus(status, activity));
+    } catch {
+      /* presence is best-effort — never throw into opencode */
+    }
+  };
+
+  // Cooperative shutdown. The manager sends an authenticated {op:"shutdown"} to this agent's local
+  // control endpoint on a signal-less runtime (ConPTY/Windows), where a hard kill would skip cleanup
+  // and leave the agent online until its presence TTL expires. We leave the mesh cleanly instead, then
+  // exit (the runtime hard-kills as a backstop). The endpoint (path + token) is minted by the
+  // connector's buildLaunch and arrives in the child env; the plugin runs inside the opencode server
+  // process, so it reads it there. Hooks are in-process (no external relay connects), so only the
+  // shutdown op is used — the handle path is inert. fatalBind: a managed agent MUST own its control
+  // endpoint, so a squatter (or a runtime that can't host the pipe) fails loud rather than running a
+  // hijacked or absent control plane.
+  let controlServer: ReturnType<typeof startControlServer> | undefined;
+  /**
+   * THE ONE TEARDOWN, because a running seat stops in more than one way and an invariant that holds
+   * on only some of them is not an invariant. Every way it stops goes through `shutdown` and so
+   * through here, and each must give the event work a bounded chance to settle before the process
+   * stops, so that wait lives here and no caller owns a copy of it.
+   *
+   * A queued swap still holds a drain that flushes and closes a run, and it runs on its own chain
+   * rather than on this one, so without waiting for it a stop can be followed by frames for a session
+   * the process no longer serves. The bounded wait REDUCES that exposure rather than removing it: a
+   * drain that outlives the bound is released and the same frames can still follow. Serializing the
+   * swap did not create the exposure but it does lengthen it, because drains that used to overlap now
+   * WAIT one after another, and only those settling inside the bound also finish in that order, since
+   * one that outlives it keeps running while the next begins. So this wait is this change's own debt
+   * rather than a courtesy. Bounded for the same reason the drain is: a
+   * teardown that waits forever on a drain is a worse outcome than one that says it gave up.
+   *
+   * LEAVING THE MESH COMES FIRST, AND THE ORDER IS THE WHOLE POINT OF IT. A supervised stop is
+   * followed by a hard kill after the runtime's grace window, which is 3s for the built-in pty
+   * runtime and 1.5s for the tmux and cmux ones. The join is bounded far above that on purpose,
+   * because a backstop near normal latency would fire on healthy drains and release them early
+   * rather than let them finish, and nothing here cancels what it releases,
+   * so this routine can be killed part way through and that is expected. What must NOT depend on
+   * finishing is the cheap step: publishing offline presence. Behind the join it is lost whenever a
+   * drain outlives the grace window; in front of it, it lands unless the kill arrives first, and the
+   * queued work then gets whatever time the runtime allows. The bounded intake wait sits in front of
+   * this publish, so a kill inside that wait takes the publish with it.
+   *
+   * WHAT THAT BUYS IS DELIBERATELY UNDERSTATED HERE. Departure becomes an EXPLICIT publish ATTEMPT
+   * rather than something a reader has to infer, and that is the whole of the claim. It is NOT that a stale
+   * live entry would otherwise survive: losing the connection purges the presence record on its own
+   * under either order, so that outcome is not this ordering's to take credit for.
+   *
+   * So this is best effort by construction, and says so rather than claiming the work completes.
+   * The endpoint stays up until `agent.stop()`, so a drain that finishes BEFORE that still publishes.
+   * One that outlived the swap bound can finish after it instead, and then it has no endpoint left
+   * to publish through.
+   *
+   * THE EVENT JOIN IS A `close`, NOT A BARE SETTLE, AND THE TWO JOINS STAY ADJACENT BELOW. It waits
+   * on exactly the chain the settle waited on, under exactly the same bound, so the join is
+   * unchanged; what it adds is the refusal, so a hook arriving while this wait is outstanding no
+   * longer starts or pumps an emitter the teardown has already decided it is done with. This
+   * paragraph is here rather than between the two calls because a mutation anchor may not span a
+   * comment: an anchor that did would stop matching the day someone reworded it, and then report a
+   * clean pass over a guard it no longer tests. The two calls are one anchor, so the prose that
+   * explains them lives above the routine.
+   *
+   * THE PRINCIPAL LOCK GOES BACK ON THE LINE AFTER THEM, and this is the only place it does. A
+   * lock is per PRINCIPAL while a holder is per THREAD, so a `/new` must keep it for the session
+   * that follows; only the final teardown may hand it back. Every stop reaches this routine, so a
+   * dispose releases it exactly as a supervised stop does. That was the reachable failure: the lock
+   * was taken and never released, so its record went on naming a pid that was alive and no longer
+   * publishing, and a replacement process for this principal was refused its own event plane.
+   */
+  const quiesce = async (): Promise<void> => {
+    stopping = true;
+    try {
+      controlServer?.close();
+    } catch {
+      /* ignore */
+    }
+    // BEFORE DEPARTURE IS ATTEMPTED, so that work this seat already admitted that settles within the
+    // bound is ordered ahead of the departure it announces. NOT "nothing admitted can act after it
+    // said it left": the bound is the honest part, and a straggler that outlives it is not
+    // cancelled, so the teardown goes on to ATTEMPT the departure publish and that straggler can
+    // still finish afterwards. Attempt is the accurate word throughout: safeStatus skips the write
+    // outright when the connection is already gone and swallows its failure when it is not, so this
+    // publish has no deadline of its own, no result anyone reads, and a kill inside it takes it.
+    // Waiting unboundedly instead is the worse of the two, because departure would go back to being
+    // inferred from a dropped connection.
+    // `allSettled` WAITS FOR EVERY ADMITTED CALL AND NEVER REJECTS, so the bounded wait covers all
+    // of them. `Promise.all` rejects the moment ONE call does, without waiting for the others, and
+    // settleWithin counts any settlement including a rejection as done, so departure would publish
+    // while another call was still parked. That rejection is reachable: setStatus begins with a
+    // connection assertion and this helper's own check is a read before an await, so a stop landing
+    // in between produces it.
+    const settled = await settleWithin(Promise.allSettled([...inFlight]), INTAKE_SETTLE_MS, "admitted intake at teardown");
+    // The generic line above already says the work is uncancelled and may land late. This adds the
+    // part specific to THIS site: the teardown stops waiting and moves on to the departure publish,
+    // so a straggler here can publish or SEND around it rather than merely out of order.
+    if (!settled) {
+      log(
+        `admitted work outlived the ${INTAKE_SETTLE_MS}ms intake bound: the teardown stops waiting and ` +
+          `ATTEMPTS the departure publish next, which is best effort and may not land; that work is ` +
+          `NOT cancelled either, so it may still publish or send afterwards`,
+      );
+      // AND THE ATTEMPT HAS TO BE ABLE TO RUN, which is a second thing from having stopped waiting.
+      // Presence writes are serialized agent-side, so departure would queue behind exactly the write
+      // this bound just abandoned: the wait ends, the publish does not happen, and the bound buys
+      // nothing. Releasing the chain here is what makes the line above true. It is deliberately
+      // inside this branch, because on the settled path the chain is already drained and departure
+      // must keep its ordering behind every write that DID land.
+      agent.abandonPresenceWrites();
+    }
+    await safeStatus("offline");
+    await settleWithin(swapChain, SWAP_SETTLE_MS, "swap chain at teardown");
+    await settleWithin(events?.close(), SWAP_SETTLE_MS, "event holder at teardown");
+    await releaseEventLock();
+    clearErrorRetry(true);
+    await agent.stop();
+  };
+  /**
+   * Every way a running seat stops calls this, and an event plane that stopped for good on a space
+   * that requires events exits 1 through it. `process.exit` waits for the whole shared teardown,
+   * because an exit the teardown cannot delay cannot honour it. It runs once `quiesce` settles,
+   * whether it resolves or rejects, so a teardown that throws still ends the process.
+   */
+  const shutdown = async (code = 0): Promise<void> => {
+    try {
+      await quiesce();
+    } finally {
+      process.exit(code);
+    }
+  };
+  // A once seat that must end itself, because its task's handoff could not be reported, leaves
+  // through the same teardown as every other stop.
+  registerOnceExit(() => void shutdown(1));
+  if (control) {
+    const handle = async (): Promise<Record<string, unknown>> => ({
+      ok: false,
+      error: "opencode runs cotal hooks in-process; only the shutdown control op is supported",
+    });
+    controlServer = startControlServer(agent, control, handle, {
+      fatalBind: true,
+      onShutdown: () => void shutdown(),
+    });
+  }
+
+  function pendingForWake(): number {
+    return agent.pendingWake(); // mode-and-channel-aware: excludes held dnd/quiet ambient
+  }
+
+  function clearErrorRetry(resetDelay = false): void {
+    if (errorRetryTimer) clearTimeout(errorRetryTimer);
+    errorRetryTimer = undefined;
+    if (resetDelay) errorRetryMs = ERROR_RETRY_INITIAL_MS;
+  }
+
+  function markInterruptIntent(sessionID?: string): void {
+    if (!busy && !batch.open) return;
+    interruptIntent = { sessionID, expires: Date.now() + INTERRUPT_INTENT_TTL_MS };
+  }
+
+  function clearInterruptIntent(): void {
+    interruptIntent = undefined;
+  }
+
+  function consumeInterruptIntent(sessionID?: string): boolean {
+    const intent = interruptIntent;
+    interruptIntent = undefined;
+    if (!intent || Date.now() > intent.expires) return false;
+    return !intent.sessionID || !sessionID || intent.sessionID === sessionID;
+  }
+
+  function isMessageAbortedError(error: unknown): boolean {
+    return typeof error === "object" && error !== null && (error as { name?: unknown }).name === "MessageAbortedError";
+  }
+
+  /**
+   * The failure a `session.error` reports, in the shape `RUN_ERROR` takes.
+   *
+   * OpenCode's error is a TAGGED UNION — `ProviderAuthError`, `APIError`, `MessageOutputLengthError`,
+   * `UnknownError`, `MessageAbortedError` — with the tag on `name` and the human-readable reason on
+   * `data.message`. The tag is published as the code and the reason as the message, both verbatim:
+   * this connector does not rank one failure kind above another, it names the one OpenCode named.
+   *
+   * `error` is OPTIONAL on the bus event, and an error-less `session.error` is still a failed turn —
+   * it just cannot say which kind, so it gets a message and no code rather than being demoted to a
+   * finish. `MessageOutputLengthError` carries no `message` either and lands on the same fallback.
+   */
+  function runErrorOf(error: unknown): { message: string; code?: string } {
+    const e = (typeof error === "object" && error !== null ? error : {}) as {
+      name?: unknown;
+      data?: { message?: unknown };
+    };
+    const code = typeof e.name === "string" && e.name ? e.name : undefined;
+    const message = typeof e.data?.message === "string" && e.data.message ? e.data.message : undefined;
+    return {
+      message: message ?? `opencode turn failed${code ? `: ${code}` : ""}`,
+      ...(code ? { code } : {}),
+    };
+  }
+
+  function scheduleErrorRetry(): void {
+    if (errorRetryTimer || !workPending()) return;
+    const delay = errorRetryMs;
+    errorRetryMs = Math.min(errorRetryMs * 2, ERROR_RETRY_MAX_MS);
+    errorRetryTimer = setTimeout(() => {
+      errorRetryTimer = undefined;
+      if (!busy && workPending()) void drive();
+    }, delay);
+    errorRetryTimer.unref?.();
+  }
+
+  /**
+   * EVENT-PLANE WORK IS ROUTED BY THE HOLDER'S OWN BINDING RATHER THAN BY THE AMBIENT SESSION ID
+   * ALONE (#600). The ambient id is still an input; what changed is that it is no longer trusted on
+   * its own. The window this closes is the REACHABLE one, under the call-site discipline described
+   * at the end of this comment, not every window of any width.
+   *
+   * The ambient id and the holder that serves it are two variables, and every attempt to ORDER them
+   * left a nearer window: the id was assigned outside the swap, then inside it but before the drain,
+   * and each time an event arriving in the remaining gap was routed by the NEW id into a holder
+   * still bound to the OLD thread, whose re-adopt refusal is terminal and takes the plane down.
+   * Ordering a two-variable race only moves its boundary, so this stops trusting the ambient id
+   * ALONE. It remains an input and stays decisional: `eventsFor` below compares it to the holder's
+   * own `path`, and a foreign id routes to nothing. What changed is that agreement with the holder's
+   * binding is now required, so an event reaches the holder only if that holder is ALREADY bound to
+   * its thread, or is not bound to anything yet and is free to take it. A holder bound elsewhere is not the route
+   * for this event, whatever the ambient id currently says.
+   *
+   * THIS IS NOT ATOMIC WITH BINDING, and does not need to be. `flush` enqueues, and the binding is
+   * taken on the holder's own chain, so two calls in one synchronous block could both read an
+   * unbound holder and the second would be refused terminally. Nothing here would stop that. What
+   * stops it is that every flush/close site in this file today is fed the AMBIENT id below, one
+   * variable holding one value, so two events present the SAME path and a repeat for one path is
+   * allowed rather than refused; the one site fed an event-carried id today is the swap's adopt,
+   * which is serialized on the swap chain. Like the presence tracking above, that is coverage by
+   * CALL SITE and not by membership, so a site added later is not covered by it. Feed a site an
+   * event-carried id off that chain and this becomes reachable.
+   */
+  function eventsFor(id: string | undefined): AguiEmitterHolder<OpenCodeRecord> | undefined {
+    const holder = events;
+    if (holder === undefined || id === undefined) return undefined;
+    return holder.path === undefined || holder.path === id ? holder : undefined;
+  }
+
+  /**
+   * A swap must not prompt into the new session halfway through its own cutover. `drive` is a TURN
+   * SUBMISSION rather than an event-plane consumer, so routing by the holder's binding does not
+   * reach it: started mid-cutover it runs against the new id while the replacement holder is not
+   * installed yet, and the records it produces can land before that holder adopts. A fresh adopt
+   * takes the position of the END of the store, so anything written in between is passed over
+   * rather than published.
+   *
+   * The guard for that is `swapping`, inside `drive`. Adopting also clears `busy`, so the inbox,
+   * wake and mention-wake doors can start a turn mid-cutover as well as this function can, and one
+   * guard where this connector submits the turn covers those doors together.
+   */
+  function adoptSession(id: string, reason: string): void {
+    if (sessionID === id) return;
+    const previous = sessionID;
+    sessionID = id;
+    agent.setContextId(id);
+    busy = false;
+    driving = false;
+    primed = false;
+    briefed = false;
+    batch.abandon();
+    clearInterruptIntent();
+    clearErrorRetry(true);
+    if (previous) {
+      log(`adopted opencode session ${id} after ${reason}; mesh identity unchanged`);
+      if (workPending()) void drive();
+    }
+  }
+
+  /** Create the session this agent owns and announce its id to the serve shim, which attaches the
+   *  foreground TUI to it. The handshake line on stderr (`[cotal-session] <id>`) is how the shim
+   *  learns *which* session to open — by exact id, so a stale same-titled session from a prior run
+   *  can't be picked. Awaited by ensureSession before the first drive. */
+  const sessionReady: Promise<string | undefined> = (async () => {
+    try {
+      await modelReady;
+      const res = await opencodeApi<{ id?: string }>("/session", {
+        method: "POST",
+        body: JSON.stringify({ title: `cotal:${config.space}:${config.name}` }),
+      }, 10_000);
+      const id = res.id;
+      if (id) {
+        adoptSession(id, "boot");
+        process.stderr.write(`[cotal-session] ${id}\n`);
+      } else log("session.create returned no id");
+    } catch (e) {
+      log(`session.create failed: ${(e as Error).message}`);
+    }
+    return sessionID;
+  })();
+
+  /** The session to drive — the one we created and the TUI is attached to. */
+  async function ensureSession(): Promise<string | undefined> {
+    return sessionID ?? (await sessionReady);
+  }
+
+  /** THE PHASE REFUSAL, as one predicate read twice rather than two copies of the same condition.
+   *  `drive` reads it on entry and again after session creation resumes, and both readings have to
+   *  mean the same thing: a copy is what lets a later change update one site and leave the other
+   *  saying something else. It is also what keeps the mutations honest. With the condition written
+   *  out twice, a mutation that removed `swapping` from the entry line was silently covered by the
+   *  second line and reported SURVIVED, so the cell that existed to prove the refusal stopped
+   *  proving anything. Measured here, not supposed: C2 and C5 both survived the moment the recheck
+   *  was added, and they discriminate again now that there is one predicate to break. */
+  const phaseClosed = (): boolean => stopping || swapping;
+
+  /** THE BOOT TURN IS WAITING WORK, exactly like a buffered inbox batch, so every place that asks
+   *  "is there anything to drive?" has to count it. It used to be driven by one shot from the boot
+   *  task, which cleared the flag and THEN called `drive`; if that call returned early because a
+   *  natively submitted prompt had already made the session busy, the operator's spawn prompt was
+   *  gone, with nothing holding it and nothing to retry it. A reviewer reproduced that loss live.
+   *  The flag is now cleared only where the submission actually happens, and this predicate is what
+   *  makes the ordinary wake paths pick it up again. */
+  const bootPending = (): boolean => bootReady && bootPrompt !== undefined;
+
+  /** Is there anything at all for a drive to carry? Three sources, and a caller that asks only about
+   *  the inbox misses two of them: the boot text and a held wake nudge are both real work that
+   *  `pendingForWake()` cannot see.
+   *
+   *  It answers WHETHER there is work, not HOW MUCH: the nudge slot holds at most one wake, so two
+   *  callers' nudges read here as one. That is sound only because a wake is a hint rather than
+   *  content; see the note on the slot itself. */
+  const workPending = (): boolean => bootPending() || pendingWake !== undefined || pendingForWake() > 0;
+
+  /** Drive a turn carrying the current inbox batch (and the boot briefing once) into the visible
+   *  session via the server API — server-side, so it can't race like the TUI input box, and the TUI
+   *  renders it live (it subscribes to that session's events). Surfaces the items but does NOT ack
+   *  them — the batch is acked on turn completion, so a crash/error redelivers. A pending wake
+   *  (`pendingWake`, a bare nudge for a focus @mention pull) replaces the body and surfaces nothing
+   *  to ack; it is read here and cleared only once its submission lands. Self-guards re-entrancy and
+   *  never prompts into a running turn (opencode would COALESCE onto it). */
+  async function drive(): Promise<void> {
+    // THE REFUSALS LIVE HERE, at the one place this connector submits a turn, rather than at each
+    // caller.
+    //
+    // Two of them are about WHEN rather than who, and the earlier version of this line named the
+    // callers instead and so missed one. `swapping` refuses mid-cutover, because a turn started
+    // then runs against a session whose replacement holder is not installed. `stopping` refuses
+    // once teardown has begun: the swap's own deferred drive fires after its cutover completes,
+    // which can be while `quiesce` is still joining the chain, so a stop that carefully drained the
+    // old work would start NEW work behind its own back, after presence had already gone offline.
+    // Listing which callers are covered is what let that through; the condition is the state, so a
+    // caller that reaches this line is refused by it. A prompt submitted natively in the host does
+    // not route through `drive` at all; the fence note on the hook table below covers that path.
+    // A refusal holds nothing: a pending wake stays in `pendingWake`, and the next turn end or wake
+    // drives it.
+    if (phaseClosed() || driving || busy) return;
+    // THE BOOT TURN GOES FIRST AND IS RETRIED HERE. While it is pending, other work waits; once its
+    // preconditions are met, whichever wake reaches this line carries it, so one early return no
+    // longer decides whether the operator's prompt is ever submitted. "Other work" is not only an
+    // inbox batch: a focus @mention is a nudge with no inbox entry behind it, and it waits in
+    // `pendingWake` rather than in this call.
+    //
+    // READ, NOT TAKEN. The slot keeps the wake until a submission carrying it lands, so every return
+    // and the catch below leave it pending with nothing to put back. The generation is read with it
+    // so the clear after the submission can tell a wake that arrived meanwhile from this one.
+    const carried = pendingWake;
+    const carriedSeq = wakeSeq;
+    // THE BOOT TEXT IS CARRIED WHENEVER THE BOOT IS PENDING, WITH OR WITHOUT A WAKE PENDING, and the
+    // "with" is the whole correction. This line once read `carried === undefined && bootPending()`,
+    // so a call holding a nudge took no boot text, fell into the branch below, and parked the nudge
+    // straight back. Nothing could then empty the slot: emptying it takes a submission, a submission
+    // takes `bootPrompt` cleared, and clearing it takes the boot submission this branch had just
+    // refused. A focus @mention landing while the boot task was parked at session creation therefore
+    // starved the boot prompt, the wake itself, and every later connector-submitted turn including a
+    // directed DM, silently and for the life of the process. Reproduced live against this plugin
+    // before it was changed: the seat stayed online, nothing was logged, and the operator's own
+    // spawn prompt was never submitted.
+    const boot = bootPending() ? bootPrompt : undefined;
+    // The boot text EXISTS but is not ready yet (no session, or the mesh link is still coming up), so
+    // there is nothing to compose with. The boot task's own drive reaches this line once the
+    // preconditions are met, and a pending wake waits in its slot until then.
+    if (bootPrompt !== undefined && boot === undefined) return;
+    driving = true;
+    // The turns this submission carries under a claim, released if it fails.
+    let turnIds: string[] = [];
+    try {
+      const id = await ensureSession();
+      if (!id) return; // no visible session yet, retry on the next event/wake
+      // RECHECKED AFTER THE AWAIT, because the guard above is a read and this is a resume. Session
+      // creation is a server round trip, so a drive admitted while the seat was running can park
+      // here and come back after `quiesce` has set `stopping` and published departure. Submitting
+      // then is the defect this change exists to stop, arriving through the one door that was
+      // already past the check rather than through a door that was never guarded. A reviewer
+      // reproduced it live by holding POST /session and disposing while a real DM was parked here.
+      // Nothing has been consumed at this point: `peekInbox` has not run and nothing is surfaced, so
+      // returning leaves the batch in the inbox for a later wake IN THIS PROCESS. That is the whole
+      // of the promise. A batch still held when the seat tears down does not survive the process:
+      // measured, by restarting the identity on a fresh uid and then on the same one and finding the
+      // message was owed to neither. Durability across a stop is a delivery question, not this one.
+      if (phaseClosed()) return;
+      const parts: { type: "text"; text: string }[] = [];
+      let ids: string[] = [];
+      // COMPOSED, NOT CHOSEN BETWEEN, and that is what lets a wake arrive at ANY point relative to
+      // the boot. The floor says the operator's prompt is the first turn this connector submits; a
+      // wake says nothing more than "go and look", and its body is recovered by the pull it triggers
+      // rather than carried here. Two claims that do not compete, so one turn answers both and
+      // neither has to wait for the other. Choosing one and re-parking the other is the deadlock.
+      const text = boot !== undefined && carried !== undefined ? `${boot}\n\n${carried}` : (boot ?? carried);
+      // Run turns ride the same composed submission; their ids commit as surfaced only once the
+      // submission lands below (two-phase — a failed submit re-surfaces them, never a lie).
+      const turnPeek = agent.peekPendingTurns();
+      if (text) {
+        parts.push({ type: "text", text });
+      } else {
+        const items = agent.peekInbox("automatic");
+        if (items.length === 0 && !turnPeek) return;
+        if (items.length > 0) {
+          ids = items.map((i) => i.recvKey);
+          const inj = formatInjection(items);
+          if (inj) parts.push({ type: "text", text: inj });
+        }
+      }
+      // NOT marked consumed here. Setting the flag before the submission meant a throw below cost
+      // the briefing permanently, on this turn and every later one.
+      const brief = briefed ? undefined : agent.channelBriefing();
+      if (brief) parts.unshift({ type: "text", text: brief });
+      if (parts.length === 0 && !turnPeek) return;
+      const body: { parts: typeof parts; system?: string } = { parts };
+      // persona once, as system (no --append-system-prompt), with the shared briefing after it —
+      // gated on persona so we never replace OpenCode's default system.
+      if (!primed && persona) body.system = `${persona}\n\n${briefing(config, "opencode")}`;
+      // The surface opens the batch, which arms the turn end BEFORE the await: a turn-end signal can
+      // land before the server request resolves, and completeTurn bails unless armed — arming after
+      // would drop it and wedge the agent.
+      if (!batch.surface(ids)) return; // at the in-flight ceiling: the batch stays queued for a later turn
+      // The turns' permit, after the last gate and right before the send with no await between: a
+      // once task another dispatch already took is left out, and a submission left with nothing to
+      // say is not sent.
+      if (turnPeek && agent.claimTurns(turnPeek.goalIds)) {
+        turnIds = turnPeek.goalIds;
+        parts.push({ type: "text", text: turnPeek.text });
+      }
+      if (!text && ids.length === 0 && turnIds.length === 0) { batch.abandon(); return; }
+      busy = true;
+      const endsAtSend = turnEndsSeen;
+      await opencodeApi(`/session/${encodeURIComponent(id)}/prompt_async`, { method: "POST", body: JSON.stringify(body) }, 10_000);
+      // A turn that ended before this answer may be the once task's own turn, already over, or one
+      // the host ran meanwhile, and nothing here tells which; a session replaced meanwhile (`/new`)
+      // hides the old one's end. Either way the task is sealed and reported rather than confirmed,
+      // so a later turn's end cannot yield it.
+      if (turnIds.length && (turnEndsSeen !== endsAtSend || sessionID !== id)) agent.releaseTurns(turnIds);
+      // The submission landed with the run turns in its prompt — they are surfaced.
+      if (turnIds.length) agent.commitSurfacedTurns(turnIds);
+      // WHAT THIS TURN CARRIED, so the `session.error` arm can re-arm it if this turn fails instead
+      // of finishing (#715). `undefined` when no wake rode this submission.
+      submittedWake = carried;
+      if (boot !== undefined) bootPrompt = undefined;
+      // THE ONLY WRITE `drive` MAKES TO THE WAKE SLOT, and it sits after the submission landed, so
+      // every other exit leaves the wake pending for the next drive.
+      //
+      // GENERATION-CHECKED, because this clear sits AFTER an await. The value was read before that
+      // await; while it was outstanding the `mention-wake` handler can have written a NEW wake here.
+      // Clearing on the strength of what THIS call read would then discard a wake that was never
+      // submitted, which is a lost update across an await.
+      //
+      // BY GENERATION, NOT BY VALUE, and that distinction is load-bearing rather than fastidious:
+      // two @mentions from the same sender produce a byte-identical nudge, so a value comparison
+      // would say "already submitted" about the later wake in precisely the case this guards.
+      //
+      // ONE SLOT IS DELIBERATE, NOT AN OVERSIGHT. A wake is not content: an @mention in focus is
+      // acked at ingest, and where the channel permits replay it stays recallable, so any single
+      // wake that fires makes the seat pull its inbox and recover the messages that channel will
+      // give back. Collapsing several wakes into one therefore loses nothing a seat could otherwise
+      // have observed, while erasing the LAST one loses the pull entirely. The
+      // invariant is that at least one wake survives to fire, which this predicate gives; a queue
+      // would preserve duplicates of an identical hint and buy nothing.
+      if (carried !== undefined && wakeSeq === carriedSeq) pendingWake = undefined;
+      briefed = true;
+      primed = true;
+    } catch (e) {
+      // First, before any retry is scheduled: a once task in a submission that failed after it may
+      // have reached the server is sealed and reported, never sent again.
+      agent.releaseTurns(turnIds);
+      busy = false;
+      batch.abandon();
+      // NOTHING TO PUT BACK. A failed submission did not land, so the wake it carried, and any wake
+      // that arrived while it was in flight, is still in `pendingWake`, and `workPending()` gives the
+      // retry below something to carry.
+      log(`drive failed: ${(e as Error).message}`);
+      scheduleErrorRetry();
+    } finally {
+      driving = false;
+    }
+  }
+
+  /** Submit the boot prompt as the first CONNECTOR-SUBMITTED turn, and only ever one of those. It
+   *  waits for the session to exist (there is nothing to prompt into before that) and for the mesh
+   *  link to be up, because that turn also orients the agent on the mesh and answers back there.
+   *
+   *  THAT WAIT IS A WINDOW, and it is not closed here. A prompt submitted natively in the host
+   *  starts a turn without passing through drive(), which is the only reader of `bootPrompt`, so
+   *  such a turn can run ahead of this one. A reviewer reproduced that order live against this
+   *  plugin with the broker held down so the loop below parked. What this guard orders is the
+   *  connector's own submissions against each other, not the host's against the connector's.
+   *
+   *  `bootPrompt` is NOT cleared here, and no longer in one synchronous step: `drive` clears it only
+   *  once the submission has landed, which is across an await. What still bounds it to a single
+   *  connector-submitted boot turn is `drive`'s own `driving` flag, which refuses a second entry
+   *  while the first is in flight, plus the clear on success. The floor is released even when there
+   *  is no session to drive into, by the early return below. drive() itself never prompts into a
+   *  running turn. */
+  void (async () => {
+    if (bootPrompt === undefined) return;
+    const id = await sessionReady;
+    while (!stopping && !agent.connected) await new Promise((r) => setTimeout(r, 100).unref?.());
+    if (stopping || bootPrompt === undefined) return;
+    if (!id) {
+      log("initial prompt not submitted — this session was never created");
+      bootPrompt = undefined; // release the floor: nothing can carry it, so nothing may wait on it
+      return;
+    }
+    // This task no longer OWNS the submission, it only opens the gate. `drive` carries the text and
+    // clears it, so a return here costs a retry rather than the prompt.
+    bootReady = true;
+    await drive();
+  })();
+
+  /**
+   * The turn end a session is still settling: the close whose position read has not answered. A
+   * next turn admitted before it answers puts the terminal after that turn's records, so every
+   * path that admits one waits here first: the event arms for the driven turn, and the prompt hook
+   * for a native one typed into the TUI or posted to the server.
+   */
+  const turnEnds = new Map<string, Promise<void>>();
+  const turnEnded = async (session: string | undefined, close: Promise<void> | undefined): Promise<void> => {
+    if (!close) return;
+    if (session === undefined) return close; // a session-less error names no session for a prompt to wait on
+    // Every turn end still settling, not the latest alone: one turn can end twice, by its error and
+    // by the idle that follows, and the later read can answer first, so the new barrier chains on
+    // the one held and removes itself only while it is still the entry.
+    const settled = Promise.all([turnEnds.get(session), close]).then(() => undefined);
+    const barrier = settled.finally(() => {
+      if (turnEnds.get(session) === barrier) turnEnds.delete(session);
+    });
+    turnEnds.set(session, barrier);
+    await barrier;
+  };
+
+  /** Native TUI / API prompts enter through OpenCode's chat.message hook before the model loop
+   *  starts. This is the real "next turn" boundary for human-typed input: prepend the buffered Cotal
+   *  batch to the user's text, then ack it when the resulting turn ends. We only mutate an existing
+   *  text part so we don't need to manufacture OpenCode's internal part IDs. */
+  function injectIntoPrompt(output: { parts?: unknown[] }): void {
+    if (driving) return; // drive() is submitting the batch itself; an open batch is refused by `inject`
+    const textPart = output.parts?.find(
+      (p): p is { type: "text"; text: string } =>
+        typeof p === "object" && p !== null && (p as { type?: unknown }).type === "text" && typeof (p as { text?: unknown }).text === "string",
+    );
+    if (!textPart) return;
+    const prefix = batch.inject();
+    if (prefix === undefined) return;
+    textPart.text = `${prefix}\n\n${textPart.text}`;
+    if (batch.open) busy = true; // it carried inbox keys, which this turn's end acks
+  }
+
+  /** A turn ended — ANY turn, ours (a driven inbox batch) OR the human's (typing into the attached
+   *  TUI, a `/reconnect`, etc). Clear `busy` regardless of who drove it: it's the COALESCE guard, so
+   *  a turn the connector didn't drive must still release it or every later push wedges behind a
+   *  finished turn. Ack only what WE surfaced (gated on the open batch — a human turn surfaced
+    *  nothing), then flush the next buffered batch — mode-aware, so bare ambient (dnd/focus) doesn't
+    *  self-wake. A truly stray idle (nothing was running and
+   *  we drove nothing) is ignored, so it can't mis-ack or empty-drive. */
+  function completeTurn(): void {
+    if (!busy && !batch.open) return; // stray/duplicate idle — no turn to close
+    busy = false;
+    if (batch.open) batch.ack(); // our driven turn: ack the surfaced batch (the sole ack site)
+    submittedWake = undefined; // the turn delivered — nothing left to re-arm (#715)
+    clearInterruptIntent();
+    clearErrorRetry(true);
+    if (workPending()) void drive();
+  }
+
+  // Inbound mesh → drive (never interrupt a running turn — matches Claude). A directed message
+  // (DM / anycast / @mention) drives when idle; ambient channel chatter drives only in `open` while
+  // idle (dnd/focus hold it for the next turn), and receive-time pull-only ambient never drives
+  // (a quiet @mention remains automatic). `muted` ambient never reaches here
+  // (ack-dropped at ingest); in `focus`, ambient/@mentions never reach "incoming" either.
+  agent.on("incoming", (item: InboxItem) => {
+    if (busy) return; // buffer; chat.message or completeTurn drives at the next safe boundary
+    const automatic = agent.inboxScope(item.recvKey) === "automatic";
+    const directed = item.kind !== "channel" || item.mentionsMe;
+    if (automatic && (directed || agent.attention === "open")) void drive();
+  });
+  agent.on("mention-wake", (item: InboxItem) => {
+    // Focus: the @mention body was acked-and-dropped at ingest — wake a turn to PULL it (recall).
+    //
+    // RECORDED FIRST AND UNCONDITIONALLY, whatever state the seat is in. The handler above may
+    // return on `busy` because an `incoming` body is BUFFERED: it sits in the inbox and the next
+    // drive peeks it, so declining to drive now defers the work. This wake has nothing behind it:
+    // the body was acked and dropped at ingest, so the nudge is the only copy this process will ever
+    // hold, and not recording it does not defer it, it destroys it. `completeTurn` would then see
+    // `pendingForWake() === 0` and no pending wake, so no later drive carries it and the seat is
+    // never told to look. Written here, the wake is held whether or not the drive below can run: a
+    // refused or failed drive leaves it pending and the next turn end drives it.
+    pendingWake = `📨 You were mentioned by ${fmtFrom(item)} on #${fmtChannel(item.channel)} — read it with cotal_inbox.`;
+    wakeSeq += 1;
+    void drive();
+  });
+  agent.on("wake", () => {
+    if (!busy) void drive();
+  });
+
+  /** Match an event's session against the one we drive. Adopt the first session id we see, then
+   *  filter to it; later top-level `session.created` events adopt explicitly as reset-in-place.
+   *
+   *  LOAD-BEARING FOR THE EVENT PLANE, not merely tidy. The flush sites are fed the AMBIENT id, so
+   *  an event that gets past this filter does not address its own session at all: it pumps whichever
+   *  this process drives, publishing that session's staged turn early. R7 in
+   *  `smoke/mutations/opencode-events-reset.json` opens this filter and requires a cell to notice. */
+  const ours = (id?: string): boolean => {
+    if (!id) return !sessionID; // a session-less event counts as ours only before we've adopted one
+    if (!sessionID) adoptSession(id, "first event");
+    return id === sessionID;
+  };
+
+  /**
+   * EVERY WAY IN THROUGH THIS HOOK TABLE, FENCED BY MEMBERSHIP IN IT. The tool map and the prompt
+   * hook are intake too and do not go through this table, because returning nothing refuses neither
+   * of them, so each is fenced at its own entry in `hooks` below. Once teardown has begun, admitting
+   * more work undoes the teardown: a late `permission.asked` or tool hook republishes presence over
+   * the offline record `quiesce` exists to publish, a part or idle enqueues holder work after the
+   * join has already snapshotted it, and a late `session.created` extends the very chain the join is
+   * waiting on.
+   *
+   * The refusal is applied by CONSTRUCTION rather than written at each entry, because writing it at
+   * each entry is the mistake this file has now made twice: the guard was correct for every caller
+   * that had been listed, and the list was mistaken for the property. A hook is fenced here by being
+   * in this table, so a door added later cannot be forgotten, and there is no per-entry line for a
+   * refactor to drop. `dispose` is deliberately NOT in it, being the teardown itself.
+   *
+   * BOUNDED, NOT ABSOLUTE, IN TWO DIRECTIONS. It closes ADMISSION, not the work already inside a
+   * hook when the flag flips; that work is what the joins in `quiesce` cover, and a hook that had
+   * already passed this point still runs. The two together are the claim, and neither is it alone.
+   *
+   * WHETHER A RUNNING TURN'S EVENTS SURVIVE IS TIMING. `quiesce` calls `agent.stop()` last, after
+   * the intake wait, the offline publish and the two settles, so holder work already queued when this
+   * flag flipped can still settle and publish through an endpoint that is still up. Work arriving
+   * afterwards is refused at this table.
+   */
+  const fence = <T extends Record<string, (...args: never[]) => Promise<unknown>>>(intake: T): T =>
+    Object.fromEntries(
+      Object.entries(intake).map(([name, hook]) => [
+        name,
+        async (...args: never[]): Promise<unknown> => (stopping ? undefined : await hook(...args)),
+      ]),
+    ) as T;
+
+  /**
+   * THE TOOL MAP IS INTAKE TOO, and it does not arrive through the table above. OpenCode is handed
+   * these closures once, at registration, so a call already inside the model's turn reaches its spec
+   * with no idea a stop is running: nothing in the turn loop knows the control socket fired. The
+   * harm is the same one, not a smaller one. `cotal_status` publishes presence and would put the
+   * seat back on the mesh it has just left, and the rest write to channels a departed seat should
+   * no longer be writing to.
+   *
+   * REFUSED, NOT DROPPED. A tool call has a caller waiting on a result, so returning nothing would
+   * read as a hang rather than as a shutdown; and it never throws, which is the convention this
+   * whole surface already keeps.
+   */
+  const fenceTools = (tools: Record<string, ToolDefinition>): Record<string, ToolDefinition> =>
+    Object.fromEntries(
+      Object.entries(tools).map(([name, def]) => [
+        name,
+        {
+          ...def,
+          execute: async (...args: Parameters<ToolDefinition["execute"]>): ReturnType<ToolDefinition["execute"]> =>
+            stopping ? `⚠ ${name} was not run: this seat is shutting down` : await track(def.execute(...args)),
+        },
+      ]),
+    );
+
+  const intake = {
+    event: async ({ event }) => {
+      // The server emits `permission.asked` (the SDK's `permission.updated` type ships but never
+      // fires — #11616), so match the real runtime name out of band. With permission:"allow" this
+      // rarely triggers, but it keeps presence correct if the posture tightens.
+      if ((event.type as string) === "permission.asked") {
+        const p = event.properties as { sessionID?: string; title?: string };
+        if (!p.sessionID || ours(p.sessionID)) await safeStatus("waiting", p.title);
+        return;
+      }
+      switch (event.type) {
+        case "session.created": {
+          // Adopt every top-level session created in this OpenCode process. That makes `/new` a
+          // Cotal-aware context reset: same mesh identity, new OpenCode context/session id.
+          if (event.properties.info.parentID) break;
+          const created = event.properties.info.id;
+          // SERIALIZED, AND NOT BY THE OBVIOUS SWAP (#600). Taking the holder out before the await
+          // and installing the replacement there looks smaller and is unsafe: a fresh holder has no
+          // `path` until something adopts it, and adopt happens after the await, so a second
+          // invocation reads the replacement as "nothing to retire", skips the drain and adopts it,
+          // then the first invocation adopts the same holder and the one-thread-per-holder refusal
+          // fires. Measured: that turns a silent leak into a dead event plane. Serializing the whole
+          // swap is what actually closes the window, because each swap then reads a holder that is
+          // installed and no longer being retired underneath it. INSTALLED, NOT NECESSARILY SETTLED:
+          // a swap awaits the holder it RETIRES, and the replacement's adopt below only enqueues its
+          // start, so the next swap can read a holder whose own start is still pending.
+          const swap = swapChain.then(async () => {
+            swapping = true;
+            try {
+            // The id is adopted here, ahead of the drain, so status and prompt work follow the new
+            // session at once. It is deliberately NOT paired with the holder install below, and does
+            // not need to be: the event plane routes on the holder's OWN binding, so an event landing
+            // in this window reaches a holder only if that holder is already bound to its thread.
+            // Ordering these two flips against each other was the earlier attempt; it only ever moved
+            // the gap, because two variables cannot be made one by sequencing them.
+            adoptSession(created, "top-level session create");
+            const previous = events;
+            if (previous && previous.path !== undefined && previous.path !== created) {
+              // DRAIN, THEN SWAP. Flush first so the session being left publishes what it settled,
+              // then close its open run: an observer that never sees the close holds a run that never
+              // ends, and the plane's rule is that a divergence is on the wire rather than silent.
+              //
+              // THE AWAIT IS THE ORDERING AND IS NOT A STYLE CHOICE. The two calls above land on the
+              // OLD holder's chain and the new session's frames go out on a DIFFERENT one, so without
+              // a settled point between them the new session's first frame can reach the subject
+              // before the old session's close.
+              // Symmetric with the adoption line above, and load-bearing rather than decorative: a
+              // retirement that never happens is otherwise invisible, because a dropped holder has no
+              // frames left to publish and its open handle looks identical to a cleanly retired one.
+              previous.flush(previous.path);
+              previous.closeRun(Date.now());
+              const drained = await settleWithin(previous.settled(), SWAP_SETTLE_MS, `drain of ${previous.path}`);
+              // AFTER the settle, never before it. Logged before, this line reports that the retire
+              // path was ENTERED, and a cell keyed on it stays green even if the drain never finishes.
+              log(`${SESSION_RETIRED} ${previous.path} superseded by ${created}; ${drained ? "drained before release" : "ABANDONED UNDRAINED"}`);
+              // RELEASED, NOT MERELY DROPPED, and that is the difference #599 is about. Overwriting
+              // `events` below makes this holder unreachable through `eventsFor`, which is not the
+              // same as making it inert: it is still reachable from this scope and from any work
+              // already on its chain, and a late pump would re-create the very log the next line may
+              // remove. `close` refuses that synchronously and then joins what was queued; it
+              // releases no durable state, because the log's lifetime and the lock's are not the
+              // holder's to decide. Bounded like every other join here, for the same reason.
+              const retired = previous.path;
+              await settleWithin(previous.close(), SWAP_SETTLE_MS, `release of ${retired}`);
+              // The lifetime is stated on the reaper, not decided here: this hands over what only the
+              // swap knows, which is whether the drain settled or spent its bound.
+              await reapRetiredWal(retired, drained);
+              events = newEventHolder();
+            }
+            // Adopt READS FROM HERE. A resumed session must not republish its history, and the
+            // source's fresh adopt returns the position of the end for exactly that reason.
+            eventsFor(created)?.adopt(created);
+            } finally {
+              swapping = false;
+            }
+            // THE DEFERRED DRIVE, and it is outside the `finally` on purpose. The cutover waiter is
+            // complete at this line: the predecessor either drained or spent the bound, the
+            // replacement holder is installed and bound, and `swapping` is already clear, so this
+            // turn is allowed to start and produces records the holder publishes rather than records
+            // it adopted past. Drained is not guaranteed, only waited for: a predecessor that
+            // outlived the bound is released undrained and this line still runs.
+            if (workPending()) void drive();
+          });
+          // The chain carries the SUCCESSFUL tail only: a rejected swap is absorbed so the next one
+          // still runs, while this invocation still sees its own failure.
+          swapChain = swap.catch(() => undefined);
+          await swap;
+          break;
+        }
+        case "session.idle": {
+          const idleSession = event.properties.sessionID;
+          if (!ours(idleSession)) return;
+          noteTurnEnd();
+          // Order matters and is not stylistic: flush the turn's records FIRST, then close the run.
+          // Both land on the holder's chain in the order they were enqueued, so closing first would
+          // terminate a run the records that follow still belong to.
+          eventsFor(sessionID)?.flush(sessionID);
+          // The close's position read is awaited BEFORE the next turn is admitted, on every path
+          // that admits one: this arm for the driven turn, and the prompt hook for a native one.
+          // The position is the session's messages over HTTP, and a next prompt that lands before
+          // that read answers puts the terminal after the next turn's records, which closes that
+          // turn with it: a failed turn closed as a finish and its successor as the error.
+          await turnEnded(idleSession, eventsFor(sessionID)?.closeRun(Date.now()));
+          await safeStatus("idle");
+          completeTurn(); // the sole turn-end site: ack-on-surface + drive the next batch
+          break;
+        }
+        case "session.status": {
+          if (!ours(event.properties.sessionID)) return;
+          const s = event.properties.status;
+          // Presence only — session.idle owns ack + drive (so a duplicate idle can't mis-ack).
+          if (s.type === "busy") {
+            busy = true;
+            await safeStatus("working");
+          } else if (s.type === "idle") {
+            noteTurnEnd();
+            await safeStatus("idle");
+          } else if (s.type === "retry") {
+            await safeStatus("working", `retrying: ${s.message}`);
+          }
+          break;
+        }
+        case "session.error":
+          // session.error's sessionID is OPTIONAL; skip only a DIFFERENT session's error — a
+          // session-less one (id undefined) during an in-flight turn must still close it, else
+          // `busy` stays stuck and every later push is buffered behind a turn that already failed.
+          if (event.properties.sessionID && !ours(event.properties.sessionID)) return;
+          noteTurnEnd();
+          if (!busy && !batch.open) return; // no turn to fail — stray error
+          // WHICH `session.error`s ARE FAILED TURNS, decided here and stated rather than left to be
+          // inferred, because that judgment is the whole of #596. Every error that reaches this line
+          // ended a turn before it finished — the ack path one block below has always treated it
+          // that way, leaving the batch un-acked so it can retry. The ONE exception is a person
+          // pressing Stop, which OpenCode delivers as this same bus event: it arrives as
+          // `MessageAbortedError`, corroborated by the TUI's own `session.interrupt` command. That
+          // is a turn someone ENDED, not one that failed, and it closes as a finish.
+          //
+          // `interrupted` IS COMPUTED ONCE AND SPENT TWICE, and the single computation is the point:
+          // the wire and the inbox now answer "did this turn fail?" from the same predicate, so they
+          // cannot drift into disagreeing about the same turn. It moved above the close for that
+          // reason and for no other; it consumes a one-shot intent, so a second read would be a
+          // different answer.
+          const interrupted = consumeInterruptIntent(event.properties.sessionID) || isMessageAbortedError(event.properties.error);
+          // Main made holders session-scoped across swaps. Select the current session's holder here,
+          // then keep this branch's one-predicate RUN_ERROR mapping on that holder.
+          const eventHolder = eventsFor(sessionID);
+          // Order matters and is not stylistic: flush the turn's records FIRST, then close the run,
+          // or the closing frame terminates a run the records that follow still belong to.
+          eventHolder?.flush(sessionID);
+          // A failed turn still ENDED, so the run is closed rather than left open for the next one to
+          // be refused against. A FAILED one closes with `RUN_ERROR` carrying OpenCode's own reason,
+          // so a reader can tell it from a turn that finished; an interrupted one closes with no
+          // outcome, which says the run ended and does not claim it succeeded. `RUN_ERROR` closes a
+          // run by itself, so no second terminal follows it.
+          // Awaited for its position read, as the idle arm does, before the next turn is admitted.
+          await turnEnded(sessionID, eventHolder?.closeRun(Date.now(), interrupted ? undefined : runErrorOf(event.properties.error)));
+          busy = false;
+          if (batch.open) {
+            if (interrupted) {
+              batch.ack(); // explicit user Stop/Cancel: treat the surfaced batch as dismissed, not failed
+              submittedWake = undefined; // dismissed the same way as the batch it rode with, not re-armed
+            } else {
+              batch.abandon(); // failed turn: leave inbox unacked so the batch can retry on a later safe turn
+              // RE-ARM THE WAKE (#715): a landed submission clears `pendingWake`, so a turn that
+              // then fails would leave `workPending()` false and the retry below a no-op, unlike a
+              // submission that never lands, which leaves the wake pending. Only into an empty slot:
+              // a wake that arrived during the turn is already pending and is not overwritten.
+              if (submittedWake !== undefined && pendingWake === undefined) {
+                pendingWake = submittedWake;
+                wakeSeq += 1;
+              }
+              submittedWake = undefined;
+            }
+          }
+          await safeStatus("idle");
+          if (!interrupted) scheduleErrorRetry();
+          else {
+            clearErrorRetry(true);
+            // The stop ended the turn, and the `session.idle` after it finds no turn to close, so
+            // drive here what arrived during it, as completeTurn would have (#3839).
+            if (workPending()) void drive();
+          }
+          break;
+        case "message.part.updated": {
+          // NEAR-LIVE. The bus is the wake signal and never the data path: this says "look now", and
+          // the source then reads the durable store and decides what is settled enough to publish.
+          const partSession = (event.properties as { part?: { sessionID?: string } }).part?.sessionID;
+          if (!ours(partSession)) return;
+          eventsFor(sessionID)?.flush(sessionID);
+          break;
+        }
+        case "tui.command.execute": {
+          const p = event.properties as { command?: string; sessionID?: string };
+          if (p.command === "session.interrupt") markInterruptIntent(p.sessionID);
+          break;
+        }
+        case "session.deleted":
+          if (!ours(event.properties.info.id)) return;
+          await safeStatus("offline");
+          break;
+      }
+    },
+
+    // Surface the running tool as presence activity (parity with Claude's PreToolUse).
+    "tool.execute.before": async (input) => {
+      if (!ours(input.sessionID)) return;
+      await safeStatus("working", input.tool);
+    },
+  } satisfies Partial<Hooks>;
+
+  const hooks: Hooks = {
+    tool: fenceTools(buildCotalTools(agent, config)),
+    ...fence(intake),
+
+    // THE PROMPT HOOK IS REFUSED BY REJECTING, because a hook that returns lets the prompt through.
+    // `chat.message`'s output names no cancel and no skip, but OpenCode awaits this hook before it
+    // saves the user message or starts the model loop, and a rejection fails the prompt there. So a
+    // prompt typed into the editor or posted to the server after the stop began starts no turn.
+    // Session `abort` cannot stand in for it: an idle session has no run yet for the abort to find.
+    // A turn already running when the stop began is not cancelled.
+    "chat.message": async (input, output) => {
+      if (stopping) throw new Error("the prompt was not run: this seat is shutting down");
+      if (!ours(input.sessionID)) return;
+      // A NATIVE PROMPT WAITS FOR EVERY TURN END STILL SETTLING. OpenCode awaits this hook before it
+      // saves the user message, so a prompt held here lands after the close's position read has
+      // answered, and the terminal keeps its own turn. A turn end reported while the prompt waits
+      // replaces the map entry, so the prompt follows each replacement until none remains.
+      for (let barrier = turnEnds.get(input.sessionID); barrier !== undefined; barrier = turnEnds.get(input.sessionID))
+        await barrier;
+      // OpenCode exposes the selected model only on this prompt hook. Do not invent a pre-turn
+      // default: before the first prompt the dashboard truthfully shows "not reported".
+      if (input.model)
+        await track(agent.setModel(`${input.model.providerID}/${input.model.modelID}`, input.variant));
+      injectIntoPrompt(output);
+    },
+
+    // The host disposing this plugin's instance, which it does with its process still serving (a
+    // global config change, `POST /instance/dispose`). The next request loads the plugin again and
+    // gets the cached hooks back, so a dispose that left the process running would leave it serving
+    // a stopped seat. Nothing the teardown closes can be taken again in-process (the launch material
+    // is scrubbed at boot), so a dispose ends the process the way the manager's stop does.
+    dispose: shutdown,
+  };
+
+  guard.__cotalOpencodeHooks = hooks;
+  log(`opencode plugin ready — space="${config.space}" name="${config.name}"${config.role ? ` role="${config.role}"` : ""}`);
+  return hooks;
+};

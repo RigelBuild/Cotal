@@ -1,0 +1,189 @@
+# Repository scripts
+
+## Pull request CI verdicts
+
+Do not infer that a pull request head is green from zero pending checks, zero failures, or Code
+Quality alone. GitHub can expose an exact head without minting the repository's ordinary workflow
+runs.
+
+Use the repository guard instead:
+
+```bash
+pnpm pr-head-gate <pull-request-number>
+```
+
+It requires a GitHub token, resolved once per run from `GH_TOKEN`, then `GITHUB_TOKEN`, then
+`gh auth token`. If no token is available, it exits before sending any request and names the
+credential setup options. It never switches to anonymous requests. `pnpm smoke:pr-head-auth`
+checks this with native `gh`, isolated placeholder credentials and an offline HTTP fixture.
+
+It parses `.github/workflows/*.yml` at the exact head with the repository's YAML parser and derives
+the expected named set, including `pull_request` path filters. Valid YAML forms such as flow event
+lists with trailing comments are handled by the parser rather than a line reader. Invalid YAML,
+invalid path-filter values, and a YAML merge key (`<<`) in `on` stop the guard. Empty trigger
+collections also stop it. A non-empty scalar or mapping that names no `pull_request` event is
+explicitly treated as a non-PR workflow.
+It then grades only runs attached to that pull request and head. Its non-green categories are
+distinct:
+
+- **missing**: an expected workflow run was never created for this PR and head
+- **pending**: the run exists but is queued or running
+- **failing**: the run completed without a `success` conclusion, including `neutral` or `skipped`
+
+The path-filter matcher understands the glob forms used in this repository. A new glob form it does
+not understand is an error, not a silently ignored or literal filter.
+
+The guard is read-only. It does not drain GitHub's queue, retrigger a run, or diagnose or fix the
+external scheduler that creates workflow runs.
+
+## Full local check
+
+`pnpm check` runs the typecheck, the docs gate, `pnpm test`, a set of local smokes, `pnpm smoke:ci`
+and the `:live` suites in order through `scripts/check.mjs`. The root `check` script lists every
+step. A failing step does not stop the run: every step runs, and the
+closing summary lists each step that failed with its exit status, so one red suite cannot hide the
+steps after it. The run exits 1 when any step failed. A step the root manifest does not define is
+refused before anything runs.
+
+No workflow runs `pnpm check`, and some of its `:live` steps are on no CI shard.
+`pnpm smoke:gate-inventory` lists those with the reason each one is left out.
+
+## Docs checks
+
+`pnpm check:docsbundle` is the CI docs gate. It runs `check-unmerged.mjs`, `check:docs-voice`,
+`check:doc-comments`, `check:docs-literals`, `check:docs-site`, the tool-docs and schema generators
+with a diff of their output, and `check-docs-bundle.mjs`. Three of them prove less than a green run
+suggests:
+
+- `check:docs-voice` grades prose style in `docs/` and never reads source.
+- `check:docs-literals` reads each code span in `docs/` that looks like emitted operator prose
+  (four or more lowercase words, not a command) and fails when no string or template literal in
+  shipped source holds it. A substituted value is written as a placeholder such as `<id>`, and it
+  must stand where the source substitutes one. Strings are read from the JavaScript each file
+  compiles to, so a comment, a type or an ambient declaration does not count as emitting a line.
+  Pages are read with a Markdown parser (`marked`), so text in a fenced or indented code block is
+  never a candidate, in a block quote or list item as well as at the top level. A capitalized,
+  short or punctuation-heavy quote is not a candidate, so a rename of one of those is still caught
+  only by review.
+- `check-docs-bundle.mjs` proves the generator turns the pages into a bundle that is not hollow.
+  It does not prove that the pages agree with the code.
+
+## Upgrade-section gate
+
+`pnpm upgrade-section-gate --base <ref>` checks `<ref>..HEAD`, and `--range <a>..<b>` checks any
+range. It exits 1 when the range carries a commit marked breaking and adds no new release section
+to `docs/UPGRADING.md`, and 2 on misuse such as an unknown ref. It reads commit markers only, so an
+unmarked break passes, and it does not check what a section says. No workflow runs it on pull
+requests since the Attribution workflow was removed, so it is a manual check. CI runs only its
+self-test, `pnpm smoke:upgrade-section`. The design note is
+[docs/design/upgrade-section-gate.md](../docs/design/upgrade-section-gate.md).
+
+## Mutation coverage
+
+Run every tracked mutation config from the current checkout:
+
+```bash
+pnpm mutation-coverage
+```
+
+Pass config paths to grade only those files. The validator examines every selected config even when
+an earlier one is refused, its command fails, or its completed output has no trustworthy executed
+cell total. It exits non-zero after the full selection and reports the checkout HEAD with counts for
+enumerated, examined, graded, refused-with-reason, unparsed, command-failed, recorded, and
+stale-records configs.
+
+Validation reports every independent refusal within each config. Unparseable JSON, an unresolved
+suite, or a missing mutations array ends that config. Malformed mutation fields skip that entry's
+witness checks, not later entries. Invalid command or path-list metadata skips reachability checks;
+other independent checks still run. Refusal and sentinel totals count configs, not reasons.
+`pnpm smoke:mutation-refusals` exercises this reporting without executing config commands.
+
+`pnpm smoke:mutation-metadata` runs that validation in CI. It passes `--gradable-only` with no
+paths, so every tracked config is validated, none is executed, and an unrecorded refusal fails the
+gate. The refusals already on main when the gate was added are listed in `scripts/mutation-coverage.recorded.json`,
+each pinned to the sha256 of its parsed config and the first refusal it drew. A discovered run
+compares that first refusal for compatibility and prints every reason as `RECORDED`. Additional
+reasons are visible but are not separately pinned. A named run does not read that file. The list
+only shrinks. An entry fails the gate when it is not in the parent commit's copy of the file, or
+once its config is accepted, changes, draws a different first refusal, or is no longer tracked:
+remove the entry, and fix the config if it is
+still refused. On a pull request the parent is the base branch. The commit that adds the file may pin
+only configs its parent already had unchanged. A shallow checkout fetches the parent from `origin`.
+The run ends with the cell-count sentinel the CI shard grades: one cell per config and per stale
+entry.
+
+The coverage reader and fixture census share named workspace-filter selection. Matching quotes,
+`--filter=value`, multiple filters, and dependency (`pkg...`) or dependent (`...pkg`) closures
+are handled alike. Build closures include development, optional and peer dependencies. Each
+reader retains its own command-admission checks. `pnpm smoke:workspace-build-filters` exercises
+these forms through read-only metadata grading; it does not execute fixture commands or mutations.
+
+Built-output witnesses read package tsconfigs through TypeScript, including JSONC and inherited
+options. Missing configs provide no mapping; unreadable or invalid configs fail with their path
+and compiler diagnostic. The effective config must declare `rootDir` and `outDir`, locally or
+through `extends`; unsupported inferred layouts are refused rather than guessed.
+`pnpm smoke:mutation-tsconfig` compares these mappings with `tsc --showConfig` without executing
+fixture commands.
+
+Metadata validation reuses the current TypeScript parse of each normalized file path while its
+source text is unchanged. A changed source replaces that cached parse. Each config reads its
+suites lazily once, preserving validation order; file reads are not memoized across configs.
+`pnpm smoke:mutation-parse-cache` checks native parse/read counts and cache invalidation without
+executing fixture commands.
+
+A native `ETIMEDOUT` result is reported as `command was killed at its timeout`, not as a
+failure to start. Missing executables and permission errors retain the startup diagnosis. Both
+remain unmeasurable; this distinction changes the reason, not the verdict or timeout budget.
+`pnpm smoke:failure-timeout-reason` checks native child results without executing mutations.
+
+`unparsed` means the suite command completed but did not prove how many cells it executed. A zero
+failure count without a total is not enough. The instrument grades only a number the suite printed:
+a tally, a checks-passed count, or a complete N/N fraction. Progress ticks are not an executed-cell
+total. `completionMarker` locates the line that may carry that fraction, and only after the tally
+and checks-passed arms have been tried. Presence of the marker string is never itself a total. A
+complete fraction on the marker line still grades when other text shares that line; the selftest
+records that as a limitation, not as a completion claim. Configs whose suite launches a repository
+entrypoint may declare it in `executes`; the declaration is accepted only when the suite passes
+that entrypoint to a Node, tsx, or node-pty subprocess and the command builds each mutated package
+reached through it. An `executes`-only config diff is coverage metadata, not a proof-definition
+change: mutation-reproof names it as a metadata-only exclusion instead of re-proving the live
+kill set.
+
+## Mutation reproof
+
+> **Mutation reproof is disabled on this fork.** The workflow is renamed
+> `.github/workflows/mutation-reproof.yml.disabled`, so GitHub never runs it.
+> Its fixtures and script remain for local runs.
+
+`node scripts/mutation-reproof.mjs --base <commit>` re-proves the mutation fixtures a diff selects.
+A fatal verdict or a pre-red command that the diff caused fails it. A command that was already red
+at the base, or a fixture whose run was inconclusive, is reported without failing, as long as at
+least one selected fixture produced a kill.
+
+The `node scripts/mutation-reproof.mjs --all` option grades the whole tree. Every proven fixture
+in the selection must produce a kill. A fixture that is pre-red, inconclusive, or graded nothing
+fails the local run and is named in its summary.
+
+## Mutation reproof budget
+
+`mutation-reproof` takes `--budget-minutes <n>` to bound a local run. Selection does not estimate
+fixture cost, so one run can draw more proof work than its deadline permits. Without a budget, an
+external timeout leaves no tally, no word about the fixtures that never ran, and a mutant left in
+the tree. With one, each `mutation-proof` child gets the deadline as `--deadline <epoch-ms>`. At
+the deadline it cuts the running suite, kills that suite's process group, puts the mutant back,
+names the mutations it did not reach and exits 5. The reproof then prints
+`MUTATION REPROOF BUDGET EXHAUSTED`, names each selected fixture as cut short or not run, and
+exits 1. That result is UNMEASURED. It is never a pass. A fatal verdict whose base comparison
+cannot finish in the budget is reported as an unmeasured transition with the budget as its reason.
+
+A process that left the suite's group survives a group kill, and anything spawned `detached` does.
+Every process a proof starts carries the proof's mark in `MUTATION_PROOF_RUN`. After any timed-out
+run the proof kills every process still carrying its mark and prints what it killed and what
+survived. mutation-reproof does the same for the commands it runs itself: the snapshot install and
+build, and the head and base runs of a pre-red comparison. It reads the marks from `/proc`, so on
+other platforms it says it did not look. A process that rebuilt its environment without the mark is
+out of reach. A seat custodian is one: it keeps only `PATH` and `COTAL_RUN`.
+
+Each proof child also gets `--restore-deadline`, one minute before the reproof would kill it. An
+`afterRestore` rebuild still running at that instant is killed by the proof and its mutation is
+reported as RESTORE FAILED, because the derived artefacts may still be built from the mutant.

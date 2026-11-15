@@ -1,0 +1,76 @@
+import type { RunHostPlanes, RunAdmissionView } from "@cotal-ai/core";
+import { digest, type EffectContext, type EffectHandler, type JournalEntry } from "@cotal-ai/lang";
+import { EpfSettleWatcher, MeshHandler, type MeshHandlerBinding } from "./mesh-handler.js";
+import { createRunPauseHost } from "./run-pause-host.js";
+import { createRunWaitHost } from "./run-wait-host.js";
+import { RunScopeAuthority, isHold } from "./run-scope-authority.js";
+
+export interface RunEffectHost extends EffectHandler {
+  adopted(entries: readonly JournalEntry[]): Promise<string[]>;
+  discharge(entries: readonly JournalEntry[]): Promise<void>;
+  release(entries: readonly JournalEntry[]): Promise<void>;
+  restoreMigratedSeats(entries: readonly JournalEntry[]): Promise<void>;
+}
+
+/** Constructed by the trusted hosting process. The driver receives only the frozen effect
+ *  methods below. The broker-backed handler and its connections remain inside the closure. */
+export function createRunEffectHost(
+  broker: RunHostPlanes,
+  binding: MeshHandlerBinding,
+  authority: RunScopeAuthority,
+  admission: () => Promise<RunAdmissionView>,
+  cancellationObserved?: () => string | undefined,
+): RunEffectHost {
+  const pinned = structuredClone(binding);
+  const pauses = createRunPauseHost(broker, pinned, authority);
+  const waits = createRunWaitHost(broker, authority, admission, cancellationObserved);
+  const handler = new MeshHandler(broker.nc, broker.kv, broker.js, broker.jsm, pinned, new EpfSettleWatcher((ref) => pauses.readSettle(ref.token)), Date.now, { pauses, waits, authority, admission, ...(cancellationObserved !== undefined ? { cancellationObserved } : {}) });
+
+  async function dispatch<R, T>(kind: string, req: R, ctx: EffectContext, call: (request: R, context: EffectContext) => Promise<T>): Promise<T> {
+    const request = structuredClone(req);
+    const key = structuredClone(ctx.key);
+    const captured = { ...ctx, key };
+    const entry = await authority.effect(kind, captured);
+    const held = isHold(kind, entry, captured);
+    // Before the hold's first bind, end the pause the held step's first dispatch armed, so the hold
+    // is the step's only open pause. A crash before the bind leaves `hold` unset and claims again.
+    if (held && entry.hold === undefined) await handler.endPause(entry);
+    const context: EffectContext = {
+      ...captured,
+      resume: held ? entry.hold : entry.external,
+      async bind(external) {
+        const snapshot = structuredClone(external);
+        await ctx.bind(snapshot);
+        const recorded = await authority.effect(kind, captured);
+        if (digest((held ? recorded.hold : recorded.external) ?? null) !== digest(snapshot))
+          throw new Error(`run ${pinned.runId} did not persist the binding for ${captured.requestId}`);
+      },
+    };
+    return call(request, context);
+  }
+
+  return Object.freeze({
+    now: () => handler.now(),
+    participant: (req, ctx) => dispatch("participant", req, ctx, (request, current) => handler.participant(request, current)),
+    spawn: (req, ctx) => dispatch("spawn", req, ctx, (request, current) => handler.spawn(request, current)),
+    turn: (req, ctx) => dispatch("turn", req, ctx, (request, current) => handler.turn(request, current)),
+    ask: (req, ctx) => dispatch("ask", req, ctx, (request, current) => handler.ask(request, current)),
+    checkpoint: (req, ctx) => dispatch("checkpoint", req, ctx, (request, current) => handler.checkpoint(request, current)),
+    sleep: (req, ctx) => dispatch("sleep", req, ctx, (request, current) => handler.sleep(request, current)),
+    wait: (req, ctx) => dispatch("wait", req, ctx, (request, current) => handler.wait(request, current)),
+    // Through the same authority dispatch as every other effect: a cadence pause is world state
+    // this driver arms under a lease, so it must re-read the entry it belongs to and re-assert the
+    // lease at each observation, exactly as a `sleep` does. A `waitUntil` parks many times under
+    // one step, so this is the one effect where that re-assertion happens repeatedly, which is a
+    // stronger reason to route it here rather than a reason to shortcut it.
+    observe: (req, ctx) => dispatch("waitUntil", req, ctx, (request, current) => handler.observe(request, current)),
+    notify: (req, ctx) => dispatch("notify", req, ctx, (request, current) => handler.notify(request, current)),
+    monitor: (req, ctx) => dispatch("monitor", req, ctx, (request, current) => handler.monitor(request, current)),
+    openConclave: (req, ctx) => dispatch("conclave", req, ctx, (request, current) => handler.openConclave(request, current)),
+    closeConclave: (req, ctx) => dispatch("conclave", req, ctx, (request, current) => handler.closeConclave(request, current)),
+    adopted: (entries) => handler.adopted(entries),
+    discharge: (entries) => handler.discharge(entries),
+    release: (entries) => handler.release(entries),
+    restoreMigratedSeats: (entries) => handler.restoreMigratedSeats(entries),
+  } satisfies RunEffectHost);
+}

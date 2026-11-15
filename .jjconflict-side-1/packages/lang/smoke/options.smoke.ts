@@ -1,0 +1,647 @@
+/**
+ * Every option the validator accepts must reach the handler.
+ *
+ * This suite exists because six did not, and nothing anywhere would have said so. `spawn` accepted
+ * `permits`, `supervise` and `onFork` and forwarded none of them: an author who wrote a turn budget
+ * got a clean parse, a clean run, and no budget. `ask` accepted `deadline` and `attempts` and
+ * forwarded neither. `checkpoint` accepted `to`, which decides WHICH PERSON gets asked, and
+ * forwarded it nowhere.
+ *
+ * The shape of the failure is worth naming, because it is not a bug in any one function. There were
+ * two lists of option names, one in the validator and one written out again at each dispatch site,
+ * and nothing compared them. Every individual site looked complete. The defect lives in the gap
+ * between two correct-looking lists, which is exactly the kind a reviewer reads past.
+ *
+ * So this does not re-read the dispatch code. It RUNS a program that passes every accepted option
+ * and asserts the option arrived in the request the handler was actually given. A static scan was
+ * tried first and produced two false positives, because it looked only inside the `case` blocks of
+ * the primitive switch and `fanOut`'s `key` is read in the scope-combinator path instead. Reading
+ * the code found the gap in the wrong places; running it finds the gap where it is.
+ */
+import { run, resume, RunDivergence } from "../src/interpret.js";
+import { digest } from "../src/keys.js";
+import { PRIMITIVES } from "../src/primitives.js";
+import { SimHandler } from "../src/sim.js";
+import type { EffectContext, EffectHandler } from "../src/effects.js";
+
+let pass = 0;
+const ok = (name: string, cond: boolean, extra?: unknown) => {
+  if (!cond) throw new Error(`FAIL: ${name}${extra !== undefined ? ` - ${JSON.stringify(extra)}` : ""}`);
+  pass++;
+  console.log(`  ok ${name}`);
+};
+
+/** Capture the request object handed to each handler method, then delegate. */
+const capturing = (inner: EffectHandler): { handler: EffectHandler; seen: Map<string, unknown[]> } => {
+  const seen = new Map<string, unknown[]>();
+  // The constraint used to be `A extends { [k: string]: unknown }`, which no request type can
+  // satisfy: an INTERFACE has no implicit index signature, so every handler method failed to
+  // infer and the whole object leaned on the `as unknown as EffectHandler` below to stay quiet.
+  // Nothing annotates this literal now, and nothing needs to: `capturing`'s declared return type
+  // checks it at the `return` below. A `satisfies` here would be a second conformance mechanism
+  // for a shape already checked once, which is machinery rather than safety.
+  // `A` is only ever pushed into `unknown[]`, so the bound bought nothing and cost ten methods.
+  const wrap = <A, R>(
+    name: string,
+    fn: (req: A, ctx: EffectContext) => Promise<R>,
+  ) => {
+    return async (req: A, ctx: EffectContext): Promise<R> => {
+      const list = seen.get(name) ?? [];
+      list.push(req);
+      seen.set(name, list);
+      return await fn.call(inner, req, ctx);
+    };
+  };
+  const handler = {
+    now: () => inner.now(),
+    participant: wrap("participant", inner.participant),
+    spawn: wrap("spawn", inner.spawn),
+    turn: wrap("turn", inner.turn),
+    ask: wrap("ask", inner.ask),
+    checkpoint: wrap("checkpoint", inner.checkpoint),
+    sleep: wrap("sleep", inner.sleep),
+    wait: wrap("wait", inner.wait),
+    observe: wrap("observe", inner.observe),
+    notify: wrap("notify", inner.notify),
+    monitor: wrap("monitor", inner.monitor),
+    openConclave: wrap("openConclave", inner.openConclave),
+    closeConclave: wrap("closeConclave", inner.closeConclave),
+  };
+  return { handler, seen };
+};
+
+/**
+ * `name` never reaches a handler by design: it is the STEP name, consumed by the interpreter to
+ * build the journal key, and a handler has no business seeing it. `schema` reaches `ask` and
+ * `checkpoint` as a request field. `key` and `channel` on the combinators are interpreter-level.
+ *
+ * Exemptions are listed with their reason rather than filtered silently, so that a future option
+ * added to this list has to be argued rather than slipped in.
+ */
+const NOT_A_HANDLER_FIELD: Readonly<Record<string, string>> = {
+  "*.name": "the step name builds the journal key; the handler never sees it",
+  "parallel.name": "combinator scope name, interpreter-level",
+  "race.name": "combinator scope name, interpreter-level",
+  "fanOut.name": "combinator scope name, interpreter-level",
+  "fanOut.key": "maps an item to its branch key, evaluated by the interpreter before any dispatch",
+  "conclave.name": "combinator scope name, interpreter-level",
+};
+
+// ---- 1) the capture instrument sees what it claims to see ---------------------------------------
+
+{
+  const sim = new SimHandler({ turns: { probe: { status: "done" } } });
+  const { handler, seen } = capturing(sim);
+  await run('const a = await spawn("p", { name: "a", role: "r" });\nawait turn(a, { name: "probe", deadline: "5m" });\n', {
+    runId: "o-0",
+    handler,
+  });
+  ok("the capture sees a spawn request", (seen.get("spawn") ?? []).length === 1, seen.get("spawn"));
+  ok("and the fields on it", (seen.get("spawn")?.[0] as { role?: string })?.role === "r");
+  // The control: an option the interpreter does NOT forward must be visibly absent, or a green
+  // below would mean the instrument cannot tell forwarded from dropped.
+  const t = seen.get("turn")?.[0] as Record<string, unknown>;
+  ok("and it can tell present from absent", t?.deadline === "5m" && t?.name === undefined, t);
+}
+
+// ---- 2) every accepted option reaches the handler ------------------------------------------------
+
+{
+  // One program per primitive, passing every option the validator accepts.
+  const CASES: Readonly<Record<string, { src: string; method: string }>> = {
+    spawn: {
+      // `placement` belongs in this fixture for the reason the whole section exists: it was added to
+      // `PRIMITIVES.spawn.options` and this program was not updated beside it, so the audit reported
+      // `spawn.placement` dropped and THIS SUITE WAS RED at a108a8ad8 — the option list and the
+      // fixture are the two correct-looking lists the header warns about, one gap further along.
+      src: 'const t = channel("c");\nconst a = await spawn("p", { name: "a", cwd: "/prepared/writer", placement: { endpoint: "manager", instanceId: "i1" }, worktree: "wt-1", runtime: "tmux", join: [t], role: "r", permits: { turns: 3 }, supervise: { restart: "on-fail" }, onFork: "adopt", events: false });\n',
+      method: "spawn",
+    },
+    turn: {
+      src: 'const a = await spawn("p", { name: "a" });\nawait turn(a, { name: "go", deadline: "5m" });\n',
+      method: "turn",
+    },
+    ask: {
+      src: 'const a = await spawn("p", { name: "a" });\nawait ask(a, { name: "q", schema: { days: "number" }, deadline: "5m", attempts: 2 });\n',
+      method: "ask",
+    },
+    checkpoint: {
+      // `to` only addresses an escalated mint (L3044), so the fixture that exercises every
+      // accepted option has to escalate. The validator refused this fixture the moment that rule
+      // landed, which is the audit catching its own test data rather than the other way round.
+      src: 'await checkpoint("approve", "ok?", { schema: { ok: "boolean" }, timeout: "10m", onExpiry: "escalate", to: "david" });\n',
+      method: "checkpoint",
+    },
+    wait: {
+      src: 'const a = await spawn("p", { name: "a" });\nawait wait(replied(a), { name: "w", timeout: "1h" });\n',
+      method: "wait",
+    },
+    // `conclave` is a scope, so its request is built on the scope path rather than in `callPrimitive`.
+    // That is a second place an option can be dropped, and until this case existed nothing walked it.
+    conclave: {
+      src: 'const a = await spawn("p", { name: "a" });\nawait conclave([a], (ch) => turn(a, { name: "go" }), { name: "t", channel: "war-room" });\n',
+      method: "openConclave",
+    },
+  };
+
+  const script = {
+    turns: { go: { status: "done" } },
+    asks: { q: { days: 3 } },
+    checkpoints: { approve: { status: "resolved", value: true, by: "sim" } },
+    events: { w: [null] },
+  } as const;
+
+  const dropped: string[] = [];
+  let checkedOptions = 0;
+  for (const [prim, { src, method }] of Object.entries(CASES)) {
+    const spec = PRIMITIVES[prim as keyof typeof PRIMITIVES] as { options: readonly string[] };
+    const { handler, seen } = capturing(new SimHandler(script));
+    await run(src, { runId: `o-${prim}`, handler });
+    const req = (seen.get(method) ?? [])[0] as Record<string, unknown> | undefined;
+    if (req === undefined) {
+      dropped.push(`${prim}: handler.${method} was never called`);
+      continue;
+    }
+    for (const opt of spec.options) {
+      if (opt === "name" || NOT_A_HANDLER_FIELD[`${prim}.${opt}`] !== undefined) continue;
+      checkedOptions += 1;
+      if (req[opt] === undefined) dropped.push(`${prim}.${opt}`);
+    }
+  }
+
+  ok("the audit actually examined options", checkedOptions >= 12, checkedOptions);
+  ok("no accepted option is silently dropped on its way to the handler", dropped.length === 0, dropped);
+}
+
+// ---- 3) every declared primitive is actually implemented ----------------------------------------
+
+{
+  // The claim worth holding is the one the catalog makes: a primitive that parses runs. The check
+  // that catches a regression is that no primitive reaches the interpreter's not-implemented default.
+  const { handler, seen } = capturing(new SimHandler({ turns: { h: { status: "done" } } }));
+  const r = await run(
+    'const a = await spawn("a", { name: "a" });\nawait conclave([a], (ch) => turn(a, { name: "h" }), { name: "t", channel: "war-room" });\n',
+    { runId: "o-c", handler },
+  );
+  ok("conclave opens its channel through the handler", (seen.get("openConclave") ?? []).length === 1);
+  ok("and closes it", (seen.get("closeConclave") ?? []).length === 1);
+  ok("and the body's own effect ran inside it", (seen.get("turn") ?? []).length === 1);
+  ok(
+    "and the scope is journalled under its own kind, so a migrate can ask whether it closed",
+    r.journal.entries().some((e) => e.kind === "conclave" && e.status === "ok"),
+    r.journal.entries().map((e) => `${e.kind}:${e.status ?? e.state}`),
+  );
+}
+
+// ---- 4) the OBJECT form of spawn, which this suite did not exercise until it had to ------------
+
+/**
+ * `spawn` takes a persona name OR a record carrying the persona with its model and variant. This
+ * suite tested only the string form, so it certified "no accepted option is silently dropped" while
+ * the object form dropped `model` and `variant` from both the request and the input hash. Editing a
+ * model did not diverge, and the handler was never told which model to run.
+ *
+ * The audit was not wrong about what it measured. It measured one of the two call forms, and
+ * reported the answer as if it covered the primitive. An instrument's universe is a choice, and
+ * this one was mine.
+ */
+{
+  const capture: Record<string, unknown>[] = [];
+  const spy = (inner: EffectHandler): EffectHandler =>
+    ({
+      ...inner,
+      now: () => inner.now(),
+      spawn: async (req: Record<string, unknown>, ctx: EffectContext) => {
+        capture.push(req);
+        return (inner as unknown as { spawn: (r: unknown, c: EffectContext) => Promise<unknown> }).spawn(req, ctx);
+      },
+    }) as unknown as EffectHandler;
+
+  const src = (model: string) =>
+    `await spawn({ persona: "worker", model: "${model}", variant: "v1" }, { name: "worker" });\n`;
+  const a = await run(src("m1"), { runId: "o-obj", handler: spy(new SimHandler({})) });
+  const b = await run(src("m2"), { runId: "o-obj", handler: spy(new SimHandler({})) });
+
+  const req = capture[0] as { model?: string; variant?: string };
+  ok("the object form forwards the model", req?.model === "m1", req);
+  ok("and the variant", req?.variant === "v1", req);
+
+  // The identity half: model and variant are hashed with the persona, so swapping a model is a
+  // different agent and a resumed run must not replay a fact recorded about the other one.
+  const ha = a.journal.entries()[0]?.inputHash;
+  const hb = b.journal.entries()[0]?.inputHash;
+  ok("and swapping the model changes the input hash", ha !== hb, { ha, hb });
+
+  // The record form with no `persona` used to resolve to the literal string "undefined", which
+  // then rode into the input hash, the step name and the handler's request. A missing persona is
+  // `undefined` crossing an effect boundary, which is what L3041 names.
+  const missing = await run(`await spawn({ model: "m1" }, { name: "worker" });\n`, { runId: "o-nopersona", handler: new SimHandler({}) })
+    .then(() => undefined, (e: unknown) => e as { code?: string; message?: string });
+  ok("a spawn record with no persona is refused as L3041, never spawned as the persona \"undefined\"",
+    missing?.code === "L3041" && String(missing?.message).includes("names no persona"), missing);
+  const numeric = await run(`await spawn(42, { name: "worker" });\n`, { runId: "o-numpersona", handler: new SimHandler({}) })
+    .then(() => undefined, (e: unknown) => e as { code?: string });
+  ok("and so is a persona that is not a string at all", numeric?.code === "L3041", numeric);
+}
+
+// ---- 5) the hash table is a claim, not a comment ------------------------------------------------
+
+/**
+ * `hashedOptions` decides, for every option, whether editing it on a resumed run diverges or
+ * replays. That is the difference between a run that notices you changed the question and one that
+ * hands you an old answer to a new one, and it was DOCUMENTATION: the interpreter grew a projection
+ * per primitive, the table stayed at whatever it said the day it was written, and the two disagreed
+ * on four primitives at once. `checkpoint` was fixed in isolation while `wait.timeout`,
+ * `turn.deadline` and `ask.attempts|deadline` still replayed clean under an edit; `sleep` hashed its
+ * subject while the table said it did not.
+ *
+ * The gap is not "someone forgot". It is that a second copy of a rule with no test between them
+ * decays, and this one decayed in the direction where nothing fails: a stale table makes the NEXT
+ * person's "align the code to the table" a regression that looks like tidying.
+ *
+ * So the table is executed. Each option is edited on a real resume and the run must diverge exactly
+ * when the table says the option is hashed. The controls matter as much as the positives: `permits`,
+ * `supervise`, `onFork` and `fail`↔`proceed` must replay CLEAN, or "diverge on everything" would
+ * pass this suite while destroying every legitimate migration.
+ */
+{
+  const spec = (prim: string) =>
+    PRIMITIVES[prim as keyof typeof PRIMITIVES] as unknown as {
+      hashedOptions: readonly string[];
+      hashedValues?: Readonly<Record<string, readonly unknown[]>>;
+    };
+
+  /**
+   * What the TABLE predicts, derived rather than restated. An option is hashed outright, or it is
+   * hashed for particular values and an edit that touches one of those crosses the boundary.
+   */
+  const tableSaysHashed = (prim: string, opt: string, a: unknown, b: unknown): boolean => {
+    const s = spec(prim);
+    if (s.hashedOptions.includes(opt)) return true;
+    const values = s.hashedValues?.[opt];
+    return values !== undefined && (values.includes(a) || values.includes(b));
+  };
+
+  interface Probe {
+    readonly prim: string;
+    readonly opt: string;
+    /** The value on each side of the edit, for the table lookup. */
+    readonly a: unknown;
+    readonly b: unknown;
+    /** The whole option bag on each side, because some options are only legal beside others. */
+    readonly bagA: string;
+    readonly bagB: string;
+  }
+
+  const SPAWN = (bag: string) => `const t = channel("t");\nconst u = channel("u");\nawait spawn("p", { ${bag} });\n`;
+  const TURN = (bag: string) => `const a = await spawn("p", { name: "a" });\nawait turn(a, { ${bag} });\n`;
+  const ASK = (bag: string) => `const a = await spawn("p", { name: "a" });\nawait ask(a, { ${bag} });\n`;
+  const CP = (bag: string) => `await checkpoint("gate", "ok?", { ${bag} });\n`;
+  const WAIT = (bag: string) => `const a = await spawn("p", { name: "a" });\nawait wait(replied(a), { ${bag} });\n`;
+  // `waitUntil` takes its subject as a FUNCTION, so unlike every probe above it cannot be edited
+  // by swapping a literal: the probe and the predicate are unhashable by construction and the
+  // table's claim is entirely about the two durations beside them.
+  const WAIT_UNTIL = (bag: string) =>
+    `const a = await spawn("p", { name: "a" });\nawait waitUntil(async () => await ask(a, { name: "q", schema: { days: "number" } }), { ${bag} });\n`;
+
+  const SOURCE: Readonly<Record<string, (bag: string) => string>> = {
+    spawn: SPAWN, turn: TURN, ask: ASK, checkpoint: CP, wait: WAIT, waitUntil: WAIT_UNTIL,
+  };
+
+  const PROBES: readonly Probe[] = [
+    // spawn: identity is hashed, policy is not. `permits` is a budget and `supervise` a restart
+    // rule; both decide how a recorded fact is ACTED ON, so they are reapplied from current source.
+    { prim: "spawn", opt: "cwd", a: "/prepared/a", b: "/prepared/b", bagA: 'name: "a", cwd: "/prepared/a"', bagB: 'name: "a", cwd: "/prepared/b"' },
+    // The PLACEMENT TARGET, on a resume that edits only the instance id. The table said `placement`
+    // was hashed and no probe executed that claim, so the audit's own coverage gap was the one the
+    // first review found: retargeting a recorded spawn at a different manager instance has to
+    // diverge as a migration, because the recorded resolution was taken against the old instance.
+    { prim: "spawn", opt: "placement", a: "i1", b: "i2",
+      bagA: 'name: "a", cwd: "/prepared/a", placement: { endpoint: "manager", instanceId: "i1" }',
+      bagB: 'name: "a", cwd: "/prepared/a", placement: { endpoint: "manager", instanceId: "i2" }' },
+    { prim: "spawn", opt: "worktree", a: "wt-1", b: "wt-2", bagA: 'name: "a", worktree: "wt-1"', bagB: 'name: "a", worktree: "wt-2"' },
+    { prim: "spawn", opt: "join", a: "t", b: "u", bagA: 'name: "a", join: [t]', bagB: 'name: "a", join: [u]' },
+    { prim: "spawn", opt: "role", a: "r1", b: "r2", bagA: 'name: "a", role: "r1"', bagB: 'name: "a", role: "r2"' },
+    { prim: "spawn", opt: "permits", a: 3, b: 9, bagA: 'name: "a", permits: { turns: 3 }', bagB: 'name: "a", permits: { turns: 9 }' },
+    { prim: "spawn", opt: "supervise", a: "never", b: "on-fail", bagA: 'name: "a", supervise: { restart: "never" }', bagB: 'name: "a", supervise: { restart: "on-fail" }' },
+    { prim: "spawn", opt: "onFork", a: "respawn", b: "adopt", bagA: 'name: "a", onFork: "respawn"', bagB: 'name: "a", onFork: "adopt"' },
+
+    // The three siblings the checkpoint fix left behind. Each one STOPS OBSERVATION: the recorded
+    // result answers "within this cutoff", and a longer cutoff is a different question.
+    { prim: "turn", opt: "deadline", a: "1m", b: "10m", bagA: 'name: "go", deadline: "1m"', bagB: 'name: "go", deadline: "10m"' },
+    { prim: "ask", opt: "deadline", a: "1m", b: "10m", bagA: 'name: "q", schema: { days: "number" }, deadline: "1m"', bagB: 'name: "q", schema: { days: "number" }, deadline: "10m"' },
+    { prim: "ask", opt: "attempts", a: 1, b: 5, bagA: 'name: "q", schema: { days: "number" }, attempts: 1', bagB: 'name: "q", schema: { days: "number" }, attempts: 5' },
+    { prim: "ask", opt: "schema", a: "days", b: "weeks", bagA: 'name: "q", schema: { days: "number" }', bagB: 'name: "q", schema: { weeks: "number" }' },
+    { prim: "wait", opt: "timeout", a: "1m", b: "10m", bagA: 'name: "w", timeout: "1m"', bagB: 'name: "w", timeout: "10m"' },
+
+    { prim: "checkpoint", opt: "schema", a: "ok", b: "fine", bagA: 'schema: { ok: "boolean" }', bagB: 'schema: { fine: "boolean" }' },
+    { prim: "checkpoint", opt: "timeout", a: "1m", b: "10m", bagA: 'timeout: "1m"', bagB: 'timeout: "10m"' },
+    // The conditional rule, both ways round. Reading an expiry differently is a reapply; minting a
+    // second checkpoint is a new effect.
+    { prim: "checkpoint", opt: "onExpiry", a: "fail", b: "proceed", bagA: 'timeout: "1m", onExpiry: "fail"', bagB: 'timeout: "1m", onExpiry: "proceed"' },
+    { prim: "checkpoint", opt: "onExpiry", a: "proceed", b: "escalate", bagA: 'timeout: "1m", onExpiry: "proceed"', bagB: 'timeout: "1m", onExpiry: "escalate", to: "david"' },
+    { prim: "checkpoint", opt: "to", a: "david", b: "sam", bagA: 'timeout: "1m", onExpiry: "escalate", to: "david"', bagB: 'timeout: "1m", onExpiry: "escalate", to: "sam"' },
+
+    // `waitUntil`'s two durations, for the same reason as `wait.timeout`: both STOP OBSERVATION.
+    // A wait that looked hourly did not ask what a minutely one asks, and a recorded answer to
+    // "within ten minutes" is not an answer to "within an hour". The `terminal` control lives in
+    // wait-until.smoke rather than here, because editing it is a function edit and this audit
+    // works by swapping literals.
+    { prim: "waitUntil", opt: "every", a: "1m", b: "5m", bagA: 'name: "u", every: "1m", deadline: "10m"', bagB: 'name: "u", every: "5m", deadline: "10m"' },
+    { prim: "waitUntil", opt: "deadline", a: "10m", b: "1h", bagA: 'name: "u", every: "1m", deadline: "10m"', bagB: 'name: "u", every: "1m", deadline: "1h"' },
+  ];
+
+  const script = {
+    turns: { go: { status: "done" } },
+    asks: { q: { days: 3 } },
+    // Resolved on the first mint, so no probe accidentally depends on an escalation hop.
+    checkpoints: { gate: { status: "resolved", value: true, by: "sim" } },
+    events: { w: ["hello"] },
+    clock: { start: 0 },
+  } as const;
+
+  let audited = 0;
+  let hashedSeen = 0;
+  let cleanSeen = 0;
+  const wrong: string[] = [];
+
+  for (const p of PROBES) {
+    const src = SOURCE[p.prim] as (bag: string) => string;
+    const runId = `o-h-${p.prim}-${p.opt}-${String(p.b)}`;
+    const live = await run(src(p.bagA), { runId, handler: new SimHandler(script) });
+
+    let diverged: unknown;
+    try {
+      await resume(src(p.bagB), live.journal, { runId, pins: live.pins, handler: new SimHandler(script) });
+    } catch (e) {
+      diverged = e;
+    }
+
+    const predicted = tableSaysHashed(p.prim, p.opt, p.a, p.b);
+    const actual = diverged instanceof RunDivergence;
+    audited += 1;
+    if (predicted) hashedSeen += 1;
+    else cleanSeen += 1;
+    if (predicted !== actual) {
+      wrong.push(
+        `${p.prim}.${p.opt} ${JSON.stringify(p.a)}->${JSON.stringify(p.b)}: table says ${predicted ? "hashed" : "reapplied"}, run ${actual ? "diverged" : "replayed clean"}`,
+      );
+    } else if (diverged !== undefined && !actual) {
+      wrong.push(`${p.prim}.${p.opt}: resume threw something other than divergence - ${String(diverged).slice(0, 80)}`);
+    }
+  }
+
+  // A count, because a loop that audits nothing prints the same green as one that audits everything.
+  ok("the hash audit ran every probe", audited === PROBES.length && audited >= 19, audited);
+  // Both halves present: an interpreter that diverged on EVERY edit would satisfy the positives
+  // while breaking every reapply, and one that never diverged would satisfy the controls.
+  ok("with both hashed options and reapplied ones under test", hashedSeen >= 12 && cleanSeen >= 4, { hashedSeen, cleanSeen });
+  ok("the interpreter's projection matches the table on every option", wrong.length === 0, wrong);
+}
+
+// ---- 6) a new option must not move an OLD step's identity ---------------------------------------
+
+/**
+ * The rule §5 above audits is "an edit to a hashed option diverges". This section audits the rule
+ * that sits under it and that §5 cannot see: ADDING AN OPTION TO A PRIMITIVE MUST NOT CHANGE THE
+ * INPUT HASH OF A STEP THAT DOES NOT USE IT.
+ *
+ * §5 is blind to it by construction. Every probe there edits one option on BOTH sides of a resume,
+ * so both sides run the same code and the same projection; a projection that grew two extra keys
+ * for every spawn in existence is identical on both sides and every probe stays green. The break is
+ * only visible against a journal written by the OLDER code, which no probe in this file has.
+ *
+ * It was a real break, not a hypothetical. #1616 added `cwd` and `placement` to the spawn
+ * projection as `cwd: req.cwd ?? null` and `placement: ... ?? null`, unconditionally. A legacy
+ * spawn hashed `{persona, model, variant, worktree, role, join}`; the same spawn then hashed those
+ * six plus two nulls it had never carried. `inputHash` changed, so every recorded pre-#1616 spawn
+ * step diverged on replay — with a `RunDivergence` that tells the operator their program changed,
+ * when it had not.
+ *
+ * Both directions are asserted, and the NEGATIVE one is why this is not just a compatibility cell:
+ * an implementation that restored the legacy hash by dropping placement from the projection
+ * entirely would satisfy (1) and silently reuse a resolution taken against a manager instance the
+ * edited program no longer names. So (1) omission is byte-identical, (2) presence is hashed.
+ */
+{
+  const hashOfSpawn = async (runId: string, bag: string): Promise<string> => {
+    const live = await run(`await spawn("p", { ${bag} });\n`, { runId, handler: new SimHandler({}) });
+    const entry = live.journal.entries().find((e) => e.kind === "spawn");
+    if (entry === undefined) throw new Error(`FAIL: ${runId} recorded no spawn entry to read an inputHash from`);
+    return entry.inputHash;
+  };
+
+  /**
+   * The object the MERGE-BASE code (aaff9d5e5) built for a spawn, restated key for key from that
+   * source. Six keys: no `cwd`, no `placement`, and no null standing in for either.
+   *
+   * Restated rather than imported, because the point is to pin the OLD shape: a copy that tracked
+   * the current projection would agree with whatever the projection becomes, which is the failure
+   * mode this whole section exists to catch. It is checked against the live hash, so it cannot
+   * silently be the wrong shape either — a wrong restatement reddens here immediately.
+   */
+  const BASE_SIX = { persona: "p", model: null, variant: null, worktree: null, role: null, join: [] };
+  const baseHash = digest(BASE_SIX);
+
+  // The digest canonicalizes (RFC 8785 sorts keys), so this cell is about the key SET and the
+  // values, never the order they are written in the source. Stated as a control rather than a
+  // comment: if it ever stopped holding, `BASE_SIX` would be testing source layout instead.
+  ok("the input digest is key-order insensitive, so the cells below test the key SET",
+    digest({ join: [], role: null, worktree: null, variant: null, model: null, persona: "p" }) === baseHash);
+
+  const legacyHash = await hashOfSpawn("o-legacy-identity", 'name: "a"');
+  ok("a spawn naming no cwd and no placement hashes the SIX-key merge-base object, byte for byte",
+    legacyHash === baseHash, { legacyHash, baseHash });
+
+  // The negative direction. Same program, same persona, one edited instance id.
+  const pinnedI1 = await hashOfSpawn("o-placed-i1",
+    'name: "a", cwd: "/prepared/a", placement: { endpoint: "manager", instanceId: "i1" }');
+  const pinnedI2 = await hashOfSpawn("o-placed-i2",
+    'name: "a", cwd: "/prepared/a", placement: { endpoint: "manager", instanceId: "i2" }');
+  ok("a PRESENT placement is hashed: the same spawn on two instance ids has two input hashes",
+    pinnedI1 !== pinnedI2, { pinnedI1, pinnedI2 });
+  ok("and a placed spawn is not the legacy spawn either",
+    pinnedI1 !== legacyHash && pinnedI2 !== legacyHash, { pinnedI1, legacyHash });
+
+  // Removing the option is the third direction, and it is the one a "hash it only when present"
+  // rule could get wrong in the other direction: dropping `cwd` from a recorded placed spawn must
+  // diverge too, not fall back to matching the legacy hash by accident.
+  const placedNoCwd = await hashOfSpawn("o-placed-nocwd",
+    'name: "a", placement: { endpoint: "manager", instanceId: "i1" }');
+  ok("dropping cwd from a placed spawn diverges from both the placed hash and the legacy hash",
+    placedNoCwd !== pinnedI1 && placedNoCwd !== legacyHash, { placedNoCwd, pinnedI1, legacyHash });
+}
+
+// ---- 7) a malformed placement is REFUSED BY NAME, before anything reads into it ----------------
+
+/**
+ * The refusal that was written for a malformed placement lives in the RUNTIME
+ * (`mesh-handler.ts`, L4000, "placement must name both an endpoint and an instanceId"), and
+ * `placement: null` never reached it. `option()` guards the BAG being null and not the VALUE, so
+ * `null` came back from the bag, passed the `!== undefined` forwarding test, and was dereferenced
+ * by the identity projection: `TypeError: Cannot read properties of null (reading 'endpoint')`,
+ * raised inside the interpreter, with no code, no effect kind and no journal entry. An author who
+ * wrote one wrong option got a stack trace where a diagnosis had been deliberately written.
+ *
+ * FOUR SHAPES, FOUR CELLS, and the three that did NOT crash are the reason this is not a
+ * one-line null check. A primitive, an empty record and a half-filled record were all forwarded
+ * too, and they projected `endpoint: undefined, instanceId: undefined` into the step identity and
+ * carried on. That is the quieter failure: the run continues under an identity describing a
+ * placement the program never named. A fix that only caught `null` would turn the loud case into a
+ * refusal and leave the three silent ones exactly as they were, which is why each shape is its own
+ * cell rather than a conjunction — a conjunction goes green the moment the null is handled and one
+ * red cell cannot say which shape regressed.
+ *
+ * The cells assert the CODE and the shape named in the message, never the message's full text: a
+ * cell that pinned the sentence would grade the wording and red on a reworded refusal that behaves
+ * identically.
+ */
+{
+  const refuse = async (runId: string, bag: string): Promise<{ code?: string; message?: string; name?: string } | undefined> =>
+    await run(`await spawn("p", { ${bag} });\n`, { runId, handler: new SimHandler({}) })
+      .then(() => undefined, (e: unknown) => e as { code?: string; message?: string; name?: string });
+
+  // THE SHAPE THAT CRASHED.
+  const nul = await refuse("o-place-null", "placement: null");
+  ok("`placement: null` is refused as a named L3048, never a raw TypeError out of the projection",
+    nul?.code === "L3048" && nul?.name !== "TypeError" && String(nul?.message).includes("null"), nul);
+
+  // THE THREE THAT DID NOT CRASH, and so were worse.
+  const prim = await refuse("o-place-primitive", "placement: 42");
+  ok("a primitive placement is refused, not projected as two undefined fields",
+    prim?.code === "L3048" && String(prim?.message).includes("42"), prim);
+
+  const empty = await refuse("o-place-empty", "placement: {}");
+  ok("an empty record placement is refused, and the message says it names neither half",
+    empty?.code === "L3048" && String(empty?.message).includes("empty record"), empty);
+
+  const partial = await refuse("o-place-partial", 'placement: { endpoint: "m" }');
+  ok("a partial placement is refused, and the message names the MISSING half rather than the given one",
+    partial?.code === "L3048" && String(partial?.message).includes("instanceId"), partial);
+
+  // The other half of "partial", so the cell above cannot pass by naming whichever half is easier.
+  const partial2 = await refuse("o-place-partial2", 'placement: { instanceId: "i" }');
+  ok("and a placement missing the endpoint instead is refused naming THAT half",
+    partial2?.code === "L3048" && String(partial2?.message).includes("endpoint"), partial2);
+
+  // Empty strings are the shape the runtime's own L4000 already refuses; lang agrees with it rather
+  // than admitting a placement the layer below would then reject.
+  const blank = await refuse("o-place-blank", 'placement: { endpoint: "", instanceId: "" }');
+  ok("a placement of two empty strings is refused, matching the runtime's own both-halves rule", blank?.code === "L3048", blank);
+
+  // `typeof [] === "object"`, so an array reaches `.endpoint` as undefined rather than as an error.
+  const arr = await refuse("o-place-array", 'placement: ["m", "i"]');
+  ok("an array placement is refused: a pair is a record, not two positions", arr?.code === "L3048", arr);
+
+  // THE TWO CONTROLS. Without these, a guard that refused EVERY placement would pass all of the
+  // above and would have removed the feature.
+  const valid = await run('await spawn("p", { placement: { endpoint: "m", instanceId: "i" } });\n',
+    { runId: "o-place-valid", handler: new SimHandler({}) }).then((r) => r, () => undefined);
+  ok("a well-formed placement still spawns, and records its step",
+    valid !== undefined && valid.journal.entries().filter((e) => e.kind === "spawn").length === 1,
+    valid === undefined ? "refused a valid placement" : valid.journal.entries().map((e) => e.status));
+  const omitted = await run('await spawn("p", { name: "a" });\n',
+    { runId: "o-place-omitted", handler: new SimHandler({}) }).then((r) => r, () => undefined);
+  ok("and a spawn that names no placement at all is untouched by the guard",
+    omitted !== undefined && omitted.journal.entries().filter((e) => e.kind === "spawn").length === 1, omitted === undefined);
+
+  // REFUSED BEFORE THE KEY IS MINTED. A refusal that had already written an entry would leave a
+  // journal recording a step the program must now be edited away from, and the edit would then
+  // diverge on resume. This is the same rule §4.4's refused-input cell states for crossing values.
+  const nothing = await run('try { await spawn("p", { placement: null }); } catch (e) { }\n',
+    { runId: "o-place-nojournal", handler: new SimHandler({}) });
+  ok("a refused placement writes NO journal entry", nothing.journal.entries().length === 0,
+    nothing.journal.entries().map((e) => `${e.kind}:${e.name}`));
+
+  // AND THE PROGRAM CAN ACT ON IT. A refusal the program cannot catch is a crash with a nicer
+  // name; the point of a code is that a workflow can branch on it. The caught value is a RECORD
+  // carrying `code`, which is what `toProgramError` makes of a `RuntimeFault`.
+  const caught = await run(
+    'try { await spawn("p", { placement: null }); } catch (e) { await spawn("p", { name: "saw", role: e.code }); }\n',
+    { runId: "o-place-catchable", handler: new SimHandler({}) });
+  const sawEntry = caught.journal.entries().find((e) => e.name === "saw");
+  ok("the refusal is CATCHABLE by the program, as a record carrying the code",
+    sawEntry !== undefined && sawEntry.status === "ok",
+    caught.journal.entries().map((e) => `${e.kind}:${e.name}:${e.status}`));
+}
+
+// ---- 8) an inline persona is the identity, so every field of it is hashed -----------------------
+
+/**
+ * `spawn({ name, prompt, ... })` defines the helper in the program. The definition reaches the
+ * handler whole, it is hashed whole, so editing any field of it on a resumed run diverges, and an
+ * omitted list and an empty one are two definitions. A malformed record is refused before a key is
+ * minted, so nothing is journalled for it.
+ */
+{
+  const capture: Record<string, unknown>[] = [];
+  const spy = (inner: EffectHandler): EffectHandler =>
+    ({
+      ...inner,
+      now: () => inner.now(),
+      spawn: async (req: Record<string, unknown>, ctx: EffectContext) => {
+        capture.push(req);
+        return (inner as unknown as { spawn: (r: unknown, c: EffectContext) => Promise<unknown> }).spawn(req, ctx);
+      },
+    }) as unknown as EffectHandler;
+  const BASE = 'name: "helper", prompt: "You review diffs.", role: "reviewer", model: "m1", variant: "high", description: "d", subscribe: ["t"], allowSubscribe: ["t"], allowPublish: ["t"], capabilities: ["spawn"], save: false';
+  const src = (fields: string) => `await spawn({ ${fields} }, { name: "helper" });\n`;
+  const live = await run(src(BASE), { runId: "o-inline", handler: spy(new SimHandler({})) });
+  const req = capture[0] as { persona?: string; inline?: Record<string, unknown>; model?: string };
+  ok("an inline spawn forwards its definition whole", JSON.stringify(req?.inline) === JSON.stringify({
+    name: "helper", prompt: "You review diffs.", role: "reviewer", model: "m1", variant: "high", description: "d",
+    subscribe: ["t"], allowSubscribe: ["t"], allowPublish: ["t"], capabilities: ["spawn"], save: false,
+  }), req);
+  ok("and names the helper as its persona, with no catalog model override", req?.persona === "helper" && req?.model === undefined, req);
+  const entry = live.journal.entries().find((e) => e.kind === "spawn");
+  ok("its input hash is the catalog projection plus the definition, byte for byte", entry?.inputHash === digest({
+    persona: "helper", model: "m1", variant: "high", worktree: null, role: null, join: [], inline: req?.inline,
+  }), entry?.inputHash);
+
+  const diverges = async (label: string, edited: string): Promise<boolean> => {
+    try {
+      await resume(src(edited), live.journal, { runId: "o-inline", pins: live.pins, handler: new SimHandler({}) });
+      return false;
+    } catch (e) {
+      if (!(e instanceof RunDivergence)) throw new Error(`FAIL: ${label} threw something other than divergence - ${String(e)}`);
+      return true;
+    }
+  };
+  ok("an unchanged definition resumes clean", !(await diverges("unchanged", BASE)));
+  const edits: [string, string][] = [
+    ["prompt", BASE.replace("You review diffs.", "You write tests.")],
+    ["role", BASE.replace('role: "reviewer"', 'role: "writer"')],
+    ["model", BASE.replace('model: "m1"', 'model: "m2"')],
+    ["variant", BASE.replace('variant: "high"', 'variant: "low"')],
+    ["description", BASE.replace('description: "d"', 'description: "e"')],
+    ["subscribe", BASE.replace('subscribe: ["t"], allowSubscribe', 'subscribe: [], allowSubscribe')],
+    ["allowSubscribe", BASE.replace('allowSubscribe: ["t"]', 'allowSubscribe: ["t", "u"]')],
+    ["allowPublish", BASE.replace('allowPublish: ["t"]', "allowPublish: []")],
+    ["capabilities", BASE.replace('capabilities: ["spawn"]', "capabilities: []")],
+    ["save", BASE.replace("save: false", "save: true")],
+    ["an omitted list", BASE.replace(', capabilities: ["spawn"]', "")],
+  ];
+  const stayed: string[] = [];
+  for (const [field, edited] of edits) if (!(await diverges(field, edited))) stayed.push(field);
+  ok("editing any field of the definition diverges, an omitted list included", stayed.length === 0, stayed);
+
+  const bad: [string, string, string][] = [
+    ["a record naming both a catalog persona and a prompt", 'persona: "p", name: "helper", prompt: "x"', "also names a catalog persona"],
+    ["a field an inline persona does not have", 'name: "helper", prompt: "x", config: "/etc/x"', "`config`, which an inline persona has no field for"],
+    ["no name", 'prompt: "x"', "names no helper"],
+    ["a blank prompt", 'name: "helper", prompt: "  "', "has no prompt"],
+    ["a list that is not of strings", 'name: "helper", prompt: "x", allowPublish: [1]', "`allowPublish` must be a list of strings"],
+    ["a save that is not a boolean", 'name: "helper", prompt: "x", save: "yes"', "`save` must be true or false"],
+  ];
+  const wrong: string[] = [];
+  for (const [label, fields, says] of bad) {
+    const e = await run(src(fields), { runId: "o-inline-bad", handler: new SimHandler({}) })
+      .then(() => undefined, (x: unknown) => x as { code?: string; message?: string });
+    if (e?.code !== "L3049" || !String(e?.message).includes(says)) wrong.push(`${label}: ${JSON.stringify(e)}`);
+  }
+  ok("a malformed inline persona is refused as L3049, naming what is wrong", wrong.length === 0, wrong);
+  const caught = await run(`try { await spawn({ ${bad[0]![1]} }, { name: "helper" }); } catch (e) { }\n`, { runId: "o-inline-nojournal", handler: new SimHandler({}) });
+  ok("and the refusal journals nothing", caught.journal.entries().length === 0, caught.journal.entries().map((e) => `${e.kind}:${e.name}`));
+}
+
+console.log(`options.smoke: ${pass} checks passed`);

@@ -1,0 +1,2 @@
+# Auth roster response size, pagination, connection-scoped cache and invalidation.
+smoke:auth-roster

@@ -1,0 +1,92 @@
+# @cotal-ai/lang
+
+Cotal Lang, the workflow language a durable Cotal run executes: a small subset of JavaScript in
+which every interaction with the world is one of a dozen effects and everything else is pure. This
+package is the validator, the interpreter, the step journal, the effect interface a host
+implements, and the simulator and dry run that exercise a program with no broker.
+
+**Tier:** `packages/` (the standard). Depends on nothing else in the repo; it knows about effects,
+not about NATS. The host that runs a program on the mesh is `@cotal-ai/runtime`.
+
+**Two engines.** `run`/`resume` are the tree-walker, language version `1`, and it stays the replay
+engine for every run recorded under it. `engine/` is version `2`: a different language, not a faster
+one, and the one fresh driver runs execute on. Each engine stamps the pins it resolves with its own
+version and compares a recorded version against its own, which is why `WALKER_LANGUAGE_VERSION` and
+`ENGINE_LANGUAGE_VERSION` are two constants and `LANGUAGE_VERSION` is an alias for the current
+language, the engine's. A record binds only under the engine that wrote it (L5008). The engine
+requires node 22 or newer and refuses below it with `EngineUnavailable`, an implementation limit
+that carries no `L` code, because the error catalog lists only conditions a program can cause. A
+host runs a program in the engine's worker thread. The handler is either built inside the thread
+from cloneable config or, when it is a live object as a driver's is, kept in the host with the
+effect seam bridged over a message port (`engine/bridge.ts`).
+
+The language is defined by [`spec/cotal-lang.md`](../../spec/cotal-lang.md) (normative; every
+`js` block in it is validated by this package's surface suite) and its wire footprint by
+[SPEC.md §14](../../SPEC.md#14-workflow-runs-v05). The guide is
+[docs/workflows.mdx](../../docs/workflows.mdx).
+
+## Use
+
+```ts
+import { validate, run, dryRun, SimHandler, Journal } from "@cotal-ai/lang";
+
+const source = `
+const builder = await spawn("builder")
+const r = await turn(builder, { name: "build", deadline: "30m" })
+log(r.status)
+`;
+
+validate(source);                       // throws LangErrors, every refusal with code, cause, fix
+
+const script = { turns: { build: { status: "done" } } };
+const plan = await dryRun(source, script);   // what it would do, with no agent touched
+
+const first = await run(source, { runId: "r-1", handler: new SimHandler(script) });
+// first.journal.entries() is the step journal; first.pins is what a resume must be handed back.
+
+const again = await run(source, {
+  runId: "r-1",
+  pins: first.pins,
+  journal: new Journal({ run: "r-1", entries: first.journal.entries() }),
+  handler: new SimHandler({}),          // nothing is scripted: every step replays
+});
+```
+
+`run` performs effects through the `EffectHandler` you pass and records each in the `Journal`;
+hand the same journal and pins back and the same program resumes. A handler binds in-flight
+external work before awaiting it; a thrown failure replays on resume, while a pending bound
+effect can reattach. A pending step inside `once` is never dispatched again: it opens a hold under
+`holdRequestId` of its recorded request id, and the answer becomes its result. `SimHandler` scripts turns, asks,
+checkpoints and events and refuses anything unscripted (L6001), so a simulation cannot silently
+invent an answer. Time is discrete-event simulated on one virtual clock: timed effects park at
+their wake times and are delivered in wake order, so concurrent branches accumulate their own
+durations and a `race` under simulation is decided by the rule itself (least recorded clock, ties
+by declaration order), not by the order effects were asked. The simulator also enforces the `ask`
+schema shorthand: an unreadable schema is refused (L4022), and non-conforming replies consume
+`attempts` before L4006.
+
+## Suites
+
+`pnpm test` in this directory runs every smoke: grammar, keys, journal, fuzz-journal, pins,
+scopes, sim, interpret, fuel, dryrun, examples, options, notify-fact, migrate, semantics (the pure
+fragment against node), surface (the syntax table, the library tables, and that every example in
+the reference and the guide validates), conformance, transform, differential, engine and
+root-cancellation.
+`smoke/mutations/*.json` are the `pnpm mutation-proof` targets.
+
+`pnpm test` emits the build without a type check (`build:emit`), then `smoke/_run.ts` runs the 21
+declared `smoke/*.smoke.ts` files, each in its own process, in parallel. Each file's full output is
+printed in declared order, and a file
+passes only if it exits 0 and its output carries a non-zero tally with no failures. Every file
+runs even after one fails, and the run then fails. A `smoke/*.smoke.ts` file that is neither
+declared nor excluded, or a declared file that is missing, is refused. `wait-until.smoke.ts` is
+excluded on purpose: it was never part of this chain and CI runs it as its own suite.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `COTAL_TEST_JOBS` | `max(1, min(6, cpus - 1))` | Files run at once. `1` runs them one at a time. |
+| `COTAL_TEST_TIMEOUT_MS` | `120000` | Per-file limit. A file over it, and its child processes, are killed and it fails. |
+
+A malformed value for either is an error. Captured output is capped at 32 MiB per file; more than
+that fails the file. On Linux each file gets its own process group, so an interrupted run leaves no
+child behind. On Windows the process tree is killed with `taskkill`. That path has not been run.

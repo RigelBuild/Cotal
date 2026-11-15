@@ -1,0 +1,5507 @@
+# @cotal-ai/connector-core
+
+## 0.151.2
+
+No changes in this release.
+
+## 0.151.1
+
+### Patch Changes
+
+- f84069e: The docs site now has a TypeScript reference for every published package, generated from source. Each of these packages' entry files gains a `@module index` comment so the reference names the main import path `index` instead of leaving it blank. The published code is otherwise unchanged.
+
+## 0.151.0
+
+### Patch Changes
+
+- 143a69e: A plain spawn of a Claude seat whose startup showed no development-channels prompt now says that mesh traffic does not wake the seat while idle: the spawn result carries `startupNotice`, `cotal spawn` prints a `STARTUP_NOTICE` warning, the `cotal_spawn` result ends with the notice, and `cotal ps` marks the seat `no idle wake`. A connector declares this with `idleWakeNeedsConfirmed`.
+- 38f5bb2: `@cotal-ai/core` no longer exports the `terminal` extension kind (`TerminalLayout`, `Tab` and `Pane`), and `@cotal-ai/tmux` and `@cotal-ai/cmux` no longer export or register `tmuxTerminalProvider` and `cmuxTerminalProvider`, along with the layout code only those providers used. Nothing in Cotal has resolved the kind since `cotal setup` became configure-only, while the contract and both providers still named `cotal setup` as their consumer. Spawned tmux and cmux agents launch as before; the cmux pane launcher keeps its `env -i` isolation and drops the login-shell and inherited-environment modes that only layout panes used. The upgrading guide lists the imports to remove.
+
+## 0.150.0
+
+### Patch Changes
+
+- c9d5969: `submitFeedback` confirms a send only from the documented 202 receipt, and a redirect no longer carries the submission to another origin.
+
+## 0.149.0
+
+### Minor Changes
+
+- 2d497ad: `createManagerInstanceIdentity` and `createAuthInstanceIdentity` take a function that returns the identity, and call it only when the root has no record. A caller that already holds an identity passes it back from that function. The manager and the auth service no longer read the record themselves before asking for one.
+
+### Patch Changes
+
+- 93794d5: Tell agents the channel-history retention limits in their shared briefing. State the default of no age limit and 1000 posts per sender per channel, identify the operator command for changing it, and warn that older posts may no longer be available.
+
+## 0.148.2
+
+No changes in this release.
+
+## 0.148.1
+
+No changes in this release.
+
+## 0.148.0
+
+### Patch Changes
+
+- c8cf718: Your own Codex conversations can now join a Cotal mesh after you approve them: `cotal setup` installs a Cotal plugin into Codex, and a connected conversation is woken when messages arrive. The plugin's server binds to the conversation Codex names in each tool call's request metadata, opens and retires its identity through the existing `cotal app-identity` approval flow, queues at most one labelled notice per connection with Codex's `thread/queue/add` (the messages themselves are read with `cotal_inbox`), and publishes the conversation's own activity only from the moment of approval.
+- c8cf718: Allow authenticated hosted gateways to implement MCP Events discovery and subscription methods through an optional adapter, with transport-bound accounts and secret-safe protocol errors.
+- c8cf718: Your own Claude Code and Codex conversations can now join an open or static mesh this computer runs with `cotal up`, not only a signed-in space. A natively bound conversation's `cotal_connect` opens its identity at once with the grant a bare `cotal spawn` gets on that mesh: the default persona's channels, role and capabilities, or the part of them a selection names. Concurrent requests for the same native session are serialized so they cannot create two identities. On a static mesh the space's local signing authority issues it as a terminal seat under its own lifecycle, and disconnecting, ending the session, or the next connection after a killed plugin server retires it with its issuance and broker footprint. A call without a native session, and a static mesh whose signing authority this account does not hold, open nothing. Signed-in spaces still require a person's approval. An endpoint whose credential expires more than about 24.8 days out, such as a terminal seat's with no expiry, no longer refreshes in a 1 ms loop and fails to connect.
+
+## 0.147.8
+
+No changes in this release.
+
+## 0.147.7
+
+No changes in this release.
+
+## 0.147.6
+
+No changes in this release.
+
+## 0.147.5
+
+No changes in this release.
+
+## 0.147.4
+
+### Patch Changes
+
+- 1d3edea: Correct bundled DM tool documentation so it no longer promises a stored sequence or complete recipient-status report. The existing tool response and message delivery are unchanged.
+- 9973a9a: Restore the descriptive classifications of migrated documentation pages in the offline docs index while preserving their current categories. Share category parsing between the bundle generator and website checks so a full classification is not mistaken for its category.
+
+## 0.147.3
+
+No changes in this release.
+
+## 0.147.2
+
+No changes in this release.
+
+## 0.147.1
+
+No changes in this release.
+
+## 0.147.0
+
+No changes in this release.
+
+## 0.146.0
+
+### Minor Changes
+
+- 6cd9b65: `cotal who` and `cotal_roster` mark a shared name by the same rule a direct message uses, so a session's own row and a lone offline participant no longer carry an instance id.
+
+## 0.145.1
+
+No changes in this release.
+
+## 0.145.0
+
+No changes in this release.
+
+## 0.144.0
+
+### Minor Changes
+
+- f792696: Refuse MCP environment references to reserved per-seat COTAL names before launch, preventing a spawned agent from inheriting its parent's role or model. Keep non-COTAL references and machine-wide operator variables available.
+
+## 0.143.0
+
+No changes in this release.
+
+## 0.142.0
+
+### Patch Changes
+
+- 32f93ed: Make `EndpointReply` a union on `ok`. Failed replies require an error; successful replies cannot carry one. TypeScript callers must construct the matching reply arm and narrow `ok` before using a required error. Interfaces that extended `EndpointReply` must use a type intersection instead.
+  
+  Keep acceptance data on local failed goal-follow results. The wire parser still rejects failed replies carrying data or missing their error. Narrowed readers no longer need fallback text for missing errors.
+
+## 0.141.11
+
+### Patch Changes
+
+- d389b22: A pause-plane deadline is recognized by the NATS client's TimeoutError class, so an error that only carries that name is no longer retried and then failed as a late reply.
+
+## 0.141.10
+
+No changes in this release.
+
+## 0.141.9
+
+No changes in this release.
+
+## 0.141.8
+
+### Patch Changes
+
+- 29b229c: Export one UserAuthLaunch type for the user-mode identity carried through launch options, material and manager provisioning/resume data. Check the material reader's reconstruction against the complete declared type without changing runtime validation or serialization.
+
+## 0.141.7
+
+No changes in this release.
+
+## 0.141.6
+
+No changes in this release.
+
+## 0.141.5
+
+No changes in this release.
+
+## 0.141.4
+
+No changes in this release.
+
+## 0.141.3
+
+No changes in this release.
+
+## 0.141.2
+
+No changes in this release.
+
+## 0.141.1
+
+No changes in this release.
+
+## 0.141.0
+
+### Minor Changes
+
+- bacabd0: An agent can define its helper on the spawn itself. `cotal_spawn` takes a `persona` record (the persona prompt, role, model, variant, description, channels and capabilities) next to `name`, and the helper runs from a private snapshot of it. `persona.save: true` also writes a catalog copy under that name, owned by the spawner. A cotal-lang program does the same with `spawn({ name, prompt, ... }, opts)`, and the run journal records the definition and its digest, so a resume never submits another one. `cotal_persona` takes `capabilities` and says how a saved persona is removed.
+  
+  A helper never gets more than its spawner holds. On a static mesh every spawn is measured against the spawner's issued evidence: each channel, the role and each capability token it does not hold is refused by name, and a spawner whose evidence does not resolve hands on nothing. Operator commands and admin agents are exempt. A workflow run's spawns are bounded by what its starter held when the run was admitted, on its host and on any other static manager its spawn reaches, which reads the run's admission. A `cotal run start --local` run's helpers get only channels within the `--admit-read` and `--admit-publish` ceiling. The static agent mint now grants task-queue rows for each `role:<r>` capability, so a spawner hands on a role it was given either way. On a participant manager the issuing host makes the agent that asked for a helper its ledger parent, taking the caller from the spawn request it observed, and a run's helper is parented to the run's starter and also bounded by the grant its admission recorded. A run revoked mid-step starts no further helper, and a persona a run saves is owned by its starter. The loopback `verify-enrollment` door a host platform asks decides the same parent and bound and answers `parent`, and a retry of the same enrollment gets the same answer.
+  
+  A seat started by foreground `cotal spawn`, or a bare `cotal join`, on a static mesh is now issued against its own lifecycle. Its credential has no expiry unless `--expires-in` or `--expires-at` is passed, is never renewed, and is retired when the seat leaves cleanly.
+  
+  Breaking: a static spawner that hands its helpers channels, capabilities or a role it does not hold is refused, an older issuing host refuses the new enrollment field, an older manager refuses a run's spawn, which now names its run, an older reader refuses an admission carrying `spawnExempt` or `delegation`, and an enrollment retry is refused when its read set is not its grant's, which is the case for a grant an older host wrote for a helper that named only a subscribe set. See UPGRADING.
+
+## 0.140.8
+
+No changes in this release.
+
+## 0.140.7
+
+No changes in this release.
+
+## 0.140.6
+
+No changes in this release.
+
+## 0.140.5
+
+No changes in this release.
+
+## 0.140.4
+
+No changes in this release.
+
+## 0.140.3
+
+No changes in this release.
+
+## 0.140.2
+
+No changes in this release.
+
+## 0.140.1
+
+No changes in this release.
+
+## 0.140.0
+
+### Minor Changes
+
+- 485bbfe: `cotal history limit` now sets the limits of DMs and of the delivery daemon's inbox and stored copies as well as channel posts, and takes `none` for any age or count. `--inbox-max-age` and `--inbox-per-agent` set the inbox and stored copies together, and `--dm-max-age` and `--dm-per-sender` set DMs. A new space keeps 1000 stored copies per agent and every DM, as before, and `cotal up` and connecting never change a limit. A lower limit shows what it deletes for each agent or DM pair and asks first. With no limit flags the command prints the four streams' limits and changes nothing. Its `--json` result now lists one entry per stream under `result.streams`. Restore brings back the recorded limits of all four streams.
+  
+  The delivery daemon stamps each stored copy with the count it was stored under in a `Cotal-Delivery-Limit` header, and the stored-copies notice compares against that count. A copy without the header counts as 1000.
+  
+  In `@cotal-ai/core`, the chat-only limit API is replaced by one that takes the stream. `ChatHistoryLimit` becomes `HistoryLimit`, whose `perSender` is now `perSubject`; `setChatHistoryLimit`, `describeChatHistory`, `chatHistoryLimitProblem`, `chatHistoryLimitOf` and `chatHistoryRestoreStaging` become `setHistoryLimit`, `describeHistoryLimit`, `historyLimitProblem`, `historyLimitOf` and `historyLimitRestoreStaging`; and `ChatHistoryChange`, `ChatHistoryUpdateUnknown` and `ChatHistoryChanged` become `HistoryLimitChange`, `HistoryLimitUpdateUnknown` and `HistoryLimitChanged`. `isAcceptedChatHistory`, `CHAT_HISTORY_MIN_AGE_MS` and `CHAT_HISTORY_MAX_AGE_MS` are removed; `historyLimitMinAgeMs` and `HISTORY_MAX_AGE_MS` give the bounds, and `historyAgeProblem` checks an age on its own, where 0 is an age below the floor. The `stored-copies-full` event now carries the stamped `limit`.
+
+## 0.139.1
+
+No changes in this release.
+
+## 0.139.0
+
+### Minor Changes
+
+- 6454ee0: The Claude Code connector publishes a `CUSTOM` event named `cotal.toolResult` on the event plane at each tool result, with the value `{ toolCallId, isError }` and the result's timestamp. It carries no tool input or output: tool arguments and results stay off the channel, and the marker only says which call finished and whether it returned an error. The closed schema admits only that shape, and the vocabulary gate checks it before the frame is written: a marker whose value is malformed, or that carries `rawEvent`, is refused as a vocabulary error rather than frozen in the write-ahead log, where it would halt recovery on every restart. The write path strips `rawEvent` from a marker, and a frozen frame from an older version that still carries one halts. The gate also refuses a marker for a call that is still open. `cotal console` draws the marker as `done` or `failed` under its call, and the dashboard uses it to show whether each call is running, done or failed and how long it took. A connector downgraded across a write-ahead log that holds a marker refuses the event name and halts.
+- c3d4af4: The `cotal web` dashboard tells agents apart and shows what each one is doing. Every avatar carries a badge with the first letter of the agent's name, plus its number (`reviewer_2` reads R2), on a colour chosen from the name, so two agents on one harness differ even in greyscale. Each agent has a page at `#/agent/<id>`, reached from the Agent tab's peek and its Open <name>'s page button, or the View work action on any live message from that agent. The page's Work tab shows the agent's text, its tool names and times, where each turn starts and ends, and its own posts. It shows no tool inputs, results or reasoning, because the event plane does not carry them. The server reads one agent's events only while a browser has its page or its peek open: the newest 200 first, then 200 more per Load earlier up to 2,000, and it forwards live frames only to the browsers watching that agent. Live and history frames are both checked by their subject's sender: history is read from the agent's own subject, and a live frame whose subject names another sender is dropped. The check is only as strong as the mesh's publish permissions. On a mesh with auth only the agent holds the grant to publish on its own subject; on an open mesh any raw NATS client can publish there, so Work can show frames the agent did not publish. A feed that falls more than 1 MiB behind on live events is closed so the browser reconnects. The state a feed opens with is sent whatever its size, and while it is still unsent on a slow link it does not count toward that limit. In `@cotal-ai/core`, `channelHistory` takes a `publisher` option that reads a channel's history from one principal's subject only. The agent card gains `meta["ai.cotal.events"]`, `on` when the agent arms its event plane and `off` when it does not, so the page can tell an agent that publishes no events from one that has not started a turn. The dashboard also keeps the newest 500 direct messages, lists the ten most recent conversations in the sidebar, refuses a history `limit` above 2,000, and shows a working agent as `Working` with no "progress unknown" suffix.
+
+## 0.138.2
+
+No changes in this release.
+
+## 0.138.1
+
+No changes in this release.
+
+## 0.138.0
+
+### Minor Changes
+
+- 534382c: Make the coordination tools say what to do next. The results of `cotal_send`, `cotal_dm` and `cotal_spawn` now say where the post, message or seat went and the next move. A post says the agents on the channel see it, and a post to a new name says so and names close matches. A DM says other agents can't read it and points anything others could use at the task's channel. A started seat names its `join` channels, or says it starts only on the channels its persona lists. The descriptions of `cotal_send`, `cotal_dm`, `cotal_anycast`, `cotal_spawn`, `cotal_persona`, `cotal_despawn`, `cotal_join`, `cotal_leave`, `cotal_channels`, `cotal_channel_info` and `cotal_run` say what each tool is for, when a neighbouring tool fits better, and give one example, and the briefing's channel guidance agrees with them. The briefing and `cotal_dm` both say to post a status meant for one peer on the shared channel with a mention, and to keep DMs for what that peer alone needs. The briefing and `cotal_send` say a post on a live channel misses an agent that is disconnected or busy, unless it mentions that agent and the agent may read the channel, and the briefing and `cotal_spawn` say `once` works on Claude Code, jcode, OpenCode and pi helpers. A persona that would not load is refused as `Couldn't define <name>: it would not load: <reason>`. `MeshAgent.describeSendChannel` returns `{ known, hints }` instead of a sentence.
+
+## 0.137.0
+
+No changes in this release.
+
+## 0.136.8
+
+No changes in this release.
+
+## 0.136.7
+
+No changes in this release.
+
+## 0.136.6
+
+No changes in this release.
+
+## 0.136.5
+
+### Patch Changes
+
+- e8003ed: Seats see the channel registry again. Since seats stopped watching presence, they had also stopped
+  watching the channel registry: `cotal_channels` and `cotal_channel_info` showed no registered
+  channel and no description, the boot briefing carried no channel notes, and a join treated every
+  channel as durable. A seat now reads the registry on demand with `CotalEndpoint.readChannels()`, a
+  batched Direct Get that binds no consumer: once at connect, and again before it lists channels,
+  looks one up, joins or leaves.
+
+## 0.136.4
+
+No changes in this release.
+
+## 0.136.3
+
+No changes in this release.
+
+## 0.136.2
+
+No changes in this release.
+
+## 0.136.1
+
+No changes in this release.
+
+## 0.136.0
+
+No changes in this release.
+
+## 0.135.21
+
+No changes in this release.
+
+## 0.135.20
+
+No changes in this release.
+
+## 0.135.19
+
+No changes in this release.
+
+## 0.135.18
+
+No changes in this release.
+
+## 0.135.17
+
+No changes in this release.
+
+## 0.135.16
+
+No changes in this release.
+
+## 0.135.15
+
+No changes in this release.
+
+## 0.135.14
+
+No changes in this release.
+
+## 0.135.13
+
+No changes in this release.
+
+## 0.135.12
+
+No changes in this release.
+
+## 0.135.11
+
+No changes in this release.
+
+## 0.135.10
+
+No changes in this release.
+
+## 0.135.9
+
+### Patch Changes
+
+- 8e12fe0: Let `cotal_inbox` with `peek` show the connector-managed automatic messages still queued in Codex, Jcode and OpenCode seats, without clearing anything. A DM that arrives during a turn the operator started, or a plain channel post during any turn, can now be read before that turn ends. The connector still delivers and clears it at the end of the turn.
+
+## 0.135.8
+
+No changes in this release.
+
+## 0.135.7
+
+No changes in this release.
+
+## 0.135.6
+
+No changes in this release.
+
+## 0.135.5
+
+No changes in this release.
+
+## 0.135.4
+
+No changes in this release.
+
+## 0.135.3
+
+No changes in this release.
+
+## 0.135.2
+
+No changes in this release.
+
+## 0.135.1
+
+No changes in this release.
+
+## 0.135.0
+
+### Minor Changes
+
+- a35249d: An agent can follow a channel family such as `team.>` and still get the posts it missed while away. The family holds a durable membership of its own, keyed with its final `>` stored as `=`, and each channel under it keeps its own delivery class, so the agent gets stored copies of posts on the durable channels and live delivery on the rest. It gets one copy of each post even when it also joined the channel by name. A family in an agent file's `subscribe` gets its membership at startup. The root `>` and patterns with `*` stay live only.
+  
+  `cotal_join` refuses a name that is no channel name, checks a pattern against the read ACL by containment, and says whether a join keeps stored copies. `cotal_channels` lists a followed family with the state of its stored copies. When an agent's 1000 stored copies were full, its next `cotal_inbox` reply says earlier posts may have been dropped and points to `cotal history <channel>`.
+  
+  An agent definition whose `subscribe` names a pattern that no single `allowSubscribe` entry contains, such as `perm.>` under `perm.*`, is now refused when it is loaded, as `cotal_join` already refused it. `cotal_persona` writes nothing the manager could not load back, which also refuses a `subscribe` channel outside `allowSubscribe`. `cotal_channels` no longer warns of a backstop on a channel read only through a pattern with `*`, shows a nested family as covered by the family above it, and shows a family the broker stopped the agent reading as no longer followed while its stored copies close. `cotal_channel_info` refuses a name that is no channel name.
+  
+  `cotal channel members`, the console topology and the web graph show a family follower as a durable member of the durable channels under the family, and the removal checks in `cotal down` and `cotal team` count it on every channel under it. The graph draws those links once it has read each channel's delivery class. The manager purges a retired agent's family row.
+- 21f937e: Channel history has no age limit by default again. A space keeps a channel post until its sender has posted 1000 newer ones on that channel, as it did up to 0.133.13, and an age applies only when an operator sets one with `cotal history limit`.
+  
+  An upgrade no longer moves or deletes posts. 0.134.0 moved every existing space to a 30-day limit at its first `cotal up`, which deleted every channel post older than 30 days. That move is gone: `cotal up` changes no space's limit, and a space that 0.134.0 already moved keeps its 30-day limit until an operator changes it. `cotal up`, `team boot` and `setup --start` no longer report `CHAT_HISTORY_MIGRATED`. `@cotal-ai/core` no longer exports `LEGACY_CHAT_HISTORY`, `isLegacyChatHistory` or `reconcileChatHistory`, and `setupSpaceStreams` returns nothing; it still refuses a chat stream whose settings other than the limit are not canonical.
+- e7fbeb8: `cotal_spawn` takes `once: true` with a `prompt` to start a helper for one task. The manager relays the prompt to the helper as its only turn and stops the helper when that turn ends or when the deadline passes. The deadline is one hour unless `deadline` sets another, and `-1` sets none. A spawn that succeeds names the task's goal in its result, and `goal-result` reads how it ended. A task that ends without the helper ending its turn may have run in part or in full, and nothing runs it again. A once spawn needs no `run` capability.
+  
+  The manager's `spawn` command takes `once: { deadlineMs }`, and the manager contract revision is 44. The task is served only after the spawn's succeeded terminal is written, so a manager that restarts before then cancels the task as never served. A seat hands a once task to its harness at most once. When it cannot confirm the harness took the task, it reports that with the new self-mode `turn-unconfirmed` command, which fails the task with `delivery-unconfirmed` and stops the seat. A manager that inherits a once seat it cannot hold ends the task without serving it, says so in the outcome, and answers that seat's every `turn-pending` with `stop` while its debt stays recorded.
+  
+  A connector declares `supportsTurnRelay` to take a once task: Jcode, OpenCode, pi and Claude Code do. A connector whose seat needs a confirmed startup declares `onceNeedsConfirmed`, and the manager serves its task only when the runtime reports the startup watch ended `confirmed`. Claude Code needs it: a once launch waits for Claude's development-channels prompt and then its `confirmNotice`, the line saying `server:cotal` messages reach the session. A runtime declares `reportsStartupOutcome` and its handles report `startupOutcome()`; the built-in pty runtime, tmux, cmux, herdr and orca do. A connector may declare `turnFrameLimit`, and a once prompt whose task does not fit it is refused at admission. A once exit registered with `registerOnceExit` may answer false to decline, and the seat then keeps reporting instead of exiting. A connector whose seat launches processes outside its own implements `retireAfterExit`, and the manager keeps the task's debt until that hook proves them gone. Jcode records each native launch of a once seat under the seat's uid for that proof, and a Jcode once seat always starts a fresh session, never one an earlier seat of the same name left in its home.
+
+## 0.134.0
+
+### Minor Changes
+
+- 8b80ca6: Every connector now hands its agent the same briefing, composed once in `@cotal-ai/connector-core` (`briefing(config, harness)`): identity, orient first, feedback, mesh-first delegation, durable workflow runs, where to talk, how a peer message arrives, how to reply, attention modes and reply etiquette. Codex, Jcode, OpenCode, Hermes and pi used to carry their own shorter copies and drifted; each now adds only the sentence that says how a peer message appears in its context. `docs/agent-briefing.mdx` is generated from the module (`pnpm gen:briefingdoc`) so a wording change shows as a diff of what each harness reads, and `pnpm check:docsbundle` fails when it drifts.
+  
+  A conversation that joins through `cotal_connect` (the Claude Code plugin in a session you opened, Claude Desktop, a hosted connector) used to be told only how to connect and listen; the connect result now carries its orientation card and the briefing. The Claude Code session-start hook hands the orientation card over at startup, resume, fork, clear and compaction, or with the next prompt when the seat was not bound yet, so the model has its bearings without asking. `orientationCard()` is the one rendering the `cotal_orientation` tool, the connect result and the hook share. Hermes' `setupProfile` takes the seat's `config` to render the briefing into `SOUL.md`.
+- 4ee7ede: A space's channel history now has a limit you can set. The chat stream keeps a post for 30 days, or until its sender has posted 1000 newer ones on that channel, whichever comes first, and `cotal history limit --max-age <age> --per-sender <n>` changes it for the whole space. A lower limit deletes the posts it no longer keeps, and in a terminal it asks first.
+  
+  The first `cotal up` that starts an existing space's broker moves a chat stream still on the old settings (no age limit, 1000 per sender) to the new default, which deletes every channel post older than 30 days. The move runs after every other setup check, so a start that a check refuses deletes nothing, and a start that fails after the move says in its error that the limit moved. `cotal setup --start` reports the move in its own receipt the same way. To keep posts longer, run `cotal history limit` against the running broker before it restarts; UPGRADING.md has the steps. INBOX and DLV keep their own bound of 1000 entries per subject.
+  
+  `cotal history` shows the age limit and the time of the oldest post the stream still holds, and says a sender at the per-sender limit may have lost older posts there. Focus recall reports a window the stream's oldest post has passed as possibly incomplete, and its warning now also names a channel recall could not read as one possible reason. Backup restore holds the chat stream at no age through its checks, then sets the age the backup recorded.
+  
+  Durable join catch-up no longer judges retention. Its per-sender check is removed because the loss it reported cannot be proven: the stream does not record which channel a removed post belonged to, so the check could refuse a join that lost nothing. Catch-up now copies the posts the stream still holds, and a post the history limit removed first is outside the durable guarantee (SPEC §4). The delivery daemon never reached that check before this release, because its read of the channel's oldest post failed.
+- 86de17e: Agents can list what a space offers them. The new `cotal_endpoints` tool asks the space's registry,
+  a registered endpoint named `registry`, which endpoints the agent can call. The answer lists each
+  registered endpoint where the agent holds at least one command, with the commands and request forms
+  its recorded grants cover, and leaves out every other endpoint. On an open mesh it lists every
+  registered endpoint. The registry reads the grants recorded when the credential was issued, so the
+  broker or the endpoint can still refuse a listed command, and the answer says so. On a user-auth
+  mesh, `view: "manager"` lists what the agent's manager-call credential can call, asked over that
+  credential. A listing drops the agent's cached `describe` of each endpoint it lists.
+  
+  To ask, a credential on the legacy rail now carries a listing generation: one `ep.v1` request row
+  that reaches only the registry's `endpoints` command, its reply row, and the read of its own
+  accepted row. The auth callout issues one for an agent connection and an unissued `manager-caller`
+  view. An agent a manager spawns on a static mesh, and an interactive `manager-caller` view, carry
+  the row on their own issued generation from their first issuance. A credential issued before this
+  release has no listing rows, and the tool says so until the agent connects again or is respawned.
+  An issued `manager-caller` view that reconnects under the same nonce keeps the ceiling it was issued
+  with.
+  The new `@cotal-ai/registry` package holds the registry's answer and reads.
+- 136a640: `cotal_spawn` takes `join`: concrete channels the new peer joins at start, on top of what its persona file lists. Each is checked against the caller's own read ACL before the request is sent, so a spawn never hands on a channel the caller may not read. The request also carries the caller's read and post ACL as `callerAcl`; the manager consults it only for a persona that names no channel field at all, so such a helper is scoped to its spawner, never wider, and the spawner's event channel is never part of it. The joined set is not copied from the spawner: without `join`, a channel-less persona still starts on no channel. The manager's `spawn` operation accepts both fields; a manifest launch rejects them like the other imperative overrides.
+  
+  A `cotal_send` with no channel and no default is now refused with the channels the agent may post to and the exact next call (`cotal_send` with `channel`, or `cotal_join` to make one the default), instead of pointing at the orientation card. The orientation card lists the concrete channels in the read ACL the agent is not on yet, each with its registry note. The briefing's channel paragraph leads with the model (information moves through channels; subscribe to what you need, publish what others need), then the rule (the channel for work, a mention only to make one peer act now, a DM only for what one peer alone needs), then the mechanics, and says a spawned helper needs `join`.
+
+## 0.133.13
+
+### Patch Changes
+
+- 8c15963: Keep generated HTTP documentation consistent between root and website installs.
+- c21c940: `MeshView` now reports disconnected while the broker is down. It used to follow only the endpoint's `connection` event, which stays true while the NATS client reconnects on its own, so `cotal console` showed a green dot and `cotal watch` read "live" through the outage. It now also follows the endpoint's `transport` edge, and `cotal watch` reads "Reconnecting" during an outage. Feed entries also carry the wire's `replyTo`, `mentions` and `contextId` when the sender set them, so `cotal watch --json` rows include those fields. A unicast burst coalesces only when those fields match.
+- 67f15b1: Show internal documentation link destinations in terminal output so readers can follow the CLI reference hub. Piped, plain and JSON pages keep their Markdown.
+- 331f050: Move `MeshView`, the live model of a space, from `@cotal-ai/cli` into `@cotal-ai/workspace`, exported as `@cotal-ai/workspace/view`. The same entry adds `openObserver`, which builds the read-only observer endpoint that `cotal console` and `cotal watch` each used to construct inline. Console and watch behave as before. `@cotal-ai/cli` never exported `MeshView` from its package entry, so no public export is removed.
+
+## 0.133.12
+
+### Patch Changes
+
+- 13499c0: Split the CLI reference into focused MDX pages and generate the MCP catalog as MDX. Include complete Markdown in the installed release's offline documentation while preserving existing page calls and section links.
+- 13499c0: Rewrite the client, connector authoring, and embedding guides as direct MDX. Split embedding contracts into focused references and include their complete Markdown in the installed release's offline `cotal_docs` bundle.
+- 13499c0: Complete the operator documentation with focused MDX procedures, current CLI instructions, separate console and dashboard guides, and a concise upgrade guide linked to the preserved migration history.
+- 13499c0: Rewrite configuration, agent file, manifest, and channel permission references as direct MDX. Preserve complete Markdown and existing page calls in the installed release's offline documentation.
+- 13499c0: Rewrite the connector guides as direct MDX and separate launch instructions from implementation reference. Include complete Markdown for the guides and new reference pages in the installed release's offline `cotal_docs` bundle.
+- 13499c0: Split mesh operation documentation into focused guides. Keep existing documentation links and offline page calls available, and point the supervision warning at the stable published guide.
+- 13499c0: Support authored MDX documentation in the release bundle. Preserve complete Markdown for offline `cotal_docs` page reads and search. Resolve exported documentation links, including MDX paths and heading references. Expand HTTP references to cover dashboard metadata and deletion, host-only auth, the manager console and feedback intake.
+- 13499c0: Preserve documentation bookmarks and offline HTTP reference navigation after the MDX migration. Keep executable documentation checks aligned with the split references, validate generated HTTP content on root builds, preserve complete Card destinations, and improve light-mode navigation contrast.
+- 13499c0: Rewrite the Fundamentals concepts as direct MDX and separate Architecture's detailed contracts into their reference pages. Include complete Markdown and schema inspection content in offline documentation. Update documentation pointers and offline checks for the renamed sources.
+- 13499c0: Rewrite the Messaging concepts as direct MDX and move detailed endpoint and daemon contracts into focused references. Preserve complete Markdown in offline documentation and update source links and documentation checks for the renamed pages.
+- 13499c0: Rewrite the MeshView, cotal-lang card, and glossary references as direct MDX with source-backed definitions and examples. Update the language example check and terminal model source references for the renamed pages. Preserve complete Markdown and existing page calls in the installed release's offline documentation.
+- e7f6b09: `cotal_send` refuses a channel pattern such as `team.>` before it reads or sends anything. The refusal and the advertised `channel` text say how to reach those agents: one post to a channel the pattern matches reaches the followers connected at the time, or post to each channel by name. A name that breaks the channel grammar, such as `team.**`, is refused too. It used to be rewritten onto another channel while the receipt named what was typed. In pi, `cotal_send` now returns the shared refusal instead of its own line.
+- 13499c0: Rewrite Security and Agent coordination as focused MDX explanations with complete supporting references. Preserve documentation URLs, Markdown downloads, and offline documentation tools, and update source links and documentation checks for the renamed pages.
+
+## 0.133.11
+
+### Patch Changes
+
+- 9182cfc: Restore the tool specs' and gateway's zod namespace import. The by-name imports released in 0.133.9 made the bundled claude, codex, hermes, jcode and opencode connectors throw `Class2 is not a constructor` when imported, so a fresh `cotal setup` failed its first connector seed.
+
+## 0.133.10
+
+No changes in this release.
+
+## 0.133.9
+
+### Patch Changes
+
+- 2e16657: Import the zod members the tool specs and gateway use by name, so bundles of those two modules no longer reach zod's locale tables through their own `z` namespace import. Tool schemas, tool names and descriptions, argument validation, and error messages are unchanged. Carriers that import zod elsewhere keep their own references.
+
+## 0.133.8
+
+No changes in this release.
+
+## 0.133.7
+
+No changes in this release.
+
+## 0.133.6
+
+### Patch Changes
+
+- Decode and cache bundled documentation one source at a time for page reads and search results. Preserve corpus/index integrity checks, search scores, returned-page behavior and the full-bundle build helper without changing the two-asset package layout.
+
+## 0.133.5
+
+No changes in this release.
+
+## 0.133.4
+
+No changes in this release.
+
+## 0.133.3
+
+### Patch Changes
+
+- Load the MCP SDK's HTTP transport when the HTTP gateway is used, keeping its initialization out of stdio-only startup. Preserve HTTP gateway and fetch-on-use behavior.
+
+## 0.133.2
+
+### Patch Changes
+
+- cb0da93: Exports `MAX_INBOX`, the per-session inbox bound, so the overflow smokes read it instead of restating it.
+
+## 0.133.1
+
+No changes in this release.
+
+## 0.133.0
+
+### Minor Changes
+
+- 1e554e4: Precompute documentation search at build time and load the corpus and compact index only when needed. Search results and scoring are unchanged. Documentation data now lives in two digest-checked files beside each module or bundle; normal packages, plugins and installers include them automatically. Custom integrations that copy or bundle an executable alone must also carry its matching `docs-bundle.bin` and `docs-index.bin` files.
+
+## 0.132.7
+
+No changes in this release.
+
+## 0.132.6
+
+### Patch Changes
+
+- 85fdb96: Keep weighted term frequencies instead of repeated token strings in the lazy documentation search index. Search results and BM25 scores are unchanged. This reduces retained memory after documentation searches in the tested stock connector workload, with extra first-search work to build the frequency maps.
+
+## 0.132.5
+
+No changes in this release.
+
+## 0.132.4
+
+No changes in this release.
+
+## 0.132.3
+
+### Patch Changes
+
+- 9ef07e1: Serve text and structured documentation indexes from generated metadata without decoding the full corpus. Preserve index output, caller-owned structured results, and page and search behavior.
+
+## 0.132.2
+
+### Patch Changes
+
+- c595436: Load bundled documentation from an inline gzip payload on first use to reduce idle connector memory. Keep the synchronous docs API and existing plugin assets unchanged; decoding adds temporary memory and work to the first docs call.
+
+## 0.132.1
+
+No changes in this release.
+
+## 0.132.0
+
+No changes in this release.
+
+## 0.131.6
+
+No changes in this release.
+
+## 0.131.5
+
+No changes in this release.
+
+## 0.131.4
+
+No changes in this release.
+
+## 0.131.3
+
+No changes in this release.
+
+## 0.131.2
+
+No changes in this release.
+
+## 0.131.1
+
+No changes in this release.
+
+## 0.131.0
+
+No changes in this release.
+
+## 0.130.2
+
+No changes in this release.
+
+## 0.130.1
+
+### Patch Changes
+
+- 3e057b0: Use core's existing peer-label sanitizer for attribution fields. Channel and kind framing now neutralize all C0/C1 controls consistently with roster labels, while preserving ordinary Unicode, spacing and the existing bracket/line-break handling.
+
+## 0.130.0
+
+No changes in this release.
+
+## 0.129.9
+
+No changes in this release.
+
+## 0.129.8
+
+No changes in this release.
+
+## 0.129.7
+
+No changes in this release.
+
+## 0.129.6
+
+No changes in this release.
+
+## 0.129.5
+
+No changes in this release.
+
+## 0.129.4
+
+No changes in this release.
+
+## 0.129.3
+
+No changes in this release.
+
+## 0.129.2
+
+No changes in this release.
+
+## 0.129.1
+
+No changes in this release.
+
+## 0.129.0
+
+No changes in this release.
+
+## 0.128.7
+
+No changes in this release.
+
+## 0.128.6
+
+No changes in this release.
+
+## 0.128.5
+
+### Patch Changes
+
+- 1c86343: Preserve the pre-submission compatibility refusal when a followed action's service does not advertise goal-result. Narrowed discovery keeps the action required and lets the existing follow preflight report the upgrade notice and not-executed outcome without publishing a mutation.
+
+## 0.128.4
+
+No changes in this release.
+
+## 0.128.3
+
+No changes in this release.
+
+## 0.128.2
+
+### Patch Changes
+
+- 653c0cd: Recheck a managed agent's issued caller view after its parent's workflow permission is restored. Repair failed discovery before submitting the command, while preserving legacy-call caching and manager instance pinning.
+
+## 0.128.1
+
+No changes in this release.
+
+## 0.128.0
+
+### Patch Changes
+
+- 6f945a2: Show sender and message IDs in Codex injected messages and cotal_inbox replies, using the existing metadata block separate from peer labels, so recipients can select one of two same-name senders without guessing.
+
+## 0.127.5
+
+### Patch Changes
+
+- 580afa4: `cotal up` over a manager pidfile that holds no pid no longer tells you to remove the file once
+  `cotal ps` finds no manager running. A manager that does not answer on the mesh, such as a stopped
+  one, still runs and owns the folder while `cotal ps` finds none, and following that step started a
+  second manager beside it. The degraded report and its Next now ask you to confirm yourself that no
+  manager runs for the folder before they name `rm <pidfile>`, in the words `cotal down` uses for the
+  same record. `up` still refuses to start over the file, keeps the broker running, and never removes
+  the file itself.
+
+## 0.127.4
+
+### Patch Changes
+
+- dd13059: `cotal down` over a pidfile that holds content that is not a pid now says the record names no
+  process, so cotal cannot tell whether that component still runs. It used to tell you to stop "that
+  process" when the file named none. It still refuses, keeps the file, does not stop the broker, and
+  keeps the artifacts and the registration. A Next now follows: it asks you to confirm that no such
+  component still runs for the folder, because a manager that does not answer on the mesh may still be
+  running, then names `rm <pidfile>` and the same `cotal down`.
+- 9d69969: The guided `cotal meshes add` on a terminal now reports a TLS broker whose certificate this machine
+  does not trust as the flag form does: the handshake failed, and `NODE_EXTRA_CA_CERTS` names the
+  issuing CA. It used to say the broker did not answer and offer another address first. Cancel is now
+  the first choice there, and registering the address anyway is still an explicit choice. A host name
+  the guided form refuses for lacking TLS now gets the flag form's next step, the `tls://` form of the
+  address, and the question that asks again shows no plaintext example. The guided form's refusals
+  and warnings now wrap to the terminal.
+
+## 0.127.3
+
+No changes in this release.
+
+## 0.127.2
+
+### Patch Changes
+
+- f97b910: An open mesh's manager no longer mints credentials from a static stack's accounts left in the same folder. After a static `cotal up`, the first `cotal up --open` there ran its manager on those accounts and recorded the credentials it minted. The next open boot had to prove them gone through a delivery daemon, which an open mesh does not run, so it exited 1 after about a minute with `! control plane degraded:` and no manager. The manager now follows the mesh's recorded mode, so static and open boots can alternate in one folder.
+  
+  This prevents new affected stores. An older build may already have staged credential families in the open account; upgrading does not remove them or unfreeze their registration gates. Open startup in such a folder can still refuse, and the existing reconcile command cannot establish liveness without the required delivery authority. Keep the store intact; this change does not provide an in-place recovery for that state.
+
+## 0.127.1
+
+### Patch Changes
+
+- 388ba4d: The guided `cotal meshes add` on a terminal now takes `--tls` as the flag form does. A host name
+  whose broker requires TLS passes the address rule, the probe requires the handshake, and the record
+  carries the TLS requirement. The guided form used to read TLS intent only from a `tls://` scheme, so
+  `--server nats://<host> --tls` was refused as a host name, and a loopback registration with `--tls`
+  was recorded without the requirement. The `--force` help now says that the address rules still apply.
+
+## 0.127.0
+
+### Minor Changes
+
+- 53fbd95: Allow an authorized personal native conversation to bind itself with `participant()` and receive hosted workflow turns through a finite exact-lifecycle lease without gaining manager seat custody.
+
+### Patch Changes
+
+- e72bd0d: A foreground `cotal up` whose broker exits before the mesh is recorded now says the broker exited
+  before the mesh was recorded. Its next step is the one a detached start gives: read the output
+  above, fix a `nats-server` found on PATH or take it off PATH, and run `cotal up` again. It no longer
+  offers the same `up` as a repair, which only repeated the exit. A broker that exits after its mesh
+  was recorded keeps the line that says the mesh stays recorded and names the repair `up`.
+
+## 0.126.3
+
+No changes in this release.
+
+## 0.126.2
+
+### Patch Changes
+
+- 96b964f: Clarify that Codex automatic-message steering applies to connector-started turns. Messages received during attached-TUI turns or native goal continuations wait for a connector delivery turn, with acknowledgements still committed at that delivery turn's boundary.
+
+## 0.126.1
+
+No changes in this release.
+
+## 0.126.0
+
+No changes in this release.
+
+## 0.125.0
+
+No changes in this release.
+
+## 0.124.3
+
+No changes in this release.
+
+## 0.124.2
+
+No changes in this release.
+
+## 0.124.1
+
+No changes in this release.
+
+## 0.124.0
+
+### Patch Changes
+
+- 4529529: The `JsonlFileSource.sealAt` doc comment, which ships in `dist/durable-source.js` and `dist/durable-source.d.ts`, no longer carries the all-caps sentence explaining why the bound is stated or the clause naming how many reviewers reproduced it. No behavior changes.
+
+## 0.123.0
+
+No changes in this release.
+
+## 0.122.0
+
+No changes in this release.
+
+## 0.121.7
+
+No changes in this release.
+
+## 0.121.6
+
+### Patch Changes
+
+- b74d18e: Label broker redelivery separately from model handling: frames keep the broker delivery count and say the prior model handoff is unknown when no separate handoff evidence exists.
+
+## 0.121.5
+
+### Patch Changes
+
+- 339a92e: Keep live mentions on unmuted focus channels retrievable as pull-only bodies when exclusion tracking makes channel recall unsafe, while preserving the incomplete-recall warning and existing ambient handling.
+
+## 0.121.4
+
+No changes in this release.
+
+## 0.121.3
+
+### Patch Changes
+
+- 479895c: Keep the native error name in connection-close diagnostics and failed reconnect replies when the transport provides an empty message.
+- 98c69c7: Preserve focus mention wake and pull-only bodies after channel drop tracking fills, and disclose the degraded delivery state in inbox and connection status replies.
+- 0744bd0: Return an empty list from `searchDocs` when `limit` is zero or negative instead of collecting one hit before checking the limit.
+- 43e67ec: Forward NODE_EXTRA_CA_CERTS and SSL_CERT_FILE to launched seats so they retain the manager's private-CA trust paths without weakening TLS verification or inheriting unrelated environment settings.
+- 0c44f1a: Explain that an unknown turn-yield deadline may have recorded the yield. Describe the measured same-turn retry outcomes without reporting a missing responder or claiming that a retry is read-only. Actual no-responder failures retain their existing advice.
+
+## 0.121.2
+
+### Patch Changes
+
+- af4b631: Report the recorded connection failure when sends or DMs cannot bind, including a
+  refused first presence write. Inbox replies now identify a connection that is not
+  ready while continuing to return locally buffered messages.
+  
+  A timed-out presence update reports that its outcome is unknown and may have landed.
+- 3d07896: Report the concrete publish subject and unknown storage outcome when a channel send or direct message times out. A missing publish acknowledgement does not prove that the broker rejected the message.
+- b02da28: Explain confirmed Claude Code hook deliveries when a later inbox read has no unread messages. The receipt names the latest handoff without returning message bodies again or changing acknowledgements.
+- f450bfe: Keep static managed seats' self-stop, persona and spawn calls bound to their launching manager without changing their class-only credential grants.
+- ee93749: `assertValidKind` validates endpoint kinds (`"agent"` or `"endpoint"`). `CotalEndpoint`, `configFromEnv`, `loadAgentFile`, and `saveAgentFile` share it, so `COTAL_KIND` and `card.kind` refuse any other value instead of passing an unvalidated string through to the card.
+
+## 0.121.1
+
+No changes in this release.
+
+## 0.121.0
+
+No changes in this release.
+
+## 0.120.2
+
+### Patch Changes
+
+- 0bb0ef4: Point relayed workflow asks to the seat's native self-targeted answer command instead of a shell command that cannot find the managed mesh. Explain that yielding submits no answer value.
+
+## 0.120.1
+
+### Patch Changes
+
+- a49bee6: Report a bound session as degraded when consecutive presence writes fail, even if core NATS remains connected. Include the observed bucket write failure in connection status and clear it when writes recover.
+
+## 0.120.0
+
+No changes in this release.
+
+## 0.119.5
+
+No changes in this release.
+
+## 0.119.4
+
+### Patch Changes
+
+- ed5c23f: Remedies, hints and messages from `run`, `actor` and `auth`, `logout`, `supervise` and `manager`, `deliver`, `docs`, `daemon`, `linear`, the web dashboard, the console, the Claude Code connector, a run's checkpoint prompt and the endpoint issuance gate now name the commands they suggest in backticks, so a terminal keeps each one whole and `--json` carries the same text. They named them bare after other words, as in "list the recorded runs with cotal run", which split inside the command when the line wrapped.
+
+## 0.119.3
+
+### Patch Changes
+
+- 8866e1e: Endpoint calls now resolve only the command contracts they need instead of fetching the endpoint's complete visible surface. Manager operations that used to read 124 contract-store artifacts for a 40-command surface now read six artifacts for one command, while `describe` still resolves every visible command.
+
+## 0.119.2
+
+No changes in this release.
+
+## 0.119.1
+
+### Patch Changes
+
+- 9f32677: Clarify that a timed-out channel publish has an unknown outcome and that a disconnected send or yield refused before submission was not sent. Keep the Jcode user-auth tool catalog aligned with the host's capability gates without exposing credentials.
+- 3431be6: `cotal up --max-payload <bytes>` sets the broker's own message size limit, a positive integer up to 67108864. `up` renders it as `max_payload: <bytes>` in the broker config and records it in `.cotal/broker-policy.json`, which `readBrokerPolicy` reads back, so a later `cotal up` on the root renders it again without the flag, after `cotal down` or a preserved resume included. A running broker refuses a different value, and `--open`, `-f` and `--restore` refuse the flag. Service endpoint caller grants need at least 2098176 bytes, so a smaller value beside `--service-endpoints` refuses before anything starts. `SERVICE_CALLER_PAYLOAD_FLOOR` and `SERVICE_CALLER_PAYLOAD_OVERHEAD` now come from `@cotal-ai/core`, so the flag's validation and the auth host's assertion read one number. Before, `serverConfig` took a `maxPayload` that no `up` ever passed and no record kept, so a limit written into `server.conf` by hand was lost the next time `up` wrote the file.
+  
+  Caller issuance now survives a broker configuration reload. A reload keeps the same incarnation serving and moves VARZ `config_digest`, and issuance was bound to the digest the bootstrap observed, so every reload refused every later caller issuance until the auth plane was reopened. On a multi-tenant broker that is every tenant sign-up. The verifier now treats a moved digest as a trigger to re-measure: when the fresh observation proves the same broker incarnation and auth store, and proves the standalone topology, the payload floor, the control line, the system account and an uncapped auth stream again, it re-asserts the payload record under the held plane claim by CAS on the exact prior row and continues. A reload that breaks any of those still refuses, a `max_payload` below the floor included, a restart is a new incarnation and still refuses, and a withdrawn record is never overwritten.
+
+## 0.119.0
+
+No changes in this release.
+
+## 0.118.3
+
+### Patch Changes
+
+- e9b85f5: Recover a Unix control socket left by a crashed connector when the host restarts its MCP server with the same launch environment. Probe before retrying so a live listener still refuses the replacement.
+
+## 0.118.2
+
+No changes in this release.
+
+## 0.118.1
+
+### Patch Changes
+
+- 6a634a6: `handleGatewayRequest` accepts `selection`, so a hosted gateway's `cotal_connect` can take the channels, role and capabilities an agent asks for. The `cotal_connect` description now tells the agent to ask for what it already knows it needs in that first call.
+
+## 0.118.0
+
+No changes in this release.
+
+## 0.117.1
+
+No changes in this release.
+
+## 0.117.0
+
+### Patch Changes
+
+- c93dded: A conversation selection may now name channel patterns. `team.*` and `team.>` in a requested or approved selection grant every channel they match, including channels created after the approval, and the issued grant carries the pattern as it is.
+  
+  Before this, `checkConversationSelection` refused any non-concrete channel. A hosted approval page that let a person grant `team.>` produced an approval every stock client then rejected, so the connection failed after the person had approved it. The grammar check is unchanged: a malformed pattern such as `team.>.x` is still refused, as are more than 32 channels. Whether the person may grant a pattern is still decided by the authority, against that person's own row.
+
+## 0.116.5
+
+No changes in this release.
+
+## 0.116.4
+
+No changes in this release.
+
+## 0.116.3
+
+### Patch Changes
+
+- 1819877: Retain a published spawn request's goal id when the caller deadline ends before acceptance is observed. Report the submission as unknown with same-caller goal-result readback instead of a plain failed spawn, without resubmitting or changing persona numbering.
+
+## 0.116.2
+
+### Patch Changes
+
+- 6309047: Report an unanswered persona definition as an unknown write outcome, with same-manager readback guidance, instead of a failed definition that invites an unsafe retry. Preserve concrete refusals and pre-submission failures.
+
+## 0.116.1
+
+No changes in this release.
+
+## 0.116.0
+
+### Minor Changes
+
+- 50ee624: Cut what an idle seat costs its host, with stock build and runtime mechanisms.
+  
+  Every connector bundle that loads into a long-running process now ships as one-byte text. V8 holds a
+  string at one byte per character only while every character is Latin-1, and a single character above
+  U+00FF made each 5 MB bundle two-byte for the life of the process. The characters were em dashes and
+  arrows in comments, so the bundles are built with esbuild's `--minify-whitespace`, which drops
+  comments and the parentheses around a single arrow parameter, and keeps every identifier. Anything
+  matching text in a built bundle sees the second part: `(e) => f(e)` now reads `e=>f(e)`. `pnpm smoke:connector-bundle-text` reads the 19 built bundles
+  and fails on any character above U+00FF. Stack-trace frames keep their function names and their line
+  and column numbers move, because the bundle is now fewer, longer lines.
+  
+  The Claude Code connector's seat is launched through a new entry, `dist/seat.cjs`, which enables
+  Node's module compile cache in `~/.cotal/compile-cache` and then loads `dist/mcp.cjs`. Node's cache
+  covers modules compiled after it is enabled, so the entry has to sit in front of the bundle. The
+  directory is created 0700 like the rest of `~/.cotal`, whatever the launching umask was. A cache
+  that cannot be opened prints one line and the seat serves without it,
+  `NODE_DISABLE_COMPILE_CACHE=1` turns it off, and `NODE_COMPILE_CACHE` takes precedence and is left
+  alone. `dist/mcp.cjs` remains the library entry (`@cotal-ai/connector-claude-code/mcp`) and still
+  serves when run directly.
+  
+  The declared Node floor rises from 22 to 22.10, which is where `module.flushCompileCache()` lands,
+  and every package's `engines.node` now says so. The `cotal` binary checks it at its front door and
+  refuses an older runtime with the floor, the running version and the repair for how it was
+  installed; the seat entry refuses before its first cache call, so an old Node gets one sentence
+  rather than a `TypeError`; and the installer compares the minor version, so a host whose own Node is
+  22.9 gets the pinned Node downloaded and verified instead. `node dist/mcp.cjs` still serves on an
+  older runtime. Operators moving a host read
+  [the upgrade note](https://github.com/Cotal-AI/Cotal/blob/main/docs/UPGRADING.md).
+  
+  Measured on one idle seat per arm, Node v22.23.2, paired and read at 160 s and 600 s: 41.9 MiB USS
+  on the stock bundle, 35.2 with one-byte text, 26.3 with the seat entry's compile cache as well.
+
+### Patch Changes
+
+- c19eaf9: Keep open managed-seat persona operations, spawns and generic manager self reads on their launching manager without changing authenticated routing or grants.
+- c8072d6: A managed seat on a legacy-rail bearer no longer asks the broker for its accepted row on every manager call. The read is attempted once per credential and rechecked hourly; a refusal is remembered, so a seat that pulls its turns every 15 s stops putting one refused `DIRECT.GET` request in the broker's log each time (100k to 340k lines a day on one hosted mesh). Issued views are unaffected: their read succeeds and nothing is remembered. `managerCallerBinding` now also returns the bearer's `credentialId` when the issuer stamped one.
+- cf3218f: `assertValidName` now refuses a name holding any line break a Unicode-aware splitter honours: VT, FF, NEL (U+0085), LINE SEPARATOR (U+2028) and PARAGRAPH SEPARATOR (U+2029), as well as CR and LF. Before, it tested only CR and LF, so `new CotalEndpoint`, agent-file loading, the gateway connect request and the manager's launch spec accepted such a name and published presence under it, although the validator states a single-line rule. The class is now exported from `@cotal-ai/core` as `LINE_BREAK`, and the connector's message framing uses the same definition.
+- 3a68499: `packUnits` refuses a unit that cannot fit in one frame as a unit. The message names the byte sizes, the event count and the run, and no longer calls the unit a source observation cut mid-record. A close hands the same function a terminal the emitter authored, which consumes no source record, and that refusal was telling the operator to look for a record the close never read. The reason a unit is never split stays in the function's doc comment.
+
+## 0.115.4
+
+No changes in this release.
+
+## 0.115.3
+
+No changes in this release.
+
+## 0.115.2
+
+No changes in this release.
+
+## 0.115.1
+
+### Patch Changes
+
+- 05eed2f: Route nameless self-despawn on open meshes to the seat's launching manager so a sibling manager cannot receive the stop. Preserve static credential grants and user-auth manager selection.
+
+## 0.115.0
+
+No changes in this release.
+
+## 0.114.1
+
+No changes in this release.
+
+## 0.114.0
+
+No changes in this release.
+
+## 0.113.3
+
+No changes in this release.
+
+## 0.113.2
+
+No changes in this release.
+
+## 0.113.1
+
+No changes in this release.
+
+## 0.113.0
+
+No changes in this release.
+
+## 0.112.0
+
+No changes in this release.
+
+## 0.111.1
+
+No changes in this release.
+
+## 0.111.0
+
+No changes in this release.
+
+## 0.110.0
+
+No changes in this release.
+
+## 0.109.25
+
+No changes in this release.
+
+## 0.109.24
+
+No changes in this release.
+
+## 0.109.23
+
+No changes in this release.
+
+## 0.109.22
+
+### Patch Changes
+
+- d3a29f8: `cotal_spawn` with a `model` pin no longer reports a running seat as a failed spawn when only the pin read fails. The read opens its own manager connection after the launch with a 10 second budget, so a slow auth callout or a manager that does not answer in time ended it with a bare `timeout`, and the result read "Couldn't spawn" while the seat was up; the caller's retry then started a second seat on the same work. The result is now a partial outcome: the seat joined, with its name, id, manager instance and runtime, its model pin could not be audited (or was not reported by this manager, which is known at once), do not spawn it again, and `cotal ps --on <manager>` as the next step. The Claude Code tool result carries the same facts as structured content. A recorded pin that differs from the request, or no recorded pin, is still refused, and a launch the manager refused keeps its refusal.
+- 1622722: Keep workflow turns active across presence-only status updates and finish the previous Jcode turn boundary before accepting another goal, preserving explicit yield outcomes and notes.
+
+## 0.109.21
+
+No changes in this release.
+
+## 0.109.20
+
+No changes in this release.
+
+## 0.109.19
+
+No changes in this release.
+
+## 0.109.18
+
+No changes in this release.
+
+## 0.109.17
+
+No changes in this release.
+
+## 0.109.16
+
+No changes in this release.
+
+## 0.109.15
+
+No changes in this release.
+
+## 0.109.14
+
+No changes in this release.
+
+## 0.109.13
+
+No changes in this release.
+
+## 0.109.12
+
+No changes in this release.
+
+## 0.109.11
+
+No changes in this release.
+
+## 0.109.10
+
+No changes in this release.
+
+## 0.109.9
+
+No changes in this release.
+
+## 0.109.8
+
+No changes in this release.
+
+## 0.109.7
+
+No changes in this release.
+
+## 0.109.6
+
+No changes in this release.
+
+## 0.109.5
+
+No changes in this release.
+
+## 0.109.4
+
+### Patch Changes
+
+- 92ac24d: Usage telemetry follows the environment into the processes Cotal starts. `DO_NOT_TRACK`, `COTAL_TELEMETRY`, `COTAL_TELEMETRY_DISABLED`, `COTAL_TELEMETRY_URL` and `CI` now reach the agents a manager spawns and the services `cotal service start` launches. Before, both dropped them: a `cotal` command an agent or a service ran reported at the settings file's level to `https://cotal.ai`, even when the run that started it had opted out or pointed at a self-hosted intake, and it reported `ci: false` inside a CI job. The `ci` field is now `false` when `CI` is `0` or `false`, which is how a script says it is not a CI run. Before, any value counted as CI.
+
+## 0.109.3
+
+No changes in this release.
+
+## 0.109.2
+
+No changes in this release.
+
+## 0.109.1
+
+No changes in this release.
+
+## 0.109.0
+
+No changes in this release.
+
+## 0.108.1
+
+No changes in this release.
+
+## 0.108.0
+
+No changes in this release.
+
+## 0.107.0
+
+### Minor Changes
+
+- 0ae11a6: One manager can host seats on different terminal runtimes at the same time.
+  
+  `cotal spawn --runtime <name>` with `-d` or `--on`, `cotal_spawn` with `runtime`, and a workflow `spawn(persona, { runtime })`, choose the runtime of that one seat. A seat that names none keeps the runtime the manager was started with. An unknown or unreachable runtime, and `auto`, refuses the launch and starts nothing. Stopping, attaching, and recovery follow the runtime recorded for that seat, so a later seat does not move one that is already running.
+
+## 0.106.1
+
+No changes in this release.
+
+## 0.106.0
+
+### Minor Changes
+
+- ba25fb6: Agent seats no longer watch presence. Every member of a space received every other member's heartbeat every two seconds, so an idle space of K seats moved K² presence deliveries per heartbeat. An idle 400-seat space pushed about 35 MB/s out of the broker. A seat now reads the roster when a tool needs it: `cotal_roster`, `cotal_orientation`, a DM to a name, a send with `@mentions`, and the anycast holder count. An idle seat now costs the broker one put, one ack and one delivery to each liveness watcher per heartbeat, whatever the size of its space. The manager, the delivery daemon, `cotal chat` and the dashboard still watch.
+  
+  The new `CotalEndpoint.readPresence()` makes batched Direct Gets of the presence bucket. It binds no consumer, applies the same reader rules as the watch, and reads a record older than the liveness window as offline. A peer that an earlier read saw stays on the roster as offline after it leaves the bucket. When a read fails, the seat refuses to say a name is absent: the error names the failed read instead of reporting an unknown peer. The agent credential gains `$JS.API.DIRECT.GET.KV_cotal_presence_<space>` (SPEC §6 and Appendix B). A credential minted before this release lacks that grant, and its reads are refused with the grant named, so upgrade the manager and auth service before the connectors. Whole-bucket Direct Get reads, including `readOnce`, now page past 1024 keys instead of refusing the read.
+
+## 0.105.1
+
+No changes in this release.
+
+## 0.105.0
+
+No changes in this release.
+
+## 0.104.2
+
+### Patch Changes
+
+- 6150d08: Keep all replayed channel messages, including mentions, pull-only so joining a channel cannot revive old requests as new agent turns. Frame historical content separately without the action-oriented footer, while preserving wakes for new mentions and direct messages.
+
+## 0.104.1
+
+No changes in this release.
+
+## 0.104.0
+
+### Patch Changes
+
+- e0c4e6e: Correct the documentation page by page against the implementation, including CLI commands, connector delivery and activity sharing, authentication, observer surfaces, hosted composition, telemetry and historical design status. Refresh package guides and generated tool and HTTP references while preserving existing links and normative contracts.
+
+## 0.103.4
+
+### Patch Changes
+
+- c05e0e3: Let personal Claude Code conversations choose a registered mesh with `cotal_connect`'s optional `space` argument, without changing project configuration. Keep hosted grants space-bound, require disconnect before replacing a live connection, and retire a previous space's pending identity before requesting another.
+
+## 0.103.3
+
+No changes in this release.
+
+## 0.103.2
+
+### Patch Changes
+
+- 2f74981: A read whose recorded broker answers and refuses the connection now keeps its registration when
+  another registered space names that same address, and refuses `CONFLICT`, exit 2, naming the space
+  that holds the address, the `cotal space forget <space>` that frees it and the
+  `cotal up --server <url>` that moves this one. `cotal status` reports that space as `address held`.
+  The rejection used to count as a stale record and delete it, which left the folder naming no space,
+  so nothing there said which space its commands meant.
+- 2f74981: The bare `cotal down` that refuses `LIFECYCLE_BLOCKED` while another registered space names this
+  stack's exact broker address now names what to run: `cotal space show <space>` for each of those
+  spaces, the `cotal space forget <space>` that takes one off this address, and the `cotal down` to run
+  again. Its next step used to name no command, so the running stack had no documented stop.
+- 2f74981: `cotal up -f` now refuses `CONFLICT`, exit 2, when its manifest's `broker.servers` is the address a
+  space registered for another folder keeps while stopped, naming that space and folder, the field to
+  point elsewhere and `cotal space forget <space>`, and starts nothing. The flag path already refused
+  this; the manifest path started a second stack on that address, after which one listener answered
+  for both registrations, the running stack's own `down` refused, and a read in the other folder
+  deleted that space's registration.
+
+## 0.103.1
+
+No changes in this release.
+
+## 0.103.0
+
+No changes in this release.
+
+## 0.102.0
+
+### Patch Changes
+
+- 30fb90c: `cotal up` on a root with no prepared record and no stack journal starts on the legacy launcher whatever it names, including a root whose space its `up` registered. Before, such a root took the controller route when the invocation named no legacy-only option. On a stopped legacy user-auth root that started a controller broker beside the root's retained auth-service record, failed its auth member (`OPERATION_PARTIAL`), and wrote a stack journal that tied the root to the controller from then on. Only a root prepared here, or one whose stack journal exists, takes the controller route.
+- f149d6a: On a user-auth mesh, when some of your managers do not answer, `cotal ps` and `cotal who` name each of them by instance id in their Next, so a registration left by a manager that ended without a clean stop can be told apart from the managers that answer. The Next used to say only to retry or read one manager with `--on`.
+- f149d6a: `cotal ps` on a user-auth mesh with several of your managers live no longer refuses or asks which one. It reads each manager the exchange counts live through its own one-instance view and lists each under its own `manager <id>` header with the host its presence reports. A manager that does not answer is listed as silent and makes the read partial, as on a static mesh. `status <agent>`, `who` and the `attach` picker read your managers the same way. When none of your managers answers, or none is live, `ps` lists your agents as presence shows them, read-only, and exits 0. Its next step starts a manager: bare `cotal up` on the root of the space's own stack, `cotal supervise` anywhere else. `--json` reports that read as `result.kind` `presence`.
+- 10ad6d3: The delivery daemon's timer writer now presents the credential the daemon holds on every connect and
+  reconnects onto each renewed credential the daemon adopts. The broker no longer closes the writer's
+  connection when the credential it dialed with expires, and a re-dial never presents an expired
+  credential, so the writer no longer goes down for a few seconds at each expiry. `standaloneConnectOpts`
+  accepts a creds getter that is read on every attempt, and `CotalEndpoint.wireCreds()` returns the
+  endpoint's checked credential.
+- d0d9e66: Deliver run turns to idle seats by notice instead of a 15-second poll. The manager publishes a data-free turn notice on the seat's own reply rail whenever the seat's pending turns change, and repeats it every 5 seconds until the seat pulls a new turn. The seat pulls `turn-pending` when a notice arrives, when it connects, and after a reconnect while it holds a turn. A seat's manager-call bearer is reused for its lifetime minus two minutes, shared by concurrent calls, and dropped after any failed call. An idle manager-launched seat no longer exchanges a manager-call bearer or opens a control connection every 15 seconds. A seat under a manager that predates notices keeps pulling every 15 seconds and logs that once. The notice needs no new grant: only the manager instance's serve credential can publish it, and a seat can read only its own.
+
+## 0.101.7
+
+### Patch Changes
+
+- ae43b58: A long-lived connection now renews its bearer at a random point between half and four fifths of the
+  bearer's lifetime and moves the live connection onto the new one, so the broker no longer closes it
+  for an expired bearer. Connections in one process and space renew at least a second apart, so seats
+  that started together no longer rebind through the auth callout in the same second. A reconnect
+  never presents an expired bearer. While renewal fails, the endpoint retries on a growing, randomized
+  wait of up to a minute and reports the failure once. The auth service's own connections renew the
+  same way, and its connect-credential reader proves a replacement on a new connection before it
+  switches to it, so a renewal no longer denies connects while the reader rebinds.
+- ae43b58: The auth service no longer exits when a native-key issuance cleanup pass fails because the store did
+  not answer, as happened when one of its connections reconnected under load. The pass is retried on a
+  growing wait and logged once, and the service keeps serving. Evidence that does not parse still
+  stops the service.
+- 0e7d42e: `cotal up` with an option only the legacy launcher takes, such as `--exchange-public-port`, starts a stopped root that launcher already started again on that launcher. This applies to a root with no stack journal whose `up` registered the space with no prepared record, or a user-auth root that holds its user-auth state. Before, such a root was refused `UNSUPPORTED` as if it were a fresh prepared root ("this root is prepared for a controller-owned stack"), so a hosted user-auth deployment that had run on 0.100 could not start. A fresh prepared root still refuses those options.
+- 9bc17b2: Allow manager control connections to use the caller’s remaining preparation deadline instead of timing out after two seconds. Preserve cancellation and refuse an expired preparation before opening the connection.
+- acc1ce4: `cotal up` without `--user-auth` on a stopped root whose space has user-auth state, `--open` included, now refuses as `CONFLICT`, exit 2, before anything is written, and the Next line says to add `--user-auth`. Before, a plain `up` refused only after it had opened the store and claimed the space, and reported the refusal as "Outcome unconfirmed" (`OPERATION_UNKNOWN`, exit 3), as did `up --open`.
+
+## 0.101.6
+
+### Patch Changes
+
+- 49cf781: `cotal up --auth-timeout <seconds>` sets how long a user-auth space's broker waits for the auth callout, from 1 to 60 seconds. `up` renders it as `authorization { timeout: N }` in the broker config and starts the space's auth service with the same value as its callout deadline, so the two never differ. The value is recorded in `.cotal/broker-policy.json`, and a later `cotal up` on the root renders it again without the flag, after `cotal down` or a preserved resume included. A running broker refuses a different value. Before, the broker config had no `authorization` block and no flag set one, so a hand-applied timeout was lost the next time `up` wrote the config. `serverConfig` takes the timeout as `authTimeout`, and renders no block without it, so existing configs are unchanged. The auth-service daemon, a `--callout-only` replica included, takes `--auth-timeout <seconds>`.
+
+## 0.101.5
+
+### Patch Changes
+
+- a9ece42: `cotal spawn` reports a managed launch the manager reports failed, such as an agent whose process
+  exits at once, as `OPERATION_FAILED` (exit 5) with the manager's reason. It used to print "Outcome
+  unconfirmed" with `OPERATION_UNKNOWN` (exit 3), though the manager had answered.
+
+## 0.101.4
+
+### Patch Changes
+
+- 0642c8f: A managed launch that waits for you before it joins no longer ends as an unknown outcome. A
+  connector can name the screen a launch waits at (`waitsForOperator`), and Claude does for
+  `--opt resume=` with no session id, which opens its session picker. The manager reports such a
+  launch ready once its process runs, and `cotal spawn` says the agent is waiting for you at that
+  screen and attaches to it in a terminal, `-d` included, or prints the attach command, exiting 0.
+  When the readiness window passes and the manager saw the agent's process still running, the
+  `uncertain` result carries an `ai.cotal.goal.entity-running` detail, and `cotal spawn` says the
+  agent has not joined yet and how to attach instead of reporting an unknown outcome.
+
+## 0.101.3
+
+### Patch Changes
+
+- 883c555: Refresh the documentation with task-oriented guides for local teams, personal sessions, hosted spaces, services and durable workflows. Correct setup and dashboard credential descriptions, document Linear user-auth support, and clarify package versus wire compatibility.
+- c54a604: `cotal help`, and `cotal --help` and `cotal -h` with it, now lists every command group under the entry screen, so no flag is needed to see what the CLI can do. Bare `cotal` keeps the compact entry screen and points to `cotal help` for the rest. `cotal help --all` is no longer needed; it still works and prints the same list. A hidden command, such as a deprecated daemon entry, is still left out of the list and still runs.
+- 6bcb8b6: `cotal help` no longer lists `cotal agent-bearer`, the plumbing spawned user-auth agents exec to fetch a fresh bearer; its docs say people never run it. It is still registered, still runs for those agents, and `cotal help agent-bearer` still prints its help.
+- 620d7ff: `cotal spawn -d` with no `--on` on a user-auth mesh now asks, in a terminal, which folder the agent
+  works in when the manager the exchange picks is on another host, as a launch with `--on` does. The
+  launch is pinned to that manager, so if it stops before you answer the launch is refused and goes
+  to no other manager.
+- a677726: `cotal spawn` handles a name that is already taken. When a live manager of yours runs that agent,
+  or presence or the mesh reports it online, the spawn launches nothing, says where it runs and exits
+  0; in a terminal it attaches to that agent, and otherwise it prints the `cotal attach` command. When
+  the mesh answers that the name is held by a lifecycle that does not run, the spawn releases that one
+  lifecycle by its UID with your login and asks again, waiting up to 2 minutes while the mesh says the
+  name is still retiring. This applies to managed launches and to spawns in this terminal; an
+  implicit name is numbered past an online holder only. The auth client keeps a host's typed HTTP 409
+  answer (`AGENT_LIFECYCLE_HELD`) and passes it through the manager. The stock auth service answers
+  409 for its own conflicts, which the CLI now reports as `CONFLICT`, and a manager's refusal of a
+  hard-pinned name it holds carries `already-exists`. `cotal auth retire <uid>` releases a lifecycle
+  on such a mesh. A failed agent provisioning now says its outcome is unknown instead of calling it
+  refused.
+- 330127a: `cotal supervise` is no longer deprecated. Help lists it under its own Run a manager group, it prints no deprecation warning, and it is not removed in `1.0.0`. Without `--space` it now supervises the space every other command targets: `COTAL_SPACE`, else the space this folder hosts or is registered for, else the one `cotal use` selected. A bare `cotal supervise` with a hosted space selected used to target the default space and refuse that it was neither hosted nor registered. A manager started for a selected space keeps its records in the folder that space is registered at, so a start from any folder is the same manager. The CLI docs gain a section on starting a manager for a hosted space.
+
+## 0.101.2
+
+### Patch Changes
+
+- 9acfc57: A manager command such as `cotal ps`, `cotal stop` or `cotal spawn --on`, and `cotal send` with the other commands that open a one-shot connection, now connects again when the broker refuses the connection or it does not open within 5 seconds: nothing was sent, so up to 4 attempts are made 1 second apart. A view the auth service refused for a moment, or an auth service that answered after the broker's callout timeout, now just works. These commands used to stop at the first refusal, or wait 20 seconds and end as `OPERATION_UNKNOWN` (exit 3) with a bare `timeout`. When every attempt fails, the command says nothing was sent and is refused, exit 2: `PERMISSION_DENIED` when the broker refused each attempt and `TARGET_UNAVAILABLE` when none opened in time. An endpoint takes a `transportConnectTimeoutMs` option for its first connect.
+- 427f28b: `cotal up` now refuses `CONFLICT`, exit 2, when its address is one that a space registered for
+  another folder keeps while stopped, naming that space and folder, and starts nothing. It used to start
+  there, after which that stack's `down` refused and a read in the other folder deleted that space's
+  registration. A takeover of that space's name is unchanged.
+- 427f28b: A second bare `cotal down` in a stopped project whose space is named after its folder now reports
+  that the stack there is not running, names `cotal up`, and exits 0. Since that space keeps its
+  registration after `down`, it exited 1 with only "Nothing running for the local stack (no recorded
+  pidfiles)." and no next step.
+- 427f28b: A command in a project folder whose stack is stopped with no registration, as after the `down` of a
+  space not named after its folder or in a moved project, now refuses `TARGET_UNAVAILABLE` with another
+  space selected too, naming the space its account names and `cotal up` there. It used to reach the
+  selected space, so `send` stored the message there and `ps` listed that space's manager.
+
+## 0.101.1
+
+### Patch Changes
+
+- 3252512: A manager command whose credential the broker refuses at connect, such as `cotal spawn --on` or `cotal ps --on` on a user-auth mesh whose auth service refuses the issued manager view, is now refused `PERMISSION_DENIED` (exit 2) and says nothing was sent to the manager. It used to end as `OPERATION_UNKNOWN` (exit 3) with only the broker's `Authorization Violation`, which read as a launch that might have happened. The message keeps the broker's reason, and on a user-auth mesh it says the space's auth service logs why. A failure after the request was sent is still reported as unknown.
+- 91909b5: On a terminal, a bare `cotal spawn` on a user-auth mesh where several of your managers are live
+  asks where the agent runs: this terminal, the default, or one of those managers, which launches it
+  and attaches here as `--on` does. A managed launch on a manager that is not known to run on this
+  host, picked or named with `--on`, then asks which folder the agent works in unless `-C` names one.
+  Enter keeps the manager's workspace and sends no folder. A typed folder is sent as typed and checked
+  by that manager with `resolve-cwd` before anything is launched; a folder it refuses is asked again.
+  No manager credential is held while a question waits. `--json`, `--no-input`, `COTAL_NO_PROMPT=1`
+  and a missing terminal never ask.
+- 0379e03: Process services, and with them a prepared stack's `cotal up` and `cotal down`, run on Windows. Each
+  background service runs under a detached custodian that creates the program inside a job object,
+  which allows no breakaway and ends every member when the custodian exits. The instance records the
+  machine, the account's SID and the custodian's pin in place of a UID and boot ID. The machine is the
+  system ID Windows documents for a publisher's apps (`GetSystemIdForPublisher`), with the TPM, UEFI
+  or registry source it came from; a service start refuses when Windows has none. Commands reach the
+  custodian over a named pipe with a per-instance capability that both sides prove on every request. A
+  stop terminates the whole job, and `service status` reports `members-running` when the program
+  exited while its job still holds processes. A manager is woken for its native stop through its
+  cooperative local stop request. A foreground start, and a manager stop that would keep agents in its
+  job, refuse on Windows. `cotal down` refuses a member whose program exited while its job still runs,
+  and names the stop that ends it.
+
+## 0.101.0
+
+### Minor Changes
+
+- bd52202: `MeshAgent` now arms the `turn-pending` poll and the turn-boundary re-poll only when `config.managerInstanceId` (`COTAL_MANAGER_INSTANCE`) is set, and `Manager` (`spawnDelegated`) / `delegatedSeatCommand` / `cotal spawn` (`applyHandoffManagerInstance`) now carry `COTAL_MANAGER_INSTANCE` alongside local spawn, restart, and resume so every manager-launched seat polls its launching manager while a directly connected session never polls a manager. `cotal spawn` with `COTAL_MANAGED_HANDOFF_FILE` now requires `COTAL_MANAGER_INSTANCE` before any broker or exchange plane is touched (`COTAL_MANAGED_HANDOFF_FILE requires COTAL_MANAGER_INSTANCE`; a newer CLI child under an older manager or runtime refuses every delegated launch). Because only manager-launched seats poll, `notePullTrouble` now reports `no responder answered` once per outage while keeping only the startup `still reconciling` window silent.
+  
+  `DelegatedSeatLaunch.managerInstanceId` is now required, and a CLI with this change refuses a managed handoff without `COTAL_MANAGER_INSTANCE`, so managers and the CLI must be upgraded together.
+
+### Patch Changes
+
+- 402c84c: A connector's status change with an activity is now one presence record, so peers no longer see the new activity beside the old status first.
+- b3738e8: `cotal run amend` sent right after an accepted answer, before the run has recorded it, now says the answer was accepted and is not recorded yet, and to amend once the step lists it. Before, it said the step was "still open, so answer it instead", which sent the caller to a pause that had already taken their answer.
+- 6d8d964: `cotal run answer` and `cotal run amend` now refuse a `--value` whose record would differ from what was typed, with `SCHEMA_INVALID` and nothing sent. That covers an object that names a key twice (JSON kept only the last), a number outside the range JSON carries such as `1e999` (recorded as null before), and a value nested more than 1000 levels deep. A value nested a few thousand levels deep failed before with a raw "Maximum call stack size exceeded", exit 1, and no `--json` envelope.
+- 3453959: `backup create` now refuses `USAGE_INVALID` (exit 1) a destination inside a path `cotal clean all`
+  removes, such as `.cotal/auth` or the space's `.cotal/space.<hex>` folder, and writes nothing.
+  Before, it published the backup there, and the next `clean all --force` removed it with the space's
+  identity.
+- 8084ce9: `backup create` now refuses `USAGE_INVALID` (exit 1) when checking its destination encounters a
+  non-directory parent (`ENOTDIR`) or a symbolic-link loop (`ELOOP`). It names the destination and
+  parent and suggests choosing a directory parent. Previously it blamed the preserved cut. The
+  refusal occurs before an attempt is started and leaves the preservation journal unchanged.
+- 9e2159f: A `nats-server` that `cotal up` started on the retained launcher and that exits before it answers
+  now fails the start as `OPERATION_FAILED`, exit 5, instead of an unconfirmed outcome. The message
+  names the file, its exit code or signal, and its log, and the next step is to read that log, then fix
+  the file or take it off PATH and run `cotal up` again. A broker that is still running when the wait
+  ends is still reported as unconfirmed.
+- da20082: `cotal up` no longer stops at a `nats-server` on PATH that a broker start would refuse as
+  unprotected, such as one in a group-writable Homebrew folder on macOS, when the bundled
+  `nats-server` passes that check. It runs the bundled one and never runs the one on PATH, and
+  `cotal status` names the one it passed over and why. A protected `nats-server` on PATH is still
+  the one used. A `nats-server` that fails the check is never run, not even for its version. When the
+  bundled one is missing or fails it too, `cotal status` shows why, and the broker start refuses
+  before anything runs, naming each folder and its fix.
+- 7a55775: Clarify that channel names retain their case and auth mint reads the persona for the requested label. A missing persona does not inherit the default persona's grants.
+- 802ca50: The `cotal channel` docs now list every flag `cotal help channel` lists: the flag table adds `--purge`, `--yes`, `--follow`, `--json` and `--plain`, and names the `--instructions` value `<text>` as the help does.
+- db56f9b: The `chat` docs state the `--name` label rule: 1 to 128 characters, not blank and without control characters.
+- 2b45f3b: The CLI docs and the `cotal channel show` card now state the bound on a chat session's replay. A
+  session holds at most 500 unread messages in its inbox, so a channel that holds more replays only
+  its newest 500. The card said only `Window: retained history`, and the docs named no bound. The card
+  adds a `Chat replay` row when replay is on, taken from the same constant the session uses.
+- b670a73: `clean store` and `clean all` now refuse an existing linked store path with `CONFLICT` (exit 2),
+  naming the link, its target and a repair step. Previously they returned a generic real-directory
+  error with no next step. Neither the link nor its target is removed, including in dry runs.
+- fd4afc3: A `clean store`, `clean all`, `reset store` or `reset space` whose removal stops inside the
+  `.cotal-clean-<id>` folder the store was moved to now ends `OPERATION_PARTIAL`, naming that folder,
+  what is left in it and the step that removes it. It used to end with the raw error, or as an unknown
+  outcome that named only the original store path, which no longer existed.
+- 69f06b0: `cotal clean store`, `clean all` and the restore targets refuse `--space`, `--server` and `--creds`
+  `USAGE_INVALID` before local cleanup inspects or removes root state. They act on the root of the folder they run in
+  and used to ignore those flags, so `clean store --space <other> --force` removed this folder's store.
+  `clean history` keeps them.
+- 412b0b3: The `clean` docs now say that a custom store directory holding only a `jetstream/` directory is
+  removed as a store, because what that directory holds is not checked.
+- 8d6bc93: Reject extra positional arguments before any cleanup runs. Previously `clean history <channel>`
+  ignored the channel name and purged all channel history, and extra words did not prevent local
+  store deletion. Quote an explicit store directory in the dry-run force command so paths with
+  spaces or shell characters remain one argument. Valid cleanup scope and missing-directory no-ops
+  are unchanged.
+- 3750ec2: The Commands table in the CLI docs now has one row per command `cotal help --all` lists, under the
+  section help lists it in. It named `channels`, which is not a command, and had no row for `watch`,
+  `team`, `manager`, `agent-bearer`, `personas`, `auth`, `app-identity`, `service-endpoint`, `version`,
+  `help` and others. The flag inventory check now fails when the table and the registry differ. The
+  identity docs name `cotal channel set` and `cotal channel defaults` in place of `cotal channels`.
+- 1228001: The CLI docs now list every command alias that `cotal help --all` shows. They left out `t` (team),
+  `ch` (channel), `w` (watch), `ep` (endpoint), `mgr` (manager), and `svc` and `services` (service).
+- 4abb222: The `cotal config` docs now say that `PREFERENCE_SHADOWED` also names your value for the selected space when it outranks a write to your defaults made without `--user`, as `config set persona beta` does while the selected space holds `alpha`. Before, the page described the warning only for a variable.
+- 66d2f93: A connector session now refuses a `COTAL_SERVERS` with a user name or password when it starts. The NATS client kept only the URL's host and port, so the session dialed without them, failed authorization in a loop with nothing saying why, and printed the URL with the password in the `cotal_roster` and `cotal_channels` not-connected lines. The refusal names the variable without repeating its value, and says to pass the credential in `COTAL_CREDS`, `COTAL_TOKEN` or a `COTAL_LINK`. The URL check moves from workspace to core so the connector can use it.
+- daf52b9: Correct the control endpoint documentation to include `COTAL_CONTROL_TOKEN` for hand-driven sessions and the refusal of a socket path or token supplied alone.
+- a856d97: A controller stack, the default from `cotal space create` plus `cotal up`, can now renew its `$SYS` credentials. After `cotal down --yes`, `cotal up --rotate-sys` rotates the system account, starts the stack on the rotated configuration, and reports the new generation and expiry in its receipt (`result.rotatedSystemAccount` in JSON). While any member runs, the rotation is refused `LIFECYCLE_BLOCKED` with `cotal down --yes` as the next step, and an open stack refuses it `UNSUPPORTED`. Before, every controller stack refused `--rotate-sys` with "no controller-owned route", so its creds could not be renewed before they expired.
+- 700695c: Process services, and with them a prepared stack's `cotal up` and `cotal down`, run on macOS. The
+  direct-process driver pins the machine's hardware UUID, the boot session UUID, the OS user and each
+  process's start in microseconds, read through the bundled binding, where Linux pins its machine ID,
+  boot ID and start ticks. A background start leads its own process group, and a stop signals and
+  waits for that whole group, as on Linux. The manager's native child, its stop reservation and the
+  native service identity records accept the same pins. Before, each of these refused with
+  `UNSUPPORTED` on macOS. Windows still refuses.
+- 04112e9: `cotal service start` of a `delivery` preset beside a running `stack-delivery` no longer calls the
+  stack's own delivery a legacy record with a Next that names nothing. Its refusal names the stack
+  member that runs the record, with its pid and instance, and its Next is that member's stop with
+  `cotal down`. After such a service takes over the delivery, `cotal status` no longer offers
+  `cotal up --root` first, which refused while the service ran. It first names that service's
+  `svc stop` with its instance, as `up`'s refusal does, then `up --root`. `status --json` carries the
+  services under `folder.heldServices`.
+- 628aaa5: `cotal_despawn` takes an optional `instance`, the manager that runs the named peer, as `cotal_spawn` does. In a space with several managers, a session no manager launched could not stop a peer: the manager selection refused and asked for an instance argument the tool did not have. The pin follows `cotal_spawn`'s rules: a seat bound to one manager cannot name another, a pin is never replaced by another manager, and `instance` without `name` is refused. A despawn without `instance`, and self-despawn, are unchanged.
+- bf94e29: The links in the MCP tool catalog's table reach each tool's section on GitHub and on the docs site, which keep the underscores of a `cotal_x` heading, and the watch-a-mesh page links the architecture page's manager supervision section by its heading.
+- ab63464: The CLI reference's command table links `channel` and `auth mint` at their real sections and adds
+  rows for `help`, `version`, `watch`, `team`, `endpoint`, `personas`, `manager`, `app-identity`,
+  `auth` and `service-endpoint`. `pnpm check:docs-site` now
+  fails on a link whose `#anchor` names no heading or
+  `<a id>` on its page.
+- 483564c: The docs index lists every page under its category, in the docs index's order: Start here, Guide,
+  Concept, Reference and Project. `docs --json` gives each page a `category` with that heading and keeps
+  `kind` as its classification line's text, the telemetry page is listed under Reference, and the docs
+  bundle refuses to build a page with no classification line.
+- 2e35fda: `cotal doctor auth --space <space>` run outside that space's root still refuses `AUTH_REQUIRED`
+  and reads no other root, and now names the folder the space is registered at, where the same
+  command runs. The `NOTHING_REPLACED` warning of `cotal auth mint --replace` names that root too.
+  Before, the warning sent users to `doctor auth --space <space>` from any folder, and the refusal
+  that came named no next step.
+- 8ce5ca8: Clarify the explicit `--server` refusal documentation: the request is not retried at a recorded broker, and target resolution probes only records at the explicit address. The paragraph distinguishes refusal wording from the separate `status` infrastructure report, records the case where no registration was retained, and names the broader checks explicitly requested by `status --all`.
+- 67ee2d0: The CLI reference now documents what a feedback intake expects: a `--key-file` holds one opaque bearer token with at most one final newline, a Cotal intake accepts reports only at `POST /v1/feedback` so `--url` names that path, and the `feedback-intake` service preset's `--keys` file is JSON in the form `{"keys":[{"key":"<token>","tester":"<tester-id>","name":"<display-name>"}]}`, with `name` optional.
+- bdc9f7b: `cotal feedback` now names the cause of an intake refusal and gives a next step. HTTP 401 says the key was refused, and points at `--key-file` or `COTAL_FEEDBACK_KEY`, or says the intake requires a key when none was sent. HTTP 404 says the URL has no feedback endpoint and names `<origin>/v1/feedback`. HTTP 429 says the intake is rate limiting submissions, with the retry time when its `Retry-After` header gives one. Before, all three printed the same sentence with no next step. The response body is still never echoed.
+- 7b0fd05: `cotal feedback` now reports a connection that never opened as not sent. A refused connection, a failed DNS lookup or a failed TLS handshake refuses `TARGET_UNAVAILABLE` (exit 2) with the native error code, such as `ECONNREFUSED`, and a next step that names the intake origin. Before, each was reported as `OPERATION_UNKNOWN` "the request may have reached the intake", which sent the user to check an intake that never received anything. A timeout or a connection that breaks after the request was written still reports that the report may have arrived.
+- e124c5a: A new project's space, which a bare `cotal up` names after its folder, now keeps that name after
+  `cotal down`. Its registration stays while it is stopped. Another folder of the same name is refused
+  `CONFLICT`, naming the stopped project, where it used to take the name over. The stopped project's
+  `ps` and `spawn` no longer reach that other folder's stack. `cotal up` in the project starts it again
+  on the same launcher, as its last start ran, and `cotal space forget <name>` frees the name. An
+  explicit `up --space` still takes over a stopped holder, and the `down` of any other legacy folder
+  still drops its registration.
+  `status` names the `cotal up` that starts again a stopped stack this machine started, where it used to
+  say its saved registration needed attention.
+- b42c0c6: The CLI docs say that a followed stream (`watch`, `history --follow`, `console`, `channel members --follow`) notices a reader that closed its output at its next line, and name the exit Ctrl-C gives each.
+- 8727696: `service logs --follow` on a log this account cannot read now ends with a `PERMISSION_DENIED` error
+  record that names the log, the cause and a `chmod u+rw` step, and exits 2. It used to end
+  `OPERATION_FAILED` with exit 5 and no path, cause or step.
+- b198527: A foreground `cotal up` whose broker exits on its own now exits 5 instead of passing on the broker's
+  exit code, which read as a usage error, or 1 for a broker ended by a signal. A broker that exited 0,
+  as after an external `down`, still exits 0. Its line says the mesh stays recorded only when the
+  registry holds that broker's record, so a broker that exits before the mesh was recorded no longer
+  claims a record `cotal meshes` does not list.
+- 0d3af83: `cotal up` in a new folder under your home folder, such as `~/Desktop/test`, now starts there. Once
+  `~/.cotal` existed, such a folder inherited the home's `.cotal` and `up` refused, asking for
+  `cotal space create <space> --root .` and then `cotal up --root .`. A bare `up` now makes the folder's
+  own `.cotal` and starts the stack as it does in a folder with no `.cotal` above it, and removes that
+  `.cotal` again when it refuses before writing anything there. When the home holds a stack an earlier
+  release started, that stack keeps running and keeps its records, and it still starts from the home.
+  `up -f` and `up --restore` there still refuse and name `space create` and an `up` from the folder.
+  `status --verbose` says that `up` makes the folder its own project root, and the
+  `--root` help says plainly that it starts the project in another folder that already has a `.cotal`.
+- fddf777: Quote the recorded root in `status` recovery commands for an interrupted startup, preserving spaces
+  and apostrophes when copied into a shell. The existing `--no-manager` choice is preserved. Startup
+  state, recovery actions and their order are unchanged; no command is run automatically.
+- 7867e47: The cotal-lang card and the CLI reference now say that `cotal run validate` warns about a `fanOut`
+  with no stable key (L3021) only for a list written in the call. A list held in a variable gets no
+  warning and the run refuses it when it reaches it, so its items need an `id` or the call a `key`.
+- 216829d: Local workflow answers and amendments missing `--by <who>` now refuse `USAGE_INVALID` before
+  contacting the broker, with a JSON envelope under `--json` and a direct step naming the required
+  flag. Previously they reached the local handler and printed raw usage with empty JSON output.
+  The explicit local answerer requirement and hosted authenticated-caller attribution are unchanged.
+- e4516c7: `cotal run start --local` and `cotal run resume --local` of a program that fails now report the
+  failure the run's status records: `OPERATION_FAILED`, exit 5, naming the run and its language code
+  with that code's title, or the first line of the recorded message when the code has none, with
+  `cotal run show <runId> --local` as the next step. Before, they
+  reported an unknown outcome, exit 3, with the whole multi-line message flattened onto one line as
+  literal `\u000a` escapes and no next step. Any other error the drive ends on is still unknown.
+- abc7d20: The managed seats section of the CLI docs now shows `stop` and `attach` as their help does: the agent named positionally or with `--name`, `stop --self` and `stop --force`, and `attach` with no name choosing from your agents on a terminal. It used to list only `--name <n>` and call it required.
+- 4fe8f9c: `cotal auth mint <name>` now names a persona file of that name that it cannot use. A file that
+  cannot be read as a persona, such as one with a YAML error or saved as UTF-16, refuses
+  `SCHEMA_INVALID` with its path and `cotal persona show <name>`, which says what is wrong. A role
+  from the file that is not one word of letters, digits, `_` and `-` refuses with its path and
+  `cotal persona edit <name>`. The mint refusals do not print file values or parser text. Before, both gave a generic refusal
+  that named no file and no step.
+- b6e1ce0: The Codex, OpenCode and Jcode guides, the manifest page and the mesh guide said `cotal models --agent <name>`, which `models` refuses as an unknown option. They now say `cotal models --harness <name>`, the flag `models` takes. The docs `cotal_docs` serves carry the change.
+- 0f0a6f0: An `up --no-manager` interrupted by a signal named bare `cotal up` as the way to finish or restart the stack, and so did the `cotal down --yes` that settled it, so following either added the manager the operator had left out. Both now name `cotal up --no-manager`. An interrupted plain `up` still names `cotal up`.
+- c204b4d: `cotal status` on a running stack started with `--no-manager` offered `cotal up --root <root>` to restart its stopped members when the only one was the manager record an earlier full `up` left, and on such a stack with a member really gone its restart dropped `--no-manager`. Following either started the manager. That record no longer counts as a stopped member, and the restart keeps `--no-manager`.
+- cf606e8: The workflows guide now says what `random()`, `randomInt(n)` and `pick(xs)` return, and that a
+  builtin ignores arguments past the ones it takes, so `randomInt(1, 1000)` is `randomInt(1)` and
+  always 0. `1 + randomInt(1000)` draws from 1 to 1000.
+- d92c955: `cotal run show` now explains that a released status records no reason and points to the executing
+  manager's log for hosted runs or the driving process's output for local runs. It does not infer an
+  execution host or log location from a journal read. Status, JSON, journal limits and resume behavior
+  are unchanged; this is evidence guidance, not a recorded cause or a prevention of repeated release.
+- 0ce7197: An agent-profile `auth mint <label> --replace` now warns `REPLACED_GRANTS_CHANGED` when an old agent
+  credential names this space's account as issuer and declares different grants. The warning names
+  both sets and the `--allow-subscribe`, `--allow-publish` and `--role` flags for the replaced ones.
+  Grant selection, inheritance, profiles, expiry and revocation are unchanged.
+- 948877c: `cotal reset store` now says what goes with the store. Its preview has a "Store contents" section (`storeContents` in JSON), its confirmation and its receipt (`removedContents`) name workflow runs and their journals, channel history and stored messages, and the preview says that a run still waiting for an answer cannot be answered or resumed afterwards. The runs are not listed, because only the stopped broker reads the store; the preview names `cotal up` and `cotal run ps` to see them first. Before, a reset removed waiting runs and history with no word in the preview or the receipt.
+- 14e3dae: `cotal reset store` now lists the workflow runs it removes. Before it stops a controller stack's live manager, `cotal down` reads the runs that manager hosts and records the unfinished ones, with the steps they wait on and their requests, in the stack journal (`operation.runs` in its JSON receipt). The reset preview, its confirmation and its receipt list those runs as of the last down (`storeContents.runsAtLastDown` and `removedRuns` in JSON), and say so when no down recorded them or the read failed. A failed read never blocks the `down`.
+- e5ddaed: A revoked workflow run no longer takes an answer. `cotal run answer`, hosted or `--local`, refuses an open checkpoint or `ask` of a revoked run with `LIFECYCLE_BLOCKED`, naming who revoked it and why, and files nothing, so the run stays parked instead of completing. A revocation marker that cannot be read refuses the answer the same way. `cotal run show` still lists the open request, says that it takes no answer, and no longer offers the answer command. SPEC §14.8 states the rule.
+- cc3ec77: `cotal run answer --local` and `cotal run amend --local` now print the same receipt as the hosted path: the step, the value filed or that none was given, any artifact and the answer id, with `result.answer` under `--json`, and a Next of `cotal r show <run> --local`. Before, they printed the raw answer record as unlabelled JSON.
+- 1533e53: The receipt of a hosted `cotal run answer` and `cotal run amend` now names the step, the value it filed and the answer id, and says "no value; --value was not given" when no `--value` was passed. With `--json` the same is in `result.answer`, with `valueGiven`. Before, the receipt said only "Answer accepted", so an answer sent without `--value` settled the step with no value and nothing said so. The CLI reference now says what an answer without a value records.
+- 8554325: Repeating `cotal run answer` right after it was accepted now gets the same `TARGET_NOT_FOUND` refusal as a later repeat, with a next step. Before, until the run recorded the first answer, a few seconds later, it got the checkpoint plane's raw conflict, with an opaque token, an epoch time and a spec section.
+- b3426bb: A failed workflow run now records why it failed. The run driver writes the error's language code, when it has one, and its message (bounded to 4000 characters) on the failed run status as `failure`. `cotal run ps` and `cotal run show` print the state as `failed (<code>)`, the run view prints the message under `Failure`, and the JSON status and `ps` rows carry `failure`. Before, a thrown error, an L4010 null access, an L4013 step budget or an L4023 deadline showed only "failed", and the cause was only in the manager's log. SPEC §13.7 adds the optional field.
+- b928dfa: The CLI reference now names the codes these refusals give. A run verb given a program file that
+  does not exist refuses `TARGET_NOT_FOUND`, one this account cannot read `PERMISSION_DENIED`, both
+  exit 2, and a folder `USAGE_INVALID`, exit 1. `up --server tls://` without a certificate and key
+  refuses `USAGE_INVALID`, and on a prepared root `UNSUPPORTED`, exit 2.
+- 0ba68ef: A malformed run ID is now one usage refusal on every `cotal run` verb that takes one. `show`, `journal`, `answer`, `amend`, `resume`, `revoke` and `check` refuse an ID that is not 1 to 64 letters, digits, `_` or `-` with `USAGE_INVALID`, exit 1, naming the format, before anything is contacted. Before, the same local check came back as exit 5 on `show` and `journal`, exit 3 "Outcome unconfirmed" on `answer`, `amend` and `resume`, and an unformatted error on `revoke` and `check`.
+- d2ecd4a: The CLI reference says what `run ps --json` and `run journal --json` write: one envelope on
+  stdout, with rows under `result.items` or the run under `result.view`, and nothing on stderr. It no
+  longer describes one JSON object per line with the run header on stderr.
+- fc38933: A `cotal run start` or `resume` past the manager's limit of 8 runs activating at once is now a clean refusal. The manager refuses before it writes the run's admission, marks the refusal `not-executed`, and names the runs still activating, and the CLI reports it as `LIFECYCLE_BLOCKED`, exit 2, with the next step to wait until one has activated and run it again. Before, the manager wrote the admission first, and the CLI reported the refusal as exit 3 "Outcome unconfirmed" with a "retry" hint it then told the caller not to follow. The limit is now in the run docs.
+- 3e09d27: A hosted `cotal run resume` of a run recorded `completed` or `failed` is now refused `LIFECYCLE_BLOCKED` (exit 2), naming the state. Before, it printed "Workflow resumed", exited 0 and drove the finished run again under a new epoch, adding a holder activation row to its journal each time.
+- ec3da5d: `cotal run show` no longer prints a long answer value whole in its Answers table. A value longer than 120 characters is cut, and a line says so and points to `--json`, which carries it whole. Before, one 100 KB answer padded every row of the table to its width, and the view printed about 300 KB for three rows.
+- ba9b70e: `cotal run validate` and a hosted `cotal run start` now refuse an empty program file the same way, `SCHEMA_INVALID` with a next step, and `--json` gets its envelope. Before, validate passed the file, and start printed a raw input-schema line on stderr and exited 1 with no JSON.
+- 571fe68: The `cotal run` verbs that read a program file now refuse one that is not valid UTF-8 with `SCHEMA_INVALID`. Before, its bytes were replaced with U+FFFD, so a Latin-1 checkpoint question was stored and shown corrupted, with no warning.
+- e382f0c: A hosted `cotal run start` interrupted with Ctrl-C or `SIGTERM` after its request went out now says the manager may already have recorded the run, with outcome `unknown` and a pointer to `cotal run ps`, and still exits 130 or 143. Before, it exited silently while the manager went on to record the run, so a retry started a second one.
+- 90ed4a4: A hosted `cotal run start` of a program larger than the broker's message limit is now refused `UNSUPPORTED`, naming the program's size and the limit, with a next step. Before, it was reported as an unconfirmed outcome with exit 3, although nothing was sent and no run was created.
+- d12f4bc: An operator command whose target is the selected space, or the space registered at its project's root, no
+  longer probes every other recorded broker before it connects. An unrelated registration whose broker
+  does not answer slowed `send`, `history`, `who`, `ps` and the other commands in the selected space by
+  several seconds. A command that picks among the running meshes still probes them once.
+- 178b537: Quote executable and working-directory paths in launch-permission repair commands, so spaces
+  and apostrophes remain part of one path when the command is copied into a shell. Refusal codes,
+  launch checks and permissions are unchanged; repairs are never applied automatically.
+- d7bb55f: When `service` or `service logs` cannot read a service record folder, they now refuse
+  `PERMISSION_DENIED`, exit 2, naming the folder and a safely quoted `chmod u+rwx <folder>` step.
+  Previously they ended with an unconfirmed outcome and a raw permission error, without repair
+  guidance. `status` keeps its partial result and warns with the same code. No permissions change
+  automatically; write paths and other error classifications are unchanged.
+- 8704be1: A service record folder that this account can read but not write, as the `chmod u+rx` of a read
+  refusal leaves it, now refuses a write or a held record there, such as `service add` or
+  `service start`, `PERMISSION_DENIED`, exit 2. The refusal names the folder and only the owner bits the
+  write lacks, such as `chmod u+w <folder>`, and nothing is written. Before, these ended with an
+  unconfirmed outcome and the raw permission error on a lock file, with no folder or step. The docs
+  now say which reads name `chmod u+rx` and which name `chmod u+rwx`.
+- f8c506f: `cotal service status --instance` of a background service with no recorded supervisor whose process
+  ended after readiness, with no stop through the controller, now names `cotal service logs <name> --space <space> --instance <id>` in its
+  Next. Before, it showed only "Process observation: gone" and "Process stop evidence: not recorded",
+  without pointing to that instance's recorded output. No exit code or signal is reported, because
+  none was observed. The log may contain output explaining the exit; it is not guaranteed to do so.
+- 81f9522: A workflow deadline short enough to pass while its pause was being armed failed the step L4000, "pause … was due … and nothing was minted for it", instead of ending it as that deadline's expiry does. A `wait` with a `1ms` timeout now resolves `null`, an `idle` window of `1ms` returns its event, a `waitUntil` with a `1ms` cadence observes again until its deadline fails it with L4023, and a `1ms` or `2ms` checkpoint expires for its `onExpiry` to act on. A `wait` still opens its channel under the run's read admission first, so a channel the run may not read is refused as before. `sleep` and `ask` already ended this way.
+- 761c861: `cotal run simulate` now tells a program that fails under its script apart from a script that does not cover the program. A program failure, such as a checkpoint scripted `expired` under the default `onExpiry: "fail"` (L4007), is a completed simulation, exit 0, whose program outcome is failed: it shows the step and that step's outcome with the language's error, and the JSON result carries `outcome` and `failure` beside the effects that ran. A script with no result for an effect (L6001) still does not complete, exit 5, and now names the step and the entry to add. Before, both printed "the offline simulation did not complete; unscripted effects are not invented" with a null result. `dryRunOutcome` returns a failed program's report with its fault, and `dryRun` takes an optional `journal`, so a caller can read the step a dry run that did not complete stopped at.
+- e61399c: A `service start` that selects an instance record of an earlier definition revision, as a definition
+  moved aside and added again leaves, still refuses `CONFLICT`, and now names that record and a Next:
+  `cotal service remove <name> --instance <id> --space <space> --yes`, then `start` again, after a
+  `service stop` of that instance when it still runs.
+- 3caf13f: `cotal status` in the folder of a static-auth stack whose broker or manager exited now puts
+  `cotal up` first under Next, which starts it again on the recorded address and store. Before, the
+  manager's stale pidfile was followed only by `setup`, `ps` and `use`. A broker's stale pidfile left
+  `clean store --force`, which removes the stored history, as the only recovery command named.
+- 0c53a6d: Quote the root in status restart commands after an interrupted stop or deleted space streams.
+  Roots containing spaces, apostrophes or shell variables stay one literal argument when the
+  printed command is copied into a shell. Recovery ordering, flags and lifecycle checks are unchanged.
+- 4bdffc8: In open or static-auth mode, `status --server` at an unreachable address other than the recorded
+  one no longer offers `cotal up --root` to restart the stack's stopped members while that stack runs. Its
+  Next names the address that did not answer and the recorded broker, as the refusal of other
+  commands does. A stack member whose process is gone still leads with `up --root`.
+- 5cb1819: The `chmod u+r` and `chmod u+rx` steps named for a saved local record this account cannot read, or
+  for the folder that withholds it, quote the path when a shell would split it, as under a Cotal home
+  whose path has spaces. They used to print it bare.
+- 595aa8e: A saved definition of a service you added that is not valid JSON, as an interrupted write can leave
+  it, is now named by `service` and its verbs, such as `service show`, `service add` and
+  `service stop`. The `SCHEMA_INVALID` refusal gives its path, the `mv` that moves it aside, and
+  `cotal service add <name> --space <space> --file <declaration>`, which adds the service again so that an instance
+  still running can be stopped. Before, the refusal named no file, so the stop that `down` names for a
+  running service could not be followed. A stack member's definition keeps the plain refusal.
+- 821e6a6: Accept `cotal up -d` as the short form of `--detach`, consistent with managed agent spawning.
+  Startup still runs in the background by default, and combining `-d` with `--foreground` refuses
+  before anything starts.
+- a3e2776: A bare `cotal up` in a new project now names its space after the project folder. Two new folders,
+  such as `~/Desktop/alpha` and `~/Desktop/beta`, start the spaces `alpha` and `beta`, where both used
+  to start `main` and the second refused. A folder name that is not a valid space name, such as
+  `My Project`, refuses `USAGE_INVALID`. A name another folder on this machine already registered or
+  prepared refuses `CONFLICT` and is not taken over. Both refusals write nothing and name
+  `cotal up --space <name>`. `--space` still names the space, and a folder whose records already name
+  one, or a folder inside such a project, keeps its recorded space. The receipt says the space was
+  named after the folder.
+  
+  This changes a default. A script that ran a bare `cotal up` in a new folder and then addressed
+  `main`, such as `cotal spawn --space main`, now finds the folder's name there. Pass `--space main` to
+  `up` to keep the old name.
+- cc1fb41: A bare `cotal up` whose folder names a space that already runs from another folder
+  now names how to start a separate space here: its Next is `cotal up --space <name>` with a name no
+  other folder uses, or the `cotal down` that stops the other stack, run in that stack's folder. It
+  used to say only "pick a different `--space`, or `cotal down` it first".
+- f9e7432: `docs/UPGRADING.md`, which `cotal_docs` serves, now has a section saying that `cotal doctor auth` reports a missing `membership-observer` or `connection-evictor` credential as a finding, so a space started before that pair existed has one until `cotal down` and `cotal up --rotate-sys`. No behavior changes.
+- c0c49fa: The JWKS check of a first `cotal up --user-auth` enable now refuses a redirect. A `3xx` answer at
+  `<idp>/jwks` is refused as an unavailable JWKS, and the place it points to gets no request. Before,
+  the check followed redirects, to another origin too, so it could pass on keys from a host that the
+  space's IdP pin does not name.
+- 5110a44: The workflow runs page now opens with what a workflow run is and a first program. The keyed
+  submission section, unchanged, follows the operator sections, ahead of what is on the wire.
+
+## 0.100.2
+
+### Patch Changes
+
+- 678a8c6: The `persona` section of the CLI docs no longer says remote `--on` operations refuse. List, show and create work on one manager's catalog with `--on`, and edit and remove refuse there, as the exact-manager section describes.
+
+## 0.100.1
+
+No changes in this release.
+
+## 0.100.0
+
+### Patch Changes
+
+- 37f4a75: The `cotal history` docs now say that the text and plain reports show a line break or other control character in a message as its `\uXXXX` escape, and that `--json` carries the text as it was sent.
+- 6471d27: `cotal run show` and `cotal run journal` now say why a step failed. A failed or refused step's journal row carries its recorded `errorMessage` beside `errorCode` in `--json`, and the text view lists each such step with its outcome and message under `Step errors`, escaping control characters. Before, both views printed only `failed (L4000)`, and the reason, such as a hosted run that is not admitted to read a channel, was only in the manager's log. The manager's `run-status` reply schema admits the new field.
+- a80904f: `cotal run validate`, `plan` and `simulate` now say what each validator warning is: its code, title, position, cause and fix, on stderr and in the `--json` envelope's `warnings`, and `validate --json` lists each one under `result.warnings` with the same fields. Before, a warning printed only "The language validator reported a warning at this source position.", so a `fanOut` over a literal list with no `key` validated with no visible reason and then failed its run with L3021.
+
+## 0.99.3
+
+No changes in this release.
+
+## 0.99.2
+
+No changes in this release.
+
+## 0.99.1
+
+No changes in this release.
+
+## 0.99.0
+
+No changes in this release.
+
+## 0.98.0
+
+### Patch Changes
+
+- d4c13db: `docs/UPGRADING.md`, which `cotal_docs` serves, now heads the section on the removed manager-service authority policy flag with 0.76.0, the first release that carries that change. It named 0.75.0, a release that does not contain the change and was never published. No behavior changes.
+
+## 0.97.1
+
+No changes in this release.
+
+## 0.97.0
+
+No changes in this release.
+
+## 0.96.1
+
+No changes in this release.
+
+## 0.96.0
+
+No changes in this release.
+
+## 0.95.2
+
+No changes in this release.
+
+## 0.95.1
+
+No changes in this release.
+
+## 0.95.0
+
+No changes in this release.
+
+## 0.94.7
+
+No changes in this release.
+
+## 0.94.6
+
+No changes in this release.
+
+## 0.94.5
+
+No changes in this release.
+
+## 0.94.4
+
+### Patch Changes
+
+- 489e9c6: Explain the native data sharing a person approves: new user messages, assistant replies, tool inputs and tool results are published to readers permitted by the space's activity policy. Reasoning is off by default, and history from before approved activation is not shared. Correct the event-plane documentation's old transcript-boundary description. No event behavior or permission is changed.
+
+## 0.94.3
+
+No changes in this release.
+
+## 0.94.2
+
+### Patch Changes
+
+- 454cb0e: Include the human-only approval, review link and unchanged-request retry instructions inside the structured pending result as well as its text. Native clients that show the model only structured content must still receive the instructions to wait for the person and never approve or poll on their behalf. Issuance remains blocked by the authority until the person's recorded decision.
+  
+  Explain expiry without incorrectly claiming the person never approved: an approved request can also expire before its connection is issued. A fresh request still needs fresh approval.
+  
+  Exercise native connection, exact recovery, capability attenuation and completed workflows through an isolated approval authority and fixture-person decision, including pre-approval transcript exclusion. Register the live approval controls in the smoke gate.
+
+## 0.94.1
+
+No changes in this release.
+
+## 0.94.0
+
+No changes in this release.
+
+## 0.93.0
+
+### Minor Changes
+
+- 92f0b8c: Report pending permission approval with an authenticated review link and no usable connection. Hosted gateways can resume one unchanged request with its approval ID; the ID grants no authority and cannot rename or replace an approved connection. Native conversations wait for the person's decision before starting their connection or capturing activity. Permission arguments are proposals, never human consent.
+- 69b0538: A signed-in native Claude Code conversation can now ask for channels, a role and capabilities within the person's own grant.
+  
+  `cotal_connect` in a native Code session takes proposed `channels` (read, or read and post), a `role` and `capabilities` (`spawn`, `run`). The person must review, edit and approve the permissions in Cotal before a new connection is issued. The approved set must stay within their current access, and the returned grant must match that approved set, not the proposal. Unsupported or refused requests never fall back to baseline or broader access. A remote mesh must advertise selection v1 and connection approval v1. The authority may refuse a capability it does not support; endpoint selection is unavailable in v1.
+  
+  A connection is offered the tools its own grant can use: spawn, despawn and the persona tools with `spawn`, `cotal_run` with `run`, and `cotal_reconnect`. Manager calls exchange the conversation's own secret for a manager-call view. A conversation is not a managed seat, so a self-despawn refuses instead of stopping the app, and `cotal_yield` is not offered.
+  
+  Core exports `conversationSelection`, `checkConversationSelection` and `conversationGrant`. The gateway gains `NATIVE_GATEWAY_TOOLS`, `GatewayOptions.tools`, `GatewayOptions.selection` and `GatewayConnection.tools`. `cotal app-identity provision` takes `--selection <json>`. The hosted gateway's tool set is unchanged.
+- 42fe091: Deliver complete short messages to personally opened Claude Code conversations without an extra inbox call. Preserve message identity and reply context, acknowledge only confirmed native handoffs, and rearm later messages while retaining the inbox path for larger deliveries. A stale offer from a closed connection no longer suppresses its replacement's messages.
+- 6e44a02: Make channel discovery and addressing feedback bounded and accurate.
+  
+  `cotal_channels` now lists the channels a session is on or may join. It counts the agents' event channels and the channels outside the read ACL that it leaves out, and `all: true` lists them too. `filter` narrows the list by name. A reply lists at most 100 rows and ends with the `after` value that continues it. A live space had returned 656 rows in one 52 KB reply, 457 of them event channels.
+  
+  `cotal_channel_info` describes an event channel as an agent's, and the session's own as its own, instead of as a name a prior send may have invented.
+  
+  `cotal_dm` to the session's own name or id says that it names this session. A name that matches no peer in full lists the present names that start with it, so `ada` points to `ada (web)`. Nothing is sent and no name is ever picked for the caller.
+  
+  `cotal_anycast` to a role nobody holds says that the request waits on the role's queue until an agent with that role takes it. The queue behavior is unchanged. `cotal_status` documents that a connector sets `working` and `idle` at turn boundaries.
+  
+  The remote gateway now offers `cotal_docs`, which the orientation card recommends, and `cotal_connect` names the channels the new connection reads, may join and may post to.
+- 6703917: Connect personal native Claude conversations to signed-in meshes with separate identities, real lifecycle and own-event publication, durable request recovery, and exact-lifecycle retirement. Bind native wake readers to their conversation while retaining immediate idle and busy-boundary delivery. Capture lifecycle metadata through ordinary command hooks so the native connection does not depend on intercepting the built-in guard's protected events. Keep notification presentation off protected notes and skill output while retaining native sender attribution.
+
+### Patch Changes
+
+- 2a56547: Recover a signed-in native Claude conversation whose identity retirement is still pending. Disconnect, every routed tool and reconnect now report one disconnected state with the mesh's retirement phase and the available retry, instead of advising a reconnect that the same conversation then refused. Reconnecting retries the pending retirement and connects with a new identity once the mesh confirms it, including after the plugin server restarts. After each signed-in connection, the plugin retires the same mesh's saved conversation identities whose plugin server process no longer exists, through the new `cotal app-identity reap` plumbing. It runs in the background, so a connection never waits for it, and it keeps any identity whose server process still exists and retains any retirement that does not finish. The same conversation from another plugin server reuses a saved identity only once the server that held it no longer exists, so a live server keeps its identity even when its process start time reads differently, as macOS `ps` does across time zones and locales.
+
+## 0.92.2
+
+No changes in this release.
+
+## 0.92.1
+
+No changes in this release.
+
+## 0.92.0
+
+### Minor Changes
+
+- eb9aef9: Show a bounded, attributed preview inside Claude Code's existing native Cotal disclosure without consuming the inbox. The collapsed row reports unread count, expansion renders neutralized DM/channel rows, and UI state never drains, acknowledges or commits delivery. Unsupported chat hosts keep the existing tool and wait paths.
+
+  `GatewayWake.signal` now receives the rendered preview as a required second argument. Embedders that implement `GatewayWake` with a one-argument `signal` still conform. Code that calls `signal` directly must pass the preview.
+
+  Preview rows replace peer control characters and lone surrogates with U+FFFD before they are bounded, so a wake frame always fits the feed and no terminal control reaches the host UI. Line breaks keep their indented continuation.
+
+### Patch Changes
+
+- ab2acc8: Tell every agent where to talk when it joins. A fresh agent can start on no channel, so the Claude Code, Codex, Jcode, OpenCode and Hermes startup text now says how to find its team's channel with `cotal_channels` and `cotal_join`, to use `cotal_dm` for one peer and `cotal_anycast` for a role, and to post on `#announce` only for a deliberate space-wide notice. OpenCode and Hermes previously carried no channel guidance at all. This is guidance only: no grant, subscription, mention or wake behaviour changes.
+- 465fbd1: Export a typed `submitFeedback` helper for hosts that need the same feedback intake contract as the MCP tool. The tool now uses that helper without changing its keyed and keyless routing, request fields, email requirement, or result text.
+- 3cefc75: Report the Cotal release a server actually loaded as its standard MCP `serverInfo.version`, instead of the placeholder `0.0.0`. The conversation gateway over HTTP and stdio and the managed Claude Code server now use the same value `cotal_orientation` shows, so a long-running server keeps reporting the release it loaded rather than whatever is installed on disk now.
+- 64fe35a: Make `cotal_orientation` identify the current session without conflating its labels. The card now reports whether the endpoint is bound, separates its display name and role from the owner+actor wire principal, names the current lifecycle UID, and states whether replacement evidence is known. Values the connector cannot establish are reported as `unknown`; a resume floor is not treated as replacement proof, and an unavailable predecessor is never presented as the current incarnation.
+
+## 0.91.0
+
+### Minor Changes
+
+- 5c85ef3: Apply the new terminal screens to status, help, settings, setup receipts and inventories. Add compact action guidance, command shorthands, named agent details and the live observer. Group guarded manager maintenance and channel metadata operations under their new command names.
+
+  Validate the public recipient and agent-target arguments before installation or catalog preparation.
+
+  Support explicit message file/stdin input, channel mentions and direct replies with non-echoing structured storage receipts. Show broker-derived channel membership without treating it as access or task progress.
+
+  Consolidate workflow reads, file-based launches, offline language tools and own-seat turn handling under run/r with explicit source and outcome labels.
+
+  Add account-provider selection, private device-approval guidance, structured sign-out receipts and a non-installing update availability report.
+
+  Expose native managed-launch readiness and original request/goal attribution, verified self stop,
+  hard despawn and manager supervision flags. Add non-echoing native terminal-input receipts,
+  authorized endpoint contract/invocation reports, the full read-only watch view family, partial
+  recorded team reads and account/actor authority reports. Keep unestablished live state explicit.
+
+  Share protected owner-private local record access between endpoint references and service
+  definitions. Add case-safe per-space service definition inventory, guided/file import, policy
+  reports and guarded local removal, keeping existing process observations distinct from owned
+  instances and serving readiness.
+
+  Resolve saved endpoint targets through the canonical describe/invoke namespace. Pin the local
+  reference revision through native calls, disclose the resolved target and preserve exact instance
+  selection without broader-caller or class-queue fallback.
+
+  Read authorized native endpoint registrations with explicit bounded-lag enumeration, leader-read
+  coordinates and partial results for unreadable or omitted keys. Keep registration, reported status,
+  process ownership and current serving responses distinct.
+
+  Add the guarded history-clear screen with default-cancel scope review, explicit scripted confirmation,
+  offline dry-run and per-stream native purge receipts. Preserve acknowledged partial work and unknown
+  submissions without retrying destructive requests.
+
+  Expose digest-verified action metadata to clients and add native endpoint action following with
+  --wait. Retain original requests and accepted goal identity, use accepting-instance reconciliation
+  and emit explicit bounded goal stream records without resubmitting an unknown action.
+
+  Apply the shared report treatment to classified failures and expose safe original-request, accepted-
+  goal and responder attribution without copying raw argument or native-detail objects into reports.
+
+  Make spawn --file select a persona on its execution host, with the native shared manifest schema
+  providing the team-deploy refusal. Add non-launching offline preview reports and a protected explicit
+  foreground enrollment-file input without changing native launch fields or adding wire authority.
+
+  Add a Linux process-service driver with machine/boot and process-creation ownership, exact
+  instance selection, explicit multi-instance launch, bounded readiness/log reads and guarded
+  stop/restart/removal. Distinguish owned process presence and HTTP reachability from endpoint
+  serving, retain uncertain launch receipts and never fall back to PID-only or remote controls.
+
+  Add ownership-aware completion installation, refresh and removal with finite JSON/plain receipts.
+  Keep custom and modified shell material, preserve the stable offline dispatcher and refresh only
+  existing recorded stubs through the current-generation updater without adding startup wiring.
+
+  Add offline endpoint contract scaffolding and checking through the installed native cluster/schema
+  compilers. Create files exclusively, derive digests from schemas and keep handler execution,
+  serving authority and opaque attribute/event semantics separate from local validation.
+
+  Expose native ephemeral endpoint casts with pre-publication journal refusal and non-execution
+  receipts. Keep original request/binding attribution, broker denial and unknown outcomes distinct.
+
+  Expose target-bound account signer export under auth signer with required protected output,
+  inspected same-account replacement, public-only receipts and no operator-root or caller issuance.
+  Share protected workstation file access across the credential, endpoint and service frontends.
+
+  Add protected, explicitly unverified handle metadata inspection without signatures, redemption or
+  caller issuance. Resolve literal nested help and scoped aliases through declared metadata while
+  keeping help offline and provider imports behind validated execution.
+
+  Move static credential minting into auth mint through a registered implementation action, with
+  one shared flag grammar and public-only JSON/plain receipts. Keep source-root authority/profile
+  checks, native provisioning and expiry metadata, use create-only default labels and explicitly
+  report a reused nkey's new out-of-band lifecycle instead of claiming its old inbox was retained.
+  Reject the top-level mint spelling before effects and keep explicit exports out of managed state.
+  Name both roots when the selected root and current folder disagree about the signing authority.
+
+  Expose one-shot native endpoint class scatter with frozen-set reconciliation, attributed member
+  results and every native anomaly bucket. Keep pinned/targeted/journaled calls off this route,
+  preserve classified mixed/unknown outcomes and retain useful result data in finite failure reports.
+
+  Add exact-manager persona list/show/create with native ownership checks and bounded complete-file
+  merging. Refuse unsupported metadata before submission, retain the actual responder/request and
+  separate a confirmed save from a denied or unknown optional announcement without retrying it.
+
+  Expose exact-target endpoint deregistration through the existing native guard as a registered
+  operator action. Require a reviewed full class/instance, preserve TLS and selected static authority,
+  refuse unsupported auth fallback, keep dry-run offline and report native deletion revisions or
+  uncertainty without retry. Turn the old default-instance spelling into a pre-effect migration refusal.
+
+  Add finite private-backup creation receipts after native cleanup, read-only manifest inspection
+  and size/SHA-256 verification without staging or restore claims. Expose exact-attempt recovery
+  and healthy fallback cleanup with default-cancel review, offline plans, revision rechecks and
+  native owner/identity guards. Keep confirmed publication and incomplete cleanup distinct.
+
+  Add public-only JSON/plain feedback receipts with bounded response metadata, explicit unknown
+  submission outcomes and no redirect or retry. Accept protected key-file input, refuse raw keys on
+  argv and keep submitted bodies, contact values, credentials and response text off diagnostic output.
+
+  Move credential diagnosis and native static daemon repair onto shared JSON/plain reports. Add
+  nonmutating observation intent at the existing local migration boundaries, retain acknowledged
+  path moves/re-signs separately from adoption, keep prior broker refusals visible and avoid live
+  agent or open-mode claims from absent/local credential files. Never expose secret fingerprints or
+  raw credential/audit parser diagnostics in the new reports.
+
+  Evolve workstation local-process providers with a versioned service ABI, closed bounded option
+  schemas and package-bound cached declaration fingerprints. Validate definitions without provider
+  imports, then route explicit adapter launches through the creation-pinned direct-process
+  controller. Retain adapter provenance, exact native readiness coordinates and unknown hook
+  outcomes. Check declared capabilities and keep service launch intents behind extension-removal
+  guards without introducing wire grants, manager impact bypasses or implicit dependencies.
+
+  Add declarative service presets with schema-derived parsing, scoped help/completion and guided
+  creation. Validate declared protected path references without reading contents. Expose the native
+  feedback-intake preset through the shared controller, using the guarded same-binary re-exec and
+  existing intake implementation. Correlate post-listen startup with the exact child/launch,
+  preserve TLS and private append-only storage, keep credentials on file references and refuse
+  the former top-level intake launcher before effects. Separate controller-only providers from
+  legacy PID inventory and retain startup/data receipts without claiming endpoint serving.
+
+  Expose the independent delivery preset through its own registered local-process provider, using
+  shared workspace custody metadata instead of an implementation import. Retain the native scoped
+  store, SYS account scan, singleton lease and TLS checks, refuse legacy custody adoption and
+  publish startup only after native readiness. Share private child-bound startup receipts and
+  public-only target resolution between native adapters, while preserving the workstation path
+  context without inheriting arbitrary credential or agent identity environment values.
+
+  Expose caller-scoped manager stop-impact observations through the native status contract. Reuse
+  its actual runtime seat policy, retain owner filtering and show pending lifecycle/retirement work
+  without treating an observation as stop authority, a reservation or completed cleanup.
+
+  Put manager gate repair and retained-seat maintenance on shared JSON/plain reports and default-
+  cancel confirmations. Preserve the registered target/TLS policy, classify uncertain submitted
+  effects without replay and separate native gate/custody receipts from serving or cleanup claims.
+
+  Apply scoped grammar/help and shared account, inventory and native-request reports to Linear.
+  Keep native MCP isError results distinct from unknown execution, bound human output without
+  truncating JSON and preserve its existing serving/caller authority during the pending transitions.
+
+  Give existing native Linear caller issuance a private create-only output preflight and shared
+  receipts. Preserve original identity/lifecycle and uncertain provisioning/publication without
+  replay, broader caller substitution, managed-launch claims or environment-export onboarding.
+
+  Keep direct-service supervisor assignment distinct from unperformed OS discovery in instance
+  and preview reports; a recorded none does not claim external supervision is absent.
+
+  Prepare private, request/process-bound native stop handoffs and immutable phase observations.
+  Keep cleanup unverified and existing reservations untouched; manager service control is not
+  activated by these primitives alone.
+
+  Expose the manager embedding's own registration/policy observation without exporting credentials,
+  URLs or grants. Keep it distinct from fresh serving evidence and wire caller authorization.
+
+  Provide a public-only native manager identity callback before endpoint construction and expose
+  its actual per-process UID in status. This supplies launch-correlation data without treating
+  identity metadata as serving readiness, ownership authority or a generic caller grant.
+
+  Prepare private native identity bindings before endpoint construction. Preserve dotted endpoint
+  class names under the native validator, keep epochs out of pre-serving identity data and require
+  a separate attributed response before any serving or process-control inference.
+
+  Add the native manager service preset with pre-endpoint identity binding, post-start signal-ready
+  receipt and invoking-caller readiness/impact observations. Show the full native seat consequences
+  before default-cancel confirmation and bind the unchanged scope to the live native reservation.
+  Require immutable accepted/returned evidence plus original process exit before a stopped record;
+  retain unknown requests without force kill or restart, and leave cleanup unverified. Keep generic
+  and legacy signal paths from bypassing this boundary. The child never publishes its console URL.
+  Foreground, OS-supervised and non-Linux manager service operation remain unsupported.
+
+  Add the prepared native auth-service preset with shared daemon inputs, exclusive real-child PID
+  custody and a private post-initialization startup receipt. Keep discovery capability and key
+  material native and private. Refuse existing custody, remote brokers and TLS-required targets
+  instead of reclaiming a daemon, weakening transport or generating new issuer material. Keep
+  foreground/OS-service operation unsupported.
+
+  Add the Linear service preset over the existing account, native static registration and renewal
+  implementation. Bind its explicit root/registered transport and publish a private handler-
+  initialization phase only after shutdown handlers exist. Keep process/initialization evidence
+  separate from broker flush, fresh endpoint response and native deregistration completion. Refuse
+  unsupported issuer/foreground/OS-service modes without substituting authority.
+
+  Show checked installed preset metadata and declared readiness/foreground/instance/stop capabilities
+  in service inventory. Keep unavailable or mismatched metadata partial with explicit warnings;
+  metadata validation is not application readiness or OS-install support.
+
+  Prepare full-instance/definition/host-bound supervisor receipts and non-echoing recorded-unit
+  file observations. Keep loaded OS state/autostart unchecked, preserve missing/modified receipts,
+  and refuse direct process controls or removal beside a recorded supervisor. OS installation and
+  native unit control remain unimplemented; no unit is created or enabled by these readers.
+
+  Claim the managed manager child's real native PID custody exclusively before endpoint startup,
+  without adopting a contender or treating a starting record as readiness. Settle the same process
+  and retain owner-bound release after native start; keep legacy entry behavior separate.
+
+  Add bounded same-host status reads for unchanged recorded systemd user units. Report physical
+  fragment, native states, invocation and exact process/launcher attribution without unit or
+  environment bodies; keep missing/ambiguous/drop-in observations partial. Status does not reload,
+  start/stop a unit, infer endpoint readiness or prove effective autostart.
+
+  Prepare a built-in direct-process unit boot entry with complete controller/definition/instance
+  validation before extension overlays, repair or package materialization. Require the recorded
+  native invocation before same-PID process replacement, refuse managed-spawn handoffs and retain
+  unknown starting evidence without retry. This does not install units or prove execution/readiness.
+
+  Declare auth and Linear foreground service lifetime through the shared owned-child controller
+  and native shutdown handlers. Print lifetime/output policy before launch, retain manager's native
+  impact requirement, and prevent native service child boot from repairing connector packages.
+  Process exit still does not prove endpoint, descendant, registration or authority cleanup.
+
+  Route recorded systemd service logs through bounded native journal reads/following pinned to the
+  original unit invocation, boot and UID. Preserve native cursors/timestamps and binary JSON, report
+  record/query/diagnostic gaps, close only the reader on interruption, and refuse missing invocation
+  evidence without substituting a direct-child file. Journal retention and cleanup stay unestablished.
+
+  Expose the service install/uninstall paths with the same exact definition/instance
+  selection and a typed unsupported boundary where native OS control is missing. Never route them
+  through the old manager-only installer, allocate a stopped record or change autostart on refusal.
+
+  Expose auth redeem with closed per-mode input and the selected native auth target. Refuse
+  unsupported conferring-handle redemption before reading the file or spending authority, rather
+  than substituting agent enrollment, session redemption or unverified artifact parsing.
+
+  Move the dashboard package from its public command to an owned service preset with explicit
+  protected static credentials and read-only intent. Preserve native HTTP/cookie/origin behavior,
+  registered TLS, exclusive PID custody and private full-launch bootstrap records; publish only
+  process initialization and non-secret reference paths. Refuse unsupported user-auth/open/OS
+  routes without operator identity or mutation-transport fallback. Hide obsolete cached web commands
+  and refuse them with an explicit matching-update remedy before loading code or repairing installs.
+  Keep legacy process observations separate and migrate setup, tool hints and dashboard guides.
+
+  Add auth mint --endpoint with closed channels/expiry/private-output inputs and the shared static
+  signing-authority checks. Resolve a live digest-verified untargeted synchronous ephemeral surface,
+  then use the native agent provisioner for its exact additional command rows and lifecycle footprint.
+  Refuse targeted/journaled/action scopes without omitting rows. Publish a create-only non-secret
+  issuance intent before native footprint work, block blind replay, preserve private output checks
+  and report temporary provisioner close separately. Do not add spawn/run/admin authority, user-auth
+  issuance, arbitrary raw-file caller derivation, managed launch or environment-export onboarding.
+
+  Expose exact auth retire grammar with a typed unsupported boundary until a caller-owned native
+  serve-gate retirement instrument exists; never borrow manager identity or use host loopback doors
+  as a substitute. Prepend native journal reader output-close handling before the binary's global
+  EPIPE exit; final stream output and reader cleanup remain observations, not assumptions.
+
+  Show endpoint caller scope in the shared receipt: actual caller/lifecycle, described owner and
+  responder, native expiry, explicit channels and bounded command rows with a JSON-preserving
+  omission count. Label the local issuance request separately from native provisioning evidence.
+
+  Consume paired native standalone endpoint caller files through registered static targets and saved
+  references. Verify signatures against current validated issuer pins, matching user keys/time windows,
+  native permission projections and principal tags before broker admission. Retain TLS and private
+  snapshots; refuse arbitrary/profile/versioned/targeted/instance/scatter/admin/action authority without
+  operator fallback, binding repair or unknown-effect replay. Show public caller binding and described
+  file-scope limits in shared reports. Share the local intent contract with issuance and validate
+  explicit dashboard credentials against the selected issuer before PID custody or initialization.
+
+  Declare the endpoint watch/session/work and invocation handle paths with closed mode
+  inputs and typed unsupported boundaries while native declaration/auth-slot adapters are absent.
+  Refuse before broker/file access or subscription, cursor, session, lease, commit or redemption;
+  never infer a generic subject, remote execution, verified attenuation or broader caller authority.
+
+  Route one named down target through the existing owned-service stop controller and retain its
+  native identity, confirmation, reservation and manager-impact policy. Keep down-labelled finite
+  receipts, full-instance selection, offline preview and saved-definition completion. Refuse
+  multi-service sets before effects until whole-set preflight exists, reject named agent-reap flags
+  with the explicit manager-service remedy, and never fall back to a legacy component PID. Reject
+  new receipt/acknowledgement flags on the bare-stack/manifest paths.
+
+  Expose the existing direct endpoint/workflow stream definitions through one pure native config
+  factory consumed by bootstrap. Retain creation order, options, retention-floor checks, independent
+  ownership census and existing contract/authority hardening; do not add schema mutations or schema
+  apply.
+
+  Add a pure conservative diff for that native stream subset. Preserve not-observed, denied,
+  not-found-without-authoritative-absence and target-mismatch states; compare only explicit fields,
+  retain uninspected defaults and never emit creation/migration actions or enable apply. Add no
+  full-space schema observation, authority policy or privileged reconciliation.
+
+  Share native message/registry, contract, authority/session, issued/admission, membership and artifact
+  creation inputs with a read-only resource catalog, retaining the existing TTL source, native guards
+  and independent inventories. Keep SDK defaults, complete canonical policy, seeds/default delivery
+  and reconciliation authority unestablished.
+
+  Add a narrowed native stream-info facade and internal resource observer with structured SDK
+  error classification, no message matching, credential substitution or authoritative absence.
+  Share declared-field comparison with the endpoint subset; keep native KV/object verification
+  required, expose uninspected fields and always disable apply.
+
+  Share native registry seed ordering and profile-default patches with explicit no-write initialization
+  definitions. Preserve seed-before-profile precedence and existing explicit delivery classes. Keep
+  validation, strict revision observations and guarded application separate; do not infer a profile,
+  expose patch bodies in diagnostics or claim legacy seeding gained revision safety.
+
+  Share pure native contract, authority/session, issued/admission and artifact config checks between
+  existing creators and schema comparison. Retain the guarded shadow/legacy-cap migrations outside
+  readers, never run TTL write canaries during diffing, suppress raw native failure text and distinguish
+  uncompared fields, unconfirmed checks and invariant matches from complete canonicality or authority.
+
+  Add bounded read-only initialization observation over an existing selected registry handle. Validate
+  native profile/patch inputs before key reads; retain revisions and tombstones and keep missing,
+  denied, unavailable, malformed, mismatched and unvisited rows distinct. Preserve private values,
+  explicit deadline/non-cancellation and incomplete field-policy labels. No bucket open/create,
+  credential fallback, revision-guarded write plan or apply authority is introduced.
+
+  Prepare a read-only existing-static schema inspection adapter with upfront native input validation,
+  strict registered root/server/TLS selection, validated current full trust and one native temporary
+  provisioner identity. Keep native mode/floor and registry read failures, private observations and
+  local reader closure explicit. Do not expose mutation ports, substitute other authority, promote
+  reported server metadata to account proof or connect an incomplete apply/public command path.
+
+  Share the existing pure primary/Limits/no-global-eviction authority-store check through core for
+  schema inspection and native lifecycle binding. Preserve the auth module's sibling import surface,
+  existing checks and error class/text. Move no lifecycle/gate operation, connection, grant or repair
+  into core, and keep complete field policy and apply authority separate.
+
+  Attribute the first failed native primary/no-eviction invariant to structured field names from the
+  same ordered check. Keep native diagnostic text private to its existing bind error, preserve its
+  class/message and avoid parsing or echoing exception strings in schema reports. Field attribution
+  is not full canonical policy, current binding, write authority or a completed migration.
+
+  Prepare explicit registered open-mode schema inspection alongside static mode. Select the mode
+  before connection, preserve registered TLS, load/mint no open-mode signer or identity and require
+  the reported broker authentication mode to match. Keep user-auth unsupported, never retry an auth
+  refusal anonymously, and retain private reads and disabled apply without public command wiring.
+
+  Compare extra observed direct-stream fields with the existing first-party baseline, without
+  normalizing absent settings from desired values or copying private SDK defaults. Classify
+  nondefault undeclared/unmodeled settings as blocked and expose field names without their values.
+  Reuse reserved NATS metadata policy; do not add KV/object expansion, full policy or apply.
+
+  Prepare a public-only schema inspection projection and shared terminal view without connecting an
+  incomplete public/apply path. Show target/profile, non-atomic resource/key observations, revisions
+  and safe policy-field attribution. Omit raw configs, registry/patch contents, unknown field names
+  and native diagnostics; retain unproven absence, incomplete policy and disabled apply labels.
+
+  Add one bounded native NATS current-connection identity query and the temporary provisioner's
+  self-only `$SYS.REQ.USER.INFO` publish grant, documented in the ownership matrix/profile summary.
+  Require matching public user/account/server before static schema reads without system credentials,
+  arbitrary-user queries or authority fallback. Ignore response permissions/expiry as ceiling or
+  lifecycle evidence and keep apply/absence authority disabled; explicit open does not invent an
+  identity. This is prepared source, not a native conformance or deployment claim.
+
+  Compare native store subjects and explicit public KV/object creation options with their documented
+  wire fields, including TTL/marker units, storage, history, limits and hardening. Do not fill SDK
+  defaults or invoke constructors. Block unexpanded options, expose their count rather than values
+  and keep full field/runtime/revision/apply policy separate.
+
+  Compare observed existing registry rows using native seed-before-profile precedence, a closed
+  known-field policy and private revision-pinned candidates. Preserve explicit delivery choices,
+  block unknown fields and unreadable/deleted/missing rows, and expose only comparison states,
+  changed field names and observed revisions. Do not turn a candidate into write authority or
+  change legacy seeding; add no guarded application or public stack/update path.
+
+  Bound the resource observer by one shared deadline, preserve unvisited rows and surface the
+  budget separately from policy comparison. Deadline expiry is not request cancellation or
+  authoritative absence; the caller still owns connection closure.
+
+  Extend observed-extra-field policy to native KV/object backing streams using shared first-party
+  baselines and scalar public KV input defaults, not private builders or missing-field filling.
+  Retain native artifact direct-read tolerance and valid smaller TTL duplicate windows. Unknown
+  or nondefault fields remain blocked, and runtime/full-schema/apply authority stay separate.
+
+  Name only the existing TTL-enforcement, stock legacy artifact-cap and contract-shadow guard
+  families in reconciliation reports. Share native constants/hardening fields, block other drift
+  and unknown settings, and keep guard-required metadata separate from an accepted migration.
+  Inspection runs no canary, state guard, creator, update or readback.
+
+  Route multi-name down through whole-set owned-service selection, process-role preflight, stable
+  definition reservations, explicit default-cancel confirmation and complete native-impact recheck
+  before the first stop. Keep per-effect native guards, input-order execution and one attributed
+  receipt. Stop on failure, retain unattempted members and never claim atomic rollback or cleanup.
+  Dry-run imports no provider and reserves/stops nothing; duplicate names and multi-name instance
+  selectors refuse. Bare-stack and manifest migration remain separate.
+
+  Include selected-space owned service definitions/instances on the shared status screen and JSON
+  result. Keep legacy pidfile rows separately labeled. Show full identities, process observations,
+  historical readiness and supervisor-record evidence without endpoint or OS-state promotion;
+  unavailable record families make the report partial rather than empty. Read no provider code
+  and control no service. Recheck each held definition again immediately before its set-stop effect.
+
+  Keep whole-set reservation/preflight and release errors in the attributed down receipt. Attempt
+  all acquired-hold releases without claiming verified lock cleanup or erasing completed stops.
+  Owned-service status warnings retain classified cause codes without native diagnostic bodies.
+
+  Share desired native resource creation configurations across the first-party stream baseline,
+  public scalar KV defaults, explicit options and hardening. Reject unexpanded inputs and include
+  hardening at creation rather than adopting and updating an existing bucket. Keep creation input
+  construction separate from mutation authority, existing-store repair and broker-store custody.
+
+  Make up background by default with an explicit --foreground mode and --detach as the accepted
+  background spelling. Reject conflicting intent before seed/effects, preserve each recovery
+  request's recorded mode, and document the supervising-unit/container migration. This retains
+  the native launch path.
+
+  Extend the background-up systemd advisory to the exact native invocation/main PID, naming the
+  unit and --foreground remedy without mistaking inherited terminal metadata for main-process
+  ownership. Preserve inherited recovery-lock release when new mode validation refuses early.
+
+  Connect setup's explicit start/detach flow after saved preparation. Validate script detachment
+  before effects, keep configure-only and default-cancel Start decisions separate, and retain one
+  finite setup envelope around the shared native managed-join observer. Local startup uses the
+  prepared root and original CLI, pins the follow-on request to its recorded manager and never
+  promotes command exit into readiness. Preserve safe failure/request/coordinator coordinates,
+  saved preparation and unknown outcomes without retrying, rolling back or replacing a manager.
+  Allow self-hosted setup startup to select one manager with --on before preparation writes;
+  retain that request in receipts and next-step hints. Local setup retains its own manager
+  pin and refuses an external selection.
+
+  Show the resolved mesh in shared rich/plain report headers, including ps and failures,
+  without re-resolving selection or changing JSON envelopes. Keep mesh context on live
+  watch and history rows and membership snapshots.
+
+  Route named Linux reset space through reviewed native local identity cleanup with
+  provider-declared key inventory, full local trust validation, unchanged filesystem scope,
+  stopped-custody checks and default-cancel confirmation. Restrict secret and raw deletions
+  to the reviewed remaining tree, retain returned per-path receipts on partial/unknown outcomes,
+  and remove only the unchanged eligible local registration after checking cleanup. Preserve
+  personas, service definitions, packages, account logins and remote data; refuse unsupported
+  provider, shared-root, foreign-material, TLS-first, remote and non-Linux targets.
+
+  Add bounded all-new agent and mixed channel/agent team deployment on static/open
+  meshes through an attributed, exact-manager native launch path. Persist one full intent
+  before effects, create new live channel cards through a separate scoped create-only
+  writer, then launch agents through the pinned manager. Sync each channel submission
+  and returned revision, each original launch request, each accepted allocation before
+  goal following, and each identity-matched joined result before continuing. Match both
+  step families before saving the full receipt. Retain unknown phases and partial channel
+  creates, allocations and joins without replay or rollback; expose them through team
+  show/inventory and keep them behind down/reset custody guards. Refuse user-auth inline
+  launch, reapply and unsupported manager/runtime selection rather than reusing the
+  unsafe legacy writer.
+
+  Extend the native manager slots read with an explicit bounded name query and optional
+  retired rows at cluster revision 30. Preserve default nonretired listing, exact manager
+  ownership and ordered slot/head observations so teardown can distinguish native terminal
+  and cleanup facts from a stop acknowledgement or a missing live-map row.
+
+  Route static agent-only team removal through the original manager and exact recorded
+  incarnations, with native impact preview, default-cancel confirmation, root maintenance
+  locking, synced original stop markers and matched retired slot/head plus cleanup receipts.
+  Retain partial and unknown per-agent outcomes without replay. Keep original creation and
+  removal history, and release only a fully receipt-matched deployment's known additive
+  blocker in boot/down/reset/deploy guards. Mixed/channel, open/user-auth and legacy removal
+  remain unsupported. Show accepted allocations without joined receipts in human deploy
+  output as well as structured output.
+
+  Add explicit static-space online handle signature inspection over native leader-served signer
+  and issuer-namespaced revocation records. Reuse one protected file snapshot for verification
+  and metadata; check raw signatures, issuer scope, parent links and containment without claiming
+  presenter binding, holder currency or use authorization. Require current spec/status pairs and
+  explicitly unrevoked sturdy handles, preserve offline unverified output by default, and never
+  redeem a handle or persist/print the ephemeral reader credential. Refuse unsupported open/user
+  authority instead of substituting a signer; report reader-close uncertainty separately.
+
+  Add the independent executable-endpoint service preset for selected Linux static-auth roots.
+  Compile and pin local contracts without handler execution, publish native contract artifacts,
+  and register through scoped native serve issuance. Run bounded no-shell JSON handlers with a
+  separate fixed argv and empty environment, retaining native schema validation, deadlines,
+  process/pipe cleanup uncertainty and no effect replay. Distinguish initialized process evidence
+  from current endpoint health, renew through the original issuer, pin native deregistration to
+  the original revision, and block reuse of unsettled full local service instances.
+
+  Correct reproduced source-build blockers in native registry-reader construction, protected
+  record imports, scoped help validation, optional observations and typed terminal reports.
+  Bind initialization reads through the public native KV API rather than private handle fields.
+
+  Avoid creating a control directory or catalog lock for a no-account observation, while keeping
+  malformed cache refusals and serialized refresh/application for existing signed-in accounts.
+
+  Create a missing extension config root privately before its first lock so a group-writable
+  umask does not make Cotal's own directory block completion installation. Keep existing
+  permissions and the completion writer's protected-ancestor refusal unchanged.
+
+  Classify local catalog-preparation cache and missing-login failures as pre-effect refusals,
+  not unknown remote operations. Keep cache paths and recovery guidance without parser excerpts
+  or cached values, and preserve existing-account refresh/application serialization.
+
+  Point unknown-space refusals at the canonical space inventory instead of a removed command,
+  and describe missing registration without claiming that its broker is down.
+
+- 5c85ef3: Bare `cotal ext` (and `ext list`) writes one structured document with `--json` and a plain report with `--plain`: `result.root` is the install prefix and `result.items` the installed extensions. This replaces one JSON line per extension. `--json` and `--plain` on the other `ext` subcommands are refused with `USAGE_INVALID`, and `ext root` stays a raw path.
+
+  A subcommand can declare its own structured outputs (`Subcommand.outputs` in `@cotal-ai/core`). The kernel reports a form by the 0 to 5 exit table only when that form declares a JSON output, and help prints each form's own `structured output` line, so `ext add`, `ext remove` and `ext seed` keep exiting 1 on any failure.
+
+  Add `cotal docs [<page>]`, the installed version's own protocol and CLI docs, offline: bare `docs` lists the pages, a page prints its Markdown, `--search <query>` shows the best-matching sections, and `--refresh` also tries the version-pinned copy on docs.cotal.ai and says which copy it served. `@cotal-ai/connector-core` exports the docs reads it uses (`docsIndex`, `readDocsPage`, `searchDocs`, `capSection`) through a new `./docs` subpath, so the bundle loads only when `docs` runs.
+
+### Patch Changes
+
+- cb1b5d5: A direct message to an agent the roster shows offline now says so, and says what happens next: the
+  message is stored and delivered when that agent reconnects, and a new agent spawned under the same
+  name does not receive it. `cotal_dm` adds the notice to its answer, `cotal send -t` prints it as a
+  `RECIPIENT_OFFLINE` warning, `cotal chat` adds it to the view and carries `recipientStatusAtSend` in
+  its `--stdio` stored result, and `cotal join` and the console print it after the send.
+- 28ae779: Declare MCP read-only and destructive-update hints on every conversation gateway tool. Message-consuming and state-changing tools remain updates; the hints do not override host permission policies.
+- 5c85ef3: Record managed-grant custody and serialize ledger reads, decisions and writes in one synchronous transaction. Bind conditional revocation to the lifecycle and custodian, preserve legacy row reads without adopting them, and define the lease-first optional retirement-only composition. Full recovery authority is not enabled.
+- 28ae779: Deliver incoming local-mesh messages through Claude Code's native plugin hooks, including supported Desktop Code sessions, without special launch flags. Surface busy notifications at a main-conversation boundary instead of waiting for the whole turn. Preserve plugin attribution, respect native Stop, and reoffer unread wakes when the local reader restarts. Idle wake notifications display as a compact, expandable Cotal indicator. Setup can use Desktop's bundled Code executable and records Node's absolute path so the app needs neither a separate terminal CLI nor Node on its PATH.
+
+  Refresh existing Claude messaging and skills plugin registrations during updates and ordinary first use after an npm upgrade. Preserve disabled settings and check the resolved payload rather than only the marketplace copy. A missing native runtime refuses the upgrade without accepting a stale generation. Allow an update after configure-only setup when the local project has no manager or broker running. Use provider readiness through the public setup entrypoint, including Desktop-only installations. Probe native executables only at an explicit availability or action boundary, with bounded timeouts, so a broken unrelated Claude command does not block connector registration, seeding or another harness's setup. Report a partial setup if the selected harness loses readiness before an action, rather than silently skipping it.
+
+## 0.90.1
+
+## 0.90.0
+
+### Minor Changes
+
+- b928aaa: Add immutable local scoped-Describe receive context and complete-envelope fingerprints, plus an explicit bounded read-only service Describe client contract. Define closed service-authority contracts, provider HTTP client hooks, host control types, registration-bound access and renewal primitives, native service gate approval guards and credential-root access checks, native caller-policy storage, create-only application-service name bindings and caller-capability policy checks. Add focused transport and structural checks and document the read-only serving-grant reader. Native service registration remains unavailable until host lifecycle support is implemented.
+
+  Keep create-only native authority writes closed over deleted key history, including concurrent caller-policy creation and pending service gates.
+
+  Bind service serving-issuance evidence to broker connection coordinates and verify it after the native gate CAS.
+
+  Add a host-only service-callout mint seam with principal attribution, a separate client inbox nonce and an original fixed expiry.
+
+  Bind native service issuance receipts to the registered witness and epcred connection, and retain expired evidence until qualified retirement.
+
+  Compose an optional sealed native service callout with current root authorization, registered serving grants, connection-bound receipts and fixed-expiry encrypted responses. Production registration and lifecycle wiring remain unavailable.
+
+### Patch Changes
+
+- 06e9515: State in the `cotal_run` tool's `page` description that a manager from release 0.88.0 or earlier refuses page mode.
+
+## 0.89.0
+
+### Minor Changes
+
+- dc458a4: Add a host-only, short-lived account census credential and a bounded pinned-server connection reader. The credential grants only one account's CONNZ request and account-qualified replies. Incomplete observations remain unknown; the reader does not grant eviction or prove terminal retirement.
+- bab4ca8: Add explicit bounded diagnostic pages for native run inventory, preserving legacy list requests and existing permissions. CLI and MCP callers can continue a pinned scan without a full-list reply or an absence claim.
+
+### Patch Changes
+
+- ae7154e: Allow persona definition tools to select a manager instance while preserving the caller's existing manager binding and permissions.
+
+## 0.88.0
+
+## 0.87.0
+
+### Minor Changes
+
+- af82e8d: A seat's launch-material directory (`cotal-launch-*` in the OS temp dir, holding the broker URL, the creds path and the control token) is now removed when the seat's process exits. Before this change a Claude seat left it behind after `cotal stop`, while the persona file and control socket of the same launch were removed. `materialEnv` in `@cotal-ai/connector-core` now takes the launch's artifact array as a second, required argument and appends the material's private directory to it, and every connector returns that array on `LaunchSpec.artifacts`, so the manager, the pty runtime and the foreground `cotal spawn` remove it the way they remove a persona file. Each connector now writes the material after its last refusal, so a refused launch leaves no material file behind. The second material file the Hermes launcher writes for its gateway child is not covered by this change.
+- 970bf2d: Accept the additive private tool-result contract in SPEC and the version-exact documentation bundle. Define consent, capture frontiers, fixed audiences, bounded revocation and exact-instance reads without implementing or enabling the path. Public tool arguments and results remain withheld; activation requires qualified owner implementations and a stock release.
+
+### Patch Changes
+
+- 5d686ff: Declare frozen private tool-result consent, revocation, serving-material and handle-mode command contracts, with closed parsers and a managed-agent issue/renew envelope. Add the consents anchor role and its tool-results scope check. These exports do not sign, issue, register, serve or enable the private path; public tool arguments and results remain withheld.
+- 9755079: Clarify private tool-result audience wording, distinguish the expired answer state from refusal codes, and spell out the consent replay row's existing signing and validity claims. No contract rule, runtime behavior or activation gate changes.
+- 8d513aa: Add a consent-only verifier for pinned signed password authentication within five minutes and a host-only proof decision door. Retain validated authentication provenance without changing ordinary bearer exchange. Private tool-result consent, issuance and serving remain unavailable.
+
+## 0.86.0
+
+### Minor Changes
+
+- 31dccc4: A Claude app conversation can join a local mesh. `serveGatewayStdio(host, options)` in `@cotal-ai/connector-core` serves the remote gateway's tools over stdio, so a local MCP server offers the same `cotal_connect`, `cotal_wait` and routed tools as the hosted connector without importing an MCP SDK. The hidden `cotal app-identity` plumbing command opens one conversation's own identity on the selected mesh: it answers `taken` for a live name, takes its channels and role from the mesh's default persona, provisions the identity's own delivery durables on a mesh with static credentials, and writes the credential to a 0600 file that never appears on stdout. `cotal app-identity retire --dir` removes the identity's broker footprint and then that file, and each provision retires what a host that exited without retiring left behind. A mesh that uses per-user sign-in is refused. The Claude Code plugin's server now serves those tools to a session Cotal did not launch, in place of `cotal_how_to_join`, and joins only when the conversation calls `cotal_connect`. `cotal setup` records the CLI's own argv beside the plugin, so that server runs the CLI by absolute path; a connector's install action receives it as `ConnectorSetupInput` from `@cotal-ai/core`. Started with `--desktop`, the same server suits Claude Desktop, whose working directory is no project. Without `--space`, provision sweeps the registry first, as `cotal spawn` does, so a recorded mesh whose broker is down no longer makes the choice ambiguous. A conversation in a Claude Code session is woken when a message arrives: the plugin declares a monitor, each local server writes the connection id of each wake to a private socket of its own, and the monitor turns each valid id into a fixed event line, so no socket text reaches the model. `GatewayOptions.wake` in `@cotal-ai/connector-core` is the hook for this: it signals a connection once until it is read, never while a `cotal_wait` holds it, and again when a client starts listening, and `cotal_connect` says whether the client will be woken. `GATEWAY_INSTRUCTIONS` now tells a conversation how to keep listening when asked, and is exported in two parts, `GATEWAY_CONNECTING` and `GATEWAY_LISTENING`. Claude Code runs the `cotal` plugin in place from the copy `cotal setup` materializes under `~/.cotal/claude-plugin`, and before this change neither a repeat `cotal setup` nor `cotal update` rewrote that copy, so after an upgrade plain sessions kept starting the old server, hooks and monitor. A setup provider can now declare `refresh` (`ConnectorSetupProvider.refresh` in `@cotal-ai/core`), which brings what it installed to this release and installs nothing new; a repeat `cotal setup` and `cotal update` run it, and `cotal update` fails when the refresh fails. The copy's version is now the release plus a digest of its files, and `cotal status` reports the plugin as current or stale against it, in place of only whether it is installed. `cotal setup` always runs `claude plugin marketplace update` after adding the marketplace, since Claude Code 2.1.295 answers a repeat add with wording the old check did not match. On macOS and Windows, where Claude Desktop is installed, `cotal setup` adds a `cotal` server to Desktop's `claude_desktop_config.json` that runs the same server with `--desktop`, keeps every other entry, refuses a file that is not valid JSON, and the refresh keeps the entry current; `cotal status` reports it.
+- 15043fa: `cotal setup` now installs the `cotal` Claude Code plugin for your user account, so every Claude Code session on the machine gets the `cotal_*` tools in any project: the terminal, the IDE extensions and the Desktop app's local Code sessions. It used to install it only for the project setup ran in. Running `cotal setup` again moves the per-project installs an earlier release made under the one user-scope install. `cotal update` still only rewrites the plugin copy and does not change where it is installed. If Claude Code cannot change one project's settings, setup still removes the others and writes the Claude Desktop entry, then fails naming that project and the `claude plugin uninstall` command to run there. `cotal status` reads `current (user scope)`. Setup and `cotal status` now read a plugin list longer than 1 MiB, which a machine with many old per-project installs reaches; before, the output was cut short and status showed `unknown`. A session Cotal launches still loads one cotal server, because its `--plugin-dir` copy replaces the installed one for that session.
+
+  The plugin's hook, which Claude Code starts for every tool call, prompt and stop, no longer bundles the `@cotal-ai/core` package root. It shrinks from 945 KB to 14 KB and starts in about half the time. `peerLabel` is now also exported from the new `@cotal-ai/core/peer-label` subpath, and the root export is unchanged.
+
+- 7e50978: The remote gateway gets `cotal_wait`, so a hosted conversation can listen for messages. A remote MCP client cannot start a turn, so a hosted conversation heard a message only when it happened to call a tool. `cotal_wait` returns at once when a wake-worthy message is buffered and otherwise as soon as one arrives, with the reply `cotal_inbox` gives, or with none after a bound. Wake-worthy follows the agent's attention, as a local seat's push does. The bound is `GatewayOptions.waitSeconds` on `registerCotalGatewayTools`, or `waitSeconds` on `handleGatewayRequest`, and defaults to `GATEWAY_WAIT_SECONDS` (50 seconds), under Claude Code's 60-second limit to a remote server's first byte, Cloudflare's origin timeout and claude.ai's tool-call timeout. A wait whose client closes the request stops listening, and a read whose client is gone clears nothing, so neither takes a message it cannot deliver. A wait ends when its connection closes, and a focus @mention that lands between two waits ends the next one. `CotalToolSpec.run` takes an optional `ToolCall` with the request's `signal`, which `cotal_inbox` honors. Every other routed tool except `cotal_inbox` now adds a line to its result when messages are waiting, and the default instructions tell the model to listen with `cotal_wait`. `MeshAgent.inboxWake()` is the inbox half of `pendingWake()`, without run turns. `MeshAgent` emits `stopping` once when `stop()` begins, whatever the transport's state.
+
+### Patch Changes
+
+- f1c80e4: `cotal agent-bearer --manager-call` is now told to name a manager with `--manager-instance <instanceId>` when an owner has more than one live manager. Before, it was told to use the instance argument, which only an agent's tools take. The exchange names `--manager-instance` for every actor-token caller, because `cotal agent-bearer` is that arm's one client, and the connector renames it to the `instance` argument when it runs the command for a tool. The refusal still refuses and still lists the owner's live manager instance ids.
+- e31affd: A forked Claude Code session no longer acts under the hosted Cotal connection of the session it was forked from. A fork inherits the parent's `connection_id` in its transcript, so before this it reused the parent's mesh name from a new session. The plugin now records which session opened each hosted connection, from a `PostToolUse` hook on `cotal_connect`, in the plugin's data directory, and its `PreToolUse` hook refuses that id in any other session with a reason that says to call `cotal_connect`. A resumed session and its subagents keep the session id and are unaffected, and `cotal_disconnect` releases the record. `runHookRelay`'s local answer now runs in every session and is told whether the session carries a mesh identity.
+- af26dda: A Claude Code session that Cotal launched now refuses the `cotal_*` tools of every MCP server other than its local Cotal server. Claude Code loads connected-account connectors in a spawned session by default, so a hosted Cotal connector beside the plugin let one session join the mesh twice under two names. The plugin's `PreToolUse` hook now denies those calls with the reason, and decides in the hook process, so the refusal holds when the control socket is down. A session Cotal did not launch keeps the hosted connector. `runHookRelay` takes an optional answer that settles an event in the hook process before the control socket is resolved.
+- 1aad363: Report the connector process working directory in session display metadata alongside its hostname.
+- 7a2c574: Claude Code sessions report the directory their own `SessionStart` hook supplies on startup, resume or fork, not the connector process directory, so sessions hosted in one process no longer all show the host's directory. The directory is absent until the hook reports it and is not changed by clear or compact. `CotalEndpoint.setCardCwd` and `MeshAgent.setCwd` set it, and `MeshAgent`'s new `withholdProcessCwd` option leaves it unset at construction.
+- 8d97d8a: Callers can name a manager instance wherever a user-auth mesh with several live managers for one owner asks them to. `cotal models` and every hosted `cotal run` verb take `--on <instance>`, and MCP `cotal_run` and `cotal_personas` take an `instance` argument under the same rules as `cotal_spawn`'s. A `cotal` command run from a managed seat's shell now selects the manager that launched the seat (`COTAL_MANAGER_INSTANCE`), as the seat's tools already did, unless `--on` names another. The ambiguity refusal still refuses, and now lists the owner's live manager instance ids and names the caller's own remedy: `--on <instanceId>` for the CLI, the `instance` argument for an agent's tools. Before, it named `--manager-instance`, which only `cotal agent-bearer` takes, so none of these callers could answer it.
+- 958e6cb: `cotal_roster`, `cotal ps`, `cotal status`, `cotal endpoints`, `cotal console` and `cotal join` print each peer's condition code and activity on one line and at most 200 characters. A control character or Unicode line separator shows as a `\uXXXX` escape, so a peer can no longer split its row into what reads as a second roster entry, pass terminal control bytes through, or flood every row with a 4000-character activity. The rule is `presenceText` in `@cotal-ai/core`, and `oneLine` moved there from `@cotal-ai/workspace`, which still re-exports it.
+
+## 0.85.0
+
+### Minor Changes
+
+- 662d6e3: `AgentConfig.userAuth` accepts `bearer`, a function returning a fresh bearer, in place of `bearerCmd`. A service that runs agents in its own process can now renew each agent's user-mode credential without executing a command per refresh. Such an agent has no manager-call bearer, so its spawn, despawn, persona and run calls are refused with a message that says so. Launched seats keep using `bearerCmd` unchanged.
+- 64d877d: `@cotal-ai/connector-core` now exports `handleGatewayRequest`, which serves one HTTP request to a remote gateway endpoint with the package's own MCP server and Streamable HTTP transport. A service that embeds the gateway authenticates the request and passes the result in. It no longer builds an MCP server, so its own MCP SDK or zod version cannot conflict with the one the tools use. The endpoint is stateless: each POST gets a fresh server and a JSON response, and GET and DELETE answer 405. `GATEWAY_INSTRUCTIONS` is the default server instructions text.
+- aff52d8: `@cotal-ai/connector-core` now exports `registerCotalGatewayTools`, the Cotal tool surface for a remote MCP server that serves many conversations at once. Each conversation calls `cotal_connect` with a name and passes the returned `connection_id` on every other call. A taken name moves to `name_2` and onward only when the host reports a real name collision, and an invalid name is refused before anything is issued. A missing, unknown or other-account handle runs nothing and never falls back to another connection. The embedding service supplies authentication, credential issuance, revocation and storage through `GatewayHost`. `cotalToolSpecs` takes an optional set of offered tool names, and the orientation card lists only those.
+
+### Patch Changes
+
+- f03a436: `cotal_send` without a `channel` no longer defaults to a channel the agent may only read. On a mesh that enforces ACLs, the default is now the first channel the agent reads and may post to, so a read-only announcements channel listed first is skipped. An agent that may post to none of the channels it reads gets a clear refusal before anything is sent, instead of a broker permissions violation. On an open mesh the default is unchanged. The remote gateway's advertised `cotal_send` text says the same.
+
+## 0.84.0
+
+## 0.83.0
+
+## 0.82.2
+
+## 0.82.1
+
+## 0.82.0
+
+### Minor Changes
+
+- 6afa12f: The Claude Code MCP server can now be hosted. `serveClaudeSession({ env, input, output })`, exported from `@cotal-ai/connector-claude-code/mcp`, serves one managed session over the streams it is given and reads its launch env only from `env`, so one process can serve several sessions. Each call snapshots that complete environment for its presence label, bearer commands, carried-fork records and feedback contact lookup, including Git; it does not merge the host environment. Hosted feedback reads only the session's global Git configuration, including includes, so the host repository cannot supply its contact. Legacy tool hosts that omit the environment retain their existing repository lookup. The runtime subpath exports only `serveClaudeSession`. `EndpointOptions.environment` accepts an explicit presence label, or `null` to omit it without reading `COTAL_ENVIRONMENT`; an omitted option preserves process inheritance. The subpath includes CommonJS declarations for TypeScript hosts. Direct stdio launches remain supported and also shut down on input closure; a failure in that teardown exits with code 1. Hosted teardown releases its input listeners, handles input EOF and transport closure, refuses input that ends during startup, and reports teardown failures without an unhandled rejection in the host. A pending broker dial that fails after shutdown begins no longer makes close fail or strands local inbox custody. Shutdown still waits for pending start and reconnect work, proves every owned connection closed, and propagates connection-close failures.
+
+### Patch Changes
+
+- 136f366: `cotal_status` with an activity and no status now changes only the activity. It used to read the current status when the tool ran and write it back behind any status write still queued, so a pending `waiting` was published as `working` with its condition cleared, and a pending turn-end `idle` left the seat reading `working`.
+
+## 0.81.1
+
+## 0.81.0
+
+## 0.80.0
+
+### Minor Changes
+
+- fded3ab: A seat never leaves the mesh because its event plane stopped, and the plane comes back on its own. The emitter holder re-establishes the plane at once after any failure, then every second while it stays down, by a fresh start that replaces the emitter: it reopens the write-ahead log, settles any pending frame, and builds the connector's mapper from the run the log has open before reading on. A turn that ends while the plane is down keeps its terminal, as does one whose terminal's own log write failed, and the re-establish closes that run with it once it has read on; every turn that ends during one outage keeps its own terminal, placed on the last turn the source had begun at the position the terminal was reported at (a turn the mapper opens no run for takes its terminal and publishes nothing, and a repeated terminal replaces nothing), a terminal is owed to its run until the frame carrying it freezes, a terminal reported with the plane up goes to the emitter at the hook too so a flush still reading when the next prompt lands closes the turn with its own terminal, and when the next prompt was already written before the plane came back the failure is published in place of the finish that prompt would have synthesized, in a frame of the failed run and ahead of the next run's first. The mapper contract gains `{ turn: true }` for a record that begins a turn and opens no run. `DurableSource` gains `end()`, the cursor after the last complete record as of the call, which every connector's source implements; the holder's hooks gain `sourceEnd`, `closeRun` returns a promise that resolves once that position is read (the Claude Code hook awaits it before replying), and the emitter takes a `ReportedTerminal` through `queueTerminal`, with `waitingTerminals`, `takeOwed`, `unsettled` and `seedLastTurn` beside it. The wait between attempts is fixed: it neither doubles nor caps, so the plane is back within a second of the fault clearing. The pi adapter's start factory, re-entered by the re-establish, checks the native file instead of reading an acknowledged cursor as a vanished file, and seeds its mapper from the pending frame. A transcript line that is not a record is stepped over and reported on every connector, the jcode journal wrapper included, and one written past the position a terminal was reported at does not hold that terminal: it is placed after the records before it, as is a terminal reported past a record no read answers, such as an OpenCode part still filling when its turn died, which used to hold the turn end reading the session without end; the OpenCode source now reads every record at or before the end reported at a turn end as settled, so that part no longer stops the turns after it from publishing. A terminal reported while the very first start is still waiting on the broker reaches the emitter before its first read, where it used to be queued behind the flush that read past it and close the next turn. On a space that requires events the seat used to exit with code 1 instead; for Claude Code that exit was the "MCP server cotal has disconnected" banner, and Claude Code restarted the server on the next tool call. The `eventPlaneStopped` sink no longer takes `required` or `stopSeat`, the holder's `onError` receives the delay before the next re-establish (`0` for at once) and `retryMs` is that fixed wait, the Claude and OpenCode mappers take `resumeRunId`, and a reported unreadable-line reason carries no text from the record itself.
+- fded3ab: A transcript line the harness left unreadable no longer ends the event plane for good. A write cut short by a full disk leaves part of one record glued to the next on a single line; the reader threw on that line and its cursor never passed it, so every restart died at the same byte, and on a space that requires events the Claude Code connector exited with it, which the harness showed as a disconnect. `JsonlFileSource` now steps over such a line and reports it on the read as a `SourceGap` with its offset, length and the parser's reason; `AguiEmitter.start` takes an `onUnreadable` reporter and refuses to advance over a gap when none was given. The Claude Code connector reports each gap on its stderr and keeps the records after it.
+
+## 0.79.0
+
+### Minor Changes
+
+- a09253b: The AG-UI emitter builds an error close's `RUN_ERROR` directly from the fixed `run failed` message, and `packUnits` bounds the closing frame as it does every other. The helper that could shorten an upstream failure detail behind a notice is gone: the close has passed only the fixed message since upstream detail stopped reaching the wire, so its truncation search never ran, and its notice-only fallback was larger than the event it replaced. A close whose envelope cannot fit still fails loud, now with `packUnits`' refusal. `takeCodePoints` is no longer exported, since the preview splitter is its only user. Code that imported it takes a string's first `n` code points with `Array.from(s).slice(0, n).join("")`.
+
+### Patch Changes
+
+- e8d37a4: Remove the unused `KNOWN_AGUI_EVENT_TYPES` set from the AG-UI module. Its doc comment described a classification role that `parseAguiFrame` already plays without it. The egress-guard differential cell that carried its name now says it counts the event types `AGUI_EVENT_TYPE` defines.
+- fdab89a: The `completion` section of the CLI page, which ships in the bundled docs, now shows how to enable completion in the current bash, zsh, fish or PowerShell session, lists the files `cotal completion install` writes for each shell along with the `XDG_CONFIG_HOME` and `ZDOTDIR` overrides it honors, and explains that the installed stub resolves candidates through the local `cotal __complete` dispatcher. No behavior changes.
+- 5500c71: The CLI reference now says what running `pnpm cotal` from a dev clone needs: a `pnpm build` first, because `bin/` loads the other packages from their built `dist/`, and `COTAL_SKIP_CONNECTOR_SEED=1` for everyday commands, which otherwise refuse the operator-global seed store from a checkout. It also notes that pointing `XDG_CONFIG_HOME` at a scratch dir is not enough on its own. Docs only.
+- 50747b1: A manager or delivery start that refuses a record it cannot attribute now names the pidfile it read. The cutover preflight, `spawn -f`, the delivery start and `service install` used to resolve the record's spelling a second time while formatting the refusal, so a record that moved between its space-keyed and pre-upgrade names in between was misnamed, and one that appeared beside the record that was read replaced the refusal and its `NEXT:` step with an ambiguous-record error. `readProcessRecord` in `@cotal-ai/workspace` now returns the path it read on every `ProcessRecord`, and `service status --json` reports that file as `manager.path`. The config and CLI pages describe both.
+- c9983e0: The connector's capacity limits now say what they bound. The inbox size, the overflow-evicted classification memory, the focus exclusion limit and the protected-disposition limit carry doc comments naming the structures each one caps, including that the focus limit bounds the exclusion list and the id-less copy tally separately. The in-flight hold ceiling, which was an unnamed twice-the-inbox expression, is now its own constant derived from the inbox size, and the endpoint notice log's cap of 16 is a named constant. No values or behavior change.
+- 4aafb0d: A manager call that fails with a thrown envelope error now returns the error's code and details, the same as a refusal that arrives as a reply. The CLI's control calls, `cotal spawn -f` and the connector's manager tools each converted the thrown error by hand and dropped the code, and two of them also dropped the details and the lifecycle-blocked suffix. A `cotal attach` reconnect therefore kept retrying a `permission-denied` or `not-found` raised on the caller side, such as a broker refusal, instead of stopping on it. Core now exports `controlReplyFromThrown`, and each caller keeps its own message.
+
+## 0.78.1
+
+## 0.78.0
+
+### Patch Changes
+
+- 1bda7c1: A Claude Code session driven by hand without a control endpoint is now refused with a message that names `COTAL_CONTROL_SOCKET` and `COTAL_CONTROL_TOKEN`, and the configuration reference says a hand-driven Claude Code or jcode session sets both. The reference used to say `COTAL_CREDS` and `COTAL_SERVERS` were enough, and the refusal named neither variable.
+- 799fd8d: `COTAL_TLS` now takes the same spellings as the other connector on/off flags. It was read as on only for the exact value `1`, so `true`, `yes` or `on` started the session without demanding TLS and, against a broker that accepts plaintext, connected unencrypted with no warning. `1`, `true`, `yes` and `on` in any case now turn TLS on, `0`, `false`, `no` and `off` keep the join link's choice, and any other value is refused at startup naming the variable.
+- 69de981: A seat no longer shows its session a run turn whose deadline has passed. The seat pulls pending turns every 15 seconds, and a turn it had pulled before its deadline was injected on any frame until the next pull dropped it, even though the run had already failed the step and the manager refuses its yield. Expired turns are now left out of the injected context while the next pull settles them.
+- a32e955: A followed manager call from a user-mode seat, such as `cotal_spawn`, now runs its bearer command, opens its control connection and resolves the manager as preparation before the submission starts. A failure in any of those steps used to be reported as a submission whose outcome was unknown and that "may have been accepted or executed", although nothing had been published, and the error's details were dropped. It now surfaces as its own error, and a stop or the call's deadline during those steps reports that the request was not run. The describe spends what is left of the deadline, so a manager that never answers it is still reported as unanswered. Only the command publish runs as the submission. A goal follow's `prepare` now receives the follow's deadline. At that deadline its signal aborts with a `TimeoutError`, and a prepare that has not settled reports that the request was not run, while a describe it started after other steps still reports its own silence. A describe whose signal aborts with a `TimeoutError` now ends as its own deadline would. A call's resolve repair after a `failed-precondition` now spends what is left of the call's deadline instead of starting a fresh one.
+
+## 0.77.1
+
+### Patch Changes
+
+- a1948eb: The Codex and Jcode hosts now arm the event plane when the session's registration requires events, even without `COTAL_EVENTS`. They used to read only that flag, so a hand-driven user-mode launch with `COTAL_EVENTS_REQUIRED=1`, or a custom launcher that passed `eventsRequired` with events opted out, ran with no event plane and the required-events policy never applied. The Claude, OpenCode, Codex, Jcode and Pi launches that carry `eventsRequired` now also set `COTAL_EVENTS` and the workspace root when the launcher passed `events: false`, so the armed session has a place for its event log. Both decisions go through `launchArmsEvents` and `eventPlaneArmed` in `@cotal-ai/connector-core`; an OpenCode 2.x session still reads only `COTAL_EVENTS`.
+
+## 0.77.0
+
+## 0.76.0
+
+### Minor Changes
+
+- 15d10c9: Refuse competing patched same-host consuming sessions without replacing their logical inbox owner. Preserve live control listeners and existing foreground actor material. Make fresh local foreground grants and departure cleanup generation-aware. This containment does not fence other hosts, broker URL aliases or older clients.
+
+### Patch Changes
+
+- d85ca1a: A launch that resolves an empty read or post list now hands the session that empty list. `aclEnv` used to omit `COTAL_SUBSCRIBE`, `COTAL_ALLOW_SUBSCRIBE` and `COTAL_ALLOW_PUBLISH` when the list was empty, so a `cotal spawn <persona> --subscribe ,` or `--allow-publish ,` session fell back to the persona file's channels while its credential and launch record carried none. The launcher now sets the variable to an empty value, and `configFromEnv` falls back to the persona file or join link only when the variable is unset. A hand-driven session that exports one of these variables as an empty string now gets an empty list instead of the persona's.
+- 7be3295: Correct workflow tool guidance for managed user-auth agents using their own issued participant-manager authority. Preserve run capability and unsupported-host refusals.
+- ba76f78: An OpenCode seat whose turn outlasts the consumer's ack wait no longer loses the role request it is working on to another holder of the role. The connector acks a batch only when its turn ends, and the 60-second ack wait used to run out under a longer turn, so the broker handed the same anycast to a second worker while the first was still on it. The batch a turn carries is now held in flight, and while it is held the agent restarts each delivery's ack wait with JetStream's in-progress ack at half the wait. A failed turn or a stop releases the batch and a crashed seat stops renewing it, so it redelivers after one ack wait as before, and a success or a user Stop acks it. Queued messages are not renewed, and the bounded inbox no longer evicts a held message to make room for them, which had stopped its renewal and left the finished turn nothing to ack. Renewal stops for good once the agent can no longer vouch that it still holds a copy: the wait ran out between renewals, the link was down past it, or the copy's connection was torn down. A durable `Delivery` now carries `redelivery` (the broker's delivery count, the consumer's ack wait, and `working()`), an `InboxItem` carries `deliveryCount`, and a frame marks a copy the broker delivered more than once as redelivered. Delivery stays at-least-once: a request can still run twice, so work with side effects that must not repeat needs its own ownership or idempotency key.
+
+## 0.75.0
+
+### Patch Changes
+
+- bcec75b: The `JsonlFileSource` seal comment, which ships in `dist/durable-source.js` and `dist/durable-source.d.ts`, no longer names an internal reviewer and a review verdict. No behavior changes.
+- 5865d2e: The event WAL's comment on why a nonzero frontier must carry its source cursor, which ships in the package's compiled output, now names the `DurableSource.read` contract for the rule that reading with no cursor adopts at the current end. It used to cite a line range in `durable-source.ts` that had drifted onto unrelated code, and that file is not in the published package. No behavior changes.
+- 597fa25: The check that a minted `manager-caller` bearer is bound to the caller and names one manager instance now lives in one `@cotal-ai/core` function, `managerCallerBinding`, which `userViewAuth` in `@cotal-ai/workspace` and the connector's manager calls both use. Before, each package kept its own copy and they had drifted: the CLI accepted a bearer with two or four segments that the connector refused, and the two gave different refusals for an undecodable bearer, a bearer with no `act.managerInstanceId` and a bearer with no `act.lifecycleUid`. Both now refuse those bearers with the connector's sentences.
+- 08828ac: The `acquirePrincipalLock` doc comment now states that the lock is held until the returned lock's `release()`, and no longer says it is held for the life of the process or recounts the module's earlier computed-only `lockPath`. No behavior changes.
+- b1bfe6a: Restate the subject-frontier comments, which ship in `dist/subject-frontier.js` and `dist/subject-frontier.d.ts`, as the rules they carry in the present tense. They no longer narrate the failure measured before the module existed, a first attempt at recovery, an earlier description of the scan, the removed `seedFromThread`, or the code that preceded the directory fsync helper. Every rule is kept: the subject tip belongs to the principal and every thread advances it, recovery scans every sibling thread log only when the record is absent and never when it reads zero, an unreadable sibling is fatal, `advance` re-reads the record before writing, and a `sent_unacked` pending contributes no sequence. No behavior changes.
+
+## 0.74.0
+
+### Minor Changes
+
+- 328d59b: Add `@cotal-ai/linear`, which serves the official Linear MCP server as a registered Cotal endpoint that agents can call. `cotal linear serve <account> --endpoint <reverse-dns-name>` registers a fresh endpoint instance on a static-auth mesh through the ordinary registration path (contract store, issuance gate, registration barrier, serve grant, ready status, fenced serve credential), renews the serve credential, and removes the service record on shutdown. The endpoint name comes from operator configuration. `cotal linear caller` provisions an isolated hand-launched caller whose credential names only the five Linear commands. Per-user-auth meshes are refused rather than signed locally. Hosted embedders can use `runLinearEndpoint` with their own authorized serve bundle.
+
+  The endpoint pins the two official Linear servers (`/mcp` and `/mcp/readonly`), takes an API key from stdin or a private file or runs Linear's OAuth login, and forwards tool, resource, prompt and completion requests without retrying. One deadline bounds queueing, discovery, connect and the call. A dispatched request that times out, is cancelled, overflows, loses its session or gets HTTP 401, 403 or 429 reports outcome `unknown`. `inventory` is paged under the broker message size, keeps every entry verbatim, and binds its cursors to the inventory digest, refusing a stale pin before anything reaches Linear.
+
+  `@cotal-ai/core` adds `CotalEndpoint.describeService`, which returns the digest-verified surface from the same cache `invokeService` uses. `@cotal-ai/connector-core` adds the generic `cotal_describe` and `cotal_invoke` agent tools, which run on the agent's own connection and grants.
+
+### Patch Changes
+
+- ad81083: The connector on/off flags `COTAL_CHANNEL`, `COTAL_EVENTS`, `COTAL_EVENTS_REQUIRED`, `COTAL_CODEX_TUI` and `COTAL_JCODE_TUI` now share one parser in `@cotal-ai/connector-core`. It accepts `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` in any case, treats an unset or blank value as unset, and refuses anything else at startup with an error naming the variable and the value. Before, each connector kept its own copy and read any other value, such as `enabled`, `2` or `y`, as off without a word. The OpenCode 2.x adapter now refuses `COTAL_EVENTS=true` the same way it refuses `COTAL_EVENTS=1`, where before only `1` was refused.
+- 8370a22: The docs site sync now resolves a relative link by its repository path. A link from a published page to a design note that shares a name with a published page, such as `design/release.md`, used to land on that page (`/release/`) even when the note did not exist. It now goes to the note on GitHub, and a link to a missing file fails the sync and names it. The pages that linked design notes through hard-coded GitHub URLs now link them relatively, so `pnpm check:docs-site` catches a renamed or deleted note. The sync also reads the Quickstart as MDX, as the site renders it, so its indented links are checked and link-shaped text in its MDX JavaScript (imports and exports, expressions, JSX tags) is kept as written. The `cotal_docs` pages carry the relative design-note links. No runtime change.
+
+## 0.73.0
+
+## 0.72.1
+
+### Patch Changes
+
+- 07fe6b3: A followed call to a manager that does not serve `goal-result` is now refused by one core check, `goalFollowRefusal`, on every path. Before, core and the user-credential connector path each built their own copy of the refusal, before the first submission and again after re-resolving, and the connector's copy was worded differently. A user-credential spawn now gets the same `failed-precondition` refusal, with the same message, as a static-credential one.
+- b851d8b: Allow a spawn-scoped caller on a per-user-auth mesh to arm the event plane of a child under its own owner, including in spaces that require it. Cross-owner arming still needs admin authority, and event-channel and delegation-envelope restrictions are unchanged. Update the bundled event-plane authority documentation.
+
+## 0.72.0
+
+## 0.71.0
+
+### Minor Changes
+
+- 3518435: A role is now refused unless it is one `[A-Za-z0-9_-]` token, both when an endpoint registers it and when a sender addresses it. Routing used to rewrite any other spelling into a subject token, so `probe` reached the `probe` queue and `pro.be` reached `pro_be` while the message kept the spelling sent, and an anycast to `*` was stored on a subject no role consumer matches. `CotalEndpoint` now throws on a `card.role` that is not a string in the grammar, and a connector passes `COTAL_ROLE` to it untrimmed. `anycast` and `anycastAttributed` throw on such a role or `*` before publishing, and `taskDurable` refuses one instead of rewriting it. `assertValidRole` is exported and `routeToken` is no longer exported, since a role routes as spelled. `cotal_anycast` names the role it was given in its receipt and counts holders whose role matches it. See the 0.71.0 section of `docs/UPGRADING.md`.
+- 50bc2fc: `spawn.env` in the cotal config now refuses a `COTAL_` name the launcher sets for each seat, such as `COTAL_ROLE`, `COTAL_MODEL` or `COTAL_SUBSCRIBE`, and the spawn fails before launch with an error naming the entry. Before, a launch with no role, model or channels of its own forwarded the spawning process's value, and the seat read it as its own role, model pin or read set while the launcher showed none. The machine-wide knobs such as `COTAL_HOME` may still be listed, and names outside the `COTAL_` namespace forward as before.
+
+### Patch Changes
+
+- 726a750: The tmux, cmux, Orca and Herdr runtimes now honour `LaunchSpec.confirm` as the PTY runtime does. Each reads its pane, presses Enter once when the declared prompt is on screen, and ends the seat with `Cotal startup confirmation failed: prompt "<prompt>" did not appear within 15000ms.` in the manager's log when it never appears. They used to press Enter five times on a one-second timer whatever the screen showed, so a dialog shown before the declared prompt was answered with its default. Core exports the shared `confirmWatch` they use.
+
+  Each backend call the watch makes times out after one second: the screen read, the terminal lookup, the Enter, and the close that ends a failed seat. A call that times out is killed with SIGKILL, because Node waits for a timed-out child to exit and a CLI that handles SIGTERM would keep the manager blocked past the timeout. The status probes and other CLI calls that share those helpers are killed the same way when they time out. No read starts once the 15 seconds are up, so a backend CLI that hangs fails the seat instead of stalling the manager. The tmux watch ends a failed seat by closing the seat's pane in whichever window holds it now, so a pane swapped into the seat's first window survives. It reads, presses Enter and closes only on the tmux server that opened the seat's window, so after a tmux restart it never types into or closes a new pane that reuses the seat's pane id.
+
+  A `confirm` prompt that is empty once ANSI codes and whitespace are removed, `""` included, is now refused before anything starts, and its launch files are removed. The PTY runtime used to start the child first and then throw, which left the child running with no handle to stop it and its launch files on disk, and every runtime treated `""` as no prompt.
+
+## 0.70.2
+
+## 0.70.1
+
+### Patch Changes
+
+- 5c6c92d: The Claude Code lifecycle hook no longer loads the NATS client, zod or yaml on every event. It imports `runHookRelay` from the new `@cotal-ai/connector-core/relay` subpath, whose environment readers (`hasIdentity`, `controlFromEnv`) now live in their own module and read the launch material through the new `@cotal-ai/core/launch-material` subpath, so neither package's barrel is in the hook's graph. `dist/hook.cjs` drops from about 1.5 MB and 305 modules to about 10 kB and six, and a hook event with no mesh identity now costs what a bare `node` does. Both readers are still exported from the package root.
+- 66a0f19: `@cotal-ai/core` now exports `runAgentBearer`, the one runner for an auth provider's agent bearer argv: it owns the 30-second default bound, the 64 KiB output limit and the failure sentence, and returns the printed line. The CLI's foreground preflight, the manager's local and remote enrollment preflights and the connector's bearer refresh and manager calls all run through it instead of carrying their own copy. The CLI still scrubs the enrollment variables from the child environment it passes, and the connector still refuses an empty line.
+- 923937f: The source-checkout refusal of the operator-global seed store now names `COTAL_SKIP_CONNECTOR_SEED=1` as the way to run other commands without seeding, and says that isolating `XDG_CONFIG_HOME` alone does not lift it. It used to name only `XDG_CONFIG_HOME`, and a sandboxed `XDG_CONFIG_HOME` is still refused, so the remedy on the line could not be followed. The refusal still does not advertise `COTAL_ALLOW_CHECKOUT_SEED`. The CLI reference, configuration and setup internals pages say the same, and the CLI reference notes that a skipped seed leaves a fresh config with no built-in connectors.
+- 6bd6099: An anycast a seat sends to a role it holds itself is no longer lost. The endpoint used to ack any message from itself as an echo on its DM inbox and role queue consumers, and on the role's work queue that ack deleted the only copy, so neither the sender nor any other holder, present or later, ever received the request. Those consumers now deliver the sender's own anycast, and its own DM, like any other addressed message. `cotal_anycast` counts the sender among the holders online at send when it holds the role, since its own task consumer can now take the request.
+
+## 0.70.0
+
+### Minor Changes
+
+- 76113ce: `AguiEmitterHolder` now takes its hooks as one named object after the emitter factory, `new AguiEmitterHolder(startEmitter, { onError, onRunClosed, waitLive, runMeta })`, typed by the exported `AguiEmitterHolderHooks`, where only `onError` is required. Before, the four hooks were positional, and a `runMeta` provider passed third was accepted as `onRunClosed`: it typechecked, ran after the run had already closed, and its metadata was dropped with no error. A caller no longer fills earlier slots with `undefined` to reach a later hook. The Claude Code, Codex, jcode, OpenCode and pi connectors pass their hooks by name, with no change in behavior.
+
+### Patch Changes
+
+- 8c8bae8: `docs/UPGRADING.md`, which `cotal_docs` serves, now heads the section on carrying a resumed Claude session to another host with 0.67.0, the release that first carries that change. An operator searching the page for 0.67.0 now finds it, and the upgrade-section gate counts it as a release section. No behavior changes.
+- 0ec35c2: A manager's endpoint reply now becomes a `ControlReply` through one core function, `controlReplyFrom`, which `cotal spawn -f`, the CLI's other manager calls (`cotal spawn --detach`, `stop`, `attach` and the rest) and `cotal_spawn` all use. Before, each caller copied the conversion and kept different fields. `cotal spawn -f` dropped the error code, the lifecycle-blocked details and their rendered `[lifecycle …]` facts, and the acceptance an uncertain launch keeps, so it could tell an `uncertain` launch from a `failed` one only by its text. `cotal spawn --detach` dropped that acceptance too, and a `stop` or `attach` whose name lookup was refused dropped the rendered facts. A refusal now carries the same code, details, facts and data whichever caller it reaches.
+- 95788eb: A seat whose AG-UI event plane stops for good now follows the space's policy on every connector. On a space that requires events the seat stops, where Pi, Claude Code and OpenCode used to keep it running without events. On any other space the seat keeps running and its log records `AG-UI emitter stopped`, where Jcode used to stop the seat and refuse further turns. Codex no longer rebuilds a stopped plane at its next turn boundary on any space, and it now waits for the mesh before starting its emitter, as the other connectors do. The rule is `eventPlaneStopped` in connector-core, which each connector passes its log sink and its stop hook.
+- 7986785: The connector and the CLI now print every peer with one label, from the new `peerLabel` in `@cotal-ai/core`: `name/role`, or the bare name for a peer with no role, with any line break or bracket shown as a space. Before, `cotal console` dropped a role equal to the name and its roster pane showed the name alone, the console's managed-agent row and the spawn line printed `name (role)`, and only message attribution sanitized the role, so `cotal_roster`, the orientation card, the ambiguous-DM candidate list, `cotal endpoints`, `cotal status` and `cotal ps` printed a role holding `]` or a newline verbatim. The DM target check that refuses a pasted label compares against the same label.
+- f5420cf: `cotal_send` and `cotal_dm` now refuse a name they cannot verify with the presence-view condition `cotal_roster` and `cotal_orientation` print, read from one function. The two refusals used to spell the condition separately, as "the presence view is stale since T (Nms silent)" and "the presence view is unpopulated", while the roster and the orientation card said "the presence watch has been silent since T" and "the presence watch has not completed its initial snapshot". A stale view now reads the same in all four, without the elapsed milliseconds.
+- b01ab5d: Restate the remaining comments in the connector-core event WAL and the Claude Code AG-UI mapper as the rule each one carries, in the present tense. They no longer tell the story of an earlier version, speak in the first person, or name the internal reviewers who found a defect, so none of that reaches the published `dist`. Every rule they held is kept: no `sourceCursor` relation because a cursor is opaque, one check for an absent `pending` key, no seeding in `bindSubjectFrontier`, `expectedTip` throwing while unbound, the stale-writer refusal before the shared record moves, and the `O_EXCL | O_NOFOLLOW` random-name temp file. No behavior changes.
+
+## 0.69.0
+
+### Patch Changes
+
+- fa83b25: The AG-UI emitter now lives in its own module. `agui.ts` keeps the event vocabulary, the frame envelope, the bracket machine, the preview splitter and the egress policy, and no longer imports the durable source, the WAL, the subject frontier or the channel derivation, which also removes its import cycle with the WAL. `AguiEmitter`, `packUnits` and the emitter's types and errors moved to `agui-emitter.ts`, and the package index re-exports both modules, so every name keeps its import path. `takeCodePoints` is newly exported because the emitter's error-close bound shares it with the preview splitter. No behavior changes.
+- ca0923f: The comment on the connector's reply-correlation bound now names all three maps it caps: unanswered directed messages, asked questions, and DM or anycast senders. It used to omit the sender map. No behavior changes.
+- 06429be: `cotal status` and `cotal endpoints` now date a presence row the way `cotal_roster` does. Both print how long the status has stood, such as `unchanged for 40m`, and the age of the activity, such as `(set 9h ago)`, and neither prints an age for a stamp that is not a finite number: `activeAt: "nope"` printed `active NaNd ago`, a `null` condition start printed an age counted from 1970, and `1e400` printed `active 0s ago`. Core exports `presenceAges`, which decides which facts a row dates, and `formatAge`, the one compact age formatter, so the CLI and the connector no longer keep separate copies.
+- adab793: Resolve an agent's read list through one core function, `resolveReadAcl`, at every site: the persona loader, the session config, the manager launch, foreground `cotal spawn` and its user-mode grant, `cotal mint` and the manifest persona merge. An explicit empty `allowSubscribe` now reads `subscribe` everywhere, as an omitted one does. Before, the session refused a persona the loader had accepted. The manager also granted and recorded an empty read list while the provisioner recorded `subscribe`.
+- 64110e0: `docs/UPGRADING.md`, which `cotal_docs` serves, now heads the `--share-tools` section with 0.69.0, the release that first carries that change; 0.68.0 was cut before it merged. The page's guidance on writing a section now says to name the next version Changesets publishes, to move the heading when a release is cut while the change is open, and to check the headings added since the previous tag before merging a release pull request. No behavior changes.
+- 98d2b41: Resolve a spawn's harness through one shared rule. Foreground `cotal spawn`, the detached `--resume` carry and the manager's `start` now all call `resolveAgentType` in `@cotal-ai/workspace` (`--agent`, then the persona's `agent:` pin, then a detached caller's default, then `COTAL_DEFAULT_AGENT`, then the product default). The foreground path no longer spells the product default as its own literal, so it can no longer pick a different harness than a detached spawn of the same persona. Behavior is unchanged while the product default stays `claude`.
+- 6540a32: The architecture and control-surface pages, which ship in the bundled docs, and several source comments described spawn auto-numbering as `reviewer-2`. They now spell the series with `_` (`reviewer_2`, `reviewer_3`), the separator the manager and `cotal spawn` use. The control-surface spawn accept example shows `reviewer_2` as both the allocated name and the user-mode actor. No behavior changes.
+- 1e093df: The committed message schema is current with the core types again: the data part's `data` now references a `JsonValue` definition, as `Part` has declared since data values were restricted to JSON. Validation verdicts on parsed JSON are unchanged. `pnpm check:docsbundle`, which CI runs, now regenerates the schema and fails when the committed file differs, so a wire-type change cannot leave it behind again. The `cotal_docs` schema page carries the regenerated file.
+
+## 0.68.0
+
+### Minor Changes
+
+- 585fdb2: Connectors launch on the model and variant their launcher resolved. `LaunchOpts.model` and `LaunchOpts.variant` are now the launcher's resolved values (the flag, else the agent file's `model:` / `variant:`), and every connector renders them as given instead of reading the agent file again in `buildLaunch`. Before, a model the launcher did not resolve was taken from a later read of a file that could have changed since, so the seat could run a model the launcher never checked or recorded, and a supervised restart re-read it each time. The in-session config takes the model and variant from `COTAL_MODEL` / `COTAL_VARIANT` only, so the card and the orientation pin no longer report a model the seat was not launched on. The Hermes connector no longer falls back to `HERMES_MODEL` from the spawning process, including one `spawn.env` forwards; set the model with `--model` or the persona's `model:`. Code that calls `buildLaunch` directly must pass `model` and `variant` itself.
+
+### Patch Changes
+
+- 4120c97: `cotal_anycast` no longer answers `Sent to one @<role>.` when no seat may hold the role. It now reports what the sender knows: `Request stored as seq <N> on the @<role> queue (<k> holders online at send; delivery not confirmed).`, with `<role>` spelled as the subject routes it and the count read from the roster a moment before the publish over every seat whose role routes to that queue, never counting the sender, and `holders unknown at send` while the presence view is not current. `CotalEndpoint.anycastAttributed` returns the JetStream publish ack alongside the message, the way `unicastAttributed` does; `anycast` keeps its signature, and `routeToken` is exported so a caller can name the queue a role routes to.
+- 218006f: A bearer command that fails without printing a sentence of its own now reports its cause. The agent auth preflight in `cotal spawn` and in the manager, and a running agent's bearer refresh, reported such a failure with Node's `Command failed` line, which repeated the whole bearer argv (exchange URL or state dir, space, owner, actor, token file and health file) and never said whether the child timed out, was killed or exited. The error now says the bearer command timed out after its limit, was killed by a named signal, or exited with a named code and printed nothing. A failure the command explains on stderr is still reported with that sentence. `bearerCommandFailure` in `@cotal-ai/core` builds the error.
+- 33be936: A Claude Code seat no longer re-prints the wake nudge for a DM it already announced each time JetStream redelivers that DM. While one long tool call kept the hook drain from running, an unacked DM was redelivered every 60s and every copy queued another identical "New dm" notice, so a 51-minute call left about 50 of them per message. The connector now nudges once per message until a hook frame carries it, including a message first counted in a batch notice, and a redelivery after a frame whose reply never reached Claude Code still nudges again, even when the original nudge was still queued behind a full stdout. The retry after a rejected nudge follows the same rule: it counts only messages no live nudge announces, and a rejection that a newer nudge already superseded is not retried. `MeshAgent.pendingWake` takes an optional predicate that leaves out items the caller has already woken the session for.
+- 79e81bd: Connector processes no longer build the `cotal_docs` bundle and its search index when they start. `cotal_docs` builds the bundle on its first call and the index on its first search, and `DOCS_VERSION` no longer reads the bundle, so the Claude Code hook and extension entry, which never serve the tool, no longer carry the docs at all. Measured on the Claude Code connector with no mesh identity: an idle bridge settles at 88 MiB resident instead of 140 to 143 MiB, and `hook.cjs` shrinks from 3.1 MB to 1.5 MB and peaks at 65 MiB per event instead of 128 to 130 MiB.
+- 237c813: `cotal_spawn` now returns an uncertain launch as a pending result instead of a tool error. A worker that has not joined the mesh within its readiness window is still managed and may yet join, so the result names the allocated agent, its id and its manager, and says to watch the roster, because spawning again starts a second agent. A launch that exits stays an error. The goal follower keeps the acceptance as the reply data of any terminal other than `succeeded`, and `ControlReply` carries the endpoint error code, so the tool keys on the `uncertain` code rather than on the message. A pinned-model spawn that settles uncertain reports its recorded pin the same way.
+
+## 0.67.0
+
+### Patch Changes
+
+- 7f909a1: Remove sentences from the AG-UI holder and the Claude Code and OpenCode AG-UI mapper comments that described what earlier revisions of those comments got wrong. The comments now state only the current contract: the `boundPath` gate keeps start-once, the chain serializes hook events, the refusals live in `subject-frontier.ts` and `event-wal.ts`, the bracket interleave is open, OpenCode publishes `RUN_ERROR` through `AguiEmitterHolder.closeRun`, and the Claude Code mapper keeps its measured predicate counts. No behavior changes.
+- e85e1fd: An agent's manager calls now repair a class-queue split as the CLI does. In a space with more than one manager, a call can reach a manager other than the one it resolved against, which refuses it before running it. `CotalEndpoint.invokeService` re-described and re-issued that call only once, and the re-issue splits again at the same rate, so with two managers about a quarter of `cotal_spawn` and `cotal_despawn` calls still failed. A spawn whose seat came up was reported as `Couldn't spawn` when the goal-result read that follows it split, and a named despawn was refused with `WAS NOT RUN`. The endpoint now re-issues up to 16 times, the bound the CLI already uses, which core now exports as `BIND_SPLIT_REISSUES`. A named `cotal_despawn` also asks its `inspect` lookup again when the manager that answered names a sibling instance as the owner, until the owner answers, within the same bound; before, it refused a live seat whenever the lookup reached the other manager.
+- 1de24fc: `cotal_roster` and `cotal_orientation` now read the presence trust condition from one function, so they print a stuck presence writer, an unpopulated view and a stale view in the same words. The roster used to spell the stuck-writer preface separately for an empty and a populated roster, a stale empty roster said "the rows below are last-known" above "No one is present", and the orientation card left out the stuck writer's recovery clause and the unpopulated view's "a missing name is not an absence verdict".
+- 8e0c2a3: Remove comment passages from the connector-core event WAL and the Claude Code AG-UI mapper that narrated earlier revisions of those comments, who flagged them, and the session they were written in. The `bindSubjectFrontier` doc ends at its contract, the temp-file write keeps its `O_EXCL`, `O_NOFOLLOW`, random suffix and `0600` rationale, and the mapper header states its measurement directly: 67 runs and 5217 events on the 5938-record session, with `diagnose()` returning `null`. No behavior changes.
+
+## 0.66.1
+
+## 0.66.0
+
+### Patch Changes
+
+- 032ce83: `AguiEmitterHolder` now takes an optional `runMeta` provider as its fifth constructor argument, so a run closed out of band through `closeRun` can carry `cotal.stopReason` and `cotal.usage` on its `RUN_FINISHED` or `RUN_ERROR`. Before, the holder close forwarded only the timestamp and an error, so the emitter's `cotal` parameter was unreachable from every connector hook. The provider is asked inside the queued close, after the flush queued ahead of it has mapped the turn's last records, and is keyed on the run being closed, so a provider that only knows another run puts nothing on this one. `AguiEmitter` gains an `openRunId` getter naming the run `closeRun` would close.
+
+## 0.65.0
+
+### Patch Changes
+
+- b09131c: AG-UI frame metadata (`CotalMeta`) now declares a `usage` carrier for a run's model usage: input and output token counts, the cached and reasoning parts of those totals, and the cost in US dollars. It rides the event that closes the run (`RUN_FINISHED` or `RUN_ERROR`), and a count the harness does not report is left out rather than written as zero. Before, a connector that read these numbers from its harness had no declared key to publish them under, so it dropped them, and a connector that invented its own key would have disagreed with the next one about the name of the same quantity. No connector fills the carrier yet; each adopts it in its own change.
+- 7782419: `cotal_yield` on a turn the run already settled now refuses with the turn id and its deadline. Before, a seat that yielded after its deadline was told "no turn is active" or that it held no such turn. One that yielded between the manager settling the turn and the seat's next poll was told the yield landed, although the run had recorded L4003.
+
+## 0.64.0
+
+## 0.63.0
+
+### Minor Changes
+
+- 22e210a: Start an already-enrolled managed agent in a child outside the manager's filesystem (SPEC §13.17). A runtime may offer `Runtime.spawnDelegated(launch, handoff)`. A manager whose runtime does enrolls through `enrollManagedAgent` once, refuses `--resume`, a manifest agent's `continuity: exact`, `--cwd`, shared MCP servers and non-string launch options before enrolling, never builds a local launch for the seat, and hands the lifecycle off at most once as one closed `cotal-managed-handoff/v1` value carrying the issued owner, actor, host-chosen lifecycle UID, sentinel, pinned exchange base and the raw actor token, which the host never receives. `delegatedSeatCommand` builds the child's `cotal spawn --expect-owner <owner> --expect-lifecycle-uid <uid>` command with `COTAL_MANAGED_HANDOFF_FILE` naming the handoff file. The `cotal` entry takes and deletes that file and drops the variable under any letter case before it parses flags, prints help or loads extensions, including when it refuses an older Node, and refuses spellings that name different files after deleting each of them. The spawn refuses a foreign space, owner, actor or lifecycle UID, an unknown field, a wrong kind and a file that is not a private regular file before any broker connection or exchange request, then runs the enrollment-redeem consumer without redeeming or minting, and exchanges through `agent-bearer --exchange-url` unchanged. No refusal on that path echoes a value from the handoff: the registration's server, exchange and enforcement checks, the local state this machine keeps for the space (its mesh record, user-auth state and agent secret files), target resolution, the policy refresh, the broker preflight, the agent auth preflight and the event-plane policy each refuse with a fixed sentence naming the field and the phase, whether a check fails or a filesystem, exchange or broker error is thrown under it, and an actor that is not a single token or a space that cannot name local state is refused as malformed before any plane. Readiness stays presence-observed, so a lost create acknowledgement settles uncertain and stays held. Every stop of a delegated seat, the reap of a child whose parent exited and a destructive manager shutdown included, runs prepare-retirement, then the handle's fenced close by `managedRuntimeKey`, then the terminal barrier. A preservation cut refuses a delegated seat at prepare time, and a manager stop after a refused cut retires it the same way. A provider resource is bound to that key only by the provider's authenticated answer to its create. The design record, the embedding guide, the CLI and configuration references and SPEC §13.17 describe the shipped shape.
+- c975258: A logged-in user can now run hosted workflows on a user-auth space. The auth callout issues an interactive user's `manager-caller` view as an issuance (SPEC 13.15): it chooses the generation, records evidence whose one source is the user's actor-ledger row, and writes the accepted row under a token derived from the connection's inbox nonce, renewing that generation on a reconnect whose ceiling is unchanged. `cotal run` and the other manager calls read the generation back with the new `issuedUserCaller` and ride `ep.v1`, so `cotal run start` against a participant manager started with `cotal supervise` is admitted. The issuing host admits a run from a user caller only for the manager's registered owner, and a participant manager now forwards the served subject of every caller resume and answer, which the host checks against the run's owner and the caller's live issuance; a legacy-rail resume is refused. The issuing host subscribes to those resume and answer request subjects itself and issues for a forwarded one only when it observed that request, only once, and only for the run a resume's envelope names or the endpoint and amendment an answer's envelope names, and never for a request bound to another manager instance or epoch or declaring another class or pinning another contract than the manager registered for that command. Every answering operator issuance must carry that served subject, and an amendment's carries `answers.amend: true`, which the host accepts only for a pause settled with an accepted answer, so `cotal run amend` works on a participant manager. A user caller starts, resumes and answers runs only on the participant manager that user registered, and a static caller keeps its admission there. A managed seat's manager call keeps the legacy rail when the broker refuses its accepted-row read, which surfaces as a request error caused by the permission violation. Revoking or re-granting the actor makes its issuances dead at the next resolution. New exports: `connectionAcceptedToken`, `actorLedgerSource`, `actorLedgerSourceBucket`, `parseActorLedgerSource`, `issuedUserCaller` and `isDerivedOwner` in core, and `ledgerActorSourceIsLive` and `UserCallerIssuer` in auth. `manager-caller` joins the issuable profiles, and the `issuer` profile gains the per-key read of the accepted store. SPEC §13.15 gains a **User-auth issuance** paragraph and §14.8 a **User-auth runs** paragraph, both insertions; `docs/design/user-auth-run-start.md` records the path, and `docs/cli.md`, `docs/workflows.md` and `docs/run-a-mesh.md` describe it. `docs/run-a-mesh.md` also says the stock auth service refuses managed-agent enrollment and retirement preparation for a host platform to intercept.
+
+### Patch Changes
+
+- cb6a0bf: A presence record now says when its status was entered. `ts` is the last heartbeat, so an activity that was true when an agent set it stayed on the roster long after it stopped describing anything, and nothing could tell it from a fresh one. Presence gains an optional `statusSince`: the epoch ms when the instance entered its current status and activity. A change to either moves it, while a heartbeat or a repeated report does not, and an offline record carries none. `cotal_roster` prints its age beside the status, such as `idle · unchanged for 40m`.
+- 101c9b0: Presence now carries `activitySince`, the epoch ms when the current activity was set. A status change or a heartbeat does not move it, so an activity left behind while hooks flip the status every turn no longer reads as fresh beside a `statusSince` that moved on the last flip. `cotal_roster` prints its age after the activity, such as `(set 9h ago)`, and dates only a finite stamp, so a record holding `null`, a string or an exponent literal such as `1e400` renders no age.
+- 9d5cc09: First-run `cotal setup` now shares your own Claude Code MCP servers with the sessions Cotal spawns. It copies the user-scope servers from your Claude Code config into the cotal config's `connectors.claude.mcpServers` and names them in its output, so a spawned session has the tools you know plus the cotal tools. Before this, a spawned session loaded only the cotal server and setup never said why. With none to copy it writes an empty list, and a cotal config that already declares that list keeps it. A server with an `env` or `headers` value that is anything but `${VAR}` references is left out and named, because the cotal config keeps secrets only as `${VAR}` references. So is an entry no session can start, such as one with a missing or empty `command` or `url`, or one whose `command` is not a string. For a lighter seat, remove entries from the cotal config or spawn with `--share-tools none`. Connector setup providers gain an optional `mcpServers` action whose `seed` input the CLI binds to workspace's new `seedConnectorServers`, which writes under a lock so two setups run at once record one list. Core exports `readCotalConfigFile` and the `ConnectorShareSetupInput` type, and connector-core exports the `ENV_REFERENCE` pattern it already used.
+- 22ed4c4: The `card-host` and `ep-rail-failure` smokes now wait for their broker to exit before removing its store. Both sent SIGTERM and removed the JetStream store on the next line, so the removal could walk a tree the broker was still writing during its graceful shutdown and fail the shard with `ENOTEMPTY` after every check had passed. Shipped behaviour is unchanged.
+
+## 0.62.0
+
+### Minor Changes
+
+- bcf66d6: Add a delegated user intent: SPEC §13.16, a design record, and the host decisions it needs. A signed-in user admits one launch or one retirement on the host's authenticated route, and a platform control holder consumes that intent once from its current registration, epoch, assignment revision and lifecycle. `@cotal-ai/core` adds the closed request types and parsers for the user's intent and the holder's execution, `parseRemoteDelegatedUserIntentExecutionResult`, and `resolveReadAcl`, the read-list resolution `provisionAgentDurables` already used. `@cotal-ai/auth` adds `authorizeDelegatedUserIntentAdmission` and `authorizeDelegatedUserIntentExecution`, the record, pin and flight types, `delegatedUserIntentHoldsAlias` and `joinOrStartDelegatedUserIntent`, `AuthServiceHandle.observeManagerGate`, which a platform composition's handle carries so the host reads the holder's gate over the context's own connection, and `AuthServiceHandle.activateManagedLifecycle`, which activates a delegated launch's lifecycle at its pinned UID before any row or durable and mints nothing, so a launch the host compensates or the user retires reaches the terminal barrier even when its agent never exchanged. Admission derives nothing from the request: it takes the owner the host derived from the verified IdP subject, requires `spawn` on the user's own fresh ledger row, binds the account's current platform assignment and the holder's open gate, and dry-runs the envelope walk from the user's principal over the read list the writer will provision. Execution compares the request with the record and with the fresh assignment, gate epoch and registration proof, and returns the user's owner and parent for the host's writers. The holder gains no grant, no decision reads `supervise`, and the `platform-control` view's same-owner rule is unchanged. Stock dispatch refuses both kinds as `unimplemented`; a host that owns an intent store and the enrollment and retirement writers composes the decisions on its own routes. `@cotal-ai/manager` adds `remoteAuthority.executeDelegatedUserIntent`, `StartAgentOpts.delegatedIntent` and `Manager.retireDelegatedAgent`: a delegated launch takes the hosted enrollment arm with the intent's execution and refuses material under any owner but the intent's, and `retireDelegatedAgent` stops a delegated agent only after the host confirms `retired: true` for its exact target and operation id. A delegated agent's name, including one whose launch failed at any step after the host's enrollment answer, stays held until then.
+
+### Patch Changes
+
+- 4c70af0: Stop the connector's inbox overflow valve from dropping direct messages. When a busy session's bounded inbox filled with directed mail, the valve evicted the oldest DM and, after five evictions of the same message, acknowledged it and wrote one stderr line. The sender had seen the message stored and the recipient was live and rostered, yet its inbox never carried it. An evicted direct message or role request is now never acknowledged, and the broker redelivers it after the ack wait until it finds room. A direct message stays pending on the recipient's durable, where `cotal deliver pending <name>` counts it; a role request stays on its role's shared queue, which that command does not read. Evicted channel traffic is still acknowledged as before.
+- 1fd4ca2: A `cotal_dm` reply to a peer that messaged you and has no roster row, such as a one-shot `cotal send`, is now stored under that sender's id in the space's DM history instead of failing with `no peer "<name>" in space "<space>"`. The sender is matched by the exact id on the message you hold, or by its display name while the presence view is current. A name that two such senders share is refused with their ids. The receipt reads `recipient had no roster row at send` and says the DM may never reach an inbox, since a one-shot send has already exited. An operator's DM view, such as the dashboard's Direct messages lens, shows the reply.
+
+## 0.61.0
+
+## 0.60.0
+
+### Minor Changes
+
+- 6ca4d8e: Add the platform control authority: a closed `platform-control` view, beside the unchanged human `manager-service` view, that lets a host platform run one pooled control manager per assigned account without a human session (SPEC §13.1, §13.6, §13.9). `startAuthService` takes an optional `platformControl: { observeAssignment }` input, and the returned handle then carries `platformControlAuthority`, a typed in-process door served on no listener. It issues the existing manager-service request family under a host-derived `p_` platform owner (`platformControlOwner`), reads the backend's assignment fresh on every call, reuses the registration proof, process epoch and all-duty renewal unchanged, confines maintenance to the assigned instance, and refuses `prepare` and `activate` while a named predecessor manager is still registered. It refuses IdP tokens, another account, a stale assignment, another owner's instance, unknown fields (a nested `session` field included) and the managed-agent kinds. `@cotal-ai/core` adds the `PlatformControlAuthorityRequest`, `PlatformControlInnerRequest`, `PlatformControlAuthorityResult` and `PlatformControlAssignment` types, the `p_` owner grammar, and an opt-in `allowPlatform` on the principal owner checks and on CONNZ attribution (`principalFromConnz`). Only the platform family's own boundaries opt in: the issuance gate row, the credential holder row, the eviction and liveness sweeps with the delivery daemon's executors, the manager goal-index scanner, the run driver caller, and, for the platform holder only, the retirement target, retained-validation target and admin caller parsers. The membership feed and the message drop guards still refuse a `p_` owner. Presence has no owner check, so a platform endpoint's roster card appears under its `p_` owner. `startAuthService` also forwards a trusted-host `standingRenewableTtlSeconds` to the authority plane. The human remote-supervision path is unchanged.
+
+## 0.59.0
+
+### Minor Changes
+
+- b5c3619: Publish every `RUN_ERROR` on the events plane with the fixed message `run failed` and no `code` or `rawEvent`. The error text and error kind a harness reports are upstream values that can echo prompts, peer messages or tool output, and `events.<owner>.<actor>` has a different read ACL from where that text was read. Codex, Claude Code, OpenCode, jcode and pi all publish through this shared fence. An event write-ahead log frame frozen before this release whose `RUN_ERROR` has any other shape halts the emitter with `egress-run-error` on recovery instead of being republished. This is a breaking change for events-channel readers that used the message or code; see the 0.59.0 section of `docs/UPGRADING.md` for settling pending frames before the upgrade.
+
+### Patch Changes
+
+- 608f5f4: Re-attach doc comments that had drifted away from the declarations they document. A `/** */` block followed directly by another one documented nothing, so editor hovers and the published type declarations showed no doc for the intended declaration (for example `Manager`, the `plane3` field and `AclResolver`). Each such block now sits above its declaration, is merged into the block it duplicated, or is removed when its declaration no longer exists. A new `pnpm check:doc-comments` check, run as part of `check:docsbundle`, refuses a doc block followed directly by another in shipped source.
+- 99eda4b: The docs gate now fails when a page quotes an operator string that no shipped source emits. A source change that renamed a printed line used to leave the old wording in `docs/`, and every docs check still passed, so `cotal_docs` served guidance an operator could not grep for. Old wording kept only in a comment, a type or an ambient declaration does not satisfy the check, since none of those reach the compiled output. Pages are read with a Markdown parser, so example text in a fenced or indented code block, at the top level or inside a block quote or list item, is never taken for a quote, and an indented block cannot hide a quote that follows it. `docs/cli.md` now writes the rail in the unanswered-manager verdict as a placeholder, `no manager answered on the <rail> rail`, and quotes the `ps` offline age and the manager's offline and back-on-mesh log lines as the source prints them, `mesh offline for <age>`, `seat offline on the mesh: <name> - last heartbeat <time>; process <state>` and `seat back on the mesh: <name>`.
+- 43c4179: Focus mode no longer loses or repeats channel messages whose id is empty. Focus recall found messages again by their wire id, so one id-less message on a quiet or muted channel hid every id-less focus message and mention from `cotal_inbox`, and an id-less recall item was handed over again on every call. A live delivery carries no stream sequence, so recall cannot match an id-less stream copy to the delivery it came from. In focus, an id-less channel message is now held in the inbox as pull-only and `cotal_inbox` hands it over once; a mention still wakes the agent. Each id-less copy the session settles records the chat stream's last sequence read after it arrived, and recall binds it to one stream copy at or below that sequence, by the stream sequence `Endpoint.recallChannel` now returns alongside each message. Identical copies arrive in stream order, so recall binds them in that order, latest first, each to the latest unbound stream copy at or below the lowest sequence read for it or any later identical copy, and reads that answer out of order cannot swap two copies. A copy that arrives while a read runs binds nothing in that read; recall reads the channel again, up to three times, and if the copy could still be a stream copy in the last read, it leaves that stream copy in the stream and reports the channel as incomplete. Inbox overflow frees only the evicted copy, held or quiet, and a copy no read has bound yet keeps its place in arrival order, so an identical muted copy is never handed back in its place. Recall hands back into the inbox only the stream copies nothing is bound to, so one sent during a reconnect gap or evicted on inbox overflow is still delivered once; a settled copy behind the focus start or out of retention never hides a later identical copy. A copy's sequence read bounds it only if it answers before the connection drops; otherwise recall reports the channel as incomplete. Every identical copy takes its own disposition, so a new identical quiet mention is still delivered automatically, and a late copy of one recall handed back can surface a second time. A full inbox leaves them in the stream and the reply reports the channel as incomplete. `Endpoint.recallChannel` also reports `unanswered` when no history read answered (replay off, or a failed read); recall then settles nothing for that channel and reports it as incomplete, recall calls run one at a time, and bookkeeping for copies that aged out is deleted. `cotal_inbox` also tracks held and oversized items by receive key, so the held note counts every id-less item it did not carry.
+- 0d267ab: Stop two Hermes seats on one channel from answering each other in a loop. The Hermes gateway posts every turn's answer, and its own busy notices, back to the channel as a reply to the message that started the turn, and the connector started a turn on every channel message, so each seat's answer started a turn on the other and the chatter ran until the gateways stopped. On a Hermes seat a channel message that replies to another message now waits in `cotal_inbox` instead of starting a turn, unless it `@mention`s the seat. The new `channelRepliesPullOnly` field of the connector-core agent config applies the rule, and the Hermes sidecar sets it.
+- 8316efb: A Claude Code hook that throws after it has started to surface peer messages no longer acks them. The empty reply it returns carries nothing, so the batch stays un-acked and reaches the model on a later frame. The seat also drops `turn-pending` rows that break the manager contract, such as one with no integer deadline, which used to make every hook frame throw. A `turn-pending` reply with no `turns` array leaves the seat's known turns in place.
+- 6662337: `cotal_inbox` now delivers a message larger than one response in parts. Once no smaller mail is waiting, each call carries the next part, a peek shows the current part without moving on, and the message is cleared only after its last part goes out. This holds for focus recall too: an oversized channel message recalled in focus is read in parts, and recall does not move past it before its last part. A recalled message that already went out in part is read to its last part, even if an exclusion lands after its first part. Within one read every message is tracked by its receive key, so a held message with an empty id is named in the reply. `cotal_inbox` calls on one session now run one at a time, so a call that overlaps another no longer hides a message the other just read in part. The read position survives a reconnect; a process restart starts the message again from its first part. Before this, such a message was named but could never be read.
+- b4c69bf: A seat whose turn died on a harness-reported error now shows it on every operator surface. A Jcode seat relays the Harness error code, such as a provider `rate_limit`, as its presence `condition`, both for a turn the host drives and for one the TUI owns. `cotal ps` now carries that condition: the human row reads `waiting (rate_limit)` and `--json` rows include the `condition` object, alongside the roster, `cotal status` and `cotal endpoints`. The next turn clears the condition when it starts. Before, the seat read a bare `waiting` and the error was recorded only in its private connector log.
+
+  Presence gains an optional `activeAt`: the epoch ms of the last work event the harness reported, carried on the next heartbeat. A Jcode seat records every token and tool event of its session there. `cotal ps`, `cotal status`, `cotal endpoints` and `cotal_roster` now print a condition with its age and the age of the last work event, such as `waiting (rate_limit for 40m) · active 40m ago`, and `cotal ps --json` rows carry `activeAt`. A turn that stopped advancing while its process keeps heartbeating no longer reads like one that is still working.
+
+- 8ce6be3: The 0.33.0 changelog entry "An agent now reads only the channels it lists" now carries a correction. It presented the read-set default-deny as new in 0.33.0, but that shipped in 0.28.0 with #821, so upgrading from 0.28.0 or later needs no migration for it. The correction names what 0.33.0 did change: the no-default-channel check in `multicast` now refuses only an omitted channel, so an explicit empty-string `channel` is no longer refused as if it were omitted, and its refusal is reworded; the `cotal_send`, `cotal_leave` and pi tool text; doc comments; and two regression suites. `docs/release.md` now describes how to correct a released entry.
+- b84dd9a: Replies now carry their correlation, so an answer reaches the Hermes session that asked. A `cotal_dm` to a peer answers the message its new `replyTo` argument names, or else the oldest DM or anycast that peer sent and that no DM back has answered yet, as long as that peer's waiting messages share one conversation; across several conversations the DM is refused with their ids rather than guessing. The reply names that message in `replyTo` and copies its `contextId` (SPEC §5), and the message counts as answered only once the reply is published; until then it still counts as waiting when a later DM to that peer has to pick what it answers. `MeshAgent.withCorrelation` stamps a per-call `contextId`, `replyTo` and conversation peer on the sends one call makes. A call bound to a message it answers copies that message's `contextId` when it names none. `MeshAgent.answersQuestion` tells whether a DM answers a question asked that way, from the peer it went to. The Hermes bridge's `tool` frame takes an optional `contextId` and `peerId`, its `reply` frame an optional `replyTo` and `contextId`, and an `incoming` frame carries `answersQuestion`. The Hermes plugin stamps each `cotal_dm` and `cotal_anycast` question with a `contextId` minted for it and runs the answer in the session that asked: a Cotal session directly, a session on another platform such as a Telegram topic through Hermes' `inject_message`, which the operator allows with `plugins.entries.cotal.allow_gateway_injection`. When the host refuses that injection or fails with an error, the answer is neither run in another session nor acknowledged: the new `deferred` bridge frame keeps it buffered and offers it again after 30 seconds. A turn's reply names the message the gateway says it answers. A question from a Cotal session records the session's chat type from its chat id, because not every supported Hermes version binds one for a tool call, so its answer runs in the session that asked rather than one keyed without a type. A `cotal_dm`'s own `replyTo` wins over the message a `withCorrelation` scope binds, both for the reply's correlation and for which message counts as answered.
+- 62b004b: Record the two accepted residuals of the seat reap in the security model. The reap kills the seat child's process group by membership with no per-member start identity check, and it trusts the pids and start tokens its custody record names, so a same-uid process that rewrites `record.json` chooses what the next reap signals. The `reapSeat` doc comment and the design note on signer isolation no longer claim that the reap signals only identity-matched pids.
+
+## 0.58.0
+
+### Patch Changes
+
+- a058bf9: Clarify that publication preflight rejects npm credential environment variables before enumerating workspace packages.
+- 417b5f0: Replay a drive's own journal again when a read loses a round, instead of failing the step
+
+  A drive reads its journal through one replay durable named after its takeover, before every effect
+  and at every poll of a parked pause. When another reader held that durable, the read raised
+  `RunJournalReplayRaced` and the interpreter recorded it on the step as `L4000 handler-fault`, so one
+  branch of a `parallel` failed on a healthy run. `activateRun` already treats the same error as a
+  lost round and replays again.
+
+  The reads behind a drive's steps (`RunScopeAuthority`, hosted and under `cotal run --local`) and the driver's diagnostic for a
+  journal with no run record now do the same, with the takeover's bound: up to three replays, one
+  straight after another, and the race is raised unchanged when the third is lost too. An operator
+  read runs under a takeover id minted for that one read (the manager and `cotal run` mint a fresh one
+  per call), so `RunHost.status`, `RunHost.locate` and `cotal run journal` still report the race on
+  their first read.
+
+  Only the race is retried. A reader in another process can also tear a fetch or return an empty
+  replay; neither is retried here.
+
+  A new suite, `smoke:runtime-run-host-replay`, drives the manager's run host through a `parallel` of
+  three `ask` steps answered within the same second: once while `RunHost.status` reads the drive's
+  own takeover id, and once while another connection takes records off the drive's durable. No branch
+  fails in either.
+
+  The `connector-core` docs bundle is regenerated for the updated paragraph in `docs/workflows.md`.
+
+## 0.57.0
+
+### Patch Changes
+
+- 93b98e9: Let a cooperative teardown publish departure after it has given up waiting on a presence write. Presence writes are serialized, so the departure publish queued behind the very write the teardown's intake bound had just abandoned: the wait ended, offline never published, the seat kept its last status until its presence TTL expired, and the plugin process never reached its exit. The agent gains `abandonPresenceWrites()`, which the teardown calls only on the path where it announces the bound expired; ordering behind writes that do settle inside the bound is unchanged (#2207).
+- e7c702a: The jcode connector now reports the provider route serving a seat's model to presence, and `cotal ps --wide`/`--json` surface it as `provider`.
+- 42448fa: A DM send now reports the stored sequence and the recipient's status at send instead of a bare success, and `cotal deliver pending <name>` reads a recipient's held DMs from the broker.
+- 8b64d64: The per-principal subject record now refuses a tip of `Number.MAX_SAFE_INTEGER` on read and write and refuses a symlinked record at open, at the re-read and before the rename.
+- ad809a2: Keep Jcode seats alive when session checkpoints interrupt tool observations or temporarily remove the journal. Validate the session snapshot, preserve pending journal reads, restore tool brackets from the event WAL, and publish explicit discontinuities without weakening event validation.
+
+## 0.56.1
+
+### Patch Changes
+
+- 6b76946: A seat resumed from a preservation cut backfills its channels from the chat stream sequence its prior incarnation had reached instead of replaying the whole retained window.
+- 8137d83: The Hermes bridge's local Unix-socket listener now authenticates the first frame of every connection against the launch's control token, dropping an unauthenticated or wrongly-tokened connection before it ever reaches the adapter or a tool call, and the Python-side client now presents that same token on every connect and reconnect.
+
+## 0.56.0
+
+### Patch Changes
+
+- 5cf0861: `spawn` refuses at admission a `cwd` the serving manager's host cannot resolve, naming the path, the reason and the host, so a misplaced spawn in a multi-manager space fails before anything is minted instead of at launch (#385 item 2). `cotal_spawn` documents that an unresolvable `cwd` is refused before launch.
+
+## 0.55.0
+
+### Minor Changes
+
+- 357af9f: `cotal_spawn` accepts an optional manager instance id. Core resolves and invokes that exact instance without placing the pinned handle in the class cache, while malformed, unreachable, or credential-conflicting pins fail instead of falling back to class anycast.
+
+### Patch Changes
+
+- a13c8bb: Capture the event plane's start boundary at adopt instead of at the emitter's first read, so a complete record written while the connector is still starting up (the mesh wait, log open, and preflight) is no longer silently dropped. Claude Code and OpenCode both wrap their session source with the shared `BoundStartSource`.
+- 7c7c853: A dead AG-UI emitter holder reports itself not running, so a health read after a refused rebind or a failed start no longer sees a live event plane.
+- 8472dc3: `cotal_channels` reports a durable channel's delivery health from the daemon's own answer: `active` requires a live lease and a membership round-trip that lists the channel for this lifecycle, a daemon that answers nothing renders `degraded`, and a reader that cannot establish it (a responder-present error) renders `unknown` instead of omitting the clause. `CotalEndpoint.fetchMemberships()` is public for that round-trip (issue #445).
+- 67bbcc5: Report a Jcode session-journal fold as a terminal event without stopping the seat.
+- eddc5f0: Serialize presence writes from one agent so they land in the order they were made, and publish departure only after every write already in flight has settled. This fixes overlapping status writes interleaving their puts (#2055) and an offline record landing before an earlier in-flight status write (#636).
+- eddc5f0: Refuse a presence write admitted after stop() began, instead of queueing it behind departure: departure's offline publish is now itself a presence-chain entry ordered after every write already admitted, and any write admitted after it rejects at once with a fixed error, so a straggler can neither sit out the connect grace behind the chain nor land after the offline record (#636).
+- db9a969: Escalate consecutive presence write failures after one liveness TTL and label connector roster snapshots as not live until a write succeeds.
+- 5418d1f: Consult `presenceView()` on every roster read in the connector, so a partial reconnect refill is not rendered or enforced as a complete roster: `cotal_roster` and `cotal_orientation` label an `unpopulated` view as a snapshot still in progress and a `stale` view as last-known, and a send or DM to a name that cannot be verified waits once for the presence snapshot and is then refused with the observer's condition instead of reporting a live peer as absent.
+
+## 0.54.0
+
+### Minor Changes
+
+- 34beea1: Route user-auth manager calls through a short-lived, instance-bound control credential. Discovery and invocation address the same authorized manager while the agent's standing connection, credentials and conversation remain unchanged. Managed launches retain their manager selection across launch and resume. Static and open mesh routing is unchanged. Confirm the standing goal-progress subscription at the broker before submitting on the separate control connection, so fast terminal events cannot outrun the subscription. Recover accepted goal results through the manager's caller-scoped `goal-result` command after connection replacement, without repeating the mutation or granting clients raw JetStream reads. Followed calls now require a compatible manager before submission; update the issuer, participant manager and client together. Stopping a caller cancels its observation without cancelling the accepted goal. Retain Linux custody records across clean child exit so retirement can prove process identity and finish cleanup even after the custodian removes its file; socket loss alone never frees the alias.
+
+## 0.53.0
+
+## 0.52.1
+
+## 0.52.0
+
+### Minor Changes
+
+- 5ee8eef: Let a workflow-spawned seat answer an ask or escalated checkpoint addressed to its own incarnation with its baseline credential. `run-answer` is now self-targeted, the manager checks the caller against the pending relay before writing an answer, connector turn text renders the hosted command without `--by`, and that literal command reuses the managed seat's issued caller identity. Other seats, unrelayed checkpoints, other runs, and run start or resume remain refused. Fixes #1877.
+- 6595c48: The console can drive the mesh as well as watch it. Every operator action (kill, spawn, status, purge, channel delete, attach) rides the CLI's own per-action control path over the endpoint rails, never the observer, using only the manager commands that already exist; `a` attaches through the full `cotal attach` loop in place; on an open mesh the operator's first send starts a presence-only peer under the observer's card so agents can reply, with concurrent sends sharing that startup result; multi-manager reads keep silent instances separate from reachable error replies; the topology lens overlays the broker-authoritative membership feed and says live, stale, traffic-only, or unreadable; channel tabs carry unread badges, the roster tags each agent's harness, the agent detail lists runs, model, and skills, and the status bar draws a 60-second activity sparkline.
+
+### Patch Changes
+
+- 794acb1: The version-exact docs bundle `cotal_docs` serves is generated during the connector's build instead of being committed. Any two branches that regenerated the same region of the checked-in artifact conflicted in it while their source pages merged cleanly, so editing a docs page now means editing the page and nothing else. `check:docsbundle` can no longer diff a committed file, so it regenerates into a temporary path and refuses a generator failure or a hollow bundle, which keeps a release unable to ship empty docs; the upgrade-section gate regenerates the same way instead of reading the tree behind an `existsSync` that silently dropped its shipped-copy check when the file was absent. Fixes #1713.
+- 9269fc2: Keep a jcode seat with events enabled alive through a mesh rebuild window. Previously an event
+  flush or run close that ran while the endpoint was reconnecting read `max_payload` off a connection
+  that was not there, and the seat exited 1 with `AG-UI emitter stopped: ... max_payload is only
+known while connected`. `AguiEmitterHolder` takes an optional `waitLive` hook that a queued step
+  awaits before it measures and publishes. The jcode host waits on both the Cotal bind and the raw
+  transport, so the queued records publish in order once the connection is live, with none dropped or
+  duplicated. A seat stopped during the outage still exits, and its unpublished records stay in
+  the journal behind the stored cursor. Every other emitter failure stays terminal. Connectors that do
+  not pass the hook behave as before. Fixes #1868.
+
+## 0.51.0
+
+### Minor Changes
+
+- 64d723e: Enable the AG-UI event plane by default for connectors that publish one. Operators and peer spawns
+  can opt out explicitly, while connectors without an event plane refuse unless that opt-out is set.
+- 491e923: The public user-auth exchange now mints `channel-writer` and `channel-purger` for a signed-in
+  human whose ledger row carries `admin`, so a remote owner can run `cotal channels set/default`
+  and a dashboard channel delete without a loopback capability. `admin`, `purger`, `deployer`, and
+  `manager-service` stay loopback-only. A managed-agent secret exchange still never mints a view.
+  This is not full remote channel management: `cotal web` still asks for the read-only admin view
+  at startup.
+- ec8649b: Preserve the closed required-events registration policy and enforce it across discovery, launch,
+  grant coverage, direct connector sessions, and trusted upgrades of existing manual registrations.
+
+### Patch Changes
+
+- 4dd4b90: Add harness-reported presence conditions, opaque environment references, binding diagnostics, and compact roster rendering.
+- 21407fd: Allow foreground seats to redeem one-time remote user-auth enrollments, bootstrap stock mesh records, and launch without a cached human login.
+
+## 0.50.1
+
+## 0.50.0
+
+### Minor Changes
+
+- 6f248ac: Enumerate broker spawn sites so an unmigrated suite fails the gate instead of leaking
+
+  The reaper claims a leaked `nats-server` by matching the store-dir token in its argv, and its header
+  states the standing condition: it "is only ever as complete as the migration that mints the token".
+  #1008 measured what that costs, 108 orphaned brokers on one box in a day, all holding loopback ports
+  inside the OS ephemeral range that suites draw from. The five suites it named were migrated, and
+  nothing was left behind that could notice the sixth.
+
+  `pnpm smoke:broker-migration` is that missing piece. It names no filenames: it walks `git ls-files`,
+  finds every call that starts a `nats-server`, and fails when one is not claimable by the reaper or
+  killable by the teardown helper. A suite added next week is in the population on the commit that
+  adds it. The census currently reads 319 spawn sites across 297 files, and the gate checks all 315
+  that are in scope.
+
+  The census found 98 unadopted sites, not five. Two conditions each break the chain on their own and
+  both are now required: the token has to be in a path the broker is STARTED with, since the reaper
+  reads argv and nothing else, and the handle has to reach `teardownOnSignal`, since the token only
+  helps once the owner is dead. Three shapes were leaking for reasons a named list would never have
+  surfaced. A suite minting a tokened store dir but launching with `-c <conf>` put the token somewhere
+  argv never carries, so it was unclaimable despite looking migrated. Brokers started with neither
+  `-sd` nor `-c` left no evidence at all; those now pass a tokened `-sd` purely as a marker, which
+  `nats-server` accepts without JetStream and writes nothing into. And suites that owned one broker
+  while leaving a sibling unowned read as clean under any file-level check, so ownership is decided per
+  spawn site.
+
+  A deliberate negative control opts out with a `SMOKE_BROKER_UNADOPTED_OK` marker, which is greppable
+  and per-site rather than a silent exclusion: `reaper.smoke.ts` must be able to start an untokened
+  broker, since that is the case it exists to detect.
+
+  The teardown helper no longer stalls three seconds and then reports a false alarm on every green
+  run. It waited on `process.kill(pid, 0)`, which keeps succeeding for a child that has been killed but
+  not yet waited on, so a suite whose own `finally` kills the broker first left a zombie that read as
+  alive until the deadline elapsed, and the helper then printed `did not exit before path cleanup`
+  about a process that was already dead. Liveness now distinguishes a zombie from a running process,
+  and a genuinely running broker is still waited on before its store dir is removed.
+
+- fc6f0b1: Scope an unanswered endpoint verdict to the rail the request rode
+
+  A CLI whose caller carries an issued generation rides the versioned `ep.v1` rail. SPEC 13.15 makes
+  that rail a separate subject space from the legacy `ep` rail and requires an endpoint to serve
+  both, so a manager built before the versioned rail serves `ep` alone and never receives the
+  request. The describe waited out its whole budget and every hosted `cotal run` verb reported that
+  no manager answered on the endpoint rails, asked whether one was running, and offered `--local`,
+  against a manager that was up, on the roster and answering `cotal ps` throughout. `--local` drives
+  the run from the calling process and names the caller as the run's answerer, so an operator who
+  took the suggestion would submit an answer under the wrong identity.
+
+  The unanswered marker now carries the `ep` plane the request was published on, and `describe`
+  names it in its own refusal. `cotal ps` and the other manager verbs state the reachability verdict
+  against that rail instead of against the mesh, and say what silence on a versioned rail does not
+  establish. `cotal run`'s hosted verbs do the same and drop both the question and the `--local`
+  suggestion there, since neither follows from what was observed. On the legacy rail every message is
+  unchanged: there is no second rail its silence could be hiding a manager on.
+
+  No fallback describe is issued on the other rail. A caller holds broker rows for its own rail only,
+  so the request would be refused at publish rather than answered.
+
+- b7e5942: A peer can no longer forge the framing of an auto-injected message
+
+  The block that carries waiting peer messages into a turn interpolated the message body and the
+  sender name raw, and the Hermes sidecar built the same shape by string concatenation. Both were
+  forgeable the two ways the inbox reply used to be: a body carrying a newline produced a second item
+  in the block, reading to the agent as a separate delivered message from a peer that never sent one,
+  and a sender naming itself with a closing bracket ended the real attribution and opened a forged
+  one. These frames are auto-injected rather than returned when the agent asks, so the agent never
+  had a chance to distrust them.
+
+  The rule both surfaces now hold is the one the inbox reply already held, and they hold it through
+  the same code rather than a second convention: a line that begins at column zero is written by the
+  connector, never by a peer. One message is one line plus indented continuations, with the
+  attribution inside a single bracket pair. The neutralization moved into a shared module that the
+  injected block and the inbox reply both render through, so the body, the sender name and role, and
+  the service and channel labels all pass through one implementation. The Python sidecar carries a
+  matching module, kept to the same character class on purpose, since a peer that can forge the frame
+  on either side of the socket has the whole class back.
+
+  Two widenings came out of stating the rule positionally rather than by example. The attribution
+  class now neutralizes the opening bracket as well as the closing one, because stripping only the
+  closing one still let a name render a bracket pair a reader takes as the innermost attribution. The
+  injected block's per-item separator is the bracketed attribution the inbox reply uses, replacing the
+  bullet, so the text of an injected block changed and the wake-path suites that assert on it were
+  updated with it.
+
+  A third injected surface holds the same rule now. A wake hint carries no message body and reads as
+  one short sentence, so it does not look like a frame, but it is written into the agent's context
+  without being asked for and it names a peer-controlled channel label, which three connectors
+  interpolated raw. A label carrying a newline put a second line at column zero reading as another
+  delivered message. That label renders through the shared module too, and the absent-channel fallback
+  moved there with it, since three connectors each spelled it themselves and an absent field is what a
+  per-call-site spelling is most likely to get wrong.
+
+- baed5d1: Report a session as stalled when its queue head is not moving, not merely when nothing moves
+
+  A session could report `state: ready` with a live transport while its oldest automatic deliveries
+  were never handed over: one reported seat held 96 of them, the oldest more than two hours old, with
+  nothing drained for 75 minutes, and every health field green throughout. The stall measure keyed on
+  any automatic commit, so a seat that kept committing the traffic arriving on top of a head it could
+  not deliver reset its own clock on every turn and reported healthy indefinitely, while the messages
+  actually owed to it aged without bound.
+
+  Progress is now measured at the head of the automatic queue: the clock resets when the commit takes
+  the oldest queued delivery, not when it takes any of them. A seat that is genuinely draining still
+  reports `ready` however busy it is, and a queue that is merely deep was never a stall. The status
+  route reports `lastAutomaticHeadDrainedAt` beside the existing `lastAutomaticDrainedAt`, because the
+  gap between the two marks is what names this fault: the first keeps moving while the second stands
+  still.
+
+### Patch Changes
+
+- 0a52594: Census the in-process half of the ambient-environment rule. `smoke:suite-ambient-env` grades the environment a suite hands a child; the new `smoke:suite-ambient-env-self` grades a suite that reads its own `process.env` through `configFromEnv` and friends, and requires a module-scope `COTAL_` prefix scrub before that first read. The connector suites in the class now scrub the whole prefix instead of dropping one variable, so running them from inside a connected session no longer dies in its own import on the one-identity-plane refusal.
+- 1112755: Give fresh setup defaults the run capability alongside spawn. Document workflow tool setup, credential refresh for existing personas, and supported authentication modes.
+- cd9c8dd: Grade the frozen-body egress guard against the predicate it actually replaced, instead of a pinned historical floor. The differential resolved its base as a fixed sha, so a guard could become stricter than that floor, be weakened back toward it, and still report zero weaker rows. The base is now resolved from history: the newest ancestor whose `agui.ts` differs from the source under test and still carries a classifier role, with the working tree as the head so an uncommitted weakening is graded, and an on-demand deepen so the pair exists in a depth-1 CI checkout. `COTAL_EGRESS_DIFF_BASE` adds a pair against an explicit PR base and never replaces one. Two holes the resolved run exposed are closed with it: the loader folded an unrecognised verdict into a throw, which would have read a new publishing verdict as withheld, and the closed-schema branch had no row naming it.
+- 7875182: A Jcode seat whose soft interrupts time out now keeps consuming its queue, and stops reporting itself healthy while it is not.
+
+  Peer messages that arrive while a Jcode session is busy are handed to it mid-turn. When that handoff got no reply, nothing else ever looked at the queue: it was served only by a new message arriving or the session going idle, and on a busy seat neither has to happen. Messages piled up behind a seat that was working normally and answering direct questions, and the seat was indistinguishable from a wedged one. Measured on a live seat: 27 messages held for 13.8 hours.
+
+  A seat now serves its own queue on a schedule rather than waiting for an event. If the mid-turn handoff stops answering, the queued messages are delivered as an ordinary turn instead, which needs no reply from it, so they arrive late rather than never. Nothing is dropped and nothing is delivered twice.
+
+  `cotal_connection_status` also stops calling such a seat `ready`. A bound session with a live transport whose queued messages have made no progress for ten minutes now reports `stalled`, alongside how long the queue has gone without committing anything, and `cotal_reconnect` says plainly when rebuilding the connection did not deliver them, instead of answering with a bare success over an untouched queue.
+
+- da119c6: A control socket path longer than the kernel's `sun_path` limit is refused at construction with a message naming the path, its byte length, the limit and the temp root budget, instead of surfacing as a bare `EINVAL` from the bind.
+- 0fdca5b: Describe Cotal Lang as programmable multi-step agent coordination. Explain each workflow tool call, required arguments, execution prerequisites and completion checks, with start and yield examples. Distinguish workflow answers from assigned-turn outcomes and point to validation and simulation before execution.
+
+## 0.49.0
+
+### Minor Changes
+
+- 6a03ccf: Stop republishing tool-call arguments and results onto `events.<owner>.<actor>`. The durable emitter drops `TOOL_CALL_ARGS` and `TOOL_CALL_RESULT` before the write-ahead log, and refuses to republish a frozen pre-fix frame that still carries them. A frozen frame whose event list cannot be read is withheld too, and the emitter halts by name rather than publishing bytes it could not inspect onto a channel with a different read ACL. An empty event list counts as unreadable rather than as nothing to object to, since no shipped writer can produce one, and so does a frame whose envelope does not parse: a wrong protocol version, or a missing or malformed `threadId`, `runId`, `epoch` or `seq`, is withheld rather than published. A body the policy cannot iterate at all is withheld on the same grounds, so the classifier answers for every input its signature accepts instead of throwing on some of them. Observers lose that tool output; that is the boundary. Tool start and end, text, and reasoning still go out.
+- 36d1779: Issued authority and run admission (SPEC 13.15, 14.8). A static credential is now an issuance: the issuer records its permission ceiling as evidence under a fresh generation before the material exists, its endpoint rows ride the versioned `ep.v1` rail with that generation pinned beside the caller triple, and a connected client reads its generation from an issuer-written accepted row. A hosted workflow run is admitted under the starting caller's resolved ceiling, recorded once per run in a dedicated admission store the driver cannot write, checked before every channel effect (wait open, fetch, recorded re-read, conclave writes), and revoked by an independent create-only marker that ends open waits at their next poll and refuses resume, takeover and reconcile. `run-start` on the legacy rail is refused with `permission-denied` and the `ai.cotal.ep.unbound-caller-authority` detail. `cotal run start --local` takes `--admit-read` and `--admit-publish` (required) and `cotal run revoke <runId> --local --by <who> --reason <text>` writes the marker. Three new per-space stores (`cotal_issued_`, `cotal_accepted_`, `cotal_admission_`), immutable at the broker: the admission and accepted stores are write-once per key, the evidence store is append-only and read first-on-key, and all three refuse rollup headers, message deletes and purges, so a holder of its own key row can neither widen nor erase what was recorded. Two new one-shot profiles (`issuer`, `run-admitter`), an admission read on the run mediator and operator profiles, and `COTAL_ACCEPTED_TOKEN` on every connector's spawn environment. Breaking pre-1.0 authority change.
+- 6fd855f: Add a target-pinned hosted manager retirement phase that preserves host release ordering, uses the existing crash-resumable auth barrier, bounds activation to the canonical contract artifacts, and keeps remote manager maintenance on fresh host-owned admin authorization without copying host ledger state to participants.
+
+### Patch Changes
+
+- 0e58bac: Grade a replacement frozen-body egress guard against the predicate it replaced, on one corpus, both directions. The export name and shape both change; the loader binds the classifier by role. A boolean arm is never coerced from a three-way verdict. Also correct the agui-tool-result mutation why-block: the rebuilds stay because command poisons dist, not because this suite reads dist.
+- cd74517: Prove Jcode pre-join readiness on the orientation `tool_done` event as it arrives. A seat that
+  already called `cotal_orientation` now joins even when that proof turn stays open. The timeout
+  outcome names whether the call was observed, and teardown no longer kills a functional session
+  just because `turn_done` is still outstanding.
+- 61d08ab: Verify the active Jcode model and provider route before applying `--variant`. A route that accepts
+  reasoning effort still receives the requested tier before its first turn. A route without that
+  capability now fails with an explicit unsupported-capability diagnostic instead of a tier refusal.
+- 062881a: Wire `--max-sessions` from the CLI into the manager's live-session ceiling.
+
+  `ManagerOptions.maxSessions` was documented as deployment-configurable, but nothing in the CLI
+  could set it, so every live manager sat at 64. `cotal supervise --max-sessions` and
+  `cotal up --max-sessions` now parse a positive integer, pass it into the manager, and record it on
+  the mesh so a same-root repair, resume, or `spawn -f` that restarts the manager does not silently
+  drop a raised ceiling. A refresh of an already-running manager refuses a different `--max-sessions`
+  rather than recording an unapplied setting. A capacity refusal names `--max-sessions`. Default
+  remains 64. Size for agents × panes: the browser console opens one session per pane.
+
+- 159c5f0: Merge a complete agent file passed as a cotal_persona prompt into one frontmatter block. Authored channel grants, role, and agent survive load, explicit tool arguments win, and a malformed leading fence is refused rather than wrapped.
+- 5395c7c: Report a refused presence-KV write by naming the bucket and how long writes have been refused, instead of asserting the mesh is unreachable while the transport is connected. A latched presence bucket still opens and watches cleanly, so only the write reveals it; bind now fails with that detail rather than a bare timeout, and `cotal_connection_status` carries a distinct `presenceWriteFailure` field. The record is connection-scoped: it is cleared whenever a connection is torn down, rebuilt or stopped, so a later failure on a different connection cannot inherit it and be described as a bucket refusal.
+
+  Clearing on teardown is not sufficient on its own, because a presence put can still be in flight when the teardown runs. A rebind reaches `publishPresence` through the empty-bucket path and nothing awaits that flight, so a put started on one connection could settle after the record was cleared and write its refusal onto a stopped endpoint or onto the connection that replaced it. The put now carries the same epoch fence the presence watch bind takes: a put that outlives its epoch still throws to its caller, and it no longer writes presence-refusal state that belongs to a later connection. A late success is fenced the same way, so it cannot erase a refusal the current connection established from its own evidence.
+
+- 5b2281c: Compile the seat JavaScript and type entrypoints during pack and publish after validating both native helpers. A new installed-distribution smoke packs the full CLI closure from an assembled seat tree and proves a fresh npm install imports seat, imports the manager, and prints the packaged CLI help banner.
+- 6836dd3: Allow `cotal send dm`, `msg`, and `ask` from an operator shell outside a managed seat. The transient
+  sender now uses a fixed advisory display name while its wire principal continues to come from the
+  resolved credential or user bearer.
+- 4b3881f: A workflow `sleep` that a busy host was simply too loaded to schedule no longer fails the run. A pause waits by reading the durable checkpoint plane, and each of those reads carries a client-side deadline that is itself a timer; when the machine is loaded hard enough that the run's process does not get back onto the CPU, that timer cannot run either, so it expires the moment the process resumes and reports a bare `timeout` even though the broker answered long ago. That was recorded as `L4000 EffectError: timeout`, which names the effect as the thing that broke and sends the author looking at their own program, and it killed runs whose only fault was being polite about load.
+
+  The runtime now measures whether its own process was actually running across the wait, namely event-loop lag over the window together with a shortfall in the ticks that window should have contained, and treats a deadline that elapsed while the process was demonstrably off the CPU as a fact about the host rather than about the effect. The pause and its timer are durable, so the wait is simply re-entered and a `sleep` whose deadline passed during the starvation completes late, which is what a lower-bound wait promises. Nothing is widened and nothing is swallowed: a deadline on a loop that was running, and every failure that is not a client deadline, still fails immediately as `L4000` with its message intact. A host that still cannot serve the run after a bounded number of consecutive starved attempts fails under the new `L4025`, "Host did not schedule the run", quoting the lag and tick measurement it made, so a caller that genuinely cannot be served fails rather than hanging and the operator reads the real cause.
+
+## 0.48.2
+
+## 0.48.1
+
+### Patch Changes
+
+- 9c101cc: Report failed static lifecycle reconciliation, retry the same durable terminal with a bounded schedule, and drain accepted reconciliation work during shutdown.
+- 9a8a2a6: Inspect version-2 workflow journals on the compiled engine when planning forks and migrations. Preserve recorded pins, stop before new effects, and retain divergence and branch-refusal details across the worker boundary. Fork cuts remain fixed through catch and finally blocks, and inspection leaves pending broker effects untouched.
+
+## 0.48.0
+
+### Minor Changes
+
+- b6c843f: Restrict workflow driver credentials to their own journal and record writes. Move effects and leader reads onto a separate trusted host connection, with journal ownership checks, cancellation cleanup checks, and host-held wait acknowledgements. Hosted and local runs use this split; authenticated local runs now require a recorded space signer rather than a single credentials file.
+
+  Custom run hosts must accept the separate mediator connection. Seat-adopting effect hosts must implement `restoreMigratedSeats` so migration reads stay on the host.
+
+  Preserve settled parent history when a version-1 fork resumes through the host, without granting the child access to parent checkpoint tokens.
+
+## 0.47.1
+
+## 0.47.0
+
+### Patch Changes
+
+- cf294e7: Settle pending wait-exit after a real child exit, drop the redundant handle catch, keep launch-failed when backlog throws on a closed attach stream, bound manager control-rail disconnects after a broker exit, refresh the bundled custody docs, and grade ci-ok as the sole always-running aggregate plus both pack polarities.
+
+## 0.46.0
+
+### Minor Changes
+
+- 9d745af: Add the local durable runtime adoption seam and report legacy manager continuity before a running update can be described as hot. `Runtime.adopt` is optional: runtimes without durable custody omit it, and the manager refuses by name rather than requiring a throwing stub on every adapter. `cotal update --self` reports the selected manager before a global install and hands `--space` / `--server` / `--creds` to the replacement child.
+- 18a0024: The manager hosts workflow runs. `run-start`, `run-resume`, `run-answer`, `run-status` and
+  `run-ps` are served on the manager's endpoint rails; a run is validated before anything is
+  recorded, driven in the manager's process under a per-run `run-driver` credential, and taken back
+  from its journal after a manager restart. `cotal run` is a client of that surface by default,
+  with `--local` keeping the in-process drive, now under the run's own `run-driver` and
+  `run-operator` credentials rather than `admin`; an answer's writes are pinned to the one pause it
+  answers. A user-auth mesh refuses the family by name until a run can carry its user's owner. A new `run` capability mints the family into an
+  agent's credential and injects the `cotal_run` tool, so an agent can write a cotal-lang program
+  and start it from a session. `run-answer` records the answerer from the caller's credential and
+  takes no `by`; `cotal run answer` drops `--by` on the hosted path. `spawn({ supervise })` is a restart policy the manager enforces in
+  place: `{ restarts, window? }` (default `10m`) until the budget is spent, then the seat is
+  retired and the next `turn` is L4002. A policy this host cannot honour is refused at accept.
+- e986173: Make manager `inspect` distinguish a stranded static slot from an unknown name through structured durable-state details, and make `attach` stop reconnecting when those details show the seat is gone.
+
+## 0.45.0
+
+### Patch Changes
+
+- 2a34295: `cotal send` identity refusal and CLI docs now name `COTAL_NAME` as required in both accepted shapes: plus either `COTAL_ID` or both `COTAL_OWNER` and `COTAL_ACTOR`.
+
+## 0.44.0
+
+### Minor Changes
+
+- ba9af19: Refuse a source-checkout `cotal` from writing or GC'ing the operator-global seed store. A missing identity answer is a refusal, not a released install. The refusal names `$XDG_CONFIG_HOME` isolation, not the test-only `COTAL_ALLOW_CHECKOUT_SEED=1` override. An older CLI that meets a newer store is pointed at `cotal ext seed --force`, not `--reset`. `COTAL_HOME` does not relocate this store.
+
+## 0.43.0
+
+### Minor Changes
+
+- 64d6131: Require a complete seat identity (`COTAL_NAME` plus `COTAL_ID`, or `COTAL_OWNER` plus `COTAL_ACTOR`) for one-shot CLI messages, so a nameless `cotal send` cannot deliver as the command verb. Isolate the send smoke's CLI subprocesses from the operator seed store (`HOME`, `XDG_CONFIG_HOME`, `TMPDIR`, strip `COTAL_*`). In-tree callers that previously relied on a missing or ambient name now set that identity: `send.smoke.ts`, `user-auth-launch.smoke.ts`, `sys-rotation-e2e.smoke.ts`, `up-tls-routes-live.smoke.ts`, `backup-usermode-live.smoke.ts`, and `backup-faults-live.smoke.ts`. A child that inherited a seat's environment is still attributed as that seat.
+
+### Patch Changes
+
+- d967f76: Bound the Jcode connector's pre-join `cotal_orientation` proof so a heavy persona cannot keep a seat alive and unreachable. A turn that overruns the declared three-minute window now exits `readiness_timeout` instead of working with no mesh presence. That teardown kills the private Jcode tree and discards the in-flight turn; nothing from it is recovered. The connector log still names the gate while the proof is running, and a later outcome line names what happened: proved (with or without a spawn `--prompt`), provider refusal, or timeout. A hang that never returns and never hits the bound has no outcome line.
+
+## 0.42.0
+
+### Minor Changes
+
+- a87709c: Every cotal-lang effect now performs on the mesh: the durable-action group is built end to end and
+  the not-yet-durable seam is gone.
+
+  `spawn` submits a real manager goal and returns the allocated seat's handle, and meters the
+  agent's `permits` (`turns`, `wallClock`; the turn that would exceed one is L4001, and a budget the
+  host cannot meter is refused at spawn); `conclave` opens a scoped sub-team as durable membership
+  rows; `ask` parks schema-checked pauses answered through `cotal run answer` and tells the agent
+  over the turn relay, one relay per attempt carrying the schema, the attempt and the previous
+  refusal, which every connector's intake renders with the answer command; `monitor` registers the
+  handle on its journal entry and `wait(down)` reads a monitored incarnation's death off presence
+  liveness, refusing an agent nobody monitored.
+  `turn` rides a new pull-shaped manager relay: the manager serves `turn` (targeted, the
+  despawn/input reach) plus `turn-pending` and `turn-yield` (self reach, manager contract revision
+  10), holds the payload on the goal-index note, pins the goal to the seat's incarnation, and denies
+  at a goal-bound deadline hold; the seat side (all connectors) pulls pending turns, surfaces them
+  two-phase into host context, auto-yields `done` when the host turn ends, and yields `blocked` or
+  `handoff` through the new `cotal_yield` tool; the run client renders context with pending notices,
+  arms its own pause on the acceptance's deadline as the L4003 authority, watches presence as the
+  L4002 authority (a death the manager marks on the deadline terminal reads the same way), and
+  honors handoffs (L4005/L4004 validation, the `handoffFrom` goal chain); the manager shows a seat
+  one turn at a time. The relay holds on an auth mesh: the agent baseline gains the self-mode
+  `turn-pending` and `turn-yield` rows, the operator seat-write set (`control-caller-admin`, the
+  `admin` capability) gains `turn` beside `input`, and the manager mints the deadline hold's
+  schedule over its serve connection and owner-expires the hold once due instead of reading a
+  fire it holds no grant for. `wait(replied)` observes the run's own turn terminals as a level, and never a
+  turn the run itself ended without an accepted yield. A `spawn` may bind a logical worktree: the
+  validator rejects two literal-worktree spawns in one concurrent scope (L3022, named branch
+  functions included) and the runtime claims a tree before it submits, refusing a second spawn into
+  a tree held by a live seat or by a spawn in flight (L4008), with sequential reuse the moment the
+  holder's presence lapses. A spawn refused at accept is L4000 (L4001 for seat capacity) and one
+  whose seat never came up is L4002; an `ask` whose deadline passes with no conforming record is
+  L4006; a fork copies a spawn that said `onFork: "adopt"` and refuses one that would have to
+  respawn (L5019). The run driver re-issues
+  recorded-but-undischarged cancellations at adoption, so recovery does not wait for completion to
+  release a dead loser's seat, pause, or tree. A migration's `--adopt <handle>` hands the orphaned
+  seat to the edited program's next spawn of that persona, and `--release <handle>` despawns it at
+  commit through the run's own discharge; both name the agent the step spawned, and a spawn that
+  produced none is an orphan like a sleep; the adopting spawn binds the orphaned spawn's goal as
+  its own, so a resume re-reads the seat and a cancellation despawns it. A turn accept the manager
+  cannot finish unwinds to a failed terminal on its bound goal, and a retry of it is refused naming
+  that terminal. The delivery daemon hosts the checkpoint timer writer, so mediated deadlines fire
+  with no suite pump.
+
+## 0.41.4
+
+## 0.41.3
+
+## 0.41.2
+
+## 0.41.1
+
+### Patch Changes
+
+- 80ddc41: Re-read managed seat credential files during renewal and reconnect while pinning the original nkey.
+
+## 0.41.0
+
+### Minor Changes
+
+- 42d80da: cotal-lang DX: the conformance corpus and the language card. Every js block in the language reference is generated into a JSON artifact shipped inside @cotal-ai/lang (conformance/corpus.json) with the verdict the validator gives it, served by a new conformanceCorpus() accessor, so a second implementation can run the same claims from the file alone; pnpm gen:conformance regenerates it and smoke:lang-conformance holds the shipped bytes identical to a fresh build from the reference. The artifact states its own adjudication rule, so a reader holding only the JSON knows a refusal is checked by membership in the validator's answered codes, never by equality with a single code. docs/lang-card.md is a one-page card of the language (effects and their results, the await rule, branch keys, top refusals), validated block by block like the reference itself, carried in the connector docs bundle, and published on the docs site beside the other reference pages.
+
+## 0.40.0
+
+## 0.39.1
+
+## 0.39.0
+
+### Minor Changes
+
+- 2277e28: A capability refusal is durable and retryable. A handler that cannot perform an effect on its host
+  throws the new `EffectRefused`; the interpreter settles the entry with the new status `refused`
+  under the handler's code (L5016 for the mesh handler's `NotYetDurable`, which now extends it) and
+  unwinds the run with the uncatchable `RunHeld` (L5025). The driver grades the run `released`, and a
+  resume on a capable host finds the new `refused` lookup verdict and performs the step live, so a
+  run started before the durable-action surface lands heals the day it does. Previously the refusal
+  settled `failed` and a resume replayed the failure forever.
+
+  Two concurrent `turn`s on one agent handle are serialized at the dispatch seam both engines share:
+  the second begins when the first settles, in dispatch order. Turns on different handles are
+  unaffected.
+
+  A fork's child records its lineage: the run record's spec gains `forkedFrom` (`{ run, step }`,
+  absent on runs started fresh), `commitFork` writes it with the spec, and `ForkCommitResult.
+lineageRecorded` is now true.
+
+  Spec: §6.5 (turn serialization), §9.2 (six uncatchables), §10.1/§10.7 (the `refused` status and
+  verdict), §11.1, §11.3, Appendix A (+L5025), and SPEC.md §14.3 (`forkedFrom`).
+
+- 34ff272: `cotal run`, the workflow-run operator surface, self-registered by `@cotal-ai/runtime` and composed
+  into the `cotal` binary: `start --file <program>` drives a new run on the mesh handler, `resume
+<runId> --file <program>` takes an existing run over and drives it to quiescence, `ps` lists an
+  endpoint's run records (state, holder, journal high-water, fork lineage), `journal <runId>` prints
+  the durable step journal, and `answer <runId> <stepKey> --by <who> [--value <json>]` resolves an
+  open checkpoint through the run driver, presenting as the arming holder read back from the
+  checkpoint record (resume is holder-bound). One raw connection per invocation against the resolved
+  mesh target; the journal's result bound is taken from the broker's own max_payload.
+
+  `docs/workflows.md` gains an "Operating a run" section, the connector docs bundle carries it, and
+  every connector folds a workflow steer (`WORKFLOW_STEER`) into its agent instructions beside the
+  mesh-first steer, so agents reach for a durable journalled run instead of improvising long
+  coordination loops in their own context.
+
+## 0.38.0
+
+### Minor Changes
+
+- 1a330c7: Managed Jcode seats launch on macOS and the BSDs again. Credential mirroring pins each parent
+  directory so an ancestor swapped mid-walk cannot redirect a copy, mkdir, or unlink outside the
+  private home, and the only pin the connector had was `/dev/fd/<fd>/<name>`, which needs Linux
+  procfs traversal, so #1170 bounded managed seats to Linux to keep that guarantee.
+
+  The pin now has a second mechanism with the same contract. macOS and the BSDs pin the parent as the
+  process working directory: after `chdir`, a single-component name resolves from that directory's
+  inode and no ancestor is walked again, which is the same guarantee `/dev/fd/<fd>/<name>` provides on
+  Linux. `chdir` takes a path, so entry is verified rather than trusted: the entered directory's
+  inode must equal the inode of the descriptor opened a moment before, which closes the window between
+  the two. The previous working directory is restored on every exit, including the refusing ones.
+
+  The Linux path is unchanged. The suite's TOCTOU battery previously stood down to eighteen
+  unfailable `check(name, true)` cells off Linux; it now drives all of them on any POSIX platform,
+  including the three controls that show the unpinned pattern still deletes and leaks outside the
+  home. Two cells cover the working-directory pin's own failure modes.
+
+  Windows is unchanged and still refused before launch: Jcode's released Harness API bridge is a
+  Unix-socket surface.
+
+## 0.37.0
+
+### Minor Changes
+
+- e5e68ed: Add a mesh-side persona catalog read (`cotal_personas` / manager `list-personas` + `show-persona`) so a spawn-capable agent can enumerate names and show a card it owns without shelling out.
+- 4e80261: Add `cotal_connection_status`, a read-only MCP tool reporting this session's mesh connection as one
+  of five distinct states: ready, degraded (bound while the transport underneath is down), connecting
+  (transport live, bind unfinished), disconnected, and stopped (shut down deliberately, which is not a
+  fault). It also reports the raw facts the state is derived from, the buffered inbox count, and the
+  measured last successful inbox drain. A retained failure is reported as the current reason only while
+  it is one, and as a post-mortem on a stopped session.
+
+  `MeshAgent` gains `stopping` and `connectionState`. Without `stopping` a deliberate shutdown and a
+  lost connection are indistinguishable, because `stop()` clears readiness and transport together.
+
+- 00ac9d9: manager: refuse a manager-role spawn of a persona without the spawn capability. A persona defined over the wire (`cotal_persona`) carries no `capabilities:` line (the write path is content-only by design), and `cotal_spawn` takes a free-form `role`, so a wire-defined persona could be spawned with `role: "manager"` and join presenting as a manager whose credential cannot reach the control plane, silently, until the seat first tried to seat a worker (issue #966). The manager now refuses that spawn at accept, before any provisioning, naming the remediation for both authors: an operator adds `capabilities: [spawn]` to the persona file; a peer-defined persona cannot declare capabilities and must ask an operator. The guard keys on the effective role (a spawn-time role override wins over the file's, mirroring existing precedence) and leaves every non-manager spawn untouched. `cotal_spawn`'s `role` argument documents the requirement. Capabilities remain non-declarable over the wire: the closed `define-persona` input schema is unchanged and still guarded by `smoke:persona-input-closed`.
+- 4feb60d: Jcode credential mirroring pins copy, mkdir, and unlink through one Linux `/dev/fd` parent walk, and names a refusal when that traversal is missing. A managed Jcode seat now launches on Linux only, so a macOS user loses managed seats.
+- 9021896: Make the runtime pid/log namespace per-space. The manager and delivery daemon now record themselves
+  as `.cotal/manager.<spaceKey>.pid`, `.cotal/manager.<spaceKey>.log`,
+  `.cotal/manager.<spaceKey>.delivery-aware`, `.cotal/delivery.<spaceKey>.pid` and
+  `.cotal/delivery.<spaceKey>.log`, through the same `{space}` expansion `auth-service.<spaceKey>.pid`
+  already used. The five names were root-scoped constants, so one workspace root hosted one manager and
+  one delivery daemon by filename: a second space booting in the same root overwrote the first space's
+  record, and every reader of that file then answered about the wrong process. `status`, `down`, `up`,
+  `clean` and `spawn -f` take the space they are answering about.
+
+  Existing single-space meshes keep working across the upgrade. Reads admit a pre-segmentation
+  root-scoped record while it is the only spelling present, byte-exact, so a `cotal down` still finds
+  and stops a daemon started by the previous build instead of orphaning it. Writes are always the
+  canonical space-keyed name, and each start reclaims a provably dead pre-upgrade record first, so an
+  ordinary upgrade does not leave both spellings behind. A live pre-upgrade daemon is refused rather
+  than overwritten, and both spellings present is reported as ambiguous rather than guessed.
+
+  A folder-wide command reads its space off the runtime records the folder holds. `resolveRuntimeSpace`
+  decodes the space out of the record filenames and prefers a space whose record is running over dead
+  residue; two spaces running under one root throws and names both. The previous read came from the
+  `.cotal/auth` account records, which an open mesh (`broker: { auth: false }`) never writes, so a bare
+  `cotal down` in such a folder answered with the default space and walked past its own manager once the
+  records became space-keyed.
+
+  `MANAGER_PIDFILE` and `MANAGER_DELIVERY_AWARE_MARKER` move from `pid.ts` to `local-process.ts` and
+  are now `{space}` templates; both are still exported from the package index. `RESERVED_COTAL_CHILDREN`
+  no longer lists the five root-scoped runtime names.
+
+- 063151b: Expose raw NATS transport liveness separately from full endpoint readiness. Connector sessions now
+  track transient disconnect and reconnect edges without flapping readiness, ignore stale events from
+  replaced connection epochs, and clear both states on stop. Connection issues remain scoped to pre-bind
+  readiness failures, clear on a successful bind, and survive stop for post-mortem diagnosis.
+
+  An endpoint stopped while its bind is still in flight also no longer announces that connection.
+  The bind's own teardown already discarded it, but the readiness event was emitted first, so any
+  listener on the endpoint was left holding a connected edge that nothing ever corrected.
+
+  The same applies to the transport seed, which reaches further back. It fires as soon as the dial
+  returns, well before the bind completes, so a stop arriving while the dial was still pending had a
+  stopped endpoint announce a live transport it never had. Both edges are now guarded.
+
+### Patch Changes
+
+- 283de1c: Identify the running CLI artifact in `cotal status` and show the compared versions for stale Claude skills.
+- 31443f1: Make package-filtered test commands run counted assertions instead of succeeding without tests.
+- 1cd9e6b: Remove stale Jcode credential mirror files when their allowlisted sources disappear.
+- 959b596: Validate workstation and injected scan credentials against the delivery daemon's account before endpoint construction or singleton lease admission.
+- 6926b34: Report a focus-mode recall as incomplete (`droppedChannels`) instead of silently claiming an empty, complete window when the channel has `replay: false` or was joined only through a wildcard subscription. Previously an ack-dropped ambient message or `@mention` on such a channel was unrecoverable and `cotal_inbox` reported no loss.
+- 11be292: Deliver directed peer messages into an active Jcode turn through the recipient session's soft-interrupt queue, committing them only after the containing turn succeeds.
+- 7e45495: Make every shipped endpoint consumer explicitly surface or ignore recoverable warnings so retry and renewal failures no longer disappear silently.
+- 0660504: Steer directed Jcode inbound while the Harness session is busy even without a Cotal-owned drive, and publish automatic queue depth and age on presence activity.
+- e703873: Report connector harness availability at manager boot and expose resolved binary paths in status.
+- c4094cb: Drop inherited `COTAL_LAUNCH_MATERIAL` from suites that default `COTAL_SERVERS` then call `configFromEnv()` on `process.env`, so `pnpm test` no longer trips the one-identity-plane refusal inside a managed seat.
+- c09d750: Stop answering progress with presence. Textual working rows without an outside last-assistant observation render progress unknown, while heartbeat age remains explicitly labelled as liveness. The render-agnostic observation classifier lives in the workstation layer, not protocol core; compact presence-only glyphs make no progress claim. A stale observation overlays stalled Xm on still-fresh presence.
+- 42af545: cotal_send still creates an unregistered channel, but the success receipt says when the name is new and names close matches, so a typo is not identical to a send into a known room.
+- d94b617: Keep synchronous spawn callers waiting through the connector-selected readiness budget instead of timing out early on slow healthy launches.
+- 17046ac: Spawn failures return the lifecycle facts the manager already had (blocked op, head state, opId, remedy) instead of a connector timeout or opaque string.
+- d8b6e63: Refuse a `cotal_spawn` model pin the manager did not record, and name the recorded pin on the spawn result and orientation card so a dropped override cannot look like cross-vendor confirmation.
+
+  A Jcode variant-tier refusal now names the requested model pin rather than the session default RuntimeInfo still reports after setModel.
+
+- b7b932e: Point status skills rows at `cotal setup --skills`, with harness-native setup declared and implemented by connectors rather than the base CLI.
+
+## 0.36.0
+
+## 0.35.0
+
+### Minor Changes
+
+- c5948e6: Seed the default persona with wildcard channel read and post ACLs while keeping its active
+  subscription set empty. A fresh default agent can now join and create channels on demand without
+  receiving every channel at boot. Repeat setup also upgrades the byte-exact legacy default while
+  leaving every edited persona unchanged. The guided demo personas retain their existing `welcome`
+  scope.
+
+  This is a minor release because packages are pre-1.0 and the shipped security default broadens the
+  default persona's broker-enforced publish authority. The connector-core bump ships the updated
+  version-matched operator docs bundle.
+
+- d457d7f: Show each managed seat's model and requested variant in the default `cotal ps` view, and expose Jcode's declared local model catalog without presenting configured effort tiers as provider-verified capabilities.
+
+## 0.34.0
+
+### Minor Changes
+
+- 22c3182: Honor the persona file's `agent:` frontmatter when picking the spawn harness. The key existed in
+  half the fleet's personas but no code path read it: it swept into the verbatim `meta` bag, and both
+  launch paths resolved the connector before the persona file was loaded, so `COTAL_DEFAULT_AGENT`
+  silently beat a deliberate per-persona pin (a `jcode` persona ran `claude` with no complaint).
+
+  The harness now resolves once, on every spawn path, as: explicit `--agent` flag > persona `agent:` >
+  `COTAL_DEFAULT_AGENT` > the product default. That is the precedence `model:` and `variant:` already
+  have, keeping the env var a _default_ rather than an override. On `--detach` the CLI now threads
+  an explicit flag and the caller's environment default as separate control fields. The manager loads
+  the persona file before resolving its connector and applies the same precedence while preserving
+  the invoking operator's default when its own environment differs. A pin naming an unregistered
+  connector fails the spawn loudly with the connector install hint (no silent fallback).
+
+  `saveAgentFile` round-trips the field, so a runtime `cotal_persona` redefine preserves a pin.
+  Docs updated (`agent-files.md`, `connectors.md`, `cli.md`, `config.md`).
+
+## 0.33.9
+
+### Patch Changes
+
+- a497dfc: Recover Codex event streams after broker outages without losing pending bracket state or the outage backlog.
+
+## 0.33.8
+
+## 0.33.7
+
+## 0.33.6
+
+### Patch Changes
+
+- 7e250a3: Keep Claude lifecycle hooks inside their existing bounded relay window when the connector control socket has not bound yet, and wait boundedly for a new startup transcript that the retained `SessionStart` can precede.
+
+## 0.33.5
+
+## 0.33.4
+
+### Patch Changes
+
+- 2151b4a: Preserve the first Claude event run when a startup prompt is written before `SessionStart`, while resumed, forked, cleared, compacted, and recovered sessions keep their no-history-replay cursor behavior.
+- 5aa8a56: Rewrite the Cotal documentation in a direct, human voice. The pass removes em dashes, filler words, list-style headings, and slogan-shaped contrasts; updates links after the heading changes; and applies the same voice to the generated MCP tool catalog and the bundled `cotal_docs` index. A docs voice check now protects the mechanical rules.
+
+## 0.33.3
+
+### Patch Changes
+
+- 9e86dcc: `cotal_spawn` now accepts an optional kickoff `prompt` and forwards it through the manager as the new peer's first turn.
+
+  A peer spawned through the MCP tool previously had no way to receive an initial prompt even though the manager's `spawn` command already supported one. The process joined the roster, and a later DM produced a successful `claude/channel` notification, but a pristine Claude session did not start its first model turn from that notification. The peer therefore stayed idle and never answered. Callers can now pass the task with the spawn itself, matching `cotal spawn --prompt` while keeping prompt-less launches idle by choice.
+
+## 0.33.2
+
+### Patch Changes
+
+- 8e212a6: Fix two defects that each, independently, left the AG-UI event plane permanently silent.
+
+  The lifecycle hooks were declared with a split `command`/`args` shape the host schema does not
+  have, so the host ran `node` with no script and every hook silently never fired — taking presence,
+  peer-message surfacing and the emitter's lazy start with it. The manifest now uses the single-string
+  command form, with the interpolated plugin root quoted so paths containing a space still work. The
+  plugin directory is also passed on both launch shapes; it was missing from the `--prompt` shape,
+  which is how hosted agents start.
+
+  Separately, the emitter set itself up before the endpoint had bound. With `--prompt` the first hook
+  beats the first bind, the holder failed terminally, and one line of stderr was the only trace for
+  the rest of the session. The emitter now awaits a bounded `whenConnected()` before setup, and that
+  wait fails past its window rather than resolving as if connected.
+
+## 0.33.1
+
+## 0.33.0
+
+### Minor Changes
+
+- ba74c84: An agent now reads only the channels it lists. An omitted or empty read set means **no channels**,
+  where it previously meant `general`: the agent-file loader, the provisioner, the credential mint and
+  the endpoint each defaulted an absent read set to `["general"]`, so any persona that simply did not
+  mention channels was subscribed to `general` by code and had the matching channel read row baked
+  into its credential.
+
+  An agent on no channel is still a full mesh peer: it appears on the roster and sends and receives
+  DMs and anycasts, and the same default-deny that already governed `allowPublish` now governs reads.
+  An empty list and an omitted one mean the same thing, for both read keys. That has one consequence
+  worth stating plainly: when **both** are omitted, `allowSubscribe` falls back to the read set and so
+  resolves empty too, which leaves the agent unable to `cotal_join` a channel at runtime. Give it an
+  explicit `allowSubscribe` if it should be able to join one later.
+
+  With no concrete channel there is no default broadcast target, so a send with no explicit channel is
+  refused with a message saying so, rather than resolving to `general`. Leaving your last channel is
+  allowed and always was; the `cotal_leave` description said otherwise and now says what actually
+  happens, including that the default send channel is gone until you join one.
+
+  Migration: **list `general` explicitly if you want it.** A hand-written persona that relied on the
+  old default needs `subscribe: [general]` added.
+
+  This changes the default `cotal setup` install as well. The seeded `default_agent` carries
+  `subscribe: []`, which used to resolve to `general` and now resolves to no channel; it keeps
+  `allowSubscribe: [">"]`, so it can still `cotal_join` anything, it just no longer arrives on a
+  channel it never asked for — which is what its own seed comment already described.
+
+  Already-running agents are not narrowed retroactively: a live seat keeps the read ACL its credential
+  was minted with, across renewal, until it is respawned.
+
+  **Correction:** the read-set default-deny described above is not new in 0.33.0. It shipped in 0.28.0
+  with 86f6b10 (#821, "Remove the implicit `general` channel floor"), and so did the refusal of a send
+  with no channel and the no-channel default for the seeded `default_agent`. Upgrading from 0.28.0 or
+  later needs no migration for it. What 0.33.0 changed is narrower. The no-default-channel check in
+  `multicast` now refuses only an omitted channel (`channel === undefined` where it was `!channel`), so
+  an explicit empty-string `channel` is no longer refused as if it were omitted, and the refusal now
+  says to name or join a channel. The `cotal_send` and `cotal_leave` tool descriptions and pi's send
+  call line no longer name `general` as a default or say the last channel cannot be left, doc comments
+  state the rule and the both-keys-omitted consequence, and the `smoke:no-implicit-general` and
+  `smoke:session-channels` suites guard it.
+
+## 0.32.0
+
+## 0.31.0
+
+### Minor Changes
+
+- 4ef59c3: A spawned seat now receives a constructed environment (PATH/HOME/locale, the machine-wide COTAL\_\* knobs, connector-declared provider keys) instead of the manager's ambient environment. Host-session markers such as CLAUDE_CODE_CHILD_SESSION no longer leak into seats and silently disable transcript saving. The Claude connector declares CLAUDE_CODE_OAUTH_TOKEN (and the rest of claude's documented credential set) so a container seat still authenticates; spawn.env remains the explicit opt-in for extra names, including a host marker a persona has chosen to receive.
+
+## 0.30.2
+
+### Patch Changes
+
+- 2395efd: A manager that died mid-registration left the issuance gate frozen, and the successor refused to
+  register until an operator ran `cotal reconcile-gate`. Boot now completes that same dead
+  registration itself when the freeze-holder is affirmatively gone under a complete CONNZ sweep
+  (`gone` and `sweepComplete=true`), then continues the normal takeover. Live, unknown,
+  unestablishable, and wrong-op-kind still refuse; there is no TTL.
+
+## 0.30.1
+
+### Patch Changes
+
+- aea08f9: Allow agents to clean up their presence and channel-registry ordered consumers, wait for real mesh readiness before opening Codex, and collapse repeated endpoint errors.
+
+## 0.30.0
+
+### Minor Changes
+
+- 569f4d3: An empty message id is never a dedup key, and an id-less delivery is individually addressable at the drain seam.
+
+  Two distinct messages that each carry an empty id collapsed to one: the receiver-side id
+  dedup read empty-equals-empty as a duplicate, silently dropped the second, and once the
+  first was handled it dropped every later empty-id message on arrival. Measured live, two
+  such messages arrived on the wire and only the first was ever delivered.
+
+  An empty id is now treated as no id: the ingest coalescing (pending, handled, protected)
+  is skipped for it in both directions, so distinct messages that carry an empty id are all
+  delivered. At the drain seam a per-delivery receive key (the wire id when there is one, a
+  per-session secret-namespaced minted key when the id is empty, never on any wire) is what
+  hosts, adapters, and the exact-key drain select by: cotal_inbox, the Claude Code hooks,
+  the OpenCode plugin, the Codex host, the Hermes bridge and its Python sidecar, and the pi
+  driver. The drain API is renamed for what it takes (drainInboxDeliveries, missingKeys).
+  Eviction classification, in-flight holds, scope routing, the focus-recall tie-break, and
+  the scoped drain's selection no longer key on the empty id either. The Hermes bridge no
+  longer wedges on an empty-id message. Delivery pumps in core now treat an absent or
+  non-string id as a malformed envelope per SPEC section 5 (durable terminate, live drop,
+  history and recall skip).
+
+  What this restores: before the receive key, an id-less delivery was unaddressable: the
+  raw id swept every pending empty-id item in one drain call, and once filtering closed
+  that, the item could never be drained or acked, was re-shown on every windowed inbox
+  read, and on a durable channel accumulated as an unretirable entry until the 200-entry
+  overflow valve evicted it, roughly a model turn of churn per entry, while one hostile
+  empty-id ambient publish self-drove back-to-back host turns on the pi adapter. This was
+  a violation of the SPEC section 8 ack-only-after-surfaced obligation at the receiver,
+  not only an adapter defect.
+
+  The cost is stated rather than hidden: with no id there is no coalescing either, so a
+  redelivered copy of an empty-id message can surface twice on a path that is already
+  at-least-once (live remains at-most-once). Dedup for real ids is unchanged: their
+  receive key is their wire id and their coalescing is untouched. SPEC section 4, section
+  7 item 5, section 8, and section 12 item 12 now state the receiver-scoped rule, and the
+  client-builder guidance mirrors it.
+
+  One named follow-up stays open: Plane-3 durable fan-out derives its publish msgID from
+  the message id, so distinct empty-id messages can still be collapsed inside the broker's
+  duplicate window on a durable channel before this receiver sees them. That path is its
+  own issue; this change's guarantee is the receiver.
+
+### Patch Changes
+
+- 68a8041: The inbox overflow valve now gives up on a directed message that keeps cycling. Leaving a
+  sacrificed directed message un-acked lets the broker redeliver it once there is room, which turns
+  permanent loss into a delay - but an un-acked id can be handed straight back into a still-full
+  inbox and evicted again, indefinitely, spending broker and connector throughput while every seat
+  involved reports healthy. Evictions are now counted per id and the reprieve ends after five, acking
+  the message and reporting the drop on stderr. The tally clears whenever a message is actually
+  handled, so one that eventually lands never carries history toward the cap, and the bookkeeping
+  itself is bounded so tracking churn cannot become a leak.
+- c6db901: The auth provider name is one exported constant shared by the provider and the discovery bundle, and the seam between the served document and the consumer that registers from it is now tested live.
+
+  The auth-service's public face serves `/.well-known/cotal-mesh`, and that document is exactly what
+  `cotal meshes add --from <origin>` fetches and registers from. The document's shape was fixed
+  separately; what was still held only by agreement is the provider NAME. It appeared as a bare
+  `"cotal"` literal at three sites, two of which are the two ends of one contract: the name the
+  registered `AuthProvider` answers to, and the name the served document advertises. A document naming
+  a provider other than the one serving it parses cleanly — the consumer requires a provider name, not
+  any particular one — and registers an entry that resolves to nothing. Those sites now read a single
+  exported `AUTH_PROVIDER_NAME`.
+
+  The regression guard lives at the composition root (`bin/smoke/discovery-bundle-consumable`), which
+  is the only tier permitted to import both the auth daemon and the CLI's consumer — the seam the
+  original defect hid behind is precisely the boundary those two packages may not cross directly. It
+  starts a real auth-service against a real broker and IdP, fetches the document over the wire, and
+  hands the raw bytes to the shipped `checkUserBundle`. Nothing in it constructs the shape it hopes to
+  see. That crossing is the part that had never existed: both sides had passed review because each
+  side's own tests build the shape that side expects, so the producer's smoke asserted the fields it
+  had just written and the consumer's smoke fed itself a hand-written fixture.
+
+  The provider-name cell compares the served name against `cotalAuthProvider.name` — the registered
+  provider's own identity — rather than against a string the test also chose, so it grades the outcome
+  (the two names agree) instead of the mechanism (both sites read one constant). Grading the mechanism
+  would pass a tree where both sites moved together, which is the failure this is for.
+
+  Scope, stated exactly: this unifies the provider name and proves the served document parses. It does
+  not change the document's shape or its fields, and registration applies further gates after that
+  parse — `checkServer`, TLS intent, and the dial policy on the bundle's `server` — so a deployment
+  that cannot publish an honestly dialable broker coordinate is still not registrable, and nothing
+  here weakens those gates or invents a coordinate to satisfy them.
+
+- 3443c57: Stabilize Jcode startup around asynchronous MCP registration: retry the mandatory orientation proof once, preserve loud refusal when it remains unavailable, open the foreground TUI during readiness, and issue the stale-orientation notice only after a completed mesh join.
+- 196dddb: Spec text plus one corrected source comment, carried into the embedded docs bundle: the `goaleff` and `epname` value
+  machines are now stated in the wire spec (phases, states, legal edges, per-phase field sets,
+  actor roles, and the rule that a settle requires the goal's terminal fact to exist first),
+  and three key-authority claims are corrected. `epmig` records cutover runs and supplies key
+  material nowhere else, so the `goaleff` generation token is the accepted submission's EPJ
+  `sourceSeq` and only that. `goalidx` gets its writer named as the goal-writer principal
+  rather than the bare commit principal. `effect` is marked as reachable only under
+  `protocol.v: 2`. The spec also now says explicitly that it does not decide which principal
+  may act as a sweeper, rather than leaving that to be inferred from a role name. The `epmig` record
+  kind's own source comment carried the same wrong claim the spec sentence corrects, and is fixed in
+  the same change so the two cannot drift apart again.
+
+## 0.29.2
+
+## 0.29.1
+
+## 0.29.0
+
+## 0.28.2
+
+## 0.28.1
+
+## 0.28.0
+
+### Minor Changes
+
+- a71fbd3: A failed turn is published as a run error, so a reader of an event plane can tell a turn that failed from a turn that finished.
+
+  Every connector used to close a run with `RUN_FINISHED` whichever way the turn ended, including a
+  turn its own harness had already classified as failed. `RUN_ERROR` was in the vocabulary, the
+  bracket machine accepted it as a close and the dashboard rendered it, but the shared close path had
+  no way to say it.
+
+  The close on the shared emitter and holder now takes an optional failure, and two connectors supply
+  one from a record they actually receive. Claude Code ends a failed turn on its own `StopFailure`
+  hook, and that turn now closes with `RUN_ERROR` carrying the harness's error kind (`rate_limit`,
+  `billing_error`, `server_error` and the rest) as the code. OpenCode reports a dead turn on
+  `session.error`, and that turn now closes with `RUN_ERROR` carrying OpenCode's own error name and
+  reason, except a turn a person stopped, which arrives on the same event and is not a failure.
+
+  The shared close also bounds that failure detail. Upstream free text (`error_details`,
+  `data.message`) can encode past the live frame ceiling; packing it as-is used to refuse the close
+  before any terminal became durable and then permanently kill the holder. The close now rebuilds the
+  one `RUN_ERROR` so it fits, keeps the code, and the emitted message says the original detail was
+  omitted or shortened because of the bound. A short message is unchanged. There is no second protocol
+  and no per-connector size table: every producer already goes through this close.
+
+  Deliberately not built: connector-specific caps, a second close method, preview-plane truncation on
+  the durable path, and any change to `packUnits`'s fail-loud rule for source observations. Those would
+  not close this hole and would duplicate a contract that already has a caller.
+
+  Migration: nothing is removed and no existing call changes shape. A consumer that only handles
+  `RUN_FINISHED` now sees fewer of them on failing sessions; the event type it needs to also handle
+  has been part of the vocabulary and accepted by the bracket machine all along.
+
+- 86f6b10: Remove the implicit `general` channel floor: undeclared access now grants nothing
+
+  An agent that declared no channel access used to fall back to `["general"]` for its
+  active read set and read ACL. That floor was applied in seven places — the provisioner,
+  the agent-file loader, the manager's spawn path, the CLI's `spawn`, the connector's
+  config resolver, and the endpoint's own channel list — so an agent with no frontmatter
+  silently joined a channel nobody had granted it.
+
+  The fallback also could not see the credentials it was guessing against. On a manifest
+  spawn the materialized persona carries no access frontmatter, so the connector fell back
+  to `general` while the minted creds allowed only the manifest's channels; the broker then
+  refused the subscription and the agent joined nothing, with no error naming the cause.
+  `COTAL_SUBSCRIBE` forwarding was added to paper over exactly this.
+
+  Undeclared read is now empty, matching the repo's no-fallbacks rule and the existing
+  default-deny on `allowPublish`. `Endpoint.send()` throws instead of defaulting to
+  `general` when the endpoint is on no concrete channel — a caller that never declared a
+  channel now gets a loud error rather than a message delivered somewhere it never asked
+  for.
+
+  The seeded personas change with it: `default_agent` no longer auto-subscribes to
+  `general` and no longer carries a wildcard post ACL (`allowPublish: [">"]` → `[]`,
+  default-deny), and the demo personas move to their own `welcome` channel. Channels are
+  implicit — created on first use — so no channel provisioning is required.
+
+  Breaking for anyone relying on the implicit floor: an agent that read `general` without
+  declaring it must now declare it.
+
+- 7bc71ab: Serialize the top-level session swap. The plugin bus does not await the event handler, so a second
+  top-level session created while the first swap is still draining captured the same holder to
+  retire and installed its replacement over the first one. The dropped replacement had already been
+  adopted, which is where its write-ahead log and subject frontier are opened, so it was orphaned
+  with an open handle and the session it held left a run open on the wire with nothing reporting it.
+  The holder they both replaced was drained twice.
+
+  Swaps now run one at a time, so each reads a holder that is installed and no longer being retired
+  underneath it, and the chain carries the absorbed tail of each swap, so the next one still runs
+  after a failed drain.
+  Installed rather than settled: a swap waits for the holder it RETIRES, not for the one it installs,
+  whose adoption is still starting when the swap resolves.
+  The connector also logs a retirement the way it already logs an adoption, which is what makes a
+  retirement that never happened visible at all.
+
+  Serializing the swap was not enough on its own, because the session id and the holder that serves
+  it are two separate things and an event could arrive while they disagreed. Ordering them only moved
+  the window: with the id assigned before the drain, an event in the gap was carried by the new id
+  into a holder still bound to the previous session, and that holder refuses a second session
+  permanently, so the event plane died rather than skipping a frame. Event work is now routed by
+  asking the holder what it is bound to, so an event reaches a holder only when that holder already
+  serves its session or serves nothing yet.
+
+  A session that OpenCode attaches to, rather than creates, is also covered. The first event of such
+  a run arrives before any session was created, and it now reaches the event plane instead of being
+  dropped, so an attached session publishes from its first turn rather than staying silent until the
+  next reset.
+
+  Stopping a seat is now a teardown rather than an exit. The cooperative stop and the editor
+  unloading the plugin run one shared routine, so neither can drift from the other, and it attempts
+  the offline publish in front of the join rather than behind it: a supervised seat is hard killed after
+  its runtime's grace window, so presence queued behind a long drain is the thing that gets lost.
+  Queued event work is then given a bounded chance to settle inside whatever time the runtime leaves.
+
+  Once that routine has begun, the connector starts no turn of its own, admits no hook work, and
+  runs no `cotal_*` tool call. That first part now holds for a drive that was ALREADY PAST the check
+  as well, which it did not before: the guards were read once, session creation was awaited, and
+  nothing looked again, so a turn admitted while the seat was healthy could be submitted after
+  departure had published. The phase condition is one predicate now, read on the way in and again on
+  the way back from that await, and a drive refused there consumes nothing, so the batch is still in
+  the inbox for a later wake in the same process.
+
+  Separately, the operator's spawn prompt is no longer lost when something else gets in front of it.
+  The boot task used to clear the prompt and then ask for a turn; if a natively submitted prompt had
+  already made the session busy, that request returned early and the text was gone. The text is now
+  cleared only once it has actually been submitted, and it counts as pending work everywhere the
+  connector asks whether there is anything to drive, so being beaten to the session costs a retry
+  rather than the prompt. What it does NOT do is cancel the editor. A hook steers
+  OpenCode by mutating its `output` argument rather than by what it returns, and `chat.message`'s
+  output carries no field that cancels or skips a turn, so a prompt submitted natively through the
+  editor or its API still starts one. Whether that turn's events reach the plane is timing rather
+  than a rule: the endpoint stays up until the end of the routine, so work already queued can still
+  settle, while work arriving after the fence closes is refused. The refusals are stated as a condition on the state rather than as a list of the callers
+  they cover, which is what let the earlier versions through: a turn could still be started by the
+  deferred drive a swap fires when its own cutover completes, a late presence event could put a seat
+  back on the mesh it had just left, and a tool call already inside the model's turn had no way to
+  know a stop was running. A refused tool call says so rather than returning nothing, because its
+  caller is waiting on a result and silence would read as a hang.
+
+  The same loss had one more door, and that one is a failure rather than a refusal. Every refusal
+  above leaves the drive through a guarded return, where the input it was carrying is put back by
+  hand. A submission the host rejects leaves through the error path instead, and that path put nothing
+  back. It looked safe only because most inputs are parked somewhere else already: the wake for an
+  @mention in focus is not, because its body is acked at ingest and stays recallable while the wake
+  itself lives only in the string handed to that one drive. So a rejected submission destroyed the
+  wake, and the retry that exists for exactly this case then saw no pending work and did not run,
+  leaving a seat that was never told to go and look. The error path now parks its input like every
+  other exit, so a failed submission costs a retry rather than the wake.
+
+  One slot, and one caller clearing another caller's wake. The three exits above each put their input
+  back by hand, but they all put it in the SAME place, and the clear that runs after a successful
+  submission sat on the far side of an await. A drive parked in session creation had read its input
+  before that await; a second caller then reached the entry guard, parked its own wake in that slot and
+  returned; and when the first call finally submitted, it emptied the slot on the strength of what IT
+  had taken. That is a lost update across an await, and it destroyed a wake that arrived through
+  exactly the guarded exit these changes exist to protect. The clear is now ownership checked, by
+  generation rather than by value, because the nudge names the sender and not the message, so two
+  mentions from one sender are byte identical and comparing them would report "still mine" about
+  someone else's input.
+
+  A wake could also be destroyed before it ever reached that slot. The handler for an @mention in
+  focus declined to ask for a turn while one was already running, which is the right thing to do one
+  handler above it, where the message is buffered in the inbox and the next turn picks it up. This
+  one has nothing buffered behind it: the body is acked and dropped as it arrives, so the nudge is
+  the only copy, and declining did not defer it, it discarded it. The turn then ended, found nothing
+  pending, and the seat was never told it had been mentioned at all. That wake is now handed over
+  whatever the seat is doing, so a busy seat parks it and drives it when the turn ends.
+
+  What that does and does not promise, stated narrowly on purpose. It does NOT prevent message loss:
+  an @mention in focus is acked at ingest, and where the channel permits replay its body stays
+  recallable from the server, so the content was never riding on the wake. Where a channel denies
+  replay, the body is gone by that channel's own policy and no wake can bring it back; the connector
+  deliberately does not buffer it, because doing so would hand a seat in focus history that the
+  channel refuses to everyone else. What this prevents is a caller's wake being erased, whether by an
+  unrelated call's clear or by a handler that never passed it on. One slot is the design rather than
+  a limit: a later wake overwriting an earlier one costs nothing, because any single wake that fires
+  makes the seat pull its inbox and recover whatever that channel will give back, while emptying the
+  slot entirely means no pull is ever triggered. The invariant is that at least one wake survives to
+  fire, not that every wake is kept.
+
+  Departure is also ordered behind the work the seat has already admitted, for as long as a short
+  bound allows. A presence write is not atomic, so a call admitted before the stop could be parked
+  mid-write while the teardown published offline, and then put the seat back to work after it had
+  announced it left; on the wire, a roster read `working` after `offline`. The teardown now waits,
+  briefly, for interactive work it has already admitted before it attempts departure, and joins the
+  slower event work afterwards as it already did. Event work is deliberately not in that wait,
+  because waiting on a drain is what publishing departure early exists to avoid.
+
+  That wait is for the whole admitted set rather than for the first thing to happen to it, and it says
+  so with `Promise.allSettled` rather than by absorbing each call by hand. The hand-rolled version was
+  the same defect one level up: a map can absorb SOME elements, and a review proved by live mutation
+  that absorbing only the two ends passed every cell the suite had at the time. The primitive waits for
+  every element and never rejects, so partial absorption is no longer a state this code can be in.
+
+  That wait is bounded below the shortest runtime grace window, which is what leaves room for
+  departure to be published before a hard kill under ordinary conditions. It is a margin rather than
+  a guarantee: the publish itself has no deadline, so a slow write in the time the bound leaves is
+  lost with everything else the kill takes. The other tradeoff is stated rather than implied: a
+  straggler that outlives the bound is not cancelled, so it can still complete after departure has
+  been published.
+
+  A wake that arrived before the boot prompt used to starve both of them, permanently and silently.
+  The two share one slot: the boot text was carried only when that slot was empty, so a focus
+  @mention landing while the boot task was still waiting for the session parked the nudge, and the
+  boot task's own request then read that nudge, put it straight back and returned. Nothing could
+  empty the slot afterwards, because emptying it takes a submission, a submission takes the boot text
+  cleared, and clearing it takes the submission that had just been refused. The seat stayed online
+  with nothing logged and no retry scheduled, and it went deaf: the spawn prompt, the wake, and every
+  later connector-submitted turn including a directed message were all lost for the life of the
+  process. Against the previous release this was a regression, which lost the wake and still
+  submitted the boot. The two now go out together in one turn rather than competing for the slot. The
+  boot floor says the operator's prompt is the first turn this connector submits, and a wake says
+  only that the seat should go and look, so there is nothing to order between them.
+
+  The event plane also gives back what a session took on disk, which is the other half of a `/new`
+  and the half that is not visible on the wire. Two things are created for a session that publishes
+  events and they have different lifetimes, so they are released differently.
+
+  The principal lock is per principal and per workspace, shared by every session of that agent. It
+  was taken and never given back: the connector read the location it came with and dropped the lock
+  itself, so nothing in shipped code released one. The record then went on naming a process that was
+  alive and no longer publishing, and a REPLACEMENT process for the same principal was refused its
+  own event plane. It is now released at the final event teardown and only there, since a `/new`
+  must keep it for the session that follows. Both ways out reach that teardown, so the editor
+  unloading the plugin while its host keeps running releases it exactly as a supervised stop does.
+
+  A session's write-ahead log is per session and its lifetime is stated rather than assumed, because
+  a log exists so a later start can recover what was not yet published and deleting one early
+  destroys exactly that. A retired session's log is removed once its run has been closed on the wire,
+  AND the drain that closed it settled rather than spending its bound, AND the log holds no frame the
+  broker never confirmed. Either of the last two keeps it, for different reasons that the connector
+  distinguishes in what it logs: an abandoned drain is uncancelled and may still be writing, while a
+  pending frame is the one thing only a later start reading that file can settle. The live session's
+  log survives teardown, because a teardown is not a retirement: nothing has told an observer that
+  thread ended, and a start that adopts it again is the case the log is for. So a process leaves one
+  log directory behind rather than one per `/new`.
+
+  `@cotal-ai/connector-core` gains a close on the emitter holder to go with that. Retiring a holder
+  was a dropped reference rather than an act: it refused nothing afterwards, and a late hook could
+  still start or pump an emitter its owner had finished with. Closing refuses admission and then
+  joins what is already queued. It cancels nothing and releases no durable state, because the log's
+  lifetime and the lock's are the connector's to decide and not the holder's.
+
+- a999a98: The advertised tool surface and the orientation card now gate on **authenticated**, not on "has static creds", so a user-auth agent is no longer told it can spawn.
+
+  `cotal_spawn` and `cotal_persona` ride the `spawn` capability, and the gate read `!config.creds` as
+  "open mode". That was true while there were two identity states. There is now a third: user-mode
+  auth. It carries no static creds by construction; the pair is refused at parse, at launch, and
+  at connect, one launch carrying one identity plane. So `!config.creds` was always true on a user-auth
+  agent, and every agent on a user-auth mesh was advertised both manager-op tools whatever its
+  capabilities. The wire still refused the call, so nothing could be done with them; what broke is the
+  guarantee the gate exists to keep, that an agent sees these tools only when it can actually use them
+  rather than discovering the denial by trying.
+
+  The orientation card was wrong twice on such a mesh. It listed both tools, and its access line said
+  `open mode (grants advisory, host-trusted)` for a mesh whose grants are broker-enforced. The tool
+  list is corrected by the wire the moment an agent tries; a card that misstates the security posture
+  is corrected by nothing.
+
+  Both sites now call one exported predicate, `isAuthed(config)`, mirroring the endpoint's own
+  open-vs-auth gate, so a third identity plane is one expression to change rather than a search.
+  `token` / `user` / `pass` are deliberately excluded: shared-token auth carries no owner+actor grant
+  and no per-agent publish ACL, so the broker gates nothing per agent for it and hiding the tools there
+  would be the same untruth in the other direction.
+
+  Open mode is unchanged in both directions: no identity plane means everything stays visible, exactly
+  as before.
+
+  Migration: an agent on a user-auth mesh without the `spawn` capability no longer sees `cotal_spawn`
+  or `cotal_persona`, and its orientation card now reports auth mode. Granting the capability restores
+  both. Static-creds and open-mode agents are unaffected.
+
+- 316f84d: Cap the dashboard delete route's request body at 8 KiB.
+
+  `POST /api/channel/delete` read its body with no size limit and no look at `content-length`, so the
+  ceiling on a request was the process heap: a 30 MB post was read in full, answered with a 70 MB
+  refusal, and cost 1.39 GB of peak RSS before the route formed any opinion.
+
+  The read now refuses at the threshold with a `413` naming the limit and the size that met it, on
+  both the declared length and the bytes as they arrive, so a body with no declared length is capped
+  too. It is never truncated to fit: a shortened channel name is a name the caller did not send, which
+  is the aliasing shape this route's validator already exists to refuse. Bodies under the cap, extra
+  fields included, are untouched.
+
+  The refusal also closes the connection the oversized body arrived on. Without that, a caller asking
+  to keep the connection alive still got to send every byte, because the server reads the rest of a
+  body to get the socket back for reuse: the refusal was early but the work was not bounded. Ordinary
+  within-cap requests keep their connection and their socket stays reusable.
+
+  `@cotal-ai/connector-core` is listed because it ships the docs bundle, which embeds the page this
+  change updates and is regenerated here. Its only diff is that regenerated file.
+
+### Patch Changes
+
+- 29c5268: A peer flooding a channel can no longer silence directed mail. The inbox overflow valve sacrificed
+  pull-only backlog first, but pull-only requires a non-forgeable signal it did not have: it is
+  `!mentionsMe && historical`, and `mentionsMe` is read from the payload `mentions` field, which the
+  sender controls. A peer stamping the victim's name on every flooded message made none of its traffic
+  pull-only, so eviction fell through to the oldest entry, which is the message that had been waiting
+  longest, and acked it without marking it handled - unrecoverable, since the broker then never
+  redelivers. Ordinary ambient channel traffic at volume did the same with no forgery at all.
+
+  Eviction now prefers channel traffic over anything addressed to this agent, reading directedness
+  from the subject-derived `kind` rather than from the payload, and a directed message that must be
+  sacrificed is left un-acked so it can be redelivered. Channel ambient is still acked, because
+  replaying it is what the earlier history flood was.
+
+- b8ee849: Announce the operator-global seed-store payload write, and its deletions, on the provenance channel. `cotal up` and the built-in-connector reconcile re-seed `~/.config/cotal/seed/store/<version>`, which is a machine-wide action (shared by every space, project directory, and checkout on the machine, moved only by `$XDG_CONFIG_HOME`), yet the store write was previously silent. It now emits a `wrote operator-global seed store payload` provenance line naming the path on each materialization, so re-seeding from a non-released checkout reads as the machine-wide write it is. The idempotent reuse path stays silent.
+
+  The same reconcile also garbage-collects unreferenced store generations, and that was silent too. A new `removed` verb on the provenance channel names every directory the collector deletes, because a silent delete is worse than a silent write: the write at least leaves the thing it made, while the delete leaves nothing to notice. The announce rides stderr with no failure policy, so a closed stderr keeps the write and loses the line; that bound is stated at the call site and in the config reference, which also documents the isolation mechanism.
+
+  The config reference that documents all of this ships inside the connector as well as in the docs tree, so the regenerated documentation bundle carries the same text: an agent asking `cotal_docs` for the configuration page now gets the announce, the removal announce, and the stderr bound along with everything else that page already said.
+
+- 1f44ca6: Add an optional reverse-proxy-facing auth exchange listener with generated mesh discovery, credential-based public proof, isolated throttling, and `cotal up --user-auth` configuration.
+- 4f7747f: The block that carries peer messages into a turn now names the order of operations rather than only
+  the reply verbs: do the work with your own tools, verify it, then reply, and never report an action
+  that was not performed. A delivered peer message is frequently a work order, and its tail arrives at
+  the moment the model chooses what to do next, so a reply-only tail reads as an invitation to answer
+  instead of to act.
+- e26f4d1: Allow an already-granted managed agent to refresh its bearer through a pinned HTTPS public exchange URL without local auth-service state or capability material.
+- 200a93f: Enable remote user-auth mesh registration now that managed agents can consume the recorded pinned exchange and sentinel through the remote bearer client. Remove the temporary development-only registration hatch and its fail-closed sequencing refusal.
+
+## 0.27.0
+
+### Minor Changes
+
+- 0aed7fa: Historical channel ambient is now buffered pull-only: a join backfill is delivered as recallable context instead of automatic turns, so a seat joining a long-lived mesh no longer receives the channel backlog as a storm of instructions. Historical @mentions and DMs keep automatic delivery, and live ambient is unchanged.
+
+## 0.26.0
+
+### Patch Changes
+
+- f339690: Document capability handles as a distinct cost of default environment inheritance, and make two env-boundary suites real gates.
+
+  The configuration guide told operators that `spawn.env` protects secrets living only in the environment, and reassured them that a shell reads `~/.ssh` either way. That understates what inheritance forwards. `SSH_AUTH_SOCK` names a live `ssh-agent` rather than holding a secret, so an inheriting child can ask that agent to sign for any key it holds, and it keeps that power when no private-key file exists on disk at all. The guide now names capability handles as their own class, states the `ssh-agent` case, and records that model-catalog discovery in the `codex` and `opencode` connectors runs the harness with the operator environment and does not consult `spawn.env`.
+
+  The environment-boundary suite asserted that an unenumerated `COTAL_*` sentinel was absent from a spawned child, but never set it in the parent, so the assertion could not fail. The sentinel is now injected, which makes the cell prove the reset is driven by the prefix rather than by the enumerated per-session list. `smoke:hermes-launch-env` and `smoke:env-isolate` are both added to the sharded CI suite list; the hermes suite carries the connector's inherit, reset and both-containment-mode coverage and was previously reachable only through a package-local command.
+
+## 0.25.0
+
+### Minor Changes
+
+- 17f8c57: OpenCode sessions publish AG-UI events, so a seat's work is readable by a program rather than only by a person.
+
+  A session spawned with `--events` now publishes run boundaries, assistant text, reasoning and every
+  tool call with its arguments, its end and its result, on `events.<owner>.<actor>`. Until now only
+  Claude Code did; an OpenCode seat's event panel was empty.
+
+  Migration: nothing is removed and no behaviour changes for a session that does not ask for events.
+  A personal `opencode` with the plugin installed still publishes nothing, because arming is
+  `COTAL_EVENTS` and the launcher sets it only for a `--events` spawn.
+
+  Two limits are deliberate and documented. No user-authored text is published: OpenCode injects a
+  peer batch by prepending it into the human's own text part, so one record holds both authors with no
+  boundary in it to filter on, and guessing where one ends would fail open the moment either formatter
+  changed. And no step events or usage numbers: OpenCode's step records carry no step name and no key
+  shared between start and finish, and what the finish carries is cost and tokens, so emitting a step
+  boundary would tell a reader that a phase ended when what happened is that counts arrived.
+
+  One OpenCode process can hold several sessions, and `/new` is a context reset that keeps the mesh
+  identity. Each session publishes under its own thread id on the one channel. The session being left
+  is flushed and its open run is closed before the switch, so a reader is never left holding a run
+  that never ends.
+
+  The reader is the same on every connector, so the channel, the grant and how to subscribe are
+  documented once in the Claude Code page and linked from the OpenCode one.
+
+  `@cotal-ai/connector-core` is listed because the generated documentation bundle it carries is
+  regenerated with the pages.
+
+- aa6c63d: Codex seats publish an AG-UI event plane
+
+  A Codex seat launched with `cotal spawn --events` now publishes a structured account of its work on
+  `events.<owner>.<actor>`: run boundaries per turn, assistant text, reasoning summaries, and the tool
+  calls the model makes through Codex's function-call and custom-tool interfaces, each with its
+  arguments, its end, and its result. Before this the connector had no event plane at all, so an
+  external observer watching a mesh saw nothing from a Codex seat.
+
+  The durable source is the thread's rollout file inside the seat's own isolated `CODEX_HOME`, not the
+  live app-server stream. The file is written by the child and outlives this process's view of it, so a
+  seat that restarts its own app-server picks a thread's records up where it stopped rather than from
+  whatever the socket delivers next.
+
+  Four behaviours are worth knowing before reading a stream. A turn that fails ends its run with a run
+  error carrying the code Codex reported, rather than as a finished run, because Codex records a
+  failure on the turn's own completion record. No user authored text is ever published: your prompts,
+  the peer messages injected into the thread, and the persona's developer instructions are all
+  withheld, because the events channel carries a different read ACL from the channel you typed into.
+  A restarted app-server is a new thread and gets a new stream: the seat finishes the old one, closing
+  any run it left open, before it begins the new one. That holds even when the new thread's file is
+  slow to appear, though the order there is the other way round: the seat spends its whole bounded
+  look for the successor first, and the old run is closed when that look gives up, not at the moment
+  the restart happened. From the give-up on it publishes nothing until a later turn boundary binds
+  the successor, rather than continuing to report the dead thread's activity as if it were live. And Codex's own built-in tools, web search, tool
+  search and image generation, are not published, because their records carry an end with no start and
+  no key that joins the halves.
+
+  What is published is worth stating plainly: an observer of the events channel sees every tool call's
+  arguments and outputs verbatim, so withholding user authored text does not make the stream safe to
+  widen.
+
+  Two limits are worth knowing as well. A stream begins at the last complete record in the file at the
+  moment the seat binds to it, never at the beginning of the thread, so anything written before that
+  moment is not republished; the seat says so in its log when it happens. And a seat whose broker was
+  unreachable when it started loses its emitter, reports that it did, and rebuilds it at a later turn
+  boundary once the broker is there, so the outage costs the turns it covered rather than the rest of
+  the seat's life.
+
+  Migration: none. The plane is opt in per spawn, arming is separate from authorization, and a seat
+  launched without `--events` behaves exactly as before.
+
+- a4e4c49: Codex event plane: take the stream's starting boundary at the bind, not when the emitter finished starting
+
+  An armed Codex seat announced its stream as started at the bind, then positioned itself wherever the
+  rollout file happened to be once its asynchronous setup had finished: the write-ahead log directory,
+  the subject frontier, the log open, then a channel resolve and a preflight. Every record the thread
+  appended inside that window landed behind the cursor and was treated as already published, so a turn
+  that completed inside it was dropped permanently and silently, underneath a line that had already
+  said the stream was live. The boundary is now captured at the bind, before the announcement, and
+  substituted on the emitter's first read, so the announced fact is true at the moment it is
+  announced. A log that already carries a cursor is a resume and keeps it, because a cursor written by
+  a live emitter is the honest one.
+
+  It is substituted rather than written into the log, and that half is what keeps a failed start from
+  changing what a later one publishes. A seat whose broker is not up yet loses its emitter at launch;
+  a boundary written into the log before that start would outlive it, and the next bind would read it
+  as a resume and republish everything the thread wrote while the seat was cut off, onto an events
+  channel whose read ACL is not the input channel's. The log's cursor is now written only by an
+  emitter that started.
+
+  Migration: a rebind after a lost connection declines to publish two things, and readers who watched
+  the old behaviour should expect both. It declines what the thread wrote during the outage. It also
+  declines the turn whose own boundary triggered it, because Codex writes a turn's first record before
+  it announces that the turn started, that announcement is what a rebind runs on, and a run is never
+  opened from the middle of a turn. The first turn to start after the rebind is published in full.
+  One case is different and is stated in full rather than in passing, because it is the one a reader
+  is most likely to be surprised by: if the emitter had already been publishing this thread and then
+  died, its position is in the log, and the rebind continues that log rather than starting where it
+  binds. An outage there costs the wait, not the content: what the thread wrote while the plane was
+  down, and what it wrote while the plane was already dead, is delivered once the plane is back. Two
+  things follow that a reader should not have to discover. A tool result is published as the tool
+  returned it, so text a tool read on the seat's behalf from a channel with a narrower reader set
+  crosses into the events channel unredacted and unattributed; and a backlog written while the plane
+  was terminal is delivered rather than discarded. The session's own record of the user's words and
+  the developer instructions is not published in either case. Neither carrier is introduced here and
+  neither changes shape; both are the same at the merge base and no new shape is added. What this
+  change does alter, on every armed seat and not only the one whose emitter never started, is which
+  records reach the stream: what the thread appended between the bind and the emitter's first read
+  used to land behind the cursor and be dropped, and it is published now. A whole turn can sit in
+  that window, tool results included, so the carrier above covers a stretch of the session it
+  previously lost. The reader set that follows from all this is a requirement and not a guarantee:
+  the grant does not enforce it. A spawn through the manager gives a seat publish rights on its own
+  event channel and nothing else and a spawn naming a different agent's is refused at the door, but
+  that fence is the manager's, it reads the concrete form rather than a pattern, and a foreground
+  spawn on your own machine grants whatever you name. Read access is minted separately and out of
+  band either way, so holding the events readers to at least the width of every channel the seat's
+  tools can read is the operator's policy to keep. Nothing is sent twice in either case. A seat launched
+  without the event plane armed is unaffected.
+
+  The window above is now graded rather than argued. A test-only setting widens the emitter's setup
+  so a fixture can release a whole completed turn into it and assert the turn reaches the wire;
+  absent, empty, zero, negative and unparseable all mean no wait, so an uninstrumented seat runs the
+  path it ran before. Measured, and the reason the cell was needed: the mutant that deletes the
+  boundary rule passed the suite three times in five without it, failing on disjoint cells the two
+  times it failed.
+
+- b31d2af: Drop `NEBIUS_API_KEY` from the model-provider allow-list. How a harness authenticates to an
+  inference provider is the harness's business, not Cotal's: OpenCode, Codex, and Hermes each
+  have their own provider config and credential store, and Cotal carrying a per-vendor env name
+  meant every new inference provider needed a change here to work through a managed spawn. The
+  Token Factory operator guide goes with it.
+- 838c01e: `cotal_inbox` clears only the messages it actually returned, so a recovery read can no longer consume mail it never delivered.
+
+  The read is destructive, recovery is when the payload is largest (reconnecting brings a channel-history
+  replay with it), and a payload can exceed what the host will hand to a model. Composed, the first pull
+  after a reconnect marked a real direct message read inside a response nobody received. Measured before this change: 200 messages, 463,788 characters, one call, inbox left at zero.
+
+  Now one call carries at most a receivable window and acks exactly what it rendered. Direct messages and
+  role requests take the window ahead of channel traffic, with replayed history last, so first-party mail
+  is not the thing a backfill crowds out. Whatever does not fit stays buffered, unacked and named in the reply, and comes back on the next call. `peek: true` still clears nothing, and is now bounded too.
+
+  A message larger than one whole response is never consumed. It is named in the reply with its sender and
+  size and left buffered, because a payload that cannot be delivered must not be cleared. The rest of the
+  buffer flows past it, so one such message wedges nothing else.
+
+  Focus recall is walked by this session's own mark, and a sender's clock cannot move it. A recalled
+  item carries the timestamp the sending endpoint stamped, so one peer running ahead, or one writing
+  whatever it likes, could park the mark in the future and filter every ordinary message after it out
+  of recall for the rest of the session. Items at or behind the local clock are ordered by timestamp
+  and move the mark; items ahead of it are handed over once, tracked by id, and never move it, under a
+  bound whose cost falls on the sender that spends it.
+
+  A response that must choose between carrying a message and describing the ones it is not carrying
+  carries the message. The held-note gives up its names, then its counts, then itself, rather than let
+  a message that fits in the window go undelivered because a note about an undeliverable one was
+  riding beside it.
+
+  A peer cannot write the reply's own framing. Every byte of a `cotal_inbox` reply is assembled from
+  text a peer controls, and the reply is structured: a head line, one line per message with its sender
+  in brackets, then the held-note and any warning. A message carrying newlines was writing that
+  structure itself, forging a second message line attributed to another named peer, the held-note with
+  its call-again promise, and the recall warning. A sender name, a service name and a channel label
+  could each close their own bracket the same way.
+
+  A line that begins at column zero is now written by the tool and never by a peer: one message is one
+  line plus indented continuations, and every peer-controlled field rendered into the frame carries
+  neither a closing bracket nor any character a line splitter may honour. The neutralization lives in
+  one helper, so the wake hints the Claude Code, Codex and OpenCode connectors build from a peer name
+  are covered by the same rule.
+
+  The focus recall mark is forgotten whenever the frontier under it changes. It records a position in
+  one walk over one frontier, and entering or leaving focus replaces that frontier, so a mark left from
+  an earlier episode was filtering a new episode's messages out of recall whenever they were stamped
+  behind it.
+
+  Migration: a caller with a large backlog now needs more than one `cotal_inbox` call to empty it, and the
+  reply says how many messages are still held. A multi-line message renders with its continuation lines
+  indented by two spaces, and a name, service or channel containing `]` or a line separator renders
+  those as spaces. Nothing is dropped, nothing is truncated, and no argument changed.
+
+- a087c2b: A spawned agent now inherits the operator's environment. A harness you installed and configured
+  should behave under `cotal spawn` the way it behaves when you run it yourself, and the alternative
+  was Cotal maintaining a list of inference vendors: every new provider needed a change in Cotal
+  before it would work through a managed spawn. `MODEL_PROVIDER_KEYS` and the per-connector lists
+  that extended it are gone, and Cotal no longer names an inference vendor anywhere in its source.
+
+  Cotal still resets its own `COTAL_*` namespace before the child starts, keeping the machine-wide
+  knobs (`COTAL_HOME`, the feedback set, the default-agent pair, the `*_BIN` overrides, the timing
+  knobs). That reset is not configurable, because it is identity and not preference: a connector
+  supplies the per-session names for each child and does so conditionally, so an inherited value is
+  never overwritten and would hand an agent another agent's credential path, ACL, or lifecycle uid.
+  The whole prefix is stripped rather than a named list, because which names a connector sets varies
+  between connectors and a deny-list only ever names what its author remembered.
+
+  To confine a spawned agent instead, declare `spawn.env` in the cotal config file. The child then
+  gets a fixed OS allow-list plus exactly the names you list. An empty array is a real policy meaning
+  the OS allow-list alone. Note what this does and does not buy: `HOME` is forwarded either way, so
+  an agent with a shell reads `~/.aws` and `~/.ssh` regardless, and this protects only secrets that
+  live nowhere but the environment.
+
+- 34caaf4: Agent seats no longer export their connection material into the environment every descendant
+  process inherits. The broker URL, the creds path, the auth token, the user-mode identity and the
+  local control token now ride a private 0600 launch-material file whose path is the only thing in the
+  seat's environment; pi, codex and OpenCode drop even that path once they have read it (for OpenCode
+  that happens in the `opencode serve` process its seat shim starts, which is also what runs the
+  session's tool calls), while claude and hermes keep the reference because their readers are
+  short-lived children that start later. A session driven by hand still sets `COTAL_CREDS` / `COTAL_SERVERS` itself, and a
+  launch that carries both carriers is refused rather than resolved by precedence.
+- 6959679: The dashboard survives a poll that fails, and its aggregation answers instead of failing.
+
+  A failed poll used to clear the peers and the channels. A 500's body is valid JSON and `fetch` does
+  not reject on one, so the refusal arrived as a successful parse and was stored as the snapshot. Reads
+  now refuse a non-200 by name, a refused read leaves the value the page already holds exactly where it
+  is, and the header says which source is stale and why. Recovery is the next successful read.
+
+  `/api/activity` no longer fans out every channel's history at once with no upper bound, where one
+  channel's rejection became the whole route's 500 and a slow link produced a 34-second success.
+  Sources race one shared deadline through a bounded pool, and the page always carries `partial`, the
+  counts, the named missing sources, and the deadline it used, so a short page cannot be mistaken for a
+  complete one. `/api/dms` is one read with no subset to serve, so its bound is a 503 that names the
+  deadline. A channel list that cannot be read is a refusal that says so rather than a page claiming
+  the space is empty.
+
+  The elevated observer/admin credential can now delete consumers on its own presence bucket. A KV
+  watch rebuilds itself when the link stalls and each rebuild deletes its predecessor; without that
+  grant the cleanup was refused, so orphaned consumers accumulated until their inactivity threshold and
+  the broker logged a violation every time.
+
+### Patch Changes
+
+- 0b602e4: Managed Pi sessions can now fork an existing Pi transcript into the mesh and recover the exact active Pi session after an unexpected process crash. The Pi adapter reports session changes through its authenticated local control endpoint and an owner-only atomic state file; the manager preserves the Cotal identity, lifecycle UID, credentials, children, and durable inbox across up to three restarts in two minutes, then retires a crash loop loudly. Deliberate stops never restart.
+
+## 0.24.0
+
+### Minor Changes
+
+- 5b0642e: SPEC v0.5: workflow runs, and the normative language reference.
+
+  `SPEC.md` gains the v0.5 binding revision: a §14 "Workflow runs" that defines a run's wire footprint
+  (the `run` record with its resolved pin set, the `WFJ_<space>` step-journal
+  stream with one subject per run and its replay-then-activate barrier, the `answer`, `notice` and
+  `migration` record kinds with their derived ids, the per-run driver grants, and a conformance list),
+  the four kinds in the §13.7 table, the stream in §13.12, and the change-log, reference-map and
+  normative-reference rows. `spec/cotal-lang.md` is the new normative reference for the workflow
+  language: syntax table, values and the boundary rule, the library, the effect primitives with their
+  hashed projections, the concurrency scopes and the clock-decided race, determinism (time, randomness,
+  pins, language version), errors, the step journal's entry schema, key grammar, digest and request id,
+  resume, migrate and fork, and the error catalog. Every `js` block in it is validated by the language's
+  surface suite. `docs/workflows.md` is the guide, and `cotal_docs` serves the reference offline as page
+  `lang` (also `cotal-lang`), indexed for search beside the spec. This is the contract, ahead of the
+  hosting: on the mesh handler `spawn`, `turn`, `ask`, `monitor`, `wait(replied)`, `wait(down)` and
+  `conclave` still refuse with L5016, and no `cotal` command starts a run yet; a program runs
+  in-process through `@cotal-ai/lang` today, as the guide says.
+
+## 0.23.0
+
+### Minor Changes
+
+- 5634356: `cotal attach` re-establishes its session when the link dies, instead of leaving you with a dead terminal.
+
+  An attach left alone while the laptop slept was gone by the time you came back, in one of two ways
+  depending on how long the link was down. Shorter than the serving side's stall watchdog: the
+  manager's rail keeps advancing its sequence into a subject nobody is subscribed to, and the session
+  transport has no retention, so those frames are gone. The moment the client redials and its
+  subscription is restored, the next frame lands far ahead of what the client expected, the rail
+  faults, and the CLI exits with `mesh session transport error: gap` about a second after the network
+  came back. Longer than the stall: the serving rail fills its window, stalls, ends the session and
+  closes, and both of those notices are published while the client is disconnected, so neither is ever
+  delivered. On redial the client is subscribed to a session nobody is serving and hangs there with no
+  output, no honest end and no exit at all.
+
+  `attach` now owns re-establishment rather than leaving it to the NATS layer. When the link breaks and
+  you did not press the detach key, it prints `[cotal: connection lost, reconnecting]` on stderr, then
+  asks the manager for a fresh grant, mints a fresh per-session credential, opens a fresh connection
+  and a fresh session, prints `[cotal: reconnected]`, and carries on in the same raw-mode terminal.
+  The manager repaints the seat's current screen through the path it already uses for any attach.
+  Retries wait 1s, 2s, 5s, 10s, then 30s, for as long as the seat exists, and the detach key is read
+  during the waits between attempts, so a reconnect never traps you. Every attempt re-runs the manager's full authorization, so a
+  reconnect cannot keep a revoked or expired grant alive: no grant is ever presented twice.
+
+  Giving up always says why. A manager that refuses the attach exits non-zero with the manager's own
+  message; a reconnect that finds the seat no longer there exits cleanly with `seat <name> is gone`. A
+  refusal that could still pass, such as a manager at its session ceiling, is relayed in the manager's
+  own words while the loop keeps trying, so waiting is never unexplained. Pressing the detach key, or
+  the agent's process exiting while you are attached, ends the attach as before.
+
+  Each reconnect also hands the abandoned session back to the manager, over the first link that can
+  carry the message, so an attach that rides out several outages does not consume a session slot per
+  outage. Nothing on the serving side reaps a session whose caller went away while the seat is quiet:
+  the stall watchdog only arms once the send window fills, and an idle seat never fills it. The client
+  is the only party that knows, so it says so, using the session's own credential, the only one
+  scoped to that session's subjects. If it never gets a link that can carry the message, it says that
+  instead, on exit. Every wait on a link that is dying is bounded, and the bound is real: the timer
+  that enforces it is what keeps the process alive while a socket that will never answer is waited
+  on. A link that stays UP and carries nothing, which is what a sleeping laptop looks like from the
+  client, ends with the same clean exit and the same message as any other fault instead of the
+  command aborting on a wait that never returned.
+
+  `--no-reconnect` restores the single-session behaviour for scripts that want one run and one exit
+  code.
+
+  Under it, `@cotal-ai/workspace` separates a connect refusal from what is done about one. Resolving a
+  mesh and its preflight answered every refusal by printing a sentence and ending the process, which is
+  right for a person who just typed a command and wrong for a loop riding out a broker that is briefly
+  unreachable. The decision now raises a `ConnectRefusal` carrying that exact sentence, and the
+  `*OrExit` entry points are thin wrappers that print it and exit as before, so one place writes each
+  message and the two forms cannot drift.
+
+- 5e3951a: events: an agent's second session publishes again, and the halt names the causes that can actually produce it
+
+  Only an agent's first session ever published AG-UI events. Every session after it halted the emitter
+  permanently. The write-ahead log is keyed per session and the event channel is keyed per principal,
+  so a new session opened with an expectation that its channel was empty, while its own previous
+  session had already filled it. The broker refused the publish and the emitter stopped for good. On a
+  mesh with user authentication the agent name is the actor, and a restart forks the session id, so
+  the first restart of any agent spawned with the event plane armed was enough to take its event
+  stream dark. An agent on a static credential is reached the same way through preserve and resume,
+  which relaunches the recorded identity while the session under it is new. Reproduced against a real
+  broker across three sessions, and it did not recover on its own.
+
+  Alongside the per-session logs the connector now keeps one record per principal, holding the last
+  sequence the broker assigned on that channel, so a new session continues the stream instead of
+  starting again from nothing. An installation upgrading from a release without that record recovers
+  the sequence from the session logs already on disk, so the fix applies to agents that have already
+  run rather than only to ones starting fresh. That recovery reads the sequence a log took an
+  acknowledgement for but did not fold, which is where the real number sits when a session died in
+  that window, and it refuses a log it cannot account for rather than taking the largest number it can
+  find. An abandonment after a channel purge clears the record with the logs, and a record that reads
+  zero is never re-seeded, because that is what abandonment writes.
+
+  The halt message previously offered three causes, another writer, a restored stream, or a filtered
+  purge, and the real one was not among them, so an operator went looking for a rogue writer. It now
+  names what a moved tip can actually mean, including a concurrent session under the same principal
+  and a frontier record that disagrees with the stream. It also names the one cause that is not
+  another writer at all: a crash between the shared record's advance and the log's own record of the
+  ack leaves the record ahead of the expectation the log is still holding, so the retry publishes a
+  sequence the subject has already passed and the halt looks exactly like a foreign write. The
+  message says what that state looks like on disk. It also states the real gap in the per-principal
+  lock rather than claiming the lock prevents the case the halt fires on: the lock file lives under a
+  workspace root, so a second emitter started against a different root meets no lock, while another
+  host or a stale pid refuse the start instead of slipping past. And where it used to name an
+  abandonment as the remedy, it now says no command performs one, names the directory that has to go,
+  and says removing less leaves a mixed state the next start refuses. Clearing that state is valid
+  only once the channel itself is back to empty, which of the causes above is true of a filtered
+  purge alone; on any other cause the tip stays where it is, so removing the directory returns the
+  same halt with the logs a tip could have been rebuilt from now gone, and the channel purge is the
+  half that comes first.
+
+  The scan that recovers a tip from the session logs refuses a linked entry and refuses a linked log,
+  matching the directory chain that creates this state and already refused a symlinked component.
+  Without that, a link planted where a session directory belongs took the scan to a log in another
+  tree. What it does not close is a session directory swapped for a link in the moment between the
+  check and the open: the non-following open flag covers the final name only, and closing that window
+  would take a per-component walk the scan does not do. A log reachable under more than one name is
+  refused too, and the ordinary way to produce one is copying a workspace with hard links, which makes
+  the recovery refuse every log rather than half-trust them.
+
+  The record itself is now graded on the file rather than on the writer's view of it. A second view of
+  one record could take the tip backwards with no error at all, because the comparison was against
+  memory while the rule was written about the value on disk. Nothing shipped reaches that today, and
+  that is measured rather than assumed: a stale view publishes a stale expectation and the broker
+  refuses it before an acknowledgement exists to record. It is guarded anyway, because an assumption
+  recorded in prose where a guard belongs is what produced this defect in the first place. A record
+  that goes corrupt underneath a live writer is now refused before the write instead of being
+  overwritten, and an abandonment refuses outright when it cannot reach the shared record, rather than
+  clearing the log's half and reporting a completed abandonment.
+
+  MIGRATION: `AguiEmitter.start` now requires a `subjectFrontier`, and refuses at runtime without one
+  rather than falling back to the per-session number, because that fallback is the defect. `EventWal`
+  refuses the same way: a log with no record bound has no publish expectation and says so instead of
+  offering its own last acknowledged sequence, and an abandonment on an unbound log now refuses rather
+  than clearing half of the state, so anyone driving a log outside the emitter must bind one first.
+  Anyone embedding the emitter directly must open a `FileSubjectFrontier` at the `subjectPath` that
+  `ensureEventWalDir` now returns and pass it. Connectors in this repository are updated. No wire
+  bytes move and no grant changes: the channel grammar is unchanged.
+
+## 0.22.0
+
+### Minor Changes
+
+- 57d3a57: A Claude session publishes a structured event plane, and the `tr-<name>` transcript mirror is
+  retired
+
+  A session launched with `cotal spawn --events` now actually publishes. The Claude connector maps
+  its session records to structured events behind the same hook relay the mirror used to sit behind:
+  run boundaries per turn, assistant text, reasoning, and each tool call with its arguments, its end
+  and its result, written to a per-session write-ahead log before they go on the wire so a restart
+  resumes at its cursor instead of replaying or skipping. Until now no connector constructed the
+  emitter at all, so every event channel was empty.
+
+  The `tr-<name>` mirror is removed in the same change rather than deprecated alongside it. Gone with
+  it: the `--transcript` and `--no-transcript` flags on `cotal spawn`, the `transcript` field on the
+  manager's spawn op and its service contract, `COTAL_TRANSCRIPT` and `COTAL_TRANSCRIPT_DEFAULT`,
+  `LaunchOpts.transcript`, `Connector.transcriptChannel`, and the mirror in all three connectors that
+  carried one.
+
+  MIGRATION. If you read a `tr-<name>` channel, nothing publishes to it any more. A managed session no
+  longer mirrors its prose there under any flag or environment variable, and a spawn that passes
+  `--transcript` now fails on an unknown flag rather than being ignored. Read the session's event
+  channel instead: launch with `--events` and subscribe to `events.<owner>.<actor>`, which is keyed on
+  the session's principal. On a static mesh that is `events.local.<key>`, where the key is what the
+  manager allocated and the spawn reply carries it as `id`; on a user-auth mesh it is
+  `events.<your-owner>.<agent-name>`, where the actor half is the agent's own name. `connect-claude.md`
+  gives both forms. `cotal console` and the web console render event frames directly. Unlike
+  `tr-<name>`, you cannot simply subscribe: the plane needs an out-of-band grant, and the command for
+  it is under "To let something read a plane" below.
+
+  What you gain and what you lose, both stated. A tool call now arrives with its full arguments, its
+  end and its result, in a vocabulary a program can read, where the mirror gave a truncated one-liner
+  of glyph-prefixed text. What you lose is prompt text somebody else wrote: the mirror republished
+  every prompt, and the event plane withholds the body of a turn the agent did not author, because
+  republishing a peer's message onto a channel that peer may not read crosses an ACL boundary. A
+  peer-authored turn still opens a run and still shows the work it caused. One stated limit on that,
+  because the loss column is only useful if it is complete: a tool result is this session's own output
+  and is republished, so peer text quoted inside one still reaches the wire. A cell in
+  `agui-authorship.smoke.ts` holds that as a measured limit rather than leaving it to be discovered.
+
+  A spawn may be granted the event plane of the agent it is creating, and no other. A spawn that names
+  a different agent's event channel in `allowSubscribe` or `allowPublish` is refused at the door,
+  because that channel carries the session's tool inputs and outputs. The same rule runs on a manager
+  resume: a retained inventory naming another agent's event channel is refused rather than adopted.
+
+  The rule reads a **concrete** channel, two principal tokens and nothing else. A pattern such as
+  `events.<owner>.>` is not an event channel to it and passes untouched, governed by ordinary ACL
+  authority. That is deliberate, since the pattern is the form an operator writes on purpose for an
+  observer.
+
+  To let something read a plane, grant it out of band. The refusal prints one command, spelled out in
+  full, for the mesh it is running on. On a user-auth mesh:
+  `cotal actor grant <reader> --owner <owner> --scope '' --allow-subscribe '<channel>' --allow-publish
+''`, every field named because `actor grant` is an upsert of the whole row and an omitted flag is the
+  wide default (`>` read, `>` post, `spawn,role:default` scope), not "leave it alone". On a static mesh there is no
+  actor ledger for `actor grant` to write to, so mint the reader instead:
+  `cotal mint watcher --profile agent --allow-subscribe '<channel>' --provision`, the agent profile and
+  not the observer one, since `mint` reads `--allow-subscribe` only for that profile and refuses it off
+  that profile.
+
+  `cotal mint` now REFUSES `--allow-subscribe` / `--allow-publish` off the agent profile rather than
+  ignoring them. Those profiles carry a FIXED read set, the chat plane for observer and the whole
+  messaging plane for admin, so
+  `--profile observer --allow-subscribe <one channel>` used to exit 0, print a success line, and hand
+  out a credential that reads every channel in the space: an operator asking to narrow got the
+  opposite, silently. `--role` and `--provision` were already refused there for the same reason. The
+  rows in `cli.md` and the sentence in `build-a-client.md` now say the same thing.
+
+### Patch Changes
+
+- dfad94f: Fix two refusals that told an operator to run a grant which silently widened the row
+
+  `cotal actor grant` is an upsert of the WHOLE row. Every flag the operator does not name is filled
+  from the wide default: `>` read, `>` post, `spawn,role:default` scope. Two refusals printed a
+  re-grant that named `--scope` and nothing else, so following either one reset the row's channel ACLs
+  to everything.
+
+  The elevated-view refusal is the sharper of the two. Asked for a view the grant lacks, it printed
+  `cotal actor grant <actor> --owner <owner> --scope <current+needed>` and called that "the upsert
+  replaces the scope list". An operator adding one view to a deliberately narrow row reset that row's
+  read and post sets to `>` and `>` in the same paste, and the same sentence sent them to
+  `cotal actor list` to confirm, where the widened row reads as confirmation that it worked. The row
+  is a human operator's, and the ACL is minted fresh at every connect, so it takes effect on the next
+  one with no restart.
+
+  The missing-spawner refusal has the longer reach. Repairing a broken delegation chain, it printed
+  `cotal actor grant <actor> --owner <owner> --scope spawn` and stopped, authoring a spawner that
+  reads and posts on every channel. A spawner's own ACL is the ceiling every agent beneath it is
+  attenuated against, so one pasted repair set a whole-plane ceiling for everything spawned under it
+  from then on.
+
+  The two doors now differ, on purpose. The elevated-view refusal has the row in hand, so it prints
+  every field it is replacing, values included. The two delegation refusals have no row to copy from,
+  so they print NO runnable command at all and name the flags and the wide default in prose instead:
+  a line carrying channel values would invent them, and a line short of all three flags widens on
+  paste. Both say what leaving a flag off means. `docs/cli.md` no
+  longer tells a reader that a re-grant adds to the current scope, the `cotal actor grant` usage line
+  now states what an omitted flag defaults to, and the two remaining hints that name a bare grant say
+  that it is the full envelope, matching the wording `cotal login` already used.
+
+  Both refusals are gated by cells that parse the service's own refusal string rather than matching a
+  hardcoded command, so the text and the assertion cannot drift apart, and a mutation per site reverts
+  each refusal to its shipped text and reddens that cell.
+
+  The strings are not new. Every release from v0.11.0 to v0.21.0 carries all three, which is the whole
+  life of the per-user actor ledger. Nothing about the on-disk row changes here, so no migration is
+  needed, but an operator who followed either refusal should check the affected rows with
+  `cotal actor list`: a widened row cannot be told from a deliberately full one, since the row records
+  only when it was granted, not what it held before.
+
+## 0.21.0
+
+### Minor Changes
+
+- 4cf5f72: Give a session's structured event plane a way to be turned on, and a channel that names who is publishing.
+
+  An agent can now be launched with `cotal spawn --events`, foreground or detached, which publishes
+  that session's structured event stream, what it did rather than the prose it wrote, on a channel of
+  its own so an external observer or UI can read it. Off by default. Nothing about an existing launch
+  changes.
+
+  **The channel is named after the principal, never the display name.** It is `events.<owner>.<actor>`,
+  derived from the principal the manager actually allocated. A display name is UI convenience: this
+  mesh permits two live agents to carry one, and the manager itself auto-numbers a collision, so a
+  name-keyed channel would fuse two principals onto one subject and, in auth mode, would authorize both
+  onto it from a value that identifies neither. The derivation is a single function on the connector
+  contract, `eventChannel`, so the subject the manager grants and the subject the session publishes to
+  cannot drift apart. A connector that does not implement it refuses `--events` before any provisioning
+  rather than starting a session whose events have nowhere legal to land, and the refusal releases the
+  name it had already reserved.
+
+  **The flag and the grant are deliberately separate.** Holding publish rights on a channel is not a
+  request to publish to it. An agent file or a manifest can hand-write anything into `allowPublish`, so
+  if a grant could arm the plane, any author who could write an agent file could turn on a full
+  transcript of another seat's tool inputs and outputs without ever touching the launch grammar. Only
+  the launch arms the session; the grant is what makes the arming useful. `cotal_spawn`, the peer-facing
+  tool, does not expose the option at all. That is the shape of the tool and not a control-plane refusal:
+  the manager's spawn service op is a second door onto the same handler and still accepts the field,
+  which is a pre-existing property of that door and is fenced separately.
+
+  **The flag rides the whole launch path, including the record a restart reads.** It is on the
+  foreground launch, the detached spawn payload, the manager service contract, and the resume document,
+  so a manager restart brings an armed session back armed. The foreground path mints its own grant, from
+  the principal it allocated, and passes the workspace root the emitter's write-ahead log needs: a
+  session armed by one launch surface and not the other would be a flag that means two different
+  things. A resume adopts the credential the spawn wrote rather than minting a new
+  one, so what a restart can lose is the record: either the channel leaves `allowPublish`, or the
+  arming flag does and the session returns holding publish rights it will never use, which reads as a
+  working system with an empty panel. Both halves are now carried and both are asserted.
+
+  **One behaviour change to state plainly.** The foreground launch now passes the mesh's root as the
+  launch's workspace root, on every foreground spawn rather than only on an armed one, which is what the
+  manager has always done. Two connectors already read that field and root their per-agent home at it:
+  Codex, which puts its per-agent home under it, and OpenCode, which puts its database and its serve
+  pidfile there. Both previously fell back to the directory the operator happened to run the command
+  in. So a foreground Codex or OpenCode session moves its local state from that directory to the mesh
+  root, which is where its detached counterpart has always put it. Operators who ran `cotal spawn` from
+  somewhere other than the mesh root will find that session's state under the mesh root instead. The
+  Claude connector reads the field only on an armed launch, and Hermes and pi do not read it at all.
+
+  **Supporting pieces in the shared connector runtime.** The event vocabulary is exported from
+  `@cotal-ai/connector-core` for the first time, so a connector can reach it by package name instead of
+  by deep path. The emitter gained a way to close an open run out of band: a harness reports the end of
+  a turn through a lifecycle hook that writes no record, so a record-sourced stream previously had no
+  vehicle for a turn terminal. The closing frame is an ordinary frame with one exception, it republishes
+  the source cursor unchanged, because advancing it would mark records consumed that were never mapped
+  and leave a consumer no gap to notice it by. The emitter refuses to close while a message or a tool
+  call is still open under the run, while a frame is still pending recovery, and after a halt.
+
+  **One pre-existing limit this makes visible earlier.** In user mode the allocated actor is the display
+  name, and principal tokens forbid `-`, which is reserved as the principal name form's separator. The
+  manager's collision handling appends `-2`, so the second user-mode launch of any persona has never
+  been principal-keyable; it already failed at the identity and provisioning sites. The event grant is
+  derived before provisioning, so that launch now fails before it leaves a footprint rather than after.
+  The underlying naming limit is unchanged and is not addressed here.
+
+## 0.20.1
+
+## 0.20.0
+
+## 0.19.0
+
+### Minor Changes
+
+- ae2f31b: Add the event channel, the durable substrate, and the emitter that publishes a frame.
+
+  The per-agent event channel is `events.<owner>.<actor>`, keyed on the principal. A display name is
+  not an identity: names may legally repeat, and they permit spaces, dots and mixed case, so a
+  name-keyed channel fuses distinct principals onto one subject and a grant minted from that value
+  authorizes both of them onto it. Keyed on the principal the mapping is injective by construction
+  rather than by digest length. Resolving a channel from a display name refuses an ambiguous name
+  instead of picking a match, because returning the first one shows one agent's stream under another's
+  name with nothing on the wire looking wrong.
+
+  The write-ahead log is one file and one state machine. It freezes the retry id, the expected subject
+  tip, the bracket state and the source cursor before a publish, so a restart re-publishes the same
+  frame rather than a new one, and a frame is either on the wire and folded into the frontier or on
+  neither. It refuses the states its own writer cannot produce, since those are the states corruption
+  produces.
+
+  The durable source returns a cursor per record rather than per read, so a crash between two records
+  of one batch resumes after the last record actually consumed.
+
+  The emitter reads that source forward from the WAL's cursor, packs records into frames that provably
+  fit, and appends them under an optimistic-concurrency expectation with a frozen dedup id. At startup
+  it reads the chat stream's replica count and refuses to run where the ordering its retry rule depends
+  on does not hold. A duplicate acknowledgement arriving on a retry is a halt, not a success: accepting
+  it would advance the frontier over a frame nobody received, and neither the wire nor the consumer's
+  sequence would show a gap.
+
+  Frame sizing is measured by the endpoint that builds the envelope and sets the headers, never
+  recomputed here. A splitter that sized a frame itself would be measuring the frame while the broker
+  measures the message, and the part it produced would be rejected, which turns a labelled truncation
+  back into a silent loss.
+
+  One emitter writes one principal's log, and that is enforced rather than described. The lock beside
+  the log is acquired and held for the life of the process, so a second start on the same principal is
+  refused by name; a lock whose recorded owner is provably gone is reclaimed, so one crash does not
+  leave a principal unstartable, and a record naming another host or naming nobody checkable is
+  refused rather than reclaimed on a guess. A lock cannot see a handle that predates it, so every
+  durable replace also carries a generation the writer bumps and verifies: a handle holding an older
+  view of the document is refused instead of overwriting a newer one. Without both, two logs opened on
+  one file let the loser rewrite a folded frontier to a subject sequence the broker never assigned,
+  which reads back as a healthy log and wedges every later publish. The document version moves to 3
+  for that generation; older documents migrate forward, and there is no downgrade.
+
+  Nothing in production emits yet: no connector constructs an emitter, and the transcript mirror is
+  untouched.
+
+- 10d9cd6: Adopt the AG-UI event vocabulary, and give a frame a wire identity a reader can recognise.
+
+  Cotal's agent-event stream carried glyph-prefixed text, so a consumer could display it and do nothing
+  else with it. The vocabulary replaces the payload: typed events with real identities, an envelope that
+  carries its own ordering, and a validator a surface can execute.
+
+  Core gains the frame's identity: the `ag-ui.frame` part kind, the event `type` discriminators, and
+  `isAguiFramePart`. It lives in core rather than in a connector because every connector emits it and
+  none may redefine it, which is what makes it a protocol shape rather than an adapter's choice. What
+  stays out of core is producer-side: the envelope version and every event constructor.
+
+  `@cotal-ai/connector-core` gains the vocabulary itself: the constructors, the frame envelope,
+  `parseAguiFrame`, the `AguiBrackets` stream machine, and the `cotal.*` CUSTOM table, which is empty
+  in v1. `parseAguiFrame` throws with the offending field named and `isAguiFramePart` never throws,
+  because routing and validity are different questions: collapsing them would make a protocol skew look
+  exactly like someone else's message, and a surface would show an empty pane for a stream it was
+  actively failing to parse. A protocol mismatch and an unrecognised event type are both refused rather
+  than partially rendered, since a skipped event is a hole in a transcript that still looks complete.
+
+  Bracketing is a property of a writer's stream and not of a single frame, so `AguiBrackets` is fed
+  frame after frame. A frame may legally open a run and not close it.
+
+  Nothing emits yet. The channel derivation, the payload-size split and the publishing emitter are not
+  in this change, and no connector constructs a frame outside a test.
+
+  `@ag-ui/core` is an exact-pinned, types-only devDependency: it declares zod as a runtime dependency
+  and connector-core is bundled into every seeded connector, so importing it at runtime would ship a
+  second zod major to every customer in order to validate events Cotal constructs itself. The
+  conformance suite imports the real schemas and parses every constructor's output under the schema
+  that owns it, which is what keeps the hand-written literals honest.
+
+- a1bc784: Display an agent event frame, and separate event channels from chat.
+
+  An `ag-ui.frame` part carries no text part by design, so every surface that renders a message as
+  flat text drew one as `[unrenderable part kind "ag-ui.frame"]`. A renderer now folds a frame's
+  events into readable lines: streamed text and reasoning deltas accumulate into one line rather than
+  one line each, a tool call reports its name, its arguments and its result, and a stream that ended
+  without its terminator is flushed and marked truncated instead of being dropped. An event type this
+  build does not know is named rather than skipped, because a skipped event is a hole in a transcript
+  that still looks complete. It registers through the part-renderer seam, so the standard resolves it
+  by the part's own kind and never learns what the vocabulary means.
+
+  The renderer is loaded by the composition root rather than by a connector. Connectors are removable
+  extensions materialized on demand, and no surface that renders imports one, so a provider that
+  registered only inside a connector would be absent from every process that draws.
+
+  The event channel's name and its classifier move into the standard, beside the frame's identity.
+  Both are things a reader needs in order to recognise an agent's stream without knowing which adapter
+  produced it, and the two surfaces that most need to classify cannot reach an extension package at
+  all. The constructor is re-exported from its former home, so no caller changes.
+
+  The classifier is now a derivation rather than a prefix test, and the two disagree on names a real
+  mesh produces. Nothing reserves the `events.` prefix, so a channel a human created and talks on
+  answered yes to "does this start with `events.`" and was swept out of the chat pane it was sent to.
+  A name that does not resolve to a principal is no longer treated as machine traffic, which returns
+  those channels to the view, and leaves a malformed publisher visible rather than hidden. The
+  collision is narrowed rather than closed: a chat channel whose remainder is itself principal shaped
+  is still indistinguishable from an agent's stream, and closing that means reserving the prefix on
+  the wire.
+
+  The console keeps event channels out of the channel strip and out of the history prefill. The order
+  matters more than the result: the channel list carries one entry per retained subject, so filtering
+  after the fetch would read history for every event channel and discard it, which is unbounded work
+  to display nothing. Live rows are marked rather than dropped, because hiding them would delete the
+  only traffic this change taught the console to draw.
+
+  The dashboard gains the same rendering through a per-kind lookup, so its dispatcher stays ignorant
+  of every kind anyone teaches it. A renderer that throws, returns a non-string, or shares a name with
+  an inherited object method is reported by name instead of blanking the body. The browser cannot
+  import the shared renderer, so the two implementations are held together by an executable
+  equivalence check rather than by intent.
+
+  The example harness records a message through the shared renderer instead of keeping only its text
+  parts, so a message whose content is not text is no longer written to the transcript as an empty
+  string and scored as an agent that said nothing.
+
+  No connector emits a frame yet, and no transcript mirror is removed. Display lands first on purpose:
+  a cutover shipped before a renderer would replace a readable mirror with a part every surface shows
+  as a marker.
+
+- 4e8d776: The `cotal_*` tools now refuse an argument they do not model instead of silently
+  dropping it. A call carrying an unmodelled key (`owner` or `actor` alongside the
+  real arguments) previously succeeded with that key stripped before the tool ran,
+  so the caller was told nothing and the tool did something other than what was
+  asked. It is now refused by name, on every adapter and on every tool: the MCP
+  renderers and pi publish a closed schema and the host rejects the call, while
+  OpenCode and Hermes pass the caller's object through untouched and are closed at
+  the connector's own dispatch. Tools that take no arguments are closed too: they
+  were previously published with no schema at all, so a host had nothing to check
+  against and forwarded the extras to be dropped, as is `cotal_inbox`, whose
+  arguments four of the connectors replace with their own. Behaviourally breaking
+  for any caller that was relying on extra keys being ignored. Every refusal names
+  the rejected keys; where the connector is the one refusing it also lists the
+  arguments the tool accepts, or says it takes none.
+
+### Patch Changes
+
+- 87c4130: Say what a refused publish, a goal deadline, and a class-queue split actually proved.
+
+  A refused publish now reports itself. `nc.publish` is fire-and-forget: a caller whose credential
+  does not authorize the subject gets an asynchronous answer on the _connection_, so the publish
+  returns normally and the only observable is that no reply arrives. That is indistinguishable from
+  an absent responder, though the two need opposite responses: mint the grant, or go find the
+  responder. An instance-addressed describe made with a class-rail credential is exactly that case,
+  and it read as an unresponsive manager: measured live, `ps --on <instance>` returned `no describe
+reply from manager within 10000ms` against a 115ms RTT while an untargeted describe answered from
+  either instance in well under a second. The describe now watches its connection for a permission
+  violation on its own subject and raises `permission-denied` naming that subject, the instance rail,
+  and the fact that the responder may be perfectly healthy. The watch closes its status iterator on
+  every exit, so it does not leave a listener parked on the connection per resolve.
+
+  A goal that produced no terminal in time no longer implies the goal failed. It was accepted; only
+  its terminal did not arrive within the wait. Observed live: seats that reported this had already
+  come up and were messaging peers, and retrying submitted a second goal that duplicated the effect.
+  The message now says the deadline is on the wait rather than the work, and says not to retry on it
+  alone.
+
+  An unpinned class-queue split no longer implies the effect did not land. Describe and invoke are
+  separate trips through the same anycast queue, so in a multi-instance space the instance that won
+  the queue received the request and may have executed it, possibly after the error was raised. The
+  core message now says so and points at `ps`/`inspect`/roster before any retry; it stops at "a call
+  that addresses one instance does not split". The CLI adds `--on <instance>` as the remedy, and only
+  on the commands that have the flag (`ps`, `stop`, `attach`, `spawn --detach`), which declare it to
+  the shared renderer; `models`, `up` and `down` ride the same rails and split the same way, and are
+  no longer told to type a flag they do not have. Absence of a pin is not evidence of the flag.
+
+  And a split is no longer silently retried into a duplicate effect. The client recovered from
+  `failed-precondition` by dropping its cached resolve and invoking again, which is a repair when the
+  bound incarnation is gone but a second attempt when the error came from a different live instance
+  answering the class queue: request received and answered (executed or refused; the reply does not
+  say which), error raised afterwards. Re-invoking there re-issued the command automatically, while
+  the error text told the operator not to retry; it is the mechanism behind one spawn producing
+  several seats. The retry now happens only for commands
+  whose second execution is observably indistinguishable from one: the reads and `describe`. Every
+  other command surfaces the split to its caller, carrying a marker that says a responder did answer
+  the request, so the caller can check before deciding. Surfacing also drops the stale bind: the
+  cached resolve named an incarnation a different live instance has just answered for, and keeping it
+  would send every later deliberate call on that endpoint into the same refusal, so the caller could
+  verify and still never reach the live instance. Dropping it re-issues nothing; the next call is the
+  caller's own.
+
+  The same rule now covers the adjacent case, a manager restarted in the same workspace root. That
+  restart keeps the logical instance id and advances its epoch, so a client that resolved before it
+  gets its next answer from the same id at a later epoch: `expired`, raised after the attributed reply
+  just like the split. It used to be rethrown untouched with the bind kept, so a long-lived client
+  (a connector's mesh agent, the console) reached the successor on every later call, may have applied
+  the effect each time, and never recovered. The stale-epoch refusal now carries the same
+  responder-answered marker, the guard keys on the marker rather than the error code, and its message
+  says which side is stale: a responder ahead of what the caller holds is a successor (re-resolve to
+  adopt it), one behind is a superseded incarnation still answering. The old text called the caller's
+  own bound epoch the responder's "current" epoch, which named the wrong side.
+
+  That classification is an allowlist and fails closed at both levels. It is keyed by endpoint, not by
+  bare command name, because the client is endpoint-agnostic and a flat list would lend the manager's
+  judgement to any endpoint that happened to reuse a name; an endpoint nobody has classified has no
+  repeat-safe commands, and an unlisted command is surfaced rather than repeated. `describe` is the one
+  exception, and structurally so: it is served by the machinery on every endpoint and can never be
+  redefined into something that mutates.
+
+  `models` is deliberately not on that list even though it is a read command. With `{refresh: true}` it
+  reaches the connector's model listing and, for OpenCode, re-fetches provider catalogs and rewrites a
+  cache: the same name, in the same grant class, answering differently because of an argument the
+  classification cannot see. A long-lived client invoking `models` through `invokeService` therefore
+  surfaces a split rather than absorbing it in a multi-instance space; encoding per-command argument
+  rules here would reintroduce exactly the fail-open shape this replaced.
+
+  Where this table bites, precisely: it is read only by `CotalEndpoint.invokeService`, the long-lived
+  client path. Its shipped callers are the connector's `cotal_*` manager tools (spawn, inspect, stop,
+  despawn, purge, define-persona), `cotal spawn -f` (launch) and `cotal down -f` (despawn), whose
+  splits now surface instead of being re-issued, plus the repeat-safe `ps` reads of `spawn -f`,
+  `down -f` and the console, which keep absorbing them. The one-shot CLI commands (`cotal ps`,
+  `cotal models`, `stop`, `attach`, `spawn --detach`) resolve fresh and invoke once on a short-lived
+  connection; they had no cached bind and no retry, and are unchanged. That is the clearest statement of what the list is: a client-side
+  stand-in for `effect` (SPEC 13.7), which the wire now carries and this change does not yet consult.
+  The spec grew both halves after this work began: `effect` declares whether repeating a command is
+  safe, and rides `protocol.v: 2`, while this tree still registers and resolves at `v: 1`, under which
+  every command reads as a write. Reconciling the two is a separate change and is named here rather
+  than described as absent from the wire.
+
+  The CLI no longer prefixes every failed manager call with "no manager reachable on the ep rails".
+  That verdict is stated only where the call went unanswered, as core marks it: no responder, or the
+  reply deadline elapsed with nothing attributed to the request. The catalog code alone was not
+  evidence of that. A manager that answers its describe with `ok:false` has the refusal rethrown under
+  its own code, `unavailable` included, and a store read after an answered describe raises the same
+  code; both printed as an unreachable manager while a manager was answering (reproduced live during
+  review). Core now sets a detail kind on the producers that observed silence and the CLI keys on it,
+  never on the code. A registry read on the caller's own side (the scatter's freeze or its reconcile)
+  is a third outcome with its own line, since the managers were not the failure and may all be up. A
+  refusal that states its own cause (a describe refused by the broker, a split, a stale epoch) is
+  printed as it is, because the prefix contradicted it, and an unanswered `--on <instance>` names the
+  instance that did not answer instead of pronouncing on the mesh (measured: three managers answering,
+  one typo in `--on`, "no manager reachable"). `up`'s resume readiness poll keys on that same
+  unanswered fact rather than on the message prefix.
+
+  `ps` prints the full instance id in its multi-manager view. That view appears only where the split
+  makes `--on <instance>` the one way to address a manager, and `--on` accepts nothing but the whole
+  26-32 character lifecycle token, so an abbreviated header named the remedy and withheld the value
+  it needed, and `--on <prefix>` was refused as a malformed token. The `stop`/`attach` seat-lookup
+  miss, which lists the instances that did not answer for the same purpose, prints them whole too and
+  says the id must be passed as printed. `spawn` refuses `--on` outside a detached imperative spawn: a
+  foreground spawn has no manager to pin and a manifest deploy launches through the manager class
+  queue, so the flag was accepted there and silently ignored. An empty `--on` (`--on ""`, an unset
+  shell variable) is refused at the flag on all four commands: `ps` and the detached `spawn` carried it
+  to the mint, which refused it as an invalid token, while `stop` and `attach` read it as absent and
+  fell through to the seat lookup, so one input had two answers and one of them was a dropped pin.
+
+  The peer-side manager tools stop reading silence off the catalog code too. `MeshAgent`'s manager
+  invoke reported "no responder answered - a manager may be down, or this credential holds no <cmd>
+  capability and the broker denied the request" for every `deadline-exceeded`, and the bare code for
+  everything else. That was wrong in both directions. The broker's no-responders 503 arrives as
+  `unavailable` carrying the unanswered marker, so the one case where the capability explanation is
+  certain was the one case that did not get it: an agent denied a capability was told only
+  "unavailable". And an answered `ok:false` describe is also `unavailable`, deliberately unmarked
+  because a manager did answer -- and this surface is read by agents, where a claim of silence invites
+  the retry that duplicates a spawn. Same code, opposite conditions, separated only by the marker,
+  which is now what the verdict keys on.
+
+- 82dd701: Forward `NEBIUS_API_KEY` to spawned agents: Nebius Token Factory joins the model-provider
+  allow-list, so OpenCode's native `nebius` provider (and the Hermes registry) can authenticate
+  from a managed spawn. Adds the Token Factory operator guide (`docs/nebius-token-factory.md`).
+- 12f2df8: Refuse to stamp the connector seed store down to an older generation. A cotal older than the store's
+  stamped generation used to miss the fast path, refresh nothing, and then write its own version over
+  the stamp, leaving the store claiming a generation whose payloads were not the ones installed and
+  making the next newer command reinstall every connector. It now fails loud before writing anything,
+  naming both generations and pointing at `cotal ext seed --reset`.
+
+## 0.18.0
+
+### Minor Changes
+
+- 0ab9b4d: Move the auth plane's retirement rail off the retired `ctl` surface onto the endpoint subjects
+
+  The auth plane served its generic "retire a lifecycle" operation on
+  `ctl.auth-admin.<owner>.<actor>`, a rail the spec retires in full and states must
+  not be handled. Rows written onto a deleted rail are defects rather than
+  exceptions to it, so the rail moves to
+  `ep.one.auth.retire-lifecycle.handle.<target triple>.<caller triple>.<nonce>`
+  instead of the cut growing a carve-out.
+
+  Two things get stronger on the way. The reply is now derived from the parsed
+  request, so there is no argument through which a caller- or payload-supplied
+  reply target could arrive; and the request and reply planes are disjoint, so the
+  listener credential cannot express a request subject at all. The per-despawn
+  requester credential now pins both its caller triple and exactly one target
+  incarnation, so a leaked requester cannot be re-aimed at another lifecycle.
+
+  Serve-time authorization additionally requires that the serve registration a
+  request names belongs to the requesting principal. The previous two-token
+  subject could not express the caller beyond a recyclable alias, so the rail
+  accepted any registered instance's registration. This is alias-level binding:
+  the registration is keyed by an id that is stable across restarts and carries no
+  lifecycle uid, so a same-principal predecessor presenting the current epoch is
+  still accepted.
+
+  The spec rows also described an authorization mechanism the implementation had
+  already replaced, and now describe what ships.
+
+  This is a subject-plane migration, not a completed endpoint migration. The rail
+  carries the endpoint subjects but still exchanges the pre-v0.4 request and reply
+  bodies, registers no service record, serves no `describe`, and has no contract
+  artifact — so a generic endpoint client can neither discover nor invoke the
+  command. That gap is tracked separately, with the acceptance test being that a
+  generic client can do both. The one acceptance-path hole is closed here rather
+  than deferred: the request carries an id, the reply echoes it, and a reply that
+  does not echo is refused, so a wrong-id success cannot clear a retirement hold.
+
+  The requester's grant pins its target with the `handle` mode, which is normatively
+  redemption-minted. This path is not: there is no issuer-signed artifact, no
+  redemption step, and no lineage — the row is built directly from the minting
+  manager's coordinates under root authority. It is used because it is the only
+  target mode that can pin an exact incarnation, and the serve-time handler
+  re-checks that triple against the current mapping. This is a documented
+  deviation, not compliant handle semantics, and it is stated at the mint site and
+  in the ownership matrix row. It resolves with the same tracked work as the
+  envelope, since the mode and the envelope are one wire-conformance surface.
+
+- 4d14037: `cotal_persona`: defining a persona no longer announces on the mesh by default
+
+  Defining a persona used to post "persona X is now available — spawn it to bring it online" on the
+  definer's first concrete channel — `#general` for most personas, since nothing ever chose the
+  destination: the send passed no channel, so it fell through to whichever concrete channel happened
+  to be first in the caller's list. Standing up a review panel therefore put one broadcast per seat
+  into every peer's inbox, and the wording read as an instruction to strangers to launch an agent they
+  knew nothing about, from a principal they had no relationship with.
+
+  `cotal_persona` and `MeshAgent.definePersona` now take an optional `announce` channel:
+
+  - **Omitted (the default): silent.** Nothing is published.
+  - **Supplied: that channel only**, never one inferred from ordering, with post rights enforced by
+    the broker as for any other message and no fallback. The channel is validated before the write, so
+    an empty string, a wildcard, or a name the subject layer would rewrite is refused loudly rather
+    than publishing somewhere you did not name.
+  - The message is now a statement of what the sender did rather than an imperative aimed at the
+    reader.
+  - A persona whose announcement is refused is reported as **saved but not announced**, pointing at
+    `allowPublish` — not as a failed definition, which named the wrong fix and invited a retry that
+    posted the duplicate.
+
+  No durable or deliberately-consultable read path is removed: `cotal personas list` / `show` read the
+  catalog directly within a workspace, and `cotal_spawn` still fails loud on a name that does not
+  exist. What is lost is unsolicited awareness of a bare name — real discovery, but incidental,
+  incomplete (no prompt, model, or role) and invisible to anyone who joined later.
+
+  `@cotal-ai/core` gains `isPublishPermissionDenied`, a public helper beside `isPermissionDenied` that
+  is true only for a typed permission violation whose `operation` is `"publish"`. `isPermissionDenied`
+  is deliberately operation-agnostic — it separates a denial from a missing service, where the
+  operation is irrelevant — so it cannot answer "did this message get stored?". A JetStream publish is
+  request/PubAck, and a denial on the reply-inbox _subscription_ rejects `js.publish()` while the
+  stream may already hold the message. Callers that report delivery must ask the narrower question.
+
+## 0.17.0
+
+### Minor Changes
+
+- c76a49d: Add the `artifact` message part: a reference to bytes too large to send.
+
+  Every Cotal message rides one NATS message under the broker's maximum payload, so moving a file
+  between agents has meant pasting bytes into chat until it breaks, or sharing a filesystem path that
+  stops working the moment two agents are not on the same machine. SPEC §5 reserved the answer; this
+  defines it. A message can now carry `{ kind: "artifact", name, mediaType, digest, size }` — the
+  content address of the bytes, and nothing about where they live, so the store behind it can change
+  without any message changing shape. This is the contract only: the transport that serves the bytes
+  lands separately.
+
+  The digest is the one field that is not taken on trust. `name`, `mediaType`, and `size` are
+  whatever the sender wrote, and a receiver that sizes a buffer from `size` or dispatches on
+  `mediaType` has believed a stranger; `verifyRawBytes` checks fetched bytes against the digest before
+  they reach a caller, which is what catches a store handing back a truncated object — otherwise
+  indistinguishable from a small one.
+
+  `artifact` is a bare core kind rather than a namespaced extension, because reverse-DNS kinds are for
+  wrapping vocabularies Cotal does not own, and this is Cotal's own reserved primitive. That
+  distinction has teeth: a core kind the message validator does not know is not a schema detail. The
+  validator gates the durable delivery frame, so an unrecognized core part means the backstop drops
+  the whole message, silently, and the loss shows up nowhere near the part that caused it. The
+  `artifact` guard is enforced there, and it checks the digest's form rather than only its type — a
+  malformed digest is not a reference to anything, and admitting one would turn a bad message into a
+  "missing artifact" that blames the store.
+
+  Message rendering moves to a single `partsToText` in core. The same one-line expression had been
+  copied into the connector inbox, `cotal join`, and the mesh view, and each copy fell back to
+  stringifying a part's `data` field — which an artifact part does not have, so all three would have
+  rendered it as the literal word "undefined". One renderer means a new core part kind is legible
+  everywhere at once, or nowhere, never in two surfaces out of three.
+
+- 019afc3: The manager control surface gains three capabilities on the v0.4 endpoint rails: spawn as an action, multi-manager instance addressing, and attach as a mesh session.
+
+  Spawn and launch are now actions (SPEC 13.6). Asking the manager for an agent no longer blocks the caller while the process comes up: the manager accepts a spawn goal and returns the allocated identity at once (`{name, owner, actor, uid, goalId, fingerprint, executor{lifecycleUid, epoch}}`), then progress events follow the launch to a terminal outcome. Presence within the readiness window settles the goal `succeeded`, an early exit `failed`, and the window elapsing with neither is `uncertain` (a bounded, durable outcome a later `ps` settles against the live roster, never a silent hang). A persona-derived name collision auto-numbers; a hard-pinned `--name` colliding with a live agent refuses at accept, before anything is minted. The `--detach` CLI spawn, the manifest `-f` launch, and the connector's `cotal_spawn` submit and follow to the terminal, so their behavior is unchanged. The goal terminal is fenced to the executing manager's own gate epoch (the terminal lands on an epoch-scoped result subject), so a superseded incarnation's terminal is invisible to current readers; a durable reconcile index lets a restarted manager settle any goal a predecessor accepted but never terminalized. The goal-fact writer is a dedicated, family-staged, renewed credential disjoint from the serve credential.
+
+  One space can now run more than one manager. Each manager persists a stable logical instance id across restarts and advances its process epoch when it comes back, so peers address a specific manager regardless of which process currently serves it; a restart re-registers the same instance and evicts its predecessor's serve family through a scoped, one-registration eviction credential. `cotal spawn --on <instance>` pins one instance by its exact id, an untargeted spawn rides class anycast (the acceptance records which instance took it), and `cotal ps` / `status` become a class scatter that merges every registered instance's rows with per-instance attribution and labels a non-answering instance unreachable, never omitting it. The manager lease is demoted from a per-space singleton to per-instance liveness (loss stops only that instance's serving, never the space), reconcile touches only rows the instance owns, and the retirement rail authorizes on the registration gate rather than a name-derived holder, so a deposed predecessor cannot retire a target.
+
+  `cotal attach` no longer returns a `127.0.0.1` websocket URL. It creates a one-use, holder-bound session over the mesh: the reply carries a signed session grant (no URL, never logged), redeemed once, after which terminal bytes stream on session subjects scoped to the two parties, with backpressure surfaced as an explicit drop notice. A late attach still repaints the full screen from a replayed terminal snapshot, and close, expiry, target despawn, and manager restart are distinct, surfaced end states. The browser console is now a real mesh session client over a served bundle (the broker gains a localhost-default websocket listener), holding only a per-session, rails-only credential that expires with the session. The manager's session writer is a scoped, family-staged, renewed credential over a dedicated sessions store.
+
+- f85ffbf: The manager now registers itself as an ordinary v0.4 `service` endpoint (`manager`) on every static auth mesh and dual-serves its FULL typed command surface on the endpoint rails beside the existing control tiers — nothing removed yet. The served commands mirror every control op through the same handler cores: `status`, `ps`, `inspect` (per-agent read), `models`, `spawn` (the full 16-field launch surface), targeted owner-mode `despawn`/`attach`, the baseline self-mode `stop`, `define-persona`, `purge`, `launch`, the resume/preservation family, and the reserved `describe`. `ps`/`inspect`/`spawn` replies now also carry each agent's `lifecycleUid` (the coordinate a targeted request pins). Core gains the production endpoint-serve credential subsystem over the durable auth store: the §13.1 endpoint issuance gate and serve ledger (`epgate…`/`epcred…`), the registration barrier with fail-closed eviction, and the serve-mint release fence — plus a key-pinned one-shot `endpoint-serve-executor` credential profile scoped to exactly one endpoint instance's gate, serve-ledger family, and registration record keys. The manager drives its registration and every serve-credential mint and renewal through that scoped executor connection (never its standing supervisor connection), applies one shared lifecycle-membership + maintenance admission gate on both control doors (the legacy `ctl` tiers and the new endpoint rails), and renews its bounded serve credential on the standing renewal pass. Registration also publishes the manager's §13.7 contract artifacts — every command's schema root, its closure manifest, and the cluster document — to the per-space content-addressed contract store (created create-or-verify at manager start alongside the authority stores), and every agent credential's baseline now carries the store's read grant, so any caller can fetch, verify, and recompile the registered schema digests without out-of-band contract sharing.
+
+  The control CONSUMERS now ride those rails (static-auth meshes): every CLI manager call (`spawn --detach`, `ps`, `stop`, `attach`, `models`, `down`/`up`'s resume and preservation phases) and every connector supervision tool (`cotal_spawn`/`cotal_despawn`/`cotal_persona`, self-stop, history purge) goes through the generic invoke path - describe, fetch the registered schemas from the contract store, recompile digest-verified validators, invoke - instead of hand-importing the manager's contracts; invoke currency is describe-bound (the answering incarnation's broker-authenticated identity), so a superseded or split-brain manager refuses instead of answering stale. New `cotal describe <endpoint>` and `cotal invoke <endpoint> <command>` expose the same generic surface to operators. Operator reach is now minted, not door-refined: `control-caller-privileged`/`control-caller-admin`/`deployer` instrument credentials carry tier-matched endpoint capability rows (the admin tier's cross-agent `despawn`/`attach` ride the operator-only `any` authorization mode, declared in the manager's revision-3 cluster document), the spawn capability additionally mints `define-persona` + `inspect`, and an `admin`-capability credential mirrors the full admin instrument set. Open meshes and user-mode bearers kept the legacy `ctl` path until the final slice below.
+
+  User-mode meshes join the migration end to end: the manager registers its v0.4 service on per-user meshes too (the registration/serve machinery is operator infrastructure riding the space's static trust material), the CLI's bearer path derives its caller triple from the bearer's ledger lifecycle claim, the connector's endpoint identity is its triple in every auth mode (no ctl branch left in the connector), and `spawn -f`'s deploy probe drives `ps`/`launch` over the generic invoke path for both the static admin credential and the user-mode deployer view. Serve-side hardening: every `manager.admin`-class command (purge, launch, and the resume/preservation family) re-checks operator reach at serve time against the caller's CURRENT ledger scope on user meshes, so a revoked `admin` scope demotes the next call instead of riding out the bearer's remaining row lifetime.
+
+  The migration is now complete: the manager's legacy `ctl` control rail is deleted. Core drops the `manager`/`self`/`admin` control tiers, the `ControlTier` type, and `controlSubject`; the server-side `ctl.delivery`/`ctl.delivery-admin`/`ctl.auth-admin` rails (the delivery daemon's and auth service's own carve-outs) are unchanged. Every credential profile is endpoint-only: agent baselines lose the `ctl.self` publish and control-reply subscribe rows, the supervisor serves no control tier, and the operator instruments carry endpoint capability rows only, so the old manager control subjects are unreachable end to end (publish rows, serve subscriptions, and handlers are all gone). The manager registers its `service` endpoint on EVERY mesh: auth meshes ride the scoped endpoint-serve executor; open meshes run the same gate/registration/serve-grant ceremony over bare one-shot connections (no credential is ever minted; the broker enforces nothing on an open mesh) and create-or-verify the authority stores at boot, so a raw broker no longer dies at the first gate write. The CLI's control layer replaces `ControlTier` with `ControlReach` (`owner`/`any`): the target's authorization mode derives from the resolved target owner (an own-domain target rides owner mode; a cross-owner target rides any mode, which the broker admits only for admin-instrument holders), open meshes ride a bare caller triple, and a raw `--creds` control caller without an endpoint caller identity refuses loud instead of falling back. `ps`/`inspect` rows pin `role` as optional (a manifest-launched agent declares none, and the reply schema previously failed the responder's own output).
+
+- 185e721: Renew the `$SYS` credentials without tearing the space down.
+
+  `membership-observer.creds` and `connection-evictor.creds` carry a 30-day expiry and are signed by
+  the system-account seed, which is never persisted, so nothing re-signs them in place. The only
+  repair the tooling named was "`cotal down` then a fresh `cotal up`", and that did nothing: `up`
+  mints the pair only on the branch that _creates_ the trust record, so re-upping a provisioned space
+  reused the same expired files and reported success. A long-running mesh therefore lost its
+  membership feed and live connection eviction every 30 days with no supported way back.
+
+  `cotal up --rotate-sys` is that way back. It issues a new system account under the same broker
+  operator, mints both `$SYS` creds against it, and renders the broker config from the rotated record,
+  so the broker it starts is the one that trusts them. The data account, the account signing key,
+  every agent credential minted from it and the JetStream store are untouched; what dies is the
+  retired system account, on every broker that loads the rotated config. It is refused wherever the
+  on-disk material and the broker could end up on different generations: a running mesh; an open mesh,
+  whether that comes from `--open` or from `broker.auth: false` in a manifest; `--restore`; an
+  unfinished restore or resume attempt on the root, including one a bare `cotal up` would recover,
+  since those paths can adopt a live listener and return without booting a broker; and a root hosting
+  more than one space, because the system account lives in the shared broker record and the rotation is
+  therefore broker-wide. `rotateSystemCreds` is exported from `@cotal-ai/workspace` and carries the
+  multi-tenant guard itself rather than at the CLI flag. It is deliberately a workstation operation and
+  takes no `SecretStore`: the `$SYS` pair has no store seam to be written through, and because a
+  `SecretStore` cannot be enumerated, accepting one would mean a broker-wide guard that reads a local
+  filesystem while enforcing nothing for the tenants actually at risk.
+
+  A rotation requires every broker for the root to be stopped, and three checks now say so: this root's
+  recorded mesh at the requested address, anything unidentified answering there (which refuses instead
+  of relocating to a free port), and the root's own ownership records: a live or unreadable `nats.pid`,
+  or any recorded mesh for this root still reachable. Without them a lost registry row, or a
+  `nats-server` started by hand against this root's `server.conf`, was enough to bypass the running-mesh
+  refusal: `up` found the port busy, picked a free one, rotated, and left the old broker serving the
+  retired config while a second one ran against the same JetStream store. These are Cotal's ownership
+  records rather than a scan of the process table, and the docs say so: a hand-started broker on a
+  different port writes none of them and is the named residual.
+
+  Two consequences the tooling now states rather than leaving to be discovered. The retirement is
+  config-load-bound, so a stale broker still running the previous config keeps honouring the old creds
+  until it is stopped. And a full backup binds to the trust chain it was taken against, which includes
+  the operator JWT and the system account, so every full artifact taken before a rotation refuses to
+  restore afterwards: the rotation says so as it happens, and `cotal up --restore` names the drift when
+  the data account still matches. The commit is a trust-record write plus two credential writes, so an
+  interrupted rotation leaves the record ahead of the creds; that split is detected rather than
+  silent. One shared check compares each `$SYS` cred's issuer against the persisted record, and it
+  runs on every auth-mesh boot as well as in `cotal doctor auth`, so the state cannot pass unremarked
+  by a mesh that simply never runs the doctor. The boot REFUSES rather than warning: a warning becomes an unread log line
+  under `--detach`'s success output, and live connection eviction rides the same credential pair, so
+  booting would silently downgrade revocation to deny-new for the life of the mesh. The delivery daemon, which never
+  loads the signer and so cannot read the record, compares the two creds against each other instead.
+
+  The recovery is covered end-to-end as well as in unit form: a suite drives the packaged binary
+  against a real broker, a real delivery daemon and a real manager, on a root whose `$SYS` pair is
+  already past its horizon. It asserts the reported symptom (the daemon's membership feed does not
+  start, and says which credential and which repair), that `down` + a plain `up` leaves both files
+  byte-identical and the doctor red, and that `down` + `up --rotate-sys` clears it in the daemon that
+  reported it. The survival claim is checked rather than asserted: an agent credential minted before
+  the rotation still connects afterwards, the CHAT stream returns at the same sequence and count, and
+  registry state written before the rotation reads back through the CLI after it.
+
+  Diagnosis now names the cause instead of the symptom. An expired observer cred used to surface as a
+  bare "Authorization Violation" in the delivery log and, one layer up, as a `membership-rw` adoption
+  refused with "membership feed is not running", neither of which mentions a credential. The daemon
+  checks the observer's own expiry before connecting and reports it, carries that reason into the
+  adoption reply, and the manager warns on every renewal pass from the 75% point onward rather than
+  letting the mesh discover the expiry at the horizon. `cotal doctor auth`, `evictPrincipal`,
+  `planeConnLiveness` and the two mint errors now print the repair that works. Where the feed is down
+  because its bundle is incomplete rather than expired, the daemon now names the missing files and
+  distinguishes the two cases: a missing `$SYS` observer is re-minted by a rotation, while a space
+  predating broker-sourced membership is missing the rw cred and the account id as well, which a
+  rotation does not write, so it is told the truth rather than sent through a stop/start that cannot
+  help it.
+
+### Patch Changes
+
+- a306df0: Never consume a Claude Code peer's message without delivering it.
+
+  An unattended agent could go permanently silent after a direct message. The connector's lifecycle
+  hook acked the message and marked it handled while it was still only _formatting_ the hook reply
+  that carries it, but that reply has to reach the runtime through the hook relay, which abandons the
+  exchange after two seconds. When it did not land, the agent's model never saw the message while the
+  connector had already committed it — and because the message was recorded as handled, its own
+  JetStream redelivery was acked and discarded on arrival, so nothing could bring it back. The peer
+  simply stopped answering, and only a human noticed.
+
+  A message is now committed only once the reply carrying it has cleared both legs of its journey, not
+  just the first. The hook relay confirms back to the connector only after its own write to the
+  runtime has completed cleanly, and the connector waits for that receipt
+  (`startControlServer` gains an additive `onReply(event, delivered)`, and a client opts in with
+  `handoff: true`); anything less leaves the message un-acked, so it redelivers and the agent is woken
+  again. Binding to the connector's own socket write was not enough: a large injection that the
+  relay's one-second flush backstop kills mid-write reaches nothing, and the batch was still
+  committed. The verdict is tracked per hook event rather than in one slot, because hook frames are
+  separate connections that can overlap and would otherwise let one frame's outcome commit another
+  frame's messages. This errs toward delivering twice rather than losing one: a re-surfaced batch is
+  flagged as a possible repeat.
+
+  Two further ways the same path could go quiet are closed. Presence updates no longer gate delivery —
+  a failed presence write used to skip both the message injection and the end-of-turn flush of
+  anything held while the agent was busy. And a rejected wake notification is now retried with a
+  bounded backoff, since for an idle agent it is the only thing that can wake it.
+
+- a26e5f2: Always answer an authenticated control-plane client, whether or not anyone observes delivery.
+
+  The reply write sat inside an optional call's argument list:
+
+  ```ts
+  opts.onReply?.(ev, await writeReply(sock, reply, awaitHandoff));
+  ```
+
+  Optional chaining short-circuits the entire call expression when the callback is absent, arguments
+  included, so `writeReply` was never evaluated for any caller that does not pass `onReply`. The
+  handler still ran and still saw the event; only the client saw the silence, then timed out. Of the
+  five callers of `startControlServer`, only the Claude Code adapter passes `onReply`, so the opencode
+  and hermes hook relays got no reply to any control frame, and the pi and codex adapters lost the
+  error reply they answer non-shutdown ops with. Cooperative shutdown was unaffected: it is acked on a
+  separate synchronous path.
+
+  Writing the reply is the server's job; `onReply` only watches it. The write is now performed first
+  and its verdict passed to the callback, so the two are no longer coupled.
+
+  Covered by a new broker-free suite, `smoke:control-reply`, which drives each of the four production
+  opts shapes and asserts the reply arrives. Mutation-proved by restoring the short-circuit, which
+  reddens the no-callback cases while the "handler ran" cell still passes, which is precisely the
+  asymmetry that made this invisible from the server side.
+
+  The one suite that did catch it, `smoke:windows`, is Windows-only, and its red had been merged past
+  repeatedly. The new suite runs on POSIX and is in `smoke:ci`.
+
+## 0.16.0
+
+## 0.15.0
+
+### Minor Changes
+
+- f89560a: New Codex connector (`--agent codex`): an OpenAI Codex session as a full lateral mesh peer, in Codex's own TUI. A host-mode peer drives a `codex app-server` thread over JSON-RPC: inbound batches wake a real turn, and directed messages steer INTO a live turn mid-flight.
+
+  `cotal spawn --agent codex` opens Codex's own TUI. The app-server runs as a loopback websocket listener guarded by a per-incarnation capability token (0600, inside the agent's private home), and the TUI attaches to the very thread the mesh drives, so mesh turns render as they happen and anything you type is a real user turn on that same thread. With no terminal (piped output, CI, a smoke) the host stays headless with an activity feed instead; `COTAL_CODEX_TUI=1|0` picks the mode explicitly when the tty check would guess wrong. Once Codex owns the terminal the host's own log moves to `host.log` in the agent's private home, and the handoff line names that path so a later failure is findable.
+
+  The shared `cotal_*` tools are served by the host process itself over a bearer-authenticated loopback MCP endpoint, with the token passed to codex by env var name so it never reaches the process table. Because the app-server is the MCP client, the same tools work on a mesh-driven turn and on one typed into the TUI; the connector's own tools are pre-approved so an unattended agent never stalls on an approval prompt nobody is watching, and `mcp_servers.cotal.*` is reserved and refused rather than silently overridden.
+
+  Autonomy defaults suit an agent woken by peer messages when nobody is watching: `approval_policy=never` (never ask before running a command, not refuse), `sandbox_mode=workspace-write`, and `sandbox_workspace_write={network_access=true}`. Network is on because Codex's own workspace-write default has it off, which breaks installing a dependency or pushing a branch with an error that reads like the task is impossible rather than the sandbox refusing; filesystem containment is kept, because a peer's message is a remote input that can make the agent run commands. The network default is applied only where the sandbox is actually `workspace-write`, so tightening the mode does not leave a network grant in the launch. All three are overridable per spawn with `--opt` (including `sandbox_mode=danger-full-access` for no sandbox at all), while an interactive `approval_policy` is refused loud rather than auto-answered on the operator's behalf.
+
+  The guide states the sandbox's guarantee literally: it blocks out-of-workspace local filesystem writes, and does not block reads, exfiltration, or networked side effects. With the network on, a peer-driven turn can read broadly and send what it reads, reach loopback and link-local services, and act through any credential it can read, including irreversibly, via a force-push or an API delete. Containing filesystem writes is not the same as containing damage, and the docs say so rather than implying the residual is disclosure-only. The offline, tighter-mode, and separate-OS-user mitigations are named in both the autonomy section and Limits.
+
+  At-least-once delivery with exact-id acks on turn completion: a failed turn retries with backoff, an interrupt redelivers, and an app-server crash restarts the child in place on the same mesh lifecycle and re-drives the un-acked batch (a crash loop is fatal, never an endless respawn). Presence from the event stream, an opt-in transcript mirror, model catalog + reasoning-effort variants (`cotal models --agent codex`, `--variant`), `--opt` passthrough to codex `-c` config overrides, and a private per-agent `CODEX_HOME` (operator config/hooks/MCP servers never load; auth.json symlinked; trust writes never touch the operator's config). Unwired options fail loud: `--resume` (a resumed codex thread comes up without its configured MCP servers, so the agent would be mute on the mesh) and tool-sharing.
+
+  Also fixes the seed reconciler, which treated a generation match alone as up-to-date: a built-in connector added at an unchanged generation would never seed on an already-installed workstation (`--agent codex` reporting no connector installed). Both fast paths now also require every `SEED_BUILTINS` entry to be present in the ever-seeded set.
+
+  A connector can now declare `launchHint`, the one line a foreground `cotal spawn` prints about what to expect next. That text used to be hard-coded to Claude Code's first-run gate for every agent type, telling operators of other harnesses to press Enter at a prompt that never appears.
+
+  The web dashboard gains Codex branding (the OpenAI mark, from Simple Icons), so a codex agent renders with an icon and a label instead of a blank badge. That map was hand-maintained with nothing tying it to the connector set, so it is now covered by a test: every official connector must have a complete entry, and a new connector cannot ship icon-less with a green suite again.
+
+## 0.14.11
+
+## 0.14.10
+
+## 0.14.9
+
+## 0.14.8
+
+## 0.14.7
+
+## 0.14.6
+
+## 0.14.5
+
+## 0.14.4
+
+## 0.14.3
+
+### Patch Changes
+
+- fce3199: Report which machine an agent runs on, and fix three defects that only appear once a mesh spans hosts.
+
+  **`meta.host` on the agent card.** A mesh can span machines: a manager on another box launches
+  agents into its own host, so "where is this agent actually running" was unanswerable from the
+  roster. Each session now publishes its own `os.hostname()` as `meta.host`, overlaid last like
+  `meta.connector` so an agent file cannot claim a host it is not on. It is advisory display
+  metadata only, never an authorization or routing input, and the dashboard renders it with no
+  change (unknown meta keys already display generically). `SPEC.md` records it alongside the other
+  reserved `meta` keys.
+
+  **`cotal up --host <addr>` killed the broker it had just started.** The bind address and the
+  broker URL were tracked independently, so `--host` bound one address while the readiness probe
+  still used the loopback default. The probe found nothing, timed out, and the caller SIGTERM'd a
+  broker that had started correctly, which made `--host` alone impossible to use. The two are now
+  reconciled: with no explicit `--server`, the URL is derived from the host; a contradicting pair is
+  refused with one sentence instead of starting something unreachable; and wildcard binds
+  (`0.0.0.0`, `::`) correctly keep a dialable loopback URL rather than advertising the wildcard. The
+  manifest path (`broker.host` without `broker.servers`) had the same defect and shares the fix.
+
+  **One slow probe silently unregistered a live mesh.** `pruneStaleMeshes` deleted any registry
+  entry that failed a single reachability check whose budget is 1s, which a healthy broker across a
+  slow or jittery link misses routinely. Deletion is destructive and, for a mesh this machine did
+  not start, unrecoverable, since only `cotal up` writes registry records. A first failure now only
+  makes an entry a candidate; it is pruned only if a second, longer probe also fails. A genuinely
+  dead mesh still prunes.
+
+  **A timed-out request killed the whole dashboard.** `cotal web` passed an async listener to
+  `createServer`, so a rejection inside any route (for example a JetStream call timing out against a
+  slow broker) became an unhandled rejection and took the process down on the first slow request.
+  The dashboard is a read-only observer: a failing route now returns 500 and the server stays up.
+
+## 0.14.2
+
+## 0.14.1
+
+## 0.14.0
+
+### Minor Changes
+
+- 7a46ce5: W4 multi-space-per-broker: split broker trust from per-space accounts and harden the broker-vs-space boundary.
+
+  Broker trust (`operator` + system account) is now persisted once per broker in `auth/broker.json`, and each space keeps only its own data account in a flat, injective, case-safe `auth/account.<key>.json` beside it (`<key>` is hex of the space name, so two case-differing spaces can never collide on a case-insensitive filesystem). Core splits the provisioning surface to match: `createBrokerAuth` mints broker trust, `createSpaceAccountAuth(broker, space)` signs one tenant's account under it, and `serverConfig(broker, spaces, opts)` (breaking signature change) renders one operator with N space accounts.
+
+  That same injective hex key now keys EVERY tenant-keyed namespace, not just the account file: the per-space user-auth state dir (`auth/space.<key>/`, with a one-time byte-exact rename of pre-hex layouts on first touch), the auth secret-store keys built over it (callout/issuer/owner-secret/service-keys), the machine mesh registry (`~/.cotal/meshes/space.<key>.json`, with legacy records swept on write/remove), and the auth-service pid/log files. Previously each of those case-folded, so `alpha` and `Alpha` could silently share state, registry records, and owner secrets. The hex key is injective only over well-formed strings, so the one builder now rejects a space name carrying an unpaired surrogate (which UTF-8 folds to U+FFFD, collapsing distinct names) before any key is derived. The auth-service pid/log files also carry a pre-hex-name upgrade path: `down`/`status` admit the old `auth-service.<encoded>.pid` byte-exact so an upgrade across the re-key never orphans the running user-auth callout signer, failing loud if both the old and new name are present.
+
+  Broker-wide lifecycle operations (`down`, `clean store|all`, `backup`, `up --restore`, and the `clean restore-attempt|restore-fallback` recovery verbs) refuse on a root that hosts more than one space, naming the tenants they would have taken out, since none can be scoped to a single space. The tenant list is one validated inventory shared by the guards, `cotal status`, and the target resolver: each record's authoritative `space` must round-trip against its filename, and anything else occupying the account namespace (unparseable, mismatched, or a non-regular entry such as a symlink) counts as corrupt and makes the guards refuse rather than undercount.
+
+  The broker record write is now two-sided fail-closed. `saveBrokerAuth` still refuses a different operator over an existing record; a same-operator system-account change is guarded by a persisted GENERATION with successor semantics: `rotateSystemAccount` bumps `BrokerAuth.gen` in memory and the write is accepted only as the direct successor of the current record, so a stale pre-rotation copy can never resurrect a retired `$SYS` (including one minted within the same second, where the JWT issue time cannot order the two; equal-generation writes with a different system account are refused, and only a byte-identical re-save is the idempotent no-op). The generation is runtime-validated on both sides and at the rotate step: only true absence reads as 0 (migration), while any present malformed value, explicit null included, refuses as a corrupt record. And with `broker.json` absent it refuses any operator that did not verifiably sign every existing account record (so a lost broker file cannot be "repaired" into orphaning the tenants; a same-operator restore still passes).
+
+  The user-auth on-disk marker no longer keys on the bare existence of a path (which a space named `broker.json` or `creds` could alias into user-mode); it requires the provider's pin inside a real state directory, and the pin check is errno-disciplined: only ENOENT reads as absent, while EACCES and friends throw instead of silently flipping a user-auth space to static mode. The pre-hex state-dir migration refuses, rather than guesses, the one genuinely ambiguous case (a space literally named `space.<hex>`, whose legacy directory name is also another space's canonical segment).
+
+  `cotal status` never crashes on trust material it cannot read: it reports the tenant list including corrupt records on a multi-space root, and frames any account record that will not load or compose (a malformed account JWT, or one signed by a foreign operator) as an unloadable record with repair guidance, exiting 0. Target resolution fails loud with a typed error rather than silently picking one tenant or crashing: an ambiguous-target on a multi-account root, on `--server` when the named broker's root holds several tenants on disk (one registered or not), and whenever the tenant list is unreadable; an unreadable-auth when a record cannot be composed into usable trust. The tenant inventory validates each record's account shape (so a semantically empty record is corrupt, not a phantom tenant), while the broker-binding check that a record cannot be validated without a broker stays at the consumer, keeping the broker.json-missing repair path from over-classifying every account as corrupt.
+
+### Patch Changes
+
+- 8aee34e: Distribute Cotal's authored Agent Skills (`SKILL.md`), starting with `team-topology`, from one canonical source in the CLI package to every AI coding harness, with real central update and removal.
+
+  - **Claude Code:** a skills-only `cotal-skills` plugin in the existing `cotal-mesh` marketplace, installed at user scope and independent of the mesh connector (it carries no code and no core dependency). Its plugin version is stamped from the running CLI release and `cotal setup` runs `claude plugin update`, so an upgrade actually replaces the cached skill; each plugin dir is rebuilt from an allowlist and swapped in, never merged, so no stale file rides in. It installs on first run and, fail-loud, on repeat runs, so upgraders are not left behind, and the install is verified via `claude plugin list --json` (exact id, scope/project, enabled, no errors, and expected version). `cotal status` gains a "Claude skills" row.
+  - **Every other harness** (Codex, Cursor, OpenCode, Gemini CLI, Windsurf/Devin): `cotal setup` reconciles the cross-vendor `~/.agents/skills/` directory at the file level, tracked by a validated manifest under `~/.cotal`. Cotal owns exactly each skill's `SKILL.md`: before overwriting a copy you have edited it copies your version into a fresh `SKILL.md.bak` slot (never overwriting an existing or third-party backup), and on removal deletes only that file (then the dir if it is left empty), never a whole directory, never a user's other files, and never a third-party skill. Every managed write (skill file and ownership manifest) goes through a stage-and-rename with an exclusively-created temp (so a hard-linked or symlinked path is replaced, never written through to an outside inode), and a malformed or corrupt manifest fails loud. `cotal status` reports current/stale/missing/retired for the drop and current/stale/missing/broken for the Claude plugin.
+  - The website Agent Skills discovery index is generated from the same canonical files and reconciled (a removed skill stops being served/indexed); a forward bet on the draft RFC, which no shipping harness consumes yet.
+
+  A corrupt or empty skills bundle fails loud rather than silently shipping zero skills.
+
+## 0.13.2
+
+### Patch Changes
+
+- 9e3fdd6: cli: make installed extensions discoverable. Bare `cotal ext` now lists the inventory instead of erroring; `cotal ext list` and the `cotal status` Extensions section lead with the install prefix and state it is a cotal-owned store kept separate from npm's global tree (which is why `npm list -g` never shows these); a new `cotal ext root` prints just the path for scripts, and `status` always renders the section with an explicit empty state. Discoverability only: where extensions install and how they upgrade is unchanged.
+- 666a1a1: docs: a new Connectors page compares every connector feature-by-feature (binding, install, TUI, delivery, resume, tool-sharing, models, containers), and the pi guide moves from Agent frameworks to Connect pi so it sits beside the other connector guides (the site redirects `/agent-frameworks` to `/connect-pi`). The bundled `cotal_docs` pages are regenerated to match.
+- 9625ec6: Add `cotal update` to reconcile first-party connectors and extensions to one generation, report third-party extensions, and check or opt into a serialized, verified global CLI upgrade.
+
+## 0.13.1
+
+### Patch Changes
+
+- 5fb7b23: Add `cotal -v` / `cotal --version`: print the binary version plus each installed extension's, then exit. `cotal status` gains the same report — the Machine section leads with the `cotal-ai` version, and a new Extensions section lists each installed extension with its pinned version, so version skew across the seeded connectors is visible at a glance.
+
+## 0.13.0
+
+### Minor Changes
+
+- 5491661: v0.4 endpoint control surface: a breaking wire revision (SPEC section 13).
+
+  Adds the endpoint control surface: the `ep` request rails and grant grammar, the
+  message envelope and error catalog, the callable-service verbs, and the session
+  and virtual-endpoint composites. Deletes the v0.3 `ctl` rail (the hard cut).
+  Requires nats-server 2.12 or newer, since the auth marker store uses native
+  per-message TTL; clients read the server version from the pre-auth INFO and fail
+  loud below the floor.
+
+  Completes the agent lifecycle end to end: registration, admission, despawn,
+  retirement, and safe name reuse, backed by a lifecycle registry, a credential
+  ledger, and a retirement barrier. Durables are keyed by lifecycle uid, so a
+  manager-resumed agent recovers its original incarnation rather than re-minting,
+  and readiness is incarnation-exact. The connectors forward the lifecycle uid into
+  spawned children so a child joins as its intended incarnation.
+
+  From v0.4 an AgentCard MUST advertise `protocolVersion "0.4"`; a participant that
+  omits it is treated as pre-0.4 and is not addressed on the endpoint rails.
+
+## 0.12.0
+
+### Patch Changes
+
+- 046f485: Re-announce an unacked durable message on JetStream redelivery, so a wake the host dropped (e.g. during Claude's channel startup window) recovers at the next redelivery instead of leaving the agent a zombie until an unrelated message arrives.
+
+## 0.11.6
+
+## 0.11.5
+
+## 0.11.4
+
+### Patch Changes
+
+- 1935221: Ship the built-in agent connectors (claude, opencode, hermes, pi) as removable `cotal ext` plugins. They are seeded on first run through the same `ext add` path a third party uses, resolved lazily per spawn, and deletable with `cotal ext remove`; they are no longer hardcoded imports or dependencies of `cotal-ai`.
+- 5634ae4: Keep quiet-channel ambient traffic pull-only across every connector.
+
+## 0.11.3
+
+## 0.11.2
+
+## 0.11.1
+
+### Patch Changes
+
+- 5b2863a: feat: `cotal clean` - one configurable cleanup verb (history / store / all)
+
+  `cotal down` deliberately preserves the on-disk JetStream store, so stale broker state (e.g.
+  durables minted by an older, incompatible Cotal generation) survived every down/up cycle and made
+  a new-generation `cotal spawn` fail with `consumer already exists`. `cotal clean <history|store|all>
+--force` is the operator reset:
+
+  - **history**: purge the retained message backlog on the running broker (channels, plus DMs with
+    `--dms`) over the least-privilege purger cred; `cotal history clear` stays as a thin alias.
+  - **store**: delete the stopped mesh's JetStream store (`.cotal/nats` or `--store-dir`).
+  - **all**: store + the space identity (`.cotal/auth`), every locally persisted cred/marker tied to
+    it, crash residue a normal `down` would have swept, and this root's registry entries; the next
+    `up` mints a fresh identity.
+
+  Hardening that shipped with it: one shared pidfile probe for `down`/`clean`/`status` (pid > 0
+  only; EPERM reads as alive), `down` no longer erases the record of a process it cannot stop nor
+  presents a failed stop as clean, registry teardown keys on the canonicalized project root
+  everywhere (a named open mesh can no longer delete another mesh's entry), and stale-store failures
+  plus `cotal status` now name the reset recipe.
+
+## 0.11.0
+
+### Minor Changes
+
+- 9061d0e: feat: per-user authentication (owner+actor identity, IdP login, credential death)
+
+  Add per-user auth as a first-class mesh mode. A mesh brought up with `cotal up --user-auth --idp <url>`
+  authenticates humans against an identity provider and issues short-lived, ledger-scoped bearers through an
+  auth callout, in place of long-lived static credential files.
+
+  - **owner+actor identity.** An instance's wire identity becomes the two-token principal `(owner, actor)`:
+    every subject carries the sender as `<owner>.<actor>`, and grants, durables, presence, and `from.id`
+    re-key onto the pair. Cross-owner and same-owner cross-actor forge/read isolation is enforced by the
+    broker; the connection nkey survives only as the transport credential.
+  - **Login and delegation.** Humans sign in with `cotal login --idp <url>` (device-code); operators grant
+    access with `cotal actor grant`. Agents are spawned under the signed-in human as managed `(owner, actor)`
+    children whose scope is a subset of the spawner's (the delegation envelope rule). Agent identities live in
+    a separate managed-actor ledger space, exchanged via their own per-agent secret, so they outlive the
+    human's login session.
+  - **Credential death.** Every managed credential is now lifetime-bounded, with supervisor and delivery
+    standing renewal, `$SYS` rotation-renewal, live connection eviction on revoke, and a `cotal doctor auth`
+    repair surface. On a user-auth mesh, static agent creds are retired (the flip): revocation closes the live
+    window at the next connect.
+  - **Elevated operator surfaces.** `cotal web`, `console`, `history clear`, `channels set/default`, and
+    `spawn -f` come online in user mode via server-authored elevated view bearers, minted only by the
+    signed-in human exchange and gated on ledger scope (`admin` / `spawn`); `ps` and `status` are
+    owner-domain scoped.
+  - **Connectors.** Add the `cotal_docs` tool (version-exact Cotal docs the agent reads natively) and an
+    opaque `launchOptions` raw passthrough for the Claude Code, OpenCode, and Hermes adapters.
+
+## 0.10.1
+
+### Patch Changes
+
+- e3a53e3: Add a connector-agnostic model/variant selector: the `cotal models` command, a `--variant` flag on spawn, and the core `listModels` / `ModelCatalog` + `LaunchOpts.variant` contract. OpenCode discovers its models and variants from the installed CLI; Claude and Hermes reject variants (fail loud) and set `COTAL_MODEL` when a model is given.
+
+## 0.10.0
+
+### Minor Changes
+
+- 6c40280: Release the 0.10 line with the onboarding and local-stack work since 0.9.1:
+
+  - Rework the CLI around dispatcher-parsed commands, operator-installed extensions (`cotal ext`), and extension-packaged web/demo surfaces.
+  - Make `cotal setup` configure-only: it checks prerequisites, installs the Claude plugin and web dashboard extension, seeds one default persona, and keeps the guided david/sven/me team behind `--demo` or `--full`.
+  - Have `cotal up` own the local stack (broker, delivery daemon, and manager), with safer teardown, manifest launch handling, and automatic free-port selection for default-port collisions.
+  - Collapse foreground and detached launches into one `spawn` grammar, with hardened manager readiness behavior and default persona / default agent environment overrides.
+  - Strengthen auth, credential lifetime/rotation, delivery, and OpenCode cancellation handling.
+  - Refresh README and getting-started onboarding around `npx cotal-ai setup`, then `cotal up --detach`, `cotal web`, `cotal spawn`, and `cotal down`.
+
+## 0.9.1
+
+## 0.9.0
+
+### Minor Changes
+
+- 1bcc154: feat: manager least-privilege — no allow-all credential — plus session resume
+
+  A coordinated minor across the workspace (lockstep `fixed` group). No wire break — the message
+  schema is unchanged and `protocolVersion` stays `0.2`; this release is about who the manager is
+  allowed to be on the broker, plus a new way to bring an existing session into the mesh.
+
+  **Security — the manager is no longer an all-powerful credential**
+
+  Until now every manager action ran under a single, blanket `manager` credential that could do almost
+  anything on the broker — read any DM, tamper with any stream, publish as any agent. That credential
+  is **gone**. Manager work now runs under a set of small, purpose-built credentials, each able to do
+  only its own job and nothing else:
+
+  - The **always-on supervisor** can serve control requests, hold its lease, and publish presence — but
+    it **cannot read anyone's messages, create arbitrary consumers, or delete/purge streams**.
+  - **Spawning, teardown, and history-purge** each run on their own short-lived, tightly scoped
+    credential that exists only for that operation.
+  - The **CLI verbs** (`send`, `spawn`, `channels`, `up`, `join`, `down -f`, …) each connect as the
+    least-privileged profile for the job — an operator posts only as itself and can never forge another
+    agent.
+
+  The practical effect: a leaked or compromised manager credential can no longer read message bodies or
+  meddle with other agents' streams — the blast radius is contained to exactly what that one credential
+  was scoped to. Control replies are bounded per caller, `cotal join` now self-provisions its own inbox
+  (no more `ConsumerNotFound` on a fresh console), and `cotal down` tears down all of a space's streams
+  and buckets rather than a subset.
+
+  **New — resume an existing session into the mesh**
+
+  `cotal spawn --resume <id>` and `cotal start --resume <id>` fork an existing `claude` session — its
+  deep context and long transcript — into the mesh, instead of always starting an agent from scratch.
+  It **forks, never hijacks**: the meshed agent gets a _new_ session branched off that transcript, and
+  the original is left untouched. Connectors that can't support this (`opencode`, `hermes`) are
+  **rejected up front, before any provisioning**, with a clear error rather than a half-provisioned
+  space.
+
+  **Fixes & UX**
+
+  - **`cotal attach` shows the real screen on (re)attach to a full-screen agent.** Re-attaching, or
+    attaching late, now reconstructs and repaints the agent's current screen instead of leaving you on
+    a blank or partial one.
+  - **Mouse-wheel scrolling works in full-screen agents over `cotal attach`.**
+  - **The `pty` runtime fails loud under Bun.** It isn't supported there, so it now says so clearly
+    instead of misbehaving silently.
+  - **Removed the `face:` viewer that had leaked from the frontier-faces example into shared connector
+    code**, so an OpenCode persona with a `face:` field boots normally. Face rendering lives entirely
+    in `examples/04-frontier-faces`.
+
+  **Migration — re-`up` spaces created before this release**
+
+  The supervisor now records its lease in a per-space manager bucket that older spaces don't have. A
+  space that was brought up on an earlier version must be re-`up`'d (a fresh `cotal up` is fine);
+  otherwise the supervisor throws `stream not found` on its first lease write. Nothing on the message
+  wire changed, so running agents and clients are otherwise unaffected.
+
+## 0.8.3
+
+### Patch Changes
+
+- a10ed79: OpenCode connector: mirror each agent's session transcript to its per-agent `tr-<name>` channel, event-driven from the plugin's in-process bus events (`message.updated` / `message.part.updated` / `session.idle`) — parity with the Claude connector, with no per-turn session refetch. The `tr-<name>` channel convention is exposed through the `Connector` contract (`Connector.transcriptChannel`) so the manager can grant the agent's publish ACL without the channel literal living in `@cotal-ai/core`, and the manager forwards control-plane `capabilities` (`COTAL_CAPABILITIES`) so a manifest-spawned agent exposes the `cotal_spawn` / `cotal_persona` tools its creds already authorize. Adds an end-to-end smoke for the mirror (`smoke:opencode-transcript`).
+
+## 0.8.2
+
+## 0.8.1
+
+## 0.8.0
+
+### Minor Changes
+
+- cce0a6a: feat: mesh manifests, the tmux runtime, and a new `@cotal-ai/workspace` layer
+
+  A coordinated minor across the workspace (lockstep `fixed` group). No wire break — `protocolVersion`
+  stays `0.2`; this release is all tooling, packaging, and hardening. The new publishable
+  `@cotal-ai/workspace` package joins the lockstep group.
+
+  **New**
+
+  - **Mesh manifests — describe and launch a whole topology from one `cotal.yaml` (`kind: Mesh`).**
+    The file is organized by channel (each lists `subscribe`/`allowSubscribe`/`allowPublish` —
+    Cotal's native verbs, holding agent names); a top `agents:` table resolves each name to a persona
+    (bare path / file + overrides / fully inline) and a connector (`agent:`, per-agent or a top-level
+    default — no silent default). Under `personaPermissions: include` a persona's own channel grants are
+    inherited for channels the manifest doesn't declare.
+
+    - `cotal up -f <cotal.yaml>` brings up a **fresh** mesh — broker + seeded channels + booted agents —
+      and owns the whole space (`cotal down` tears it down). A broker already reachable at the
+      manifest's address is refused with a redirect to `spawn -f`, never re-seeded as fresh.
+    - `cotal spawn -f <cotal.yaml>` deploys a manifest **additively** onto a mesh that's already
+      running: brand-new channels are seeded and owned, already-present ones are left untouched
+      (`exists-unmanaged`), and exactly what it created is written to a creation-only ledger
+      (`.cotal/manifests/<runId>.json`). A re-declared agent whose policy changed is **stale** and
+      exits non-zero unless `--allow-stale <names>`; unmanaged actors with access to a declared channel
+      are surfaced as a SECURITY warning.
+    - `cotal down -f <cotal.yaml>` (or `--run <id>`) tears down **only** what a `spawn -f` run created —
+      never foreign actors on the shared mesh. The ledger is treated as untrusted input and validated
+      whole before any deletion; an owned agent is stopped only when its recorded name **and** id match
+      the live one, cred paths are derived from the auth root and deleted without following symlinks,
+      and an owned channel is removed only when no other members remain. Local-only: same checkout/host
+      that created the run.
+    - `cotal topology view -f <cotal.yaml>` validates a manifest and renders its access graph
+      (per-channel and per-agent subscribe/read/post, persona-inherited scopes, warnings) — read-only,
+      no broker needed. `--dry-run` previews `up -f`/`spawn -f` and mutates nothing.
+
+    Resolved agents boot via a transient, non-authoritative launch artifact under `.cotal/run/` (no
+    generated personas in `.cotal/agents/`), handed to the manager through a new **operator-only**
+    `launch` control op that reads the run spec by id, never an arbitrary path.
+
+  - **`@cotal-ai/tmux` — a tmux Runtime and `TerminalLayout` extension.** Each agent spawned via
+    `--runtime tmux` gets its own window in a shared per-space tmux session, with P3 `env -i`
+    isolation; a `TerminalLayout` provider lets `cotal setup` open and close tmux windows from the
+    ambient `$TMUX` session. Self-registers on import (`import "@cotal-ai/tmux"`), exactly like
+    `@cotal-ai/cmux`. `cotal setup` now offers a tmux demo when run inside a tmux session.
+
+  - **Web graph — hide offline members by default**, with a toggle to show them. Backed by
+    broker-sourced authoritative channel membership.
+
+  **Architecture**
+
+  - **New `@cotal-ai/workspace` package — the machine-local workstation layer, split out of
+    `@cotal-ai/core`.** Core is now strictly the wire standard (endpoint, subjects, message types,
+    extension contracts) and depends on nothing else in the repo; the `~/.cotal` mesh registry, target
+    resolution, preflight, `.cotal/` auth-path I/O, and the `cotal …` command-copy renderer now live in
+    `@cotal-ai/workspace`. Dependencies flow one way:
+    `examples → implementations → workspace → core ← (peer) extensions`. A `smoke:core-boundary` guard
+    (in `pnpm check` and CI) fails the build if core ever imports workspace.
+
+    **Migration (importers only — no runtime/wire change):** `mesh-registry`, `mesh-target`,
+    `preflight`, and the auth-path helpers (`authDir`/`findCotalRoot`/`loadSpaceAuth`/`saveSpaceAuth`)
+    now import from `@cotal-ai/workspace` instead of `@cotal-ai/core`. Mesh-target failures throw a
+    typed `MeshTargetError` (with a `code` and structured `details`); detect it with the exported
+    `isWorkspaceTargetError(e)` guard rather than `instanceof`. The `cotal …`-flavored error copy is
+    rendered through a single `renderWorkspaceError(...)` over a `target | preflight | reachable`
+    union.
+
+  - **`cotal ps` / `start` / `stop` / `attach` now resolve their broker from the mesh registry** — the
+    same way `send` / `channels` / `console` / `web` and the manifest verbs already do — instead of
+    silently defaulting to `nats://127.0.0.1:4222`. `--space <name>` finds the recorded broker (and
+    mints the privileged `manager` cred from that mesh's own recorded root); `--server` stays an
+    override and `--creds` a raw off-registry escape hatch. The shared mesh-target preflight is now
+    used by both the transient commands and the manager control commands.
+
+  **Fixes & hardening**
+
+  - **Manager forwards the resolved channel ACL to spawned connectors**, so a manifest-spawned agent
+    actually subscribes to the channels its persona grants (no missing `COTAL_SUBSCRIBE`).
+  - **Never prune a recorded mesh on an explicit `--server` override** — an off-registry target no
+    longer evicts the registry entry it didn't come from.
+  - **Web graph correctness** — mode chips filter persistent edges (not just animation), hidden nodes
+    stay hidden under the visibility filters, and dashboard assets are served with
+    `cache-control: no-cache` so the UI doesn't get pinned to a stale build.
+  - **`cotal attach` restores terminal modes on detach** — focus-reporting is reset and stdout writes
+    are guarded against a dead pipe, so detaching no longer leaves the terminal in a wedged state.
+  - **Security hardening** — symlink-safe run directories, launch-policy re-validation at spawn,
+    tightened launch-spec validation, and the operator-only manager `launch` op (above).
+  - **CI** — the security/protocol smoke suite (`smoke:ci`) and the mesh-resolution / spawn-from-anywhere
+    / core-boundary smokes are gated in the `check` workflow.
+
+  **Runtime defaults (carried from the tmux work)**
+
+  The built-in `tmux` manager runtime is gone — `tmux` is resolved from `@cotal-ai/tmux`, exactly like
+  `cmux`. The default `auto` mode is deterministic `pty`; tmux and cmux are never auto-selected. Choose
+  them explicitly with `--runtime tmux`/`cmux`, which fails loud with a clear
+  `"import @cotal-ai/<runtime>"` error if the matching extension isn't imported — no silent fallback to
+  pty.
+
+## 0.7.0
+
+### Minor Changes
+
+- a6a0a8d: feat: agent orientation, spawn-from-anywhere, live space graph, model-aware spawning
+
+  A coordinated minor across the workspace (lockstep `fixed` group). No wire break — `protocolVersion`
+  stays 0.2.
+
+  **New**
+
+  - **`cotal_orientation`** — a self/context card MCP tool: an agent's identity, the channels it can
+    read and post to, its capabilities, available tools, and who's present. Claude Code, OpenCode, and
+    Hermes connectors all point new agents at it on boot for the same first-turn orientation.
+  - **Spawn from any directory** — `cotal spawn` resolves a running mesh from a registry, so agents can
+    be spawned outside the project directory. The registry self-prunes space-mismatched and stale
+    `current` entries; its dir is locked to `0700` so space names aren't world-readable.
+  - **Model- and harness-aware spawning** — `cotal start --model` overrides the model, the harness CLI
+    is preflighted before spawn, and the harness/model knobs are shared across both spawn doors (CLI
+    `cotal spawn` and MCP `cotal_spawn`).
+  - **Live space graph** — a force-directed graph view of a space in the web UI, backed by
+    broker-sourced authoritative channel membership (offline agents drop from the graph immediately).
+
+  **Fixes & hardening**
+
+  - **Manager persona spawn is fail-loud and ACL-correct.** A spawn (`start` op / `cotal_spawn` /
+    roster boot) now treats its argument as a persona ref (a filename in `.cotal/agents`), takes the
+    mesh identity from the file's `name:` (auto-numbered on collision), fails loud on a missing persona,
+    and always provisions read/post ACLs from the loaded persona. Previously a miss silently minted
+    default creds (read `general` only, default-deny publish, no capabilities), so a persona spawned by
+    display name, a typo, or a renamed file became a live agent with silently-wrong ACLs.
+  - **Mesh-connect resolution unified** — `web`/`console`/`join` (and the transient commands) route
+    through a shared `resolveMeshTarget` + preflight: the recorded server/mode is honored (open ≠ auth),
+    the `--server`+`--space` raw escape works again for open remote meshes, the `channels` subcommand is
+    validated, and a silent wrong-mesh fallback is refused rather than connecting to the wrong broker.
+  - **`cotal web` no longer holds the account signing seed.** The dashboard used to keep the space
+    `SpaceAuth` (which can mint _any_ identity/role) in scope for the whole session, re-minting on every
+    channel delete — a compromise of the loopback process could mint anything for the account. It now
+    pre-mints one scoped `manager` cred at startup for the lone write path (channel delete) and lets the
+    seed fall out of scope, shrinking the blast radius from "mint anything" to "purge channels as one
+    manager". Open / `--creds` modes are unaffected (no seed; they use the connection creds).
+
+## 0.6.0
+
+### Minor Changes
+
+- ba5e622: feat(delivery): server-side delivery daemon for the Plane-3 durable backstop, + auth-by-default
+
+  Extracts the durable backstop (the offline catch-up tier) out of the manager into a standalone,
+  least-privilege, server-side **delivery daemon** (`@cotal-ai/delivery`, the `deliver` command). The
+  manager is now lifecycle-only (spawn/despawn/stop/attach/ps); the daemon owns all of Plane-3 — the
+  fan-out writer + trusted reader, the durable-membership registry, the runtime durable join/leave/list
+  ops (on a new `ctl.delivery` control service), activation catch-up, and a single-flight lease — and
+  re-authorizes durable delivery against a durable read-ACL registry. Live channel reads are unchanged
+  (native NATS, broker-enforced). No wire break (`protocolVersion` stays 0.2).
+
+  - The daemon is part of the server: `cotal up` starts it by default and it is coupled to the broker
+    (it exits if the broker is gone; `cotal down` / `cotal up` shutdown stop it).
+  - **The mesh is now JWT-authed by default** — `cotal setup`/`go`/`up` bring up an authed mesh with the
+    durable backstop; pass `--open` for the previous frictionless open, live-only mesh.
+  - `cotal_channels` reports honest durable-delivery health (membership + lease aware).
+
+  Hardened over multiple review rounds (sender-bound `ctl.delivery` replies, reconnect-safe responder +
+  KV handles, ACL-independent leave so revocation closes the §7 boundary, signer-free daemon runtime,
+  responder-after-bind readiness, pid-bound cutover marker), each with a guard smoke.
+
+## 0.5.0
+
+### Minor Changes
+
+- 58f2d41: Self-serve channel join + durable backstop (SPEC v0.3 delivery rebuild)
+
+  Agents whose read ACL allows a channel now join/leave its **live** feed themselves over a native NATS core subscription — manager-free, broker-enforced by `sub.allow` (join = subscribe, leave = unsubscribe). A manager-hosted **Plane-3 durable backstop** (a privileged fan-out writer → a trusted reader that re-authorizes every entry against the current read ACL and membership interval → a per-member DELIVER durable the agent acks natively, SPEC §8) ensures a post still reaches a busy or offline agent on its next turn. Channel membership moves to a privileged cursored KV registry (`cotal_members_<space>`), and channels carry explicit `live`/`durable` delivery classes (default `durable`; a space with no manager is live-only).
+
+  The legacy per-instance `chat_<id>` live-tail durable and the mediated filter-move are removed — one clean model with no coexistence code. This is a wire-protocol change (SPEC bumped to v0.3): new and old clients do not interoperate on channel delivery.
+
+## 0.4.0
+
+### Minor Changes
+
+- 878f406: Persona ownership, env allow-list, MCP sharing, and the reconnect tool
+
+  - **`definePersona` content/policy split** with a write-once persistent file owner: a peer can't
+    grant itself a capability or seize ownership of a persona file, and a persona-only edit can't
+    silently clear an existing model. `role` is spawn-time policy and has been removed from the
+    `cotal_persona` tool surface (advertising it was a silent no-op).
+  - **Spawned-child env allow-list** (`launch.ts`): runtimes receive only the declared env, never
+    `process.env`, with per-connector model-key forwarding.
+  - **Opt-in per-connector MCP server sharing** for spawned agents.
+  - **`cotal_reconnect`** tool added to the shared tool surface (renders on both Claude Code and
+    OpenCode) for manual mesh recovery. `cotal_purge` is dropped from the agent tool surface — it
+    is admin-only now, so the operator path is `cotal history clear`.
+  - Agent transcript mirroring is now opt-in (default off); a spawn permission denial names the
+    missing capability instead of blaming the manager.
+
+## 0.3.2
+
+## 0.3.1
+
+## 0.3.0
+
+### Minor Changes
+
+- df8e64c: Add `cotal-ai` — a guided, two-tier setup. The composition root (`bin/`) ships as the
+  publishable `cotal-ai` package, so `npm i -g cotal-ai` / `npx cotal-ai <cmd>` works (bare
+  `cotal` runs `setup`). The **first run** is a narrated, branded flow (`@clack/prompts` UI,
+  wordmark splash, a live pane that streams the mesh booting) that checks prerequisites, locates
+  the NATS server (bundled platform binary via `@eplightning/nats-server-*`, or one already on
+  PATH), then a **connector picker** (Claude / OpenCode — only Claude installs a plugin; OpenCode
+  auto-wires at spawn), and writes two default Cotal experts you can chat with — **david — the
+  engineer** (how it works) and **sven — the guide** (what to build) — plus **me**, the session
+  you drive. The finale is cmux-aware: inside cmux it opens a manager tab that pre-spawns david/sven
+  into their own tabs alongside a console + driving session, otherwise a background manager
+  pre-spawns them and the terminal is handed to your session. **Later runs** are a compact
+  ensure+status card; `cotal setup --full` forces the full flow, and `cotal setup --yes` runs it
+  non-interactively (agents/CI) — installs the plugin, writes the experts, starts the web, and exits
+  non-zero with the log path on failure. Each failed interactive step offers a Claude handoff
+  (skippable with `COTAL_SKIP_ASSIST=1`) that carries the failure context and resumes setup on
+  `/exit`.
+
+  Supporting changes across the stack:
+
+  - **core** — `Connector.pluginRoot` (find a connector's installable plugin assets without
+    importing the extension), `LaunchOpts.prompt` (an auto-submitted first message), a `TerminalLayout`
+    extension contract (a host-side, not-wire contract: open/close editor tabs from a backend-agnostic
+    `Tab` — panes as argv + an optional split — resolved by name from the registry), and `findCotalRoot`
+    (walk up to `.cotal/`, so `cotal` runs from any subdirectory).
+  - **connector-core** — `cotal_purge`, an agent-driven request that has the manager clear the
+    space's retained chat backlog (the privileged `STREAM.PURGE` regular agents are denied).
+  - **manager** — pre-spawn teammates at startup (`cotal cmux --spawn a,b`, staggered on presence),
+    the `purge` control op (native JetStream purge), and a WS attach endpoint.
+  - **cmux** — a self-registering `TerminalLayout` provider (plus `listWorkspaces`/`workspaceRefs` on
+    the driver) that translates the agnostic `Tab` into cmux's native layout, so `cotal setup`
+    opens/closes cmux tabs through the registry without depending on the package or building any
+    cmux-shaped layout itself.
+  - **connector-claude-code** — MCP isolation for spawned sessions (`--strict-mcp-config` +
+    `--mcp-config`, channel ref `server:cotal`), `prompt` passthrough, and the plugin manifest files
+    shipped in the published package.
+
+  Adds `cotal up --detach` + `cotal down` for a background mesh. `cotal up` now pre-creates the
+  space's JetStream streams + KV buckets for **both** modes (open connects without creds), so
+  anything that touches a stream before an endpoint has joined — `cotal spawn`'s DM-inbox
+  provisioning, `cotal_purge`, `history clear` — works on a fresh open mesh instead of failing with
+  StreamNotFound. When run via `npx` without a global
+  `cotal`, setup offers to `npm i -g cotal-ai` (default yes; non-interactive takes the default),
+  best-effort — and the status-card hints render the right prefix (`cotal` / `npx cotal-ai` /
+  `pnpm cotal`) for how you ran it.
+
+## 0.2.0
+
+### Minor Changes
+
+- 73b030f: Add the `cotal_feedback` sender: a connector tool (always exposed) and a `cotal feedback "<summary>"` CLI mode. With a `COTAL_FEEDBACK_KEY` feedback routes to the keyed broker intake as before; without one it goes to the public intake at `https://cotal.ai/v1/feedback`, which requires a contact email (`COTAL_FEEDBACK_EMAIL` → git config → ask). `COTAL_FEEDBACK_URL` overrides either URL for self-hosted intakes.
+- 739649a: Spaces model, operator console, cmux onboarding, personas, and faces (PRs #15–#20).
+
+  - **cli** — a lazygit-style Ink `console` over a shared `MeshView`, plus `setup`/`supervise`/`cmux`/`demo` onboarding.
+  - **manager** — registry-resolved runtimes (the manager no longer depends on cmux), graceful stop, and `definePersona`.
+  - **cmux** — a self-registering `cmux` `RuntimeProvider` with real teardown.
+  - **connector-core** — `cotal_persona` and `cotal_despawn` tools.
+  - **connector-opencode** — an optional animated face viewer (avatar id read from the agent file's `meta.face`).
+  - **core** — space discovery (`listSpaces`/`deleteSpace`), a pluggable `Runtime` extension contract, `DEFAULT_SPACE`, `saveAgentFile`, and a generic `meta` passthrough bag (kept a patch to avoid force-majoring the connectors that peer-depend on core).
+
+### Patch Changes
+
+- Updated dependencies [b3a790e]
+- Updated dependencies [739649a]
+  - @cotal-ai/core@0.1.3
+
+## 0.1.3
+
+### Patch Changes
+
+- 246c9b9: Add the `cotal_feedback` beta egress: a `COTAL_FEEDBACK_KEY` config plus `feedbackLine()` guidance folded into the Claude/Codex connector instructions, and a `cotal feedback` authenticated intake server (tester keys, JSONL source of truth, republish to an internal `#feedback` channel). Note: the agent-side `cotal_feedback` tool registration is still pending.
+- 246c9b9: Add the OpenCode connector. It launches a watchable `opencode` TUI bound to the agent's session — a headless `opencode serve` with the mesh plugin loaded, plus a foreground `opencode attach --session <id>` — drives that visible session via `session.promptAsync`, and renders the `cotal_*` tools as native plugin tools at Claude-Code parity. The tool surface is extracted into `cotalToolSpecs` in connector-core so the Claude/Codex MCP adapters and the OpenCode plugin render the same tools.
+
+## 0.1.2
+
+### Patch Changes
+
+- 5f9e171: Publish all packages: add repository field for OIDC provenance, plus in-flight changes (cmux runtime exec-via-env fix, manager runtime selector, .gitignore product/, etc.).
+- Updated dependencies [5f9e171]
+  - @cotal-ai/core@0.1.2
+
+## 0.1.1
+
+### Patch Changes
+
+- 18c271f: Publish all packages: configure GitHub Actions changesets workflow with npm OIDC trusted publishing.
+- Updated dependencies [18c271f]
+  - @cotal-ai/core@0.1.1

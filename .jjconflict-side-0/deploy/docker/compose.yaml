@@ -1,0 +1,56 @@
+# Containerized Cotal teams. The broker is EXTERNAL (not in this file) - point each
+# container at it with COTAL_SERVERS. Adding or reshaping a team = edit env + roster,
+# never the image. Build once:  docker build -f deploy/docker/Dockerfile -t cotal-runner .
+#
+# Before first run, on the host beside your broker:  cotal auth signer --out signer.json   (writes ./signer.json,
+# the account signing material with no operator key - see deploy/README.md).
+services:
+  # A team: a manager that boots every agent in the roster (pty runtime, all in this container).
+  # Can mix connector types - the roster's `agent:` field picks claude or opencode per agent.
+  team-a:
+    image: cotal-runner
+    command: ["supervise", "--space", "team-a", "--roster", "/workspace/roster.yaml"]
+    # Auth is per connector type. Every var set here reaches every agent (the container is the
+    # team's trust boundary); each CLI reads only the vars it understands, so they don't collide.
+    #   claude   -> CLAUDE_CODE_OAUTH_TOKEN (your Claude Pro/Max; from `claude setup-token` on the host)
+    #   opencode -> the env var of the provider behind each agent's model: (provider/model). opencode's
+    #               hosted models read OPENCODE_API_KEY; OpenAI OPENAI_API_KEY; Anthropic ANTHROPIC_API_KEY;
+    #               etc. OAuth-only providers can't run headless (XDG_DATA_HOME is per-agent, hiding auth.json).
+    environment:
+      COTAL_SERVERS: ${COTAL_SERVERS:-tls://broker.host:4222}
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN}
+      OPENCODE_API_KEY: ${OPENCODE_API_KEY}      # opencode's hosted models; add OPENAI_API_KEY etc. per your roster
+    volumes:
+      - ./team-a/agents:/workspace/.cotal/agents:ro          # personas the roster references
+      - ./team-a/roster.yaml:/workspace/roster.yaml:ro
+      - ./signer.json:/workspace/.cotal/auth/auth.json:ro    # stripped signing material, NOT the full auth.json
+      # Minted per-agent creds live in RAM only. A bare tmpfs mounts root-owned and would be
+      # unwritable by the non-root user - mode 01777 (sticky + world-writable, like /tmp) fixes
+      # that; the cred files themselves are written 0600.
+      - type: tmpfs
+        target: /workspace/.cotal/auth/creds
+        tmpfs:
+          mode: 01777
+    user: "10001:10001"
+    cap_drop: [ALL]
+    restart: unless-stopped
+
+  # A solo agent: one foreground session, no manager. `spawn --foreground` runs the application
+  # directly in the container and loads .cotal/agents/<name>.md.
+  # Use one container per agent when you want each agent's secrets isolated from the others.
+  solo:
+    image: cotal-runner
+    command: ["spawn", "scout", "--foreground"]              # loads /workspace/.cotal/agents/scout.md
+    environment:
+      COTAL_SERVERS: ${COTAL_SERVERS:-tls://broker.host:4222}
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN}    # scout is a claude agent; swap per its connector
+    volumes:
+      - ./solo/agents:/workspace/.cotal/agents:ro
+      - ./signer.json:/workspace/.cotal/auth/auth.json:ro
+      - type: tmpfs                                # creds in RAM only; mode 01777 so the non-root user can write
+        target: /workspace/.cotal/auth/creds
+        tmpfs:
+          mode: 01777
+    user: "10001:10001"
+    cap_drop: [ALL]
+    restart: unless-stopped

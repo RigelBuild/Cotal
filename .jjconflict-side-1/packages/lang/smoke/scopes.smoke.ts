@@ -1,0 +1,1472 @@
+/**
+ * The concurrency scopes' proof: a scope is a durable record, and a replayed `race` resolves the
+ * arm it resolved before.
+ *
+ * This suite exists because the interpreter shipped without it. Scopes pushed a key frame,
+ * allocated an occurrence, and journalled NOTHING, so `race` was a bare `Promise.race`: both arms
+ * could settle before the cancellation reached the loser, leaving two successful branches in the
+ * journal and nothing recording which had won. A replayed run could then take the other path and
+ * reach a step that was never recorded — a durable choice decided by the event loop.
+ *
+ * So the cells below are about WHAT IS RECORDED and WHAT REPLAY DOES WITH IT, not about whether
+ * concurrency works. Section 4 is the one that matters: it hands the interpreter a journal where
+ * both arms succeeded and requires the same winner every time.
+ */
+import { run, resume, RunDivergence } from "../src/interpret.js";
+import { validate } from "../src/grammar.js";
+import { SimHandler } from "../src/sim.js";
+import { Journal, type JournalEntry } from "../src/journal.js";
+import { resolvePins, WALKER_LANGUAGE_VERSION } from "../src/pins.js";
+import type { EffectHandler } from "../src/effects.js";
+
+let pass = 0;
+const ok = (name: string, cond: boolean, extra?: unknown) => {
+  if (!cond) throw new Error(`FAIL: ${name}${extra !== undefined ? ` - ${JSON.stringify(extra)}` : ""}`);
+  pass++;
+  console.log(`  ok ${name}`);
+};
+
+const logged: unknown[][] = [];
+const sink = (line: { scope: string; values: readonly unknown[] }) => {
+  logged.push([...line.values]);
+};
+
+const scopeOf = (j: Journal, kind: string) => j.entries().find((e) => e.kind === kind);
+
+// ---- 1) a race is journalled, with BOTH the index and the value ------------------------------
+
+// The arms are declared SLOW FIRST on purpose. If the winner were "whichever fulfilled promise
+// comes first in declaration order" — which is what the code did before, and what a plausible
+// simplification of it would do again — this program would resolve `slow`. The earliest arm being
+// the second one declared is the only shape in which those two rules disagree, and a fixture where
+// they agree cannot tell them apart.
+//
+// Each arm also LOGS on entry. Logs are not journalled, so they are the detector for section 4's
+// real claim: a settled scope must deliver from its own entry and enter no branch at all, which is
+// a stronger statement than "no live effect was performed" — the branches' own effects would
+// replay from their own entries and look innocent.
+const RACE = `
+const r = await race({
+  slow: async () => { log("entered-slow"); await sleep("5m"); return "from-slow"; },
+  fast: async () => { log("entered-fast"); await sleep("1m"); return "from-fast"; },
+}, { name: "first-answer" });
+log(r.index, r.value);
+`;
+
+let raceJournal: Journal;
+// The pins the recorded race ran under. Every replay below is a resume and carries them: resolving
+// them again would put the replay on this host's clock and a re-seeded PRNG.
+let racePins: import("../src/index.js").RunPins;
+{
+  logged.length = 0;
+  // Caught, because the way a race breaks is not always a wrong answer. A rule that lets the
+  // CANCELLED loser count as a candidate makes the winner a rejection, and the whole scope fails —
+  // an uncaught throw here would kill the suite from outside every assertion, which reads as a
+  // crash rather than as this rule being broken.
+  let liveError: unknown;
+  let r!: Awaited<ReturnType<typeof run>>;
+  try {
+    r = await run(RACE, { runId: "r-1", handler: new SimHandler({}), onLog: sink });
+  } catch (e) {
+    liveError = e;
+  }
+  ok("a live race resolves rather than failing on the branch it cancelled", liveError === undefined,
+    String(liveError).slice(0, 80));
+  raceJournal = r.journal;
+  racePins = r.pins;
+
+  const scope = scopeOf(r.journal, "race");
+  ok("a race appends a scope entry of its own kind", scope !== undefined && scope.kind === "race");
+  ok("keyed by its name and occurrence", scope?.name === "first-answer" && scope?.occurrence === 0);
+  ok("it records the branches it launched", JSON.stringify((scope?.result as { branches: string[] }).branches) === '["slow","fast"]');
+
+  const value = (scope?.result as { value: { index: string; value: unknown } }).value;
+  // On the LIVE pass the simulator delivers parked sleeps in wake order: `fast` parks at 60000,
+  // `slow` at 300000, so `fast` settles first with the earlier clock and wins under the rule
+  // (least recorded clock). Declaration order says `slow`, so the live pick discriminates the
+  // rule from declaration order here; the disagreeing-clocks cell below holds it where wake
+  // order and clocks disagree, and section 4 holds what a replay does with the record.
+  ok("the live pass records the arm with the least clock, not the first declared", value.index === "fast", value);
+  ok("both arms did run on the live pass", logged.some((l) => l[0] === "entered-slow") && logged.some((l) => l[0] === "entered-fast"));
+  ok(
+    "and BOTH the index and the value are recorded, so an edit to the arm's expression cannot resume as the new value",
+    value.value === "from-fast",
+    value,
+  );
+  const said = logged.find((l) => l.length === 2);
+  ok("the program saw the same winner the journal recorded", said?.[0] === value.index && said?.[1] === value.value, logged);
+
+  ok("the losers are recorded WITH the outcome, as intent", JSON.stringify(scope?.cancel?.losers) === '["slow"]');
+  ok(
+    "and the intent is UNDISCHARGED: a journal write cancels nothing by itself",
+    scope?.cancel?.issued === false,
+  );
+}
+
+// ---- 1b) LIVE, the recorded clocks decide, not the order the arms woke in -------------------
+//
+// A handler whose sleeps resolve in WALL order that disagrees with the clocks they record: the arm
+// declared first wakes first with the LATER clock, the arm declared second wakes 25ms later with the
+// EARLIER clock. Under "first to wake wins" the winner is `slow`; under the rule (least branch clock
+// among settled arms) it is `fast`. This is the only live shape in which the two rules disagree, so
+// it is the cell that goes red if the live pick ever falls back to wake order.
+{
+  class RecordedClock extends SimHandler {
+    private stamp = 0;
+    override now(): number { return this.stamp; }
+    override async sleep(req: Parameters<SimHandler["sleep"]>[0], _ctx: Parameters<SimHandler["sleep"]>[1]) {
+      const ms = req.duration === "5m" ? 0 : 25;
+      await new Promise((r) => setTimeout(r, ms));
+      this.stamp = req.duration === "5m" ? 300000 : 60000;
+      return null;
+    }
+  }
+  logged.length = 0;
+  const r = await run(RACE, { runId: "r-1b", handler: new RecordedClock({}), onLog: sink });
+  const scope = scopeOf(r.journal, "race");
+  const value = (scope?.result as { value: { index: string; value: unknown } }).value;
+  ok("a live race is decided by the recorded clocks, not by which arm woke first",
+    value.index === "fast" && value.value === "from-fast", value);
+  ok("and the program saw that winner", logged.some((l) => l[0] === "fast" && l[1] === "from-fast"), logged);
+  ok("and the arm that woke first is the recorded loser", JSON.stringify(scope?.cancel?.losers) === '["slow"]', scope?.cancel);
+}
+
+// ---- 2) a parallel records branch keys and NO selected winner --------------------------------
+
+{
+  const r = await run(
+    `await parallel({ a: async () => { await sleep("1m"); return 1; }, b: async () => { await sleep("2m"); return 2; } }, { name: "both" });`,
+    { runId: "r-2", handler: new SimHandler({}) },
+  );
+  const scope = scopeOf(r.journal, "parallel");
+  ok("a parallel appends its own scope entry", scope !== undefined);
+  ok("recording its branch keys", JSON.stringify((scope?.result as { branches: string[] }).branches) === '["a","b"]');
+  ok(
+    "and NO selected winner, which is why an array index is a lint there and an error for race",
+    scope?.cancel === undefined,
+  );
+}
+
+// ---- 3) a fanOut records the keys its branches were namespaced by ----------------------------
+
+{
+  const r = await run(
+    `await fanOut(["security", "perf"], async (lens) => { await sleep("1m"); return lens; }, { name: "reviews", key: (lens) => lens });`,
+    { runId: "r-3", handler: new SimHandler({}) },
+  );
+  const scope = scopeOf(r.journal, "fanOut");
+  ok("a fanOut appends its own scope entry", scope !== undefined);
+  ok(
+    "keyed by the stable branch keys, not by list position",
+    JSON.stringify((scope?.result as { branches: string[] }).branches) === '["security","perf"]',
+  );
+}
+
+// ---- 3b) a fanOut branch that rejects fails the scope and cancels its siblings ----------------
+//
+// The same law as `parallel`. Measured before it: a rejecting branch threw out of the scope alone,
+// and its siblings went on performing effects against a scope whose entry had already settled
+// failed. The handler below wakes `c`'s first sleep AFTER `b` has thrown, so `c` is the branch that
+// would begin a new effect past the failure; the cell holds that it never does.
+{
+  const performed: string[] = [];
+  class Staggered extends SimHandler {
+    override async sleep(req: Parameters<SimHandler["sleep"]>[0], ctx: Parameters<SimHandler["sleep"]>[1]) {
+      const name = String((ctx as { key?: { name?: string } }).key?.name ?? "");
+      performed.push(name);
+      await new Promise((r) => setTimeout(r, name === "first-c" ? 30 : 1));
+      return await super.sleep(req, ctx);
+    }
+  }
+  logged.length = 0;
+  const r = await run(
+    `try {
+  await fanOut(["a", "b", "c"], async (x) => {
+    await sleep("1m", { name: "first-" + x });
+    if (x === "b") { throw { code: "mine", x }; }
+    await sleep("1m", { name: "second-" + x });
+    return x;
+  }, { name: "f", key: (x) => x });
+} catch (e) { log("caught", e.code, e.x); }
+await sleep("1m", { name: "after" });`,
+    { runId: "r-3b", handler: new Staggered(), onLog: sink },
+  );
+  const scope = scopeOf(r.journal, "fanOut");
+  ok("a rejecting fanOut branch fails the scope with the branch's own thrown value, which the program can catch",
+    JSON.stringify(logged) === '[["caught","mine","b"]]', logged);
+  ok("and the siblings are cancelled: a branch whose effect completes after the failure begins no new effect",
+    !performed.includes("second-c") && performed.includes("after"), performed);
+  ok("and the failed scope entry records the losers as intent, like a failed parallel",
+    scope?.status === "failed" && JSON.stringify(scope?.cancel?.losers) === '["a","c"]' && scope?.cancel?.issued === false,
+    { status: scope?.status, cancel: scope?.cancel });
+}
+
+// ---- 4) THE ONE THAT MATTERS: a replayed race cannot re-decide -------------------------------
+
+{
+  // A settled race, replayed against an EMPTY simulation script. The simulator refuses every
+  // unscripted effect with L6001, so if replay re-entered a branch it would die rather than
+  // quietly resolve. Completing is the proof that no branch was entered.
+  logged.length = 0;
+  const j = new Journal({ run: "r-1", entries: raceJournal.entries() });
+  await resume(RACE, j, { runId: "r-1", pins: racePins, handler: new SimHandler({}), onLog: sink });
+  ok(
+    "a settled race ENTERS NO BRANCH: neither arm's body ran",
+    !logged.some((l) => String(l[0]).startsWith("entered-")),
+    logged,
+  );
+  ok("and the program is handed the recorded winner", logged[0]?.[0] === "fast", logged);
+  ok("and the recorded value, not a re-derived one", logged[0]?.[1] === "from-fast");
+  ok("its subtree is accounted for rather than left as removed steps", j.orphans().length === 0, j.orphans().map((o) => o.kind));
+}
+
+{
+  // The crash case the scope entry exists for: BOTH arms settled before the cancellation reached
+  // the loser, and the scope itself never settled. Re-entering re-runs both branches from their
+  // recorded results, so scheduling decides which promise resumes first — and the winner must NOT
+  // be that. It must be the earliest recorded branch, every time.
+  //
+  // The fixture is built so DECLARATION ORDER AND RECORDED TIME DISAGREE: `slow` is declared first
+  // and finished at 300000, `fast` is declared second and finished at 60000. A rule that took the
+  // first fulfilled branch in order would answer `slow`; the recorded times say `fast`. Without
+  // that disagreement the two rules are indistinguishable and this section proves nothing, which is
+  // exactly what a mutation run showed about its first version.
+  const entries = raceJournal.entries().map((e): JournalEntry => {
+    if (e.kind === "race") {
+      return { v: 1, seq: e.seq, run: e.run, scope: e.scope, kind: e.kind, name: e.name, occurrence: e.occurrence, inputHash: e.inputHash, state: "pending", startedAt: e.startedAt };
+    }
+    if (e.kind === "sleep") {
+      // The live recording cancels the loser's parked sleep, so the two-settled-arms state this
+      // cell needs is CONSTRUCTED: both sleeps are forced to settled ok at the times the comment
+      // names, whatever the live pass recorded for them.
+      const at = e.scope.endsWith("/b:fast") ? 60_000 : 300_000;
+      return { ...e, startedAt: 0, endedAt: at, state: "settled", status: "ok", result: null };
+    }
+    return e;
+  });
+  ok("the fixture really does have a pending scope over two settled arms",
+    entries.filter((e) => e.state === "pending").length === 1
+    && entries.filter((e) => e.kind === "sleep" && e.status === "ok").length === 2);
+  ok("and its recorded times disagree with declaration order, or the two rules cannot be told apart",
+    (entries.find((e) => e.scope.endsWith("/b:fast"))?.endedAt ?? 0) < (entries.find((e) => e.scope.endsWith("/b:slow"))?.endedAt ?? 0));
+
+  const winners: unknown[] = [];
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    logged.length = 0;
+    const jj = new Journal({ run: "r-1", entries });
+    await resume(RACE, jj, { runId: "r-1", pins: racePins, handler: new SimHandler({}), onLog: sink });
+    winners.push(logged.find((l) => l.length === 2)?.[0]);
+  }
+  ok("a re-entered race resolves the SAME arm every time", new Set(winners).size === 1, winners);
+  ok("and it is the earliest arm, not the first one declared or the first the event loop woke", winners[0] === "fast", winners);
+}
+
+// ---- 5) a failed parallel owes its losers too -------------------------------------------------
+
+{
+  const FAILING = `
+await parallel({
+  ok:  async () => { await sleep("5m"); return 1; },
+  bad: async () => { await turn(await spawn("x"), { name: "boom" }); },
+}, { name: "both" });
+`;
+  let caught: unknown;
+  let journal: Journal | undefined;
+  try {
+    await run(FAILING, {
+      runId: "r-5",
+      handler: new SimHandler({ faults: [{ at: "/parallel:both#0/b:bad/turn:boom#0", kind: "agent-down" }] }),
+    });
+  } catch (e) {
+    caught = e;
+  }
+  ok("a rejecting branch fails the scope", caught !== undefined);
+
+  // Re-run capturing the journal: the scope's failure has to carry the siblings it cancelled,
+  // because a rejecting branch can crash before they hear about it.
+  const j2 = new Journal({ run: "r-5b" });
+  try {
+    await run(FAILING, {
+      runId: "r-5b",
+      journal: j2,
+      handler: new SimHandler({ faults: [{ at: "/parallel:both#0/b:bad/turn:boom#0", kind: "agent-down" }] }),
+    });
+  } catch {
+    journal = j2;
+  }
+  const scope = journal === undefined ? undefined : scopeOf(journal, "parallel");
+  ok("the failed scope is journalled as failed", scope?.status === "failed", scope?.status);
+  ok("carrying the sibling it cancelled", JSON.stringify(scope?.cancel?.losers) === '["ok"]', scope?.cancel);
+  ok("with the cancellation still undischarged", scope?.cancel?.issued === false);
+}
+
+{
+  // THE SAME ENVELOPE RULE ON THE PARALLEL PATH. A branch may throw a primitive, and the losers are
+  // the interpreter's fact about the scope, not a property to staple onto whatever the program
+  // threw — `Object.assign(null, …)` is a TypeError, which would have replaced the branch's failure
+  // with the recorder's and lost the cancellation intent with it.
+  const j = new Journal({ run: "r-5c" });
+  let caught: unknown = "nothing was thrown";
+  try {
+    await run('await parallel({ ok: async () => { await sleep("5m"); return 1; }, bad: async () => { throw null; } }, { name: "both" });',
+      { runId: "r-5c", journal: j, handler: new SimHandler({}) });
+  } catch (e) {
+    caught = e;
+  }
+  const scope = scopeOf(j, "parallel");
+  ok("a branch that throws a PRIMITIVE fails the scope with its own value", caught === null, String(caught));
+  ok("and the losers are still recorded", JSON.stringify(scope?.cancel?.losers) === '["ok"]', scope?.cancel);
+  ok("with the thrown value described rather than the recorder's own failure",
+    scope?.error?.message === "null", scope?.error);
+}
+
+// ---- 6) conclave: a scope that is also an effect ---------------------------------------------
+
+/**
+ * A conclave gets ONE journal entry, of kind `conclave`, and that entry answers "is this sub-team
+ * still live" — with an explicit `closed` FACT, not with its state. The state cannot answer it: a
+ * body that failed after a clean close settles `failed` exactly like one whose close never
+ * acknowledged, and a cancelled conclave is settled with its membership deliberately still joined.
+ * Pending means a close is still owed. The migrate table reads the fact when it rejects an orphaned
+ * conclave "unless the scope closed".
+ *
+ * The handler is watched method by method rather than spread over the simulator. A spread loses
+ * SimHandler's prototype methods and the run dies as a handler fault, which is how this suite's
+ * sibling learned the difference.
+ */
+const watching = (inner: SimHandler, slowSleep = false) => {
+  const calls: string[] = [];
+  const handler: EffectHandler = {
+    now: () => inner.now(),
+    participant: (r, c) => inner.participant(r, c),
+    spawn: (r, c) => inner.spawn(r, c),
+    turn: (r, c) => inner.turn(r, c),
+    ask: (r, c) => inner.ask(r, c),
+    checkpoint: (r, c) => inner.checkpoint(r, c),
+    // A macrotask, so that a race's arms settle in an order this test decides rather than one the
+    // microtask queue happens to produce.
+    sleep: async (r, c) => {
+      if (slowSleep) await new Promise<void>((res) => setTimeout(res, 0));
+      return await inner.sleep(r, c);
+    },
+    wait: (r, c) => inner.wait(r, c),
+    observe: (r, c) => inner.observe(r, c),
+    notify: (r, c) => inner.notify(r, c),
+    monitor: (r, c) => inner.monitor(r, c),
+    openConclave: async (r, c) => {
+      calls.push("open");
+      return await inner.openConclave(r, c);
+    },
+    closeConclave: async (r, c) => {
+      calls.push("close");
+      return await inner.closeConclave(r, c);
+    },
+  };
+  return { handler, calls };
+};
+
+const CONCLAVE = `
+const a = await spawn("a", { name: "a" });
+const out = await conclave([a], async (ch) => {
+  log("inside");
+  await sleep("1m", { name: "huddling" });
+  return ch.channel;
+}, { name: "huddle", channel: "war-room" });
+log("out", out);
+`;
+
+let conclaveJournal: Journal;
+let conclavePins: import("../src/index.js").RunPins;
+{
+  logged.length = 0;
+  const { handler, calls } = watching(new SimHandler({}));
+  const r = await run(CONCLAVE, { runId: "c-1", handler, onLog: sink });
+  conclaveJournal = r.journal;
+  conclavePins = r.pins;
+
+  ok("a conclave opens and closes around its body", JSON.stringify(calls) === '["open","close"]', calls);
+  ok("the body ran between them", logged.some((l) => l[0] === "inside"));
+  ok("and the channel option reached the handler, so the body got the room it asked for",
+    logged.find((l) => l[0] === "out")?.[1] === "war-room", logged);
+
+  const scope = scopeOf(r.journal, "conclave");
+  ok("it is journalled as ONE entry of its own kind, not as an open and a close", scope !== undefined
+    && r.journal.entries().filter((e) => e.kind === "conclave").length === 1);
+  ok("settled ok", scope?.status === "ok");
+  // The status cannot answer "did this sub-team close" on its own: a CANCELLED conclave is also
+  // `settled`, deliberately still open, and a scope whose body AND close both failed settles
+  // `failed` too. So the closure is its own fact.
+  ok("and it STATES that it closed, which is what an orphan walk reads", scope?.closed === true);
+  ok("recording its single branch", JSON.stringify((scope?.result as { branches: string[] }).branches) === '["in"]',
+    scope?.result);
+  // And the branch key is checked WHERE IT BITES: on the scope path the body's own steps were filed
+  // under. The recorded `branches` list is a claim, and a first version of this section asserted
+  // only the claim — which a namespace keyed by the handler-minted channel satisfies while filing
+  // every step somewhere else. A mutation run said so.
+  const inner = conclaveJournal.entries().find((e) => e.kind === "sleep");
+  ok(
+    "and the body's steps are filed under that key, not under the handler-minted channel name",
+    inner?.scope === "/conclave:huddle#0/b:in",
+    inner?.scope,
+  );
+  ok("and it carries a request id, because it DISPATCHED: a crash after the mint must not lose who opened the room",
+    typeof scope?.requestId === "string" && (scope?.requestId as string).length > 0, scope?.requestId);
+  // The control. A scope that launches thunks and calls no handler has no request to identify, and
+  // minting one anyway would be a durable field that means nothing.
+  ok("while a parallel, which dispatches nothing, carries none", scopeOf(raceJournal, "race")?.requestId === undefined);
+}
+
+{
+  // Replay. A settled conclave ENTERS NO BRANCH and RE-OPENS NOTHING: the members already left, so
+  // re-joining them would recreate a room the recorded run had torn down.
+  logged.length = 0;
+  const { handler, calls } = watching(new SimHandler({}));
+  const j = new Journal({ run: "c-1", entries: conclaveJournal.entries() });
+  await resume(CONCLAVE, j, { runId: "c-1", pins: conclavePins, handler, onLog: sink });
+  ok("a settled conclave re-opens nothing", JSON.stringify(calls) === "[]", calls);
+  ok("and enters no branch", !logged.some((l) => l[0] === "inside"), logged);
+  ok("the program still receives the recorded room", logged.find((l) => l[0] === "out")?.[1] === "war-room", logged);
+  ok("and the body's own steps are accounted for, not left as removed steps", j.orphans().length === 0,
+    j.orphans().map((o) => o.kind));
+}
+
+{
+  // The members are part of the conclave's IDENTITY (`hashesSubject`), so editing the guest list
+  // must diverge rather than resume into a different room with the old room's recorded answer.
+  const BEFORE = `
+const a = await spawn("a", { name: "a" });
+const b = await spawn("b", { name: "b" });
+await conclave([a], async (ch) => ch.channel, { name: "huddle" });
+`;
+  const AFTER = BEFORE.replace("conclave([a]", "conclave([a, b]");
+  const { handler } = watching(new SimHandler({}));
+  const r = await run(BEFORE, { runId: "c-2", handler });
+  let caught: unknown;
+  try {
+    await resume(AFTER, new Journal({ run: "c-2", entries: r.journal.entries() }), { runId: "c-2", pins: r.pins, handler });
+  } catch (e) {
+    caught = e;
+  }
+  ok("adding a member diverges rather than replaying the old room's answer",
+    (caught as { stepKey?: string })?.stepKey === "/conclave:huddle#0", String(caught).slice(0, 100));
+  ok("and it is reported as a run divergence, with the fork the author can take from here",
+    String((caught as Error)?.message).includes("L5001") && String((caught as Error)?.message).includes("fork(run,"),
+    String(caught).slice(0, 120));
+}
+
+{
+  // A body that FAILS still closes. This process is live and the world is reachable, so walking
+  // away from joined members would be the `spawn` leak in another shape.
+  const FAILING = `
+const a = await spawn("a", { name: "a" });
+await conclave([a], async (ch) => { await turn(a, { name: "t" }); return 1; }, { name: "huddle" });
+`;
+  const { handler, calls } = watching(
+    new SimHandler({ faults: [{ at: "/conclave:huddle#0/b:in/turn:t#0", kind: "agent-down" }] }),
+  );
+  const j = new Journal({ run: "c-3" });
+  let caught: unknown;
+  try {
+    await run(FAILING, { runId: "c-3", journal: j, handler });
+  } catch (e) {
+    caught = e;
+  }
+  ok("a failing body fails the conclave", caught !== undefined);
+  ok("but the room is still closed", JSON.stringify(calls) === '["open","close"]', calls);
+  ok("and the entry says it failed, not that it never happened", scopeOf(j, "conclave")?.status === "failed");
+  ok("and it STATES that the room closed, because the status alone cannot say so",
+    scopeOf(j, "conclave")?.closed === true, scopeOf(j, "conclave")?.closed);
+}
+
+{
+  /**
+   * A BODY MAY THROW A PRIMITIVE, and the disposition must survive it.
+   *
+   * `throw` is part of the language and `null` is a value, so a body can fail with something that
+   * is not an object. Writing the facts ONTO the thrown value with `Object.assign` is a TypeError
+   * on `null`, thrown after the close has been acknowledged: the caller gets a manufactured type
+   * error instead of the body's own failure, and the entry records `closed: undefined` for a room
+   * that was genuinely closed, so an orphan walk rejects a correctly closed conclave. The facts are
+   * the interpreter's, so they travel in the interpreter's own envelope and the program's value
+   * rides untouched.
+   */
+  const { handler, calls } = watching(new SimHandler({}));
+  const j = new Journal({ run: "c-3p" });
+  let caught: unknown = "nothing was thrown";
+  try {
+    await run(
+      'const a = await spawn("a", { name: "a" });\nawait conclave([a], async (ch) => { throw null; }, { name: "huddle" });',
+      { runId: "c-3p", journal: j, handler },
+    );
+  } catch (e) {
+    caught = e;
+  }
+  const scope = scopeOf(j, "conclave");
+  ok("a body that throws a PRIMITIVE still closes the room exactly once",
+    JSON.stringify(calls) === '["open","close"]', calls);
+  ok("and the entry states the closure it actually achieved", scope?.closed === true, scope?.closed);
+  ok("settled failed, not pending", scope?.state === "settled" && scope?.status === "failed",
+    `${scope?.state}:${scope?.status ?? ""}`);
+  ok("and the caller gets the body's own thrown value, not one the interpreter manufactured",
+    caught === null, String(caught));
+
+  // A body can also fail WITH `undefined` — not by naming it, which does not resolve, but by
+  // throwing an absent field, which is ordinary code. "The body failed" must not be read off what
+  // it failed with: comparing the caught value against `undefined` makes this program, which threw,
+  // look like one that returned cleanly — a conclave settling `ok` with no value the author wrote.
+  const j2 = new Journal({ run: "c-3u" });
+  const w2 = watching(new SimHandler({}));
+  let caught2: unknown = "nothing was thrown";
+  let returned = false;
+  try {
+    await run(
+      'const a = await spawn("a", { name: "a" });\nconst empty = {};\nawait conclave([a], async (ch) => { throw empty.missing; }, { name: "huddle" });',
+      { runId: "c-3u", journal: j2, handler: w2.handler },
+    );
+    returned = true;
+  } catch (e) {
+    caught2 = e;
+  }
+  ok("a body that fails WITH undefined fails the conclave rather than settling ok",
+    !returned && caught2 === undefined && scopeOf(j2, "conclave")?.status === "failed",
+    `${returned ? "returned" : "threw"}:${scopeOf(j2, "conclave")?.status ?? ""}`);
+  ok("and it closed on the way out", scopeOf(j2, "conclave")?.closed === true, scopeOf(j2, "conclave")?.closed);
+}
+
+{
+  /**
+   * THE CASE THE DISPOSITION EXISTS FOR: the close itself is refused.
+   *
+   * A first version folded the close into the body's try, so a close rejection was caught, RETRIED
+   * once, and then settled as an ordinary `failed` scope — indistinguishable from "the body failed
+   * and the room closed cleanly", which an orphan walk reads as closed while the members are still
+   * joined. Now the scope does not settle at all: a pending entry IS "a close is still owed".
+   */
+  const sim = new SimHandler({});
+  let closes = 0;
+  const handler: EffectHandler = {
+    now: () => sim.now(),
+    participant: (r, c) => sim.participant(r, c),
+    spawn: (r, c) => sim.spawn(r, c),
+    turn: (r, c) => sim.turn(r, c),
+    ask: (r, c) => sim.ask(r, c),
+    checkpoint: (r, c) => sim.checkpoint(r, c),
+    sleep: (r, c) => sim.sleep(r, c),
+    wait: (r, c) => sim.wait(r, c),
+    observe: (r, c) => sim.observe(r, c),
+    notify: (r, c) => sim.notify(r, c),
+    monitor: (r, c) => sim.monitor(r, c),
+    openConclave: (r, c) => sim.openConclave(r, c),
+    closeConclave: async () => {
+      closes += 1;
+      throw new Error("the room would not close");
+    },
+  };
+  const j = new Journal({ run: "c-3b" });
+  let caught: unknown;
+  try {
+    await run(
+      'const a = await spawn("a", { name: "a" });\nawait conclave([a], async (ch) => 1, { name: "huddle" });',
+      { runId: "c-3b", journal: j, handler },
+    );
+  } catch (e) {
+    caught = e;
+  }
+  const scope = scopeOf(j, "conclave");
+  ok("a refused close fails the run", caught !== undefined);
+  ok("and is not retried behind the author's back", closes === 1, closes);
+  ok("the scope does NOT settle: a pending entry is the durable 'a close is still owed'",
+    scope?.state === "pending", `${scope?.state}:${scope?.status ?? ""}`);
+  ok("and it never claims to have closed while the members are still joined", scope?.closed !== true,
+    scope?.closed);
+  ok("the caller sees the handler's own error, not a manufactured one",
+    String((caught as Error)?.message).includes("would not close"), String(caught).slice(0, 80));
+}
+
+{
+  // A CANCELLED body does NOT close itself. A cancelled branch performs no new effects, and
+  // releasing a loser's branch-local resources travels the recovery path along with everything else
+  // it took. The entry settles `cancelled`, which is the record recovery reads — and which the
+  // migrate table treats as "did not close" and rejects.
+  //
+  // `fast` is gated on the conclave's body having DISPATCHED its first sleep, so the cancellation
+  // arrives while the room is open and the body is mid-flight — after the boundary's begin-gap
+  // re-check, a cancel that arrives before the open means the room is never opened at all, which
+  // is its own cell. The loser is decided by the test, not by the event loop.
+  const CANCELLED_SRC = `
+const a = await spawn("a", { name: "a" });
+await race({
+  slow: async () => await conclave([a], async (ch) => {
+    await sleep("1m", { name: "s1" });
+    await sleep("1m", { name: "s2" });
+    return 1;
+  }, { name: "huddle" }),
+  fast: async () => { await sleep("1m", { name: "f" }); return "fast"; },
+}, { name: "r" });
+`;
+  let bodyEntered!: () => void;
+  const bodyGate = new Promise<void>((r) => { bodyEntered = r; });
+  let landS1!: () => void;
+  const s1Gate = new Promise<void>((r) => { landS1 = r; });
+  const { handler, calls } = watching(new SimHandler({}));
+  const sleepThrough = handler.sleep.bind(handler);
+  handler.sleep = async (r, c) => {
+    const name = String((c as { key?: { name?: string } }).key?.name ?? "");
+    if (name === "s1") {
+      bodyEntered();
+      await s1Gate;
+      return null;
+    }
+    if (name === "f") {
+      await bodyGate;
+      setTimeout(landS1, 5);
+      return null;
+    }
+    return await sleepThrough(r, c);
+  };
+  const j = new Journal({ run: "c-4" });
+  await run(CANCELLED_SRC, { runId: "c-4", journal: j, handler });
+  ok("the conclave really was opened, or this cell proves nothing about closing", calls.includes("open"));
+  ok("a cancelled conclave does NOT close itself from inside the losing branch",
+    !calls.includes("close"), calls);
+  ok("and its entry records that it did not close", scopeOf(j, "conclave")?.status === "cancelled"
+    && scopeOf(j, "conclave")?.closed === false,
+    `${scopeOf(j, "conclave")?.status}:${String(scopeOf(j, "conclave")?.closed)}`);
+}
+
+{
+  // A conclave REACHED on a branch that is already cancelled is admitted as an effect is: its open is
+  // a new effect, so the cancellation is raised before the entry begins and the room is never opened.
+  // `slow` is declared first, so its equal clock keeps it running its pure tail after `fast` settles,
+  // and the log shows it reached the boundary. The `sleep` in the same position is the control.
+  // Measured before the rule: the conclave's entry was begun and settled `cancelled`.
+  const late = (tail: string) => `
+const a = await spawn("a", { name: "a" });
+const r = await race({
+  slow: async () => { let n = 0; for (let i = 0; i < 50; i++) { n = n + i } log("reached"); return await ${tail}; },
+  fast: () => 1,
+}, { name: "r" });
+log(r.index);
+`;
+  const LATE_CONCLAVE = late('conclave([a], async (ch) => n, { name: "late" })');
+  for (const [what, src] of [["a conclave", LATE_CONCLAVE], ["a sleep", late('sleep("1s", { name: "late" })')]] as const) {
+    logged.length = 0;
+    const { handler, calls } = watching(new SimHandler({}));
+    const j = new Journal({ run: "c-late" });
+    await run(src, { runId: "c-late", journal: j, handler, onLog: sink });
+    ok(`the losing branch reaches ${what} after the race is decided`,
+      JSON.stringify(logged) === '[["reached"],["fast"]]', logged);
+    ok(`${what} reached on a cancelled branch begins no entry and opens nothing`,
+      !j.entries().some((e) => e.name === "late") && !calls.includes("open"),
+      { entries: j.entries().map((e) => `${e.kind}:${e.name}:${e.status}`), calls });
+  }
+
+  // AND ON RE-ENTRY. A crash after the conclave's begin leaves it pending inside a pending race, and
+  // the resume decides the race again, so the loser re-enters a PENDING conclave on a cancelled
+  // branch. Measured before the rule: the cancelled branch opened and closed the room, settled it
+  // `ok`, and that `ok` won the race the live run gave to `fast`. The pending pair is recorded where
+  // `slow` wins and the conclave really begins.
+  const won = new Journal({ run: "c-late-pending" });
+  const recorded = await run(
+    LATE_CONCLAVE.replace("fast: () => 1", 'fast: async () => { await sleep("1h", { name: "f" }); return 1; }'),
+    { runId: "c-late-pending", journal: won, handler: new SimHandler({}) },
+  );
+  const crashed = won.entries().filter((e) => e.name !== "f").map((e) => e.kind === "spawn" ? e : {
+    ...e, state: "pending" as const, status: undefined, endedAt: undefined, result: undefined, cancel: undefined,
+    closed: undefined, branchDigest: undefined, branches: undefined,
+  });
+  ok("the seed holds the race and the loser's conclave pending",
+    crashed.map((e) => `${e.kind}:${e.state}`).join() === "spawn:settled,race:pending,conclave:pending", crashed);
+  logged.length = 0;
+  const { handler, calls } = watching(new SimHandler({}));
+  const j = new Journal({ run: "c-late-pending", entries: crashed });
+  await resume(LATE_CONCLAVE, j, { runId: "c-late-pending", pins: recorded.pins, handler, onLog: sink });
+  ok("a pending conclave re-entered on a cancelled branch opens and closes nothing", calls.length === 0, calls);
+  ok("and the race resolves as the live run did", JSON.stringify(logged) === '[["reached"],["fast"]]', logged);
+}
+
+{
+  // A scope that dispatches is refused inside `once` (L4028) by its `dispatches` trait, before its
+  // entry begins. The body arrives through a parameter, so the validator's L2033 cannot see it and the
+  // run's own refusal is what this cell grades; the validator control comes first.
+  const IN_ONCE = `
+const a = await spawn("a", { name: "a" });
+async function inside(body) {
+  return await once(body, { name: "o" });
+}
+await inside(async () => await conclave([a], async (ch) => 1, { name: "c" }));
+`;
+  let staticError: unknown;
+  try {
+    validate(IN_ONCE);
+  } catch (e) {
+    staticError = e;
+  }
+  ok("a conclave reached inside once through a parameter passes the validator", staticError === undefined,
+    String(staticError).slice(0, 120));
+  const { handler, calls } = watching(new SimHandler({}));
+  const j = new Journal({ run: "c-once" });
+  let caught: unknown;
+  try {
+    await run(IN_ONCE, { runId: "c-once", journal: j, handler });
+  } catch (e) {
+    caught = e;
+  }
+  ok("and the run refuses it with L4028", (caught as { code?: string })?.code === "L4028", String(caught).slice(0, 120));
+  ok("before its entry begins, so the room is never opened",
+    calls.length === 0 && !j.entries().some((e) => e.kind === "conclave"),
+    { calls, entries: j.entries().map((e) => e.kind) });
+}
+
+// ---- 7) a race arm that FAILS is still a settle ------------------------------------------------
+
+{
+  /**
+   * The signal a `race` waits on must not propagate a rejection. A `p.then(() => undefined)` does,
+   * so the first arm to FAIL throws straight out of the await: past the cancellation of its
+   * siblings, past `allSettled`, and into a scope entry recorded as failed with no losers on it.
+   * The run then terminates while a sibling is still performing effects, and nothing durable says
+   * the two disagree.
+   *
+   * `bad` fails in microtasks while `slow` is parked in the watched handler's macrotask sleep, so
+   * which arm settles first is decided here rather than by the event loop. `slow` then has a SECOND
+   * effect after the park, which is where a cancelled branch learns it lost.
+   */
+  const FAILING_RACE = `
+const a = await spawn("a", { name: "a" });
+await race({
+  bad: async () => { await turn(a, { name: "boom" }); return 1; },
+  slow: async () => { await sleep("1m", { name: "s1" }); await sleep("1m", { name: "s2" }); return 2; },
+}, { name: "r" });
+`;
+  const { handler } = watching(
+    new SimHandler({ faults: [{ at: "/race:r#0/b:bad/turn:boom#0", kind: "agent-down" }] }),
+    true,
+  );
+  const j = new Journal({ run: "c-5" });
+  let caught: unknown;
+  try {
+    await run(FAILING_RACE, { runId: "c-5", journal: j, handler });
+  } catch (e) {
+    caught = e;
+  }
+  // Give the losing branch every chance to keep going. Without the cancellation it is a detached
+  // promise that resumes from its macrotask AFTER the run has already thrown, which is precisely
+  // the "run is over, agent is still working" state — and asserting before it wakes would let that
+  // state pass as clean.
+  await new Promise<void>((r) => setTimeout(r, 5));
+
+  ok("a rejecting arm fails the race", caught !== undefined);
+  ok("the loser really was mid-flight when the race ended", j.entries().some((e) => e.name === "s1"),
+    j.entries().map((e) => e.name));
+  // FIRST, because it is the claim that matters: the run being over and the sibling still working
+  // is the state the scope entry exists to make impossible.
+  ok("and it performed NO effect after the race ended", !j.entries().some((e) => e.name === "s2"),
+    j.entries().map((e) => `${e.name}:${e.state}`));
+  const scope = scopeOf(j, "race");
+  ok("the scope is journalled as failed", scope?.status === "failed", scope?.status);
+  ok("carrying the sibling it cancelled, because a failing arm owes its losers exactly as a winning one does",
+    JSON.stringify(scope?.cancel?.losers) === '["slow"]', scope?.cancel);
+  ok("with the cancellation still undischarged", scope?.cancel?.issued === false);
+
+  // And the winning-arm-failed path carries the same envelope: a primitive is a legal thing to
+  // throw, and the losers a race owes are the interpreter's fact, not a field on the program's
+  // value. `bad` throws in microtasks while `slow` parks in the watched macrotask sleep.
+  const jp = new Journal({ run: "c-5p" });
+  const wp = watching(new SimHandler({}), true);
+  let caughtP: unknown = "nothing was thrown";
+  try {
+    await run('await race({ bad: async () => { throw null; }, slow: async () => { await sleep("1m", { name: "s1" }); return 2; } }, { name: "r" });',
+      { runId: "c-5p", journal: jp, handler: wp.handler });
+  } catch (e) {
+    caughtP = e;
+  }
+  const sp = scopeOf(jp, "race");
+  ok("an arm that throws a PRIMITIVE fails the race with its own value", caughtP === null, String(caughtP));
+  ok("and the race still records the loser it cancelled", JSON.stringify(sp?.cancel?.losers) === '["slow"]', sp?.cancel);
+}
+
+{
+  // The other half of the same rule. A branch that rejected with `Cancelled` is not a candidate to
+  // win: that is not an outcome it reached, it is what losing did to it. Counting it would let a
+  // loser cut short at an early step outrank the winner that ran longer — and on a re-entered scope
+  // the recorded clocks make that a durable wrong answer rather than a transient one.
+  const entries = raceJournal.entries().map((e): JournalEntry => {
+    if (e.kind === "race") {
+      return { v: 1, seq: e.seq, run: e.run, scope: e.scope, kind: e.kind, name: e.name, occurrence: e.occurrence, inputHash: e.inputHash, state: "pending", startedAt: e.startedAt };
+    }
+    if (e.kind === "sleep" && e.scope.endsWith("/b:fast")) {
+      // `fast` was cancelled at 10ms — far earlier than either real arm finished.
+      return { ...e, startedAt: 0, endedAt: 10, status: "cancelled", result: undefined };
+    }
+    // The candidate arm must be a real settle: the live pass cancelled `slow` as the loser, so
+    // this fixture forces it ok at 300000.
+    if (e.kind === "sleep") return { ...e, startedAt: 0, endedAt: 300_000, state: "settled", status: "ok", result: null };
+    return e;
+  });
+  logged.length = 0;
+  const jj = new Journal({ run: "r-1", entries });
+  // Admitting the cancelled arm does not merely pick the wrong winner: the winner is a rejection,
+  // so the whole scope re-settles as cancelled and the resume throws. Caught here so the failure
+  // lands on this cell rather than killing the suite from outside any assertion.
+  let winner: unknown;
+  try {
+    await resume(RACE, jj, { runId: "r-1", pins: racePins, handler: new SimHandler({}), onLog: sink });
+    winner = logged.find((l) => l.length === 2)?.[0];
+  } catch (e) {
+    winner = `threw:${(e as Error).name}`;
+  }
+  ok("a branch recorded as cancelled does not win the race it lost", winner === "slow", winner);
+}
+
+// ---- 8) L2032's runtime half: the branch the validator could not prove -------------------------
+
+/**
+ * The static rule follows inline branches and named ones, and follows a branch into the helpers it
+ * calls. What it cannot follow is a branch that does not exist until the program runs — a record of
+ * thunks returned from a function, reached through a parameter, built by a call. Banning that shape
+ * would cost more than the hazard, so the rule has a second half that runs where the write happens:
+ * a binding declared OUTSIDE a concurrent branch cannot be written from inside one.
+ *
+ * The fixture below passes the validator — there is no function node at the combinator call to
+ * check — and must still be refused.
+ */
+{
+  const UNPROVEN = `
+let winner = "none";
+function branches() {
+  return {
+    a: async () => { await sleep("5m", { name: "a" }); winner = "a"; return 1; },
+    b: async () => { await sleep("1m", { name: "b" }); winner = "b"; return 2; },
+  };
+}
+await parallel(branches(), { name: "p" });
+`;
+  // The control FIRST: if this program did not parse, the cell below would prove nothing about the
+  // runtime, only that the validator caught it.
+  let staticError: unknown;
+  try {
+    validate(UNPROVEN);
+  } catch (e) {
+    staticError = e;
+  }
+  ok("the fixture really is one the validator cannot prove", staticError === undefined,
+    String(staticError).slice(0, 120));
+
+  let caught: unknown;
+  try {
+    await run(UNPROVEN, { runId: "c-6", handler: new SimHandler({}) });
+  } catch (e) {
+    caught = e;
+  }
+  ok("a write to a binding declared outside the branch is refused where it happens",
+    (caught as { code?: string })?.code === "L2032", String(caught).slice(0, 100));
+  ok("and the refusal names the binding", String((caught as Error)?.message).includes("winner"),
+    String(caught).slice(0, 120));
+}
+
+{
+  // The inverse control, and the one that decides whether the rule is usable. A branch writing what
+  // it declared itself is ordinary code and must run.
+  const OWN = `
+function branches() {
+  return { a: async () => { let n = 0; await sleep("1m", { name: "a" }); n = n + 1; return n; } };
+}
+const r = await parallel(branches(), { name: "p" });
+log(r.a);
+`;
+  logged.length = 0;
+  await run(OWN, { runId: "c-7", handler: new SimHandler({}), onLog: sink });
+  ok("a branch writing its OWN binding still runs", logged[0]?.[0] === 1, logged);
+}
+
+{
+  // `conclave` raises the depth though its one body has nothing to race: a settled conclave is
+  // replayed without entering its body, so a write from it would happen on the live run only. The
+  // body comes from a call, so the validator cannot follow it and only the runtime half refuses.
+  const IN_CONCLAVE = `
+let notes = "";
+function bodies() {
+  return { b: async (ch) => { notes = ch.channel; return 1; } };
+}
+const a = await spawn("a", { name: "a" });
+await conclave([a], bodies().b, { name: "t" });
+log(notes);
+`;
+  let caught: unknown;
+  try {
+    await run(IN_CONCLAVE, { runId: "c-8", handler: new SimHandler({}), onLog: sink });
+  } catch (e) {
+    caught = e;
+  }
+  ok("a conclave body may not write an outer binding at runtime either, past the validator",
+    (caught as { code?: string })?.code === "L2032", String(caught).slice(0, 100));
+}
+
+// ---- 9) `now()` after a scope is the same value live and on resume ----------------------------
+//
+// The scope's entry is stamped with the JOINED branch clock at settle, not the host's clock at
+// append time. Live, the parent clock joins every branch that ran; replay advances the parent from
+// the entry's stamp and enters no branch. The two must be the same number, or a program that
+// branches on `now()` after a scope takes a path on resume that the live run never took. The
+// handlers below make the two sources DISAGREE on purpose: the last effect to land is not the
+// effect with the greatest recorded clock, so a stamp taken from the handler's clock at append
+// time is wrong and the cell goes red.
+{
+  // parallel: `sa` records 9000 but lands first; `sb` records 4000 and lands LAST, so the
+  // handler's clock at the scope's settle is 4000 while the joined branch clock is 9000.
+  class LastLandsLow extends SimHandler {
+    private stamp = 0;
+    override now(): number { return this.stamp; }
+    override async sleep(req: Parameters<SimHandler["sleep"]>[0], ctx: Parameters<SimHandler["sleep"]>[1]) {
+      const name = String((ctx as { key?: { name?: string } }).key?.name ?? "");
+      await new Promise((r) => setTimeout(r, name === "sb" ? 25 : 1));
+      this.stamp = name === "sb" ? 4000 : 9000;
+      return null;
+    }
+  }
+  const PAR = `
+await parallel({
+  a: async () => { await sleep("1m", { name: "sa" }); return 1; },
+  b: async () => { await sleep("1m", { name: "sb" }); return 2; },
+}, { name: "both" });
+log("t", now());
+`;
+  logged.length = 0;
+  const r = await run(PAR, { runId: "r-9", handler: new LastLandsLow({}), onLog: sink, startedAt: 1000, seed: "r-9" });
+  const scope = scopeOf(r.journal, "parallel");
+  const liveT = logged.find((l) => l[0] === "t")?.[1];
+  ok("live, now() after a parallel is the join of the branch clocks", liveT === 9000, logged);
+  ok("and the scope entry is stamped with that joined clock, not the handler's clock at append time",
+    scope?.endedAt === 9000, scope?.endedAt);
+  logged.length = 0;
+  await resume(PAR, new Journal({ run: "r-9", entries: r.journal.entries() }), {
+    runId: "r-9",
+    pins: { seed: "r-9", startedAt: 1000, yieldEvery: 1024, stepBudget: 1_000_000, effectCeiling: 10_000, languageVersion: "1" },
+    handler: new SimHandler({}),
+    onLog: sink,
+  });
+  ok("and a resume answers the same now() the live run saw", logged.find((l) => l[0] === "t")?.[1] === 9000, logged);
+}
+
+{
+  // race: the LOSER lands first with the greater clock (300000), the winner lands last with the
+  // lesser one (60000). Joined clock 300000; handler clock at append time 60000. A program that
+  // branches on now() after the race must take the same path live and on resume.
+  class LoserLandsFirst extends SimHandler {
+    private stamp = 0;
+    override now(): number { return this.stamp; }
+    override async sleep(req: Parameters<SimHandler["sleep"]>[0], _ctx: Parameters<SimHandler["sleep"]>[1]) {
+      const late = req.duration === "5m";
+      await new Promise((r) => setTimeout(r, late ? 1 : 25));
+      this.stamp = late ? 300000 : 60000;
+      return null;
+    }
+  }
+  const PICK = `
+const r = await race({
+  early: async () => { await sleep("1m", { name: "se" }); return "E"; },
+  late: async () => { await sleep("5m", { name: "sl" }); return "L"; },
+}, { name: "pick" });
+log("win", r.index);
+if (now() > 200000) { log("path", "late"); } else { log("path", "early"); }
+`;
+  logged.length = 0;
+  const r = await run(PICK, { runId: "r-9b", handler: new LoserLandsFirst({}), onLog: sink, startedAt: 1000, seed: "r-9b" });
+  const livePath = logged.find((l) => l[0] === "path")?.[1];
+  ok("the winner is the least recorded clock even when the loser landed first",
+    logged.some((l) => l[0] === "win" && l[1] === "early"), logged);
+  ok("live, now() after the race saw the loser's landing (the scope awaited it)", livePath === "late", logged);
+  logged.length = 0;
+  await resume(PICK, new Journal({ run: "r-9b", entries: r.journal.entries() }), {
+    runId: "r-9b",
+    pins: { seed: "r-9b", startedAt: 1000, yieldEvery: 1024, stepBudget: 1_000_000, effectCeiling: 10_000, languageVersion: "1" },
+    handler: new SimHandler({}),
+    onLog: sink,
+  });
+  ok("and the resume takes the SAME path", logged.find((l) => l[0] === "path")?.[1] === livePath, logged);
+}
+
+// ---- 10) an in-flight effect that lands past the frontier re-decides the cut ------------------
+//
+// A cancelled arm may see an effect it already issued land; landing advances its clock, and an arm
+// that lands PAST the settled frontier has proven it cannot win. Before the re-decision existed,
+// the verdict from the settle (reached with the arm's OLD clock) stood, the loser's pure tail ran
+// on, and an infinite tail burned the whole step budget: the live run died on L4013 while a resume
+// of its journal returned the winner. The cell holds that the live run completes.
+{
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  class InFlight extends SimHandler {
+    private stamp = 0;
+    override now(): number { return this.stamp; }
+    override async sleep(req: Parameters<SimHandler["sleep"]>[0], ctx: Parameters<SimHandler["sleep"]>[1]) {
+      const name = String((ctx as { key?: { name?: string } }).key?.name ?? "");
+      if (name === "sb") { await gate; this.stamp = 15000; return null; }
+      this.stamp = 10000;
+      setTimeout(release, 5);
+      return null;
+    }
+  }
+  const INFLIGHT = `
+const r = await race({
+  a: async () => { await sleep("1s", { name: "sa" }); return "A"; },
+  b: async () => { await sleep("1s", { name: "sb" }); let n = 0; while (true) { n = n + 1; } },
+}, { name: "inflight" });
+log("win", r.index, r.value);
+`;
+  logged.length = 0;
+  // The failure mode this cell guards is run() REJECTING (the tail burns the step budget, L4013):
+  // caught here so the regression reds on this cell's name instead of crashing the suite unnamed.
+  let r: Awaited<ReturnType<typeof run>> | null = null;
+  let died: unknown = null;
+  try {
+    r = await run(INFLIGHT, { runId: "r-10", handler: new InFlight({}), onLog: sink, startedAt: 1000, seed: "r-10", yieldEvery: 64, stepBudget: 25_000 });
+  } catch (e) {
+    died = e;
+  }
+  ok("the loser's infinite pure tail is abandoned once its in-flight effect lands past the frontier, and the run completes",
+    died === null && logged.some((l) => l[0] === "win" && l[1] === "a" && l[2] === "A"),
+    died === null ? logged : String(died));
+  const scope = r === null ? undefined : scopeOf(r.journal, "race");
+  ok("with the race settled ok and the in-flight landing recorded",
+    r !== null && scope?.status === "ok" && r.journal.entries().some((e) => e.name === "sb" && e.status === "ok" && e.endedAt === 15000),
+    r === null ? "no journal" : r.journal.entries().map((e) => `${e.name}:${e.status ?? e.state}`));
+}
+
+{
+  // And the other half of the same rule: an arm whose in-flight effect lands BEFORE the frontier
+  // can still win, so it is NOT cut — its pure tail runs to a settle and it takes the race. This
+  // is the cell that guards against over-cutting every cancelled arm on any landing.
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  class LandsEarly extends SimHandler {
+    private stamp = 0;
+    override now(): number { return this.stamp; }
+    override async sleep(req: Parameters<SimHandler["sleep"]>[0], ctx: Parameters<SimHandler["sleep"]>[1]) {
+      const name = String((ctx as { key?: { name?: string } }).key?.name ?? "");
+      if (name === "sb") { await gate; this.stamp = 5000; return null; }
+      this.stamp = 10000;
+      setTimeout(release, 5);
+      return null;
+    }
+  }
+  const STILL = `
+const r = await race({
+  a: async () => { await sleep("1s", { name: "sa" }); return "A"; },
+  b: async () => { await sleep("1s", { name: "sb" }); let n = 0; while (n < 400) { n = n + 1; } return "B"; },
+}, { name: "still" });
+log("win", r.index, r.value);
+`;
+  logged.length = 0;
+  await run(STILL, { runId: "r-10b", handler: new LandsEarly({}), onLog: sink, startedAt: 1000, seed: "r-10b", yieldEvery: 64, stepBudget: 25_000 });
+  ok("an arm whose in-flight effect lands BEFORE the frontier runs its pure tail and wins",
+    logged.some((l) => l[0] === "win" && l[1] === "b" && l[2] === "B"), logged);
+}
+
+// ---- 11) a cancellation that arrives during `begin` still stops the dispatch -------------------
+//
+// `begin` is awaited so the request id is durable before the work is issued, and that await is a
+// gap: a sibling can settle the race and cancel this branch while the append is in flight. The
+// boundary re-checks on the far side of the append, so the handler is never asked for work the
+// branch already lost — measured before the re-check: the loser's effect was dispatched anyway,
+// performed against the world, and recorded `ok` under a scope that had already picked its winner.
+{
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  class SlowAppend extends Journal {
+    override async begin(...args: Parameters<Journal["begin"]>): ReturnType<Journal["begin"]> {
+      const entry = await super.begin(...args);
+      if (args[0].name === "sb") await gate;
+      return entry;
+    }
+  }
+  const asked: string[] = [];
+  class Asked extends SimHandler {
+    private stamp = 0;
+    override now(): number { return this.stamp; }
+    override async sleep(req: Parameters<SimHandler["sleep"]>[0], ctx: Parameters<SimHandler["sleep"]>[1]) {
+      asked.push(String((ctx as { key?: { name?: string } }).key?.name ?? ""));
+      this.stamp = 10000;
+      setTimeout(release, 5);
+      return null;
+    }
+  }
+  const GAP = `
+const r = await race({
+  a: async () => { await sleep("1s", { name: "sa" }); return "A"; },
+  b: async () => { await sleep("1s", { name: "sb" }); return "B"; },
+}, { name: "gap" });
+log("win", r.index, r.value);
+`;
+  logged.length = 0;
+  const journal = new SlowAppend({ run: "r-11" });
+  await run(GAP, { runId: "r-11", journal, handler: new Asked({}), onLog: sink, startedAt: 1000, seed: "r-11" });
+  ok("the handler is never asked for the effect a cancellation overtook inside `begin`",
+    !asked.includes("sb") && asked.includes("sa"), asked);
+  ok("and the pending entry settles as what the branch now is: cancelled, not ok",
+    journal.entries().some((e) => e.name === "sb" && e.state === "settled" && e.status === "cancelled"),
+    journal.entries().map((e) => `${e.name}:${e.status ?? e.state}`));
+  ok("and the race records the winner that overtook it",
+    logged.some((l) => l[0] === "win" && l[1] === "a"), logged);
+}
+
+// ---- 12) a divergence inside a scope is not the scope's own outcome --------------------------------
+//
+// A `RunDivergence` is the journal saying this program is not the one that wrote it. The
+// interpreter treats it as uncatchable; `performScope`'s catch ladder treats `RunReleased`,
+// `RunHeld` and `Cancelled` as "not this scope's outcome, settle nothing". Until the ladder entry
+// existed, a divergence raised inside a live or resumed scope fell through to the generic settle
+// and was DURABLY recorded as the scope failing for a reason of its own (`L4000` scope-fault), so
+// the next resume replayed a scope-fault — an `EffectError` a program's `try` could swallow —
+// instead of the divergence, and the loudness the class exists for was spent before anyone saw it
+// (#1176). The cells below pin both sites: the ladder, and the `race` winner scan that used to
+// discard a losing arm's divergence behind a winning sibling.
+//
+// The same deadline shape section 5's neighbours use in the migrate suite: a cell whose
+// implementation regresses to "wait forever" must fail on a clock, not on the runner's patience.
+const deadline = async (label: string, p: Promise<unknown>, ms = 2_000) => {
+  let t: ReturnType<typeof setTimeout>;
+  const timer = new Promise<"HUNG">((res) => { t = setTimeout(() => res("HUNG"), ms); });
+  const outcome = await Promise.race([p.then(() => null, (e: unknown) => e as Error), timer]);
+  clearTimeout(t!);
+  return outcome === "HUNG" ? new Error(`HUNG: ${label} did not return within ${ms}ms`) : outcome;
+};
+
+// The shape the issue's triage measured: a `parallel` stopped after one branch effect (scope
+// pending), resumed with edited source whose recorded sleep duration differs inside the scope.
+{
+  const P = `
+await parallel({
+  a: async () => { await sleep("1m", { name: "a-work" }); return 1; },
+  b: async () => { await sleep("2m", { name: "b-work" }); return 2; },
+}, { name: "both" });
+await sleep("1m", { name: "tail" });
+`;
+  const runId = "r-div-scope";
+  const journal = new Journal({ run: runId });
+  const pins = resolvePins({ runId }, 0, WALKER_LANGUAGE_VERSION);
+  let effects = 0;
+  let released: unknown;
+  try {
+    await run(P, { runId, pins, journal, handler: new SimHandler({}), shouldStop: () => (effects++ === 1 ? "host stop" : undefined) });
+  } catch (e) { released = e; }
+  ok("the recorded prefix stopped inside a pending parallel", released !== undefined
+    && scopeOf(journal, "parallel")?.state === "pending", journal.entries().map((e) => `${e.kind}:${e.name}/${e.state}`));
+
+  const EDITED = P.replace('sleep("1m", { name: "a-work" })', 'sleep("9m", { name: "a-work" })');
+  ok("the edit landed inside the scope", EDITED !== P);
+  const j2 = new Journal({ run: runId, entries: journal.entries() });
+  const first = await deadline("the diverging resume", resume(EDITED, j2, { runId, pins, handler: new SimHandler({}) }));
+  ok("(1) a resume whose edit diverged inside the pending parallel throws the divergence",
+    first instanceof RunDivergence, `${(first as Error)?.name}: ${(first as Error)?.message?.slice(0, 90)}`);
+  // The journal's own shape, not a message match: under the defect this entry is `settled` with
+  // `status: "failed"` and `error.code: "L4000"`, exactly what the `RunReleased` cell above guards.
+  const scope = scopeOf(j2, "parallel");
+  ok("(1) and the scope entry stays PENDING rather than recording the divergence as its outcome",
+    scope !== undefined
+      && scope.state === "pending"
+      && (scope as { status?: string }).status === undefined
+      && (scope as { error?: unknown }).error === undefined,
+    scope === undefined ? "no scope entry at all" : { state: scope.state, status: (scope as { status?: string }).status, error: (scope as { error?: { code?: string } }).error?.code });
+
+  // (2) THE CONSEQUENCE: the same journal resumed again must diverge again, not replay a
+  // scope-fault. Under the defect the second resume threw `EffectError` carrying `L4000`, and a
+  // program with `try/catch` around the scope swallowed it and performed NEW effects against the
+  // journal it had just diverged from.
+  const j3 = new Journal({ run: runId, entries: j2.entries() });
+  const second = await deadline("the second resume", resume(EDITED, j3, { runId, pins, handler: new SimHandler({}) }));
+  ok("(2) a second resume of that journal diverges again, at the step that broke",
+    second instanceof RunDivergence
+      && (second as Error).message.includes("/parallel:both#0/b:a/sleep:a-work#0"),
+    `${(second as Error)?.name}: ${(second as Error)?.message?.slice(0, 90)}`);
+
+  // (3) and the try/catch half of the same claim: the interpreter's uncatchable set already holds
+  // `RunDivergence`; this proves the SCOPE path does not launder it into a catchable scope-fault.
+  const CAUGHT = `try {\n${EDITED}\n} catch (e) { log("caught", e.code ?? "none"); }\nawait sleep("1s", { name: "after-catch" });`;
+  const j4 = new Journal({ run: runId, entries: journal.entries() });
+  logged.length = 0;
+  // `deadline` hands a rejection back as a value, so reading the outcome (rather than wrapping
+  // the await in try/catch, which cannot see it) is what makes this cell say anything at all.
+  const caughtOutcome = await deadline("the try/catch resume", resume(CAUGHT, j4, { runId, pins, handler: new SimHandler({}), onLog: sink }));
+  ok("(3) a divergence inside a scope the program wrapped in try/catch is NOT caught",
+    caughtOutcome instanceof RunDivergence && logged.length === 0,
+    `${(caughtOutcome as Error)?.name}; logs: ${JSON.stringify(logged)}`);
+  ok("(3) and no effect after the catch runs against the journal it diverged from",
+    !j4.entries().some((e) => e.name === "after-catch"), j4.entries().map((e) => e.name));
+}
+
+// (4) the race winner scan: a divergence in a losing arm must outrank the winner, not be discarded
+// by the tie-break. The journal is built by hand in the pending-race shape the scan reads: the
+// losing arm's sleep is BEGUN (pending, recorded 9s hash) and the winner is a pure arm declared
+// first, so its settle clock ties or beats the loser and the scan must pick it — unless the
+// divergence is hoisted above the scan. Under the defect the run COMPLETED with the winner's
+// value and the divergence never surfaced at all.
+{
+  const R = `
+const r = await race({
+  pure: async () => { return "pure"; },
+  sleepy: async () => { await sleep("9s", { name: "slow-work" }); return "slow"; },
+}, { name: "either" });
+log("win", r.index, r.value);
+`;
+  const runId = "r-div-race";
+  const pins = resolvePins({ runId }, 0, WALKER_LANGUAGE_VERSION);
+  const harvest = new Journal({ run: runId });
+  await run(R, { runId, pins, journal: harvest, handler: new SimHandler({}) });
+  const h = harvest.entries();
+  const sleepy = h.find((e) => e.name === "slow-work") as JournalEntry;
+  ok("the harvest holds the loser's sleep under its recorded 9s hash", sleepy !== undefined, h.map((e) => e.name));
+  const seeded = new Journal({ run: runId, entries: [
+    // The scope entry and the loser's effect, both back to `pending`: the race re-enters, replays
+    // the pure winner, and re-enters the loser whose edited duration no longer hashes to the entry.
+    { ...(h.find((e) => e.kind === "race") as JournalEntry), state: "pending", status: undefined, endedAt: undefined, result: undefined, cancel: undefined, branchDigest: undefined, branches: undefined },
+    { ...sleepy, state: "pending", status: undefined, endedAt: undefined, result: undefined, cancel: undefined },
+  ] });
+  const EDITED = R.replace('sleep("9s", { name: "slow-work" })', 'sleep("7s", { name: "slow-work" })');
+  ok("the race edit landed on the losing arm", EDITED !== R);
+  logged.length = 0;
+  const outcome = await deadline("the race resume", run(EDITED, { runId, pins, journal: seeded, handler: new SimHandler({}), onLog: sink }));
+  ok("(4) a divergence in a losing race arm surfaces as RunDivergence",
+    outcome instanceof RunDivergence, `${(outcome as Error)?.name}: ${(outcome as Error)?.message?.slice(0, 90)}`);
+  ok("(4) and the winner's value is not returned",
+    !logged.some((l) => l[0] === "win"), logged);
+  ok("(4) and the race entry settles nothing over the discarded arm",
+    scopeOf(seeded, "race")?.state === "pending"
+      && (scopeOf(seeded, "race") as { status?: string }).status === undefined,
+    seeded.entries().map((e) => `${e.kind}:${e.name}/${e.state}${e.status ? `:${e.status}` : ""}`));
+}
+
+// (5) THE CONTROLS. An ordinary branch throw on the same path is still the scope's own failure —
+// the ladder entry must not widen into "nothing a branch throws is an outcome" — and a later
+// resume replays that recorded failure. `Cancelled` and `RunReleased` inside scopes keep their
+// existing cells above (section 5 and the release cells in the interpret suite); this is the
+// third member of the set that must keep recording.
+{
+  const P = `
+await parallel({
+  ok: async () => { await sleep("5m"); return 1; },
+  bad: async () => { null.length; },
+}, { name: "both" });
+`;
+  const runId = "r-div-control";
+  const pins = resolvePins({ runId }, 0, WALKER_LANGUAGE_VERSION);
+  const j = new Journal({ run: runId });
+  let threw: unknown;
+  try {
+    await run(P, { runId, pins, journal: j, handler: new SimHandler({}) });
+  } catch (e) { threw = e; }
+  const scope = scopeOf(j, "parallel");
+  ok("(5) control: an ordinary branch throw still fails the scope with the branch's own code",
+    threw !== undefined && scope?.state === "settled" && scope?.status === "failed"
+      && (scope as { error?: { code?: string; kind?: string } }).error?.code === "L4010"
+      && (scope as { error?: { code?: string; kind?: string } }).error?.kind === "runtime",
+    { name: (threw as Error)?.name, status: scope?.status, error: (scope as { error?: unknown }).error });
+  const j2 = new Journal({ run: runId, entries: j.entries() });
+  let replayed: unknown;
+  try {
+    await resume(P, j2, { runId, pins, handler: new SimHandler({}) });
+  } catch (e) { replayed = e; }
+  ok("(5) and a later resume replays that recorded failure as an EffectError",
+    (replayed as { name?: string; code?: string })?.name === "EffectError"
+      && (replayed as { code?: string }).code === "L4010",
+    `${(replayed as Error)?.name}: ${(replayed as { code?: string }).code}`);
+}
+
+// (6)-(8) the round-2 blocker, the reviewer's exact input: a scope whose arms have BOTH begun,
+// resumed with one arm's recorded sleep duration changed. The ladder entry from (1) keeps the
+// scope entry pending, but the `parallel`/`fanOut` catches and the race `onSettle` non-candidate
+// set used to treat the divergence as a branch failure anyway: every sibling was cancelled — a
+// durable `settled/cancelled` on a run the program had no standing to speak for — and a resume
+// of the ORIGINAL source then threw `Cancelled` (or settled the scope `cancelled`) instead of
+// completing. A divergence is a fact about the program, not an outcome the run reached, so it
+// cancels no sibling and the healthy source must be able to finish the run.
+//
+// The seed is the harvest shape cell (4) already uses: a completed run's entries reset to
+// pending, so both arms' effects are recorded under their original hashes and the race
+// re-enters each arm against them.
+// Re-entry seed shared by (6)-(8): a settled entry back to pending, so both arms are recorded
+// under their original hashes and the scope re-enters each arm against them.
+const pend = (e: JournalEntry): JournalEntry => ({ ...e, state: "pending", status: undefined, endedAt: undefined, result: undefined, cancel: undefined, branchDigest: undefined, branches: undefined });
+
+{
+  const P6 = `
+await parallel({
+  a: async () => { await sleep("1m", { name: "a-work" }); return 1; },
+  b: async () => { await sleep("2m", { name: "b-work" }); return 2; },
+}, { name: "both" });
+await sleep("1m", { name: "tail" });
+`;
+  const runId = "r-div-parallel-sib";
+  const pins = resolvePins({ runId }, 0, WALKER_LANGUAGE_VERSION);
+  const harvest = new Journal({ run: runId });
+  await run(P6, { runId, pins, journal: harvest, handler: new SimHandler({}) });
+  const h = harvest.entries();
+  const seeded = new Journal({ run: runId, entries: [
+    pend(h.find((e) => e.kind === "parallel") as JournalEntry),
+    pend(h.find((e) => e.name === "a-work") as JournalEntry),
+    pend(h.find((e) => e.name === "b-work") as JournalEntry),
+  ] });
+  const EDITED = P6.replace('sleep("1m", { name: "a-work" })', 'sleep("9m", { name: "a-work" })');
+  ok("the parallel seed edit landed", EDITED !== P6);
+  const diverged = await deadline("the diverging parallel", run(EDITED, { runId, pins, journal: seeded, handler: new SimHandler({}) }));
+  ok("(6) a divergence in one arm of a both-begun parallel still surfaces as RunDivergence",
+    diverged instanceof RunDivergence, `${(diverged as Error)?.name}: ${(diverged as Error)?.message?.slice(0, 90)}`);
+  const sibling = seeded.entries().find((e) => e.name === "b-work");
+  ok("(6) and the sibling arm's entry settles ok, not cancelled",
+    sibling !== undefined && sibling.state === "settled" && (sibling as { status?: string }).status === "ok",
+    sibling === undefined ? "no sibling entry" : { state: sibling.state, status: (sibling as { status?: string }).status });
+  const j6 = new Journal({ run: runId, entries: seeded.entries() });
+  const orig = await deadline("the original-source resume", resume(P6, j6, { runId, pins, handler: new SimHandler({}) }));
+  ok("(6) and a resume of the original source completes both arms and settles the scope ok",
+    orig === null && scopeOf(j6, "parallel")?.state === "settled" && (scopeOf(j6, "parallel") as { status?: string }).status === "ok",
+    `${(orig as Error)?.name ?? "COMPLETED"}; ${j6.entries().map((e) => `${e.kind}:${e.name}/${e.state}${e.status ? `:${e.status}` : ""}`)}`);
+}
+
+{
+  const F7 = `
+await fanOut(["x", "y"], async (lens) => { await sleep(lens === "x" ? "1m" : "2m", { name: "w-" + lens }); return lens; }, { name: "fan", key: (lens) => lens });
+await sleep("1m", { name: "tail" });
+`;
+  const runId = "r-div-fanout-sib";
+  const pins = resolvePins({ runId }, 0, WALKER_LANGUAGE_VERSION);
+  const harvest = new Journal({ run: runId });
+  await run(F7, { runId, pins, journal: harvest, handler: new SimHandler({}) });
+  const h = harvest.entries();
+  const seeded = new Journal({ run: runId, entries: [
+    pend(h.find((e) => e.kind === "fanOut") as JournalEntry),
+    pend(h.find((e) => e.name === "w-x") as JournalEntry),
+    pend(h.find((e) => e.name === "w-y") as JournalEntry),
+  ] });
+  const EDITED = F7.replace('lens === "x" ? "1m"', 'lens === "x" ? "9m"');
+  ok("the fanOut seed edit landed", EDITED !== F7);
+  const diverged = await deadline("the diverging fanOut", run(EDITED, { runId, pins, journal: seeded, handler: new SimHandler({}) }));
+  ok("(7) a divergence in one branch of a both-begun fanOut still surfaces as RunDivergence",
+    diverged instanceof RunDivergence, `${(diverged as Error)?.name}: ${(diverged as Error)?.message?.slice(0, 90)}`);
+  const sibling = seeded.entries().find((e) => e.name === "w-y");
+  ok("(7) and the sibling branch's entry settles ok, not cancelled",
+    sibling !== undefined && sibling.state === "settled" && (sibling as { status?: string }).status === "ok",
+    sibling === undefined ? "no sibling entry" : { state: sibling.state, status: (sibling as { status?: string }).status });
+  const j7 = new Journal({ run: runId, entries: seeded.entries() });
+  const orig = await deadline("the original-source resume", resume(F7, j7, { runId, pins, handler: new SimHandler({}) }));
+  ok("(7) and a resume of the original source completes both branches and settles the scope ok",
+    orig === null && scopeOf(j7, "fanOut")?.state === "settled" && (scopeOf(j7, "fanOut") as { status?: string }).status === "ok",
+    `${(orig as Error)?.name ?? "COMPLETED"}; ${j7.entries().map((e) => `${e.kind}:${e.name}/${e.state}${e.status ? `:${e.status}` : ""}`)}`);
+}
+
+{
+  const R8 = `
+const r = await race({
+  fast: async () => { await sleep("1m", { name: "fast-work" }); return "fast"; },
+  slow: async () => { await sleep("2m", { name: "slow-work" }); return "slow"; },
+}, { name: "either" });
+log("win", r.index, r.value);
+`;
+  const runId = "r-div-race-sib";
+  const pins = resolvePins({ runId }, 0, WALKER_LANGUAGE_VERSION);
+  const harvest = new Journal({ run: runId });
+  await run(R8, { runId, pins, journal: harvest, handler: new SimHandler({}) });
+  const h = harvest.entries();
+  const seeded = new Journal({ run: runId, entries: [
+    pend(h.find((e) => e.kind === "race") as JournalEntry),
+    pend(h.find((e) => e.name === "fast-work") as JournalEntry),
+    pend(h.find((e) => e.name === "slow-work") as JournalEntry),
+  ] });
+  const EDITED = R8.replace('sleep("1m", { name: "fast-work" })', 'sleep("9m", { name: "fast-work" })');
+  ok("the race seed edit landed", EDITED !== R8);
+  const diverged = await deadline("the diverging race", run(EDITED, { runId, pins, journal: seeded, handler: new SimHandler({}) }));
+  ok("(8) a divergence in one arm of a both-begun race still surfaces as RunDivergence",
+    diverged instanceof RunDivergence, `${(diverged as Error)?.name}: ${(diverged as Error)?.message?.slice(0, 90)}`);
+  const other = seeded.entries().find((e) => e.name === "slow-work");
+  ok("(8) and the other arm's entry settles ok, not cancelled",
+    other !== undefined && other.state === "settled" && (other as { status?: string }).status === "ok",
+    other === undefined ? "no other-arm entry" : { state: other.state, status: (other as { status?: string }).status });
+}
+
+// #3224: a scope's value is the frozen copy its record carries, live as on resume. Freezing the
+// value in place froze a record a branch returned from OUTSIDE the scope for the rest of the live
+// run, while a resume, which never runs the branch, left it writable: a write after the scope read
+// L2031 live and succeeded on resume, and the effect depending on it diverged (L5001).
+{
+  const P = `
+const a = await spawn("a")
+const rec = { n: 1 }
+const r = await parallel({ x: async () => rec }, { name: "p" })
+let out = "unset"
+try { rec.n = 2; out = "wrote" } catch (w) { out = w.code === "L2031" ? "frozen" : "threw" }
+let viaResult = "unset"
+try { r.x.n = 3; viaResult = "wrote" } catch (w) { viaResult = w.code === "L2031" ? "frozen" : "threw" }
+await notify([a], { decision: "d", outcome: out })
+log("outer", out, viaResult)
+`;
+  const runId = "r-scope-copy";
+  const pins = resolvePins({ runId }, 0, WALKER_LANGUAGE_VERSION);
+  const j = new Journal({ run: runId });
+  logged.length = 0;
+  await run(P, { runId, pins, journal: j, handler: new SimHandler({}), onLog: sink });
+  const live = logged.find((l) => l[0] === "outer");
+  ok("a record a branch returns from outside the scope stays writable after it, live",
+    live?.[1] === "wrote", live);
+  ok("while the scope's own value is still frozen, live", live?.[2] === "frozen", live);
+  for (const [form, entries] of [["as recorded", j.entries()], ["JSON round-tripped", JSON.parse(JSON.stringify(j.entries())) as JournalEntry[]]] as const) {
+    logged.length = 0;
+    let threw: unknown;
+    try {
+      await resume(P, new Journal({ run: runId, entries }), { runId, pins, handler: new SimHandler({}), onLog: sink });
+    } catch (e) { threw = e; }
+    const replayed = logged.find((l) => l[0] === "outer");
+    ok(`and the resume of unchanged source (entries ${form}) completes, reading the same`,
+      threw === undefined && JSON.stringify(replayed) === JSON.stringify(live),
+      { threw: (threw as Error)?.message?.slice(0, 120), replayed, live });
+  }
+}
+
+// #3215: an `Error` that fails a scope is caught as `{ code: "L4000", kind: "host" }` live, so the
+// record carries that kind and a resume binds the same. Recorded as `scope-fault`, the resume bound
+// a different kind and the `notify` carrying it diverged (L5001), for a refused branch value and for
+// a plain throw from the scope's own dispatch alike.
+{
+  const caughtKind = (scope: string): string => `
+const a = await spawn("a")
+const b = await spawn("b")
+let seen = null
+try { await ${scope} } catch (e) { seen = e }
+log("caught", seen)
+await notify([a], { decision: "d", outcome: seen.kind })
+`;
+  const plainThrow = (): EffectHandler => {
+    const h = Object.create(new SimHandler({})) as EffectHandler;
+    h.openConclave = async () => { throw new Error("plain handler boom"); };
+    return h;
+  };
+  const cases = [
+    ["a branch value the crossing rule refuses", caughtKind('parallel({ x: async () => () => 1 }, { name: "p" })'), () => new SimHandler({})],
+    ["a plain throw from the scope's own dispatch", caughtKind('conclave([a, b], () => 1, { name: "c" })'), plainThrow],
+  ] as const;
+  for (const [name, P, handler] of cases) {
+    const runId = "r-scope-host";
+    const pins = resolvePins({ runId }, 0, WALKER_LANGUAGE_VERSION);
+    const j = new Journal({ run: runId });
+    logged.length = 0;
+    await run(P, { runId, pins, journal: j, handler: handler(), onLog: sink });
+    const live = logged.find((l) => l[0] === "caught");
+    const scope = j.entries().find((e) => e.kind === "parallel" || e.kind === "conclave");
+    ok(`${name}: the live catch binds L4000 host, and the scope records that kind`,
+      (live?.[1] as { kind?: string })?.kind === "host" && (live?.[1] as { code?: string })?.code === "L4000"
+        && scope?.error?.code === "L4000" && scope?.error?.kind === "host",
+      { live, recorded: scope?.error });
+    for (const [form, entries] of [["as recorded", j.entries()], ["JSON round-tripped", JSON.parse(JSON.stringify(j.entries())) as JournalEntry[]]] as const) {
+      logged.length = 0;
+      let threw: unknown;
+      try {
+        await resume(P, new Journal({ run: runId, entries }), { runId, pins, handler: handler(), onLog: sink });
+      } catch (e) { threw = e; }
+      const replayed = logged.find((l) => l[0] === "caught");
+      ok(`${name}: the resume of unchanged source (entries ${form}) binds the same and completes`,
+        threw === undefined && JSON.stringify(replayed) === JSON.stringify(live),
+        { threw: (threw as Error)?.message?.slice(0, 120), replayed, live });
+    }
+  }
+}
+
+console.log(`scopes.smoke: ${pass} checks passed`);
