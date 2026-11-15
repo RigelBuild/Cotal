@@ -4468,7 +4468,7 @@ the caller's own, and for `handle`, redemption-pinned; the owner for
 **attribution**, and plane writer ownership.
 The `roster` command serves validated, paged presence rows. Static managers use a separate
 `auth-roster-reader` credential holding presence stream info and Direct Get, with no presence write.
-Token-mode managers serve from their existing presence watch cache. Auth serves user-mode callers;
+Token-mode managers use their existing endpoint presence watch cache. Auth serves user-mode callers;
 manager serves static and token-authenticated callers. Authenticated agent credentials have no raw
 presence read.
 
@@ -6754,8 +6754,8 @@ placeholders:
 Grouped placeholders such as `<CHAT|DM|TASK>` mean one concrete subject per listed token.
 The `auth-roster-reader` profile holds `$JS.API.STREAM.INFO.<KV>`,
 `$JS.API.DIRECT.GET.<KV>`, and its own inbox subscription only. Auth serves user-mode roster;
-manager serves static roster. Token-mode managers serve their roster from the existing presence
-watch cache. The agent profile holds the request grant, not raw presence reads.
+manager serves static and token-authenticated roster. Token-mode managers read their roster from the
+existing presence watch cache. The agent profile holds the request grant, not raw presence reads.
 
 
 ### Agent
