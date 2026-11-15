@@ -9,11 +9,11 @@ import {
   principalKey,
   rejectionText,
   type EvictionResult,
+  type LifecycleStateTransport,
   type SpaceAuth,
 } from "@cotal-ai/core";
+import { makeManagerEndpointEvictionEvidence } from "../endpoint-evict.js";
 import {
-  makeManagerEndpointEvictionEvidence,
-  type LifecycleStateTransport,
   readStaticSlot,
   activateStaticLifecycle,
   runStaticTerminal,

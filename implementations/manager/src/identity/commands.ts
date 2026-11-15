@@ -9,22 +9,21 @@ import {
   STATIC_GENERATION_HORIZON_SEC,
   STANDING_RENEWABLE_TTL_SEC as MANAGED_STATIC_TTL_SEC,
   issuedHorizon,
+  credentialIdOf,
   type EpServeContext,
   type IssuanceSeam,
   type IssuedStore,
+  type LifecycleStateTransport,
   type SpaceAuth,
 } from "@cotal-ai/core";
 import type { CotalEndpoint } from "@cotal-ai/core";
 import type { KV } from "@nats-io/kv";
 import {
   casStaticSlot,
-  credentialIdOf,
   readStaticSlot,
   resumeIdentityActivation,
-  type LifecycleStateTransport,
 } from "../static-lifecycle.js";
 import { IdentityStore, type IdentityRecord } from "./store.js";
-
 export type IdentityMintResult = { name: string; jwt: string; lifecycleUid: string; exp: number; acceptedToken: string };
 export interface IdentityIssuerContext { store: IssuedStore; accepted: KV }
 
