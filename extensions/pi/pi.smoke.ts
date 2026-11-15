@@ -1064,7 +1064,8 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   mesh.peekPendingTurns = () => ({ text: renderPendingTurnText(header, [blocks.g1, blocks.g2], footer), goalIds: ["g1", "g2"], header, footer, blocks });
   ctx.idle = true;
   ctx.pending = false;
-  await delay(300);
+  const deadline = Date.now() + 5_000;
+  while (host.sent.length < 2 && Date.now() < deadline) await delay(10);
   const first = host.sent[0];
   const second = host.sent[1];
   assert.ok(first && second, "the lost turn is re-dispatched with the new goal");
@@ -1111,9 +1112,10 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
     checks++;
   } finally {
     const runtimes = globals[runtimeKey];
-    const key = "pi-context-smoke\0pi-context-smoke";
-    await runtimes?.get(key)?.mesh.stop();
-    runtimes?.delete(key);
+    if (runtimes) {
+      for (const runtime of runtimes.values()) await runtime.mesh.stop();
+      runtimes.clear();
+    }
     if (globals[onceKey]) globals[onceKey].exit = oldExit;
     for (const key of keys) {
       const value = saved[key];
