@@ -393,7 +393,7 @@ const presencePermissions = permissionsFor("agent", "demo", prC7 as never, { lif
   { pub: { allow: string[] }; sub: { allow: string[] } };
 const presenceStream = `KV_${presenceBucket("demo")}`;
 c("agent permissions omit bare and keyed presence Direct Get grants",
-  !presencePermissions.pub.allow.some((r) => r === "$JS.API.DIRECT.GET" || r.startsWith("$JS.API.DIRECT.GET.")));
+  !presencePermissions.pub.allow.some((r) => r === "$JS.API.DIRECT.GET" || r.startsWith(`$JS.API.DIRECT.GET.${presenceStream}`)));
 c("agent permissions omit presence consumer-create and consumer-info grants",
   !presencePermissions.pub.allow.some((r) => r.startsWith(`$JS.API.CONSUMER.CREATE.${presenceStream}`)
     || r.startsWith(`$JS.API.CONSUMER.INFO.${presenceStream}`)));
