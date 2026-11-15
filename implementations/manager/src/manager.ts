@@ -8,7 +8,6 @@ import Headless from "@xterm/headless";
 import {
   CotalEndpoint,
   answerAuthRoster,
-  openAuthRosterReader,
   type RosterReader,
   canonicalJson,
   MANAGED_HANDOFF_KIND,
@@ -1804,6 +1803,9 @@ export class Manager {
    *  in user mode, and before registration completes. */
   private serviceServe?: { handle: EpServeHandle; nc: NatsConnection; identity: Identity; grant: EpServeGrant; creds?: string };
   private rosterReader?: Promise<RosterReader>;
+  private managerRosterReader?: RosterReader;
+  private managerEndpointConnection?: NatsConnection;
+  private managerEndpointTransportConnected = false;
   /** #1577: dedicated connections (serve, goal-writer, session-ledger) whose transport is down while
    *  the client reconnects them, tracked by {@link trackTransport}. Such a connection is open
    *  (`isClosed()` is false under unbounded reconnects) yet the broker holds none of its rails, so
@@ -2574,6 +2576,10 @@ export class Manager {
       // pull/display), so skip the channel-registry watch — the supervisor cred (residual 2) then
       // holds no channel-KV read grant. Presence (the roster) is still watched.
       watchChannels: false,
+      onConnection: (connection) => {
+        this.managerEndpointConnection = connection;
+        this.managerEndpointTransportConnected = false;
+      },
       // `host` says which machine runs this manager, as an agent's card does: an owner with several
       // managers tells them apart by it. Advisory display metadata, never a routing input.
       card: { id, ...(this.remoteAuthority ? { owner: this.remoteAuthority.owner, actor: this.remoteAuthority.actors.supervisor } : {}), name: this.name, role: "manager", kind: "endpoint", meta: { host: hostname(), terminal: this.streamsTerminal ? "stream" : "none" } },
@@ -2587,6 +2593,7 @@ export class Manager {
     // (recorded with no presence event) is logged the moment the view can support the verdict.
     this.ep.on("roster", () => this.logSeatMeshTransitions());
     this.ep.on("presence-view", () => this.logSeatMeshTransitions());
+    this.ep.on("transport", (state) => { this.managerEndpointTransportConnected = state.connected; });
     await this.ep.start();
     await this.ep.setActivity(`agent host (${this.runtimeKind})`);
     // Per-instance liveness lease (the old per-space singleton is DEMOTED). Acquire
@@ -4743,8 +4750,30 @@ export class Manager {
     };
     return managerCommandDefs({
       roster: (ctx) => this.serveObservation(ctx, async () => {
-        if (this.userMode) throw new EpEnvelopeError("unavailable", "user-mode roster is served by auth");
-        if (!this.auth) throw new EpEnvelopeError("unavailable", "manager roster requires a dedicated reader credential; this manager has no local signing authority");
+        if (this.userMode && !this.remoteAuthority) throw new EpEnvelopeError("unavailable", "user-mode roster is served by auth");
+        if (!this.auth) {
+          this.managerRosterReader ??= {
+            read: async () => {
+              const endpoint = this.ep;
+              const connection = this.managerEndpointConnection;
+              if (!endpoint || !connection || connection.isClosed() || !this.managerEndpointTransportConnected)
+                throw new Error("manager roster endpoint connection is unavailable");
+              if (endpoint.presenceView().state !== "current")
+                throw new Error("manager roster presence view is not current");
+              const rows = endpoint.getRoster();
+              rows.sort((a, b) => a.card.id < b.card.id ? -1 : a.card.id > b.card.id ? 1 : 0);
+              if (this.managerEndpointConnection !== connection || connection.isClosed() || !this.managerEndpointTransportConnected || endpoint.presenceView().state !== "current")
+                throw new Error("manager roster endpoint changed during the read");
+              return rows;
+            },
+            dropOversized: () => {},
+            // The manager owns this endpoint connection.
+            close: async () => {},
+          };
+          const args = ctx.request.args;
+          const limit = args?.limit, after = args?.after;
+          return answerAuthRoster(this.managerRosterReader, ctx, { ...(typeof limit === "number" ? { limit } : {}), ...(typeof after === "string" ? { after } : {}) });
+        }
         if (!this.rosterReader) {
           const pending = openAuthRosterReader({ server: this.servers ?? DEFAULT_SERVER, space: this.space, auth: this.auth, log: (line) => console.error(line) });
           this.rosterReader = pending;

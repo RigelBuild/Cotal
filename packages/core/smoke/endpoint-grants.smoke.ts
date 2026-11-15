@@ -14,6 +14,7 @@ import {
   epRequestGrantRows, epJournalGrantRow, epCallerReplyGrantRow, epGoalProgressGrantRow,
   epCallerGrantRows, epServeSubscribeRows, epServePublishRows, epServeGrantRows,
   epBaselineGrantRows, spawnCallerCapabilities, runCallerCapabilities, operatorInstrumentCapabilities, instancePinnedInstrumentCapabilities, baselineCallerCapabilities, permissionsFor,
+  presenceBucket, presenceKeySubject,
   SPAWN_CREATE_COMMANDS,
   MAX_CONTROL_LINE_BYTES, CONNECT_ENVELOPE_OVERHEAD_BYTES, MAX_MINTED_JWT_BYTES,
   subjectMatches,
@@ -388,6 +389,19 @@ const agreed = permissionsFor("agent", "demo", prC7 as never, { endpointCapabili
 c("permissionsFor with an AGREEING opts.lifecycleUid mints, and every caller-rail row carries the ONE uid",
   agreed.pub.allow.concat(agreed.sub.allow).filter((r: string) => r.includes(".ep.")).every((r: string) => r.includes(`.${UID}.`) || r.includes(`.${UID}`))
   && !agreed.pub.allow.some((r: string) => r.includes(OTHER_UID)));
+const presencePermissions = permissionsFor("agent", "demo", prC7 as never, { lifecycleUid: UID }) as
+  { pub: { allow: string[] }; sub: { allow: string[] } };
+const presenceStream = `KV_${presenceBucket("demo")}`;
+c("agent permissions omit bare and keyed presence Direct Get grants",
+  !presencePermissions.pub.allow.some((r) => r === "$JS.API.DIRECT.GET" || r.startsWith("$JS.API.DIRECT.GET.")));
+c("agent permissions omit presence consumer-create and consumer-info grants",
+  !presencePermissions.pub.allow.some((r) => r.startsWith(`$JS.API.CONSUMER.CREATE.${presenceStream}`)
+    || r.startsWith(`$JS.API.CONSUMER.INFO.${presenceStream}`)));
+c("agent permissions retain presence STREAM.INFO and only the principal's exact own-key write",
+  presencePermissions.pub.allow.includes(`$JS.API.STREAM.INFO.${presenceStream}`)
+  && presencePermissions.pub.allow.includes(presenceKeySubject("demo", prC7.owner, prC7.actor))
+  && !presencePermissions.pub.allow.some((r) => r.startsWith(`$KV.${presenceBucket("demo")}.`)
+    && r !== presenceKeySubject("demo", prC7.owner, prC7.actor)));
 let threw = false;
 try {
   await mintCreds(auth, newIdentity(), "agent", { principal: { owner: "u_abc", actor: "cli" }, endpointCapabilities: [spawnCap] });

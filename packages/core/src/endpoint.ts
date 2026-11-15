@@ -382,7 +382,8 @@ export interface EndpointOptions {
   ttlMs?: number;
   /** Publish our own presence (default true). */
   registerPresence?: boolean;
-  /** Read presence through the manager roster command. */
+  /** Route roster reads through the service command instead of reading the presence bucket directly.
+   *  Authenticated agents select this automatically; open-mode agents retain direct reads. */
   managerRoster?: boolean;
   /** Track the roster of peers with a live watch (default true). Every watcher receives every
    *  member's heartbeat, so a space of K watching members moves K² deliveries per heartbeat. An
@@ -397,13 +398,10 @@ export interface EndpointOptions {
    *  registry, because the join-time replay decision reads it. */
   watchChannels?: boolean;
   /** Read presence and the channel registry ONCE at start instead of watching them (default false),
-   *  for an endpoint that does one thing and stops (`cotal send`, a roster probe). Each read is a
-   *  batched Direct Get of every key's last record, so it binds no consumer. A watch's ordered consumer
-   *  outlives {@link CotalEndpoint.stop} by the broker's five-minute inactive threshold, because the
-   *  operator and agent profiles hold no CONSUMER.DELETE on these buckets (#691), and one per
-   *  short-lived process piles up until the broker refuses new consumers there (#4091). The roster
-   *  and the channel cache hold the state at start and never update, and no sweep runs. Requires
-   *  `consume` and `registerPresence` false. */
+   *  for an endpoint that does one thing and stops (`cotal send`, a roster probe). Trusted direct
+   *  reads use a batched Direct Get, which binds no consumer. Agents read their roster through the
+   *  auth or manager service command instead. The roster and channel cache hold state only at
+   *  start and never update, and no sweep runs. Requires `consume` and `registerPresence` false. */
   readOnce?: boolean;
   /** Consume ONLY this endpoint's own existing DM durable, for a credential that can read nothing
    *  else. The endpoint binds `dm_<owner>-<actor>-<uid>` and opens no channel registry, presence,
@@ -1007,7 +1005,7 @@ export class CotalEndpoint extends EventEmitter {
      *  `connId` so the ephemeral verdict below can never read an unassigned value. */
     let selfMintedConnId = false;
     this.space = opts.space;
-    this.managerRoster = opts.managerRoster === true || (typeof opts.creds === "string" && agentCredentialLifecycleUid(opts.creds, opts.space) !== undefined) || (typeof opts.creds === "function" && opts.card.kind === "agent");
+    this.managerRoster = opts.managerRoster === true || (opts.card.kind === "agent" && (opts.bearer !== undefined || opts.creds !== undefined || opts.token !== undefined || opts.user !== undefined || opts.pass !== undefined)) || (typeof opts.creds === "string" && agentCredentialLifecycleUid(opts.creds, opts.space) !== undefined);
     // A display name is the client-side handle a peer is addressed by; reject the reserved `/`
     // (the future owner/name separator) and surrounding whitespace at the one identity choke
     // point every join/spawn path flows through. A role is an address too, refused here before
@@ -1135,7 +1133,7 @@ export class CotalEndpoint extends EventEmitter {
     this.doConsume = opts.consume ?? true;
     this.readOnce = opts.readOnce ?? false;
     if (this.managerRoster && this.doWatch && !this.readOnce)
-      throw new Error("agent roster watches are unavailable; disable watchPresence and poll readPresence through manager");
+      throw new Error("mediated roster watches are unavailable; disable watchPresence and poll readPresence through the roster service");
     if (this.readOnce && (this.doConsume || this.doRegister))
       throw new Error("EndpointOptions.readOnce requires consume and registerPresence false: a one-time read cannot keep a consumer's channel cache or its own presence current");
     if (opts.dmOnly !== undefined) {
@@ -3312,8 +3310,8 @@ export class CotalEndpoint extends EventEmitter {
   }
 
   /**
-   * Read the roster now. Agents use auth in user mode and manager otherwise; trusted observers may
-   * use a direct read without a consumer.
+   * Read presence now. Authenticated agents use the roster command on auth in user mode and manager
+   * otherwise; open-mode agents and trusted non-agent observers may use a direct read without a consumer.
    * A record that says `offline` or whose `ts` is past the liveness window reads offline. A peer an
    * earlier read saw that is gone from the bucket stays in the roster as offline, as a watch keeps
    * it. The result is also what {@link getRoster} returns until the next read.
@@ -7855,8 +7853,9 @@ export class CotalEndpoint extends EventEmitter {
     return info;
   }
 
-  /** {@link EndpointOptions.readOnce}: fill the roster from one read of the presence bucket. Stale
-   *  and offline records resolve as they do in a watch's initial replay. */
+  /** {@link EndpointOptions.readOnce}: fill the roster from a service command for authenticated
+   *  agents or a direct read for open agents and trusted non-agent observers. Stale and offline
+   *  records resolve as they do in a watch's initial replay. */
   private async readPresenceOnce(): Promise<void> {
     if (this.userMode || this.managerRoster) {
       const rows = await this.readPresence();
