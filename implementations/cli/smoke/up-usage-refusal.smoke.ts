@@ -53,6 +53,7 @@ import { connect, createServer, type AddressInfo } from "node:net";
 import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { acquireMaintenanceLock, beginMaintenanceCut, releaseMaintenanceLock, writeMaintenanceResumeDocument } from "@cotal-ai/workspace";
 import { assertSmokeSandboxDown, createSuite, freePort, recordSmokeSandbox, type SmokeSandboxAnchor } from "@cotal-ai/smoke-kit";
 import { clean, ptySpawn } from "./_console-pty.js";
 
@@ -68,8 +69,8 @@ const { readStackJournal, writeStackJournal } = await import("../src/lib/stack-j
 const { check, finish } = createSuite();
 const home = mkdtempSync(join(tmpdir(), "cotal-up-usage-home-"));
 const folder = mkdtempSync(join(tmpdir(), "cotal-up-usage-cwd-"));
-const roots = ["unprepared", "journal"].map((name) => realpathSync(mkdtempSync(join(tmpdir(), `cotal-up-usage-${name}-`))));
-const [unprepared, journalRoot] = roots as [string, string];
+const roots = ["unprepared", "journal", "pending"].map((name) => realpathSync(mkdtempSync(join(tmpdir(), `cotal-up-usage-${name}-`))));
+const [unprepared, journalRoot, pendingRoot] = roots as [string, string, string];
 process.on("exit", () => { for (const dir of [home, folder, ...roots]) rmSync(dir, { recursive: true, force: true }); });
 
 const HOST_ENV = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("COTAL_") && k !== "FORCE_COLOR" && k !== "NO_COLOR"));
@@ -109,6 +110,30 @@ for (const { args, message } of cases) {
   check(`up ${args.join(" ")} prints the error and the help on stderr, nothing on stdout, exit 1`, text.status === 1 && text.stdout === "" && message.test(text.stderr) && /Usage/.test(text.stderr), shown(text));
 }
 
+mkdirSync(join(pendingRoot, "store"));
+const pendingLock = acquireMaintenanceLock(pendingRoot);
+try {
+  const resume = writeMaintenanceResumeDocument(pendingLock, { version: 1, inventory: { agents: [] }, launch: { runtime: "pty" } });
+  beginMaintenanceCut(pendingLock, {
+    attemptId: "cut-no-manager", space: "no-manager-pending", mode: "open",
+    sourcePath: join(pendingRoot, "store"), resume, launch: { server: "nats://127.0.0.1:4222" },
+  });
+} finally {
+  releaseMaintenanceLock(pendingLock);
+}
+sandbox(pendingRoot);
+const pendingNoManager = run(["up", "--no-manager", "--json"], pendingRoot);
+check("up --no-manager with a pending non-admitted journal exits 2 with LIFECYCLE_BLOCKED",
+  pendingNoManager.status === 2 && pendingNoManager.envelope?.outcome === "refused" && pendingNoManager.envelope.target?.root === pendingRoot && pendingNoManager.envelope.error?.code === "LIFECYCLE_BLOCKED", shown(pendingNoManager));
+check("the pending no-manager refusal names the status inspection and its actual state-specific remedy",
+  /cotal status/.test(pendingNoManager.envelope?.error?.remedy ?? "") && /finish the interrupted cut/.test(pendingNoManager.envelope?.error?.remedy ?? "") && /pnpm cotal down --preserve-state/.test(pendingNoManager.envelope?.error?.remedy ?? ""), pendingNoManager.envelope?.error);
+const pendingPlainNoManager = run(["up", "--no-manager"], pendingRoot);
+check("up --no-manager with a pending non-admitted journal prints its refusal and remedy on stderr only, exit 2",
+  pendingPlainNoManager.status === 2 && pendingPlainNoManager.stdout === "" && /--no-manager is refused/.test(pendingPlainNoManager.stderr) && /cotal status/.test(pendingPlainNoManager.stderr) && /finish the interrupted cut/.test(pendingPlainNoManager.stderr) && /pnpm cotal down --preserve-state/.test(pendingPlainNoManager.stderr), shown(pendingPlainNoManager));
+
+const pendingRotate = run(["up", "--rotate-sys", "--json"], pendingRoot);
+check("up --rotate-sys with a pending maintenance journal is refused as LIFECYCLE_BLOCKED, exit 2",
+  pendingRotate.status === 2 && pendingRotate.envelope?.outcome === "refused" && pendingRotate.envelope.error?.code === "LIFECYCLE_BLOCKED" && pendingRotate.envelope.target?.root === pendingRoot, shown(pendingRotate));
 const servers: { server: string; message: RegExp; example: string }[] = [
   { server: "http://127.0.0.1:43131", message: /--server must be a nats:\/\/ or tls:\/\/ URL/, example: "--server nats://127.0.0.1:43131" },
   { server: "nats://localhost:43131", message: /--server names the host localhost/, example: "--server nats://127.0.0.1:43131" },

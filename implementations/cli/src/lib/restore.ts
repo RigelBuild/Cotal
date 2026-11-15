@@ -841,7 +841,8 @@ export function maintenanceNextStep(root: string, journal: NonNullable<ReturnTyp
   const attemptId = "restore" in journal ? journal.restore.attemptId : journal.state === "claimed" ? journal.claim.attemptId : journal.cut.attemptId;
   const next = "restore" in journal ? restoreNextStep(journal.state, attemptId, restoreLeftOut(journal))
     : journal.state === "ready" ? readyNextStep(root, journal.source)
-    : journal.state === "claimed" ? claimedNextStep(root, journal.claim) : null;
+      : journal.state === "claimed" ? claimedNextStep(root, journal.claim)
+        : journal.state === "cut-intent" || journal.state === "cut-committed" ? `finish the interrupted cut with \`${displayCmd()} down --preserve-state\`` : null;
   return { attemptId, next };
 }
 

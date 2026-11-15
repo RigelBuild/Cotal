@@ -2804,8 +2804,7 @@ export interface ControllerStackView {
  *  restore's address and restored store, and must have settled the restore's own operation. Every
  *  other state and journal kind still fences. This only reads: the journal is never consumed,
  *  rewritten or deleted. */
-export function admittedControllerRestore(root: string, stack: ControllerStackView): RestoreActiveRecord | undefined {
-  const record = readMaintenanceJournal(root);
+export function admittedControllerRestore(root: string, stack: ControllerStackView, record = readMaintenanceJournal(root)): RestoreActiveRecord | undefined {
   const binding = record ? controllerAttemptBinding(record) : undefined;
   if (!record || record.state !== "active" || !binding || record.space !== stack.space || record.launch.server !== stack.server ||
       record.restore.target.path !== stack.storeDir || stack.operation.id === binding.stackOperationId && stack.operation.phase !== "completed")

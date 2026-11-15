@@ -23,6 +23,7 @@ import {
   settleControllerMemberStart, writeMaintenanceResumeDocument, writeRestoreCommitIntent,
   type ControllerReconfiguration, type ControllerStop, type MaintenanceLock, type ListenerProof,
 } from "@cotal-ai/workspace";
+import { status } from "../src/commands/status.js";
 import { serviceAction } from "../src/commands/service-actions.js";
 import "../src/lib/broker-service.js";
 import { preserveControllerStack } from "../src/lib/controller-preserve.js";
@@ -31,7 +32,7 @@ import { resolveServiceAdapter } from "../src/lib/service-adapters.js";
 import { serviceDefinitionStore, type ServiceDefinitionSnapshot } from "../src/lib/service-definitions.js";
 import { processServiceHost, requireProcessIdentity, serviceInstanceStore } from "../src/lib/service-instances.js";
 import { assertRestartAdmitted } from "../src/lib/service-process.js";
-import { admittedStackRestore, maintenanceStackView, readStackJournal, stackMaintenanceFence, writeStackJournal, type StackJournal } from "../src/lib/stack-journal.js";
+import { admittedStackRestore, maintenanceStackView, noManagerRefused, readStackJournal, stackMaintenanceFence, writeStackJournal, type StackJournal } from "../src/lib/stack-journal.js";
 import { stackResumeEligibility } from "../src/lib/stack-resume.js";
 
 let passed = 0;
@@ -298,8 +299,23 @@ console.log("a settled active restore: manager launch facts, team boot and prese
   const a = activeRestore("active");
   await check("the restored stack admits its settled restore", admittedStackRestore(a.root) === a.attemptId);
   const view = maintenanceStackView(a.root, a.space);
+  await check("the broker-only refusal predicate admits a settled active restore", !noManagerRefused(a.root));
   await check("a manager launch carries this stack's facts", view?.space === a.space && view.server === server && view.storeDir === a.stack.broker!.storeDir && view.operation.id === a.stack.operation.id && view.operation.phase === "completed");
   await check("a manager launch for another space carries none", maintenanceStackView(a.root, "other-space") === undefined);
+  const previousCwd = process.cwd(), previousExitCode = process.exitCode, originalWrite = process.stdout.write;
+  let statusJson = "";
+  try {
+    process.chdir(a.root);
+    process.exitCode = undefined;
+    process.stdout.write = ((chunk: string | Uint8Array) => (statusJson += String(chunk), true)) as typeof process.stdout.write;
+    await status({ values: { json: true }, positionals: [], raw: [] });
+  } finally {
+    process.stdout.write = originalWrite;
+    process.chdir(previousCwd);
+    process.exitCode = previousExitCode;
+  }
+  const statusEnvelope = JSON.parse(statusJson) as { result?: { maintenance?: { noManagerRefused?: boolean } } };
+  await check("status --json says an admitted active restore does not refuse --no-manager", statusEnvelope.result?.maintenance?.noManagerRefused === false);
   register(a.space, a.root);
   await check("a manager restart under the settled restore of its own stack is admitted", admitted(() => assertRestartAdmitted(managerDefinition(a.space, a.root))));
   await check("so is a broker restart", admitted(() => assertRestartAdmitted(serviceDefinitionStore(a.space).read("stack-broker")!)));
