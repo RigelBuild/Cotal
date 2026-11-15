@@ -71,6 +71,11 @@ try {
       error.details?.some((detail) => detail.kind === "ai.cotal.ep.seat-mint-cap" && detail.seats === 1 && detail.cap === 1) === true,
     "cap checking and reservation share the same transaction",
   );
+  reopened.latchRetirement("alice", "next-minter", nextMinter.lifecycleUid);
+  assert.equal(new IdentityStore(root, "smoke", "manager").get("alice")?.terminalizing, true);
+  assert.throws(() => reopened.reserve("alice", "next-minter", 13, 1),
+    (error: unknown) => error instanceof EpEnvelopeError && error.code === "failed-precondition");
+  console.log("PASS reserve refused while terminalizing");
 
   console.log("identity-store smoke passed");
 } finally {

@@ -29,9 +29,10 @@ export type IdentityRecord = {
   issuance?: IdentityIssuance;
   renewal?: { issuanceId: string; iat: number; exp: number };
   initialIssuance?: IdentityIssuance;
+  terminalizing?: boolean;
 };
 
-const KEYS = new Set(["version", "name", "lifecycleUid", "minter", "reservedAt", "touchedAt", "retiredAt", "publicKey", "issuance", "renewal", "initialIssuance"]);
+const KEYS = new Set(["version", "name", "lifecycleUid", "minter", "reservedAt", "touchedAt", "retiredAt", "publicKey", "issuance", "renewal", "initialIssuance", "terminalizing"]);
 const ISSUANCE_KEYS = new Set(["generation", "iat", "exp", "acceptedToken", "issuanceId", "credentialId", "state"]);
 const UID = /^[a-z0-9]{26,32}$/;
 const USER_NKEY = /^U[A-Z2-7]{55}$/;
@@ -67,6 +68,7 @@ export function parseIdentityRecord(raw: unknown): IdentityRecord {
       typeof raw.name !== "string" || !raw.name || typeof raw.lifecycleUid !== "string" || !UID.test(raw.lifecycleUid) ||
       typeof raw.minter !== "string" || !raw.minter || !Number.isSafeInteger(raw.reservedAt) || !Number.isSafeInteger(raw.touchedAt) ||
       (raw.retiredAt !== undefined && !Number.isSafeInteger(raw.retiredAt)) ||
+      (raw.terminalizing !== undefined && raw.terminalizing !== true) ||
       (raw.publicKey !== undefined && (typeof raw.publicKey !== "string" || !USER_NKEY.test(raw.publicKey))))
     throw new Error("invalid identity record");
   const issuance = parseIssuance(raw.issuance);
@@ -93,6 +95,7 @@ export function parseIdentityRecord(raw: unknown): IdentityRecord {
     ...(issuance === undefined ? {} : { issuance }),
     ...(renewal === undefined ? {} : { renewal }),
     ...(initialIssuance === undefined ? {} : { initialIssuance }),
+    ...(raw.terminalizing === true ? { terminalizing: true } : {}),
   };
 }
 
@@ -254,6 +257,8 @@ export class IdentityStore {
       throw identityError("bad-request", "identity reservation cap must be a positive safe integer");
     return this.#withLock(() => {
       const previous = this.#current(name);
+      if (previous?.terminalizing && previous.retiredAt === undefined)
+        throw identityError("failed-precondition", `identity name ${name} is terminalizing`);
       if (previous && previous.retiredAt === undefined && previous.issuance?.state !== "retired" && previous.minter !== minter)
         throw identityError("already-exists", `identity name ${name} is owned by another minter`);
       if (previous && previous.retiredAt === undefined && previous.issuance?.state !== "retired") {
@@ -283,6 +288,7 @@ export class IdentityStore {
       const current = this.#current(name);
       if (!current || current.lifecycleUid !== lifecycleUid)
         throw identityError("conflict", "public-key binding does not match the current lifecycle UID");
+      if (current.terminalizing) throw identityError("failed-precondition", "identity is terminalizing");
       if (current.minter !== minter)
         throw identityError("permission-denied", "public-key binding is not owned by this minter");
       if (current.retiredAt !== undefined || current.issuance?.state === "retired")
@@ -301,7 +307,7 @@ export class IdentityStore {
   beginRenewal(name: string, minter: string, lifecycleUid: string, expectedIssuanceId: string, renewal: NonNullable<IdentityRecord["renewal"]>): IdentityRecord {
     return this.#withLock(() => {
       const current = this.#current(name);
-      if (!current || current.lifecycleUid !== lifecycleUid || current.minter !== minter || current.retiredAt !== undefined || current.issuance?.state !== "issued" || current.issuance.issuanceId !== expectedIssuanceId)
+      if (!current || current.lifecycleUid !== lifecycleUid || current.minter !== minter || current.terminalizing || current.retiredAt !== undefined || current.issuance?.state !== "issued" || current.issuance.issuanceId !== expectedIssuanceId)
         throw identityError("conflict", "identity changed before renewal");
       if (current.renewal) return cloneRecord(current);
       if (!UID.test(renewal.issuanceId) || !Number.isSafeInteger(renewal.iat) || !Number.isSafeInteger(renewal.exp) || renewal.iat <= current.issuance.iat || renewal.exp <= current.issuance.exp)
@@ -374,6 +380,18 @@ export class IdentityStore {
         touchedAt: Math.max(current.touchedAt, now),
       };
       this.#records[this.#indexByUid(current.lifecycleUid)] = updated;
+      this.#persist();
+      return cloneRecord(updated);
+    });
+  }
+
+  latchRetirement(name: string, minter: string, lifecycleUid: string): IdentityRecord {
+    return this.#withLock(() => {
+      const current = this.#current(name);
+      if (!current || current.lifecycleUid !== lifecycleUid || current.minter !== minter) throw identityError("conflict", "identity retirement does not match the reservation");
+      if (current.retiredAt !== undefined || current.terminalizing) return cloneRecord(current);
+      const updated = { ...current, terminalizing: true as const };
+      this.#records[this.#indexByUid(lifecycleUid)] = updated;
       this.#persist();
       return cloneRecord(updated);
     });
