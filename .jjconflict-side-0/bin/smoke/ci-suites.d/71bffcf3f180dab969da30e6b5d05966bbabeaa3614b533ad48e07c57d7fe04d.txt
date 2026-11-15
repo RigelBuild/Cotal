@@ -1,2 +1,0 @@
-# Packaged current CLI refuses update against a published legacy manager.
-smoke:legacy-packaged-manager

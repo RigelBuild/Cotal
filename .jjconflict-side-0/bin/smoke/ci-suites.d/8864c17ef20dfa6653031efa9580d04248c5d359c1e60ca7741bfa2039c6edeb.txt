@@ -1,2 +1,0 @@
-# Live install-probe CI shape: cold qualification and installer lanes.
-smoke:install-probe-ci

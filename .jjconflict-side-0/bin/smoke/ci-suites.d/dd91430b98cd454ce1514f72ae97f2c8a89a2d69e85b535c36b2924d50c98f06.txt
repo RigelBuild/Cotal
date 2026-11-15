@@ -1,2 +1,0 @@
-# An exchanged bearer and the NATS user JWT minted from it never outlive the IdP proof (#4184).
-smoke:bearer-exp-ceiling:auth

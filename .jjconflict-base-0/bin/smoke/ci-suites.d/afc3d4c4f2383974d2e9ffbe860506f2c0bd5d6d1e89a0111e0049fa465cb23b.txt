@@ -1,2 +1,0 @@
-# Exact frozen-legacy parsed-index invariant and full-cycle move detection.
-smoke:shard-stability

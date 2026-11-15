@@ -32,11 +32,20 @@ import { connect, PermissionViolationError, type NatsConnection } from "@nats-io
 import {
   isReachable, createSpaceAuth, serverConfig, setupSpaceStreams, mintCreds, newIdentity,
   mintLifecycleUid, standaloneConnectOpts, DEV_OWNER, EpEnvelopeError,
-  MANAGER_VITALS_SCOPE,
+  MANAGER_VITALS_SCOPE, epBaselineGrantRows,
   resolveService, invokeCommand, registry, parseGoalResultFact, goalResultSubject, epfStreamName,
-  parseEpSubject, deriveReplySubject, epCallerReplyFilter, epRequestSubject,
-  type Connector, type ControlReply, type EpCaller, type EpAttributedReply, type LaunchOpts, type LaunchSpec,
+  epRequestGrantRows, epRequestSubject, credsClaims,
+  type EpCapability, type EpCaller,
 } from "@cotal-ai/core";
+
+
+function identityRequestSubject(caller: EpCaller, command: string): string {
+  return epRequestSubject(space, {
+    route: { mode: "one" }, endpoint: MANAGER_ENDPOINT, command, caller,
+    nonce: randomUUID().replaceAll("-", ""),
+  });
+}
+ [rig8455-manager-livesmoke/implementations/manager/smoke/manager-service-invoke.smoke.ts#B350]
 import { authDir, saveSpaceAuth } from "@cotal-ai/workspace";
 import { Manager } from "../src/manager.js";
 // Endpoint name + shipped surface pin. Never MANAGER_CONTRACTS: a generic caller does not
@@ -107,9 +116,60 @@ try {
   const nc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds, tls: false }), maxReconnectAttempts: 0 });
   connections.push(nc);
 
+  console.log("2a. verify minter identity rows and live broker enforcement");
+  const minterId = newIdentity();
+  const minterUid = mintLifecycleUid();
+  const minterCaller: EpCaller = { owner: DEV_OWNER, actor: minterId.id, uid: minterUid };
+  const minterCaps: EpCapability[] = ["identity-reserve", "identity-mint", "identity-renew", "identity-retire"].map((command) => ({ endpoint: MANAGER_ENDPOINT, command }));
+  const minterCreds = await mintCreds(auth, minterId, "agent", {
+    principal: { owner: DEV_OWNER, actor: minterId.id },
+    lifecycleUid: minterUid,
+    endpointCapabilities: minterCaps,
+  });
+  const minterClaims = credsClaims(minterCreds);
+  const expectedIdentityRows = minterCaps.flatMap((cap: EpCapability) => epRequestGrantRows(space, cap, minterCaller)).sort();
+  const actualPubRows = minterClaims.nats?.pub?.allow ?? [];
+  const actualIdentityRows = actualPubRows.filter((row) => row.includes(".identity-")).sort();
+  check("minter JWT contains exactly the four identity request rows", JSON.stringify(actualIdentityRows) === JSON.stringify(expectedIdentityRows), { actualIdentityRows, expectedIdentityRows });
+  const expectedBaselineRows = epBaselineGrantRows(space, minterCaller).pub;
+  check("minter JWT carries its baseline alongside identity rows", expectedBaselineRows.every((row) => actualPubRows.includes(row)), { missing: expectedBaselineRows.filter((row) => !actualPubRows.includes(row)) });
+  const seatIdentityRows = (credsClaims(creds).nats?.pub?.allow ?? []).filter((row) => row.includes(".identity-"));
+  check("the ordinary seat JWT carries zero identity-command rows", seatIdentityRows.length === 0, seatIdentityRows);
+  const minterNc = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds: minterCreds, tls: false }), maxReconnectAttempts: 0 });
+  connections.push(minterNc);
+  const minterService = await resolveService(minterNc, space, MANAGER_ENDPOINT, minterCaller, { deadlineMs: 10_000 });
+  const reserveReply = await invokeCommand(minterNc, space, minterService, "identity-reserve", { name: "broker-grant-probe" }, { currentEpoch });
+  check("the live broker admits the minter's identity-reserve row and manager responds", reserveReply.reply.ok === true, reserveReply.reply);
+
+  const adminRetireSubject = identityRequestSubject(minterCaller, "identity-retire-admin");
+  let adminRetireBrokerDenied = false;
+  let adminRetireBrokerOutcome: unknown;
+  try {
+    const reply = await minterNc.request(adminRetireSubject, new TextEncoder().encode("{}"), { timeout: 1_000 });
+    adminRetireBrokerOutcome = { status: reply.headers?.code };
+  } catch (error) {
+    const denied = permissionDenial(error);
+    adminRetireBrokerDenied = denied?.subject === adminRetireSubject;
+    adminRetireBrokerOutcome = { name: error instanceof Error ? error.name : typeof error, deniedSubject: denied?.subject };
+  }
+  check("the live broker denies an ungranted identity-retire-admin row", adminRetireBrokerDenied, adminRetireBrokerOutcome);
+
+  const seatReserveSubject = identityRequestSubject(caller, "identity-reserve");
+  let seatReserveDenied = false;
+  let seatReserveOutcome: unknown;
+  try {
+    const reply = await nc.request(seatReserveSubject, new TextEncoder().encode("{}"), { timeout: 1_000 });
+    seatReserveOutcome = { status: reply.headers?.code };
+  } catch (error) {
+    const denied = permissionDenial(error);
+    seatReserveDenied = denied?.subject === seatReserveSubject;
+    seatReserveOutcome = { name: error instanceof Error ? error.name : typeof error, deniedSubject: denied?.subject };
+  }
+  check("the live broker denies an ordinary seat's identity-reserve publish row", seatReserveDenied, seatReserveOutcome);
+
   console.log("1. resolveService: describe + fetch + recompile the full surface (no hand-imported schemas)");
   const service = await resolveService(nc, space, MANAGER_ENDPOINT, caller, { deadlineMs: 10_000 });
-  check("roster advances the manager cluster revision and retains existing commands", shipped.revision === 52 && service.commands.has("roster") && service.commands.has("turn-unconfirmed") && service.commands.has("turn-participate") && service.commands.has("remove-persona") && service.commands.has("vitals") && service.commands.has("run-cancel") && service.commands.has("run-start-keyed") && service.commands.has("run-submission-status") && service.commands.has("chat-session-open") && service.commands.has("chat-session-retire") && service.commands.has("attest-gone") && service.commands.has("allowlist-set") && service.commands.has("release-seat") && service.commands.has("cancel") && service.commands.has("transcript-receive") && service.commands.has("goal-result") && service.commands.has("resolve-cwd"), shipped);
+  check("manager revision 53 retains roster and exposes seat identity commands", shipped.revision === 53 && ["roster", "allowlist-set", "identity-reserve", "identity-mint", "identity-renew", "identity-retire", "identity-retire-admin"].every((name) => service.commands.has(name)));
   check("the resolved surface matches the shipped cluster document", service.commands.size === shipped.commandCount && shipped.names.every((n) => service.commands.has(n)) && service.commands.has("status") && service.commands.has("spawn") && service.commands.has("despawn"), [...service.commands.keys()].sort());
   const personaInput = service.commands.get("define-persona")!.contract.input;
   for (const field of ["model", "role", "agent"] as const) {

@@ -1,2 +1,0 @@
-# channel members on a running stack: an unknown name is refused, and a follow writes changes only.
-smoke:channel-members:live

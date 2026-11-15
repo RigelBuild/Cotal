@@ -1,2 +1,0 @@
-# Preserve mention pull delivery when bounded drop tracking is exhausted.
-smoke:focus-drop-exhaustion

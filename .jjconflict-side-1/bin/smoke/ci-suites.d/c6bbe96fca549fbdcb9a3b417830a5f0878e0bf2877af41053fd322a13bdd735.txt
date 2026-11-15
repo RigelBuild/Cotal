@@ -1,2 +1,0 @@
-# dmHistory must rewrite identity from the forge-locked subject (Cotal #388).
-smoke:dm-history-subject

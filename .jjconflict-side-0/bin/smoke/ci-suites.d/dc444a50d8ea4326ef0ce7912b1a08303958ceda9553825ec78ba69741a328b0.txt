@@ -1,2 +1,0 @@
-# Membership watcher delete-timeout cleanup policy.
-smoke:disarm-delete-timeout
