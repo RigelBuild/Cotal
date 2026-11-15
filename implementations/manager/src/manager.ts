@@ -9595,7 +9595,7 @@ export class Manager {
       mode,
       store: i.store,
       accepted: i.accepted,
-      sources: mode === "issue" ? [{ space: this.space, bucket: epAuthBucket(this.space), key: `cred.${a.lifecycleUid}` }] : [],
+      sources: [{ space: this.space, bucket: epAuthBucket(this.space), key: `cred.${a.lifecycleUid}` }],
       finalize: async (credentialId) => {
         await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: a.id, lifecycleUid: a.lifecycleUid, alias: a.name }, async (t) => {
           await recordSlotCredential(t, DEV_OWNER, a.name, a.lifecycleUid, credentialId);
