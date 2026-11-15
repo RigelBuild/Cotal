@@ -237,6 +237,7 @@ import type { KV } from "@nats-io/kv";
 import {
   staticLifecycleTransport,
   activateStaticLifecycle,
+  resumeIdentityActivation,
   runStaticTerminal,
   readStaticRelease,
   writeStaticRelease,
@@ -12539,11 +12540,13 @@ export class Manager {
       if (!issuance) {
         issuance = { generation: mintGeneration(now + STATIC_GENERATION_HORIZON_SEC), acceptedToken: mintAcceptedToken(), issuanceId: mintLifecycleUid(), iat: now, exp: now + MANAGED_STATIC_TTL_SEC, state: "pending" };
         store.transition(name, minter, record.lifecycleUid, undefined, issuance);
-        await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: publicKey, lifecycleUid: record.lifecycleUid, alias: name }, (t) =>
-          activateStaticLifecycle(t, { owner: DEV_OWNER, alias: name, actor: publicKey, lifecycleUid: record.lifecycleUid, managerInstance: this.managerLifecycleUid, ownerInstanceId: this.managerInstanceId }));
       }
       if (issuance.state !== "pending" && issuance.state !== "issued")
         throw new EpEnvelopeError("failed-precondition", "identity issuance is terminalizing", undefined, "not-executed");
+      if (issuance.state === "pending") {
+        await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: publicKey, lifecycleUid: record.lifecycleUid, alias: name }, (t) =>
+          resumeIdentityActivation(t, { owner: DEV_OWNER, alias: name, actor: publicKey, lifecycleUid: record.lifecycleUid, managerInstance: this.managerLifecycleUid, ownerInstanceId: this.managerInstanceId }));
+      }
       const current = issuance;
       const minted = await this.withIssuer((i) => mintPublicSeatUserJwt(this.auth!, publicKey, {
         name, principal: { owner: DEV_OWNER, actor: publicKey }, lifecycleUid: record.lifecycleUid,
@@ -12554,9 +12557,9 @@ export class Manager {
       if (current.state === "pending") {
         await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: publicKey, lifecycleUid: record.lifecycleUid, alias: name }, async (t) => {
           const slot = await readStaticSlot(t, DEV_OWNER, name);
-          if (!slot || slot.row.lifecycleUid !== record.lifecycleUid || slot.row.actor !== publicKey || slot.row.phase !== "provisioning")
+          if (!slot || slot.row.lifecycleUid !== record.lifecycleUid || slot.row.actor !== publicKey || (slot.row.phase !== "provisioning" && slot.row.phase !== "active") || !slot.row.credentialIds.includes(credentialIdOf(minted.jwt)))
             throw new EpEnvelopeError("failed-precondition", "identity static slot does not match its issuance", undefined, "not-executed");
-          await casStaticSlot(t, { ...slot.row, phase: "active" }, slot.revision);
+          if (slot.row.phase === "provisioning") await casStaticSlot(t, { ...slot.row, phase: "active" }, slot.revision);
         });
         store.transition(name, minter, record.lifecycleUid, current.generation, { ...current, credentialId: credentialIdOf(minted.jwt), state: "issued" });
       }
@@ -12912,8 +12915,9 @@ export class Manager {
   private isAdoptedIdentity(row: StaticManagedSlotRow): boolean {
     const record = this.identityStore?.getByUid(row.lifecycleUid);
     return record !== undefined && record.name === row.alias && record.publicKey === row.actor && row.owner === DEV_OWNER &&
-      record.retiredAt === undefined && record.issuance?.state === "issued" && row.phase === "active" &&
-      record.issuance.credentialId !== undefined && row.credentialIds.includes(record.issuance.credentialId);
+      record.retiredAt === undefined &&
+      ((record.issuance?.state === "pending" && (row.phase === "provisioning" || row.phase === "active")) ||
+      (record.issuance?.state === "issued" && row.phase === "active" && record.issuance.credentialId !== undefined && row.credentialIds.includes(record.issuance.credentialId)));
   }
 
   private credentialGateApplies(row: StaticManagedSlotRow, adopted: boolean): boolean {
@@ -13001,6 +13005,10 @@ export class Manager {
       const actor = current.publicKey;
       try {
         await this.withLifecycleExecutor({ owner: DEV_OWNER, actor, lifecycleUid: current.lifecycleUid, alias: current.name }, async (t) => {
+          const slot = await readStaticSlot(t, DEV_OWNER, current.name);
+          if (!slot) {
+            await activateStaticLifecycle(t, { owner: DEV_OWNER, alias: current.name, actor, lifecycleUid: current.lifecycleUid, managerInstance: this.managerLifecycleUid, ownerInstanceId: this.managerInstanceId });
+          }
           await runStaticTerminal(t, { owner: DEV_OWNER, alias: current.name, actor, lifecycleUid: current.lifecycleUid, opId: managedRetirementOpId(current.lifecycleUid), managerInstance: this.managerInstanceId, managerProcessUid: this.managerLifecycleUid }, {
             evict: this.staticLifecycleEvict ?? makeManagerEndpointEvictionEvidence({ space: this.space, servers: this.servers ?? DEFAULT_SERVER, auth: this.auth!, log: (line) => console.error(line), unreachableWaitMs: DEPROVISION_TIMEOUT_MS }),
             log: (line) => console.error(`identity retirement ${current.name}: ${line}`),
