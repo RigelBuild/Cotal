@@ -38,17 +38,18 @@ const root = mkdtempSync(join(tmpdir(), "cotal-placement-contract-"));
 try {
   const snapshot = { name: "default", revision: "r1", configRevision: "c1", modelRoles: { default: "provider/model" }, sha256: "abc" };
   const requested: string[] = [];
-  const manager = new Manager({ space: "main", runtime: "pty", workspaceRoot: root, profileGet: async (name) => { requested.push(name); return snapshot; } });
-  const absent = new Manager({ space: "main", runtime: "pty", workspaceRoot: root });
+  const authorizePlacement = (caller: EpServeContext["subject"]["caller"]) => caller.actor === "reconciler";
+  const manager = new Manager({ space: "main", runtime: "pty", workspaceRoot: root, authorizePlacement, profileGet: async (name) => { requested.push(name); return snapshot; } });
+  const absent = new Manager({ space: "main", runtime: "pty", workspaceRoot: root, authorizePlacement });
   // This test reaches the private service table without starting the broker.
   const managerSeam = manager as unknown as { managerServiceDefs(): EpCommandDef[] };
   const absentSeam = absent as unknown as { managerServiceDefs(): EpCommandDef[] };
   const managerDefs = managerSeam.managerServiceDefs();
   const absentDefs = absentSeam.managerServiceDefs();
-  const context = (command: string): EpServeContext => ({
+  const context = (command: string, actor = "reconciler"): EpServeContext => ({
     identity: { endpoint: "manager", instanceId: "manager", epoch: 1 },
     subject: { plane: "request", route: "one", endpoint: "manager", command, target: null,
-      caller: { owner: DEV_OWNER, actor: "operator", uid: "00112233445566778899aabbccddeeff" }, nonce: "ffeeddccbbaa99887766554433221100" },
+      caller: { owner: DEV_OWNER, actor, uid: "00112233445566778899aabbccddeeff" }, nonce: "ffeeddccbbaa99887766554433221100" },
     request: { v: 1, id: "ffeeddccbbaa99887766554433221100", args: { name: "default" } } as unknown as EpServeContext["request"],
   });
   const handler = (defs: EpCommandDef[], command: string) => {
@@ -58,6 +59,12 @@ try {
   };
   const actual = await handler(managerDefs, "profile-get")(context("profile-get"));
   if (actual !== snapshot || requested.length !== 1 || requested[0] !== "default" || !profile.output.validate(actual)) throw new Error("profile callback result was not served");
+  for (const command of names) {
+    let denied: unknown;
+    try { await handler(managerDefs, command)(context(command, "operator")); } catch (error) { denied = error; }
+    if (!(denied instanceof EpEnvelopeError) || denied.code !== "permission-denied") throw new Error(`${command} admitted operator`, { cause: denied });
+  }
+  if (requested.length !== 1) throw new Error("unauthorized caller reached profile source");
   for (const command of names) {
     const subject = command === "profile-get" ? absentDefs : managerDefs;
     let failure: unknown;

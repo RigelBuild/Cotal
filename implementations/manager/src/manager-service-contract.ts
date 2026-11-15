@@ -1045,11 +1045,11 @@ interface CommandRow {
 }
 
 const ROWS: CommandRow[] = [
-  { name: "place", capability: "manager.admin", input: placementContracts.place.input, output: placementContracts.place.output, targeted: false, handler: "place" },
-  { name: "observe", capability: "manager.admin", input: placementContracts.observe.input, output: placementContracts.observe.output, targeted: false, handler: "observe" },
-  { name: "stop-placement", capability: "manager.admin", input: placementContracts.stopPlacement.input, output: placementContracts.stopPlacement.output, targeted: false, handler: "stopPlacement" },
-  { name: "prepare-launch", capability: "manager.admin", input: placementContracts.prepareLaunch.input, output: placementContracts.prepareLaunch.output, targeted: false, handler: "prepareLaunch" },
-  { name: "profile-get", capability: "manager.admin", input: placementContracts.profileGet.input, output: placementContracts.profileGet.output, targeted: false, handler: "profileGet" },
+  { name: "place", capability: "manager.placement", input: placementContracts.place.input, output: placementContracts.place.output, targeted: false, handler: "place" },
+  { name: "observe", capability: "manager.placement", input: placementContracts.observe.input, output: placementContracts.observe.output, targeted: false, handler: "observe" },
+  { name: "stop-placement", capability: "manager.placement", input: placementContracts.stopPlacement.input, output: placementContracts.stopPlacement.output, targeted: false, handler: "stopPlacement" },
+  { name: "prepare-launch", capability: "manager.placement", input: placementContracts.prepareLaunch.input, output: placementContracts.prepareLaunch.output, targeted: false, handler: "prepareLaunch" },
+  { name: "profile-get", capability: "manager.placement", input: placementContracts.profileGet.input, output: placementContracts.profileGet.output, targeted: false, handler: "profileGet" },
   { name: "vitals", capability: "manager.vitals", input: VOID_SCHEMA, output: VITALS_OUTPUT_SCHEMA, targeted: false, handler: "vitals" },
   { name: "status", capability: "manager.read", input: VOID_SCHEMA, output: STATUS_OUTPUT_SCHEMA, targeted: false, handler: "status" },
   { name: "ps", capability: "manager.read", input: VOID_SCHEMA, output: PS_OUTPUT_SCHEMA, targeted: false, handler: "ps" },

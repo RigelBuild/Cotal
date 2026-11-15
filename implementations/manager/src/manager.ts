@@ -546,6 +546,8 @@ export interface ManagerOptions {
   /** Trusted embedding resolves a named immutable snapshot from configured profile, CUE-rendered
    *  roles config, and model catalog sources. Paths never come from the request. */
   profileGet?: (name: string) => Promise<{ name: string; revision: string; configRevision: string; modelRoles: Record<string, string>; sha256: string }>;
+  /** Trusted composition verifies the authenticated reconciler service principal on each call. */
+  authorizePlacement?: (caller: EpServeContext["subject"]["caller"]) => boolean | Promise<boolean>;
   /** The selected registration requires every launched connector session to publish events. */
   eventsRequired?: boolean;
   /** Trusted registration policy withholds tool payloads for every seat. */
@@ -2007,6 +2009,7 @@ export class Manager {
   private readonly resumedAgentNames = new Set<string>();
   private readonly remoteAuthority?: NonNullable<ManagerOptions["remoteAuthority"]>;
   private readonly profileGet?: ManagerOptions["profileGet"];
+  private readonly authorizePlacement?: ManagerOptions["authorizePlacement"];
   private remoteExecutorCreds?: string;
   private remoteSupervisorCreds?: string;
   private remoteBundleRenewal?: Promise<void>;
@@ -2051,6 +2054,7 @@ export class Manager {
       throw new Error(`expected connector generation ${opts.expectedConnectorGeneration} differs from this Manager's loaded generation ${MANAGER_VERSION}; restart from the installed CLI`);
     if (opts.onServiceIdentity !== undefined && typeof opts.onServiceIdentity !== "function") throw new Error("manager onServiceIdentity must be a trusted embedding callback");
     if (opts.profileGet !== undefined && typeof opts.profileGet !== "function") throw new Error("manager profileGet must be a trusted embedding callback");
+    if (opts.authorizePlacement !== undefined && typeof opts.authorizePlacement !== "function") throw new Error("manager authorizePlacement must be a trusted embedding callback");
     if (opts.execution !== undefined && opts.execution !== "runtime" && opts.execution !== "none")
       throw new Error(`unknown manager execution capability ${JSON.stringify(opts.execution)}`);
     if (opts.execution === "none" && ((opts.pooled !== undefined && typeof opts.pooled !== "boolean") ||
@@ -2071,6 +2075,7 @@ export class Manager {
     this.workspaceRoot = opts.workspaceRoot ?? findCotalRoot();
     this.onServiceIdentity = opts.onServiceIdentity;
     this.profileGet = opts.profileGet;
+    this.authorizePlacement = opts.authorizePlacement;
     this.eventsRequired = opts.eventsRequired === true;
     this.eventPayloadsWithheld = opts.eventPayloadsWithheld === true;
     this.maxSessions = opts.maxSessions;
@@ -4825,6 +4830,11 @@ export class Manager {
         throw new EpEnvelopeError("permission-denied", `${ctx.subject.command} is operator reach; the caller's current ledger grant does not carry "admin" (SPEC 13.2)`, undefined, "not-executed");
       return fn();
     };
+    const placementGated = async <T>(ctx: EpServeContext, fn: () => T | Promise<T>): Promise<T> => {
+      if (!this.authorizePlacement || !(await this.authorizePlacement(ctx.subject.caller)))
+        throw new EpEnvelopeError("permission-denied", "placement requires the authenticated reconciler service principal", undefined, "not-executed");
+      return fn();
+    };
     const targetAgent = (ctx: EpServeContext): ManagedAgent => {
       if (this.execution === "none") throw new EpEnvelopeError("unimplemented", this.executionRefusal());
       const t = ctx.request.target!; // targeted commands only: the serve boundary enforced body-target presence + fresh currency
@@ -4833,11 +4843,11 @@ export class Manager {
       return a;
     };
     return managerCommandDefs({
-      place: (ctx) => adminGated(ctx, () => placementUnsupported("RuntimeProvider rebind/create and private stage/bootstrap")),
-      observe: (ctx) => adminGated(ctx, () => placementUnsupported("retained placement observation and RuntimeProvider rebind")),
-      stopPlacement: (ctx) => adminGated(ctx, () => placementUnsupported("RuntimeProvider stop")),
-      prepareLaunch: (ctx) => adminGated(ctx, () => placementUnsupported("trusted workspace/profile/assets preparation")),
-      profileGet: (ctx) => adminGated(ctx, () => this.profileGet ? this.profileGet(String(args(ctx).name)) : placementUnsupported("configured trusted roles CUE profile source")),
+      place: (ctx) => placementGated(ctx, () => placementUnsupported("RuntimeProvider rebind/create and private stage/bootstrap")),
+      observe: (ctx) => placementGated(ctx, () => placementUnsupported("retained placement observation and RuntimeProvider rebind")),
+      stopPlacement: (ctx) => placementGated(ctx, () => placementUnsupported("RuntimeProvider stop")),
+      prepareLaunch: (ctx) => placementGated(ctx, () => placementUnsupported("trusted workspace/profile/assets preparation")),
+      profileGet: (ctx) => placementGated(ctx, () => this.profileGet ? this.profileGet(String(args(ctx).name)) : placementUnsupported("configured trusted roles CUE profile source")),
       vitals: (ctx) => this.serveGated(ctx, () => measureManagerVitals()),
       // A remote Manager files every seat under its own owner, so only a user mesh's shared local
       // Manager narrows the count, and status never waits on a remote admin check.
