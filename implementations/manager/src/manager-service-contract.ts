@@ -53,6 +53,7 @@ import {
   CANCEL_INPUT_SCHEMA,
   TURN_OUTPUT_SCHEMA,
   VOID_SCHEMA,
+  EpEnvelopeError,
   type ClusterDocument,
   type CompiledContract,
   type ContractClosureManifest,
@@ -742,7 +743,219 @@ const LAUNCH_INPUT_SCHEMA = {
  *  pre-action reply carried are re-derivable by the deploy caller (it submitted the runId + name) and
  *  are not part of the goal acceptance; the spawned outcome rides the goal terminal. */
 const LAUNCH_OUTPUT_SCHEMA = SPAWN_OUTPUT_SCHEMA;
+// Frozen placement protocol records from the RIG-8502 launch contract. These closed schemas are
+// the served wire boundary; the port below is the typed seam to a reconciler-backed implementation.
+const PLACEMENT_UUID = { type: "string", pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" } as const;
+const PLACEMENT_DIGEST = { type: "string", pattern: "^sha256:[0-9a-f]{64}$" } as const;
+const PLACEMENT_UINT = { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER } as const;
+const PLACEMENT_LIFECYCLE_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["space", "owner", "actor", "lifecycleUid"],
+  properties: { space: { type: "string", minLength: 1 }, owner: { type: "string", minLength: 1 }, actor: { type: "string", minLength: 1 }, lifecycleUid: { type: "string", minLength: 1 } },
+} as const;
+const PLACEMENT_CLAIM_SCHEMA = {
+  type: "object", additionalProperties: false,
+  required: ["accountPublicKey", "instanceId", "managerLifecycleUid", "assignmentRevision", "currentRegistrationRevision", "serveEpoch"],
+  properties: {
+    accountPublicKey: { type: "string", minLength: 1 }, instanceId: { type: "string", minLength: 1 }, managerLifecycleUid: { type: "string", minLength: 1 },
+    assignmentRevision: PLACEMENT_UINT, currentRegistrationRevision: PLACEMENT_UINT, serveEpoch: PLACEMENT_UINT,
+  },
+} as const;
+const PLACEMENT_SCHEMA = {
+  type: "object", additionalProperties: false,
+  required: ["space", "name", "desiredRevision", "seatRevision", "claim", "generation", "operationId", "workspace"],
+  properties: {
+    space: { const: "main" }, name: { type: "string", minLength: 1 }, desiredRevision: PLACEMENT_UINT, seatRevision: PLACEMENT_UINT,
+    claim: PLACEMENT_CLAIM_SCHEMA, generation: PLACEMENT_UINT, operationId: PLACEMENT_UUID, workspace: { type: "string", minLength: 1 },
+  },
+} as const;
+const PLACEMENT_WINDOW_SCHEMA = {
+  anyOf: [
+    { type: "object", additionalProperties: false, required: ["kind", "seconds", "anchorUtc", "timezone"], properties: { kind: { const: "fixed" }, seconds: PLACEMENT_UINT, anchorUtc: { type: "string", format: "date-time" }, timezone: { type: "string", minLength: 1 } } },
+    { type: "object", additionalProperties: false, required: ["kind", "seconds"], properties: { kind: { const: "rolling" }, seconds: PLACEMENT_UINT } },
+  ],
+} as const;
+const PLACEMENT_CAP_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["usd", "window"],
+  properties: { usd: { type: "number", minimum: 0 }, window: PLACEMENT_WINDOW_SCHEMA },
+} as const;
+const PLACEMENT_KEY_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["routing", "limits", "policyId"],
+  properties: {
+    routing: { type: "object", additionalProperties: false, properties: {
+      claude: { anyOf: [{ const: "shared" }, { type: "array", items: { type: "string", minLength: 1 } }] },
+      codex: { anyOf: [{ const: "shared" }, { type: "array", items: { type: "string", minLength: 1 } }] },
+    } },
+    limits: { type: "object", additionalProperties: false, properties: {
+      keyCap: PLACEMENT_CAP_SCHEMA,
+      perModel: { type: "object", additionalProperties: { type: "object", additionalProperties: false, properties: { tokens: PLACEMENT_UINT, tpm: PLACEMENT_UINT, rpm: PLACEMENT_UINT } } },
+    } },
+    policyId: { type: "string", minLength: 1 },
+  },
+} as const;
+const PLACEMENT_SEAT_ENTRY_SCHEMA = {
+  type: "object", additionalProperties: false,
+  required: ["name", "seatRevision", "cwd", "tab", "state", "restartGeneration", "updatedAt", "profile", "role", "roleTreeRevision", "key", "workspace", "persona"],
+  properties: {
+    name: { type: "string", minLength: 1 }, seatRevision: PLACEMENT_UINT, cwd: { type: "string", minLength: 1 }, tab: { type: "string", minLength: 1 },
+    state: { enum: ["active", "paused", "retired"] }, restartGeneration: PLACEMENT_UINT, parent: { type: "string", minLength: 1 }, note: { type: "string" },
+    updatedAt: { type: "string", format: "date-time" }, host: { enum: ["k3s", "macbook", "mattmini"] }, profile: { type: "string", minLength: 1 },
+    role: { type: "string", minLength: 1 }, roleTreeRevision: PLACEMENT_UINT, key: PLACEMENT_KEY_SCHEMA, workspace: { type: "string", minLength: 1 },
+    persona: { type: "string", minLength: 1 }, expiresAt: { type: "string", format: "date-time" },
+  },
+} as const;
+const PLACEMENT_PROFILE_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["name", "revision", "configRevision", "modelRoles", "sha256"],
+  properties: { name: { type: "string" }, revision: { type: "string" }, configRevision: { type: "string" }, modelRoles: { type: "object", additionalProperties: { type: "string" } }, sha256: PLACEMENT_DIGEST },
+} as const;
+const PLACEMENT_ASSETS_SCHEMA = {
+  type: "object", additionalProperties: false,
+  required: ["revision", "digest", "imageDigest", "baselineConfigDigest", "modelCatalogDigest", "personaCatalogDigest", "extensionsDigest", "rulesSkillsDigest", "cliClosureDigest", "toolBindings"],
+  properties: {
+    revision: { type: "string" }, digest: PLACEMENT_DIGEST, imageDigest: { type: "string", minLength: 1 }, baselineConfigDigest: PLACEMENT_DIGEST,
+    modelCatalogDigest: PLACEMENT_DIGEST, personaCatalogDigest: PLACEMENT_DIGEST, extensionsDigest: PLACEMENT_DIGEST, rulesSkillsDigest: PLACEMENT_DIGEST,
+    cliClosureDigest: PLACEMENT_DIGEST,
+    toolBindings: { type: "array", items: { type: "object", additionalProperties: false, required: ["id", "endpoint", "entitlementRef"], properties: { id: { type: "string" }, endpoint: { type: "string" }, entitlementRef: { type: "string" } } } },
+  },
+} as const;
+const PLACEMENT_HANDOFF_REQUEST_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["restartOperationId", "name", "predecessorGeneration", "restartGeneration"],
+  properties: { restartOperationId: PLACEMENT_UUID, name: { type: "string" }, predecessorGeneration: PLACEMENT_UINT, restartGeneration: PLACEMENT_UINT },
+} as const;
+const PLACEMENT_HANDOFF_SCHEMA = { anyOf: [
+  { type: "object", additionalProperties: false, required: ["mode", "receipt"], properties: { mode: { const: "document" }, receipt: { type: "object", additionalProperties: false, required: ["receiptId", "request", "lifecycle", "artifactRef", "artifactDigest", "sizeBytes", "at"], properties: {
+    receiptId: PLACEMENT_UUID, request: PLACEMENT_HANDOFF_REQUEST_SCHEMA, lifecycle: PLACEMENT_LIFECYCLE_SCHEMA,
+    artifactRef: { type: "object", additionalProperties: false, required: ["kind", "id"], properties: { kind: { const: "wave-handoff/v1" }, id: PLACEMENT_UUID } },
+    artifactDigest: PLACEMENT_DIGEST, sizeBytes: PLACEMENT_UINT, at: { type: "string", format: "date-time" },
+  } } } },
+  { type: "object", additionalProperties: false, required: ["mode", "reason"], properties: { mode: { const: "none" }, reason: { enum: ["skip", "not-running", "superseded"] } } },
+] } as const;
+const PLACEMENT_INTENT_SCHEMA = {
+  type: "object", additionalProperties: false,
+  required: ["placement", "cwd", "workspaceDigest", "persona", "personaDigest", "profile", "role", "roleTreeRevision", "assets", "key", "policyRevision", "restartGeneration", "digest"],
+  properties: {
+    placement: PLACEMENT_SCHEMA, cwd: { type: "string", minLength: 1 }, workspaceDigest: PLACEMENT_DIGEST, persona: { type: "string" }, personaDigest: PLACEMENT_DIGEST,
+    cardRole: { type: "string" }, profile: PLACEMENT_PROFILE_SCHEMA, role: { type: "string" }, roleTreeRevision: PLACEMENT_UINT, assets: PLACEMENT_ASSETS_SCHEMA,
+    key: PLACEMENT_KEY_SCHEMA, policyRevision: PLACEMENT_UINT, restartGeneration: PLACEMENT_UINT, handoff: PLACEMENT_HANDOFF_SCHEMA, digest: PLACEMENT_DIGEST,
+  },
+} as const;
+const PLACEMENT_TARGET_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["seatName", "lifecycle", "generation"],
+  properties: { seatName: { type: "string" }, lifecycle: PLACEMENT_LIFECYCLE_SCHEMA, generation: PLACEMENT_UINT },
+} as const;
+const PLACEMENT_EXECUTION_AUTHORITY_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["subject", "placementOperationId", "intentDigest", "claim", "launchRevision"],
+  properties: {
+    subject: { anyOf: [
+      { type: "object", additionalProperties: false, required: ["acceptanceId", "enrollmentOperationId", "phase"], properties: { acceptanceId: PLACEMENT_UUID, enrollmentOperationId: PLACEMENT_UUID, phase: { const: "accepted" } } },
+      { type: "object", additionalProperties: false, required: ["acceptanceId", "enrollmentOperationId", "phase", "bindingId", "target"], properties: { acceptanceId: PLACEMENT_UUID, enrollmentOperationId: PLACEMENT_UUID, phase: { const: "bound" }, bindingId: PLACEMENT_UUID, target: PLACEMENT_TARGET_SCHEMA } },
+    ] },
+    placementOperationId: PLACEMENT_UUID, intentDigest: PLACEMENT_DIGEST, claim: PLACEMENT_CLAIM_SCHEMA, launchRevision: PLACEMENT_UINT,
+  },
+} as const;
+const PLACEMENT_EXECUTION_GATE_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["authority", "state"],
+  properties: { authority: PLACEMENT_EXECUTION_AUTHORITY_SCHEMA, state: { enum: ["open", "closing", "closed"] }, fenceId: PLACEMENT_UUID },
+} as const;
+const PLACEMENT_ACCEPTED_INTENT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["acceptanceId", "intent", "acceptedListRevision", "acceptedSeatRevision", "enrollmentOperationId", "executionGate"],
+  properties: { acceptanceId: PLACEMENT_UUID, intent: PLACEMENT_INTENT_SCHEMA, acceptedListRevision: PLACEMENT_UINT, acceptedSeatRevision: PLACEMENT_UINT, enrollmentOperationId: PLACEMENT_UUID, executionGate: PLACEMENT_EXECUTION_GATE_SCHEMA },
+} as const;
+const PLACEMENT_OBLIGATION_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["obligationId", "name", "generation", "reason", "committedRevision", "state"],
+  properties: { obligationId: PLACEMENT_UUID, name: { type: "string" }, generation: PLACEMENT_UINT, reason: { enum: ["pause", "remove", "replace"] }, committedRevision: PLACEMENT_UINT, state: { enum: ["pending", "unknown", "terminal"] }, deathProofId: PLACEMENT_UUID, keyDenialProofId: PLACEMENT_UUID },
+} as const;
+const PLACEMENT_OBSERVATION_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["placement", "state", "obligations"],
+  properties: {
+    placement: PLACEMENT_SCHEMA, lifecycle: PLACEMENT_LIFECYCLE_SCHEMA, state: { enum: ["pending", "starting", "running", "stopping", "stopped", "unknown", "parked"] },
+    executionIdentity: { type: "string" }, keyId: { type: "string" }, reason: { type: "string" },
+    key: { type: "object", additionalProperties: false, required: ["desiredAuthorizationRevision", "condition", "observedAt"], properties: {
+      desiredAuthorizationRevision: PLACEMENT_UINT, appliedAuthorizationRevision: PLACEMENT_UINT, settingsRevision: PLACEMENT_UINT, operationId: PLACEMENT_UUID,
+      condition: { enum: ["effective", "pending", "unknown", "rejected"] }, observedAt: { type: "string", format: "date-time" },
+    } },
+    obligations: { type: "array", items: PLACEMENT_OBLIGATION_SCHEMA },
+  },
+} as const;
+const PREPARE_LAUNCH_INPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["placement", "entry"], properties: { placement: PLACEMENT_SCHEMA, entry: PLACEMENT_SEAT_ENTRY_SCHEMA },
+} as const;
+const PLACE_INPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["accepted"], properties: { accepted: PLACEMENT_ACCEPTED_INTENT_SCHEMA },
+} as const;
+const PLACE_OUTPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["observation", "executionGate"], properties: { observation: PLACEMENT_OBSERVATION_SCHEMA, executionGate: PLACEMENT_EXECUTION_GATE_SCHEMA },
+} as const;
+const OBSERVE_PLACEMENT_INPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["name", "generation"], properties: { name: { type: "string", minLength: 1 }, generation: PLACEMENT_UINT },
+} as const;
+const STOP_PLACEMENT_INPUT_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["placement"], properties: { placement: PLACEMENT_SCHEMA },
+} as const;
 
+export interface ManagerPlacementClaim {
+  accountPublicKey: string; instanceId: string; managerLifecycleUid: string;
+  assignmentRevision: number; currentRegistrationRevision: number; serveEpoch: number;
+}
+export interface ManagerPlacement {
+  space: "main"; name: string; desiredRevision: number; seatRevision: number; claim: ManagerPlacementClaim;
+  generation: number; operationId: string; workspace: string;
+}
+export interface ManagerPlacementSeatEntry {
+  name: string; seatRevision: number; cwd: string; tab: string; state: "active" | "paused" | "retired";
+  restartGeneration: number; parent?: string; note?: string; updatedAt: string; host?: "k3s" | "macbook" | "mattmini";
+  profile: string; role: string; roleTreeRevision: number; key: ManagerPlacementKeySettings; workspace: string; persona: string; expiresAt?: string;
+}
+export interface ManagerPlacementKeySettings {
+  routing: Partial<Record<"claude" | "codex", "shared" | string[]>>;
+  limits: { keyCap?: { usd: number; window: { kind: "fixed"; seconds: number; anchorUtc: string; timezone: string } | { kind: "rolling"; seconds: number } }; perModel?: Record<string, { tokens?: number; tpm?: number; rpm?: number }> };
+  policyId: string;
+}
+export interface ManagerHandoffReceipt {
+  receiptId: string;
+  request: { restartOperationId: string; name: string; predecessorGeneration: number; restartGeneration: number };
+  lifecycle: { space: string; owner: string; actor: string; lifecycleUid: string };
+  artifactRef: { kind: "wave-handoff/v1"; id: string };
+  artifactDigest: string; sizeBytes: number; at: string;
+}
+export type ManagerHandoffInput = { mode: "document"; receipt: ManagerHandoffReceipt } |
+  { mode: "none"; reason: "skip" | "not-running" | "superseded" };
+export interface ManagerLaunchIntent {
+  placement: ManagerPlacement; cwd: string; workspaceDigest: string; persona: string; personaDigest: string; cardRole?: string;
+  profile: { name: string; revision: string; configRevision: string; modelRoles: Record<string, string>; sha256: string };
+  role: string; roleTreeRevision: number; assets: {
+    revision: string; digest: string; imageDigest: string; baselineConfigDigest: string; modelCatalogDigest: string;
+    personaCatalogDigest: string; extensionsDigest: string; rulesSkillsDigest: string; cliClosureDigest: string;
+    toolBindings: { id: string; endpoint: string; entitlementRef: string }[];
+  };
+  key: ManagerPlacementKeySettings; policyRevision: number; restartGeneration: number;
+  handoff?: ManagerHandoffInput;
+  digest: string;
+}
+export interface ManagerPlacementAuthority {
+  subject: { acceptanceId: string; enrollmentOperationId: string; phase: "accepted" } |
+    { acceptanceId: string; enrollmentOperationId: string; phase: "bound"; bindingId: string; target: { seatName: string; lifecycle: { space: string; owner: string; actor: string; lifecycleUid: string }; generation: number } };
+  placementOperationId: string; intentDigest: string; claim: ManagerPlacementClaim; launchRevision: number;
+}
+export interface ManagerPlacementExecutionGate { authority: ManagerPlacementAuthority; state: "open" | "closing" | "closed"; fenceId?: string }
+export interface ManagerAcceptedIntent {
+  acceptanceId: string; intent: ManagerLaunchIntent; acceptedListRevision: number; acceptedSeatRevision: number;
+  enrollmentOperationId: string; executionGate: ManagerPlacementExecutionGate;
+}
+export interface ManagerSeatObservation {
+  placement: ManagerPlacement; lifecycle?: { space: string; owner: string; actor: string; lifecycleUid: string };
+  state: "pending" | "starting" | "running" | "stopping" | "stopped" | "unknown" | "parked";
+  executionIdentity?: string; keyId?: string; reason?: string;
+  key?: { desiredAuthorizationRevision: number; appliedAuthorizationRevision?: number; settingsRevision?: number; operationId?: string; condition: "effective" | "pending" | "unknown" | "rejected"; observedAt: string };
+  obligations: { obligationId: string; name: string; generation: number; reason: "pause" | "remove" | "replace"; committedRevision: number; state: "pending" | "unknown" | "terminal"; deathProofId?: string; keyDenialProofId?: string }[];
+}
+
+export interface PlacementPort {
+  prepareLaunch(input: { placement: ManagerPlacement; entry: ManagerPlacementSeatEntry }): Promise<ManagerLaunchIntent>;
+  place(input: { accepted: ManagerAcceptedIntent }): Promise<{ observation: ManagerSeatObservation; executionGate: ManagerPlacementExecutionGate }>;
+  observe(input: { name: string; generation: number }): Promise<ManagerSeatObservation>;
+  stopPlacement(input: { placement: ManagerPlacement }): Promise<ManagerSeatObservation>;
+}
+type PlacementPortMethod = "placement:prepareLaunch" | "placement:place" | "placement:observe" | "placement:stopPlacement";
 // The resume/preservation family (admin maintenance coordination). Inputs pin the coordination
 // keys; the INVENTORY payload and the plan/result outputs stay OPEN objects — their deep schema
 // is the SHARED `parseResumeControlArgs`/plan validation in the handlers (the ctl parser is the
@@ -1059,7 +1272,7 @@ interface CommandRow {
   output: unknown;
   targeted: boolean;
   modes?: EpAuthzMode[];
-  handler: keyof ManagerServiceHandlers;
+  handler: Exclude<keyof ManagerServiceHandlers, "placementPort"> | PlacementPortMethod;
 }
 
 const ROWS: CommandRow[] = [
@@ -1125,8 +1338,11 @@ const ROWS: CommandRow[] = [
   { name: "release-seat", capability: "manager.admin", input: RELEASE_SEAT_INPUT_SCHEMA, output: RELEASE_SEAT_OUTPUT_SCHEMA, targeted: false, handler: "releaseSeat" },
   { name: "attest-gone", capability: "manager.admin", input: ATTEST_GONE_INPUT_SCHEMA, output: ATTEST_GONE_OUTPUT_SCHEMA, targeted: false, handler: "attestGone" },
   { name: "allowlist-set", capability: "manager.admin", input: ALLOWLIST_SET_INPUT_SCHEMA, output: ALLOWLIST_SET_OUTPUT_SCHEMA, targeted: false, handler: "allowlistSet" },
+  { name: "prepare-launch", capability: "manager.admin", input: PREPARE_LAUNCH_INPUT_SCHEMA, output: PLACEMENT_INTENT_SCHEMA, targeted: false, handler: "placement:prepareLaunch" },
+  { name: "place", capability: "manager.admin", input: PLACE_INPUT_SCHEMA, output: PLACE_OUTPUT_SCHEMA, targeted: false, handler: "placement:place" },
+  { name: "observe", capability: "manager.admin", input: OBSERVE_PLACEMENT_INPUT_SCHEMA, output: PLACEMENT_OBSERVATION_SCHEMA, targeted: false, handler: "placement:observe" },
+  { name: "stop-placement", capability: "manager.admin", input: STOP_PLACEMENT_INPUT_SCHEMA, output: PLACEMENT_OBSERVATION_SCHEMA, targeted: false, handler: "placement:stopPlacement" },
 ];
-
 // WHEN THE COMPILE HAPPENS (#1323): every CLI invocation loads this module before its verb is
 // read (`bin/run.ts` self-registers the manager), and compiling the 41 distinct schema roots cost
 // ~1.8 CPU-seconds of Ajv work paid by `cotal --version`. The compile therefore runs ON FIRST
@@ -1256,9 +1472,11 @@ export const MANAGER_STATUS_CONTRACT: { input: CompiledContract; output: Compile
  *
  *  48 adds retained-custody and deferred-seat reconciliation status; 49 adds `release-seat`;
  *  50 adds `attest-gone`; 51 adds `allowlist-set` and the fork's blank continuation refusal.
+ *
+ *  52 adds the frozen RIG-8502 `prepare-launch`, `place`, `observe` and `stop-placement` contracts.
  */
 export function managerClusterDocument(): ClusterDocument {
-  return buildClusterDocument(MANAGER_CLUSTER_URN, 51, ROWS);
+  return buildClusterDocument(MANAGER_CLUSTER_URN, 52, ROWS);
 }
 
 /** Revision, count, and names from the shipped cluster document. Reached smokes derive surface pins from this. */
@@ -1355,8 +1573,7 @@ export interface ManagerServiceHandlers {
   transcriptReceive(ctx: EpServeContext): unknown | Promise<unknown>;
   releaseSeat(ctx: EpServeContext): unknown | Promise<unknown>;
   attestGone(ctx: EpServeContext): unknown | Promise<unknown>;
-  allowlistSet(ctx: EpServeContext): unknown | Promise<unknown>;
-}
+  placementPort?: PlacementPort;
 
 /** Build the `EpCommandDef[]` `serveEndpoint` consumes: each command's provenance-branded compiled
  *  contracts (matching the document's pinned digests exactly) plus its handler. */
@@ -1366,6 +1583,37 @@ export function managerCommandDefs(handlers: ManagerServiceHandlers): EpCommandD
   return ROWS.map((r) => ({
     command: r.name,
     contract: MANAGER_CONTRACTS[r.name],
-    handler: (ctx: EpServeContext) => handlers[r.handler](ctx),
+    handler: (ctx: EpServeContext) => {
+      const placementInput = <T>(value: unknown): T => {
+        if (value === null || typeof value !== "object" || Array.isArray(value))
+          throw new EpEnvelopeError("bad-request", "placement command input must be an object");
+        // SAFETY: serve validates this object against the registered closed command input schema before dispatch.
+        return value as T;
+      };
+      switch (r.handler) {
+        case "placement:prepareLaunch": {
+          const port = handlers.placementPort;
+          if (!port) throw new EpEnvelopeError("unavailable", "manager placement port is unavailable");
+          return port.prepareLaunch(placementInput(ctx.request.args));
+        }
+        case "placement:place": {
+          const port = handlers.placementPort;
+          if (!port) throw new EpEnvelopeError("unavailable", "manager placement port is unavailable");
+          return port.place(placementInput(ctx.request.args));
+        }
+        case "placement:observe": {
+          const port = handlers.placementPort;
+          if (!port) throw new EpEnvelopeError("unavailable", "manager placement port is unavailable");
+          return port.observe(placementInput(ctx.request.args));
+        }
+        case "placement:stopPlacement": {
+          const port = handlers.placementPort;
+          if (!port) throw new EpEnvelopeError("unavailable", "manager placement port is unavailable");
+          return port.stopPlacement(placementInput(ctx.request.args));
+        }
+        default:
+          return handlers[r.handler](ctx);
+      }
+    },
   }));
 }
