@@ -2005,6 +2005,8 @@ export class Manager {
   private identityStore?: IdentityStore;
   private readonly identityMintFlights = new Map<string, Promise<{ name: string; jwt: string; lifecycleUid: string; exp: number; acceptedToken: string }>>();
   private readonly identityRenewFlights = new Map<string, Promise<{ name: string; jwt: string; lifecycleUid: string; exp: number; acceptedToken: string }>>();
+  private identityRetirementClock = () => Date.now();
+  private identityRetirementSweep?: Promise<void>;
   /** Readiness-race backstop (#159 B1) — the {@link READINESS_TIMEOUT_MS} constant, held as an instance
    *  field so a test can shorten it (the join/exit signals are event-driven; only the backstop is timed).
    *  Production leaves it at the constant. */
@@ -2659,6 +2661,7 @@ export class Manager {
     const startupReconcile = this.auth && !this.userMode ? this.reconcileStaticLifecycles() : undefined;
     if (startupReconcile)
       void startupReconcile.catch((e) => console.error(`! ${STARTUP_RECONCILING}: ${rejectionText(e)} - no per-alias retry could be planned; a later manager start re-reads unfinished durable terminals`));
+    if (this.identityStore) void this.recheckIdentityRetirements().catch((error) => console.error(`identity retirement sweep: ${rejectionText(error)}`));
     // A default stop records a user-mode seat it released while the seat was still running. This
     // start adopts that seat, or retires it when the runtime proves it gone. Static seats stay on
     // the sweep above.
@@ -12494,6 +12497,7 @@ export class Manager {
     const renewal = this.identityRenewFlights.get(record.lifecycleUid);
     if (renewal) await renewal.catch(() => {});
     store.recordRetirementExpiry(name, minter, record.lifecycleUid);
+    void this.recheckIdentityRetirements().catch((error) => console.error(`identity retirement sweep: ${rejectionText(error)}`));
     return {};
   }
 
@@ -12969,6 +12973,48 @@ export class Manager {
   private onCredRenewTick(): void {
     void this.renewDaemonCreds();
     void this.recheckDeferredSeats();
+    void this.recheckIdentityRetirements().catch((error) => console.error(`identity retirement sweep: ${rejectionText(error)}`));
+  }
+
+  private recheckIdentityRetirements(): Promise<void> {
+    if (this.identityRetirementSweep) return this.identityRetirementSweep;
+    const flight = this.driveIdentityRetirements().finally(() => { this.identityRetirementSweep = undefined; });
+    this.identityRetirementSweep = flight;
+    return flight;
+  }
+
+  private async driveIdentityRetirements(): Promise<void> {
+    const store = this.identityStore;
+    if (!store || !this.auth || this.staticReconcileStopping) return;
+    for (const row of store.list()) {
+      if (!row.terminalizing || row.retiredAt !== undefined) continue;
+      const active = this.identityRenewFlights.get(row.lifecycleUid);
+      if (active) await active.catch(() => {});
+      const current = store.recordRetirementExpiry(row.name, row.minter, row.lifecycleUid);
+      if (this.identityRetirementClock() < ((current.retirementExpiry ?? 0) + 60) * 1000) continue;
+      if (!current.publicKey) {
+        store.retire(current.name, current.minter, current.lifecycleUid, current.issuance?.generation);
+        continue;
+      }
+      const actor = current.publicKey;
+      try {
+        await this.withLifecycleExecutor({ owner: DEV_OWNER, actor, lifecycleUid: current.lifecycleUid, alias: current.name }, async (t) => {
+          await runStaticTerminal(t, { owner: DEV_OWNER, alias: current.name, actor, lifecycleUid: current.lifecycleUid, opId: managedRetirementOpId(current.lifecycleUid), managerInstance: this.managerInstanceId, managerProcessUid: this.managerLifecycleUid }, {
+            evict: this.staticLifecycleEvict ?? makeManagerEndpointEvictionEvidence({ space: this.space, servers: this.servers ?? DEFAULT_SERVER, auth: this.auth!, log: (line) => console.error(line), unreachableWaitMs: DEPROVISION_TIMEOUT_MS }),
+            log: (line) => console.error(`identity retirement ${current.name}: ${line}`),
+            cleanup: async () => {
+              await this.withIssuer((i) => i.store.retireSource({ space: this.space, bucket: epAuthBucket(this.space), key: `cred.${current.lifecycleUid}` }));
+              const creds = await mintCreds(this.auth!, newIdentity(), "deprovisioner", { deprovisionTarget: { principal: actor, lifecycleUid: current.lifecycleUid, memberChannels: [] } });
+              await deprovisionAgent({ servers: this.servers ?? DEFAULT_SERVER, space: this.space, targetId: actor, lifecycleUid: current.lifecycleUid, memberChannels: [], creds });
+            },
+          });
+        });
+        store.retire(current.name, current.minter, current.lifecycleUid, current.issuance?.generation);
+        this.retiredPrincipals.add(principalKey(DEV_OWNER, actor).key);
+      } catch (error) {
+        console.error(`identity retirement ${current.name}: ${rejectionText(error)}`);
+      }
+    }
   }
 
   /** The renewal tick's re-check: a deferred seat whose credential has expired takes the terminal. */

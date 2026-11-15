@@ -423,8 +423,9 @@ export class IdentityStore {
       if (current.issuance?.generation !== expectedGeneration)
         throw identityError("conflict", "identity issuance generation changed before retirement");
       if (current.retiredAt !== undefined) return cloneRecord(current);
+      const { renewal: _renewal, ...settled } = current;
       const retired: IdentityRecord = {
-        ...current,
+        ...settled,
         retiredAt: now,
         ...(current.issuance === undefined ? {} : { issuance: { ...current.issuance, state: "retired" } }),
         touchedAt: Math.max(current.touchedAt, now),
