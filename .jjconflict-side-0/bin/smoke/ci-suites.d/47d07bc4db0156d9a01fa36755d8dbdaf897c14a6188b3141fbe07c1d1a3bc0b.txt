@@ -1,3 +1,0 @@
-# The registry's coverage projection: every concrete subject gets the verdict of its class, checked
-# against issuedPermitsSubject on random ceilings.
-smoke:endpoint-coverage

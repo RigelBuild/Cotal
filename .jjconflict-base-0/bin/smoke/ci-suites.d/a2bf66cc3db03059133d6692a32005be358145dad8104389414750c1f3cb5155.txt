@@ -1,2 +1,0 @@
-# Presence view refill regression coverage for the unpopulated state.
-smoke:presence-view-refill

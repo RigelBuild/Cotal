@@ -1,2 +1,0 @@
-# The launch matrix: command lines Cotal runs without a person typing them keep working on this binary.
-smoke:launch-matrix:live

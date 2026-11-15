@@ -1,3 +1,0 @@
-# A static mesh end to end: minted credentials on a JWT broker, a served registry, and agents with
-# and without a listing generation asking it through their own endpoint.
-smoke:registry-listing-e2e:live

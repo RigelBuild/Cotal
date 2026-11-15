@@ -1,3 +1,0 @@
-# Operator release-seat over a real broker (RIG-4320 T4): the record, the terminal it completes,
-# its refusals, crash retries and a successor process's release.
-smoke:seat-release

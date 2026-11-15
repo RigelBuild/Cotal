@@ -1,2 +1,0 @@
-# Backing up and recreating the issued-authority stores created before bounded retention touches only those two streams (#4975).
-smoke:issued-store-recreate

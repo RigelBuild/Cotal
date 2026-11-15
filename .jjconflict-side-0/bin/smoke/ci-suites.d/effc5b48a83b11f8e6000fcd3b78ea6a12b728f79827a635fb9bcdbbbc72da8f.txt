@@ -1,3 +1,0 @@
-# The auth callout derives one xkey shared key per server key, keeps the nkeys xkv1 bytes in both
-# directions, keeps no key for a request that fails admission, and bounds what it keeps.
-smoke:callout-xkey

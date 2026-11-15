@@ -1,2 +1,0 @@
-# Public process-record types and native reader state shapes agree.
-smoke:process-record

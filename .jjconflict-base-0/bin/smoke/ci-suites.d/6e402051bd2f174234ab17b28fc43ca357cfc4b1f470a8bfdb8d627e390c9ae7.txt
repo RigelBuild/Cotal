@@ -1,2 +1,0 @@
-# Run turns on the claude-code hook frames: verdict-committed surface, Stop auto-yield.
-smoke:claude-turn-frames

@@ -1,3 +1,0 @@
-# cotal space, space show and use: the registered spaces, one space in full, and the selection, on the
-# structured output contract.
-smoke:space-reads

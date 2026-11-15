@@ -1,2 +1,0 @@
-# Native transport detector expiry and broker-recovery controls.
-smoke:delivery-transport-health

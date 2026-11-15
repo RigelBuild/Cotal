@@ -12803,8 +12803,8 @@ export class Manager {
     const record = this.identityStore?.getByUid(row.lifecycleUid);
     return record !== undefined && record.name === row.alias && record.publicKey === row.actor && row.owner === DEV_OWNER &&
       record.retiredAt === undefined &&
-      ((record.issuance?.state === "pending" && (row.phase === "provisioning" || row.phase === "active")) ||
-      (record.issuance?.state === "issued" && row.phase === "active" && record.issuance.credentialId !== undefined && row.credentialIds.includes(record.issuance.credentialId)));
+      (record.issuance?.state === "pending" ||
+        (record.issuance?.state === "issued" && row.phase === "active" && record.issuance.credentialId !== undefined && row.credentialIds.includes(record.issuance.credentialId)));
   }
 
   private credentialGateApplies(row: StaticManagedSlotRow, adopted: boolean): boolean {
@@ -13251,6 +13251,9 @@ export class Manager {
         if (adopted) {
           preservedAdopted++;
         }
+        // A pending identity is adopted even before it owns credentials or a runtime reference.
+        // Keep its provisioning row for identity-mint replay; other provisioning slots are crashed spawns.
+        if (row.phase === "provisioning" && adopted) continue;
         // Boot sweep with a resume PENDING: an active slot may yet be adopted (the resume path runs
         // AFTER this boot sweep), so DEFER it — the post-adoption sweep terminalizes any the resume
         // did not claim. provisioning/terminalizing NEVER defer (they are crashed operations, never
