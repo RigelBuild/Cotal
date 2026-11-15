@@ -118,7 +118,7 @@ import {
 } from "./runtime/index.js";
 import { CustodialPtyRuntime } from "./runtime/custodial-pty.js";
 import { agentCanReplace, agentPrimaryGid } from "@cotal-ai/seat";
-import { managedStaticCredOffTickRenewalDue } from "./renewal.js";
+import { identityIdleRetireDue, managedStaticCredOffTickRenewalDue } from "./renewal.js";
 import { AttachEndpoint, type SessionEstablishment } from "./attach-endpoint.js";
 import { DELIVERY_ADMIN_BOOT_WAIT_MS, isUnansweredDeliveryAdmin, makeManagerEndpointEvictionEvidence, makeManagerEndpointHolderEvictor, untilDeliveryAdminAnswers, withScopedEndpoint } from "./endpoint-evict.js";
 import { makeManagerHolderLivenessProbe } from "./holder-liveness.js";
@@ -12994,6 +12994,10 @@ export class Manager {
     const store = this.identityStore;
     if (!store || !this.auth || this.staticReconcileStopping) return;
     for (const row of store.list()) {
+      if (!row.terminalizing && row.retiredAt === undefined && identityIdleRetireDue(Math.max(row.issuance?.exp ?? 0, row.renewal?.exp ?? 0, Math.floor(row.touchedAt / 1000)), Math.floor(this.identityRetirementClock() / 1000))) {
+        store.latchRetirement(row.name, row.minter, row.lifecycleUid);
+        row.terminalizing = true;
+      }
       if (!row.terminalizing || row.retiredAt !== undefined) continue;
       const active = this.identityRenewFlights.get(row.lifecycleUid);
       if (active) await active.catch(() => {});
