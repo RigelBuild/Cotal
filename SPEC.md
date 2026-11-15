@@ -7042,6 +7042,7 @@ single-function profiles, each granting only the verbs its function needs and no
   a new one. Each issuance on it makes its own source, gate and accepted-row reads and its own
   create-only and CAS writes under the request deadline, and no issuance reuses what another read.
   A write in flight when the connection is lost has an unknown outcome and is never sent again.
+- `reconciler`: the standing-renewable placement caller. It publishes exactly the four `ep.one.auth.<command>.<owner>.<actor>.<uid>.*` placement requests (nonce-only wildcard), caller-pinned `describe`, and `$JS.API.DIRECT.GET.EPC_<space>.cotal.<space>.epc.>`; it subscribes only to its own `ep.reply.*.*.*.<owner>.<actor>.<uid>.*` rail and `_INBOX_<connId>.>`. The 24-hour credential is renewed by the reconciler service for the same caller triple. No `ep.all`, `ep.inst`, `retire-lifecycle`, or other store authority.
 - `run-admitter`: one run's admission record or revocation marker (§14.8), minted per run for
   60 seconds; two exact keys and nothing else.
 - `transfer-writer`: one carried resume transcript (§8), minted per CLI call for five minutes, or on
