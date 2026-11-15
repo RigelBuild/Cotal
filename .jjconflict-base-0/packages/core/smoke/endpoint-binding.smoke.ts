@@ -787,7 +787,7 @@ try {
       "permissions" in resolved && resolved.permissions.publish.allow.mode === "patterns" && resolved.permissions.subscribe.allow.mode === "none",
       resolved);
     const reused = await store.stage({ version: 1, ref, sources: [], permissions: shadow.permissions as never, expiresAt }).then(() => "staged", (e: Error) => e.message);
-    c("a generation whose evidence exists is refused a second stage, shadow or not", reused.includes("never reused"), reused);
+    c("a generation refuses different evidence even when the new record matches the shadow", reused.includes("different issued evidence"), reused);
   }
 
   const wfj = await cfg(wfjStreamName(SPACE));
