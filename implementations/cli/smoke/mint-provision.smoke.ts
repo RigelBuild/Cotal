@@ -177,7 +177,7 @@ try {
     writeFileSync(join(agents, "mint-caller.md"), "---\nname: mint-caller\ncapabilities: [spawn]\n---\n");
     const out = join(root, "mint-caller.creds");
     const r = await runMint(["mint-caller", "--out", out]);
-    check("mint-caller child mint writes its output", r.code === 0 && existsSync(out), r.out);
+    check("mint-caller child mint writes its output", r.code === 0 && existsSync(out), { code: r.code, outputExists: existsSync(out), output: r.out });
     const minted = facts(readFileSync(out, "utf8"));
     const caller: EpCaller = { owner: DEV_OWNER, actor: minted.principal!.split(".")[1]!, uid: minted.uids[0]! };
     const required = spawnCallerCapabilities(DEV_OWNER).flatMap((cap) => epRequestGrantRows(SPACE, cap, caller));
