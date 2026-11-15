@@ -46,7 +46,7 @@ const entry = closed(["name", "seatRevision", "cwd", "tab", "state", "restartGen
 const obligation = closed(["obligationId", "name", "generation", "reason", "committedRevision", "state"], { obligationId: text, name: text, generation: uint, reason: { enum: ["pause", "remove", "replace"] }, committedRevision: uint, state: { enum: ["pending", "unknown", "terminal"] }, deathProofId: text, keyDenialProofId: text });
 const keyObservation = closed(["desiredAuthorizationRevision", "condition", "observedAt"], { desiredAuthorizationRevision: uint, appliedAuthorizationRevision: uint, settingsRevision: uint, operationId: text, condition: { enum: ["effective", "pending", "unknown", "rejected"] }, observedAt: text });
 const intent = closed(["placement", "cwd", "workspaceDigest", "persona", "personaDigest", "profile", "role", "roleTreeRevision", "assets", "key", "policyRevision", "restartGeneration", "digest"], {
-  placement, cwd: text, workspaceDigest: text, persona: text, personaDigest: text, cardRole: text,
+  placement, cwd: text, workspaceDigest: text, persona: text, personaDigest: text,
   profile, role: text, roleTreeRevision: uint, assets, key, policyRevision: uint,
   restartGeneration: uint, handoff, digest: text,
 });
