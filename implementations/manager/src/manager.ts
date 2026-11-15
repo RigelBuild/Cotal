@@ -13027,6 +13027,7 @@ export class Manager {
         store.retire(current.name, current.minter, current.lifecycleUid, current.issuance?.generation);
         this.retiredPrincipals.add(principalKey(DEV_OWNER, actor).key);
       } catch (error) {
+        store.recordRetirementError(current.name, current.minter, current.lifecycleUid, rejectionText(error));
         console.error(`identity retirement ${current.name}: ${rejectionText(error)}`);
       }
     }

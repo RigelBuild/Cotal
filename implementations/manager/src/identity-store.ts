@@ -31,9 +31,10 @@ export type IdentityRecord = {
   initialIssuance?: IdentityIssuance;
   terminalizing?: boolean;
   retirementExpiry?: number;
+  retirementError?: string;
 };
 
-const KEYS = new Set(["version", "name", "lifecycleUid", "minter", "reservedAt", "touchedAt", "retiredAt", "publicKey", "issuance", "renewal", "initialIssuance", "terminalizing", "retirementExpiry"]);
+const KEYS = new Set(["version", "name", "lifecycleUid", "minter", "reservedAt", "touchedAt", "retiredAt", "publicKey", "issuance", "renewal", "initialIssuance", "terminalizing", "retirementExpiry", "retirementError"]);
 const ISSUANCE_KEYS = new Set(["generation", "iat", "exp", "acceptedToken", "issuanceId", "credentialId", "state"]);
 const UID = /^[a-z0-9]{26,32}$/;
 const USER_NKEY = /^U[A-Z2-7]{55}$/;
@@ -71,6 +72,7 @@ export function parseIdentityRecord(raw: unknown): IdentityRecord {
       (raw.retiredAt !== undefined && !Number.isSafeInteger(raw.retiredAt)) ||
       (raw.terminalizing !== undefined && raw.terminalizing !== true) ||
       (raw.retirementExpiry !== undefined && (!Number.isSafeInteger(raw.retirementExpiry) || raw.terminalizing !== true)) ||
+      (raw.retirementError !== undefined && (typeof raw.retirementError !== "string" || raw.terminalizing !== true)) ||
       (raw.publicKey !== undefined && (typeof raw.publicKey !== "string" || !USER_NKEY.test(raw.publicKey))))
     throw new Error("invalid identity record");
   const issuance = parseIssuance(raw.issuance);
@@ -99,6 +101,7 @@ export function parseIdentityRecord(raw: unknown): IdentityRecord {
     ...(initialIssuance === undefined ? {} : { initialIssuance }),
     ...(raw.terminalizing === true ? { terminalizing: true } : {}),
     ...(raw.retirementExpiry === undefined ? {} : { retirementExpiry: raw.retirementExpiry as number }),
+    ...(raw.retirementError === undefined ? {} : { retirementError: raw.retirementError as string }),
   };
 }
 
@@ -397,6 +400,16 @@ export class IdentityStore {
       this.#records[this.#indexByUid(lifecycleUid)] = updated;
       this.#persist();
       return cloneRecord(updated);
+    });
+  }
+
+  recordRetirementError(name: string, minter: string, lifecycleUid: string, message: string): void {
+    this.#withLock(() => {
+      const current = this.#current(name);
+      if (!current || current.lifecycleUid !== lifecycleUid || current.minter !== minter || !current.terminalizing || current.retiredAt !== undefined)
+        throw identityError("conflict", "identity retirement latch changed");
+      this.#records[this.#indexByUid(lifecycleUid)] = { ...current, retirementError: message.slice(0, 1024) };
+      this.#persist();
     });
   }
 
