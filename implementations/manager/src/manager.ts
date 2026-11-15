@@ -12547,6 +12547,7 @@ export class Manager {
         await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: publicKey, lifecycleUid: record.lifecycleUid, alias: name }, (t) =>
           resumeIdentityActivation(t, { owner: DEV_OWNER, alias: name, actor: publicKey, lifecycleUid: record.lifecycleUid, managerInstance: this.managerLifecycleUid, ownerInstanceId: this.managerInstanceId }));
       }
+      await this.withProvisioner((provisioner) => provisioner.provisionDmInbox(DEV_OWNER, publicKey, record.lifecycleUid));
       const current = issuance;
       const minted = await this.withIssuer((i) => mintPublicSeatUserJwt(this.auth!, publicKey, {
         name, principal: { owner: DEV_OWNER, actor: publicKey }, lifecycleUid: record.lifecycleUid,
