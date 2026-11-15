@@ -13,7 +13,7 @@ import { authDir, saveSpaceAuth } from "@cotal-ai/workspace";
 import { SMOKE_BROKER_TOKEN, awaitBrokerReady, freePort, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import { Manager } from "../src/manager.js";
 import { bootDeliveryDaemon, type DeliveryDaemon } from "./_boot-delivery.js";
-import { IdentityStore } from "../src/identity-store.js";
+import { IdentityStore } from "../src/identity/store.js";
 import { principalKey } from "@cotal-ai/core";
 import { MANAGER_ENDPOINT } from "../src/manager-service-contract.js";
 

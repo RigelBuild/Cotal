@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EpEnvelopeError, mintLifecycleUid } from "@cotal-ai/core";
-import { IdentityStore } from "../src/identity-store.js";
+import { IdentityStore } from "../src/identity/store.js";
 
 const root = mkdtempSync(join(tmpdir(), "cotal-identity-store-"));
 
