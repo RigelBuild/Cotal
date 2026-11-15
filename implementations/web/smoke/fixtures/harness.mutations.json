@@ -26,8 +26,8 @@
       "file": "implementations/web/client/src/lib/harness.ts",
       "find": "  codex: {\n    label: \"Codex\",",
       "replace": "  codexx: {\n    label: \"Codex\",",
-      "expectRed": "HARNESS has exactly the six branded connectors",
-      "cell": "HARNESS has exactly the six branded connectors"
+      "expectRed": "HARNESS has exactly the seven branded connectors",
+      "cell": "HARNESS has exactly the seven branded connectors"
     }
   ]
 }

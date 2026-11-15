@@ -50,6 +50,7 @@ function makeSeat(name: string, opts: { holdExit?: boolean; reference?: RuntimeR
     interrupt: () => {},
     attach: () => session,
     waitForExit: () => exitP,
+    waitForWorkExit: () => exitP,
   };
   return { handle, exit, stopped: () => stopped };
 }
@@ -121,6 +122,8 @@ function makeManager(spawnAllowlist?: string) {
   let nextSeat: ((name: string) => Seat) | undefined;
   M.runtime = {
     kind: "pty",
+    supportsWorkClosure: true,
+    reapWork: async () => {},
     spawn: (name: string, _spec: LaunchSpec) => {
       spawned.push(name);
       const seat = nextSeat ? nextSeat(name) : makeSeat(name);
@@ -331,7 +334,7 @@ const realSpawnCustodied = M.spawnCustodied;
       health: join(workspaceRoot, `${String(name)}.health`),
     },
     launch: { owner: DEV_OWNER, actor: String(name), sentinelCredsPath: "", bearerCmd: [] },
-    enrolled: { material: {}, actorToken: "" },
+    enrolled: { material: { allowSubscribe: [], allowPublish: [] }, actorToken: "" },
   });
   noCustody.M.deprovision = async () => {};
   let seat: Seat | undefined;
@@ -458,7 +461,7 @@ const resumeEntry = (name: string): ManagerResumeAgent => {
     owner: DEV_OWNER, lifecycleUid: mintLifecycleUid(),
     files: { actorToken: join(workspaceRoot, `${String(name)}.token`), sentinelCreds: join(workspaceRoot, `${String(name)}.creds`), health: join(workspaceRoot, `${String(name)}.health`) },
     launch: { owner: DEV_OWNER, actor: String(name), sentinelCredsPath: "", bearerCmd: [] },
-    enrolled: { material: {}, actorToken: "" },
+    enrolled: { material: { allowSubscribe: [], allowPublish: [] }, actorToken: "" },
   });
   const listed = await D.mgr.startAgent({ name: "deleg1", agent: "smoke-allow", events: false });
   const g = gate();

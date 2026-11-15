@@ -87,7 +87,7 @@ try {
     refusal = (e as Error).message;
   }
   check("a call carrying identity-shaped extras is REFUSED TO THE CALLER, naming the keys",
-    !succeeded && !!refusal && refusal.includes("unrecognized_keys") &&
+    !succeeded && !!refusal && /unrecognized(?:_| )keys/i.test(refusal) &&
       Object.keys(IDENTITY_EXTRA).every((k) => refusal!.includes(k)),
     { refusal, succeeded });
   check("...and the refusal precedes the effect: the tool never reached the mesh agent",

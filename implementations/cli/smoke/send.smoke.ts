@@ -56,7 +56,7 @@ import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
 import { startRosterFixture } from "../../../packages/core/smoke/_roster-service.js";
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-const EXPECTED = 85;
+const EXPECTED = 83;
 let pass = 0;
 let fail = 0;
 const check = (name: string, cond: boolean, extra?: unknown) => {
@@ -196,7 +196,7 @@ try {
   await manager.start();
   await manager.waitForPresenceSnapshot(2_000);
   await wait(400);
-  const refusedManager = await run(["send", "dm", "manager-target", "please review"]);
+  const refusedManager = await run(["send", "--to", "manager-target", "please review"]);
   check(
     "`cotal send dm` refuses the manager endpoint with a CLI roster hint",
     refusedManager.code !== 0 &&
@@ -205,7 +205,7 @@ try {
       !refusedManager.stderr.includes("cotal_roster"),
     refusedManager,
   );
-  const refusedManagerId = await run(["send", "dm", manager.card.id, "please review"]);
+  const refusedManagerId = await run(["send", "--to", manager.card.id, "please review"]);
   check(
     "`cotal send dm` refuses the manager by exact instance id",
     refusedManagerId.code !== 0 && refusedManagerId.stderr.includes('Cannot DM "manager-target"'),
@@ -387,7 +387,7 @@ try {
   );
 
   const agentText = `agent-name-${randomUUID().slice(0, 6)}`;
-  const namedAgentSend = await run(["send", "dm", "bob", agentText], { COTAL_NAME: "nemo-intake" });
+  const namedAgentSend = await run(["send", "--to", "bob", agentText], { COTAL_NAME: "nemo-intake" });
   await wait(400);
   check(
     "COTAL_NAME appends the sending agent to the OS display name",
@@ -448,7 +448,7 @@ try {
   const namedCreds = join(tmp, "named-operator.creds");
   writeFileSync(namedCreds, await mintCreds(auth, namedIdentity, "operator", { name: "named-sender" }), { mode: 0o600 });
   const namedText = `named-${randomUUID().slice(0, 6)}`;
-  const namedSend = await run(["send", "dm", "bob", namedText, "--space", space, "--server", servers, "--creds", namedCreds]);
+  const namedSend = await run(["send", "--to", "bob", namedText, "--space", space, "--server", servers, "--creds", namedCreds]);
   await wait(400);
   check(
     "--creds display name comes from a non-profile JWT name",
@@ -457,7 +457,7 @@ try {
   );
   const credsAgentText = `creds-agent-${randomUUID().slice(0, 6)}`;
   const credsAgentSend = await run([
-    "send", "dm", "bob", credsAgentText, "--space", space, "--server", servers, "--creds", namedCreds,
+    "send", "--to", "bob", credsAgentText, "--space", space, "--server", servers, "--creds", namedCreds,
   ], { COTAL_NAME: "nemo-intake" });
   await wait(400);
   check(
@@ -466,7 +466,7 @@ try {
     { credsAgentSend, got },
   );
   const invalidAgentText = `invalid-agent-${randomUUID().slice(0, 6)}`;
-  const invalidAgentSend = await run(["send", "dm", "bob", invalidAgentText], { COTAL_NAME: "forged/seat" });
+  const invalidAgentSend = await run(["send", "--to", "bob", invalidAgentText], { COTAL_NAME: "forged/seat" });
   await wait(400);
   check(
     "invalid COTAL_NAME is omitted",

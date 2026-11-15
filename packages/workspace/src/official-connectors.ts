@@ -16,7 +16,6 @@ export const OFFICIAL_CONNECTORS: Readonly<Record<string, string>> = {
   jcode: "@cotal-ai/connector-jcode",
   pi: "@cotal-ai/pi",
   omp: "@cotal-ai/omp",
-  zellij: "@cotal-ai/zellij",
 };
 
 /** A first-party extension the umbrella (`cotal-ai`) bundles and versions in lockstep: its npm package

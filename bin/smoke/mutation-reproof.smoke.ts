@@ -248,7 +248,7 @@ const previousSentinel = process.env.COTAL_REPROOF_SENTINEL;
 try {
   process.env.COTAL_REPROOF_SENTINEL = "synthetic-session-secret";
   const shards = Array.from({ length: 12 }, (_, i) => i);
-  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/mutation-reproof.yml"), "utf8"));
+  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/mutation-reproof.yml.disabled"), "utf8"));
   const plan = workflow.jobs.plan;
   const job = workflow.jobs.changed_shard;
   const aggregate = workflow.jobs.changed;

@@ -31,7 +31,7 @@ if (!existsSync(BIN)) {
 }
 const { check, finish } = createSuite();
 const TIERS = ["COTAL_DEFAULT_AGENT", "COTAL_DEFAULT_PERSONA", "COTAL_DETACH_KEY", "NO_COLOR", "FORCE_COLOR", "VISUAL", "EDITOR"];
-const HOST_ENV = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("COTAL_") && !TIERS.includes(k)));
+const HOST_ENV = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("COTAL_") && !TIERS.includes(k) && k !== "PATH" && k !== "ZDOTDIR"));
 const home = mkdtempSync(join(tmpdir(), "cotal-config-"));
 process.on("exit", () => rmSync(home, { recursive: true, force: true }));
 const xdg = join(home, ".config");
@@ -52,7 +52,8 @@ type Envelope = {
   warnings: { code: string; message: string }[];
   error?: { code: string; message: string; remedy?: string };
 };
-const sandboxEnv = (extra: NodeJS.ProcessEnv) => ({ ...HOST_ENV, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: xdg, COTAL_HOME: cotalHome, COTAL_SKIP_CONNECTOR_SEED: "1", ...extra });
+const PATH = process.env.PATH ?? "";
+const sandboxEnv = (extra: NodeJS.ProcessEnv) => ({ ...HOST_ENV, PATH, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: xdg, COTAL_HOME: cotalHome, COTAL_SKIP_CONNECTOR_SEED: "1", ...extra });
 function run(args: string[], extra: NodeJS.ProcessEnv = {}, cwd = home) {
   const r = spawnSync(process.execPath, [BIN, ...args], { cwd, env: sandboxEnv(extra), encoding: "utf8", timeout: 60_000 });
   const stdout = r.stdout ?? "";
@@ -548,8 +549,9 @@ if (process.platform !== "win32") {
   check("a write does not replace an invalid file", write.status === 1 && /is invalid/.test(write.stderr) && fileText()?.includes("spaces") === true, shown(write));
   const help = run(["config", "--help"]);
   check("help still works", help.status === 0 && /cotal config/.test(help.stdout), shown(help));
+  // Bare completion probes pwsh when it is on PATH and exits 4 if that probe fails. Hide pwsh so this checks preferences only.
   for (const args of [["help"], ["--help"], ["help", "config"], ["completion"], ["completion", "script", "bash"]]) {
-    const r = run(args);
+    const r = run(args, args.length === 1 && args[0] === "completion" ? { PATH: join(home, "empty-bin") } : {});
     check(`cotal ${args.join(" ")} still works`, r.status === 0 && r.stdout !== "" && !/is invalid/.test(r.stderr), shown(r));
   }
   // version and docs use no preference. They used to refuse with SCHEMA_INVALID like every other command.

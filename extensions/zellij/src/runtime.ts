@@ -112,6 +112,12 @@ function paneForTab(session: string, tabId: number): string {
   return pane.id;
 }
 
+/** The zellij handle: the shared AgentHandle, plus the startup confirm's outcome. The outcome is
+ * undefined until the watch settles, so a caller waits on that event rather than on a timer. */
+export interface ZellijAgentHandle extends AgentHandle {
+  confirmOutcome(): string | undefined;
+}
+
 export class ZellijRuntime implements Runtime {
   readonly kind = "zellij" as const;
   readonly streamsTerminal = false;
@@ -122,7 +128,7 @@ export class ZellijRuntime implements Runtime {
     private readonly createSession: boolean = true,
   ) {}
 
-  spawn(name: string, spec: LaunchSpec, cwd: string): AgentHandle {
+  spawn(name: string, spec: LaunchSpec, cwd: string): ZellijAgentHandle {
     if (!/^[A-Za-z0-9_.-]+$/.test(name))
       throw new SpawnRefused(`zellij runtime: unsafe agent name ${JSON.stringify(name)} (allowed: letters, digits, _ . -)`);
     if (!zellij.available()) throw new SpawnRefused("zellij runtime: zellij is not available — is it installed and on PATH?");
@@ -177,6 +183,9 @@ export class ZellijRuntime implements Runtime {
     }
 
     const startedPane = paneId;
+    // The watch reports how it ended through `settled`. The handle exposes that outcome, so a caller
+    // waits on the event itself rather than on a timer.
+    let settledOutcome: string | undefined;
     watch?.({
       read: () => zellij.dumpScreen(this.session, startedPane, Date.now() + CONFIRM_BUDGET_MS),
       enter: () => zellij.writePane(this.session, startedPane, "13", Date.now() + CONFIRM_BUDGET_MS),
@@ -190,6 +199,7 @@ export class ZellijRuntime implements Runtime {
         }
         cleanupLauncher(launcher);
       },
+      settled: (outcome) => { settledOutcome = outcome; },
     });
 
     return {
@@ -204,6 +214,7 @@ export class ZellijRuntime implements Runtime {
         }
       },
       interrupt: () => zellij.interruptPane(this.session, startedPane),
+      confirmOutcome: () => settledOutcome,
       waitForExit: () => waitForLauncherExit(launcher.dir),
       attach: () => {
         throw new Error(`zellij runtime: attach natively with zellij attach ${this.session}`);
