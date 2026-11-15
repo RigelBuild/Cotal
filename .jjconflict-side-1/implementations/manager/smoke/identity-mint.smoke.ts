@@ -124,7 +124,25 @@ try {
     assert.equal(retireDenied.reply.error?.code, "permission-denied");
     console.log("PASS retirement rejects different minter");
   } finally { await strangerNc.close(); }
-  const retired = await invokeCommand(nc, space, service, "identity-retire", { name: "first" }, opts);
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  const controlled = manager as unknown as { withIssuer: (...args: unknown[]) => Promise<unknown> };
+  const originalIssuer = controlled.withIssuer.bind(manager);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  controlled.withIssuer = async (...args) => { entered.resolve(); await release.promise; return originalIssuer(...args); };
+  const renewing = invokeCommand(nc, space, service, "identity-renew", { name: "first", publicKey: seat.id }, opts);
+  await entered.promise;
+  const retirement = invokeCommand(nc, space, service, "identity-retire", { name: "first" }, opts);
+  while (!store.get(reservation.name)?.terminalizing) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(store.get(reservation.name)?.retirementExpiry, undefined);
+  release.resolve();
+  const inFlight = await renewing;
+  assert.equal(inFlight.reply.ok, true, JSON.stringify(inFlight.reply));
+  const retired = await retirement;
+  assert.ok(inFlight.reply.data && typeof inFlight.reply.data === "object" && "exp" in inFlight.reply.data);
+  assert.equal(store.get(reservation.name)?.retirementExpiry, inFlight.reply.data.exp);
+  controlled.withIssuer = originalIssuer;
+  console.log("PASS retirement drains admitted renewal before recording expiry");
   assert.equal(retired.reply.ok, true, JSON.stringify(retired.reply));
   assert.equal(store.get(reservation.name)?.terminalizing, true);
   console.log("PASS retirement latches identity");

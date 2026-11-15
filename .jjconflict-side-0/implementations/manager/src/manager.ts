@@ -12478,7 +12478,7 @@ export class Manager {
     return { name, lifecycleUid: record.lifecycleUid };
   }
 
-  private identityRetire(ctx: EpServeContext): Record<string, never> {
+  private async identityRetire(ctx: EpServeContext): Promise<Record<string, never>> {
     const store = this.identityStoreForCommand();
     const input = ctx.request.args;
     const slug = typeof input === "object" && input !== null && !Array.isArray(input) ? (input as Record<string, unknown>).name : undefined;
@@ -12491,6 +12491,9 @@ export class Manager {
       throw new EpEnvelopeError("permission-denied", `identity ${name} is owned by another minter`, undefined, "not-executed");
     if (record.retiredAt !== undefined || record.issuance?.state === "retired") return {};
     store.latchRetirement(name, minter, record.lifecycleUid);
+    const renewal = this.identityRenewFlights.get(record.lifecycleUid);
+    if (renewal) await renewal.catch(() => {});
+    store.recordRetirementExpiry(name, minter, record.lifecycleUid);
     return {};
   }
 

@@ -30,9 +30,10 @@ export type IdentityRecord = {
   renewal?: { issuanceId: string; iat: number; exp: number };
   initialIssuance?: IdentityIssuance;
   terminalizing?: boolean;
+  retirementExpiry?: number;
 };
 
-const KEYS = new Set(["version", "name", "lifecycleUid", "minter", "reservedAt", "touchedAt", "retiredAt", "publicKey", "issuance", "renewal", "initialIssuance", "terminalizing"]);
+const KEYS = new Set(["version", "name", "lifecycleUid", "minter", "reservedAt", "touchedAt", "retiredAt", "publicKey", "issuance", "renewal", "initialIssuance", "terminalizing", "retirementExpiry"]);
 const ISSUANCE_KEYS = new Set(["generation", "iat", "exp", "acceptedToken", "issuanceId", "credentialId", "state"]);
 const UID = /^[a-z0-9]{26,32}$/;
 const USER_NKEY = /^U[A-Z2-7]{55}$/;
@@ -69,6 +70,7 @@ export function parseIdentityRecord(raw: unknown): IdentityRecord {
       typeof raw.minter !== "string" || !raw.minter || !Number.isSafeInteger(raw.reservedAt) || !Number.isSafeInteger(raw.touchedAt) ||
       (raw.retiredAt !== undefined && !Number.isSafeInteger(raw.retiredAt)) ||
       (raw.terminalizing !== undefined && raw.terminalizing !== true) ||
+      (raw.retirementExpiry !== undefined && (!Number.isSafeInteger(raw.retirementExpiry) || raw.terminalizing !== true)) ||
       (raw.publicKey !== undefined && (typeof raw.publicKey !== "string" || !USER_NKEY.test(raw.publicKey))))
     throw new Error("invalid identity record");
   const issuance = parseIssuance(raw.issuance);
@@ -96,6 +98,7 @@ export function parseIdentityRecord(raw: unknown): IdentityRecord {
     ...(renewal === undefined ? {} : { renewal }),
     ...(initialIssuance === undefined ? {} : { initialIssuance }),
     ...(raw.terminalizing === true ? { terminalizing: true } : {}),
+    ...(raw.retirementExpiry === undefined ? {} : { retirementExpiry: raw.retirementExpiry as number }),
   };
 }
 
@@ -391,6 +394,19 @@ export class IdentityStore {
       if (!current || current.lifecycleUid !== lifecycleUid || current.minter !== minter) throw identityError("conflict", "identity retirement does not match the reservation");
       if (current.retiredAt !== undefined || current.terminalizing) return cloneRecord(current);
       const updated = { ...current, terminalizing: true as const };
+      this.#records[this.#indexByUid(lifecycleUid)] = updated;
+      this.#persist();
+      return cloneRecord(updated);
+    });
+  }
+
+  recordRetirementExpiry(name: string, minter: string, lifecycleUid: string): IdentityRecord {
+    return this.#withLock(() => {
+      const current = this.#current(name);
+      if (!current || current.lifecycleUid !== lifecycleUid || current.minter !== minter || !current.terminalizing)
+        throw identityError("conflict", "identity retirement latch changed");
+      const expiry = Math.max(current.issuance?.exp ?? 0, current.renewal?.exp ?? 0, current.retirementExpiry ?? 0);
+      const updated = { ...current, retirementExpiry: expiry };
       this.#records[this.#indexByUid(lifecycleUid)] = updated;
       this.#persist();
       return cloneRecord(updated);
