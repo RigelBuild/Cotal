@@ -543,6 +543,9 @@ export interface ManagerOptions {
   /** Trusted embedding hook after native identity selection, before endpoint construction.
    *  It receives no key, credential or readiness claim. A rejection aborts this start. */
   onServiceIdentity?: (identity: ManagerServiceIdentity) => void | Promise<void>;
+  /** Trusted embedding resolves a named immutable snapshot from configured profile, CUE-rendered
+   *  roles config, and model catalog sources. Paths never come from the request. */
+  profileGet?: (name: string) => Promise<{ name: string; revision: string; configRevision: string; modelRoles: Record<string, string>; sha256: string }>;
   /** The selected registration requires every launched connector session to publish events. */
   eventsRequired?: boolean;
   /** Trusted registration policy withholds tool payloads for every seat. */
@@ -2003,6 +2006,7 @@ export class Manager {
   private resumeDurableCommitToken?: string;
   private readonly resumedAgentNames = new Set<string>();
   private readonly remoteAuthority?: NonNullable<ManagerOptions["remoteAuthority"]>;
+  private readonly profileGet?: ManagerOptions["profileGet"];
   private remoteExecutorCreds?: string;
   private remoteSupervisorCreds?: string;
   private remoteBundleRenewal?: Promise<void>;
@@ -2046,6 +2050,7 @@ export class Manager {
     if (opts.expectedConnectorGeneration !== undefined && opts.expectedConnectorGeneration !== MANAGER_VERSION)
       throw new Error(`expected connector generation ${opts.expectedConnectorGeneration} differs from this Manager's loaded generation ${MANAGER_VERSION}; restart from the installed CLI`);
     if (opts.onServiceIdentity !== undefined && typeof opts.onServiceIdentity !== "function") throw new Error("manager onServiceIdentity must be a trusted embedding callback");
+    if (opts.profileGet !== undefined && typeof opts.profileGet !== "function") throw new Error("manager profileGet must be a trusted embedding callback");
     if (opts.execution !== undefined && opts.execution !== "runtime" && opts.execution !== "none")
       throw new Error(`unknown manager execution capability ${JSON.stringify(opts.execution)}`);
     if (opts.execution === "none" && ((opts.pooled !== undefined && typeof opts.pooled !== "boolean") ||
@@ -2065,6 +2070,7 @@ export class Manager {
     this.name = opts.name ?? "manager";
     this.workspaceRoot = opts.workspaceRoot ?? findCotalRoot();
     this.onServiceIdentity = opts.onServiceIdentity;
+    this.profileGet = opts.profileGet;
     this.eventsRequired = opts.eventsRequired === true;
     this.eventPayloadsWithheld = opts.eventPayloadsWithheld === true;
     this.maxSessions = opts.maxSessions;
@@ -4831,7 +4837,7 @@ export class Manager {
       observe: (ctx) => adminGated(ctx, () => placementUnsupported("retained placement observation and RuntimeProvider rebind")),
       stopPlacement: (ctx) => adminGated(ctx, () => placementUnsupported("RuntimeProvider stop")),
       prepareLaunch: (ctx) => adminGated(ctx, () => placementUnsupported("trusted workspace/profile/assets preparation")),
-      profileGet: (ctx) => adminGated(ctx, () => placementUnsupported("configured trusted roles CUE profile source")),
+      profileGet: (ctx) => adminGated(ctx, () => this.profileGet ? this.profileGet(String(args(ctx).name)) : placementUnsupported("configured trusted roles CUE profile source")),
       vitals: (ctx) => this.serveGated(ctx, () => measureManagerVitals()),
       // A remote Manager files every seat under its own owner, so only a user mesh's shared local
       // Manager narrows the count, and status never waits on a remote admin check.
