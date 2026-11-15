@@ -72,5 +72,6 @@ try {
   );
 
   console.log("identity-store smoke passed");
+} finally {
   rmSync(root, { recursive: true, force: true });
 }
