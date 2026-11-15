@@ -58,6 +58,7 @@ try {
   const retiredReservation = reopened.retire("unissued", "other", unissued.lifecycleUid, undefined, 10);
   assert.equal(retiredReservation.retiredAt, 10, "an unissued reservation can be retired");
   assert.equal(reopened.ownsName("unissued", "other"), false, "retiring an unissued reservation frees its name");
+  reopened.retire("alice", "signer", replacement.lifecycleUid, undefined, 10);
 
   const nextMinter = reopened.reserve("alice", "next-minter", 11, 1);
   assert.notEqual(nextMinter.lifecycleUid, alice.lifecycleUid, "a different minter gets a fresh lifecycle UID");
