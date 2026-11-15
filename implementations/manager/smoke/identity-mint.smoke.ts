@@ -58,10 +58,11 @@ try {
   assert.ok(first.jwt && first.acceptedToken);
   const seatNc = await connect({ servers, authenticator: credsAuthenticator(new TextEncoder().encode(credsFromJwt(first.jwt, seat))), inboxPrefix: `_INBOX_${seat.id}`, maxReconnectAttempts: 0 });
   try {
-    const adminCreds = await mintCreds(auth, newIdentity(), "provisioner");
+    const senderId = newIdentity();
+    const adminCreds = await mintCreds(auth, senderId, "agent", { principal: { owner: DEV_OWNER, actor: senderId.id }, lifecycleUid: mintLifecycleUid() });
     const admin = await connect({ servers, ...standaloneConnectOpts({ creds: adminCreds, tls: false }), maxReconnectAttempts: 0 });
     try {
-      await jetstream(admin).publish(unicastSubject(space, DEV_OWNER, seat.id, DEV_OWNER, caller.actor), new TextEncoder().encode("seat-dm"));
+      await jetstream(admin).publish(unicastSubject(space, DEV_OWNER, seat.id, DEV_OWNER, senderId.id), new TextEncoder().encode("seat-dm"));
     } finally { await admin.close(); }
     const consumer = await jetstream(seatNc, { checkAPI: false }).consumers.get(dmStream(space), dmDurable(DEV_OWNER, seat.id, reservation.lifecycleUid));
     const message = await consumer.next({ expires: 5000 });
