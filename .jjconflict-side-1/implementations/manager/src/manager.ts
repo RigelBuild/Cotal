@@ -12450,7 +12450,73 @@ export class Manager {
       throw e;
     }
   }
+  /** Parse the compact identity command name before deriving its durable alias. */
+  private identityAlias(raw: unknown): string {
+    if (typeof raw !== "string" || raw.length < 1 || raw.length > 64 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(raw))
+      throw new EpEnvelopeError("bad-request", "identity name must be a lowercase slug of at most 64 characters", undefined, "not-executed");
+    const alias = `${this.name}-${raw}`;
+    if (alias.length > 64)
+      throw new EpEnvelopeError("bad-request", "the manager name plus identity slug must be at most 64 characters", undefined, "not-executed");
+    return alias;
+  }
 
+  private identityStoreForCommand(): IdentityStore {
+    if (this.remoteAuthority || this.userMode || !this.auth || !this.identityStore)
+      throw new EpEnvelopeError("unavailable", "manager identity commands require a local static-auth manager", undefined, "not-executed");
+    return this.identityStore;
+  }
+
+  private identityReserve(ctx: EpServeContext): { name: string; lifecycleUid: string } {
+    const store = this.identityStoreForCommand();
+    const input = ctx.request.args;
+    const slug = typeof input === "object" && input !== null && !Array.isArray(input) ? (input as Record<string, unknown>).name : undefined;
+    const name = this.identityAlias(slug);
+    const record = store.reserve(name, principalKey(ctx.subject.caller.owner, ctx.subject.caller.actor).key, Date.now(), this.seatMintCap);
+    return { name, lifecycleUid: record.lifecycleUid };
+  }
+
+  private identityRetire(ctx: EpServeContext): Record<string, never> {
+    const store = this.identityStoreForCommand();
+    const input = ctx.request.args;
+    const slug = typeof input === "object" && input !== null && !Array.isArray(input) ? (input as Record<string, unknown>).name : undefined;
+    const name = this.identityAlias(slug);
+    const minter = principalKey(ctx.subject.caller.owner, ctx.subject.caller.actor).key;
+    const record = store.get(name);
+    if (!record)
+      throw new EpEnvelopeError("not-found", `identity ${name} has no reservation`, undefined, "not-executed");
+    if (record.minter !== minter)
+      throw new EpEnvelopeError("permission-denied", `identity ${name} is owned by another minter`, undefined, "not-executed");
+    if (record.retiredAt !== undefined || record.issuance?.state === "retired") return {};
+    if (record.publicKey !== undefined || record.issuance !== undefined)
+      throw new EpEnvelopeError("unavailable", `identity ${name} is bound to a public key; safe static terminal support is not available`, undefined, "not-executed");
+    store.retire(name, minter, record.lifecycleUid, undefined);
+    return {};
+  }
+
+  private identityRetireAdmin(ctx: EpServeContext): Record<string, never> {
+    const store = this.identityStoreForCommand();
+    const input = ctx.request.args;
+    const slug = typeof input === "object" && input !== null && !Array.isArray(input) ? (input as Record<string, unknown>).name : undefined;
+    const name = this.identityAlias(slug);
+    const record = store.get(name);
+    if (!record)
+      throw new EpEnvelopeError("not-found", `identity ${name} has no reservation`, undefined, "not-executed");
+    if (record.retiredAt !== undefined || record.issuance?.state === "retired") return {};
+    if (record.publicKey !== undefined || record.issuance !== undefined)
+      throw new EpEnvelopeError("unavailable", `identity ${name} is bound to a public key; safe static terminal support is not available`, undefined, "not-executed");
+    store.retire(name, record.minter, record.lifecycleUid, undefined);
+    return {};
+  }
+
+  private identityMint(_ctx: EpServeContext): never {
+    this.identityStoreForCommand();
+    throw new EpEnvelopeError("unavailable", "public-seat JWT issuance is unavailable until the core mintPublicSeatUserJwt API is integrated", undefined, "not-executed");
+  }
+
+  private identityRenew(_ctx: EpServeContext): never {
+    this.identityStoreForCommand();
+    throw new EpEnvelopeError("unavailable", "public-seat JWT renewal is unavailable until the core mintPublicSeatUserJwt API is integrated", undefined, "not-executed");
+  }
 
   /** `chat-session-open`: admit one static chat session. The manager draws the `chat_` alias and a
    *  fresh nkey identity, then runs the same native steps a static spawn does: the slot intent and
