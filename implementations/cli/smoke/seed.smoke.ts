@@ -134,6 +134,8 @@ if (process.platform === "win32") {
   }
   files.splice(files.indexOf("failed-seed.smoke.ts"), 1);
   excluded["failed-seed.smoke.ts"] = "its PATH holds only a symlink to node, which needs a privilege on Windows";
+  files.splice(files.indexOf("failed-seed-waiter.smoke.ts"), 1);
+  excluded["failed-seed-waiter.smoke.ts"] = "its PATH holds only a symlink to node, which needs a privilege on Windows";
   files.splice(files.indexOf("absent-extension.smoke.ts"), 1);
   excluded["absent-extension.smoke.ts"] = "its failed-seed PATH and dangling package link are symlinks, which need a privilege on Windows";
   files.splice(files.indexOf("config-modes.smoke.ts"), 1);
@@ -165,7 +167,7 @@ try {
     process.exitCode = 1;
   } else {
     const passed = unit.passed + result.results.reduce((sum, row) => sum + row.cells, 0);
-    const expected = process.platform === "win32" ? 94 : 143;
+    const expected = process.platform === "win32" ? 89 : 143;
     if (passed !== expected) throw new Error(`seed smoke: expected ${expected} checks, observed ${passed}`);
     console.log(`seed smoke: ${passed} passed, 0 failed`);
     emitSentinel({ passed, failed: 0 });
