@@ -21,6 +21,13 @@ agent session or use an operator credential.
 Static agent endpoints now default to no presence watch. Embedders that consume presence events
 must poll `readPresence()` and diff the results. An explicit `watchPresence: true` is refused.
 
+## Signed credential profiles after RIG-10102
+
+Static credentials now carry a signed `profile:<profile>` tag. Profile-specific behavior is available only when the credential verifies against the space's trusted account and signing-key pins. The JWT `name` is a holder-selected display label, not a profile.
+
+Legacy credentials without a profile tag need attention before an operator uses them with profile-aware features. Re-mint endpoint-caller credentials with `cotal auth mint <name> --endpoint <endpoint> --out <private-file>`. Agent credentials minted before this change cannot supply verified grants or lifecycle state to `--identity`; choose the intended profile and grants from a trusted source and mint a fresh key, or use `--new-incarnation` to reuse a current-authority key without its prior grants or lifecycle. Credentials from an old authority cannot be re-signed with `--identity`; mint a fresh key. For an exported agent file, use a new identity with an explicit profile and trusted grants. Do not infer them from the JWT name, the export record or unverified claims. Doctor reports an unmarked file and gives this guidance. Managed agents acquire the signed marker when their manager renews their credential.
+
+`whoami --creds --json` reports the trusted profile in `profile` and the unverified holder label in `nameUnverified`. An unavailable or untrusted profile is `null`. A profile word in an older holder name does not count as a profile.
 ## Migration commits need pause cleanup custody
 
 Library callers of `commitMigration` that supply journal entries and a handler must provide the

@@ -83,11 +83,11 @@ that is not current within two seconds adds no warning. A message over the broke
 only to one byte past that limit. A pipe or a device such as `/dev/zero` has no size to report, so
 its refusal names the limit alone. A channel post the broker
 refuses was not stored, so it refuses `PERMISSION_DENIED` (exit 2): the channel does not exist in
-the space or this identity may not post to it. The remedy lists the channels this identity may post
-to, read from the grant ledger as `cotal whoami` reads it, or with `--creds` from an agent file's own
-claims. When the ledger is on another machine it says so and lists the space's registered channels
-instead. A broker whose JetStream store holds more
-than its cap refuses every write with JetStream error 10023 and stores nothing, so `send` refuses
+the space or this identity may not post to it. The remedy lists channels from the grant ledger, or
+with `--creds` only from an agent credential whose profile verifies against this machine's trusted
+issuer pins. Holder names and unverified claims do not supply grants. When the ledger is on another
+machine it says so and lists the space's registered channels instead. A broker whose JetStream store
+holds more than its cap refuses every write with JetStream error 10023 and stores nothing, so `send` refuses
 `DEPENDENCY_UNAVAILABLE` (exit 2), naming the store and the `--max-file-store` cap this machine
 recorded for it. Its Next is `cotal history clear --yes`, which purges the space's channel history;
 a larger cap applies after that through `cotal down` and `cotal up --max-file-store <bytes>`. Any other unconfirmed publish outcome is
@@ -105,7 +105,10 @@ or transfer replies to a later chat session.
 ### Sender connection
 
 The sending principal comes from the selected space's credentials or user login. Its display name
-is the OS login and host, not `COTAL_NAME`. A one-shot sender never registers as a participant.
+is the OS login and host, unless a supplied static credential has a non-profile holder name whose
+signature verifies against this machine's registered issuer pins. A recognized profile word or an
+unverified/custom name falls back to the OS login and host. `COTAL_NAME` appends the sending agent to
+that base. A one-shot sender never registers as a participant.
 The broker and native channel policy still decide which publications are authorized.
 
 The transient endpoint never joins the roster and binds no inbox. With the static credential this
@@ -477,12 +480,12 @@ messages but no saved entry is a `no-op`, and its Metadata row says `no saved en
 still deletes that channel's retained messages. In `--json`, `result.removed` says whether a saved entry was removed. Neither
 removal nor replay settings revoke grants or stop participants; future posts can create retained
 history again. A `set`, `defaults` or `remove` that the broker refuses for the credential's grant
-applied nothing, so it is refused with `PERMISSION_DENIED` (exit 2), naming the credential's profile,
-the write it lacks and the subject the broker refused. With `--creds`, the Next is to run it without
-`--creds`, on the operator credential this machine records. A remove whose credential may not read
-the registry skips the name check, and the broker's answer to the remove decides. A change that the
-root's default `.cotal/channels.json` would undo at the next start warns that it will, as the
-[channel seed file](cli-startup.mdx#channel-seed-file) section says.
+applied nothing, so it is refused with `PERMISSION_DENIED` (exit 2), naming the write it lacks and
+the subject the broker refused. It does not name a profile from the unverified credential holder
+name. With `--creds`, run it without `--creds` on the operator credential this machine records.
+A remove whose credential may not read the registry skips the name check, and the
+broker's answer to the remove decides. A change that the root's default `.cotal/channels.json`
+would undo at the next start warns that it will, as the [channel seed file](cli-startup.mdx#channel-seed-file) section says.
 
 
 | Flag | Default | Meaning |
@@ -691,8 +694,9 @@ it to direct-message history. It refuses extra channel names, read filters and `
 purging. These inputs cannot narrow a clear operation. It is the same operation as [`clean history`](cli-shutdown.mdx#clean). On a user-auth mesh the purge rides a short-lived
 purger view over your login, which needs ledger scope `admin` ([Identity & auth](identity-and-auth.mdx)).
 A purge the broker refuses for the credential's grant purged nothing, so it is refused with
-`PERMISSION_DENIED` (exit 2), naming the credential's profile; with `--creds`, the Next is to run it
-without `--creds`, on the operator credential this machine records.
+`PERMISSION_DENIED` (exit 2), naming the refused write and target without inferring a profile from
+the unverified credential holder name. With `--creds`, the Next is to run it without `--creds`, on
+the operator credential this machine records.
 
 
 ## pending [#pending]

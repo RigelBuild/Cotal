@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, readlinkSync, realpathSync, unlinkSync, type Stats } from "node:fs";
 import { dirname, join, parse, relative, resolve, sep } from "node:path";
 import {
-  DEV_OWNER, accountRevocations, acquireLock, agentFilePath, assertKnownAgentCapabilities, assertValidRole, assertLifecycleToken, credsClaims, ensureDirNoSymlink, identityFromCreds,
+  DEV_OWNER, accountRevocations, acquireLock, agentFilePath, assertKnownAgentCapabilities, assertValidRole, assertLifecycleToken, credsClaims, ensureDirNoSymlink, identityFromCreds, verifyStaticUserCredential,
   loadAgentFile, mintCreds, mintLifecycleUid, newIdentity, principalKey, provisionAgentDurables, resolveReadAcl, writeSecretFileAtomic, writeSecretFileCreateOnly,
   type FlagValues, type HeldLock, type Identity, type ParsedArgs, type Profile, type SpaceAuth,
 } from "@cotal-ai/core";
@@ -35,12 +35,31 @@ const expiry = (seconds: number | undefined): string => {
  *  other standing credential stays, because something may still use it. */
 interface Replaced { state: "expired" | "unbounded" | "revoked"; expiresAt: number | null; publicKey: string; revokedAt: number | null; profile: string | null }
 
-function replaceable(standing: string, name: string, target: object, revocations: Readonly<Record<string, number>>): Replaced {
-  let claims: ReturnType<typeof credsClaims> | undefined;
-  try { claims = credsClaims(standing); } catch { claims = undefined; }
-  if (!claims?.sub) throw new CommandFailure("refused", "CONFLICT", `the standing credential "${name}" is not a native credential this command can read; it was not replaced`, { target });
-  const exp = claims.exp, publicKey = claims.sub, profile = claims.name ?? null;
-  // The broker refuses a revoked key whatever the expiry, and the replacement takes a new key.
+function replaceable(standing: string, name: string, target: object, revocations: Readonly<Record<string, number>>, auth: SpaceAuth): Replaced {
+  let claims: ReturnType<typeof credsClaims>;
+  try { claims = credsClaims(standing); }
+  catch {
+    throw new CommandFailure("refused", "CONFLICT", `the standing credential "${name}" is not a native credential this command can read; it was not replaced`, { target });
+  }
+  let publicKey: string, profile: string | null;
+  try {
+    const verified = verifyStaticUserCredential(standing, { accountPub: auth.account.pub, signingPub: auth.account.signingPub }, { allowOutOfWindow: true });
+    publicKey = verified.identity;
+    profile = verified.profile;
+  } catch {
+    // The credential's self-described issuer and account prove signature consistency only; the
+    // profile remains untrusted after an authority rotation.
+    const signingPub = claims.iss;
+    const accountPub = claims.nats?.issuer_account ?? signingPub;
+    try {
+      if (signingPub === undefined || accountPub === undefined) throw new Error();
+      publicKey = verifyStaticUserCredential(standing, { accountPub, signingPub }, { allowOutOfWindow: true }).identity;
+      profile = null;
+    } catch {
+      throw new CommandFailure("refused", "CONFLICT", `the standing credential "${name}" is not a native credential this command can read; it was not replaced`, { target });
+    }
+  }
+  const exp = claims.exp;
   const revokedAt = revocations[publicKey];
   if (revokedAt !== undefined && (claims.iat === undefined || claims.iat <= revokedAt)) return { state: "revoked", expiresAt: exp ?? null, publicKey, revokedAt, profile };
   if (exp === undefined) return { state: "unbounded", expiresAt: null, publicKey, revokedAt: null, profile };
@@ -179,7 +198,7 @@ export async function mint(args: ParsedArgs): Promise<void> {
       standing = await store.get(key);
       if (standing !== undefined && !values.replace) throw new CommandFailure("refused", "CONFLICT", "the named standing credential already exists; it was not replaced", { target, remedy: "choose a new label or an explicit separate private --out path, or replace it with --replace once it has expired, if it has no expiry or if its key was revoked" });
       if (standing !== undefined) {
-        replaced = replaceable(standing, name, target, accountRevocations(auth.account.jwt));
+        replaced = replaceable(standing, name, target, accountRevocations(auth.account.jwt), auth);
         replacedGrants = heldGrants(standing, space, auth.account.pub);
       }
     }

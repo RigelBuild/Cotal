@@ -415,6 +415,58 @@ async function completionOut(positionals: string[]): Promise<string> {
   assert.deepEqual(standaloneCallerIntent(JSON.parse(JSON.stringify(written))), written, "the written intent reads back unchanged");
   assert.throws(() => standaloneCallerIntent({ ...written, endpoint: "com_example_reviews" }), (e: unknown) => isCommandFailure(e) && e.code === "SCHEMA_INVALID" && e.remedy !== undefined, "an intent that records the endpoint's wire token is refused with a remedy");
 }
+// --- static standalone endpoint caller reads require its exact signed agent profile --------------
+{
+  const { createSpaceAuth, credsClaims, identityFromCreds, mintCreds, mintLifecycleUid, newIdentity, principalTags } = await import("@cotal-ai/core");
+  const { encodeUser, fmtCreds } = await import("@nats-io/jwt");
+  const { fromPublic, fromSeed } = await import("@nats-io/nkeys");
+  const { authDir, saveSpaceAuth, readPinnedStaticCredential, readStandaloneEndpointCaller } = await import("@cotal-ai/workspace");
+  const root = mkdtempSync(join(tmpdir(), "cotal-standalone-caller-profile-"));
+  const space = "standalone_profile_smoke", endpoint = "com.example.reviews", lifecycleUid = mintLifecycleUid();
+  const auth = await createSpaceAuth(space), id = newIdentity(), credsPath = join(root, "caller.creds");
+  const intent = {
+    schemaVersion: 1, kind: "endpoint-caller-issuance-intent", requestId: "11111111-1111-4111-8111-111111111111", createdAt: new Date(0).toISOString(),
+    space, endpoint, identity: id.id, owner: "local", lifecycleUid, output: credsPath, channels: [], expiresInSeconds: null, phase: "local-intent-only", secretIncluded: false,
+    scope: { source: "fresh-native-resolution", supportedMode: "untargeted-synchronous-ephemeral", owner: "local", responder: { instanceId: mintLifecycleUid(), epoch: 0 }, instancePinned: false,
+      commands: [{ command: "echo", class: "ephemeral", capability: "echo", inputDigest: "sha256:in", outputDigest: "sha256:out" }] },
+  };
+  const nativeTarget = { root, space, server: "nats://127.0.0.1:4222", tlsRequired: false, mode: "auth" as const };
+  const signedAgent = await mintCreds(auth, id, "agent", { lifecycleUid, endpointCapabilities: [{ endpoint, command: "echo" }], allowSubscribe: [], allowPublish: [] });
+  const actual = credsClaims(signedAgent).nats! as NonNullable<Parameters<typeof encodeUser>[3]>;
+  const signWith = async (tags: string[]) => {
+    const jwt = await encodeUser("standalone-profile", fromPublic(id.id), fromPublic(auth.account.pub), {
+      ...actual, tags,
+    }, { signer: fromSeed(new TextEncoder().encode(auth.account.signingSeed)), exp: Math.floor(Date.now() / 1000) + 600 });
+    return new TextDecoder().decode(fmtCreds(jwt, fromSeed(new TextEncoder().encode(id.seed))));
+  };
+  saveSpaceAuth(authDir(root), auth);
+  try {
+    const observer = await mintCreds(auth, newIdentity(), "observer"), observerClaims = credsClaims(observer), observerIdentity = identityFromCreds(observer);
+    const observerNats = observerClaims.nats as NonNullable<Parameters<typeof encodeUser>[3]> & { tags?: unknown[] };
+    const observerJwt = await encodeUser(observerClaims.name ?? "observer", fromPublic(observerIdentity.id), fromPublic(auth.account.pub), { ...observerNats, tags: observerNats.tags?.filter((tag): tag is string => typeof tag === "string" && !tag.startsWith("profile:")) }, { signer: fromSeed(new TextEncoder().encode(auth.account.signingSeed)) });
+    writeFileSync(credsPath, new TextDecoder().decode(fmtCreds(observerJwt, fromSeed(new TextEncoder().encode(observerIdentity.seed)))), { mode: 0o600 });
+    assert.equal((await readPinnedStaticCredential(nativeTarget, credsPath)).profile, null, "an unmarked legacy observer credential remains readable by the shared pinned adapter used by the web dashboard");
+    writeFileSync(credsPath, signedAgent, { mode: 0o600 });
+    writeFileSync(`${credsPath}.issuance.json`, JSON.stringify(intent), { mode: 0o600 });
+    assert.equal((await readStandaloneEndpointCaller(nativeTarget, credsPath, endpoint)).identity, id.id, "the verified signed agent marker is accepted with the exact principal tags and permissions");
+    const principal = principalTags("local", id.id);
+    const malformed: Array<[string, string[], string]> = [["missing", [...principal], "UNSUPPORTED"], ["wrong", [...principal, "profile:observer"], "UNSUPPORTED"], ["multiple", [...principal, "profile:agent", "profile:observer"], "UNSUPPORTED"]];
+    for (const [name, tags, code] of malformed) {
+      writeFileSync(credsPath, await signWith(tags), { mode: 0o600 });
+      await assert.rejects(readStandaloneEndpointCaller(nativeTarget, credsPath, endpoint), (error: unknown) => isCommandFailure(error) && error.code === code && (name !== "missing" || error.remedy?.includes("cotal auth mint <name> --endpoint <endpoint>") === true), `${name} profile marker is rejected${name === "missing" ? " with a re-mint remedy" : ""}`);
+    }
+    const accepted = await signWith([...principal, "profile:agent"]);
+    writeFileSync(credsPath, accepted, { mode: 0o600 });
+    assert.equal((await readStandaloneEndpointCaller(nativeTarget, credsPath, endpoint)).identity, id.id, "a correctly re-signed agent profile with its exact permission projection is accepted");
+    const wrongProjection = await encodeUser("standalone-profile", fromPublic(id.id), fromPublic(auth.account.pub), {
+      ...actual, pub: { allow: [] }, sub: { allow: [] }, tags: [...principal, "profile:agent"],
+    }, { signer: fromSeed(new TextEncoder().encode(auth.account.signingSeed)), exp: Math.floor(Date.now() / 1000) + 600 });
+    writeFileSync(credsPath, new TextDecoder().decode(fmtCreds(wrongProjection, fromSeed(new TextEncoder().encode(id.seed)))), { mode: 0o600 });
+    await assert.rejects(readStandaloneEndpointCaller(nativeTarget, credsPath, endpoint), (error: unknown) => isCommandFailure(error) && error.code === "UNSUPPORTED", "a valid signed profile with a different permission projection still refuses");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
 
 // --- the caller remedy names the space the refused call resolved, not the current one -------------
 // `endpoint invoke` reaches this refusal only after a static-auth broker answers and a served

@@ -196,7 +196,7 @@ export async function doctor(args: ParsedArgs): Promise<void> {
   try { exported = exportedCredentials(root, auth); } catch { exported = null; }
   const warnings = [
     ...items.filter((row) => row.warning !== null).map((row) => ({ code: "CREDENTIAL_UNBOUNDED_BY_REQUEST", target: { path: row.path }, message: `${row.label}: ${row.warning}` })),
-    ...(exported ?? []).filter((row) => row.state === "expired").map((row) => ({ code: "EXPORTED_CREDENTIAL_EXPIRED", target: { path: row.path }, message: `${row.label}: ${row.path} expired at ${at(row.expiresAt ?? undefined)}; ${row.repair}` })),
+    ...(exported ?? []).filter((row) => row.state === "expired").map((row) => ({ code: "EXPORTED_CREDENTIAL_EXPIRED", target: { path: row.path }, message: `${row.label}: ${row.path} expired at ${at(row.expiresAt ?? undefined)}; ${row.repair ?? "profile and grants are unverified; select them from a trusted source before minting a new key"}` })),
     ...(exported === null ? [{ code: "EXPORTED_CREDENTIALS_UNREAD", target: { space: auth.space }, message: "the records of the files auth mint --out wrote could not be read, so those files are not listed" }] : []),
   ];
   const findings = items.filter((row) => row.problem !== null).length;
@@ -322,19 +322,37 @@ function exportedCredentials(root: string, auth: SpaceAuth): ExportedRow[] {
     }
     // A file removed since is not listed.
     if (!bytes) continue;
-    let claims: ReturnType<typeof credsClaims>;
-    try { claims = credsClaims(bytes.toString("utf8")); } catch { rows.push(row); continue; }
-    const health = inspectCredHealth(bytes.toString("utf8"));
-    const profile = entry.profile === "agent" ? "" : ` --profile ${entry.profile}`;
-    // A new key holds only the grants its mint names, so the mint names the ones this file holds.
-    const grants = entry.profile === "agent" && claims.name === "agent" ? agentGrants(claims.nats ?? {}, auth.space) : undefined;
-    const fresh = `mint a new key${grants ? " with the grants this file holds" : ""}: \`${cmd} auth mint ${entry.label}${profile}${grants ? grantMintFlags(grants) : ""} --out <new file>\``;
-    const revokedAt = claims.sub === undefined ? undefined : revocations[claims.sub];
+    const text = bytes.toString("utf8");
+    let claims;
+    try { claims = credsClaims(text); } catch { row.repair = `this credential's profile and grants are unreadable; select the intended profile and grants from a trusted source, then mint a new identity without --identity: \`${cmd} auth mint ${entry.label} --profile <intended-profile> --out <new file>\`; supply trusted grants if the intended profile is agent`; rows.push(row); continue; }
+    const health = inspectCredHealth(text);
     Object.assign(row, { state: health.state, issuedAt: claims.iat ?? null, expiresAt: claims.exp ?? null });
-    if ((claims.nats?.issuer_account ?? claims.iss) !== auth.account.pub)
-      Object.assign(row, { state: "other-account", repair: `the space's identity changed after it was written, so its broker refuses it; ${fresh}` });
-    else if (revokedAt !== undefined && (claims.iat === undefined || claims.iat <= revokedAt))
-      Object.assign(row, { state: "revoked", revokedAt, repair: `its key was revoked at ${at(revokedAt)}, and auth mint --identity refuses that key; ${fresh}` });
+    const issuerAccount = claims.nats?.issuer_account;
+    const issuerMismatch = issuerAccount !== undefined && issuerAccount !== auth.account.pub
+      || claims.iss !== undefined && claims.iss !== auth.account.signingPub;
+    if (issuerMismatch) {
+      const freshFromOldAuthority = `select the intended profile and grants from a trusted source, then mint a new identity without --identity: \`${cmd} auth mint ${entry.label} --profile <intended-profile> --out <new file>\`; supply trusted grants if the intended profile is agent`;
+      Object.assign(row, { state: "other-account", repair: `the space's identity changed after it was written, so its broker refuses it; the old credential's profile and grants are not trusted here. ${freshFromOldAuthority}` });
+      rows.push(row);
+      continue;
+    }
+    let verified;
+    try { verified = verifyStaticUserCredential(text, { accountPub: auth.account.pub, signingPub: auth.account.signingPub }, { allowOutOfWindow: true }); }
+    catch {
+      row.repair = `this credential's profile and grants are unverified; select the intended profile and grants from a trusted source, then mint a new identity without --identity: \`${cmd} auth mint ${entry.label} --profile <intended-profile> --out <new file>\`; supply trusted grants if the intended profile is agent`;
+      rows.push(row);
+      continue;
+    }
+    row.profile = verified.profile;
+    const profile = verified.profile && verified.profile !== "agent" ? ` --profile ${verified.profile}` : "";
+    const grants = verified.profile === "agent" ? agentGrants(claims.nats ?? {}, auth.space) : undefined;
+    const fresh = verified.profile === null
+      ? `this credential has no verified profile marker; select the intended profile and grants from a trusted source, then mint a new identity without --identity: \`${cmd} auth mint ${entry.label} --profile <intended-profile> --out <new file>\`; supply trusted grants if the intended profile is agent`
+      : `mint a new key${grants ? " with the grants this file holds" : ""}: \`${cmd} auth mint ${entry.label}${profile}${grants ? grantMintFlags(grants) : ""} --out <new file>\``;
+    if (verified.profile === null && entry.label !== WEB_CREDS_KIND) row.repair ??= fresh;
+    const revokedAt = claims.sub === undefined ? undefined : revocations[claims.sub];
+    if (revokedAt !== undefined && (claims.iat === undefined || claims.iat <= revokedAt))
+      Object.assign(row, { state: "revoked", revokedAt, repair: `${verified.profile === null ? "this credential's profile is unmarked, so its identity, grants and lifecycle UID cannot be reused safely; " : ""}its key was revoked at ${at(revokedAt)}, and auth mint --identity refuses that key; ${fresh}` });
     else if (health.state === "expired" || health.state === "near-expiry")
       row.repair = `\`${cmd} auth mint ${entry.label}${profile} --identity ${entry.path} --out ${entry.path}\` signs the same key again${entry.profile === "agent" ? " with the same grants" : ""}`;
     rows.push(row);

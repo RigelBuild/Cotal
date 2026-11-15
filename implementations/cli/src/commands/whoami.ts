@@ -3,7 +3,7 @@ import { credsClaims, dlvStream, dmStream, principalKey, resolveAuthProvider, sp
 import { authDir, brokerAddressForDisplay, recordOperationSpace, CLI_USER_ACTOR, CommandFailure, findMesh, hasUserAuthState, isMeshRegistryError, isWorkspaceTargetError, jsonFlag, loadSpaceAuth, MeshTargetError, plainFlag, presentationOf, readCredsFile, recordedRevocation, resolveMeshTarget, serverFlag, spaceFlag, spaceInCreds, userAuthStateDir, workspaceSecretStore, writeResult, type Cell, type OutputWarning, type Presentation, type Report, type Section } from "@cotal-ai/workspace";
 import { registryFailure } from "../lib/registry-errors.js";
 
-const credsFlag = { name: "creds", type: "string", value: "<file>", description: "report what this credential file may do, from its own claims; no broker is contacted" } as const satisfies FlagSpec;
+const credsFlag = { name: "creds", type: "string", value: "<file>", description: "report this credential's claims and its profile only when verified against registered issuer pins; no broker is contacted" } as const satisfies FlagSpec;
 
 export const whoamiFlags = [spaceFlag, serverFlag, credsFlag, jsonFlag, plainFlag] as const satisfies readonly FlagSpec[];
 
@@ -44,9 +44,9 @@ export interface WhoamiResult {
   readonly capabilities: Grant | null;
 }
 
-/** What `cotal whoami --creds <file>` reports: what a credential file's own claims permit, in the
- *  one space they name. The claims are decoded, not verified, and no broker is contacted; the broker
- *  enforces them. */
+/** What `cotal whoami --creds <file>` reports: public fields decoded from the credential claims,
+ *  including an unverified holder name, plus a profile only when verified against registered pins.
+ *  No broker is contacted; the broker enforces permission claims. */
 export interface WhoamiCredentialResult {
   readonly kind: "credential";
   readonly file: string;

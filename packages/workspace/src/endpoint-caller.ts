@@ -91,7 +91,7 @@ export async function readPinnedStaticCredential(target: NativeServiceTarget, in
   try { creds = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
   catch { throw new CommandFailure("refused", "SCHEMA_INVALID", "the selected credential is not native credential text; bytes were not printed"); }
   try { return { path, creds, ...verifyStaticUserCredential(creds, pins) }; }
-  catch { throw new CommandFailure("refused", "AUTH_REQUIRED", "the selected file does not bind a matching native user key and current window to this root's pinned static issuer; no credential bytes or alternative identity were used"); }
+  catch { throw new CommandFailure("refused", "AUTH_REQUIRED", "the selected file does not verify as an unexpired native user credential under this root's pinned static issuer; no credential bytes or alternative identity were used"); }
 }
 
 function permissionProjection(input: { pub?: unknown; sub?: unknown; resp?: unknown }) {
@@ -120,7 +120,9 @@ export async function readStandaloneEndpointCaller(target: NativeServiceTarget, 
   const capabilities: EpCapability[] = intent.scope.commands.map((command) => ({ endpoint, command: command.command }));
   const expected = permissionsFor("agent", target.space, { owner: caller.owner, actor: caller.actor, connId: credential.identity, lifecycleUid: caller.uid }, { lifecycleUid: caller.uid, capabilities: [], endpointCapabilities: capabilities, allowSubscribe: resolveReadAcl(intent.channels, intent.channels), allowPublish: intent.channels });
   const tags = credential.principalTags;
-  if (!Array.isArray(tags) || tags.some((tag) => typeof tag !== "string") || canonicalJson([...new Set(tags)].sort()) !== canonicalJson(principalTags(caller.owner, caller.actor).sort()) || permissionProjection(credential.permissionFields) !== permissionProjection({ pub: expected.pub, sub: expected.sub, resp: expected.resp })) throw new CommandFailure("refused", "UNSUPPORTED", "the signed credential is not the native standalone scope recorded for this caller; broader, issued-generation or different-profile authority was not substituted");
+  if (credential.profile !== "agent") throw new CommandFailure("refused", "UNSUPPORTED", "the saved standalone endpoint caller has no verified signed agent profile under this root's current issuer pins", { remedy: "re-mint it with `cotal auth mint <name> --endpoint <endpoint>`" });
+  const expectedTags = principalTags(caller.owner, caller.actor).sort();
+  if (!Array.isArray(tags) || tags.some((tag) => typeof tag !== "string") || canonicalJson([...new Set(tags)].sort()) !== canonicalJson(expectedTags) || permissionProjection(credential.permissionFields) !== permissionProjection({ pub: expected.pub, sub: expected.sub, resp: expected.resp })) throw new CommandFailure("refused", "UNSUPPORTED", "the signed credential is not the native standalone scope recorded for this caller; broader, issued-generation or different-profile authority was not substituted");
   return { creds: credential.creds, caller, accountPub: credential.accountPub, identity: credential.identity, commands: intent.scope.commands.map((command) => command.command),
     reference: { path: credential.path, intentPath, localRequestId: intent.requestId, endpoint, identity: credential.identity, lifecycleUid: caller.uid, callerKind: "native-static-out-of-band" as const, binding: "signature-current-issuer-and-native-permission-projection" as const, brokerAdmitted: false as const } };
 }

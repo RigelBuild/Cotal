@@ -177,6 +177,7 @@ try {
     writeFileSync(join(agents, "mint-caller.md"), "---\nname: mint-caller\ncapabilities: [spawn]\n---\n");
     const out = join(root, "mint-caller.creds");
     const r = await runMint(["mint-caller", "--out", out]);
+    check("mint-caller child mint writes its output", r.code === 0 && existsSync(out), r.out);
     const minted = facts(readFileSync(out, "utf8"));
     const caller: EpCaller = { owner: DEV_OWNER, actor: minted.principal!.split(".")[1]!, uid: minted.uids[0]! };
     const required = spawnCallerCapabilities(DEV_OWNER).flatMap((cap) => epRequestGrantRows(SPACE, cap, caller));
@@ -725,11 +726,15 @@ try {
     const unreplaced = await runMint(["neu", "--replace"]);
     check("--replace on a label with no standing credential mints one and warns that it replaced nothing",
       unreplaced.code === 0 && unreplaced.out.includes('! --replace found no standing credential named "neu", so this is a new standing credential and it replaced nothing') && existsSync(standing("neu")), unreplaced.out);
+    const malformedStanding = standing("bad-native"), malformedBytes = "not a native credential\n";
+    writeFileSync(malformedStanding, malformedBytes, { mode: 0o600 });
+    const malformedReplacement = await runMint(["bad-native", "--replace"]);
+    check("--replace classifies malformed standing bytes as CONFLICT and preserves them", malformedReplacement.code === 2 && /^\s*Code:\s+CONFLICT$/m.test(malformedReplacement.out) && readFileSync(malformedStanding, "utf8") === malformedBytes, malformedReplacement.out);
   }
 
   // ── 11. --identity keeps an agent credential's grants; doctor auth lists each --out file ─────
   {
-    type Envelope = { result?: { grants?: unknown; exported?: { path: string; state: string; repair: string | null }[] | null }; warnings?: { code: string; message: string }[] };
+    type Envelope = { result?: { grants?: unknown; exported?: { path: string; state: string; profile: string | null; repair: string | null }[] | null }; warnings?: { code: string; message: string }[] };
     const envelope = (out: string): Envelope => {
       const line = out.split("\n").find((text) => text.startsWith('{"schemaVersion"'));
       try { return line ? JSON.parse(line) as Envelope : {}; } catch { return {}; }
@@ -754,10 +759,41 @@ try {
     const expired = await runCotal(["doctor", "auth", "--space", SPACE, "--json"]);
     const rows = envelope(expired.out).result?.exported ?? [];
     const row = rows.find((entry) => entry.path === first);
+    check("doctor reports the signed profile marker for a verified exported agent", row?.profile === "agent", row);
     check("doctor auth lists the files auth mint --out wrote, each with its state",
       row?.state === "expired" && rows.some((entry) => entry.path === again && entry.state === "healthy") && rows.some((entry) => entry.path === other), rows);
     check("  an expired one is a warning, and its repair mints the same key into the same file",
       row?.repair?.includes(`auth mint grants --identity ${first} --out ${first}\``) === true && envelope(expired.out).warnings?.some((warning) => warning.code === "EXPORTED_CREDENTIAL_EXPIRED" && warning.message.includes(first)) === true, { row, warnings: envelope(expired.out).warnings });
+    const unmarked = join(root, "legacy-unmarked.creds"), legacyLabel = "legacy-unmarked";
+    const legacyMint = await runMint([legacyLabel, "--profile", "agent", "--out", unmarked]);
+    check("mint an agent credential for the doctor profile migration case", legacyMint.code === 0 && existsSync(unmarked), legacyMint.out);
+    const legacyBytes = readFileSync(unmarked, "utf8");
+    const legacyClaims = credsClaims(legacyBytes);
+    const { encodeUser, fmtCreds } = await import("@nats-io/jwt");
+    const { fromPublic, fromSeed } = await import("@nats-io/nkeys");
+    const workspace = await import("@cotal-ai/workspace");
+    const pins = await workspace.getSpaceAuth(workspace.workspaceSecretStore(root), SPACE);
+    assert.ok(pins);
+    const pinnedNats = legacyClaims.nats as NonNullable<Parameters<typeof encodeUser>[3]> & { tags?: unknown[] };
+    const holder = (await import("@cotal-ai/core")).identityFromCreds(legacyBytes);
+    const unmarkedTags = pinnedNats.tags?.filter((tag): tag is string => typeof tag === "string" && !tag.startsWith("profile:"));
+    const unmarkedJwt = await encodeUser(legacyLabel, fromPublic(holder.id), fromPublic(pins.account.pub), { ...pinnedNats, tags: unmarkedTags }, { signer: fromSeed(new TextEncoder().encode(pins.account.signingSeed)), exp: Math.floor(Date.now() / 1000) + 3600 });
+    writeFileSync(unmarked, new TextDecoder().decode(fmtCreds(unmarkedJwt, fromSeed(new TextEncoder().encode(holder.seed)))), { mode: 0o600 });
+    const exportedProfile = envelope((await runCotal(["doctor", "auth", "--space", SPACE, "--json"])).out).result?.exported?.find((entry) => entry.path === unmarked);
+    check("doctor lists the unmarked export with null verified profile and trusted-source repair guidance", exportedProfile?.profile === null && exportedProfile.repair?.includes("this credential has no verified profile marker") === true, exportedProfile);
+    const legacyRevokedKey = credsClaims(readFileSync(unmarked, "utf8")).sub;
+    assert.ok(legacyRevokedKey);
+    const { revokeAccountUser } = await import("@cotal-ai/core");
+    await workspace.putSpaceAuth(workspace.workspaceSecretStore(root), await revokeAccountUser(pins, legacyRevokedKey, Math.floor(Date.now() / 1000)));
+    const revokedExport = envelope((await runCotal(["doctor", "auth", "--space", SPACE, "--json"])).out).result?.exported?.find((entry) => entry.path === unmarked);
+    check("doctor reports a revoked unmarked export without trusting its profile", revokedExport?.state === "revoked" && revokedExport.profile === null && revokedExport.repair?.includes("trusted source") === true, revokedExport);
+    const revokedJwt = jwtFromCreds(readFileSync(unmarked, "utf8"));
+    assert.ok(revokedJwt);
+    const signatureStart = revokedJwt.lastIndexOf(".") + 1;
+    const brokenSignature = `${revokedJwt.slice(0, signatureStart)}${revokedJwt[signatureStart] === "A" ? "B" : "A"}${revokedJwt.slice(signatureStart + 1)}`;
+    writeFileSync(unmarked, readFileSync(unmarked, "utf8").replace(revokedJwt, brokenSignature), { mode: 0o600 });
+    const tamperedExport = envelope((await runCotal(["doctor", "auth", "--space", SPACE, "--json"])).out).result?.exported?.find((entry) => entry.path === unmarked);
+    check("doctor does not classify a broken-signature export as revoked from its untrusted subject", tamperedExport?.state === "healthy" && tamperedExport.profile === null && tamperedExport.repair?.includes("profile and grants are unverified") === true, tamperedExport);
     const renewed = await runMint(["grants", "--identity", first, "--out", first]);
     const after = envelope((await runCotal(["doctor", "auth", "--space", SPACE, "--json"])).out).result?.exported ?? [];
     check("  following it renews the file with its grants, and doctor then reads it healthy",
