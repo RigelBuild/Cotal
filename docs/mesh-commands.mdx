@@ -4804,11 +4804,15 @@ Output schema:
 
 ## auth
 
-Cluster `ai.cotal.auth`, revision 1. 1 commands.
+Cluster `ai.cotal.auth`, revision 2. 5 commands.
 
-| Command                                      | Capability   | Class     | Target modes |
-| -------------------------------------------- | ------------ | --------- | ------------ |
-| [`retire-lifecycle`](#auth-retire-lifecycle) | `auth.admin` | ephemeral | exact        |
+| Command                                                            | Capability       | Class     | Target modes |
+| ------------------------------------------------------------------ | ---------------- | --------- | ------------ |
+| [`retire-lifecycle`](#auth-retire-lifecycle)                       | `auth.admin`     | ephemeral | exact        |
+| [`verify-placement-enrollment`](#auth-verify-placement-enrollment) | `auth.placement` | ephemeral | untargeted   |
+| [`enrollment-effect-status`](#auth-enrollment-effect-status)       | `auth.placement` | ephemeral | untargeted   |
+| [`close-enrollment-effect`](#auth-close-enrollment-effect)         | `auth.placement` | ephemeral | untargeted   |
+| [`retire-placement-enrollment`](#auth-retire-placement-enrollment) | `auth.placement` | ephemeral | untargeted   |
 
 ### auth retire-lifecycle
 
@@ -4887,6 +4891,739 @@ Output schema:
       }
     }
   }
+}
+```
+
+### auth verify-placement-enrollment
+
+Registered declaration:
+
+```json
+{
+  "name": "verify-placement-enrollment",
+  "class": "ephemeral",
+  "targeted": false,
+  "capability": "auth.placement",
+  "inputDigest": "sha256:2be8b98175801efe0a919cc2391f95fbbe8c506572cc87cbd73700ef813f346e",
+  "outputDigest": "sha256:64bc2ff9e607c6560294e28dae18856ecfd1d2e5c084761f7ef9941301baef91"
+}
+```
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "identity",
+    "claim"
+  ],
+  "properties": {
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "acceptanceId",
+        "enrollmentOperationId",
+        "enrollmentRef",
+        "target",
+        "intentDigest"
+      ],
+      "properties": {
+        "acceptanceId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "enrollmentOperationId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "enrollmentRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "seatName",
+            "lifecycle",
+            "generation"
+          ],
+          "properties": {
+            "seatName": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "lifecycle": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "space",
+                "owner",
+                "actor",
+                "lifecycleUid"
+              ],
+              "properties": {
+                "space": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "owner": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_]+$",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "actor": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_]+$",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "lifecycleUid": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9]{26,32}$"
+                }
+              }
+            },
+            "generation": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "intentDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accountPublicKey",
+        "instanceId",
+        "managerLifecycleUid",
+        "assignmentRevision",
+        "currentRegistrationRevision",
+        "serveEpoch"
+      ],
+      "properties": {
+        "accountPublicKey": {
+          "type": "string",
+          "pattern": "^A[A-Z2-7]{55}$"
+        },
+        "instanceId": {
+          "type": "string",
+          "pattern": "^[a-z0-9]{26,32}$"
+        },
+        "managerLifecycleUid": {
+          "type": "string",
+          "pattern": "^[a-z0-9]{26,32}$"
+        },
+        "assignmentRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "currentRegistrationRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "serveEpoch": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}
+```
+
+Output schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "identity",
+    "active"
+  ],
+  "properties": {
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "acceptanceId",
+        "enrollmentOperationId",
+        "enrollmentRef",
+        "target",
+        "intentDigest"
+      ],
+      "properties": {
+        "acceptanceId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "enrollmentOperationId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "enrollmentRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "seatName",
+            "lifecycle",
+            "generation"
+          ],
+          "properties": {
+            "seatName": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "lifecycle": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "space",
+                "owner",
+                "actor",
+                "lifecycleUid"
+              ],
+              "properties": {
+                "space": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "owner": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_]+$",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "actor": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_]+$",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "lifecycleUid": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9]{26,32}$"
+                }
+              }
+            },
+            "generation": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "intentDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "active": {
+      "type": "boolean",
+      "const": true
+    }
+  }
+}
+```
+
+### auth enrollment-effect-status
+
+Registered declaration:
+
+```json
+{
+  "name": "enrollment-effect-status",
+  "class": "ephemeral",
+  "targeted": false,
+  "capability": "auth.placement",
+  "inputDigest": "sha256:96cc52fedaa07af4e27f312c9ee696a327e168e24cfa97a230a4be4b98b1a594",
+  "outputDigest": "sha256:b6ea71edb8d5ee639db5d08f45d788adc89f5c8b562c4f7a24c40842acf93990"
+}
+```
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "effectId"
+  ],
+  "properties": {
+    "effectId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    }
+  }
+}
+```
+
+Output schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "effectId",
+    "state",
+    "noLateEffects",
+    "privateCustody"
+  ],
+  "properties": {
+    "effectId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "effective",
+        "unknown",
+        "cancelled",
+        "pending"
+      ]
+    },
+    "enrollment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "acceptanceId",
+        "enrollmentOperationId",
+        "enrollmentRef",
+        "target",
+        "intentDigest"
+      ],
+      "properties": {
+        "acceptanceId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "enrollmentOperationId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "enrollmentRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "seatName",
+            "lifecycle",
+            "generation"
+          ],
+          "properties": {
+            "seatName": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "lifecycle": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "space",
+                "owner",
+                "actor",
+                "lifecycleUid"
+              ],
+              "properties": {
+                "space": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "owner": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_]+$",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "actor": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_]+$",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "lifecycleUid": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9]{26,32}$"
+                }
+              }
+            },
+            "generation": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "intentDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "noLateEffects": {
+      "type": "boolean"
+    },
+    "privateCustody": {
+      "type": "string",
+      "enum": [
+        "none"
+      ]
+    }
+  }
+}
+```
+
+### auth close-enrollment-effect
+
+Registered declaration:
+
+```json
+{
+  "name": "close-enrollment-effect",
+  "class": "ephemeral",
+  "targeted": false,
+  "capability": "auth.placement",
+  "inputDigest": "sha256:35f71a50e1f297f733d86f013ca1bbb0906f7d8833eb23ce5d11f44b2baa949e",
+  "outputDigest": "sha256:b6ea71edb8d5ee639db5d08f45d788adc89f5c8b562c4f7a24c40842acf93990"
+}
+```
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "effectId",
+    "fenceId"
+  ],
+  "properties": {
+    "effectId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "fenceId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    }
+  }
+}
+```
+
+Output schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "effectId",
+    "state",
+    "noLateEffects",
+    "privateCustody"
+  ],
+  "properties": {
+    "effectId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "effective",
+        "unknown",
+        "cancelled",
+        "pending"
+      ]
+    },
+    "enrollment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "acceptanceId",
+        "enrollmentOperationId",
+        "enrollmentRef",
+        "target",
+        "intentDigest"
+      ],
+      "properties": {
+        "acceptanceId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "enrollmentOperationId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "enrollmentRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "seatName",
+            "lifecycle",
+            "generation"
+          ],
+          "properties": {
+            "seatName": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "lifecycle": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "space",
+                "owner",
+                "actor",
+                "lifecycleUid"
+              ],
+              "properties": {
+                "space": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "owner": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_]+$",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "actor": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_]+$",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "lifecycleUid": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9]{26,32}$"
+                }
+              }
+            },
+            "generation": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "intentDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "noLateEffects": {
+      "type": "boolean"
+    },
+    "privateCustody": {
+      "type": "string",
+      "enum": [
+        "none"
+      ]
+    }
+  }
+}
+```
+
+### auth retire-placement-enrollment
+
+Registered declaration:
+
+```json
+{
+  "name": "retire-placement-enrollment",
+  "class": "ephemeral",
+  "targeted": false,
+  "capability": "auth.placement",
+  "inputDigest": "sha256:027d4f99fd39e4b7dfaf916ec55b354a99fd6cdd4f527e9efe1cfcfe1686ecca",
+  "outputDigest": "sha256:360f6a02b48bc631cb2d6deeeeffdef19303508568aa41e07254f131f7c4157b"
+}
+```
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "operationId",
+    "identity",
+    "fenceId"
+  ],
+  "properties": {
+    "operationId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "acceptanceId",
+        "enrollmentOperationId",
+        "enrollmentRef",
+        "target",
+        "intentDigest"
+      ],
+      "properties": {
+        "acceptanceId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "enrollmentOperationId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "enrollmentRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "seatName",
+            "lifecycle",
+            "generation"
+          ],
+          "properties": {
+            "seatName": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "lifecycle": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "space",
+                "owner",
+                "actor",
+                "lifecycleUid"
+              ],
+              "properties": {
+                "space": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "owner": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_]+$",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "actor": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_]+$",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "lifecycleUid": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9]{26,32}$"
+                }
+              }
+            },
+            "generation": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "intentDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "fenceId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    }
+  }
+}
+```
+
+Output schema:
+
+```json
+{
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "denialProofId"
+      ],
+      "properties": {
+        "state": {
+          "type": "string",
+          "const": "retired"
+        },
+        "denialProofId": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state"
+      ],
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "unknown"
+          ]
+        }
+      }
+    }
+  ]
 }
 ```
 
