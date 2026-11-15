@@ -3,3 +3,10 @@
 export function managedStaticCredOffTickRenewalDue(iat: number, exp: number, nowSec: number): boolean {
   return nowSec >= Math.ceil(iat + 0.375 * (exp - iat));
 }
+
+/** An identity is idle once its latest expiry (or reservation time) is 30 days old. */
+export const IDENTITY_IDLE_RETIRE_SEC = 30 * 86_400;
+
+export function identityIdleRetireDue(lastExp: number, nowSec: number): boolean {
+  return nowSec >= lastExp + IDENTITY_IDLE_RETIRE_SEC;
+}

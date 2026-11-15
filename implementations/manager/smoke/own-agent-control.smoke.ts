@@ -15,7 +15,8 @@
  *
  * Run: pnpm smoke:own-agent-control
  */
-import { authorizeLaunch, authorizeNamedControl } from "../src/authorize.js";
+import { authorizeIdentityControl, authorizeLaunch, authorizeNamedControl } from "../src/authorize.js";
+import { IDENTITY_IDLE_RETIRE_SEC, identityIdleRetireDue } from "../src/renewal.js";
 
 let failures = 0;
 function check(name: string, cond: boolean, detail?: unknown): void {
@@ -33,6 +34,13 @@ const noScope = async () => undefined;
 const neverCalled = async (): Promise<string[] | undefined> => {
   throw new Error("ledger must not be consulted on this row");
 };
+
+const identity = { name: "worker-identity", minter: `${OWNER_A}.cli` };
+check("identity minter may control its identity", authorizeIdentityControl(identity, identity.minter, false) === undefined);
+check("another caller cannot control the identity", typeof authorizeIdentityControl(identity, `${OWNER_B}.cli`, false) === "string");
+check("a separately granted admin route may retire the identity", authorizeIdentityControl(identity, `${OWNER_B}.cli`, true) === undefined);
+check("identity is not idle before its deadline", !identityIdleRetireDue(100, 100 + IDENTITY_IDLE_RETIRE_SEC - 1));
+check("identity becomes idle at its deadline", identityIdleRetireDue(100, 100 + IDENTITY_IDLE_RETIRE_SEC));
 
 // 1. admin tier — any target, both modes.
 check(
