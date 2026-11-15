@@ -1,7 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { constants, closeSync, existsSync, fchmodSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { EpEnvelopeError, ensureDirNoSymlink, mintLifecycleUid, spaceKey } from "@cotal-ai/core";
+import { EpEnvelopeError, ensureDirNoSymlink, mintLifecycleUid } from "@cotal-ai/core";
+import { spaceKey } from "@cotal-ai/workspace";
 import { lockExclusiveNb } from "@cotal-ai/seat";
 
 const LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));

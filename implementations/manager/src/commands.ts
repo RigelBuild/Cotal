@@ -20,6 +20,7 @@ import {
   isAuthRejection,
   registry,
   parseCommandArgs,
+  token,
   writePrivateRecord,
   writeSecretFileAtomic,
   type Command,
@@ -31,6 +32,7 @@ import {
 import {
   assertManagerName, authDir, canonicalLocalProcessPath, canonicalRoot, claimServicePid, consumeManagerShutdownIntent, findCotalRoot, getSpaceAuth, hasUserAuthState, isWorkspaceTargetError, listenForLocalStop, loadManagerInstanceIdentity, loadSpaceAccountAuth, parsePositiveIntegerFlag, parseSeatCapFlag, publishManagerSpareCapability, readManagerName, readManagerSeatCap, readManagerSeatMintCap, reclaimDeadPreUpgradeRecord, recordManagerName, recordManagerSeatCap, recordManagerSeatMintCap, removePidPair, resolveMeshTarget, soleSpaceOf, userAuthStateDir, workspaceSecretStore, writePidPair,
   DEFAULT_SEAT_MINT_CAP,
+  c, MANAGER_DELIVERY_AWARE_MARKER, MANAGER_PIDFILE, stderrLines, UNTRUSTED_CERTIFICATE, untilInputEnds,
   brokerAddressForDisplay, brokerUrlCredentialRefusal, brokerUrlHasUserinfo, CommandFailure, exitCode, inputDisabledByFlag, isCommandFailure, jsonFlag, plainFlag, presentationOf, renderReport, resolveNativeServiceTarget, writeResult, type Report,
   refreshRegistrationPolicy, publishServiceStartup, serviceStartupPath, publishServiceStopReceipt, publishServedContract, protectedCredentialReference, readLocalRecordSource, type NativeServiceStopRequest,
   ConfirmationRequired, findMesh, folderSpace, folderSpaceHeld, getCurrent, targetErrorCode, targetErrorSpace, workspaceErrorParts, type MeshEntry, type MeshTargetError, type SeatCap,
@@ -54,11 +56,6 @@ import { managerClusterArtifacts } from "./manager-service-contract.js";
 
 type Values = Record<string, string | undefined>;
 
-
-
-
-
- 
 /** Read the resume commit token from its protected handoff file once, check it against the
  *  digest named on argv, then unlink it. Errors name the field only; the value is never echoed. */
 export function readResumeCommitFile(path: string, sha256: string): string {
