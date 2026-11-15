@@ -313,9 +313,10 @@ function evidenceSnapshot(value: IssuedEvidence): IssuedEvidence {
   const issuedAt = raw.issuedAt;
   const jwtExpiresAt = raw.jwtExpiresAt;
   const jwtClaimsDigest = raw.jwtClaimsDigest;
-  for (const [name, time] of [["issuedAt", issuedAt], ["jwtExpiresAt", jwtExpiresAt]] as const)
-    if (time !== undefined && (typeof time !== "number" || !Number.isSafeInteger(time) || time <= 0))
-      throw new Error(`issued evidence ${name} must be a positive integer (unix seconds)`);
+  if (issuedAt !== undefined && (typeof issuedAt !== "number" || !Number.isSafeInteger(issuedAt) || issuedAt <= 0))
+    throw new Error("issued evidence issuedAt must be a positive integer (unix seconds)");
+  if (jwtExpiresAt !== undefined && (typeof jwtExpiresAt !== "number" || !Number.isSafeInteger(jwtExpiresAt) || jwtExpiresAt <= 0))
+    throw new Error("issued evidence jwtExpiresAt must be a positive integer (unix seconds)");
   if (issuedAt !== undefined && jwtExpiresAt === undefined)
     throw new Error("issued evidence issuedAt requires jwtExpiresAt");
   if (jwtExpiresAt !== undefined && jwtClaimsDigest === undefined)
