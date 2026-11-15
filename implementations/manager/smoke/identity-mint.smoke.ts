@@ -6,10 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect, type NatsConnection } from "@nats-io/transport-node";
 import { credsAuthenticator } from "@nats-io/transport-node";
-import { fmtCreds } from "@nats-io/jwt";
-import { fromSeed } from "@nats-io/nkeys";
 import { jetstream } from "@nats-io/jetstream";
-import { dmDurable, dmStream, unicastSubject } from "@cotal-ai/core";
+import { credsFromJwt, dmDurable, dmStream, unicastSubject } from "@cotal-ai/core";
 import { createSpaceAuth, DEV_OWNER, invokeCommand, isReachable, mintCreds, mintLifecycleUid, newIdentity, resolveService, serverConfig, setupSpaceStreams, standaloneConnectOpts } from "@cotal-ai/core";
 import { authDir, saveSpaceAuth } from "@cotal-ai/workspace";
 import { SMOKE_BROKER_TOKEN, awaitBrokerReady, freePort, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
@@ -58,7 +56,7 @@ try {
   assert.equal(minted.reply.ok, true, JSON.stringify(minted.reply));
   const first = minted.reply.data as { jwt: string; acceptedToken: string };
   assert.ok(first.jwt && first.acceptedToken);
-  const seatNc = await connect({ servers, authenticator: credsAuthenticator(fmtCreds(first.jwt, fromSeed(new TextEncoder().encode(seat.seed)))), inboxPrefix: `_INBOX_${seat.id}`, maxReconnectAttempts: 0 });
+  const seatNc = await connect({ servers, authenticator: credsAuthenticator(new TextEncoder().encode(credsFromJwt(first.jwt, seat))), inboxPrefix: `_INBOX_${seat.id}`, maxReconnectAttempts: 0 });
   try {
     const adminCreds = await mintCreds(auth, newIdentity(), "provisioner");
     const admin = await connect({ servers, ...standaloneConnectOpts({ creds: adminCreds, tls: false }), maxReconnectAttempts: 0 });
