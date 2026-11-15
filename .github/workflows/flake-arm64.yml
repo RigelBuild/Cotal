@@ -1,0 +1,24 @@
+name: Linux arm64 flake
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - flake.nix
+      - flake.lock
+      - nix/**
+      - .github/workflows/flake-arm64.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@91f6a0f59e94dfb2cfed0f4000f36a68ead1d20c # v31.11.4
+      - name: Build Cotal for Linux arm64
+        run: nix build .#packages.aarch64-linux.cotal
+      - name: Check Cotal version
+        run: ./result/bin/cotal --version
