@@ -1168,6 +1168,7 @@ const ROWS: CommandRow[] = [
   { name: "transcript-receive", capability: "manager.admin", input: TRANSCRIPT_RECEIVE_INPUT_SCHEMA, output: TRANSCRIPT_RECEIVE_OUTPUT_SCHEMA, targeted: false, handler: "transcriptReceive" },
   { name: "release-seat", capability: "manager.admin", input: RELEASE_SEAT_INPUT_SCHEMA, output: RELEASE_SEAT_OUTPUT_SCHEMA, targeted: false, handler: "releaseSeat" },
   { name: "attest-gone", capability: "manager.admin", input: ATTEST_GONE_INPUT_SCHEMA, output: ATTEST_GONE_OUTPUT_SCHEMA, targeted: false, handler: "attestGone" },
+  { name: "allowlist-set", capability: "manager.admin", input: ALLOWLIST_SET_INPUT_SCHEMA, output: ALLOWLIST_SET_OUTPUT_SCHEMA, targeted: false, handler: "allowlistSet" },
   { name: "identity-reserve", capability: "manager.seat", input: IDENTITY_RESERVE_INPUT_SCHEMA, output: IDENTITY_RESERVE_OUTPUT_SCHEMA, targeted: false, handler: "identityReserve" },
   { name: "identity-mint", capability: "manager.seat", input: IDENTITY_MINT_INPUT_SCHEMA, output: IDENTITY_MINT_OUTPUT_SCHEMA, targeted: false, handler: "identityMint" },
   { name: "identity-renew", capability: "manager.seat", input: IDENTITY_RENEW_INPUT_SCHEMA, output: IDENTITY_RENEW_OUTPUT_SCHEMA, targeted: false, handler: "identityRenew" },
