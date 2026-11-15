@@ -8,6 +8,7 @@ import Headless from "@xterm/headless";
 import {
   CotalEndpoint,
   answerAuthRoster,
+  openAuthRosterReader,
   type RosterReader,
   canonicalJson,
   MANAGED_HANDOFF_KIND,
