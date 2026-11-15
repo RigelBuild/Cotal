@@ -32,6 +32,7 @@ import {
   type EpCaller,
   type MintOpts,
   type ProbeResult,
+  verifyStaticUserCredential,
   type Profile,
   type SpaceAuth,
 } from "@cotal-ai/core";
@@ -626,6 +627,11 @@ export async function connectOrThrow(flags: ConnectFlags, role: Profile, opts: C
           // The account here records the revocation, so the refusal says so instead of "check your creds".
           const claims = credsClaims(creds);
           const message = `credentials rejected at ${at}: the key ${claims.sub} in ${flags.creds} was revoked at ${new Date(revokedAt * 1000).toISOString()} with auth revoke-credential`;
+          let profile: Profile | null = null;
+          try {
+            const auth = await getSpaceAuth(workspaceSecretStore(findMesh(space)?.root ?? findCotalRoot()), space);
+            if (auth !== undefined) profile = verifyStaticUserCredential(creds, { accountPub: auth.account.pub, signingPub: auth.account.signingPub }, { allowOutOfWindow: true }).profile;
+          } catch { /* no valid issuer pins or marker means guidance stays generic */ }
           const mint = profile === "agent"
             ? `mint a new key with the grants it held: \`cotal auth mint <label>${grantMintFlags(agentGrants(claims.nats ?? {}, space))} --out <new file>\``
             : profile === "observer" || profile === "admin"
