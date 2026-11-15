@@ -303,6 +303,12 @@ export function admittedStackRestore(root: string): string | undefined {
   return journal ? stackMaintenanceFence(canonical, journal).admittedRestore : undefined;
 }
 
+/** Whether the root's maintenance journal blocks a broker-only start. A settled active controller
+ *  restore of this root's stack is the only journal admitted. The journal is only read. */
+export function noManagerRefused(root: string): boolean {
+  return Boolean(readMaintenanceJournal(root) && !admittedStackRestore(root));
+}
+
 /** The stack facts a controller restore admission compares. */
 function controllerStackView(journal: StackJournal): ControllerStackView {
   return { space: journal.space, server: journal.server, ...(journal.broker ? { storeDir: journal.broker.storeDir } : {}), operation: { id: journal.operation.id, phase: journal.operation.phase } };

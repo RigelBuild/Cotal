@@ -260,7 +260,7 @@ import {
   currentControllerAttempt, managerResumeAttempt, relaunchCommittedManager, settleControllerResume, startControllerMember, startControllerMembers,
 } from "../lib/controller-resume.js";
 import { removeRetiredBrokerInstance } from "../lib/controller-restore.js";
-import { acquireStackOperationLock, admittedStackRestore, readStackJournal, refuseControllerCut, STACK_DEFINITION, STACK_ROLES } from "../lib/stack-journal.js";
+import { acquireStackOperationLock, admittedStackRestore, noManagerRefused, readStackJournal, refuseControllerCut, STACK_DEFINITION, STACK_ROLES } from "../lib/stack-journal.js";
 import { observeServiceProcess, serviceInstances } from "../lib/service-instances.js";
 import { serviceDefinitionStore } from "../lib/service-definitions.js";
 import { MissingFlags } from "../lib/missing-flags.js";
@@ -290,8 +290,9 @@ import {
   journaledRestoredStreams,
   leftOutNotes,
   replacePreparedDeadRestoreListener,
-  restoreComposition,
+  maintenanceNextStep,
   restoreNextStep,
+  restoreComposition,
   restoreOnlyCopy,
   type PreparedRestore,
   type RestoreFlags,
@@ -945,6 +946,16 @@ function removeEmptyRecords(path: string): void {
   }
 }
 
+/** One classified refusal for both the pre-lock check and the under-lock recheck. */
+function noManagerDuringRecovery(root: string): CommandFailure {
+  const journal = readMaintenanceJournal(root);
+  const step = journal ? maintenanceNextStep(root, journal) : undefined;
+  const recovery = step?.next ?? `maintenance state ${journal?.state ?? "unknown"}; bare \`cotal up\` does not advance it`;
+  return new CommandFailure("refused", "LIFECYCLE_BLOCKED", "--no-manager is refused while this root has a maintenance attempt to recover; a resume needs a manager to commit the preserved inventory; nothing was started", {
+    target: { root, ...(journal && step ? { attemptId: step.attemptId, journalState: journal.state } : {}) },
+    remedy: `run \`cotal status\` to see the next step, then ${recovery}`,
+  });
+}
 
 async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?: () => void, freshTeamBoot = false, restoreSink?: (result: RestoreStartupResult) => void): Promise<void> {
   const values = args.values as {
@@ -1058,7 +1069,7 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
     // re-entered, so the operator reads one clear error instead of one thrown from inside a nested
     // `up` that has already begun adopting a maintenance attempt.
     if (values["rotate-sys"] && readMaintenanceJournal(root))
-      throw new Error("--rotate-sys is refused while this root has a maintenance attempt to recover - finish or roll back that attempt (`cotal up` alone recovers it), then `cotal down` and `cotal up --rotate-sys`");
+      throw new CommandFailure("refused", "LIFECYCLE_BLOCKED", "--rotate-sys is refused while this root has a maintenance attempt to recover; nothing was started", { target: { root }, remedy: "run `cotal status` to inspect this root's maintenance state; complete its recorded recovery before rotating the system account" });
     if (values["recreate-issued-stores"] !== undefined && readMaintenanceJournal(root))
       throw new CommandFailure("refused", "LIFECYCLE_BLOCKED", "--recreate-issued-stores needs a fresh broker start, and this root has a maintenance attempt to recover; nothing was started", { target: { root }, remedy: "finish or roll back that attempt first (`cotal up` alone recovers it)" });
     // Raised here for the stronger reason the journal itself carries: a pending maintenance attempt
@@ -1066,8 +1077,7 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
     // manager half. The manager half is why the FLAG specifically cannot apply. A settled active
     // restore of this root's own controller stack has nothing left to commit; it takes the
     // controller stack route below, which applies --no-manager as an ordinary start does.
-    if (values["no-manager"] && readMaintenanceJournal(root) && !admittedStackRestore(root))
-      throw new CommandFailure("refused", "LIFECYCLE_BLOCKED", "--no-manager is refused while this root has a maintenance attempt to recover; a resume needs a manager to commit the preserved inventory; nothing was started", { target: { root }, remedy: "run `cotal status` to see the next step, then recover the attempt (`cotal up` alone) or roll it back" });
+    if (values["no-manager"] && noManagerRefused(root)) throw noManagerDuringRecovery(root);
     // Refuse first-enable IdP failures and explicit pin conflicts before even recovery's lock
     // creates its layout. Existing recovery keeps its own recorded startup and trust checks.
     const stackSpace = values.space ?? folderSpace();
@@ -1115,7 +1125,7 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
         // through to the controller stack route below. The lock is released before a
         // foreground stack holds this terminal. `--no-manager` is rechecked here, under the lock.
         if (!admittedStackRestore(root)) {
-          if (values["no-manager"]) throw new CommandFailure("refused", "LIFECYCLE_BLOCKED", "--no-manager is refused while this root has a maintenance attempt to recover; a resume needs a manager to commit the preserved inventory; nothing was started", { target: { root }, remedy: "run `cotal status` to see the next step, then recover the attempt (`cotal up` alone) or roll it back" });
+          if (values["no-manager"]) throw noManagerDuringRecovery(root);
           const foreground = await resumeControllerStack(lock, root, values);
           // Released here, once, so the foreground hold below does not keep the maintenance lock.
           handedOff = true;

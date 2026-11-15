@@ -51,7 +51,7 @@ type Envelope = {
     folder: { auth: { state: string }; personas: { root: string; default: string; error: string | null }; processes: { name: string; state: string }[] | null };
     meshes: { current: string | null; folder?: string | null; unreadable: { file: string; error: string }[]; items: Mesh[] };
     selected: { resolved: boolean; code?: string; space?: string; server?: string | null; connection?: string };
-    maintenance?: { root: string; space: string | null; state: string; attemptId: string | null; next: string | null } | null;
+    maintenance?: { root: string; space: string | null; state: string; attemptId: string | null; next: string | null; noManagerRefused: boolean } | null;
     store?: { state: string; at?: string; cause?: string; path?: string | null };
     hints: string[];
   } | null;
@@ -308,7 +308,8 @@ if (!brokerDisplayOnly) {
   const { home, run } = sandbox();
   const server = ["--server", `nats://127.0.0.1:${await freePort()}`];
   const none = run(["status", ...server, "--json"]);
-  check("control: a folder with no maintenance journal reports none", none.envelope?.result?.maintenance === null, shown(none));
+  const noneMaintenance = none.envelope?.result?.maintenance;
+  check("control: a folder with no maintenance journal reports no no-manager refusal", noneMaintenance?.state === "none" && noneMaintenance.noManagerRefused === false, shown(none));
   mkdirSync(join(home, ".cotal", "nats"));
   const lock = acquireMaintenanceLock(home);
   const resume = writeMaintenanceResumeDocument(lock, { version: 1, inventory: { agents: [] }, launch: { runtime: "pty" } });
@@ -316,12 +317,12 @@ if (!brokerDisplayOnly) {
   releaseMaintenanceLock(lock);
   const json = run(["status", ...server, "--json"]);
   const held = json.envelope?.result?.maintenance;
-  check("status --json carries the journal's state, space and attempt", held?.state === "cut-intent" && held.space === "held" && held.attemptId === "cut-status", shown(json));
+  check("status --json carries a pending cut and says --no-manager is refused", held?.state === "cut-intent" && held.space === "held" && held.attemptId === "cut-status" && held.noManagerRefused === true, shown(json));
   const plain = run(["status", ...server, "--plain"]);
   check("the report shows it under Maintenance with the attempt", titles(plain.stdout).includes("Maintenance") && /Attempt: +cut-status/.test(plain.stdout), plain.stdout);
   // A held restore names the command that moves it on, with the full attempt id.
   const attempt = "restore-00000000-0000-4000-8000-000000000000";
-  const restoring = { ...json.envelope!.result!, maintenance: { root: home, space: "held", state: "restore-ready", attemptId: attempt, next: restoreNextStep("restore-ready", attempt) } };
+  const restoring = { ...json.envelope!.result!, maintenance: { root: home, space: "held", state: "restore-ready", attemptId: attempt, next: restoreNextStep("restore-ready", attempt), noManagerRefused: true } };
   const report = renderReport(statusView(restoring as unknown as Parameters<typeof statusView>[0]), "plain");
   check("a held restore names its recover command with the full attempt id", new RegExp(`Attempt: +${attempt}`).test(report) && report.includes(`cotal backup recover ${attempt} --yes`), report);
 }

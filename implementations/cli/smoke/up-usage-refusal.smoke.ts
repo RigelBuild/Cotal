@@ -125,9 +125,15 @@ sandbox(pendingRoot);
 const pendingNoManager = run(["up", "--no-manager", "--json"], pendingRoot);
 check("up --no-manager with a pending non-admitted journal exits 2 with LIFECYCLE_BLOCKED",
   pendingNoManager.status === 2 && pendingNoManager.envelope?.outcome === "refused" && pendingNoManager.envelope.target?.root === pendingRoot && pendingNoManager.envelope.error?.code === "LIFECYCLE_BLOCKED", shown(pendingNoManager));
-check("the pending no-manager refusal names cotal status and recovery or rollback",
-  /cotal status/.test(pendingNoManager.envelope?.error?.remedy ?? "") && /recover|roll back/.test(pendingNoManager.envelope?.error?.remedy ?? ""), pendingNoManager.envelope?.error);
+check("the pending no-manager refusal names cotal status and its actual state-specific remedy",
+  /cotal status/.test(pendingNoManager.envelope?.error?.remedy ?? "") && /cut-intent/.test(pendingNoManager.envelope?.error?.remedy ?? "") && /bare `cotal up` does not advance it/.test(pendingNoManager.envelope?.error?.remedy ?? ""), pendingNoManager.envelope?.error);
+const pendingPlainNoManager = run(["up", "--no-manager"], pendingRoot);
+check("up --no-manager with a pending non-admitted journal prints its refusal and remedy on stderr only, exit 2",
+  pendingPlainNoManager.status === 2 && pendingPlainNoManager.stdout === "" && /--no-manager is refused/.test(pendingPlainNoManager.stderr) && /cotal status/.test(pendingPlainNoManager.stderr) && /cut-intent/.test(pendingPlainNoManager.stderr) && /bare `cotal up` does not advance it/.test(pendingPlainNoManager.stderr), shown(pendingPlainNoManager));
 
+const pendingRotate = run(["up", "--rotate-sys", "--json"], pendingRoot);
+check("up --rotate-sys with a pending maintenance journal is refused as LIFECYCLE_BLOCKED, exit 2",
+  pendingRotate.status === 2 && pendingRotate.envelope?.outcome === "refused" && pendingRotate.envelope.error?.code === "LIFECYCLE_BLOCKED" && pendingRotate.envelope.target?.root === pendingRoot, shown(pendingRotate));
 const servers: { server: string; message: RegExp; example: string }[] = [
   { server: "http://127.0.0.1:43131", message: /--server must be a nats:\/\/ or tls:\/\/ URL/, example: "--server nats://127.0.0.1:43131" },
   { server: "nats://localhost:43131", message: /--server names the host localhost/, example: "--server nats://127.0.0.1:43131" },

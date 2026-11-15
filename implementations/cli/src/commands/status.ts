@@ -145,6 +145,7 @@ import {
   stackOperationBlock,
   goneStackRoot,
   unfinishedStackOperation,
+  noManagerRefused,
   type StackJournal,
   type StackOperationBlock,
   type StackRole,
@@ -330,10 +331,11 @@ export interface StatusResult {
   /** Selected folder's local boot intents, not a live broker or ownership census. */
   bootAttempts?: { root: string; state: "read" | "partial" | "not-checked"; observedAt: string; unsettled: { deploymentId: string; space: string; server: string; createdAt: string }[]; additive: { deploymentId: string; space: string; server: string; createdAt: string; recordedState: ReturnType<typeof additiveTeamRecordedState> }[]; unreadable: string[]; elsewhere: { deploymentId: string; root: string }[] };
   /** This folder's maintenance journal: a preserved cut, a restore or a resume, with the full attempt
-   *  a recovery command names. Null when the root holds none; older inputs may omit it.
-   *  `rolledBackRuns` names the runs a restore over a newer cut rolled back, and `rolledBackRunsMore`
+   *  a recovery command names. `noManagerRefused` reports whether `up --no-manager` refuses this
+   *  journal. State is `none` when the root holds no journal; older inputs may omit this field.
+   *  `rolledBackRuns` names runs a restore over a newer cut rolled back, and `rolledBackRunsMore`
    *  counts those it did not list. */
-  maintenance?: { root: string; space: string | null; state: string; attemptId: string | null; next: string | null; rolledBackRuns?: readonly RolledBackRun[]; rolledBackRunsMore?: number } | null;
+  maintenance?: { root: string; space: string | null; state: string; attemptId: string | null; next: string | null; noManagerRefused: boolean; rolledBackRuns?: readonly RolledBackRun[]; rolledBackRunsMore?: number } | null;
   /** A store write failure the selected space's running local broker logged, or a store over its
    *  recorded cap; older inputs may omit it. */
   store?: StoreWriteObservation;
@@ -459,7 +461,7 @@ export async function status(args: ParsedArgs): Promise<void> {
   if (held && !folder.stackBlock && !folder.stackUnfinished && unsettledStackOperation(held.root, held.space)) hints.push(`start it with \`cotal up\` in ${held.root}`);
   const services = readOwnedServices(selected, gaps);
   const bootAttempts: StatusResult["bootAttempts"] = blocked ? { root, state: "partial", observedAt: new Date().toISOString(), unsettled: [], additive: [], unreadable: [], elsewhere: [] } : readBootAttempts(root, gaps);
-  const maintenance: StatusResult["maintenance"] = blocked ? { root, space: null, state: "unreadable", attemptId: null, next: null } : readMaintenance(root, gaps);
+  const maintenance: StatusResult["maintenance"] = blocked ? { root, space: null, state: "unreadable", attemptId: null, next: null, noManagerRefused: true } : readMaintenance(root, gaps);
   const logged = selected.ok ? brokerStoreWrite(selected.target.root, selected.target.space) : undefined;
   // A store write failure holds until the broker restarts, so it is named before a full store.
   const full = selected.ok && target.resolved && target.storedBytes !== null && logged?.state !== "write-failed" ? storeFull(selected.target.root, selected.target.space, target.storedBytes) : undefined;
@@ -512,12 +514,12 @@ function unreadFolder(root: string, code: string): StatusResult["folder"] {
 function readMaintenance(root: string, gaps: Gaps): NonNullable<StatusResult["maintenance"]> | null {
   try {
     const journal = readMaintenanceJournal(root);
-    if (!journal) return null;
+    if (!journal) return { root, space: null, state: "none", attemptId: null, next: null, noManagerRefused: false };
     const rolledBack = "restore" in journal ? restoreRolledBackRuns(journal) : undefined;
-    return { root, space: journal.space, state: journal.state, ...maintenanceNextStep(root, journal), ...(rolledBack?.runs.length ? { rolledBackRuns: rolledBack.runs, ...(rolledBack.more ? { rolledBackRunsMore: rolledBack.more } : {}) } : {}) };
+    return { root, space: journal.space, state: journal.state, ...maintenanceNextStep(root, journal), noManagerRefused: noManagerRefused(root), ...(rolledBack?.runs.length ? { rolledBackRuns: rolledBack.runs, ...(rolledBack.more ? { rolledBackRunsMore: rolledBack.more } : {}) } : {}) };
   } catch {
     gaps.add("MAINTENANCE_JOURNAL_UNREADABLE", "this folder's maintenance journal could not be read; no absent or settled state was inferred", { root });
-    return { root, space: null, state: "unreadable", attemptId: null, next: null };
+    return { root, space: null, state: "unreadable", attemptId: null, next: null, noManagerRefused: true };
   }
 }
 
@@ -2122,7 +2124,7 @@ function bootAttemptOverview(snapshot: StatusResult["bootAttempts"]): Section | 
 }
 
 function maintenanceOverview(maintenance: StatusResult["maintenance"]): Section | undefined {
-  if (!maintenance) return undefined;
+  if (!maintenance || maintenance.state === "none") return undefined;
   return { title: "Maintenance", blocks: [
     { kind: "fields", rows: [["Folder root", maintenance.root], ["Space", maintenance.space ?? "not read"], ["State", maintenance.state], ["Attempt", maintenance.attemptId ?? "not read"]] },
     ...(maintenance.next ? [{ kind: "lines" as const, lines: [maintenance.next] }] : []),
