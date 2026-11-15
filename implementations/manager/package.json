@@ -26,6 +26,7 @@
     "prepublishOnly": "pnpm run build",
     "smoke:identity-store": "tsx smoke/identity-store.smoke.ts",
     "smoke:identity-mint": "tsx smoke/identity-mint.smoke.ts",
+    "smoke:identity-mint-replay": "tsx smoke/identity-mint-replay.smoke.ts",
     "smoke:shutdown-custody": "tsx smoke/shutdown-custody.smoke.ts"
   },
   "dependencies": {
