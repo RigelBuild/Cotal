@@ -12490,9 +12490,7 @@ export class Manager {
     if (record.minter !== minter)
       throw new EpEnvelopeError("permission-denied", `identity ${name} is owned by another minter`, undefined, "not-executed");
     if (record.retiredAt !== undefined || record.issuance?.state === "retired") return {};
-    if (record.publicKey !== undefined || record.issuance !== undefined)
-      throw new EpEnvelopeError("unavailable", `identity ${name} is bound to a public key; safe static terminal support is not available`, undefined, "not-executed");
-    store.retire(name, minter, record.lifecycleUid, undefined);
+    store.latchRetirement(name, minter, record.lifecycleUid);
     return {};
   }
 
@@ -12573,7 +12571,7 @@ export class Manager {
     if (!record) throw new EpEnvelopeError("not-found", `identity ${name} has no reservation`, undefined, "not-executed");
     if (record.minter !== minter) throw new EpEnvelopeError("permission-denied", `identity ${name} is owned by another minter`, undefined, "not-executed");
     if (record.publicKey !== publicKey) throw new EpEnvelopeError("permission-denied", "identity public key does not match", undefined, "not-executed");
-    if (record.retiredAt !== undefined || record.issuance?.state !== "issued") throw new EpEnvelopeError("failed-precondition", "identity is not issued", undefined, "not-executed");
+    if (record.terminalizing || record.retiredAt !== undefined || record.issuance?.state !== "issued") throw new EpEnvelopeError("failed-precondition", "identity is not issued or is terminalizing", undefined, "not-executed");
     const existing = this.identityRenewFlights.get(record.lifecycleUid);
     if (existing) return existing;
     const flight = (async () => {

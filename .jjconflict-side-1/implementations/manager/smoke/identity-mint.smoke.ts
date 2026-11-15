@@ -38,7 +38,7 @@ try {
   await manager.start();
   const minter = newIdentity();
   const caller = { owner: DEV_OWNER, actor: minter.id, uid: mintLifecycleUid() };
-  const creds = await mintCreds(auth, minter, "agent", { principal: caller, lifecycleUid: caller.uid, endpointCapabilities: ["identity-reserve", "identity-mint", "identity-renew"].map((command) => ({ endpoint: MANAGER_ENDPOINT, command })) });
+  const creds = await mintCreds(auth, minter, "agent", { principal: caller, lifecycleUid: caller.uid, endpointCapabilities: ["identity-reserve", "identity-mint", "identity-renew", "identity-retire"].map((command) => ({ endpoint: MANAGER_ENDPOINT, command })) });
   nc = await connect({ servers, ...standaloneConnectOpts({ creds, tls: false }), maxReconnectAttempts: 0 });
   let service = await resolveService(nc, space, MANAGER_ENDPOINT, caller, { deadlineMs: 10_000 });
   let epoch = 0;
@@ -111,7 +111,7 @@ try {
   console.log("PASS renewal rejects different public key");
   const stranger = newIdentity();
   const strangerCaller = { owner: DEV_OWNER, actor: stranger.id, uid: mintLifecycleUid() };
-  const strangerCreds = await mintCreds(auth, stranger, "agent", { principal: strangerCaller, lifecycleUid: strangerCaller.uid, endpointCapabilities: [{ endpoint: MANAGER_ENDPOINT, command: "identity-renew" }] });
+  const strangerCreds = await mintCreds(auth, stranger, "agent", { principal: strangerCaller, lifecycleUid: strangerCaller.uid, endpointCapabilities: ["identity-renew", "identity-retire"].map((command) => ({ endpoint: MANAGER_ENDPOINT, command })) });
   const strangerNc = await connect({ servers, ...standaloneConnectOpts({ creds: strangerCreds, tls: false }), maxReconnectAttempts: 0 });
   try {
     const strangerService = await resolveService(strangerNc, space, MANAGER_ENDPOINT, strangerCaller, { deadlineMs: 10_000 });
@@ -119,7 +119,19 @@ try {
     assert.equal(denied.reply.ok, false);
     assert.equal(denied.reply.error?.code, "permission-denied");
     console.log("PASS renewal rejects different minter");
+    const retireDenied = await invokeCommand(strangerNc, space, strangerService, "identity-retire", { name: "first" }, opts);
+    assert.equal(retireDenied.reply.ok, false);
+    assert.equal(retireDenied.reply.error?.code, "permission-denied");
+    console.log("PASS retirement rejects different minter");
   } finally { await strangerNc.close(); }
+  const retired = await invokeCommand(nc, space, service, "identity-retire", { name: "first" }, opts);
+  assert.equal(retired.reply.ok, true, JSON.stringify(retired.reply));
+  assert.equal(store.get(reservation.name)?.terminalizing, true);
+  console.log("PASS retirement latches identity");
+  const afterRetire = await invokeCommand(nc, space, service, "identity-renew", { name: "first", publicKey: seat.id }, opts);
+  assert.equal(afterRetire.reply.ok, false);
+  assert.equal(afterRetire.reply.error?.code, "failed-precondition");
+  console.log("PASS renewal refused after retirement latch");
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
   let decodeBits = 0, decodeValue = 0;
   const decoded: number[] = [];
