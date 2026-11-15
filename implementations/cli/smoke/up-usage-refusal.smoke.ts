@@ -53,6 +53,7 @@ import { connect, createServer, type AddressInfo } from "node:net";
 import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { acquireMaintenanceLock, beginMaintenanceCut, releaseMaintenanceLock, writeMaintenanceResumeDocument } from "@cotal-ai/workspace";
 import { assertSmokeSandboxDown, createSuite, freePort, recordSmokeSandbox, type SmokeSandboxAnchor } from "@cotal-ai/smoke-kit";
 import { clean, ptySpawn } from "./_console-pty.js";
 
@@ -68,8 +69,8 @@ const { readStackJournal, writeStackJournal } = await import("../src/lib/stack-j
 const { check, finish } = createSuite();
 const home = mkdtempSync(join(tmpdir(), "cotal-up-usage-home-"));
 const folder = mkdtempSync(join(tmpdir(), "cotal-up-usage-cwd-"));
-const roots = ["unprepared", "journal"].map((name) => realpathSync(mkdtempSync(join(tmpdir(), `cotal-up-usage-${name}-`))));
-const [unprepared, journalRoot] = roots as [string, string];
+const roots = ["unprepared", "journal", "pending"].map((name) => realpathSync(mkdtempSync(join(tmpdir(), `cotal-up-usage-${name}-`))));
+const [unprepared, journalRoot, pendingRoot] = roots as [string, string, string];
 process.on("exit", () => { for (const dir of [home, folder, ...roots]) rmSync(dir, { recursive: true, force: true }); });
 
 const HOST_ENV = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("COTAL_") && k !== "FORCE_COLOR" && k !== "NO_COLOR"));
@@ -108,6 +109,24 @@ for (const { args, message } of cases) {
   const text = run(["up", ...args]);
   check(`up ${args.join(" ")} prints the error and the help on stderr, nothing on stdout, exit 1`, text.status === 1 && text.stdout === "" && message.test(text.stderr) && /Usage/.test(text.stderr), shown(text));
 }
+
+mkdirSync(join(pendingRoot, "store"));
+const pendingLock = acquireMaintenanceLock(pendingRoot);
+try {
+  const resume = writeMaintenanceResumeDocument(pendingLock, { version: 1, inventory: { agents: [] }, launch: { runtime: "pty" } });
+  beginMaintenanceCut(pendingLock, {
+    attemptId: "cut-no-manager", space: "no-manager-pending", mode: "open",
+    sourcePath: join(pendingRoot, "store"), resume, launch: { server: "nats://127.0.0.1:4222" },
+  });
+} finally {
+  releaseMaintenanceLock(pendingLock);
+}
+sandbox(pendingRoot);
+const pendingNoManager = run(["up", "--no-manager", "--json"], pendingRoot);
+check("up --no-manager with a pending non-admitted journal exits 2 with LIFECYCLE_BLOCKED",
+  pendingNoManager.status === 2 && pendingNoManager.envelope?.outcome === "refused" && pendingNoManager.envelope.target?.root === pendingRoot && pendingNoManager.envelope.error?.code === "LIFECYCLE_BLOCKED", shown(pendingNoManager));
+check("the pending no-manager refusal names cotal status and recovery or rollback",
+  /cotal status/.test(pendingNoManager.envelope?.error?.remedy ?? "") && /recover|roll back/.test(pendingNoManager.envelope?.error?.remedy ?? ""), pendingNoManager.envelope?.error);
 
 const servers: { server: string; message: RegExp; example: string }[] = [
   { server: "http://127.0.0.1:43131", message: /--server must be a nats:\/\/ or tls:\/\/ URL/, example: "--server nats://127.0.0.1:43131" },
