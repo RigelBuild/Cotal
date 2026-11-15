@@ -168,7 +168,7 @@ try {
 }
 
 check("an MCP call carrying identity-shaped extras is REFUSED TO THE CALLER, naming the keys",
-  !succeeded && !!refusal && refusal.includes("unrecognized_keys") &&
+  !succeeded && !!refusal && /unrecognized(?:_| )keys/i.test(refusal) &&
     Object.keys(IDENTITY_EXTRA).every((k) => refusal!.includes(k)),
   { refusal, succeeded });
 check("...and the tool's run never executed — the refusal precedes the effect, it does not report one",
@@ -187,7 +187,7 @@ try {
   zeroRefusal = (e as Error).message;
 }
 check(`a ZERO-ARGUMENT tool (${zeroName}) also refuses identity-shaped extras rather than running without them`,
-  !zeroSucceeded && !!zeroRefusal && zeroRefusal.includes("unrecognized_keys") &&
+  !zeroSucceeded && !!zeroRefusal && /unrecognized(?:_| )keys/i.test(zeroRefusal) &&
     Object.keys(IDENTITY_EXTRA).every((k) => zeroRefusal!.includes(k)) && reached.length === 0,
   { zeroRefusal, zeroSucceeded, reached });
 

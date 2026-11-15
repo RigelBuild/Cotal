@@ -152,7 +152,7 @@ try {
 }
 check(
   "unknown input is refused before the status route executes",
-  refused.includes("owner") && refused.includes("unrecognized_keys"),
+  refused.includes("owner") && /unrecognized(?:_| )keys/i.test(refused),
   refused,
 );
 
