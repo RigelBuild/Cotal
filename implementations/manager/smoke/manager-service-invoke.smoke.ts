@@ -45,7 +45,6 @@ function identityRequestSubject(caller: EpCaller, command: string): string {
     nonce: randomUUID().replaceAll("-", ""),
   });
 }
- [rig8455-manager-livesmoke/implementations/manager/smoke/manager-service-invoke.smoke.ts#B350]
 import { authDir, saveSpaceAuth } from "@cotal-ai/workspace";
 import { Manager } from "../src/manager.js";
 // Endpoint name + shipped surface pin. Never MANAGER_CONTRACTS: a generic caller does not
