@@ -153,7 +153,7 @@ try {
     const ep = new CotalEndpoint({
       space, servers: SERVERS, creds: who.creds,
       card: { id: who.id.id, name: who.name, kind: "agent" },
-      channels: who.subscribe, lifecycleUid: who.uid, heartbeatMs: 500, ttlMs: 2000,
+      channels: who.subscribe, lifecycleUid: who.uid, heartbeatMs: 500, ttlMs: 2000, watchPresence: false,
     });
     const texts: string[] = [];
     ep.on("error", () => {});
@@ -334,7 +334,7 @@ try {
   let notices = 0;
   const fredEp = new CotalEndpoint({
     space, servers: SERVERS, creds: fred.creds, card: { id: fred.id.id, name: fred.name, kind: "agent" },
-    channels: [], lifecycleUid: fred.uid, heartbeatMs: 500, ttlMs: 2000,
+    channels: [], lifecycleUid: fred.uid, heartbeatMs: 500, ttlMs: 2000, watchPresence: false,
   });
   const gotF: string[] = [];
   fredEp.on("error", () => {});
@@ -355,7 +355,7 @@ try {
   let smallNotices = 0;
   const fredAgain = new CotalEndpoint({
     space, servers: SERVERS, creds: fred.creds, card: { id: fred.id.id, name: fred.name, kind: "agent" },
-    channels: [], lifecycleUid: fred.uid, heartbeatMs: 500, ttlMs: 2000,
+    channels: [], lifecycleUid: fred.uid, heartbeatMs: 500, ttlMs: 2000, watchPresence: false,
   });
   const gotAgain: string[] = [];
   fredAgain.on("error", () => {});

@@ -7,6 +7,9 @@ import { parse as parseYaml } from "yaml";
 import Headless from "@xterm/headless";
 import {
   CotalEndpoint,
+  answerAuthRoster,
+  openAuthRosterReader,
+  type RosterReader,
   canonicalJson,
   MANAGED_HANDOFF_KIND,
   accountFromCreds,
@@ -1800,6 +1803,7 @@ export class Manager {
    *  every (re)connect, so a renewal is adopted without re-registration). Absent on open meshes,
    *  in user mode, and before registration completes. */
   private serviceServe?: { handle: EpServeHandle; nc: NatsConnection; identity: Identity; grant: EpServeGrant; creds?: string };
+  private rosterReader?: Promise<RosterReader>;
   /** #1577: dedicated connections (serve, goal-writer, session-ledger) whose transport is down while
    *  the client reconnects them, tracked by {@link trackTransport}. Such a connection is open
    *  (`isClosed()` is false under unbounded reconnects) yet the broker holds none of its rails, so
@@ -4048,6 +4052,7 @@ export class Manager {
     // in-flight command can write a status back onto the record it just removed.
     const registrationRevision = this.serviceServe?.grant.registrationRevision;
     await step("stop service serve", () => this.stopServiceServe());
+    await step("stop roster reader", async () => { if (this.rosterReader) await (await this.rosterReader).close(); });
     // The drives AFTER the serve loop (no new `run-start` can land) and BEFORE deregistration: a
     // released run's status write is the last thing this incarnation says about it.
     await step("stop run hosting", () => this.runHosting?.stop());
@@ -4737,6 +4742,18 @@ export class Manager {
       return a;
     };
     return managerCommandDefs({
+      roster: (ctx) => this.serveObservation(ctx, async () => {
+        if (this.userMode) throw new EpEnvelopeError("unavailable", "user-mode roster is served by auth");
+        if (!this.auth) throw new EpEnvelopeError("unavailable", "manager roster requires a dedicated reader credential; this manager has no local signing authority");
+        if (!this.rosterReader) {
+          const pending = openAuthRosterReader({ server: this.servers ?? DEFAULT_SERVER, space: this.space, auth: this.auth, log: (line) => console.error(line) });
+          this.rosterReader = pending;
+          pending.catch(() => { if (this.rosterReader === pending) this.rosterReader = undefined; });
+        }
+        const args = ctx.request.args;
+        const limit = args?.limit, after = args?.after;
+        return answerAuthRoster(await this.rosterReader, ctx, { ...(typeof limit === "number" ? { limit } : {}), ...(typeof after === "string" ? { after } : {}) });
+      }),
       vitals: (ctx) => this.serveGated(ctx, () => measureManagerVitals()),
       // A remote Manager files every seat under its own owner, so only a user mesh's shared local
       // Manager narrows the count, and status never waits on a remote admin check.

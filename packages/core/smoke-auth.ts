@@ -195,7 +195,7 @@ try {
   const omitted = await a.multicast("noping", { channel: "general", mentions: [""] });
   await wait(300);
 
-  const bob = a.getRoster().find((p) => p.card.name === "bob");
+  const bob = reader.getRoster().find((p) => p.card.name === "bob");
   // Addressed by PRINCIPAL (<owner>.<actor>), not by the card's bare nkey: the owner+actor cutover
   // made a nkey an invalid recipient, and the roster still carries the nkey as the card id.
   if (bob) await a.unicast(principalKey(DEV_OWNER, bobId.id).key, "psst bob");
@@ -227,7 +227,7 @@ try {
   await carol.start();
   await wait(600);
 
-  const aliceInB = b.getRoster().find((p) => p.card.name === "alice");
+  const aliceInB = reader.getRoster().find((p) => p.card.name === "alice");
 
   // Membership = the privileged members KV registry ∩ presence liveness — read on the delivery
   // credential, the only profile holding both halves (see the header).
@@ -236,7 +236,7 @@ try {
 
   await b.stop();
   await wait(500);
-  const bobInA = a.getRoster().find((p) => p.card.name === "bob");
+  const bobInA = reader.getRoster().find((p) => p.card.name === "bob");
 
   // Bob's membership record persists past his stop (stop ≠ leave — no tombstone), but presence flipped
   // offline: he stays visible as a STALE member (live:false), distinct from still-live alice.

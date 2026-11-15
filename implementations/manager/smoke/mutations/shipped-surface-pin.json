@@ -28,11 +28,11 @@
       "cell": "the resolved surface matches the shipped cluster document"
     },
     {
-      "name": "M2 keep revision 50 after manager-specific fork commands advance the upstream surface",
+      "name": "M2 keep revision 51 after adding roster",
       "file": "implementations/manager/src/manager-service-contract.ts",
-      "find": "  return buildClusterDocument(MANAGER_CLUSTER_URN, 51, ROWS);",
-      "replace": "  return buildClusterDocument(MANAGER_CLUSTER_URN, 50, ROWS);",
-      "cell": "persona input validation advances the manager cluster revision and retains upstream and fork commands"
+      "find": "  return buildClusterDocument(MANAGER_CLUSTER_URN, 52, ROWS);",
+      "replace": "  return buildClusterDocument(MANAGER_CLUSTER_URN, 51, ROWS);",
+      "cell": "roster advances the manager cluster revision and retains existing commands"
     },
     {
       "name": "M3 compile every contract pair at module scope again",

@@ -1,3 +1,4 @@
+import { AUTH_ROSTER_COMMAND, parseAuthRosterOutput } from "./roster-contract.js";
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
@@ -33,7 +34,7 @@ import {
   type ResponderState,
 } from "./liveness.js";
 import { processRuntime } from "./process-runtime.js";
-import { credsClaims, credsFingerprint, credsRenewalDelayMs, idFromCreds } from "./identity.js";
+import { agentCredentialLifecycleUid, credsClaims, credsFingerprint, credsRenewalDelayMs, idFromCreds } from "./identity.js";
 import { nativeCredsAuthenticator } from "./creds-authenticator.js";
 import { armRenewal, renewalDeadlineMs, jitteredBackoffMs } from "./renewal.js";
 import { requireBrokerFloor } from "./broker-floor.js";
@@ -60,7 +61,7 @@ import { ARTIFACT_PART_KIND, isArtifactPart } from "./artifact.js";
 import { assertValidKind } from "./agent-file.js";
 import { assertValidName } from "./resolve.js";
 import { EVICT_PRINCIPALS_MAX } from "./evict.js";
-import { nextHeartbeat } from "./presence-heartbeat.js";
+import { DEFAULT_HEARTBEAT_MS, nextHeartbeat } from "./presence-heartbeat.js";
 import { createSpaceStreams, dmDurableConfig, dlvDurableConfig, taskDurableConfig, fanoutDurableConfig, inboxReaderConfig, MANAGER_LEASE_TTL_MS, MANAGER_LEASE_ATTEMPT_MS, TTL_RECONCILE_CANARY_KEY, PRESENCE_STORAGE } from "./streams.js";
 import { DELIVERY_LIMIT_HEADER, HISTORY_NO_COUNT, PLANE3_MAX_MSGS_PER_SUBJECT } from "./backup-config.js";
 import {
@@ -179,7 +180,7 @@ import {
   type ParsedSubject,
   presenceBucket,
   channelBucket,
-  isPresenceRow, assertPresenceRow,
+  isPresenceRow, assertPresenceRow, parsePresenceRow,
   membershipBucket,
   MEMBERSHIP_FEED_KEY,
   principalKey,
@@ -381,6 +382,8 @@ export interface EndpointOptions {
   ttlMs?: number;
   /** Publish our own presence (default true). */
   registerPresence?: boolean;
+  /** Read presence through the manager roster command. */
+  managerRoster?: boolean;
   /** Track the roster of peers with a live watch (default true). Every watcher receives every
    *  member's heartbeat, so a space of K watching members moves K² deliveries per heartbeat. An
    *  endpoint that only needs the roster when it acts sets this false and calls
@@ -625,6 +628,7 @@ export class CotalEndpoint extends EventEmitter {
   private readonly watchDeletePermissions = new WeakMap<object, () => IssuedSubjectPermission | undefined>();
   /** True in user mode (bearer string OR source) — gates the callout-shaped connect. */
   private readonly userMode: boolean = false;
+  private readonly managerRoster: boolean;
   /** The bearer source, when auth refreshes (spawned agents); undefined for a one-shot string. */
   private readonly bearerSource?: () => Promise<string>;
   /** The freshest bearer — what every (re)connect attempt presents. */
@@ -1003,6 +1007,7 @@ export class CotalEndpoint extends EventEmitter {
      *  `connId` so the ephemeral verdict below can never read an unassigned value. */
     let selfMintedConnId = false;
     this.space = opts.space;
+    this.managerRoster = opts.managerRoster === true || (typeof opts.creds === "string" && agentCredentialLifecycleUid(opts.creds, opts.space) !== undefined) || (typeof opts.creds === "function" && opts.card.kind === "agent");
     // A display name is the client-side handle a peer is addressed by; reject the reserved `/`
     // (the future owner/name separator) and surrounding whitespace at the one identity choke
     // point every join/spawn path flows through. A role is an address too, refused here before
@@ -1122,13 +1127,15 @@ export class CotalEndpoint extends EventEmitter {
     this.transportConnectTimeoutMs = opts.transportConnectTimeoutMs;
     // No implicit channel: an endpoint reads exactly what its caller lists. Omitted means none.
     this.channels = opts.channels ?? [];
-    this.heartbeatMs = opts.heartbeatMs ?? 2000;
+    this.heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
     this.ttlMs = opts.ttlMs ?? 6000;
     this.doRegister = opts.registerPresence ?? true;
-    this.doWatch = opts.watchPresence ?? true;
+    this.doWatch = opts.watchPresence ?? !this.managerRoster;
     this.doWatchChannels = opts.watchChannels ?? true;
     this.doConsume = opts.consume ?? true;
     this.readOnce = opts.readOnce ?? false;
+    if (this.managerRoster && this.doWatch && !this.readOnce)
+      throw new Error("agent roster watches are unavailable; disable watchPresence and poll readPresence through manager");
     if (this.readOnce && (this.doConsume || this.doRegister))
       throw new Error("EndpointOptions.readOnce requires consume and registerPresence false: a one-time read cannot keep a consumer's channel cache or its own presence current");
     if (opts.dmOnly !== undefined) {
@@ -1811,7 +1818,7 @@ export class CotalEndpoint extends EventEmitter {
       this.issuedGeneration = ref.generation;
     }
 
-    if (this.doWatch || this.doRegister) {
+    if (this.doWatch || this.doRegister || (!this.userMode && !this.managerRoster)) {
       const kvm = new Kvm(this.nc);
       // The presence bucket is a JetStream stream. Open mode lazily creates it; auth mode
       // OPENs it (it's pre-created at `cotal up`; KV stream-create is denied to agents).
@@ -3305,8 +3312,8 @@ export class CotalEndpoint extends EventEmitter {
   }
 
   /**
-   * Read the roster from the broker now, for an endpoint that does not watch presence (SPEC §6). One
-   * batched Direct Get of the bucket that binds no consumer, decoded and dropped as the watch decodes.
+   * Read the roster now. Agents use auth in user mode and manager otherwise; trusted observers may
+   * use a direct read without a consumer.
    * A record that says `offline` or whose `ts` is past the liveness window reads offline. A peer an
    * earlier read saw that is gone from the bucket stays in the roster as offline, as a watch keeps
    * it. The result is also what {@link getRoster} returns until the next read.
@@ -3319,26 +3326,37 @@ export class CotalEndpoint extends EventEmitter {
     if (this.doWatch && !this.readOnce)
       throw new Error("readPresence is for an endpoint that does not watch presence; this one keeps its roster live (getRoster)");
     const kv = this.kv;
-    if (!kv) throw new Error(this.nc ? "readPresence needs the presence bucket open (registerPresence or watchPresence)" : this.notLiveMsg());
+    if (!this.nc) throw new Error(this.notLiveMsg());
     if (this.presenceRead) return this.presenceRead;
     const generation = ++this.presenceReadGeneration;
     const roster = (async () => {
-      let entries: KvEntry[];
-      try {
-        entries = await lastKvEntries(kv);
-      } catch (e) {
-        if (!isPublishPermissionDenied(e)) throw e;
-        throw new Error(
-          `presence read refused for ${this.card.id}: this credential may not publish $JS.API.DIRECT.GET.KV_${presenceBucket(this.space)}, the on-demand roster read (SPEC Appendix B). A credential minted by an older issuer can lack this grant even when newly minted; upgrade the manager or auth service that issues credentials, then mint a new credential. Reusing credentials or reconnecting does not add the grant.`,
-          { cause: e },
-        );
-      }
-      const at = Date.now();
       const read = new Map<string, Presence>();
-      for (const e of entries) {
-        if (e.key === TTL_RECONCILE_CANARY_KEY || e.operation === "DEL" || e.operation === "PURGE") continue;
-        const p = this.decodePresence(e);
-        if (p) read.set(e.key, p.status === "offline" || at - p.ts > this.ttlMs ? this.toOffline(p) : p);
+      if (this.userMode || this.managerRoster) {
+        const servingEndpoint = this.userMode ? "auth" : "manager";
+        let after: string | undefined;
+        do {
+          const result = await this.invokeService(servingEndpoint, AUTH_ROSTER_COMMAND, after === undefined ? {} : { after });
+          if (!result.reply.ok) throw new Error(`${servingEndpoint}.roster refused: ${result.reply.error.message}`);
+          const page = parseAuthRosterOutput(result.reply.data);
+          for (const row of page.rows) read.set(row.card.id, row.status === "offline" || Date.now() - row.ts > this.ttlMs ? this.toOffline(row) : row);
+          if (page.next !== undefined && (page.rows.length === 0 || (after !== undefined && page.next <= after)))
+            throw new Error(`${servingEndpoint} roster returned a non-advancing cursor`);
+          after = page.next;
+        } while (after !== undefined);
+      } else {
+        if (!kv) throw new Error("readPresence needs the presence bucket open");
+        let entries: KvEntry[];
+        try { entries = await lastKvEntries(kv); }
+        catch (e) {
+          if (!isPublishPermissionDenied(e)) throw e;
+          throw new Error(`presence read refused for ${this.card.id}: this credential may not publish $JS.API.DIRECT.GET.KV_${presenceBucket(this.space)}, the on-demand roster read (SPEC Appendix B). A credential minted by an older issuer can lack this grant even when newly minted; upgrade the manager or auth service that issues credentials, then mint a new credential. Reusing credentials or reconnecting does not add the grant.`, { cause: e });
+        }
+        const at = Date.now();
+        for (const e of entries) {
+          if (e.key === TTL_RECONCILE_CANARY_KEY || e.operation === "DEL" || e.operation === "PURGE") continue;
+          const p = this.decodePresence(e);
+          if (p) read.set(e.key, p.status === "offline" || at - p.ts > this.ttlMs ? this.toOffline(p) : p);
+        }
       }
       if (generation > this.presenceReadApplied) {
         this.presenceReadApplied = generation;
@@ -7840,8 +7858,20 @@ export class CotalEndpoint extends EventEmitter {
   /** {@link EndpointOptions.readOnce}: fill the roster from one read of the presence bucket. Stale
    *  and offline records resolve as they do in a watch's initial replay. */
   private async readPresenceOnce(): Promise<void> {
-    if (!this.kv) return;
-    for (const e of await lastKvEntries(this.kv)) this.handleKvEntry(e);
+    if (this.userMode || this.managerRoster) {
+      const rows = await this.readPresence();
+      this.presenceSnapshotPopulated = true;
+      if (rows.length === 0) this.markPresenceBucketEmpty();
+      else {
+        this.lastPresenceWatchAt = Date.now();
+        this.presenceWatchEmpty = false;
+        this.emitPresenceViewIfChanged();
+      }
+      return;
+    } else {
+      if (!this.kv) return;
+      for (const e of await lastKvEntries(this.kv)) this.handleKvEntry(e);
+    }
     this.presenceSnapshotPopulated = true;
     // No record reached the roster (an empty bucket, or only the TTL canary): nobody is present.
     if (this.lastPresenceWatchAt === 0) this.markPresenceBucketEmpty();
@@ -8004,20 +8034,12 @@ export class CotalEndpoint extends EventEmitter {
   /** The record a presence PUT carries, or undefined when a reader must drop it (SPEC §6). The watch
    *  and {@link readPresence} decode through this one gate, so they drop the same records. */
   private decodePresence(e: KvEntry): Presence | undefined {
-    let p: unknown;
-    try {
-      p = e.json<unknown>();
-    } catch {
-      return undefined;
-    }
-    if (!isPresenceRow(p, e.key)) {
+    const p = parsePresenceRow(e.string(), e.key);
+    if (!p) {
       this.presenceBindingDrops++;
       this.emitRecoverable(new Error(`dropped presence entry for key ${JSON.stringify(e.key)}: not a usable presence row (a record with card.id equal to its KV key, a string card.name, a known status, a finite ts, string display fields and a condition with a string code)`));
       return undefined;
     }
-    // isPresenceRow is the one gate: it refuses a row whose card.id disagrees with the KV key, so a
-    // forged or mis-keyed record never surfaces a spoofed roster identity. The write-side scoping
-    // ($KV.<presenceBucket>.<own-id>) is the primary guard.
     return p;
   }
 

@@ -37,7 +37,7 @@ import {
   mintLifecycleUid, standaloneConnectOpts, principalKey, DEV_OWNER,
   recordsBucket, epAuthBucket, epgateKey, parseEndpointGate,
   epcredFamilyPrefix, parseLedgerRow, credentialIdOf, recordSpecKey, RECORD_KINDS,
-  epCall, epRequestSubject, epCallerReplyFilter, EpEnvelopeError,
+  epCall, epRequestSubject, epCallerReplyFilter, EpEnvelopeError, parseAuthRosterOutput,
   serveIssuanceGateKv,
   type CredentialLedgerRow,
 } from "@cotal-ai/core";
@@ -157,6 +157,22 @@ try {
   // checklist 6: the `one`-rail currency reader is the GATE's processEpoch (the service epoch
   // authority), read fresh per reply — never a bare call.
   const serviceEpochReader = async () => (await readGate()).processEpoch;
+  const roster = await epCall(callerNc, space, { mode: "one" },
+    { endpoint: MANAGER_ENDPOINT, command: "roster", contract: MANAGER_CONTRACTS.roster, caller, args: {} },
+    { deadlineMs: 8000, currentEpoch: serviceEpochReader });
+  check("agent reads roster through manager", roster.reply.ok && parseAuthRosterOutput(roster.reply.data).rows.length > 0, roster);
+  const rawSubject = `$JS.API.DIRECT.GET.KV_cotal_presence_${space}`;
+  const rosterRow = roster.reply.ok ? parseAuthRosterOutput(roster.reply.data).rows[0] : undefined;
+  if (!rosterRow) throw new Error("manager roster returned no presence row for the Direct Get control");
+  const rawRequest = enc.encode(JSON.stringify({ last_by_subj: `$KV.cotal_presence_${space}.${rosterRow.card.id}` }));
+  const trusted = await connect({ servers: SERVERS, ...standaloneConnectOpts({ creds: await mintCreds(auth, newIdentity(), "auth-roster-reader"), tls: false }) });
+  const trustedReply = await trusted.request(rawSubject, rawRequest, { timeout: 1500 });
+  check("trusted reader can issue the same Direct Get", trustedReply.headers?.get("Nats-Subject") === `$KV.cotal_presence_${space}.${rosterRow.card.id}` && trustedReply.data.length > 0);
+  await trusted.drain();
+  let rawError: unknown;
+  try { await callerNc.request(rawSubject, rawRequest, { timeout: 1500 }); }
+  catch (error) { rawError = error; }
+  check("agent raw presence Direct Get is denied", rawError instanceof Error && /Permissions Violation/i.test(rawError.message) && rawError.message.includes(rawSubject), rawError);
   const callStatus = () => epCall(callerNc, space, { mode: "one" },
     { endpoint: MANAGER_ENDPOINT, command: "status", contract: MANAGER_STATUS_CONTRACT, caller },
     { deadlineMs: 8000, currentEpoch: serviceEpochReader });

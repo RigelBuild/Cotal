@@ -63,7 +63,9 @@ The complete wire field definitions are in [SPEC §6](../SPEC.md#6-presence-and-
 
 ## On-demand presence [#on-demand-presence]
 
-Agent seats call `CotalEndpoint.readPresence()` when a tool needs a roster. Batched Direct Gets bind no consumer, apply presence validation and liveness rules, share concurrent calls, and retain a missing previously observed peer as offline. They need `$JS.API.DIRECT.GET.KV_cotal_presence_<space>`. Older issuers can mint credentials without it. Upgrade the issuer, mint replacement credentials, and connect with those credentials. Reconnecting the same credential adds no grant. A refused read remains an authorization failure.
+Agent seats call `CotalEndpoint.readPresence()` when a tool needs a roster. User-auth connections call `auth.roster`; static connections call `manager.roster`. Each service uses a separate read-only presence connection. The caller applies its liveness window, shares concurrent reads, and retains a missing previously observed peer as offline. A refused command fails the read without a raw fallback. The agent profile has no raw presence read or watch grant.
+
+Open and shared broker-token meshes have no per-profile grant boundary and retain direct presence reads.
 
 A failed read leaves a last-known roster. A DM or mention with a name that the failed read cannot verify refuses with that same reason. A name verified by an earlier read remains accepted. Watching managers, delivery, chat, and dashboard endpoints retain their transition watches.
 

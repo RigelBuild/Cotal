@@ -123,6 +123,7 @@ const releaseBroker = teardownOnSignal(srv, dir);
 
 let mgr: CotalEndpoint | undefined;
 let watcher: CotalEndpoint | undefined;
+let observer: CotalEndpoint | undefined;
 let probe: ReturnType<typeof spawn> | undefined;
 let toolProbe: ReturnType<typeof spawn> | undefined;
 let modelProbe: ReturnType<typeof spawn> | undefined;
@@ -192,6 +193,9 @@ try {
   });
   watcher.on("error", (e: Error) => console.error("  ! watcher:", e.message));
   await watcher.start();
+  observer = new CotalEndpoint({ space, servers: SERVERS, creds: await mintCreds(auth, newIdentity(), "observer"), channels: [], consume: false, registerPresence: false, card: { name: "observer", kind: "endpoint" }, ttlMs: 30_000 });
+  observer.on("error", () => {});
+  await observer.start();
 
   // Write Otto's creds to a file (COTAL_CREDS is a path), then build the launch THROUGH the connector
   // — so this also guards that buildLaunch attaches the control endpoint to the LaunchSpec + child env
@@ -283,7 +287,7 @@ try {
   let ottoLive = false;
   for (let i = 0; i < 100 && !ottoLive; i++) {
     await wait(100);
-    const otto = watcher.getRoster().find((p) => p.card.name === "Otto");
+    const otto = observer.getRoster().find((p) => p.card.name === "Otto");
     ottoLive = otto !== undefined && otto.status !== "offline";
   }
   check("the opencode plugin came online (Otto live in the watcher roster)", ottoLive);
@@ -299,7 +303,7 @@ try {
   // itself uses. Adopting a session clears `busy`, and the inbox handler starts a turn on `!busy`, so
   // a plain inbound message is enough; nothing here reaches into the plugin. The refusal has to come
   // from the connector deciding no turn may start mid-cutover.
-  const otto = watcher.getRoster().find((pr) => pr.card.name === "Otto");
+  const otto = observer.getRoster().find((pr) => pr.card.name === "Otto");
   if (otto) await watcher.unicast(otto.card.id, "a message arriving mid-cutover");
   await wait(600);
 
@@ -346,7 +350,7 @@ try {
   writeFileSync(rejectRelease, "go\n");
 
   await wait(200);
-  const beforeRelease = watcher.getRoster().find((pr) => pr.card.name === "Otto")?.status;
+  const beforeRelease = observer.getRoster().find((pr) => pr.card.name === "Otto")?.status;
   // THE ADMISSION IS THE HALF WITH TEETH, and the roster reading on its own has none. Presence
   // writes are serialized agent-side (#2065), so the departure publish queues behind the write that
   // is parked here and cannot reach the mesh while one is held. A teardown that skipped its wait
@@ -368,12 +372,12 @@ try {
   let markerAtOffline = true;
   for (let i = 0; i < 60 && !ottoOffline; i++) {
     await wait(100);
-    ottoOffline = watcher.getRoster().find((p) => p.card.name === "Otto")?.status === "offline";
+    ottoOffline = observer.getRoster().find((p) => p.card.name === "Otto")?.status === "offline";
     // Sampled AT the moment presence flips, because the question is an ORDER and it is unanswerable
     // afterwards: by the end of the run both have happened either way.
     if (ottoOffline) markerAtOffline = existsSync(marker);
   }
-  check("cooperative stop leaves the mesh (watcher sees Otto offline)", ottoOffline, watcher.getRoster().find((p) => p.card.name === "Otto")?.status);
+  check("cooperative stop leaves the mesh (watcher sees Otto offline)", ottoOffline, observer.getRoster().find((p) => p.card.name === "Otto")?.status);
 
   // ---- ADMISSION IS CLOSED, and it is graded here rather than at the end because it is only
   // answerable while the process is still up: once it exits, losing the connection purges presence
@@ -389,7 +393,7 @@ try {
   for (let i = 0; i < 50 && reversed === undefined; i++) {
     await wait(60);
     knocked = knocked || existsSync(lateFired);
-    const s = watcher.getRoster().find((p) => p.card.name === "Otto")?.status;
+    const s = observer.getRoster().find((p) => p.card.name === "Otto")?.status;
     if (s !== undefined && s !== "offline") reversed = s;
   }
   // THE POSITIVE CONTROL, and it is a separate cell on purpose: without it, "nothing changed" also
@@ -478,7 +482,7 @@ try {
   let tillyLive = false;
   for (let i = 0; i < 100 && !tillyLive; i++) {
     await wait(100);
-    const tilly = watcher.getRoster().find((pr) => pr.card.name === "Tilly");
+    const tilly = observer.getRoster().find((pr) => pr.card.name === "Tilly");
     tillyLive = tilly !== undefined && tilly.status !== "offline";
   }
   check("tool-seat: the second seat came online, so this leg grades a live one", tillyLive);
@@ -498,7 +502,7 @@ try {
   // because an inversion looked for afterwards can complete between two polls and then be repaired
   // by the terminal stop, leaving the cell green against a broken implementation.
   await wait(300);
-  const toolBeforeRelease = watcher.getRoster().find((pr) => pr.card.name === "Tilly")?.status;
+  const toolBeforeRelease = observer.getRoster().find((pr) => pr.card.name === "Tilly")?.status;
   // Same pairing as the hook seat above, for the same reason recorded there.
   const toolDepartedEarly = existsSync(toolDepartureAdmitted);
   check("tool-seat: departure was still unpublished while admitted work was in flight",
@@ -544,7 +548,7 @@ try {
   let miloLive = false;
   for (let i = 0; i < 100 && !miloLive; i++) {
     await wait(100);
-    const milo = watcher.getRoster().find((pr) => pr.card.name === "Milo");
+    const milo = observer.getRoster().find((pr) => pr.card.name === "Milo");
     miloLive = milo !== undefined && milo.status !== "offline";
   }
   check("model-seat: the third seat came online, so this leg grades a live one", miloLive);
@@ -561,7 +565,7 @@ try {
   check("model-seat: control server acked the shutdown", modelReply.trim() === JSON.stringify({ ok: true }), modelReply);
 
   await wait(300);
-  const modelBeforeRelease = watcher.getRoster().find((pr) => pr.card.name === "Milo")?.status;
+  const modelBeforeRelease = observer.getRoster().find((pr) => pr.card.name === "Milo")?.status;
   // Same pairing as the hook seat above. The model door parks in a different endpoint method, but
   // departure still leaves through the status write, so the admission marker reads the same here.
   const modelDepartedEarly = existsSync(modelDepartureAdmitted);
@@ -613,7 +617,7 @@ try {
   let nellLive = false;
   for (let i = 0; i < 100 && !nellLive; i++) {
     await wait(100);
-    const nell = watcher.getRoster().find((pr) => pr.card.name === "Nell");
+    const nell = observer.getRoster().find((pr) => pr.card.name === "Nell");
     nellLive = nell !== undefined && nell.status !== "offline";
   }
   check("mirror-seat: the fourth seat came online, so this leg grades a live one", nellLive);
@@ -634,7 +638,7 @@ try {
   await wait(100);
   writeFileSync(mirrorRejectRelease, "go\n");
   await wait(200);
-  const mirrorBeforeRelease = watcher.getRoster().find((pr) => pr.card.name === "Nell")?.status;
+  const mirrorBeforeRelease = observer.getRoster().find((pr) => pr.card.name === "Nell")?.status;
   // Same pairing as the hook seat above. C16 absorbs the TAIL of the set, which in this seat is the
   // parked call, so the failing head still ends a Promise.all early and departure is admitted at
   // once. That is the difference this half reads and the roster one could not.
@@ -692,7 +696,7 @@ try {
   let ivyLive = false;
   for (let i = 0; i < 100 && !ivyLive; i++) {
     await wait(100);
-    const ivy = watcher.getRoster().find((pr) => pr.card.name === "Ivy");
+    const ivy = observer.getRoster().find((pr) => pr.card.name === "Ivy");
     ivyLive = ivy !== undefined && ivy.status !== "offline";
   }
   check("interior-seat: the fifth seat came online, so this leg grades a live one", ivyLive);
@@ -725,7 +729,7 @@ try {
   await wait(50);
   writeFileSync(interiorRejectRelease, "go\n");
   await wait(200);
-  const interiorBeforeRelease = watcher.getRoster().find((pr) => pr.card.name === "Ivy")?.status;
+  const interiorBeforeRelease = observer.getRoster().find((pr) => pr.card.name === "Ivy")?.status;
   // An interior rejection must not end the wait: both parked calls are still in flight, so departure
   // may not have been attempted yet. Paired with the admission marker for the reason recorded at the
   // hook seat: the roster half cannot fail while a write is parked, so on its own it graded nothing
@@ -798,7 +802,7 @@ try {
   let rheaLive = false;
   for (let i = 0; i < 100 && !rheaLive; i++) {
     await wait(100);
-    const r = watcher.getRoster().find((p) => p.card.name === "Rhea");
+    const r = observer.getRoster().find((p) => p.card.name === "Rhea");
     rheaLive = r !== undefined && r.status !== "offline";
   }
   let sessionHeld = false;
@@ -811,7 +815,7 @@ try {
 
   // A REAL INBOUND MESSAGE, through the ordinary door. The inbox handler starts a turn on `!busy`,
   // so this admits a drive that immediately parks awaiting the held session.
-  const rhea = watcher.getRoster().find((pr) => pr.card.name === "Rhea");
+  const rhea = observer.getRoster().find((pr) => pr.card.name === "Rhea");
   if (rhea) await watcher.unicast(rhea.card.id, "a message admitted before the stop");
   await wait(500);
 
@@ -883,7 +887,7 @@ try {
   let carrieLive = false;
   for (let i = 0; i < 100 && !carrieLive; i++) {
     await wait(100);
-    const c = watcher.getRoster().find((p) => p.card.name === "Carrie");
+    const c = observer.getRoster().find((p) => p.card.name === "Carrie");
     carrieLive = c !== undefined && c.status !== "offline";
   }
   check("carry-seat: the seventh seat came online, so this leg grades a live one", carrieLive);
@@ -901,7 +905,7 @@ try {
   // holder is not installed, which is the same refusal the stop path takes.
   writeFileSync(carryTrigger, "go\n");
   await wait(400);
-  const carrie = watcher.getRoster().find((pr) => pr.card.name === "Carrie");
+  const carrie = observer.getRoster().find((pr) => pr.card.name === "Carrie");
   if (carrie) await watcher.unicast(carrie.card.id, "a message refused mid-cutover");
   // AND AN @MENTION, which in focus is a different kind of input: its body is acked-and-dropped at
   // ingest and stays recallable, so the WAKE is the only thing the connector still holds, and it
@@ -986,7 +990,7 @@ try {
   let theaLive = false;
   for (let i = 0; i < 100 && !theaLive; i++) {
     await wait(100);
-    const t = watcher.getRoster().find((p) => p.card.name === "Thea");
+    const t = observer.getRoster().find((p) => p.card.name === "Thea");
     theaLive = t !== undefined && t.status !== "offline";
   }
   check("throw-seat: the eighth seat came online, so this leg grades a live one", theaLive);
@@ -1079,7 +1083,7 @@ try {
   let cleoLive = false;
   for (let i = 0; i < 100 && !cleoLive; i++) {
     await wait(100);
-    const c = watcher.getRoster().find((p) => p.card.name === "Cleo");
+    const c = observer.getRoster().find((p) => p.card.name === "Cleo");
     cleoLive = c !== undefined && c.status !== "offline";
   }
   check("collide-seat: the ninth seat came online, so this leg grades a live one", cleoLive);
@@ -1209,7 +1213,7 @@ try {
   let bramAddr = "";
   for (let i = 0; i < 100 && !bramLive; i++) {
     await wait(100);
-    const b = watcher.getRoster().find((p) => p.card.name === "Bram");
+    const b = observer.getRoster().find((p) => p.card.name === "Bram");
     bramLive = b !== undefined && b.status !== "offline";
     if (b) bramAddr = b.card.id;
   }
@@ -1289,7 +1293,7 @@ try {
   } catch {
     /* ignore */
   }
-  for (const ep of [watcher, mgr]) {
+  for (const ep of [watcher, observer, mgr]) {
     try {
       await ep?.stop();
     } catch {

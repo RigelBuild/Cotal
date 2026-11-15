@@ -1,4 +1,4 @@
-import { CotalEndpoint, DEV_OWNER, channelBucket, credsClaims, isPublishPermissionDenied, mintCreds, newIdentity, presenceBucket, subjectMatches } from "@cotal-ai/core";
+import { CotalEndpoint, DEV_OWNER, EpEnvelopeError, agentCredentialLifecycleUid, channelBucket, credsClaims, isPublishPermissionDenied, mintCreds, newIdentity, parsePrincipalKey, presenceBucket, principalFromTags, subjectMatches } from "@cotal-ai/core";
 import { CommandFailure, endpointAuth, type Connection } from "@cotal-ai/workspace";
 import { c } from "../ui.js";
 import { connectOrExit, connectOrThrow } from "./connect.js";
@@ -29,11 +29,7 @@ export async function resolveConnect(values: ConnectValues): Promise<Connection>
   return connectOrExit(values, "operator");
 }
 
-/** Whether this connection may read a KV bucket with one batched Direct Get, whose request subject
- *  is the bare stream. An open mesh may. A user bearer may: the auth service mints its connection
- *  with the agent profile, which carries that read on the presence bucket and the channel registry.
- *  A static credential may when its own grant allows that subject: the operator credential this
- *  machine mints and an agent credential from `cotal auth mint` do. */
+/** Whether a static or open connection may read a KV bucket with a batched Direct Get. */
 export function batchedRead(conn: Connection, bucket: string): boolean {
   if (conn.creds === undefined) return true;
   const subject = `$JS.API.DIRECT.GET.KV_${bucket}`;
@@ -82,29 +78,39 @@ function jetStreamUnanswered(conn: Connection): CommandFailure {
   return new CommandFailure("refused", "DEPENDENCY_UNAVAILABLE", `the broker of ${conn.space} answered no JetStream read, and the space's streams were not found missing`, { target: { space: conn.space }, remedy: "run `cotal status`, which names a store write failure its broker logged on this machine" });
 }
 
-/** Open a transient endpoint: it holds the roster and channel registry on return but never registers
- *  itself, binds no inbox, and consumes no channels. The caller stops it. A connection that may read
- *  both buckets with a batched Direct Get ({@link batchedRead}) reads them once, leaving no watch
- *  consumer behind. Any other, such as a user bearer or an agent credential passed with `--creds`,
- *  watches them and waits for the presence replay; the consumer lasts until the broker's inactive
- *  threshold. `presenceOnly` holds the roster alone and opens no channel registry, so only the
- *  presence bucket's grant decides whether it is read once. `watch` keeps both watches for every
- *  credential, for a caller that reports the watch's own state (`cotal who`); that caller waits for
- *  the presence replay itself, on its own bound. `throwOnRefusal` hands connection refusals to the
- *  command kernel, and `report` takes endpoint errors and warnings instead of printing them. A
- *  credential the broker will not let read a bucket is refused with `PERMISSION_DENIED`. */
+/** Open a transient endpoint with a roster and optional channel registry. User-mode reads the
+ *  roster through auth; other connections use the direct read or an explicitly requested watch. */
 export async function openTransient(
   values: ConnectValues,
   name: string,
   opts: { throwOnRefusal?: boolean; senderActor?: string; watch?: boolean; presenceOnly?: boolean; report?: (level: "error" | "warning", e: Error) => void } = {},
 ): Promise<{ ep: CotalEndpoint; space: string; connection: Connection }> {
   const conn = opts.throwOnRefusal ? await connectOrThrow(values, "operator", { operatorActor: opts.senderActor }) : await resolveConnect(values);
-  // Match the principal just minted by this connection's account signer, never a launch identity.
-  // Raw credentials and user-mode retain their existing path.
-  const senderPrincipal = opts.senderActor !== undefined && conn.auth && conn.creds
-    ? { owner: DEV_OWNER, actor: opts.senderActor } : undefined;
-  const readOnce = batchedRead(conn, presenceBucket(conn.space)) && batchedRead(conn, channelBucket(conn.space));
-  const once = !opts.watch && (opts.presenceOnly ? batchedRead(conn, presenceBucket(conn.space)) : readOnce);
+  const claims = values.creds && conn.creds ? credsClaims(conn.creds) : undefined;
+  const grants = claims?.nats?.pub?.allow ?? [];
+  const credentialUid = values.creds && conn.creds ? agentCredentialLifecycleUid(conn.creds, conn.space) : undefined;
+  const watchSubject = `$JS.API.CONSUMER.CREATE.KV_${presenceBucket(conn.space)}.>`;
+  const canWatch = grants.some((row) => subjectMatches(row, watchSubject));
+  const managerRoster = credentialUid !== undefined;
+  if (claims && !managerRoster && !canWatch && !batchedRead(conn, presenceBucket(conn.space)))
+    throw new CommandFailure("refused", "PERMISSION_DENIED", `this credential cannot read the roster in ${conn.space}`, { target: { space: conn.space }, remedy: "use an operator or observer credential with presence access" });
+  let credentialPrincipal: { owner: string; actor: string } | undefined;
+  if (managerRoster) {
+    const remedy = "run it inside the agent session or use an operator credential";
+    if (grants.some((subject) => subject.includes(".ep.v1.one.")))
+      throw new CommandFailure("refused", "PERMISSION_DENIED", "an issued agent credential cannot read the roster from a one-shot CLI call", { target: { space: conn.space }, remedy });
+    const key = principalFromTags(claims?.nats?.tags);
+    const principal = key === null ? null : parsePrincipalKey(key);
+    if (!principal) throw new CommandFailure("refused", "PERMISSION_DENIED", "the agent credential has no valid principal tag", { target: { space: conn.space }, remedy });
+    credentialPrincipal = { owner: principal.owner, actor: principal.actor };
+  }
+  // Explicit agent credentials carry their minted principal in the shared static-identity tag.
+  // Otherwise match the principal minted by this connection's account signer.
+  const senderPrincipal = credentialPrincipal ?? (opts.senderActor !== undefined && conn.auth && conn.creds
+    ? { owner: DEV_OWNER, actor: opts.senderActor } : undefined);
+  const rosterRead = managerRoster || conn.bearer !== undefined || batchedRead(conn, presenceBucket(conn.space));
+  const readOnce = rosterRead && batchedRead(conn, channelBucket(conn.space));
+  const once = managerRoster || (!opts.watch && (opts.presenceOnly ? rosterRead : readOnce));
   const report = opts.report ?? ((level, e) => console.error(level === "error" ? c.red("! " + e.message) : c.yellow("! " + e.message)));
   // A connect the broker refuses or does not complete in time sends nothing, so it is tried again
   // with a new endpoint. What a failed attempt reported is dropped with it; a failure after the
@@ -118,6 +124,8 @@ export async function openTransient(
         space: conn.space,
         servers: conn.server,
         ...endpointAuth(conn),
+        ...((conn.epCaller?.uid ?? credentialUid) ? { lifecycleUid: conn.epCaller?.uid ?? credentialUid } : {}),
+        ...(managerRoster ? { managerRoster: true } : {}),
         channels: [],
         consume: false,
         registerPresence: false,
@@ -146,17 +154,18 @@ export async function openTransient(
   } catch (raw) {
     if (raw instanceof DialNotAdmitted) throw notAdmittedRefusal(raw, `space "${conn.space}"`, "nothing was sent", { space: conn.space }, conn.mode === "user");
     const e = raw instanceof AfterOpen ? raw.cause : raw;
+    if (managerRoster && e instanceof Error && ((e instanceof EpEnvelopeError && e.code === "unavailable" && e.outcome === "not-executed" && e.message.includes("no responder for manager.roster")) || e.message.startsWith("manager.roster refused:"))) throw new CommandFailure("refused", "PERMISSION_DENIED", `the agent credential could not read the roster from manager: ${e.message}`, { target: { space: conn.space }, remedy: "start a manager for this space, or use an operator credential" });
+    if (managerRoster && e instanceof EpEnvelopeError && e.code === "deadline-exceeded" && e.message.includes("no describe reply from manager"))
+      throw new CommandFailure("refused", "TARGET_UNAVAILABLE", `manager.roster discovery did not answer: ${e.message}`, { target: { space: conn.space } });
     if (conn.bearer === undefined && !opts.watch && isPublishPermissionDenied(e))
       throw new CommandFailure("refused", "PERMISSION_DENIED", `this identity may not read the presence or channel registry of ${conn.space}: ${(e as Error).message}`, {
         target: { space: conn.space },
         remedy: values.creds === undefined ? `use a credential that may read both in ${conn.space}` : `run it without --creds to use the credential this machine records for ${conn.space}, or use one that may read both`,
       });
-    // The user's connection is minted by the space's auth service. One that refuses the batched read
-    // predates the agent profile row that grants it; the command never falls back to a watch.
     if (conn.bearer !== undefined && once && isPublishPermissionDenied(e))
-      throw new CommandFailure("refused", "PERMISSION_DENIED", `the connection the auth service of ${conn.space} minted for your user may not read ${opts.presenceOnly ? "the presence bucket" : "the presence bucket or the channel registry"} with one batched read: ${(e as Error).message}`, {
+      throw new CommandFailure("refused", "PERMISSION_DENIED", `the connection the auth service of ${conn.space} minted for your user could not read the roster or channel registry: ${(e as Error).message}`, {
         target: { space: conn.space },
-        remedy: `update the auth service of ${conn.space} to a release whose agent profile grants $JS.API.DIRECT.GET.KV_${(opts.presenceOnly ? presenceBucket : channelBucket)(conn.space)}`,
+        remedy: `update the auth service of ${conn.space} and mint a new credential`,
       });
     // A one-time read is a Direct Get, which nothing answers when the bucket's stream is gone, and
     // nothing answers either while the broker's JetStream is stopped, as nats-server stops it after a

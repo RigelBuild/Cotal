@@ -316,7 +316,7 @@ try {
     const unread = async () => (await jsm.consumers.info(dlvStream(S), dlvDurable(DEV_OWNER, id.id, uid))).num_pending;
     /** Connects, reads until `last` arrives, and returns the limits each notice carried. */
     const read = async (last: string) => {
-      const ep = new CotalEndpoint({ space: S, servers: authBroker.servers, creds, channels: [], lifecycleUid: uid, heartbeatMs: 500, ttlMs: 2000, card: { id: id.id, name: `stamp-${channel || "raw"}`, kind: "agent" } });
+      const ep = new CotalEndpoint({ space: S, servers: authBroker.servers, creds, channels: [], lifecycleUid: uid, heartbeatMs: 500, ttlMs: 2000, watchPresence: false, card: { id: id.id, name: `stamp-${channel || "raw"}`, kind: "agent" } });
       const got: string[] = [], notices: number[] = [];
       ep.on("error", () => {});
       ep.on("stored-copies-full", (full: { limit: number }) => notices.push(full.limit));

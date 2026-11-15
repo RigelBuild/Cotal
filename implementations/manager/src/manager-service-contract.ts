@@ -43,6 +43,9 @@ import {
   serviceContractTable,
   singleDocumentClosure,
   TURN_INPUT_SCHEMA,
+  AUTH_ROSTER_COMMAND,
+  AUTH_ROSTER_INPUT_SCHEMA,
+  AUTH_ROSTER_OUTPUT_SCHEMA,
   AGENT_ROW_SCHEMA,
   INSPECT_INPUT_SCHEMA,
   SPAWN_INPUT_SCHEMA,
@@ -1061,8 +1064,12 @@ interface CommandRow {
   modes?: EpAuthzMode[];
   handler: keyof ManagerServiceHandlers;
 }
+// Keep validator and published artifacts independent of the exported schema objects.
+const ROSTER_INPUT_SCHEMA = structuredClone(AUTH_ROSTER_INPUT_SCHEMA);
+const ROSTER_OUTPUT_SCHEMA = structuredClone(AUTH_ROSTER_OUTPUT_SCHEMA);
 
 const ROWS: CommandRow[] = [
+  { name: AUTH_ROSTER_COMMAND, capability: "manager.read", input: ROSTER_INPUT_SCHEMA, output: ROSTER_OUTPUT_SCHEMA, targeted: false, handler: "roster" },
   { name: "vitals", capability: "manager.vitals", input: VOID_SCHEMA, output: VITALS_OUTPUT_SCHEMA, targeted: false, handler: "vitals" },
   { name: "status", capability: "manager.read", input: VOID_SCHEMA, output: STATUS_OUTPUT_SCHEMA, targeted: false, handler: "status" },
   { name: "ps", capability: "manager.read", input: VOID_SCHEMA, output: PS_OUTPUT_SCHEMA, targeted: false, handler: "ps" },
@@ -1255,10 +1262,11 @@ export const MANAGER_STATUS_CONTRACT: { input: CompiledContract; output: Compile
  *  47 preserves the fork's blank `continueSession` refusal on the merged surface.
  *
  *  48 adds retained-custody and deferred-seat reconciliation status; 49 adds `release-seat`;
- *  50 adds `attest-gone`; 51 adds `allowlist-set` and the fork's blank continuation refusal.
+ *  50 adds `attest-gone`; 51 adds `allowlist-set` and the fork's blank continuation refusal;
+ *  52 adds `roster` for static agent presence reads.
  */
 export function managerClusterDocument(): ClusterDocument {
-  return buildClusterDocument(MANAGER_CLUSTER_URN, 51, ROWS);
+  return buildClusterDocument(MANAGER_CLUSTER_URN, 52, ROWS);
 }
 
 /** Revision, count, and names from the shipped cluster document. Reached smokes derive surface pins from this. */
@@ -1310,6 +1318,7 @@ export function managerBrowserContractSource(): BrowserContractSource {
  *  the command's output value (the compiled output contract validates it at the serve boundary).
  *  Kept as a narrow interface so the contract module stays broker-free. */
 export interface ManagerServiceHandlers {
+  roster(ctx: EpServeContext): unknown | Promise<unknown>;
   vitals(ctx: EpServeContext): ManagerVitals | Promise<ManagerVitals>;
   status(ctx: EpServeContext): ManagerStatus | Promise<ManagerStatus>;
   ps(ctx: EpServeContext): unknown | Promise<unknown>;

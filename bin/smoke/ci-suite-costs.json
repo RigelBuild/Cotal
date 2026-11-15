@@ -48,6 +48,7 @@
     "smoke:attribution-seat-names": { "seconds": 0.7, "shard": 0 },
     "smoke:auth": { "seconds": 5.2, "shard": 3 },
     "smoke:auth-admin:auth": { "seconds": 5.6, "shard": 0 },
+    "smoke:auth-roster": { "seconds": 1.5, "shard": 2 },
     "smoke:auth-attenuation": { "seconds": 1.5, "shard": 1 },
     "smoke:auth-callout:auth": { "seconds": 2.5, "shard": 3 },
     "smoke:auth-idp-bridge": { "seconds": 2.1, "shard": 3 },

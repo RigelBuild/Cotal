@@ -112,6 +112,7 @@ try {
   const a = new CotalEndpoint({
     space, servers: SERVERS, creds: aCreds,
     card: { id: aId.id, name: "alice", kind: "agent" },
+    watchPresence: false,
     channels: ["general"], lifecycleUid: uidA, heartbeatMs: 500, ttlMs: 2000,
   });
   const got: string[] = [];

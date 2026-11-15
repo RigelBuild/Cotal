@@ -8,7 +8,7 @@ import { join, dirname } from "node:path";
 import { connect, credsAuthenticator, type NatsConnection } from "@nats-io/transport-node";
 import { encodeUser, fmtCreds, type User } from "@nats-io/jwt";
 import { createUser, fromPublic, fromSeed } from "@nats-io/nkeys";
-import { createSpaceAuth, serverConfig, isReachable, patternCovers } from "@cotal-ai/core";
+import { createSpaceAuth, serverConfig, isReachable, patternCovers, presenceBucket } from "@cotal-ai/core";
 import { SMOKE_BROKER_TOKEN, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import { pickFreePort } from "../../../packages/core/smoke/_free-port.js";
 import { importNativeSubjectPermissions } from "../../../packages/core/smoke/prototypes/issued-subject-permissions.js";
@@ -295,6 +295,19 @@ try {
     const classified = [...PEER_HELD_PROFILES, ...TRUSTED_PROFILES].sort();
     assert.deepEqual(classified, all);
     assert.equal(new Set(classified).size, classified.length, "a profile is classified twice");
+  });
+
+  await check("roster readers have only presence read and inbox grants", async () => {
+    const readers = fixtures.filter((f) => f.profile === "auth-roster-reader");
+    assert.deepEqual(readers.map((f) => f.variant).sort(), ["auth-host", "manager-host"]);
+    for (const fixture of readers) {
+      const pub = fixture.permissions.pub as { allow: string[] };
+      const sub = fixture.permissions.sub as { allow: string[] };
+      assert.deepEqual(pub.allow, [`$JS.API.STREAM.INFO.KV_${presenceBucket(space)}`, `$JS.API.DIRECT.GET.KV_${presenceBucket(space)}`]);
+      assert.deepEqual(sub.allow, ["_INBOX_census0123456789abcdef.>"]);
+      assert.ok(TRUSTED_PROFILES.includes(fixture.profile));
+      assert.deepEqual(writeAndRawReadStreams(fixture.permissions, space), []);
+    }
   });
 
   await check("peers hold the push-consumer door and none of the republish doors", async () => {

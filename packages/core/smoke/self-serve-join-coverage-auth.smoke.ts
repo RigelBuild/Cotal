@@ -119,6 +119,7 @@ try {
   const a = new CotalEndpoint({
     space, servers: SERVERS, creds: aCreds,
     card: { id: aId.id, name: "alice", kind: "agent" },
+    watchPresence: false,
     channels: ["general"], lifecycleUid: uidA, heartbeatMs: 500, ttlMs: 2000,
   });
   const got: string[] = [];
@@ -201,6 +202,7 @@ try {
   const c = new CotalEndpoint({
     space, servers: SERVERS, creds: cCreds,
     card: { id: cId.id, name: "carol", kind: "agent" },
+    watchPresence: false,
     channels: ["rev.>"], lifecycleUid: uidC, heartbeatMs: 500, ttlMs: 2000,
   });
   const gotC: { text: string; historical: boolean }[] = [];
@@ -220,6 +222,7 @@ try {
   const b = new CotalEndpoint({
     space, servers: SERVERS, creds: bCreds,
     card: { id: bId.id, name: "bob", kind: "agent" },
+    watchPresence: false,
     channels: ["genb"], lifecycleUid: uidB, heartbeatMs: 500, ttlMs: 2000,
   });
   const gotB: string[] = [];

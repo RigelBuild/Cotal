@@ -140,6 +140,7 @@ try {
     card: { name: "ag1", role: "worker", kind: "agent", id: agentId.id },
     channels: ["general"],
     lifecycleUid: agentUid,
+    watchPresence: false,
     heartbeatMs: 300,
     ttlMs: 1500,
   });

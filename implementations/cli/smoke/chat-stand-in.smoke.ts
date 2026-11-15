@@ -262,6 +262,20 @@ if (mode === "plain" || mode === "stdio") {
     check("the peer whose display name spells the principal received nothing", !sent.includes("u_d.mallory"), sent);
   }
 
+  {
+    const peer = { card: { id: "local.peer", name: "peer", kind: "agent" }, status: "idle", ts: 1 };
+    const states = [[peer], [peer], [{ ...peer, activity: "working" }], [{ ...peer, status: "offline" }]];
+    let index = 0;
+    const endpoint = Object.assign(new EventEmitter(), { readPresence: async () => states[Math.min(index++, states.length - 1)], stop: async () => {} }) as unknown as CotalEndpoint;
+    const session = new NativeChatSession({ endpoint, identity: { ...identity, mode: "user" }, retire: async () => ({ retirement: "retired", connectionClosed: "confirmed", message: "" }), words });
+    const events: SessionEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    await session.roster(); await session.roster(); await session.roster(); await session.roster();
+    const changes = events.flatMap((event) => event.type === "presence" ? [event.change] : []);
+    check("user roster emits joined, updated and left once", changes.join() === "joined,updated,left", changes);
+    await session.close();
+  }
+
   console.log("5. a reconnect that finds the session's inbox gone ends the session with that reason");
   {
     const consumerGone = new JetStreamApiError({ code: 404, err_code: 10014, description: "consumer not found" });

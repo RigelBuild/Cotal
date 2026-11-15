@@ -11,8 +11,9 @@
  */
 import { spacePrefix } from "./subjects.js";
 import { epcStreamName } from "./endpoint-binding.js";
+import { AUTH_ROSTER_COMMAND } from "./roster-contract.js";
 import {
-  endpointToken, assertCommandToken, assertLifecycleToken, assertBoundedOwner,
+  AUTH_ENDPOINT, endpointToken, assertCommandToken, assertLifecycleToken, assertBoundedOwner,
   type EpCaller, type EpTarget,
   epCallerReplyFilter, epResponderReplyPattern, epResponderIssuedReplyPattern, epClassQueueGroup,
   epPlaneTokens, callerRailTokens, callerTokens, epGoalProgressGrantRow, EP_RAIL_V1,
@@ -38,6 +39,9 @@ export interface EpCapability {
   /** Also grant the matching journal-submission append row (`epj`, §13.9 matrix). */
   journal?: boolean;
 }
+/** The auth endpoint's untargeted read-only roster command. */
+export const AUTH_ROSTER_CAPABILITY: EpCapability = Object.freeze({ endpoint: AUTH_ENDPOINT, command: AUTH_ROSTER_COMMAND });
+
 
 /** Grant-row token block for a capability's authz/target segment, enforcing the §13.2 minting
  *  rules per mode: `owner`/`child` standing mints pin `<tOwner>` to the caller's own owner
@@ -342,6 +346,8 @@ export function epDescribeAllGrantRow(space: string, caller: EpCaller): string {
  *  describe row: delivery join/leave/list (untargeted) + self-mode lifecycle. */
 export function baselineCallerCapabilities(): EpCapability[] {
   return [
+    AUTH_ROSTER_CAPABILITY,
+    { endpoint: BASELINE_LIFECYCLE_ENDPOINT, command: AUTH_ROSTER_COMMAND },
     ...DELIVERY_COMMANDS_SNAP.map((command) => ({ endpoint: BASELINE_DELIVERY_ENDPOINT, command })),
     ...SELF_LIFECYCLE_SNAP.map((command) => ({ endpoint: BASELINE_LIFECYCLE_ENDPOINT, command, target: { mode: "self" } as const })),
   ];

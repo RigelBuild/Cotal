@@ -16,6 +16,7 @@
  * A denial is never turned into an empty `ok`.
  */
 import {
+  DEFAULT_HEARTBEAT_MS,
   EpEnvelopeError,
   channelInAllow,
   isConcreteChannel,
@@ -33,6 +34,7 @@ import {
   type PresenceView,
 } from "@cotal-ai/core";
 import type { RefusalCode } from "../output.js";
+import { createPresencePoller, type PresencePoller } from "../presence-poller.js";
 import { spaceStreamsAbsent, spaceStreamsExpected } from "../space-streams.js";
 import { mentionsName } from "./compose.js";
 import { ParticipantEngine } from "./engine.js";
@@ -189,6 +191,7 @@ export class NativeChatSession implements AdmittedChatSession {
   /** What the full inbox let go that no gap has reported yet. */
   private overflow = { channelDropped: 0, directedDeferred: 0 };
   private overflowTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly rosterPoller: PresencePoller;
   private readonly onMessage = (m: CotalMessage, d: Delivery, meta?: MessageMeta) => this.ingest(m, d, meta);
   /** The endpoint drops its connection during a reconnect this session asked for. That outage was
    *  reported when the reconnect started, so the state stays reconnecting until it is back. */
@@ -207,6 +210,9 @@ export class NativeChatSession implements AdmittedChatSession {
     else this.rows.set(row.id, shown);
     this.emit({ type: "presence", row, change: ev.type === "join" ? "joined" : ev.type === "offline" ? "left" : "updated" });
   };
+  private readUserRoster(): Promise<Presence[]> { return this.rosterPoller.read(); }
+  async startUserRoster(): Promise<void> { await this.rosterPoller.start();
+  }
   private readonly onError = () => { /* surfaced through call results; never thrown at the UI */ };
   /** The session's own DM inbox is gone, so a later send is stored for a recipient that will
    *  never be told. A reconnect that finds the durable gone cannot succeed by retrying: the session
@@ -226,6 +232,7 @@ export class NativeChatSession implements AdmittedChatSession {
   };
 
   constructor(private readonly inputs: NativeSessionInputs) {
+    this.rosterPoller = createPresencePoller(inputs.endpoint, DEFAULT_HEARTBEAT_MS, (event) => this.onPresence(event), () => {});
     this.engine = new ParticipantEngine(inputs.identity.principal);
     const ep = inputs.endpoint;
     ep.on("message", this.onMessage);
@@ -317,12 +324,20 @@ export class NativeChatSession implements AdmittedChatSession {
 
   async resolveDm(to: DmTarget): Promise<Result<{ readonly id: string; readonly name: string }>> {
     const ep = this.inputs.endpoint;
+    if (this.inputs.identity.mode === "user" || this.inputs.identity.mode === "static") {
+      try { await this.readUserRoster(); }
+      catch (error) { return { outcome: "refused", code: "TARGET_UNAVAILABLE", message: `roster read failed: ${error instanceof Error ? error.message : String(error)}` }; }
+    }
     const recipient = resolveDmTarget(to, ep.getRoster(), ep.presenceView().state, this.engine, this.self());
     return "outcome" in recipient ? recipient : { outcome: "ok", value: recipient };
   }
 
   async dm(to: DmTarget, text: string, replyTo?: string): Promise<PublishResult> {
     const ep = this.inputs.endpoint;
+    if (this.inputs.identity.mode === "user" || this.inputs.identity.mode === "static") {
+      try { await this.readUserRoster(); }
+      catch (error) { return { outcome: "refused", code: "TARGET_UNAVAILABLE", message: `roster read failed: ${error instanceof Error ? error.message : String(error)}` }; }
+    }
     const recipient = resolveDmTarget(to, ep.getRoster(), ep.presenceView().state, this.engine, this.self());
     if ("outcome" in recipient) return recipient;
     const gone = await this.beforePublish();
@@ -398,6 +413,7 @@ export class NativeChatSession implements AdmittedChatSession {
 
   async roster(): Promise<Result<RosterView>> {
     const ep = this.inputs.endpoint;
+    if (this.inputs.identity.mode === "user" || this.inputs.identity.mode === "static") return this.call(async () => ({ rows: (await this.readUserRoster()).map(rowOf), view: "current" as const }));
     return { outcome: "ok", value: { rows: ep.getRoster().map(rowOf), view: ep.presenceView().state } };
   }
 
@@ -494,6 +510,7 @@ export class NativeChatSession implements AdmittedChatSession {
 
   close(): Promise<CloseReport> {
     this.closed ??= (async () => {
+      this.rosterPoller.stop();
       const ep = this.inputs.endpoint;
       ep.off("message", this.onMessage);
       ep.off("connection", this.onConnection);

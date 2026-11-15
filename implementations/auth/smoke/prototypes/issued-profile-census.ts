@@ -88,6 +88,7 @@ export async function profileFixtures(space: string): Promise<ProfileFixture[]> 
     "endpoint-evictor": () => one("endpoint-evictor"),
     issuer: () => one("issuer"),
     "registry-reader": () => one("registry-reader"),
+    "auth-roster-reader": () => { one("auth-roster-reader", {}, "auth-host"); one("auth-roster-reader", {}, "manager-host"); },
     "run-admitter": () => one("run-admitter", { runAdmitter: { endpoint: "manager", runId: "census-run" } }),
     "transfer-writer": () => one("transfer-writer", { transferWriter: { instanceId: instance, hex: "0".repeat(64) } }),
     "transfer-reader": () => one("transfer-reader", { transferReader: { instanceId: instance } }),
@@ -263,6 +264,7 @@ export const TRUSTED_PROFILES: readonly Profile[] = Object.freeze([
   "issuer", "run-admitter", "transfer-writer", "transfer-reader", "reconciler",
   // The registry's reads: the evidence store stream-wide, so never a peer's.
   "registry-reader",
+  "auth-roster-reader",
   // Manager-only infrastructure duties, like remote-manager. This classification is not
   // an isolation proof; host admission and the child UID boundary remain separate requirements.
   "environment-bootstrap", "environment-manager-supervisor", "environment-manager-executor",

@@ -399,9 +399,11 @@ reader's roster.
 A watch delivers every member's heartbeat to every watcher, so a space of K watching members moves
 K² deliveries per heartbeat interval. A participant that needs the roster only when it acts (an
 agent resolving a DM target, checking an `@mention`, listing who is present) SHOULD read it on
-demand instead: batched Direct Gets over `$KV.cotal_presence_<space>.>` (`next_by_subj`, paged), which
-bind no consumer. A read applies the reader rules above, and a record whose `ts` is older than the
-liveness window reads `offline`. Only a read that completed supports an absence verdict; a failed
+demand instead. User-mode clients call the paged `auth.roster` command; static clients call
+`manager.roster`. The service reads presence through a separate read-only credential and returns
+validated rows, never raw KV bytes. Replies use the authenticated request's derived reply rail.
+Open and shared broker-token meshes have no per-profile grant boundary and retain direct presence reads. A reader applies its liveness window;
+a record whose `ts` is older reads `offline`. Only a read that completed supports an absence verdict; a failed
 read MUST NOT be reported as "no such peer". Observers that act on liveness transitions
 (supervision, delivery `@mention` resolution, dashboards) watch.
 
@@ -831,7 +833,7 @@ credential diverge (§2): the principal keys subjects/durables/presence; the con
 
 | Profile | Application publish | Read surface | Notes |
 | --- | --- | --- | --- |
-| `agent` | own `chat.<owner>.<actor>.<ch>` for each `allowPublish` channel (post ACL, default-deny), `inst.*.*.<owner>.<actor>`, `svc.*.<owner>.<actor>`; endpoint request forms per minted capability (`ep.one`/`ep.all`/`ep.inst` with the capability's authz-mode/target pattern, caller triple `<owner>.<actor>.<uid>` pinned; `describe` by default; `epj` submissions for journaled capabilities; §13.9); own presence key | own `_INBOX_<connId>.>` + own endpoint reply rail (`ep.reply.*.*.*.<owner>.<actor>.<uid>.*`, exact arity); channel live tail via native `sub.allow` subscriptions to `chat.*.*.<channel>` per `allowSubscribe` (wildcards preserved); `STREAM.INFO` (stream-level state only, no body read) on `CHAT` and the world-readable KVs, plus `TASK` when the credential carries a `role`; presence and channel-registry KV watches, including create/info of their client-managed ordered consumers on those two streams only, and no `CONSUMER.DELETE` on either; CHAT history via single-filter `chathist_<owner>-<actor>-<uid>` creates, one per `allowSubscribe` channel (ACL-bounded); own lifecycle-scoped `dm_…`/`svc_…` bind-only; durable backstop via own bind-only lifecycle-scoped `dlv_…` DELIVER consumer, **no** grant on the mixed pre-auth fan-out stream; granted record-key/event-topic read subtrees per capability | read bounded by `allowSubscribe`; no watch-consumer delete: the broker removes a watch's ordered consumer at its inactive threshold, and a client treats a refused delete of its own watch consumer as that outcome (Appendix B); durable copies re-authorized (current ACL + membership + lifecycle) by the trusted reader before the `dlv` handoff; no Direct Get; DM/TASK/DLV create denied. The `manager-caller` view narrows this endpoint control set to `ep.inst.manager.<managerInstanceId>.<command>` only, plus the exact instance `describe`, contract reads, own reply/progress rows, and own inbox. It carries no agent messaging, delivery, class, or scatter rows. When the actor holds `spawn`, the view also carries `status`, `models` and `resolve-cwd` on that instance, the reads a launch there needs; a view without `spawn` gains none of them, and no view gains `ps` or `slots` from `spawn`. |
+| `agent` | Own allowed chat, direct and service subjects; caller-bound endpoint requests and own presence key | Own inbox and endpoint reply rail; ACL-bounded channel live tail and history; own bind-only DM, task and delivery consumers; mediated roster | No raw presence read or watch. The `manager-caller` view is instance-pinned and carries no agent messaging or delivery rows. |
 | `observer` | none | chat, CHAT history, presence, channel registry | DMs invisible |
 | `admin` | none | whole space live tap plus DM history | plaintext god-view, opt-in |
 | `transfer-writer` | one carried transcript's chunk and meta subjects in one manager instance's transfer bucket (§8) | a last-message Direct Get on those two subjects | one-shot per CLI call, minted after the transcript is hashed; no consumer and no other object |
@@ -952,6 +954,9 @@ reader/mediator (§8) onto the agent's own confined rail. Which of these read pa
 mediation and which are provably safe depends on whether a redelivered message retains its
 original captured subject and how the receiver's subject-derived kind check (§12) then
 classifies it; the reference implementation determines this by test and pins the exact grants.
+The agent profile grants neither raw presence Direct Get nor presence watch creation. Agent roster
+reads use the trusted service command.
+
 On the v0.3 rails without this mediation, read containment holds only against a *conforming*
 client; the broker does not enforce it.
 See [docs/security.mdx](docs/security.mdx).
@@ -4458,6 +4463,10 @@ command, the target components each mode pins statically (§13.2: the full tripl
 the caller's own, and for `handle`, redemption-pinned; the owner for
 `owner`/`any`/`child`/`ledger`), serve identity, reply
 **attribution**, and plane writer ownership.
+The `roster` command serves validated, paged presence rows from a separate `auth-roster-reader`
+credential. It holds presence stream info, Direct Get and its own inbox, but no presence write.
+Auth serves user-mode callers; manager serves static callers. Agent credentials have no raw presence read.
+
 Reply **addressing** is the one deliberate exception: it is capability-by-secret (the
 per-request nonce, §13.2), not a broker grant, and it is sound precisely because serve
 credentials cannot plain-subscribe the class rail (queue-qualified grants, §13.2), so nonces
@@ -6738,6 +6747,10 @@ placeholders:
 - `inbox = _INBOX_<connId>.>`
 
 Grouped placeholders such as `<CHAT|DM|TASK>` mean one concrete subject per listed token.
+The `auth-roster-reader` profile holds `$JS.API.STREAM.INFO.<KV>`,
+`$JS.API.DIRECT.GET.<KV>`, and its own inbox subscription only. Auth serves user-mode roster;
+manager serves static roster. The agent profile holds the request grant, not raw presence reads.
+
 
 ### Agent
 
@@ -6793,9 +6806,6 @@ Grouped placeholders such as `<CHAT|DM|TASK>` mean one concrete subject per list
 - `$JS.API.CONSUMER.INFO.<DLV>.<dlvD>`
 - `$JS.API.CONSUMER.MSG.NEXT.<DLV>.<dlvD>`
 - `$JS.ACK.<DLV>.<dlvD>.>`, the **durable backstop**: BIND-ONLY its own pre-created per-member DELIVER consumer `dlvD` (the trusted reader's re-authorized handoff, §8). The agent holds NO grant on the mixed pre-auth `INBOX` fan-out stream.
-- `$JS.API.DIRECT.GET.<KV>` (the on-demand presence read, §6)
-- `$JS.API.CONSUMER.CREATE.<KV>.>`
-- `$JS.API.CONSUMER.INFO.<KV>.>`
 - `$JS.FC.>`
 - `$KV.cotal_presence_<space>.<owner>.<actor>`
 - `$JS.API.STREAM.MSG.GET.<CHKV>`

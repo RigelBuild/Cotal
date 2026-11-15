@@ -1,3 +1,5 @@
+export const DEFAULT_HEARTBEAT_MS = 2000;
+
 /** The next heartbeat of an endpoint that beats at its own phase. Beats fall on
  *  `phaseMs + beat * intervalMs`; the next is the first after `lastBeat` that is not already past, so
  *  a beat the loop could not reach in time is skipped rather than queued, and a beat never moves to

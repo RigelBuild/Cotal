@@ -3,6 +3,7 @@ import { decode, fmtCreds, Types } from "@nats-io/jwt";
 import { credsAuthenticator } from "@nats-io/nats-core";
 import { createUser, fromSeed } from "@nats-io/nkeys";
 import { nativeNkeySigner } from "./nkey-signer.js";
+import { presenceBucket, subjectMatches } from "./subjects.js";
 
 /**
  * A locally-generated agent identity (an nkey user keypair).
@@ -165,6 +166,7 @@ export function credsFingerprint(creds: string): string {
 export interface NatsUserClaims {
   pub?: { allow?: string[]; deny?: string[] };
   sub?: { allow?: string[]; deny?: string[] };
+  tags?: string[];
   /** The account that ISSUED this user (for a data-account cred, the data account). */
   issuer_account?: string;
 }
@@ -185,6 +187,19 @@ export function credsClaims(creds: string): { sub?: string; iat?: number; exp?: 
   } catch {
     throw new Error("creds: undecodable user JWT payload");
   }
+}
+
+/** Identify a static agent credential from its lifecycle DM grant and absence of a presence watch. */
+export function agentCredentialLifecycleUid(creds: string, space: string): string | undefined {
+  if (!jwtFromCreds(creds)) return undefined;
+  const grants = credsClaims(creds).nats?.pub?.allow ?? [];
+  const ids = new Set<string>();
+  for (const subject of grants) {
+    const match = /\.dm_[A-Za-z0-9_]+-[A-Za-z0-9_]+-([a-z0-9]{26,32})$/.exec(subject);
+    if (match) ids.add(match[1]!);
+  }
+  const watch = `$JS.API.CONSUMER.CREATE.KV_${presenceBucket(space)}.>`;
+  return ids.size === 1 && !grants.some((row) => subjectMatches(row, watch)) ? [...ids][0] : undefined;
 }
 
 /** Verify the native NATS signature, current window and matching user seed under supplied

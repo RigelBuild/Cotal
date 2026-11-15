@@ -215,6 +215,8 @@ export async function openStaticChatSession(target: MeshTarget, options: {
     servers: mesh.server,
     tls: mesh.tlsRequired,
     creds,
+    managerRoster: true,
+    watchPresence: false,
     card: { owner: DEV_OWNER, actor: slot.actor, name: options.label, kind: "endpoint", meta: { sessionKind: "chat" } },
     lifecycleUid: slot.lifecycleUid,
     // A copy: the endpoint edits its list on /leave and /join, and the read grant may be this array.
@@ -231,6 +233,7 @@ export async function openStaticChatSession(target: MeshTarget, options: {
   }
   try {
     await endpoint.start();
+    await session.startUserRoster();
     // The leaf is never renewed, so the session ends at its expiry. Closing is memoized, so an
     // earlier close by the front end makes this a no-op.
     setTimeout(() => void session.close(), Math.max(0, slot.expiresAt - Date.now())).unref();

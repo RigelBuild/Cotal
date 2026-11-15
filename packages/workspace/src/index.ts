@@ -7,6 +7,7 @@ export * from "./agent-health.js";
 export * from "./bin-path.js";
 export * from "./colors.js";
 export * from "./connect.js";
+export * from "./presence-poller.js";
 export * from "./cotal-config.js";
 export * from "./control-target.js";
 export * from "./default-agent.js";

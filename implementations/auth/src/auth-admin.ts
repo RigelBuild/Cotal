@@ -50,6 +50,7 @@
 import { Kvm } from "@nats-io/kv";
 import {
   AUTH_ENDPOINT,
+  AUTH_ROSTER_COMMAND,
   EP_CMD_RETIRE_LIFECYCLE,
   EpEnvelopeError,
   epAuthBucket,
@@ -64,6 +65,7 @@ import {
   type EpServeHandle,
 } from "@cotal-ai/core";
 import { authCommandDefs, AUTH_PLACEMENT_COMMANDS, type AuthServiceHandlers } from "./auth-service-contract.js";
+import { answerAuthRoster, type Presence } from "@cotal-ai/core";
 import { openAuthorityClient, type AuthorityClient } from "./authority-client.js";
 import { runAgentRetirementBarrier, type RetirementDeps } from "./retirement-barrier.js";
 import type { PlacementEnrollmentAuthority } from "./placement-enrollment.js";
@@ -87,7 +89,7 @@ export function authAdminListenerGrants(
     endpoint: AUTH_ENDPOINT,
     instanceId: responder.instanceId,
     epoch: responder.epoch,
-    ephemeralCommands: [EP_CMD_RETIRE_LIFECYCLE, ...AUTH_PLACEMENT_COMMANDS],
+    ephemeralCommands: [EP_CMD_RETIRE_LIFECYCLE, AUTH_ROSTER_COMMAND, ...AUTH_PLACEMENT_COMMANDS],
   });
   return {
     publish: [
@@ -160,6 +162,7 @@ export async function openAuthAdminListener(opts: {
   dataAccount: ServiceKeys["dataAccount"];
   reg: LifecycleRegistry;
   retirement: RetirementDeps;
+  rosterReader: { read(): Promise<Presence[]>; dropOversized(id: string): void };
   barrierFlight: RetirementFlights;
   /** The plane's #399 M2-registered instance id and current process epoch (`authServeGrant.epoch`)
    *  — the SAME instance/epoch the registration ceremony fenced. The gate's process-epoch reader is
@@ -220,6 +223,7 @@ export async function openAuthAdminListener(opts: {
 
   const handlers: AuthServiceHandlers = {
     ...createPlacementDoorHandlers(opts.placement),
+    roster: (ctx, input) => answerAuthRoster(opts.rosterReader, ctx, input),
     retireLifecycle: async (ctx: EpServeContext) => {
       // The TARGET comes from the subject (`exact` mode, arity 3) — broker-enforced and
       // grant-pinned, not a claim the caller can vary independently of what it may publish.

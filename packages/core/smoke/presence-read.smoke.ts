@@ -20,13 +20,15 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect } from "@nats-io/transport-node";
-import { Kvm, type KV } from "@nats-io/kv";
+import { Kvm } from "@nats-io/kv";
 import {
   CotalEndpoint, composeSpaceAuth, createBrokerAuth, createSpaceAccountAuth, isReachable, mintCreds,
   lastKvEntries, mintLifecycleUid, newIdentity, presenceBucket, provisionAgent, serverConfig,
   setupSpaceStreams, type Presence,
+  standaloneConnectOpts,
 } from "../src/index.js";
 import { pickFreePort } from "./_free-port.js";
+import { startRosterFixture } from "./_roster-service.js";
 import { SMOKE_BROKER_TOKEN, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
 
 let cells = 0;
@@ -55,7 +57,17 @@ const dirs: string[] = [];
 const brokers: ChildProcess[] = [];
 const releases: Array<() => void> = [];
 const endpoints: CotalEndpoint[] = [];
+let stopRoster: (() => Promise<void>) | undefined;
 try {
+  {
+    const peer: Presence = { card: { id: "local.peer", name: "peer", kind: "agent" }, status: "idle", ts: Date.now() };
+    const endpoint = new CotalEndpoint({ space: "snapshot-test", bearer: async () => "unused", sentinelCreds: "unused", lifecycleUid: mintLifecycleUid(), card: { owner: "local", actor: "reader", name: "reader", kind: "endpoint" }, channels: [], consume: false, registerPresence: false, watchPresence: true, readOnce: true });
+    const internals = endpoint as unknown as { roster: Map<string, Presence>; readPresenceOnce(): Promise<void> };
+    endpoint.readPresence = async () => { internals.roster.set(peer.card.id, peer); return [peer]; };
+    await internals.readPresenceOnce();
+    check("user-mode readOnce keeps a live peer online", endpoint.getRoster()[0]?.status === "idle", endpoint.getRoster());
+    check("user-mode readOnce has a current presence view", endpoint.presenceView().state === "current", endpoint.presenceView());
+  }
   // ---- auth mode -----------------------------------------------------------------------------------
   {
     const port = await pickFreePort();
@@ -79,12 +91,13 @@ try {
     const prov = new CotalEndpoint({ space, servers, creds: provCreds, channels: [], consume: false, watchPresence: false, registerPresence: false, watchChannels: false, card: { name: "prov", role: "manager", kind: "endpoint" } });
     prov.on("error", () => {});
     await prov.start();
-    const seat = async (name: string): Promise<CotalEndpoint> => {
+    stopRoster = await startRosterFixture(space, servers, auth);
+    const seat = async (name: string, kind: "agent" | "endpoint"): Promise<CotalEndpoint> => {
       const identity = newIdentity();
       const uid = mintLifecycleUid();
       const creds = await provisionAgent(prov, auth, identity, { subscribe: ["general"], allowSubscribe: ["general"], allowPublish: ["general"], lifecycleUid: uid });
-      // As connector-core's MeshAgent configures a seat: presence registered, not watched.
-      const ep = new CotalEndpoint({ space, servers, creds, lifecycleUid: uid, channels: ["general"], watchPresence: false, heartbeatMs: HEARTBEAT_MS, ttlMs: TTL_MS, card: { id: identity.id, name, kind: "agent" } });
+      // The credential, not the card kind, selects manager roster and disables the watch.
+      const ep = new CotalEndpoint({ space, servers, creds, lifecycleUid: uid, channels: ["general"], heartbeatMs: HEARTBEAT_MS, ttlMs: TTL_MS, card: { id: identity.id, name, kind } });
       ep.on("error", () => {});
       ep.on("warning", () => {});
       endpoints.push(ep);
@@ -101,11 +114,13 @@ try {
       return stream.state.consumer_count;
     };
     const consumersBefore = await consumerCount();
-    const ada = await seat("ada");
-    const bob = await seat("bob");
+    const ada = await seat("ada", "agent");
+    const bob = await seat("bob", "endpoint");
     check("a seat that does not watch holds no roster until it reads", ada.getRoster().length === 0, ada.getRoster());
 
     const first = await ada.readPresence();
+    const endpointCardRoster = await bob.readPresence();
+    check("an endpoint card with agent credentials reads through manager", byName(endpointCardRoster, "ada")?.status === "idle");
     check("one read returns both seats live", byName(first, "ada")?.status === "idle" && byName(first, "bob")?.status === "idle", first.map((p) => [p.card.name, p.status]));
     check("the read is also what getRoster returns until the next read", ada.getRoster().length === first.length);
     const [r1, r2] = await Promise.all([ada.readPresence(), ada.readPresence()]);
@@ -113,12 +128,16 @@ try {
     check("neither seat nor any read left a consumer on the presence stream", (await consumerCount()) === consumersBefore, { before: consumersBefore, after: await consumerCount() });
 
     await bob.stop();
+    await wait(1_100); // The trusted reader caches a complete snapshot for half a heartbeat.
     const afterStop = await ada.readPresence();
     check("a gracefully stopped peer reads offline", byName(afterStop, "bob")?.status === "offline", byName(afterStop, "bob"));
 
     // The bucket's max_age drops bob's key; a peer an earlier read saw stays on the roster as offline.
     await wait(6_000 + 1_500);
-    const keys = (await lastKvEntries((ada as unknown as { kv: KV }).kv)).map((e) => e.key);
+    const controlCreds = await mintCreds(auth, newIdentity(), "auth-roster-reader");
+    const controlNc = await connect({ servers, ...standaloneConnectOpts({ creds: controlCreds, tls: false }) });
+    const keys = (await lastKvEntries(await new Kvm(controlNc).open(presenceBucket(space)))).map((e) => e.key);
+    await controlNc.drain();
     check("control: bob's key has left the bucket", !keys.includes(bob.card.id) && keys.includes(ada.card.id), keys);
     const gone = await ada.readPresence();
     check("a peer whose key left the bucket stays in the roster as offline", byName(gone, "bob")?.status === "offline" && byName(gone, "ada")?.status === "idle", gone.map((p) => [p.card.name, p.status]));
@@ -145,6 +164,8 @@ try {
     let watching = "";
     try { await watcher.readPresence(); } catch (e) { watching = (e as Error).message; }
     check("a watching endpoint refuses readPresence", /does not watch presence/.test(watching), watching);
+    await stopRoster();
+    stopRoster = undefined;
     await prov.stop();
   }
 
@@ -211,6 +232,7 @@ try {
   failed++;
   console.log(`  x FAIL  fixture: ${(e as Error).stack ?? e}`);
 } finally {
+  await stopRoster?.().catch(() => {});
   await Promise.all(endpoints.map((ep) => ep.stop().catch(() => {})));
   for (const b of brokers) await killAndAwaitExit(b).catch(() => {});
   for (const r of releases) r();
