@@ -4016,9 +4016,10 @@ export class Manager {
       item.timer = undefined;
       item.nextRetryAt = undefined;
     }
+    const starting = this.startTask;
+    if (this.leaseTimer) clearInterval(this.leaseTimer);
     await this.awaitStaticReconcileDrain();
     await starting?.catch(() => {});
-    if (this.leaseTimer) clearInterval(this.leaseTimer);
     if (this.credRenewTimer) clearInterval(this.credRenewTimer);
     if (this.endpointServeRenewalTimer) clearTimeout(this.endpointServeRenewalTimer);
     if (this.daemonRenewalLeaseTimer) clearInterval(this.daemonRenewalLeaseTimer);
