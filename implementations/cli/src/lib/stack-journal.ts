@@ -6,7 +6,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, rmdirSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
 import { acquireLock, writeSecretFileAtomic } from "@cotal-ai/core";
-import { CommandFailure, acquireMaintenanceLock, codeSpan, admittedControllerRestore, canonicalRoot, decodeLocalJson, isCommandFailure, isMaintenanceError, loadMeshes, localProcessPath, localProcessPathCandidates, localRecordObject, maintenancePaths, parsePid, probeLiveness, readContainedRecord, readLocalRecordSource, readMaintenanceJournal, readPidfile, recordedLocalProcessPaths, releaseMaintenanceLock, removePidPair, serviceOperationId, shellPath, stackJournalPath, maintenanceLockHolder, cotalDirLink, preparedSpaceAt, recordsMovedTo, stackAdoptionBlock, stackElsewhereRemedy, verifyIdentityPin, type ControllerStackView, type MaintenanceLock, type ServiceAdapterStopAbandonment } from "@cotal-ai/workspace";
+import { CommandFailure, acquireMaintenanceLock, codeSpan, admittedControllerRestore, canonicalRoot, decodeLocalJson, isCommandFailure, isMaintenanceError, loadMeshes, localProcessPath, localProcessPathCandidates, localRecordObject, maintenancePaths, parsePid, probeLiveness, readContainedRecord, readLocalRecordSource, readMaintenanceJournal, readPidfile, recordedLocalProcessPaths, releaseMaintenanceLock, removePidPair, serviceOperationId, shellPath, stackJournalPath, maintenanceLockHolder, cotalDirLink, preparedSpaceAt, recordsMovedTo, stackAdoptionBlock, stackElsewhereRemedy, verifyIdentityPin, type ControllerStackView, type MaintenanceJournal, type MaintenanceLock, type ServiceAdapterStopAbandonment } from "@cotal-ai/workspace";
 import { localProcessSurface } from "../ext-loader.js";
 import { serviceDefinitionStore, type ServiceDefinitionSnapshot } from "./service-definitions.js";
 import { observeServiceProcess, serviceInstances, type ServiceInstance, type ServiceInstanceSnapshot } from "./service-instances.js";
@@ -290,9 +290,9 @@ export function writeStackJournal(root: string, expected: StackJournalSnapshot |
 /** Whether the root's maintenance journal fences this stack. A settled active controller restore of
  *  this same stack does not; its attempt is returned so the caller names it
  *  in its result. Any other journal fences. The journal is only read. */
-export function stackMaintenanceFence(root: string, journal: StackJournal): { fenced: boolean; admittedRestore?: string } {
-  if (!readMaintenanceJournal(root)) return { fenced: false };
-  const admitted = admittedControllerRestore(root, controllerStackView(journal));
+export function stackMaintenanceFence(root: string, journal: StackJournal, maintenance = readMaintenanceJournal(root)): { fenced: boolean; admittedRestore?: string } {
+  if (!maintenance) return { fenced: false };
+  const admitted = admittedControllerRestore(root, controllerStackView(journal), maintenance);
   return admitted ? { fenced: false, admittedRestore: admitted.restore.attemptId } : { fenced: true };
 }
 
@@ -305,8 +305,11 @@ export function admittedStackRestore(root: string): string | undefined {
 
 /** Whether the root's maintenance journal blocks a broker-only start. A settled active controller
  *  restore of this root's stack is the only journal admitted. The journal is only read. */
-export function noManagerRefused(root: string): boolean {
-  return Boolean(readMaintenanceJournal(root) && !admittedStackRestore(root));
+export function noManagerRefused(root: string, maintenance = readMaintenanceJournal(root)): boolean {
+  if (!maintenance) return false;
+  const canonical = canonicalRoot(root);
+  const stack = readStackJournal(canonical)?.journal;
+  return !stack || stackMaintenanceFence(canonical, stack, maintenance).fenced;
 }
 
 /** The stack facts a controller restore admission compares. */

@@ -21,7 +21,7 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFile
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { assertSmokeSandboxDown, createSuite, freePort } from "@cotal-ai/smoke-kit";
-import { acquireMaintenanceLock, beginMaintenanceCut, canonicalLocalProcessPath, findMesh, recordMesh, releaseMaintenanceLock, renderReport, WEB_PIDFILE, writeMaintenanceResumeDocument } from "@cotal-ai/workspace";
+import { acquireMaintenanceLock, beginMaintenanceCut, canonicalLocalProcessPath, findMesh, recordMesh, releaseMaintenanceLock, renderReport, stackJournalPath, WEB_PIDFILE, writeMaintenanceResumeDocument } from "@cotal-ai/workspace";
 import { statusView } from "../src/commands/status.js";
 import { restoreNextStep } from "../src/lib/restore.js";
 
@@ -308,8 +308,8 @@ if (!brokerDisplayOnly) {
   const { home, run } = sandbox();
   const server = ["--server", `nats://127.0.0.1:${await freePort()}`];
   const none = run(["status", ...server, "--json"]);
-  const noneMaintenance = none.envelope?.result?.maintenance;
-  check("control: a folder with no maintenance journal reports no no-manager refusal", noneMaintenance?.state === "none" && noneMaintenance.noManagerRefused === false, shown(none));
+  check("control: a folder with no maintenance journal retains a null maintenance field", none.envelope?.result?.maintenance === null, shown(none));
+  check("the no-manager refusal flag treats absent maintenance as false", (none.envelope?.result?.maintenance?.noManagerRefused ?? false) === false, shown(none));
   mkdirSync(join(home, ".cotal", "nats"));
   const lock = acquireMaintenanceLock(home);
   const resume = writeMaintenanceResumeDocument(lock, { version: 1, inventory: { agents: [] }, launch: { runtime: "pty" } });
@@ -318,6 +318,11 @@ if (!brokerDisplayOnly) {
   const json = run(["status", ...server, "--json"]);
   const held = json.envelope?.result?.maintenance;
   check("status --json carries a pending cut and says --no-manager is refused", held?.state === "cut-intent" && held.space === "held" && held.attemptId === "cut-status" && held.noManagerRefused === true, shown(json));
+  writeFileSync(stackJournalPath(home), "{not json");
+  const damaged = run(["status", ...server, "--json"]);
+  const damagedMaintenance = damaged.envelope?.result?.maintenance;
+  check("a damaged stack journal preserves the maintenance state, attempt and recovery step and fails closed", damagedMaintenance?.state === "cut-intent" && damagedMaintenance.attemptId === "cut-status" && damagedMaintenance.next?.endsWith("down --preserve-state`") === true && damagedMaintenance.noManagerRefused === true, shown(damaged));
+  check("a damaged stack journal does not misreport the maintenance journal as unreadable", damaged.envelope?.warnings.every((warning) => warning.code !== "MAINTENANCE_JOURNAL_UNREADABLE") === true, damaged.envelope?.warnings);
   const plain = run(["status", ...server, "--plain"]);
   check("the report shows it under Maintenance with the attempt", titles(plain.stdout).includes("Maintenance") && /Attempt: +cut-status/.test(plain.stdout), plain.stdout);
   // A held restore names the command that moves it on, with the full attempt id.
@@ -455,6 +460,7 @@ if (process.platform !== "win32" && process.getuid?.() !== 0) {
   const shownR = { status: r.status, stdout: (r.stdout ?? "").slice(0, 900), stderr: (r.stderr ?? "").slice(0, 600) };
   check("status in a folder this account cannot read is partial, exit 4, with a warning naming the folder",
     r.status === 4 && envelope?.outcome === "partial" && envelope.warnings.some((w) => w.code === "FOLDER_UNREADABLE" && w.message === `this folder ${folder} cannot be read by this account (EACCES), so nothing in it was read`), shownR);
+  check("an unreadable folder fails closed for --no-manager", envelope?.result?.maintenance?.noManagerRefused === true, envelope?.result?.maintenance);
   check("…and no other warning about a part of that folder, such as an auth.json it does not hold",
     envelope?.warnings.every((w) => !/^(AUTH_UNREADABLE|PERSONAS_UNREADABLE|FRESH_BOOT_RECORD_UNAVAILABLE|ADDITIVE_ATTEMPT_UNAVAILABLE|MAINTENANCE_JOURNAL_UNREADABLE)$/.test(w.code)) === true && !(envelope?.result?.hints ?? []).some((h) => h.includes("auth.json")), envelope?.warnings);
   check("…and its Next is the chmod that makes it readable", (envelope?.result?.hints ?? []).includes(`make it readable by you, for example with chmod u+rx ${folder}`), envelope?.result?.hints);

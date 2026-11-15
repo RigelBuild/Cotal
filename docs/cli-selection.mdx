@@ -532,6 +532,7 @@ attempt and next step; `maintenance` in JSON), unsettled fresh and additive atte
 when present, owned service records and useful commands under Next. Connection state, local process
 state and service replies remain separate observations.
 
+When no maintenance journal exists, `maintenance` in JSON remains `null`.
 This machine shows what is set up and what needs attention. The version line is always there. Agent
 applications is one line: the applications whose required executables are on PATH, and a count of the
 others, which `cotal setup` adds. An application's own rows, such as the Claude plugin, Claude
@@ -888,6 +889,7 @@ space or `null` and `scope` is `selected` or `all`. Its `result` is the report t
 | `stackManager` | The selected space's running stack manager: `instanceId`, `pid` and `endpoint`, which is `answered`, `not-answering` or `unchecked`. Absent when no stack manager runs |
 | `store` | What the selected space's running local broker logged about its JetStream store: `state` `write-failed` with `pid`, `log`, `at`, `cause`, `path` and `jetStreamDisabled`, true when the broker then disabled JetStream; `full` with `used`, `cap` and `path` when the space holds more than its broker's recorded cap; `damaged` with `pid`, `log`, `at` and the broker's `warning` when it logged damage in a stored file; `none-recorded` with `pid` and `log`; or `not-checked` with a `reason`. Absent when no space resolves |
 | `hints` | The hints, in the order the report prints them |
+| `maintenance` | This folder's journal `{root, space, state, attemptId, next, noManagerRefused}` and optional restore rollback details; `null` when no journal exists. `noManagerRefused` is true when `up --no-manager` is refused by the journal, including when the stack journal cannot be read, and false when the journal is absent or its active controller restore is admitted. Consumers that only need the refusal flag can use `maintenance?.noManagerRefused ?? false`. |
 
 `store` covers only a broker whose log is on this machine: a controller stack's `stack-broker`
 instance, or the broker a legacy root records in `.cotal/nats.pid` with its log `.cotal/nats.log`.

@@ -97,6 +97,7 @@ import {
   type LocalProcess,
   type LocalProcessContext,
   type MaintenanceClaim,
+  type MaintenanceJournal,
   type MeshEntry,
   type MeshTarget,
   type OutputWarning,
@@ -330,11 +331,7 @@ export interface StatusResult {
   services?: OwnedServiceStatus;
   /** Selected folder's local boot intents, not a live broker or ownership census. */
   bootAttempts?: { root: string; state: "read" | "partial" | "not-checked"; observedAt: string; unsettled: { deploymentId: string; space: string; server: string; createdAt: string }[]; additive: { deploymentId: string; space: string; server: string; createdAt: string; recordedState: ReturnType<typeof additiveTeamRecordedState> }[]; unreadable: string[]; elsewhere: { deploymentId: string; root: string }[] };
-  /** This folder's maintenance journal: a preserved cut, a restore or a resume, with the full attempt
-   *  a recovery command names. `noManagerRefused` reports whether `up --no-manager` refuses this
-   *  journal. State is `none` when the root holds no journal; older inputs may omit this field.
-   *  `rolledBackRuns` names runs a restore over a newer cut rolled back, and `rolledBackRunsMore`
-   *  counts those it did not list. */
+  /** This folder's maintenance journal, when present. `noManagerRefused` reports whether `up --no-manager` refuses it; it is true if the stack journal cannot be read. */
   maintenance?: { root: string; space: string | null; state: string; attemptId: string | null; next: string | null; noManagerRefused: boolean; rolledBackRuns?: readonly RolledBackRun[]; rolledBackRunsMore?: number } | null;
   /** A store write failure the selected space's running local broker logged, or a store over its
    *  recorded cap; older inputs may omit it. */
@@ -512,15 +509,18 @@ function unreadFolder(root: string, code: string): StatusResult["folder"] {
 
 /** The folder's maintenance journal, read only. An unreadable one is reported, never taken for none. */
 function readMaintenance(root: string, gaps: Gaps): NonNullable<StatusResult["maintenance"]> | null {
+  let journal: MaintenanceJournal | undefined;
   try {
-    const journal = readMaintenanceJournal(root);
-    if (!journal) return { root, space: null, state: "none", attemptId: null, next: null, noManagerRefused: false };
-    const rolledBack = "restore" in journal ? restoreRolledBackRuns(journal) : undefined;
-    return { root, space: journal.space, state: journal.state, ...maintenanceNextStep(root, journal), noManagerRefused: noManagerRefused(root), ...(rolledBack?.runs.length ? { rolledBackRuns: rolledBack.runs, ...(rolledBack.more ? { rolledBackRunsMore: rolledBack.more } : {}) } : {}) };
+    journal = readMaintenanceJournal(root);
   } catch {
     gaps.add("MAINTENANCE_JOURNAL_UNREADABLE", "this folder's maintenance journal could not be read; no absent or settled state was inferred", { root });
     return { root, space: null, state: "unreadable", attemptId: null, next: null, noManagerRefused: true };
   }
+  if (!journal) return null;
+  let refused = true;
+  try { refused = noManagerRefused(root, journal); } catch { /* a damaged stack journal fails closed without obscuring this journal */ }
+  const rolledBack = "restore" in journal ? restoreRolledBackRuns(journal) : undefined;
+  return { root, space: journal.space, state: journal.state, ...maintenanceNextStep(root, journal), noManagerRefused: refused, ...(rolledBack?.runs.length ? { rolledBackRuns: rolledBack.runs, ...(rolledBack.more ? { rolledBackRunsMore: rolledBack.more } : {}) } : {}) };
 }
 
 /** Local boot and additive intents are recovery coordinates, not evidence of native state. */

@@ -947,13 +947,12 @@ function removeEmptyRecords(path: string): void {
 }
 
 /** One classified refusal for both the pre-lock check and the under-lock recheck. */
-function noManagerDuringRecovery(root: string): CommandFailure {
-  const journal = readMaintenanceJournal(root);
+function noManagerDuringRecovery(root: string, journal = readMaintenanceJournal(root)): CommandFailure {
   const step = journal ? maintenanceNextStep(root, journal) : undefined;
   const recovery = step?.next ?? `maintenance state ${journal?.state ?? "unknown"}; bare \`cotal up\` does not advance it`;
   return new CommandFailure("refused", "LIFECYCLE_BLOCKED", "--no-manager is refused while this root has a maintenance attempt to recover; a resume needs a manager to commit the preserved inventory; nothing was started", {
     target: { root, ...(journal && step ? { attemptId: step.attemptId, journalState: journal.state } : {}) },
-    remedy: `run \`cotal status\` to see the next step, then ${recovery}`,
+    remedy: `run \`cotal status\` to inspect this attempt. Then ${recovery}.`,
   });
 }
 
@@ -1077,7 +1076,10 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
     // manager half. The manager half is why the FLAG specifically cannot apply. A settled active
     // restore of this root's own controller stack has nothing left to commit; it takes the
     // controller stack route below, which applies --no-manager as an ordinary start does.
-    if (values["no-manager"] && noManagerRefused(root)) throw noManagerDuringRecovery(root);
+    if (values["no-manager"]) {
+      const maintenance = readMaintenanceJournal(root);
+      if (noManagerRefused(root, maintenance)) throw noManagerDuringRecovery(root, maintenance);
+    }
     // Refuse first-enable IdP failures and explicit pin conflicts before even recovery's lock
     // creates its layout. Existing recovery keeps its own recorded startup and trust checks.
     const stackSpace = values.space ?? folderSpace();
@@ -1125,7 +1127,7 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
         // through to the controller stack route below. The lock is released before a
         // foreground stack holds this terminal. `--no-manager` is rechecked here, under the lock.
         if (!admittedStackRestore(root)) {
-          if (values["no-manager"]) throw noManagerDuringRecovery(root);
+          if (values["no-manager"]) throw noManagerDuringRecovery(root, journal);
           const foreground = await resumeControllerStack(lock, root, values);
           // Released here, once, so the foreground hold below does not keep the maintenance lock.
           handedOff = true;
