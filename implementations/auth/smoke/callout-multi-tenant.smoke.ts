@@ -419,6 +419,7 @@ if (process.argv[2] === "__daemon-auth-service") {
       // ---- retrying the refused space holds nothing over time ----------------------------------------
       // Samples every 10 s: the host's open descriptors and RSS, and the broker's live connections the
       // host holds for the plain spaces and for E. A retry in flight holds at most E's store connection.
+      // Issuer connections are lazy and retire on credential renewal; the other three stay live.
       const hostPid = mixed.child.pid!;
       const liveConns = async () => {
         const names = (await connz()).connections.map((c) => c.name ?? "").filter((n) => n.startsWith("cotal:auth-replica") || n.startsWith("cotal:auth-callout-replica"));
