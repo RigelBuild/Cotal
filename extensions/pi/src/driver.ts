@@ -30,9 +30,12 @@ export interface CotalBatchDetails {
   batchId: string;
   ids: string[];
   items?: InboxItem[];
-  /** Goal ids of the run turns this batch carries; the dedupe keys on these, not on rendered text. */
+  /** Goal ids of run turns in this batch; repeated goal text can be removed when rebuilding copies. */
   turnIds?: string[];
   suffix?: string;
+  turnPrefix?: string;
+  turnFooter?: string;
+  turnBlocks?: Record<string, string>;
 }
 
 export interface PiContextLike {
@@ -65,9 +68,12 @@ interface Batch {
    *  request carrying it (two-phase — a lost batch re-surfaces them instead of arming a `done` for
    *  unseen work). */
   turnIds?: string[];
-  /** Inbox items and run-turn text carried for the Pi renderer; re-sent unchanged on continuation. */
+  /** Inbox items and run-turn blocks carried for the Pi renderer; re-sent unchanged on continuation. */
   items?: InboxItem[];
   suffix?: string;
+  turnPrefix?: string;
+  turnFooter?: string;
+  turnBlocks?: Record<string, string>;
 }
 
 function detailsOf(message: unknown): CotalBatchDetails | undefined {
@@ -372,7 +378,6 @@ export class PiDriver {
     this.inbox.discardMatching((item) => ownChannelEcho(this.mesh, item));
     const reserved = new Set(this.batches.flatMap((batch) => batch.ids));
     const available = this.inbox.peek("automatic").filter((item) => !reserved.has(item.recvKey));
-    // A pending run turn is directed-strength: it justifies a pump on its own, like a wakeable item.
     const turnPeek = this.mesh.peekPendingTurns();
     if (!force && this.nudges.length === 0 && !turnPeek && !available.some((item) => wakeable(this.mesh, item))) {
       if (this.batches.length === 0) this.publishIdleWhenSettled(this.context);
@@ -401,7 +406,15 @@ export class PiDriver {
 
     const batch: Batch = {
       id: randomUUID(), ids, content, started: false, confirmed: false, items,
-      ...(turns ? { turnIds: turns.goalIds, suffix: turns.text } : {}),
+      ...(turns ? {
+        turnIds: turns.goalIds,
+        suffix: turns.text,
+        ...(turns.blocks ? {
+          turnPrefix: turns.once ? "" : (turns.header ?? "") + (turns.goalIds.length === 1 ? "its turn" : `${turns.goalIds.length} turns`) + ":\n",
+          turnFooter: turns.footer ?? "",
+          turnBlocks: turns.blocks,
+        } : {}),
+      } : {}),
     };
     this.batches.push(batch);
     this._state = "dispatching";
@@ -418,7 +431,17 @@ export class PiDriver {
           customType: CUSTOM_TYPE,
           content: batch.content,
           display: true,
-          details: { version: 1, batchId: batch.id, ids: [...batch.ids], items: batch.items ?? [], ...(batch.turnIds ? { turnIds: [...batch.turnIds] } : {}), ...(batch.suffix !== undefined ? { suffix: batch.suffix } : {}) },
+          details: {
+            version: 1,
+            batchId: batch.id,
+            ids: [...batch.ids],
+            items: batch.items ?? [],
+            ...(batch.turnIds ? { turnIds: [...batch.turnIds] } : {}),
+            ...(batch.suffix !== undefined ? { suffix: batch.suffix } : {}),
+            ...(batch.turnPrefix !== undefined ? { turnPrefix: batch.turnPrefix } : {}),
+            ...(batch.turnFooter !== undefined ? { turnFooter: batch.turnFooter } : {}),
+            ...(batch.turnBlocks !== undefined ? { turnBlocks: batch.turnBlocks } : {}),
+          },
         },
         { triggerTurn: true, deliverAs: "steer" },
       );
@@ -457,10 +480,9 @@ export class PiDriver {
 
   /** The messages a provider request carries. A lost steer re-dispatched after its settle window can
    *  still drain into Pi beside its replacement, so a delivery can sit in the request twice. A later
-   *  copy is dropped only when no assistant message sits between it and the first copy it repeats;
-   *  otherwise the request would end on an assistant turn. A kept copy is rebuilt from its new items
-   *  or run turn, or becomes a short stub when it carries nothing new. Run turns dedupe by goal id; a multi-goal run-turn suffix is kept whole, so its earlier goals' text can repeat.
-   *  Returns undefined when nothing changed. */
+   *  copy is dropped only when no assistant message has appeared since the last kept Cotal copy.
+   *  Otherwise the request would end on an assistant turn. Kept copies are rebuilt only when their
+   *  retained metadata covers every new item and goal block. */
   private withoutSupersededBatches<T>(messages: readonly T[]): T[] | undefined {
     const seenIds = new Set<string>();
     const seenTurnIds = new Set<string>();
@@ -492,8 +514,23 @@ export class PiDriver {
       changed = true;
       const dropped = newIds.length === 0 && newTurnIds.length === 0;
       if (dropped && !assistantSinceLastCopy) continue;
+      // Legacy batches without complete metadata can repeat text; retaining it avoids losing unseen work.
       const items = (details.items ?? []).filter((item) => newIds.includes(item.recvKey));
-      const suffix = newTurnIds.length > 0 ? details.suffix : undefined;
+      if (items.length < newIds.length) {
+        kept.push(message);
+        assistantSinceLastCopy = false;
+        continue;
+      }
+      const turnBlocks = details.turnBlocks;
+      if (newTurnIds.length > 0 && (!turnBlocks || !newTurnIds.every((id) => typeof turnBlocks[id] === "string"))) {
+        kept.push(message);
+        assistantSinceLastCopy = false;
+        continue;
+      }
+      const prefix = details.turnPrefix?.replace(/\d+ turns|its turn/, newTurnIds.length === 1 ? "its turn" : `${newTurnIds.length} turns`) ?? "";
+      const suffix = newTurnIds.length > 0 && turnBlocks
+        ? `${prefix}${newTurnIds.map((id) => turnBlocks[id]).join("\n")}${details.turnFooter ?? ""}`
+        : undefined;
       const body = [items.length > 0 ? formatInjection(items) : undefined, suffix]
         .filter((part): part is string => part !== undefined)
         .join("\n\n");
@@ -504,6 +541,12 @@ export class PiDriver {
         items,
         ...(newTurnIds.length > 0 ? { turnIds: newTurnIds } : {}),
         ...(suffix !== undefined ? { suffix } : {}),
+        ...(details.turnPrefix !== undefined ? { turnPrefix: prefix } : {}),
+        ...(details.turnFooter !== undefined ? { turnFooter: details.turnFooter } : {}),
+        ...(turnBlocks ? { turnBlocks: Object.fromEntries(newTurnIds.flatMap((id) => {
+          const block = turnBlocks[id];
+          return block === undefined ? [] : [[id, block]];
+        })) } : {}),
       };
       kept.push({ ...(message as object), content: body.length > 0 ? body : ALREADY_DELIVERED_STUB, details: rebuilt } as T);
       assistantSinceLastCopy = false;

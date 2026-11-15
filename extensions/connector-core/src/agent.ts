@@ -2845,13 +2845,15 @@ export class MeshAgent extends EventEmitter {
   }
 
   /** Format every not-yet-surfaced turn still inside its deadline as an injectable context block,
-   *  WITHOUT marking anything (undefined when none wait). Two-phase on purpose, like the inbox's
-   *  format-then-verdict rail: marking at format time would let a lost frame auto-yield `done` for
-   *  work the model never saw. A caller commits with {@link commitSurfacedTurns} only once the
-   *  injection verifiably reached the host. The payload is opaque relay bytes; when it parses as
-   *  JSON with a string `context`, that rendered context is what the model reads, else the raw
-   *  payload is shown. */
-  peekPendingTurns(): { text: string; goalIds: string[]; once?: true } | undefined {
+   *  without mutating the surface state. */
+  peekPendingTurns(): {
+    text: string;
+    goalIds: string[];
+    once?: true;
+    header?: string;
+    footer?: string;
+    blocks?: Record<string, string>;
+  } | undefined {
     if (this.config.turnRelay === false && !this.nativeTurnLeaseValid()) return undefined;
     // A turn past its deadline is already settled at the manager, which refuses its yield, though
     // this cache holds it until the next pull settles it here.
@@ -2860,8 +2862,12 @@ export class MeshAgent extends EventEmitter {
     if (!waiting.length) return undefined;
     // A once seat holds its task and nothing else (the manager refuses it any other turn).
     const once = waiting.find((t) => t.once !== undefined);
-    if (once !== undefined) return { text: renderOnceTask({ goalId: once.goalId, payload: once.payload, spawner: once.once?.spawner, deadlineAt: once.deadlineAt }), goalIds: [once.goalId], once: true };
-    const blocks = waiting.map((t) => {
+    if (once !== undefined) {
+      const text = renderOnceTask({ goalId: once.goalId, payload: once.payload, spawner: once.once?.spawner, deadlineAt: once.deadlineAt });
+      const result = { text, goalIds: [once.goalId], once: true as const };
+      return { ...result, blocks: { [once.goalId]: text } };
+    }
+    const entries = waiting.map((t) => {
       let context = t.payload;
       let ask = "";
       try {
@@ -2869,14 +2875,16 @@ export class MeshAgent extends EventEmitter {
         if (typeof p.context === "string" && p.context.length > 0) context = p.context;
         ask = renderAskRequest(p);
       } catch { /* opaque payload — surface it as it came */ }
-      return `— turn ${t.goalId}${t.deadlineAt !== undefined ? ` (deadline ${new Date(t.deadlineAt).toISOString()})` : ""}:\n${context}${ask}`;
+      const block = `— turn ${t.goalId}${t.deadlineAt !== undefined ? ` (deadline ${new Date(t.deadlineAt).toISOString()})` : ""}:\n${context}${ask}`;
+      return [t.goalId, block] as const;
     });
-    const text =
-      `🎯 Cotal — a run handed you ${waiting.length === 1 ? "its turn" : `${waiting.length} turns`}:\n` +
-      `${blocks.join("\n")}\n` +
-      `(Do the work now with your own tools. An ask must be answered through its native route above before ending your host turn. ` +
+    const header = "🎯 Cotal — a run handed you ";
+    const footer =
+      `\n(Do the work now with your own tools. An ask must be answered through its native route above before ending your host turn. ` +
       `For ordinary turns, ending your turn yields "done" automatically; call cotal_yield when blocked or handing off an ordinary turn.)`;
-    return { text, goalIds: waiting.map((t) => t.goalId) };
+    const text = `${header}${waiting.length === 1 ? "its turn" : `${waiting.length} turns`}:\n` +
+      `${entries.map(([, block]) => block).join("\n")}${footer}`;
+    return { text, goalIds: waiting.map((t) => t.goalId), header, footer, blocks: Object.fromEntries(entries) };
   }
 
   /** Mark peeked turns as surfaced — the second phase, called once their injection verifiably

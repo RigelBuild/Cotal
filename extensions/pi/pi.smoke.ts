@@ -7,6 +7,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ProjectTrustStore, SessionManager } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import type { ExactDrainResult, InboxItem, InboxScope, MeshAgent } from "@cotal-ai/connector-core";
+import { formatInjection } from "@cotal-ai/connector-core";
 import { PiDriver, type CotalBatchDetails, type PiContextLike, type PiHost } from "./src/driver.js";
 import cotalMesh, { persistSessionId, supervisedProjectTrust } from "./src/extension.js";
 import { InboxTurn } from "./src/inbox-turn.js";
@@ -180,7 +181,7 @@ class FakeMesh {
 
   // The run-turn intake is two-phase on the real agent (peek is pure, commit arms). Nothing here
   // drives a turn, so the peek is empty and a commit would be a defect worth failing on.
-  peekPendingTurns(): { text: string; goalIds: string[] } | undefined {
+  peekPendingTurns(): { text: string; goalIds: string[]; once?: true; header?: string; footer?: string; blocks?: Record<string, string> } | undefined {
     return undefined;
   }
 
@@ -1009,20 +1010,79 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
 
   ok(driver.onContext([other, fresh]) === undefined, "a request without a repeated delivery passes through unchanged");
 
-  const extra = { role: "custom", customType: "cotal-inbox", content: "wide", details: { version: 1, batchId: "wide", ids: ["m1", "m2"], items: [item("m1"), item("m2")] } };
+  const extraItems = [item("m1"), item("m2")];
+  const extra = { role: "custom", customType: "cotal-inbox", content: "wide", details: { version: 1, batchId: "wide", ids: ["m1", "m2"], items: extraItems } };
   const widened = driver.onContext([old, extra]);
   ok(widened?.length === 2 && widened[0] === old && widened[1]?.details?.ids.join() === "m2" &&
     widened[1]?.details?.items?.map((value) => value.id).join() === "m2",
     "a re-dispatch with an extra item keeps only the item no earlier copy carried");
+  ok(widened?.[1]?.content === formatInjection([extraItems[1]!]),
+    "the rebuilt item content sent to the model excludes the earlier item");
 
-  const turnA = { role: "custom", customType: "cotal-inbox", content: "turn", details: { version: 1, batchId: "t1", ids: [], turnIds: ["g1"], suffix: "Run turn: yield when done" } };
-  const turnB = { role: "custom", customType: "cotal-inbox", content: "turn", details: { version: 1, batchId: "t2", ids: [], turnIds: ["g1"], suffix: "Run turn: yield when done (reworded)" } };
-  const turned = driver.onContext([turnA, turnB]);
-  ok(turned?.length === 1 && turned[0] === turnA, "a run turn repeated by goal id is kept once, as its first copy, even when its text differs");
-  const twoTurns = { role: "custom", customType: "cotal-inbox", content: "turn2", details: { version: 1, batchId: "t3", ids: [], turnIds: ["g1", "g2"], suffix: "Run turn: second" } };
+  const turnHeader = "🎯 Cotal — a run handed you ";
+  const turnFooter = "\n(Do the work now with your own tools. An ask must be answered through its native route above before ending your host turn. For ordinary turns, ending your turn yields \"done\" automatically; call cotal_yield when blocked or handing off an ordinary turn.)";
+  const firstBlock = "— turn g1:\nfirst goal";
+  const secondBlock = "— turn g2:\nsecond goal";
+  const firstSuffix = `${turnHeader}its turn:\n${firstBlock}${turnFooter}`;
+  const turnPrefix = `${turnHeader}its turn:\n`;
+  const turnA = {
+    role: "custom", customType: "cotal-inbox", content: firstSuffix,
+    details: { version: 1, batchId: "t1", ids: [], turnIds: ["g1"], suffix: firstSuffix, turnPrefix, turnFooter, turnBlocks: { g1: firstBlock } },
+  };
+  const secondSuffix = `${turnHeader}2 turns:\n${firstBlock}\n${secondBlock}${turnFooter}`;
+  const twoTurns = {
+    role: "custom", customType: "cotal-inbox", content: secondSuffix,
+    details: { version: 1, batchId: "t3", ids: [], turnIds: ["g1", "g2"], suffix: secondSuffix, turnPrefix: `${turnHeader}2 turns:\n`, turnFooter, turnBlocks: { g1: firstBlock, g2: secondBlock } },
+  };
   const newTurn = driver.onContext([turnA, twoTurns]);
-  ok(newTurn?.length === 1 && newTurn[0]?.details?.turnIds?.join() === "g2" && newTurn[0]?.details?.suffix === "Run turn: second",
-    "a re-dispatch that adds a second goal id keeps only that goal's text");
+  const expectedTurnSuffix = `${turnHeader}its turn:\n${secondBlock}${turnFooter}`;
+  ok(newTurn?.length === 2 && newTurn[0] === turnA && newTurn[1]?.details?.turnIds?.join() === "g2" &&
+    newTurn[1]?.details?.suffix === expectedTurnSuffix && newTurn[1]?.content === expectedTurnSuffix,
+    "a rebuilt multi-goal copy sends only the new goal block to the model");
+
+  const legacy = { role: "custom", customType: "cotal-inbox", content: "legacy body", details: { version: 1, batchId: "legacy", ids: ["m1", "m3"] } };
+  const legacyResult = driver.onContext([old, legacy]);
+  ok(legacyResult?.[1] === legacy,
+    "a legacy partly repeated copy without item metadata keeps its original model content");
+}
+// The real extension callback must return Pi's context result wrapper, not the driver's bare array.
+{
+  const keys = ["COTAL_NAME", "COTAL_SPACE", "COTAL_SERVERS", "COTAL_SUBSCRIBE", "COTAL_ALLOW_PUBLISH", "COTAL_CONTROL_SOCKET", "COTAL_CONTROL_TOKEN"] as const;
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  process.env.COTAL_NAME = "pi-context-smoke";
+  process.env.COTAL_SPACE = "pi-context-smoke";
+  delete process.env.COTAL_SERVERS;
+  delete process.env.COTAL_SUBSCRIBE;
+  delete process.env.COTAL_ALLOW_PUBLISH;
+  delete process.env.COTAL_CONTROL_SOCKET;
+  delete process.env.COTAL_CONTROL_TOKEN;
+  const api = {
+    sendMessage(): void {},
+    registerMessageRenderer(): void {},
+    registerTool(): void {},
+    on(event: string, handler: (...args: unknown[]) => unknown): void { handlers.set(event, handler); },
+  } as unknown as ExtensionAPI;
+  try {
+    await cotalMesh(api);
+    const onContext = handlers.get("context");
+    assert.ok(onContext, "the real cotalMesh extension registers a context callback");
+    const old = { role: "custom", customType: "cotal-inbox", content: "old", details: { version: 1, batchId: "ctx-old", ids: ["ctx-m1"], items: [item("ctx-m1")] } };
+    const fresh = { role: "custom", customType: "cotal-inbox", content: "new", details: { version: 1, batchId: "ctx-new", ids: ["ctx-m1"], items: [item("ctx-m1")] } };
+    assert.deepEqual(onContext({ messages: [old, fresh] }), { messages: [old] });
+    checks++;
+    const unique = { role: "custom", customType: "cotal-inbox", content: "unique", details: { version: 1, batchId: "ctx-unique", ids: ["ctx-m2"], items: [item("ctx-m2")] } };
+    assert.equal(onContext({ messages: [unique] }), undefined);
+    checks++;
+  } finally {
+    const shutdown = handlers.get("session_shutdown");
+    if (shutdown) await shutdown({ reason: "quit" }, { sessionManager: { getSessionId: () => "context-smoke", getSessionFile: () => "" } });
+    for (const key of keys) {
+      const value = saved[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 }
 
 // A turn that starts while the lost-steer check waits owns the hold again; a stale check never fires.
