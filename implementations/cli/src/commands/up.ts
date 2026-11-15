@@ -1649,6 +1649,7 @@ async function runUp(args: ParsedArgs, inheritedLock?: MaintenanceLock, onAdopt?
         userAuth: wantUser,
         idp: values.idp,
         rotateSys: values["rotate-sys"],
+        maxSessions,
         seatMintCap,
         noManager,
         storeDir: values["store-dir"],
