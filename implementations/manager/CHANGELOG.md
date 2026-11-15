@@ -1,5 +1,11 @@
 # @cotal-ai/manager
 
+## Unreleased
+
+### Patch Changes
+
+- Add manager-private lifecycle-scoped actorToken custody and placement callback options.
+
 ## 0.164.17
 
 ### Patch Changes

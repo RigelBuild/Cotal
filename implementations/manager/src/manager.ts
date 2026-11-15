@@ -100,6 +100,7 @@ import {
 import { loadLaunchPersonaFile, PersonaSourceError } from "@cotal-ai/workspace";
 import { agentAuthState, agentCredsDir, agentLifecycleSecretFilePaths, agentSecretFilePaths, agentSecretKeyForFile, authDir, claimIdentityRecord, claimManagerSiblingIdentities, connectorInstallHint, DEFAULT_SEAT_CAP, DELIVERY_CREDS_KIND, extensionConnectors, findCotalRoot, getSpaceAuth, hasUserAuthState, loadExtensionsManifest, loadManagerInstanceIdentity, loadMeshes, localTrustOfSpace, manifestExtensionNames, materializeFromManifest, materializeSecretToFile, MEMBERSHIP_RW_CREDS_KIND, mergeLaunchOptions, probeLiveness, remintDaemonCreds, resolveAgentType, resolveOnPath, runtimeInstallHint, createManagerInstanceIdentity, SEAT_CAP_UNLIMITED, spaceKey, spaceMaterialKey, SYSTEM_CREDS_FILES, userAuthStateDir, workspaceSecretStore, writeRenewalRecord, type ManagerInstanceIdentity, type MeshEntry, type RenewalRecord, type SeatCap, type UserAuthInfo } from "@cotal-ai/workspace";
 import type { ActionContext, AgentDef, EpCapability, PersonaEndpoint, RunAdmission, RunRevocation, AttachSession, Connector, ConnectorModelCatalog, ControlReply, CredHealth, DaemonStoreAnswer, DelegatedGrant, DeliveryLeaseInfo, EpCaller, EpErrorCode, EpErrorDetail, GrantOverreach, InlinePersona, IssuedSubjectPermissions, LaunchOpts, LaunchSpec, ManagedLifecycleHandoff, ManagerLeaseInfo, MeshLaunchAgent, Presence, RuntimeProvider, RuntimeReference, SecretStore, SecretStoreIdentity, SpaceAuth, StartupOutcome, UserAuthLaunch } from "@cotal-ai/core";
+import type { ProfileSnapshot } from "@cotal-ai/core";
 import {
   createRuntime,
   exitProof,
@@ -221,6 +222,7 @@ import {
 } from "@cotal-ai/core";
 import { MANAGER_ENDPOINT, managerClusterArtifacts, managerCommandDefs, managerContractArtifactValues, type ManagerConnectorStatus, type ManagerStaticReconciliationFailure, type ManagerStaticReconciliationStatus, type ManagerStaticReconciliationSweep, type ManagerStatus, type ManagerStopImpact } from "./manager-service-contract.js";
 import { measureManagerVitals } from "./vitals.js";
+import { prepareActorToken } from "./placement/custody.js";
 import type { NatsConnection } from "@nats-io/transport-node";
 import type { KV } from "@nats-io/kv";
 import {
@@ -2203,6 +2205,12 @@ export class Manager {
     return requireRuntimeAdopt(this.requiredRuntime, reference);
   }
 
+  /** Keep an execution-private actorToken under this manager and placement lifecycle. Only the
+   * digest may cross the authenticated Auth/Reconciler callbacks. */
+  async preparePlacementActorToken(args: { actor: string; lifecycleUid: string }): Promise<{ actorToken: string; actorTokenHash: string }> {
+    if (!this.managerInstanceId) throw new Error("manager instance identity is not available for placement token custody");
+    return prepareActorToken({ store: this.secrets, space: this.space, instanceId: this.managerInstanceId, ...args });
+  }
   /** Snapshot this embedding's own registration and stop policy. It is not a fresh serving
    *  response, registration-leader read or authorization for another process to act. Wire callers
    *  still use status through its fresh owner/admin visibility gate. No credential or URL leaves. */
