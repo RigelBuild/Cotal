@@ -37,6 +37,7 @@
  */
 import type { BrowserContractSource } from "@cotal-ai/core/browser-validators-build";
 import type { ManagerVitals } from "./vitals.js";
+import { placementContracts } from "./placement-contract.js";
 import {
   buildClusterArtifacts,
   buildClusterDocument,
@@ -1044,6 +1045,11 @@ interface CommandRow {
 }
 
 const ROWS: CommandRow[] = [
+  { name: "place", capability: "manager.admin", input: placementContracts.place.input, output: placementContracts.place.output, targeted: false, handler: "place" },
+  { name: "observe", capability: "manager.admin", input: placementContracts.observe.input, output: placementContracts.observe.output, targeted: false, handler: "observe" },
+  { name: "stop-placement", capability: "manager.admin", input: placementContracts.stopPlacement.input, output: placementContracts.stopPlacement.output, targeted: false, handler: "stopPlacement" },
+  { name: "prepare-launch", capability: "manager.admin", input: placementContracts.prepareLaunch.input, output: placementContracts.prepareLaunch.output, targeted: false, handler: "prepareLaunch" },
+  { name: "profile-get", capability: "manager.admin", input: placementContracts.profileGet.input, output: placementContracts.profileGet.output, targeted: false, handler: "profileGet" },
   { name: "vitals", capability: "manager.vitals", input: VOID_SCHEMA, output: VITALS_OUTPUT_SCHEMA, targeted: false, handler: "vitals" },
   { name: "status", capability: "manager.read", input: VOID_SCHEMA, output: STATUS_OUTPUT_SCHEMA, targeted: false, handler: "status" },
   { name: "ps", capability: "manager.read", input: VOID_SCHEMA, output: PS_OUTPUT_SCHEMA, targeted: false, handler: "ps" },
@@ -1286,9 +1292,11 @@ export const MANAGER_STATUS_CONTRACT: { input: CompiledContract; output: Compile
  *  48 = `list-dir` lists bounded child directory names on the selected Manager's host.
  *
  *  49 = `spawn` takes `eventPayloads` to withhold tool arguments and results. The input schema
- *  is closed, so a revision-48 contract rejects this field. */
+ *  is closed, so a revision-48 contract rejects this field.
+ *
+ *  50 = placement service commands. */
 export function managerClusterDocument(): ClusterDocument {
-  return buildClusterDocument(MANAGER_CLUSTER_URN, 49, ROWS);
+  return buildClusterDocument(MANAGER_CLUSTER_URN, 50, ROWS);
 }
 
 /** Revision, count, and names from the shipped cluster document. Reached smokes derive surface pins from this. */
@@ -1340,6 +1348,11 @@ export function managerBrowserContractSource(): BrowserContractSource {
  *  the command's output value (the compiled output contract validates it at the serve boundary).
  *  Kept as a narrow interface so the contract module stays broker-free. */
 export interface ManagerServiceHandlers {
+  place(ctx: EpServeContext): unknown | Promise<unknown>;
+  observe(ctx: EpServeContext): unknown | Promise<unknown>;
+  stopPlacement(ctx: EpServeContext): unknown | Promise<unknown>;
+  prepareLaunch(ctx: EpServeContext): unknown | Promise<unknown>;
+  profileGet(ctx: EpServeContext): unknown | Promise<unknown>;
   vitals(ctx: EpServeContext): ManagerVitals | Promise<ManagerVitals>;
   status(ctx: EpServeContext): ManagerStatus | Promise<ManagerStatus>;
   ps(ctx: EpServeContext): unknown | Promise<unknown>;

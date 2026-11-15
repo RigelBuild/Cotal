@@ -220,6 +220,7 @@ import {
   type ServiceNameAuthority,
 } from "@cotal-ai/core";
 import { MANAGER_ENDPOINT, managerClusterArtifacts, managerCommandDefs, managerContractArtifactValues, type ManagerConnectorStatus, type ManagerStaticReconciliationFailure, type ManagerStaticReconciliationStatus, type ManagerStaticReconciliationSweep, type ManagerStatus, type ManagerStopImpact } from "./manager-service-contract.js";
+import { placementUnsupported } from "./placement-contract.js";
 import { measureManagerVitals } from "./vitals.js";
 import type { NatsConnection } from "@nats-io/transport-node";
 import type { KV } from "@nats-io/kv";
@@ -4826,6 +4827,11 @@ export class Manager {
       return a;
     };
     return managerCommandDefs({
+      place: (ctx) => adminGated(ctx, () => placementUnsupported("RuntimeProvider rebind/create and private stage/bootstrap")),
+      observe: (ctx) => adminGated(ctx, () => placementUnsupported("retained placement observation and RuntimeProvider rebind")),
+      stopPlacement: (ctx) => adminGated(ctx, () => placementUnsupported("RuntimeProvider stop")),
+      prepareLaunch: (ctx) => adminGated(ctx, () => placementUnsupported("trusted workspace/profile/assets preparation")),
+      profileGet: (ctx) => adminGated(ctx, () => placementUnsupported("configured trusted roles CUE profile source")),
       vitals: (ctx) => this.serveGated(ctx, () => measureManagerVitals()),
       // A remote Manager files every seat under its own owner, so only a user mesh's shared local
       // Manager narrows the count, and status never waits on a remote admin check.
