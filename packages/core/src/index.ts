@@ -144,6 +144,7 @@ export * from "./private-tool-results.js";
 export * from "./sealed-reply.js";
 export * from "./run-host.js";
 export * from "./issued-authority.js";
+export * from "./issued-user-jwt.js";
 export * from "./grant-bound.js";
 export * from "./issued-store-recreate.js";
 export * from "./run-admission.js";

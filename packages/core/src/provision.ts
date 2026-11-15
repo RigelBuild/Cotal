@@ -19,8 +19,9 @@ import { decodeNatsJwt, nativeNkeySigner } from "./nkey-signer.js";
 import { spaceDeletionStreams } from "./space-deletion-targets.js";
 import { assertValidName } from "./resolve.js";
 import { BROKER_USER_INFO_SUBJECT } from "./broker-identity.js";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { join } from "node:path";
+import { canonicalJson } from "./canonical.js";
 import {
   decode,
   encodeOperator,
@@ -100,7 +101,8 @@ import { SERVICE_ACCESS_TTL_SECONDS } from "./service-authority-limits.js";
 import { effectsBindGrants, poolOwnerBindGrants, goalWriterGrants, environmentManagerGoalWriterGrants, sessionLedgerGrants, epAuthBucket, sessionsBucket, epcStreamName, endpointPlaneStreamNames, eptReqStreamName, eptStreamName, hardenedAuthorityStreamNames, timerWriterDurable, timerWriterGrants } from "./endpoint-binding.js";
 import { epsSubject, epCallerReplyFilter, assertGeneration, isIssuedCaller, AUTH_ENDPOINT, EP_CMD_RETIRE_LIFECYCLE, type EpCaller, type IssuedCaller } from "./endpoint-subjects.js";
 import { managerRegistrationFamilySubject } from "./endpoint-subjects.js";
-import { acceptedReadGrant, acceptedBucket, importNativeSubjectPermissions, issuedBucket, issuedHorizon, issuedPermitsPattern, issuedStoreStreamNames, prepareListing, writeAcceptedRow, type IssuanceSeam, type IssuedAuthorityRef, type ListingBinding, type ListingSeam, type PreparedListing } from "./issued-authority.js";
+import { acceptedKey, acceptedReadGrant, acceptedBucket, importNativeSubjectPermissions, issuedBucket, issuedHorizon, issuedPermitsPattern, issuedStoreStreamNames, prepareListing, writeAcceptedRow, type IssuanceSeam, type IssuedAuthorityRef, type ListingBinding, type ListingSeam, type PreparedListing } from "./issued-authority.js";
+import { signIssuedUserJwt } from "./issued-user-jwt.js";
 import { REGISTRY_ENDPOINTS_GRANT } from "./registry-contract.js";
 import { admissionBucket, admissionKey, revocationKey } from "./run-admission.js";
 import { runSubmissionKey } from "./run-submission.js";
@@ -647,6 +649,8 @@ export interface IssuedBinding {
 export interface MintOpts {
   /** Display name placed in the JWT `name` claim. Defaults to the profile label. */
   name?: string;
+  /** Restrict an agent to sending DMs and binding its own DM durable. */
+  dmOnly?: boolean;
   /** The owner+actor principal to mint for. Omitted ⇒ the no-login dev default (owner `"local"`, actor
    *  = the connection id) via {@link principalOf}. User mode supplies the derived owner + ledger actor. */
   principal?: { owner: string; actor: string };
@@ -678,8 +682,8 @@ export interface MintOpts {
   /** `manager-caller` profile only: the one manager instance every request row pins. */
   managerInstanceId?: string;
   /** The caller's lifecycle UID (SPEC §13.1), minted by the managing authority BEFORE the
-   *  entity is reachable. REQUIRED with `endpointCapabilities` — every endpoint-rail row
-   *  forge-locks it as the third caller token. */
+   * entity is reachable. REQUIRED with `endpointCapabilities` — every endpoint-rail row
+   * forge-locks it as the third caller token. */
   lifecycleUid?: string;
   /** v0.4 SERVE identity (SPEC §13.9 serve rows), `endpoint-serve` profile ONLY: mints the
    *  instance's queue-qualified class subscribes (no plain class-rail subscribe exists on any
@@ -1187,6 +1191,88 @@ async function releaseIssuance(
   await writeAcceptedRow(seam.accepted, opts.issued.acceptedToken, ref);
 }
 
+/** Issue a DM-only seat credential without accepting the holder's private key. */
+export async function mintPublicSeatUserJwt(
+  auth: { space: string; account: Pick<SpaceAccountAuth["account"], "pub" | "signingSeed"> },
+  publicId: string,
+  opts: { name: string; principal: { owner: string; actor: string }; lifecycleUid: string; expiresAt: number; issued: IssuedBinding; issuance: IssuanceSeam },
+): Promise<{ jwt: string; exp: number; acceptedToken: string }> {
+  if (!isUserNkey(publicId)) throw new Error("mintPublicSeatUserJwt: publicId must be a user nkey");
+  assertValidName(opts.name);
+  const now = Math.floor(Date.now() / 1000);
+  if (!Number.isSafeInteger(opts.expiresAt) || opts.expiresAt <= now || opts.expiresAt > now + STANDING_RENEWABLE_TTL_SEC)
+    throw new Error("mintPublicSeatUserJwt: expiresAt must be within the next 24 hours");
+  if (opts.issuance.mode !== "issue") throw new Error("mintPublicSeatUserJwt: a public seat requires a new issuance");
+  const pr: MintPrincipal = { ...opts.principal, connId: publicId, lifecycleUid: opts.lifecycleUid };
+  const mintOpts: MintOpts = { ...opts, dmOnly: true };
+  const perms = permissionsFor("agent", auth.space, pr, mintOpts);
+  const tags = userTags("agent", pr);
+  const encodedSeed = new TextEncoder().encode(auth.account.signingSeed);
+  const signer = nativeNkeySigner(encodedSeed);
+  encodedSeed.fill(0);
+  try {
+    const signerPublicKey = signer.getPublicKey();
+    const claimsDigest = createHash("sha256").update(canonicalJson({
+      accountIssuer: auth.account.pub,
+      signerPublicKey,
+      userPublicKey: publicId,
+      name: opts.name,
+      permissions: perms,
+      tags,
+    })).digest("hex");
+    const ref: IssuedAuthorityRef = {
+      space: auth.space,
+      owner: pr.owner,
+      actor: pr.actor,
+      uid: opts.lifecycleUid,
+      generation: opts.issued.generation,
+    };
+    const permissions = importNativeSubjectPermissions(perms);
+    if (opts.expiresAt > issuedHorizon(ref.generation))
+      throw new Error(`mintPublicSeatUserJwt: expiresAt must not pass generation horizon ${issuedHorizon(ref.generation)}`);
+    const source = { space: auth.space, bucket: epAuthBucket(auth.space), key: `cred.${opts.lifecycleUid}` };
+    if (opts.issuance.sources.length !== 1 || canonicalJson(opts.issuance.sources[0]) !== canonicalJson(source))
+      throw new Error("mintPublicSeatUserJwt: issuance must name this lifecycle's static credential-family source");
+    const prepared = await opts.issuance.store.stage({
+      version: 1,
+      ref,
+      sources: [source],
+      permissions,
+      jwtExpiresAt: opts.expiresAt,
+      jwtClaimsDigest: claimsDigest,
+    });
+    if (prepared.issuedAt === undefined || prepared.jwtExpiresAt !== opts.expiresAt || prepared.jwtClaimsDigest !== claimsDigest)
+      throw new Error("mintPublicSeatUserJwt: prepared issuance is missing or mismatches persisted JWT claims");
+    const jwt = signIssuedUserJwt({
+      accountSigner: signer,
+      accountIssuer: auth.account.pub,
+      userPublicKey: publicId,
+      name: opts.name,
+      permissions: perms,
+      tags,
+      exp: prepared.jwtExpiresAt,
+      iat: prepared.issuedAt,
+    });
+    if (Buffer.byteLength(jwt, "utf8") > MAX_MINTED_JWT_BYTES)
+      throw new Error("mintPublicSeatUserJwt: minted JWT exceeds the CONNECT line budget");
+    const credentialId = credentialIdOf(jwt);
+    if (prepared.state === "prepared") {
+      await opts.issuance.store.release(prepared, () => opts.issuance.finalize(credentialId));
+      await writeAcceptedRow(opts.issuance.accepted, opts.issued.acceptedToken, ref);
+    } else {
+      if (prepared.state !== "active") throw new Error("mintPublicSeatUserJwt: issuance is not active");
+      await opts.issuance.store.release(prepared, async () => {});
+      const accepted = await opts.issuance.accepted.get(acceptedKey(opts.issued.acceptedToken));
+      if (!accepted || accepted.operation !== "PUT"
+        || canonicalJson(accepted.json<unknown>()) !== canonicalJson({ version: 1, ref }))
+        throw new Error("mintPublicSeatUserJwt: active issuance has no identical accepted row");
+    }
+    return { jwt, exp: prepared.jwtExpiresAt, acceptedToken: opts.issued.acceptedToken };
+  } finally {
+    signer.clear();
+  }
+}
+
 /** Issue a host-signed NATS user JWT for a caller-generated nkey. The private seed stays with
  * the remote manager. This is deliberately narrower than {@link mintCreds}: only the typed remote
  * manager protocol may request it, and every profile still goes through the same permission and
@@ -1578,8 +1664,19 @@ export function permissionsFor(
   // No silent fallthrough: every non-agent profile is handled above, so anything else reaching here is a
   // stale/unwired profile string (e.g. a JS caller bypassing the closed `Profile` union). Fail loud rather
   // than mint it agent perms by accident (the no-fallbacks rule; matches the deleted `manager`'s intent).
-  if (profile !== "agent")
-    throw new Error(`permissionsFor: unhandled profile "${profile}" - add an explicit arm, do not fall through to agent`);
+  if (opts.dmOnly) {
+    if (opts.endpointCapabilities !== undefined || opts.capabilities !== undefined || opts.role !== undefined ||
+        opts.allowPublish !== undefined || opts.allowSubscribe !== undefined || opts.listing !== undefined || opts.listingSeam !== undefined)
+      throw new Error("permissionsFor(agent): dmOnly cannot carry other permission options");
+    if (!pr.lifecycleUid)
+      throw new Error("permissionsFor(agent): dmOnly requires lifecycleUid");
+    const dm = dmStream(space);
+    const durable = dmDurable(pr.owner, pr.actor, assertLifecycleToken(pr.lifecycleUid));
+    return {
+      pub: { allow: [unicastSubject(space, "*", "*", pr.owner, pr.actor), `$JS.API.CONSUMER.INFO.${dm}.${durable}`, `$JS.API.CONSUMER.MSG.NEXT.${dm}.${durable}`, `$JS.ACK.${dm}.${durable}.>`] },
+      sub: { allow: [inbox] },
+    };
+  }
   const allowPublish = opts.allowPublish ?? []; // post ACL — DEFAULT-DENY (publish must be declared)
   // Read ACL — DEFAULT-DENY for channels, exactly like allowPublish above. Omitted or empty mints
   // NO channel row: no per-channel history-consumer create grant and no `chat.*.<ch>` sub.allow.

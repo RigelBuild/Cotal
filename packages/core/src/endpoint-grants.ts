@@ -235,6 +235,13 @@ export const RUN_READ_COMMANDS = Object.freeze(["run-status", "run-ps"] as const
  *  agent rollup: there, every spawn-capable agent could mint chat leaves. */
 export const CHAT_SESSION_COMMANDS = Object.freeze(["chat-session-open", "chat-session-retire"] as const);
 
+/** Identity commands are granted to minters, never to the seats they issue. */
+export const MINTER_IDENTITY_COMMANDS = Object.freeze(["identity-reserve", "identity-mint", "identity-renew", "identity-retire"] as const);
+const MINTER_IDENTITY_COMMANDS_SNAP = Object.freeze([...MINTER_IDENTITY_COMMANDS]);
+export function minterIdentityCapabilities(): EpCapability[] {
+  return MINTER_IDENTITY_COMMANDS_SNAP.map((command) => ({ endpoint: BASELINE_LIFECYCLE_ENDPOINT, command }));
+}
+
 // ---- operator INSTRUMENT capability sets (the 1c grant-migration table's admin row) --------------
 /** The actor capability that grants one pinned Manager's machine-vitals read. */
 export const MANAGER_VITALS_SCOPE = "machine-vitals" as const;
@@ -251,7 +258,7 @@ export const MANAGER_ADMIN_COMMANDS = Object.freeze([
   "resume-preserved", "commit-resume", "finalize-resume",
   "prepare-preservation", "commit-preservation", "abort-preservation",
   "transcript-receive",
-  "release-seat", "attest-gone", "allowlist-set",
+  "release-seat", "attest-gone", "allowlist-set", "identity-retire-admin",
 ] as const);
 
 /** The ACTION commands (§13.6): submitting one accepts a GOAL, so the caller may follow its OWN
@@ -434,6 +441,7 @@ export function operatorInstrumentCapabilities(tier: "privileged" | "admin", cal
         target: { mode: "any", tOwner: "*" } as EpTarget,
       })),
       ...MANAGER_ADMIN_SNAP.map((command) => ({ endpoint: BASELINE_LIFECYCLE_ENDPOINT, command })),
+      ...MINTER_IDENTITY_COMMANDS_SNAP.map((command) => ({ endpoint: BASELINE_LIFECYCLE_ENDPOINT, command })),
     );
     // The owner-mode half of `input`, minted only when the mint site knows the caller's own owner.
     // An operator on a USER mesh reaches seats through OWNER reach, not any-mode (the bearer's one
