@@ -312,7 +312,7 @@ export class IdentityStore {
       const current = this.#current(name);
       if (!current || current.lifecycleUid !== lifecycleUid || current.minter !== minter || current.terminalizing || current.retiredAt !== undefined || current.issuance?.state !== "issued" || current.issuance.issuanceId !== expectedIssuanceId)
         throw identityError("conflict", "identity changed before renewal");
-      if (current.renewal) return cloneRecord(current);
+      if (current.renewal && current.renewal.exp > renewal.iat) return cloneRecord(current);
       if (!UID.test(renewal.issuanceId) || !Number.isSafeInteger(renewal.iat) || !Number.isSafeInteger(renewal.exp) || renewal.iat <= current.issuance.iat || renewal.exp <= current.issuance.exp)
         throw identityError("failed-precondition", "renewal must advance the issued credential");
       const updated = { ...current, renewal: { ...renewal } };

@@ -12591,7 +12591,7 @@ export class Manager {
       const issuance = record.issuance!;
       const now = Math.floor(Date.now() / 1000);
       const exp = Math.min(now + MANAGED_STATIC_TTL_SEC, issuedHorizon(issuance.generation));
-      const saved = record.renewal ? record : store.beginRenewal(name, minter, record.lifecycleUid, issuance.issuanceId, { issuanceId: mintLifecycleUid(), iat: now, exp });
+      const saved = store.beginRenewal(name, minter, record.lifecycleUid, issuance.issuanceId, { issuanceId: mintLifecycleUid(), iat: now, exp });
       const pending = saved.renewal;
       if (!pending) throw new Error("renewal intent was not persisted");
       const minted = await this.withIssuer((i) => mintPublicSeatUserJwt(this.auth!, publicKey, {
