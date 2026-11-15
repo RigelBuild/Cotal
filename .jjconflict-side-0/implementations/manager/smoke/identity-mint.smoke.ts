@@ -173,6 +173,22 @@ try {
   assert.ok(replacement.reply.data && typeof replacement.reply.data === "object" && "lifecycleUid" in replacement.reply.data);
   assert.notEqual(replacement.reply.data.lifecycleUid, reservation.lifecycleUid);
   console.log("PASS deferred cleanup completes after deadline and reserve gets fresh UID");
+  const replacementKey = newIdentity();
+  const replacementMint = await invokeCommand(nc, space, service, "identity-mint", { name: "first", lifecycleUid: replacement.reply.data.lifecycleUid, publicKey: replacementKey.id }, opts);
+  assert.equal(replacementMint.reply.ok, true, JSON.stringify(replacementMint.reply));
+  await assert.rejects(() => invokeCommand(nc!, space, service, "identity-retire-admin", { name: "first" }, opts), { code: "permission-denied" });
+  const admin = newIdentity();
+  const adminCaller = { owner: DEV_OWNER, actor: admin.id, uid: mintLifecycleUid() };
+  const adminCreds = await mintCreds(auth, admin, "agent", { principal: adminCaller, lifecycleUid: adminCaller.uid, endpointCapabilities: [{ endpoint: MANAGER_ENDPOINT, command: "identity-retire-admin" }] });
+  const adminNc = await connect({ servers, ...standaloneConnectOpts({ creds: adminCreds, tls: false }), maxReconnectAttempts: 0 });
+  try {
+    const adminService = await resolveService(adminNc, space, MANAGER_ENDPOINT, adminCaller, { deadlineMs: 10_000 });
+    const retiredByAdmin = await invokeCommand(adminNc, space, adminService, "identity-retire-admin", { name: "first" }, opts);
+    assert.equal(retiredByAdmin.reply.ok, true, JSON.stringify(retiredByAdmin.reply));
+    const afterAdmin = await invokeCommand(nc, space, service, "identity-renew", { name: "first", publicKey: replacementKey.id }, opts);
+    assert.equal(afterAdmin.reply.error?.code, "failed-precondition");
+    console.log("PASS admin retirement latches a bound identity and ordinary caller is denied");
+  } finally { await adminNc.close(); }
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
   let decodeBits = 0, decodeValue = 0;
   const decoded: number[] = [];

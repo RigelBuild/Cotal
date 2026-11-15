@@ -12501,7 +12501,7 @@ export class Manager {
     return {};
   }
 
-  private identityRetireAdmin(ctx: EpServeContext): Record<string, never> {
+  private async identityRetireAdmin(ctx: EpServeContext): Promise<Record<string, never>> {
     const store = this.identityStoreForCommand();
     const input = ctx.request.args;
     const slug = typeof input === "object" && input !== null && !Array.isArray(input) ? (input as Record<string, unknown>).name : undefined;
@@ -12510,9 +12510,11 @@ export class Manager {
     if (!record)
       throw new EpEnvelopeError("not-found", `identity ${name} has no reservation`, undefined, "not-executed");
     if (record.retiredAt !== undefined || record.issuance?.state === "retired") return {};
-    if (record.publicKey !== undefined || record.issuance !== undefined)
-      throw new EpEnvelopeError("unavailable", `identity ${name} is bound to a public key; safe static terminal support is not available`, undefined, "not-executed");
-    store.retire(name, record.minter, record.lifecycleUid, undefined);
+    store.latchRetirement(name, record.minter, record.lifecycleUid);
+    const renewal = this.identityRenewFlights.get(record.lifecycleUid);
+    if (renewal) await renewal.catch(() => {});
+    store.recordRetirementExpiry(name, record.minter, record.lifecycleUid);
+    void this.recheckIdentityRetirements().catch((error) => console.error(`identity retirement sweep: ${rejectionText(error)}`));
     return {};
   }
 
