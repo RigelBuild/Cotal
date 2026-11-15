@@ -57,7 +57,6 @@ import {
   type CotalConfig,
   modelPolicyRefusal,
   mintCreds,
-  mintPublicSeatUserJwt,
   mintGeneration,
   mintAcceptedToken,
   type IssuedBinding,
@@ -98,6 +97,15 @@ import {
   renderOnceTask,
 } from "@cotal-ai/core";
 import { IdentityStore } from "./identity/store.js";
+import {
+  identityMint,
+  identityRenew,
+  identityReserve,
+  identityRetire,
+  identityRetireAdmin,
+  type IdentityCommandServices,
+} from "./identity/commands.js";
+import { IdentityRetirementDriver, type IdentityRetirementServices } from "./identity/retirements.js";
 import { loadLaunchPersonaFile, PersonaSourceError } from "@cotal-ai/workspace";
 import { agentAuthState, agentCredsDir, agentLifecycleSecretFilePaths, agentSecretFilePaths, agentSecretKeyForFile, authDir, claimIdentityRecord, claimManagerSiblingIdentities, connectorInstallHint, DEFAULT_SEAT_CAP, DELIVERY_CREDS_KIND, extensionConnectors, findCotalRoot, getSpaceAuth, hasUserAuthState, loadExtensionsManifest, loadManagerInstanceIdentity, loadMeshes, localTrustOfSpace, manifestExtensionNames, materializeFromManifest, materializeSecretToFile, MEMBERSHIP_RW_CREDS_KIND, mergeLaunchOptions, probeLiveness, remintDaemonCreds, resolveAgentType, resolveOnPath, runtimeInstallHint, createManagerInstanceIdentity, SEAT_CAP_UNLIMITED, spaceKey, spaceMaterialKey, SYSTEM_CREDS_FILES, userAuthStateDir, workspaceSecretStore, writeRenewalRecord, type ManagerInstanceIdentity, type MeshEntry, type RenewalRecord, type SeatCap, type UserAuthInfo } from "@cotal-ai/workspace";
 import type { ActionContext, AgentDef, RunAdmission, RunRevocation, AttachSession, Connector, ConnectorModelCatalog, ControlReply, CredHealth, DaemonStoreAnswer, DelegatedGrant, DeliveryLeaseInfo, EpCaller, EpErrorCode, EpErrorDetail, GrantOverreach, InlinePersona, IssuedSubjectPermissions, LaunchOpts, LaunchSpec, ManagedLifecycleHandoff, ManagerLeaseInfo, MeshLaunchAgent, Presence, RuntimeProvider, RuntimeReference, SecretStore, SecretStoreIdentity, SpaceAuth, StartupOutcome, UserAuthLaunch } from "@cotal-ai/core";
@@ -118,7 +126,7 @@ import {
 } from "./runtime/index.js";
 import { CustodialPtyRuntime } from "./runtime/custodial-pty.js";
 import { agentCanReplace, agentPrimaryGid } from "@cotal-ai/seat";
-import { identityIdleRetireDue, managedStaticCredOffTickRenewalDue } from "./renewal.js";
+import { managedStaticCredOffTickRenewalDue } from "./renewal.js";
 import { AttachEndpoint, type SessionEstablishment } from "./attach-endpoint.js";
 import { DELIVERY_ADMIN_BOOT_WAIT_MS, isUnansweredDeliveryAdmin, makeManagerEndpointEvictionEvidence, makeManagerEndpointHolderEvictor, untilDeliveryAdminAnswers, withScopedEndpoint } from "./endpoint-evict.js";
 import { makeManagerHolderLivenessProbe } from "./holder-liveness.js";
@@ -237,7 +245,6 @@ import type { KV } from "@nats-io/kv";
 import {
   staticLifecycleTransport,
   activateStaticLifecycle,
-  resumeIdentityActivation,
   runStaticTerminal,
   readStaticRelease,
   writeStaticRelease,
@@ -2004,10 +2011,10 @@ export class Manager {
   private auth?: SpaceAuth;
   /** Durable reservation and issuance state for identities this static manager mints. */
   private identityStore?: IdentityStore;
-  private readonly identityMintFlights = new Map<string, Promise<{ name: string; jwt: string; lifecycleUid: string; exp: number; acceptedToken: string }>>();
-  private readonly identityRenewFlights = new Map<string, Promise<{ name: string; jwt: string; lifecycleUid: string; exp: number; acceptedToken: string }>>();
+  private readonly identityMintFlights = new Map<string, Promise<IdentityMintResult>>();
+  private readonly identityRenewFlights = new Map<string, Promise<IdentityMintResult>>();
   private identityRetirementClock = () => Date.now();
-  private identityRetirementSweep?: Promise<void>;
+  private readonly identityRetirementDriver = new IdentityRetirementDriver(() => this.identityRetirementServices());
   /** Readiness-race backstop (#159 B1) — the {@link READINESS_TIMEOUT_MS} constant, held as an instance
    *  field so a test can shorten it (the join/exit signals are event-driven; only the backstop is timed).
    *  Production leaves it at the constant. */
@@ -4002,7 +4009,7 @@ export class Manager {
     this.transcripts?.stop();
     this.staticReconcileStopping = true;
     this.chatExpiry.stop();
-    const starting = this.startTask;
+    this.identityRetirementDriver.stop();
     for (const item of this.staticReconcileItems.values()) {
       if (item.timer) clearTimeout(item.timer);
       item.timer = undefined;
@@ -12457,15 +12464,6 @@ export class Manager {
       throw e;
     }
   }
-  /** Parse the compact identity command name before deriving its durable alias. */
-  private identityAlias(raw: unknown): string {
-    if (typeof raw !== "string" || raw.length < 1 || raw.length > 64 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(raw))
-      throw new EpEnvelopeError("bad-request", "identity name must be a lowercase slug of at most 64 characters", undefined, "not-executed");
-    const alias = `${this.name}-${raw}`;
-    if (alias.length > 64)
-      throw new EpEnvelopeError("bad-request", "the manager name plus identity slug must be at most 64 characters", undefined, "not-executed");
-    return alias;
-  }
 
   private identityStoreForCommand(): IdentityStore {
     if (this.remoteAuthority || this.userMode || !this.auth || !this.identityStore)
@@ -12474,137 +12472,23 @@ export class Manager {
   }
 
   private identityReserve(ctx: EpServeContext): { name: string; lifecycleUid: string } {
-    const store = this.identityStoreForCommand();
-    const input = ctx.request.args;
-    const slug = typeof input === "object" && input !== null && !Array.isArray(input) ? (input as Record<string, unknown>).name : undefined;
-    const name = this.identityAlias(slug);
-    const record = store.reserve(name, principalKey(ctx.subject.caller.owner, ctx.subject.caller.actor).key, Date.now(), this.seatMintCap);
-    return { name, lifecycleUid: record.lifecycleUid };
+    return identityReserve(this.identityCommandServices(), ctx);
   }
 
-  private async identityRetire(ctx: EpServeContext): Promise<Record<string, never>> {
-    const store = this.identityStoreForCommand();
-    const input = ctx.request.args;
-    const slug = typeof input === "object" && input !== null && !Array.isArray(input) ? (input as Record<string, unknown>).name : undefined;
-    const name = this.identityAlias(slug);
-    const minter = principalKey(ctx.subject.caller.owner, ctx.subject.caller.actor).key;
-    const record = store.get(name);
-    if (!record)
-      throw new EpEnvelopeError("not-found", `identity ${name} has no reservation`, undefined, "not-executed");
-    if (record.minter !== minter)
-      throw new EpEnvelopeError("permission-denied", `identity ${name} is owned by another minter`, undefined, "not-executed");
-    if (record.retiredAt !== undefined || record.issuance?.state === "retired") return {};
-    store.latchRetirement(name, minter, record.lifecycleUid);
-    const renewal = this.identityRenewFlights.get(record.lifecycleUid);
-    if (renewal) await renewal.catch(() => {});
-    store.recordRetirementExpiry(name, minter, record.lifecycleUid);
-    void this.recheckIdentityRetirements().catch((error) => console.error(`identity retirement sweep: ${rejectionText(error)}`));
-    return {};
+  private identityRetire(ctx: EpServeContext): Promise<Record<string, never>> {
+    return identityRetire(this.identityCommandServices(), ctx);
   }
 
-  private async identityRetireAdmin(ctx: EpServeContext): Promise<Record<string, never>> {
-    const store = this.identityStoreForCommand();
-    const input = ctx.request.args;
-    const slug = typeof input === "object" && input !== null && !Array.isArray(input) ? (input as Record<string, unknown>).name : undefined;
-    const name = this.identityAlias(slug);
-    const record = store.get(name);
-    if (!record)
-      throw new EpEnvelopeError("not-found", `identity ${name} has no reservation`, undefined, "not-executed");
-    if (record.retiredAt !== undefined || record.issuance?.state === "retired") return {};
-    store.latchRetirement(name, record.minter, record.lifecycleUid);
-    const renewal = this.identityRenewFlights.get(record.lifecycleUid);
-    if (renewal) await renewal.catch(() => {});
-    store.recordRetirementExpiry(name, record.minter, record.lifecycleUid);
-    void this.recheckIdentityRetirements().catch((error) => console.error(`identity retirement sweep: ${rejectionText(error)}`));
-    return {};
+  private identityRetireAdmin(ctx: EpServeContext): Promise<Record<string, never>> {
+    return identityRetireAdmin(this.identityCommandServices(), ctx);
   }
 
-  private async identityMint(ctx: EpServeContext): Promise<{ name: string; jwt: string; lifecycleUid: string; exp: number; acceptedToken: string }> {
-    const store = this.identityStoreForCommand();
-    const input = ctx.request.args;
-    if (typeof input !== "object" || input === null || Array.isArray(input) || !("name" in input) || !("lifecycleUid" in input) || !("publicKey" in input) || typeof input.lifecycleUid !== "string" || typeof input.publicKey !== "string")
-      throw new EpEnvelopeError("bad-request", "identity mint requires a name, lifecycle UID and public key", undefined, "not-executed");
-    const publicKey = input.publicKey;
-    const name = this.identityAlias(input.name);
-    const minter = principalKey(ctx.subject.caller.owner, ctx.subject.caller.actor).key;
-    const record = store.get(name);
-    if (!record) throw new EpEnvelopeError("not-found", `identity ${name} has no reservation`, undefined, "not-executed");
-    if (record.minter !== minter) throw new EpEnvelopeError("permission-denied", `identity ${name} is owned by another minter`, undefined, "not-executed");
-    if (record.lifecycleUid !== input.lifecycleUid) throw new EpEnvelopeError("failed-precondition", "identity lifecycle UID does not match its reservation", undefined, "not-executed");
-    const bound = store.bindPublicKey(name, minter, record.lifecycleUid, input.publicKey);
-    const existing = this.identityMintFlights.get(record.lifecycleUid);
-    if (existing) return existing;
-    const flight = (async () => {
-      const now = Math.floor(Date.now() / 1000);
-      let issuance = bound.initialIssuance ?? bound.issuance;
-      if (!issuance) {
-        issuance = { generation: mintGeneration(now + STATIC_GENERATION_HORIZON_SEC), acceptedToken: mintAcceptedToken(), issuanceId: mintLifecycleUid(), iat: now, exp: now + MANAGED_STATIC_TTL_SEC, state: "pending" };
-        store.transition(name, minter, record.lifecycleUid, undefined, issuance);
-      }
-      if (issuance.state !== "pending" && issuance.state !== "issued")
-        throw new EpEnvelopeError("failed-precondition", "identity issuance is terminalizing", undefined, "not-executed");
-      if (issuance.state === "pending") {
-        await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: publicKey, lifecycleUid: record.lifecycleUid, alias: name }, (t) =>
-          resumeIdentityActivation(t, { owner: DEV_OWNER, alias: name, actor: publicKey, lifecycleUid: record.lifecycleUid, managerInstance: this.managerLifecycleUid, ownerInstanceId: this.managerInstanceId }));
-      }
-      await this.withProvisioner((provisioner) => provisioner.provisionDmInbox(DEV_OWNER, publicKey, record.lifecycleUid));
-      const current = issuance;
-      const minted = await this.withIssuer((i) => mintPublicSeatUserJwt(this.auth!, publicKey, {
-        name, principal: { owner: DEV_OWNER, actor: publicKey }, lifecycleUid: record.lifecycleUid,
-        issuedAt: current.iat, expiresAt: current.exp,
-        issued: { generation: current.generation, acceptedToken: current.acceptedToken },
-        issuance: this.issuanceSeam(i, "issue", { name, id: publicKey, lifecycleUid: record.lifecycleUid }, current.exp),
-      }));
-      if (current.state === "pending") {
-        await this.withLifecycleExecutor({ owner: DEV_OWNER, actor: publicKey, lifecycleUid: record.lifecycleUid, alias: name }, async (t) => {
-          const slot = await readStaticSlot(t, DEV_OWNER, name);
-          if (!slot || slot.row.lifecycleUid !== record.lifecycleUid || slot.row.actor !== publicKey || (slot.row.phase !== "provisioning" && slot.row.phase !== "active") || !slot.row.credentialIds.includes(credentialIdOf(minted.jwt)))
-            throw new EpEnvelopeError("failed-precondition", "identity static slot does not match its issuance", undefined, "not-executed");
-          if (slot.row.phase === "provisioning") await casStaticSlot(t, { ...slot.row, phase: "active" }, slot.revision);
-        });
-        store.transition(name, minter, record.lifecycleUid, current.generation, { ...current, credentialId: credentialIdOf(minted.jwt), state: "issued" });
-      }
-      if (current.credentialId !== undefined && current.credentialId !== credentialIdOf(minted.jwt))
-        throw new EpEnvelopeError("failed-precondition", "identity credential does not match its persisted reference", undefined, "not-executed");
-      return { name, lifecycleUid: record.lifecycleUid, ...minted };
-    })();
-    this.identityMintFlights.set(record.lifecycleUid, flight);
-    try { return await flight; } finally { if (this.identityMintFlights.get(record.lifecycleUid) === flight) this.identityMintFlights.delete(record.lifecycleUid); }
+  private identityMint(ctx: EpServeContext): Promise<IdentityMintResult> {
+    return identityMint(this.identityCommandServices(), ctx);
   }
 
-  private async identityRenew(ctx: EpServeContext): Promise<{ name: string; jwt: string; lifecycleUid: string; exp: number; acceptedToken: string }> {
-    const store = this.identityStoreForCommand();
-    const input = ctx.request.args;
-    if (typeof input !== "object" || input === null || Array.isArray(input) || !("name" in input) || !("publicKey" in input) || typeof input.publicKey !== "string")
-      throw new EpEnvelopeError("bad-request", "identity renewal requires a name and public key", undefined, "not-executed");
-    const name = this.identityAlias(input.name);
-    const publicKey = input.publicKey;
-    const minter = principalKey(ctx.subject.caller.owner, ctx.subject.caller.actor).key;
-    const record = store.get(name);
-    if (!record) throw new EpEnvelopeError("not-found", `identity ${name} has no reservation`, undefined, "not-executed");
-    if (record.minter !== minter) throw new EpEnvelopeError("permission-denied", `identity ${name} is owned by another minter`, undefined, "not-executed");
-    if (record.publicKey !== publicKey) throw new EpEnvelopeError("permission-denied", "identity public key does not match", undefined, "not-executed");
-    if (record.terminalizing || record.retiredAt !== undefined || record.issuance?.state !== "issued") throw new EpEnvelopeError("failed-precondition", "identity is not issued or is terminalizing", undefined, "not-executed");
-    const existing = this.identityRenewFlights.get(record.lifecycleUid);
-    if (existing) return existing;
-    const flight = (async () => {
-      const issuance = record.issuance!;
-      const now = Math.floor(Date.now() / 1000);
-      const exp = Math.min(now + MANAGED_STATIC_TTL_SEC, issuedHorizon(issuance.generation));
-      const saved = store.beginRenewal(name, minter, record.lifecycleUid, issuance.issuanceId, { issuanceId: mintLifecycleUid(), iat: now, exp });
-      const pending = saved.renewal;
-      if (!pending) throw new Error("renewal intent was not persisted");
-      const minted = await this.withIssuer((i) => mintPublicSeatUserJwt(this.auth!, publicKey, {
-        name, principal: { owner: DEV_OWNER, actor: publicKey }, lifecycleUid: record.lifecycleUid,
-        issuedAt: pending.iat, expiresAt: pending.exp,
-        issued: { generation: issuance.generation, acceptedToken: issuance.acceptedToken },
-        issuance: this.issuanceSeam(i, "renew", { name, id: publicKey, lifecycleUid: record.lifecycleUid }, pending.exp),
-      }));
-      store.finishRenewal(name, minter, record.lifecycleUid, pending.issuanceId, credentialIdOf(minted.jwt));
-      return { name, lifecycleUid: record.lifecycleUid, ...minted };
-    })();
-    this.identityRenewFlights.set(record.lifecycleUid, flight);
-    try { return await flight; } finally { if (this.identityRenewFlights.get(record.lifecycleUid) === flight) this.identityRenewFlights.delete(record.lifecycleUid); }
+  private identityRenew(ctx: EpServeContext): Promise<IdentityMintResult> {
+    return identityRenew(this.identityCommandServices(), ctx);
   }
 
   /** `chat-session-open`: admit one static chat session. The manager draws the `chat_` alias and a
@@ -12983,54 +12867,44 @@ export class Manager {
     void this.recheckIdentityRetirements().catch((error) => console.error(`identity retirement sweep: ${rejectionText(error)}`));
   }
 
-  private recheckIdentityRetirements(): Promise<void> {
-    if (this.identityRetirementSweep) return this.identityRetirementSweep;
-    const flight = this.driveIdentityRetirements().finally(() => { this.identityRetirementSweep = undefined; });
-    this.identityRetirementSweep = flight;
-    return flight;
+  private identityCommandServices(): IdentityCommandServices {
+    return {
+      managerName: this.name,
+      seatMintCap: this.seatMintCap,
+      auth: this.auth,
+      managerLifecycleUid: this.managerLifecycleUid,
+      managerInstanceId: this.managerInstanceId,
+      identityMintFlights: this.identityMintFlights,
+      identityRenewFlights: this.identityRenewFlights,
+      identityStoreForCommand: () => this.identityStoreForCommand(),
+      withLifecycleExecutor: (pin, fn) => this.withLifecycleExecutor(pin, fn),
+      withProvisioner: (fn) => this.withProvisioner(fn),
+      withIssuer: (fn) => this.withIssuer(fn),
+      issuanceSeam: (issuer, mode, identity, exp) => this.issuanceSeam(issuer, mode, identity, exp),
+      recheckIdentityRetirements: () => this.recheckIdentityRetirements(),
+    };
   }
 
-  private async driveIdentityRetirements(): Promise<void> {
-    const store = this.identityStore;
-    if (!store || !this.auth || this.staticReconcileStopping) return;
-    for (const row of store.list()) {
-      if (!row.terminalizing && row.retiredAt === undefined && identityIdleRetireDue(Math.max(row.issuance?.exp ?? 0, row.renewal?.exp ?? 0, Math.floor(row.touchedAt / 1000)), Math.floor(this.identityRetirementClock() / 1000))) {
-        store.latchRetirement(row.name, row.minter, row.lifecycleUid);
-        row.terminalizing = true;
-      }
-      if (!row.terminalizing || row.retiredAt !== undefined) continue;
-      const active = this.identityRenewFlights.get(row.lifecycleUid);
-      if (active) await active.catch(() => {});
-      const current = store.recordRetirementExpiry(row.name, row.minter, row.lifecycleUid);
-      if (this.identityRetirementClock() < ((current.retirementExpiry ?? 0) + 60) * 1000) continue;
-      if (!current.publicKey) {
-        store.retire(current.name, current.minter, current.lifecycleUid, current.issuance?.generation);
-        continue;
-      }
-      const actor = current.publicKey;
-      try {
-        await this.withLifecycleExecutor({ owner: DEV_OWNER, actor, lifecycleUid: current.lifecycleUid, alias: current.name }, async (t) => {
-          const slot = await readStaticSlot(t, DEV_OWNER, current.name);
-          if (!slot) {
-            await activateStaticLifecycle(t, { owner: DEV_OWNER, alias: current.name, actor, lifecycleUid: current.lifecycleUid, managerInstance: this.managerLifecycleUid, ownerInstanceId: this.managerInstanceId });
-          }
-          await runStaticTerminal(t, { owner: DEV_OWNER, alias: current.name, actor, lifecycleUid: current.lifecycleUid, opId: managedRetirementOpId(current.lifecycleUid), managerInstance: this.managerInstanceId, managerProcessUid: this.managerLifecycleUid }, {
-            evict: this.staticLifecycleEvict ?? makeManagerEndpointEvictionEvidence({ space: this.space, servers: this.servers ?? DEFAULT_SERVER, auth: this.auth!, log: (line) => console.error(line), unreachableWaitMs: DEPROVISION_TIMEOUT_MS }),
-            log: (line) => console.error(`identity retirement ${current.name}: ${line}`),
-            cleanup: async () => {
-              await this.withIssuer((i) => i.store.retireSource({ space: this.space, bucket: epAuthBucket(this.space), key: `cred.${current.lifecycleUid}` }));
-              const creds = await mintCreds(this.auth!, newIdentity(), "deprovisioner", { deprovisionTarget: { principal: actor, lifecycleUid: current.lifecycleUid, memberChannels: [] } });
-              await deprovisionAgent({ servers: this.servers ?? DEFAULT_SERVER, space: this.space, targetId: actor, lifecycleUid: current.lifecycleUid, memberChannels: [], creds });
-            },
-          });
-        });
-        store.retire(current.name, current.minter, current.lifecycleUid, current.issuance?.generation);
-        this.retiredPrincipals.add(principalKey(DEV_OWNER, actor).key);
-      } catch (error) {
-        store.recordRetirementError(current.name, current.minter, current.lifecycleUid, rejectionText(error));
-        console.error(`identity retirement ${current.name}: ${rejectionText(error)}`);
-      }
-    }
+  private identityRetirementServices(): IdentityRetirementServices {
+    return {
+      identityStore: this.identityStore,
+      auth: this.auth,
+      identityRenewFlights: this.identityRenewFlights,
+      staticReconcileStopping: this.staticReconcileStopping,
+      managerLifecycleUid: this.managerLifecycleUid,
+      managerInstanceId: this.managerInstanceId,
+      space: this.space,
+      servers: this.servers,
+      staticLifecycleEvict: this.staticLifecycleEvict,
+      retiredPrincipals: this.retiredPrincipals,
+      identityRetirementClock: this.identityRetirementClock,
+      withLifecycleExecutor: (pin, fn) => this.withLifecycleExecutor(pin, fn),
+      withIssuer: (fn) => this.withIssuer(fn),
+    };
+  }
+
+  private recheckIdentityRetirements(): Promise<void> {
+    return this.identityRetirementDriver.recheckIdentityRetirements();
   }
 
   /** The renewal tick's re-check: a deferred seat whose credential has expired takes the terminal. */
