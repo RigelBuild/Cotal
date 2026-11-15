@@ -39,12 +39,6 @@ import {
 } from "@cotal-ai/core";
 
 
-function identityRequestSubject(caller: EpCaller, command: string): string {
-  return epRequestSubject(space, {
-    route: { mode: "one" }, endpoint: MANAGER_ENDPOINT, command, caller,
-    nonce: randomUUID().replaceAll("-", ""),
-  });
-}
 import { authDir, saveSpaceAuth } from "@cotal-ai/workspace";
 import { Manager } from "../src/manager.js";
 // Endpoint name + shipped surface pin. Never MANAGER_CONTRACTS: a generic caller does not
@@ -52,6 +46,12 @@ import { Manager } from "../src/manager.js";
 import { MANAGER_ENDPOINT, managerShippedSurface } from "../src/manager-service-contract.js";
 import { SMOKE_BROKER_TOKEN, freePort, teardownOnSignal, killAndAwaitExit, emitSentinel } from "@cotal-ai/smoke-kit";
 const shipped = managerShippedSurface();
+function identityRequestSubject(caller: EpCaller, command: string): string {
+  return epRequestSubject(space, {
+    route: { mode: "one" }, endpoint: MANAGER_ENDPOINT, command, caller,
+    nonce: randomUUID().replaceAll("-", ""),
+  });
+}
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../..");
