@@ -422,10 +422,13 @@ if (process.argv[2] === "__daemon-auth-service") {
       const hostPid = mixed.child.pid!;
       const liveConns = async () => {
         const names = (await connz()).connections.map((c) => c.name ?? "").filter((n) => n.startsWith("cotal:auth-replica") || n.startsWith("cotal:auth-callout-replica"));
-        return { plain: names.filter((n) => !n.endsWith(`:${E.name}`)).length, refused: names.filter((n) => n.endsWith(`:${E.name}`)).length };
+        const required = spaces.slice(0, 2).flatMap((s) => ["cotal:auth-replica-store", "cotal:auth-replica-reader", "cotal:auth-callout-replica"].map((role) => `${role}:${s.name}`));
+        const plain = names.filter((n) => !n.endsWith(`:${E.name}`));
+        const issuers = spaces.slice(0, 2).map((s) => plain.filter((n) => n === `cotal:auth-replica-issuer:${s.name}`).length);
+        return { plain: plain.length, refused: names.length - plain.length, stable: required.every((n) => plain.filter((x) => x === n).length === 1) && issuers.every((n) => n <= 1) && plain.length === required.length + issuers.reduce((a, n) => a + n, 0) };
       };
       const soakRetries0 = retries();
-      const samples: Array<{ s: number; fds: number; rssMb: number; plain: number; refused: number }> = [];
+      const samples: Array<{ s: number; fds: number; rssMb: number; plain: number; refused: number; stable: boolean }> = [];
       const soakStart = Date.now();
       while (Date.now() - soakStart < SOAK * 1000) {
         const conns = await liveConns();
@@ -439,9 +442,9 @@ if (process.argv[2] === "__daemon-auth-service") {
       const fdGrowth = Math.max(...samples.slice(-third).map((x) => x.fds)) - Math.max(...samples.slice(0, third).map((x) => x.fds));
       console.log(`  soak ${SOAK}s, ${soakRetries} retries of ${E.name}, load ${readFileSync("/proc/loadavg", "utf8").split(" ").slice(0, 3).join(" ")}: ${JSON.stringify(samples)}`);
       check(`the host retried the refused space throughout the ${SOAK}s soak`, soakRetries >= Math.floor(SOAK / 10), { retries: soakRetries });
-      check("no sample holds more than one connection for the refused space, and the plain spaces' connections stay level",
-        samples.every((x) => x.refused <= 1) && Math.max(...samples.map((x) => x.plain)) - Math.min(...samples.map((x) => x.plain)) <= 1,
-        { refused: samples.map((x) => x.refused), plain: samples.map((x) => x.plain) });
+      check("no sample holds more than one connection for the refused space, and each plain lane retains its required connections",
+        samples.every((x) => x.refused <= 1 && x.stable),
+        { refused: samples.map((x) => x.refused), plain: samples.map((x) => x.plain), stable: samples.map((x) => x.stable) });
       check("the host's open descriptors do not grow across the retries", fdGrowth <= 2, { fdGrowth, fds: samples.map((x) => x.fds) });
       check("the host's RSS does not grow across the retries", rssGrowth <= 16, { rssGrowthMb: Number(rssGrowth.toFixed(1)) });
 
