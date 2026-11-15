@@ -105,6 +105,7 @@ jobs:
         run: nix build --file nix/seat-image.nix --argstr runtimeDir "$RUNTIME_DIR" --out-link result --print-build-logs
 
       - name: Test native addons in seat image
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           ./result > seat-image.tar
