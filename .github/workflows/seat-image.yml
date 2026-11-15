@@ -104,6 +104,71 @@ jobs:
       - name: Build seat image
         run: nix build --file nix/seat-image.nix --argstr runtimeDir "$RUNTIME_DIR" --out-link result --print-build-logs
 
+      - name: Test native addons in seat image
+        run: |
+          set -euo pipefail
+          ./result > seat-image.tar
+          docker load --input seat-image.tar
+          node="$(docker image inspect --format '{{index .Config.Entrypoint 0}}' cotal-seat:seat)"
+          runtime_entry="$(docker image inspect --format '{{index .Config.Entrypoint 1}}' cotal-seat:seat)"
+          workdir="$(dirname "$(dirname "$runtime_entry")")"
+          docker run --rm -i \
+            --entrypoint "$node" \
+            --workdir "$workdir" \
+            cotal-seat:seat \
+            --input-type=module - <<'NODE'
+          import assert from "node:assert/strict";
+          import { mkdtempSync, rmSync } from "node:fs";
+          import { once } from "node:events";
+          import { createConnection, createServer } from "node:net";
+          import { join } from "node:path";
+          import { peerCredentials, spawnPinned } from "@cotal-ai/seat";
+
+          const home = process.env.HOME ?? "/tmp";
+          const root = mkdtempSync(join(home, "seat-native-"));
+          const socketPath = join(root, "peer.sock");
+          const server = createServer();
+          let client;
+          let peer;
+          try {
+            const listening = once(server, "listening");
+            server.listen(socketPath);
+            await listening;
+            const connected = once(server, "connection");
+            client = createConnection(socketPath);
+            [peer] = await connected;
+            const credentials = peerCredentials(peer);
+            assert.equal(credentials.pid, process.pid);
+            assert.equal(credentials.uid, process.getuid());
+
+            const pty = spawnPinned(process.execPath, ["-e", "process.stdout.write('seat-native-pty-ok\\n')"], {
+              name: "xterm", cols: 80, rows: 24,
+              cwd: root,
+              env: { PATH: process.env.PATH ?? "/bin:/usr/bin", HOME: home },
+            });
+            let output = "";
+            await new Promise((resolve, reject) => {
+              const timeout = setTimeout(() => {
+                pty.handle.signal("SIGKILL");
+                reject(new Error("PTY native smoke timed out"));
+              }, 10000);
+              pty.onData((data) => { output += data; });
+              pty.onExit(({ exitCode }) => {
+                clearTimeout(timeout);
+                if (exitCode !== 0 || !output.includes("seat-native-pty-ok")) {
+                  reject(new Error(`PTY native smoke failed: exit ${exitCode}, output ${JSON.stringify(output)}`));
+                } else resolve();
+              });
+            });
+            console.log("peercred.node and pty.node loaded and exercised in the final image");
+          } finally {
+            client?.destroy();
+            peer?.destroy();
+            if (server.listening) await new Promise((resolve) => server.close(resolve));
+            rmSync(root, { recursive: true, force: true });
+          }
+          NODE
+
       - name: Log in to GHCR
         env:
           GH_TOKEN_VALUE: ${{ secrets.GITHUB_TOKEN }}
@@ -121,7 +186,6 @@ jobs:
           set -euo pipefail
           # Compute the digest first, then push to $IMAGE@digest. A bare $IMAGE reference
           # would be tagged :latest, so the digest is the only reference used here.
-          ./result > seat-image.tar
           digest="$("$CRANE" digest --tarball seat-image.tar)"
           if ! [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
             echo "::error::crane digest returned no valid digest: $digest" >&2
