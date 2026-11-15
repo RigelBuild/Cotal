@@ -331,7 +331,8 @@ export interface StatusResult {
   services?: OwnedServiceStatus;
   /** Selected folder's local boot intents, not a live broker or ownership census. */
   bootAttempts?: { root: string; state: "read" | "partial" | "not-checked"; observedAt: string; unsettled: { deploymentId: string; space: string; server: string; createdAt: string }[]; additive: { deploymentId: string; space: string; server: string; createdAt: string; recordedState: ReturnType<typeof additiveTeamRecordedState> }[]; unreadable: string[]; elsewhere: { deploymentId: string; root: string }[] };
-  /** This folder's maintenance journal, when present. `noManagerRefused` reports whether `up --no-manager` refuses it; it is true if the stack journal cannot be read. */
+  /** This folder's maintenance journal when present; null when absent. `noManagerRefused` includes unreadable stack journals.
+   *  Optional `rolledBackRuns` and `rolledBackRunsMore` report restore rollback details; older inputs may omit them. */
   maintenance?: { root: string; space: string | null; state: string; attemptId: string | null; next: string | null; noManagerRefused: boolean; rolledBackRuns?: readonly RolledBackRun[]; rolledBackRunsMore?: number } | null;
   /** A store write failure the selected space's running local broker logged, or a store over its
    *  recorded cap; older inputs may omit it. */

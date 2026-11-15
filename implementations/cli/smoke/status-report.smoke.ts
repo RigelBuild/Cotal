@@ -17,11 +17,11 @@
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { connect } from "node:net";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, appendFileSync, chmodSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { assertSmokeSandboxDown, createSuite, freePort } from "@cotal-ai/smoke-kit";
-import { acquireMaintenanceLock, beginMaintenanceCut, canonicalLocalProcessPath, findMesh, recordMesh, releaseMaintenanceLock, renderReport, stackJournalPath, WEB_PIDFILE, writeMaintenanceResumeDocument } from "@cotal-ai/workspace";
+import { acquireMaintenanceLock, beginMaintenanceCut, canonicalLocalProcessPath, completeMaintenanceCut, findMesh, maintenancePaths, recordMesh, recordPreservationManagerCommit, releaseMaintenanceLock, renderReport, stackJournalPath, WEB_PIDFILE, writeMaintenanceResumeDocument } from "@cotal-ai/workspace";
 import { statusView } from "../src/commands/status.js";
 import { restoreNextStep } from "../src/lib/restore.js";
 
@@ -324,6 +324,26 @@ if (!brokerDisplayOnly) {
   check("a damaged stack journal preserves the maintenance state, attempt and recovery step and fails closed", damagedMaintenance?.state === "cut-intent" && damagedMaintenance.attemptId === "cut-status" && damagedMaintenance.next?.endsWith("down --preserve-state`") === true && damagedMaintenance.noManagerRefused === true, shown(damaged));
   check("a damaged stack journal does not misreport the maintenance journal as unreadable", damaged.envelope?.warnings.every((warning) => warning.code !== "MAINTENANCE_JOURNAL_UNREADABLE") === true, damaged.envelope?.warnings);
   const plain = run(["status", ...server, "--plain"]);
+  const readySandbox = sandbox();
+  mkdirSync(join(readySandbox.home, ".cotal", "nats"));
+  const readyLock = acquireMaintenanceLock(readySandbox.home);
+  const readyResume = writeMaintenanceResumeDocument(readyLock, { version: 1, inventory: { agents: [] }, launch: { runtime: "pty" } });
+  beginMaintenanceCut(readyLock, { attemptId: "ready-status", space: "held", mode: "open", sourcePath: join(readySandbox.home, ".cotal", "nats"), resume: readyResume, launch: { server: "nats://127.0.0.1:4222" } });
+  const readyCommit = { operation: "commitPreservation" as const, attemptId: "ready-status", state: "preserved" as const };
+  recordPreservationManagerCommit(readyLock, readyCommit);
+  completeMaintenanceCut(readyLock, { attemptId: "ready-status", observedAt: new Date().toISOString(), managerCommit: readyCommit, stopped: { manager: true, broker: true, localProcesses: true }, listener: { endpoint: "nats://127.0.0.1:4222", unreachable: true } });
+  releaseMaintenanceLock(readyLock);
+  const ready = readySandbox.run(["status", ...server, "--json"]);
+  check("status gives a ready preserved cut the bare-up resume step", ready.envelope?.result?.maintenance?.state === "ready" && /bare `(?:pnpm )?cotal up`/.test(ready.envelope.result.maintenance.next ?? ""), shown(ready));
+
+  const unreadableSandbox = sandbox();
+  const journalPath = maintenancePaths(unreadableSandbox.home).journal;
+  mkdirSync(dirname(journalPath), { recursive: true });
+  writeFileSync(journalPath, "{not json");
+  const unreadableJournal = unreadableSandbox.run(["status", ...server, "--json"]);
+  const unreadableMaintenance = unreadableJournal.envelope?.result?.maintenance;
+  check("an unreadable maintenance journal is reported and fails closed for --no-manager", unreadableMaintenance?.state === "unreadable" && unreadableMaintenance.noManagerRefused === true && unreadableJournal.envelope?.warnings.some((warning) => warning.code === "MAINTENANCE_JOURNAL_UNREADABLE") === true, shown(unreadableJournal));
+
   check("the report shows it under Maintenance with the attempt", titles(plain.stdout).includes("Maintenance") && /Attempt: +cut-status/.test(plain.stdout), plain.stdout);
   // A held restore names the command that moves it on, with the full attempt id.
   const attempt = "restore-00000000-0000-4000-8000-000000000000";
@@ -455,15 +475,22 @@ if (process.platform !== "win32" && process.getuid?.() !== 0) {
   const env = { ...HOST_ENV, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: join(home, ".config"), COTAL_HOME: join(home, ".cotal-home"), COTAL_SKIP_CONNECTOR_SEED: "1" };
   // The shell enters the folder before its mode drops, as it would for an operator already in it.
   const r = spawnSync("/bin/sh", ["-c", 'cd "$0" && chmod 000 . && exec "$@"', folder, process.execPath, BIN, "status", "--json"], { env, encoding: "utf8", timeout: 120_000 });
+  let stillReadable = true;
+  try { accessSync(folder, constants.R_OK | constants.X_OK); }
+  catch { stillReadable = false; }
   chmodSync(folder, 0o700);
-  const envelope = (r.stdout ?? "").startsWith("{") ? (JSON.parse(r.stdout) as Envelope) : undefined;
-  const shownR = { status: r.status, stdout: (r.stdout ?? "").slice(0, 900), stderr: (r.stderr ?? "").slice(0, 600) };
-  check("status in a folder this account cannot read is partial, exit 4, with a warning naming the folder",
-    r.status === 4 && envelope?.outcome === "partial" && envelope.warnings.some((w) => w.code === "FOLDER_UNREADABLE" && w.message === `this folder ${folder} cannot be read by this account (EACCES), so nothing in it was read`), shownR);
-  check("an unreadable folder fails closed for --no-manager", envelope?.result?.maintenance?.noManagerRefused === true, envelope?.result?.maintenance);
-  check("…and no other warning about a part of that folder, such as an auth.json it does not hold",
-    envelope?.warnings.every((w) => !/^(AUTH_UNREADABLE|PERSONAS_UNREADABLE|FRESH_BOOT_RECORD_UNAVAILABLE|ADDITIVE_ATTEMPT_UNAVAILABLE|MAINTENANCE_JOURNAL_UNREADABLE)$/.test(w.code)) === true && !(envelope?.result?.hints ?? []).some((h) => h.includes("auth.json")), envelope?.warnings);
-  check("…and its Next is the chmod that makes it readable", (envelope?.result?.hints ?? []).includes(`make it readable by you, for example with chmod u+rx ${folder}`), envelope?.result?.hints);
+  if (stillReadable) {
+    console.log("  · skipped: chmod 000 did not make the folder unreadable to this account");
+  } else {
+    const envelope = (r.stdout ?? "").startsWith("{") ? (JSON.parse(r.stdout) as Envelope) : undefined;
+    const shownR = { status: r.status, stdout: (r.stdout ?? "").slice(0, 900), stderr: (r.stderr ?? "").slice(0, 600) };
+    check("status in a folder this account cannot read is partial, exit 4, with a warning naming the folder",
+      r.status === 4 && envelope?.outcome === "partial" && envelope.warnings.some((w) => w.code === "FOLDER_UNREADABLE" && w.message === `this folder ${folder} cannot be read by this account (EACCES), so nothing in it was read`), shownR);
+    check("an unreadable folder fails closed for --no-manager", envelope?.result?.maintenance?.noManagerRefused === true, envelope?.result?.maintenance);
+    check("…and no other warning about a part of that folder, such as an auth.json it does not hold",
+      envelope?.warnings.every((w) => !/^(AUTH_UNREADABLE|PERSONAS_UNREADABLE|FRESH_BOOT_RECORD_UNAVAILABLE|ADDITIVE_ATTEMPT_UNAVAILABLE|MAINTENANCE_JOURNAL_UNREADABLE)$/.test(w.code)) === true && !(envelope?.result?.hints ?? []).some((h) => h.includes("auth.json")), envelope?.warnings);
+    check("…and its Next is the chmod that makes it readable", (envelope?.result?.hints ?? []).includes(`make it readable by you, for example with chmod u+rx ${folder}`), envelope?.result?.hints);
+  }
 }
 
 // ── usage ────────────────────────────────────────────────────────────────────────────────────────

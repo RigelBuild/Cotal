@@ -840,8 +840,9 @@ function claimedNextStep(root: string, claim: MaintenanceClaim): string {
 export function maintenanceNextStep(root: string, journal: NonNullable<ReturnType<typeof readMaintenanceJournal>>): { attemptId: string; next: string | null } {
   const attemptId = "restore" in journal ? journal.restore.attemptId : journal.state === "claimed" ? journal.claim.attemptId : journal.cut.attemptId;
   const next = "restore" in journal ? restoreNextStep(journal.state, attemptId, restoreLeftOut(journal))
-    : journal.state === "claimed" ? claimedNextStep(root, journal.claim)
-      : journal.state === "cut-intent" || journal.state === "cut-committed" ? `finish the interrupted cut with \`${displayCmd()} down --preserve-state\`` : null;
+    : journal.state === "ready" ? readyNextStep(root, journal.source)
+      : journal.state === "claimed" ? claimedNextStep(root, journal.claim)
+        : journal.state === "cut-intent" || journal.state === "cut-committed" ? `finish the interrupted cut with \`${displayCmd()} down --preserve-state\`` : null;
   return { attemptId, next };
 }
 
