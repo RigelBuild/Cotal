@@ -82,6 +82,7 @@ const M = mgr as unknown as {
   remoteAuthority: object | undefined;
   rosterReader?: Promise<{ read(): Promise<Presence[]> }>;
   managerRosterReader?: { read(): Promise<Presence[]> };
+  managerEndpointTransportConnected: boolean;
 };
 
 try {
@@ -182,11 +183,12 @@ try {
   const savedAuth = M.auth;
   const savedUserMode = M.userMode;
   const savedRemoteAuthority = M.remoteAuthority;
+  const savedTransport = M.managerEndpointTransportConnected;
   const staticReader = M.rosterReader;
   try {
     M.auth = undefined;
-    M.userMode = true;
-    M.remoteAuthority = { owner: DEV_OWNER, actors: { supervisor: "supervisor" } };
+    M.userMode = false;
+    M.remoteAuthority = undefined;
     const tokenRoster = await epCall(callerNc, space, { mode: "one" },
       { endpoint: MANAGER_ENDPOINT, command: "roster", contract: MANAGER_CONTRACTS.roster, caller, args: {} },
       { deadlineMs: 8000, currentEpoch: serviceEpochReader });
@@ -194,7 +196,24 @@ try {
     check("token-mode manager serves roster from its existing presence watch cache",
       tokenRoster.reply.ok && tokenRows.some((row) => row.card.id === rosterRow.card.id)
         && M.rosterReader === staticReader && M.managerRosterReader !== undefined, tokenRoster);
+    const cachedReader = M.managerRosterReader;
+    M.managerEndpointTransportConnected = false;
+    let cacheReadError = "";
+    try { await cachedReader?.read(); } catch (error) { cacheReadError = (error as Error).message; }
+    check("token-mode roster cache refuses a read while endpoint transport is down",
+      cacheReadError.includes("connection is unavailable"), cacheReadError);
+    M.managerEndpointTransportConnected = savedTransport;
+    M.userMode = true;
+    M.remoteAuthority = { owner: DEV_OWNER, actors: { supervisor: "supervisor" } };
+    const userModeRoster = await epCall(callerNc, space, { mode: "one" },
+      { endpoint: MANAGER_ENDPOINT, command: "roster", contract: MANAGER_CONTRACTS.roster, caller, args: {} },
+      { deadlineMs: 8000, currentEpoch: serviceEpochReader });
+    check("user-mode manager refuses roster because auth owns that surface",
+      !userModeRoster.reply.ok && userModeRoster.reply.error.code === "unavailable", userModeRoster.reply);
+    M.userMode = false;
+    M.remoteAuthority = undefined;
   } finally {
+    M.managerEndpointTransportConnected = savedTransport;
     M.auth = savedAuth;
     M.userMode = savedUserMode;
     M.remoteAuthority = savedRemoteAuthority;

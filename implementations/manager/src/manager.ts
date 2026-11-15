@@ -4751,26 +4751,35 @@ export class Manager {
     };
     return managerCommandDefs({
       roster: (ctx) => this.serveObservation(ctx, async () => {
-        if (this.userMode && !this.remoteAuthority) throw new EpEnvelopeError("unavailable", "user-mode roster is served by auth");
+        if (this.userMode) throw new EpEnvelopeError("unavailable", "user-mode roster is served by auth");
         if (!this.auth) {
-          this.managerRosterReader ??= {
-            read: async () => {
-              const endpoint = this.ep;
-              const connection = this.managerEndpointConnection;
-              if (!endpoint || !connection || connection.isClosed() || !this.managerEndpointTransportConnected)
-                throw new Error("manager roster endpoint connection is unavailable");
-              if (endpoint.presenceView().state !== "current")
-                throw new Error("manager roster presence view is not current");
-              const rows = endpoint.getRoster();
-              rows.sort((a, b) => a.card.id < b.card.id ? -1 : a.card.id > b.card.id ? 1 : 0);
-              if (this.managerEndpointConnection !== connection || connection.isClosed() || !this.managerEndpointTransportConnected || endpoint.presenceView().state !== "current")
-                throw new Error("manager roster endpoint changed during the read");
-              return rows;
-            },
-            dropOversized: () => {},
-            // The manager owns this endpoint connection.
-            close: async () => {},
-          };
+          this.managerRosterReader ??= (() => {
+            let oversizedDrops = 0;
+            const dropped = new Set<string>();
+            return {
+              read: async () => {
+                const endpoint = this.ep;
+                const connection = this.managerEndpointConnection;
+                if (!endpoint || !connection || connection.isClosed() || !this.managerEndpointTransportConnected)
+                  throw new Error("manager roster endpoint connection is unavailable");
+                if (endpoint.presenceView().state !== "current")
+                  throw new Error("manager roster presence view is not current");
+                const rows = endpoint.getRoster();
+                rows.sort((a, b) => a.card.id < b.card.id ? -1 : a.card.id > b.card.id ? 1 : 0);
+                if (this.managerEndpointConnection !== connection || connection.isClosed() || !this.managerEndpointTransportConnected || endpoint.presenceView().state !== "current")
+                  throw new Error("manager roster endpoint changed during the read");
+                return rows;
+              },
+              dropOversized: (id: string) => {
+                if (dropped.has(id)) return;
+                dropped.add(id);
+                oversizedDrops++;
+                console.error(`manager roster dropped oversized row ${id} (total ${oversizedDrops})`);
+              },
+              // The manager owns this endpoint connection.
+              close: async () => {},
+            };
+          })();
           const args = ctx.request.args;
           const limit = args?.limit, after = args?.after;
           return answerAuthRoster(this.managerRosterReader, ctx, { ...(typeof limit === "number" ? { limit } : {}), ...(typeof after === "string" ? { after } : {}) });
