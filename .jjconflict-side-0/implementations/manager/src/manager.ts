@@ -12871,6 +12871,13 @@ export class Manager {
 
   /** An unadopted live-phase row with credentials and no custody reference, on a runtime that cannot
    *  prove its seat gone, terminalizes only once its credentials have expired. */
+  private isAdoptedIdentity(row: StaticManagedSlotRow): boolean {
+    const record = this.identityStore?.getByUid(row.lifecycleUid);
+    return record !== undefined && record.name === row.alias && record.publicKey === row.actor && row.owner === DEV_OWNER &&
+      record.retiredAt === undefined && record.issuance?.state === "issued" && row.phase === "active" &&
+      record.issuance.credentialId !== undefined && row.credentialIds.includes(record.issuance.credentialId);
+  }
+
   private credentialGateApplies(row: StaticManagedSlotRow, adopted: boolean): boolean {
     if (adopted || (row.phase !== "active" && row.phase !== "provisioning")) return false;
     if (row.credentialIds.length === 0 || row.runtime !== undefined) return false;
@@ -12954,7 +12961,7 @@ export class Manager {
           const row = await this.readStaticReconcileSlot(item.alias);
           if (this.staticReconcileItems.get(key) !== item || item.disposition !== "deferred" || item.flight !== undefined) continue;
           const live = row === undefined ? undefined : this.agents.get(row.alias);
-          if (row === undefined || row.lifecycleUid !== item.lifecycleUid || row.actor !== item.actor || (row.phase !== "active" && row.phase !== "provisioning") || live?.lifecycleUid === row.lifecycleUid) {
+          if (row === undefined || row.lifecycleUid !== item.lifecycleUid || row.actor !== item.actor || (row.phase !== "active" && row.phase !== "provisioning") || live?.lifecycleUid === row.lifecycleUid || this.isAdoptedIdentity(row)) {
             this.staticReconcileItems.delete(key);
             console.error(`static reconcile deferred alias=${item.alias} uid=${item.lifecycleUid} left the deferred set: the durable slot is ${row === undefined ? "absent" : `${row.phase} at uid ${row.lifecycleUid}`}`);
             continue;
@@ -13079,7 +13086,7 @@ export class Manager {
       return;
     }
     const live = this.agents.get(row.alias);
-    const adopted = live !== undefined && live.lifecycleUid === row.lifecycleUid;
+    const adopted = live !== undefined && live.lifecycleUid === row.lifecycleUid || this.isAdoptedIdentity(row);
     if (planStaticSlotResume(row, adopted) !== "drive-terminal") {
       item.disposition = "refused";
       item.remedy = adopted ? "leave the adopted live lifecycle running" : "inspect the fresh durable slot state";
@@ -13270,7 +13277,7 @@ export class Manager {
         // at the SAME uid is never an orphan (empty at boot; exactly the adopted set at the
         // post-adoption sweep — the fix for the resume hole).
         const live = this.agents.get(row.alias);
-        const adopted = live !== undefined && live.lifecycleUid === row.lifecycleUid;
+        const adopted = live !== undefined && live.lifecycleUid === row.lifecycleUid || this.isAdoptedIdentity(row);
         if (adopted) {
           preservedAdopted++;
         }

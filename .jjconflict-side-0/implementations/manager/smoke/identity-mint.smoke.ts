@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect, type NatsConnection } from "@nats-io/transport-node";
@@ -9,6 +9,7 @@ import { createSpaceAuth, DEV_OWNER, invokeCommand, isReachable, mintCreds, mint
 import { authDir, saveSpaceAuth } from "@cotal-ai/workspace";
 import { SMOKE_BROKER_TOKEN, awaitBrokerReady, freePort, killAndAwaitExit, teardownOnSignal } from "@cotal-ai/smoke-kit";
 import { Manager } from "../src/manager.js";
+import { bootDeliveryDaemon, type DeliveryDaemon } from "./_boot-delivery.js";
 import { MANAGER_ENDPOINT } from "../src/manager-service-contract.js";
 
 const space = `mint-${randomUUID().slice(0, 8)}`;
@@ -22,23 +23,30 @@ const servers = `nats://127.0.0.1:${port}`;
 writeFileSync(join(dir, "server.conf"), serverConfig(auth, [auth], { transport: { kind: "plaintext" }, port, storeDir: join(dir, "js") }));
 const broker = spawn("nats-server", ["-c", join(dir, "server.conf")], { stdio: "ignore" });
 const releaseBroker = teardownOnSignal(broker, dir);
-const manager = new Manager({ space, servers, runtime: "pty", workspaceRoot, seatMintCap: 1 });
+let manager = new Manager({ space, servers, runtime: "pty", workspaceRoot, seatMintCap: 2 });
+const logs: string[] = [];
+const originalError = console.error;
+console.error = (...args: unknown[]) => { logs.push(args.map(String).join(" ")); originalError(...args); };
 let nc: NatsConnection | undefined;
+let delivery: DeliveryDaemon | undefined;
 try {
   await awaitBrokerReady(() => isReachable(servers), { servers, attempts: 50, delayMs: 100 });
   await setupSpaceStreams({ servers, space, creds: await mintCreds(auth, newIdentity(), "provisioner") });
+  delivery = await bootDeliveryDaemon({ space, servers, auth, reloadStoreIdentity: { kind: "injected", coordinate: "identity-mint-smoke" } });
   await manager.start();
   const minter = newIdentity();
   const caller = { owner: DEV_OWNER, actor: minter.id, uid: mintLifecycleUid() };
   const creds = await mintCreds(auth, minter, "agent", { principal: caller, lifecycleUid: caller.uid, endpointCapabilities: ["identity-reserve", "identity-mint"].map((command) => ({ endpoint: MANAGER_ENDPOINT, command })) });
   nc = await connect({ servers, ...standaloneConnectOpts({ creds, tls: false }), maxReconnectAttempts: 0 });
-  const service = await resolveService(nc, space, MANAGER_ENDPOINT, caller, { deadlineMs: 10_000 });
-  const opts = { currentEpoch: async () => 0 };
+  let service = await resolveService(nc, space, MANAGER_ENDPOINT, caller, { deadlineMs: 10_000 });
+  let epoch = 0;
+  const opts = { currentEpoch: async () => epoch };
   const reserved = await invokeCommand(nc, space, service, "identity-reserve", { name: "first" }, opts);
   assert.equal(reserved.reply.ok, true);
   const reservation = reserved.reply.data as { name: string; lifecycleUid: string };
   console.log("PASS reserve");
-  const input = { name: "first", lifecycleUid: reservation.lifecycleUid, publicKey: newIdentity().id };
+  const seat = newIdentity();
+  const input = { name: "first", lifecycleUid: reservation.lifecycleUid, publicKey: seat.id };
   const minted = await invokeCommand(nc, space, service, "identity-mint", input, opts);
   assert.equal(minted.reply.ok, true, JSON.stringify(minted.reply));
   const first = minted.reply.data as { jwt: string; acceptedToken: string };
@@ -48,14 +56,64 @@ try {
   assert.equal(replay.reply.ok, true, JSON.stringify(replay.reply));
   assert.deepEqual(replay.reply.data, minted.reply.data);
   console.log("PASS replay identical credential");
-  const refused = await invokeCommand(nc, space, service, "identity-reserve", { name: "second" }, opts);
+  const second = await invokeCommand(nc, space, service, "identity-reserve", { name: "second" }, opts);
+  assert.equal(second.reply.ok, true);
+  const secondReservation = second.reply.data as { lifecycleUid: string };
+  const refused = await invokeCommand(nc, space, service, "identity-reserve", { name: "third" }, opts);
   assert.equal(refused.reply.ok, false);
   assert.equal(refused.reply.error?.code, "resource-exhausted");
   assert.equal(refused.reply.error?.details?.[0]?.kind, "ai.cotal.ep.seat-mint-cap");
   console.log("PASS cap refusal");
+  await manager.stop({ withAgents: true });
+  manager = new Manager({ space, servers, runtime: "pty", workspaceRoot, seatMintCap: 2 });
+  await manager.start();
+  service = await resolveService(nc, space, MANAGER_ENDPOINT, caller, { deadlineMs: 10_000 });
+  epoch = 1;
+  const adoptedReservation = await invokeCommand(nc, space, service, "identity-reserve", { name: "second" }, opts);
+  assert.equal(adoptedReservation.reply.ok, true);
+  assert.ok(adoptedReservation.reply.data && typeof adoptedReservation.reply.data === "object" && "lifecycleUid" in adoptedReservation.reply.data);
+  assert.equal(adoptedReservation.reply.data.lifecycleUid, secondReservation.lifecycleUid);
+  console.log("PASS restart retains unbound reservation");
+  const afterRestart = await invokeCommand(nc, space, service, "identity-mint", input, opts);
+  assert.equal(afterRestart.reply.ok, true, JSON.stringify(afterRestart.reply));
+  assert.deepEqual(afterRestart.reply.data, minted.reply.data);
+  console.log("PASS restart adopts issued identity and replays credential");
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let decodeBits = 0, decodeValue = 0;
+  const decoded: number[] = [];
+  for (const char of seat.seed) {
+    const index = alphabet.indexOf(char);
+    assert.ok(index >= 0);
+    decodeValue = (decodeValue << 5) | index;
+    decodeBits += 5;
+    if (decodeBits >= 8) { decodeBits -= 8; decoded.push((decodeValue >>> decodeBits) & 255); }
+  }
+  assert.equal(decoded.length, 36);
+  const raw = Buffer.from(decoded.slice(2, 34));
+  let bits = 0, value = 0, base32 = "";
+  for (const byte of raw) { value = (value << 8) | byte; bits += 8; while (bits >= 5) { bits -= 5; base32 += alphabet[(value >>> bits) & 31]; } }
+  if (bits) base32 += alphabet[(value << (5 - bits)) & 31];
+  const needles = [raw, Buffer.from(base32), Buffer.from(seat.seed)];
+  const scan = (path: string): void => {
+    for (const entry of readdirSync(path, { withFileTypes: true })) {
+      const child = join(path, entry.name);
+      if (entry.isDirectory()) scan(child);
+      else if (entry.isFile()) {
+        const bytes = readFileSync(child);
+        for (const needle of needles) assert.equal(bytes.includes(needle), false, `seed found in ${child}`);
+      }
+    }
+  };
+  scan(join(workspaceRoot, ".cotal"));
+  const captured = Buffer.from(logs.join("\n"));
+  for (const needle of needles) assert.equal(captured.includes(needle), false, "seed found in manager log");
+  raw.fill(0);
+  console.log("PASS seed absent from store and manager logs");
 } finally {
   if (nc) await nc.close();
   await manager.stop({ withAgents: true });
+  await delivery?.stop();
+  console.error = originalError;
   await killAndAwaitExit(broker);
   rmSync(dir, { recursive: true, force: true });
   releaseBroker();
