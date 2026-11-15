@@ -3,11 +3,12 @@ import { LAUNCH_MATERIAL_ENV, readLaunchMaterial } from "@cotal-ai/core";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ProjectTrustStore, SessionManager } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import type { ExactDrainResult, InboxItem, InboxScope, MeshAgent } from "@cotal-ai/connector-core";
-import { formatInjection } from "@cotal-ai/connector-core";
+import type { ExactDrainResult, InboxItem, InboxScope, MeshAgent, PendingTurnsPeek } from "@cotal-ai/connector-core";
+import { formatInjection, renderPendingTurnText } from "@cotal-ai/connector-core";
 import { PiDriver, type CotalBatchDetails, type PiContextLike, type PiHost } from "./src/driver.js";
 import cotalMesh, { persistSessionId, supervisedProjectTrust } from "./src/extension.js";
 import { InboxTurn } from "./src/inbox-turn.js";
@@ -181,7 +182,7 @@ class FakeMesh {
 
   // The run-turn intake is two-phase on the real agent (peek is pure, commit arms). Nothing here
   // drives a turn, so the peek is empty and a commit would be a defect worth failing on.
-  peekPendingTurns(): { text: string; goalIds: string[]; once?: true; header?: string; footer?: string; blocks?: Record<string, string> } | undefined {
+  peekPendingTurns(): PendingTurnsPeek | undefined {
     return undefined;
   }
 
@@ -1024,15 +1025,14 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const firstBlock = "— turn g1:\nfirst goal";
   const secondBlock = "— turn g2:\nsecond goal";
   const firstSuffix = `${turnHeader}its turn:\n${firstBlock}${turnFooter}`;
-  const turnPrefix = `${turnHeader}its turn:\n`;
   const turnA = {
     role: "custom", customType: "cotal-inbox", content: firstSuffix,
-    details: { version: 1, batchId: "t1", ids: [], turnIds: ["g1"], suffix: firstSuffix, turnPrefix, turnFooter, turnBlocks: { g1: firstBlock } },
+    details: { version: 1, batchId: "t1", ids: [], turnIds: ["g1"], suffix: firstSuffix, turnHeader, turnFooter, turnBlocks: { g1: firstBlock } },
   };
   const secondSuffix = `${turnHeader}2 turns:\n${firstBlock}\n${secondBlock}${turnFooter}`;
   const twoTurns = {
     role: "custom", customType: "cotal-inbox", content: secondSuffix,
-    details: { version: 1, batchId: "t3", ids: [], turnIds: ["g1", "g2"], suffix: secondSuffix, turnPrefix: `${turnHeader}2 turns:\n`, turnFooter, turnBlocks: { g1: firstBlock, g2: secondBlock } },
+    details: { version: 1, batchId: "t3", ids: [], turnIds: ["g1", "g2"], suffix: secondSuffix, turnHeader, turnFooter, turnBlocks: { g1: firstBlock, g2: secondBlock } },
   };
   const newTurn = driver.onContext([turnA, twoTurns]);
   const expectedTurnSuffix = `${turnHeader}its turn:\n${secondBlock}${turnFooter}`;
@@ -1044,19 +1044,54 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
   const legacyResult = driver.onContext([old, legacy]);
   ok(legacyResult?.[1] === legacy,
     "a legacy partly repeated copy without item metadata keeps its original model content");
+  const legacyTurn = { role: "custom", customType: "cotal-inbox", content: secondSuffix, details: { version: 1, batchId: "legacy-turn", ids: [], turnIds: ["g1", "g2"], suffix: secondSuffix } };
+  ok(driver.onContext([turnA, legacyTurn])?.[1] === legacyTurn, "legacy turn text without blocks is retained whole");
+}
+
+{
+  const mesh = new FakeMesh();
+  const host = new FakeHost();
+  const ctx = context();
+  const header = "Run: ";
+  const footer = " end";
+  const blocks = { g1: "first goal", g2: "second goal" };
+  mesh.peekPendingTurns = () => ({ text: renderPendingTurnText(header, [blocks.g1], footer), goalIds: ["g1"], header, footer, blocks });
+  const driver = new PiDriver(mesh as unknown as MeshAgent, 200, 50);
+  driver.bind(host);
+  driver.onSessionStart(ctx);
+  driver.onAgentStart(ctx);
+  driver.onAgentEnd([{ role: "assistant", stopReason: "stop" }], ctx);
+  mesh.peekPendingTurns = () => ({ text: renderPendingTurnText(header, [blocks.g1, blocks.g2], footer), goalIds: ["g1", "g2"], header, footer, blocks });
+  ctx.idle = true;
+  ctx.pending = false;
+  await delay(300);
+  const first = host.sent[0];
+  const second = host.sent[1];
+  assert.ok(first && second, "the lost turn is re-dispatched with the new goal");
+  const firstMessage = { role: "custom", customType: "cotal-inbox", ...first };
+  const secondMessage = { role: "custom", customType: "cotal-inbox", ...second };
+  const rebuilt = driver.onContext([firstMessage, secondMessage]);
+  ok(rebuilt?.[0] === firstMessage && rebuilt[1]?.content === renderPendingTurnText(header, [blocks.g2], footer),
+    "dispatched turn metadata rebuilds only the new goal text");
+  await driver.quit();
 }
 // The real extension callback must return Pi's context result wrapper, not the driver's bare array.
 {
-  const keys = ["COTAL_NAME", "COTAL_SPACE", "COTAL_SERVERS", "COTAL_SUBSCRIBE", "COTAL_ALLOW_PUBLISH", "COTAL_CONTROL_SOCKET", "COTAL_CONTROL_TOKEN"] as const;
+  const keys = ["COTAL_NAME", "COTAL_AGENT_FILE", "COTAL_LINK", "COTAL_HOME", "COTAL_DEFAULT_AGENT",
+    "COTAL_CONTROL_SOCKET", "COTAL_CONTROL_TOKEN", "COTAL_LAUNCH_MATERIAL", "COTAL_ACCEPTED_TOKEN", "COTAL_CREDS",
+    "COTAL_SPACE", "COTAL_SERVERS", "COTAL_SUBSCRIBE", "COTAL_ALLOW_PUBLISH", "COTAL_EVENTS", "COTAL_TOKEN",
+    "COTAL_ID", "COTAL_LIFECYCLE_UID", "PI_SESSION_ID", "COTAL_PI_SESSION_STATE", "COTAL_PI_EXPECTED_SESSION",
+    "COTAL_PI_FRESH_SESSION", "COTAL_PI_SUPERVISED_CWD", "COTAL_PI_PERSONA_FILE"] as const;
   const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  const runtimeKey = Symbol.for("cotal.pi.runtimes");
+  const onceKey = Symbol.for("cotal.once-handoff");
+  const globals = globalThis as typeof globalThis & { [runtimeKey]?: Map<string, { mesh: MeshAgent }>; [onceKey]?: { exit?: unknown } };
+  const oldExit = globals[onceKey]?.exit;
+  for (const key of keys) delete process.env[key];
   process.env.COTAL_NAME = "pi-context-smoke";
   process.env.COTAL_SPACE = "pi-context-smoke";
-  delete process.env.COTAL_SERVERS;
-  delete process.env.COTAL_SUBSCRIBE;
-  delete process.env.COTAL_ALLOW_PUBLISH;
-  delete process.env.COTAL_CONTROL_SOCKET;
-  delete process.env.COTAL_CONTROL_TOKEN;
+  process.env.COTAL_SERVERS = "nats://127.0.0.1:1";
   const api = {
     sendMessage(): void {},
     registerMessageRenderer(): void {},
@@ -1075,8 +1110,11 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
     assert.equal(onContext({ messages: [unique] }), undefined);
     checks++;
   } finally {
-    const shutdown = handlers.get("session_shutdown");
-    if (shutdown) await shutdown({ reason: "quit" }, { sessionManager: { getSessionId: () => "context-smoke", getSessionFile: () => "" } });
+    const runtimes = globals[runtimeKey];
+    const key = "pi-context-smoke\0pi-context-smoke";
+    await runtimes?.get(key)?.mesh.stop();
+    runtimes?.delete(key);
+    if (globals[onceKey]) globals[onceKey].exit = oldExit;
     for (const key of keys) {
       const value = saved[key];
       if (value === undefined) delete process.env[key];

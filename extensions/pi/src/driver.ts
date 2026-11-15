@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { InboxItem, MeshAgent } from "@cotal-ai/connector-core";
-import { formatInjection } from "@cotal-ai/connector-core";
+import { formatInjection, renderPendingTurnText } from "@cotal-ai/connector-core";
 import { InboxTurn } from "./inbox-turn.js";
 
 const CUSTOM_TYPE = "cotal-inbox";
@@ -33,7 +33,7 @@ export interface CotalBatchDetails {
   /** Goal ids of run turns in this batch; repeated goal text can be removed when rebuilding copies. */
   turnIds?: string[];
   suffix?: string;
-  turnPrefix?: string;
+  turnHeader?: string;
   turnFooter?: string;
   turnBlocks?: Record<string, string>;
 }
@@ -71,7 +71,7 @@ interface Batch {
   /** Inbox items and run-turn blocks carried for the Pi renderer; re-sent unchanged on continuation. */
   items?: InboxItem[];
   suffix?: string;
-  turnPrefix?: string;
+  turnHeader?: string;
   turnFooter?: string;
   turnBlocks?: Record<string, string>;
 }
@@ -378,6 +378,7 @@ export class PiDriver {
     this.inbox.discardMatching((item) => ownChannelEcho(this.mesh, item));
     const reserved = new Set(this.batches.flatMap((batch) => batch.ids));
     const available = this.inbox.peek("automatic").filter((item) => !reserved.has(item.recvKey));
+    // A pending run turn is directed-strength: it justifies a pump on its own, like a wakeable item.
     const turnPeek = this.mesh.peekPendingTurns();
     if (!force && this.nudges.length === 0 && !turnPeek && !available.some((item) => wakeable(this.mesh, item))) {
       if (this.batches.length === 0) this.publishIdleWhenSettled(this.context);
@@ -410,7 +411,7 @@ export class PiDriver {
         turnIds: turns.goalIds,
         suffix: turns.text,
         ...(turns.blocks ? {
-          turnPrefix: turns.once ? "" : (turns.header ?? "") + (turns.goalIds.length === 1 ? "its turn" : `${turns.goalIds.length} turns`) + ":\n",
+          turnHeader: turns.header ?? "",
           turnFooter: turns.footer ?? "",
           turnBlocks: turns.blocks,
         } : {}),
@@ -438,7 +439,7 @@ export class PiDriver {
             items: batch.items ?? [],
             ...(batch.turnIds ? { turnIds: [...batch.turnIds] } : {}),
             ...(batch.suffix !== undefined ? { suffix: batch.suffix } : {}),
-            ...(batch.turnPrefix !== undefined ? { turnPrefix: batch.turnPrefix } : {}),
+            ...(batch.turnHeader !== undefined ? { turnHeader: batch.turnHeader } : {}),
             ...(batch.turnFooter !== undefined ? { turnFooter: batch.turnFooter } : {}),
             ...(batch.turnBlocks !== undefined ? { turnBlocks: batch.turnBlocks } : {}),
           },
@@ -527,9 +528,8 @@ export class PiDriver {
         assistantSinceLastCopy = false;
         continue;
       }
-      const prefix = details.turnPrefix?.replace(/\d+ turns|its turn/, newTurnIds.length === 1 ? "its turn" : `${newTurnIds.length} turns`) ?? "";
       const suffix = newTurnIds.length > 0 && turnBlocks
-        ? `${prefix}${newTurnIds.map((id) => turnBlocks[id]).join("\n")}${details.turnFooter ?? ""}`
+        ? renderPendingTurnText(details.turnHeader ?? "", newTurnIds.map((id) => turnBlocks[id] ?? ""), details.turnFooter ?? "")
         : undefined;
       const body = [items.length > 0 ? formatInjection(items) : undefined, suffix]
         .filter((part): part is string => part !== undefined)
@@ -541,7 +541,7 @@ export class PiDriver {
         items,
         ...(newTurnIds.length > 0 ? { turnIds: newTurnIds } : {}),
         ...(suffix !== undefined ? { suffix } : {}),
-        ...(details.turnPrefix !== undefined ? { turnPrefix: prefix } : {}),
+        ...(details.turnHeader !== undefined ? { turnHeader: details.turnHeader } : {}),
         ...(details.turnFooter !== undefined ? { turnFooter: details.turnFooter } : {}),
         ...(turnBlocks ? { turnBlocks: Object.fromEntries(newTurnIds.flatMap((id) => {
           const block = turnBlocks[id];

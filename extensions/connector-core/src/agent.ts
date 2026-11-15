@@ -136,6 +136,20 @@ export interface NativeTurnParticipationLease {
   expiresAt: number;
 }
 
+export interface PendingTurnsPeek {
+  text: string;
+  goalIds: string[];
+  once?: true;
+  header?: string;
+  footer?: string;
+  blocks?: Record<string, string>;
+}
+
+/** Render run-turn blocks with their shared framing. Once tasks have no framing. */
+export function renderPendingTurnText(header: string, blocks: readonly string[], footer: string): string {
+  return header ? `${header}${blocks.length === 1 ? "its turn" : `${blocks.length} turns`}:\n${blocks.join("\n")}${footer}` : `${blocks.join("\n")}${footer}`;
+}
+
 /** A message that has arrived for us, normalized for the agent to read. */
 export interface InboxItem {
   id: string;
@@ -2845,15 +2859,14 @@ export class MeshAgent extends EventEmitter {
   }
 
   /** Format every not-yet-surfaced turn still inside its deadline as an injectable context block,
-   *  without mutating the surface state. */
-  peekPendingTurns(): {
-    text: string;
-    goalIds: string[];
-    once?: true;
-    header?: string;
-    footer?: string;
-    blocks?: Record<string, string>;
-  } | undefined {
+   *  WITHOUT marking anything (undefined when none wait). Two-phase on purpose, like the inbox's
+   *  format-then-verdict rail: marking at format time would let a lost frame auto-yield `done` for
+   *  work the model never saw. A caller commits with {@link commitSurfacedTurns} only once the
+   *  injection verifiably reached the host. The payload is opaque relay bytes; when it parses as
+   *  JSON with a string `context`, that rendered context is what the model reads, else the raw
+   *  payload is shown.
+   *  Header, footer and goal blocks allow a caller to rebuild a subset of the rendered turns. */
+  peekPendingTurns(): PendingTurnsPeek | undefined {
     if (this.config.turnRelay === false && !this.nativeTurnLeaseValid()) return undefined;
     // A turn past its deadline is already settled at the manager, which refuses its yield, though
     // this cache holds it until the next pull settles it here.
@@ -2882,8 +2895,7 @@ export class MeshAgent extends EventEmitter {
     const footer =
       `\n(Do the work now with your own tools. An ask must be answered through its native route above before ending your host turn. ` +
       `For ordinary turns, ending your turn yields "done" automatically; call cotal_yield when blocked or handing off an ordinary turn.)`;
-    const text = `${header}${waiting.length === 1 ? "its turn" : `${waiting.length} turns`}:\n` +
-      `${entries.map(([, block]) => block).join("\n")}${footer}`;
+    const text = renderPendingTurnText(header, entries.map(([, block]) => block), footer);
     return { text, goalIds: waiting.map((t) => t.goalId), header, footer, blocks: Object.fromEntries(entries) };
   }
 
